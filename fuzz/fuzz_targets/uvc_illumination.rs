@@ -97,7 +97,8 @@ fuzz_target!(|data: &[u8]| {
     identity.descriptors[18 + 44 + 9 + 9 + 4] ^= 1;
     assert_ne!(first, identity.descriptor_fingerprint());
     let chunk = usize::from(data[0]) % 243 + 1;
-    let flags = 0x80 | (data[0] & 0x0c);
+    // Select FID independently of the illumination bit used below.
+    let flags = 0x80 | (data[0] & 0x0c) | ((data[0] >> 4) & 1);
     // Malformed as well as valid item streams must be partition-independent.
     // Limit transport expansion when the fuzzer chooses one-byte fragments.
     let items = &data[..data.len().min(4096)];
@@ -126,6 +127,25 @@ fuzz_target!(|data: &[u8]| {
         parse_illumination(&frame_bytes(&valid, chunk, flags)),
         expected
     );
+
+    // A complete record does not authorize crossing a retained frame boundary.
+    let mut framed = frame_bytes(&valid, chunk, flags);
+    let mut at = 0;
+    let mut last = 0;
+    while at < framed.len() {
+        last = at;
+        at += 10 + usize::from(framed[at + 10]);
+    }
+    framed[last + 11] |= 2; // EOF is accepted on the last retained header.
+    assert_eq!(parse_illumination(&framed), expected);
+    let mut empty = vec![0; 10];
+    empty.extend_from_slice(&[2, 0x80 | (flags & 1)]);
+    framed.extend_from_slice(&empty);
+    assert_eq!(parse_illumination(&framed), None, "no header after observed EOF");
+    let mut crossed = frame_bytes(&valid, chunk, flags);
+    empty[11] ^= 1;
+    crossed.extend_from_slice(&empty);
+    assert_eq!(parse_illumination(&crossed), None, "no cross-FID assembly");
 
     // Derive a small selection problem from the bytes so the invariant runs
     // on fuzzer-shaped inputs rather than only the unit fixtures.

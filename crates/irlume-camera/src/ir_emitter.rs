@@ -2360,14 +2360,21 @@ impl EmitterBackend for SentinelBackend {
 ///
 /// `Drop` does the restoring, because the paths that need it most are the ones
 /// no statement covers: an error taken by `?`, a panic in the decoder, a
-/// cancelled request.
-#[must_use = "dropping this immediately puts the control back and leaves the stream unlit"]
+/// cancelled request. When bound internally to an image producer, restoration
+/// waits for acknowledged shutdown. An unconfirmed stop retains the complete
+/// backend for the process lifetime and withholds restoration.
+#[must_use = "hold this guard for the stream lifetime to preserve emitter ownership"]
 pub struct StreamMode {
     backend: Box<dyn EmitterBackend + Send>,
     timing: crate::capture_timing::Recorder,
+    producer: Option<crate::capture_shutdown::Producer>,
 }
 
 impl StreamMode {
+    pub(crate) fn with_producer(mut self, producer: crate::capture_shutdown::Producer) -> Self {
+        self.producer = Some(producer);
+        self
+    }
     pub(crate) fn with_timing(mut self, timing: crate::capture_timing::Recorder) -> Self {
         self.timing = timing;
         self
@@ -2377,6 +2384,7 @@ impl StreamMode {
         StreamMode {
             backend,
             timing: crate::capture_timing::Recorder::default(),
+            producer: None,
         }
     }
 
@@ -2423,6 +2431,11 @@ impl StreamMode {
     /// Put the control back now, rather than waiting for the drop.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn restore(&mut self) -> std::result::Result<(), RestoreError> {
+        if self.producer.as_ref().is_some_and(|p| !p.is_quiescent()) {
+            return Err(RestoreError::Bookkeeping(
+                "emitter restoration withheld: capture producer is not quiescent".into(),
+            ));
+        }
         let _timing = self
             .timing
             .stage(crate::capture_timing::Stage::EmitterRestore);
@@ -2436,6 +2449,19 @@ impl StreamMode {
 
 impl Drop for StreamMode {
     fn drop(&mut self) {
+        if let Some(producer) = self.producer.take() {
+            if !producer.is_quiescent() {
+                let owner = Self {
+                    backend: std::mem::replace(&mut self.backend, Box::new(InertBackend)),
+                    timing: std::mem::take(&mut self.timing),
+                    producer: None,
+                };
+                // Retain the entire backend: fd, original/applied values,
+                // persistent restore record and live exclusion lock.
+                producer.after_stop(owner);
+                return;
+            }
+        }
         let _timing = self
             .timing
             .stage(crate::capture_timing::Stage::EmitterRestore);
@@ -2446,6 +2472,25 @@ impl Drop for StreamMode {
                 "irlume: could not put the IR emitter back to the value irlume displaced: {e}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn restore_cannot_write_until_the_bound_producer_is_quiescent() {
+        let producer = crate::capture_shutdown::Producer::for_test();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        producer.begin().unwrap();
+        let mut mode = StreamMode::test_sentinel(events.clone()).with_producer(producer.clone());
+        assert!(mode.restore().is_err());
+        assert!(events.lock().unwrap().is_empty());
+        drop(mode);
+        assert!(events.lock().unwrap().is_empty());
+        producer.stopped();
+        assert_eq!(*events.lock().unwrap(), ["emitter-restore"]);
     }
 }
 

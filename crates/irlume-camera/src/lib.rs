@@ -32,6 +32,7 @@
 
 mod backend;
 mod capture_control;
+mod capture_shutdown;
 mod capture_timing;
 pub use capture_control::CaptureControl;
 use capture_timing::Stage;
@@ -72,6 +73,7 @@ pub fn initialize_camera_monitor() {
 }
 pub mod measurement;
 mod media_graph;
+mod mmap_capture;
 mod paired_processing;
 pub mod profiles;
 pub use paired_processing::process_pair_while_draining;
@@ -555,10 +557,18 @@ fn blc_restore_decision(
 struct BlcRestore<'a> {
     cam: &'a RgbCamera,
     displaced: i64,
+    producer: Option<capture_shutdown::Producer>,
 }
 
 impl Drop for BlcRestore<'_> {
     fn drop(&mut self) {
+        if self.producer.as_ref().is_some_and(|p| !p.is_quiescent()) {
+            irlume_common::jout_err!(
+                "irlume: withholding backlight restore to {}: capture producer is not quiescent",
+                self.displaced
+            );
+            return;
+        }
         // Read back before restoring: only a control still reading as
         // irlume's value carries a change of irlume's to undo. Best-effort
         // like the write; a failed restore costs the next application a
@@ -608,7 +618,11 @@ fn apply_blc(cam: &RgbCamera) -> Option<BlcRestore<'_>> {
         .ok()?;
     let confirm = cam.dev.control(V4L2_CID_BACKLIGHT_COMPENSATION);
     if blc_restore_decision(displaced, confirm).is_some() {
-        Some(BlcRestore { cam, displaced })
+        Some(BlcRestore {
+            cam,
+            displaced,
+            producer: None,
+        })
     } else {
         cam.lease.require_endpoint(&cam.device).ok()?;
         let _ = cam.dev.set_control(v4l::control::Control {
@@ -630,12 +644,9 @@ const MMAP_BUFFERS: u32 = 4;
 /// reference may survive another dequeue.
 trait CaptureDequeue {
     fn dequeue(&mut self) -> std::io::Result<(&[u8], v4l::buffer::Metadata)>;
-}
-
-impl CaptureDequeue for v4l::io::mmap::Stream<'_> {
-    fn dequeue(&mut self) -> std::io::Result<(&[u8], v4l::buffer::Metadata)> {
-        let (mapped, metadata) = v4l::io::traits::CaptureStream::next(self)?;
-        Ok((mapped, *metadata))
+    // In-memory fixtures have no kernel producer. Native claims override this.
+    fn quiesce(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -830,7 +841,7 @@ impl V4l2CameraState {
 
 impl CameraState for V4l2CameraState {
     type Device = Device;
-    type Claim<'a> = v4l::io::mmap::Stream<'a>;
+    type Claim<'a> = mmap_capture::MmapCapture;
     type EndpointError = lease::CameraLeaseError;
 
     fn set_format(&self, dev: &Device, requested: &Format) -> std::io::Result<Format> {
@@ -912,10 +923,7 @@ impl CameraState for V4l2CameraState {
     }
 
     fn claim_buffers<'a>(&self, dev: &'a Device) -> std::io::Result<Self::Claim<'a>> {
-        let mut stream =
-            v4l::io::mmap::Stream::with_buffers(dev, Type::VideoCapture, MMAP_BUFFERS)?;
-        stream.set_timeout(STREAM_DEQUEUE_TIMEOUT);
-        Ok(stream)
+        mmap_capture::MmapCapture::with_buffers(dev, MMAP_BUFFERS, STREAM_DEQUEUE_TIMEOUT)
     }
 
     fn accepted_interval(&self) -> Option<frame_interval::FrameInterval> {
@@ -1434,6 +1442,13 @@ fn format_moved(expect: &v4l::Format, now: &v4l::Format) -> Option<String> {
 }
 
 impl<'a, S: CameraState> CameraStateStream<'a, S> {
+    fn quiesce(&mut self) -> std::io::Result<()> {
+        let _timing = self.timing.stage(Stage::ImageStop);
+        match self.inner.as_mut() {
+            Some(inner) => inner.quiesce(),
+            None => Ok(()),
+        }
+    }
     /// Open a stream on `dev` with the standard buffer ring, and verify the
     /// device still holds the format the caller negotiated.
     ///
@@ -1483,8 +1498,7 @@ impl<'a, S: CameraState> CameraStateStream<'a, S> {
         .map_err(|error| Error::Hardware(format!("{device}: {error}")))?;
         let inner = state.claim_buffers(dev).map_err(|e| map_io(device, e))?;
         // Constructed before the read-back so every error path below releases
-        // the queue through the guarded Drop (STREAMOFF + REQBUFS(0)), never
-        // through the v4l crate's panicking one.
+        // the queue through the guarded Drop (STREAMOFF + REQBUFS(0)).
         let mut stream = Self {
             inner: Some(inner),
             state,
@@ -1588,9 +1602,16 @@ trait ValidatedStream {
     fn next_validated(
         &mut self,
     ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError>;
+    // Pure frame fixtures have no kernel producer; native streams override it.
+    fn quiesce(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<S: CameraState> ValidatedStream for CameraStateStream<'_, S> {
+    fn quiesce(&mut self) -> std::io::Result<()> {
+        CameraStateStream::quiesce(self)
+    }
     fn next_validated(
         &mut self,
     ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError> {
@@ -1747,13 +1768,26 @@ impl<S> TrackedStream<S> {
         self.stream.take()
     }
 
-    fn install_recovered(&mut self, stream: S) -> std::io::Result<()> {
+    fn quiesce(&mut self) -> std::io::Result<()>
+    where
+        S: ValidatedStream,
+    {
+        match self.stream.as_mut() {
+            Some(stream) => stream.quiesce(),
+            None => Ok(()),
+        }
+    }
+
+    fn install_recovered(&mut self, stream: &mut Option<S>) -> std::io::Result<()> {
         if self.stream.is_some() {
             return Err(std::io::Error::other(
                 "replacement capture installed before the old stream was removed",
             ));
         }
-        self.stream = Some(stream);
+        if stream.is_none() {
+            return Err(std::io::Error::other("replacement capture is absent"));
+        }
+        self.stream = stream.take();
         self.recovery_epoch_pending = true;
         if let Some(key) = &self.amort_key {
             rate_amortization::invalidate(key);
@@ -1773,6 +1807,12 @@ impl<S> TrackedStream<S> {
 }
 
 impl TrackedStream<SafeStream<'_>> {
+    fn producer(&self) -> capture_shutdown::Producer {
+        self.stream
+            .as_ref()
+            .expect("new native stream exists")
+            .producer()
+    }
     #[cfg(test)]
     fn refuse_privacy_after(&self, boundaries: usize) {
         self.stream
@@ -1807,6 +1847,55 @@ impl TrackedStream<SafeStream<'_>> {
         self.stream
             .as_mut()
             .is_some_and(CameraStateStream::take_privacy_refusal)
+    }
+}
+
+impl CameraStateStream<'_, V4l2CameraState> {
+    fn producer(&self) -> capture_shutdown::Producer {
+        self.inner
+            .as_ref()
+            .expect("new native buffer claim exists")
+            .producer()
+    }
+}
+
+/// Keep image queue ownership until its metadata has been safely retired.
+fn close_ir_stream<S: ValidatedStream>(
+    stream: &mut TrackedStream<S>,
+    metadata: &mut Option<ir_metadata::IlluminationLog>,
+) -> std::io::Result<()> {
+    let stopped = stream.quiesce();
+    drop(metadata.take()); // Bound guard retains it if stop was unconfirmed.
+    drop(stream.take());
+    stopped
+}
+
+/// Stack owner for the public streaming/sequence paths, including early return.
+struct IrCaptureResources<S: ValidatedStream> {
+    stream: TrackedStream<S>,
+    meta: Option<ir_metadata::IlluminationLog>,
+    _mode: ir_emitter::StreamMode,
+}
+
+impl<S: ValidatedStream> Drop for IrCaptureResources<S> {
+    fn drop(&mut self) {
+        if let Err(error) = close_ir_stream(&mut self.stream, &mut self.meta) {
+            irlume_common::dlog!("IR producer shutdown unconfirmed: {error}");
+        }
+    }
+}
+
+struct RawMetadataResources<'a> {
+    stream: SafeStream<'a>,
+    meta: Option<ir_metadata::IlluminationLog>,
+}
+
+impl Drop for RawMetadataResources<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.stream.quiesce() {
+            irlume_common::dlog!("IR measurement shutdown unconfirmed: {error}");
+        }
+        drop(self.meta.take());
     }
 }
 
@@ -2699,20 +2788,34 @@ fn install_recovered_resources<S, M, G, E>(
     replacement: S,
     metadata: M,
     emitter_guard: G,
-    install: impl FnOnce(S) -> Result<(), E>,
+    install: impl FnOnce(&mut Option<S>) -> Result<(), E>,
+    quiesce: impl FnOnce(&mut S),
 ) -> Result<(M, G), E> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| install(replacement))) {
-        Ok(Ok(())) => Ok((metadata, emitter_guard)),
-        Ok(Err(error)) => {
-            // The replacement is dropped before `install` returns. Stop any
-            // separately-owned metadata queue before restoring the emitter.
+    let mut replacement = Some(replacement);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| install(&mut replacement))) {
+        Ok(Ok(())) if replacement.is_none() => Ok((metadata, emitter_guard)),
+        Ok(Ok(())) => {
+            quiesce(replacement.as_mut().expect("replacement still owned"));
             drop(metadata);
+            drop(replacement);
+            drop(emitter_guard);
+            panic!("successful stream installation must take the replacement");
+        }
+        Ok(Err(error)) => {
+            if let Some(stream) = replacement.as_mut() {
+                quiesce(stream);
+            }
+            drop(metadata);
+            drop(replacement);
             drop(emitter_guard);
             Err(error)
         }
         Err(payload) => {
-            // Preserve panic semantics after enforcing the same teardown order.
+            if let Some(stream) = replacement.as_mut() {
+                quiesce(stream);
+            }
             drop(metadata);
+            drop(replacement);
             drop(emitter_guard);
             std::panic::resume_unwind(payload);
         }
@@ -2723,9 +2826,13 @@ fn teardown_ir_after_privacy_refusal<S, M, E>(
     stream: &mut Option<S>,
     metadata: &mut Option<M>,
     restore_emitter: impl FnOnce() -> Result<(), E>,
+    quiesce: impl FnOnce(&mut S),
 ) -> Result<(), E> {
-    drop(stream.take());
+    if let Some(stream) = stream.as_mut() {
+        quiesce(stream);
+    }
     drop(metadata.take());
+    drop(stream.take());
     restore_emitter()
 }
 
@@ -3734,6 +3841,7 @@ pub fn node_removable_class(device: &str) -> &'static str {
 /// work; `removable` is also frequently `unknown` even for legitimate devices).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
+    capture_shutdown::check_capture().map_err(|error| map_io(device, error))?;
     // Distinguish "no camera at all" from "a node that isn't physical"; the
     // anti-injection message only makes sense when something answered to the path.
     if !std::path::Path::new(device).exists() {
@@ -4396,7 +4504,7 @@ impl RgbCamera {
         // it. Guard rather than session-drop bookkeeping, because a stream
         // open that fails below must restore too, and the first version did
         // not (the Codex round's finding 1 on this PR).
-        let blc_restore = apply_blc(self);
+        let mut blc_restore = apply_blc(self);
         let stream = SafeStream::open(
             V4l2CameraState::with_interval(
                 &self.device,
@@ -4407,6 +4515,9 @@ impl RgbCamera {
             &self.dev,
             &self.negotiated,
         )?;
+        if let Some(restore) = blc_restore.as_mut() {
+            restore.producer = Some(stream.producer());
+        }
         self.lease
             .require_endpoint(&self.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
@@ -4713,14 +4824,19 @@ impl<'a> RgbSession<'a> {
             .lease
             .require_endpoint(&self.cam.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
-        self.stream.install_recovered(stream).map_err(|error| {
-            Error::Hardware(format!(
-                "{}: could not install the recovered stream: {error}",
-                self.cam.device
-            ))
-        })?;
+        self.stream
+            .install_recovered(&mut Some(stream))
+            .map_err(|error| {
+                Error::Hardware(format!(
+                    "{}: could not install the recovered stream: {error}",
+                    self.cam.device
+                ))
+            })?;
         // The fresh stream's auto-exposure starts unsettled, like any new
         // session's.
+        if let Some(restore) = self._blc_restore.as_mut() {
+            restore.producer = Some(self.stream.producer());
+        }
         self.warmed = false;
         Ok(())
     }
@@ -5924,17 +6040,21 @@ impl IrCamera {
             inner.timing = capture_timing::Recorder::from_control(control);
         }
         let alloc_ms = arm_alloc_started.elapsed().as_millis();
+        let producer = stream.producer();
         // The metadata queue has to be streaming before the image queue starts,
         // or uvcvideo produces no metadata at all (measured: zero bytes over
         // 25s when video went first). `SafeStream::open` only allocates
         // buffers; STREAMON happens on the first dequeue, inside ordinary
         // warm-up below or the paired joint fill. Metadata must start here.
         let meta_started = std::time::Instant::now();
-        let mut meta = {
+        let meta = {
             let _timing = control.stage(Stage::Metadata);
             ir_metadata::IlluminationLog::open_selected(&self.device, metadata)
                 .map_err(|reason| Error::Hardware(format!("{}: {reason}", self.device)))?
-                .map(|log| log.with_timing(capture_timing::Recorder::from_control(control)))
+                .map(|log| {
+                    log.with_timing(capture_timing::Recorder::from_control(control))
+                        .with_producer(producer.clone())
+                })
         };
         let metadata_ms = meta_started.elapsed().as_millis();
         // BEFORE any image dequeue, because the first dequeue is STREAMON.
@@ -5973,14 +6093,26 @@ impl IrCamera {
                 "before Face Authentication D1",
             )?
             .with_timing(capture_timing::Recorder::from_control(control))
+            .with_producer(producer)
         };
         let emitter_ms = emitter_started.elapsed().as_millis();
+        // Install the producer-first owner before any operation can STREAMON.
+        // Every warm-up/fill error now follows the same cleanup as success.
+        let mut session = IrSession {
+            cam: self,
+            stream,
+            dec: IrDecoder::new(self.pix, self.quantization),
+            lit: mode.lit(),
+            _mode: mode,
+            meta,
+            _session_slot: session_slot,
+        };
         // Survive the first-capture-after-resume race (uvcvideo still
         // re-initializing).
         let warmup_started = std::time::Instant::now();
         {
             let _timing = control.stage(Stage::Warmup);
-            startup.warm_up(&self.device, &mut stream, &control.progress)?;
+            startup.warm_up(&self.device, &mut session.stream, &control.progress)?;
         }
         let warmup_ms = warmup_started.elapsed().as_millis();
         // Rate establishment internally discards more frames than the metadata
@@ -5990,9 +6122,9 @@ impl IrCamera {
         let fill_result = {
             let _timing = control.stage(Stage::RateFill);
             fill_rate_then_drain_metadata(
-                || startup.fill(&mut stream),
+                || startup.fill(&mut session.stream),
                 || {
-                    if let Some(log) = meta.as_mut() {
+                    if let Some(log) = session.meta.as_mut() {
                         log.drain();
                     }
                 },
@@ -6005,15 +6137,7 @@ impl IrCamera {
             self.device
         );
         fill_result.map_err(|error| map_io(&self.device, error))?;
-        Ok(IrSession {
-            cam: self,
-            stream,
-            dec: IrDecoder::new(self.pix, self.quantization),
-            lit: mode.lit(),
-            _mode: mode,
-            meta,
-            _session_slot: session_slot,
-        })
+        Ok(session)
     }
 }
 
@@ -6029,19 +6153,28 @@ pub struct IrSession<'a> {
     /// The camera's own per-frame illumination reporting, when it has any.
     /// `None` means this camera cannot say, and brightness decides as before.
     meta: Option<ir_metadata::IlluminationLog>,
-    /// Restores the face-auth control when this session ends, on every path out
-    /// including an error or a panic. Declared LAST of the streaming fields, so
-    /// it drops last: struct fields drop in declaration order, and both `stream`
-    /// and `meta` have to stop before the control is put back. `meta` is a
-    /// running V4L2 stream of its own that issues STREAMOFF from its `Drop`, so
-    /// with it declared after this one the restore went out while a stream tied
-    /// to the same capture was still live.
+    /// Restores the face-auth control after acknowledged producer shutdown.
+    /// The session's explicit Drop stops image production while holding its
+    /// allocation, closes metadata, then releases the image ring. This field
+    /// drops afterward on normal, error and unwind paths. An unconfirmed stop
+    /// retains its complete backend for the process lifetime without restoring.
     ///
     /// Never read. It is held for its `Drop`, which is the whole point, and the
     /// dead-code lint cannot see that.
     _mode: ir_emitter::StreamMode,
-    /// Reset last, after image/metadata STREAMOFF and emitter restoration.
+    /// Reset last, after coupled cleanup or transfer into process retention.
     _session_slot: SessionSlot<'a>,
+}
+
+impl Drop for IrSession<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = close_ir_stream(&mut self.stream, &mut self.meta) {
+            irlume_common::dlog!(
+                "{}: IR producer shutdown unconfirmed: {error}",
+                self.cam.device
+            );
+        }
+    }
 }
 
 impl IrSession<'_> {
@@ -6086,10 +6219,14 @@ impl IrSession<'_> {
     }
 
     fn stop_after_privacy_refusal(&mut self, refusal: Error) -> Error {
-        let restore =
-            teardown_ir_after_privacy_refusal(&mut self.stream.stream, &mut self.meta, || {
-                self._mode.restore()
-            });
+        let restore = teardown_ir_after_privacy_refusal(
+            &mut self.stream.stream,
+            &mut self.meta,
+            || self._mode.restore(),
+            |stream| {
+                let _ = stream.quiesce();
+            },
+        );
         self._mode = ir_emitter::StreamMode::inert();
         self.lit = false;
         finish_privacy_teardown(refusal, restore)
@@ -6522,11 +6659,11 @@ impl IrSession<'_> {
             .lease
             .require_endpoint(&self.cam.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
-        drop(self.stream.take()); // STREAMOFF + buffer release before replacement
-        self.meta = None; // drop the metadata queue
-                          // A restore failure PROPAGATES before any replacement write:
-                          // the guard is spent after one attempt, and an unrecorded write whose
-                          // restore failed would otherwise become permanently unowned.
+        close_ir_stream(&mut self.stream, &mut self.meta)
+            .map_err(|error| map_io(&self.cam.device, error))?;
+        // A restore failure PROPAGATES before any replacement write:
+        // the guard is spent after one attempt, and an unrecorded write whose
+        // restore failed would otherwise become permanently unowned.
         self._mode.restore().map_err(|e| {
             Error::Hardware(format!(
                 "{}: could not restore the emitter before recovering the stream: {e}",
@@ -6544,7 +6681,9 @@ impl IrSession<'_> {
             &self.cam.dev,
             &self.cam.negotiated,
         )?;
-        let meta = ir_metadata::IlluminationLog::open(&self.cam.device);
+        let producer = stream.producer();
+        let meta = ir_metadata::IlluminationLog::open(&self.cam.device)
+            .map(|log| log.with_producer(producer.clone()));
         self.cam
             .lease
             .require_endpoint(&self.cam.device)
@@ -6555,20 +6694,29 @@ impl IrSession<'_> {
             &self.cam.card,
             self.cam.lease.clone(),
             "before recovered Face Authentication D1",
-        )?;
+        )?
+        .with_producer(producer);
         let lit = mode.lit();
-        let (meta, mode) = install_recovered_resources(stream, meta, mode, |stream| {
-            self.cam
-                .lease
-                .require_endpoint(&self.cam.device)
-                .map_err(|error| Error::Hardware(error.to_string()))?;
-            self.stream.install_recovered(stream).map_err(|error| {
-                Error::Hardware(format!(
-                    "{}: could not install the recovered stream: {error}",
-                    self.cam.device
-                ))
-            })
-        })?;
+        let (meta, mode) = install_recovered_resources(
+            stream,
+            meta,
+            mode,
+            |stream| {
+                self.cam
+                    .lease
+                    .require_endpoint(&self.cam.device)
+                    .map_err(|error| Error::Hardware(error.to_string()))?;
+                self.stream.install_recovered(stream).map_err(|error| {
+                    Error::Hardware(format!(
+                        "{}: could not install the recovered stream: {error}",
+                        self.cam.device
+                    ))
+                })
+            },
+            |stream| {
+                let _ = stream.quiesce();
+            },
+        )?;
         self.meta = meta;
         self._mode = mode;
         self.dec = IrDecoder::new(self.cam.pix, self.cam.quantization);
@@ -6839,7 +6987,8 @@ pub mod ir_probe {
             &card,
             permit.clone(),
             "before Face Authentication D1",
-        )?;
+        )?
+        .with_producer(stream.producer());
         // Bound, never read: held for its `Drop`, which restores the control.
         let _ = &mode;
         let mut out = Vec::with_capacity(n);
@@ -6997,7 +7146,8 @@ pub mod startup_probe {
             &cam.card,
             cam.lease.clone(),
             "before Face Authentication D1",
-        )?;
+        )?
+        .with_producer(stream.producer());
         // Bound, never read: held for its `Drop`, which restores the control.
         let _ = &mode;
         let t0 = std::time::Instant::now();
@@ -7111,11 +7261,10 @@ pub fn capture_ir_streaming<B>(
         .map_err(|error| Error::Hardware(error.to_string()))?;
     let format = frame_provenance::ValidatedFormatIdentity::from_stable_format(&fmt);
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
-    // DECLARED before the stream, ASSIGNED after it opens. Locals drop in
-    // reverse declaration order, so `stream` drops first and stops the
-    // stream, and only then does this guard put the control back; declaring
-    // it after `stream` sent the restore out while the stream was still
-    // live, which is the mid-stream write this change exists to remove.
+    // Declare before image allocation for setup-error cleanup. Before the
+    // first dequeue, IrCaptureResources takes all three owners and explicitly
+    // stops image production, closes metadata, then releases the image ring.
+    // The bound emitter restores afterward, or is retained on unconfirmed stop.
     //
     // The assignment waits for the open because writing first would touch
     // the camera for a stream that may never exist: an open that fails on
@@ -7131,7 +7280,7 @@ pub fn capture_ir_streaming<B>(
         &dev,
         &fmt,
     )?;
-    let mut stream = TrackedStream::new(
+    let stream = TrackedStream::new(
         stream,
         rate_gate::StreamRateConfig::new(
             contracts::StreamRole::Ir,
@@ -7141,14 +7290,23 @@ pub fn capture_ir_streaming<B>(
     )
     .with_rate_amortization(device);
     // Metadata must STREAMON before the image queue's first dequeue.
-    let mut meta = ir_metadata::IlluminationLog::open(device);
+    let producer = stream.producer();
+    let meta =
+        ir_metadata::IlluminationLog::open(device).map(|log| log.with_producer(producer.clone()));
     _mode = enable_ir_emitter_privacy_bounded(
         device,
         &dev,
         &card,
         permit.clone(),
         "before Face Authentication D1",
-    )?;
+    )?
+    .with_producer(producer);
+    let mut resources = IrCaptureResources {
+        stream,
+        meta,
+        _mode,
+    };
+    let IrCaptureResources { stream, meta, .. } = &mut resources;
     if max_frames > 0 {
         fill_rate_then_drain_metadata(
             || stream.fill_rate_evidence(),
@@ -7254,11 +7412,10 @@ pub fn capture_ir_sequence(
         .map_err(|error| Error::Hardware(error.to_string()))?;
     let format = frame_provenance::ValidatedFormatIdentity::from_stable_format(&fmt);
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
-    // DECLARED before the stream, ASSIGNED after it opens. Locals drop in
-    // reverse declaration order, so `stream` drops first and stops the
-    // stream, and only then does this guard put the control back; declaring
-    // it after `stream` sent the restore out while the stream was still
-    // live, which is the mid-stream write this change exists to remove.
+    // Declare before image allocation for setup-error cleanup. Before the
+    // first dequeue, IrCaptureResources takes all three owners and explicitly
+    // stops image production, closes metadata, then releases the image ring.
+    // The bound emitter restores afterward, or is retained on unconfirmed stop.
     //
     // The assignment waits for the open because writing first would touch
     // the camera for a stream that may never exist: an open that fails on
@@ -7274,7 +7431,7 @@ pub fn capture_ir_sequence(
         &dev,
         &fmt,
     )?;
-    let mut stream = TrackedStream::new(
+    let stream = TrackedStream::new(
         stream,
         rate_gate::StreamRateConfig::new(
             contracts::StreamRole::Ir,
@@ -7284,14 +7441,23 @@ pub fn capture_ir_sequence(
     )
     .with_rate_amortization(device);
     // Metadata must STREAMON before the image queue's first dequeue.
-    let mut meta = ir_metadata::IlluminationLog::open(device);
+    let producer = stream.producer();
+    let meta =
+        ir_metadata::IlluminationLog::open(device).map(|log| log.with_producer(producer.clone()));
     _mode = enable_ir_emitter_privacy_bounded(
         device,
         &dev,
         &card,
         permit.clone(),
         "before Face Authentication D1",
-    )?;
+    )?
+    .with_producer(producer);
+    let mut resources = IrCaptureResources {
+        stream,
+        meta,
+        _mode,
+    };
+    let IrCaptureResources { stream, meta, .. } = &mut resources;
     if samples > 0 {
         fill_rate_then_drain_metadata(
             || stream.fill_rate_evidence(),
@@ -9867,7 +10033,7 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     let (fmt, pix, interval) = negotiate_ir_format_and_interval(device, &dev, &permit)?;
     let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream = SafeStream::open(
+    let stream = SafeStream::open(
         V4l2CameraState::with_ir_interval(device, permit.clone(), interval.accepted),
         device,
         &dev,
@@ -9876,7 +10042,10 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     let fd = dev.handle().fd();
     // Start the metadata queue before the image queue's first dequeue. uvcvideo
     // otherwise produces no metadata for this stream at all.
-    let mut meta = ir_metadata::IlluminationLog::open(device);
+    let producer = stream.producer();
+    let meta = ir_metadata::IlluminationLog::open(device).map(|log| log.with_producer(producer));
+    let mut resources = RawMetadataResources { stream, meta };
+    let RawMetadataResources { stream, meta } = &mut resources;
     for _ in 0..4 {
         let _ = stream.next(); // let the sensor settle before baseline
         if let Some(log) = meta.as_mut() {
@@ -10132,6 +10301,9 @@ where
             Err(e) => {
                 if capture_control::is_expired(&e) {
                     return Err(Error::DeadlineExpired);
+                }
+                if capture_shutdown::is_fault(&e) {
+                    return Err(map_io(device, e));
                 }
                 // The window COMPLETED: the driver call came back, the thread
                 // was never stuck, and the watchdog clock resets before the
@@ -11406,15 +11578,25 @@ mod tests {
         let mut image = Some(mark("image-stream"));
         let mut metadata = Some(mark("metadata-stream"));
 
-        teardown_ir_after_privacy_refusal(&mut image, &mut metadata, || {
-            drops.borrow_mut().push("emitter-restore");
-            Ok::<(), &str>(())
-        })
+        teardown_ir_after_privacy_refusal(
+            &mut image,
+            &mut metadata,
+            || {
+                drops.borrow_mut().push("emitter-restore");
+                Ok::<(), &str>(())
+            },
+            |_| drops.borrow_mut().push("image-stop"),
+        )
         .expect("restore succeeds");
 
         assert_eq!(
             drops.borrow().as_slice(),
-            ["image-stream", "metadata-stream", "emitter-restore"]
+            [
+                "image-stop",
+                "metadata-stream",
+                "image-stream",
+                "emitter-restore"
+            ]
         );
     }
 
@@ -11452,16 +11634,19 @@ mod tests {
             mark("image-stream"),
             mark("metadata-stream"),
             mark("emitter-restore"),
-            |stream| {
-                drop(stream);
-                Err::<(), _>("install failed")
-            },
+            |_| Err::<(), _>("install failed"),
+            |_| drops.borrow_mut().push("image-stop"),
         );
 
         assert!(matches!(result, Err("install failed")));
         assert_eq!(
             drops.borrow().as_slice(),
-            ["image-stream", "metadata-stream", "emitter-restore"]
+            [
+                "image-stop",
+                "metadata-stream",
+                "image-stream",
+                "emitter-restore"
+            ]
         );
     }
 
@@ -11489,17 +11674,22 @@ mod tests {
                 mark("image-stream"),
                 mark("metadata-stream"),
                 mark("emitter-restore"),
-                |stream| -> Result<(), ()> {
-                    drop(stream);
+                |_| -> Result<(), ()> {
                     panic!("injected install panic");
                 },
+                |_| drops.borrow_mut().push("image-stop"),
             );
         }));
 
         assert!(result.is_err());
         assert_eq!(
             drops.borrow().as_slice(),
-            ["image-stream", "metadata-stream", "emitter-restore"]
+            [
+                "image-stop",
+                "metadata-stream",
+                "image-stream",
+                "emitter-restore"
+            ]
         );
     }
 
@@ -12016,7 +12206,7 @@ mod tests {
         let replacement = rate_fill_fixture(contracts::StreamRole::Rgb, 32, 100_000)
             .take()
             .unwrap();
-        stream.install_recovered(replacement).unwrap();
+        stream.install_recovered(&mut Some(replacement)).unwrap();
         for _ in 0..1 + AE_WARMUP {
             stream.next_discarded().unwrap();
         }
@@ -12066,17 +12256,11 @@ mod tests {
         rgb.take();
         ir.take();
         rgb.install_recovered(
-            rate_fill_fixture(contracts::StreamRole::Rgb, 100, 66_667)
-                .take()
-                .unwrap(),
+            &mut rate_fill_fixture(contracts::StreamRole::Rgb, 100, 66_667).take(),
         )
         .unwrap();
-        ir.install_recovered(
-            rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667)
-                .take()
-                .unwrap(),
-        )
-        .unwrap();
+        ir.install_recovered(&mut rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667).take())
+            .unwrap();
         let before = (rgb.observations, ir.observations);
         start_rgb_before_ir("rgb", &mut rgb, &ir, &no_progress()).unwrap();
         assert_eq!(rgb.observations, before.0 + 1);
@@ -12364,7 +12548,7 @@ mod tests {
         let replacement = rate_fill_fixture(contracts::StreamRole::Ir, 100, 200_000)
             .take()
             .unwrap();
-        stream.install_recovered(replacement).unwrap();
+        stream.install_recovered(&mut Some(replacement)).unwrap();
         stream.fill_rate_evidence_with_startup(true).unwrap();
         assert!(matches!(stream.next(), Err(DeliveryError::BelowFloor(_))));
     }
@@ -12679,7 +12863,7 @@ mod tests {
 
         capture.take();
         capture
-            .install_recovered(fixture(&[500, 501]))
+            .install_recovered(&mut Some(fixture(&[500, 501])))
             .expect("representable recovery epoch");
         capture.next_discarded().expect("discarded warm-up dequeue");
 
@@ -12734,10 +12918,10 @@ mod tests {
 
         assert!(capture.take().is_some());
         capture
-            .install_recovered(ContinuityFixture {
+            .install_recovered(&mut Some(ContinuityFixture {
                 payload: [1],
                 metadata: metadata(10, 10),
-            })
+            }))
             .expect("recovery");
         capture.next_discarded().expect("recovered warm-up frame");
         capture.stream_mut().expect("stream").metadata = metadata(11, 11);
@@ -12785,10 +12969,10 @@ mod tests {
 
         assert!(capture.take().is_some());
         capture
-            .install_recovered(ContinuityFixture {
+            .install_recovered(&mut Some(ContinuityFixture {
                 payload: [1],
                 metadata: metadata(10, 10),
-            })
+            }))
             .expect("recovery");
         let (_, _, sequence, timestamp, _) = capture.next().expect("recovered frame");
         assert_eq!(sequence.stream_epoch(), timestamp.stream_epoch());
@@ -12820,10 +13004,10 @@ mod tests {
 
         capture.take();
         capture
-            .install_recovered(ContinuityFixture {
+            .install_recovered(&mut Some(ContinuityFixture {
                 payload: [1],
                 metadata: metadata(10, 1, monotonic),
-            })
+            }))
             .expect("recovery");
         let (_, _, sequence, timestamp, _) = capture.next().expect("recovered frame");
         assert_eq!(sequence.cumulative_drops(), 0);
@@ -12845,7 +13029,7 @@ mod tests {
         capture.sequence.force_stream_epoch_overflow_on_recovery();
         assert!(capture.take().is_some());
         capture
-            .install_recovered(fixture(false))
+            .install_recovered(&mut Some(fixture(false)))
             .expect("replacement installation is lazy");
         assert!(capture.next_discarded().is_err());
         assert_eq!(calls.get(), 1, "replacement was not validated first");
@@ -12864,12 +13048,12 @@ mod tests {
         let timestamp_state = validation_failure.timestamp.continuity_state_for_test();
         assert!(validation_failure.take().is_some());
         validation_failure
-            .install_recovered(RecoveryValidationFixture {
+            .install_recovered(&mut Some(RecoveryValidationFixture {
                 payload: [1],
                 metadata: v4l::buffer::Metadata::default(),
                 calls: failed_calls.clone(),
                 fail_validation: true,
-            })
+            }))
             .expect("replacement installation is lazy");
         assert!(validation_failure.next().is_err());
         assert_eq!(failed_calls.get(), 1);
@@ -12897,7 +13081,7 @@ mod tests {
             .force_stream_epoch_overflow_on_recovery();
         assert!(sequence_failure.take().is_some());
         sequence_failure
-            .install_recovered(fixture())
+            .install_recovered(&mut Some(fixture()))
             .expect("replacement installation is lazy");
         assert!(sequence_failure.next().is_err());
         assert!(sequence_failure.stream_mut().is_some());
@@ -12912,7 +13096,7 @@ mod tests {
             .force_stream_epoch_overflow_on_recovery();
         assert!(timestamp_failure.take().is_some());
         timestamp_failure
-            .install_recovered(fixture())
+            .install_recovered(&mut Some(fixture()))
             .expect("replacement installation is lazy");
         assert!(timestamp_failure.next().is_err());
         assert!(timestamp_failure.stream_mut().is_some());
@@ -13018,10 +13202,10 @@ mod tests {
         assert!(capture.next().is_err(), "same epoch must remain failed");
         capture.take();
         capture
-            .install_recovered(ContinuityFixture {
+            .install_recovered(&mut Some(ContinuityFixture {
                 payload: [1],
                 metadata: valid,
-            })
+            }))
             .expect("recovery");
         capture.next().expect("recovered frame");
     }

@@ -244,7 +244,8 @@ pub enum Illumination {
 /// A record may cross any payload boundary. Unknown items are skipped by their
 /// whole size, including opaque bytes that resemble an illumination item.
 /// Validate the entire stream before returning evidence: malformed tails, UVC
-/// errors and contradictory illumination records make the frame unknown.
+/// errors, conflicting frame IDs, continuation after EOF and contradictory
+/// illumination records make the frame unknown. EOF itself is optional.
 /// Assembly is local to this call, never shared across V4L2 frame buffers.
 ///
 /// Returns `None` when the buffer carries no illumination record, which is
@@ -255,6 +256,8 @@ pub enum Illumination {
 /// buffers" series), and a camera is external hardware, so this parses
 /// attacker-reachable bytes for a root daemon and must never panic.
 pub fn parse_illumination(buf: &[u8]) -> Option<Illumination> {
+    const FID: u8 = 1;
+    const EOF: u8 = 1 << 1;
     const PTS: u8 = 1 << 2;
     const SCR: u8 = 1 << 3;
     const ERR: u8 = 1 << 6;
@@ -263,6 +266,8 @@ pub fn parse_illumination(buf: &[u8]) -> Option<Illumination> {
     let mut extra = Vec::new();
     extra.try_reserve_exact(buf.len()).ok()?;
     let mut at = 0usize;
+    let mut fid = None;
+    let mut ended = false;
     while at < buf.len() {
         let body_start = at.checked_add(UVC_META_BUF_HEADER)?;
         if body_start > buf.len() {
@@ -274,6 +279,13 @@ pub fn parse_illumination(buf: &[u8]) -> Option<Illumination> {
         if length < 2 || flags & ERR != 0 {
             return None;
         }
+        // An empty preceding image can leave different wire frames in one
+        // kernel metadata buffer. The retained headers must agree themselves.
+        if ended || fid.is_some_and(|first| first != flags & FID) {
+            return None;
+        }
+        fid = Some(flags & FID);
+        ended = flags & EOF != 0;
         let body_end = body_start.checked_add(length - 2)?;
         let body = buf.get(body_start..body_end)?;
         let standard =
@@ -568,6 +580,8 @@ pub(crate) struct IlluminationLog {
     buffers_requested: bool,
     streaming: bool,
     timing: crate::capture_timing::Recorder,
+    producer: Option<crate::capture_shutdown::Producer>,
+    retired: bool,
     #[cfg(test)]
     sentinel_events: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
     #[cfg(test)]
@@ -582,6 +596,10 @@ pub(crate) enum MetadataSelection<'a> {
 }
 
 impl IlluminationLog {
+    pub(crate) fn with_producer(mut self, producer: crate::capture_shutdown::Producer) -> Self {
+        self.producer = Some(producer);
+        self
+    }
     pub(crate) fn with_timing(mut self, timing: crate::capture_timing::Recorder) -> Self {
         self.timing = timing;
         self
@@ -666,6 +684,8 @@ impl IlluminationLog {
             buffers_requested: false,
             streaming: false,
             timing: crate::capture_timing::Recorder::default(),
+            producer: None,
+            retired: false,
             #[cfg(test)]
             sentinel_events: None,
             #[cfg(test)]
@@ -887,6 +907,10 @@ impl IlluminationLog {
     /// queues advance together, so a drain per image frame keeps up, and a
     /// missed record costs one frame's classification rather than a stall.
     pub(crate) fn drain(&mut self) {
+        if self.retired || self.producer.as_ref().is_some_and(|p| p.check().is_err()) {
+            self.by_timestamp.clear();
+            return;
+        }
         #[cfg(test)]
         if let Some(events) = &self.sentinel_events {
             events
@@ -900,22 +924,25 @@ impl IlluminationLog {
         }
         loop {
             let mut buf = zeroed_buffer(0);
-            // SAFETY: buf is a valid, correctly sized v4l2_buffer; fd is ours.
-            let rc = unsafe {
-                libc::ioctl(
-                    self.fd,
-                    vidioc_dqbuf(),
-                    &mut buf as *mut _ as *mut libc::c_void,
-                )
-            };
-            if rc < 0 {
+            if !self.dequeue_buffer(&mut buf) {
                 // EAGAIN simply means nothing is ready yet, which is the
                 // ordinary way this loop ends on a non-blocking fd.
+                return;
+            }
+            if buf.flags & v4l::buffer::Flags::ERROR.bits() != 0 {
+                // Inspect ioctl metadata before forming any mapped reference.
+                // Keep this retired ring until its main producer is quiescent.
+                self.retired = true;
+                self.by_timestamp.clear();
                 return;
             }
             let index = buf.index as usize;
             if let Some(mapped) = self.buffers.get(index) {
                 let used = (buf.bytesused as usize).min(mapped.len);
+                #[cfg(test)]
+                if let Some(device) = &self.lifecycle {
+                    device.lock().unwrap().view_created();
+                }
                 // SAFETY: the driver has handed this buffer back to us and will
                 // not touch it until it is re-queued below; `used` is within
                 // the mapping.
@@ -947,6 +974,23 @@ impl IlluminationLog {
     /// What the camera said about the image frame captured at `timestamp`.
     pub(crate) fn illumination_at(&self, timestamp_us: i64) -> Option<Illumination> {
         self.by_timestamp.get(&timestamp_us).copied()
+    }
+
+    fn dequeue_buffer(&self, buf: &mut V4l2Buffer) -> bool {
+        #[cfg(test)]
+        if self.lifecycle.is_some() {
+            return self
+                .ioctl(vidioc_dqbuf(), (buf as *mut V4l2Buffer).cast(), "DQBUF")
+                .is_ok();
+        }
+        // SAFETY: buf is a valid, correctly sized v4l2_buffer; fd is ours.
+        unsafe {
+            libc::ioctl(
+                self.fd,
+                vidioc_dqbuf(),
+                (buf as *mut V4l2Buffer).cast::<libc::c_void>(),
+            ) >= 0
+        }
     }
 
     fn ioctl(
@@ -986,6 +1030,8 @@ impl IlluminationLog {
             buffers_requested: false,
             streaming: false,
             timing: crate::capture_timing::Recorder::default(),
+            producer: None,
+            retired: false,
             sentinel_events: Some(events),
             lifecycle: None,
         }
@@ -994,6 +1040,15 @@ impl IlluminationLog {
 
 impl Drop for IlluminationLog {
     fn drop(&mut self) {
+        if let Some(producer) = self.producer.take() {
+            if !producer.is_quiescent() {
+                // The replacement is inert; the deferred owner has no Producer
+                // link, so retention cannot make a reference cycle.
+                let owner = std::mem::replace(self, Self::from_fd(-1, "deferred metadata"));
+                producer.after_stop(owner);
+                return;
+            }
+        }
         #[cfg(test)]
         if let Some(events) = &self.sentinel_events {
             events
@@ -1500,6 +1555,61 @@ mod tests {
     }
 
     #[test]
+    fn metadata_rejects_kernel_reachable_cross_fid_record_assembly() {
+        // Linux can retain both headers when the FID=0 frame has no image
+        // bytes. Neither frame supplies a complete illumination record.
+        let mut frame = metadata_fragment(&[6, 0, 0, 0, 16, 0, 0, 0], 0x80);
+        frame.extend(metadata_fragment(&[1, 0, 0, 0, 0, 0, 0, 0], 0x83));
+        assert_eq!(parse_illumination(&frame), None);
+    }
+
+    #[test]
+    fn metadata_rejects_fid_changes_even_in_standard_only_headers() {
+        for fid in [0, 1] {
+            let full = metadata_fragment(&illumination_item(true), 0x80 | fid);
+            let other = metadata_fragment(&[], 0x8c | (fid ^ 1));
+            assert_eq!(
+                parse_illumination(&[full.clone(), other.clone()].concat()),
+                None
+            );
+            assert_eq!(parse_illumination(&[other, full].concat()), None);
+        }
+    }
+
+    #[test]
+    fn metadata_refuses_any_header_after_observed_eof() {
+        let item = illumination_item(true);
+        for split in 1..=item.len() {
+            let mut frame = metadata_fragment(&item[..split], 0x82);
+            frame.extend(metadata_fragment(&item[split..], 0x80));
+            assert_eq!(parse_illumination(&frame), None, "split {split}");
+        }
+    }
+
+    #[test]
+    fn metadata_preserves_same_fid_splits_with_optional_final_eof() {
+        for fid in [0, 1] {
+            for eof in [0, 2] {
+                for lit in [false, true] {
+                    let item = illumination_item(lit);
+                    for split in 1..item.len() {
+                        let mut frame = metadata_fragment(&item[..split], 0x84 | fid);
+                        frame.extend(metadata_fragment(&item[split..], 0x88 | fid | eof));
+                        assert_eq!(
+                            parse_illumination(&frame),
+                            Some(if lit {
+                                Illumination::Lit
+                            } else {
+                                Illumination::Dark
+                            })
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn metadata_record_survives_every_split_and_optional_timestamp_layout() {
         for lit in [false, true] {
             let item = illumination_item(lit);
@@ -1749,12 +1859,14 @@ mod tests {
         first.extend_from_slice(&1u64.to_le_bytes());
         first.extend_from_slice(&0u16.to_le_bytes());
         first.push(12);
-        first.push(DARK_FLAGS);
+        first.push(LIT_FLAGS); // Both payloads belong to the same wire frame.
         first.extend_from_slice(&0u32.to_le_bytes());
         first.extend_from_slice(&[0u8; 6]);
         let mut both = first;
         both.extend_from_slice(&real_buffer(true, LIT_FLAGS));
         assert_eq!(parse_illumination(&both), Some(Illumination::Lit));
+        both[11] ^= 1; // The historical mixed-FID fixture must now be refused.
+        assert_eq!(parse_illumination(&both), None);
     }
 
     #[test]

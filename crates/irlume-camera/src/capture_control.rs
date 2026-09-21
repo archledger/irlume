@@ -64,13 +64,16 @@ impl CaptureControl {
     ///
     /// # Errors
     /// Returns [`Error::Preempted`] on cancellation or [`Error::DeadlineExpired`]
-    /// when the authentication window has ended.
+    /// when the authentication window has ended. Returns [`Error::Hardware`] if
+    /// an unconfirmed stream shutdown has disabled further capture in this process.
     pub fn check(&self) -> Result<()> {
         self.check_io().map_err(|error| {
             if is_expired(&error) {
                 Error::DeadlineExpired
-            } else {
+            } else if is_cancelled(&error) {
                 Error::Preempted("camera capture cancelled".into())
+            } else {
+                Error::Hardware(error.to_string())
             }
         })
     }
@@ -90,7 +93,7 @@ impl CaptureControl {
                 CaptureExpired,
             ))
         } else {
-            Ok(())
+            crate::capture_shutdown::check_capture()
         }
     }
 }

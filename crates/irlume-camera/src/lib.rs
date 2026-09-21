@@ -1319,10 +1319,10 @@ impl CameraStateStream<'_, V4l2CameraState> {
 const STREAM_DEQUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Warm-up retry budget (see [`warm_up_stream`]): how many dequeue attempts
-/// the post-resume race gets, and the pause between them. The race it covers
-/// (uvcvideo re-initializing after suspend or USB re-enumeration) fails FAST,
-/// with EIO/ENODEV in milliseconds, so eight tries spaced 120ms apart cover
-/// roughly a second of re-init without adding meaningful wall time. `TimedOut`
+/// a pending capture gets, and the pause between them. Fast EIO/ENODEV from
+/// poll/DQBUF can spend eight tries spaced 120ms apart while the same endpoint
+/// remains valid. They do not prove a resume race or authorize retrying a failed
+/// queue write/start; re-enumeration invalidates the lease. `TimedOut`
 /// keeps the same full budget on purpose: a camera that sits silent for two
 /// windows and delivers on its third succeeded before #336 and must keep
 /// succeeding after it (Codex review of PR #338), so the watchdog problem is
@@ -2902,7 +2902,7 @@ fn map_io(device: &str, e: std::io::Error) -> Error {
         return Error::Preempted("camera capture cancelled".into());
     }
     use std::io::ErrorKind;
-    match e.raw_os_error() {
+    match mmap_capture::source_io(&e).raw_os_error() {
         Some(libc::EBUSY) => camera_busy_error(device, camera_holders(device)),
         _ if e.kind() == ErrorKind::PermissionDenied => Error::Hardware(format!(
             "{device}: permission denied; add your user to the 'video' group (camera) and re-login"
@@ -10252,12 +10252,13 @@ pub fn nv12_to_rgb(nv12: &[u8], width: u32, height: u32) -> Vec<u8> {
     rgb
 }
 
-/// Pull and discard one frame with a short retry, so the FIRST capture after a
-/// suspend/resume (or USB re-enumeration) does not fail outright while the
-/// uvcvideo device is still coming back. The daemon opens the device per
-/// request, so there is no stale handle to recover; the only gap is that the
-/// very first `stream.next()` can return EIO/ENODEV for a few hundred ms after
-/// resume. Retry that, then let the normal AE warmup run.
+/// Pull and discard one frame with a bounded retry of pending capture errors.
+/// Raw EIO/ENODEV from poll/DQBUF receive the retry budget even when Rust maps
+/// them to an uncategorized ErrorKind. The transport retains operation context:
+/// failed QBUF/STREAMON and retired rings are terminal, irrespective of errno.
+/// No retry guesses a consumed buffer index, restarts the producer or reopens
+/// the device. The endpoint/privacy and request-control checks still run on
+/// every attempt; a stale lease cannot be recovered by waiting here.
 ///
 /// Every retryable kind, `TimedOut` included, keeps the FULL retry budget: a
 /// camera silent for two 5s windows that delivers on its third warmed up
@@ -10305,23 +10306,30 @@ where
                 if capture_shutdown::is_fault(&e) {
                     return Err(map_io(device, e));
                 }
-                // The window COMPLETED: the driver call came back, the thread
-                // was never stuck, and the watchdog clock resets before the
-                // caller spends unbounded time (inference, a retry's reopen)
-                // on the way to the next window. Reported on the terminal try
-                // too, for the same reason.
-                if e.kind() == ErrorKind::TimedOut {
-                    progress();
+                if is_privacy_boundary_error(&e)
+                    || e.get_ref()
+                        .is_some_and(|inner| inner.is::<lease::CameraLeaseError>())
+                {
+                    return Err(map_io(device, e));
                 }
-                if attempt + 1 < WARMUP_TRIES
-                    && matches!(
+                let retryable = mmap_capture::warmup_retry(&e).unwrap_or_else(|| {
+                    matches!(
                         e.kind(),
                         ErrorKind::BrokenPipe
                             | ErrorKind::NotConnected
                             | ErrorKind::Other
                             | ErrorKind::TimedOut
                     )
-                {
+                });
+                // The window COMPLETED: the driver call came back, the thread
+                // was never stuck, and the watchdog clock resets before the
+                // caller spends unbounded time (inference, a retry's reopen)
+                // on the way to the next window. Reported on the terminal try
+                // too, for the same reason.
+                if retryable && e.kind() == ErrorKind::TimedOut {
+                    progress();
+                }
+                if attempt + 1 < WARMUP_TRIES && retryable {
                     sleep(WARMUP_GAP);
                 } else {
                     return Err(map_io(device, e));
@@ -18265,9 +18273,9 @@ mod tests {
         );
     }
 
-    /// The resume race keeps its full budget and stays silent on the
-    /// reporter: its errors return in milliseconds, so there is no window to
-    /// report, and asserting zero pins that only TimedOut heartbeats.
+    /// Preserve the legacy synthetic NotConnected policy and its silent
+    /// reporter. Actual raw EIO/ENODEV and operation-aware refusal are covered
+    /// by the composed transport tests in mmap_capture::tests::warmup.
     #[test]
     fn fast_resume_errors_keep_the_full_retry_budget_without_heartbeats() {
         use std::io::{Error, ErrorKind};

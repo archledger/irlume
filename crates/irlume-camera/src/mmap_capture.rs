@@ -21,6 +21,74 @@ use v4l::{
 
 use crate::CaptureDequeue;
 
+#[derive(Clone, Copy, Debug)]
+enum Operation {
+    Queue,
+    Start,
+    Wait,
+    Dequeue,
+    Retired,
+}
+
+/// Preserve which operation failed across the io::Error-based policy layers.
+/// An errno alone cannot authorize a retry of a queue mutation.
+#[derive(Debug)]
+struct CaptureIoError {
+    operation: Operation,
+    source: io::Error,
+}
+
+impl std::fmt::Display for CaptureIoError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let operation = match self.operation {
+            Operation::Queue => "VIDIOC_QBUF",
+            Operation::Start => "VIDIOC_STREAMON",
+            Operation::Wait => "capture poll",
+            Operation::Dequeue => "VIDIOC_DQBUF",
+            Operation::Retired => "retired capture queue",
+        };
+        write!(formatter, "{operation}: {}", self.source)
+    }
+}
+
+impl std::error::Error for CaptureIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn operation_error(operation: Operation, source: io::Error) -> io::Error {
+    io::Error::new(source.kind(), CaptureIoError { operation, source })
+}
+
+fn capture_error(error: &io::Error) -> Option<&CaptureIoError> {
+    error.get_ref()?.downcast_ref()
+}
+
+/// Retain errno-based diagnostics when an operation context wraps a raw error.
+pub(super) fn source_io(error: &io::Error) -> &io::Error {
+    capture_error(error).map_or(error, |error| &error.source)
+}
+
+/// `None` leaves non-transport errors to the caller's existing policy. The
+/// transport authorizes only another wait/dequeue, never a failed queue/start.
+pub(super) fn warmup_retry(error: &io::Error) -> Option<bool> {
+    let error = capture_error(error)?;
+    Some(match error.operation {
+        Operation::Queue | Operation::Start | Operation::Retired => false,
+        Operation::Wait | Operation::Dequeue => {
+            matches!(error.source.raw_os_error(), Some(libc::EIO | libc::ENODEV))
+                || matches!(
+                    error.source.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::NotConnected
+                        | io::ErrorKind::Other
+                        | io::ErrorKind::TimedOut
+                )
+        }
+    })
+}
+
 struct Mapping {
     ptr: NonNull<libc::c_void>,
     len: usize,
@@ -195,6 +263,7 @@ impl MmapCapture {
             (&mut buf as *mut v4l2_buffer).cast(),
             "QBUF",
         )
+        .map_err(|error| operation_error(Operation::Queue, error))
     }
 
     fn wait(&self) -> io::Result<()> {
@@ -217,8 +286,9 @@ impl CaptureDequeue for MmapCapture {
     fn dequeue(&mut self) -> io::Result<(&[u8], Metadata)> {
         self.producer.check()?;
         if self.failed {
-            return Err(io::Error::other(
-                "capture queue state is uncertain; recreate the stream",
+            return Err(operation_error(
+                Operation::Retired,
+                io::Error::other("capture queue state is uncertain; recreate the stream"),
             ));
         }
         if !self.active {
@@ -232,7 +302,8 @@ impl CaptureDequeue for MmapCapture {
                 vidioc::VIDIOC_STREAMON,
                 (&mut kind as *mut u32).cast(),
                 "STREAMON",
-            )?;
+            )
+            .map_err(|error| operation_error(Operation::Start, error))?;
             self.active = true;
             self.failed = false;
         } else if let Some(index) = self.held.take() {
@@ -244,13 +315,15 @@ impl CaptureDequeue for MmapCapture {
         // No userspace-owned buffer exists past this point until DQBUF succeeds.
         // A timeout, interruption or EAGAIN therefore retries only the wait/DQ.
         // EIO may even consume an unidentified buffer: never guess its index.
-        self.wait()?;
+        self.wait()
+            .map_err(|error| operation_error(Operation::Wait, error))?;
         let mut buf = buffer(0);
         self.ioctl(
             vidioc::VIDIOC_DQBUF,
             (&mut buf as *mut v4l2_buffer).cast(),
             "DQBUF",
-        )?;
+        )
+        .map_err(|error| operation_error(Operation::Dequeue, error))?;
         self.producer.check()?;
         if buf.flags & v4l::buffer::Flags::ERROR.bits() != 0 {
             // Affected UVC cancel paths can publish ERROR before async copies

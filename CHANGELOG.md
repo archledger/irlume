@@ -13,14 +13,23 @@ All notable changes to irlume are documented here. This project adheres to
   refusal can ask for a fresh password. Other frontends and daemon authorization
   are unchanged. Vendor-only COSMIC PAM files also use the existing reversible
   `/etc` override path. Live COSMIC face-grant qualification remains pending.
+
+- Camera warm-up retries raw `EIO`/`ENODEV` from pending poll/dequeue operations
+  within the existing budget while the endpoint remains valid. Failed queue
+  writes, stream starts and retired rings stop immediately instead of consuming
+  retries based on their error kind. Lease/privacy refusal, cancellation and
+  deadlines remain authoritative; errno-based diagnostics are preserved.
+
 - PCR-signing public keys are decoded from complete DER containers after PEM
   label validation. Keys hidden inside the algorithm identifier, trailing DER
   fields and non-byte-aligned key bits are rejected. Valid RSA keys with NULL
   or absent algorithm parameters retain their existing interpretation.
+
 - Camera warm-up can retry a dequeue timeout without requeueing a buffer still
   owned by the kernel. Capture now tracks the last successfully dequeued buffer
   explicitly, preserving the existing retry budget, cancellation, deadlines and
   frame validation.
+
 - Capture rejects error-marked buffers before creating mapped references and
   retires the affected ring. IR cleanup stops the image producer while holding
   its allocation, then closes metadata before releasing the image ring and
@@ -30,13 +39,16 @@ All notable changes to irlume are documented here. This project adheres to
   failure cannot unwind this retention transition. This containment depends on
   normal driver completion for non-error buffers and cannot protect against
   kernel bugs during abrupt process termination.
+
 - Illumination metadata fragments with conflicting frame IDs or headers after
   an observed end-of-frame marker are rejected. Same-frame fragments remain
   accepted with or without a final end-of-frame marker.
+
 - Metadata capture restores both the observed format and buffer size, including
   when the node was already using UVCM. Failed initial reads and uncertain format
   writes cannot authorize a guessed restore. Cleanup checks the current format
   before restoring, releases the buffer ring first, and bounds capture allocations.
+
 - USB extension-unit discovery now uses the active configuration instead of
   combining every configuration in sysfs. Descriptor-based restoration and
   capture qualification distinguish configurations, and UVC queries recheck
@@ -46,30 +58,36 @@ All notable changes to irlume are documented here. This project adheres to
   multi-configuration recovery records remain visible and block conflicting
   writes without authorizing a restore; live locks remain compatible across
   the identity change.
+
 - RGB-only verification no longer treats a user's runtime directory as proof
   that a shared-greeter request unlocks an existing session. COSMIC requests
   require a live peer bound to the selected user's active local graphical
   logind session, rechecked before grant delivery. Ambiguous GDM and other
   greeter requests fall back to the password. Dedicated locker services retain
   their existing policy; IR-backed authentication is unchanged.
+
 - Frame illumination metadata is assembled across USB payload headers before
   records are interpreted. Complete 16-byte illumination records are required;
   opaque custom payloads, incomplete streams, conflicting records and reported
   buffer errors cannot supply illumination evidence. Missing metadata keeps the
   existing frame-selection fallback.
+
 - Microsoft Face Authentication payloads now use the specified eight-byte
   interface entries in both mode selection and readback evidence. Valid
   multi-interface controls are accepted; truncated or compact entries,
   reserved flag bits, duplicate interfaces and nonzero padding are refused.
   The measured single-interface nine-byte payload is unchanged.
+
 - Public support guidance distinguishes shipped v0.14.0 behavior from dated
   hardware validation, frontend-dependent password/cancel behavior, and
   secondary-store migration on the next authorized write.
+
 - Release SBOM generation now runs once in an isolated committed source tree,
   preserves versioned component and binary-target identities, rewrites dependency
   edges consistently, and removes local filesystem URLs. The release verifier
   rejects duplicate identifiers and dangling references even in signed metadata.
   Lockfile drift fails generation, and intermediate BOMs stay out of the checkout.
+
 - The KCM design now records the v0.14.0 implementation and validation status,
   including the optional scope of future native controls and the default-off
   NixOS loading limitation.
@@ -85,6 +103,7 @@ All notable changes to irlume are documented here. This project adheres to
   the commit journal carries only encrypted bytes, and an unavailable key
   fails closed instead of downgrading. Keyless (no-TPM) hosts keep the
   documented root-only plaintext behavior.
+
 - A KDE Plasma System Settings module (KCM): read-only status, diagnostics,
   camera census and login-wiring pages rendered from the machine API, plus
   launch buttons that hand interactive work to the TUI (deep-linked when
@@ -95,17 +114,20 @@ All notable changes to irlume are documented here. This project adheres to
   The universal .deb does not carry it (its Debian 12 base has no KF6).
   The module holds no policy and performs no privileged action
   (docs/KCM.md).
+
 - `irlume tui --page <name>` starts the TUI on a named screen (`overview`,
   `diagnostics`, `cameras`, `faces`, `identify`, `wallet`, `recovery`,
   `fingerprint`, `login`, `settings`); the System Settings module this
   repo's KCM design specifies uses it for deep links. Usage errors print
   the page list and exit 2.
+
 - A single-instance guard for the TUI: launching `irlume tui` while
   another is running switches the running instance to the requested screen
   and exits instead of piling up terminals (kernel-held `flock` under
   `$XDG_RUNTIME_DIR/irlume`, navigate-only same-uid handoff channel;
   `--new` starts a parallel instance; the guard is off without a runtime
   directory and never blocks startup).
+
 - Signed releases now carry per-binary CycloneDX SBOMs and an OpenVEX
   document: `scripts/generate-release-sbom.sh` and
   `scripts/generate-vex.py` produce them from the release tag,
@@ -113,6 +135,7 @@ All notable changes to irlume are documented here. This project adheres to
   coverage, and v0.13.0's release was updated to carry the full set.
   `SUPPORT.md` documents where to ask for help; `RELEASING.md` records the
   SBOM/VEX publication steps.
+
 - `irlume uninstall` now evicts irlume's persisted TPM storage root key
   (owner-hierarchy handle `0x81010002`) after a fully completed data wipe,
   closing the residue gap the 2026-09-17 uninstall audit found: the key was
@@ -130,6 +153,7 @@ All notable changes to irlume are documented here. This project adheres to
   RSA encryption algorithm identifier before the modulus is read. The
   advisory ignore list in `deny.toml` is empty again and the VEX document
   records the clean scan.
+
 - Documentation accuracy pass over the whole repo: encryption-at-rest
   claims describe the TPM requirement and upgrade-on-write migration for
   secondary stores; removed features (head gestures, the third-party model
@@ -302,6 +326,7 @@ All notable changes to irlume are documented here. This project adheres to
   reason), evidence-only in schema v1 - no executable capture settings
   exist yet, so loading a profile changes no behavior. A missing
   directory is an empty set.
+
 - Multi-camera secondary store (ADR-0024 Phase 1 foundation): a separate,
   versioned, strictly validated store for secondary camera groups -
   complete role-labelled pairs with immutable group ids, per-profile scan
@@ -345,12 +370,14 @@ All notable changes to irlume are documented here. This project adheres to
   behavior. Expected effect on the second and later sequential attempts:
   several seconds shorter authentication; the first attempt per process is
   unchanged.
+
 - `irlume doctor --check` turns the health report into a scriptable verdict:
   exit 0 clean, 1 warnings only, 2 any failure. The default informational
   run is unchanged and still exits 0, and the human report closes with a
   warning/failure count when there is anything to act on. Dummy (software
   created) camera nodes no longer carry a formats claim in the census,
   because a probe answer about a device that does not exist was noise.
+
 - The machine error envelope now carries one action line for every published
   failure code (previously only camera-busy had one), so a consumer can tell a
   user what to do next without interpreting prose, and a new
@@ -358,6 +385,7 @@ All notable changes to irlume are documented here. This project adheres to
   a failure. The daemon publishes it, and `not-authorized`, when the client
   asks for structured errors; older clients keep decoding unknown codes as
   `operation-failed`.
+
 - Daemon journal lines now carry real syslog priorities: failures are logged
   at err, degradations and configuration fallbacks at warning, significant
   but expected events at notice, routine operation at info, and the opt-in
@@ -388,22 +416,28 @@ All notable changes to irlume are documented here. This project adheres to
 
 - Shared-interface IR targets retain all four nodes' evidence so replacement of
   the RGB metadata companion also invalidates the target before capture.
+
 - Authentication reports typed liveness refusal causes and additional timing
   boundaries, including model-load failures (#700).
+
 - IR capture reuses a validated warmup frame without reducing the delivered-rate
   observation window (#702). This is not a general login-speed improvement claim.
+
 - Fedora Packit targets include the branched development release (#699).
+
 - Experimental IR-only target resolution accepts the exact four-node
   shared-interface layout (RGB image at index 0, its same-name metadata at
   index 1, IR image at index 2, its same-name metadata at index 3), reported
   for the Logitech BRIO 046d:085e. Any other shared-interface member set,
   index assignment, or name pairing remains refused, and resolution still
   opens no device node (#704).
+
 - Experimental IR-only preflight now distinguishes an unconfigured camera pair
   from unavailable endpoints, identity failures, changed targets and unsupported
   layouts. Missing-pair guidance names `set-cameras`; unsupported-layout guidance
   does not suggest an impossible reconfiguration. The optional diagnostic field
   preserves older wire readers and adds no discovery, capture or grant authority.
+
 - Human camera census and doctor output clarify that paired-camera support does
   not establish experimental IR-only readiness.
 
@@ -428,21 +462,28 @@ All notable changes to irlume are documented here. This project adheres to
 
 - Application-menu launcher for the TUI, using the desktop's terminal as the
   normal user, across Fedora, Arch, Debian, PPA, Nix and source installs.
+
 - TUI Sections chooser (F3), keyboard page controls (F6), theme-aware state
   badges, and bounded session Activity with timestamps and full wrapped history
   (Shift+L). First-run guidance and long dialogs support keyboard scrolling.
+
 - An 80×24 minimum window size, with a resize-only notice and disabled hidden
   controls below either dimension. Resizing preserves the current page or dialog.
+
 - Current observations (F4), with live daemon work, queued requests, automatic
   background qualification, and separate observation ages and failure states.
+
 - Explicit experimental IR-only policy (`irlume auth sensor ir-only --yes`),
   with dual RGB+IR remaining the default. Requires enrollment-bound IR capture,
   fresh emitter evidence and IR PAD; it does not establish deployment qualification.
+
 - CLI and TUI controls for the machine owner's optional privileged confirmation
   waiver. Typed `yes` remains the default; restoring it is
   `sudo irlume auth consent required`. This does not enable automatic desktop scans.
+
 - Bound OS authorization for enrollment and recovery-credential management,
   with packaged polkit policies and a dedicated password-verification helper.
+
 - Durable 50-request face failure limit and independently password-verified retry
   recovery. Cancellation and interruption retain their charge; password login
   stays available. See [upgrade and recovery requirements](docs/RELEASING.md).
@@ -458,13 +499,16 @@ All notable changes to irlume are documented here. This project adheres to
   the input thread, and use wallet metadata for routine status. Reuse verified
   model buffers and release serialized recognizer weights before auxiliary
   sessions are loaded.
+
 - Use adaptive startup for validated, configured IR-only targets while
   preserving the full rate window, rate floor, continuity and exact metadata
   selection. Generic fixed and paired sessions retain their existing behavior.
+
 - Collect complete PAD evidence in one serviced RGB/IR session for eligible
   concurrent login/lock requests, then prepare identity for the final admissible
   sample. Ordinary RGB+IR preparation remains eager; capture ownership,
   cancellation, deadlines and admission checks remain enforced.
+
 - Read KDE wallet salts through the packaged helper after it permanently enters
   the target account, then pass the fixed-size value to the daemon's unchanged KDF.
   The daemon no longer opens that user path as root or falls back to doing so;
@@ -482,23 +526,31 @@ All notable changes to irlume are documented here. This project adheres to
 
 - Preserve administrator-selected daemon/socket activity and enablement during
   package upgrades, including stopped services in the PPA hooks.
+
 - Require recorded IR template provenance before using IR identity evidence.
   Faces and the CLI explain compatible, missing and unknown IR coverage without
   guessing provenance for old scans or removing existing RGB data.
+
 - Avoid duplicate login scans except after an explicit pre-authentication
   unseal refusal, and report camera contention with actionable feedback.
+
 - Correct package descriptions for removed head gestures and persistent face
   retry limits; password login remains available.
+
 - Refresh TUI camera choices on device changes, reject a switch whose device
   changed during confirmation, and show failed or expired observations as
   unavailable. Live daemon worker status remains observable during TUI dialogs.
+
 - Keep TUI enrollment instructions visible in supported terminal sizes, make Cancel and
   quit controls clickable, and preserve reading position when Activity reflows.
+
 - Report TUI worker loss as stale state or an unknown outcome, disclose camera
   diagnostics capture, and avoid copying unexpected protocol payloads into
   activity messages. Unknown login wiring no longer appears ready.
+
 - Make the emitter undo-record regression independent of root permission bypass,
   so the Arch container tests the same save-failure invariant as ordinary CI.
+
 - Fail release verification on incomplete assets, verify Arch packages alongside
   Debian packages, and attest all signed packages. Manual provenance runs now
   upload to the requested tag and require a confirmed upload.
@@ -528,11 +580,13 @@ All notable changes to irlume are documented here. This project adheres to
   qualification state, reason, and degradation. A user whose qualification
   went stale after a kernel upgrade can see that from the TUI without
   running `camera-mode` or `doctor`.
+
 - **Proactive concurrent degradation (#586 lesson).** A concurrent capture
   that succeeds but shows provenance warning signs (sequence gaps,
   timestamp discontinuity) trips runtime degradation immediately, so the
   next capture goes sequential instead of waiting for the hard failure
   the signs are building toward. The current auth completes normally.
+
 - **Background auto-requalification after camera-context change.** When
   the daemon detects at startup that the stored qualification's context
   no longer matches (kernel upgrade, USB replug), it schedules a
@@ -579,6 +633,7 @@ All notable changes to irlume are documented here. This project adheres to
   row now follows the exact surface `login enable` wires, and the mode
   naming (verify / on-demand / keyring / face-first) is one pure, tested
   decision shared by the human report, `login status --json`, and the TUI.
+
 - **Docs: the Mint/Cinnamon fingerprint detour and the PPA's release
   coverage.** The FAQ explains why typing anything at a Cinnamon lock
   reaches the fingerprint prompt first (stock Debian-lane ordering; the
@@ -612,6 +667,7 @@ All notable changes to irlume are documented here. This project adheres to
   service classifies as ScreenUnlock so biopolicy treats it as an unlock
   surface. Non-Omarchy machines keep the KDE lock lane and its on-demand
   shape byte-for-byte.
+
 - **Omarchy: `irlume fingerprint enable` now wires the distro's own
   fingerprint layout.** Omarchy (Arch underneath) owns an opinionated
   fingerprint contract its lock and scripts depend on: a clamshell gate
@@ -634,6 +690,7 @@ All notable changes to irlume are documented here. This project adheres to
   qualification, watch skew) reflecting upstream uvcvideo's active
   timestamping and metadata changes. The hardware-report template's intro
   points reporters at the check. (#569)
+
 - **FAIRNESS.md and FAQ grounded in their primary sources.** A new "Against
   the Windows Hello bars" subsection states Microsoft's certified facial
   bars (FAR below 0.001 percent, TAR above 95 percent) and irlume's measured
@@ -644,6 +701,7 @@ All notable changes to irlume are documented here. This project adheres to
   entry now cites the documented incident (howdy #822, a phone photo
   unlocking an Ubuntu 22.04 machine) and what irlume does differently, with
   the published ISO/IEC 30107-3 self-test linked. (#570)
+
 - **TPM tiers mapped to the Windows ESS/SDEV vocabulary.**
   SECURITY_AT_REST.md gains a short comparison note: what corresponds
   (TPM-sealed secrets, measured-boot PCR policies versus SDEV-style firmware
@@ -651,11 +709,13 @@ All notable changes to irlume are documented here. This project adheres to
   isolation on Linux; fail-closed design and TPM gating compensate), and
   the deliberate difference (the user-controlled recovery passphrase).
   Explicitly a vocabulary mapping, not an equivalence claim. (#571)
+
 - **The camera-landscape research is in the repo.** The 2026-08-27 survey
   (Windows Hello deep dive, MS-XU protocol, ESS/SDEV, OEM camera taxonomy,
   ecosystem issue mining) is committed as
   docs/research/2026-08-27-camera-landscape-research.md; #570 and #571 cite
   its preserved copies of Microsoft pages that have since been retired.
+
 - **The camera census: every camera-like device on the machine, classified
   once, each row printing the evidence it keyed on.** New
   `irlume camera census [--json]` (#575) and a doctor camera section rebuilt
@@ -671,6 +731,7 @@ All notable changes to irlume are documented here. This project adheres to
   shares the scan with its capability check. Diagnostics only: no capture
   behavior changed. Fixture-tree tests cover the walks; the per-class
   hardware evidence rides in the PR.
+
 - **MS-XU illumination metadata is a recorded, reportable, fuzzed pipeline
   capability.** Camera qualification measurements now record whether the IR
   node's Microsoft-metadata sibling was discoverable (a `TRY_FMT` probe;
@@ -686,6 +747,7 @@ All notable changes to irlume are documented here. This project adheres to
   permitted partial first metadata buffers until the 6.12.97-era "Avoid
   partial metadata buffers" fix, so the records are untrusted input to a
   root daemon, replayed from checked-in seeds on every CI run.
+
 - **`doctor` recognizes the IPU3 generation and the verified MIPI camera
   bridge class.** A cameraless machine now gets an honest explanation for
   two more classes instead of a bare "no camera": IPU3 CIO2 systems (the
@@ -750,6 +812,7 @@ All notable changes to irlume are documented here. This project adheres to
   stored, the reason is named (provenance continuity/contract counts,
   or delivered-rate floors), and a concurrent time saving is never
   advertised for a sequential verdict.
+
 - **AppArmor: `camera-tune` could not persist any qualification on
   enforcing hosts.** The capture-qualification store serializes every
   save behind a lock file of its own, and the shipped `irlumed` profiles
@@ -837,6 +900,7 @@ All notable changes to irlume are documented here. This project adheres to
   (fail-closed direction); upgrading from an older version and back again
   during one boot mixes lock paths for the transition window, disclosed
   here.
+
 - **An unexaminable emitter journal no longer reports a phantom pending
   change.** With non-root tools reaching the journal read for the first
   time (they used to stop at the lock), a permission failure reading the
@@ -914,9 +978,11 @@ All notable changes to irlume are documented here. This project adheres to
   click-to-select then click-to-fix; the IR-test and Support lines and
   every footer chip are click targets; the diagnosis box breathes with
   proper spacing.
+
 - Eye-based user challenges are retired. Gesture-gated requests now use only
   repeated head nodding to approve and a head shake to decline. Existing
   per-service defaults are unchanged; passive PAD remains mandatory.
+
 - **Capture-path latency and pairing (ADR-0014, PR #518).** The rate-gate
   startup flush is role-aware (IR 10 dequeues, RGB 0; was 30/30) from fleet
   measurement: lit authentication on sequential-schedule dual hosts drops
@@ -936,6 +1002,7 @@ All notable changes to irlume are documented here. This project adheres to
   remaining-time vs costliest-attempt, and a read-only MSXU probe
   (`irlume-camera` examples) reports Microsoft face-auth XU capabilities
   without writing camera controls.
+
 - Legacy `consent_gesture=closure` and `require_eyes_open=true` fail closed with
   migration instructions for one release. Contract-1 eye fields remain present
   and frozen at `false`.
@@ -947,18 +1014,21 @@ All notable changes to irlume are documented here. This project adheres to
   probing, pairing, negotiation, privacy, emitter, and capture behavior remain
   unchanged. A v1 evidence schema now fails closed on unknown versions and
   fields (#452).
+
 - **The camera supervisor now owns process-scoped lifecycle identity.**
   Distinct CSPRNG physical-camera identifiers and a transactional inventory keep
   generations monotonic while continuity is proven; removal retires an incarnation
   permanently, and rediscovery starts a fresh identifier at generation one. Stale,
   forged, foreign-instance, duplicate, exhausted, and poisoned states fail closed.
   Capture and hardware-control behavior remain unchanged (#455).
+
 - **Linux camera lifecycle changes now invalidate stale inventory tokens.**
   A monitor-before-scan libudev adapter coalesces UVC and USB-parent events, detects
   monitor socket errors, and rebuilds one authoritative sysfs snapshot without opening video
   nodes. Monitor loss, overflow, unstable scans, and continuity loss retire stale
   references before replacements become visible; capture and hardware-control behavior
   remain unchanged (#456).
+
 - **Camera operations now share one descriptor-bound cooperative lease.**
   Authentication and enrollment acquire RGB+IR atomically by physical camera identity;
   diagnostics, preview, setup, raw controls, and legacy single-node opens use the same
@@ -976,6 +1046,7 @@ All notable changes to irlume are documented here. This project adheres to
   clears at reboot). A lock owned by the process with no world bits is
   strictly tighter than the mirror target and now proceeds; a
   world-accessible uncorrectable lock still refuses.
+
 - **AppArmor profile gaps (enforce-mode installs):** the deferred
   template-key loader's flocks and camera classification's media-graph
   reads were both denied under enforcement. The first broke every
@@ -983,24 +1054,29 @@ All notable changes to irlume are documented here. This project adheres to
   classification to the privacy-LED open probe. Both rules added; a
   complain-mode audit across the full exercise battery confirmed no
   other denial class remains.
+
 - **TUI could not be exited discoverably:** `q` was documented only in the
   `?` overlay and bare `Esc` exited the whole app without confirmation.
   Every screen's header now carries a clickable `✕ Exit (q)` chip; Esc
   returns to Overview instead of quitting (it remains the escape hatch
   during a stalled camera probe); the Cameras sudo action confirms
   before running.
+
 - **`[s] Create Support Report` appeared broken:** the report ran silently
   during the terminal suspend, showing a blank screen. The outcome now
   prints with the absolute path on the suspended terminal (failure
   included), and the file lands findably in the TUI's working directory.
+
 - **`sudo irlume` no longer writes user state into the invoking user's
   HOME** (a root-owned `~/.local/share/irlume/<user>.json` survived
   until now); privileged processes resolve to the system state dir
   whenever $HOME is foreign.
+
 - **Uninstall leaves nothing behind:** the stale `/run/irlume.sock`, the
   kernel-loaded AppArmor profile, `systemctl enable`'s unit copies in
   `/etc/systemd/system/` (with a still-enabled timer), and per-user
   `~/.local/share/irlume` state are all swept.
+
 - **install.sh:** verified channel fallbacks (Copr/PPA outage →
   checksum+signature-verified release packages, upgrade-only: no
   downgrades or lane flip-flop; `IRLUME_UPDATE=1` updates an installed
@@ -1010,17 +1086,21 @@ All notable changes to irlume are documented here. This project adheres to
   asset matching is anchored with exactly-one-match, and the RPM path
   uses `dnf install` (upgrade cannot fresh-install). Tampered sums,
   stripped signatures, and reruns are container-verified fail-closed.
+
 - **The universal .deb container build** installs `libudev-dev` and
   accepts docker as a podman fallback.
+
 - **`irlume diag` reports the keyring and face-template seals separately.** A
   healthy keyring credential envelope can no longer hide a missing, unreadable,
   or PCR-drifted template-key envelope behind one generic seal status; each row
   now names the secret it protects and gives its own recovery action (#472).
+
 - **CUDA and OpenVINO feature builds compile against pinned `ort` rc.13 again.**
   The dependency update removed deprecated execution-provider aliases while these
   two optional paths still referenced them. CI now compiles every supported ONNX
   execution provider independently and together so future API drift is caught
   before release (#454).
+
 - **TPM unseal returns the sealed secret instead of mangled bytes.** Policy
   sessions are now salted against the SRK, so ESYS parameter encryption has a
   real session key instead of the empty key of an unsalted, unbound session.
@@ -1041,16 +1121,20 @@ All notable changes to irlume are documented here. This project adheres to
   head shake DECLINES the prompt instead of letting it time out; what the
   dialog does next is the desktop agent's call (the KDE agent re-prompts
   and closes after about three declined attempts) (#424).
+
 - **The Repair tab reports the TFLite runtime** the way it reports ONNX:
   from the daemon's Health when it answers, and from a local path probe
   when it does not, with a set-but-missing `IRLUME_TFLITE_LIB` called out
   as its own failure. The mesh has run on this runtime since it became the
   production default, and its absence had no row anywhere.
+
 - **`doctor` reports the capture mode a camera pair uses and why**
   (`capture-mode`), and the emitter's pending per-stream restore records
   (`emitter-stream-pending`) (#100, #429).
+
 - **`status --json` reports a starting daemon as `"starting"`** instead of
   folding the model-loading window into `"unreachable"`.
+
 - **A contention probe example** (`cargo run -p irlume-camera --example
   contention_probe`) measures two-opener behaviour on real hardware (#341).
 
@@ -1085,6 +1169,7 @@ All notable changes to irlume are documented here. This project adheres to
   pairs. Bytes read before the socket serves fall from 527.8 MB to 267.2 MB,
   which is one recognizer. Resident memory is unchanged, because the buffer is
   released as soon as the session owns its copy (#346).
+
 - **An unmeasured camera pair now captures one stream at a time, and the
   first enrollment measures the real answer.** The old fallback assumed
   concurrent capture, which broke an enrollment outright on a module whose
@@ -1098,6 +1183,7 @@ All notable changes to irlume are documented here. This project adheres to
   cameras.conf writer lock, so it can only fill an empty verdict; explicit
   `camera-tune` keeps its overwrite semantics. Stored verdicts are
   untouched, in both directions, and keep deciding every capture (#340).
+
 - **Capture-mode verdicts are keyed by the RGB+IR pairing, not the RGB
   camera alone.** Contention belongs to the pairing (the same RGB module
   that starves against its own IR sibling holds 99% of its brightness
@@ -1106,6 +1192,7 @@ All notable changes to irlume are documented here. This project adheres to
   carries only the RGB identity; it keeps deciding while both nodes belong
   to that one physical module and counts as unmeasured for any other
   pairing.
+
 - **Capture errors treat the errno as a search key, not a verdict.** The
   kernel reuses EINVAL, EIO, and ENOSPC across negotiation, bandwidth, and
   descriptor paths, so the messages now say what each errno covers and point
@@ -1119,6 +1206,7 @@ All notable changes to irlume are documented here. This project adheres to
   write clears the origin record. Captures on the affected pair become
   0.7 to 1.3 s slower and stop failing; `doctor`'s `capture-mode` row says
   which mode is active and why (#100).
+
 - **The production landmark mesh is Google's published
   `face_landmarks_detector.tflite`**, run on a TFLite C runtime the FHS
   packages bundle at `/usr/share/irlume/tflite`, built from a pinned
@@ -1132,16 +1220,21 @@ All notable changes to irlume are documented here. This project adheres to
   metadata, video2 IR, video3 its metadata) the IR node was handed the RGB
   stream's metadata queue and classified nothing; measured 0/20 to 20/20
   frames classified on the Brio (#310).
+
 - **An unusable ONNX Runtime is refused at load instead of parking the
   daemon forever** (#304).
+
 - **One table decides what a PAM service name is.** The elevation set
   (`sudo`, `su`, `doas`, `sudo-i`, `su-l`, `runuser`, `runuser-l`) lives in
   `pam_service::classify`, and the surfaces that carried their own shorter
   lists now read it (#362).
+
 - **Four places where an unrecognised or new value chose the permissive
   answer now choose the restrictive one** (#365).
+
 - **The camera pin is published and read as one value**, so the writer and
   the reader can no longer disagree about what is pinned (#374).
+
 - **`irlume login enable` refuses to run when nothing established the
   camera capabilities.** On a packaged install a dead daemon leaves the
   socket-activated `/run/irlume.sock` in place, so the capability query
@@ -1149,6 +1242,7 @@ All notable changes to irlume are documented here. This project adheres to
   camera" and removed face auth from every greeter and the lock screen
   while reporting success. An enable now requires an established reading;
   a disable never needed one.
+
 - **A face match no longer collides with its own consent watch.** The
   held-session rework passed session references down, so the release
   before the gesture capture dropped references while the sessions kept
@@ -1157,29 +1251,35 @@ All notable changes to irlume are documented here. This project adheres to
   The owning sessions are now released where the decision is made,
   verified against the camera by holding, colliding, releasing, and
   reopening (#346 follow-up).
+
 - **The Repair tab's SELinux fix relabels the socket it claims to
   relabel.** Under socket activation a service restart never recreates
   `/run/irlume.sock`, so the old fix reported done while the label stayed
   wrong; `irlume selinux load` now runs the module load, the try-restart,
   and the `restorecon` as one sequence, and no longer prefers an
   `irlume.pp` from the caller's working directory over the packaged one.
+
 - **A starting daemon is no longer reported as dead.** For the seconds
   models take to load, `status` said "NOT reachable" about a socket that
   had just answered and the Repair tab offered a restart that reopened the
   same window; both now say the daemon is starting and to retry, and
   EACCES renders as a permission problem instead of "not reachable".
+
 - **The Settings tab no longer offers the require-eyes-open toggle the
   daemon refuses.** Enabling is declined by design (#386), so the row
   advertised an action whose only outcome was an error modal; the hint now
   appears only for a legacy ON, and three multi-line messages that
   rendered with embedded 20-plus-space runs are formed correctly.
+
 - **The Cameras tab no longer claims "no camera hardware" when the daemon
   has not answered**; unknown renders as unknown, and "none" is reserved
   for a daemon that answered with no devices.
+
 - **`irlume credential-release-challenge <service> status` works.** The
   usage line and three other surfaces taught the per-service status form
   while the parser accepted only `on|off`, so the exact command they
   recommended exited 2.
+
 - **The backlight-compensation tuning no longer outlives the session onto
   other applications' pictures.** RGB sessions write
   `V4L2_CID_BACKLIGHT_COMPENSATION=2` so auto-exposure favors the face over
@@ -1298,6 +1398,7 @@ All notable changes to irlume are documented here. This project adheres to
   opt back in with `sudo irlume credential-release-challenge on` or the
   per-service key `service_gesture.credential_release=1`; nothing in the
   upgrade restores the old behaviour (#424).
+
 - **The require-eyes-open gate granted with the eyes closed, behind glasses.**
   `both_eyes_open` took the maximum grey level in a window around each eye
   landmark and compared it against a fixed 200, with no notion of the sensor's
@@ -1390,29 +1491,37 @@ All notable changes to irlume are documented here. This project adheres to
   `-i`/`-l`/`runuser` variants) demand the consent gesture by default. Turn
   one off with `sudo irlume credential-release-challenge sudo off` (it asks
   for confirmation).
+
 - **The keyring-release gesture default flipped from ON to OFF.** A greeter
   cold login and a logout now release the TPM-sealed keyring password on the
   face match alone. Opt back in with
   `sudo irlume credential-release-challenge credential_release on`.
+
 - **Anyone who enabled require-eyes-open should run
   `irlume profiles eyes-open off`.** Enabling is refused now (#386), but an
   existing `true` is still enforced by a gate measured to deny nearly every
   genuine frame.
+
 - **`irlume profiles challenge on|off` is gone** with the retired blink gate
   (ADR-0002); a script calling it exits 2.
+
 - **Check `grep consent_gesture /etc/irlume/settings.conf`.** A misspelled
   value now disables every gesture (loudly) instead of accepting either, and
   an unrecognized truthy spelling of `credential_release_challenge` (for
   example `enabled`) now reads as OFF where 0.9.0 read it as ON.
+
 - **Machine-API consumers: re-pull the schema from the package.**
   `require_challenge` in `profiles.list` is frozen at `false` for contract 1
   and leaves with contract 2.
+
 - **Close any running `irlume tui` before upgrading.** A 0.9.0 TUI cannot
   parse the new daemon's Enrollment reply (its `require_challenge` field had
   no serde default at 0.9.0) until it is restarted.
+
 - **`/etc/irlume` is enforced to mode 0755 on every daemon start** by
   `ConfigurationDirectory=`; a directory tightened to 0700 is reset. The
   files inside stay 0600.
+
 - The polkit PAM stanza migrates to the head-shake-capable `abort=die`
   control automatically: the packaging scriptlets run
   `irlume login reconcile`, which now treats the old `sufficient` shape as a
@@ -1940,6 +2049,7 @@ working. The upgrade was tested both ways with fixtures produced by real
   line can be the tail of another directive's arguments (verified: the spliced
   line never ran), and under-reporting is the safe direction where
   over-reporting is the defect this exists to fix. Closes #155.
+
 - **The wallet hand-off check was blind to the fingerprint path.** It anchored
   on the face `unseal` line, but the post-auth `keyring` line releases the same
   sealed password. On a fingerprint-only box the greeter carries ONLY that
@@ -2759,15 +2869,18 @@ Security release. Please upgrade.
   doctor actions, not only the sudo ones; a caught signal resets to the default
   across exec, so a child (sudo, dnf, a prompt) still gets Ctrl-C. Found when
   Ctrl-C in the third-party-model license prompt took the whole TUI down.
+
 - **Ctrl-modified letters no longer alias to plain-letter TUI actions.**
   Ctrl-C arrives as Char('c')+CONTROL and fired the calibrate binding;
   modifier-carrying letters are now ignored by the key dispatcher.
+
 - **The TUI runs its own binary for privileged steps, even shell-wrapped
   ones.** The self-exe substitution only rewrote a bare `irlume` argument, so
   the `sh -c "irlume selinux load && ..."` action resolved `irlume` from root's
   PATH, a possibly older installed build. It now splices the running binary into
   the command, and falls back to the PATH name only when an in-session update has
   replaced the on-disk binary.
+
 - **Packaged installs can re-load the SELinux module after `login
   disable`.** The pp lookup never searched
   `/usr/share/selinux/packages/irlume.pp`, the irlume-selinux rpm's
@@ -2844,6 +2957,7 @@ Security release. Please upgrade.
 
 - NixOS now appears in the packaged badge and the comparison table's "Runs on"
   row (the `nixosModules.irlume` flake target already shipped).
+
 - The `irlume biopolicy <on|off|status>` operation-class toggle is now in
   docs/COMMANDS.md (it was reachable in the CLI and TUI but undocumented).
 
@@ -2853,17 +2967,21 @@ Security release. Please upgrade.
   only barrier on the template-key envelope against an offline attacker with the
   disk, so a trivial passphrase is refused; the confirmation copy is zeroized
   rather than left in the heap as plaintext.
+
 - `irlumed` warns loudly when no `irlume` group exists and it leaves the socket
   world-connectable, instead of falling back to 0666 silently. Privileged
   operations stay gated by the peer-credential check regardless.
+
 - `cameras.conf` / `settings.conf` are created mode 0600 instead of
   written-then-chmod, closing the brief window where a new file was
   world-readable.
+
 - A profile that opted into the passive-blink liveness challenge now fails
   closed to the password when the challenge cannot run (no IR camera, or the
   FaceMesh model is not deployed), instead of granting without it. The password
   always works, so this is a fallback, not a lockout; it was previously a silent
   skip-and-grant.
+
 - The per-user IR depth floor (an anti-print 3D-structure check, fitted
   automatically at every IR enrollment and enforced on both IR paths) is now
   surfaced by doctor: on IR hardware, an enrollment made before the feature
@@ -2944,6 +3062,7 @@ Security release. Please upgrade.
   silently ignored and the job installed 1.88.0 (a duplicate of the MSRV job).
   The stable, coverage, and fuzz jobs now pin `@master`, which declares the
   input and honors the requested toolchain. Found by a workflow audit.
+
 - **The `install.sh` installer refuses to run without a verified signature.**
   It previously fell back to unsigned checksums with a warning when
   `SHA256SUMS.asc` or `gpg` was absent, so an attacker serving a modified
@@ -2962,6 +3081,7 @@ Security release. Please upgrade.
   is now read through `secure_getenv`, which returns NULL under AT_SECURE, so the
   compiled socket path always wins in a setuid stack while the daemon and dev/test
   keep the override. Found by a pre-release security audit.
+
 - **Self-heal marker hardened.** The `login.wired` reconcile marker is written
   0600 root-owned and trusted only when root-owned in production, so it cannot be
   planted by a non-root user to force `--with-sudo` wiring. reconcile also now
@@ -3023,15 +3143,18 @@ fixed its first kernel-drift bug before this release shipped.
   greeter, since Rust 1.81), and the module's own dependency stack contains
   reachable panics. Crashing auth modules were the dominant lockout/fail-open
   class in the pre-2020 generation of face-PAM projects.
+
 - **NIST known-answer test for the template envelope.** A CAVP AES-256-GCM
   vector (`gcmEncryptExtIV256.rsp`) is decrypted through the on-disk
   `nonce ‖ ciphertext ‖ tag` layout in the test suite, and the 28-byte framing
   overhead is pinned. An `aes-gcm` upgrade that changes the algorithm or the
   blob layout now fails CI instead of silently orphaning every encrypted
   enrollment (a sibling project nearly merged exactly that dependency bump).
+
 - **Hardware-report issue template.** New GitHub issue form that asks for the
   machine/camera model, distro, and `irlume doctor` / `irlume detect` output up
   front, so camera and emitter quirks arrive with the data a fix needs.
+
 - **`irlume fingerprint verify` and `irlume fingerprint reset`.** `verify` runs
   one interactive round against the enrolled prints and is offered
   automatically after every enrollment, catching the "enroll succeeds, verify
@@ -3040,6 +3163,7 @@ fixed its first kernel-drift bug before this release shipped.
   `--yes` for scripts; refuses to delete without a terminal) and offers a fresh
   enrollment: the remedy for chip/host template desync after a Windows
   dual-boot enrollment, an OS reinstall, or a BIOS fingerprint wipe.
+
 - **Fingerprint doctor checks.** `irlume doctor` now warns on: a stale fprintd
   device claim (the dominant post-suspend failure; finger prompts silently stop
   until `systemctl restart fprintd`), a vendor driver stack
@@ -3058,6 +3182,7 @@ fixed its first kernel-drift bug before this release shipped.
   also now installed and smoke-tested weekly on bare Debian 12/13 and
   Ubuntu 22.04/24.04/26.04 images, guarding the glibc floor the package
   promises.
+
 - **IR capture negotiates beyond native GREY.** IR nodes that expose only the
   16-bit grey family (Y16/Y10/Y12) or only a packed colour container
   (NV12/YUYV) now work: 16-bit frames are converted with an effective-depth
@@ -3074,15 +3199,18 @@ fixed its first kernel-drift bug before this release shipped.
 - Every fprintd/busctl helper now runs under `LC_ALL=C`; the fprintd CLI tools
   are gettext-localized, so on a non-English locale the status parsing silently
   stopped working.
+
 - Enrollment has a 120-second completion deadline (a wedged driver otherwise
   hangs the enroll forever), captures stderr, and maps each failure class to
   its own actionable message: reader claimed by another session, on-sensor
   storage full, reader disconnected mid-enroll, polkit refusal, no device.
+
 - Listing enrolled fingers now distinguishes "no fingers enrolled" from "the
   listing failed" (stale claim, polkit refusal, readerless box;
   `fprintd-list` exits 0 in all of them). Found live: over SSH, polkit refuses
   the listing, and status/verify used to answer "no finger enrolled; run
   irlume fingerprint add", pointing exactly the wrong way.
+
 - Stale-claim detection matches the D-Bus error names (never translated) in
   addition to the C-locale phrases, and multi-reader machines now report every
   reader's name instead of only the first.
@@ -3111,15 +3239,18 @@ room and in the dark) before release.
   A camera that offers neither (MJPEG-only) gets a clear up-front error and an
   `irlume doctor` diagnosis, in place of a cryptic "expected YUYV". `doctor`
   reports RGB decodability using the same format list capture actually decodes.
+
 - **`irlume doctor` recognizes Intel IPU6/IPU7 cameras.** These expose no direct
   V4L2 node, so a bare "no camera" was misleading; doctor now names the sensor
   and points at the libcamera software relay, covering both IPU6 and IPU7 across
   the dkms and in-kernel drivers with a PCI-ID fallback. It also states the
   accurate limitation that the IR sensor is not exposed on Linux at all.
+
 - **`irlume doctor` warns when a user is enrolled but no greeter is wired.**
   `authselect` / `pam-auth-update` can regenerate the PAM stacks and drop
   irlume; doctor now surfaces that state instead of leaving a silently
   face-less login.
+
 - **Consecutive-failure throttle.** After a run of failed face attempts (5 by
   default, `IRLUME_RATE_LIMIT`) the daemon stops firing the camera on the
   gesture for a cooldown (30s, `IRLUME_RATE_COOLDOWN_SECS`) and PAM falls
@@ -3129,6 +3260,7 @@ room and in the dark) before release.
   gate. This is a throttle, not the NIST SP 800-63B-4 §3.2.3 hard
   biometric-disable tier: the password is always the fallback and there is no
   account lockout. Applied on both the login/sudo and keyring-unseal paths.
+
 - **Informed opt-in for the anti-spoof blink challenge at enrollment.** Every
   mainstream authenticator (Face ID, Android, Windows Hello) ships passive
   presentation-attack detection rather than an active challenge, so the blink
@@ -3141,6 +3273,7 @@ room and in the dark) before release.
 - **First capture warms up and retries.** A suspend/resume can leave `uvcvideo`
   re-initializing when the first frame is requested; capture now warms the
   stream and retries so a resume does not fail the login outright.
+
 - **`irlumed.service` stops promptly and runs sandboxed.** `TimeoutStopSec=10s`
   caps the stop wait so a package-upgrade restart cannot stall (the 90s-hang
   class seen elsewhere), guarded by a SIGTERM regression test. The unit also
@@ -3152,6 +3285,7 @@ room and in the dark) before release.
   (per-user `$HOME` state, camera and TPM access, the ONNX runtime's JIT).
   Validated live: the daemon starts, loads models, binds the socket, and raises
   no SELinux denials under the restrictions.
+
 - **`docs/THREAT_MODEL.md`** documents that the on-demand empty-Enter gesture
   already supplies the deliberate intent (FIDO User Presence) a passive
   face-auth tool otherwise lacks for `sudo`, so privilege elevation needs no
@@ -3166,6 +3300,7 @@ room and in the dark) before release.
   environment markers) up front and returns `PAM_IGNORE` for a remote
   transaction, so the password or another factor authenticates instead. Always
   on, independent of how the stack is wired.
+
 - **Stage-2 fusion weighs the RGB modality by its real brightness.** The
   cross-spectrum path passed a hardcoded RGB face brightness of 0 into fusion's
   quality weight, so fusion always treated RGB as if the room were pitch-dark
@@ -3173,15 +3308,18 @@ room and in the dark) before release.
   weakened the "an impostor must fool both modalities at once" bound in bright
   rooms. `assess_full` now measures the real RGB face luma (as the RGB-only
   path already did); the liveness gate is unchanged.
+
 - **The dark (IR-only) path enforces the per-user calibrated depth floor.** The
   RGB path already required the live frame to clear the user's enrolled
   3D-structure floor; the dark path used only the lenient global ratio, so a
   curved warm spoof sitting between the two could be rejected in lit conditions
   yet granted in the dark. The same floor now applies on both paths.
+
 - **The daemon self-test is gated to root.** `SelfTest` fires the camera and
   returns raw liveness measurements (IR brightness, depth, glint), a
   spoof-tuning oracle; it now refuses a non-root peer like the other
   camera-bearing requests, which matters on the permissive-socket fallback.
+
 - **Sealed key and recovery files are created at mode 0600 atomically.** They
   were written and then `chmod`-ed, leaving a brief window where the file
   existed under the default umask. The payload is TPM-sealed or
@@ -3195,15 +3333,18 @@ room and in the dark) before release.
   which sliced two bytes at a time with no guard: an odd-length or non-ASCII
   (multi-byte) value in `pcrlock.json` panicked the root daemon. It now rejects
   odd-length and non-ASCII input up front, mirroring `pcrsig::from_hex`.
+
 - **A non-finite detector score can no longer hide the real face.** A NaN
   detection score passed the `< threshold` test (false for NaN) and then ranked
   highest under `total_cmp`, so a single NaN cell would win the top-face pick
   and shadow the genuine face, forcing a false reject. Non-finite scores are
   now dropped at decode.
+
 - **A truncated IR frame degrades to a safe deny instead of panicking.**
   `mean_in_bbox` indexed the frame assuming `len == width * height`; a short or
   mismatched buffer from the camera would panic. It now length-checks once and
   returns 0 (read as "too dark") on a short frame.
+
 - **A wrong-dimension stored template can no longer crash the daemon.** The
   cosine matcher assumed both embeddings were the same length (only a
   debug-time assertion), so a template whose dimension differs from the live
@@ -3225,13 +3366,16 @@ room and in the dark) before release.
   deleting the source-installed files) and clears the residual repo files and
   systemd drop-in that a plain package remove leaves behind. The TUI requires
   a typed-word confirmation before it proceeds.
+
 - **NixOS module.** `nixosModules.irlume` (in the flake, backed by
   `nix/module.nix`) wires the daemon, PAM, and per-greeter login and lock
   configuration declaratively; `docs/NIXOS.md` documents it.
+
 - **Merge-aware enrollment in the TUI.** Enrolling a face the system already
   knows now adds the new scans to that profile instead of creating a second
   one; a face maps to exactly one profile. This brings the 0.2.1 CLI behavior
   to the TUI (issue #15), with a confirmation prompt before the merge.
+
 - **`irlume models`: opt-in third-party liveness models** (the runtime shape
   of the issue #4 `nonfree-pad` idea). The catalog lists externally-trained
   models with real weight licenses that fail the shipped-stack provenance bar;
@@ -3245,6 +3389,7 @@ room and in the dark) before release.
   refuses weights whose checksum stops matching. First entry: the MIT-licensed
   DAMO FLIR IR model, which closes the vinyl-print gap above. `irlume doctor`
   reports the enabled model.
+
 - Third-party PAD candidate evaluation (issue #4 follow-through):
   `docs/pad-results/2026-07-17-third-party-pad-candidates.md` measures the two
   externally-trained liveness models that carry real weight licenses on real
@@ -3254,12 +3399,14 @@ room and in the dark) before release.
   CelebA-Spoof-trained `anti-spoof-mn3` saturates at "spoof" for genuine users
   under indoor lighting and is not listed. Eval scripts and score summaries in
   `benchmarks/pad-candidates/`.
+
 - `docs/STANDARDS.md`: maps the biometric standards that apply to a device
   login system (ISO/IEC 30107-3, 19795-1, 24745, the Windows Hello bar,
   Android's biometric classes) onto irlume's committed evidence, states what
   is not claimed under each (no certification, no Hello-bar FAR, no 3D-mask
   resistance), and points every number at the artifact and reproduction path
   behind it.
+
 - `landmark_dump` example (issue #4): captures a raw IR strobe burst and
   writes, per frame, the PGM plus a CSV of all 478 FaceMesh landmark
   coordinates and the IR brightness (3x3 patch mean) at each; the input a
@@ -3279,16 +3426,20 @@ room and in the dark) before release.
   Same fail-closed verdict, honest reason. The sensor cannot tell what the
   source is, so the message names examples rather than guessing. The measured
   ambient level also joins the liveness debug traces.
+
 - The daemon startup notice about stale IR templates fires only when dark/dim
   login is actually broken (no usable current-space templates), not forever
   after a completed re-enroll.
+
 - README documents the measured outdoor operating envelope; packaging comments
   record the verified distro onnxruntime versions (Fedora and Ubuntu are all
   below irlume's 1.24 floor, so the bundle stays).
+
 - ARCHITECTURE.md documents the IR strobe capture and the opt-in ambient
   subtraction path with its gates (previously only in this changelog);
   ADR-0001 gains the acceptance bar for a future learned PAD model, including
   the model-inversion criterion raised in issue #4.
+
 - Every operator-facing knob is now documented: SETUP.md gains a configuration
   reference (the four `/etc/irlume` + `/var/lib/irlume` config files, camera
   selection precedence, and the daemon environment variables from
@@ -3306,15 +3457,18 @@ room and in the dark) before release.
   enable on startup so a suspend/resume or a fresh boot does not leave the
   emitter dark, and the PAM include layout is wired the way Arch's stack
   expects.
+
 - **The PCR-signature parser rejects non-ASCII hex instead of panicking.** A
   multi-byte UTF-8 character in a hex field split a byte boundary and panicked
   the root daemon's parser; it now rejects non-ASCII input up front. Found by
   fuzzing the signature parser.
+
 - **TUI micro-audit fixes.** A full pass over the TUI produced deliberate
   `[y]`/`[n]` confirmations (a stray key no longer counts as "yes"), correct
   rendering of the merge and delete prompts, a static two-row footer with all
   live messages moved to a scrollable Activity panel, and scroll-handling
   fixes for the enroll and operation views.
+
 - **The universal `.deb` works on Debian 12 (and now Ubuntu 22.04).** It was
   built on Ubuntu 24.04 (glibc 2.39), so on Debian 12 (glibc 2.36) dpkg
   installed it and then every binary failed to start with "GLIBC_2.39 not
@@ -3326,6 +3480,7 @@ room and in the dark) before release.
   bump cannot reintroduce this silently. Found by container-testing the
   install matrix on Debian proper. The v0.2.1 release asset was rebuilt and
   replaced in place (same source, same tag; only the build base changed).
+
 - **`install.sh` GPG verification can actually fire.** The script verified
   `SHA256SUMS.asc` against a keyserver fetch of the pinned key, but no `.asc`
   was published with releases and the key was not on keys.openpgp.org, so
@@ -3334,11 +3489,13 @@ room and in the dark) before release.
   (same trust anchor as the already-pinned fingerprint), importing it into a
   throwaway GNUPGHOME, with no keyserver dependency, and the user's keyring is
   never touched.
+
 - **The Arch PKGBUILD builds on a clean system.** `clang` joins
   `makedepends`: the V4L2 bindings are generated by bindgen, which needs
   libclang at build time, so `makepkg` on a machine without clang failed in
   `v4l2-sys-mit`. Found by a container dry run of the AUR install; dev boxes
   had clang installed and never hit it. (AUR updated as pkgrel 2.)
+
 - **Arch update and install paths point at the AUR.** `irlume update` on a
   pacman install and the one-step `install.sh` both still referenced a
   `.pkg.tar.zst` release asset that stopped shipping after 0.1.x, so each
@@ -3364,6 +3521,7 @@ room and in the dark) before release.
   their old profile through the unchanged RGB path, exactly when they needed
   fresh current-space scans to revive dark/dim login. On 0.2.0 itself, the
   working paths are `irlume tui` (Profiles, improve) or `irlume enroll --reset`.
+
 - **Enroll captures only what fits.** A one-scan probe decides whether the
   face merges into an existing profile and sizes the session from the free
   slots: a profile with 5 slots left gets a 5-scan top-up instead of a 10-scan
@@ -3387,20 +3545,24 @@ room and in the dark) before release.
   box into the 5 alignment points. The cascade detects 98.5% of those frames
   while never firing when YuNet succeeds, so easy detection is unchanged (LFW:
   0 rescues, identical accuracy). Both models are Apache-2.0.
+
 - **FaceMesh upgraded to the 478-point FaceLandmarker mesh** (256px), converted
   from Google's Apache-2.0 `face_landmarker.task`. Measured 28% better eye
   accuracy on CBSR ground truth (NME 0.0378 → 0.0273). The loader auto-detects
   the input size and accepts either the 468 or 478 generation.
+
 - **Per-enrollment IR calibration (ADR-0004).** A ridge-regularized linear map
   fitted on-device from each user's own consented scans, pulling IR embeddings
   toward their RGB space; it activates whenever no global adapter is loaded and
   ships no weights (no license surface). Replaces the research-only-trained
   `ir_adapter.onnx` (now removed, see below).
+
 - **Presence grace window after the consent gesture.** After the blank-Enter
   gesture, capture retries while no usable face is in frame so walking up or
   settling still authenticates: ~15s for login/lock, ~5s for `sudo`/`su`
   (`IRLUME_GRACE_MS` overrides). Only presence-class failures retry, never a
   below-threshold match (FAR-neutral by construction).
+
 - **IR-template embedding-space tagging** so a future adapter swap/removal fails
   loud ("re-enroll") instead of scoring across embedding spaces.
 
@@ -3423,9 +3585,11 @@ room and in the dark) before release.
 - Enabled the cargo-deny license gate (`check licenses` in CI) with a curated
   permissive + GPL-compatible allowlist; no non-commercial or AGPL/SSPL license
   is permitted in the dependency tree.
+
 - Dropped the unused `ndarray` dependency (the `ort` bridge only used the tuple
   tensor API), trimming the build; reduced per-match string allocation in the
   argmax path. No auth-decision, threshold, or model change.
+
 - Added a Microsoft trademark disclaimer for the descriptive "Windows Hello"
   references.
 
@@ -3441,14 +3605,18 @@ room and in the dark) before release.
   literal PCR-7 seal, and round-trip-verifies each candidate before trusting
   it, so a policy that cannot unseal on the current boot never holds the
   secret. Existing envelopes are untouched until the next arm or reseal.
+
 - `irlume status` and the TUI keyring panel now name the seal tier and warn
   when the bound PCRs have drifted since sealing. This uses a new daemon
   `KeyringInfo` request; against an older daemon both surfaces fall back to
   the previous armed yes/no display.
+
 - `irlume diag` reports whether a pcrlock policy is provisioned and which NV
   index new seals would bind to.
+
 - The daemon log names the exact remedy when a PCR drift locks face
   authentication (re-arm for a literal seal, `make-policy` for pcrlock).
+
 - TPM fault-injection test hooks and ignored real-hardware tests covering
   pcrlock seal/unseal, drift, and the seal-tier ladder.
 
@@ -3458,6 +3626,7 @@ room and in the dark) before release.
   fork: tss-esapi 7.7.0 plus the `PolicyAuthorizeNV` wrapper (upstream merged
   it in 2024 but never shipped it in a 7.x release) and upstream PR #530's
   session-handle leak fix. `Cargo.lock` pins the exact commit.
+
 - IR ambient subtraction (opt-in via `IRLUME_IR_AMBIENT_SUBTRACT=1`) reworked
   its gate against a real sunlight dataset. Under strong ambient IR the sensor
   saturates and a genuine strobe compresses to a gap of ~8-10, so the old
@@ -3477,6 +3646,7 @@ room and in the dark) before release.
   operation and mid-enrollment, and the Welcome screen's `[i]` identify key
   works in the default view; both were previously swallowed by the panel's
   key handling.
+
 - A pcrlock policy that covers zero PCRs is refused at seal and unseal time;
   binding a secret to it would give no measured-boot protection.
 
@@ -3493,14 +3663,17 @@ unchanged; this makes installing and updating irlume smooth on every distro.
   release asset for your CPU architecture, and only offers a download that
   exists: no more dead links or steering an Ubuntu derivative to a PPA
   that can't serve it.
+
 - **Two Ubuntu lanes.** The PPA carries the current Ubuntu LTS (native,
   auto-updating); every derivative (Mint, Pop!_OS, Zorin, elementary) uses the
   universal `.deb` below: one binary that installs on Ubuntu 24.04 and newer.
+
 - Declared minimum Rust is now 1.88 (the real floor, via the ONNX Runtime binding).
 
 ### Fixed
 
 - Arch: `git lfs pull` fetches the model weights correctly under `makepkg`.
+
 - PPA source builds pack a deterministic orig tarball.
 
 ### Downloads: which asset do I need?
@@ -3511,10 +3684,13 @@ arrive automatically; these assets are direct downloads for everyone else.
 - **`irlume_0.1.4_amd64.deb`**: Debian and Ubuntu derivatives. Built on the
   oldest supported Ubuntu base, so this single file installs on Mint, Pop!_OS,
   Zorin, elementary, and any newer Ubuntu (`sudo apt install ./…`).
+
 - **`irlume-0.1.4-1-x86_64.pkg.tar.zst`**: Arch Linux (`sudo pacman -U ./…`).
+
 - **`irlume-0.1.4-1.fc44.x86_64.rpm`**: Fedora, the main package
   (`sudo dnf install ./…`). The [Copr](https://copr.fedorainfracloud.org/coprs/archledger/irlume)
   is the auto-updating Fedora channel and pulls the SELinux policy in for you.
+
 - **`irlume-selinux-0.1.4-1.fc44.noarch.rpm`**: the SELinux policy companion for
   the Fedora RPM. Fedora enforces SELinux by default and the login greeter can't
   reach the daemon without this module. It's a *weak* dependency, so a local
@@ -3536,16 +3712,19 @@ friendlier guided enrollment.
   behaviour its greeter supports. Face is **on-demand** by default:
   leave the password empty and press Enter; typing a password never starts the
   camera.
+
 - **`irlume logs`**: every face-auth journal line (daemon, PAM grantors, keyring
   modules) in one view, with `-f` / `--since`. **`irlume logs debug
   on|off`** toggles per-stage pipeline tracing (`IRLUME_LOG=debug`) for
   diagnosing a failed or slow login: capture timings, liveness cues vs
   thresholds, match scores. Numbers only; never frames, embeddings, or secrets.
+
 - **Directional enrollment guidance**: the framing guide now tells you which way
   to turn ("Turn your head left") and tilt ("Lift your chin"), and **auto-
   calibrates the frontal pitch neutral per user/camera** so the coaching centres
   on wherever a level face reads on your hardware. Fresh enrollment now captures
   **5 scans** (was 3).
+
 - A per-tab **hint bar** in the TUI so a first-time user always knows what a
   screen is for and which key to press. `docs/DEBUGGING.md` scrutineer's guide.
 
@@ -3554,6 +3733,7 @@ friendlier guided enrollment.
 - **1:N `identify` and identity verification are peer-authenticated**: a
   non-root caller is scoped to its own account (root keeps the cross-user
   search), closing a similarity-score oracle on a world-connectable socket.
+
 - **Journal deny lines are redacted** with tracing off: denied-attempt scores
   quantize to one decimal and cue measurements are stripped, so the system
   journal can't be used as a spoof-tuning oracle. Exact values still reach the
@@ -3577,16 +3757,20 @@ with no terminal detours.
   starts `irlumed` at install (systemd preset + scriptlet), matching what the
   Arch and Debian packages already did. Previously the daemon shipped disabled
   and the first enrollment failed with a cryptic `os error 2`.
+
 - **SELinux**: `dnf install irlume` now pulls the policy subpackage in by
   default (weak dependency), and both the subpackage scriptlet and
   `irlume login enable` restart the daemon after loading the module; the
   already-bound socket kept its pre-policy label, which silently blocked the
   confined greeter until the next reboot.
+
 - `sudo irlume login disable --apply` now always unwires `/etc/pam.d/sudo`
   (the "undoes everything" promise was false unless `--with-sudo` was passed).
+
 - Daemon-unreachable errors name the exact fix
   (`sudo systemctl enable --now irlumed`) instead of `os error 2`; the
   dry-run `login disable` no longer claims it removed the SELinux module.
+
 - Security-audit hardening: enrollment saves are atomic (0600 temp + rename,
   no truncation on crash, no permissions window); the daemon zeroizes response
   buffers that may carry an unsealed credential; a cancelled sudo during the
@@ -3598,14 +3782,18 @@ with no terminal detours.
 - **TUI essential view**: the wizard shows only the setup path: Welcome →
   Enroll → Keyring → Recovery → Login wiring → Done. `[v]` reveals all tabs;
   Repair appears automatically when something fails.
+
 - **Press `[e]` and it works**: enrolling with a stopped daemon now runs the
   sudo enable+start fix and resumes enrollment automatically.
+
 - **`[w]` wires login from the TUI** (Done tab and Login-wiring tab); the Done
   dashboard gained a "login wiring" row and says "one step left" instead of a
   premature "All set".
+
 - Enrollment guidance (glasses profile, appearance changes, sunlight) on the
   Profiles tab and in the README FAQ; THREAT_MODEL now states that the
   fingerprint companion has no presentation-attack detection of its own.
+
 - New `irlume version` subcommand, and `irlume update` now detects how irlume
   was installed (Copr, PPA, release asset, source) and updates through that
   same channel.
@@ -3624,6 +3812,7 @@ No functional changes to the daemon, CLI, or PAM module.
   `pkgconf-pkg-config` BuildRequires (bindgen for V4L2, pkg-config for
   tss-esapi); and the SELinux policy module is compiled from its committed
   `.te` source during the build instead of expecting a pregenerated `.pp`.
+
 - Fedora users can install from Copr: `dnf copr enable archledger/irlume &&
   dnf install irlume`.
 
@@ -3644,22 +3833,29 @@ is always the fallback: no lockout, ever.
   `irlume` CLI are untrusted clients of a privileged `irlumed` daemon (the only
   component that touches the camera, IR emitter, models, templates, or TPM),
   over a `SO_PEERCRED`-authenticated Unix socket.
+
 - **Clean model bill-of-materials**, all permissive & GPLv3-compatible, bundled:
   YuNet (MIT) detection, AuraFace 512-D ArcFace (Apache-2.0) recognition,
   self-built algorithmic IR liveness, and opt-in passive blink liveness via
   MediaPipe FaceMesh (Apache-2.0) eye-aspect-ratio.
+
 - **Encrypted at rest**: templates are 512-D embeddings only (never images),
   AES-256-GCM encrypted under a key the TPM seals to boot state. Disk-theft
   tested: sealed data is undecryptable on another machine.
+
 - **Hardware tiers**: IR camera → Secure (login, `sudo`, lock screen, keyring
   unlock); RGB-only → Convenience (screen unlock only); optional fingerprint
   companion factor.
+
 - **TPM-sealed keyring unlock**: a face login unseals the login password and
   hands it to gnome-keyring / KWallet, so the wallet opens with no prompt.
+
 - **Method/tier/login-manager-aware PAM wiring** (`irlume login enable`) for
   GDM, SDDM, and Plasma `plasmalogin`; opt-in, never auto-wired on install.
+
 - **Guided TUI** (`irlume tui`) for enrollment, configuration, live status, and
   a Repair tab that detects and fixes common issues.
+
 - **Packaging for all three families**: Fedora RPM (Copr/Packit), Arch
   PKGBUILD, Debian/Ubuntu `.deb` (nfpm). onnxruntime is bundled on Fedora and
   Debian/Ubuntu; Arch uses the system package.
@@ -3668,6 +3864,7 @@ is always the fallback: no lockout, ever.
 
 - ISO/IEC 30107-3 PAD self-test tooling (`padcapture` / `padreport`) with
   per-species APCER / BPCER / ACER and exact-binomial confidence intervals.
+
 - SO_PEERCRED + operation-class biopolicy gate on credential release (opt-in, off by default);
   bounded request size and read/write timeouts on the daemon socket.
 
@@ -3676,8 +3873,10 @@ is always the fallback: no lockout, ever.
 - Passive blink liveness is a deterrent, not a guarantee: a determined
   life-size glossy print can still slip through occasionally, and it does not
   cover glasses-wearers; every miss falls safely to the password.
+
 - RGB-only laptops get the Convenience tier by design (face never releases
   credentials).
+
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
 [Unreleased]: https://github.com/archledger/irlume/compare/v0.12.0...HEAD

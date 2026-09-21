@@ -109,6 +109,7 @@ impl RateFillFailure {
                 };
             }
         }
+        let error = crate::mmap_capture::source_io(error);
         match error.raw_os_error() {
             Some(libc::EACCES | libc::EPERM) => Self::IoPermissionDenied,
             Some(libc::EINVAL) => Self::IoInvalidArgument,

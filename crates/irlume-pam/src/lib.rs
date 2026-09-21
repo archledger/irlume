@@ -49,7 +49,7 @@ const WAIT_BUDGET: Duration = Duration::from_secs(20);
 /// (avoids back-to-back EBUSY) and keeps us from busy-looping.
 const WAIT_RETRY_GAP: Duration = Duration::from_millis(400);
 const FACE_INTENT_INFO: &str = "Type yes to use face authentication";
-const COSMIC_FACE_PROMPT: &str = "Password, or type yes for face: ";
+const COSMIC_FACE_PROMPT: &str = "Password or yes for face: ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IntentInput {

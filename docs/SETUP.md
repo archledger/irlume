@@ -222,9 +222,11 @@ the plan and writes nothing.
 
 **How you log in:** on supported on-demand frontends, leave the password field
 **empty and press Enter** to choose face. Unreleased COSMIC support instead shows
-**Password, or type yes for face:** because COSMIC ignores empty Enter. Type
-`yes` for one attempt or enter your password; live COSMIC face-unlock
-qualification remains pending. Typed passwords use the password provider, whose
+**Password or yes for face:** because COSMIC 1.8.0 ignores empty Enter. Type
+`yes` for one attempt or enter your password. The
+[named frontend checks](research/2026-09-21-cosmic-frontend.md) cover initiation
+and password fallback; genuine face-grant qualification remains pending.
+Typed passwords use the password provider, whose
 OS account policies still apply. Older or undetected GNOME and unknown greeters
 can use face-first compatibility wiring, which starts when the account is
 selected. `irlume login status` shows the wired mode and selection hint. See the

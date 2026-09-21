@@ -5,7 +5,7 @@ use super::*;
 use std::time::{Duration, Instant};
 
 const SERVICE: &str = "cosmic-greeter";
-const CHOICE: &str = "Password, or type yes for face: ";
+const CHOICE: &str = "Password or yes for face: ";
 
 fn run(
     h: &Harness,

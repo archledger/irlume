@@ -84,7 +84,7 @@ const GREETERS: &[Svc] = &[
     }, // Plasma 6
     Svc {
         etc: "/etc/pam.d/cosmic-greeter",
-        vendor: None,
+        vendor: Some("/usr/lib/pam.d/cosmic-greeter"),
     }, // COSMIC (Pop!_OS / System76)
     Svc {
         etc: "/etc/pam.d/greetd",
@@ -3078,6 +3078,7 @@ mod tests {
             ("/etc/pam.d/sddm", "/usr/lib/pam.d/sddm"),
             ("/etc/pam.d/gdm-password", "/usr/lib/pam.d/gdm-password"),
             ("/etc/pam.d/lightdm", "/usr/lib/pam.d/lightdm"),
+            ("/etc/pam.d/cosmic-greeter", "/usr/lib/pam.d/cosmic-greeter"),
         ] {
             let svc = GREETERS
                 .iter()
@@ -3088,11 +3089,7 @@ mod tests {
         // No accidental over-reach: greeters without a verified vendor-only
         // layout keep vendor: None (the /etc file is the only copy families
         // ship for these today).
-        for etc in [
-            "/etc/pam.d/greetd",
-            "/etc/pam.d/ly",
-            "/etc/pam.d/cosmic-greeter",
-        ] {
+        for etc in ["/etc/pam.d/greetd", "/etc/pam.d/ly"] {
             let svc = GREETERS
                 .iter()
                 .find(|s| s.etc == etc)
@@ -3129,6 +3126,45 @@ mod tests {
             materialized.contains("substack       common-auth"),
             "the vendor stack's carrier line survives: {materialized}"
         );
+    }
+
+    #[test]
+    fn fedora_cosmic_vendor_service_materializes_and_removes_only_its_override() {
+        let dir = TestDir::new("fedora-cosmic-vendor");
+        let declared = GREETERS
+            .iter()
+            .find(|service| service.etc == "/etc/pam.d/cosmic-greeter")
+            .unwrap();
+        let etc = dir.0.join(declared.etc.trim_start_matches('/'));
+        let vendor = dir.0.join("usr/lib/pam.d/cosmic-greeter");
+        std::fs::create_dir_all(etc.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(vendor.parent().unwrap()).unwrap();
+        // Exact vendor file from cosmic-greeter-1.8.0-1.fc44.x86_64.
+        let fixture = include_str!("../tests/fixtures/pam/fedora/cosmic-greeter");
+        std::fs::write(&vendor, fixture).unwrap();
+        let service = Svc {
+            etc: leak(&etc),
+            vendor: declared
+                .vendor
+                .map(|path| leak(&dir.0.join(path.trim_start_matches('/')))),
+        };
+        let profile = dm_profile(declared.etc, None);
+        let wire = |content: &str| wire_greeter_impl(content, true, true, profile.ondemand);
+        wire_service(&service, true, true, &wire).unwrap();
+        let first = std::fs::read_to_string(&etc).expect("vendor-only COSMIC must be wired");
+        assert!(first.contains("pam_irlume.so unseal ondemand"));
+        assert!(
+            first.contains("pam_oo7.so"),
+            "keep the vendor's wallet module"
+        );
+        wire_service(&service, true, true, &wire).unwrap();
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), first);
+        wire_service(&service, false, true, &wire).unwrap();
+        assert!(
+            !etc.exists(),
+            "disable must expose the original vendor stack"
+        );
+        assert_eq!(std::fs::read_to_string(&vendor).unwrap(), fixture);
     }
 
     /// Self-cleaning scratch dir for the wire_service file tests.

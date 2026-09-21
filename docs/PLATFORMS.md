@@ -35,16 +35,18 @@ GDM's separate worker does not expose a qualified transaction-purpose binding
 through Irlume's current protocol. **RGB-only GDM requests now use the password,
 including GDM screen unlock.** Other ambiguous greeter services also refuse
 RGB-only verification. IR-backed authentication retains its existing policy.
-This source change has camera-free daemon/PAM coverage; actual COSMIC process
-placement and logind visibility still require desktop qualification. A locker
-running outside a logind session falls back rather than borrowing another
-session. See the [request-purpose evidence](research/2026-09-20-shared-greeter-purpose.md).
+This source change has camera-free daemon/PAM coverage. In the named Fedora
+44/COSMIC 1.8.0 desktop check, the locker runs under the user manager and has no
+logind session for its PID. That shape falls back rather than borrowing the
+user's active Wayland session. See the
+[request-purpose evidence](research/2026-09-20-shared-greeter-purpose.md) and
+[live frontend results](research/2026-09-21-cosmic-frontend.md).
 
 The unreleased COSMIC on-demand prompt now asks for `yes` to select face, or a
 password to use the password provider. Upstream ignores empty Enter, so the
-previous empty-selection recipe could not initiate face authentication. Real-PAM
-conversation tests cover this correction; live COSMIC face unlock remains
-unqualified. See [the desktop flow](DESKTOP-AUTH.md).
+previous empty-selection recipe could not initiate face authentication on 1.8.0.
+Real-PAM and live GUI checks cover initiation and password fallback; genuine face
+grants remain unqualified. See [the desktop flow](DESKTOP-AUTH.md).
 
 ## Install lane per distro
 
@@ -173,7 +175,7 @@ than assuming every desktop has the same prompt or cancellation behavior.
 | SDDM | wired and exercised in the login-manager matrix |
 | LightDM (gtk and slick greeters, X11) | wired and exercised in the login-manager matrix |
 | greetd (tuigreet) | wired and exercised in the login-manager matrix |
-| COSMIC greeter | installation/wiring/password paths exercised in the historical matrix; unreleased explicit-yes flow has real-PAM tests, while live face unlock and process placement remain unqualified |
+| COSMIC greeter | unreleased explicit-yes prompt and password fallback checked on Fedora 44/COSMIC 1.8.0; vendor-only PAM override covered. Genuine face grants remain unqualified; the observed user-manager locker placement cannot satisfy RGB-only session binding |
 | ly (TUI) | wired and validated on a real `ly` install: detected, wired, password fallback confirmed. The greeter's own login was not driven, so the face-first wiring it gets is the conservative default rather than a measured choice |
 | polkit-1 (app prompts: Bitwarden, pkexec) | validated live (pre-0.12.0 via the then-current head-nod approval; today's confirmation is the typed `yes` field): Bitwarden flatpak biometric unlock approved |
 

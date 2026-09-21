@@ -143,7 +143,9 @@ The daemon's process/session binding is unchanged.
 
 These tests do not establish COSMIC's live process placement on every distro.
 Desktop components launched outside a logind session may be refused even when
-another graphical session exists. Qualify actual COSMIC unlock and password
-fallback on a named desktop build before claiming fleet support. GDM's RGB-only
+another graphical session exists. The [Fedora 44/COSMIC 1.8.0 check](2026-09-21-cosmic-frontend.md)
+observed exactly that user-manager placement. It verified prompt initiation and
+password fallback, without biometric grants. Qualify actual face unlock before
+claiming fleet support. GDM's RGB-only
 unlock path remains intentionally unavailable pending its separate provider
 contract. Attended hardware and desktop validation remains outstanding.

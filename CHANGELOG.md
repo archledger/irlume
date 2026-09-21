@@ -11,7 +11,8 @@ All notable changes to irlume are documented here. This project adheres to
   choice, because its frontend ignores empty Enter. Cached passwords never count
   as fresh face consent, and the choice is cleared before a face request so
   refusal can ask for a fresh password. Other frontends and daemon authorization
-  are unchanged. Live COSMIC desktop qualification remains pending.
+  are unchanged. Vendor-only COSMIC PAM files also use the existing reversible
+  `/etc` override path. Live COSMIC face-grant qualification remains pending.
 - PCR-signing public keys are decoded from complete DER containers after PEM
   label validation. Keys hidden inside the algorithm identifier, trailing DER
   fields and non-byte-aligned key bits are rejected. Valid RSA keys with NULL

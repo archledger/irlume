@@ -39,7 +39,7 @@ static int converse(int n, const struct pam_message **messages,
             // COSMIC uses nonempty yes; other on-demand services use empty Enter.
             const char *answer = strstr(messages[i]->msg, "Fixture password:")
                 ? (const char *)data
-                : strstr(messages[i]->msg, "Password, or type yes for face:")
+                : strstr(messages[i]->msg, "Password or yes for face:")
                     ? "yes" : "";
             responses[i].resp = strdup(answer);
             if (!responses[i].resp) {

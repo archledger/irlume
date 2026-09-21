@@ -7,6 +7,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Illumination metadata capture requests 1 MiB UVCM buffers instead of the
+  driver's 10 KiB default. uvcvideo collects every payload header sent during
+  sensor start-up into the first metadata buffer (54 KiB on a Logitech BRIO, up
+  to 68 KiB on a NexiGo N930W), and BRIO steady-state frames also exceed
+  10 KiB, so the overflowed buffer was ERROR-marked and no frame was classified
+  as actively lit. Linux 7.1 and later honour the request; older kernels keep
+  their fixed size and behave as before. ERROR-marked metadata is still never
+  parsed, and the original format and size are restored after capture.
+
 - COSMIC on-demand PAM requests now offer an explicit hidden password-or-`yes`
   choice, because its frontend ignores empty Enter. Cached passwords never count
   as fresh face consent, and the choice is cleared before a face request so

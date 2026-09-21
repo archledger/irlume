@@ -194,7 +194,7 @@ fn initial_get_failure_never_writes_a_guessed_restore() {
 
 #[test]
 fn successful_capture_restores_fourcc_and_nondefault_buffer_size() {
-    for initial in [(UVCH, 65536), (UVCM, 65536), (UVCH, u32::MAX)] {
+    for initial in [(UVCH, 65536), (UVCM, 32768), (UVCH, u32::MAX)] {
         let device = Arc::new(Mutex::new(FakeDevice::new(initial)));
         let (mut log, peer) = log_for(&device);
         log.start().unwrap();
@@ -212,6 +212,25 @@ fn successful_capture_restores_fourcc_and_nondefault_buffer_size() {
 }
 
 #[test]
+fn startup_requests_capacity_for_multi_header_frames() {
+    let device = Arc::new(Mutex::new(FakeDevice::new((UVCH, 10240))));
+    let (mut log, peer) = log_for(&device);
+    log.start().unwrap();
+    let negotiated = device.lock().unwrap().format;
+    drop(log);
+    assert_closed(&device, peer);
+    // uvcvideo completes a metadata buffer only with an image frame, so the
+    // first buffer collects every payload header sent during sensor start-up:
+    // 54 KiB on a Logitech BRIO and up to 68 KiB measured on a NexiGo N930W.
+    assert_eq!(
+        negotiated,
+        (UVCM, 1024 * 1024),
+        "start-up and multi-header frames overflow smaller metadata buffers"
+    );
+    assert_eq!(device.lock().unwrap().format, (UVCH, 10240));
+}
+
+#[test]
 fn later_startup_failures_restore_the_complete_observed_format() {
     for failure in ["REQBUFS", "QUERYBUF", "map", "QBUF", "STREAMON"] {
         let device = Arc::new(Mutex::new(FakeDevice::new((UVCH, 65536))));
@@ -226,13 +245,16 @@ fn later_startup_failures_restore_the_complete_observed_format() {
 
 #[test]
 fn already_uvcm_still_restores_a_changed_buffer_size() {
-    let device = Arc::new(Mutex::new(FakeDevice::new((UVCM, 65536))));
+    let device = Arc::new(Mutex::new(FakeDevice::new((UVCM, 10240))));
     let (mut log, peer) = log_for(&device);
     log.start().unwrap();
-    assert_eq!(device.lock().unwrap().format, (UVCM, 10240));
+    assert_eq!(
+        device.lock().unwrap().format,
+        (UVCM, REQUESTED_META_BUFFER_SIZE)
+    );
     drop(log);
     assert_closed(&device, peer);
-    assert_eq!(device.lock().unwrap().format, (UVCM, 65536));
+    assert_eq!(device.lock().unwrap().format, (UVCM, 10240));
 }
 
 #[test]
@@ -312,14 +334,17 @@ fn failed_restore_read_does_not_authorize_a_write() {
 
 #[test]
 fn unchanged_negotiation_does_not_restore_someone_elses_later_format() {
-    let device = Arc::new(Mutex::new(FakeDevice::new((UVCM, 10240))));
+    let device = Arc::new(Mutex::new(FakeDevice::new((
+        UVCM,
+        REQUESTED_META_BUFFER_SIZE,
+    ))));
     let (mut log, peer) = log_for(&device);
     log.start().unwrap();
-    device.lock().unwrap().format = (UVCH, 65536);
+    device.lock().unwrap().format = (UVCH, 10240);
     drop(log);
     assert_closed(&device, peer);
     assert_eq!(device.lock().unwrap().writes.len(), 1);
-    assert_eq!(device.lock().unwrap().format, (UVCH, 65536));
+    assert_eq!(device.lock().unwrap().format, (UVCH, 10240));
 }
 
 #[test]
@@ -414,7 +439,7 @@ fn failed_or_adjusted_restore_is_not_retried() {
             if applied {
                 (UVCH, 65536)
             } else {
-                (UVCM, 10240)
+                (UVCM, REQUESTED_META_BUFFER_SIZE)
             }
         );
     }
@@ -432,6 +457,7 @@ fn failed_or_adjusted_restore_is_not_retried() {
 fn fixed_size_kernel_snapshot_round_trips() {
     // Linux v6.12 reports 10240 irrespective of the requested buffer size.
     let device = Arc::new(Mutex::new(FakeDevice::new((UVCH, 10240))));
+    device.lock().unwrap().negotiated = Some((UVCM, 10240));
     let (mut log, peer) = log_for(&device);
     log.start().unwrap();
     device.lock().unwrap().negotiated = Some((UVCH, 10240));
@@ -442,7 +468,7 @@ fn fixed_size_kernel_snapshot_round_trips() {
 
 #[test]
 fn unwind_releases_the_ring_and_restores_the_snapshot() {
-    let device = Arc::new(Mutex::new(FakeDevice::new((UVCM, 65536))));
+    let device = Arc::new(Mutex::new(FakeDevice::new((UVCM, 10240))));
     let (mut log, peer) = log_for(&device);
     log.start().unwrap();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -451,7 +477,7 @@ fn unwind_releases_the_ring_and_restores_the_snapshot() {
     }));
     assert!(result.is_err());
     assert_closed(&device, peer);
-    assert_eq!(device.lock().unwrap().format, (UVCM, 65536));
+    assert_eq!(device.lock().unwrap().format, (UVCM, 10240));
 }
 
 #[test]

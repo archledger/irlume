@@ -78,11 +78,19 @@ const METADATA_ID_FRAME_ILLUMINATION: u32 = 6;
 ///
 /// Larger than the image ring because metadata is drained opportunistically
 /// between image dequeues rather than in its own loop; a few frames of slack
-/// costs 10KiB per buffer and avoids losing records to a slow burst iteration.
+/// costs 1MiB per buffer and avoids losing records to a slow burst iteration.
 const META_BUFFERS: u32 = 8;
+/// uvcvideo records one block per payload header and completes a metadata
+/// buffer only together with an image frame, so the first buffer collects
+/// every header sent while the sensor starts: 54 KiB on a Logitech BRIO and up
+/// to 68 KiB on a NexiGo N930W, against 4-10 KiB per steady-state frame. The
+/// count is unbounded by the device, and no descriptor reports it reliably, so
+/// ask for several seconds of start-up headroom. Linux before v7.1 ignores the
+/// request and keeps its fixed 10 KiB; whatever is negotiated is what is used.
+const REQUESTED_META_BUFFER_SIZE: u32 = 1024 * 1024;
 
-// Application allocation ceiling, not a UVC wire limit. Request the driver's
-// default (normally 10 KiB), but refuse unexpectedly large negotiated buffers
+// Application allocation ceiling, not a UVC wire limit. Startup requests
+// REQUESTED_META_BUFFER_SIZE, but refuse unexpectedly large negotiated buffers
 // before allocating a ring. A larger original snapshot can still be restored.
 const MAX_META_BUFFER_SIZE: u32 = 1024 * 1024;
 
@@ -699,7 +707,7 @@ impl IlluminationLog {
         self.format_change = FormatChange::Uncertain;
         let got = self.set_format(MetadataFormat {
             dataformat: UVCM,
-            buffersize: 0,
+            buffersize: REQUESTED_META_BUFFER_SIZE,
         })?;
         self.format_change = if got == original {
             FormatChange::Unchanged

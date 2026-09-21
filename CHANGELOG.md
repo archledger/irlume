@@ -7,6 +7,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Metadata capture restores both the observed format and buffer size, including
+  when the node was already using UVCM. Failed initial reads and uncertain format
+  writes cannot authorize a guessed restore. Cleanup checks the current format
+  before restoring, releases the buffer ring first, and bounds capture allocations.
 - USB extension-unit discovery now uses the active configuration instead of
   combining every configuration in sysfs. Descriptor-based restoration and
   capture qualification distinguish configurations, and UVC queries recheck

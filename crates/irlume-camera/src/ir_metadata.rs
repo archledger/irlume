@@ -68,6 +68,7 @@ const UVCM: u32 = fourcc(b"UVCM");
 /// `V4L2_META_FMT_UVC`, four character code `UVCH`. The kernel's default and
 /// what a device falls back to when it does not recognise a requested format,
 /// which makes it the value that proves a request was refused.
+#[cfg(test)]
 const UVCH: u32 = fourcc(b"UVCH");
 
 /// `MetadataId_FrameIllumination` from Microsoft's UVC extensions.
@@ -79,6 +80,11 @@ const METADATA_ID_FRAME_ILLUMINATION: u32 = 6;
 /// between image dequeues rather than in its own loop; a few frames of slack
 /// costs 10KiB per buffer and avoids losing records to a slow burst iteration.
 const META_BUFFERS: u32 = 8;
+
+// Application allocation ceiling, not a UVC wire limit. Request the driver's
+// default (normally 10 KiB), but refuse unexpectedly large negotiated buffers
+// before allocating a ring. A larger original snapshot can still be restored.
+const MAX_META_BUFFER_SIZE: u32 = 1024 * 1024;
 
 const fn fourcc(c: &[u8; 4]) -> u32 {
     (c[0] as u32) | ((c[1] as u32) << 8) | ((c[2] as u32) << 16) | ((c[3] as u32) << 24)
@@ -204,8 +210,7 @@ fn vidioc_streamoff() -> libc::c_ulong {
 }
 
 // ---------------------------------------------------------------------------
-// Parsing. Pure, and the part worth testing: everything above it is ioctl
-// plumbing that only real hardware can exercise.
+// Parsing. Pure; lifecycle fault injection is tested separately below.
 // ---------------------------------------------------------------------------
 
 /// One frame's worth of illumination, as the camera reported it.
@@ -502,10 +507,27 @@ pub(crate) fn ambient_partner(
 // The metadata stream itself.
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MetadataFormat {
+    dataformat: u32,
+    buffersize: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FormatChange {
+    Unchanged,
+    // A failed S_FMT does not prove zero mutation, nor does a later G_FMT
+    // establish who wrote that state. Keep the snapshot but never guess an undo.
+    Uncertain,
+    Applied(MetadataFormat),
+}
+
 /// A memory-mapped metadata buffer.
 struct MappedBuffer {
     ptr: *mut libc::c_void,
     len: usize,
+    #[cfg(test)]
+    lifecycle: Option<std::sync::Arc<std::sync::Mutex<tests::lifecycle::FakeDevice>>>,
 }
 
 // SAFETY: the mapping belongs to this value alone. It is created in
@@ -521,6 +543,10 @@ impl Drop for MappedBuffer {
         // SAFETY: ptr/len come from the mmap that created this value and are
         // unmapped exactly once, here.
         unsafe { libc::munmap(self.ptr, self.len) };
+        #[cfg(test)]
+        if let Some(device) = &self.lifecycle {
+            device.lock().unwrap().unmapped();
+        }
     }
 }
 
@@ -537,11 +563,15 @@ pub(crate) struct IlluminationLog {
     /// What the metadata node was set to before we changed it, so it can be
     /// put back; the format persists across close and would otherwise be left
     /// changed for the next process to open this camera.
-    restore_format: u32,
+    restore_format: Option<MetadataFormat>,
+    format_change: FormatChange,
+    buffers_requested: bool,
     streaming: bool,
     timing: crate::capture_timing::Recorder,
     #[cfg(test)]
     sentinel_events: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
+    #[cfg(test)]
+    lifecycle: Option<std::sync::Arc<std::sync::Mutex<tests::lifecycle::FakeDevice>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -612,17 +642,7 @@ impl IlluminationLog {
             );
             return Err(format!("metadata node {node} would not open"));
         }
-        let mut log = Self {
-            fd,
-            device: node.to_string(),
-            buffers: Vec::new(),
-            by_timestamp: std::collections::HashMap::new(),
-            restore_format: UVCH,
-            streaming: false,
-            timing: crate::capture_timing::Recorder::default(),
-            #[cfg(test)]
-            sentinel_events: None,
-        };
+        let mut log = Self::from_fd(fd, node);
         match log.start() {
             Ok(()) => Ok(log),
             Err(why) => {
@@ -634,13 +654,45 @@ impl IlluminationLog {
         }
     }
 
+    // Takes sole ownership of the already-open fd, including on startup error.
+    fn from_fd(fd: c_int, node: &str) -> Self {
+        Self {
+            fd,
+            device: node.to_string(),
+            buffers: Vec::new(),
+            by_timestamp: std::collections::HashMap::new(),
+            restore_format: None,
+            format_change: FormatChange::Unchanged,
+            buffers_requested: false,
+            streaming: false,
+            timing: crate::capture_timing::Recorder::default(),
+            #[cfg(test)]
+            sentinel_events: None,
+            #[cfg(test)]
+            lifecycle: None,
+        }
+    }
+
     fn start(&mut self) -> std::result::Result<(), String> {
-        self.restore_format = self.get_format()?;
-        let got = self.set_format(UVCM)?;
-        if got != UVCM {
+        let original = self.get_format()?;
+        self.restore_format = Some(original);
+        self.format_change = FormatChange::Uncertain;
+        let got = self.set_format(MetadataFormat {
+            dataformat: UVCM,
+            buffersize: 0,
+        })?;
+        self.format_change = if got == original {
+            FormatChange::Unchanged
+        } else {
+            FormatChange::Applied(got)
+        };
+        if got.dataformat != UVCM {
             // The driver coerces an unrecognised format to UVCH rather than
             // failing, so a successful ioctl proves nothing on its own.
             return Err("the device does not accept the UVCM metadata format".into());
+        }
+        if got.buffersize == 0 || got.buffersize > MAX_META_BUFFER_SIZE {
+            return Err("the device negotiated an unsupported metadata buffer size".into());
         }
         self.request_and_map()?;
         self.stream_on()?;
@@ -648,7 +700,7 @@ impl IlluminationLog {
         Ok(())
     }
 
-    fn get_format(&self) -> std::result::Result<u32, String> {
+    fn get_format(&self) -> std::result::Result<MetadataFormat, String> {
         let mut f = zeroed_format();
         f.kind = META_CAPTURE;
         self.ioctl(
@@ -656,19 +708,26 @@ impl IlluminationLog {
             &mut f as *mut _ as *mut libc::c_void,
             "G_FMT",
         )?;
-        Ok(f.dataformat)
+        Ok(MetadataFormat {
+            dataformat: f.dataformat,
+            buffersize: f.buffersize,
+        })
     }
 
-    fn set_format(&self, want: u32) -> std::result::Result<u32, String> {
+    fn set_format(&self, want: MetadataFormat) -> std::result::Result<MetadataFormat, String> {
         let mut f = zeroed_format();
         f.kind = META_CAPTURE;
-        f.dataformat = want;
+        f.dataformat = want.dataformat;
+        f.buffersize = want.buffersize;
         self.ioctl(
             vidioc_s_fmt(),
             &mut f as *mut _ as *mut libc::c_void,
             "S_FMT",
         )?;
-        Ok(f.dataformat)
+        Ok(MetadataFormat {
+            dataformat: f.dataformat,
+            buffersize: f.buffersize,
+        })
     }
 
     fn request_and_map(&mut self) -> std::result::Result<(), String> {
@@ -680,6 +739,9 @@ impl IlluminationLog {
             flags: 0,
             _reserved: [0; 3],
         };
+        // Even an allocation error gets fd-scoped REQBUFS(0) cleanup: the
+        // driver may have made partial progress before reporting failure.
+        self.buffers_requested = true;
         self.ioctl(
             vidioc_reqbufs(),
             &mut req as *mut _ as *mut libc::c_void,
@@ -688,6 +750,9 @@ impl IlluminationLog {
         if req.count == 0 {
             return Err("the device granted no metadata buffers".into());
         }
+        if req.count > META_BUFFERS {
+            return Err("the device granted too many metadata buffers".into());
+        }
         for index in 0..req.count {
             let mut buf = zeroed_buffer(index);
             self.ioctl(
@@ -695,29 +760,44 @@ impl IlluminationLog {
                 &mut buf as *mut _ as *mut libc::c_void,
                 "QUERYBUF",
             )?;
-            // SAFETY: offset and length are the driver's own answer for this
-            // buffer index; the mapping is owned by MappedBuffer from here.
-            let ptr = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    buf.length as usize,
-                    libc::PROT_READ,
-                    libc::MAP_SHARED,
-                    self.fd,
-                    i64::from(buf.offset),
-                )
-            };
-            if ptr == libc::MAP_FAILED {
-                return Err(format!("mapping metadata buffer {index} failed"));
+            if buf.length == 0 || buf.length > MAX_META_BUFFER_SIZE {
+                return Err(format!(
+                    "unsupported metadata buffer length at index {index}"
+                ));
             }
-            self.buffers.push(MappedBuffer {
-                ptr,
-                len: buf.length as usize,
-            });
+            self.buffers.push(self.map_buffer(&buf)?);
             let mut q = zeroed_buffer(index);
             self.ioctl(vidioc_qbuf(), &mut q as *mut _ as *mut libc::c_void, "QBUF")?;
         }
         Ok(())
+    }
+
+    fn map_buffer(&self, buf: &V4l2Buffer) -> Result<MappedBuffer, String> {
+        #[cfg(test)]
+        if let Some(device) = &self.lifecycle {
+            return tests::lifecycle::map_buffer(device, buf);
+        }
+        // SAFETY: offset and length are the driver's answer for this index;
+        // the mapping is owned by MappedBuffer from here.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                buf.length as usize,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                self.fd,
+                i64::from(buf.offset),
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(format!("mapping metadata buffer {} failed", buf.index));
+        }
+        Ok(MappedBuffer {
+            ptr,
+            len: buf.length as usize,
+            #[cfg(test)]
+            lifecycle: None,
+        })
     }
 
     fn stream_on(&self) -> std::result::Result<(), String> {
@@ -727,6 +807,61 @@ impl IlluminationLog {
             &mut kind as *mut _ as *mut libc::c_void,
             "STREAMON",
         )
+    }
+
+    fn restore_owned_format(&self, buffers_released: bool) {
+        let Some(original) = self.restore_format else {
+            return;
+        };
+        let applied = match self.format_change {
+            FormatChange::Unchanged => return,
+            FormatChange::Uncertain => {
+                irlume_common::dlog!(
+                    "{}: metadata S_FMT outcome uncertain; original {original:?}; no speculative restore",
+                    self.device
+                );
+                return;
+            }
+            FormatChange::Applied(applied) => applied,
+        };
+        let _timing = self
+            .timing
+            .stage(crate::capture_timing::Stage::MetadataFormat);
+        if !buffers_released {
+            irlume_common::dlog!(
+                "{}: metadata buffers not released; skipping format restore",
+                self.device
+            );
+            return;
+        }
+        match self.get_format() {
+            Ok(current) if current == applied => {}
+            Ok(current) => {
+                irlume_common::dlog!(
+                    "{}: metadata format changed since negotiation ({current:?}); leaving it alone",
+                    self.device
+                );
+                return;
+            }
+            Err(error) => {
+                irlume_common::dlog!("{}: metadata restore read failed: {error}", self.device);
+                return;
+            }
+        }
+        // V4L2 has no atomic compare-and-set. This is a best-effort ownership
+        // check, not protection against an uncooperative writer racing these
+        // ioctls (or replacing the state with identical values).
+        match self.set_format(original) {
+            Ok(restored) if restored == original => {}
+            Ok(restored) => irlume_common::dlog!(
+                "{}: metadata restore was adjusted: wanted {original:?}, got {restored:?}",
+                self.device
+            ),
+            Err(error) => irlume_common::dlog!(
+                "{}: metadata restore failed ({error}); outcome uncertain, no retry",
+                self.device
+            ),
+        }
     }
 
     /// Drop the previous burst's records.
@@ -820,6 +955,11 @@ impl IlluminationLog {
         argp: *mut libc::c_void,
         what: &str,
     ) -> std::result::Result<(), String> {
+        #[cfg(test)]
+        if let Some(device) = &self.lifecycle {
+            // SAFETY: callers supply the same typed arguments as for libc::ioctl.
+            return unsafe { device.lock().unwrap().ioctl(request, argp, what) };
+        }
         // SAFETY: fd is a valid open metadata node owned by self, and argp
         // points at a correctly sized struct for `request`.
         let rc = unsafe { libc::ioctl(self.fd, request, argp) };
@@ -841,10 +981,13 @@ impl IlluminationLog {
             device: "test-metadata".into(),
             buffers: Vec::new(),
             by_timestamp: std::collections::HashMap::new(),
-            restore_format: 0,
+            restore_format: None,
+            format_change: FormatChange::Unchanged,
+            buffers_requested: false,
             streaming: false,
             timing: crate::capture_timing::Recorder::default(),
             sentinel_events: Some(events),
+            lifecycle: None,
         }
     }
 }
@@ -864,11 +1007,13 @@ impl Drop for IlluminationLog {
                 .timing
                 .stage(crate::capture_timing::Stage::MetadataStreamoff);
             let mut kind = META_CAPTURE as c_int;
-            let _ = self.ioctl(
+            if let Err(error) = self.ioctl(
                 vidioc_streamoff(),
                 &mut kind as *mut _ as *mut libc::c_void,
                 "STREAMOFF",
-            );
+            ) {
+                irlume_common::dlog!("{}: metadata stop failed: {error}", self.device);
+            }
         }
         // Unmap our views, then hand the buffers back to the driver. Both are
         // needed before the format can be changed: unmapping alone leaves the
@@ -876,6 +1021,7 @@ impl Drop for IlluminationLog {
         // skipping this silently left the node on UVCM for the next process
         // (measured: the format survived every capture until REQBUFS(0) was
         // added here).
+        let mut buffers_released = !self.buffers_requested;
         {
             let _timing = self
                 .timing
@@ -889,25 +1035,32 @@ impl Drop for IlluminationLog {
                 flags: 0,
                 _reserved: [0; 3],
             };
-            let _ = self.ioctl(
-                vidioc_reqbufs(),
-                &mut release as *mut _ as *mut libc::c_void,
-                "REQBUFS(0)",
-            );
+            if self.buffers_requested {
+                match self.ioctl(
+                    vidioc_reqbufs(),
+                    &mut release as *mut _ as *mut libc::c_void,
+                    "REQBUFS(0)",
+                ) {
+                    Ok(()) => buffers_released = true,
+                    Err(error) => irlume_common::dlog!(
+                        "{}: metadata buffer release failed: {error}",
+                        self.device
+                    ),
+                }
+            }
         }
         // The format outlives this process, so hand the node back as found.
-        if self.restore_format != 0 && self.restore_format != UVCM {
-            let _timing = self
-                .timing
-                .stage(crate::capture_timing::Stage::MetadataFormat);
-            let _ = self.set_format(self.restore_format);
-        }
+        self.restore_owned_format(buffers_released);
         if self.fd >= 0 {
             let _timing = self
                 .timing
                 .stage(crate::capture_timing::Stage::MetadataClose);
             // SAFETY: fd was opened by this type and is closed exactly once.
             unsafe { libc::close(self.fd) };
+            #[cfg(test)]
+            if let Some(device) = &self.lifecycle {
+                device.lock().unwrap().closed();
+            }
         }
         irlume_common::dlog!(
             "{}: illumination metadata closed after {} classified frames",
@@ -1127,6 +1280,7 @@ fn offers_uvcm(node: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    pub(super) mod lifecycle;
     #[cfg(feature = "capture-timing")]
     #[test]
     fn teardown_timing_keeps_close_after_metadata_ioctl_failures() {
@@ -1146,7 +1300,15 @@ mod tests {
         log.sentinel_events = None;
         log.fd = owned.into_raw_fd();
         log.streaming = true;
-        log.restore_format = super::UVCH;
+        log.restore_format = Some(super::MetadataFormat {
+            dataformat: super::UVCH,
+            buffersize: 65536,
+        });
+        log.format_change = super::FormatChange::Applied(super::MetadataFormat {
+            dataformat: super::UVCM,
+            buffersize: 10240,
+        });
+        log.buffers_requested = true;
         drop(log.with_timing(crate::capture_timing::Recorder::from_control(&control)));
         assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0);
         let snapshot = timings.snapshot();

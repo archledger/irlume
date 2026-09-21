@@ -10,8 +10,19 @@ All notable changes to irlume are documented here. This project adheres to
 - Camera warm-up can retry a dequeue timeout without requeueing a buffer still
   owned by the kernel. Capture now tracks the last successfully dequeued buffer
   explicitly, preserving the existing retry budget, cancellation, deadlines and
-  frame validation. Cleanup preserves stream-stop, unmap and buffer-release
-  ordering on errors.
+  frame validation.
+- Capture rejects error-marked buffers before creating mapped references and
+  retires the affected ring. IR cleanup stops the image producer while holding
+  its allocation, then closes metadata before releasing the image ring and
+  restoring the emitter. If producer shutdown is unconfirmed, kernel-facing
+  owners are retained for the process lifetime, emitter/backlight restoration
+  is withheld, and further capture in that process is refused. Diagnostic I/O
+  failure cannot unwind this retention transition. This containment depends on
+  normal driver completion for non-error buffers and cannot protect against
+  kernel bugs during abrupt process termination.
+- Illumination metadata fragments with conflicting frame IDs or headers after
+  an observed end-of-frame marker are rejected. Same-frame fragments remain
+  accepted with or without a final end-of-frame marker.
 - Metadata capture restores both the observed format and buffer size, including
   when the node was already using UVCM. Failed initial reads and uncertain format
   writes cannot authorize a guessed restore. Cleanup checks the current format

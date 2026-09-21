@@ -56,12 +56,15 @@ pub(super) struct MmapCapture {
     held: Option<u32>,
     /// A failed QBUF/STREAMON has an uncertain outcome: do not repeat it.
     failed: bool,
+    producer: crate::capture_shutdown::Producer,
+    stop_attempted: bool,
     #[cfg(test)]
     fake: Option<Arc<std::sync::Mutex<tests::FakeIo>>>,
 }
 
 impl MmapCapture {
     pub(super) fn with_buffers(device: &Device, count: u32, timeout: Duration) -> io::Result<Self> {
+        crate::capture_shutdown::check_capture()?;
         let timeout_ms = timeout.as_millis().try_into().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -82,9 +85,22 @@ impl MmapCapture {
             active: false,
             held: None,
             failed: false,
+            producer: crate::capture_shutdown::Producer::new(),
+            stop_attempted: false,
             #[cfg(test)]
             fake: None,
         }
+    }
+
+    pub(super) fn producer(&self) -> crate::capture_shutdown::Producer {
+        self.producer.clone()
+    }
+
+    #[cfg(test)]
+    fn test_new(handle: Arc<Handle>, timeout_ms: i32) -> Self {
+        let mut stream = Self::new(handle, timeout_ms);
+        stream.producer = crate::capture_shutdown::Producer::for_test();
+        stream
     }
 
     fn allocate(&mut self, count: u32) -> io::Result<()> {
@@ -199,6 +215,7 @@ impl MmapCapture {
 
 impl CaptureDequeue for MmapCapture {
     fn dequeue(&mut self) -> io::Result<(&[u8], Metadata)> {
+        self.producer.check()?;
         if self.failed {
             return Err(io::Error::other(
                 "capture queue state is uncertain; recreate the stream",
@@ -210,6 +227,7 @@ impl CaptureDequeue for MmapCapture {
                 self.queue(index as u32)?;
             }
             let mut kind = Type::VideoCapture as u32;
+            self.producer.begin()?;
             self.ioctl(
                 vidioc::VIDIOC_STREAMON,
                 (&mut kind as *mut u32).cast(),
@@ -233,6 +251,16 @@ impl CaptureDequeue for MmapCapture {
             (&mut buf as *mut v4l2_buffer).cast(),
             "DQBUF",
         )?;
+        self.producer.check()?;
+        if buf.flags & v4l::buffer::Flags::ERROR.bits() != 0 {
+            // Affected UVC cancel paths can publish ERROR before async copies
+            // finish. No mapped reference or requeue is permissible here.
+            self.failed = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "driver returned an error-marked capture buffer; ring retired",
+            ));
+        }
         let Some(mapping) = self.buffers.get(buf.index as usize) else {
             self.failed = true;
             return Err(io::Error::new(
@@ -248,12 +276,45 @@ impl CaptureDequeue for MmapCapture {
             timestamp: buf.timestamp.into(),
             sequence: buf.sequence,
         };
-        // SAFETY: successful DQBUF transferred this buffer to userspace. The
-        // slice is bounded by the mapping and borrows self, preventing QBUF or
-        // unmap while borrowed. The caller validates bytesused before reading.
+        #[cfg(test)]
+        if let Some(fake) = &self.fake {
+            fake.lock().unwrap().view_created();
+        }
+        // SAFETY: non-ERROR DQBUF transfers a normally completed buffer to
+        // userspace. This relies on initialized mapping backing (as supplied by
+        // UVC/vb2), completion of driver writes, one queue operator, and no
+        // independent authorized writer. ERROR completion is rejected above
+        // because affected UVC cancellation can finish async copies later.
+        // The slice is bounded by the mapping and borrows self, preventing our
+        // QBUF/unmap while borrowed. Later bytesused validation checks payload
+        // bounds; it does not establish initialization or writer exclusion.
         let bytes =
             unsafe { std::slice::from_raw_parts(mapping.ptr.as_ptr().cast::<u8>(), mapping.len) };
         Ok((bytes, metadata))
+    }
+
+    fn quiesce(&mut self) -> io::Result<()> {
+        self.failed = true;
+        if self.stop_attempted {
+            return if self.producer.is_quiescent() {
+                Ok(())
+            } else {
+                Err(io::Error::other("capture stream stop remains unconfirmed"))
+            };
+        }
+        self.stop_attempted = true;
+        let mut kind = Type::VideoCapture as u32;
+        let result = self.ioctl(
+            vidioc::VIDIOC_STREAMOFF,
+            (&mut kind as *mut u32).cast(),
+            "STREAMOFF",
+        );
+        match &result {
+            Ok(()) => self.producer.stopped(),
+            Err(_) if !self.producer.is_quiescent() => self.producer.unconfirmed(),
+            Err(_) => {} // STREAMON was never attempted: no producer to drain.
+        }
+        result
     }
 }
 
@@ -262,16 +323,16 @@ impl Drop for MmapCapture {
         if !self.buffers_requested {
             return;
         }
-        // Attempt stop even when startup failed; queued buffers may exist, or
-        // STREAMON may have made progress before its error. Cleanup ioctl errors
-        // are logged rather than panicking and skipping later cleanup steps.
-        let mut kind = Type::VideoCapture as u32;
-        if let Err(error) = self.ioctl(
-            vidioc::VIDIOC_STREAMOFF,
-            (&mut kind as *mut u32).cast(),
-            "STREAMOFF",
-        ) {
+        if let Err(error) = self.quiesce() {
             irlume_common::dlog!("capture STREAMOFF failed: {error}");
+        }
+        if !self.producer.is_quiescent() {
+            // Keep the allocation reference, mapped views and file description
+            // alive. The native domain never drops these on guessed close or
+            // disconnect evidence; subsequent capture admission is faulted.
+            self.producer
+                .after_stop((self.handle.clone(), std::mem::take(&mut self.buffers)));
+            return;
         }
         self.buffers.clear();
         let mut req = request_buffers(0);

@@ -21,6 +21,8 @@ pub(crate) struct FakeDevice {
     count: u32,
     length: Option<u32>,
     map_failure_at: Option<u32>,
+    error_frame: bool,
+    dequeued: bool,
 }
 
 impl FakeDevice {
@@ -37,6 +39,8 @@ impl FakeDevice {
             count: 2,
             length: None,
             map_failure_at: None,
+            error_frame: false,
+            dequeued: false,
         }
     }
 
@@ -44,6 +48,10 @@ impl FakeDevice {
         assert!(self.mapped > 0, "unmap without a live metadata mapping");
         self.mapped -= 1;
         self.events.push("unmap".into());
+    }
+
+    pub(crate) fn view_created(&mut self) {
+        self.events.push("view".into());
     }
 
     pub(crate) fn closed(&mut self) {
@@ -94,6 +102,16 @@ impl FakeDevice {
             // SAFETY: QUERYBUF takes V4l2Buffer.
             let buf = unsafe { &mut *argp.cast::<V4l2Buffer>() };
             buf.length = self.length.unwrap_or(self.format.1);
+        } else if request == vidioc_dqbuf() {
+            if self.dequeued {
+                return Err("no metadata ready".into());
+            }
+            self.dequeued = true;
+            // SAFETY: DQBUF takes the initialized metadata V4l2Buffer.
+            let buf = unsafe { &mut *argp.cast::<V4l2Buffer>() };
+            buf.index = 0;
+            buf.bytesused = 16;
+            buf.flags = if self.error_frame { 0x40 } else { 0 };
         } else {
             assert!(
                 request == vidioc_qbuf()
@@ -434,4 +452,59 @@ fn unwind_releases_the_ring_and_restores_the_snapshot() {
     assert!(result.is_err());
     assert_closed(&device, peer);
     assert_eq!(device.lock().unwrap().format, (UVCM, 65536));
+}
+
+#[test]
+fn error_metadata_never_forms_a_view_or_requeues_the_buffer() {
+    let device = Arc::new(Mutex::new(FakeDevice::new((UVCH, 10240))));
+    device.lock().unwrap().error_frame = true;
+    let (mut log, peer) = log_for(&device);
+    log.start().unwrap();
+    let queued = device
+        .lock()
+        .unwrap()
+        .events
+        .iter()
+        .filter(|e| *e == "QBUF")
+        .count();
+    log.drain();
+    log.drain();
+    let events = device.lock().unwrap().events.clone();
+    assert!(!events.iter().any(|e| e == "view"));
+    assert_eq!(events.iter().filter(|e| *e == "QBUF").count(), queued);
+    drop(log);
+    assert_closed(&device, peer);
+}
+
+#[test]
+fn metadata_drop_waits_for_acknowledged_main_producer_stop() {
+    let producer = crate::capture_shutdown::Producer::for_test();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    producer.begin().unwrap();
+    let log = IlluminationLog::test_sentinel(events.clone()).with_producer(producer.clone());
+    drop(log);
+    assert!(events.lock().unwrap().is_empty());
+    producer.stopped();
+    assert_eq!(*events.lock().unwrap(), ["metadata-drop"]);
+}
+
+#[test]
+fn deferred_metadata_keeps_its_real_fd_mappings_and_original_format_snapshot() {
+    let producer = crate::capture_shutdown::Producer::for_test();
+    let device = Arc::new(Mutex::new(FakeDevice::new((UVCH, 65536))));
+    let (mut log, peer) = log_for(&device);
+    log.start().unwrap();
+    producer.begin().unwrap();
+    drop(log.with_producer(producer.clone()));
+    let state = device.lock().unwrap();
+    assert_eq!(state.closes, 0);
+    assert_eq!(state.mapped, 2);
+    assert!(!state
+        .events
+        .iter()
+        .any(|e| e == "STREAMOFF" || e == "REQBUFS(0)"));
+    drop(state);
+    producer.stopped();
+    assert_closed(&device, peer);
+    assert_eq!(device.lock().unwrap().format, (UVCH, 65536));
 }

@@ -17,6 +17,7 @@ pub(super) struct FakeIo {
     sequence: u32,
     flags: u32,
     consume_on_error: bool,
+    shared_events: Option<Arc<Mutex<Vec<&'static str>>>>,
 }
 
 impl Default for FakeIo {
@@ -33,11 +34,16 @@ impl Default for FakeIo {
             sequence: 0,
             flags: 0x2000, // V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC
             consume_on_error: false,
+            shared_events: None,
         }
     }
 }
 
 impl FakeIo {
+    pub(super) fn view_created(&mut self) {
+        self.events.push("view".into());
+    }
+
     pub(super) fn poll(&mut self) -> io::Result<i32> {
         self.events.push("poll".into());
         self.polls
@@ -50,6 +56,9 @@ impl FakeIo {
         assert!(self.mapped > 0, "unmap without a live mapping");
         self.mapped -= 1;
         self.events.push("unmap".into());
+        if let Some(events) = &self.shared_events {
+            events.lock().unwrap().push("image-unmap");
+        }
     }
 
     /// # Safety
@@ -61,6 +70,13 @@ impl FakeIo {
         operation: &str,
     ) -> io::Result<()> {
         self.events.push(operation.into());
+        if let Some(events) = &self.shared_events {
+            match operation {
+                "STREAMOFF" => events.lock().unwrap().push("image-stop"),
+                "REQBUFS(0)" => events.lock().unwrap().push("image-release"),
+                _ => {}
+            }
+        }
         if self.fail == Some(operation)
             || (self.fail == Some("teardown") && matches!(operation, "STREAMOFF" | "REQBUFS(0)"))
         {
@@ -164,7 +180,7 @@ fn stream(fake: &Arc<Mutex<FakeIo>>) -> MmapCapture {
     // The fake intercepts only kernel operations; Handle lifetime and mappings
     // remain real. This path never opens a camera.
     let device = Device::with_path("/dev/null").unwrap();
-    let mut stream = MmapCapture::new(device.handle(), 5000);
+    let mut stream = MmapCapture::test_new(device.handle(), 5000);
     stream.fake = Some(fake.clone());
     stream.allocate(4).unwrap();
     stream
@@ -333,7 +349,7 @@ fn partial_mapping_and_allocation_errors_release_every_acquired_resource() {
             }
         }
         let device = Device::with_path("/dev/null").unwrap();
-        let mut stream = MmapCapture::new(device.handle(), 5000);
+        let mut stream = MmapCapture::test_new(device.handle(), 5000);
         stream.fake = Some(fake.clone());
         assert!(stream.allocate(4).is_err());
         drop(stream);
@@ -343,34 +359,74 @@ fn partial_mapping_and_allocation_errors_release_every_acquired_resource() {
 }
 
 #[test]
-fn teardown_failure_cannot_panic_or_skip_later_cleanup() {
+fn teardown_distinguishes_unconfirmed_stop_from_failed_release() {
     for failure in ["STREAMOFF", "REQBUFS(0)"] {
         let fake = Arc::new(Mutex::new(FakeIo::default()));
         let mut stream = stream(&fake);
+        let producer = stream.producer();
         stream.dequeue().unwrap();
         fake.lock().unwrap().fail = Some(failure);
         drop(stream);
         assert_eq!(calls(&fake, "STREAMOFF"), 1);
-        assert_eq!(calls(&fake, "REQBUFS(0)"), 1);
-        assert_eq!(fake.lock().unwrap().mapped, 0);
+        if failure == "STREAMOFF" {
+            assert_eq!(calls(&fake, "REQBUFS(0)"), 0);
+            assert_eq!(fake.lock().unwrap().mapped, 4);
+            assert!(producer.check().is_err());
+        } else {
+            assert_eq!(calls(&fake, "REQBUFS(0)"), 1);
+            assert_eq!(fake.lock().unwrap().mapped, 0);
+            assert!(producer.check().is_ok());
+        }
     }
 }
 
 #[test]
-fn delivered_corruption_is_still_rejected_by_the_trusted_boundary() {
+fn delivered_corruption_retires_before_the_trusted_boundary_can_borrow_bytes() {
     let fake = Arc::new(Mutex::new(FakeIo::default()));
     fake.lock().unwrap().flags |= 0x40; // V4L2_BUF_FLAG_ERROR
     let mut stream = stream(&fake);
     let layout = crate::frame_provenance::PayloadLayout::new(*b"GREY", 4, 4, 4).unwrap();
     assert!(crate::dequeue_validated_typed(&mut stream, layout, || Ok(())).is_err());
     fake.lock().unwrap().flags = 0x2000;
-    assert!(crate::dequeue_validated_typed(&mut stream, layout, || Ok(())).is_ok());
-    assert_eq!(calls(&fake, "QBUF"), 5);
+    assert!(crate::dequeue_validated_typed(&mut stream, layout, || Ok(())).is_err());
+    assert_eq!(calls(&fake, "view"), 0);
+    assert_eq!(calls(&fake, "QBUF"), 4);
+}
+
+#[test]
+fn error_buffer_is_retired_before_any_mapped_view_or_requeue() {
+    let fake = Arc::new(Mutex::new(FakeIo::default()));
+    fake.lock().unwrap().flags |= 0x40;
+    let mut stream = stream(&fake);
+    assert_eq!(
+        dequeue_error(&mut stream).kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(calls(&fake, "view"), 0);
+    assert!(stream.dequeue().is_err());
+    assert_eq!(calls(&fake, "DQBUF"), 1);
+    assert_eq!(calls(&fake, "QBUF"), 4);
+}
+
+#[test]
+fn unconfirmed_stop_retains_mappings_instead_of_releasing_the_ring() {
+    let fake = Arc::new(Mutex::new(FakeIo::default()));
+    let mut stream = stream(&fake);
+    stream.dequeue().unwrap();
+    let producer = stream.producer();
+    fake.lock().unwrap().fail = Some("STREAMOFF");
+    drop(stream);
+    assert_eq!(fake.lock().unwrap().mapped, 4);
+    assert_eq!(calls(&fake, "REQBUFS(0)"), 0);
+    assert!(producer.check().is_err());
 }
 
 struct ValidatedMmap(MmapCapture);
 
 impl crate::ValidatedStream for ValidatedMmap {
+    fn quiesce(&mut self) -> io::Result<()> {
+        self.0.quiesce()
+    }
     fn next_validated(
         &mut self,
     ) -> Result<(&[u8], crate::frame_provenance::DequeuedBufferFacts), crate::ValidatedDequeueError>
@@ -503,10 +559,11 @@ fn deadline_after_a_timeout_is_not_another_retryable_driver_timeout() {
 }
 
 #[test]
-fn an_unwinding_consumer_still_unmaps_if_both_teardown_ioctls_fail() {
+fn an_unwinding_consumer_retains_resources_after_unconfirmed_stop() {
     let fake = Arc::new(Mutex::new(FakeIo::default()));
     let mut stream = stream(&fake);
     stream.dequeue().unwrap();
+    let producer = stream.producer();
     fake.lock().unwrap().fail = Some("teardown");
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let _stream = stream;
@@ -514,8 +571,9 @@ fn an_unwinding_consumer_still_unmaps_if_both_teardown_ioctls_fail() {
     }));
     assert!(result.is_err());
     assert_eq!(calls(&fake, "STREAMOFF"), 1);
-    assert_eq!(calls(&fake, "REQBUFS(0)"), 1);
-    assert_eq!(fake.lock().unwrap().mapped, 0);
+    assert_eq!(calls(&fake, "REQBUFS(0)"), 0);
+    assert_eq!(fake.lock().unwrap().mapped, 4);
+    assert!(producer.check().is_err());
 }
 
 #[test]
@@ -524,7 +582,7 @@ fn the_driver_granted_count_controls_the_ring_and_zero_is_refused() {
         let fake = Arc::new(Mutex::new(FakeIo::default()));
         fake.lock().unwrap().granted = count;
         let device = Device::with_path("/dev/null").unwrap();
-        let mut stream = MmapCapture::new(device.handle(), 5000);
+        let mut stream = MmapCapture::test_new(device.handle(), 5000);
         stream.fake = Some(fake.clone());
         let allocated = stream.allocate(4);
         if count == 0 {
@@ -537,5 +595,156 @@ fn the_driver_granted_count_controls_the_ring_and_zero_is_refused() {
         drop(stream);
         assert_eq!(fake.lock().unwrap().mapped, 0);
         assert_eq!(calls(&fake, "REQBUFS(0)"), 1);
+    }
+}
+
+#[test]
+fn coupled_owner_stops_metadata_before_releasing_image_queue_ownership() {
+    for unwind in [false, true] {
+        let fake = Arc::new(Mutex::new(FakeIo::default()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        fake.lock().unwrap().shared_events = Some(events.clone());
+        let mut raw = stream(&fake);
+        raw.dequeue().unwrap();
+        let producer = raw.producer();
+        let interval = crate::frame_interval::FrameInterval::new(1, 30).unwrap();
+        let owner = crate::IrCaptureResources {
+            stream: crate::TrackedStream::new(
+                ValidatedMmap(raw),
+                crate::rate_gate::StreamRateConfig::new(
+                    crate::contracts::StreamRole::Ir,
+                    interval,
+                    interval,
+                ),
+            ),
+            meta: Some(
+                crate::ir_metadata::IlluminationLog::test_sentinel(events.clone())
+                    .with_producer(producer.clone()),
+            ),
+            _mode: crate::ir_emitter::StreamMode::test_sentinel(events.clone())
+                .with_producer(producer),
+        };
+        if unwind {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let _owner = owner;
+                    panic!("consumer failure");
+                }))
+                .is_err()
+            );
+        } else {
+            drop(owner);
+        }
+        let observed = events.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            [
+                "image-stop",
+                "metadata-drop",
+                "image-unmap",
+                "image-unmap",
+                "image-unmap",
+                "image-unmap",
+                "image-release",
+                "emitter-restore"
+            ]
+        );
+    }
+}
+
+#[test]
+fn coupled_owner_keeps_metadata_and_emitter_when_image_stop_is_unconfirmed() {
+    let fake = Arc::new(Mutex::new(FakeIo::default()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    fake.lock().unwrap().shared_events = Some(events.clone());
+    let mut raw = stream(&fake);
+    raw.dequeue().unwrap();
+    let producer = raw.producer(); // Keep this isolated test retention domain alive.
+    let interval = crate::frame_interval::FrameInterval::new(1, 30).unwrap();
+    let owner = crate::IrCaptureResources {
+        stream: crate::TrackedStream::new(
+            ValidatedMmap(raw),
+            crate::rate_gate::StreamRateConfig::new(
+                crate::contracts::StreamRole::Ir,
+                interval,
+                interval,
+            ),
+        ),
+        meta: Some(
+            crate::ir_metadata::IlluminationLog::test_sentinel(events.clone())
+                .with_producer(producer.clone()),
+        ),
+        _mode: crate::ir_emitter::StreamMode::test_sentinel(events.clone())
+            .with_producer(producer.clone()),
+    };
+    fake.lock().unwrap().fail = Some("STREAMOFF");
+    drop(owner);
+    assert_eq!(events.lock().unwrap().clone(), ["image-stop"]);
+    assert_eq!(fake.lock().unwrap().mapped, 4);
+    assert!(producer.check().is_err());
+}
+
+#[test]
+fn failed_stop_retains_all_owners_even_when_stderr_is_closed() {
+    use std::io::{Read, Write};
+    const CHILD: &str = "IRLUME_TEST_CLOSED_STDERR_SHUTDOWN";
+    if std::env::var_os(CHILD).is_some() {
+        std::panic::set_hook(Box::new(|_| {}));
+        let fake = Arc::new(Mutex::new(FakeIo::default()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut raw = stream(&fake);
+        raw.dequeue().unwrap();
+        let producer = raw.producer();
+        let handle = Arc::downgrade(&raw.handle);
+        drop(
+            crate::ir_metadata::IlluminationLog::test_sentinel(events.clone())
+                .with_producer(producer.clone()),
+        );
+        drop(
+            crate::ir_emitter::StreamMode::test_sentinel(events.clone())
+                .with_producer(producer.clone()),
+        );
+        std::io::stdin().read_exact(&mut [0u8]).unwrap();
+        fake.lock().unwrap().fail = Some("STREAMOFF");
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(raw)));
+        assert!(
+            stopped.is_ok(),
+            "diagnostic output must not unwind containment"
+        );
+        assert!(events.lock().unwrap().clone().is_empty());
+        assert!(producer.check().is_err());
+        assert_eq!(fake.lock().unwrap().mapped, 4);
+        assert_eq!(calls(&fake, "REQBUFS(0)"), 0);
+        assert!(
+            handle.upgrade().is_some(),
+            "retained ring must keep the fd alive"
+        );
+        return;
+    }
+    let _env = crate::testenv::env_lock();
+    for broken in [false, true] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "mmap_capture::tests::failed_stop_retains_all_owners_even_when_stderr_is_closed",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        if broken {
+            drop(child.stderr.take());
+        }
+        child.stdin.take().unwrap().write_all(&[1]).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "broken={broken}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

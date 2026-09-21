@@ -12,9 +12,14 @@ pub(crate) const BACKUP: &str = ".pre-irlume";
 
 pub(super) const CREATED_PREFIX: &str = "# irlume: created from ";
 
-/// The one sentence that explains the on-demand trigger; shared so the status
-/// line, the plan line, and docs/SETUP.md's mirror never drift apart.
-pub(super) const ONDEMAND_HINT: &str = "leave the password empty and press Enter to use your face";
+/// Explain the service's on-demand trigger in both status and plan output.
+pub(super) fn ondemand_hint(service: &str) -> &'static str {
+    if service.rsplit('/').next() == Some("cosmic-greeter") {
+        "COSMIC: type yes at the face/password prompt, or enter your password"
+    } else {
+        "leave the password empty and press Enter to use your face"
+    }
+}
 
 // Greeter block for a non-`@include` (Fedora `substack`) stack: a `success=1`
 // jump over the password substack, plus the `PERMIT_LANDING` it lands on.
@@ -33,7 +38,7 @@ pub(super) const GREETER_UNSEAL_FACEFIRST_JUMP: &str =
 /// unlock is handled by the module's `kr` arg, NOT the control: on a cold login
 /// the module returns IGNORE (having set the token), so `sufficient` continues to
 /// pam_unix + pam_gnome_keyring; a warm lock returns SUCCESS and short-circuits.
-/// `mode` is `facefirst` (GDM scan-immediately) or `ondemand` (empty-Enter). `kr`
+/// `mode` is `facefirst` (GDM scan-immediately) or `ondemand` (explicit input). `kr`
 /// adds the keyring-continue arg: true for greeters (cold login unlocks the
 /// keyring), false for a separate warm lock service (keyring already open).
 pub(super) fn include_greeter_line(mode: &str, kr: bool) -> String {

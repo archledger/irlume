@@ -49,6 +49,7 @@ const WAIT_BUDGET: Duration = Duration::from_secs(20);
 /// (avoids back-to-back EBUSY) and keeps us from busy-looping.
 const WAIT_RETRY_GAP: Duration = Duration::from_millis(400);
 const FACE_INTENT_INFO: &str = "Type yes to use face authentication";
+const COSMIC_FACE_PROMPT: &str = "Password, or type yes for face: ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IntentInput {
@@ -119,6 +120,28 @@ fn confirm_face_intent(pamh: &Pam, service: ServiceKind) -> IntentConfirmation {
         || pamh.get_authtok(None),
         || pamh.clear_authtok(),
     )
+}
+
+/// COSMIC discards empty submissions before answering PAM. Ask for a fresh,
+/// nonempty choice in its hidden prompt; an earlier module's token is never
+/// consent, even when that password happens to be `yes`.
+fn confirm_cosmic_face(pamh: &Pam) -> IntentConfirmation {
+    match pamh.get_cached_authtok() {
+        Ok(Some(token)) if !token.to_bytes().is_empty() => return IntentConfirmation::Fallback,
+        Ok(Some(_)) => {
+            if pamh.clear_authtok().is_err() {
+                return IntentConfirmation::Abort;
+            }
+        }
+        Ok(None) => {}
+        Err(_) => return IntentConfirmation::Fallback,
+    }
+    let Ok(Some(token)) = pamh.get_authtok(Some(COSMIC_FACE_PROMPT)) else {
+        return IntentConfirmation::Fallback;
+    };
+    resolve_intent_input(classify_intent_input(Some(token.to_bytes())), || {
+        pamh.clear_authtok()
+    })
 }
 
 /// PAM-data key under which the `reseal` AUTH line stashes the typed password for
@@ -290,15 +313,10 @@ impl PamServiceModule for IrlumePam {
             // scan right away; a typed password still wins via the modules after us.
             let facefirst = args.iter().any(|a| a == "facefirst");
 
-            // `ondemand` (COSMIC / cosmic-greeter): a greeter that DOES answer the
-            // active probe from the buffered field (like plasmalogin) but drives BOTH
-            // the cold login and the live lock screen through ONE service (like GDM).
-            // So we want the on-demand ACTIVE probe (face engages only when the user
-            // submits an empty field; never ambient, never after a typed/rejected
-            // password) AND the warm `unseal→verify` fallback below (so the lock
-            // screen still unlocks). It is `facefirst`'s warm-fallback WITHOUT its
-            // scan-immediately probe. Uses the active-probe path (it never sets
-            // `facefirst`, so the `!facefirst` probe test below stays true).
+            // `ondemand`: explicit input selects face, with the warm
+            // unseal→verify fallback for shared login/lock services. COSMIC needs
+            // a nonempty `yes` choice because its frontend drops empty input;
+            // other on-demand frontends keep their empty-Enter selection.
             let ondemand = args.iter().any(|a| a == "ondemand");
 
             // `reseal` AUTH line (placed AFTER password-auth): STASH ONLY. We copy the
@@ -314,7 +332,26 @@ impl PamServiceModule for IrlumePam {
                 return PamError::IGNORE;
             }
 
-            // If the user has typed a password, defer to it; don't power up the
+            let service = pamh
+                .get_service()
+                .ok()
+                .flatten()
+                .and_then(|value| value.to_str().ok().map(str::to_string));
+            let cosmic_choice = unseal
+                && ondemand
+                && !wait
+                && !facefirst
+                && service.as_deref() == Some("cosmic-greeter");
+            if cosmic_choice {
+                match confirm_cosmic_face(&pamh) {
+                    IntentConfirmation::Confirmed => {}
+                    IntentConfirmation::Fallback => return PamError::IGNORE,
+                    IntentConfirmation::Abort => return PamError::ABORT,
+                }
+            }
+
+            // Except for COSMIC's consumed explicit choice above, if the user
+            // has typed a password, defer to it; don't power up the
             // camera at all. Scanning a face when they already chose to type would be
             // a 2-3s annoyance for nothing, and we lose no capability by skipping:
             // pam_kwallet5/pam_gnome_keyring open the wallet from the typed password
@@ -343,7 +380,9 @@ impl PamServiceModule for IrlumePam {
             //    A privileged one-shot service offers its explicit
             //    face-intent choice only after this password-first check, then obtains
             //    the ordinary PAM token so a non-`yes` password is not asked twice.
-            let typed = if unseal && !wait && !facefirst {
+            let typed = if cosmic_choice {
+                None // The explicit face-selection token was already consumed.
+            } else if unseal && !wait && !facefirst {
                 match pamh.get_authtok(Some("Password: ")) {
                     Ok(Some(token)) => Some(token),
                     // Only an explicitly returned empty token chooses face.
@@ -366,11 +405,6 @@ impl PamServiceModule for IrlumePam {
                 }
             }
 
-            let service = pamh
-                .get_service()
-                .ok()
-                .flatten()
-                .and_then(|value| value.to_str().ok().map(str::to_string));
             let service_kind = service
                 .as_deref()
                 .and_then(irlume_common::pam_service::classify);

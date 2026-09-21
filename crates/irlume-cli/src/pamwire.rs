@@ -780,7 +780,8 @@ fn gdm_uses_ondemand(gnome_major: Option<u32>) -> bool {
 /// their lock screens differently, and those differences we've validated on
 /// hardware live here rather than scattered across the wiring code.
 struct DmProfile {
-    /// Face engages on an empty-field Enter (`ondemand`) vs GDM's
+    /// Face engages on explicit input (`ondemand`: yes on COSMIC, empty Enter
+    /// on other supported frontends) vs GDM's
     /// scan-immediately (`facefirst`). For GDM this is gated by GNOME version.
     /// The cold-login-vs-warm-lock control tension (keyring unlock) is handled
     /// uniformly by the module's `kr` arg, so it needs no per-DM field here.
@@ -791,7 +792,8 @@ struct DmProfile {
 /// detected GNOME Shell major (for GDM's version gate).
 fn dm_profile(greeter_etc: &str, gnome: Option<u32>) -> DmProfile {
     match greeter_etc.rsplit('/').next().unwrap_or("") {
-        // COSMIC (System76 / Pop!_OS): answers the probe on submit → ondemand.
+        // COSMIC drops empty submits. The PAM module's service-specific hidden
+        // prompt accepts an explicit nonempty yes; no ambient face-first switch.
         "cosmic-greeter" => DmProfile { ondemand: true },
         // GDM (GNOME): modern gnome-shell submits the empty field (ondemand);
         // older gnome-shell blocked the probe → facefirst.
@@ -1511,7 +1513,7 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
                 println!(
                     "  face trigger: {}",
                     if dm_profile(&format!("/etc/pam.d/{greeter}"), gnome_shell_major()).ondemand {
-                        format!("on-demand; {ONDEMAND_HINT}")
+                        format!("on-demand; {}", ondemand_hint(greeter))
                     } else {
                         "face-first; the camera verifies as soon as your account is selected"
                             .to_string()
@@ -2633,7 +2635,7 @@ mod tests {
 
     #[test]
     fn cosmic_greeter_wires_ondemand_not_facefirst() {
-        // ondemand=true → on-demand probe line (face only on empty-Enter), placed
+        // ondemand=true → explicit on-demand choice (yes on COSMIC), placed
         // before the password include so the password stays a fallback.
         let (w, changed) = wire_greeter_impl(COSMIC, true, false, true);
         assert!(changed);
@@ -2686,7 +2688,7 @@ mod tests {
 
     #[test]
     fn dm_profile_tailors_per_login_manager() {
-        // COSMIC answers the probe on submit → ondemand.
+        // COSMIC answers a nonempty yes selection → ondemand.
         assert!(dm_profile("/etc/pam.d/cosmic-greeter", Some(50)).ondemand);
         // GDM: ondemand is version-gated (modern GNOME) → facefirst below.
         assert!(dm_profile("/etc/pam.d/gdm-password", Some(50)).ondemand);

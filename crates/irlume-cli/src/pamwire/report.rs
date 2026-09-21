@@ -282,7 +282,7 @@ pub(super) fn status() -> ExitCode {
         }
     }
     let mut any = false;
-    let mut any_ondemand = false;
+    let mut ondemand_hints = std::collections::BTreeSet::new();
     for f in surface_facts() {
         if !f.present {
             continue;
@@ -294,7 +294,7 @@ pub(super) fn status() -> ExitCode {
             (ROLE_POLKIT, None) => "○ not wired (polkit app prompts)",
             (_, None) => "○ not wired",
             (_, Some("on-demand")) => {
-                any_ondemand = true;
+                ondemand_hints.insert(ondemand_hint(f.path));
                 "● wired (face on-demand)"
             }
             (_, Some("face-first")) => "● wired (face-first)",
@@ -306,8 +306,8 @@ pub(super) fn status() -> ExitCode {
         any |= f.wired && f.role != ROLE_SUDO && f.role != ROLE_POLKIT;
         println!("  {:<34} {}", f.path, label);
     }
-    if any_ondemand {
-        println!("  on-demand: {ONDEMAND_HINT}");
+    for hint in ondemand_hints {
+        println!("  on-demand: {hint}");
     }
     // #607: say WHY the stock Omarchy lock row shows not wired when the
     // dedicated lane owns face-on-lock.

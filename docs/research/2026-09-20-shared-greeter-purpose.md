@@ -123,6 +123,24 @@ the installed PAM stack and real credentials are not touched.
 
 ## Remaining qualification
 
+### Frontend initiation correction, 2026-09-21
+
+At the pinned COSMIC revision, both
+[locker Submit](https://github.com/pop-os/cosmic-greeter/blob/0b0d2925ffa18ffb9a7f7175f90097bb502fbf43/src/locker.rs#L1087-L1101)
+and [greeter Auth](https://github.com/pop-os/cosmic-greeter/blob/0b0d2925ffa18ffb9a7f7175f90097bb502fbf43/src/greeter.rs#L1512-L1518)
+discard empty input. The earlier policy fixture supplied empty input directly;
+it did not prove that the frontend could initiate that request.
+
+The module now uses a hidden password-or-`yes` prompt for the exact
+`cosmic-greeter` on-demand active-probe path. Cached passwords are not consent,
+and the explicit selection is consumed before daemon work. The policy fixture
+supplies `yes` for that prompt while retaining all authorization assertions.
+Additional real-PAM tests model the pinned empty-submit filter, explicit choice,
+cached tokens, correct/wrong passwords, cancellation and fresh fallback.
+The daemon's process/session binding is unchanged.
+
+### Desktop qualification
+
 These tests do not establish COSMIC's live process placement on every distro.
 Desktop components launched outside a logind session may be refused even when
 another graphical session exists. Qualify actual COSMIC unlock and password

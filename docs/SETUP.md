@@ -220,13 +220,15 @@ the plan and writes nothing.
 [login] done. Password remains the fallback everywhere.
 ```
 
-**How you log in:** face is **on-demand**. At the greeter (and lock screen),
-leave the password field **empty and press Enter**; the camera fires only then,
-never on its own. Typing a password never starts the camera, and the password
-always works. The one exception is older GNOME greeters (Shell < 46), whose
-greeter can't relay the empty-field probe; there the camera verifies as soon
-as your account is selected (face-first). `irlume login status` shows which
-mode each wired service uses.
+**How you log in:** on supported on-demand frontends, leave the password field
+**empty and press Enter** to choose face. Unreleased COSMIC support instead shows
+**Password, or type yes for face:** because COSMIC ignores empty Enter. Type
+`yes` for one attempt or enter your password; live COSMIC face-unlock
+qualification remains pending. Typed passwords use the password provider, whose
+OS account policies still apply. Older or undetected GNOME and unknown greeters
+can use face-first compatibility wiring, which starts when the account is
+selected. `irlume login status` shows the wired mode and selection hint. See the
+[desktop contract](DESKTOP-AUTH.md) for release and frontend limits.
 
 ### 4. Keyring unlock: recommended (IR camera + TPM)
 

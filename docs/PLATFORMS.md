@@ -40,6 +40,12 @@ placement and logind visibility still require desktop qualification. A locker
 running outside a logind session falls back rather than borrowing another
 session. See the [request-purpose evidence](research/2026-09-20-shared-greeter-purpose.md).
 
+The unreleased COSMIC on-demand prompt now asks for `yes` to select face, or a
+password to use the password provider. Upstream ignores empty Enter, so the
+previous empty-selection recipe could not initiate face authentication. Real-PAM
+conversation tests cover this correction; live COSMIC face unlock remains
+unqualified. See [the desktop flow](DESKTOP-AUTH.md).
+
 ## Install lane per distro
 
 | Distro | Lane | Notes |
@@ -153,7 +159,8 @@ module misbehaves).
 
 ## Login managers
 
-On-demand wiring uses an empty password and Enter to trigger the camera.
+On-demand wiring generally uses an empty password and Enter to trigger the camera.
+Unreleased COSMIC support uses the explicit `yes` prompt described above.
 `irlume login enable` selects a recipe for the detected login manager; some
 compatibility paths remain face-first. Check the planned PAM changes rather
 than assuming every desktop has the same prompt or cancellation behavior.
@@ -166,7 +173,7 @@ than assuming every desktop has the same prompt or cancellation behavior.
 | SDDM | wired and exercised in the login-manager matrix |
 | LightDM (gtk and slick greeters, X11) | wired and exercised in the login-manager matrix |
 | greetd (tuigreet) | wired and exercised in the login-manager matrix |
-| COSMIC greeter | wired and exercised in the login-manager matrix |
+| COSMIC greeter | installation/wiring/password paths exercised in the historical matrix; unreleased explicit-yes flow has real-PAM tests, while live face unlock and process placement remain unqualified |
 | ly (TUI) | wired and validated on a real `ly` install: detected, wired, password fallback confirmed. The greeter's own login was not driven, so the face-first wiring it gets is the conservative default rather than a measured choice |
 | polkit-1 (app prompts: Bitwarden, pkexec) | validated live (pre-0.12.0 via the then-current head-nod approval; today's confirmation is the typed `yes` field): Bitwarden flatpak biometric unlock approved |
 

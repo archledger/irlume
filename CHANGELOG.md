@@ -7,6 +7,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- COSMIC on-demand PAM requests now offer an explicit hidden password-or-`yes`
+  choice, because its frontend ignores empty Enter. Cached passwords never count
+  as fresh face consent, and the choice is cleared before a face request so
+  refusal can ask for a fresh password. Other frontends and daemon authorization
+  are unchanged. Live COSMIC desktop qualification remains pending.
 - PCR-signing public keys are decoded from complete DER containers after PEM
   label validation. Keys hidden inside the algorithm identifier, trailing DER
   fields and non-byte-aligned key bits are rejected. Valid RSA keys with NULL

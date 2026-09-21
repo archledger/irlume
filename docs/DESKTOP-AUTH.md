@@ -9,11 +9,25 @@ promised upstream feature.
 
 ## Existing desktop flow
 
-The current on-demand PAM path waits for input. A successfully returned empty
-password response selects one face attempt. A nonempty password proceeds to the
+The on-demand PAM path waits for input. On frontends other than COSMIC, a
+successfully returned empty password response selects one face attempt.
+A nonempty password proceeds to the
 password provider. Cancelling the initial conversation, EOF, or a missing token
 returns without contacting the daemon. The consumed empty face-selection token
 is cleared so a refusal or timeout can reach a fresh password prompt.
+
+In unreleased source, `cosmic-greeter` with `unseal ondemand` instead shows a
+hidden **Password, or type yes for face:** prompt. COSMIC ignores empty Enter;
+type `yes` to select one attempt, or enter your password. A nonempty token cached
+by an earlier PAM module remains a password, even if it is `yes`. The face-choice
+token is cleared before the request so a refusal can ask for a fresh password.
+Clearing failure returns `PAM_ABORT` without contacting the daemon; the installed
+PAM stack controls how that return is handled. Other frontends retain their
+existing selection behavior.
+
+This correction has real-PAM tests with a source-matched COSMIC conversation
+adapter. Live prompt rendering, process placement and face unlock still need
+qualification on a named COSMIC build; v0.14.0 does not contain this correction.
 
 Existing greeter compatibility remains supported: the established `facefirst`,
 `ondemand`, and legacy `wait` arguments are retained where existing deployments

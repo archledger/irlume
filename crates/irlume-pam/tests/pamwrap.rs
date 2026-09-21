@@ -43,6 +43,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+#[path = "pamwrap/cosmic.rs"]
+mod cosmic;
+
 // ---------------------------------------------------------------- harness
 
 /// Everything a test needs: tool paths, a per-test scratch dir with the

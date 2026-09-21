@@ -7,6 +7,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Camera warm-up retries raw `EIO`/`ENODEV` from pending poll/dequeue operations
+  within the existing budget while the endpoint remains valid. Failed queue
+  writes, stream starts and retired rings stop immediately instead of consuming
+  retries based on their error kind. Lease/privacy refusal, cancellation and
+  deadlines remain authoritative; errno-based diagnostics are preserved.
 - PCR-signing public keys are decoded from complete DER containers after PEM
   label validation. Keys hidden inside the algorithm identifier, trailing DER
   fields and non-byte-aligned key bits are rejected. Valid RSA keys with NULL

@@ -5,12 +5,15 @@ use super::*;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+mod warmup;
+
 pub(super) struct FakeIo {
     queued: Vec<bool>,
     polls: VecDeque<Result<i32, i32>>,
     dequeues: VecDeque<Result<u32, i32>>,
     events: Vec<String>,
     fail: Option<&'static str>,
+    fail_errno: i32,
     fail_map: Option<u32>,
     mapped: usize,
     granted: u32,
@@ -28,6 +31,7 @@ impl Default for FakeIo {
             dequeues: VecDeque::new(),
             events: Vec::new(),
             fail: None,
+            fail_errno: libc::EIO,
             fail_map: None,
             mapped: 0,
             granted: 4,
@@ -80,7 +84,7 @@ impl FakeIo {
         if self.fail == Some(operation)
             || (self.fail == Some("teardown") && matches!(operation, "STREAMOFF" | "REQBUFS(0)"))
         {
-            return Err(io::Error::from_raw_os_error(libc::EIO));
+            return Err(io::Error::from_raw_os_error(self.fail_errno));
         }
         if request == vidioc::VIDIOC_REQBUFS {
             // SAFETY: the request identifies the caller's requestbuffers.
@@ -241,9 +245,12 @@ fn poll_interrupt_and_dequeue_eagain_retry_without_duplicate_queue() {
         f.dequeues = [Err(libc::EAGAIN), Ok(0)].into();
     }
     let mut stream = stream(&fake);
-    assert_eq!(dequeue_error(&mut stream).raw_os_error(), Some(libc::EINTR));
     assert_eq!(
-        dequeue_error(&mut stream).raw_os_error(),
+        source_io(&dequeue_error(&mut stream)).raw_os_error(),
+        Some(libc::EINTR)
+    );
+    assert_eq!(
+        source_io(&dequeue_error(&mut stream)).raw_os_error(),
         Some(libc::EAGAIN)
     );
     stream.dequeue().unwrap();
@@ -260,7 +267,10 @@ fn dequeue_error_with_unknown_consumed_buffer_never_guesses_an_index() {
         f.dequeues = [Err(libc::EIO), Ok(1)].into();
     }
     let mut stream = stream(&fake);
-    assert_eq!(dequeue_error(&mut stream).raw_os_error(), Some(libc::EIO));
+    assert_eq!(
+        source_io(&dequeue_error(&mut stream)).raw_os_error(),
+        Some(libc::EIO)
+    );
     stream.dequeue().unwrap();
     assert_eq!(calls(&fake, "QBUF"), 4);
     assert!(!fake.lock().unwrap().queued[0]);
@@ -272,7 +282,10 @@ fn setup_or_queue_failure_refuses_further_io_and_still_releases() {
         let fake = Arc::new(Mutex::new(FakeIo::default()));
         let mut stream = stream(&fake);
         fake.lock().unwrap().fail = Some(failure);
-        assert_eq!(dequeue_error(&mut stream).raw_os_error(), Some(libc::EIO));
+        assert_eq!(
+            source_io(&dequeue_error(&mut stream)).raw_os_error(),
+            Some(libc::EIO)
+        );
         let before = fake.lock().unwrap().events.clone();
         assert!(stream.dequeue().is_err());
         assert_eq!(fake.lock().unwrap().events, before);
@@ -289,7 +302,10 @@ fn a_failed_requeue_after_a_frame_is_not_retried_speculatively() {
     let mut stream = stream(&fake);
     stream.dequeue().unwrap();
     fake.lock().unwrap().fail = Some("QBUF");
-    assert_eq!(dequeue_error(&mut stream).raw_os_error(), Some(libc::EIO));
+    assert_eq!(
+        source_io(&dequeue_error(&mut stream)).raw_os_error(),
+        Some(libc::EIO)
+    );
     assert!(stream.dequeue().is_err());
     assert_eq!(calls(&fake, "QBUF"), 5);
     assert_eq!(calls(&fake, "DQBUF"), 1);

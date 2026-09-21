@@ -72,6 +72,7 @@ pub fn initialize_camera_monitor() {
 }
 pub mod measurement;
 mod media_graph;
+mod mmap_capture;
 mod paired_processing;
 pub mod profiles;
 pub use paired_processing::process_pair_while_draining;
@@ -632,13 +633,6 @@ trait CaptureDequeue {
     fn dequeue(&mut self) -> std::io::Result<(&[u8], v4l::buffer::Metadata)>;
 }
 
-impl CaptureDequeue for v4l::io::mmap::Stream<'_> {
-    fn dequeue(&mut self) -> std::io::Result<(&[u8], v4l::buffer::Metadata)> {
-        let (mapped, metadata) = v4l::io::traits::CaptureStream::next(self)?;
-        Ok((mapped, *metadata))
-    }
-}
-
 /// Existing camera-state operations used while negotiating and claiming a
 /// capture stream. This protocol stays crate-private: it is an injected test
 /// seam, not new public API.
@@ -830,7 +824,7 @@ impl V4l2CameraState {
 
 impl CameraState for V4l2CameraState {
     type Device = Device;
-    type Claim<'a> = v4l::io::mmap::Stream<'a>;
+    type Claim<'a> = mmap_capture::MmapCapture;
     type EndpointError = lease::CameraLeaseError;
 
     fn set_format(&self, dev: &Device, requested: &Format) -> std::io::Result<Format> {
@@ -912,10 +906,7 @@ impl CameraState for V4l2CameraState {
     }
 
     fn claim_buffers<'a>(&self, dev: &'a Device) -> std::io::Result<Self::Claim<'a>> {
-        let mut stream =
-            v4l::io::mmap::Stream::with_buffers(dev, Type::VideoCapture, MMAP_BUFFERS)?;
-        stream.set_timeout(STREAM_DEQUEUE_TIMEOUT);
-        Ok(stream)
+        mmap_capture::MmapCapture::with_buffers(dev, MMAP_BUFFERS, STREAM_DEQUEUE_TIMEOUT)
     }
 
     fn accepted_interval(&self) -> Option<frame_interval::FrameInterval> {
@@ -1483,8 +1474,7 @@ impl<'a, S: CameraState> CameraStateStream<'a, S> {
         .map_err(|error| Error::Hardware(format!("{device}: {error}")))?;
         let inner = state.claim_buffers(dev).map_err(|e| map_io(device, e))?;
         // Constructed before the read-back so every error path below releases
-        // the queue through the guarded Drop (STREAMOFF + REQBUFS(0)), never
-        // through the v4l crate's panicking one.
+        // the queue through the guarded Drop (STREAMOFF + REQBUFS(0)).
         let mut stream = Self {
             inner: Some(inner),
             state,

@@ -7,6 +7,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Camera warm-up can retry a dequeue timeout without requeueing a buffer still
+  owned by the kernel. Capture now tracks the last successfully dequeued buffer
+  explicitly, preserving the existing retry budget, cancellation, deadlines and
+  frame validation. Cleanup preserves stream-stop, unmap and buffer-release
+  ordering on errors.
 - Metadata capture restores both the observed format and buffer size, including
   when the node was already using UVCM. Failed initial reads and uncertain format
   writes cannot authorize a guessed restore. Cleanup checks the current format

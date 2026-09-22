@@ -56,18 +56,30 @@ all its cameras.
    during preflight, the contract established for issue #701) carries both
    identities. Resolution matches the configured RGB and IR identities
    first against the primary binding, then against an ACTIVE secondary
-   store through the existing `group_for_pair` exact match on the complete
-   pair. A configured pair that carries only an IR identity, or an IR
-   identity shared by several groups whose RGB sides differ (ADR-0024
-   permits shared endpoints without merging groups), does not resolve: it
-   is refused as `BindingMismatch`, never resolved by store order. The
-   primary keeps precedence; no automatic movement to another group after
-   a refusal (§5 unchanged).
+   store by STRICT equality of both sides: the group's `pair.rgb` and
+   `pair.ir` must each be `Some` and equal to the configured identity.
+   `GroupPair::matches` is not used here: it treats a missing side as
+   unchecked, so a valid one-sided group `(None, IR-X)` would match any
+   pair on IR-X. Exactly one strict match resolves; zero, or more than one
+   (store validation does not forbid duplicate pairs), is refused as
+   `BindingMismatch`, never resolved by store order. A configured pair that
+   carries only an IR identity, or an IR identity shared by several groups
+   whose RGB sides differ (ADR-0024 permits shared endpoints without
+   merging groups), does not resolve either. The primary keeps precedence;
+   no automatic movement to another group after a refusal (§5 unchanged).
 
 2. A secondary match scores against that group's camera-scoped view: its
    own IR scans and its own `ir_calibs` for the live recognizer (§3), through
    the existing IR-only pipeline (detect, align, embed, adapt, identify) and
-   the existing IR PAD gate. No pooling: the primary's scans are not added to
+   the existing IR PAD gate. Account-level enrollment policy is checked
+   against the REAL primary enrollment for every scope before any scoped
+   view is built: `CameraGroupView::matching_enrollment` bridges a group
+   with `..Enrollment::default()`, which clears account-level fields such
+   as `require_eyes_open`, so running `legacy_eye_policy` on the bridged
+   view would let a secondary attempt proceed where the same account's
+   primary attempt is `IncompatibleEnrollment`. The readiness sequence is
+   therefore: primary load, account policy on it, scope resolution, scoped
+   view; a legacy-policy fixture pins this. No pooling: the primary's scans are not added to
    a secondary attempt and a secondary group's scans are never mixed into
    the primary's. The IR-only thresholds and the experimental-attempt
    evidence rules (ADR-0016) apply unchanged; a group whose view yields zero
@@ -81,30 +93,54 @@ all its cameras.
    - the pair matches a secondary group but the store is inactive (the
      primary changed since authorization, §1.1): a new
      `SecondaryInactive` readiness, refused with "this camera's authorization
-     is inactive since the primary enrollment changed; remove the camera and
-     add it again, or use your password". Remove-then-add is the recovery
-     because the retained inactive group makes `add` refuse the same pair as
-     already enrolled; a credential-authorized rebind operation is out of
-     scope here;
+     is inactive since the primary enrollment changed; remove your added
+     cameras and add back the ones you use, or use your password". The
+     store carries ONE `primary_snapshot_sha256`, and `publish_camera_group`
+     rewrites it for the whole store, so adding one camera into an
+     inactive store would silently reactivate every other stale group,
+     which ADR-0024 forbids (no automatic rebind). Phase 1 therefore adds a
+     writer guard: adding a group into an inactive store is refused while
+     any other stale group remains ("remove the other added cameras
+     first"), so recovery is remove every retained group, then add back
+     each wanted one under its own authorization. A rebind transaction is
+     out of scope here;
    - the pair matches an authorized group whose IR view is empty:
      `IncompatibleEnrollment`, as above.
-   Reporting: the preferences/status wire gains an optional
-   `ir_scope` field beside `ir_readiness`, either `primary` or the group's
-   opaque `CameraGroupId` (an id, never a device identity), absent on older
-   daemons and ignored by older clients. `irlume auth sensor preflight`
-   prints it. The refusal reasons keep the closed vocabulary and expose no
-   identities.
+   Wire compatibility: `IrOnlyReadiness` has no `#[serde(other)]`
+   fallback, so an older client would reject a whole `FaceSensorStatus`
+   carrying an unknown readiness value. The existing `ir_readiness` field
+   therefore keeps its current vocabulary: `SecondaryInactive` and
+   `SecondaryUnvalidated` are sent there as `BindingMismatch`, which is
+   what an older daemon would have said. The precise cause travels in a new
+   optional field, `ir_readiness_detail`, absent on older daemons and
+   ignored by older clients; new clients prefer it when present. The enum
+   also gains a `#[serde(other)]` `Unknown` fallback so this class of
+   incompatibility cannot recur. An old-client/new-daemon test decodes a
+   new daemon's payload for each new value with a frozen copy of the
+   pre-change types.
 
-4. Revocation at the grant boundary. The IR-only path decides through
-   `assessed_outcome` and does not pass the dual path's
-   `authenticate_qualified_assessment`, so pinning a scoped view at capture
-   time would not by itself inherit ADR-0024's guarantee. Immediately before
-   every IR-only grant, both stores are re-read and re-validated: the
-   primary's bytes against the pinned digest, the secondary store's
-   activation against the current primary, and the pinned group's presence
-   and pair; any change refuses. For the primary scope the existing primary
-   boundary check applies. This is the same `grant_boundary_now_with` step
-   the dual path runs, with the ADR-0025 request key.
+   Scope reporting: `CameraGroupId` is derived from the device identity
+   (`derive_group_id` sanitizes `vid:pid[:serial]`), so it is not opaque
+   and must not be printed. The wire gains an optional `ir_scope` of
+   `primary` or `secondary`, with `ir_scope_index` (the group's 1-based
+   position in the store) as the only handle: an ordinal, never an
+   identity. `irlume auth sensor preflight` prints these. Making stored
+   group ids genuinely opaque is an ADR-0024 follow-up, not this ADR. The
+   refusal reasons keep the closed vocabulary and expose no identities.
+
+4. Revocation at the grant boundary, for BOTH scopes. The IR-only path
+   decides through `assessed_outcome` and does not pass the dual path's
+   `authenticate_qualified_assessment`; that function also skips its
+   boundary logic for primary attempts, so there is no existing primary
+   boundary check for this path to inherit and a primary reset during an
+   IR-only capture could grant from the stale in-memory enrollment.
+   Immediately before every IR-only grant: the primary scope re-reads the
+   primary file and requires its digest to equal the one pinned at load;
+   the secondary scope additionally re-reads the secondary store and
+   requires activation against the current primary and the pinned group's
+   presence with the same strict pair. Any change refuses. The secondary
+   check is the dual path's `grant_boundary_now_with` step, with the
+   ADR-0025 request key.
 
 5. The request key. `load_ir_enrollment` today discards the key its load
    returns, and preflight uses the read-only loader. Phase 1 adopts the key
@@ -114,7 +150,11 @@ all its cameras.
    unseals once. Preflight is not an authentication request: it adopts the
    key from its own read-only load for the duration of the call, so a
    preflight also unseals once, as it does today. The cost added by this ADR
-   is two file reads, not a TPM operation.
+   is file reads, not a TPM operation: a primary-scoped attempt adds one
+   (the boundary re-read of the primary); a secondary-scoped attempt adds at
+   least three (the secondary store at resolution, then both stores at the
+   boundary), and the primary bytes pinned at load are retained so that
+   count does not grow. Phase 2 measures the route as specified here.
 
 6. Everything else stays: the account-level attempt budget, retry state and
    deadline are shared across scopes; the camera lease, the per-attempt
@@ -149,15 +189,18 @@ all its cameras.
   extending it to secondary cameras does not change that trade-off, and the
   experimental label stays.
 - With the key threaded as in item 5, an authentication request still
-  unseals once and gains two file reads; preflight is unchanged at one
-  unseal. Without item 5 the route would pay a second unseal, which is why
-  item 5 is a Phase 1 requirement and not an optimisation.
+  unseals once and gains one file read on the primary scope and at least
+  three on a secondary scope; preflight is unchanged at one unseal. Without
+  item 5 the route would pay a second unseal, which is why item 5 is a
+  Phase 1 requirement and not an optimisation.
 
 ## Phasing
 
-- Phase 1: exact-pair resolution against active secondary groups, the
-  scoped IR view, request-key adoption on both flows, the grant-boundary
-  revalidation, the readiness causes and `ir_scope` reporting, unit tests,
+- Phase 1: strict-pair resolution against active secondary groups, account
+  policy on the real primary, the scoped IR view, request-key adoption on
+  both flows, the grant-boundary revalidation for both scopes, the
+  readiness causes with the compatible wire mapping and `ir_scope` /
+  `ir_scope_index` reporting, the inactive-store writer guard, unit tests,
   all behind the `SecondaryUnvalidated` gate.
 - Phase 2: hardware confirmation on archhost (NexiGo secondary, BRIO
   primary) with the gate lifted through the validation hook, in both
@@ -168,20 +211,36 @@ all its cameras.
 
 ## Acceptance tests
 
-- Resolution (pure): primary match → primary scope; exact secondary match
+- Resolution (pure): primary match → primary scope; strict secondary match
   in an active store → that group's scope; two groups sharing the IR
   identity with different RGB sides and a configured pair naming one of
   them → that one; the same two groups with a configured pair carrying
-  only the IR identity → `BindingMismatch`; secondary match in an inactive
-  store → `SecondaryInactive`; no match → `BindingMismatch`; matched group
-  with an empty IR view → `IncompatibleEnrollment`; gate set and no
-  validation hook → `SecondaryUnvalidated`.
+  only the IR identity → `BindingMismatch`; a one-sided group
+  `(None, IR-X)` beside `(RGB-B, IR-X)` with configured `(RGB-B, IR-X)` →
+  the two-sided one, and with configured `(RGB-A, IR-X)` → `BindingMismatch`
+  (the one-sided group never wildcards); two groups with identical pairs →
+  `BindingMismatch`; secondary match in an inactive store →
+  `SecondaryInactive`; no match → `BindingMismatch`; matched group with an
+  empty IR view → `IncompatibleEnrollment`; gate set and no validation hook
+  → `SecondaryUnvalidated`.
+- Account policy: a legacy enrollment with `require_eyes_open` set is
+  `IncompatibleEnrollment` on the secondary scope exactly as on the
+  primary, checked on the real primary before the scoped view exists.
 - Scope pinning: an attempt resolved to a group scores only that group's
   scans; a fixture with a primary scan that would match and a group scan
   that would not must refuse when the configured pair is the group's.
 - Grant boundary: with a matching scoped assessment in hand, removing the
   group, replacing the secondary store, or changing the primary file
-  before the grant step refuses; unchanged stores grant.
+  before the grant step refuses; unchanged stores grant. On the primary
+  scope, resetting or removing the primary enrollment during capture
+  refuses.
+- Writer guard: adding a camera into an inactive store that still holds
+  another stale group is refused; after removing the others, adding works
+  and activates only the added group's store snapshot.
+- Wire: a new daemon's `FaceSensorStatus` for each new readiness value
+  decodes with a frozen copy of the pre-change types (`ir_readiness` reads
+  `binding_mismatch`, extra fields ignored); a new client reads the detail
+  and the scope.
 - Request key: the IR-only authentication path performs exactly one unseal
   with a secondary scope (counted through `RequestTemplateKey::unseals`),
   and preflight exactly one.

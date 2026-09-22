@@ -136,20 +136,27 @@ fn transport_error(
 /// One startup/rate boundary and one owned streaming scope per collection.
 /// Dependencies are injectable so real owner and collector behavior can be
 /// tested without opening cameras; a result cannot borrow either owner.
+///
+/// The second value says whether a streaming owner existed and was released,
+/// whatever the result: false only when arming itself failed.
 pub(super) fn with_managed_pair<R, I, T>(
     arm: impl FnOnce() -> Result<(R, I), CapturePathError>,
     establish: impl FnOnce(&mut R, &mut I) -> Result<(), CapturePathError>,
     collect: impl FnOnce(&mut R, &mut I) -> Result<T, CapturePathError>,
     diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
-) -> Result<T, CapturePathError> {
-    let pair = {
+) -> (Result<T, CapturePathError>, bool) {
+    let armed = {
         let _timing = TraceStageTimer::new(
             diagnostics,
             irlume_common::diagnostics::TraceStage::StreamArm,
         );
-        arm()?
+        arm()
     };
-    with_owned_pair(pair, diagnostics, |rgb, ir| {
+    let pair = match armed {
+        Ok(pair) => pair,
+        Err(error) => return (Err(error), false),
+    };
+    let result = with_owned_pair(pair, diagnostics, |rgb, ir| {
         {
             let _timing = TraceStageTimer::new(
                 diagnostics,
@@ -158,7 +165,8 @@ pub(super) fn with_managed_pair<R, I, T>(
             establish(rgb, ir)?;
         }
         collect(rgb, ir)
-    })
+    });
+    (result, true)
 }
 
 impl Engine {
@@ -254,10 +262,11 @@ impl Engine {
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Outcome> {
         self.emit_capture_setup(diagnostics);
+        let mut owned = false;
         let prepared = (|| {
             self.check_request_active()?;
             let control = self.capture_control();
-            with_managed_pair(
+            let (prepared, released) = with_managed_pair(
                 || {
                     arm_pair_transactionally(
                         || cameras.0.session_with_control(&control),
@@ -311,11 +320,15 @@ impl Engine {
                     )
                 },
                 diagnostics,
-            )
+            );
+            owned = released;
+            prepared
         })();
         // The streaming owners and processing workers have finished before
         // cancellation/deadline admission checks or any identity comparison.
-        self.arm_finalization();
+        if owned {
+            self.arm_finalization();
+        }
         self.check_request_cancelled()?;
         if matches!(&prepared, Ok(PreparedPairAuthentication::Ready(_))) {
             self.check_request_active()?;

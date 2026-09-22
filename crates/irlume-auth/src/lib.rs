@@ -5942,8 +5942,11 @@ impl Engine {
         let sync_enr = if loader.receiver.is_none() {
             let loaded = irlume_core::storage::load(user);
             // Completed work boundary: the plaintext store load itself,
-            // before any policy decision on its content.
+            // before any policy decision on its content. Attempt preparation
+            // starts here on this path (the deferred path starts it at its
+            // join below).
             emit_enrollment_load_timing(diagnostics, load_started);
+            self.begin_capture_setup();
             match loaded? {
                 Some(enr) => match self.resolve_attempt_enrollment(user, enr, &live_pair) {
                     Err(outcome) => return Ok(outcome),
@@ -6109,10 +6112,11 @@ impl Engine {
                 "plaintext, synchronous"
             }
         );
-        // Attempt preparation starts here: secondary-camera resolution below
-        // can load and unseal further stores, and belongs to the interval.
-        self.begin_capture_setup();
         if loader_was_async {
+            // Attempt preparation starts at the join: secondary-camera
+            // resolution below can load and unseal further stores, and
+            // belongs to the interval.
+            self.begin_capture_setup();
             enr = match self.resolve_attempt_enrollment(user, enr, &live_pair) {
                 Err(outcome) => return Ok(outcome),
                 Ok(scoped) => scoped,
@@ -6457,6 +6461,8 @@ impl Engine {
                         return Err(error);
                     }
                 };
+                // The one-shot helper opened and released its own sessions.
+                self.arm_finalization();
                 self.last_attempt_facts = AttemptFacts::from_assessment(&a);
                 return self.authenticate_assessment(enr, purpose, service, a, diagnostics);
             }
@@ -6471,7 +6477,13 @@ impl Engine {
         let prepared = if let Some((rgb, ir)) = cameras {
             self.assess_with_fresh_pair_finish(rgb, ir, mode, operation, diagnostics, finish)
         } else {
-            self.assess_full_with_finish(None, mode, operation, diagnostics, finish)
+            let prepared = self.assess_full_with_finish(None, mode, operation, diagnostics, finish);
+            // A completed one-shot pair capture opened and released its own
+            // sessions; a failed one may not have opened any.
+            if prepared.is_ok() {
+                self.arm_finalization();
+            }
+            prepared
         };
         self.finish_pair_authentication(
             enr,
@@ -13831,9 +13843,29 @@ mod engine_tests {
             "{:?}",
             sink.0.lock().unwrap()
         );
+        // A refused request may have started the interval before denying;
+        // the next request must not report it as its own.
+        let next = StageSink::default();
+        let o = s
+            .engine
+            .authenticate_for_with_diagnostics(
+                "irlume-test-empty-setup",
+                None,
+                AuthenticationPurpose::Verify,
+                &next,
+            )
+            .unwrap();
+        assert_eq!(o.kind, OutcomeKind::SetupUnavailable);
         assert!(
-            s.engine.capture_setup_started.is_none(),
-            "a refused request must not leave a setup interval pending for the next one"
+            !next.0.lock().unwrap().iter().any(|event| matches!(
+                event,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CaptureSetup | TraceStage::Finalization,
+                    ..
+                }
+            )),
+            "{:?}",
+            next.0.lock().unwrap()
         );
     }
 
@@ -13856,6 +13888,9 @@ mod engine_tests {
         let _g = env_guard();
         let mut s = shared();
         let sink = StageSink::default();
+        // The shared engine may carry another test's pending start; a real
+        // request resets it at entry, which this stands in for.
+        drop(s.engine.finalization_timer(&sink));
         s.engine.emit_capture_setup(&sink);
         assert!(sink.0.lock().unwrap().is_empty(), "nothing began");
         s.engine.begin_capture_setup();

@@ -410,8 +410,11 @@ impl Engine {
             },
             &control,
         );
-        // Both streams were released inside the batch, whatever its outcome.
-        self.arm_finalization();
+        // A completed batch opened and released both streams; a failed one
+        // may have opened none.
+        if samples.is_ok() {
+            self.arm_finalization();
+        }
         let samples = samples?;
         irlume_common::dlog!(
             "[assessment-stage] grouped-capture: pairs={} elapsed={}ms",
@@ -491,7 +494,9 @@ impl Engine {
             },
             &control,
         );
-        self.arm_finalization();
+        if frames.is_ok() {
+            self.arm_finalization();
+        }
         let frames = frames?;
         irlume_common::dlog!(
             "[assessment-stage] grouped-rgb-capture: samples={} elapsed={}ms",

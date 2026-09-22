@@ -59,34 +59,22 @@ schema throughout; unsupported versions, version changes within a stream and
 newer-tier events marked with an older schema are rejected.
 
 Schema 4 adds two stage timings that close the gaps between the schema 3
-stages. `capture_setup` runs from the completed enrollment load to the moment
-the first capture route starts streaming: attempt enrollment resolution,
+stages. `capture_setup` runs from the completed enrollment load until the
+first capture route begins arming its streams: attempt enrollment resolution,
 including the secondary-camera store loads and unseals a non-primary camera
-pair requires, schedule dispatch and per-attempt admission; it is reported once per request and is
-absent when the request refused before any capture began. `finalization` runs
-from the release of the owned streaming sessions (`stream_owner_release`) to
-the engine return: final matching, camera handle close and lease release; it is
-absent when no owned session was released. Neither is a first-frame or
-desktop-unlock latency. Schema 3 and older subscribers omit both records
-before queue, sequence and drop accounting.
-
-Schema 2 adds `identity_inference` and `stream_owner_release` stage timings,
-and an `authentication_refusal` event whose `reason` is one of:
-`rgb_pad_pending`, `no_face`, `uncertain`, `spoof_no_ir_face`, `spoof`,
-`below_threshold`, `setup_unavailable`, `deadline_expired`,
-`runtime_unavailable`, or `other_deny`. These are fixed labels, with no raw
-reason text, account names or matching measurements. `rgb_pad_pending` means
-that the existing RGB PAD vote is incomplete; it is not an identity mismatch.
-`identity_inference` measures one identity-materialization call, including
-alignment, RGB TTA embedding, IR embedding and adapter application when those
-inputs exist; it is not a count of individual model invocations.
-`stream_owner_release` measures the wall time spent dropping both owned
-streaming sessions, not an observation that the optical emitter is off.
-Neither stage measures first-frame or desktop-unlock latency. The internal
-pending-PAD distinction preserves the existing client reason, situation,
-presence-retry and account-throttling behavior. Schema 1 subscribers omit
-these new records before queue, sequence and drop accounting, so the omission
-does not generate `events_dropped`.
+pair requires, camera lease and open, schedule dispatch and per-attempt
+admission. It is reported once per request by that route, whether or not its
+arming then succeeds, and is absent when the request refused before any
+capture route began. `finalization` runs from the release of the owned
+streaming sessions (`stream_owner_release`) to the engine return: final
+matching, camera handle close and lease release. It is reported only when a
+route armed and released a streaming owner (the managed and fresh-pair
+routes), or completed a capture that opened and released its own sessions
+(the grouped and one-shot routes); a route that failed before owning any
+session reports none. Neither is a first-frame or desktop-unlock latency, and
+stages nest (`camera_open` lies inside `capture_setup`), so they are not
+summed. Schema 3 and older subscribers omit both records before queue,
+sequence and drop accounting.
 
 For a public issue, start with `irlume support-report`. Its default action is
 read-only and camera-free, and its `.txt` output is structurally share-safe and

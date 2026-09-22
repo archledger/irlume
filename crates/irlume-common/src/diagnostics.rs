@@ -701,14 +701,16 @@ impl TraceLimits {
 diagnostic_enum!(TraceWarning {
     PrivilegedDiagnosticOracle,
 });
-// Schema 4 adds `CaptureSetup` (attempt preparation after the enrollment
-// load completed and before the capture route starts streaming: attempt
-// enrollment resolution including any secondary-camera store loads, schedule
-// dispatch, per-attempt admission; emitted once per request by
-// the route that first starts capture, absent when the request refused before
-// any capture began) and `Finalization` (from the release of the owned
-// streaming sessions to the engine return: final matching, camera handle
-// close, lease release; absent when no owned session was released).
+// Schema 4 adds `CaptureSetup` (attempt preparation from the completed
+// enrollment load until the first capture route begins arming its streams:
+// attempt enrollment resolution including any secondary-camera store loads,
+// camera lease and open, schedule dispatch, per-attempt admission; reported
+// once per request by that route whether or not arming then succeeds, absent
+// when the request refused before any capture route began) and
+// `Finalization` (from the release of the owned streaming sessions to the
+// engine return: final matching, camera handle close, lease release; reported
+// only when a route armed and released an owner, or completed a capture that
+// opened and released its own sessions; absent otherwise).
 diagnostic_enum!(TraceStage {
     CameraOpen,
     StreamArm,

@@ -11877,6 +11877,9 @@ mod tests {
         // Session one pays the full fill and records completion; session two
         // on the same node and role admits on seed + 5 probe deltas.
         let node = "/dev/video-amort-probe";
+        // Admission depends on the kill switch being clear; hold the env lock
+        // so the kill-switch test cannot flip it mid-assertion.
+        let _guard = crate::testenv::env_lock();
         let mut first =
             rate_fill_fixture(contracts::StreamRole::Rgb, 40, 66_667).with_rate_amortization(node);
         rate_amortization::test_support::force_completion(
@@ -11924,7 +11927,9 @@ mod tests {
     #[test]
     fn the_kill_switch_forces_the_full_fill_despite_a_fresh_completion() {
         let node = "/dev/video-amort-off";
-        std::env::set_var("IRLUME_RATE_AMORTIZATION", "0");
+        // Same lock as the `rate_amortization` tests: they read this variable.
+        let _guard = crate::testenv::env_lock();
+        let _off = crate::testenv::EnvGuard::set("IRLUME_RATE_AMORTIZATION", "0");
         let mut stream =
             rate_fill_fixture(contracts::StreamRole::Rgb, 40, 66_667).with_rate_amortization(node);
         stream.fill_rate_evidence().expect("full fill");
@@ -11933,7 +11938,6 @@ mod tests {
             discarded >= 31,
             "kill switch re-pays the full window: {discarded}"
         );
-        std::env::remove_var("IRLUME_RATE_AMORTIZATION");
     }
 
     #[test]
@@ -11943,6 +11947,9 @@ mod tests {
         // probe-eligible stream must pay the fixed flush first (the probe
         // cannot tell a STREAMON transient from degradation).
         let node = "/dev/video-amort-adaptive";
+        // Admission depends on the kill switch being clear; hold the env lock
+        // so the kill-switch test cannot flip it mid-assertion.
+        let _guard = crate::testenv::env_lock();
         let key = rate_amortization::Key::new(node, contracts::StreamRole::Ir);
         rate_amortization::test_support::force_completion(key.clone(), None);
         let mut first =
@@ -18793,6 +18800,9 @@ mod tests {
         // escalation admits them without ever letting a genuinely slow
         // stream through (it still misses, invalidates, and re-fills).
         let node = "/dev/video-probe-escalation";
+        // Admission depends on the kill switch being clear; hold the env lock
+        // so the kill-switch test cannot flip it mid-assertion.
+        let _guard = crate::testenv::env_lock();
         // IR shape: first 6 frames sloped, then steady. A 5-delta window
         // inside the slope measures 14.37 fps < the 14.55 floor.
         let mut ir =
@@ -18851,6 +18861,9 @@ mod tests {
         // cost was ~4.4s of joint fill on EVERY concurrent attempt; with
         // probes, a warm pair pays its role flush plus a few frames.
         let node = "/dev/video-pair-amort";
+        // Admission depends on the kill switch being clear; hold the env lock
+        // so the kill-switch test cannot flip it mid-assertion.
+        let _guard = crate::testenv::env_lock();
         rate_amortization::test_support::force_completion(
             rate_amortization::Key::new(node, contracts::StreamRole::Rgb),
             Some(std::time::Instant::now()),

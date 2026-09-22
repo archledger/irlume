@@ -122,11 +122,11 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::force_completion;
     use super::*;
-
-    // The kill switch reads the process environment, so env-sensitive tests
-    // serialize on this lock (kept local; the crate-wide lock lives in
-    // `crate::testenv`, this module predates it).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // The kill switch reads the process environment, so every test that
+    // touches `IRLUME_RATE_AMORTIZATION` (here and the stream-level tests in
+    // `lib.rs`) serializes on the ONE crate-wide lock; a module-local mutex
+    // would leave them racing each other across modules.
+    use crate::testenv::{env_lock, EnvGuard};
 
     fn key() -> Key {
         Key::new("/dev/video-probe", StreamRole::Rgb)
@@ -134,8 +134,8 @@ mod tests {
 
     #[test]
     fn a_recent_completion_is_amortizable_and_invalidation_removes_it() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("IRLUME_RATE_AMORTIZATION");
+        let _g = env_lock();
+        let _env = EnvGuard::unset("IRLUME_RATE_AMORTIZATION");
         force_completion(key(), Some(Instant::now()));
         assert!(amortizable(&key()));
         invalidate(&key());
@@ -144,8 +144,8 @@ mod tests {
 
     #[test]
     fn a_stale_completion_is_not_amortizable() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("IRLUME_RATE_AMORTIZATION");
+        let _g = env_lock();
+        let _env = EnvGuard::unset("IRLUME_RATE_AMORTIZATION");
         force_completion(
             key(),
             Some(Instant::now() - MAX_STALENESS - Duration::from_secs(1)),
@@ -159,8 +159,8 @@ mod tests {
     /// (ADR-0021 amendment of 2026-09-22).
     #[test]
     fn a_completion_from_earlier_the_same_day_is_still_amortizable() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("IRLUME_RATE_AMORTIZATION");
+        let _g = env_lock();
+        let _env = EnvGuard::unset("IRLUME_RATE_AMORTIZATION");
         force_completion(
             key(),
             Some(Instant::now() - Duration::from_secs(8 * 60 * 60)),
@@ -171,11 +171,13 @@ mod tests {
 
     #[test]
     fn the_kill_switch_disables_reuse_even_with_a_fresh_completion() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("IRLUME_RATE_AMORTIZATION", "0");
+        let _g = env_lock();
         force_completion(key(), Some(Instant::now()));
-        assert!(!amortizable(&key()));
-        std::env::remove_var("IRLUME_RATE_AMORTIZATION");
+        {
+            let _off = EnvGuard::set("IRLUME_RATE_AMORTIZATION", "0");
+            assert!(!amortizable(&key()));
+        }
+        let _on = EnvGuard::unset("IRLUME_RATE_AMORTIZATION");
         assert!(amortizable(&key()));
         force_completion(key(), None);
     }

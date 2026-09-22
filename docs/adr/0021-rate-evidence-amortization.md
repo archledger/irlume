@@ -37,7 +37,8 @@ probe when ALL of the following hold:
 
 1. The same node and stream role, in this same process, previously
    completed a full 30-delta window that met its floor.
-2. That completion is no older than 5 minutes (staleness bound).
+2. That completion is no older than the staleness bound: 5 minutes
+   originally, 24 hours since the 2026-09-22 amendment below.
 3. No invalidating event occurred for that key since: a stream recovery
    epoch, a dequeue I/O error, or a failed probe all remove the entry.
 4. The role startup flush still runs (the probe measures THIS session).
@@ -82,3 +83,24 @@ valve.
 - The cache is process-local memory keyed by node path and role; a
   replugged or re-pinned camera is caught by `verify_pinned` at open, and
   error-path invalidation removes stale entries aggressively.
+
+## Amendment 2026-09-22: staleness bound raised to 24 hours
+
+Measured on the NexiGo N930W pair on archhost with the schema 4 trace
+stages: back-to-back attempts admit on the probe and spend about 2.2 s in
+rate establishment (the IR stream's start-up), while an attempt 9 minutes
+after the previous one found the cache expired and spent 3.8 s re-paying
+the full 30-delta fill. Unlocks after more than five minutes away are the
+common case, so the 5-minute bound made the amortization miss most real
+unlocks.
+
+The security argument above does not depend on the bound's value: a
+session is admitted by its own probe (5 deltas, escalating to 15) through
+the same floor arithmetic, every later frame is judged by the sliding ring,
+a failed probe re-pays the full fill and invalidates the entry, and camera
+identity is re-pinned at every open. The bound only states how long ago the
+stream's full shape was last observed in this process. It is now 24 hours,
+a working day of unlocks; the entry is still removed by every invalidating
+event and by a daemon restart, and `IRLUME_RATE_AMORTIZATION=0` still
+disables reuse.
+

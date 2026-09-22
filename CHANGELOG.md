@@ -17,6 +17,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Delivered-rate evidence stays reusable for 24 hours instead of 5 minutes
+  (ADR-0021 amendment). An unlock after more than five minutes away used to
+  re-pay the full 30-delta rate fill, about 1.5 s more than a back-to-back
+  attempt on a NexiGo N930W pair; the session is still admitted only by its
+  own continuity probe and per-frame judgment, and every invalidating event
+  and a daemon restart still clear the cached evidence.
+
 - An authentication request unseals the account template key at most once
   (ADR-0025). A secondary camera pair used to unseal the same key four times
   (enrollment load, the secondary store and the primary re-load in the pin,

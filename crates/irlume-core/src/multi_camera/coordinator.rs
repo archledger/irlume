@@ -76,16 +76,44 @@ impl SecondaryAuthContext {
         live_rgb: Option<&str>,
         live_ir: Option<&str>,
     ) -> Result<Self, PinError> {
+        Self::pin_with_source(
+            secondary_path,
+            primary_path,
+            live_rgb,
+            live_ir,
+            &mut crate::template_key::RequestTemplateKey::production(),
+        )
+    }
+
+    /// [`Self::pin`] lending the request's template key to both store reads
+    /// (ADR-0025): the encrypted secondary and the primary re-load borrow
+    /// the key the request already unsealed, or have the source unseal once.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::pin`].
+    pub fn pin_with_source(
+        secondary_path: &Path,
+        primary_path: &Path,
+        live_rgb: Option<&str>,
+        live_ir: Option<&str>,
+        keys: &mut dyn crate::template_key::TemplateKeySource,
+    ) -> Result<Self, PinError> {
         resolve_commit(secondary_path).map_err(|error| PinError::Secondary(error.to_string()))?;
-        let secondary: SecondaryStore =
-            load(secondary_path).map_err(|error| PinError::Secondary(error.to_string()))?;
+        let secondary: SecondaryStore = super::load_secondary_with_source(secondary_path, keys)
+            .and_then(|option| {
+                option
+                    .ok_or_else(|| super::SecondaryStoreError::Io("secondary store absent".into()))
+            })
+            .map_err(|error| PinError::Secondary(error.to_string()))?;
         let primary_bytes = std::fs::read(primary_path)
             .map_err(|error| PinError::Secondary(format!("primary unreadable: {error}")))?;
         // Parse through the SAME loader authentication uses: legacy-format
-        // primaries migrate in memory and TPM-sealed envelopes unseal here.
-        // A raw serde parse of the bytes would silently refuse every legacy
-        // or encrypted account's secondary cameras.
-        let primary = crate::storage::load_path_unlocked(&secondary.owner, primary_path)
+        // primaries migrate in memory and TPM-sealed envelopes decrypt here
+        // under the borrowed key. A raw serde parse of the bytes would
+        // silently refuse every legacy or encrypted account's secondary
+        // cameras.
+        let primary = crate::storage::load_path_with_source(&secondary.owner, primary_path, keys)
             .map_err(|error| PinError::Secondary(format!("primary unloadable: {error}")))?
             .ok_or_else(|| PinError::Secondary("primary absent".into()))?;
         let views = CameraScopedViews::compose(&primary, &primary_bytes, Some(&secondary))
@@ -149,6 +177,25 @@ impl SecondaryAuthContext {
         grant_boundary_now(&self.pinned, &self.secondary_path, &self.primary_path)
     }
 
+    /// [`Self::boundary_check_now`] lending the request's template key to the
+    /// secondary re-read (ADR-0025). The primary is compared by digest and
+    /// needs no key.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::boundary_check_now`].
+    pub fn boundary_check_now_with(
+        &self,
+        keys: &mut dyn crate::template_key::TemplateKeySource,
+    ) -> Result<GrantDecision, super::commit::CommitError> {
+        super::commit::grant_boundary_now_with(
+            &self.pinned,
+            &self.secondary_path,
+            &self.primary_path,
+            keys,
+        )
+    }
+
     /// The pure boundary check over caller-provided current state (for
     /// callers that already hold freshly read bytes).
     #[must_use]
@@ -159,12 +206,6 @@ impl SecondaryAuthContext {
     ) -> GrantDecision {
         grant_boundary_check(&self.pinned, current_primary_bytes, current_secondary)
     }
-}
-
-fn load(path: &Path) -> Result<SecondaryStore, super::SecondaryStoreError> {
-    super::load_secondary(path).and_then(|option| {
-        option.ok_or_else(|| super::SecondaryStoreError::Io("secondary store absent".into()))
-    })
 }
 
 #[cfg(test)]
@@ -263,6 +304,201 @@ mod integration {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// Encrypted primary and secondary under one key, at paths whose stem
+    /// names the owner (the secondary loader derives the user from it).
+    fn enroll_encrypted_pair(
+        rig: &Rig,
+        key: Option<&[u8]>,
+        secondary_key: Option<&[u8]>,
+    ) -> (PathBuf, PathBuf, String, String) {
+        let enrollment = Enrollment {
+            user: "alice".into(),
+            profiles: vec![FaceProfile {
+                name: "main".into(),
+                scans: vec![scan(0.1), scan(0.12), scan(0.14)],
+                ir_calib: None,
+                ir_calibs: Default::default(),
+            }],
+            ..Enrollment::default()
+        };
+        let primary_path = rig.dir.join("primary.json");
+        let secondary_path = rig.dir.join("alice.json");
+        let bytes = crate::storage::serialize_enrollment(&enrollment, key).expect("primary bytes");
+        std::fs::write(&primary_path, &bytes).expect("primary write");
+        let store = SecondaryStore {
+            format_version: super::super::SECONDARY_STORE_VERSION,
+            owner: "alice".into(),
+            generation: 1,
+            primary_snapshot_sha256: irlume_common::sha256_hex(&bytes),
+            groups: vec![SecondaryGroup {
+                id: CameraGroupId::new("desk".into()).unwrap(),
+                pair: GroupPair {
+                    rgb: Some("3443:c803".into()),
+                    ir: Some("3443:c803".into()),
+                },
+                profiles: vec![SecondaryProfileScans {
+                    ir_calibs: Default::default(),
+                    profile: "main".into(),
+                    scans: vec![scan(0.5), scan(0.52), scan(0.54)],
+                }],
+            }],
+        };
+        super::super::save_secondary_with_key(&secondary_path, &store, secondary_key)
+            .expect("secondary write");
+        (
+            secondary_path,
+            primary_path,
+            "3443:c803".into(),
+            "3443:c803".into(),
+        )
+    }
+
+    fn counting_source(key: Option<Vec<u8>>) -> crate::template_key::RequestTemplateKey {
+        crate::template_key::RequestTemplateKey::with_unsealer(move |user| {
+            assert_eq!(user, "alice");
+            Ok(key.clone().map(zeroize::Zeroizing::new))
+        })
+    }
+
+    /// ADR-0025: the pin (secondary and primary re-load) and the boundary
+    /// re-read borrow one key; the source unseals exactly once, or never
+    /// when the enrollment load already lent it.
+    #[test]
+    fn pin_and_boundary_unseal_the_request_key_once_for_encrypted_stores() {
+        let rig = Rig::new("one-unseal");
+        let key = crate::crypto::generate_key();
+        let (secondary_path, primary_path, rgb, ir) =
+            enroll_encrypted_pair(&rig, Some(&key), Some(&key));
+        let mut keys = counting_source(Some(key.to_vec()));
+        let context = SecondaryAuthContext::pin_with_source(
+            &secondary_path,
+            &primary_path,
+            Some(&rgb),
+            Some(&ir),
+            &mut keys,
+        )
+        .expect("pin");
+        assert_eq!(
+            keys.unseals(),
+            1,
+            "the pin's two encrypted reads share one unseal"
+        );
+        assert!(matches!(
+            context.boundary_check_now_with(&mut keys),
+            Ok(Boundary::Grant)
+        ));
+        assert_eq!(keys.unseals(), 1, "the boundary borrows the same key");
+
+        let mut adopted = counting_source(None);
+        adopted.adopt(Some(zeroize::Zeroizing::new(key.to_vec())));
+        let context = SecondaryAuthContext::pin_with_source(
+            &secondary_path,
+            &primary_path,
+            Some(&rgb),
+            Some(&ir),
+            &mut adopted,
+        )
+        .expect("pin with adopted key");
+        assert!(matches!(
+            context.boundary_check_now_with(&mut adopted),
+            Ok(Boundary::Grant)
+        ));
+        assert_eq!(
+            adopted.unseals(),
+            0,
+            "a key lent by the enrollment load is never unsealed again"
+        );
+    }
+
+    /// A legacy plaintext primary beside an encrypted secondary (ADR-0024
+    /// §1.2 mixed state): the first encrypted read, at the pin, unseals.
+    #[test]
+    fn plaintext_primary_with_encrypted_secondary_unseals_once_at_the_pin() {
+        let rig = Rig::new("mixed");
+        let key = crate::crypto::generate_key();
+        let (secondary_path, primary_path, rgb, ir) = enroll_encrypted_pair(&rig, None, Some(&key));
+        let mut keys = counting_source(Some(key.to_vec()));
+        let context = SecondaryAuthContext::pin_with_source(
+            &secondary_path,
+            &primary_path,
+            Some(&rgb),
+            Some(&ir),
+            &mut keys,
+        )
+        .expect("pin");
+        assert_eq!(keys.unseals(), 1);
+        assert!(matches!(
+            context.boundary_check_now_with(&mut keys),
+            Ok(Boundary::Grant)
+        ));
+        assert_eq!(keys.unseals(), 1);
+    }
+
+    /// Plaintext stores throughout never ask the source for a key.
+    #[test]
+    fn plaintext_stores_never_ask_for_a_key() {
+        let rig = Rig::new("plain");
+        let (secondary_path, primary_path, rgb, ir) = enroll_encrypted_pair(&rig, None, None);
+        let mut keys = counting_source(None);
+        let context = SecondaryAuthContext::pin_with_source(
+            &secondary_path,
+            &primary_path,
+            Some(&rgb),
+            Some(&ir),
+            &mut keys,
+        )
+        .expect("pin");
+        assert!(matches!(
+            context.boundary_check_now_with(&mut keys),
+            Ok(Boundary::Grant)
+        ));
+        assert_eq!(keys.unseals(), 0);
+        assert!(!keys.holds_key());
+    }
+
+    /// An encrypted store with no lendable key (no TPM) fails closed at the
+    /// pin, and a store re-keyed during the request fails at the boundary.
+    #[test]
+    fn encrypted_stores_fail_closed_without_the_key_and_on_rekeying() {
+        let rig = Rig::new("closed");
+        let key = crate::crypto::generate_key();
+        let (secondary_path, primary_path, rgb, ir) =
+            enroll_encrypted_pair(&rig, Some(&key), Some(&key));
+        let mut none = counting_source(None);
+        assert!(SecondaryAuthContext::pin_with_source(
+            &secondary_path,
+            &primary_path,
+            Some(&rgb),
+            Some(&ir),
+            &mut none,
+        )
+        .is_err());
+
+        let mut keys = counting_source(Some(key.to_vec()));
+        let context = SecondaryAuthContext::pin_with_source(
+            &secondary_path,
+            &primary_path,
+            Some(&rgb),
+            Some(&ir),
+            &mut keys,
+        )
+        .expect("pin");
+        let other = crate::crypto::generate_key();
+        let store = super::super::load_secondary_with_key(&secondary_path, Some(&key))
+            .expect("read")
+            .expect("present");
+        super::super::save_secondary_with_key(&secondary_path, &store, Some(&other))
+            .expect("rekey");
+        assert!(
+            !matches!(
+                context.boundary_check_now_with(&mut keys),
+                Ok(Boundary::Grant)
+            ),
+            "a store re-keyed during the request must not grant"
+        );
+        assert_eq!(keys.unseals(), 1);
     }
 
     #[test]

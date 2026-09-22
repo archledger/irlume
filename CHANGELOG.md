@@ -17,6 +17,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- An authentication request unseals the account template key at most once
+  (ADR-0025). A secondary camera pair used to unseal the same key four times
+  (enrollment load, the secondary store and the primary re-load in the pin,
+  the secondary store again at the grant boundary), about 6 s of a 13 s grant
+  on the reference machine; the pin and the boundary now borrow the key the
+  request already holds, or unseal once on the request's first encrypted
+  read. Every store read and check is unchanged, the key is never copied,
+  and it is cleared when the request returns. Primary-pair requests and
+  plaintext stores are unaffected.
+
 - Capture tolerates a bounded number of ERROR-marked buffers that arrive before
   a stream's first sound frame. A Logitech BRIO marks the first IR frame after
   its RGB sensor was used as ERROR, and uvcvideo copies that flag onto the

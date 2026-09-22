@@ -563,7 +563,10 @@ fn is_encrypted_enrollment(v: &serde_json::Value) -> irlume_common::Result<bool>
 /// Serialize an enrollment, encrypting under `key` when one is supplied (TPM
 /// host) or emitting pretty plaintext when not (dev / no-TPM). Pure; tested
 /// without a TPM.
-fn serialize_enrollment(e: &Enrollment, key: Option<&[u8]>) -> irlume_common::Result<Vec<u8>> {
+pub(crate) fn serialize_enrollment(
+    e: &Enrollment,
+    key: Option<&[u8]>,
+) -> irlume_common::Result<Vec<u8>> {
     match key {
         Some(k) => {
             // The serialized enrollment is template plaintext; keep it zeroized
@@ -705,6 +708,20 @@ fn save_with_key(
 /// falling back to the password, if the seal can no longer be satisfied).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn load(user: &str) -> irlume_common::Result<Option<Enrollment>> {
+    load_with_key(user).map(|loaded| loaded.map(|(enrollment, _)| enrollment))
+}
+
+/// An enrollment together with the template key its load unsealed (`None`
+/// for a plaintext store).
+pub type LoadedEnrollment = (Enrollment, Option<Zeroizing<Vec<u8>>>);
+
+/// [`load`] that also returns the template key it unsealed (`None` for a
+/// plaintext store), so the rest of an authentication request can lend that
+/// key to its later encrypted reads instead of unsealing again (ADR-0025).
+///
+/// # Errors
+/// As [`load`].
+pub fn load_with_key(user: &str) -> irlume_common::Result<Option<LoadedEnrollment>> {
     load_with(
         user,
         template_key::UserStateLock::acquire,
@@ -725,13 +742,14 @@ pub fn load_read_only(user: &str) -> irlume_common::Result<Option<Enrollment>> {
         template_key::UserStateLock::acquire_read_only,
         template_key::load_key_read_only_unlocked,
     )
+    .map(|loaded| loaded.map(|(enrollment, _)| enrollment))
 }
 
 fn load_with(
     user: &str,
     acquire_lock: impl FnOnce(&str) -> irlume_common::Result<template_key::UserStateLock>,
     load_key: impl FnOnce(&str) -> irlume_common::Result<Zeroizing<Vec<u8>>>,
-) -> irlume_common::Result<Option<Enrollment>> {
+) -> irlume_common::Result<Option<LoadedEnrollment>> {
     let _state = acquire_lock(user)?;
     let path = profile_path(user);
     if !path.exists() {
@@ -745,7 +763,8 @@ fn load_with(
         Err(_) => false,
     };
     let key = if is_enc { Some(load_key(user)?) } else { None };
-    deserialize_enrollment(&data, key.as_ref().map(|k| k.as_slice())).map(Some)
+    let enrollment = deserialize_enrollment(&data, key.as_ref().map(|k| k.as_slice()))?;
+    Ok(Some((enrollment, key)))
 }
 
 /// Parses the enrollment at an explicit path WITHOUT acquiring the user
@@ -765,6 +784,25 @@ pub fn load_path_unlocked(
     user: &str,
     path: &std::path::Path,
 ) -> irlume_common::Result<Option<Enrollment>> {
+    load_path_with_source(
+        user,
+        path,
+        &mut template_key::RequestTemplateKey::production(),
+    )
+}
+
+/// [`load_path_unlocked`] with the request's key source (ADR-0025): an
+/// encrypted store borrows the key the request already holds, or has the
+/// source unseal once; a plaintext store never asks for a key. An encrypted
+/// store on a host whose source lends no key fails closed.
+///
+/// # Errors
+/// As [`load_path_unlocked`].
+pub fn load_path_with_source(
+    user: &str,
+    path: &std::path::Path,
+    keys: &mut dyn template_key::TemplateKeySource,
+) -> irlume_common::Result<Option<Enrollment>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -773,12 +811,15 @@ pub fn load_path_unlocked(
         Ok(value) => is_encrypted_enrollment(&value)?,
         Err(_) => false,
     };
-    let key = if is_enc {
-        Some(template_key::load_key_read_only_unlocked(user)?)
-    } else {
-        None
+    if !is_enc {
+        return deserialize_enrollment(&data, None).map(Some);
+    }
+    let Some(key) = keys.template_key(user)? else {
+        return Err(irlume_common::Error::Policy(format!(
+            "no template key is available to read '{user}'s encrypted store"
+        )));
     };
-    deserialize_enrollment(&data, key.as_ref().map(|k| k.as_slice())).map(Some)
+    deserialize_enrollment(&data, Some(key)).map(Some)
 }
 
 /// Whether the on-disk store for `user` is encrypted, `Ok(None)` when there
@@ -976,6 +1017,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        let (loaded, key) = loaded;
+        assert_eq!(
+            key.as_deref().map(Vec::as_slice),
+            Some(&[42u8; 32][..]),
+            "the key the load unsealed is returned for the request to lend"
+        );
         assert_eq!(
             loaded.profiles[0].scans[0].ir.as_deref(),
             Some(&[0.5, 0.6][..])

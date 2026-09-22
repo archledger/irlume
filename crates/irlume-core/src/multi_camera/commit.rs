@@ -35,7 +35,9 @@
 //! primary refuses the attempt before any grant decision - including for
 //! an attempt already in progress.
 
-use super::{load_secondary, Activation, SecondaryStore, SecondaryStoreError};
+#[cfg(test)]
+use super::load_secondary;
+use super::{Activation, SecondaryStore, SecondaryStoreError};
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -396,8 +398,29 @@ pub fn grant_boundary_now(
     secondary_path: &Path,
     primary_path: &Path,
 ) -> Result<GrantDecision, CommitError> {
+    grant_boundary_now_with(
+        pinned,
+        secondary_path,
+        primary_path,
+        &mut crate::template_key::RequestTemplateKey::production(),
+    )
+}
+
+/// [`grant_boundary_now`] lending the request's template key to the
+/// secondary re-read (ADR-0025). Every read and check is unchanged; only the
+/// key resolution is.
+///
+/// # Errors
+///
+/// As [`grant_boundary_now`].
+pub fn grant_boundary_now_with(
+    pinned: &GrantContext,
+    secondary_path: &Path,
+    primary_path: &Path,
+    keys: &mut dyn crate::template_key::TemplateKeySource,
+) -> Result<GrantDecision, CommitError> {
     resolve_commit(secondary_path)?;
-    let secondary = match load_secondary(secondary_path)? {
+    let secondary = match super::load_secondary_with_source(secondary_path, keys)? {
         Some(store) => store,
         None => return Ok(grant_boundary_check(pinned, None, None)),
     };

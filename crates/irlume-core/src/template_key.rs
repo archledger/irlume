@@ -176,6 +176,112 @@ pub(crate) fn ensure_key_unlocked(user: &str) -> Result<Zeroizing<Vec<u8>>> {
     Ok(persisted)
 }
 
+/// The unsealed template key as the TPM seam returns it: zeroized on drop.
+pub type UnsealedKey = Zeroizing<Vec<u8>>;
+
+/// Lends the account template key to the readers of one authentication
+/// request (ADR-0025). Implementations unseal at most once per request and
+/// lend a borrow, never a copy.
+pub trait TemplateKeySource {
+    /// The key for `user`'s encrypted stores: `None` on a host without a
+    /// TPM (encrypted stores then fail closed in the readers).
+    ///
+    /// # Errors
+    /// Returns the unseal error when the key cannot be obtained.
+    fn template_key(&mut self, user: &str) -> Result<Option<&[u8]>>;
+}
+
+/// One request's template key: adopted from the enrollment load when that
+/// load unsealed, or unsealed lazily on the request's first encrypted read
+/// (a legacy plaintext primary beside an encrypted secondary). Holds the one
+/// memlocked `Zeroizing` allocation the unseal produced and drops it, and
+/// so zeroizes it, with the request.
+pub struct RequestTemplateKey {
+    key: Option<UnsealedKey>,
+    unseals: usize,
+    unseal: Box<Unsealer>,
+}
+
+/// Resolves the key for a user when the request first needs it.
+type Unsealer = dyn FnMut(&str) -> Result<Option<UnsealedKey>> + Send;
+
+impl Default for RequestTemplateKey {
+    fn default() -> Self {
+        Self::production()
+    }
+}
+
+impl std::fmt::Debug for RequestTemplateKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RequestTemplateKey")
+            .field("held", &self.key.is_some())
+            .field("unseals", &self.unseals)
+            .finish()
+    }
+}
+
+impl RequestTemplateKey {
+    /// A source that unseals read-only through the TPM when a key is first
+    /// needed, and lends nothing on a host without a TPM.
+    #[must_use]
+    pub fn production() -> Self {
+        Self::with_unsealer(|user| {
+            if !tpm_available() {
+                return Ok(None);
+            }
+            load_key_read_only_unlocked(user).map(Some)
+        })
+    }
+
+    /// A source with an injected unsealer (tests count and script it).
+    pub fn with_unsealer(
+        unseal: impl FnMut(&str) -> Result<Option<UnsealedKey>> + Send + 'static,
+    ) -> Self {
+        Self {
+            key: None,
+            unseals: 0,
+            unseal: Box::new(unseal),
+        }
+    }
+
+    /// Adopt a key another loader in this request already unsealed, so no
+    /// later reader unseals again. `None` leaves the lazy path in place.
+    pub fn adopt(&mut self, key: Option<UnsealedKey>) {
+        if key.is_some() {
+            self.key = key;
+        }
+    }
+
+    /// Forget the key (zeroized on drop). Called when the request ends.
+    pub fn clear(&mut self) {
+        self.key = None;
+        self.unseals = 0;
+    }
+
+    /// How many times this source unsealed through its unsealer.
+    #[must_use]
+    pub fn unseals(&self) -> usize {
+        self.unseals
+    }
+
+    /// Whether a key is currently held.
+    #[must_use]
+    pub fn holds_key(&self) -> bool {
+        self.key.is_some()
+    }
+}
+
+impl TemplateKeySource for RequestTemplateKey {
+    fn template_key(&mut self, user: &str) -> Result<Option<&[u8]>> {
+        if self.key.is_none() {
+            self.unseals += 1;
+            self.key = (self.unseal)(user)?;
+        }
+        Ok(self.key.as_deref().map(Vec::as_slice))
+    }
+}
+
 /// Unseal the existing template key for `user`. Errors if none is sealed (the
 /// caller must NOT generate one here; that would orphan already-encrypted data).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]

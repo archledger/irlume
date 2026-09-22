@@ -130,6 +130,10 @@ pub struct Engine {
     /// Start of the `CaptureSetup` interval: taken once the enrollment has
     /// resolved and consumed by the first capture route to start streaming.
     capture_setup_started: Option<std::time::Instant>,
+    /// The request's template key (ADR-0025): adopted from the enrollment
+    /// load or unsealed once on the first encrypted read, lent to the
+    /// secondary pin and the grant boundary, cleared when the request ends.
+    request_key: irlume_core::template_key::RequestTemplateKey,
     /// Start of the `Finalization` interval: armed once the owned streaming
     /// sessions have been released, reported by the guard that outlives the
     /// request's camera handles and lease.
@@ -1188,7 +1192,12 @@ impl AuthenticationPurpose {
 
 /// The deferred enrollment load's result, as sent by the loader thread in
 /// [`Engine::authenticate_for_with_diagnostics`].
-type EnrollmentLoad = irlume_common::Result<Option<irlume_core::storage::Enrollment>>;
+type EnrollmentLoad = irlume_common::Result<
+    Option<(
+        irlume_core::storage::Enrollment,
+        Option<irlume_core::template_key::UnsealedKey>,
+    )>,
+>;
 
 /// Own an in-flight enrollment helper until setup consumes its result. Declared
 /// before camera owners so early exits drop those owners before draining it.
@@ -1236,9 +1245,15 @@ enum LoaderExit {
 /// [`Engine::authenticate_for_with_diagnostics`] is exactly this mapping.
 fn resolve_loader(
     recv: Result<EnrollmentLoad, std::sync::mpsc::RecvTimeoutError>,
-) -> Result<irlume_core::storage::Enrollment, LoaderExit> {
+) -> Result<
+    (
+        irlume_core::storage::Enrollment,
+        Option<irlume_core::template_key::UnsealedKey>,
+    ),
+    LoaderExit,
+> {
     match recv {
-        Ok(Ok(Some(enr))) => Ok(enr),
+        Ok(Ok(Some(loaded))) => Ok(loaded),
         Ok(Ok(None)) => Err(LoaderExit::NotEnrolled),
         Ok(Err(e)) => Err(LoaderExit::Fallback(e)),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -3561,6 +3576,7 @@ impl Engine {
             last_attempt_facts: AttemptFacts::default(),
             last_attempt_situation: None,
             capture_setup_started: None,
+            request_key: irlume_core::template_key::RequestTemplateKey::production(),
             finalization_started: std::sync::Arc::default(),
         })
     }
@@ -5840,6 +5856,9 @@ impl Engine {
             engine: self,
             previous,
         };
+        // The request's template key lives exactly as long as the request
+        // (ADR-0025 §3): `begin_attempt` starts it empty and it is zeroized
+        // on every return path here.
         let result = scope.engine.authenticate_in_window_inner(
             user,
             service,
@@ -5848,6 +5867,7 @@ impl Engine {
             policy,
             diagnostics,
         );
+        scope.engine.request_key.clear();
         // Covers setup and cleanup paths that return before the retry loop.
         scope.engine.check_completed_attempt(&result)?;
         result
@@ -5922,7 +5942,7 @@ impl Engine {
                     std::thread::Builder::new()
                         .name("irlume-enrollment-load".into())
                         .spawn(move || {
-                            let _ = tx.send(irlume_core::storage::load(&loader_user));
+                            let _ = tx.send(irlume_core::storage::load_with_key(&loader_user));
                         })
                         .map_err(|e| irlume_common::Error::Io(e.to_string()))?;
                     rx
@@ -5940,7 +5960,7 @@ impl Engine {
             irlume_camera::device_identity(&self.ir_dev),
         );
         let sync_enr = if loader.receiver.is_none() {
-            let loaded = irlume_core::storage::load(user);
+            let loaded = irlume_core::storage::load_with_key(user);
             // Completed work boundary: the plaintext store load itself,
             // before any policy decision on its content. Attempt preparation
             // starts here on this path (the deferred path starts it at its
@@ -5948,10 +5968,17 @@ impl Engine {
             emit_enrollment_load_timing(diagnostics, load_started);
             self.begin_capture_setup();
             match loaded? {
-                Some(enr) => match self.resolve_attempt_enrollment(user, enr, &live_pair) {
-                    Err(outcome) => return Ok(outcome),
-                    Ok(scoped) => Some(scoped),
-                },
+                Some((enr, key)) => {
+                    // The key this load unsealed serves the rest of the
+                    // request (ADR-0025): the pin and the grant boundary
+                    // borrow it instead of unsealing again.
+                    self.request_key.adopt(key);
+                    let resolved = self.resolve_attempt_enrollment(user, enr, &live_pair);
+                    match resolved {
+                        Err(outcome) => return Ok(outcome),
+                        Ok(scoped) => Some(scoped),
+                    }
+                }
                 None => {
                     return Ok(Outcome::deny(
                         OutcomeKind::SetupUnavailable,
@@ -6080,7 +6107,10 @@ impl Engine {
                 // the camera preflight it was deferred behind.
                 emit_enrollment_load_timing(diagnostics, load_started);
                 match resolved {
-                    Ok(enr) => enr,
+                    Ok((enr, key)) => {
+                        self.request_key.adopt(key);
+                        enr
+                    }
                     Err(LoaderExit::NotEnrolled) => {
                         return Ok(Outcome::deny(
                             OutcomeKind::SetupUnavailable,
@@ -6615,7 +6645,7 @@ impl Engine {
         // a legacy primary rewrite that never touched the secondary
         // generation. Primary attempts never pay this check.
         if let Some(context) = &self.secondary_attempt {
-            match context.boundary_check_now() {
+            match context.boundary_check_now_with(&mut self.request_key) {
                 Ok(irlume_core::multi_camera::commit::GrantDecision::Grant) => {}
                 Ok(irlume_core::multi_camera::commit::GrantDecision::Refuse(clause)) => {
                     return Ok(Outcome::deny(
@@ -8131,6 +8161,9 @@ impl Engine {
     /// leak into the next.
     fn begin_attempt(&mut self) {
         self.secondary_attempt = None;
+        // The request's template key starts empty (ADR-0025 §3): the load
+        // that follows adopts this request's key, never a previous one's.
+        self.request_key.clear();
     }
 
     /// Decides which enrollment data THIS attempt may use (ADR-0024 §5),
@@ -8169,11 +8202,12 @@ impl Engine {
         });
         if !primary_matches {
             let secondary_path = irlume_core::multi_camera::secondary_store_path(user);
-            match irlume_core::multi_camera::coordinator::SecondaryAuthContext::pin(
+            match irlume_core::multi_camera::coordinator::SecondaryAuthContext::pin_with_source(
                 &secondary_path,
                 &primary_path,
                 live.0.as_deref(),
                 live.1.as_deref(),
+                &mut self.request_key,
             ) {
                 Ok(context) => {
                     let scoped = context.group_view().matching_enrollment(user);
@@ -13953,6 +13987,58 @@ mod engine_tests {
         assert_eq!(sink.0.lock().unwrap().len(), 1);
     }
 
+    /// ADR-0025 §3: the request's template key is cleared on every return
+    /// path, and a plaintext store never asks the source to unseal.
+    #[test]
+    fn request_key_never_outlives_the_request_and_plaintext_never_unseals() {
+        use irlume_core::template_key::RequestTemplateKey;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _g = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("auth-request-key");
+        let mut e = Enrollment::new("irlume-test-request-key");
+        e.profiles.push(FaceProfile {
+            name: "P1".into(),
+            scans: vec![],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        write_enrollment(&dir, &e);
+        let unseals = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&unseals);
+        s.engine.request_key = RequestTemplateKey::with_unsealer(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(zeroize_key()))
+        });
+        // A key left by an earlier request must not be lent to this one.
+        s.engine.request_key.adopt(Some(zeroize_key()));
+        let o = s
+            .engine
+            .authenticate_for_with_diagnostics(
+                "irlume-test-request-key",
+                None,
+                AuthenticationPurpose::Verify,
+                &(),
+            )
+            .unwrap();
+        assert_eq!(o.kind, OutcomeKind::SetupUnavailable);
+        assert!(
+            !s.engine.request_key.holds_key(),
+            "the key is cleared when the request returns, on a refusal too"
+        );
+        assert_eq!(
+            unseals.load(Ordering::SeqCst),
+            0,
+            "a plaintext store never asks the source to unseal"
+        );
+        s.engine.request_key = RequestTemplateKey::production();
+    }
+
+    fn zeroize_key() -> irlume_core::template_key::UnsealedKey {
+        irlume_core::template_key::UnsealedKey::new(vec![7; 32])
+    }
+
     /// The enrollment-load boundary is a completed-work interval: it is
     /// emitted exactly when a load (or deferred unseal join) finishes, never
     /// for the pre-check instant deny of a user with no store at all.
@@ -15438,7 +15524,7 @@ mod engine_tests {
         // camera hardware.
         // A finished load passes through, even at zero remaining deadline.
         let (tx, rx) = std::sync::mpsc::channel::<EnrollmentLoad>();
-        tx.send(Ok(Some(Enrollment::new("u")))).unwrap();
+        tx.send(Ok(Some((Enrollment::new("u"), None)))).unwrap();
         drop(tx);
         assert!(resolve_loader(rx.recv_timeout(std::time::Duration::ZERO)).is_ok());
 

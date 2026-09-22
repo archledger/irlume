@@ -577,6 +577,49 @@ fn store_user(path: &Path) -> Result<String, SecondaryStoreError> {
 /// Same contract as [`load_secondary`]; an encrypted store plus a missing or
 /// wrong key is [`SecondaryStoreError::Corrupt`]/[`SecondaryStoreError::Invalid`]
 /// naming the key.
+/// [`load_secondary`] with the request's key source (ADR-0025): the key is
+/// requested only for an encrypted store, borrowed, never copied.
+///
+/// # Errors
+///
+/// Same contract as [`load_secondary`].
+pub fn load_secondary_with_source(
+    path: &Path,
+    keys: &mut dyn crate::template_key::TemplateKeySource,
+) -> Result<Option<SecondaryStore>, SecondaryStoreError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(SecondaryStoreError::Io(error.to_string())),
+    };
+    if bytes.len() > MAX_STORE_BYTES {
+        return Err(SecondaryStoreError::Invalid(format!(
+            "store larger than {MAX_STORE_BYTES} bytes"
+        )));
+    }
+    let version: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| SecondaryStoreError::Corrupt(error.to_string()))?;
+    let declared = version
+        .get("format_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| SecondaryStoreError::Corrupt("no format_version".into()))?;
+    if declared != SECONDARY_ENC_ENVELOPE_VERSION {
+        return parse_store_bytes(&bytes, None).map(Some);
+    }
+    let user = store_user(path)?;
+    let key = keys.template_key(&user).map_err(|error| {
+        SecondaryStoreError::Invalid(format!("the account template key is unavailable: {error}"))
+    })?;
+    parse_store_bytes(&bytes, key).map(Some)
+}
+
+/// [`load_secondary`] with an explicit borrowed key: `Some` decrypts an
+/// envelope (or reads a legacy plaintext store unchanged); `None` reads
+/// legacy plaintext and fails closed on an encrypted store.
+///
+/// # Errors
+///
+/// Same contract as [`load_secondary`].
 pub fn load_secondary_with_key(
     path: &Path,
     key: Option<&[u8]>,

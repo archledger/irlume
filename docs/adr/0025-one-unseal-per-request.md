@@ -2,8 +2,10 @@
 
 ## Status
 
-Proposed 2026-09-22. Motivated by the latency measurements in issue #797 on
-the current `main` (a44b5037) with the schema 4 trace stages of #798.
+Accepted 2026-09-22 (proposed the same day; Phase 1 implemented with this
+revision, Phase 2 measurement pending). Motivated by the latency
+measurements in issue #797 on the then-current `main` (a44b5037) with the
+schema 4 trace stages of #798.
 Depends on ADR-0024 (multi-camera enrollment) and ADR-0021 (rate-evidence
 amortization); changes neither's invariants. No implementation yet.
 

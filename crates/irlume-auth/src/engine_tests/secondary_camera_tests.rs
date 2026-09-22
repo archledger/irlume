@@ -165,6 +165,8 @@ fn a_secondary_pair_pins_its_group_and_grants_from_scoped_data_only() {
     let sandbox = Sandbox::new("pin-grant");
     let (enr, assessment) = pinned_fixture(&sandbox);
 
+    // Attempt entry, as production does before resolving.
+    s.engine.begin_attempt();
     let resolved = s
         .engine
         .resolve_attempt_enrollment("pad-contract", enr, &desk_pair())
@@ -196,6 +198,8 @@ fn a_primary_attempt_is_unchanged_by_a_present_secondary_store() {
     let expected_binding = enr.camera_binding.clone();
     let expected_profiles = enr.profiles.len();
 
+    // Attempt entry, as production does before resolving.
+    s.engine.begin_attempt();
     let resolved = s
         .engine
         .resolve_attempt_enrollment("pad-contract", enr, &laptop_pair())
@@ -218,6 +222,8 @@ fn an_unknown_pair_keeps_todays_binding_refusal() {
     let sandbox = Sandbox::new("unknown-pair");
     let (enr, _) = pinned_fixture(&sandbox);
 
+    // Attempt entry, as production does before resolving.
+    s.engine.begin_attempt();
     let refusal = s
         .engine
         .resolve_attempt_enrollment(
@@ -256,6 +262,8 @@ fn a_stale_secondary_activation_refuses_instead_of_pinning() {
     );
     save_secondary(&secondary_store_path("pad-contract"), &stale).expect("save");
 
+    // Attempt entry, as production does before resolving.
+    s.engine.begin_attempt();
     let refusal = s
         .engine
         .resolve_attempt_enrollment("pad-contract", enr, &desk_pair())
@@ -275,6 +283,8 @@ fn a_primary_rewrite_mid_attempt_refuses_the_grant_at_the_boundary() {
     let mut s = shared();
     let sandbox = Sandbox::new("mid-rewrite");
     let (enr, assessment) = pinned_fixture(&sandbox);
+    // Attempt entry, as production does before resolving.
+    s.engine.begin_attempt();
     let resolved = s
         .engine
         .resolve_attempt_enrollment("pad-contract", enr, &desk_pair())
@@ -300,6 +310,8 @@ fn a_revoked_group_refuses_the_grant_at_the_boundary() {
     let mut s = shared();
     let sandbox = Sandbox::new("revoked");
     let (enr, assessment) = pinned_fixture(&sandbox);
+    // Attempt entry, as production does before resolving.
+    s.engine.begin_attempt();
     let resolved = s
         .engine
         .resolve_attempt_enrollment("pad-contract", enr, &desk_pair())
@@ -333,6 +345,8 @@ fn begin_attempt_clears_any_residue_from_a_previous_attempt() {
     let mut s = shared();
     let sandbox = Sandbox::new("residue");
     let (enr, _) = pinned_fixture(&sandbox);
+    // Attempt entry, as production does before resolving.
+    s.engine.begin_attempt();
     let _resolved = s
         .engine
         .resolve_attempt_enrollment("pad-contract", enr, &desk_pair())
@@ -383,6 +397,8 @@ fn group_calibrations_reach_ir_matching_through_the_bridge() {
         .insert(s.engine.embed_space.clone(), calib);
     save_secondary(&secondary_store_path("pad-contract"), &store).expect("save");
 
+    // Attempt entry, as production does before resolving.
+    s.engine.begin_attempt();
     let resolved = s
         .engine
         .resolve_attempt_enrollment("pad-contract", enr, &desk_pair())
@@ -697,6 +713,8 @@ fn remove_camera_group_publishes_revocation_and_invalidates_pins() {
     let mut s = shared();
     let sandbox = Sandbox::new("remove");
     let (enr, _) = pinned_fixture(&sandbox);
+    // Attempt entry, as production does before resolving.
+    s.engine.begin_attempt();
     let resolved = s
         .engine
         .resolve_attempt_enrollment("pad-contract", enr, &desk_pair())

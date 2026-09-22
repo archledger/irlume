@@ -1018,10 +1018,14 @@ impl Engine {
         std::thread::Builder::new()
             .name("irlume-ir-enrollment".into())
             .spawn(move || {
+                // The IR-only path keeps no request key: it lends nothing
+                // to later readers, so the load's key is not retained.
                 let loaded = if read_only {
                     irlume_core::storage::load_read_only(&user)
+                        .map(|loaded| loaded.map(|enrollment| (enrollment, None)))
                 } else {
-                    irlume_core::storage::load(&user)
+                    irlume_core::storage::load_with_key(&user)
+                        .map(|loaded| loaded.map(|(enrollment, _)| (enrollment, None)))
                 };
                 let _ = sender.send(loaded);
             })
@@ -1048,7 +1052,7 @@ impl Engine {
         loader.receiver.take();
         self.check_authentication_completion(window)?;
         match loaded {
-            Ok(enrollment) => Ok(Some(enrollment)),
+            Ok((enrollment, _)) => Ok(Some(enrollment)),
             Err(LoaderExit::NotEnrolled) => Ok(None),
             Err(LoaderExit::Fallback(error)) => Err(error),
         }

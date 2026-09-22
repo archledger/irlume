@@ -10330,7 +10330,9 @@ where
                     progress();
                 }
                 if attempt + 1 < WARMUP_TRIES && retryable {
-                    sleep(WARMUP_GAP);
+                    if !mmap_capture::parked(&e) {
+                        sleep(WARMUP_GAP);
+                    }
                 } else {
                     return Err(map_io(device, e));
                 }
@@ -18271,6 +18273,40 @@ mod tests {
             WARMUP_TRIES,
             "one heartbeat per completed silent window, terminal window included"
         );
+    }
+
+    /// A parked start-up buffer is a completed driver return with more frames
+    /// already waiting, so warm-up retries at once: no silent window, no
+    /// heartbeat, no gap, and one try of the budget.
+    #[test]
+    fn parked_startup_buffers_retry_immediately_within_the_warm_up_budget() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = std::cell::Cell::new(0u32);
+        let sleeps = std::cell::Cell::new(0u32);
+        let pings = std::sync::Arc::new(AtomicU32::new(0));
+        let progress: Progress = {
+            let pings = std::sync::Arc::clone(&pings);
+            std::sync::Arc::new(move || {
+                pings.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let result = warm_up_with(
+            "/dev/test",
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() <= 2 {
+                    Err(mmap_capture::parked_error_for_test())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+            &progress,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(calls.get(), 3);
+        assert_eq!(sleeps.get(), 0, "a parked return has frames waiting");
+        assert_eq!(pings.load(Ordering::SeqCst), 0);
     }
 
     /// Preserve the legacy synthetic NotConnected policy and its silent

@@ -400,16 +400,24 @@ fn teardown_distinguishes_unconfirmed_stop_from_failed_release() {
 }
 
 #[test]
-fn delivered_corruption_retires_before_the_trusted_boundary_can_borrow_bytes() {
+fn delivered_corruption_never_reaches_the_trusted_boundary() {
+    // A start-up ERROR buffer is parked and reported as a retryable boundary;
+    // its bytes are never borrowed. The following sound frame is delivered.
+    // After a delivered frame, ERROR retires the ring (covered below).
     let fake = Arc::new(Mutex::new(FakeIo::default()));
     fake.lock().unwrap().flags |= 0x40; // V4L2_BUF_FLAG_ERROR
     let mut stream = stream(&fake);
     let layout = crate::frame_provenance::PayloadLayout::new(*b"GREY", 4, 4, 4).unwrap();
     assert!(crate::dequeue_validated_typed(&mut stream, layout, || Ok(())).is_err());
-    fake.lock().unwrap().flags = 0x2000;
-    assert!(crate::dequeue_validated_typed(&mut stream, layout, || Ok(())).is_err());
     assert_eq!(calls(&fake, "view"), 0);
-    assert_eq!(calls(&fake, "QBUF"), 4);
+    fake.lock().unwrap().flags = 0x2000;
+    assert!(crate::dequeue_validated_typed(&mut stream, layout, || Ok(())).is_ok());
+    assert_eq!(calls(&fake, "view"), 1);
+    assert_eq!(
+        calls(&fake, "QBUF"),
+        4,
+        "the parked buffer is never requeued"
+    );
 }
 
 #[test]
@@ -417,6 +425,11 @@ fn persistent_error_buffers_retire_the_ring_without_any_mapped_view_or_requeue()
     let fake = Arc::new(Mutex::new(FakeIo::default()));
     fake.lock().unwrap().flags |= 0x40;
     let mut stream = stream(&fake);
+    for _ in 0..MAX_PARKED_STARTUP_ERRORS {
+        let error = dequeue_error(&mut stream);
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(warmup_retry(&error), Some(true));
+    }
     assert_eq!(
         dequeue_error(&mut stream).kind(),
         io::ErrorKind::InvalidData
@@ -433,14 +446,21 @@ fn persistent_error_buffers_retire_the_ring_without_any_mapped_view_or_requeue()
 #[test]
 fn startup_error_buffer_is_parked_without_view_or_requeue_and_capture_continues() {
     // A Logitech BRIO marks the first IR buffer after RGB use as ERROR; every
-    // following frame is sound.
+    // following frame is sound. The parked buffer returns to the caller as a
+    // retryable boundary so cancellation, leases and the watchdog heartbeat
+    // run between driver returns, exactly as for a timed-out window.
     let fake = Arc::new(Mutex::new(FakeIo::default()));
     fake.lock().unwrap().next_flags = [0x2040].into();
     let mut stream = stream(&fake);
+    let error = dequeue_error(&mut stream);
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert_eq!(warmup_retry(&error), Some(true));
+    assert!(parked(&error));
+    assert_eq!(calls(&fake, "view"), 0);
+    assert_eq!(calls(&fake, "DQBUF"), 1);
     let sequence = stream.dequeue().unwrap().1.sequence;
     assert_eq!(sequence, 2, "the parked buffer is never delivered");
     assert_eq!(calls(&fake, "view"), 1);
-    assert_eq!(calls(&fake, "DQBUF"), 2);
     assert_eq!(calls(&fake, "QBUF"), 4);
     stream.dequeue().unwrap();
     stream.dequeue().unwrap();
@@ -479,6 +499,10 @@ fn startup_parking_never_starves_a_small_ring() {
     let mut stream = MmapCapture::test_new(device.handle(), 5000);
     stream.fake = Some(fake.clone());
     stream.allocate(2).unwrap();
+    assert_eq!(
+        dequeue_error(&mut stream).kind(),
+        io::ErrorKind::Interrupted
+    );
     assert_eq!(
         dequeue_error(&mut stream).kind(),
         io::ErrorKind::InvalidData

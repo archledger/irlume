@@ -31,12 +31,15 @@ camera pair (ADR-0024 §5) unseals the same key four times:
    unsealed here.
 
 Measured on the NexiGo N930W pair (a secondary group on archhost, whose
-primary binding is the BRIO), three granted attempts: `capture_setup`
-(which now contains the pin) 2.9–3.0 s, `finalization` (which contains the
-boundary) 1.5 s, on top of `enrollment_load` 1.5 s: about 6 s of a 13.4 s
-grant, against a 15 s window. One attempt on the same pair expired at
-15.1 s. On the primary pair the same build grants in about 8 s with one
-unseal. The other large costs (IR stream start-up inside rate
+primary binding is the BRIO) with the first #798 commit installed on
+archhost and its schema 4 stages traced (the runs are recorded in #797,
+comments of 2026-09-22 03:31Z and 03:41Z): three granted attempts, the
+2.9–3.0 s interval before `stream_arm` (the pin; the first #798 cut placed
+`capture_setup` after it and read 0 ms, which located the cost), and
+`finalization` 1.5 s (the boundary), on top of `enrollment_load` 1.5 s:
+about 6 s of a 13.4 s grant, against a 15 s window. One attempt on the same
+pair expired at 15.1 s. On the primary pair the same build grants in about
+8 s with one unseal. The other large costs (IR stream start-up inside rate
 establishment, five PAD samples, stream release) are per-camera or are
 measured security parameters and are out of scope here.
 
@@ -50,14 +53,24 @@ of each loader resolving its key independently.
 ### 1. The request owns one unsealed key
 
 An authentication request unseals the account template key at most once.
-The key obtained for `enrollment_load` is retained by the request (not by
-the engine across requests) and is offered to every later loader in that
-request: the secondary pin (secondary envelope and primary re-load) and the
-grant-boundary read of the secondary store. The existing explicit-key entry
-points carry it: `multi_camera::load_secondary_resolved` with a `key_for`
-that returns the request's key, and the primary loader's key-injection seam
-(`storage::load_with`-style, already used by the plaintext and replacement
-paths). No new decryption path is added.
+The request holds a lazy key resolver: the first encrypted read in the
+request (normally `enrollment_load`; the pin when the primary is a legacy
+plaintext store and the secondary is encrypted, a supported mixed state
+under ADR-0024 §1.2) performs the unseal and the resolver adopts that key;
+every later encrypted read in the same request borrows it. A request whose
+reads are all plaintext, or on a host without a TPM, never unseals. The
+resolver is owned by the request scope, not by the engine across requests.
+
+Later readers borrow the key as `&[u8]`; no copy is made. The borrowed-key
+entry points are `multi_camera::load_secondary_with_key(path, Option<&[u8]>)`
+(existing; the pin and the grant boundary read the secondary store through
+it instead of `load_secondary`) and a new borrowed-key variant of the
+primary loader beside `storage::load_path_unlocked` for the pin's primary
+re-load (same legacy migration and envelope handling, key injected instead
+of resolved). The callback-based `load_secondary_resolved` and the
+`load_with` seam, which take an owned key, are not used for reuse because
+an owned copy of the TPM output would not be memlocked
+(`SecretBytes::clone` documents this). No new decryption path is added.
 
 ### 2. Every read still happens
 
@@ -72,11 +85,12 @@ this request must not follow.
 
 ### 3. Lifetime and disposal
 
-The retained key is a `Zeroizing<Vec<u8>>` owned by the request scope and
-dropped, and therefore zeroized, when the request returns, whatever the
-outcome. It is not stored on the engine, not shared between requests, not
-written anywhere, and not exposed through any diagnostic or trace. Cancel,
-deadline, refusal and error paths drop it the same way as a grant.
+The retained key is the single memlocked `Zeroizing<Vec<u8>>` the unseal
+produced, owned by the request scope and dropped, and therefore zeroized,
+when the request returns, whatever the outcome. It is not copied, not
+stored on the engine, not shared between requests, not written anywhere,
+and not exposed through any diagnostic or trace. Cancel, deadline, refusal
+and error paths drop it the same way as a grant.
 
 ### 4. What this ADR does not do
 
@@ -89,20 +103,27 @@ re-read, its digest binding, or the serialized commit protocol.
 
 ## Phasing
 
-- **Phase 1: key threading.** Add a request-scoped key holder; thread it
-  through `resolve_attempt_enrollment` → `SecondaryAuthContext::pin` and the
-  boundary check. Keep the unlocked loaders' signatures for existing
-  callers; add the injected-key variants beside them.
+- **Phase 1: key threading.** Add the request-scoped lazy resolver; thread
+  a borrowed key through `resolve_attempt_enrollment` →
+  `SecondaryAuthContext::pin` (secondary via `load_secondary_with_key`,
+  primary via the new borrowed-key primary loader) and the boundary check.
+  Keep the unlocked loaders' signatures for existing callers.
 - **Phase 2: measurement.** Re-run the schema 4 trace on the NexiGo pair
   and record `capture_setup` and `finalization` before and after.
 
 ## Acceptance tests
 
-- A secondary-pair authentication performs exactly one template-key
-  unseal: count unseals through the TPM seam in the daemon's existing fake
-  TPM tests, for grant, refusal, cancellation and deadline outcomes.
-- A primary-pair authentication is unchanged: one unseal, and the
-  secondary loaders are never invoked.
+- A secondary-pair authentication with encrypted stores performs exactly
+  one template-key unseal: count unseals through the TPM seam in the
+  daemon's existing fake TPM tests, for grant, refusal, cancellation and
+  deadline outcomes. With a plaintext primary and an encrypted secondary,
+  the pin performs that one unseal and the boundary borrows it. With
+  plaintext stores throughout, or without a TPM, the count is zero.
+- A primary-pair authentication is unchanged: one unseal for an encrypted
+  store, and the secondary loaders are never invoked.
+- No read in the request copies the key: the only `Zeroizing` allocation
+  holding it is the unseal output (asserted through the memlock seam or an
+  allocation-counting test double).
 - The pin and boundary reads still refuse on a primary digest mismatch, a
   stale secondary generation, an inactive group, and a secondary store
   re-keyed during the request, with the retained key offered.

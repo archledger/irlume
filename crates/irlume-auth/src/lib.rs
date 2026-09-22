@@ -6549,11 +6549,13 @@ impl Engine {
     ) -> (irlume_common::Result<Outcome>, bool, Option<D>) {
         let mut attempt = 0_u32;
         // The costliest CAPTURE this loop has seen, before any release: the
-        // next attempt's estimate. `costliest_attempt` keeps its old meaning
-        // (a whole round, release included) for the caller's fallback seed;
-        // it must not feed the retry estimate, where the pending release is
-        // added explicitly, or a round's release would be counted twice.
-        let mut costliest_capture = std::time::Duration::ZERO;
+        // next attempt's estimate. It starts from the caller's seed (a whole
+        // round of an earlier loop, conservative by construction) and grows
+        // only with captures measured here. `costliest_attempt` keeps its
+        // whole-round meaning (release included) for the caller; it must not
+        // feed the retry estimate, where the pending release is added
+        // explicitly, or a round's release would be counted twice.
+        let mut costliest_capture = *costliest_attempt;
         // The costliest attempt so far (caller-seeded: the sequential fallback
         // starts with the concurrent loop's observed worst). A retry that
         // cannot FINISH before the deadline would overrun mid-capture —

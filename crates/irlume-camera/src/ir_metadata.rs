@@ -94,6 +94,10 @@ const REQUESTED_META_BUFFER_SIZE: u32 = 1024 * 1024;
 // before allocating a ring. A larger original snapshot can still be restored.
 const MAX_META_BUFFER_SIZE: u32 = 1024 * 1024;
 
+/// ERROR-marked metadata buffers that may be parked before the first sound
+/// one; matches the image ring's start-up allowance.
+const MAX_PARKED_STARTUP_ERRORS: u32 = 2;
+
 const fn fourcc(c: &[u8; 4]) -> u32 {
     (c[0] as u32) | ((c[1] as u32) << 8) | ((c[2] as u32) << 16) | ((c[3] as u32) << 24)
 }
@@ -590,6 +594,10 @@ pub(crate) struct IlluminationLog {
     timing: crate::capture_timing::Recorder,
     producer: Option<crate::capture_shutdown::Producer>,
     retired: bool,
+    /// ERROR-marked start-up buffers left dequeued: never viewed or requeued.
+    parked: u32,
+    /// Parking ends with the first sound buffer; later ERROR retires the ring.
+    delivered: bool,
     #[cfg(test)]
     sentinel_events: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
     #[cfg(test)]
@@ -694,6 +702,8 @@ impl IlluminationLog {
             timing: crate::capture_timing::Recorder::default(),
             producer: None,
             retired: false,
+            parked: 0,
+            delivered: false,
             #[cfg(test)]
             sentinel_events: None,
             #[cfg(test)]
@@ -939,11 +949,22 @@ impl IlluminationLog {
             }
             if buf.flags & v4l::buffer::Flags::ERROR.bits() != 0 {
                 // Inspect ioctl metadata before forming any mapped reference.
-                // Keep this retired ring until its main producer is quiescent.
-                self.retired = true;
-                self.by_timestamp.clear();
-                return;
+                // uvcvideo copies the paired image buffer's ERROR here, so a
+                // camera whose start-up image frame is ERROR-marked (see the
+                // image ring) also marks this buffer. Park it the same way:
+                // dequeued, unviewed and unrequeued until teardown, leaving
+                // the driver at least one buffer. Otherwise keep this retired
+                // ring until its main producer is quiescent.
+                let remaining = self.buffers.len().saturating_sub(self.parked as usize + 1);
+                if self.delivered || self.parked >= MAX_PARKED_STARTUP_ERRORS || remaining == 0 {
+                    self.retired = true;
+                    self.by_timestamp.clear();
+                    return;
+                }
+                self.parked += 1;
+                continue;
             }
+            self.delivered = true;
             let index = buf.index as usize;
             if let Some(mapped) = self.buffers.get(index) {
                 let used = (buf.bytesused as usize).min(mapped.len);
@@ -1040,6 +1061,8 @@ impl IlluminationLog {
             timing: crate::capture_timing::Recorder::default(),
             producer: None,
             retired: false,
+            parked: 0,
+            delivered: false,
             sentinel_events: Some(events),
             lifecycle: None,
         }

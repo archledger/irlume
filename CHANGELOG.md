@@ -7,6 +7,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Capture tolerates a bounded number of ERROR-marked buffers that arrive before
+  a stream's first sound frame. A Logitech BRIO marks the first IR frame after
+  its RGB sensor was used as ERROR, and uvcvideo copies that flag onto the
+  paired metadata buffer, so every sequential RGB-then-IR authentication capture
+  retired its ring before a decision. At most two such start-up buffers per
+  stream are parked: never mapped, read or requeued, and released with the ring
+  at teardown, leaving the driver at least one buffer. Any ERROR after a
+  delivered frame, or beyond the bound, still retires the ring.
+
 - Illumination metadata capture requests 1 MiB UVCM buffers instead of the
   driver's 10 KiB default. uvcvideo collects every payload header sent during
   sensor start-up into the first metadata buffer (54 KiB on a Logitech BRIO, up

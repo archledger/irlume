@@ -89,6 +89,11 @@ pub(super) fn warmup_retry(error: &io::Error) -> Option<bool> {
     })
 }
 
+/// ERROR-marked buffers that may be parked before a stream delivers its first
+/// frame. A Logitech BRIO marks exactly one: the first IR buffer after its RGB
+/// sensor path was used. Two leaves margin without hiding a failing stream.
+const MAX_PARKED_STARTUP_ERRORS: u32 = 2;
+
 struct Mapping {
     ptr: NonNull<libc::c_void>,
     len: usize,
@@ -126,6 +131,10 @@ pub(super) struct MmapCapture {
     failed: bool,
     producer: crate::capture_shutdown::Producer,
     stop_attempted: bool,
+    /// ERROR-marked start-up buffers left dequeued: never viewed or requeued.
+    parked: u32,
+    /// Parking ends with the first delivered frame; later ERROR retires the ring.
+    delivered: bool,
     #[cfg(test)]
     fake: Option<Arc<std::sync::Mutex<tests::FakeIo>>>,
 }
@@ -155,6 +164,8 @@ impl MmapCapture {
             failed: false,
             producer: crate::capture_shutdown::Producer::new(),
             stop_attempted: false,
+            parked: 0,
+            delivered: false,
             #[cfg(test)]
             fake: None,
         }
@@ -315,25 +326,41 @@ impl CaptureDequeue for MmapCapture {
         // No userspace-owned buffer exists past this point until DQBUF succeeds.
         // A timeout, interruption or EAGAIN therefore retries only the wait/DQ.
         // EIO may even consume an unidentified buffer: never guess its index.
-        self.wait()
-            .map_err(|error| operation_error(Operation::Wait, error))?;
-        let mut buf = buffer(0);
-        self.ioctl(
-            vidioc::VIDIOC_DQBUF,
-            (&mut buf as *mut v4l2_buffer).cast(),
-            "DQBUF",
-        )
-        .map_err(|error| operation_error(Operation::Dequeue, error))?;
-        self.producer.check()?;
-        if buf.flags & v4l::buffer::Flags::ERROR.bits() != 0 {
+        let buf = loop {
+            self.wait()
+                .map_err(|error| operation_error(Operation::Wait, error))?;
+            let mut buf = buffer(0);
+            self.ioctl(
+                vidioc::VIDIOC_DQBUF,
+                (&mut buf as *mut v4l2_buffer).cast(),
+                "DQBUF",
+            )
+            .map_err(|error| operation_error(Operation::Dequeue, error))?;
+            self.producer.check()?;
+            if buf.flags & v4l::buffer::Flags::ERROR.bits() == 0 {
+                break buf;
+            }
             // Affected UVC cancel paths can publish ERROR before async copies
             // finish. No mapped reference or requeue is permissible here.
-            self.failed = true;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "driver returned an error-marked capture buffer; ring retired",
-            ));
-        }
+            //
+            // Some cameras mark a start-up frame as ERROR while the stream
+            // itself is sound. Parking keeps both rules: the buffer stays
+            // dequeued and unviewed until teardown, as in a retired ring, and
+            // the kernel keeps at least one other buffer to fill.
+            let remaining = self.buffers.len().saturating_sub(self.parked as usize + 1);
+            if self.delivered || self.parked >= MAX_PARKED_STARTUP_ERRORS || remaining == 0 {
+                self.failed = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "driver returned an error-marked capture buffer; ring retired",
+                ));
+            }
+            self.parked += 1;
+            irlume_common::dlog!(
+                "parked error-marked start-up capture buffer {}",
+                self.parked
+            );
+        };
         let Some(mapping) = self.buffers.get(buf.index as usize) else {
             self.failed = true;
             return Err(io::Error::new(
@@ -342,6 +369,7 @@ impl CaptureDequeue for MmapCapture {
             ));
         };
         self.held = Some(buf.index);
+        self.delivered = true;
         let metadata = Metadata {
             bytesused: buf.bytesused,
             flags: buf.flags.into(),

@@ -19,6 +19,8 @@ pub(super) struct FakeIo {
     granted: u32,
     sequence: u32,
     flags: u32,
+    /// Flags for successive DQBUFs; `flags` applies once this is exhausted.
+    next_flags: VecDeque<u32>,
     consume_on_error: bool,
     shared_events: Option<Arc<Mutex<Vec<&'static str>>>>,
 }
@@ -37,6 +39,7 @@ impl Default for FakeIo {
             granted: 4,
             sequence: 0,
             flags: 0x2000, // V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC
+            next_flags: VecDeque::new(),
             consume_on_error: false,
             shared_events: None,
         }
@@ -140,7 +143,7 @@ impl FakeIo {
                 self.sequence += 1;
                 buf.sequence = self.sequence;
                 buf.bytesused = 16;
-                buf.flags = self.flags;
+                buf.flags = self.next_flags.pop_front().unwrap_or(self.flags);
                 buf.timestamp.tv_usec = i64::from(self.sequence) * 1000;
             } else {
                 panic!("unexpected request {operation}");
@@ -410,7 +413,7 @@ fn delivered_corruption_retires_before_the_trusted_boundary_can_borrow_bytes() {
 }
 
 #[test]
-fn error_buffer_is_retired_before_any_mapped_view_or_requeue() {
+fn persistent_error_buffers_retire_the_ring_without_any_mapped_view_or_requeue() {
     let fake = Arc::new(Mutex::new(FakeIo::default()));
     fake.lock().unwrap().flags |= 0x40;
     let mut stream = stream(&fake);
@@ -420,8 +423,69 @@ fn error_buffer_is_retired_before_any_mapped_view_or_requeue() {
     );
     assert_eq!(calls(&fake, "view"), 0);
     assert!(stream.dequeue().is_err());
-    assert_eq!(calls(&fake, "DQBUF"), 1);
+    assert_eq!(
+        calls(&fake, "DQBUF"),
+        MAX_PARKED_STARTUP_ERRORS as usize + 1
+    );
     assert_eq!(calls(&fake, "QBUF"), 4);
+}
+
+#[test]
+fn startup_error_buffer_is_parked_without_view_or_requeue_and_capture_continues() {
+    // A Logitech BRIO marks the first IR buffer after RGB use as ERROR; every
+    // following frame is sound.
+    let fake = Arc::new(Mutex::new(FakeIo::default()));
+    fake.lock().unwrap().next_flags = [0x2040].into();
+    let mut stream = stream(&fake);
+    let sequence = stream.dequeue().unwrap().1.sequence;
+    assert_eq!(sequence, 2, "the parked buffer is never delivered");
+    assert_eq!(calls(&fake, "view"), 1);
+    assert_eq!(calls(&fake, "DQBUF"), 2);
+    assert_eq!(calls(&fake, "QBUF"), 4);
+    stream.dequeue().unwrap();
+    stream.dequeue().unwrap();
+    // Only delivered buffers were requeued; index 0 stays parked.
+    assert_eq!(calls(&fake, "QBUF"), 6);
+    assert!(!fake.lock().unwrap().queued[0]);
+    drop(stream);
+    assert_eq!(fake.lock().unwrap().mapped, 0);
+    assert_eq!(calls(&fake, "REQBUFS(0)"), 1);
+}
+
+#[test]
+fn error_after_a_delivered_frame_still_retires_the_ring() {
+    let fake = Arc::new(Mutex::new(FakeIo::default()));
+    fake.lock().unwrap().next_flags = [0x2000, 0x2040].into();
+    let mut stream = stream(&fake);
+    stream.dequeue().unwrap();
+    assert_eq!(
+        dequeue_error(&mut stream).kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(calls(&fake, "view"), 1);
+    assert!(stream.dequeue().is_err());
+    assert_eq!(calls(&fake, "DQBUF"), 2);
+}
+
+#[test]
+fn startup_parking_never_starves_a_small_ring() {
+    let fake = Arc::new(Mutex::new(FakeIo::default()));
+    {
+        let mut f = fake.lock().unwrap();
+        f.granted = 2;
+        f.next_flags = [0x2040, 0x2040].into();
+    }
+    let device = Device::with_path("/dev/null").unwrap();
+    let mut stream = MmapCapture::test_new(device.handle(), 5000);
+    stream.fake = Some(fake.clone());
+    stream.allocate(2).unwrap();
+    assert_eq!(
+        dequeue_error(&mut stream).kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(calls(&fake, "view"), 0);
+    assert_eq!(calls(&fake, "DQBUF"), 2);
+    assert_eq!(calls(&fake, "QBUF"), 2);
 }
 
 #[test]

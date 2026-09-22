@@ -23,6 +23,9 @@ pub(crate) struct FakeDevice {
     map_failure_at: Option<u32>,
     error_frame: bool,
     dequeued: bool,
+    /// Scripted DQBUF flags, consumed before the one-shot `error_frame` path.
+    frame_flags: std::collections::VecDeque<u32>,
+    delivered: u32,
 }
 
 impl FakeDevice {
@@ -41,6 +44,8 @@ impl FakeDevice {
             map_failure_at: None,
             error_frame: false,
             dequeued: false,
+            frame_flags: std::collections::VecDeque::new(),
+            delivered: 0,
         }
     }
 
@@ -103,12 +108,22 @@ impl FakeDevice {
             let buf = unsafe { &mut *argp.cast::<V4l2Buffer>() };
             buf.length = self.length.unwrap_or(self.format.1);
         } else if request == vidioc_dqbuf() {
+            // SAFETY: DQBUF takes the initialized metadata V4l2Buffer.
+            let buf = unsafe { &mut *argp.cast::<V4l2Buffer>() };
+            if self.delivered > 0 || !self.frame_flags.is_empty() {
+                let Some(flags) = self.frame_flags.pop_front() else {
+                    return Err("no metadata ready".into());
+                };
+                buf.index = self.delivered % self.count;
+                self.delivered += 1;
+                buf.bytesused = 16;
+                buf.flags = flags;
+                return Ok(());
+            }
             if self.dequeued {
                 return Err("no metadata ready".into());
             }
             self.dequeued = true;
-            // SAFETY: DQBUF takes the initialized metadata V4l2Buffer.
-            let buf = unsafe { &mut *argp.cast::<V4l2Buffer>() };
             buf.index = 0;
             buf.bytesused = 16;
             buf.flags = if self.error_frame { 0x40 } else { 0 };
@@ -498,6 +513,77 @@ fn error_metadata_never_forms_a_view_or_requeues_the_buffer() {
     let events = device.lock().unwrap().events.clone();
     assert!(!events.iter().any(|e| e == "view"));
     assert_eq!(events.iter().filter(|e| *e == "QBUF").count(), queued);
+    drop(log);
+    assert_closed(&device, peer);
+}
+
+fn count(device: &Arc<Mutex<FakeDevice>>, event: &str) -> usize {
+    device
+        .lock()
+        .unwrap()
+        .events
+        .iter()
+        .filter(|e| *e == event)
+        .count()
+}
+
+#[test]
+fn startup_error_metadata_is_parked_and_later_records_still_drain() {
+    // uvcvideo copies the paired image buffer's ERROR onto the metadata buffer,
+    // so a camera whose first image frame is ERROR-marked also delivers its
+    // first metadata buffer ERROR-marked; later buffers are sound.
+    let device = Arc::new(Mutex::new(FakeDevice::new((UVCH, 10240))));
+    device.lock().unwrap().frame_flags = [0x40, 0, 0].into();
+    let (mut log, peer) = log_for(&device);
+    log.start().unwrap();
+    let queued = count(&device, "QBUF");
+    log.drain();
+    assert!(!log.retired);
+    assert_eq!(
+        count(&device, "view"),
+        2,
+        "the parked buffer is never viewed"
+    );
+    assert_eq!(
+        count(&device, "QBUF"),
+        queued + 2,
+        "the parked buffer is never requeued"
+    );
+    drop(log);
+    assert_closed(&device, peer);
+}
+
+#[test]
+fn error_metadata_after_a_delivered_buffer_retires_the_ring() {
+    let device = Arc::new(Mutex::new(FakeDevice::new((UVCH, 10240))));
+    device.lock().unwrap().frame_flags = [0, 0x40, 0].into();
+    let (mut log, peer) = log_for(&device);
+    log.start().unwrap();
+    let queued = count(&device, "QBUF");
+    log.drain();
+    assert!(log.retired);
+    assert_eq!(count(&device, "view"), 1);
+    assert_eq!(count(&device, "QBUF"), queued + 1);
+    log.drain();
+    assert_eq!(count(&device, "DQBUF"), 2, "a retired ring is not drained");
+    drop(log);
+    assert_closed(&device, peer);
+}
+
+#[test]
+fn startup_parking_is_bounded_for_metadata() {
+    let device = Arc::new(Mutex::new(FakeDevice::new((UVCH, 10240))));
+    {
+        let mut state = device.lock().unwrap();
+        state.count = 8;
+        state.frame_flags = [0x40, 0x40, 0x40, 0].into();
+    }
+    let (mut log, peer) = log_for(&device);
+    log.start().unwrap();
+    log.drain();
+    assert!(log.retired);
+    assert_eq!(count(&device, "view"), 0);
+    assert_eq!(count(&device, "DQBUF"), 3);
     drop(log);
     assert_closed(&device, peer);
 }

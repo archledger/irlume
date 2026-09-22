@@ -8,7 +8,7 @@ All notable changes to irlume are documented here. This project adheres to
 ### Added
 
 - Diagnostic trace schema 4 adds two stage timings: `capture_setup`, from the
-  resolved enrollment to the first capture route starting to stream, and
+  completed enrollment load to the first capture route starting to stream, and
   `finalization`, from the release of the owned streaming sessions to the
   engine return. They close the two uninstrumented gaps that accounted for
   about a third of a concurrent authentication's wall time on the NexiGo N930W

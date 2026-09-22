@@ -702,8 +702,9 @@ diagnostic_enum!(TraceWarning {
     PrivilegedDiagnosticOracle,
 });
 // Schema 4 adds `CaptureSetup` (attempt preparation after the enrollment
-// resolved and before the capture route starts streaming: schedule dispatch,
-// camera-pair resolution, per-attempt admission; emitted once per request by
+// load completed and before the capture route starts streaming: attempt
+// enrollment resolution including any secondary-camera store loads, schedule
+// dispatch, per-attempt admission; emitted once per request by
 // the route that first starts capture, absent when the request refused before
 // any capture began) and `Finalization` (from the release of the owned
 // streaming sessions to the engine return: final matching, camera handle

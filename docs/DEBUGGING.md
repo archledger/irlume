@@ -59,9 +59,10 @@ schema throughout; unsupported versions, version changes within a stream and
 newer-tier events marked with an older schema are rejected.
 
 Schema 4 adds two stage timings that close the gaps between the schema 3
-stages. `capture_setup` runs from the resolved enrollment to the moment the
-first capture route starts streaming (schedule dispatch, camera-pair
-resolution, per-attempt admission); it is reported once per request and is
+stages. `capture_setup` runs from the completed enrollment load to the moment
+the first capture route starts streaming: attempt enrollment resolution,
+including the secondary-camera store loads and unseals a non-primary camera
+pair requires, schedule dispatch and per-attempt admission; it is reported once per request and is
 absent when the request refused before any capture began. `finalization` runs
 from the release of the owned streaming sessions (`stream_owner_release`) to
 the engine return: final matching, camera handle close and lease release; it is

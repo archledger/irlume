@@ -1413,8 +1413,9 @@ impl Drop for FinalizationTimer<'_> {
 }
 
 impl Engine {
-    /// The enrollment resolved: everything until a capture route starts
-    /// streaming is attempt preparation.
+    /// The enrollment loaded: everything until a capture route starts
+    /// streaming (attempt enrollment resolution, schedule dispatch,
+    /// per-attempt admission) is attempt preparation.
     fn begin_capture_setup(&mut self) {
         self.capture_setup_started = Some(std::time::Instant::now());
     }
@@ -6108,13 +6109,15 @@ impl Engine {
                 "plaintext, synchronous"
             }
         );
+        // Attempt preparation starts here: secondary-camera resolution below
+        // can load and unseal further stores, and belongs to the interval.
+        self.begin_capture_setup();
         if loader_was_async {
             enr = match self.resolve_attempt_enrollment(user, enr, &live_pair) {
                 Err(outcome) => return Ok(outcome),
                 Ok(scoped) => scoped,
             };
         }
-        self.begin_capture_setup();
         if let Some(cameras) = grouped_cams {
             let mut costliest_attempt = std::time::Duration::ZERO;
             return self

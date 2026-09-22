@@ -61,8 +61,11 @@ Evidence cannot cross recovery, fallback or requests. Any transport failure,
 including a failure during the final dequeue after successful processing,
 invalidates the prepared result and clears the collection's votes.
 
-Streaming owners are released before final admission. The original request
-deadline applies throughout. The retry estimator measures the complete
+Streaming owners are released before final admission. (Amended by ADR-0027,
+2026-09-22: the final release of a request happens after the decision has
+been handed to the connection thread; the inter-round releases of the retry
+loop and everything the decision depends on are unchanged.) The original
+request deadline applies throughout. The retry estimator measures the complete
 collection, including inference and cleanup, and retains the existing
 sequential fallback cost floor. The rate window, PAD operating points,
 concurrent skew limit and identity thresholds do not change.

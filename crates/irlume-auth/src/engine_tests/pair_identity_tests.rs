@@ -178,10 +178,12 @@ impl Drop for DropStream<'_> {
 
 fn assert_pair_released(sink: &RecordingSink) {
     let recorded = sink.0.lock().unwrap();
+    // IR first, then RGB: the mirror of the start order, and the order that
+    // keeps the NexiGo's stall out of the release (see `with_owned_pair`).
     assert!(
         matches!(recorded.as_slice(), [
-            Recorded::Dropped("rgb"),
             Recorded::Dropped("ir"),
+            Recorded::Dropped("rgb"),
             Recorded::Trace(TraceEventKind::StageTiming {
                 stage: TraceStage::StreamOwnerRelease,
                 elapsed_us,

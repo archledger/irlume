@@ -17,6 +17,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The concurrent authentication path releases its two streams IR first,
+  then RGB, the mirror of the start order. A tuple drop stopped RGB first, and
+  on the NexiGo N930W that order paid an ~0.8 s camera stall inside every
+  release, after the identity decision and before the reply
+  (`stream_owner_release` 1.0–1.2 s in the #797 traces). New
+  `release_probe` example in `irlume-camera` measures both orders.
 - The TPM is reached through the raw device (`/dev/tpm0`) first, with the
   kernel resource manager (`/dev/tpmrm0`) as the per-call fallback (ADR-0026).
   The manager saves and flushes every session and object after every command,

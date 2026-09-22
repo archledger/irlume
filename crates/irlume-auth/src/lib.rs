@@ -3470,6 +3470,36 @@ mod capture_mode_switch_tests {
         );
     }
 
+    /// The pair is released IR first, then RGB (the mirror of the start
+    /// order); a plain tuple drop would do the opposite and, on the NexiGo,
+    /// pay the camera's stall inside every release.
+    #[test]
+    fn an_owned_pair_releases_ir_before_rgb() {
+        use std::sync::{Arc, Mutex};
+        struct Side(&'static str, Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for Side {
+            fn drop(&mut self) {
+                self.1.lock().unwrap().push(self.0);
+            }
+        }
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let seen = with_owned_pair(
+            (Side("rgb", order.clone()), Side("ir", order.clone())),
+            &(),
+            |rgb, ir| format!("{}+{}", rgb.0, ir.0),
+        );
+        assert_eq!(seen, "rgb+ir", "both sides were usable during assessment");
+        assert_eq!(*order.lock().unwrap(), ["ir", "rgb"]);
+        // The helper on its own, including the nothing-to-release case.
+        let order = Arc::new(Mutex::new(Vec::new()));
+        release_pair_ir_first(Some((
+            Side("rgb", order.clone()),
+            Side("ir", order.clone()),
+        )));
+        assert_eq!(*order.lock().unwrap(), ["ir", "rgb"]);
+        release_pair_ir_first::<Side, Side>(None);
+    }
+
     /// A mode the operator forced is never narrowed by runtime learning.
     #[test]
     fn an_operator_forced_mode_is_never_learned_from() {
@@ -3489,6 +3519,15 @@ mod capture_mode_switch_tests {
 
 /// Own streaming queues only for one assessment. The result cannot borrow
 /// either session, so both drop before matching, consent or another attempt.
+///
+/// The pair is released IR first, then RGB: the mirror of the start order
+/// (`start_rgb_before_ir`, RGB is the outer stream). A tuple drop would stop
+/// RGB first, and on the NexiGo N930W that order paid an ~0.8 s blocking
+/// operation inside every release (`stream_owner_release` 1.0–1.2 s in the
+/// #797 traces). With IR stopped first the release measured 140–175 ms in most
+/// rounds of `release_probe`, and when the camera's stall lands anyway it
+/// lands on the next arm after an immediate reopen, which an authentication
+/// request never does; after two seconds idle the next arm was 60 ms.
 fn with_owned_pair<R, I, T>(
     pair: (R, I),
     diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
@@ -3507,7 +3546,7 @@ fn with_owned_pair<R, I, T>(
                 self.diagnostics,
                 irlume_common::diagnostics::TraceStage::StreamOwnerRelease,
             );
-            drop(self.pair.take());
+            release_pair_ir_first(self.pair.take());
         }
     }
 
@@ -3520,6 +3559,14 @@ fn with_owned_pair<R, I, T>(
         .as_mut()
         .expect("owners hold the assessment pair");
     assess(&mut pair.0, &mut pair.1)
+}
+
+/// Stop the IR side before the RGB side. Pure ordering; see [`with_owned_pair`].
+fn release_pair_ir_first<R, I>(pair: Option<(R, I)>) {
+    if let Some((rgb, ir)) = pair {
+        drop(ir);
+        drop(rgb);
+    }
 }
 
 /// Keep camera objects only when this operation will arm a held pair.

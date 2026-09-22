@@ -9,6 +9,7 @@
 //! embedding against the user's enrolled templates at the fixed threshold.
 
 mod ir_assessment;
+pub use ir_assessment::{IrOnlyPreflight, IrOnlyRefusal};
 
 /// Non-granting developer IR evaluation; absent from normal builds.
 #[cfg(feature = "ir-only-evaluation")]
@@ -447,6 +448,7 @@ fn publish_camera_group(
     let primary_path = irlume_core::multi_camera::primary_enrollment_path(user);
     let primary_bytes = std::fs::read(&primary_path)
         .map_err(|error| irlume_common::Error::Io(error.to_string()))?;
+    inactive_store_write_refusal(&store, &primary_bytes)?;
     let current_enr = irlume_core::storage::load_path_unlocked(user, &primary_path)
         .map_err(|error| irlume_common::Error::Protocol(error.to_string()))?
         .ok_or_else(|| {
@@ -482,6 +484,28 @@ fn publish_camera_group(
     )
     .map_err(|error| irlume_common::Error::Protocol(error.to_string()))?;
     Ok(group_id.to_owned())
+}
+
+/// ADR-0028 §3 writer guard. The store carries ONE primary snapshot digest
+/// and an addition rewrites it for the whole store, so publishing into a
+/// store whose retained groups are inactive (the primary changed since they
+/// were authorized) would silently reactivate all of them under an
+/// authorization that covered only this addition, which ADR-0024 forbids.
+/// Those groups are removed first, then each wanted one is added back on
+/// its own; an empty store has nothing to reactivate.
+fn inactive_store_write_refusal(
+    store: &irlume_core::multi_camera::SecondaryStore,
+    primary_bytes: &[u8],
+) -> irlume_common::Result<()> {
+    if !store.groups.is_empty()
+        && store.activation_against(Some(primary_bytes))
+            != irlume_core::multi_camera::Activation::Active
+    {
+        return Err(irlume_common::Error::Protocol(
+            "the other added cameras are inactive since the primary enrollment changed; remove them first, then add back the ones you use".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn enrollment_ir_enabled(ir_available: bool, force_rgb_only: bool) -> bool {
@@ -1201,21 +1225,27 @@ impl AuthenticationPurpose {
 }
 
 /// The deferred enrollment load's result, as sent by the loader thread in
-/// [`Engine::authenticate_for_with_diagnostics`].
-type EnrollmentLoad = irlume_common::Result<
-    Option<(
+/// [`Engine::authenticate_for_with_diagnostics`]. The IR-only loader sends
+/// a [`irlume_core::storage::PrimarySnapshot`] through the same helpers.
+type EnrollmentLoad<
+    T = (
         irlume_core::storage::Enrollment,
         Option<irlume_core::template_key::UnsealedKey>,
-    )>,
->;
+    ),
+> = irlume_common::Result<Option<T>>;
 
 /// Own an in-flight enrollment helper until setup consumes its result. Declared
 /// before camera owners so early exits drop those owners before draining it.
-struct PendingEnrollmentLoad {
-    receiver: Option<std::sync::mpsc::Receiver<EnrollmentLoad>>,
+struct PendingEnrollmentLoad<
+    T = (
+        irlume_core::storage::Enrollment,
+        Option<irlume_core::template_key::UnsealedKey>,
+    ),
+> {
+    receiver: Option<std::sync::mpsc::Receiver<EnrollmentLoad<T>>>,
 }
 
-impl Drop for PendingEnrollmentLoad {
+impl<T> Drop for PendingEnrollmentLoad<T> {
     fn drop(&mut self) {
         finish_loader(&mut self.receiver);
     }
@@ -1229,7 +1259,7 @@ impl Drop for PendingEnrollmentLoad {
 /// waiting include cancellation during setup and camera-lease failure;
 /// the post-watch exits arrive seconds after the spawn, by which
 /// time the load has long finished.
-fn finish_loader(loader: &mut Option<std::sync::mpsc::Receiver<EnrollmentLoad>>) {
+fn finish_loader<T>(loader: &mut Option<std::sync::mpsc::Receiver<EnrollmentLoad<T>>>) {
     if let Some(rx) = loader.take() {
         // The loader always sends or drops its sender (a panic drops it), so
         // this returns as soon as the load — not the whole thread — is done.
@@ -1253,15 +1283,9 @@ enum LoaderExit {
 /// request-ending fallback). Pure, so every arm of the fail-closed mapping
 /// is unit-testable without camera hardware; the join in
 /// [`Engine::authenticate_for_with_diagnostics`] is exactly this mapping.
-fn resolve_loader(
-    recv: Result<EnrollmentLoad, std::sync::mpsc::RecvTimeoutError>,
-) -> Result<
-    (
-        irlume_core::storage::Enrollment,
-        Option<irlume_core::template_key::UnsealedKey>,
-    ),
-    LoaderExit,
-> {
+fn resolve_loader<T>(
+    recv: Result<EnrollmentLoad<T>, std::sync::mpsc::RecvTimeoutError>,
+) -> Result<T, LoaderExit> {
     match recv {
         Ok(Ok(Some(loaded))) => Ok(loaded),
         Ok(Ok(None)) => Err(LoaderExit::NotEnrolled),
@@ -13876,6 +13900,48 @@ mod engine_tests {
         );
     }
 
+    /// ADR-0028 §3: adding a camera into an inactive store that still holds
+    /// another stale group is refused; an emptied store, or an active one,
+    /// accepts the addition (whose publication then binds only the current
+    /// primary snapshot).
+    #[test]
+    fn adding_a_camera_into_an_inactive_store_with_stale_groups_is_refused() {
+        use irlume_core::multi_camera::{
+            CameraGroupId, GroupPair, SecondaryGroup, SecondaryProfileScans, SecondaryStore,
+            SECONDARY_STORE_VERSION,
+        };
+        let stale = SecondaryGroup {
+            id: CameraGroupId::new("stale".into()).unwrap(),
+            pair: GroupPair {
+                rgb: Some("1bcf:28c4".into()),
+                ir: Some("1bcf:28c4".into()),
+            },
+            profiles: vec![SecondaryProfileScans {
+                ir_calibs: Default::default(),
+                profile: "main".into(),
+                scans: Vec::new(),
+            }],
+        };
+        let authorized_against = b"primary v1".to_vec();
+        let mut store = SecondaryStore {
+            format_version: SECONDARY_STORE_VERSION,
+            owner: "alice".into(),
+            generation: 3,
+            primary_snapshot_sha256: irlume_common::sha256_hex(&authorized_against),
+            groups: vec![stale],
+        };
+        // The primary changed: the retained group is inactive and the store
+        // refuses another addition.
+        let error = inactive_store_write_refusal(&store, b"primary v2").unwrap_err();
+        assert!(error.to_string().contains("remove them first"), "{error}");
+        // Unchanged primary: the store is active and accepts.
+        assert!(inactive_store_write_refusal(&store, &authorized_against).is_ok());
+        // Every retained group removed: nothing can be reactivated, so the
+        // addition proceeds against the current primary.
+        store.groups.clear();
+        assert!(inactive_store_write_refusal(&store, b"primary v2").is_ok());
+    }
+
     #[test]
     fn binding_mismatch_refuses_swapped_or_vanished_cameras() {
         let _g = env_guard();
@@ -14435,7 +14501,7 @@ mod engine_tests {
             .load_ir_enrollment(user, AuthenticationWindow::new(10_000), false, Some(&sink))
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.user, user);
+        assert_eq!(loaded.enrollment.user, user);
         // Missing and corrupt stores retain their different return semantics,
         // and each attempted load emits one completed boundary, no capture.
         assert!(s

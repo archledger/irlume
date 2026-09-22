@@ -11,29 +11,296 @@ pub(super) struct IrAssessment {
     pub(super) pad: PadEvidence,
 }
 
+/// Whether the configured pair is the primary binding: the bound IR
+/// identity must match; a bound RGB identity must match the configured
+/// RGB side when both are known (an unbound side is unchecked, as
+/// `GroupPair::matches` treats it on the dual path).
+fn primary_binding_matches(
+    enrollment: &irlume_core::storage::Enrollment,
+    rgb_identity: Option<&str>,
+    ir_identity: &str,
+) -> Option<bool> {
+    let binding = enrollment.camera_binding.as_ref()?;
+    let ir = binding.ir.as_deref()?;
+    let rgb_matches = match (binding.rgb.as_deref(), rgb_identity) {
+        (Some(bound), Some(configured)) => bound == configured,
+        _ => true,
+    };
+    Some(ir == ir_identity && rgb_matches)
+}
+
 fn enrollment_readiness(
     enrollment: &irlume_core::storage::Enrollment,
-    identity: &str,
+    rgb_identity: Option<&str>,
+    ir_identity: &str,
     compatible_templates: usize,
 ) -> irlume_common::IrOnlyReadiness {
     use irlume_common::IrOnlyReadiness as Ready;
     if legacy_eye_policy(enrollment).is_err() {
         return Ready::IncompatibleEnrollment;
     }
-    let Some(binding) = enrollment
-        .camera_binding
-        .as_ref()
-        .and_then(|binding| binding.ir.as_deref())
-    else {
-        return Ready::BindingUnavailable;
-    };
-    if binding != identity {
-        return Ready::BindingMismatch;
+    match primary_binding_matches(enrollment, rgb_identity, ir_identity) {
+        None => return Ready::BindingUnavailable,
+        Some(false) => return Ready::BindingMismatch,
+        Some(true) => {}
     }
     if compatible_templates == 0 {
         return Ready::IncompatibleEnrollment;
     }
     Ready::ReadyForExperimentalAttempt
+}
+
+/// The validation hook that lifts the Phase 1 gate on the secondary scope
+/// (ADR-0028 §7): set only in the daemon's environment during hardware
+/// validation; the gate's removal is its own change.
+fn secondary_route_enabled() -> bool {
+    std::env::var_os("IRLUME_IR_ONLY_SECONDARY").is_some_and(|value| value == "1")
+}
+
+/// What an IR-only attempt scores against and the pin its grant boundary
+/// re-checks (ADR-0028 §3-4). Resolved before the camera opens; hotplug or
+/// configuration changes cannot redirect a resolved attempt (§6).
+#[derive(Debug)]
+pub(super) enum IrOnlyScope {
+    /// The primary enrollment, pinned by the digest of the bytes it was
+    /// parsed from.
+    Primary {
+        path: std::path::PathBuf,
+        digest: String,
+    },
+    /// One active secondary group, pinned by the coordinator.
+    Secondary(irlume_core::multi_camera::coordinator::SecondaryAuthContext),
+}
+
+impl IrOnlyScope {
+    /// The wire report: the scope and, for a group, its 1-based store
+    /// position (an ordinal, never an identity).
+    pub(super) fn report(&self) -> (irlume_common::IrScope, Option<usize>) {
+        match self {
+            Self::Primary { .. } => (irlume_common::IrScope::Primary, None),
+            Self::Secondary(context) => (
+                irlume_common::IrScope::Secondary,
+                Some(context.store_index() + 1),
+            ),
+        }
+    }
+
+    /// The grant boundary (ADR-0028 §4), run immediately before every
+    /// IR-only grant: the primary scope re-reads the primary file and
+    /// requires the pinned digest; the secondary scope is the dual path's
+    /// serialized boundary step under the request key. Any change refuses.
+    pub(super) fn boundary_refusal(
+        &self,
+        keys: &mut dyn irlume_core::template_key::TemplateKeySource,
+    ) -> Option<Outcome> {
+        use irlume_core::multi_camera::commit::GrantDecision;
+        match self {
+            Self::Primary { path, digest } => match std::fs::read(path) {
+                Ok(bytes) if irlume_common::sha256_hex(&bytes) == *digest => None,
+                Ok(_) => Some(Outcome::deny(
+                    OutcomeKind::OtherDeny,
+                    "enrollment changed during authentication; use your password",
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(Outcome::deny(
+                    OutcomeKind::OtherDeny,
+                    "enrollment removed during authentication; use your password",
+                )),
+                Err(error) => Some(Outcome::deny(
+                    OutcomeKind::SetupUnavailable,
+                    format!("enrollment unreadable at the grant boundary: {error}"),
+                )),
+            },
+            Self::Secondary(context) => match context.boundary_check_now_with(keys) {
+                Ok(GrantDecision::Grant) => None,
+                Ok(GrantDecision::Refuse(clause)) => Some(Outcome::deny(
+                    OutcomeKind::OtherDeny,
+                    format!("secondary grant refused at the boundary: {clause}"),
+                )),
+                Err(error) => Some(Outcome::deny(
+                    OutcomeKind::SetupUnavailable,
+                    format!("secondary grant boundary unreadable: {error}"),
+                )),
+            },
+        }
+    }
+}
+
+/// A resolved IR-only attempt: the enrollment it scores (the primary, or a
+/// group's camera-scoped bridge) and its scope.
+#[derive(Debug)]
+pub(super) struct IrOnlyResolution {
+    pub(super) enrollment: irlume_core::storage::Enrollment,
+    pub(super) scope: IrOnlyScope,
+}
+
+/// A camera-free IR-only refusal with the scope it was found in, when one
+/// resolved far enough to name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrOnlyRefusal {
+    pub readiness: irlume_common::IrOnlyReadiness,
+    pub scope: Option<irlume_common::IrScope>,
+    pub scope_index: Option<usize>,
+}
+
+impl IrOnlyRefusal {
+    fn unscoped(readiness: irlume_common::IrOnlyReadiness) -> Self {
+        Self {
+            readiness,
+            scope: None,
+            scope_index: None,
+        }
+    }
+
+    fn secondary(readiness: irlume_common::IrOnlyReadiness, index: Option<usize>) -> Self {
+        Self {
+            readiness,
+            scope: Some(irlume_common::IrScope::Secondary),
+            scope_index: index,
+        }
+    }
+}
+
+/// The IR-only preflight report: the readiness, the closed target-refusal
+/// cause, and the scope the configured pair resolved to when it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrOnlyPreflight {
+    pub readiness: irlume_common::IrOnlyReadiness,
+    pub target_issue: Option<irlume_common::IrTargetIssue>,
+    pub scope: Option<irlume_common::IrScope>,
+    pub scope_index: Option<usize>,
+}
+
+impl IrOnlyPreflight {
+    fn target(
+        readiness: irlume_common::IrOnlyReadiness,
+        issue: irlume_common::IrTargetIssue,
+    ) -> Self {
+        Self {
+            readiness,
+            target_issue: Some(issue),
+            scope: None,
+            scope_index: None,
+        }
+    }
+
+    fn unscoped(readiness: irlume_common::IrOnlyReadiness) -> Self {
+        Self {
+            readiness,
+            target_issue: None,
+            scope: None,
+            scope_index: None,
+        }
+    }
+}
+
+impl From<IrOnlyRefusal> for IrOnlyPreflight {
+    fn from(refusal: IrOnlyRefusal) -> Self {
+        Self {
+            readiness: refusal.readiness,
+            target_issue: None,
+            scope: refusal.scope,
+            scope_index: refusal.scope_index,
+        }
+    }
+}
+
+/// The account's stores an IR-only resolution reads.
+struct IrOnlyStores<'a> {
+    user: &'a str,
+    primary_path: &'a std::path::Path,
+    secondary_path: &'a std::path::Path,
+}
+
+/// Resolve the configured pair `(rgb, ir)` to the scope an IR-only attempt
+/// scores against (ADR-0028 §1-3): account policy on the real primary
+/// first, then the primary binding, then an ACTIVE secondary group by
+/// strict equality of both sides, read through `keys`. The primary keeps
+/// precedence; a secondary refusal never falls back to another group, and
+/// no device is discovered or opened (the identities are the only input).
+/// `compatible_templates` counts the IR templates the live recognizer can
+/// score in an enrollment; `secondary_enabled` is the Phase 1 gate (§7).
+fn resolve_ir_only_scope_at(
+    stores: &IrOnlyStores<'_>,
+    primary: irlume_core::storage::PrimarySnapshot,
+    (rgb, ir): (&str, &str),
+    compatible_templates: &dyn Fn(&irlume_core::storage::Enrollment) -> usize,
+    keys: &mut dyn irlume_core::template_key::TemplateKeySource,
+    secondary_enabled: bool,
+) -> Result<IrOnlyResolution, IrOnlyRefusal> {
+    use irlume_common::IrOnlyReadiness as Ready;
+    use irlume_core::multi_camera::coordinator::{PinError, SecondaryAuthContext};
+    let irlume_core::storage::PrimarySnapshot {
+        enrollment, bytes, ..
+    } = primary;
+    // Today's primary readiness, in its order: account policy on the real
+    // primary, then the binding, then the compatible templates. Only a
+    // binding mismatch goes on to the secondary store.
+    let primary_readiness = enrollment_readiness(
+        &enrollment,
+        Some(rgb),
+        ir,
+        compatible_templates(&enrollment),
+    );
+    match primary_readiness {
+        Ready::ReadyForExperimentalAttempt => {
+            return Ok(IrOnlyResolution {
+                scope: IrOnlyScope::Primary {
+                    path: stores.primary_path.to_owned(),
+                    digest: irlume_common::sha256_hex(&bytes),
+                },
+                enrollment,
+            });
+        }
+        Ready::BindingMismatch => {}
+        Ready::IncompatibleEnrollment if legacy_eye_policy(&enrollment).is_ok() => {
+            return Err(IrOnlyRefusal {
+                readiness: Ready::IncompatibleEnrollment,
+                scope: Some(irlume_common::IrScope::Primary),
+                scope_index: None,
+            });
+        }
+        other => return Err(IrOnlyRefusal::unscoped(other)),
+    }
+    if !stores.secondary_path.exists() {
+        return Err(IrOnlyRefusal::unscoped(Ready::BindingMismatch));
+    }
+    let pinned = SecondaryAuthContext::pin_strict_with_source(
+        stores.secondary_path,
+        stores.primary_path,
+        &enrollment,
+        &bytes,
+        rgb,
+        ir,
+        keys,
+    );
+    let context = match pinned {
+        Ok(context) => context,
+        Err(PinError::GroupInactive(cause)) => {
+            irlume_common::dlog!("ir-only: secondary group inactive: {cause}");
+            return Err(IrOnlyRefusal::secondary(Ready::SecondaryInactive, None));
+        }
+        Err(error) => {
+            // No strict match, an ambiguous store or an unusable one: the
+            // binding-mismatch refusal answers, never store order.
+            irlume_common::dlog!("ir-only: secondary pin refused: {error}");
+            return Err(IrOnlyRefusal::unscoped(Ready::BindingMismatch));
+        }
+    };
+    let index = Some(context.store_index() + 1);
+    if !secondary_enabled {
+        return Err(IrOnlyRefusal::secondary(Ready::SecondaryUnvalidated, index));
+    }
+    let scoped = context.group_view().matching_enrollment(stores.user);
+    if compatible_templates(&scoped) == 0 {
+        return Err(IrOnlyRefusal::secondary(
+            Ready::IncompatibleEnrollment,
+            index,
+        ));
+    }
+    Ok(IrOnlyResolution {
+        enrollment: scoped,
+        scope: IrOnlyScope::Secondary(context),
+    })
 }
 
 fn model_readiness(
@@ -402,7 +669,7 @@ mod tests {
         use irlume_core::storage::{CameraBinding, Enrollment};
         let mut enrollment = Enrollment::new("synthetic");
         assert_eq!(
-            enrollment_readiness(&enrollment, "target", 1),
+            enrollment_readiness(&enrollment, None, "target", 1),
             Ready::BindingUnavailable
         );
         enrollment.camera_binding = Some(CameraBinding {
@@ -410,28 +677,641 @@ mod tests {
             ir: None,
         });
         assert_eq!(
-            enrollment_readiness(&enrollment, "target", 1),
+            enrollment_readiness(&enrollment, None, "target", 1),
             Ready::BindingUnavailable
         );
         enrollment.camera_binding.as_mut().unwrap().ir = Some("different".into());
         assert_eq!(
-            enrollment_readiness(&enrollment, "target", 1),
+            enrollment_readiness(&enrollment, None, "target", 1),
             Ready::BindingMismatch
         );
         enrollment.camera_binding.as_mut().unwrap().ir = Some("target".into());
         assert_eq!(
-            enrollment_readiness(&enrollment, "target", 0),
+            enrollment_readiness(&enrollment, None, "target", 0),
             Ready::IncompatibleEnrollment
         );
         assert_eq!(
-            enrollment_readiness(&enrollment, "target", 1),
+            enrollment_readiness(&enrollment, None, "target", 1),
             Ready::ReadyForExperimentalAttempt
         );
         enrollment.require_eyes_open = true;
         assert_eq!(
-            enrollment_readiness(&enrollment, "target", 1),
+            enrollment_readiness(&enrollment, None, "target", 1),
             Ready::IncompatibleEnrollment
         );
+    }
+
+    /// ADR-0028 fixtures: a primary bound to (RGB-P, IR-P) and a secondary
+    /// store beside it, at paths under a private temp dir. Nothing reads
+    /// the state dir or the environment.
+    mod adr28 {
+        use super::super::*;
+        use irlume_core::multi_camera::{
+            CameraGroupId, GroupPair, SecondaryGroup, SecondaryProfileScans, SecondaryStore,
+            SECONDARY_STORE_VERSION,
+        };
+        use irlume_core::storage::{CameraBinding, Enrollment, FaceProfile, FaceScan};
+        use irlume_core::template_key::RequestTemplateKey;
+        use std::path::{Path, PathBuf};
+
+        pub(super) const USER: &str = "alice";
+        pub(super) const RGB_P: &str = "046d:085e:P";
+        pub(super) const IR_P: &str = "046d:085e:P-ir";
+        pub(super) const RGB_A: &str = "1bcf:28c4:A";
+        pub(super) const RGB_B: &str = "1bcf:28c4:B";
+        pub(super) const IR_X: &str = "1bcf:28c4:X-ir";
+
+        pub(super) struct Rig {
+            pub(super) dir: PathBuf,
+        }
+
+        impl Rig {
+            pub(super) fn new(tag: &str) -> Self {
+                let dir = std::env::temp_dir()
+                    .join(format!("irlume-auth-adr28-{tag}-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).expect("dir");
+                Self { dir }
+            }
+
+            pub(super) fn primary_path(&self) -> PathBuf {
+                self.dir.join(format!("{USER}.json"))
+            }
+
+            pub(super) fn secondary_path(&self) -> PathBuf {
+                self.dir.join("cameras").join(format!("{USER}.json"))
+            }
+
+            pub(super) fn stores(&self) -> (PathBuf, PathBuf) {
+                (self.primary_path(), self.secondary_path())
+            }
+
+            /// Writes the primary (plaintext, or sealed under `key`) and
+            /// returns its exact bytes.
+            pub(super) fn write_primary(
+                &self,
+                enrollment: &Enrollment,
+                key: Option<&[u8]>,
+            ) -> Vec<u8> {
+                let bytes = irlume_core::storage::serialize_enrollment(enrollment, key)
+                    .expect("primary bytes");
+                std::fs::write(self.primary_path(), &bytes).expect("primary write");
+                bytes
+            }
+
+            /// Writes a secondary store activated against `primary_bytes`.
+            pub(super) fn write_secondary(
+                &self,
+                groups: Vec<SecondaryGroup>,
+                primary_bytes: &[u8],
+                key: Option<&[u8]>,
+            ) {
+                let store = SecondaryStore {
+                    format_version: SECONDARY_STORE_VERSION,
+                    owner: USER.into(),
+                    generation: 1,
+                    primary_snapshot_sha256: irlume_common::sha256_hex(primary_bytes),
+                    groups,
+                };
+                std::fs::create_dir_all(self.secondary_path().parent().unwrap()).unwrap();
+                let key = key.map(<[u8]>::to_vec);
+                irlume_core::multi_camera::save_secondary_resolved(
+                    &self.secondary_path(),
+                    &store,
+                    move |_| {
+                        Ok(key
+                            .clone()
+                            .map(irlume_core::template_key::UnsealedKey::from))
+                    },
+                )
+                .expect("secondary write");
+            }
+        }
+
+        impl Drop for Rig {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        pub(super) fn scan(pitch: f32, with_ir: bool) -> FaceScan {
+            FaceScan {
+                name: "s".into(),
+                rgb: vec![0.5; 8],
+                ir: with_ir.then(|| vec![0.25; 4]),
+                ir_space: Some("raw".into()),
+                embed_space: Some("embed:test".into()),
+                ir_center_edge_ratio: 2.0,
+                ir_brightness: 1.0,
+                pitch,
+            }
+        }
+
+        pub(super) fn primary() -> Enrollment {
+            Enrollment {
+                user: USER.into(),
+                profiles: vec![FaceProfile {
+                    name: "main".into(),
+                    scans: vec![scan(0.1, true), scan(0.12, true), scan(0.14, true)],
+                    ir_calib: None,
+                    ir_calibs: Default::default(),
+                }],
+                camera_binding: Some(CameraBinding {
+                    rgb: Some(RGB_P.into()),
+                    ir: Some(IR_P.into()),
+                }),
+                ..Enrollment::default()
+            }
+        }
+
+        pub(super) fn group(
+            id: &str,
+            rgb: Option<&str>,
+            ir: Option<&str>,
+            pitch: f32,
+            with_ir: bool,
+        ) -> SecondaryGroup {
+            SecondaryGroup {
+                id: CameraGroupId::new(id.into()).unwrap(),
+                pair: GroupPair {
+                    rgb: rgb.map(str::to_owned),
+                    ir: ir.map(str::to_owned),
+                },
+                profiles: vec![SecondaryProfileScans {
+                    ir_calibs: Default::default(),
+                    profile: "main".into(),
+                    scans: vec![scan(pitch, with_ir), scan(pitch, with_ir)],
+                }],
+            }
+        }
+
+        /// The recognizer stand-in: every scan carrying an IR template is
+        /// compatible.
+        pub(super) fn compatible(enrollment: &Enrollment) -> usize {
+            enrollment
+                .profiles
+                .iter()
+                .flat_map(|profile| profile.scans.iter())
+                .filter(|scan| scan.ir.is_some())
+                .count()
+        }
+
+        pub(super) fn snapshot(
+            enrollment: Enrollment,
+            bytes: &[u8],
+            key: Option<&[u8]>,
+        ) -> irlume_core::storage::PrimarySnapshot {
+            irlume_core::storage::PrimarySnapshot {
+                enrollment,
+                key: key.map(|key| irlume_core::template_key::UnsealedKey::from(key.to_vec())),
+                bytes: bytes.to_vec(),
+            }
+        }
+
+        pub(super) fn resolve(
+            rig: &Rig,
+            enrollment: Enrollment,
+            bytes: &[u8],
+            pair: (&str, &str),
+            keys: &mut RequestTemplateKey,
+            enabled: bool,
+        ) -> Result<IrOnlyResolution, IrOnlyRefusal> {
+            let (primary_path, secondary_path) = rig.stores();
+            resolve_ir_only_scope_at(
+                &IrOnlyStores {
+                    user: USER,
+                    primary_path: &primary_path,
+                    secondary_path: &secondary_path,
+                },
+                snapshot(enrollment, bytes, None),
+                pair,
+                &compatible,
+                keys,
+                enabled,
+            )
+        }
+
+        pub(super) fn readiness(
+            result: &Result<IrOnlyResolution, IrOnlyRefusal>,
+        ) -> irlume_common::IrOnlyReadiness {
+            match result {
+                Ok(_) => irlume_common::IrOnlyReadiness::ReadyForExperimentalAttempt,
+                Err(refusal) => refusal.readiness,
+            }
+        }
+
+        pub(super) fn no_key() -> RequestTemplateKey {
+            RequestTemplateKey::with_unsealer(|_| Ok(None))
+        }
+
+        pub(super) fn digest_of(path: &Path) -> String {
+            irlume_common::sha256_hex(&std::fs::read(path).unwrap())
+        }
+    }
+
+    /// ADR-0028 acceptance: resolution, pure.
+    #[test]
+    fn ir_only_scope_resolves_the_primary_before_any_secondary_group() {
+        use adr28::*;
+        use irlume_common::IrScope;
+        let rig = Rig::new("primary-first");
+        let bytes = rig.write_primary(&primary(), None);
+        rig.write_secondary(
+            vec![group("desk", Some(RGB_P), Some(IR_P), 0.5, true)],
+            &bytes,
+            None,
+        );
+        // The primary's own pair resolves to the primary even when a group
+        // duplicates it.
+        let resolution =
+            resolve(&rig, primary(), &bytes, (RGB_P, IR_P), &mut no_key(), true).expect("primary");
+        assert_eq!(resolution.scope.report(), (IrScope::Primary, None));
+        match &resolution.scope {
+            IrOnlyScope::Primary { path, digest } => {
+                assert_eq!(path, &rig.primary_path());
+                assert_eq!(digest, &irlume_common::sha256_hex(&bytes));
+            }
+            IrOnlyScope::Secondary(_) => panic!("primary scope expected"),
+        }
+        assert_eq!(resolution.enrollment.profiles[0].scans[0].pitch, 0.1);
+        // An unbound primary is BindingUnavailable, as today; no group is
+        // consulted.
+        let mut unbound = primary();
+        unbound.camera_binding = None;
+        let unbound_bytes = rig.write_primary(&unbound, None);
+        assert_eq!(
+            readiness(&resolve(
+                &rig,
+                unbound,
+                &unbound_bytes,
+                (RGB_P, IR_P),
+                &mut no_key(),
+                true
+            )),
+            irlume_common::IrOnlyReadiness::BindingUnavailable
+        );
+        // A bound primary whose IR templates the recognizer cannot score is
+        // IncompatibleEnrollment in the primary scope.
+        let mut foreign = primary();
+        for scan in &mut foreign.profiles[0].scans {
+            scan.ir = None;
+        }
+        let foreign_bytes = rig.write_primary(&foreign, None);
+        let refusal = resolve(
+            &rig,
+            foreign,
+            &foreign_bytes,
+            (RGB_P, IR_P),
+            &mut no_key(),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal.readiness,
+            irlume_common::IrOnlyReadiness::IncompatibleEnrollment
+        );
+        assert_eq!(refusal.scope, Some(IrScope::Primary));
+    }
+
+    #[test]
+    fn ir_only_scope_resolves_a_strict_secondary_match_to_its_group_only() {
+        use adr28::*;
+        use irlume_common::{IrOnlyReadiness as Ready, IrScope};
+        let rig = Rig::new("strict");
+        let bytes = rig.write_primary(&primary(), None);
+        // Two groups share IR-X with different RGB sides (ADR-0024 permits
+        // shared endpoints); a one-sided (None, IR-X) group sits beside them.
+        rig.write_secondary(
+            vec![
+                group("a", Some(RGB_A), Some(IR_X), 0.5, true),
+                group("b", Some(RGB_B), Some(IR_X), 0.7, true),
+                group("one-sided", None, Some(IR_X), 0.9, true),
+            ],
+            &bytes,
+            None,
+        );
+        // The configured pair naming group B resolves to B: position 2,
+        // scoring B's scans and nothing of the primary's.
+        let resolution =
+            resolve(&rig, primary(), &bytes, (RGB_B, IR_X), &mut no_key(), true).expect("group b");
+        assert_eq!(resolution.scope.report(), (IrScope::Secondary, Some(2)));
+        let pitches: Vec<f32> = resolution.enrollment.profiles[0]
+            .scans
+            .iter()
+            .map(|scan| scan.pitch)
+            .collect();
+        assert_eq!(pitches, vec![0.7, 0.7]);
+        assert_eq!(resolution.enrollment.profiles.len(), 1);
+        // Naming group A resolves to A, never the one-sided group.
+        let resolution =
+            resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key(), true).expect("group a");
+        assert_eq!(resolution.scope.report(), (IrScope::Secondary, Some(1)));
+        // A configured pair carrying only the IR identity, or an RGB side no
+        // group has, is BindingMismatch: the one-sided group never wildcards
+        // and store order never decides.
+        for pair in [("", IR_X), ("046d:0000:other", IR_X)] {
+            let refusal = resolve(&rig, primary(), &bytes, pair, &mut no_key(), true).unwrap_err();
+            assert_eq!(refusal.readiness, Ready::BindingMismatch, "{pair:?}");
+            assert_eq!(refusal.scope, None);
+        }
+        // No group at all for the pair: BindingMismatch.
+        assert_eq!(
+            readiness(&resolve(
+                &rig,
+                primary(),
+                &bytes,
+                (RGB_A, "0000:0000:none"),
+                &mut no_key(),
+                true
+            )),
+            Ready::BindingMismatch
+        );
+    }
+
+    #[test]
+    fn ir_only_scope_refuses_duplicate_pairs_and_an_absent_store() {
+        use adr28::*;
+        use irlume_common::IrOnlyReadiness as Ready;
+        let rig = Rig::new("duplicates");
+        let bytes = rig.write_primary(&primary(), None);
+        // No store: the binding mismatch answers.
+        assert_eq!(
+            readiness(&resolve(
+                &rig,
+                primary(),
+                &bytes,
+                (RGB_A, IR_X),
+                &mut no_key(),
+                true
+            )),
+            Ready::BindingMismatch
+        );
+        // Two groups with identical pairs: ambiguous, refused as
+        // BindingMismatch rather than resolved by store order.
+        rig.write_secondary(
+            vec![
+                group("first", Some(RGB_A), Some(IR_X), 0.5, true),
+                group("second", Some(RGB_A), Some(IR_X), 0.7, true),
+            ],
+            &bytes,
+            None,
+        );
+        let refusal =
+            resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key(), true).unwrap_err();
+        assert_eq!(refusal.readiness, Ready::BindingMismatch);
+        assert_eq!(refusal.scope, None);
+    }
+
+    #[test]
+    fn ir_only_scope_reports_inactive_unvalidated_and_incompatible_groups() {
+        use adr28::*;
+        use irlume_common::{IrOnlyReadiness as Ready, IrScope};
+        let rig = Rig::new("causes");
+        let bytes = rig.write_primary(&primary(), None);
+        rig.write_secondary(
+            vec![
+                group("a", Some(RGB_A), Some(IR_X), 0.5, true),
+                group("no-ir", Some(RGB_B), Some(IR_X), 0.7, false),
+            ],
+            &bytes,
+            None,
+        );
+        // The Phase 1 gate: a matched, active group without the validation
+        // hook is SecondaryUnvalidated, named with its position.
+        let refusal =
+            resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key(), false).unwrap_err();
+        assert_eq!(refusal.readiness, Ready::SecondaryUnvalidated);
+        assert_eq!(
+            (refusal.scope, refusal.scope_index),
+            (Some(IrScope::Secondary), Some(1))
+        );
+        // A matched group whose IR view is empty is IncompatibleEnrollment,
+        // as the primary would be.
+        let refusal =
+            resolve(&rig, primary(), &bytes, (RGB_B, IR_X), &mut no_key(), true).unwrap_err();
+        assert_eq!(refusal.readiness, Ready::IncompatibleEnrollment);
+        assert_eq!(
+            (refusal.scope, refusal.scope_index),
+            (Some(IrScope::Secondary), Some(2))
+        );
+        // The primary changed since the store was authorized: the exact
+        // group is found but the store is inactive.
+        let mut changed = primary();
+        changed.profiles[0].scans.push(scan(0.3, true));
+        let changed_bytes = rig.write_primary(&changed, None);
+        let refusal = resolve(
+            &rig,
+            changed,
+            &changed_bytes,
+            (RGB_A, IR_X),
+            &mut no_key(),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(refusal.readiness, Ready::SecondaryInactive);
+        assert_eq!(refusal.scope, Some(IrScope::Secondary));
+    }
+
+    /// ADR-0028 §2: account policy is checked on the REAL primary before the
+    /// scoped view exists, so a legacy enrollment is IncompatibleEnrollment
+    /// on the secondary scope exactly as on the primary.
+    #[test]
+    fn ir_only_scope_applies_account_policy_to_the_real_primary_for_every_scope() {
+        use adr28::*;
+        use irlume_common::IrOnlyReadiness as Ready;
+        let rig = Rig::new("legacy-policy");
+        let mut legacy = primary();
+        legacy.require_eyes_open = true;
+        let bytes = rig.write_primary(&legacy, None);
+        rig.write_secondary(
+            vec![group("a", Some(RGB_A), Some(IR_X), 0.5, true)],
+            &bytes,
+            None,
+        );
+        assert!(legacy_eye_policy(&legacy).is_err());
+        for pair in [(RGB_P, IR_P), (RGB_A, IR_X)] {
+            let refusal =
+                resolve(&rig, legacy.clone(), &bytes, pair, &mut no_key(), true).unwrap_err();
+            assert_eq!(refusal.readiness, Ready::IncompatibleEnrollment, "{pair:?}");
+            assert_eq!(refusal.scope, None, "refused before any scope resolved");
+        }
+    }
+
+    /// ADR-0028 §4: the grant boundary for both scopes.
+    #[test]
+    fn ir_only_grant_boundary_refuses_any_store_change_for_both_scopes() {
+        use adr28::*;
+        let rig = Rig::new("boundary");
+        let bytes = rig.write_primary(&primary(), None);
+        rig.write_secondary(
+            vec![group("a", Some(RGB_A), Some(IR_X), 0.5, true)],
+            &bytes,
+            None,
+        );
+        let primary_scope = resolve(&rig, primary(), &bytes, (RGB_P, IR_P), &mut no_key(), true)
+            .expect("primary")
+            .scope;
+        let secondary_scope = resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key(), true)
+            .expect("secondary")
+            .scope;
+        // Unchanged stores grant.
+        assert!(primary_scope.boundary_refusal(&mut no_key()).is_none());
+        assert!(secondary_scope.boundary_refusal(&mut no_key()).is_none());
+        // Removing the group refuses the secondary scope; the primary scope
+        // never reads the secondary store.
+        rig.write_secondary(
+            vec![group("b", Some(RGB_B), Some(IR_X), 0.7, true)],
+            &bytes,
+            None,
+        );
+        let refusal = secondary_scope
+            .boundary_refusal(&mut no_key())
+            .expect("group removed");
+        assert!(!refusal.granted);
+        assert_eq!(refusal.kind, OutcomeKind::OtherDeny);
+        assert!(primary_scope.boundary_refusal(&mut no_key()).is_none());
+        // Replacing the store with one holding the same group under a new
+        // generation refuses too: the pin is the generation, not the id.
+        rig.write_secondary(
+            vec![group("a", Some(RGB_A), Some(IR_X), 0.5, true)],
+            &bytes,
+            None,
+        );
+        let mut replaced = irlume_core::multi_camera::load_secondary(&rig.secondary_path())
+            .unwrap()
+            .unwrap();
+        replaced.generation += 1;
+        irlume_core::multi_camera::save_secondary_resolved(
+            &rig.secondary_path(),
+            &replaced,
+            |_| Ok(None),
+        )
+        .unwrap();
+        assert_eq!(
+            secondary_scope
+                .boundary_refusal(&mut no_key())
+                .map(|o| o.kind),
+            Some(OutcomeKind::OtherDeny)
+        );
+        // Changing the primary file refuses BOTH scopes: the secondary store
+        // deactivates and the primary digest no longer matches.
+        let mut changed = primary();
+        changed.profiles[0].scans.push(scan(0.3, true));
+        let changed_bytes = rig.write_primary(&changed, None);
+        assert_ne!(
+            digest_of(&rig.primary_path()),
+            irlume_common::sha256_hex(&bytes)
+        );
+        rig.write_secondary(
+            vec![group("a", Some(RGB_A), Some(IR_X), 0.5, true)],
+            &changed_bytes,
+            None,
+        );
+        let refusal = primary_scope
+            .boundary_refusal(&mut no_key())
+            .expect("primary changed");
+        assert_eq!(refusal.kind, OutcomeKind::OtherDeny);
+        assert!(
+            refusal.reason.contains("enrollment changed"),
+            "{}",
+            refusal.reason
+        );
+        assert_eq!(
+            secondary_scope
+                .boundary_refusal(&mut no_key())
+                .map(|o| o.kind),
+            Some(OutcomeKind::OtherDeny)
+        );
+        // Removing the primary during capture refuses the primary scope
+        // with its own cause, and never as an unreadable-store error.
+        std::fs::remove_file(rig.primary_path()).unwrap();
+        let refusal = primary_scope
+            .boundary_refusal(&mut no_key())
+            .expect("primary removed");
+        assert_eq!(refusal.kind, OutcomeKind::OtherDeny);
+        assert!(refusal.reason.contains("removed"), "{}", refusal.reason);
+    }
+
+    /// ADR-0028 §5: with the load's key adopted, resolution and the boundary
+    /// borrow it and the request never unseals; without adoption the request
+    /// unseals exactly once for both.
+    #[test]
+    fn ir_only_secondary_scope_unseals_the_request_key_at_most_once() {
+        use adr28::*;
+        use irlume_core::template_key::RequestTemplateKey;
+        let rig = Rig::new("one-unseal");
+        let key = irlume_core::crypto::generate_key();
+        let bytes = rig.write_primary(&primary(), Some(&key));
+        rig.write_secondary(
+            vec![group("a", Some(RGB_A), Some(IR_X), 0.5, true)],
+            &bytes,
+            Some(&key),
+        );
+        let counting = || {
+            let key = key.clone();
+            RequestTemplateKey::with_unsealer(move |user| {
+                assert_eq!(user, USER);
+                Ok(Some(key.clone()))
+            })
+        };
+        let (primary_path, secondary_path) = rig.stores();
+        let stores = IrOnlyStores {
+            user: USER,
+            primary_path: &primary_path,
+            secondary_path: &secondary_path,
+        };
+        // Adopted from the load, as the authentication path and the
+        // preflight both do: zero unseals through the request source.
+        let mut adopted = counting();
+        adopted.adopt(USER, Some(key.clone()));
+        let resolution = resolve_ir_only_scope_at(
+            &stores,
+            snapshot(primary(), &bytes, Some(&key)),
+            (RGB_A, IR_X),
+            &compatible,
+            &mut adopted,
+            true,
+        )
+        .expect("secondary");
+        assert!(resolution.scope.boundary_refusal(&mut adopted).is_none());
+        assert_eq!(adopted.unseals(), 0);
+        // Not adopted: one unseal serves the store read and the boundary.
+        let mut lazy = counting();
+        let resolution = resolve_ir_only_scope_at(
+            &stores,
+            snapshot(primary(), &bytes, Some(&key)),
+            (RGB_A, IR_X),
+            &compatible,
+            &mut lazy,
+            true,
+        )
+        .expect("secondary");
+        assert!(resolution.scope.boundary_refusal(&mut lazy).is_none());
+        assert_eq!(lazy.unseals(), 1);
+    }
+
+    #[test]
+    fn ir_only_readiness_wire_mapping_keeps_the_pre_change_vocabulary() {
+        use irlume_common::IrOnlyReadiness as Ready;
+        for (detail, compatible) in [
+            (Ready::SecondaryInactive, Ready::BindingMismatch),
+            (Ready::SecondaryUnvalidated, Ready::BindingMismatch),
+            (Ready::Unknown, Ready::BindingMismatch),
+            (Ready::BindingMismatch, Ready::BindingMismatch),
+            (
+                Ready::ReadyForExperimentalAttempt,
+                Ready::ReadyForExperimentalAttempt,
+            ),
+            (Ready::IncompatibleEnrollment, Ready::IncompatibleEnrollment),
+        ] {
+            assert_eq!(detail.wire_compatible(), compatible);
+        }
+        assert!(readiness_refusal(Ready::SecondaryInactive)
+            .reason
+            .contains("inactive since the primary enrollment changed"));
+        assert!(readiness_refusal(Ready::SecondaryUnvalidated)
+            .reason
+            .contains("not yet validated"));
     }
 
     #[test]
@@ -942,6 +1822,13 @@ fn readiness_refusal(readiness: irlume_common::IrOnlyReadiness) -> Outcome {
         Ready::BindingMismatch => {
             "IR camera differs from enrollment; re-enroll on this camera or use your password"
         }
+        Ready::SecondaryInactive => {
+            "this camera's authorization is inactive since the primary enrollment changed; \
+             remove your added cameras and add back the ones you use, or use your password"
+        }
+        Ready::SecondaryUnvalidated => {
+            "IR-only on additional cameras is not yet validated on this build; use your password"
+        }
         Ready::ModelsUnavailable => "required IR model is unavailable; use your password",
         Ready::PadUnavailable => "required IR PAD model is unavailable; use your password",
         Ready::EnrollmentUnavailable => "IR enrollment is unavailable; enroll or use your password",
@@ -985,15 +1872,30 @@ impl Engine {
         )
     }
 
-    fn ir_enrollment_readiness(
+    fn compatible_ir_templates(&self, enrollment: &irlume_core::storage::Enrollment) -> usize {
+        self.ir_match(enrollment, &[0.0; EMBED_DIM]).n_templates
+    }
+
+    /// Resolve the configured pair to the scope an IR-only attempt scores
+    /// against (ADR-0028 §1-3), reading the account's stores through `keys`.
+    fn resolve_ir_only_scope(
         &self,
-        enrollment: &irlume_core::storage::Enrollment,
+        user: &str,
+        primary: irlume_core::storage::PrimarySnapshot,
         target: &irlume_camera::IrCaptureTarget,
-    ) -> irlume_common::IrOnlyReadiness {
-        enrollment_readiness(
-            enrollment,
-            target.identity(),
-            self.ir_match(enrollment, &[0.0; EMBED_DIM]).n_templates,
+        keys: &mut dyn irlume_core::template_key::TemplateKeySource,
+    ) -> Result<IrOnlyResolution, IrOnlyRefusal> {
+        resolve_ir_only_scope_at(
+            &IrOnlyStores {
+                user,
+                primary_path: &irlume_core::multi_camera::primary_enrollment_path(user),
+                secondary_path: &irlume_core::multi_camera::secondary_store_path(user),
+            },
+            primary,
+            (target.rgb_identity(), target.identity()),
+            &|enrollment| self.compatible_ir_templates(enrollment),
+            keys,
+            secondary_route_enabled(),
         )
     }
 
@@ -1005,7 +1907,7 @@ impl Engine {
         window: AuthenticationWindow,
         read_only: bool,
         diagnostics: Option<&dyn irlume_common::diagnostics::DiagnosticSink>,
-    ) -> irlume_common::Result<Option<irlume_core::storage::Enrollment>> {
+    ) -> irlume_common::Result<Option<irlume_core::storage::PrimarySnapshot>> {
         self.check_authentication_completion(window)?;
         // This route dispatches before the dual-sensor loader's timing site.
         // Include resolution and any cancellation drain, but not a request
@@ -1018,14 +1920,13 @@ impl Engine {
         std::thread::Builder::new()
             .name("irlume-ir-enrollment".into())
             .spawn(move || {
-                // The IR-only path keeps no request key: it lends nothing
-                // to later readers, so the load's key is not retained.
+                // The snapshot keeps the key and the bytes: the caller
+                // adopts the key into its request source and pins the
+                // scope by the bytes (ADR-0028 §4-5).
                 let loaded = if read_only {
-                    irlume_core::storage::load_read_only(&user)
-                        .map(|loaded| loaded.map(|enrollment| (enrollment, None)))
+                    irlume_core::storage::load_snapshot_read_only(&user)
                 } else {
-                    irlume_core::storage::load_with_key(&user)
-                        .map(|loaded| loaded.map(|(enrollment, _)| (enrollment, None)))
+                    irlume_core::storage::load_snapshot(&user)
                 };
                 let _ = sender.send(loaded);
             })
@@ -1052,7 +1953,7 @@ impl Engine {
         loader.receiver.take();
         self.check_authentication_completion(window)?;
         match loaded {
-            Ok((enrollment, _)) => Ok(Some(enrollment)),
+            Ok(snapshot) => Ok(Some(snapshot)),
             Err(LoaderExit::NotEnrolled) => Ok(None),
             Err(LoaderExit::Fallback(error)) => Err(error),
         }
@@ -1062,30 +1963,29 @@ impl Engine {
     /// changing enrollment. Template-key unseal may be needed for protected data.
     /// Readiness does not establish capture latency, identity or qualification.
     pub fn ir_only_preflight(&self, user: &str) -> irlume_common::IrOnlyReadiness {
-        self.ir_only_preflight_details(user).0
+        self.ir_only_preflight_details(user).readiness
     }
 
     /// Preserve the closed target-refusal cause without repeating resolution or
-    /// exposing driver/path error strings. This never discovers or opens a camera.
-    pub fn ir_only_preflight_details(
-        &self,
-        user: &str,
-    ) -> (
-        irlume_common::IrOnlyReadiness,
-        Option<irlume_common::IrTargetIssue>,
-    ) {
+    /// exposing driver/path error strings, and name the scope the configured
+    /// pair resolved to (ADR-0028 §3). This never discovers or opens a camera.
+    /// Not an authentication request: the key its read-only load unsealed is
+    /// lent to the secondary store read for this call only (§5).
+    pub fn ir_only_preflight_details(&self, user: &str) -> IrOnlyPreflight {
         use irlume_common::IrOnlyReadiness as Ready;
         use irlume_common::IrTargetIssue as Issue;
         let window = AuthenticationWindow::new(GRACE_WINDOW_MS);
         let target = match irlume_camera::configured_ir_target() {
             Ok(target) => target,
-            Err(error) => return (Ready::TargetUnavailable, Some(target_issue(&error))),
+            Err(error) => {
+                return IrOnlyPreflight::target(Ready::TargetUnavailable, target_issue(&error))
+            }
         };
         if !selected_ir_available(target.endpoint()) {
-            return (Ready::TargetUnavailable, Some(Issue::Unavailable));
+            return IrOnlyPreflight::target(Ready::TargetUnavailable, Issue::Unavailable);
         }
         if let Err(error) = target.validate() {
-            return (Ready::TargetUnavailable, Some(target_issue(&error)));
+            return IrOnlyPreflight::target(Ready::TargetUnavailable, target_issue(&error));
         }
         if let Some(refusal) = model_readiness(
             true,
@@ -1093,16 +1993,29 @@ impl Engine {
             self.has_ir_adapter(),
             self.has_pad_ir(),
         ) {
-            return (refusal, None);
+            return IrOnlyPreflight::unscoped(refusal);
         }
-        let enrollment = match self.load_ir_enrollment(user, window, true, None) {
-            Ok(Some(enrollment)) => enrollment,
-            _ => return (Ready::EnrollmentUnavailable, None),
+        let snapshot = match self.load_ir_enrollment(user, window, true, None) {
+            Ok(Some(snapshot)) => snapshot,
+            _ => return IrOnlyPreflight::unscoped(Ready::EnrollmentUnavailable),
         };
         if self.check_authentication_completion(window).is_err() {
-            return (Ready::Unavailable, None);
+            return IrOnlyPreflight::unscoped(Ready::Unavailable);
         }
-        (self.ir_enrollment_readiness(&enrollment, &target), None)
+        let mut keys = irlume_core::template_key::RequestTemplateKey::production();
+        keys.adopt(user, snapshot.key.clone());
+        match self.resolve_ir_only_scope(user, snapshot, &target, &mut keys) {
+            Ok(resolution) => {
+                let (scope, scope_index) = resolution.scope.report();
+                IrOnlyPreflight {
+                    readiness: Ready::ReadyForExperimentalAttempt,
+                    target_issue: None,
+                    scope: Some(scope),
+                    scope_index,
+                }
+            }
+            Err(refusal) => refusal.into(),
+        }
     }
 
     pub(super) fn authenticate_ir_in_window(
@@ -1120,14 +2033,21 @@ impl Engine {
         if let Some(refusal) = self.ir_model_readiness(&target) {
             return Ok(readiness_refusal(refusal));
         }
-        let enrollment = match self.load_ir_enrollment(user, window, false, Some(diagnostics))? {
-            Some(enrollment) => enrollment,
+        let snapshot = match self.load_ir_enrollment(user, window, false, Some(diagnostics))? {
+            Some(snapshot) => snapshot,
             None => return Ok(readiness_refusal(Ready::EnrollmentUnavailable)),
         };
-        let readiness = self.ir_enrollment_readiness(&enrollment, &target);
-        if readiness != Ready::ReadyForExperimentalAttempt {
-            return Ok(readiness_refusal(readiness));
-        }
+        // The request key (ADR-0025 §3, ADR-0028 §5): the load's key is
+        // lent to the secondary store read and the grant boundary.
+        self.request_key().adopt(user, snapshot.key.clone());
+        let resolved = {
+            let mut keys = self.request_key();
+            self.resolve_ir_only_scope(user, snapshot, &target, &mut *keys)
+        };
+        let IrOnlyResolution { enrollment, scope } = match resolved {
+            Ok(resolution) => resolution,
+            Err(refusal) => return Ok(readiness_refusal(refusal.readiness)),
+        };
         self.check_request_active()?;
         let operation = match lease::acquire_camera_operation(
             &target.lease_endpoints(),
@@ -1152,6 +2072,7 @@ impl Engine {
                 (
                     engine.authenticate_ir_target_attempt(
                         &enrollment,
+                        &scope,
                         &target,
                         &operation,
                         diagnostics,
@@ -1168,6 +2089,7 @@ impl Engine {
     fn authenticate_ir_target_attempt(
         &mut self,
         enrollment: &irlume_core::storage::Enrollment,
+        scope: &IrOnlyScope,
         target: &irlume_camera::IrCaptureTarget,
         operation: &lease::CameraOperationSession,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
@@ -1205,7 +2127,19 @@ impl Engine {
         irlume_common::dlog!("experimental IR assessment elapsed {}ms", run.elapsed_ms);
         self.check_request_active()?;
         let outcome = match run.result {
-            Ok(assessment) => assessed_outcome(&assessment, enrollment, adapter),
+            Ok(assessment) => {
+                let outcome = assessed_outcome(&assessment, enrollment, adapter);
+                if outcome.granted {
+                    // The grant boundary (ADR-0028 §4): the stores the
+                    // attempt was pinned to must still be in that state at
+                    // the moment of the decision.
+                    scope
+                        .boundary_refusal(&mut *self.request_key())
+                        .unwrap_or(outcome)
+                } else {
+                    outcome
+                }
+            }
             Err(IrFailure::Cancelled) => {
                 return Err(irlume_common::Error::Preempted(
                     "authentication cancelled".into(),

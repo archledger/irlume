@@ -62,6 +62,15 @@ that prerequisites were observed. It does not establish capture timing, a usable
 login, or qualification. Missing prerequisites, old/unexpected daemon responses,
 and unknown readiness values fail to the password path.
 
+The configured pair resolves to the primary enrollment or, by exact equality of
+both camera identities, to one of the account's added cameras (ADR-0028); the
+preflight prints which (`scope: primary enrollment` or `scope: added camera
+#N`, the group's position in the store). An added camera whose authorization
+is inactive because the primary enrollment changed reports
+`secondary_inactive`: remove the added cameras and add back the ones you use.
+Until the route is validated on hardware, an added camera reports
+`secondary_unvalidated` and the attempt is refused.
+
 ## Bounded attempts and cleanup
 
 One monotonic authentication window covers engine setup, presence retries and

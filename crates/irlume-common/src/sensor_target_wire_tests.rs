@@ -28,6 +28,9 @@ fn target_detail_preserves_old_and_new_wire_readers() {
         ),
         ir_readiness: Some(IrOnlyReadiness::TargetUnavailable),
         ir_target_issue: Some(IrTargetIssue::Unconfigured),
+        ir_readiness_detail: None,
+        ir_scope: None,
+        ir_scope_index: None,
     };
     let wire = serde_json::to_string(&new).unwrap();
     let LegacyResponse::FaceSensorStatus {
@@ -56,8 +59,120 @@ fn ordinary_sensor_status_omits_absent_detail() {
         policy: config::FaceSensorPolicyObservation::DefaultDual,
         ir_readiness: None,
         ir_target_issue: None,
+        ir_readiness_detail: None,
+        ir_scope: None,
+        ir_scope_index: None,
     };
     let wire = serde_json::to_value(status).unwrap();
     assert_eq!(wire["FaceSensorStatus"].as_object().unwrap().len(), 2);
     assert!(wire["FaceSensorStatus"].get("ir_target_issue").is_none());
+}
+
+/// A frozen copy of the pre-ADR-0028 types: the readiness vocabulary had
+/// no fallback, so an unknown value rejected the whole status.
+mod frozen {
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum IrOnlyReadiness {
+        Unavailable,
+        ReadyForExperimentalAttempt,
+        InvalidPolicy,
+        TargetUnavailable,
+        BindingUnavailable,
+        BindingMismatch,
+        ModelsUnavailable,
+        PadUnavailable,
+        EnrollmentUnavailable,
+        IncompatibleEnrollment,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum IrTargetIssue {
+        Unconfigured,
+        Unavailable,
+        UnsupportedTopology,
+        BindingUnavailable,
+        Changed,
+        #[serde(other)]
+        Unknown,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub enum Response {
+        FaceSensorStatus {
+            policy: crate::config::FaceSensorPolicyObservation,
+            ir_readiness: Option<IrOnlyReadiness>,
+            #[serde(default)]
+            ir_target_issue: Option<IrTargetIssue>,
+        },
+    }
+}
+
+/// ADR-0028 §3: a new daemon's status for each new readiness value decodes
+/// with the pre-change types (`ir_readiness` reads `binding_mismatch`, the
+/// extra fields are ignored), and a new client reads the detail and the
+/// scope. A status carrying the new value in the OLD field would have been
+/// rejected outright, which is what the mapping prevents.
+#[test]
+fn secondary_readiness_decodes_with_pre_change_clients() {
+    let policy =
+        config::FaceSensorPolicyObservation::Explicit(config::FaceSensorPolicy::IrOnlyExperimental);
+    for detail in [
+        IrOnlyReadiness::SecondaryInactive,
+        IrOnlyReadiness::SecondaryUnvalidated,
+    ] {
+        let status = Response::FaceSensorStatus {
+            policy,
+            ir_readiness: Some(detail.wire_compatible()),
+            ir_target_issue: None,
+            ir_readiness_detail: Some(detail),
+            ir_scope: Some(IrScope::Secondary),
+            ir_scope_index: Some(2),
+        };
+        let wire = serde_json::to_string(&status).unwrap();
+        let frozen::Response::FaceSensorStatus {
+            policy: seen,
+            ir_readiness,
+            ir_target_issue,
+        } = serde_json::from_str(&wire).unwrap();
+        assert_eq!(seen, policy);
+        assert_eq!(ir_readiness, Some(frozen::IrOnlyReadiness::BindingMismatch));
+        assert_eq!(ir_target_issue, None);
+        // The unmapped value in the old field is exactly what an old client
+        // could not decode.
+        let unmapped = wire.replacen(
+            "\"binding_mismatch\"",
+            &format!(
+                "\"{}\"",
+                serde_json::to_string(&detail).unwrap().trim_matches('"')
+            ),
+            1,
+        );
+        assert!(serde_json::from_str::<frozen::Response>(&unmapped).is_err());
+        // A new client reads the detail and the scope.
+        assert!(matches!(
+            serde_json::from_str::<Response>(&wire).unwrap(),
+            Response::FaceSensorStatus {
+                ir_readiness: Some(IrOnlyReadiness::BindingMismatch),
+                ir_readiness_detail: Some(d),
+                ir_scope: Some(IrScope::Secondary),
+                ir_scope_index: Some(2),
+                ..
+            } if d == detail
+        ));
+    }
+    // A value neither side knows yet lands on the fallbacks, never on a
+    // rejected status.
+    let future = r#"{"FaceSensorStatus":{"policy":{"explicit":"ir-only-experimental"},"ir_readiness":"binding_mismatch","ir_readiness_detail":"later_cause","ir_scope":"tertiary","ir_scope_index":1}}"#;
+    assert!(matches!(
+        serde_json::from_str::<Response>(future).unwrap(),
+        Response::FaceSensorStatus {
+            ir_readiness_detail: Some(IrOnlyReadiness::Unknown),
+            ir_scope: Some(IrScope::Unknown),
+            ..
+        }
+    ));
 }

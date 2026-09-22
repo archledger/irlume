@@ -7,6 +7,26 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- The experimental IR-only policy resolves the configured camera pair against
+  the account's added cameras as the dual path does (ADR-0028, Phase 1). A
+  pair that matches an active secondary group by strict equality of both
+  sides scores against that group's own IR scans and calibrations; account
+  policy is checked on the real primary first, the primary keeps precedence,
+  and an ambiguous or one-sided match is still a binding mismatch. Immediately
+  before every IR-only grant the resolved store is re-read: the primary scope
+  requires the digest pinned at load, the secondary scope the dual path's
+  grant boundary under the request key, so a reset or removal during capture
+  refuses. `irlume auth sensor preflight` names the resolved scope (primary,
+  or an added camera by its position) and two new causes: the added camera's
+  store is inactive because the primary changed (`secondary_inactive`), and
+  the route is not yet validated on this build (`secondary_unvalidated`,
+  lifted only by `IRLUME_IR_ONLY_SECONDARY=1` in the daemon's environment
+  during hardware validation). On the wire `ir_readiness` keeps its old
+  vocabulary for older clients and the precise cause travels in
+  `ir_readiness_detail`; adding a camera into a store whose other groups are
+  inactive is refused until those are removed, so one addition can never
+  silently reactivate stale authorizations.
+
 - `release_probe` example in `irlume-camera`: arms a paired RGB+IR session
   through the crate's real paths and times the two stream releases
   separately, in either order, with an optional idle pause between rounds.

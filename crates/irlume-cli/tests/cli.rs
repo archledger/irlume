@@ -2447,6 +2447,9 @@ fn auth_sensor_preflight_accepts_selected_user_flag() {
         policy: irlume_common::config::FaceSensorPolicyObservation::DefaultDual,
         ir_readiness: Some(irlume_common::IrOnlyReadiness::Unavailable),
         ir_target_issue: None,
+        ir_readiness_detail: None,
+        ir_scope: None,
+        ir_scope_index: None,
     });
     let (_, _, err) = run(&mut sb.cmd(&["auth", "sensor", "preflight", "--user", "alice"]));
     let requests = requests.lock().unwrap();
@@ -2465,6 +2468,9 @@ fn auth_sensor_status_uses_daemon_observation_and_preflight_is_explicit() {
         Request::FaceSensorStatus { user } => Response::FaceSensorStatus {
             policy: FaceSensorPolicyObservation::Explicit(FaceSensorPolicy::IrOnlyExperimental),
             ir_target_issue: None,
+            ir_readiness_detail: None,
+            ir_scope: None,
+            ir_scope_index: None,
             ir_readiness: user
                 .as_ref()
                 .map(|_| irlume_common::IrOnlyReadiness::Unavailable),
@@ -2517,12 +2523,27 @@ fn auth_sensor_preflight_renders_each_readiness_without_exposing_the_account() {
             "pad-account" => IrOnlyReadiness::PadUnavailable,
             "enrollment-account" => IrOnlyReadiness::EnrollmentUnavailable,
             "incompatible-account" => IrOnlyReadiness::IncompatibleEnrollment,
+            // ADR-0028: a new daemon widens these to binding_mismatch in
+            // the old field and names the cause and scope beside it.
+            "inactive-account" => IrOnlyReadiness::SecondaryInactive,
+            "unvalidated-account" => IrOnlyReadiness::SecondaryUnvalidated,
             _ => return Response::Error("unknown fixture account".into()),
         };
+        let secondary = matches!(
+            ir_readiness,
+            IrOnlyReadiness::SecondaryInactive | IrOnlyReadiness::SecondaryUnvalidated
+        );
         Response::FaceSensorStatus {
             policy: FaceSensorPolicyObservation::Explicit(FaceSensorPolicy::IrOnlyExperimental),
-            ir_readiness: Some(ir_readiness),
+            ir_readiness: Some(ir_readiness.wire_compatible()),
             ir_target_issue: None,
+            ir_readiness_detail: Some(ir_readiness),
+            ir_scope: Some(if secondary {
+                irlume_common::IrScope::Secondary
+            } else {
+                irlume_common::IrScope::Primary
+            }),
+            ir_scope_index: secondary.then_some(2),
         }
     });
 
@@ -2540,7 +2561,11 @@ fn auth_sensor_preflight_renders_each_readiness_without_exposing_the_account() {
             false,
             "IR enrollment has no camera binding",
         ),
-        ("binding-mismatch-account", false, "different IR camera"),
+        (
+            "binding-mismatch-account",
+            false,
+            "neither the enrolled pair nor an added camera",
+        ),
         ("models-account", false, "face models are unavailable"),
         ("pad-account", false, "IR anti-spoofing is unavailable"),
         (
@@ -2549,6 +2574,16 @@ fn auth_sensor_preflight_renders_each_readiness_without_exposing_the_account() {
             "face enrollment is unavailable",
         ),
         ("incompatible-account", false, "compatible IR scans"),
+        (
+            "inactive-account",
+            false,
+            "inactive since the primary enrollment changed",
+        ),
+        (
+            "unvalidated-account",
+            false,
+            "not yet validated on this build",
+        ),
     ] {
         let (code, out, err) = run(&mut sb.cmd(&["auth", "sensor", "preflight", account]));
         assert_eq!(code == 0, success, "{account}: {out} {err}");
@@ -2559,6 +2594,13 @@ fn auth_sensor_preflight_renders_each_readiness_without_exposing_the_account() {
             rendered.contains("daemon observed: EXPERIMENTAL IR-only"),
             "{account}: {rendered}"
         );
+        // The scope line names the scope by ordinal only.
+        let scope = if account.starts_with("inactive") || account.starts_with("unvalidated") {
+            "scope: added camera #2"
+        } else {
+            "scope: primary enrollment"
+        };
+        assert!(rendered.contains(scope), "{account}: {rendered}");
         if success {
             assert!(rendered.contains("EXPERIMENTAL"), "{rendered}");
             assert!(rendered.contains("does not prove capture"), "{rendered}");
@@ -2567,7 +2609,7 @@ fn auth_sensor_preflight_renders_each_readiness_without_exposing_the_account() {
             assert!(rendered.contains("password"), "{account}: {rendered}");
         }
     }
-    assert_eq!(requests.lock().unwrap().len(), 10);
+    assert_eq!(requests.lock().unwrap().len(), 12);
 }
 
 #[test]
@@ -2579,6 +2621,9 @@ fn auth_sensor_preflight_fails_closed_for_missing_or_future_readiness() {
         policy: FaceSensorPolicyObservation::Explicit(FaceSensorPolicy::IrOnlyExperimental),
         ir_readiness: None,
         ir_target_issue: None,
+        ir_readiness_detail: None,
+        ir_scope: None,
+        ir_scope_index: None,
     });
     let (code, out, err) = run(&mut sb.cmd(&["auth", "sensor", "preflight", "missing-account"]));
     assert_ne!(code, 0, "{out} {err}");
@@ -2598,6 +2643,9 @@ fn auth_sensor_preflight_fails_closed_for_missing_or_future_readiness() {
             policy: FaceSensorPolicyObservation::Explicit(FaceSensorPolicy::IrOnlyExperimental),
             ir_readiness: Some(irlume_common::IrOnlyReadiness::Unavailable),
             ir_target_issue: None,
+            ir_readiness_detail: None,
+            ir_scope: None,
+            ir_scope_index: None,
         })
         .unwrap()
         .replace("unavailable", "future_readiness");
@@ -2605,7 +2653,10 @@ fn auth_sensor_preflight_fails_closed_for_missing_or_future_readiness() {
     });
     let (code, out, err) = run(&mut sb.cmd(&["auth", "sensor", "preflight", "future-account"]));
     assert_ne!(code, 0, "{out} {err}");
-    assert!(err.contains("could not establish"), "{out} {err}");
+    // ADR-0028: an unknown readiness no longer rejects the whole status; it
+    // decodes to the fallback and still fails closed, without echoing the
+    // value.
+    assert!(err.contains("does not know"), "{out} {err}");
     let rendered = format!("{out}{err}");
     assert!(!rendered.contains("future-account"), "{rendered}");
     assert!(!rendered.contains("future_readiness"), "{rendered}");
@@ -2665,6 +2716,9 @@ fn auth_sensor_target_details_are_actionable_and_do_not_upgrade_readiness() {
             policy: Seen::Explicit(Policy::IrOnlyExperimental),
             ir_readiness: Some(readiness),
             ir_target_issue: issue,
+            ir_readiness_detail: None,
+            ir_scope: None,
+            ir_scope_index: None,
         }
     });
     for (account, expected) in [
@@ -3304,6 +3358,9 @@ fn auth_sensor_preflight_requires_ir_policy_even_if_readiness_claims_ready() {
             policy,
             ir_readiness: Some(irlume_common::IrOnlyReadiness::ReadyForExperimentalAttempt),
             ir_target_issue: None,
+            ir_readiness_detail: None,
+            ir_scope: None,
+            ir_scope_index: None,
         }
     });
     for (account, expected) in [

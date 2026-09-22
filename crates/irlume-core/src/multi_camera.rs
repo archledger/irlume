@@ -474,6 +474,46 @@ impl SecondaryStore {
             .iter()
             .find(|group| group.pair.matches(live_rgb, live_ir))
     }
+
+    /// ADR-0028 strict-pair resolution: a group resolves only when BOTH of
+    /// its sides are present and equal to the configured identities.
+    /// Unlike [`GroupPair::matches`], a missing side is never a wildcard, so
+    /// a valid one-sided group `(None, IR-X)` cannot claim every pair on
+    /// IR-X. Exactly one match resolves; several is ambiguity, and store
+    /// order never decides.
+    #[must_use]
+    pub fn strict_group_for_pair(&self, rgb: &str, ir: &str) -> StrictPairMatch<'_> {
+        let mut found = None;
+        for (index, group) in self.groups.iter().enumerate() {
+            let exact =
+                group.pair.rgb.as_deref() == Some(rgb) && group.pair.ir.as_deref() == Some(ir);
+            if exact {
+                if found.is_some() {
+                    return StrictPairMatch::Ambiguous;
+                }
+                found = Some((index, group));
+            }
+        }
+        match found {
+            Some((index, group)) => StrictPairMatch::One { index, group },
+            None => StrictPairMatch::None,
+        }
+    }
+}
+
+/// The result of [`SecondaryStore::strict_group_for_pair`].
+#[derive(Debug)]
+pub enum StrictPairMatch<'a> {
+    /// No group has exactly this pair.
+    None,
+    /// Exactly one group has exactly this pair; `index` is its 0-based
+    /// position in the store, the only handle ever reported (ADR-0028).
+    One {
+        index: usize,
+        group: &'a SecondaryGroup,
+    },
+    /// More than one group has exactly this pair: refuse, never pick.
+    Ambiguous,
 }
 
 /// Loads the secondary store. A missing file is `Ok(None)` (no secondary

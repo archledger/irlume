@@ -53,6 +53,9 @@ impl DeviceAccess for HostDevices {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IrCaptureTarget {
     rgb_endpoint: String,
+    /// The configured RGB side's `vid:pid[:serial]`, for the strict-pair
+    /// resolution of ADR-0028; IR-only capture never opens that node.
+    rgb_identity: String,
     endpoint: String,
     metadata_endpoint: Option<String>,
     identity: String,
@@ -106,6 +109,12 @@ impl IrCaptureTarget {
     #[must_use]
     pub fn identity(&self) -> &str {
         &self.identity
+    }
+
+    /// The configured RGB side's identity (ADR-0028 strict-pair resolution).
+    #[must_use]
+    pub fn rgb_identity(&self) -> &str {
+        &self.rgb_identity
     }
 
     #[must_use]
@@ -420,6 +429,7 @@ fn resolve_configured_pair_with(
         _ => return Err(IrTargetError::UnsupportedTopology("IR interface must contain one image node and at most its same-name index-1 metadata companion".into())),
     };
     Ok(IrCaptureTarget {
+        rgb_identity: identity(&rgb.interface)?,
         rgb_endpoint: rgb.endpoint,
         endpoint: ir.endpoint,
         metadata_endpoint,
@@ -467,6 +477,7 @@ fn resolve_shared_interface(
         return Err(IrTargetError::UnsupportedTopology(REASON.into()));
     }
     Ok(IrCaptureTarget {
+        rgb_identity: identity(&rgb.interface)?,
         rgb_endpoint: rgb.endpoint,
         endpoint: ir.endpoint,
         metadata_endpoint: Some(ir_metadata.endpoint.clone()),
@@ -1061,6 +1072,7 @@ mod tests {
     fn unopened_target() -> IrCaptureTarget {
         IrCaptureTarget {
             rgb_endpoint: "/definitely-missing-irlume-context-fixture/rgb".into(),
+            rgb_identity: "fixture-rgb".into(),
             endpoint: MISSING_IR.into(),
             metadata_endpoint: None,
             identity: "fixture".into(),

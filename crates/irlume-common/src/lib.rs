@@ -1029,6 +1029,47 @@ pub enum IrOnlyReadiness {
     PadUnavailable,
     EnrollmentUnavailable,
     IncompatibleEnrollment,
+    /// ADR-0028: the configured pair is an enrolled secondary camera group,
+    /// but the store is inactive because the primary enrollment changed
+    /// since that group was authorized.
+    SecondaryInactive,
+    /// ADR-0028: the configured pair resolves to a secondary group, and the
+    /// IR-only route to secondary cameras is not yet validated on this build
+    /// (Phase 2 gate).
+    SecondaryUnvalidated,
+    /// A value this build does not know. Present so a newer daemon's status
+    /// never makes an older client reject the whole response (ADR-0028).
+    #[serde(other)]
+    Unknown,
+}
+
+impl IrOnlyReadiness {
+    /// The value to put in the long-standing `ir_readiness` wire field: a
+    /// vocabulary every released client decodes. The ADR-0028 states travel
+    /// there as [`Self::BindingMismatch`], which is what an older daemon would
+    /// have reported for the same configuration; the precise state goes in
+    /// `ir_readiness_detail`, which older clients ignore.
+    #[must_use]
+    pub fn wire_compatible(self) -> Self {
+        match self {
+            Self::SecondaryInactive | Self::SecondaryUnvalidated | Self::Unknown => {
+                Self::BindingMismatch
+            }
+            other => other,
+        }
+    }
+}
+
+/// Which enrollment scope an IR-only readiness or attempt resolved to
+/// (ADR-0028). A secondary scope is identified only by its ordinal in the
+/// store; group ids derive from device identities and are never reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrScope {
+    Primary,
+    Secondary,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Camera-free explanation of a target refusal. This is diagnostic information,
@@ -1210,9 +1251,21 @@ pub enum Response {
     /// Camera-free policy observation. Readiness is absent for ordinary status.
     FaceSensorStatus {
         policy: config::FaceSensorPolicyObservation,
+        /// Always a value every released client decodes
+        /// ([`IrOnlyReadiness::wire_compatible`]).
         ir_readiness: Option<IrOnlyReadiness>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ir_target_issue: Option<IrTargetIssue>,
+        /// ADR-0028: the precise readiness when `ir_readiness` had to be
+        /// widened for older clients; absent on older daemons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ir_readiness_detail: Option<IrOnlyReadiness>,
+        /// ADR-0028: the resolved enrollment scope, when one resolved.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ir_scope: Option<IrScope>,
+        /// ADR-0028: the secondary group's 1-based ordinal in the store.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ir_scope_index: Option<usize>,
     },
     /// Retry recovery capability and current per-account state.
     RetryStatus {

@@ -439,20 +439,37 @@ fn permits_background_requalification(
 
 fn sensor_preflight_with(
     policy: irlume_common::config::FaceSensorPolicyObservation,
-    preflight: impl FnOnce() -> (
-        irlume_common::IrOnlyReadiness,
-        Option<irlume_common::IrTargetIssue>,
-    ),
-) -> (
-    irlume_common::IrOnlyReadiness,
-    Option<irlume_common::IrTargetIssue>,
-) {
+    preflight: impl FnOnce() -> irlume_auth::IrOnlyPreflight,
+) -> irlume_auth::IrOnlyPreflight {
+    let unscoped = |readiness| irlume_auth::IrOnlyPreflight {
+        readiness,
+        target_issue: None,
+        scope: None,
+        scope_index: None,
+    };
     match policy.resolve() {
         Ok(irlume_common::config::FaceSensorPolicy::IrOnlyExperimental) => preflight(),
         Ok(irlume_common::config::FaceSensorPolicy::Dual) => {
-            (irlume_common::IrOnlyReadiness::Unavailable, None)
+            unscoped(irlume_common::IrOnlyReadiness::Unavailable)
         }
-        Err(_) => (irlume_common::IrOnlyReadiness::InvalidPolicy, None),
+        Err(_) => unscoped(irlume_common::IrOnlyReadiness::InvalidPolicy),
+    }
+}
+
+/// The wire form of a preflight (ADR-0028 §3): `ir_readiness` keeps the
+/// vocabulary older clients decode, the precise cause and the scope travel
+/// in the optional fields they ignore.
+fn face_sensor_status(
+    policy: irlume_common::config::FaceSensorPolicyObservation,
+    preflight: irlume_auth::IrOnlyPreflight,
+) -> Response {
+    Response::FaceSensorStatus {
+        policy,
+        ir_readiness: Some(preflight.readiness.wire_compatible()),
+        ir_target_issue: preflight.target_issue,
+        ir_readiness_detail: Some(preflight.readiness),
+        ir_scope: preflight.scope,
+        ir_scope_index: preflight.scope_index,
     }
 }
 
@@ -2955,6 +2972,9 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             policy: irlume_common::config::observe_face_sensor_policy(),
             ir_readiness: user.map(|_| irlume_common::IrOnlyReadiness::Unavailable),
             ir_target_issue: None,
+            ir_readiness_detail: None,
+            ir_scope: None,
+            ir_scope_index: None,
         },
         _ => Response::Error(
             "irlumed is still starting (loading models); retry, or use your password".into(),
@@ -4135,6 +4155,9 @@ fn dispatch_status_with_diagnostics(
             policy: irlume_common::config::observe_face_sensor_policy(),
             ir_readiness: None,
             ir_target_issue: None,
+            ir_readiness_detail: None,
+            ir_scope: None,
+            ir_scope_index: None,
         },
         Request::Ping => Response::Pong,
         Request::Health => {
@@ -5319,13 +5342,10 @@ fn dispatch_scoped_session_inner(
         },
         Request::FaceSensorStatus { user: Some(user) } => {
             let policy = irlume_common::config::observe_face_sensor_policy();
-            let (readiness, ir_target_issue) =
-                sensor_preflight_with(policy, || engine.ir_only_preflight_details(&user));
-            Response::FaceSensorStatus {
+            face_sensor_status(
                 policy,
-                ir_readiness: Some(readiness),
-                ir_target_issue,
-            }
+                sensor_preflight_with(policy, || engine.ir_only_preflight_details(&user)),
+            )
         }
         Request::KeyringInfo { user } => keyring_info(&user, |env| {
             irlume_core::tpm::diagnose_pcrs(env)
@@ -10663,9 +10683,11 @@ mod tests {
         ));
         let wire = serde_json::to_value(response).unwrap();
         let body = wire.get("FaceSensorStatus").unwrap().as_object().unwrap();
-        assert_eq!(body.len(), 3);
+        // No scope resolved: the scope fields stay off the wire (ADR-0028).
+        assert_eq!(body.len(), 4);
         assert!(body.contains_key("policy") && body.contains_key("ir_readiness"));
         assert_eq!(body["ir_target_issue"], "unavailable");
+        assert_eq!(body["ir_readiness_detail"], body["ir_readiness"]);
     }
 
     #[test]
@@ -10779,12 +10801,17 @@ mod tests {
             let calls = std::cell::Cell::new(0);
             let readiness = sensor_preflight_with(policy, || {
                 calls.set(calls.get() + 1);
-                (Ready::ReadyForExperimentalAttempt, None)
+                irlume_auth::IrOnlyPreflight {
+                    readiness: Ready::ReadyForExperimentalAttempt,
+                    target_issue: None,
+                    scope: Some(irlume_common::IrScope::Primary),
+                    scope_index: None,
+                }
             });
             let selected = policy == Seen::Explicit(Policy::IrOnlyExperimental);
             assert_eq!(calls.get(), usize::from(selected));
             assert_eq!(
-                readiness.0,
+                readiness.readiness,
                 if selected {
                     Ready::ReadyForExperimentalAttempt
                 } else if policy.resolve().is_err() {

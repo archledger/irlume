@@ -563,10 +563,12 @@ fn is_encrypted_enrollment(v: &serde_json::Value) -> irlume_common::Result<bool>
 /// Serialize an enrollment, encrypting under `key` when one is supplied (TPM
 /// host) or emitting pretty plaintext when not (dev / no-TPM). Pure; tested
 /// without a TPM.
-pub(crate) fn serialize_enrollment(
-    e: &Enrollment,
-    key: Option<&[u8]>,
-) -> irlume_common::Result<Vec<u8>> {
+/// The on-disk bytes of `e`: the sealed envelope under `key`, or plaintext.
+/// Public for fixtures that write a store without touching a TPM.
+///
+/// # Errors
+/// Returns an error when serialization or encryption fails.
+pub fn serialize_enrollment(e: &Enrollment, key: Option<&[u8]>) -> irlume_common::Result<Vec<u8>> {
     match key {
         Some(k) => {
             // The serialized enrollment is template plaintext; keep it zeroized
@@ -745,11 +747,57 @@ pub fn load_read_only(user: &str) -> irlume_common::Result<Option<Enrollment>> {
     .map(|loaded| loaded.map(|(enrollment, _)| enrollment))
 }
 
+/// A primary enrollment together with the key its load unsealed and the
+/// exact bytes it was parsed from. The IR-only route pins its primary
+/// scope by these bytes' digest, offers them to the secondary store's
+/// activation check without a second read, and lends the key to the
+/// request so nothing unseals twice (ADR-0028 §4-5).
+pub struct PrimarySnapshot {
+    pub enrollment: Enrollment,
+    /// `None` for a plaintext store.
+    pub key: Option<Zeroizing<Vec<u8>>>,
+    /// The file's bytes as parsed (ciphertext for an encrypted store).
+    pub bytes: Vec<u8>,
+}
+
+/// [`load_with_key`] as a [`PrimarySnapshot`].
+///
+/// # Errors
+/// As [`load_with_key`].
+pub fn load_snapshot(user: &str) -> irlume_common::Result<Option<PrimarySnapshot>> {
+    load_snapshot_with(
+        user,
+        template_key::UserStateLock::acquire,
+        template_key::load_key_unlocked,
+    )
+}
+
+/// [`load_read_only`] as a [`PrimarySnapshot`], keeping the key it unsealed.
+///
+/// # Errors
+/// As [`load_read_only`].
+pub fn load_snapshot_read_only(user: &str) -> irlume_common::Result<Option<PrimarySnapshot>> {
+    load_snapshot_with(
+        user,
+        template_key::UserStateLock::acquire_read_only,
+        template_key::load_key_read_only_unlocked,
+    )
+}
+
 fn load_with(
     user: &str,
     acquire_lock: impl FnOnce(&str) -> irlume_common::Result<template_key::UserStateLock>,
     load_key: impl FnOnce(&str) -> irlume_common::Result<Zeroizing<Vec<u8>>>,
 ) -> irlume_common::Result<Option<LoadedEnrollment>> {
+    load_snapshot_with(user, acquire_lock, load_key)
+        .map(|loaded| loaded.map(|snapshot| (snapshot.enrollment, snapshot.key)))
+}
+
+fn load_snapshot_with(
+    user: &str,
+    acquire_lock: impl FnOnce(&str) -> irlume_common::Result<template_key::UserStateLock>,
+    load_key: impl FnOnce(&str) -> irlume_common::Result<Zeroizing<Vec<u8>>>,
+) -> irlume_common::Result<Option<PrimarySnapshot>> {
     let _state = acquire_lock(user)?;
     let path = profile_path(user);
     if !path.exists() {
@@ -764,7 +812,11 @@ fn load_with(
     };
     let key = if is_enc { Some(load_key(user)?) } else { None };
     let enrollment = deserialize_enrollment(&data, key.as_ref().map(|k| k.as_slice()))?;
-    Ok(Some((enrollment, key)))
+    Ok(Some(PrimarySnapshot {
+        enrollment,
+        key,
+        bytes: data,
+    }))
 }
 
 /// Parses the enrollment at an explicit path WITHOUT acquiring the user

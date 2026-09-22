@@ -122,6 +122,19 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The scope line: the enrollment the configured pair resolved to, with
+/// an added camera's position in the store (an ordinal, never an identity).
+fn scope_label(scope: irlume_common::IrScope, index: Option<usize>) -> String {
+    match (scope, index) {
+        (irlume_common::IrScope::Primary, _) => "scope: primary enrollment".into(),
+        (irlume_common::IrScope::Secondary, Some(index)) => {
+            format!("scope: added camera #{index}")
+        }
+        (irlume_common::IrScope::Secondary, None) => "scope: added camera".into(),
+        (irlume_common::IrScope::Unknown, _) => "scope: unknown to this client".into(),
+    }
+}
+
 fn valid_user(user: &str) -> bool {
     !user.is_empty() && !user.starts_with('-') && !user.chars().any(char::is_control)
 }
@@ -130,9 +143,15 @@ fn preflight_for(user: String) -> ExitCode {
     match crate::daemon_request(&Request::FaceSensorStatus { user: Some(user) }) {
         Ok(Response::FaceSensorStatus {
             policy,
-            ir_readiness: Some(readiness),
+            ir_readiness: Some(compatible),
             ir_target_issue,
+            ir_readiness_detail,
+            ir_scope,
+            ir_scope_index,
         }) => {
+            // A new daemon sends the precise cause beside the compatible
+            // value; an older one sends only the latter (ADR-0028 §3).
+            let readiness = ir_readiness_detail.unwrap_or(compatible);
             println!("[sensor] daemon observed: {}", state_label(policy));
             match policy.resolve() {
                 Ok(Policy::IrOnlyExperimental) => {}
@@ -149,6 +168,9 @@ fn preflight_for(user: String) -> ExitCode {
             if ir_target_issue.is_some() && readiness != Readiness::TargetUnavailable {
                 eprintln!("[sensor] daemon returned inconsistent target readiness; rerun preflight and use your password");
                 return ExitCode::FAILURE;
+            }
+            if let Some(scope) = ir_scope {
+                println!("[sensor] {}", scope_label(scope, ir_scope_index));
             }
             let refusal = match readiness {
                 Readiness::ReadyForExperimentalAttempt => {
@@ -168,7 +190,16 @@ fn preflight_for(user: String) -> ExitCode {
                     "IR enrollment has no camera binding; add fresh scans with the configured camera and use your password"
                 }
                 Readiness::BindingMismatch => {
-                    "enrollment belongs to a different IR camera; use the enrolled camera or add fresh scans, then use your password"
+                    "the configured cameras are neither the enrolled pair nor an added camera; use an enrolled camera or add this one, then use your password"
+                }
+                Readiness::SecondaryInactive => {
+                    "this camera's authorization is inactive since the primary enrollment changed; remove your added cameras and add back the ones you use, then use your password"
+                }
+                Readiness::SecondaryUnvalidated => {
+                    "IR-only on additional cameras is not yet validated on this build; use your password"
+                }
+                Readiness::Unknown => {
+                    "the daemon reported a readiness this client does not know; update the client and use your password"
                 }
                 Readiness::ModelsUnavailable => {
                     "required face models are unavailable; repair the installed models, restart the daemon, and use your password"

@@ -91,7 +91,7 @@ fn one_camera_operation_spans_camera_open_and_every_authentication_retry() {
         .find("    pub fn authenticate_for(")
         .expect("authenticate_for exists");
     let end = text[start..]
-        .find("\n    #[allow(clippy::too_many_arguments)]\n    fn authentication_attempt_loop(")
+        .find("\n    #[allow(clippy::too_many_arguments)]\n    fn authentication_attempt_loop<")
         .map(|offset| start + offset)
         .expect("authentication attempt loop follows authenticate_for");
     let body = &text[start..end];
@@ -117,7 +117,7 @@ fn one_camera_operation_spans_camera_open_and_every_authentication_retry() {
     assert!(body.contains("&camera_operation"));
 
     let loop_start = text[end..]
-        .find("    fn authentication_attempt_loop(")
+        .find("    fn authentication_attempt_loop<")
         .map(|offset| end + offset)
         .expect("authentication attempt loop exists");
     let loop_end = text[loop_start..]

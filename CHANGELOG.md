@@ -24,6 +24,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- On the concurrent capture path the authentication decision is handed to
+  the connection thread before the two camera streams are torn down
+  (ADR-0027). The teardown costs 1.0–1.2 s on the NexiGo N930W after the
+  identity decision, and reordering the two stops only moved that cost
+  (`release_probe`); now it runs after the reply. The camera LED and the IR
+  emitter therefore turn off about a second later than before after a
+  decision. Nothing about the decision's inputs, the admission checks or the
+  camera lease changes; the pair is still released before the next request.
 - The TPM is reached through the raw device (`/dev/tpm0`) first, with the
   kernel resource manager (`/dev/tpmrm0`) as the per-call fallback (ADR-0026).
   The manager saves and flushes every session and object after every command,

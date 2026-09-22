@@ -191,6 +191,24 @@ fn assert_pair_released(sink: &RecordingSink) {
     );
 }
 
+/// ADR-0027: the deferred release measures both destructors in one
+/// `stream_owner_release` interval, RGB first, exactly like the immediate
+/// path; only WHEN it runs changes.
+#[test]
+fn deferred_release_measures_both_destructors_rgb_first() {
+    let sink = RecordingSink::default();
+    let release = crate::DeferredPairRelease {
+        pair: Some((DropStream(&sink, "rgb"), DropStream(&sink, "ir"))),
+        diagnostics: &sink,
+    };
+    assert!(
+        sink.0.lock().unwrap().is_empty(),
+        "nothing is released while deferred"
+    );
+    drop(release);
+    assert_pair_released(&sink);
+}
+
 #[test]
 fn stream_release_trace_follows_both_destructors_on_success_and_error() {
     for succeed in [true, false] {
@@ -1036,7 +1054,7 @@ fn managed_preparation_retry_loop_reaches_identity_once_and_stops_after_a_match_
         let attempts = Cell::new(0);
         let identities = Cell::new(0);
         let mut costliest = Duration::ZERO;
-        let (result, fallback) = engine.authentication_attempt_loop_with(
+        let (result, fallback, _deferred) = engine.authentication_attempt_loop_with(
             started + Duration::from_secs(15),
             15_000,
             &mut costliest,
@@ -1064,7 +1082,7 @@ fn managed_preparation_retry_loop_reaches_identity_once_and_stops_after_a_match_
                     &(),
                 );
                 clock.set(clock.get() + Duration::from_millis(1000));
-                (out, false)
+                (out, false, None::<()>)
             },
             || clock.get(),
         );

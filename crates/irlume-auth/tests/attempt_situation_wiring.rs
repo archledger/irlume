@@ -83,7 +83,7 @@ fn every_failed_attempt_emits_exactly_one_situation_line() {
     // The emission lives in the retry loop, guarded by !out.granted, so a
     // grant never logs a situation and every failure logs exactly one.
     let loop_start = text
-        .find("    fn authentication_attempt_loop(")
+        .find("    fn authentication_attempt_loop<")
         .expect("the grace-retry loop exists");
     let loop_end = text[loop_start..]
         .find("\n    fn authenticate_once(")
@@ -131,7 +131,7 @@ fn the_final_failed_attempts_situation_is_exposed_for_the_prompt() {
     // Whitespace-flattened so rustfmt's line wrapping cannot break the
     // needles.
     let loop_start = text
-        .find("    fn authentication_attempt_loop(")
+        .find("    fn authentication_attempt_loop<")
         .expect("the grace-retry loop exists");
     let loop_end = text[loop_start..]
         .find("\n    fn authenticate_once(")

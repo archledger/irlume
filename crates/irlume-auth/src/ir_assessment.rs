@@ -1157,6 +1157,7 @@ impl Engine {
                         diagnostics,
                     ),
                     false,
+                    None::<()>,
                 )
             },
             std::time::Instant::now,

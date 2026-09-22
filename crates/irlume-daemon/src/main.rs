@@ -1011,8 +1011,9 @@ fn main() {
                             // request and let PAM fall back to the password, never
                             // unwind out of the worker and take down all face auth for
                             // every user.
+                            let mut delivery = Delivery::attached(&reply);
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                dispatch_scoped_session(req, &peer, &mut engine, &scope, authorization, session.as_ref(), position.as_ref())
+                                dispatch_scoped_session_delivering(req, &peer, &mut engine, &scope, authorization, session.as_ref(), position.as_ref(), &mut delivery)
                             }));
                             // Release the slot before anything else can fail, so a
                             // panicking request cannot lock its uid out of the camera
@@ -1079,7 +1080,12 @@ fn main() {
                             link.finish_activity();
                             scope.finish(categorical_outcome(&resp.response));
                             // The client may already be gone; its thread owns that.
-                            let _ = reply.send(resp);
+                            // ADR-0027: a decision handed over inside the engine
+                            // call is not sent again; the returned value only
+                            // classified the operation above.
+                            if !delivery.delivered {
+                                let _ = reply.send(resp);
+                            }
                             // Back to waiting for work: idle is healthy, and leaving the
                             // last job's timestamp behind would read as a wedge (#141).
                             note_worker_idle();
@@ -1550,6 +1556,59 @@ struct FaceCompletion {
 struct WorkerReply {
     response: Response,
     completion: Option<FaceCompletion>,
+}
+
+/// The worker's reply channel, lent to the Authenticate arm so the decision
+/// can be handed to the connection thread BEFORE the engine tears the
+/// concurrent camera pair down (ADR-0027). `delivered` tells the worker loop
+/// that the reply already went out and the value the arm returns is only for
+/// the operation's own bookkeeping (the trace's categorical outcome).
+struct Delivery<'a> {
+    sender: Option<&'a std::sync::mpsc::Sender<WorkerReply>>,
+    delivered: bool,
+}
+
+impl<'a> Delivery<'a> {
+    /// No channel: the caller returns the reply the ordinary way. Production
+    /// always attaches the worker's channel; tests dispatch without one.
+    #[cfg(test)]
+    fn none() -> Self {
+        Self {
+            sender: None,
+            delivered: false,
+        }
+    }
+
+    fn attached(sender: &'a std::sync::mpsc::Sender<WorkerReply>) -> Self {
+        Self {
+            sender: Some(sender),
+            delivered: false,
+        }
+    }
+
+    /// Send the reply now. Returns false when there is no channel or the
+    /// connection thread is gone; the caller then returns the reply as
+    /// before and nothing is lost. Never sends twice.
+    fn send(&mut self, reply: WorkerReply) -> bool {
+        if self.delivered {
+            return true;
+        }
+        let Some(sender) = self.sender else {
+            return false;
+        };
+        match sender.send(reply) {
+            Ok(()) => {
+                self.delivered = true;
+                true
+            }
+            Err(_) => {
+                jout_warn!(
+                    "irlumed: decision ready before camera release, but the connection thread is gone"
+                );
+                false
+            }
+        }
+    }
 }
 
 /// Report one daemon-side timing boundary as a closed-vocabulary trace
@@ -4951,6 +5010,7 @@ fn dispatch_scoped(
     dispatch_scoped_session(req, peer, engine, scope, authorization, None, None).response
 }
 
+#[cfg(test)]
 fn dispatch_scoped_session(
     req: Request,
     peer: &Peer,
@@ -4959,6 +5019,33 @@ fn dispatch_scoped_session(
     authorization: Option<operation_authorization::Grant>,
     session: Option<&enrollment_session::Worker>,
     position: Option<&position_session::Worker>,
+) -> WorkerReply {
+    dispatch_scoped_session_delivering(
+        req,
+        peer,
+        engine,
+        scope,
+        authorization,
+        session,
+        position,
+        &mut Delivery::none(),
+    )
+}
+
+/// [`dispatch_scoped_session`] with the worker's reply channel attached, so
+/// an authentication decision can be delivered before the camera pair is
+/// released (ADR-0027). When that happened, `delivery.delivered` is set and
+/// the returned reply must not be sent again.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_scoped_session_delivering(
+    req: Request,
+    peer: &Peer,
+    engine: &mut irlume_auth::Engine,
+    scope: &diagnostics::OperationScope,
+    authorization: Option<operation_authorization::Grant>,
+    session: Option<&enrollment_session::Worker>,
+    position: Option<&position_session::Worker>,
+    delivery: &mut Delivery<'_>,
 ) -> WorkerReply {
     let mut completion = None;
     let response = dispatch_scoped_session_inner(
@@ -4970,6 +5057,7 @@ fn dispatch_scoped_session(
         session,
         position,
         &mut completion,
+        delivery,
     );
     if !is_face_grant(&response) {
         completion = None;
@@ -4980,6 +5068,103 @@ fn dispatch_scoped_session(
     }
 }
 
+/// What the Authenticate arm needs, beyond the engine's outcome, to build its
+/// reply: consumed exactly once, by the early delivery hook or by the
+/// ordinary return path.
+struct VerifyReplyInputs {
+    retry_attempt: retry_throttle::FaceAttempt,
+    shared_unlock: Option<std::sync::Arc<shared_unlock::Binding>>,
+    window: irlume_auth::AuthenticationWindow,
+    convenience: bool,
+    started: std::time::Instant,
+}
+
+/// The Authenticate arm's reply for an engine outcome: the completion and
+/// shared-unlock checks, journal line, response, and retry accounting, in the
+/// bounded order `bounded_face_response` enforces. Reads the engine only.
+fn verify_reply(
+    engine: &irlume_auth::Engine,
+    o: &irlume_auth::Outcome,
+    user: &str,
+    inputs: VerifyReplyInputs,
+    completion: &mut Option<FaceCompletion>,
+) -> Response {
+    let VerifyReplyInputs {
+        retry_attempt,
+        shared_unlock,
+        window,
+        convenience,
+        started,
+    } = inputs;
+    bounded_face_response(
+        o.granted,
+        || {
+            engine.check_authentication_completion(window)?;
+            if let Some(binding) = &shared_unlock {
+                binding
+                    .validate()
+                    .map_err(|reason| irlume_common::Error::Policy(reason.into()))?;
+            }
+            engine.check_authentication_completion(window)
+        },
+        || {
+            if convenience || irlume_common::dbglog::on() {
+                // Denied score + reason measurements quantized/redacted
+                // unless tracing (anti-oracle); grants log exact.
+                let (score, reason) = if o.granted {
+                    (format!("{:.3}", o.score), o.reason.clone())
+                } else {
+                    (deny_score(o.score), deny_reason(&o.reason))
+                };
+                jout_info!(
+                    "irlumed: face auth '{user}': granted={} live={} score={score} ({reason})",
+                    o.granted,
+                    o.live
+                );
+            }
+            irlume_common::dlog!("verify '{user}' total {}ms", started.elapsed().as_millis());
+            Response::AuthResult {
+                granted: o.granted,
+                score: o.score,
+                live: o.live,
+                // Reserved v1 response field; gestures are no longer produced.
+                declined_by_gesture: false,
+                // This arm carries an engine verdict, including setup
+                // refusals before capture. Daemon policy refusals return
+                // above with refused_by_policy set.
+                refused_by_policy: false,
+                // #616 step 3: the final failed attempt's situation,
+                // in the stable journal vocabulary, for pam's action
+                // wording. The engine resets it at request entry, so
+                // early setup refusals cannot reuse an older hint;
+                // grants and daemon policy refusals also send empty.
+                situation: if o.granted {
+                    String::new()
+                } else {
+                    engine
+                        .last_attempt_situation_label()
+                        .unwrap_or_default()
+                        .to_string()
+                },
+                reason: o.reason.clone(),
+            }
+        },
+        || {
+            if o.granted {
+                *completion = Some(FaceCompletion {
+                    attempt: retry_attempt,
+                    window,
+                    shared_unlock: shared_unlock.clone(),
+                });
+                Ok(())
+            } else {
+                retry_attempt.denied(o)
+            }
+        },
+        retry_verify_refusal,
+    )
+}
+
 fn authenticate_for_dispatch(
     engine: &mut irlume_auth::Engine,
     user: &str,
@@ -4987,6 +5172,7 @@ fn authenticate_for_dispatch(
     window: irlume_auth::AuthenticationWindow,
     policy: irlume_common::config::FaceSensorPolicy,
     scope: &diagnostics::OperationScope,
+    deliver: irlume_auth::DecisionDelivery<'_>,
 ) -> irlume_common::Result<irlume_auth::Outcome> {
     // Only the test binary can replace the biometric result. Request policy,
     // completion checks and socket delivery remain the production code path.
@@ -4994,13 +5180,14 @@ fn authenticate_for_dispatch(
     if let Some(outcome) = tests::shared_greeter::biometric_outcome() {
         return Ok(outcome);
     }
-    engine.authenticate_for_in_window_with_policy(
+    engine.authenticate_for_in_window_with_policy_delivering(
         user,
         service,
         irlume_auth::AuthenticationPurpose::for_service(service),
         window,
         policy,
         scope,
+        deliver,
     )
 }
 
@@ -5014,6 +5201,7 @@ fn dispatch_scoped_session_inner(
     session: Option<&enrollment_session::Worker>,
     position: Option<&position_session::Worker>,
     completion: &mut Option<FaceCompletion>,
+    delivery: &mut Delivery<'_>,
 ) -> Response {
     // Status requests are normally answered on the connection thread and
     // never reach here; delegating keeps this dispatch total (and identical
@@ -5325,14 +5513,46 @@ fn dispatch_scoped_session_inner(
             };
             let convenience = tier == irlume_core::biopolicy::Tier::Convenience;
             let t = std::time::Instant::now();
-            let auth_result = authenticate_for_dispatch(
-                engine,
-                &user,
-                service.as_deref(),
+            // The reply is built by ONE function whether the engine hands the
+            // decision over early (ADR-0027, concurrent path: before the camera
+            // pair is released) or returns it the ordinary way. The retry
+            // attempt and the completion binding move into whichever runs.
+            let mut reply_inputs = Some(VerifyReplyInputs {
+                retry_attempt,
+                shared_unlock: shared_unlock.clone(),
                 window,
-                sensor_policy,
-                scope,
-            );
+                convenience,
+                started: t,
+            });
+            let mut early: Option<Response> = None;
+            let auth_result = {
+                let mut deliver = |engine: &irlume_auth::Engine, outcome: &irlume_auth::Outcome| {
+                    let Some(inputs) = reply_inputs.take() else {
+                        return;
+                    };
+                    let mut completed = None;
+                    let response = verify_reply(engine, outcome, &user, inputs, &mut completed);
+                    let sent = delivery.send(WorkerReply {
+                        response: response.clone(),
+                        completion: completed.take().filter(|_| is_face_grant(&response)),
+                    });
+                    if !sent {
+                        // No channel (or the connection thread is gone): the
+                        // reply is returned below exactly as before.
+                        *completion = completed;
+                    }
+                    early = Some(response);
+                };
+                authenticate_for_dispatch(
+                    engine,
+                    &user,
+                    service.as_deref(),
+                    window,
+                    sensor_policy,
+                    scope,
+                    &mut deliver,
+                )
+            };
             // Engine-call boundary: the daemon's wall time around the whole
             // engine authentication (policy refusals above never reach it).
             emit_stage_timing(
@@ -5340,71 +5560,26 @@ fn dispatch_scoped_session_inner(
                 irlume_common::diagnostics::TraceStage::EngineAuthenticate,
                 t,
             );
+            if let Some(response) = early {
+                // Delivered inside the engine call (or prepared there when no
+                // channel was attached). A later engine error cannot retract a
+                // reply the connection thread already owns; it is journaled.
+                if let Err(e) = &auth_result {
+                    if delivery.delivered {
+                        jout_warn!(
+                            "irlumed: face auth '{user}': engine reported {e} after the decision was delivered"
+                        );
+                    }
+                }
+                return response;
+            }
             match auth_result {
-                Ok(o) => bounded_face_response(
-                    o.granted,
-                    || {
-                        engine.check_authentication_completion(window)?;
-                        if let Some(binding) = &shared_unlock {
-                            binding
-                                .validate()
-                                .map_err(|reason| irlume_common::Error::Policy(reason.into()))?;
-                        }
-                        engine.check_authentication_completion(window)
-                    },
-                    || {
-                        if convenience || irlume_common::dbglog::on() {
-                            // Denied score + reason measurements quantized/redacted
-                            // unless tracing (anti-oracle); grants log exact.
-                            let (score, reason) = if o.granted {
-                                (format!("{:.3}", o.score), o.reason.clone())
-                            } else {
-                                (deny_score(o.score), deny_reason(&o.reason))
-                            };
-                            jout_info!("irlumed: face auth '{user}': granted={} live={} score={score} ({reason})",
-                            o.granted, o.live);
-                        }
-                        irlume_common::dlog!("verify '{user}' total {}ms", t.elapsed().as_millis());
-                        Response::AuthResult {
-                            granted: o.granted,
-                            score: o.score,
-                            live: o.live,
-                            // Reserved v1 response field; gestures are no longer produced.
-                            declined_by_gesture: false,
-                            // This arm carries an engine verdict, including setup
-                            // refusals before capture. Daemon policy refusals return
-                            // above with refused_by_policy set.
-                            refused_by_policy: false,
-                            // #616 step 3: the final failed attempt's situation,
-                            // in the stable journal vocabulary, for pam's action
-                            // wording. The engine resets it at request entry, so
-                            // early setup refusals cannot reuse an older hint;
-                            // grants and daemon policy refusals also send empty.
-                            situation: if o.granted {
-                                String::new()
-                            } else {
-                                engine
-                                    .last_attempt_situation_label()
-                                    .unwrap_or_default()
-                                    .to_string()
-                            },
-                            reason: o.reason.clone(),
-                        }
-                    },
-                    || {
-                        if o.granted {
-                            *completion = Some(FaceCompletion {
-                                attempt: retry_attempt,
-                                window,
-                                shared_unlock: shared_unlock.clone(),
-                            });
-                            Ok(())
-                        } else {
-                            retry_attempt.denied(&o)
-                        }
-                    },
-                    retry_verify_refusal,
-                ),
+                Ok(o) => {
+                    let inputs = reply_inputs
+                        .take()
+                        .expect("the reply inputs are consumed exactly once");
+                    verify_reply(engine, &o, &user, inputs, completion)
+                }
                 Err(e) => authentication_error(e, structured_errors),
             }
         }
@@ -6782,6 +6957,59 @@ fn journal_safe(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plain_reply(reason: &str) -> WorkerReply {
+        WorkerReply {
+            response: Response::AuthResult {
+                granted: true,
+                score: 1.0,
+                live: true,
+                reason: reason.into(),
+                declined_by_gesture: false,
+                refused_by_policy: false,
+                // Spelled this way on purpose: a wiring test pins the count of
+                // production `situation: String::new()` sites.
+                situation: String::from(""),
+            },
+            completion: None,
+        }
+    }
+
+    /// ADR-0027: with a channel attached the reply goes out once, and only
+    /// once; without one the caller is told to return it the ordinary way.
+    #[test]
+    fn early_delivery_sends_once_and_reports_absence_of_a_channel() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut delivery = Delivery::attached(&tx);
+        assert!(!delivery.delivered);
+        assert!(delivery.send(plain_reply("first")));
+        assert!(delivery.delivered);
+        // A second send is swallowed: the connection thread must never see
+        // two replies for one request.
+        assert!(delivery.send(plain_reply("second")));
+        let received: Vec<WorkerReply> = rx.try_iter().collect();
+        assert_eq!(received.len(), 1);
+        assert!(
+            matches!(&received[0].response, Response::AuthResult { reason, .. } if reason == "first")
+        );
+
+        let mut none = Delivery::none();
+        assert!(!none.send(plain_reply("unsent")));
+        assert!(!none.delivered);
+    }
+
+    /// The connection thread's receiver is gone: not delivered, so the arm
+    /// returns the reply and the worker loop's ordinary send reports the
+    /// same fate it would have reported before.
+    #[test]
+    fn early_delivery_on_a_closed_channel_is_not_counted_as_delivered() {
+        let (tx, rx) = std::sync::mpsc::channel::<WorkerReply>();
+        drop(rx);
+        let mut delivery = Delivery::attached(&tx);
+        assert!(!delivery.send(plain_reply("orphaned")));
+        assert!(!delivery.delivered);
+    }
+
     use irlume_common::jout_debug;
 
     #[test]

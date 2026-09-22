@@ -137,14 +137,24 @@ fn transport_error(
 /// Dependencies are injectable so real owner and collector behavior can be
 /// tested without opening cameras; a result cannot borrow either owner.
 ///
-/// The second value says whether a streaming owner existed and was released,
-/// whatever the result: false only when arming itself failed.
-pub(super) fn with_managed_pair<R, I, T>(
+/// The second value says whether a streaming owner existed, whatever the
+/// result: false only when arming itself failed.
+///
+/// On a collected result the owners are NOT released here: they come back as
+/// the third value, a deferred release the caller drops after the decision
+/// has been delivered (ADR-0027). On an error they are released here, as
+/// before, because the request goes on to a fallback or an error reply and
+/// nothing is waiting on the decision.
+pub(super) fn with_managed_pair<'d, R, I, T>(
     arm: impl FnOnce() -> Result<(R, I), CapturePathError>,
     establish: impl FnOnce(&mut R, &mut I) -> Result<(), CapturePathError>,
     collect: impl FnOnce(&mut R, &mut I) -> Result<T, CapturePathError>,
-    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
-) -> (Result<T, CapturePathError>, bool) {
+    diagnostics: &'d dyn irlume_common::diagnostics::DiagnosticSink,
+) -> (
+    Result<T, CapturePathError>,
+    bool,
+    Option<DeferredPairRelease<'d, R, I>>,
+) {
     let armed = {
         let _timing = TraceStageTimer::new(
             diagnostics,
@@ -154,19 +164,33 @@ pub(super) fn with_managed_pair<R, I, T>(
     };
     let pair = match armed {
         Ok(pair) => pair,
-        Err(error) => return (Err(error), false),
+        Err(error) => return (Err(error), false, None),
     };
-    let result = with_owned_pair(pair, diagnostics, |rgb, ir| {
-        {
-            let _timing = TraceStageTimer::new(
-                diagnostics,
-                irlume_common::diagnostics::TraceStage::RateEstablishment,
-            );
-            establish(rgb, ir)?;
-        }
-        collect(rgb, ir)
-    });
-    (result, true)
+    let mut release = DeferredPairRelease {
+        pair: Some(pair),
+        diagnostics,
+    };
+    let result = {
+        let (rgb, ir) = release
+            .pair
+            .as_mut()
+            .expect("the deferred release holds the armed pair");
+        (|| {
+            {
+                let _timing = TraceStageTimer::new(
+                    diagnostics,
+                    irlume_common::diagnostics::TraceStage::RateEstablishment,
+                );
+                establish(rgb, ir)?;
+            }
+            collect(rgb, ir)
+        })()
+    };
+    if result.is_err() {
+        drop(release);
+        return (result, true, None);
+    }
+    (result, true, Some(release))
 }
 
 impl Engine {
@@ -222,20 +246,23 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn authenticate_managed_concurrent_once(
+    pub(super) fn authenticate_managed_concurrent_once<'c, 'd>(
         &mut self,
         enrollment: &irlume_core::storage::Enrollment,
         purpose: AuthenticationPurpose,
         service: Option<&str>,
-        cameras: &(irlume_camera::RgbCamera, irlume_camera::IrCamera),
+        cameras: &'c (irlume_camera::RgbCamera, irlume_camera::IrCamera),
         mode: &CaptureModeSelection,
         deadline: Instant,
         held_pair_failed: &mut bool,
-        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
-    ) -> irlume_common::Result<Outcome> {
+        diagnostics: &'d dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> (
+        irlume_common::Result<Outcome>,
+        Option<DeferredSessionRelease<'c, 'd>>,
+    ) {
         // This outer owner also covers setup, stream destruction and admission.
         let mut state = CollectionState::new(self);
-        let result = state.engine.managed_concurrent_attempt(
+        let (result, release) = state.engine.managed_concurrent_attempt(
             enrollment,
             purpose,
             service,
@@ -246,27 +273,31 @@ impl Engine {
             diagnostics,
         );
         state.retain_facts = result.is_ok();
-        result
+        (result, release)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn managed_concurrent_attempt(
+    fn managed_concurrent_attempt<'c, 'd>(
         &mut self,
         enrollment: &irlume_core::storage::Enrollment,
         purpose: AuthenticationPurpose,
         service: Option<&str>,
-        cameras: &(irlume_camera::RgbCamera, irlume_camera::IrCamera),
+        cameras: &'c (irlume_camera::RgbCamera, irlume_camera::IrCamera),
         mode: &CaptureModeSelection,
         deadline: Instant,
         held_pair_failed: &mut bool,
-        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
-    ) -> irlume_common::Result<Outcome> {
+        diagnostics: &'d dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> (
+        irlume_common::Result<Outcome>,
+        Option<DeferredSessionRelease<'c, 'd>>,
+    ) {
         self.emit_capture_setup(diagnostics);
         let mut owned = false;
+        let mut release = None;
         let prepared = (|| {
             self.check_request_active()?;
             let control = self.capture_control();
-            let (prepared, released) = with_managed_pair(
+            let (prepared, existed, deferred) = with_managed_pair(
                 || {
                     arm_pair_transactionally(
                         || cameras.0.session_with_control(&control),
@@ -321,26 +352,34 @@ impl Engine {
                 },
                 diagnostics,
             );
-            owned = released;
+            owned = existed;
+            release = deferred;
             prepared
         })();
-        // The streaming owners and processing workers have finished before
-        // cancellation/deadline admission checks or any identity comparison.
+        // The processing workers have finished and no frame is dequeued from
+        // here on; the streaming owners are held, unused, until the caller
+        // has delivered the decision (ADR-0027). Admission and the identity
+        // comparison read only what was collected.
         if owned {
             self.arm_finalization();
         }
-        self.check_request_cancelled()?;
-        if matches!(&prepared, Ok(PreparedPairAuthentication::Ready(_))) {
-            self.check_request_active()?;
+        if let Err(error) = self.check_request_cancelled() {
+            return (Err(error), release);
         }
-        self.finish_pair_authentication(
+        if matches!(&prepared, Ok(PreparedPairAuthentication::Ready(_))) {
+            if let Err(error) = self.check_request_active() {
+                return (Err(error), release);
+            }
+        }
+        let outcome = self.finish_pair_authentication(
             enrollment,
             purpose,
             service,
             prepared,
             Some(held_pair_failed),
             diagnostics,
-        )
+        );
+        (outcome, release)
     }
 
     fn prepare_managed_concurrent_sample(

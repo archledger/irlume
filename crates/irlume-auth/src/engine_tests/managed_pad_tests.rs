@@ -433,7 +433,7 @@ fn managed_complete_batch_is_one_outer_attempt_and_preserves_final_match_decisio
         let mut samples = 0;
         let mut identities = 0;
         let mut costliest = Duration::ZERO;
-        let (result, fallback) = engine.authentication_attempt_loop_with(
+        let (result, fallback, _deferred) = engine.authentication_attempt_loop_with(
             started + Duration::from_secs(15),
             15_000,
             &mut costliest,
@@ -471,6 +471,7 @@ fn managed_complete_batch_is_one_outer_attempt_and_preserves_final_match_decisio
                         &(),
                     ),
                     false,
+                    None::<()>,
                 )
             },
             || clock.get(),
@@ -600,7 +601,7 @@ fn managed_pair_arms_and_establishes_once_and_releases_before_admission() {
     let armed = Cell::new(0);
     let rate = Cell::new(0);
     let mut samples = 0;
-    let (prepared, owned) = with_managed_pair(
+    let (prepared, owned, deferred) = with_managed_pair(
         || {
             armed.set(armed.get() + 1);
             Ok((Owner(&released), Owner(&released)))
@@ -635,11 +636,19 @@ fn managed_pair_arms_and_establishes_once_and_releases_before_admission() {
         },
         &(),
     );
+    // ADR-0027: a collected pair comes back deferred, still unreleased, so
+    // the decision can be delivered first; the caller's drop releases both.
     assert_eq!(
         (armed.get(), rate.get(), samples, released.get()),
-        (1, 1, 5, 2)
+        (1, 1, 5, 0)
     );
-    assert!(owned, "an armed pair was released");
+    assert!(owned, "an armed pair existed");
+    assert!(
+        deferred.is_some(),
+        "a collected pair is handed back for deferred release"
+    );
+    drop(deferred);
+    assert_eq!(released.get(), 2, "the deferred release drops both owners");
     let previous_ir = state.engine.ir_available;
     state.engine.ir_available = true;
     let result = state.engine.finish_pair_authentication(
@@ -691,15 +700,19 @@ fn managed_pair_releases_on_rate_processing_error_and_panic_without_admission() 
         assert_eq!(released.get(), 2);
         assert_eq!(processed.get(), usize::from(fault != "rate"));
         match result {
-            Ok((Err(error), owned)) => {
+            Ok((Err(error), owned, deferred)) => {
                 assert_eq!(
                     matches!(error, CapturePathError::ConcurrentPair(_)),
                     fault == "rate"
                 );
                 assert!(owned, "the failed pair still existed and was released");
+                assert!(
+                    deferred.is_none(),
+                    "an errored pair is released inside, nothing is deferred"
+                );
             }
             Err(_) => assert_eq!(fault, "panic"),
-            Ok((Ok(_), _)) => panic!("failed work admitted"),
+            Ok((Ok(_), _, _)) => panic!("failed work admitted"),
         }
     }
 }
@@ -710,7 +723,7 @@ fn managed_pair_releases_on_rate_processing_error_and_panic_without_admission() 
 fn managed_pair_reports_no_owner_when_arming_fails() {
     use crate::managed_pad::with_managed_pair;
     let established = Cell::new(false);
-    let (result, owned) = with_managed_pair(
+    let (result, owned, deferred) = with_managed_pair(
         || {
             Err::<((), ()), _>(CapturePathError::ConcurrentPair(
                 irlume_common::Error::Hardware("first session refused".into()),
@@ -725,7 +738,66 @@ fn managed_pair_reports_no_owner_when_arming_fails() {
     );
     assert!(matches!(result, Err(CapturePathError::ConcurrentPair(_))));
     assert!(!owned);
+    assert!(deferred.is_none());
     assert!(!established.get());
+}
+
+/// ADR-0027 at the loop: a final round hands its deferred release back to
+/// the caller unreleased; a round the loop retries releases it inside the
+/// loop, and the round's measured cost includes that release.
+#[test]
+fn attempt_loop_defers_release_on_final_rounds_and_releases_retried_rounds_inside() {
+    use std::cell::Cell;
+    struct Owner<'a>(&'a Cell<usize>);
+    impl Drop for Owner<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    let _guard = env_guard();
+    let mut state = shared();
+    let released = Cell::new(0);
+    let start = Instant::now();
+    let clock = Cell::new(start);
+    let round = Cell::new(0);
+    let mut costliest = Duration::ZERO;
+    let (result, fallback, deferred) = state.engine.authentication_attempt_loop_with(
+        start + Duration::from_secs(15),
+        15_000,
+        &mut costliest,
+        |_| {
+            round.set(round.get() + 1);
+            clock.set(clock.get() + Duration::from_secs(1));
+            // Round 1: pending PAD (retryable), round 2: a grant (final).
+            let outcome = if round.get() == 1 {
+                Outcome::deny(OutcomeKind::RgbPadPending, "one vote short")
+            } else {
+                Outcome::grant(1.0, "synthetic match")
+            };
+            // Each round's release, seen by the loop through its drop.
+            let release = crate::DeferredPairRelease {
+                pair: Some((Owner(&released), Owner(&released))),
+                diagnostics: &(),
+            };
+            (Ok(outcome), false, Some(release))
+        },
+        || clock.get(),
+    );
+    assert!(!fallback);
+    assert_eq!(round.get(), 2);
+    assert!(result.unwrap().granted);
+    assert_eq!(
+        released.get(),
+        2,
+        "the retried round was released inside the loop, the final one was not"
+    );
+    let deferred = deferred.expect("the final round hands its release back");
+    drop(deferred);
+    assert_eq!(
+        released.get(),
+        4,
+        "the caller's drop releases the final pair"
+    );
 }
 
 #[test]

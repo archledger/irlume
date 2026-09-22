@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed 2026-09-22. Amends ADR-0020 (managed concurrent PAD collection),
+Accepted 2026-09-22 (proposed and implemented the same day). Amends ADR-0020 (managed concurrent PAD collection),
 whose rule "streaming owners are released before final admission" this
 decision replaces for the final release of a request. Motivated by the
 `stream_owner_release` measurements in issue #797 and the release-order

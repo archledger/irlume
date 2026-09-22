@@ -442,7 +442,7 @@ fn grouped_pending_retry_keeps_existing_budget_and_never_adds_identity_attempts(
     let clock = Cell::new(start);
     let groups = Cell::new(0);
     let mut worst = Duration::ZERO;
-    let (result, fallback) = s.engine.authentication_attempt_loop_with(
+    let (result, fallback, _deferred) = s.engine.authentication_attempt_loop_with(
         start + Duration::from_secs(15),
         15_000,
         &mut worst,
@@ -469,7 +469,7 @@ fn grouped_pending_retry_keeps_existing_budget_and_never_adds_identity_attempts(
             let PreparedGroup::Refused(o) = prepared else {
                 panic!("pending group admitted")
             };
-            (Ok(o), false)
+            (Ok(o), false, None::<()>)
         },
         || clock.get(),
     );
@@ -626,7 +626,7 @@ fn grouped_deadline_keeps_timeout_label_through_retry_loop() {
     let clock = Cell::new(start);
     let mut calls = 0;
     let mut costliest = Duration::ZERO;
-    let (result, fallback) = s.engine.authentication_attempt_loop_with(
+    let (result, fallback, _deferred) = s.engine.authentication_attempt_loop_with(
         deadline,
         15_000,
         &mut costliest,
@@ -650,7 +650,7 @@ fn grouped_deadline_keeps_timeout_label_through_retry_loop() {
             let PreparedGroup::Refused(out) = prepared.unwrap() else {
                 panic!("expired group admitted")
             };
-            (Ok(out), false)
+            (Ok(out), false, None::<()>)
         },
         || clock.get(),
     );

@@ -133,7 +133,7 @@ pub struct Engine {
     /// The request's template key (ADR-0025): adopted from the enrollment
     /// load or unsealed once on the first encrypted read, lent to the
     /// secondary pin and the grant boundary, cleared when the request ends.
-    request_key: irlume_core::template_key::RequestTemplateKey,
+    request_key: std::sync::Arc<std::sync::Mutex<irlume_core::template_key::RequestTemplateKey>>,
     /// Start of the `Finalization` interval: armed once the owned streaming
     /// sessions have been released, reported by the guard that outlives the
     /// request's camera handles and lease.
@@ -1427,7 +1427,32 @@ impl Drop for FinalizationTimer<'_> {
     }
 }
 
+/// Clears the request's template key when dropped, on every return path
+/// and while unwinding: the daemon may retain the engine after a caught
+/// panic, so a held key must not depend on a normal return (ADR-0025 §3).
+struct RequestKeyGuard(
+    std::sync::Arc<std::sync::Mutex<irlume_core::template_key::RequestTemplateKey>>,
+);
+
+impl Drop for RequestKeyGuard {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+}
+
 impl Engine {
+    /// The request's template key source, for the readers that borrow it.
+    fn request_key(
+        &self,
+    ) -> std::sync::MutexGuard<'_, irlume_core::template_key::RequestTemplateKey> {
+        self.request_key
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// The enrollment loaded: everything until a capture route starts
     /// streaming (attempt enrollment resolution, schedule dispatch,
     /// per-attempt admission) is attempt preparation.
@@ -3576,7 +3601,9 @@ impl Engine {
             last_attempt_facts: AttemptFacts::default(),
             last_attempt_situation: None,
             capture_setup_started: None,
-            request_key: irlume_core::template_key::RequestTemplateKey::production(),
+            request_key: std::sync::Arc::new(std::sync::Mutex::new(
+                irlume_core::template_key::RequestTemplateKey::production(),
+            )),
             finalization_started: std::sync::Arc::default(),
         })
     }
@@ -5857,8 +5884,9 @@ impl Engine {
             previous,
         };
         // The request's template key lives exactly as long as the request
-        // (ADR-0025 §3): `begin_attempt` starts it empty and it is zeroized
-        // on every return path here.
+        // (ADR-0025 §3): `begin_attempt` starts it empty and this guard
+        // zeroizes it on every return path, including an unwinding panic.
+        let _request_key = RequestKeyGuard(std::sync::Arc::clone(&scope.engine.request_key));
         let result = scope.engine.authenticate_in_window_inner(
             user,
             service,
@@ -5867,7 +5895,6 @@ impl Engine {
             policy,
             diagnostics,
         );
-        scope.engine.request_key.clear();
         // Covers setup and cleanup paths that return before the retry loop.
         scope.engine.check_completed_attempt(&result)?;
         result
@@ -5972,7 +5999,7 @@ impl Engine {
                     // The key this load unsealed serves the rest of the
                     // request (ADR-0025): the pin and the grant boundary
                     // borrow it instead of unsealing again.
-                    self.request_key.adopt(key);
+                    self.request_key().adopt(user, key);
                     let resolved = self.resolve_attempt_enrollment(user, enr, &live_pair);
                     match resolved {
                         Err(outcome) => return Ok(outcome),
@@ -6108,7 +6135,7 @@ impl Engine {
                 emit_enrollment_load_timing(diagnostics, load_started);
                 match resolved {
                     Ok((enr, key)) => {
-                        self.request_key.adopt(key);
+                        self.request_key().adopt(user, key);
                         enr
                     }
                     Err(LoaderExit::NotEnrolled) => {
@@ -6645,7 +6672,8 @@ impl Engine {
         // a legacy primary rewrite that never touched the secondary
         // generation. Primary attempts never pay this check.
         if let Some(context) = &self.secondary_attempt {
-            match context.boundary_check_now_with(&mut self.request_key) {
+            let decision = context.boundary_check_now_with(&mut *self.request_key());
+            match decision {
                 Ok(irlume_core::multi_camera::commit::GrantDecision::Grant) => {}
                 Ok(irlume_core::multi_camera::commit::GrantDecision::Refuse(clause)) => {
                     return Ok(Outcome::deny(
@@ -8163,7 +8191,7 @@ impl Engine {
         self.secondary_attempt = None;
         // The request's template key starts empty (ADR-0025 §3): the load
         // that follows adopts this request's key, never a previous one's.
-        self.request_key.clear();
+        self.request_key().clear();
     }
 
     /// Decides which enrollment data THIS attempt may use (ADR-0024 §5),
@@ -8202,13 +8230,15 @@ impl Engine {
         });
         if !primary_matches {
             let secondary_path = irlume_core::multi_camera::secondary_store_path(user);
-            match irlume_core::multi_camera::coordinator::SecondaryAuthContext::pin_with_source(
-                &secondary_path,
-                &primary_path,
-                live.0.as_deref(),
-                live.1.as_deref(),
-                &mut self.request_key,
-            ) {
+            let pinned =
+                irlume_core::multi_camera::coordinator::SecondaryAuthContext::pin_with_source(
+                    &secondary_path,
+                    &primary_path,
+                    live.0.as_deref(),
+                    live.1.as_deref(),
+                    &mut *self.request_key(),
+                );
+            match pinned {
                 Ok(context) => {
                     let scoped = context.group_view().matching_enrollment(user);
                     if let Some(refusal) = self.enrollment_policy_refusal_for(user, &scoped, live) {
@@ -14007,12 +14037,14 @@ mod engine_tests {
         write_enrollment(&dir, &e);
         let unseals = std::sync::Arc::new(AtomicUsize::new(0));
         let counter = std::sync::Arc::clone(&unseals);
-        s.engine.request_key = RequestTemplateKey::with_unsealer(move |_| {
+        *s.engine.request_key() = RequestTemplateKey::with_unsealer(move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
             Ok(Some(zeroize_key()))
         });
         // A key left by an earlier request must not be lent to this one.
-        s.engine.request_key.adopt(Some(zeroize_key()));
+        s.engine
+            .request_key()
+            .adopt("irlume-test-request-key", Some(zeroize_key()));
         let o = s
             .engine
             .authenticate_for_with_diagnostics(
@@ -14024,7 +14056,7 @@ mod engine_tests {
             .unwrap();
         assert_eq!(o.kind, OutcomeKind::SetupUnavailable);
         assert!(
-            !s.engine.request_key.holds_key(),
+            !s.engine.request_key().holds_key(),
             "the key is cleared when the request returns, on a refusal too"
         );
         assert_eq!(
@@ -14032,7 +14064,29 @@ mod engine_tests {
             0,
             "a plaintext store never asks the source to unseal"
         );
-        s.engine.request_key = RequestTemplateKey::production();
+        *s.engine.request_key() = RequestTemplateKey::production();
+    }
+
+    /// ADR-0025 §3: the guard clears the key while unwinding too, because
+    /// the daemon may keep the engine after a caught panic.
+    #[test]
+    fn request_key_guard_clears_the_key_while_unwinding() {
+        let _g = env_guard();
+        let s = shared();
+        s.engine
+            .request_key()
+            .adopt("irlume-test-unwind", Some(zeroize_key()));
+        assert!(s.engine.request_key().holds_key());
+        let holder = std::sync::Arc::clone(&s.engine.request_key);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = RequestKeyGuard(holder);
+            panic!("capture failed mid-request");
+        }));
+        assert!(unwound.is_err());
+        assert!(
+            !s.engine.request_key().holds_key(),
+            "a panic after adoption must not leave the key held"
+        );
     }
 
     fn zeroize_key() -> irlume_core::template_key::UnsealedKey {

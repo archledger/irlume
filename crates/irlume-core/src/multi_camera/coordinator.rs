@@ -392,7 +392,7 @@ mod integration {
         assert_eq!(keys.unseals(), 1, "the boundary borrows the same key");
 
         let mut adopted = counting_source(None);
-        adopted.adopt(Some(zeroize::Zeroizing::new(key.to_vec())));
+        adopted.adopt("alice", Some(zeroize::Zeroizing::new(key.to_vec())));
         let context = SecondaryAuthContext::pin_with_source(
             &secondary_path,
             &primary_path,
@@ -456,6 +456,39 @@ mod integration {
         ));
         assert_eq!(keys.unseals(), 0);
         assert!(!keys.holds_key());
+    }
+
+    /// A secondary store that decrypts under the request's key but declares
+    /// another owner cannot borrow that key for the owner's primary: the pin
+    /// fails closed instead of activating a group across accounts.
+    #[test]
+    fn a_secondary_naming_another_owner_cannot_borrow_the_request_key() {
+        let rig = Rig::new("owner");
+        let key = crate::crypto::generate_key();
+        let (secondary_path, primary_path, rgb, ir) =
+            enroll_encrypted_pair(&rig, Some(&key), Some(&key));
+        let mut store = super::super::load_secondary_with_key(&secondary_path, Some(&key))
+            .expect("read")
+            .expect("present");
+        store.owner = "mallory".into();
+        super::super::save_secondary_with_key(&secondary_path, &store, Some(&key))
+            .expect("rewrite");
+        let mut keys = crate::template_key::RequestTemplateKey::with_unsealer(move |user| {
+            assert_eq!(user, "alice", "only the path's account may unseal");
+            Ok(Some(zeroize::Zeroizing::new(key.to_vec())))
+        });
+        let pinned = SecondaryAuthContext::pin_with_source(
+            &secondary_path,
+            &primary_path,
+            Some(&rgb),
+            Some(&ir),
+            &mut keys,
+        );
+        assert!(
+            matches!(pinned, Err(PinError::Secondary(ref reason)) if reason.contains("mallory")),
+            "{pinned:?}"
+        );
+        assert_eq!(keys.unseals(), 1);
     }
 
     /// An encrypted store with no lendable key (no TPM) fails closed at the

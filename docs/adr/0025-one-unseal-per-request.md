@@ -7,7 +7,7 @@ revision, Phase 2 measurement pending). Motivated by the latency
 measurements in issue #797 on the then-current `main` (a44b5037) with the
 schema 4 trace stages of #798.
 Depends on ADR-0024 (multi-camera enrollment) and ADR-0021 (rate-evidence
-amortization); changes neither's invariants. No implementation yet.
+amortization); changes neither's invariants.
 
 ## Context
 
@@ -89,10 +89,13 @@ this request must not follow.
 
 The retained key is the single memlocked `Zeroizing<Vec<u8>>` the unseal
 produced, owned by the request scope and dropped, and therefore zeroized,
-when the request returns, whatever the outcome. It is not copied, not
-stored on the engine, not shared between requests, not written anywhere,
-and not exposed through any diagnostic or trace. Cancel, deadline, refusal
-and error paths drop it the same way as a grant.
+when the request returns, whatever the outcome, including an unwinding
+panic (an RAII guard clears it, since the daemon may retain the engine
+after a caught panic). It is bound to the account it was resolved for: a
+store naming another owner cannot borrow it and fails closed. A resolution
+that found no key (no TPM) is remembered too, so the request asks at most
+once. The key is not copied, not shared between requests, not written
+anywhere, and not exposed through any diagnostic or trace.
 
 ### 4. What this ADR does not do
 

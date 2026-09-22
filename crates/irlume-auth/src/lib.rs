@@ -6548,6 +6548,12 @@ impl Engine {
         now: impl Fn() -> std::time::Instant,
     ) -> (irlume_common::Result<Outcome>, bool, Option<D>) {
         let mut attempt = 0_u32;
+        // The costliest CAPTURE this loop has seen, before any release: the
+        // next attempt's estimate. `costliest_attempt` keeps its old meaning
+        // (a whole round, release included) for the caller's fallback seed;
+        // it must not feed the retry estimate, where the pending release is
+        // added explicitly, or a round's release would be counted twice.
+        let mut costliest_capture = std::time::Duration::ZERO;
         // The costliest attempt so far (caller-seeded: the sequential fallback
         // starts with the concurrent loop's observed worst). A retry that
         // cannot FINISH before the deadline would overrun mid-capture —
@@ -6573,8 +6579,10 @@ impl Engine {
             }
             // Measured before any deferred release: a final round hands its
             // teardown to the caller, a retried round pays it just below and
-            // is re-measured then.
-            *costliest_attempt = (*costliest_attempt).max(now().duration_since(attempt_started));
+            // re-measures the whole round then.
+            let capture_cost = now().duration_since(attempt_started);
+            costliest_capture = costliest_capture.max(capture_cost);
+            *costliest_attempt = (*costliest_attempt).max(capture_cost);
             let out = match attempt_result {
                 Ok(out) => out,
                 Err(error) => {
@@ -6622,16 +6630,18 @@ impl Engine {
             // and must complete before the next capture can start, so the two
             // costs ADD: the pending release, at the costliest release this
             // request has measured (or the floor before one has been), plus
-            // the costliest attempt, which is the next attempt's estimate. A
-            // round that settles here keeps its deferral, so the final refusal
-            // is still delivered before the teardown; a round that retries
-            // pays the teardown now, inside its own measured cost, as before.
+            // the costliest capture, the next attempt's estimate. Capture and
+            // release are kept apart so neither is counted twice across
+            // rounds. A round that settles here keeps its deferral, so the
+            // final refusal is still delivered before the teardown; a round
+            // that retries pays the teardown now, inside its own measured
+            // whole-round cost, as before.
             let pending_release = if deferred.is_some() {
                 self.last_release_cost.unwrap_or(RELEASE_ALLOWANCE_FLOOR)
             } else {
                 std::time::Duration::ZERO
             };
-            let estimate = pending_release + *costliest_attempt;
+            let estimate = pending_release + costliest_capture;
             let retry_wont_fit = deadline.saturating_duration_since(now()) < estimate;
             if retry_wont_fit {
                 irlume_common::dlog!(

@@ -97,8 +97,10 @@ before delivery.
    its measured cost; a round that would retry but no longer fits keeps its
    deferral. The fit question adds the pending release (the costliest release
    this request measured, or a 1.5 s floor above the NexiGo's worst) to the
-   costliest attempt, since the release must finish before the next capture
-   starts, so a retry is never admitted on a cost that omits its teardown.
+   costliest capture, since the release must finish before the next capture
+   starts; capture and release are tracked apart so a retry is neither
+   admitted on a cost that omits its teardown nor refused on one that counts
+   it twice.
 
 7. The same hook serves credential release: `UnsealPassword` (cold login
    with `unseal ondemand`) prepares the credential and sends it inside the

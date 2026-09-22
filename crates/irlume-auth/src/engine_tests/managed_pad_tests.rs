@@ -791,6 +791,72 @@ fn attempt_loop_keeps_the_deferral_when_a_retry_would_not_fit() {
     assert_eq!(released.get(), 2);
 }
 
+/// Across several retryable rounds the release is counted once per round,
+/// never twice: after round 1 retried (capture 2 s, release 1.5 s), round 2
+/// ends with 4 s left; the next retry needs the pending release (1.5 s) plus
+/// one capture (2 s) = 3.5 s, so it fits and round 3 runs. Counting the
+/// release inside the capture estimate as well (5 s) would have settled
+/// with a false refusal.
+#[test]
+fn attempt_loop_counts_each_rounds_release_once_across_retries() {
+    use std::cell::Cell;
+    // Dropping an owner takes 750 ms of the scripted clock: a pair release
+    // is 1.5 s, and the loop measures it through `now()` like production.
+    struct Owner<'a>(&'a Cell<usize>, &'a Cell<Instant>);
+    impl Drop for Owner<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+            self.1.set(self.1.get() + Duration::from_millis(750));
+        }
+    }
+    let _guard = env_guard();
+    let mut state = shared();
+    let released = Cell::new(0);
+    let start = Instant::now();
+    let clock = Cell::new(start);
+    let rounds = Cell::new(0);
+    let mut costliest = Duration::ZERO;
+    // Window 10.4 s. Round 1: capture 2 s (t=2), retried, release 1.5 s
+    // (t=3.5). Round 2: capture 2 s (t=5.5); 4.9 s left against 1.5 + 2 =
+    // 3.5: fits, release (t=7). Round 3: capture 2 s (t=9); 1.4 s left:
+    // settle, deferral kept. With the release counted inside the capture
+    // estimate as well (1.5 + 3.5 = 5 s), round 2 would have settled.
+    let (result, fallback, deferred) = state.engine.authentication_attempt_loop_with(
+        start + Duration::from_millis(10_400),
+        10_400,
+        &mut costliest,
+        |_| {
+            rounds.set(rounds.get() + 1);
+            clock.set(clock.get() + Duration::from_secs(2));
+            let release = crate::DeferredPairRelease {
+                pair: Some((Owner(&released, &clock), Owner(&released, &clock))),
+                diagnostics: &(),
+            };
+            (
+                Ok(Outcome::deny(OutcomeKind::RgbPadPending, "one vote short")),
+                false,
+                Some(release),
+            )
+        },
+        || clock.get(),
+    );
+    assert!(!fallback);
+    assert_eq!(
+        rounds.get(),
+        3,
+        "round 2 retried because the release was counted once, round 3 settled"
+    );
+    assert_eq!(result.unwrap().kind, OutcomeKind::RgbPadPending);
+    assert_eq!(released.get(), 4, "rounds 1 and 2 released inside the loop");
+    assert_eq!(
+        state.engine.last_release_cost,
+        Some(Duration::from_millis(1500)),
+        "the loop measured the release through the clock"
+    );
+    drop(deferred.expect("round 3 settled with its deferral"));
+    assert_eq!(released.get(), 6);
+}
+
 /// ADR-0027 at the loop: a final round hands its deferred release back to
 /// the caller unreleased; a round the loop retries releases it inside the
 /// loop, and the round's measured cost includes that release.

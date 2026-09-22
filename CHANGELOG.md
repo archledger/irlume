@@ -17,6 +17,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The TPM is reached through the raw device (`/dev/tpm0`) first, with the
+  kernel resource manager (`/dev/tpmrm0`) as the per-call fallback (ADR-0026).
+  The manager saves and flushes every session and object after every command,
+  which on AMD firmware TPMs made the one remaining template-key unseal cost
+  1.5 s per authentication (`enrollment_load` in the schema 4 trace); the same
+  commands over the raw device take about 80 ms. Policies, PCR binding and key
+  lifetime are unchanged; `IRLUME_TCTI=device:/dev/tpmrm0` pins the previous
+  transport. Each raw-device conversation first flushes any loaded handle a
+  crashed predecessor left behind.
 - Delivered-rate evidence stays reusable for 24 hours instead of 5 minutes
   (ADR-0021 amendment). An unlock after more than five minutes away used to
   re-pay the full 30-delta rate fill, about 1.5 s more than a back-to-back

@@ -82,3 +82,13 @@ jobs:
             --test-threads=1
         env:
           IRLUME_TCTI: device:/dev/tpmrm0
+      - name: TPM round trip over the default transport order (raw device, manager fallback; ADR-0026)
+        run: |
+          # IRLUME_TCTI deliberately unset: the production transport order. The
+          # runner is not root and udev gives /dev/tpm0 to the tss user only, so
+          # here the raw open is refused and the FALLBACK branch is what this
+          # step proves against the real chip. The raw branch itself is covered
+          # as root on the reference machines (ADR-0026 acceptance tests).
+          ./scripts/run-tests-guarded.sh --require seal_unseal_roundtrip_default_transport_order \
+            -- cargo test -p irlume-core --lib --locked -- --ignored \
+            seal_unseal_roundtrip_default_transport_order --test-threads=1

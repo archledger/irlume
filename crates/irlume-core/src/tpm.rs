@@ -31,7 +31,10 @@ use std::str::FromStr;
 use zeroize::Zeroizing;
 
 use tss_esapi::attributes::{ObjectAttributesBuilder, SessionAttributesBuilder};
-use tss_esapi::constants::tss::{TPM2_HR_NV_INDEX, TPM2_HR_PERSISTENT};
+use tss_esapi::constants::tss::{
+    TPM2_HR_HMAC_SESSION, TPM2_HR_NV_INDEX, TPM2_HR_PERSISTENT, TPM2_HR_POLICY_SESSION,
+    TPM2_HR_TRANSIENT,
+};
 use tss_esapi::constants::{CapabilityType, SessionType};
 use tss_esapi::handles::{
     KeyHandle, NvIndexHandle, NvIndexTpmHandle, ObjectHandle, PersistentTpmHandle, SessionHandle,
@@ -54,7 +57,18 @@ use tss_esapi::traits::{Marshall, UnMarshall};
 use tss_esapi::tss2_esys::ESYS_TR;
 use tss_esapi::{Context, TctiNameConf};
 
-const TCTI_DEFAULT: &str = "device:/dev/tpmrm0";
+/// The raw TPM character device, tried first. The kernel resource manager
+/// (`/dev/tpmrm0`) saves and flushes every session and transient object after
+/// EVERY command so that spaces can share the chip; on AMD firmware TPMs each
+/// of those context round trips costs 40–90 ms, which turned a Tier-1 unseal
+/// of ~80 ms of TPM work into ~1.5 s (#797, ADR-0026). The raw device runs the
+/// same commands with no juggling. It is exclusive-open, so anything else on
+/// it (a userspace resource manager, another irlume process mid-unseal) makes
+/// the open fail with EBUSY, and we fall back to the manager for that call.
+const TCTI_RAW_DEVICE: &str = "device:/dev/tpm0";
+/// The kernel resource manager: the fallback, and what `IRLUME_TCTI` should
+/// name to pin the previous behaviour.
+const TCTI_RESOURCE_MANAGER: &str = "device:/dev/tpmrm0";
 
 /// TPM2_PolicyAuthorize command code (big-endian), folded into the authorized
 /// policy digest per the TPM2 spec.
@@ -77,9 +91,95 @@ fn tpm_err<E: std::fmt::Display>(e: E) -> Error {
 }
 
 fn open_context() -> Result<Context> {
-    let tcti = std::env::var("IRLUME_TCTI").unwrap_or_else(|_| TCTI_DEFAULT.into());
-    let conf = TctiNameConf::from_str(&tcti).map_err(tpm_err)?;
-    Context::new(conf).map_err(tpm_err)
+    open_context_from(std::env::var("IRLUME_TCTI").ok().as_deref(), |tcti| {
+        let conf = TctiNameConf::from_str(tcti).map_err(tpm_err)?;
+        Context::new(conf).map_err(tpm_err)
+    })
+}
+
+/// Transport order for one TPM conversation. An explicit `IRLUME_TCTI` is
+/// obeyed alone (tests, swtpm, a pinned manager); otherwise the raw device is
+/// tried and the resource manager is the fallback.
+fn tcti_candidates(explicit: Option<&str>) -> Vec<&str> {
+    match explicit {
+        Some(tcti) => vec![tcti],
+        None => vec![TCTI_RAW_DEVICE, TCTI_RESOURCE_MANAGER],
+    }
+}
+
+/// Open the first transport in [`tcti_candidates`] that works. A raw-device
+/// context is swept of stale slots first (see [`flush_stale_slots`]); if the
+/// sweep fails the context is dropped and the next transport is tried, so a
+/// raw device that opens but misbehaves never strands a request.
+fn open_context_from(
+    explicit: Option<&str>,
+    open: impl Fn(&str) -> Result<Context>,
+) -> Result<Context> {
+    let candidates = tcti_candidates(explicit);
+    let mut last = None;
+    for (index, tcti) in candidates.iter().enumerate() {
+        let attempt = open(tcti).and_then(|mut ctx| {
+            if *tcti == TCTI_RAW_DEVICE {
+                flush_stale_slots(&mut ctx)?;
+            }
+            Ok(ctx)
+        });
+        match attempt {
+            Ok(ctx) => return Ok(ctx),
+            Err(e) => {
+                if index + 1 < candidates.len() {
+                    note_fallback_once(tcti, &e);
+                }
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| Error::Tpm("no TPM transport configured".into())))
+}
+
+/// Say once per process that the raw device was unavailable. EBUSY from a
+/// concurrent opener is ordinary; a permanent denial is worth a line in the
+/// journal because every later unseal then pays the manager's cost.
+fn note_fallback_once(tcti: &str, error: &Error) {
+    static NOTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    NOTED.get_or_init(|| {
+        irlume_common::dlog!(
+            "irlume: TPM transport {tcti} unavailable ({error}); using {TCTI_RESOURCE_MANAGER} \
+             (slower on some firmware TPMs; set IRLUME_TCTI to pin a transport)"
+        );
+    });
+}
+
+/// Flush every loaded transient object and loaded session on a raw-device
+/// context. Objects loaded through `/dev/tpm0` live in real chip slots that
+/// nobody frees if the loading process dies mid-conversation (the kernel only
+/// reclaims resource-manager spaces), and a chip with its handful of slots
+/// full refuses every later `Load`. The sweep is safe because the raw device
+/// is exclusive-open (no other raw user exists while we hold it) and the
+/// kernel resource manager leaves nothing loaded between commands; so any
+/// loaded handle we can see is a leak, ours or a predecessor's.
+fn flush_stale_slots(ctx: &mut Context) -> Result<()> {
+    for range in [
+        TPM2_HR_TRANSIENT,
+        TPM2_HR_HMAC_SESSION,
+        TPM2_HR_POLICY_SESSION,
+    ] {
+        let (data, _more) = ctx
+            .get_capability(CapabilityType::Handles, range, 0xff)
+            .map_err(tpm_err)?;
+        let CapabilityData::Handles(list) = data else {
+            return Err(Error::Tpm(
+                "TPM returned a non-handle capability for a handle query".into(),
+            ));
+        };
+        for handle in list.into_inner() {
+            // The same route `tpm2_flushcontext --transient/--loaded-session`
+            // takes: resolve the chip handle to an ESYS resource, then flush.
+            let object = ctx.tr_from_tpm_public(handle).map_err(tpm_err)?;
+            ctx.flush_context(object).map_err(tpm_err)?;
+        }
+    }
+    Ok(())
 }
 
 /// The PCRs to bind to: `IRLUME_PCRS` (comma-separated) or `DEFAULT_PCRS`.
@@ -2149,6 +2249,85 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let secret = b"irlume-keyring-secret-roundtrip!";
         let env = seal_with_pcrs(secret, &[7]).expect("seal");
         let got = unseal(&env).expect("unseal");
+        assert_eq!(&*got, secret, "round-trip must match");
+    }
+
+    // --- transport selection (ADR-0026) ---------------------------------
+
+    #[test]
+    fn an_explicit_tcti_is_the_only_candidate() {
+        assert_eq!(
+            tcti_candidates(Some("swtpm:host=127.0.0.1,port=2321")),
+            vec!["swtpm:host=127.0.0.1,port=2321"]
+        );
+        assert_eq!(
+            tcti_candidates(Some(TCTI_RESOURCE_MANAGER)),
+            vec![TCTI_RESOURCE_MANAGER],
+            "pinning the manager must not also try the raw device"
+        );
+    }
+
+    #[test]
+    fn the_default_tries_the_raw_device_then_the_resource_manager() {
+        assert_eq!(
+            tcti_candidates(None),
+            vec![TCTI_RAW_DEVICE, TCTI_RESOURCE_MANAGER]
+        );
+    }
+
+    #[test]
+    fn a_failed_raw_open_falls_back_and_a_failed_fallback_reports_its_own_error() {
+        let tried = std::cell::RefCell::new(Vec::new());
+        let result = open_context_from(None, |tcti| {
+            tried.borrow_mut().push(tcti.to_string());
+            Err(Error::Tpm(format!("cannot open {tcti}")))
+        });
+        assert_eq!(
+            tried.into_inner(),
+            vec![
+                TCTI_RAW_DEVICE.to_string(),
+                TCTI_RESOURCE_MANAGER.to_string()
+            ],
+            "raw first, manager second, nothing else"
+        );
+        let err = result.expect_err("both transports failed");
+        assert!(
+            err.to_string().contains(TCTI_RESOURCE_MANAGER),
+            "the error a caller sees is the last transport's: {err}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_tcti_that_fails_is_not_retried_elsewhere() {
+        let tried = std::cell::RefCell::new(Vec::new());
+        let result = open_context_from(Some("device:/dev/tpmrm9"), |tcti| {
+            tried.borrow_mut().push(tcti.to_string());
+            Err(Error::Tpm("no such device".into()))
+        });
+        assert_eq!(tried.into_inner(), vec!["device:/dev/tpmrm9".to_string()]);
+        assert!(result.is_err());
+    }
+
+    /// The production default (raw device, manager fallback) against the host
+    /// TPM: a seal→unseal round trip with `IRLUME_TCTI` unset. On a machine
+    /// where the raw device opens this exercises the stale-slot sweep and the
+    /// exclusive-open path; where it does not, the fallback. Either way the
+    /// secret must come back intact.
+    #[test]
+    #[ignore = "requires a real TPM (root); run with IRLUME_TCTI unset so the default transport order is exercised"]
+    fn seal_unseal_roundtrip_default_transport_order() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("IRLUME_TCTI");
+        std::env::remove_var("IRLUME_TCTI");
+        let secret = b"irlume-transport-order-roundtrip";
+        let outcome = seal_with_pcrs(secret, &[7]).and_then(|env| unseal(&env));
+        match previous {
+            Some(v) => std::env::set_var("IRLUME_TCTI", v),
+            None => std::env::remove_var("IRLUME_TCTI"),
+        }
+        let got = outcome.expect("seal then unseal over the default transport order");
         assert_eq!(&*got, secret, "round-trip must match");
     }
 

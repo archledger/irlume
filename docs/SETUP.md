@@ -672,7 +672,7 @@ Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
 | `IRLUME_IR_EMITTER_CONF` | alternate path for `ir_emitter.conf` | `/var/lib/irlume/ir_emitter.conf` |
 | `IRLUME_RGB_MOIRE_MAX` | per-camera ceiling for the screen-replay moiré cue | 28 |
 | `IRLUME_IR_AMBIENT_SUBTRACT` | `1` enables experimental lit-minus-ambient IR subtraction; changes the IR frames the matcher sees, so re-enroll after toggling (see [ARCHITECTURE.md](ARCHITECTURE.md)) | off |
-| `IRLUME_TCTI` | TPM transport | `device:/dev/tpmrm0` |
+| `IRLUME_TCTI` | TPM transport; set to pin one (no fallback), e.g. `device:/dev/tpmrm0` to force the kernel resource manager | `device:/dev/tpm0`, falling back to `device:/dev/tpmrm0` when the raw device cannot be opened (ADR-0026) |
 | `IRLUME_PCRS` | comma-separated PCR list the sealed secret binds to | `7` |
 | `IRLUME_SRK_HANDLE` | persistent SRK handle (hex), if the default collides with another TPM user | `0x81010002` |
 | `IRLUME_METHOD_CONF` | alternate path for the method file | `/etc/irlume/method` |

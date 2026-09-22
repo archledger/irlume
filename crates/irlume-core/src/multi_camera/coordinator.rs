@@ -38,8 +38,9 @@ pub enum PinError {
     GroupNotActive(String),
     /// ADR-0028: a group matches the configured pair exactly, but the store
     /// is inactive because the primary enrollment changed since that group
-    /// was authorized.
-    GroupInactive(String),
+    /// was authorized. `index` is the group's 0-based store position, so
+    /// the refusal can still name the scope by ordinal.
+    GroupInactive { index: usize, detail: String },
     /// ADR-0028: more than one group matches the configured pair exactly.
     Ambiguous(String),
 }
@@ -49,13 +50,22 @@ impl std::fmt::Display for PinError {
         match self {
             PinError::Secondary(detail) => write!(f, "secondary store unusable: {detail}"),
             PinError::GroupNotActive(detail) => write!(f, "no active group: {detail}"),
-            PinError::GroupInactive(detail) => write!(f, "group inactive: {detail}"),
+            PinError::GroupInactive { detail, .. } => write!(f, "group inactive: {detail}"),
             PinError::Ambiguous(detail) => write!(f, "ambiguous group: {detail}"),
         }
     }
 }
 
 impl std::error::Error for PinError {}
+
+/// The account and store paths a strict pin resolves against (ADR-0028).
+#[derive(Debug, Clone, Copy)]
+pub struct StrictPinStores<'a> {
+    /// The authenticating account; a store naming another owner fails closed.
+    pub user: &'a str,
+    pub secondary_path: &'a Path,
+    pub primary_path: &'a Path,
+}
 
 /// One authentication attempt's pinned secondary context.
 #[derive(Debug)]
@@ -166,27 +176,34 @@ impl SecondaryAuthContext {
     /// ADR-0028: pin an IR-only attempt on the secondary group whose pair
     /// EXACTLY equals the configured pair (both sides present and equal;
     /// [`SecondaryStore::strict_group_for_pair`]). The caller has already
-    /// loaded the primary and retains the bytes it parsed (`primary` and
-    /// `primary_bytes`, ADR-0028 §5), so only the secondary store is read
-    /// here, under the lent key. Distinguishes the causes the IR-only
-    /// readiness must report: no such group, an exact group in an inactive
-    /// store, and an ambiguous store.
+    /// loaded `user`'s primary and retains the bytes it parsed (`primary`
+    /// and `primary_bytes`, ADR-0028 §5), so only the secondary store is
+    /// read here, under the lent key, after the commit journal is resolved
+    /// (a store missing after a crashed publication is recovered first).
+    /// A store that names another owner fails closed before any matching.
+    /// Distinguishes the causes the IR-only readiness must report: no such
+    /// group, an exact group in an inactive store, and an ambiguous store.
     ///
     /// # Errors
     ///
-    /// [`PinError::Secondary`] when the store is unusable or absent,
-    /// [`PinError::GroupNotActive`] when no group has exactly this pair,
-    /// [`PinError::GroupInactive`] when one does but the store's primary
-    /// snapshot no longer matches, [`PinError::Ambiguous`] when several do.
+    /// [`PinError::Secondary`] when the store is unusable, absent or names
+    /// another owner, [`PinError::GroupNotActive`] when no group has exactly
+    /// this pair, [`PinError::GroupInactive`] when one does but the store's
+    /// primary snapshot no longer matches, [`PinError::Ambiguous`] when
+    /// several do.
     pub fn pin_strict_with_source(
-        secondary_path: &Path,
-        primary_path: &Path,
+        stores: StrictPinStores<'_>,
         primary: &crate::storage::Enrollment,
         primary_bytes: &[u8],
         rgb: &str,
         ir: &str,
         keys: &mut dyn crate::template_key::TemplateKeySource,
     ) -> Result<Self, PinError> {
+        let StrictPinStores {
+            user,
+            secondary_path,
+            primary_path,
+        } = stores;
         resolve_commit(secondary_path).map_err(|error| PinError::Secondary(error.to_string()))?;
         let secondary: SecondaryStore = super::load_secondary_with_source(secondary_path, keys)
             .and_then(|option| {
@@ -194,6 +211,12 @@ impl SecondaryAuthContext {
                     .ok_or_else(|| super::SecondaryStoreError::Io("secondary store absent".into()))
             })
             .map_err(|error| PinError::Secondary(error.to_string()))?;
+        if secondary.owner != user {
+            return Err(PinError::Secondary(format!(
+                "the store names owner '{}', not the authenticating account",
+                secondary.owner
+            )));
+        }
         let (store_index, group_id) = match secondary.strict_group_for_pair(rgb, ir) {
             super::StrictPairMatch::One { index, group } => (index, group.id.as_str().to_owned()),
             super::StrictPairMatch::None => {
@@ -208,9 +231,10 @@ impl SecondaryAuthContext {
             }
         };
         if secondary.activation_against(Some(primary_bytes)) != super::Activation::Active {
-            return Err(PinError::GroupInactive(
-                "the primary enrollment changed since this camera was authorized".into(),
-            ));
+            return Err(PinError::GroupInactive {
+                index: store_index,
+                detail: "the primary enrollment changed since this camera was authorized".into(),
+            });
         }
         let views = CameraScopedViews::compose(primary, primary_bytes, Some(&secondary))
             .map_err(|error| PinError::Secondary(error.to_string()))?;
@@ -219,9 +243,10 @@ impl SecondaryAuthContext {
             .iter()
             .position(|view| matches!(&view.scope, GroupScope::Secondary(id) if id == &group_id))
         else {
-            return Err(PinError::GroupInactive(
-                "group matches the pair but its activation is stale".into(),
-            ));
+            return Err(PinError::GroupInactive {
+                index: store_index,
+                detail: "group matches the pair but its activation is stale".into(),
+            });
         };
         Ok(Self {
             secondary_path: secondary_path.to_owned(),

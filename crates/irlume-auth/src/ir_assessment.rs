@@ -261,12 +261,15 @@ fn resolve_ir_only_scope_at(
         }
         other => return Err(IrOnlyRefusal::unscoped(other)),
     }
-    if !stores.secondary_path.exists() {
-        return Err(IrOnlyRefusal::unscoped(Ready::BindingMismatch));
-    }
+    // No existence pre-check: the pin resolves the commit journal first, so
+    // a store missing after a crashed publication is recovered rather than
+    // reported absent; an absent store is then a binding mismatch.
     let pinned = SecondaryAuthContext::pin_strict_with_source(
-        stores.secondary_path,
-        stores.primary_path,
+        irlume_core::multi_camera::coordinator::StrictPinStores {
+            user: stores.user,
+            secondary_path: stores.secondary_path,
+            primary_path: stores.primary_path,
+        },
         &enrollment,
         &bytes,
         rgb,
@@ -275,13 +278,17 @@ fn resolve_ir_only_scope_at(
     );
     let context = match pinned {
         Ok(context) => context,
-        Err(PinError::GroupInactive(cause)) => {
-            irlume_common::dlog!("ir-only: secondary group inactive: {cause}");
-            return Err(IrOnlyRefusal::secondary(Ready::SecondaryInactive, None));
+        Err(PinError::GroupInactive { index, detail }) => {
+            irlume_common::dlog!("ir-only: secondary group inactive: {detail}");
+            return Err(IrOnlyRefusal::secondary(
+                Ready::SecondaryInactive,
+                Some(index + 1),
+            ));
         }
         Err(error) => {
-            // No strict match, an ambiguous store or an unusable one: the
-            // binding-mismatch refusal answers, never store order.
+            // No strict match, an ambiguous, absent, foreign-owned or
+            // unusable store: the binding-mismatch refusal answers, never
+            // store order.
             irlume_common::dlog!("ir-only: secondary pin refused: {error}");
             return Err(IrOnlyRefusal::unscoped(Ready::BindingMismatch));
         }
@@ -759,6 +766,16 @@ mod tests {
                 bytes
             }
 
+            /// Writes a plaintext secondary store declaring `owner`.
+            pub(super) fn write_secondary_owned(
+                &self,
+                owner: &str,
+                groups: Vec<SecondaryGroup>,
+                primary_bytes: &[u8],
+            ) {
+                self.write_store(owner, groups, primary_bytes, None);
+            }
+
             /// Writes a secondary store activated against `primary_bytes`.
             pub(super) fn write_secondary(
                 &self,
@@ -766,9 +783,19 @@ mod tests {
                 primary_bytes: &[u8],
                 key: Option<&[u8]>,
             ) {
+                self.write_store(USER, groups, primary_bytes, key);
+            }
+
+            fn write_store(
+                &self,
+                owner: &str,
+                groups: Vec<SecondaryGroup>,
+                primary_bytes: &[u8],
+                key: Option<&[u8]>,
+            ) {
                 let store = SecondaryStore {
                     format_version: SECONDARY_STORE_VERSION,
-                    owner: USER.into(),
+                    owner: owner.into(),
                     generation: 1,
                     primary_snapshot_sha256: irlume_common::sha256_hex(primary_bytes),
                     groups,
@@ -902,6 +929,26 @@ mod tests {
 
         pub(super) fn no_key() -> RequestTemplateKey {
             RequestTemplateKey::with_unsealer(|_| Ok(None))
+        }
+
+        /// Standard base64 without a dependency: the journal payload field.
+        pub(super) fn base64_std(bytes: &[u8]) -> String {
+            const TABLE: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let mut word = [0u8; 3];
+                word[..chunk.len()].copy_from_slice(chunk);
+                let n = (u32::from(word[0]) << 16) | (u32::from(word[1]) << 8) | u32::from(word[2]);
+                for i in 0..4 {
+                    if i <= chunk.len() {
+                        out.push(TABLE[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                    } else {
+                        out.push('=');
+                    }
+                }
+            }
+            out
         }
 
         pub(super) fn digest_of(path: &Path) -> String {
@@ -1109,7 +1156,66 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(refusal.readiness, Ready::SecondaryInactive);
-        assert_eq!(refusal.scope, Some(IrScope::Secondary));
+        assert_eq!(
+            (refusal.scope, refusal.scope_index),
+            (Some(IrScope::Secondary), Some(1)),
+            "an inactive group is still named by its position"
+        );
+    }
+
+    /// A store at the account's path that names another owner never lends
+    /// its groups to this account, whatever its digest says.
+    #[test]
+    fn ir_only_scope_refuses_a_store_naming_another_owner() {
+        use adr28::*;
+        use irlume_common::IrOnlyReadiness as Ready;
+        let rig = Rig::new("owner");
+        let bytes = rig.write_primary(&primary(), None);
+        rig.write_secondary_owned(
+            "mallory",
+            vec![group("a", Some(RGB_A), Some(IR_X), 0.5, true)],
+            &bytes,
+        );
+        let refusal =
+            resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key(), true).unwrap_err();
+        assert_eq!(refusal.readiness, Ready::BindingMismatch);
+        assert_eq!(refusal.scope, None);
+    }
+
+    /// A publication that crashed after journaling its intent and before the
+    /// rename leaves no store file; the resolution recovers the journal
+    /// forward instead of reporting the store absent (ADR-0024 §4.1).
+    #[test]
+    fn ir_only_scope_recovers_a_journaled_store_before_resolving() {
+        use adr28::*;
+        use irlume_common::IrScope;
+        let rig = Rig::new("journal");
+        let bytes = rig.write_primary(&primary(), None);
+        rig.write_secondary(
+            vec![group("a", Some(RGB_A), Some(IR_X), 0.5, true)],
+            &bytes,
+            None,
+        );
+        // Model the crash: the intent journal carries the committed store
+        // and the store file itself is missing.
+        let store_path = rig.secondary_path();
+        let store_bytes = std::fs::read(&store_path).unwrap();
+        std::fs::remove_file(&store_path).unwrap();
+        let intent = serde_json::json!({
+            "format_version": irlume_core::multi_camera::commit::INTENT_FORMAT_VERSION,
+            "generation": 1,
+            "primary_snapshot_sha256": irlume_common::sha256_hex(&bytes),
+            "new_secondary_b64": base64_std(&store_bytes),
+        });
+        std::fs::write(
+            irlume_core::multi_camera::commit::intent_path_for(&store_path),
+            serde_json::to_vec(&intent).unwrap(),
+        )
+        .unwrap();
+        let resolution = resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key(), true)
+            .expect("recovered");
+        assert_eq!(resolution.scope.report(), (IrScope::Secondary, Some(1)));
+        assert!(store_path.exists(), "the journal was committed");
     }
 
     /// ADR-0028 §2: account policy is checked on the REAL primary before the
@@ -1995,15 +2101,17 @@ impl Engine {
         ) {
             return IrOnlyPreflight::unscoped(refusal);
         }
-        let snapshot = match self.load_ir_enrollment(user, window, true, None) {
+        let mut snapshot = match self.load_ir_enrollment(user, window, true, None) {
             Ok(Some(snapshot)) => snapshot,
             _ => return IrOnlyPreflight::unscoped(Ready::EnrollmentUnavailable),
         };
         if self.check_authentication_completion(window).is_err() {
             return IrOnlyPreflight::unscoped(Ready::Unavailable);
         }
+        // The one unsealed allocation moves into the call's source; nothing
+        // keeps a second copy.
         let mut keys = irlume_core::template_key::RequestTemplateKey::production();
-        keys.adopt(user, snapshot.key.clone());
+        keys.adopt(user, snapshot.key.take());
         match self.resolve_ir_only_scope(user, snapshot, &target, &mut keys) {
             Ok(resolution) => {
                 let (scope, scope_index) = resolution.scope.report();
@@ -2033,13 +2141,14 @@ impl Engine {
         if let Some(refusal) = self.ir_model_readiness(&target) {
             return Ok(readiness_refusal(refusal));
         }
-        let snapshot = match self.load_ir_enrollment(user, window, false, Some(diagnostics))? {
+        let mut snapshot = match self.load_ir_enrollment(user, window, false, Some(diagnostics))? {
             Some(snapshot) => snapshot,
             None => return Ok(readiness_refusal(Ready::EnrollmentUnavailable)),
         };
-        // The request key (ADR-0025 §3, ADR-0028 §5): the load's key is
-        // lent to the secondary store read and the grant boundary.
-        self.request_key().adopt(user, snapshot.key.clone());
+        // The request key (ADR-0025 §3, ADR-0028 §5): the load's one key
+        // allocation moves into the request source, which lends it to the
+        // secondary store read and the grant boundary.
+        self.request_key().adopt(user, snapshot.key.take());
         let resolved = {
             let mut keys = self.request_key();
             self.resolve_ir_only_scope(user, snapshot, &target, &mut *keys)

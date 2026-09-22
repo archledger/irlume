@@ -5032,7 +5032,7 @@ fn dispatch_scoped_session(
     )
 }
 
-/// [`dispatch_scoped_session`] with the worker's reply channel attached, so
+/// `dispatch_scoped_session` with the worker's reply channel attached, so
 /// an authentication decision can be delivered before the camera pair is
 /// released (ADR-0027). When that happened, `delivery.delivered` is set and
 /// the returned reply must not be sent again.
@@ -6042,6 +6042,7 @@ fn dispatch_scoped_session_inner(
                 scope,
                 completion,
                 sensor_policy,
+                delivery,
             )
         }
         Request::UnsealKeyring {
@@ -6765,9 +6766,18 @@ fn do_unseal_password(
         Ok(policy) => policy,
         Err(error) => return Response::Error(error.to_string()),
     };
-    do_unseal_password_scoped(user, service, engine, &scope, &mut None, policy)
+    do_unseal_password_scoped(
+        user,
+        service,
+        engine,
+        &scope,
+        &mut None,
+        policy,
+        &mut Delivery::none(),
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn do_unseal_password_scoped(
     user: &str,
     service: Option<&str>,
@@ -6775,6 +6785,7 @@ fn do_unseal_password_scoped(
     diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     completion: &mut Option<FaceCompletion>,
     sensor_policy: irlume_common::config::FaceSensorPolicy,
+    delivery: &mut Delivery<'_>,
 ) -> Response {
     jout_info!("irlumed: UnsealPassword: attempt for '{user}'");
     let t = std::time::Instant::now();
@@ -6788,20 +6799,55 @@ fn do_unseal_password_scoped(
         Ok(attempt) => attempt,
         Err(reason) => return retry_unseal_refusal(reason),
     };
-    let engine_result = engine.authenticate_for_in_window_with_policy(
-        user,
-        service,
-        credential_release_purpose(),
-        window,
-        sensor_policy,
-        diagnostics,
-    );
+    // ADR-0027, same shape as the Authenticate arm: one reply builder, run by
+    // the engine's decision hook before the concurrent pair is released, or
+    // by the ordinary return path. The credential itself is prepared inside
+    // (a TPM unseal, ~0.1 s on the raw device), so cold login gains the same
+    // second as verification does.
+    let mut retry_attempt = Some(retry_attempt);
+    let mut early: Option<Response> = None;
+    let engine_result = {
+        let mut deliver = |engine: &irlume_auth::Engine, outcome: &irlume_auth::Outcome| {
+            let Some(attempt) = retry_attempt.take() else {
+                return;
+            };
+            let mut completed = None;
+            let response = unseal_reply(engine, outcome, user, window, attempt, t, &mut completed);
+            let sent = delivery.send(WorkerReply {
+                response: response.clone(),
+                completion: completed.take().filter(|_| is_face_grant(&response)),
+            });
+            if !sent {
+                *completion = completed;
+            }
+            early = Some(response);
+        };
+        engine.authenticate_for_in_window_with_policy_delivering(
+            user,
+            service,
+            credential_release_purpose(),
+            window,
+            sensor_policy,
+            diagnostics,
+            &mut deliver,
+        )
+    };
     // Engine-call boundary, same closed vocabulary as the Authenticate arm.
     emit_stage_timing(
         diagnostics,
         irlume_common::diagnostics::TraceStage::EngineAuthenticate,
         t,
     );
+    if let Some(response) = early {
+        if let Err(e) = &engine_result {
+            if delivery.delivered {
+                jout_warn!(
+                    "irlumed: UnsealPassword: engine reported {e} for '{user}' after the decision was delivered"
+                );
+            }
+        }
+        return response;
+    }
     let outcome = match engine_result {
         Ok(o) => o,
         Err(e) => {
@@ -6819,10 +6865,28 @@ fn do_unseal_password_scoped(
             return Response::Error(e.to_string());
         }
     };
+    let attempt = retry_attempt
+        .take()
+        .expect("the retry attempt is consumed exactly once");
+    unseal_reply(engine, &outcome, user, window, attempt, t, completion)
+}
+
+/// The UnsealPassword reply for an engine outcome: completion check, the
+/// credential unseal, and retry accounting in the bounded order
+/// `bounded_face_response` enforces. Reads the engine only.
+fn unseal_reply(
+    engine: &irlume_auth::Engine,
+    outcome: &irlume_auth::Outcome,
+    user: &str,
+    window: irlume_auth::AuthenticationWindow,
+    retry_attempt: retry_throttle::FaceAttempt,
+    t: std::time::Instant,
+    completion: &mut Option<FaceCompletion>,
+) -> Response {
     bounded_face_response(
         outcome.granted,
         || engine.check_authentication_completion(window),
-        || finish_unseal_password(user, &outcome, t),
+        || finish_unseal_password(user, outcome, t),
         || {
             if outcome.granted {
                 *completion = Some(FaceCompletion {
@@ -6832,7 +6896,7 @@ fn do_unseal_password_scoped(
                 });
                 Ok(())
             } else {
-                retry_attempt.denied(&outcome)
+                retry_attempt.denied(outcome)
             }
         },
         retry_unseal_refusal,

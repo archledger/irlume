@@ -360,7 +360,10 @@ impl Engine {
         // here on; the streaming owners are held, unused, until the caller
         // has delivered the decision (ADR-0027). Admission and the identity
         // comparison read only what was collected.
-        if owned {
+        // Finalization starts when the owners are released (schema 4): here
+        // only when they were released here, on the error paths; a deferred
+        // pair arms it in `deliver_then_release` after its drop.
+        if owned && release.is_none() {
             self.arm_finalization();
         }
         if let Err(error) = self.check_request_cancelled() {

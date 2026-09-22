@@ -12,8 +12,9 @@ on the shared ledger.
 ## Context
 
 On the concurrent capture path the engine arms an RGB and an IR streaming
-session as a pair, establishes the delivered rate, collects the PAD samples,
-decides, and then drops both sessions (`with_owned_pair`) before it returns.
+session as a pair, establishes the delivered rate, collects the PAD samples
+(`managed_pad::with_managed_pair`), decides, and then drops both sessions
+before it returns.
 The daemon's worker builds the reply from the returned outcome and hands it
 to the connection thread, which performs the last admission checks and
 writes it. The client therefore waits for the camera teardown after the
@@ -50,8 +51,9 @@ before delivery.
 
 ## Decision
 
-1. On the concurrent path, when the assessment inside `with_owned_pair`
-   produces a final outcome (a grant, or a refusal that the pending-PAD
+1. On the managed concurrent path (`with_managed_pair`, ADR-0020; the
+   eager `with_owned_pair` helper of the other routes is unchanged), when the
+   collected assessment produces a final outcome (a grant, or a refusal that the pending-PAD
    retry loop will not retry), the engine invokes a delivery hook with that
    outcome BEFORE the two streaming owners are dropped. Every engine-side
    admission check that gates the outcome (identity threshold, PAD votes,
@@ -89,9 +91,17 @@ before delivery.
 6. Tracing: `stream_owner_release` keeps measuring both destructors in one
    interval; it now appears after the reply has been handed over, and the
    operation's terminal `finished` record is still emitted after it, so a
-   subscriber sees the whole request. The retry estimator of ADR-0020
-   (which sizes the in-request retry loop) keeps including the inter-round
-   teardown; only the final teardown leaves the client's critical path.
+   subscriber sees the whole request. `finalization` is armed after the
+   deferred release, as schema 4 defines it. The retry estimator of ADR-0014
+   keeps including the inter-round teardown: a retried round releases inside
+   its measured cost; a round that would retry but no longer fits keeps its
+   deferral and is judged with a release allowance (the costliest release
+   this request measured, or a 1.5 s floor above the NexiGo's worst) so a
+   retry is never admitted on a cost that omits its teardown.
+
+7. The same hook serves credential release: `UnsealPassword` (cold login
+   with `unseal ondemand`) prepares the credential and sends it inside the
+   hook, so that path gains the same second.
 
 ## Consequences
 

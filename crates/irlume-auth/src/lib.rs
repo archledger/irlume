@@ -127,6 +127,10 @@ pub struct Engine {
     /// read-only as the label the daemon wires onto `AuthResult` for
     /// pam_irlume's prompt wording. Reporting only: it gates nothing.
     last_attempt_situation: Option<AttemptSituation>,
+    /// The costliest deferred pair release this request has measured
+    /// (ADR-0027), the retry estimator's allowance for a teardown that has
+    /// not run yet. Reset at request entry.
+    last_release_cost: Option<std::time::Duration>,
     /// Start of the `CaptureSetup` interval: taken once the enrollment has
     /// resolved and consumed by the first capture route to start streaming.
     capture_setup_started: Option<std::time::Instant>,
@@ -1019,6 +1023,12 @@ const SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW: std::time::Duration = std::time::Durat
 /// fallback can still finish inside the remaining window before it starts
 /// re-opening cameras.
 const SEQUENTIAL_PAIR_ATTEMPT_COST: std::time::Duration = std::time::Duration::from_secs(7);
+
+/// What a deferred pair release is assumed to cost before this request has
+/// measured one (ADR-0027): above the 1.0–1.2 s measured on the NexiGo N930W,
+/// so the retry estimator never admits a retry the teardown would push past
+/// the window.
+const RELEASE_ALLOWANCE_FLOOR: std::time::Duration = std::time::Duration::from_millis(1500);
 
 #[derive(Debug, Eq, PartialEq)]
 enum EligiblePairEvidence<T> {
@@ -3634,6 +3644,7 @@ impl Engine {
             authentication_deadline: None,
             last_attempt_facts: AttemptFacts::default(),
             last_attempt_situation: None,
+            last_release_cost: None,
             capture_setup_started: None,
             request_key: std::sync::Arc::new(std::sync::Mutex::new(
                 irlume_core::template_key::RequestTemplateKey::production(),
@@ -3713,6 +3724,51 @@ impl Engine {
 
     /// Completed refusals retain their established accounting classification.
     /// Expiry prevents granting, not recording evidence already obtained.
+    /// Release a deferred pair now (ADR-0027, the non-final paths: a retried
+    /// round, an error, an expired grant). Arms finalization after the drop
+    /// exactly as the immediate release used to, so the trace keeps its
+    /// shape, and reports how long the release took for the retry estimator.
+    fn release_deferred<D>(
+        &mut self,
+        deferred: Option<D>,
+        now: &impl Fn() -> std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let deferred = deferred?;
+        let started = now();
+        drop(deferred);
+        self.arm_finalization();
+        let cost = now().duration_since(started);
+        self.last_release_cost = Some(self.last_release_cost.map_or(cost, |c| c.max(cost)));
+        Some(cost)
+    }
+
+    /// ADR-0027, the final step of a request whose decision is in hand: hand
+    /// the outcome over, then release what the attempt deferred, then arm the
+    /// finalization interval. The completion check mirrors the one the public
+    /// entry runs afterwards, so a request cancelled or expired by now is not
+    /// delivered as a grant. The release measures `stream_owner_release`
+    /// (RGB first, as always), and finalization starts only after it, which
+    /// is the schema 4 meaning of that stage. An error result is returned
+    /// untouched, after the same release.
+    fn deliver_then_release<R, I>(
+        &mut self,
+        result: irlume_common::Result<Outcome>,
+        deferred: Option<DeferredPairRelease<'_, R, I>>,
+        deliver: DecisionDelivery<'_>,
+    ) -> irlume_common::Result<Outcome> {
+        if let Ok(outcome) = &result {
+            if self.check_completed_attempt(&result).is_ok() {
+                deliver(&*self, outcome);
+            }
+        }
+        let released = deferred.is_some();
+        drop(deferred);
+        if released {
+            self.arm_finalization();
+        }
+        result
+    }
+
     fn check_completed_attempt(
         &mut self,
         result: &irlume_common::Result<Outcome>,
@@ -5982,6 +6038,7 @@ impl Engine {
         // The daemon reuses this engine across requests. Setup refusals and
         // errors can return before the attempt loop publishes a new situation.
         self.last_attempt_situation = None;
+        self.last_release_cost = None;
         // Outlives the camera handles and lease declared below, so their
         // release is part of the reported finalization interval.
         let _finalization = self.finalization_timer(diagnostics);
@@ -6352,18 +6409,7 @@ impl Engine {
             &mut costliest_attempt,
         );
         if !held_pair_failed {
-            // ADR-0027: the decision is final here. Hand it over first, then
-            // release the held pair (the drop measures `stream_owner_release`),
-            // then the cameras and the lease below as before. The completion
-            // check mirrors the one the public entry runs afterwards, so a
-            // request cancelled or expired by now is not delivered as a grant.
-            if let Ok(outcome) = &first_result {
-                if self.check_completed_attempt(&first_result).is_ok() {
-                    deliver(&*self, outcome);
-                }
-            }
-            drop(deferred_release);
-            return first_result;
+            return self.deliver_then_release(first_result, deferred_release, deliver);
         }
         drop(deferred_release);
         let error = first_result.expect_err("held-pair failure must return an error");
@@ -6522,7 +6568,7 @@ impl Engine {
             let attempt_started = now();
             let (attempt_result, held_pair_failed, deferred) = capture_attempt(self);
             if let Err(error) = self.check_completed_attempt(&attempt_result) {
-                drop(deferred);
+                self.release_deferred(deferred, &now);
                 return (Err(error), false, None);
             }
             // Measured before any deferred release: a final round hands its
@@ -6532,7 +6578,7 @@ impl Engine {
             let out = match attempt_result {
                 Ok(out) => out,
                 Err(error) => {
-                    drop(deferred);
+                    self.release_deferred(deferred, &now);
                     return (Err(error), held_pair_failed, None);
                 }
             };
@@ -6557,7 +6603,7 @@ impl Engine {
             }
             let expired = now() >= deadline;
             if window != 0 && expired && out.granted {
-                drop(deferred);
+                self.release_deferred(deferred, &now);
                 self.vit_scores.clear();
                 self.last_attempt_situation = Some(AttemptSituation::TimedOut);
                 return (Err(irlume_common::Error::DeadlineExpired), false, None);
@@ -6572,16 +6618,27 @@ impl Engine {
                 }
                 return (Ok(out), false, deferred);
             }
-            // A retry candidate: its teardown belongs to THIS round's cost, so
-            // release now and re-measure before asking whether a retry fits.
-            drop(deferred);
-            *costliest_attempt = (*costliest_attempt).max(now().duration_since(attempt_started));
-            let retry_wont_fit = deadline.saturating_duration_since(now()) < *costliest_attempt;
+            // A retry candidate. Its teardown has not run yet (it is deferred),
+            // so the fit question is asked with a conservative allowance for
+            // it: the costliest release this request has measured, or the
+            // floor before one has been. A round that settles here keeps its
+            // deferral, so the final refusal is still delivered before the
+            // teardown; a round that retries pays the teardown now, inside
+            // its own measured cost, exactly as before.
+            let allowance = self.last_release_cost.unwrap_or(RELEASE_ALLOWANCE_FLOOR);
+            let this_round = now().duration_since(attempt_started)
+                + if deferred.is_some() {
+                    allowance
+                } else {
+                    std::time::Duration::ZERO
+                };
+            let estimate = (*costliest_attempt).max(this_round);
+            let retry_wont_fit = deadline.saturating_duration_since(now()) < estimate;
             if retry_wont_fit {
                 irlume_common::dlog!(
                     "grace: retry skipped ({}ms left, costliest attempt {}ms); settling",
                     deadline.saturating_duration_since(now()).as_millis(),
-                    costliest_attempt.as_millis()
+                    estimate.as_millis()
                 );
                 if attempt > 1 {
                     irlume_common::dlog!(
@@ -6589,8 +6646,10 @@ impl Engine {
                         window
                     );
                 }
-                return (Ok(out), false, None);
+                return (Ok(out), false, deferred);
             }
+            self.release_deferred(deferred, &now);
+            *costliest_attempt = (*costliest_attempt).max(now().duration_since(attempt_started));
             irlume_common::dlog!(
                 "grace: attempt {attempt} has incomplete face evidence ({}); retrying within window",
                 out.reason

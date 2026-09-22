@@ -742,6 +742,55 @@ fn managed_pair_reports_no_owner_when_arming_fails() {
     assert!(!established.get());
 }
 
+/// ADR-0027 at the loop, the settling case: a retryable refusal whose retry
+/// would not fit keeps its deferral (the final refusal is delivered before
+/// the teardown), and the fit question was asked with the release allowance
+/// included, so a retry is never admitted on a cost that omits its teardown.
+#[test]
+fn attempt_loop_keeps_the_deferral_when_a_retry_would_not_fit() {
+    use std::cell::Cell;
+    struct Owner<'a>(&'a Cell<usize>);
+    impl Drop for Owner<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    let _guard = env_guard();
+    let mut state = shared();
+    let released = Cell::new(0);
+    let start = Instant::now();
+    let clock = Cell::new(start);
+    let rounds = Cell::new(0);
+    let mut costliest = Duration::ZERO;
+    // 15 s window; the round takes 12 s, leaving 3 s: a retry of 12 s (+ the
+    // 1.5 s release allowance) cannot fit, so the loop settles.
+    let (result, fallback, deferred) = state.engine.authentication_attempt_loop_with(
+        start + Duration::from_secs(15),
+        15_000,
+        &mut costliest,
+        |_| {
+            rounds.set(rounds.get() + 1);
+            clock.set(clock.get() + Duration::from_secs(12));
+            let release = crate::DeferredPairRelease {
+                pair: Some((Owner(&released), Owner(&released))),
+                diagnostics: &(),
+            };
+            (
+                Ok(Outcome::deny(OutcomeKind::RgbPadPending, "one vote short")),
+                false,
+                Some(release),
+            )
+        },
+        || clock.get(),
+    );
+    assert!(!fallback);
+    assert_eq!(rounds.get(), 1, "no retry was admitted");
+    assert_eq!(result.unwrap().kind, OutcomeKind::RgbPadPending);
+    assert_eq!(released.get(), 0, "the settling round kept its deferral");
+    drop(deferred.expect("handed back"));
+    assert_eq!(released.get(), 2);
+}
+
 /// ADR-0027 at the loop: a final round hands its deferred release back to
 /// the caller unreleased; a round the loop retries releases it inside the
 /// loop, and the round's measured cost includes that release.

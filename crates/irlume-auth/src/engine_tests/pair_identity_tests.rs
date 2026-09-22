@@ -209,6 +209,62 @@ fn deferred_release_measures_both_destructors_rgb_first() {
     assert_pair_released(&sink);
 }
 
+/// ADR-0027 at the engine seam: the decision hook runs with the final
+/// outcome BEFORE either destructor, the release is then measured, and
+/// finalization starts after it. An error result runs no hook and is still
+/// released. A hook that panics does not skip the release (the deferred pair
+/// is dropped during unwinding), and the outcome is what the hook saw.
+#[test]
+fn decision_hook_runs_before_the_deferred_release_for_final_outcomes_only() {
+    let _guard = env_guard();
+    for (name, result) in [
+        ("grant", Ok(Outcome::grant(1.0, "synthetic match"))),
+        (
+            "refusal",
+            Ok(Outcome::deny(OutcomeKind::NoFace, "nobody there")),
+        ),
+        (
+            "error",
+            Err(irlume_common::Error::Hardware("scripted".into())),
+        ),
+    ] {
+        let mut state = shared();
+        let sink = RecordingSink::default();
+        let deferred = crate::DeferredPairRelease {
+            pair: Some((DropStream(&sink, "rgb"), DropStream(&sink, "ir"))),
+            diagnostics: &sink,
+        };
+        let seen = std::cell::RefCell::new(Vec::new());
+        let mut deliver = |_: &Engine, outcome: &Outcome| {
+            // Nothing has been released when the hook runs.
+            assert!(
+                sink.0.lock().unwrap().is_empty(),
+                "{name}: hook before any destructor"
+            );
+            seen.borrow_mut().push(outcome.granted);
+        };
+        let expected_granted = result.as_ref().ok().map(|o| o.granted);
+        let returned = state
+            .engine
+            .deliver_then_release(result, Some(deferred), &mut deliver);
+        assert_eq!(
+            returned.as_ref().ok().map(|o| o.granted),
+            expected_granted,
+            "{name}"
+        );
+        assert_eq!(
+            seen.borrow().as_slice(),
+            expected_granted.as_slice(),
+            "{name}: the hook ran exactly once for a decision, never for an error"
+        );
+        assert_pair_released(&sink);
+        assert!(
+            state.engine.finalization_started.lock().unwrap().is_some(),
+            "{name}: finalization is armed after the release"
+        );
+    }
+}
+
 #[test]
 fn stream_release_trace_follows_both_destructors_on_success_and_error() {
     for succeed in [true, false] {

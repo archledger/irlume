@@ -51,12 +51,23 @@ contain exact liveness and match measurements, but never frames, crops,
 landmarks, embeddings, credentials, account/profile names, or raw emitter
 payloads.
 
-The recorder requests trace schema 2. A current daemon honors explicit schema
-1 or 2; a request without `trace_schema` retains schema 1 for older recorders.
-An older daemon ignores the optional request field and continues producing
-schema 1, which the current reader also accepts. Each stream uses one schema
-throughout; unsupported versions, version changes within a stream and
-schema-2-only events marked as schema 1 are rejected.
+The recorder requests trace schema 4. A current daemon honors explicit schema
+1 through 4; a request without `trace_schema` retains schema 1 for older
+recorders. An older daemon ignores the optional request field and continues
+producing schema 1, which the current reader also accepts. Each stream uses one
+schema throughout; unsupported versions, version changes within a stream and
+newer-tier events marked with an older schema are rejected.
+
+Schema 4 adds two stage timings that close the gaps between the schema 3
+stages. `capture_setup` runs from the resolved enrollment to the moment the
+first capture route starts streaming (schedule dispatch, camera-pair
+resolution, per-attempt admission); it is reported once per request and is
+absent when the request refused before any capture began. `finalization` runs
+from the release of the owned streaming sessions (`stream_owner_release`) to
+the engine return: final matching, camera handle close and lease release; it is
+absent when no owned session was released. Neither is a first-frame or
+desktop-unlock latency. Schema 3 and older subscribers omit both records
+before queue, sequence and drop accounting.
 
 Schema 2 adds `identity_inference` and `stream_owner_release` stage timings,
 and an `authentication_refusal` event whose `reason` is one of:

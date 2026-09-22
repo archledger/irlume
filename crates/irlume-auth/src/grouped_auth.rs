@@ -397,6 +397,7 @@ impl Engine {
             )
         })?;
         let control = self.capture_control();
+        self.emit_capture_setup(diagnostics);
         let started = Instant::now();
         let samples = irlume_camera::capture_sequential_batch_with_control(
             &cameras.0,
@@ -408,7 +409,10 @@ impl Engine {
                 deadline,
             },
             &control,
-        )?;
+        );
+        // Both streams were released inside the batch, whatever its outcome.
+        self.arm_finalization();
+        let samples = samples?;
         irlume_common::dlog!(
             "[assessment-stage] grouped-capture: pairs={} elapsed={}ms",
             samples.len(),
@@ -477,6 +481,7 @@ impl Engine {
             return Ok(expired());
         }
         let control = self.capture_control();
+        self.emit_capture_setup(diagnostics);
         let started = Instant::now();
         let frames = irlume_camera::capture_rgb_denoised_batch_with_control(
             rgb,
@@ -485,7 +490,9 @@ impl Engine {
                 deadline,
             },
             &control,
-        )?;
+        );
+        self.arm_finalization();
+        let frames = frames?;
         irlume_common::dlog!(
             "[assessment-stage] grouped-rgb-capture: samples={} elapsed={}ms",
             frames.len(),

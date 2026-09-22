@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const HELP: &str = "Usage: daemon_timing <user> [--service NAME|none] [--trials N] [--cancel-after MS] [--no-trace]
 Sends real Authenticate requests to the running daemon and measures request-to-reply.
 With a trace subscription (root; default on unless --no-trace) it also prints the
-daemon-side stage boundaries (schema 3). Refused and cancelled trials are labeled,
+daemon-side stage boundaries (schema 4). Refused and cancelled trials are labeled,
 never pooled with grants. Stage intervals may overlap or nest and are never summed.
 Unmeasured boundaries (worker reply to socket write, PAM stack, desktop unlock) are
 printed explicitly. Replies have a 30s deadline; cancellation must be 0..=30000ms.
@@ -327,7 +327,7 @@ impl TraceConnection {
             || !matches!(first.event, TraceEventKind::TraceStarted { .. })
             || first.terminal
         {
-            return Err("daemon did not start the requested schema 3 trace; use --no-trace for an older daemon".into());
+            return Err(format!("daemon did not start the requested schema {CURRENT_TRACE_SCHEMA_VERSION} trace; use --no-trace for an older daemon"));
         }
         Ok(Self {
             reader,
@@ -692,8 +692,8 @@ mod tests {
         assert!(TraceConnection::on_stream(client, 100)
             .err()
             .unwrap()
-            .contains("schema 3"));
-        let (client, _server) = trace_pair(3, 50);
+            .contains("schema 4"));
+        let (client, _server) = trace_pair(CURRENT_TRACE_SCHEMA_VERSION, 50);
         assert!(TraceConnection::on_stream(client, 100)
             .err()
             .unwrap()
@@ -714,29 +714,34 @@ mod tests {
 
     #[test]
     fn trace_requires_a_terminal_record_and_rejects_dropped_events() {
-        let (client, server) = trace_pair(3, 100);
+        let (client, server) = trace_pair(CURRENT_TRACE_SCHEMA_VERSION, 100);
         let connection = TraceConnection::on_stream(client, 100).unwrap();
         server.shutdown(std::net::Shutdown::Write).unwrap();
         assert!(connection.drain().unwrap_err().contains("terminal"));
-        let (client, mut server) = trace_pair(3, 100);
+        let (client, mut server) = trace_pair(CURRENT_TRACE_SCHEMA_VERSION, 100);
         let connection = TraceConnection::on_stream(client, 100).unwrap();
         send_record(
             &mut server,
-            &trace_record(3, 1, TraceEventKind::EventsDropped { count: 1 }, false),
+            &trace_record(
+                CURRENT_TRACE_SCHEMA_VERSION,
+                1,
+                TraceEventKind::EventsDropped { count: 1 },
+                false,
+            ),
         );
         assert!(connection.drain().unwrap_err().contains("dropped"));
     }
 
     #[test]
     fn trace_waits_for_the_promised_window_instead_of_a_fixed_five_second_drain() {
-        let (client, mut server) = trace_pair(3, 6_000);
+        let (client, mut server) = trace_pair(CURRENT_TRACE_SCHEMA_VERSION, 6_000);
         let connection = TraceConnection::on_stream(client, 6_000).unwrap();
         let worker = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(6));
             send_record(
                 &mut server,
                 &trace_record(
-                    3,
+                    CURRENT_TRACE_SCHEMA_VERSION,
                     1,
                     TraceEventKind::StageTiming {
                         stage: TraceStage::QueueWait,
@@ -748,7 +753,7 @@ mod tests {
             send_record(
                 &mut server,
                 &trace_record(
-                    3,
+                    CURRENT_TRACE_SCHEMA_VERSION,
                     2,
                     TraceEventKind::Finished {
                         outcome: CategoricalOutcome::Completed,

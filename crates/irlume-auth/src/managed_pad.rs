@@ -253,6 +253,7 @@ impl Engine {
         held_pair_failed: &mut bool,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Outcome> {
+        self.emit_capture_setup(diagnostics);
         let prepared = (|| {
             self.check_request_active()?;
             let control = self.capture_control();
@@ -314,6 +315,7 @@ impl Engine {
         })();
         // The streaming owners and processing workers have finished before
         // cancellation/deadline admission checks or any identity comparison.
+        self.arm_finalization();
         self.check_request_cancelled()?;
         if matches!(&prepared, Ok(PreparedPairAuthentication::Ready(_))) {
             self.check_request_active()?;

@@ -19,8 +19,13 @@ pub const LEGACY_TRACE_SCHEMA_VERSION: u32 = 1;
 /// stages, but not the end-to-end timing stages of the current tier. Kept
 /// addressable so an older client that negotiated it keeps working.
 pub const V2_TRACE_SCHEMA_VERSION: u32 = 2;
+/// The tier that added the end-to-end timing stages (enrollment load,
+/// ingress, queue, engine call, credential unseal) but not the setup and
+/// finalization stages of the current tier. Kept addressable so an older
+/// client that negotiated it keeps working.
+pub const V3_TRACE_SCHEMA_VERSION: u32 = 3;
 /// Latest trace vocabulary, requested explicitly by current clients.
-pub const CURRENT_TRACE_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_TRACE_SCHEMA_VERSION: u32 = 4;
 /// Current schema for callers constructing new records, not a subscription default.
 pub const TRACE_SCHEMA_VERSION: u32 = CURRENT_TRACE_SCHEMA_VERSION;
 pub const DEFAULT_TRACE_DURATION_MS: u64 = 60_000;
@@ -696,6 +701,13 @@ impl TraceLimits {
 diagnostic_enum!(TraceWarning {
     PrivilegedDiagnosticOracle,
 });
+// Schema 4 adds `CaptureSetup` (attempt preparation after the enrollment
+// resolved and before the capture route starts streaming: schedule dispatch,
+// camera-pair resolution, per-attempt admission; emitted once per request by
+// the route that first starts capture, absent when the request refused before
+// any capture began) and `Finalization` (from the release of the owned
+// streaming sessions to the engine return: final matching, camera handle
+// close, lease release; absent when no owned session was released).
 diagnostic_enum!(TraceStage {
     CameraOpen,
     StreamArm,
@@ -713,6 +725,8 @@ diagnostic_enum!(TraceStage {
     QueueWait,
     EngineAuthenticate,
     CredentialUnseal,
+    CaptureSetup,
+    Finalization,
 });
 diagnostic_enum!(TraceRefusalReason {
     RgbPadPending,
@@ -872,6 +886,11 @@ impl TraceEventKind {
                     | TraceStage::CredentialUnseal
             };
         }
+        macro_rules! setup_and_finalization_stage {
+            () => {
+                TraceStage::CaptureSetup | TraceStage::Finalization
+            };
+        }
         match schema {
             LEGACY_TRACE_SCHEMA_VERSION => !matches!(
                 self,
@@ -879,14 +898,22 @@ impl TraceEventKind {
                     | Self::StageTiming {
                         stage: TraceStage::IdentityInference
                             | TraceStage::StreamOwnerRelease
-                            | end_to_end_timing_stage!(),
+                            | end_to_end_timing_stage!()
+                            | setup_and_finalization_stage!(),
                         ..
                     }
             ),
             V2_TRACE_SCHEMA_VERSION => !matches!(
                 self,
                 Self::StageTiming {
-                    stage: end_to_end_timing_stage!(),
+                    stage: end_to_end_timing_stage!() | setup_and_finalization_stage!(),
+                    ..
+                }
+            ),
+            V3_TRACE_SCHEMA_VERSION => !matches!(
+                self,
+                Self::StageTiming {
+                    stage: setup_and_finalization_stage!(),
                     ..
                 }
             ),
@@ -1540,7 +1567,7 @@ mod tests {
                 Err(TraceParseError::Schema)
             ));
         }
-        for schema in [0, 4, u32::MAX] {
+        for schema in [0, 5, u32::MAX] {
             records[0].trace_schema = schema;
             assert!(matches!(
                 parse_trace(std::io::Cursor::new(trace_jsonl(&records)), limits),
@@ -1638,6 +1665,46 @@ mod tests {
                     "{event} under schema {schema}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn trace_v4_setup_and_finalization_stages_are_not_valid_below_v4() {
+        let limits = TraceLimits::bounded(1000);
+        for stage in ["capture_setup", "finalization"] {
+            let event = serde_json::json!({
+                "event":"stage_timing", "stage":stage, "elapsed_us":12
+            });
+            let typed = serde_json::from_value::<TraceEventKind>(event.clone())
+                .expect("schema 4 closed event vocabulary must deserialize");
+            assert_eq!(serde_json::to_value(&typed).unwrap(), event);
+            assert!(typed.supports_schema(CURRENT_TRACE_SCHEMA_VERSION));
+            for schema in [
+                V3_TRACE_SCHEMA_VERSION,
+                V2_TRACE_SCHEMA_VERSION,
+                LEGACY_TRACE_SCHEMA_VERSION,
+            ] {
+                assert!(!typed.supports_schema(schema), "{event} under {schema}");
+                let mut record = trace_record(0, typed.clone(), false);
+                record.trace_schema = schema;
+                let mut validator = TraceValidator::new(limits).unwrap();
+                assert!(
+                    matches!(
+                        validator.push_line(&serde_json::to_vec(&record).unwrap()),
+                        Err(TraceParseError::Schema)
+                    ),
+                    "{event} under schema {schema}"
+                );
+            }
+        }
+        // Every earlier stage remains valid at the new tier.
+        for stage in ["stream_arm", "stream_owner_release", "credential_unseal"] {
+            let typed = serde_json::from_value::<TraceEventKind>(
+                serde_json::json!({"event":"stage_timing", "stage":stage, "elapsed_us":1}),
+            )
+            .unwrap();
+            assert!(typed.supports_schema(CURRENT_TRACE_SCHEMA_VERSION));
+            assert!(typed.supports_schema(V3_TRACE_SCHEMA_VERSION));
         }
     }
 

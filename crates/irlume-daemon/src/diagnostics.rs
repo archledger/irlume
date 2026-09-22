@@ -8,7 +8,7 @@ use irlume_common::diagnostics::{
     SanitizedCameraContext, ShareSafeEvent, ShareSafeEventKind, SupportSnapshot, TraceEventKind,
     TraceLimits, TraceRecord, TraceWarning, CURRENT_TRACE_SCHEMA_VERSION,
     LEGACY_TRACE_SCHEMA_VERSION, MAX_HISTORY_MS, MAX_SHARE_SAFE_EVENTS, MAX_TRACE_LINE_BYTES,
-    V2_TRACE_SCHEMA_VERSION,
+    V2_TRACE_SCHEMA_VERSION, V3_TRACE_SCHEMA_VERSION,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
@@ -221,7 +221,10 @@ impl DiagnosticState {
         let trace_schema = trace_schema.unwrap_or(LEGACY_TRACE_SCHEMA_VERSION);
         if !matches!(
             trace_schema,
-            LEGACY_TRACE_SCHEMA_VERSION | V2_TRACE_SCHEMA_VERSION | CURRENT_TRACE_SCHEMA_VERSION
+            LEGACY_TRACE_SCHEMA_VERSION
+                | V2_TRACE_SCHEMA_VERSION
+                | V3_TRACE_SCHEMA_VERSION
+                | CURRENT_TRACE_SCHEMA_VERSION
         ) {
             return Err(TraceSubscribeError::UnsupportedSchema);
         }
@@ -788,13 +791,19 @@ mod tests {
     #[test]
     fn trace_negotiation_defaults_to_legacy_and_rejects_unknown_versions_without_ownership() {
         let state = DiagnosticState::default();
-        for unsupported in [0, 4, u32::MAX] {
+        for unsupported in [0, 5, u32::MAX] {
             assert!(matches!(
                 state.subscribe_trace(0, 60_000, Some(unsupported)),
                 Err(TraceSubscribeError::UnsupportedSchema)
             ));
         }
-        for (requested, expected) in [(None, 1), (Some(1), 1), (Some(2), 2), (Some(3), 3)] {
+        for (requested, expected) in [
+            (None, 1),
+            (Some(1), 1),
+            (Some(2), 2),
+            (Some(3), 3),
+            (Some(4), 4),
+        ] {
             let subscription = state.subscribe_trace(0, 60_000, requested).unwrap();
             let mut records: Vec<_> = subscription.receiver.try_iter().collect();
             records.extend(subscription.finish(CategoricalOutcome::Completed));
@@ -881,6 +890,67 @@ mod tests {
             .iter()
             .any(|record| matches!(record.event, TraceEventKind::EventsDropped { .. })));
         assert!(records.last().unwrap().terminal);
+    }
+
+    /// A schema 3 subscriber (the previous current tier) keeps working and
+    /// never receives the schema 4 setup/finalization stages; a schema 4
+    /// subscriber receives them.
+    #[test]
+    fn schema_3_subscriber_omits_setup_and_finalization_stages() {
+        use irlume_common::diagnostics::TraceStage;
+        let state = DiagnosticState::default();
+        let older = state
+            .subscribe_trace_with_capacity(0, 60_000, Some(V3_TRACE_SCHEMA_VERSION), 8)
+            .unwrap();
+        let operation = state.begin(OperationClass::Authentication);
+        for stage in [
+            TraceStage::CaptureSetup,
+            TraceStage::Finalization,
+            TraceStage::CredentialUnseal,
+        ] {
+            operation.emit_trace(TraceEventKind::StageTiming {
+                stage,
+                elapsed_us: 7,
+            });
+        }
+        let mut records: Vec<_> = older.receiver.try_iter().collect();
+        records.extend(older.finish(CategoricalOutcome::Completed));
+        assert!(records.iter().all(|record| record.trace_schema == 3));
+        let stages: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record.event {
+                TraceEventKind::StageTiming { stage, .. } => Some(stage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stages, [TraceStage::CredentialUnseal], "{records:?}");
+        assert!(records
+            .iter()
+            .enumerate()
+            .all(|(index, record)| record.sequence == index as u64));
+        drop(operation);
+        drop(older);
+
+        let current = state
+            .subscribe_trace_with_capacity(0, 60_000, Some(CURRENT_TRACE_SCHEMA_VERSION), 8)
+            .unwrap();
+        let operation = state.begin(OperationClass::Authentication);
+        for stage in [TraceStage::CaptureSetup, TraceStage::Finalization] {
+            operation.emit_trace(TraceEventKind::StageTiming {
+                stage,
+                elapsed_us: 7,
+            });
+        }
+        let records: Vec<_> = current.receiver.try_iter().collect();
+        let stages: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record.event {
+                TraceEventKind::StageTiming { stage, .. } => Some(stage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stages, [TraceStage::CaptureSetup, TraceStage::Finalization]);
+        assert!(records.iter().all(|record| record.trace_schema == 4));
     }
 
     #[test]

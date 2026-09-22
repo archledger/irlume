@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `release_probe` example in `irlume-camera`: arms a paired RGB+IR session
+  through the crate's real paths and times the two stream releases
+  separately, in either order, with an optional idle pause between rounds.
+  Used to attribute the NexiGo N930W's ~0.8 s `stream_owner_release`
+  (#797): the camera stalls once per session cycle wherever the sequence
+  hits it, so the order of the two stops moves the cost rather than
+  removing it.
 - Diagnostic trace schema 4 adds two stage timings: `capture_setup`, from the
   completed enrollment load to the first capture route starting to stream, and
   `finalization`, from the release of the owned streaming sessions to the

@@ -95,9 +95,10 @@ before delivery.
    deferred release, as schema 4 defines it. The retry estimator of ADR-0014
    keeps including the inter-round teardown: a retried round releases inside
    its measured cost; a round that would retry but no longer fits keeps its
-   deferral and is judged with a release allowance (the costliest release
-   this request measured, or a 1.5 s floor above the NexiGo's worst) so a
-   retry is never admitted on a cost that omits its teardown.
+   deferral. The fit question adds the pending release (the costliest release
+   this request measured, or a 1.5 s floor above the NexiGo's worst) to the
+   costliest attempt, since the release must finish before the next capture
+   starts, so a retry is never admitted on a cost that omits its teardown.
 
 7. The same hook serves credential release: `UnsealPassword` (cold login
    with `unseal ondemand`) prepares the credential and sends it inside the

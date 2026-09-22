@@ -6618,21 +6618,20 @@ impl Engine {
                 }
                 return (Ok(out), false, deferred);
             }
-            // A retry candidate. Its teardown has not run yet (it is deferred),
-            // so the fit question is asked with a conservative allowance for
-            // it: the costliest release this request has measured, or the
-            // floor before one has been. A round that settles here keeps its
-            // deferral, so the final refusal is still delivered before the
-            // teardown; a round that retries pays the teardown now, inside
-            // its own measured cost, exactly as before.
-            let allowance = self.last_release_cost.unwrap_or(RELEASE_ALLOWANCE_FLOOR);
-            let this_round = now().duration_since(attempt_started)
-                + if deferred.is_some() {
-                    allowance
-                } else {
-                    std::time::Duration::ZERO
-                };
-            let estimate = (*costliest_attempt).max(this_round);
+            // A retry candidate. Its teardown has not run yet (it is deferred)
+            // and must complete before the next capture can start, so the two
+            // costs ADD: the pending release, at the costliest release this
+            // request has measured (or the floor before one has been), plus
+            // the costliest attempt, which is the next attempt's estimate. A
+            // round that settles here keeps its deferral, so the final refusal
+            // is still delivered before the teardown; a round that retries
+            // pays the teardown now, inside its own measured cost, as before.
+            let pending_release = if deferred.is_some() {
+                self.last_release_cost.unwrap_or(RELEASE_ALLOWANCE_FLOOR)
+            } else {
+                std::time::Duration::ZERO
+            };
+            let estimate = pending_release + *costliest_attempt;
             let retry_wont_fit = deadline.saturating_duration_since(now()) < estimate;
             if retry_wont_fit {
                 irlume_common::dlog!(

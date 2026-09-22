@@ -600,7 +600,7 @@ fn managed_pair_arms_and_establishes_once_and_releases_before_admission() {
     let armed = Cell::new(0);
     let rate = Cell::new(0);
     let mut samples = 0;
-    let prepared = with_managed_pair(
+    let (prepared, owned) = with_managed_pair(
         || {
             armed.set(armed.get() + 1);
             Ok((Owner(&released), Owner(&released)))
@@ -639,6 +639,7 @@ fn managed_pair_arms_and_establishes_once_and_releases_before_admission() {
         (armed.get(), rate.get(), samples, released.get()),
         (1, 1, 5, 2)
     );
+    assert!(owned, "an armed pair was released");
     let previous_ir = state.engine.ir_available;
     state.engine.ir_available = true;
     let result = state.engine.finish_pair_authentication(
@@ -690,14 +691,41 @@ fn managed_pair_releases_on_rate_processing_error_and_panic_without_admission() 
         assert_eq!(released.get(), 2);
         assert_eq!(processed.get(), usize::from(fault != "rate"));
         match result {
-            Ok(Err(error)) => assert_eq!(
-                matches!(error, CapturePathError::ConcurrentPair(_)),
-                fault == "rate"
-            ),
+            Ok((Err(error), owned)) => {
+                assert_eq!(
+                    matches!(error, CapturePathError::ConcurrentPair(_)),
+                    fault == "rate"
+                );
+                assert!(owned, "the failed pair still existed and was released");
+            }
             Err(_) => assert_eq!(fault, "panic"),
-            Ok(Ok(_)) => panic!("failed work admitted"),
+            Ok((Ok(_), _)) => panic!("failed work admitted"),
         }
     }
+}
+
+/// A pair that never armed owned nothing: the caller must not report a
+/// finalization interval for a release that did not happen.
+#[test]
+fn managed_pair_reports_no_owner_when_arming_fails() {
+    use crate::managed_pad::with_managed_pair;
+    let established = Cell::new(false);
+    let (result, owned) = with_managed_pair(
+        || {
+            Err::<((), ()), _>(CapturePathError::ConcurrentPair(
+                irlume_common::Error::Hardware("first session refused".into()),
+            ))
+        },
+        |_, _| {
+            established.set(true);
+            Ok(())
+        },
+        |_, _| Ok(()),
+        &(),
+    );
+    assert!(matches!(result, Err(CapturePathError::ConcurrentPair(_))));
+    assert!(!owned);
+    assert!(!established.get());
 }
 
 #[test]

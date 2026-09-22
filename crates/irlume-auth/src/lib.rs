@@ -127,6 +127,13 @@ pub struct Engine {
     /// read-only as the label the daemon wires onto `AuthResult` for
     /// pam_irlume's prompt wording. Reporting only: it gates nothing.
     last_attempt_situation: Option<AttemptSituation>,
+    /// Start of the `CaptureSetup` interval: taken once the enrollment has
+    /// resolved and consumed by the first capture route to start streaming.
+    capture_setup_started: Option<std::time::Instant>,
+    /// Start of the `Finalization` interval: armed once the owned streaming
+    /// sessions have been released, reported by the guard that outlives the
+    /// request's camera handles and lease.
+    finalization_started: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// Asked between whole captures: "should this long operation stop now?".
     ///
     /// The daemon points this at its arbiter so an enrolment yields the camera
@@ -1377,6 +1384,76 @@ impl Drop for TraceStageTimer<'_> {
                 stage: self.stage,
                 elapsed_us: u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX),
             });
+    }
+}
+
+/// Reports the `Finalization` interval when dropped, if a release armed it.
+/// Declared before the request's camera handles and lease so their drops
+/// fall inside the interval.
+struct FinalizationTimer<'a> {
+    diagnostics: &'a dyn irlume_common::diagnostics::DiagnosticSink,
+    started: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+}
+
+impl Drop for FinalizationTimer<'_> {
+    fn drop(&mut self) {
+        let started = self
+            .started
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(started) = started {
+            self.diagnostics
+                .emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+                    stage: irlume_common::diagnostics::TraceStage::Finalization,
+                    elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                });
+        }
+    }
+}
+
+impl Engine {
+    /// The enrollment loaded: everything until a capture route starts
+    /// streaming (attempt enrollment resolution, schedule dispatch,
+    /// per-attempt admission) is attempt preparation.
+    fn begin_capture_setup(&mut self) {
+        self.capture_setup_started = Some(std::time::Instant::now());
+    }
+
+    /// Report the `CaptureSetup` interval once, from the route that first
+    /// starts capture. Later routes and retries find nothing to report.
+    fn emit_capture_setup(&mut self, diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink) {
+        if let Some(started) = self.capture_setup_started.take() {
+            emit_trace_stage_ms(
+                diagnostics,
+                irlume_common::diagnostics::TraceStage::CaptureSetup,
+                started.elapsed().as_millis(),
+            );
+        }
+    }
+
+    /// The owned streaming sessions are released: the `Finalization` interval
+    /// runs from here to the engine return.
+    fn arm_finalization(&mut self) {
+        *self
+            .finalization_started
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::time::Instant::now());
+    }
+
+    fn finalization_timer<'a>(
+        &mut self,
+        diagnostics: &'a dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> FinalizationTimer<'a> {
+        *self
+            .finalization_started
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.capture_setup_started = None;
+        FinalizationTimer {
+            diagnostics,
+            started: std::sync::Arc::clone(&self.finalization_started),
+        }
     }
 }
 
@@ -3483,6 +3560,8 @@ impl Engine {
             authentication_deadline: None,
             last_attempt_facts: AttemptFacts::default(),
             last_attempt_situation: None,
+            capture_setup_started: None,
+            finalization_started: std::sync::Arc::default(),
         })
     }
 
@@ -4484,7 +4563,7 @@ impl Engine {
             elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
         });
         let pair = pair.map_err(|error| setup_error(RuntimeDegradation::PairArmFailure, error))?;
-        with_owned_pair(pair, diagnostics, |rgb, ir| {
+        let result = with_owned_pair(pair, diagnostics, |rgb, ir| {
             let started = std::time::Instant::now();
             let rate = irlume_camera::establish_pair_rate(rgb, ir);
             diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
@@ -4495,7 +4574,9 @@ impl Engine {
                 setup_error(RuntimeDegradation::PairRateEstablishmentFailure, error)
             })?;
             self.assess_full_with_finish(Some((rgb, ir)), mode, operation, diagnostics, finish)
-        })
+        });
+        self.arm_finalization();
+        result
     }
 
     fn assess_full_with_operation(
@@ -5784,6 +5865,9 @@ impl Engine {
         // The daemon reuses this engine across requests. Setup refusals and
         // errors can return before the attempt loop publishes a new situation.
         self.last_attempt_situation = None;
+        // Outlives the camera handles and lease declared below, so their
+        // release is part of the reported finalization interval.
+        let _finalization = self.finalization_timer(diagnostics);
         // A pinned secondary context belongs to exactly one attempt
         // (ADR-0024 §5): nothing from a previous attempt may influence
         // this one's grant boundary.
@@ -5858,8 +5942,11 @@ impl Engine {
         let sync_enr = if loader.receiver.is_none() {
             let loaded = irlume_core::storage::load(user);
             // Completed work boundary: the plaintext store load itself,
-            // before any policy decision on its content.
+            // before any policy decision on its content. Attempt preparation
+            // starts here on this path (the deferred path starts it at its
+            // join below).
             emit_enrollment_load_timing(diagnostics, load_started);
+            self.begin_capture_setup();
             match loaded? {
                 Some(enr) => match self.resolve_attempt_enrollment(user, enr, &live_pair) {
                     Err(outcome) => return Ok(outcome),
@@ -6026,6 +6113,10 @@ impl Engine {
             }
         );
         if loader_was_async {
+            // Attempt preparation starts at the join: secondary-camera
+            // resolution below can load and unseal further stores, and
+            // belongs to the interval.
+            self.begin_capture_setup();
             enr = match self.resolve_attempt_enrollment(user, enr, &live_pair) {
                 Err(outcome) => return Ok(outcome),
                 Ok(scoped) => scoped,
@@ -6353,6 +6444,7 @@ impl Engine {
             held_pair_failed,
             diagnostics,
         } = capture;
+        self.emit_capture_setup(diagnostics);
         let operation = match (self.ir_available, operation) {
             (true, Some(operation)) => operation,
             _ => {
@@ -6369,6 +6461,8 @@ impl Engine {
                         return Err(error);
                     }
                 };
+                // The one-shot helper opened and released its own sessions.
+                self.arm_finalization();
                 self.last_attempt_facts = AttemptFacts::from_assessment(&a);
                 return self.authenticate_assessment(enr, purpose, service, a, diagnostics);
             }
@@ -6383,7 +6477,13 @@ impl Engine {
         let prepared = if let Some((rgb, ir)) = cameras {
             self.assess_with_fresh_pair_finish(rgb, ir, mode, operation, diagnostics, finish)
         } else {
-            self.assess_full_with_finish(None, mode, operation, diagnostics, finish)
+            let prepared = self.assess_full_with_finish(None, mode, operation, diagnostics, finish);
+            // A completed one-shot pair capture opened and released its own
+            // sessions; a failed one may not have opened any.
+            if prepared.is_ok() {
+                self.arm_finalization();
+            }
+            prepared
         };
         self.finish_pair_authentication(
             enr,
@@ -13692,6 +13792,165 @@ mod engine_tests {
         assert!(err.to_string().contains("no camera found"), "{err}");
 
         teardown_sandbox(&dir);
+    }
+
+    /// Setup and finalization are capture-route intervals: a request that
+    /// refuses before any capture route starts reports neither.
+    #[test]
+    fn setup_and_finalization_stages_are_absent_without_a_capture_route() {
+        use irlume_common::diagnostics::{DiagnosticSink, TraceEventKind, TraceStage};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct StageSink(Mutex<Vec<TraceEventKind>>);
+
+        impl DiagnosticSink for StageSink {
+            fn emit_trace(&self, kind: TraceEventKind) {
+                self.0.lock().unwrap().push(kind);
+            }
+        }
+
+        let _g = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("auth-setup-trace");
+        let mut e = Enrollment::new("irlume-test-empty-setup");
+        e.profiles.push(FaceProfile {
+            name: "P1".into(),
+            scans: vec![],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        write_enrollment(&dir, &e);
+        let sink = StageSink::default();
+        let o = s
+            .engine
+            .authenticate_for_with_diagnostics(
+                "irlume-test-empty-setup",
+                None,
+                AuthenticationPurpose::Verify,
+                &sink,
+            )
+            .unwrap();
+        assert_eq!(o.kind, OutcomeKind::SetupUnavailable);
+        assert!(
+            !sink.0.lock().unwrap().iter().any(|event| matches!(
+                event,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CaptureSetup | TraceStage::Finalization,
+                    ..
+                }
+            )),
+            "{:?}",
+            sink.0.lock().unwrap()
+        );
+        // A refused request may have started the interval before denying;
+        // the next request must not report it as its own.
+        let next = StageSink::default();
+        let o = s
+            .engine
+            .authenticate_for_with_diagnostics(
+                "irlume-test-empty-setup",
+                None,
+                AuthenticationPurpose::Verify,
+                &next,
+            )
+            .unwrap();
+        assert_eq!(o.kind, OutcomeKind::SetupUnavailable);
+        assert!(
+            !next.0.lock().unwrap().iter().any(|event| matches!(
+                event,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CaptureSetup | TraceStage::Finalization,
+                    ..
+                }
+            )),
+            "{:?}",
+            next.0.lock().unwrap()
+        );
+    }
+
+    /// The setup interval is reported once, by whichever route starts capture
+    /// first; a retry or fallback route finds nothing left to report.
+    #[test]
+    fn capture_setup_is_reported_once_by_the_first_capture_route() {
+        use irlume_common::diagnostics::{DiagnosticSink, TraceEventKind, TraceStage};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct StageSink(Mutex<Vec<TraceEventKind>>);
+
+        impl DiagnosticSink for StageSink {
+            fn emit_trace(&self, kind: TraceEventKind) {
+                self.0.lock().unwrap().push(kind);
+            }
+        }
+
+        let _g = env_guard();
+        let mut s = shared();
+        let sink = StageSink::default();
+        // The shared engine may carry another test's pending start; a real
+        // request resets it at entry, which this stands in for.
+        drop(s.engine.finalization_timer(&sink));
+        s.engine.emit_capture_setup(&sink);
+        assert!(sink.0.lock().unwrap().is_empty(), "nothing began");
+        s.engine.begin_capture_setup();
+        s.engine.emit_capture_setup(&sink);
+        s.engine.emit_capture_setup(&sink);
+        let events = sink.0.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(
+            events[0],
+            TraceEventKind::StageTiming {
+                stage: TraceStage::CaptureSetup,
+                ..
+            }
+        ));
+    }
+
+    /// The finalization guard reports only when a release armed it, and
+    /// the reported interval covers everything dropped after the guard.
+    #[test]
+    fn finalization_is_reported_by_the_guard_only_after_a_release() {
+        use irlume_common::diagnostics::{DiagnosticSink, TraceEventKind, TraceStage};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct StageSink(Mutex<Vec<TraceEventKind>>);
+
+        impl DiagnosticSink for StageSink {
+            fn emit_trace(&self, kind: TraceEventKind) {
+                self.0.lock().unwrap().push(kind);
+            }
+        }
+
+        let _g = env_guard();
+        let mut s = shared();
+        let sink = StageSink::default();
+        {
+            let _guard = s.engine.finalization_timer(&sink);
+        }
+        assert!(sink.0.lock().unwrap().is_empty(), "no release, no interval");
+        {
+            let _guard = s.engine.finalization_timer(&sink);
+            s.engine.arm_finalization();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let events = sink.0.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(
+            events[0],
+            TraceEventKind::StageTiming {
+                stage: TraceStage::Finalization,
+                elapsed_us,
+            } if elapsed_us >= 2_000
+        ));
+        drop(events);
+        // A stale arm from an earlier request never leaks into the next one.
+        s.engine.arm_finalization();
+        {
+            let _guard = s.engine.finalization_timer(&sink);
+        }
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
     }
 
     /// The enrollment-load boundary is a completed-work interval: it is

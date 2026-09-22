@@ -408,6 +408,13 @@ APPARMOR_RUNTIME_RULES=(
   "/var/lib/irlume/capture-qualifications/*.lock rwk,"
   "/var/lib/irlume/retry/ rwk,"
   "/var/lib/irlume/retry/*.operation rwk,"
+  # ADR-0026: the raw TPM device is the primary transport (the manager is the
+  # fallback), and the crash-recovery marker lives in the tmpfs lock dir. A
+  # profile missing the device rule silently costs ~1.4 s per unseal on AMD
+  # fTPMs; one missing the marker rule silently turns crash recovery off.
+  "/dev/tpmrm[0-9] rw,"
+  "/dev/tpm[0-9] rw,"
+  "/run/lock/irlume/tpm-raw-conversation rw,"
 )
 for profile in "${APPARMOR_PROFILES[@]}"; do
   for rule in "${APPARMOR_RUNTIME_RULES[@]}"; do

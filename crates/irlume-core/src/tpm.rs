@@ -150,6 +150,29 @@ fn note_fallback_once(tcti: &str, error: &Error) {
     });
 }
 
+/// The handle ranges a raw-device sweep looks at. The chip answers a
+/// loaded-session query from the HMAC range with EVERY loaded session, policy
+/// sessions included (observed on the AMD fTPM and the Intel PTTs); the
+/// policy range is still asked so a chip that separates them is covered.
+const SWEEP_RANGES: [u32; 3] = [
+    TPM2_HR_TRANSIENT,
+    TPM2_HR_HMAC_SESSION,
+    TPM2_HR_POLICY_SESSION,
+];
+
+/// Every loaded handle in `range` as the chip reports it.
+fn loaded_handles(ctx: &mut Context, range: u32) -> Result<Vec<TpmHandle>> {
+    let (data, _more) = ctx
+        .get_capability(CapabilityType::Handles, range, 0xff)
+        .map_err(tpm_err)?;
+    let CapabilityData::Handles(list) = data else {
+        return Err(Error::Tpm(
+            "TPM returned a non-handle capability for a handle query".into(),
+        ));
+    };
+    Ok(list.into_inner())
+}
+
 /// Flush every loaded transient object and loaded session on a raw-device
 /// context. Objects loaded through `/dev/tpm0` live in real chip slots that
 /// nobody frees if the loading process dies mid-conversation (the kernel only
@@ -158,25 +181,29 @@ fn note_fallback_once(tcti: &str, error: &Error) {
 /// is exclusive-open (no other raw user exists while we hold it) and the
 /// kernel resource manager leaves nothing loaded between commands; so any
 /// loaded handle we can see is a leak, ours or a predecessor's.
+///
+/// Individual flush results are not decisive: ESYS reports "invalid handle
+/// state" for a reconstructed policy session AFTER the chip has flushed it
+/// (observed on the AMD fTPM), and a `?` there turned a successful sweep into
+/// a fallback. What decides is the chip's view afterwards: the sweep fails
+/// only if something is still loaded, and then this context is abandoned.
 fn flush_stale_slots(ctx: &mut Context) -> Result<()> {
-    for range in [
-        TPM2_HR_TRANSIENT,
-        TPM2_HR_HMAC_SESSION,
-        TPM2_HR_POLICY_SESSION,
-    ] {
-        let (data, _more) = ctx
-            .get_capability(CapabilityType::Handles, range, 0xff)
-            .map_err(tpm_err)?;
-        let CapabilityData::Handles(list) = data else {
-            return Err(Error::Tpm(
-                "TPM returned a non-handle capability for a handle query".into(),
-            ));
-        };
-        for handle in list.into_inner() {
+    for range in SWEEP_RANGES {
+        for handle in loaded_handles(ctx, range)? {
             // The same route `tpm2_flushcontext --transient/--loaded-session`
             // takes: resolve the chip handle to an ESYS resource, then flush.
-            let object = ctx.tr_from_tpm_public(handle).map_err(tpm_err)?;
-            ctx.flush_context(object).map_err(tpm_err)?;
+            if let Ok(object) = ctx.tr_from_tpm_public(handle) {
+                let _ = ctx.flush_context(object);
+            }
+        }
+    }
+    for range in SWEEP_RANGES {
+        let remaining = loaded_handles(ctx, range)?;
+        if !remaining.is_empty() {
+            return Err(Error::Tpm(format!(
+                "{} stale TPM handle(s) could not be flushed from the raw device",
+                remaining.len()
+            )));
         }
     }
     Ok(())
@@ -2306,6 +2333,129 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         });
         assert_eq!(tried.into_inner(), vec!["device:/dev/tpmrm9".to_string()]);
         assert!(result.is_err());
+    }
+
+    /// Child half of the crash fixture below: on the raw device, start a
+    /// policy session and an HMAC session and load a transient object, then
+    /// exit the PROCESS without flushing anything, exactly as a crash
+    /// mid-unseal would. Runs only when the parent asks for it by name with
+    /// the guard variable set; otherwise it is a no-op.
+    #[test]
+    #[ignore = "helper for a_raw_open_sweeps_handles_a_dead_process_left_loaded; not a test on its own"]
+    fn leak_raw_handles_then_exit_helper() {
+        if std::env::var_os("IRLUME_TEST_LEAK_RAW_HANDLES").is_none() {
+            return;
+        }
+        let public = std::env::var("IRLUME_TEST_LEAK_PUBLIC").expect("public");
+        let private = std::env::var("IRLUME_TEST_LEAK_PRIVATE").expect("private");
+        let decode = |hex: &str| -> Vec<u8> {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let conf = TctiNameConf::from_str(TCTI_RAW_DEVICE).expect("tcti");
+        let mut ctx = Context::new(conf).expect("raw device");
+        let (srk, _) = load_or_create_srk(&mut ctx, SrkMode::ReadOnly).expect("srk");
+        ctx.start_auth_session(
+            Some(srk),
+            None,
+            None,
+            SessionType::Policy,
+            SymmetricDefinition::AES_128_CFB,
+            HashingAlgorithm::Sha256,
+        )
+        .expect("policy session");
+        ctx.start_auth_session(
+            None,
+            None,
+            None,
+            SessionType::Hmac,
+            SymmetricDefinition::AES_128_CFB,
+            HashingAlgorithm::Sha256,
+        )
+        .expect("hmac session");
+        let public = Public::unmarshall(&decode(&public)).expect("public");
+        let private = Private::try_from(decode(&private)).expect("private");
+        ctx.execute_with_nullauth_session(|ctx| ctx.load(srk, private, public))
+            .expect("load");
+        // No drop, no flush: the ESYS context is abandoned with the process.
+        std::process::exit(0);
+    }
+
+    /// The crash-recovery path, for real: a child process on the raw device
+    /// starts a policy session, an HMAC session and loads a transient object,
+    /// then exits without a single flush. The next production open must find
+    /// the chip's slots occupied, sweep them, and hand back a context that
+    /// works; a full unseal over the same path must still succeed after it.
+    #[test]
+    #[ignore = "requires the raw TPM device (root); leaks and then reclaims chip slots on purpose"]
+    fn a_raw_open_sweeps_handles_a_dead_process_left_loaded() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("IRLUME_TCTI");
+        std::env::remove_var("IRLUME_TCTI");
+        let raw = || {
+            let conf = TctiNameConf::from_str(TCTI_RAW_DEVICE).map_err(tpm_err)?;
+            Context::new(conf).map_err(tpm_err)
+        };
+        let count_loaded = |ctx: &mut Context| -> Result<usize> {
+            SWEEP_RANGES
+                .iter()
+                .map(|range| loaded_handles(ctx, *range).map(|v| v.len()))
+                .sum()
+        };
+        let encode = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let outcome = (|| -> Result<()> {
+            // A throwaway sealed blob for the child to load (sealed before the
+            // child holds the exclusive device).
+            let env = seal_with_pcrs(b"leak-fixture", &[7])?;
+
+            let status = std::process::Command::new(
+                std::env::current_exe().map_err(|e| Error::Io(e.to_string()))?,
+            )
+            .args([
+                "--ignored",
+                "--exact",
+                "tpm::tests::leak_raw_handles_then_exit_helper",
+                "--test-threads=1",
+            ])
+            .env("IRLUME_TEST_LEAK_RAW_HANDLES", "1")
+            .env("IRLUME_TEST_LEAK_PUBLIC", encode(&env.public))
+            .env("IRLUME_TEST_LEAK_PRIVATE", encode(&env.private))
+            .env_remove("IRLUME_TCTI")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .map_err(|e| Error::Io(e.to_string()))?;
+            assert!(status.success(), "leak helper exited {status}");
+
+            let mut observer = raw()?;
+            let leaked = count_loaded(&mut observer)?;
+            drop(observer);
+            assert!(
+                leaked >= 3,
+                "precondition: the dead process left its handles loaded, saw {leaked}"
+            );
+
+            // The production open: raw device first, sweep, then usable.
+            let mut ctx = open_context()?;
+            assert_eq!(
+                count_loaded(&mut ctx)?,
+                0,
+                "the sweep reclaimed every leaked slot"
+            );
+            let _ = read_pcr_values(&mut ctx, &[7])?;
+            drop(ctx);
+            let got = unseal(&env)?;
+            assert_eq!(&*got, b"leak-fixture");
+            Ok(())
+        })();
+        match previous {
+            Some(v) => std::env::set_var("IRLUME_TCTI", v),
+            None => std::env::remove_var("IRLUME_TCTI"),
+        }
+        outcome.expect("leak in a child, sweep, reuse over the raw device");
     }
 
     /// The production default (raw device, manager fallback) against the host

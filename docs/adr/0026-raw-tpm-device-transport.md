@@ -81,12 +81,16 @@ The daemon's AppArmor profile already allows `/dev/tpm[0-9] rw` alongside
    (`IRLUME_TCTI=device:/dev/tpmrm0` restores the previous behaviour exactly).
 
 3. Every raw-device context is swept before use: `GetCapability` over the
-   transient, HMAC-session and policy-session handle ranges, and
+   transient, HMAC-session and policy-session handle ranges (the chip answers
+   the HMAC range with every loaded session, policy ones included), and
    `FlushContext` of everything listed. Any loaded handle visible through the
    raw device is a leak by construction (no other raw user exists while we hold
    the exclusive open; the manager leaves nothing loaded between commands), so
    the sweep is safe and makes the crash hazard self-healing at the next open.
-   If the sweep fails, that context is dropped and the next transport is tried.
+   Individual flush results are not trusted: ESYS reports an invalid handle
+   state for a reconstructed policy session after the chip has already flushed
+   it. The chip is re-queried afterwards, and only a handle still loaded fails
+   the sweep; then that context is dropped and the next transport is tried.
 
 4. The command sequences themselves do not change. Every load stays paired
    with a flush on success and error paths (the module's existing rule), which
@@ -110,8 +114,8 @@ The daemon's AppArmor profile already allows `/dev/tpm[0-9] rw` alongside
   `root` (mode 0660), so the daemon and the PAM module (root) use it; a
   non-root CLI invocation and the non-root CI runner fall back to the manager
   on every call. The fallback note is a debug-level line, silent unless
-  `IRLUME_DEBUG` is on; the schema 4 `enrollment_load` stage is the plain
-  indicator of which transport a daemon is getting.
+  `IRLUME_LOG=debug` (or `trace`) is set; the schema 4 `enrollment_load`
+  stage is the plain indicator of which transport a daemon is getting.
 - CI: the swtpm jobs set `IRLUME_TCTI` and are unaffected. The hardware job
   keeps its pinned-manager round trip and adds one with `IRLUME_TCTI` unset;
   because the runner is not root that step proves the fallback branch on the
@@ -124,6 +128,11 @@ The daemon's AppArmor profile already allows `/dev/tpm[0-9] rw` alongside
   `the_default_tries_the_raw_device_then_the_resource_manager`,
   `a_failed_raw_open_falls_back_and_a_failed_fallback_reports_its_own_error`,
   `an_explicit_tcti_that_fails_is_not_retried_elsewhere` (pure).
+- `a_raw_open_sweeps_handles_a_dead_process_left_loaded` (real TPM, root): a
+  child process leaks a policy session, an HMAC session and a transient object
+  through the raw device and exits without flushing; the next production open
+  must report the slots occupied, sweep them to zero, and a full unseal must
+  follow. Passed on all three fleet machines.
 - `seal_unseal_roundtrip_default_transport_order` (real TPM, `IRLUME_TCTI`
   unset): as root on the laptop's Intel PTT it passed with `strace` showing
   only `/dev/tpm0` opened (raw branch and sweep); in the hardware-checks

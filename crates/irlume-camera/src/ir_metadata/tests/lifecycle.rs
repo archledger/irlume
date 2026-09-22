@@ -589,6 +589,28 @@ fn startup_parking_is_bounded_for_metadata() {
 }
 
 #[test]
+fn startup_parking_never_starves_a_small_metadata_ring() {
+    // Two buffers: parking one leaves the driver one, parking a second
+    // would leave it none, so the ring retires on the second start-up ERROR.
+    let device = Arc::new(Mutex::new(FakeDevice::new((UVCH, 10240))));
+    {
+        let mut state = device.lock().unwrap();
+        state.count = 2;
+        state.frame_flags = [0x40, 0x40, 0].into();
+    }
+    let (mut log, peer) = log_for(&device);
+    log.start().unwrap();
+    let queued = count(&device, "QBUF");
+    log.drain();
+    assert!(log.retired);
+    assert_eq!(count(&device, "view"), 0);
+    assert_eq!(count(&device, "QBUF"), queued);
+    assert_eq!(count(&device, "DQBUF"), 2);
+    drop(log);
+    assert_closed(&device, peer);
+}
+
+#[test]
 fn metadata_drop_waits_for_acknowledged_main_producer_stop() {
     let producer = crate::capture_shutdown::Producer::for_test();
     let events = Arc::new(Mutex::new(Vec::new()));

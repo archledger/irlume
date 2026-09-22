@@ -115,6 +115,10 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   # recorded denials named only the file path, and enumerate/modify authority
   # over every service's lock is nothing this daemon needs.
   /run/lock/irlume/irlume-emitter-*.lock rwk,
+  # Raw TPM device conversation marker (ADR-0026): the handles already loaded
+  # when a conversation starts, removed on normal exit; a leftover marker
+  # scopes the crash-recovery sweep to irlume's own leaked handles.
+  /run/lock/irlume/tpm-raw-conversation rw,
   # Pre-0.11.1 flat-path locks (kept one release so a still-running old
   # binary stays confined during an upgrade's restart window).
   /run/lock/irlume-emitter-*.lock rwk,

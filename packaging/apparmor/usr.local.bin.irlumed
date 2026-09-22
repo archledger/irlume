@@ -96,6 +96,10 @@ profile irlumed /usr/local/bin/irlumed {
   # whose 'k' the state-dir ** rule does not grant (#283). The flat-path rule
   # is kept one release for a still-running old binary at upgrade time.
   /run/lock/irlume/irlume-emitter-*.lock rwk,
+  # Raw TPM device conversation marker (ADR-0026): the handles already loaded
+  # when a conversation starts, removed on normal exit; a leftover marker
+  # scopes the crash-recovery sweep to irlume's own leaked handles.
+  /run/lock/irlume/tpm-raw-conversation rw,
   /run/lock/irlume-emitter-*.lock rwk,
   /var/lib/irlume/ir-emitter-stream/*.lock rwk,
   # The capture-qualification store serializes every save behind a lock file

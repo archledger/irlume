@@ -80,21 +80,37 @@ The daemon's AppArmor profile already allows `/dev/tpm[0-9] rw` alongside
    test and swtpm hook and the way to pin the manager
    (`IRLUME_TCTI=device:/dev/tpmrm0` restores the previous behaviour exactly).
 
-3. Every raw-device context is swept before use: `GetCapability` over the
-   transient, HMAC-session and policy-session handle ranges (the chip answers
-   the HMAC range with every loaded session, policy ones included), and
-   `FlushContext` of everything listed. Any loaded handle visible through the
-   raw device is a leak by construction (no other raw user exists while we hold
-   the exclusive open; the manager leaves nothing loaded between commands), so
-   the sweep is safe and makes the crash hazard self-healing at the next open.
-   Individual flush results are not trusted: ESYS reports an invalid handle
-   state for a reconstructed policy session after the chip has already flushed
-   it. The chip is re-queried afterwards, and only a handle still loaded fails
-   the sweep; then that context is dropped and the next transport is tried.
+3. Chip handles carry no owner, so crash recovery must not mistake another
+   raw client's state for a leak. Every raw-device conversation writes a
+   marker (`/run/lock/irlume/tpm-raw-conversation`, tmpfs, so a reboot that
+   also resets the chip clears it) listing the handles ALREADY loaded when it
+   began, and removes the marker on any normal exit. A marker still present at
+   the next open means irlume died mid-conversation: the handles loaded now
+   that are not in the marker are its leaks and are flushed; the recorded ones
+   are left alone. The chip answers the HMAC-session range query with every
+   loaded session, policy ones included; individual flush results are not
+   trusted (ESYS reports an invalid handle state for a reconstructed policy
+   session after the chip has already flushed it), the chip is re-queried
+   afterwards, and only one of the predecessor's handles still loaded fails
+   the recovery, after which that context is dropped and the next transport
+   is tried. Where the lock directory is missing or not writable the raw
+   device is used without a marker and without recovery. The one corner the
+   marker cannot see is a handle number reused by another raw client inside
+   the window between irlume's crash and its next open.
 
-4. The command sequences themselves do not change. Every load stays paired
-   with a flush on success and error paths (the module's existing rule), which
-   on the raw device is what frees the chip's slots rather than a formality.
+4. A conversation holds at most one transient object and one session at a
+   time. The Tier 1 unseal used to keep the sealed object loaded while it
+   loaded and used the signing key; it now verifies the signature and flushes
+   the key before loading the sealed object, since `PolicyAuthorize` needs only
+   the key's Name and the ticket. On a chip at the TPM-mandated minimum (three
+   transient objects, three loaded sessions) that leaves two of each free for
+   concurrent resource-manager clients during irlume's tens of milliseconds
+   on the device. Observed on the Intel PTT: with all three session slots
+   loaded, even a password-authorized `Load` is refused with
+   `TPM_RC_SESSION_HANDLES`, so the session budget is the tighter one. Every
+   load stays paired with a flush on success and error paths (the module's
+   existing rule), which on the raw device is what frees the chip's slots
+   rather than a formality.
 
 ## Consequences
 
@@ -128,11 +144,15 @@ The daemon's AppArmor profile already allows `/dev/tpm[0-9] rw` alongside
   `the_default_tries_the_raw_device_then_the_resource_manager`,
   `a_failed_raw_open_falls_back_and_a_failed_fallback_reports_its_own_error`,
   `an_explicit_tcti_that_fails_is_not_retried_elsewhere` (pure).
+- `a_sweep_touches_only_handles_that_appeared_after_the_marker`,
+  `the_marker_round_trips_and_ignores_garbage_lines`,
+  `no_lock_directory_means_no_marker_and_no_recovery` (pure).
 - `a_raw_open_sweeps_handles_a_dead_process_left_loaded` (real TPM, root): a
-  child process leaks a policy session, an HMAC session and a transient object
-  through the raw device and exits without flushing; the next production open
-  must report the slots occupied, sweep them to zero, and a full unseal must
-  follow. Passed on all three fleet machines.
+  foreign raw client leaves an HMAC session loaded; then a child on the
+  production path records the marker, leaks a policy session and a transient
+  object and exits without flushing; the next production open must flush
+  exactly those two, leave the foreign session loaded, remove the stale
+  marker, and a full unseal must follow. Passed on all three fleet machines.
 - `seal_unseal_roundtrip_default_transport_order` (real TPM, `IRLUME_TCTI`
   unset): as root on the laptop's Intel PTT it passed with `strace` showing
   only `/dev/tpm0` opened (raw branch and sweep); in the hardware-checks

@@ -90,7 +90,28 @@ fn tpm_err<E: std::fmt::Display>(e: E) -> Error {
     Error::Tpm(e.to_string())
 }
 
-fn open_context() -> Result<Context> {
+/// One TPM conversation's context. Derefs to the ESAPI [`Context`]; on the raw
+/// device it also carries the conversation marker (see [`RawConversation`]),
+/// which is removed when the context is dropped on any normal exit.
+pub(crate) struct TpmContext {
+    ctx: Context,
+    _conversation: Option<RawConversation>,
+}
+
+impl std::ops::Deref for TpmContext {
+    type Target = Context;
+    fn deref(&self) -> &Context {
+        &self.ctx
+    }
+}
+
+impl std::ops::DerefMut for TpmContext {
+    fn deref_mut(&mut self) -> &mut Context {
+        &mut self.ctx
+    }
+}
+
+fn open_context() -> Result<TpmContext> {
     open_context_from(std::env::var("IRLUME_TCTI").ok().as_deref(), |tcti| {
         let conf = TctiNameConf::from_str(tcti).map_err(tpm_err)?;
         Context::new(conf).map_err(tpm_err)
@@ -107,22 +128,29 @@ fn tcti_candidates(explicit: Option<&str>) -> Vec<&str> {
     }
 }
 
-/// Open the first transport in [`tcti_candidates`] that works. A raw-device
-/// context is swept of stale slots first (see [`flush_stale_slots`]); if the
-/// sweep fails the context is dropped and the next transport is tried, so a
-/// raw device that opens but misbehaves never strands a request.
+/// Open the first transport in [`tcti_candidates`] that works. On the raw
+/// device the conversation marker is consulted first: a marker left by a
+/// predecessor that died mid-conversation triggers a sweep of that
+/// predecessor's leaked handles (see [`RawConversation::begin`]); if the sweep
+/// fails the context is dropped and the next transport is tried, so a raw
+/// device that opens but misbehaves never strands a request.
 fn open_context_from(
     explicit: Option<&str>,
     open: impl Fn(&str) -> Result<Context>,
-) -> Result<Context> {
+) -> Result<TpmContext> {
     let candidates = tcti_candidates(explicit);
     let mut last = None;
     for (index, tcti) in candidates.iter().enumerate() {
         let attempt = open(tcti).and_then(|mut ctx| {
-            if *tcti == TCTI_RAW_DEVICE {
-                flush_stale_slots(&mut ctx)?;
-            }
-            Ok(ctx)
+            let conversation = if *tcti == TCTI_RAW_DEVICE {
+                RawConversation::begin(&mut ctx)?
+            } else {
+                None
+            };
+            Ok(TpmContext {
+                ctx,
+                _conversation: conversation,
+            })
         });
         match attempt {
             Ok(ctx) => return Ok(ctx),
@@ -173,40 +201,140 @@ fn loaded_handles(ctx: &mut Context, range: u32) -> Result<Vec<TpmHandle>> {
     Ok(list.into_inner())
 }
 
-/// Flush every loaded transient object and loaded session on a raw-device
-/// context. Objects loaded through `/dev/tpm0` live in real chip slots that
-/// nobody frees if the loading process dies mid-conversation (the kernel only
-/// reclaims resource-manager spaces), and a chip with its handful of slots
-/// full refuses every later `Load`. The sweep is safe because the raw device
-/// is exclusive-open (no other raw user exists while we hold it) and the
-/// kernel resource manager leaves nothing loaded between commands; so any
-/// loaded handle we can see is a leak, ours or a predecessor's.
+/// Every loaded handle across [`SWEEP_RANGES`], as raw handle numbers, sorted
+/// and deduplicated (the HMAC and policy queries can list the same session).
+fn loaded_handle_numbers(ctx: &mut Context) -> Result<Vec<u32>> {
+    let mut numbers = Vec::new();
+    for range in SWEEP_RANGES {
+        numbers.extend(loaded_handles(ctx, range)?.into_iter().map(u32::from));
+    }
+    numbers.sort_unstable();
+    numbers.dedup();
+    Ok(numbers)
+}
+
+/// The marker of one raw-device conversation. Handles loaded through
+/// `/dev/tpm0` belong to the chip, not to a process: nothing frees them if the
+/// loading process dies mid-conversation (the kernel reclaims only
+/// resource-manager spaces), and a chip whose handful of slots is full refuses
+/// every later `Load`. Nor do they carry an owner, so "flush whatever is
+/// loaded" would also destroy the state of another raw client that keeps a
+/// handle loaded between its own opens. The marker separates the two: at the
+/// start of a conversation it records the handles ALREADY loaded (someone
+/// else's, to be preserved) and is removed on any normal exit. A marker still
+/// present at the next open means irlume died mid-conversation, and only the
+/// handles that appeared after that record are irlume's leaks and get flushed.
 ///
-/// Individual flush results are not decisive: ESYS reports "invalid handle
-/// state" for a reconstructed policy session AFTER the chip has flushed it
-/// (observed on the AMD fTPM), and a `?` there turned a successful sweep into
-/// a fallback. What decides is the chip's view afterwards: the sweep fails
-/// only if something is still loaded, and then this context is abandoned.
-fn flush_stale_slots(ctx: &mut Context) -> Result<()> {
+/// The marker lives on tmpfs under the daemon's lock directory, so a reboot
+/// (which also resets the chip) clears it. Where the directory is missing or
+/// not writable the conversation runs without a marker and without a sweep;
+/// the raw device is still used, and only the crash recovery is lost.
+struct RawConversation {
+    path: std::path::PathBuf,
+}
+
+impl RawConversation {
+    /// Recover from a predecessor's crash if its marker is present, then
+    /// record this conversation's starting state. `None` when no marker can be
+    /// kept (no lock directory): the raw device is used without recovery.
+    fn begin(ctx: &mut Context) -> Result<Option<Self>> {
+        let Some(path) = marker_path() else {
+            return Ok(None);
+        };
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            sweep_after_crash(ctx, &parse_marker(&text))?;
+        }
+        let loaded = loaded_handle_numbers(ctx)?;
+        if std::fs::write(&path, format_marker(&loaded)).is_err() {
+            note_marker_unavailable_once(&path);
+            return Ok(None);
+        }
+        Ok(Some(Self { path }))
+    }
+}
+
+impl Drop for RawConversation {
+    fn drop(&mut self) {
+        // Every load in this module is paired with a flush on success and
+        // error paths, so on a normal exit nothing of ours is left loaded and
+        // the marker has served its purpose. A crash skips this, on purpose.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Flush the handles a crashed predecessor left loaded: those loaded now that
+/// were NOT already loaded when it began (`prior`). Individual flush results
+/// are not decisive: ESYS reports "invalid handle state" for a reconstructed
+/// policy session AFTER the chip has flushed it (observed on the AMD fTPM).
+/// What decides is the chip's view afterwards: the sweep fails only if one of
+/// the predecessor's handles is still loaded, and then this context is
+/// abandoned for the fallback transport.
+fn sweep_after_crash(ctx: &mut Context, prior: &[u32]) -> Result<()> {
     for range in SWEEP_RANGES {
         for handle in loaded_handles(ctx, range)? {
-            // The same route `tpm2_flushcontext --transient/--loaded-session`
-            // takes: resolve the chip handle to an ESYS resource, then flush.
-            if let Ok(object) = ctx.tr_from_tpm_public(handle) {
-                let _ = ctx.flush_context(object);
+            if !handles_to_flush(&[u32::from(handle)], prior).is_empty() {
+                // The same route `tpm2_flushcontext --transient/--loaded-session`
+                // takes: resolve the chip handle to an ESYS resource, then flush.
+                if let Ok(object) = ctx.tr_from_tpm_public(handle) {
+                    let _ = ctx.flush_context(object);
+                }
             }
         }
     }
-    for range in SWEEP_RANGES {
-        let remaining = loaded_handles(ctx, range)?;
-        if !remaining.is_empty() {
-            return Err(Error::Tpm(format!(
-                "{} stale TPM handle(s) could not be flushed from the raw device",
-                remaining.len()
-            )));
-        }
+    let remaining = handles_to_flush(&loaded_handle_numbers(ctx)?, prior);
+    if remaining.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Tpm(format!(
+            "{} stale TPM handle(s) from an interrupted conversation could not be flushed",
+            remaining.len()
+        )))
     }
-    Ok(())
+}
+
+/// The handles a sweep may touch: loaded now and not in the recorded prior
+/// set. Pure; the ownership rule of [`RawConversation`] in one place.
+fn handles_to_flush(loaded: &[u32], prior: &[u32]) -> Vec<u32> {
+    loaded
+        .iter()
+        .copied()
+        .filter(|h| !prior.contains(h))
+        .collect()
+}
+
+/// Marker file location: `IRLUME_TPM_MARKER_DIR` (tests, containers) or the
+/// daemon's tmpfs lock directory. `None` when the directory does not exist.
+fn marker_path() -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("IRLUME_TPM_MARKER_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/run/lock/irlume"));
+    dir.is_dir().then(|| dir.join("tpm-raw-conversation"))
+}
+
+fn format_marker(handles: &[u32]) -> String {
+    handles.iter().map(|h| format!("{h:#010x}\n")).collect()
+}
+
+/// Lenient: a line that is not a hex handle is ignored rather than aborting
+/// recovery, since an unreadable marker must not strand the raw device.
+fn parse_marker(text: &str) -> Vec<u32> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let hex = line.strip_prefix("0x").unwrap_or(line);
+            u32::from_str_radix(hex, 16).ok()
+        })
+        .collect()
+}
+
+fn note_marker_unavailable_once(path: &std::path::Path) {
+    static NOTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    NOTED.get_or_init(|| {
+        irlume_common::dlog!(
+            "irlume: cannot write the TPM conversation marker {}; raw-device crash recovery is off for this process",
+            path.display()
+        );
+    });
 }
 
 /// The PCRs to bind to: `IRLUME_PCRS` (comma-separated) or `DEFAULT_PCRS`.
@@ -1043,76 +1171,82 @@ fn unseal_authorized(
     let mut ctx = open_context()?;
 
     with_srk_mode(&mut ctx, mode, |ctx, srk| {
-        let public = Public::unmarshall(&env.public).map_err(tpm_err)?;
-        let private = Private::try_from(env.private.clone()).map_err(tpm_err)?;
-        let sealed_handle = ctx
-            .execute_with_nullauth_session(|ctx| ctx.load(*srk, private, public))
+        with_session(ctx, Some(*srk), SessionType::Policy, |ctx, session| {
+            let policy_session = PolicySession::try_from(session).map_err(tpm_err)?;
+
+            // 1. Fold the current PCR state in and read the resulting policy
+            //    digest, the "approved policy" that must carry a signature.
+            let sel = pcr_selection(&env.pcrs)?;
+            ctx.policy_pcr(policy_session, Digest::default(), sel)
+                .map_err(retryable_tpm_err)?;
+            let approved = ctx.policy_get_digest(policy_session).map_err(tpm_err)?;
+
+            // 2. Find a signature for exactly this PCR set + policy digest.
+            let sigs = crate::pcrsig::load_signatures(crate::pcrsig::DEFAULT_BANK)?;
+            let sig = crate::pcrsig::find_for_policy(&sigs, &env.pcrs, approved.value())
+                .ok_or_else(|| {
+                    Error::Policy(
+                        "no signed PCR policy matches the current boot state \
+                         (kernel/UKI not yet enrolled; re-sign required)"
+                            .into(),
+                    )
+                })?;
+
+            // 3. Verify the signature over aHash = H(approvedPolicy ‖ ref)
+            //    under the public key, yielding a verification ticket. The key
+            //    is flushed as soon as the ticket exists, BEFORE the sealed
+            //    object is loaded: the ticket and the key's Name are all
+            //    PolicyAuthorize needs, so the conversation never holds more
+            //    than one transient object at a time. On the raw device that
+            //    leaves a minimum chip (three transient slots) two free slots
+            //    for concurrent resource-manager clients (ADR-0026).
+            let key_handle = load_external_pubkey(ctx, pubkey_pem)?;
+            let verified: Result<(
+                tss_esapi::structures::Name,
+                tss_esapi::structures::VerifiedTicket,
+            )> = (|| {
+                let key_name = ctx.tr_get_name(key_handle.into()).map_err(tpm_err)?;
+                let a_hash = a_hash(approved.value(), policy_ref)?;
+                let signature = Signature::RsaSsa(
+                    RsaSignature::create(
+                        HashingAlgorithm::Sha256,
+                        PublicKeyRsa::try_from(sig.sig.clone()).map_err(tpm_err)?,
+                    )
+                    .map_err(tpm_err)?,
+                );
+                let ticket = ctx
+                    .verify_signature(key_handle, a_hash, signature)
+                    .map_err(tpm_err)?;
+                Ok((key_name, ticket))
+            })();
+            let _ = ctx.flush_context(key_handle.into());
+            let (key_name, ticket) = verified?;
+
+            // 4. Authorize: rewrite the session policy to the key-bound
+            //    value, which equals the object's authPolicy.
+            let ref_nonce = Nonce::try_from(policy_ref.to_vec()).map_err(tpm_err)?;
+            ctx.policy_authorize(
+                policy_session,
+                approved.clone(),
+                ref_nonce,
+                &key_name,
+                ticket,
+            )
             .map_err(tpm_err)?;
 
-        let result: Result<Zeroizing<Vec<u8>>> = (|| {
-            with_session(ctx, Some(*srk), SessionType::Policy, |ctx, session| {
-                let policy_session = PolicySession::try_from(session).map_err(tpm_err)?;
-
-                // 1. Fold the current PCR state in and read the resulting policy
-                //    digest, the "approved policy" that must carry a signature.
-                let sel = pcr_selection(&env.pcrs)?;
-                ctx.policy_pcr(policy_session, Digest::default(), sel)
-                    .map_err(retryable_tpm_err)?;
-                let approved = ctx.policy_get_digest(policy_session).map_err(tpm_err)?;
-
-                // 2. Find a signature for exactly this PCR set + policy digest.
-                let sigs = crate::pcrsig::load_signatures(crate::pcrsig::DEFAULT_BANK)?;
-                let sig = crate::pcrsig::find_for_policy(&sigs, &env.pcrs, approved.value())
-                    .ok_or_else(|| {
-                        Error::Policy(
-                            "no signed PCR policy matches the current boot state \
-                             (kernel/UKI not yet enrolled; re-sign required)"
-                                .into(),
-                        )
-                    })?;
-
-                // 3. Verify the signature over aHash = H(approvedPolicy ‖ ref)
-                //    under the public key, yielding a verification ticket.
-                let key_handle = load_external_pubkey(ctx, pubkey_pem)?;
-                let verify_result: Result<Zeroizing<Vec<u8>>> = (|| {
-                    let key_name = ctx.tr_get_name(key_handle.into()).map_err(tpm_err)?;
-                    let a_hash = a_hash(approved.value(), policy_ref)?;
-                    let signature = Signature::RsaSsa(
-                        RsaSignature::create(
-                            HashingAlgorithm::Sha256,
-                            PublicKeyRsa::try_from(sig.sig.clone()).map_err(tpm_err)?,
-                        )
-                        .map_err(tpm_err)?,
-                    );
-                    let ticket = ctx
-                        .verify_signature(key_handle, a_hash, signature)
-                        .map_err(tpm_err)?;
-
-                    // 4. Authorize: rewrite the session policy to the key-bound
-                    //    value, which equals the object's authPolicy.
-                    let ref_nonce = Nonce::try_from(policy_ref.to_vec()).map_err(tpm_err)?;
-                    ctx.policy_authorize(
-                        policy_session,
-                        approved.clone(),
-                        ref_nonce,
-                        &key_name,
-                        ticket,
-                    )
-                    .map_err(tpm_err)?;
-
-                    // 5. Unseal under the now-satisfied policy session.
-                    let data = ctx
-                        .execute_with_session(Some(session), |ctx| ctx.unseal(sealed_handle.into()))
-                        .map_err(|e| policy_aware_err(e, env))?;
-                    Ok(Zeroizing::new(data.to_vec()))
-                })();
-                let _ = ctx.flush_context(key_handle.into());
-                verify_result
-            })
-        })();
-
-        let _ = ctx.flush_context(sealed_handle.into());
-        result
+            // 5. Load the sealed object and unseal it under the now-satisfied
+            //    policy session. Scoped so the object is flushed on every exit.
+            let public = Public::unmarshall(&env.public).map_err(tpm_err)?;
+            let private = Private::try_from(env.private.clone()).map_err(tpm_err)?;
+            let sealed_handle = ctx
+                .execute_with_nullauth_session(|ctx| ctx.load(*srk, private, public))
+                .map_err(tpm_err)?;
+            let data = ctx
+                .execute_with_session(Some(session), |ctx| ctx.unseal(sealed_handle.into()))
+                .map_err(|e| policy_aware_err(e, env));
+            let _ = ctx.flush_context(sealed_handle.into());
+            Ok(Zeroizing::new(data?.to_vec()))
+        })
     })
 }
 
@@ -2317,7 +2451,10 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             ],
             "raw first, manager second, nothing else"
         );
-        let err = result.expect_err("both transports failed");
+        let err = match result {
+            Ok(_) => panic!("both transports failed, so no context can exist"),
+            Err(e) => e,
+        };
         assert!(
             err.to_string().contains(TCTI_RESOURCE_MANAGER),
             "the error a caller sees is the last transport's: {err}"
@@ -2335,27 +2472,82 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert!(result.is_err());
     }
 
-    /// Child half of the crash fixture below: on the raw device, start a
-    /// policy session and an HMAC session and load a transient object, then
-    /// exit the PROCESS without flushing anything, exactly as a crash
-    /// mid-unseal would. Runs only when the parent asks for it by name with
-    /// the guard variable set; otherwise it is a no-op.
+    #[test]
+    fn a_sweep_touches_only_handles_that_appeared_after_the_marker() {
+        // Loaded now: a foreign session recorded at the start, plus two of ours.
+        let prior = [0x0200_0000];
+        let loaded = [0x0200_0000, 0x0200_0001, 0x8000_0000];
+        assert_eq!(
+            handles_to_flush(&loaded, &prior),
+            vec![0x0200_0001, 0x8000_0000]
+        );
+        assert!(handles_to_flush(&prior, &prior).is_empty());
+        assert!(handles_to_flush(&[], &prior).is_empty());
+    }
+
+    #[test]
+    fn the_marker_round_trips_and_ignores_garbage_lines() {
+        let handles = [0x0200_0000, 0x0300_0000, 0x8000_0001];
+        let text = format_marker(&handles);
+        assert_eq!(parse_marker(&text), handles);
+        assert_eq!(parse_marker(""), Vec::<u32>::new());
+        assert_eq!(parse_marker("nonsense\n0x80000002\n"), vec![0x8000_0002]);
+    }
+
+    #[test]
+    fn no_lock_directory_means_no_marker_and_no_recovery() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("IRLUME_TPM_MARKER_DIR");
+        std::env::set_var("IRLUME_TPM_MARKER_DIR", "/nonexistent/irlume-marker-dir");
+        let path = marker_path();
+        match previous {
+            Some(v) => std::env::set_var("IRLUME_TPM_MARKER_DIR", v),
+            None => std::env::remove_var("IRLUME_TPM_MARKER_DIR"),
+        }
+        assert!(path.is_none());
+    }
+
+    /// Child half of the crash fixture below. Mode `foreign`: a plain raw
+    /// context (no marker, as another raw client would be) starts an HMAC
+    /// session and exits without flushing. Mode `leak`: the production
+    /// `open_context` (which records the marker) starts a policy session and
+    /// loads a transient object, then exits the PROCESS
+    /// without flushing anything, exactly as a crash mid-unseal would. Runs
+    /// only when the parent asks for it by name with the guard variable set.
     #[test]
     #[ignore = "helper for a_raw_open_sweeps_handles_a_dead_process_left_loaded; not a test on its own"]
     fn leak_raw_handles_then_exit_helper() {
-        if std::env::var_os("IRLUME_TEST_LEAK_RAW_HANDLES").is_none() {
+        let Some(mode) = std::env::var_os("IRLUME_TEST_LEAK_RAW_HANDLES") else {
             return;
-        }
-        let public = std::env::var("IRLUME_TEST_LEAK_PUBLIC").expect("public");
-        let private = std::env::var("IRLUME_TEST_LEAK_PRIVATE").expect("private");
+        };
         let decode = |hex: &str| -> Vec<u8> {
             (0..hex.len())
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
                 .collect()
         };
-        let conf = TctiNameConf::from_str(TCTI_RAW_DEVICE).expect("tcti");
-        let mut ctx = Context::new(conf).expect("raw device");
+        let hmac = |ctx: &mut Context| {
+            ctx.start_auth_session(
+                None,
+                None,
+                None,
+                SessionType::Hmac,
+                SymmetricDefinition::AES_128_CFB,
+                HashingAlgorithm::Sha256,
+            )
+            .expect("hmac session");
+        };
+        if mode == "foreign" {
+            let conf = TctiNameConf::from_str(TCTI_RAW_DEVICE).expect("tcti");
+            let mut ctx = Context::new(conf).expect("raw device");
+            hmac(&mut ctx);
+            std::process::exit(0);
+        }
+        let public = std::env::var("IRLUME_TEST_LEAK_PUBLIC").expect("public");
+        let private = std::env::var("IRLUME_TEST_LEAK_PRIVATE").expect("private");
+        let mut ctx = open_context().expect("production open");
         let (srk, _) = load_or_create_srk(&mut ctx, SrkMode::ReadOnly).expect("srk");
         ctx.start_auth_session(
             Some(srk),
@@ -2366,96 +2558,154 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             HashingAlgorithm::Sha256,
         )
         .expect("policy session");
-        ctx.start_auth_session(
-            None,
-            None,
-            None,
-            SessionType::Hmac,
-            SymmetricDefinition::AES_128_CFB,
-            HashingAlgorithm::Sha256,
-        )
-        .expect("hmac session");
+        // Deliberately no second session: with the foreign one already loaded
+        // a third would fill a minimum chip's three session slots, and the
+        // Intel PTT then refuses even a password-authorized `Load` with
+        // TPM_RC_SESSION_HANDLES. One session plus one object covers both
+        // handle classes the sweep handles.
         let public = Public::unmarshall(&decode(&public)).expect("public");
         let private = Private::try_from(decode(&private)).expect("private");
         ctx.execute_with_nullauth_session(|ctx| ctx.load(srk, private, public))
             .expect("load");
-        // No drop, no flush: the ESYS context is abandoned with the process.
+        // No drop, no flush, no marker removal: abandoned with the process.
         std::process::exit(0);
     }
 
-    /// The crash-recovery path, for real: a child process on the raw device
-    /// starts a policy session, an HMAC session and loads a transient object,
-    /// then exits without a single flush. The next production open must find
-    /// the chip's slots occupied, sweep them, and hand back a context that
-    /// works; a full unseal over the same path must still succeed after it.
+    /// The crash-recovery path, for real, with the ownership rule: first a
+    /// foreign raw client leaves an HMAC session loaded and exits; then a child
+    /// on the production path records the marker (the foreign session is in
+    /// it), leaks a policy session and a transient object, and exits without
+    /// a single flush. The next production open must sweep exactly irlume's
+    /// two leaks, leave the foreign session loaded, remove
+    /// the stale marker, and a full unseal must still succeed afterwards.
     #[test]
     #[ignore = "requires the raw TPM device (root); leaks and then reclaims chip slots on purpose"]
     fn a_raw_open_sweeps_handles_a_dead_process_left_loaded() {
         let _g = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let previous = std::env::var_os("IRLUME_TCTI");
+        let previous_tcti = std::env::var_os("IRLUME_TCTI");
+        let previous_dir = std::env::var_os("IRLUME_TPM_MARKER_DIR");
+        let marker_dir = std::path::PathBuf::from(crate::test_tmp_dir("tpm-marker"));
+        let _ = std::fs::remove_dir_all(&marker_dir);
+        std::fs::create_dir_all(&marker_dir).expect("marker dir");
         std::env::remove_var("IRLUME_TCTI");
+        std::env::set_var("IRLUME_TPM_MARKER_DIR", &marker_dir);
+        let marker = marker_dir.join("tpm-raw-conversation");
         let raw = || {
             let conf = TctiNameConf::from_str(TCTI_RAW_DEVICE).map_err(tpm_err)?;
             Context::new(conf).map_err(tpm_err)
         };
-        let count_loaded = |ctx: &mut Context| -> Result<usize> {
-            SWEEP_RANGES
-                .iter()
-                .map(|range| loaded_handles(ctx, *range).map(|v| v.len()))
-                .sum()
-        };
         let encode = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let run_child = |mode: &str, env: &SealedEnvelope| -> Result<()> {
+            let exe = std::env::current_exe().map_err(|e| Error::Io(e.to_string()))?;
+            let status = std::process::Command::new(exe)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "tpm::tests::leak_raw_handles_then_exit_helper",
+                    "--test-threads=1",
+                ])
+                .env("IRLUME_TEST_LEAK_RAW_HANDLES", mode)
+                .env("IRLUME_TEST_LEAK_PUBLIC", encode(&env.public))
+                .env("IRLUME_TEST_LEAK_PRIVATE", encode(&env.private))
+                .env("IRLUME_TPM_MARKER_DIR", &marker_dir)
+                .env_remove("IRLUME_TCTI")
+                .stdout(std::process::Stdio::null())
+                .status()
+                .map_err(|e| Error::Io(e.to_string()))?;
+            assert!(status.success(), "leak helper ({mode}) exited {status}");
+            Ok(())
+        };
+        let flush_everything = |ctx: &mut Context| -> Result<()> {
+            for range in SWEEP_RANGES {
+                for handle in loaded_handles(ctx, range)? {
+                    if let Ok(object) = ctx.tr_from_tpm_public(handle) {
+                        let _ = ctx.flush_context(object);
+                    }
+                }
+            }
+            Ok(())
+        };
         let outcome = (|| -> Result<()> {
-            // A throwaway sealed blob for the child to load (sealed before the
-            // child holds the exclusive device).
-            let env = seal_with_pcrs(b"leak-fixture", &[7])?;
-
-            let status = std::process::Command::new(
-                std::env::current_exe().map_err(|e| Error::Io(e.to_string()))?,
-            )
-            .args([
-                "--ignored",
-                "--exact",
-                "tpm::tests::leak_raw_handles_then_exit_helper",
-                "--test-threads=1",
-            ])
-            .env("IRLUME_TEST_LEAK_RAW_HANDLES", "1")
-            .env("IRLUME_TEST_LEAK_PUBLIC", encode(&env.public))
-            .env("IRLUME_TEST_LEAK_PRIVATE", encode(&env.private))
-            .env_remove("IRLUME_TCTI")
-            .stdout(std::process::Stdio::null())
-            .status()
-            .map_err(|e| Error::Io(e.to_string()))?;
-            assert!(status.success(), "leak helper exited {status}");
-
-            let mut observer = raw()?;
-            let leaked = count_loaded(&mut observer)?;
-            drop(observer);
+            // Start from a clean chip: a failed earlier run of this test may
+            // have left its fixtures loaded, and the preconditions are exact.
+            let mut cleaner = raw()?;
+            flush_everything(&mut cleaner)?;
             assert!(
-                leaked >= 3,
-                "precondition: the dead process left its handles loaded, saw {leaked}"
+                loaded_handle_numbers(&mut cleaner)?.is_empty(),
+                "chip clean at start"
+            );
+            drop(cleaner);
+            // Sealed before any child holds the exclusive device.
+            let env = seal_with_pcrs(b"leak-fixture", &[7])?;
+            assert!(!marker.exists(), "a normal conversation leaves no marker");
+
+            run_child("foreign", &env)?;
+            let mut observer = raw()?;
+            let foreign = loaded_handle_numbers(&mut observer)?;
+            drop(observer);
+            assert_eq!(
+                foreign.len(),
+                1,
+                "precondition: one foreign session loaded: {foreign:x?}"
             );
 
-            // The production open: raw device first, sweep, then usable.
-            let mut ctx = open_context()?;
-            assert_eq!(
-                count_loaded(&mut ctx)?,
-                0,
-                "the sweep reclaimed every leaked slot"
+            run_child("leak", &env)?;
+            assert!(
+                marker.exists(),
+                "the dead conversation left its marker behind"
             );
+            assert_eq!(
+                parse_marker(
+                    &std::fs::read_to_string(&marker).map_err(|e| Error::Io(e.to_string()))?
+                ),
+                foreign,
+                "the marker recorded the foreign session as prior state"
+            );
+            let mut observer = raw()?;
+            let before = loaded_handle_numbers(&mut observer)?;
+            drop(observer);
+            assert_eq!(
+                before.len(),
+                3,
+                "precondition: foreign + two of ours loaded, saw {before:x?}"
+            );
+
+            // The production open: recover, then usable.
+            let mut ctx = open_context()?;
+            let after = loaded_handle_numbers(&mut ctx)?;
+            assert_eq!(
+                after, foreign,
+                "exactly irlume's leaks were swept; the foreign session survived"
+            );
+            assert!(marker.exists(), "this conversation holds its own marker");
             let _ = read_pcr_values(&mut ctx, &[7])?;
             drop(ctx);
+            assert!(!marker.exists(), "a normal exit removed the marker");
+
             let got = unseal(&env)?;
             assert_eq!(&*got, b"leak-fixture");
+
+            // Clean up the foreign session we planted (it is ours to flush).
+            let mut cleaner = raw()?;
+            flush_everything(&mut cleaner)?;
+            assert!(
+                loaded_handle_numbers(&mut cleaner)?.is_empty(),
+                "left the chip clean"
+            );
             Ok(())
         })();
-        match previous {
+        match previous_tcti {
             Some(v) => std::env::set_var("IRLUME_TCTI", v),
             None => std::env::remove_var("IRLUME_TCTI"),
         }
-        outcome.expect("leak in a child, sweep, reuse over the raw device");
+        match previous_dir {
+            Some(v) => std::env::set_var("IRLUME_TPM_MARKER_DIR", v),
+            None => std::env::remove_var("IRLUME_TPM_MARKER_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&marker_dir);
+        outcome.expect("foreign preserved, own leaks swept, reuse over the raw device");
     }
 
     /// The production default (raw device, manager fallback) against the host

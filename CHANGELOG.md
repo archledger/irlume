@@ -24,8 +24,11 @@ All notable changes to irlume are documented here. This project adheres to
   1.5 s per authentication (`enrollment_load` in the schema 4 trace); the same
   commands over the raw device take about 80 ms. Policies, PCR binding and key
   lifetime are unchanged; `IRLUME_TCTI=device:/dev/tpmrm0` pins the previous
-  transport. Each raw-device conversation first flushes any loaded handle a
-  crashed predecessor left behind.
+  transport. Each raw-device conversation records the handles already loaded
+  in a tmpfs marker and removes it on exit, so a conversation that died
+  mid-way is recovered at the next open by flushing exactly its own leaked
+  handles, never another raw client's; the Tier 1 unseal now holds one
+  transient object at a time.
 - Delivered-rate evidence stays reusable for 24 hours instead of 5 minutes
   (ADR-0021 amendment). An unlock after more than five minutes away used to
   re-pay the full 30-delta rate fill, about 1.5 s more than a back-to-back

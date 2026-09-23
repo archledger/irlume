@@ -5203,6 +5203,10 @@ impl App {
             // the page does not need.
             (SC_PROFILES, KeyCode::Char('r')) => {
                 self.log('·', "refreshing faces…");
+                // Invalidate first: a load already running (the TPM-backed
+                // startup load, typically) then cannot publish a reply older
+                // than this key press, and a replacement is queued.
+                self.freshness.cycle_mut(Worker::Profiles).invalidate();
                 self.refresh_profiles();
             }
             (SC_KEYRING | SC_RECOVERY | SC_SETTINGS, KeyCode::Char('r')) => {
@@ -5215,6 +5219,10 @@ impl App {
                 self.freshness.cycle_mut(Worker::Light).invalidate();
                 self.refresh_light();
                 if self.screen == SC_KEYRING {
+                    // The wallet page also shows the machine (TPM) row.
+                    self.invalidate_source(Source::Machine);
+                    self.freshness.cycle_mut(Worker::Machine).invalidate();
+                    self.request_probes();
                     self.invalidate_keyring_diagnostic();
                     self.refresh_keyring_diagnostic();
                 }
@@ -15743,6 +15751,46 @@ mod tests {
         app.screen = SC_FINGERPRINT;
         assert!(draw_text(&app).contains("unknown"));
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// ADR-0030 §1.3: r on Password Wallet refreshes the machine (TPM) row
+    /// it shows, not only the light wallet facts.
+    #[test]
+    fn wallet_refresh_requests_the_machine_snapshot() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_KEYRING;
+        assert!(app.probes_load.is_none());
+        app.on_key(KeyCode::Char('r'));
+        assert!(
+            app.probes_load.is_some(),
+            "the wallet page's refresh must relaunch the machine probe"
+        );
+        drain_loads(&mut app);
+    }
+
+    /// r on Faces while a profile load is already running queues a
+    /// replacement instead of letting the older reply stand as the refresh.
+    #[test]
+    fn faces_refresh_during_a_running_load_queues_a_replacement() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.refresh_profiles();
+        assert!(app.profiles_load.is_some(), "premise: a load is in flight");
+        assert!(!app.freshness.cycle(Worker::Profiles).pending());
+        app.on_key(KeyCode::Char('r'));
+        drain_loads(&mut app);
+        assert!(
+            app.freshness.cycle(Worker::Profiles).pending(),
+            "the pre-keypress reply is discarded and a replacement is queued"
+        );
+        assert!(
+            !app.freshness
+                .observation(Source::Profiles)
+                .last_request_failed(),
+            "the stale reply must not be published as this refresh's result"
+        );
     }
 
     #[test]

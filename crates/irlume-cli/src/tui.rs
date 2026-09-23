@@ -14399,6 +14399,12 @@ mod tests {
         app.freshness
             .observation_mut(Source::Cameras)
             .record(true, now);
+        // The enrollment is described, so the row's status column shows
+        // the privacy state rather than an unknown role.
+        app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
+            rgb: Some("3277:0059".into()),
+            ir: Some("3277:0059".into()),
+        });
         app.pairs = vec![irlume_common::CameraPairInfo {
             rgb: "/dev/video0".into(),
             ir: "/dev/video2".into(),

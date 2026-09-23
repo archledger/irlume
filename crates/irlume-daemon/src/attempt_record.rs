@@ -474,6 +474,40 @@ pub(crate) fn record(user: &str, filed: Filed) -> io::Result<()> {
 /// Queue capacity for the background writer: attempts complete far
 /// slower than this drains; a peer spinning on refusals fills it and its
 /// later attempts are dropped (journaled), never queued without bound.
+/// An entry prepared for a reply and committed once the reply is
+/// delivered (ADR-0030 §5), so the record says what the client got.
+#[derive(Debug)]
+pub(crate) struct Pending(Option<(String, Filed)>);
+
+impl Pending {
+    pub(crate) fn new(user: String, filed: Filed) -> Self {
+        Self(Some((user, filed)))
+    }
+
+    /// A reply that files nothing.
+    pub(crate) const fn nothing() -> Self {
+        Self(None)
+    }
+
+    /// The reply never reached the client: a grant it carried was not one.
+    /// A decision against the face stands as decided.
+    pub(crate) fn undelivered(mut self, cause: OutcomeCause) -> Self {
+        if let Some((_, filed)) = &mut self.0 {
+            if filed.result == AttemptResult::Granted {
+                filed.result = AttemptResult::Failed;
+                filed.cause = Some(cause);
+            }
+        }
+        self
+    }
+
+    pub(crate) fn commit(self) {
+        if let Some((user, filed)) = self.0 {
+            record_in_background(user, filed);
+        }
+    }
+}
+
 const WRITER_QUEUE: usize = 64;
 
 /// File an attempt from the one background writer: a bounded queue and a
@@ -975,5 +1009,40 @@ mod tests {
         );
         std::env::remove_var("IRLUME_STATE_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_undelivered_grant_is_filed_as_a_failure_and_a_refusal_stands() {
+        let filed = |result: AttemptResult, cause: Option<OutcomeCause>| Filed {
+            at: 1_700_000_000,
+            kind: AttemptKind::Authenticate,
+            surface: AttemptSurface::Login,
+            result,
+            cause,
+            elapsed_ms: 900,
+            capture_ms: Some(400),
+            camera: None,
+        };
+        let grant = Pending::new("me".into(), filed(AttemptResult::Granted, None))
+            .undelivered(OutcomeCause::TimedOut);
+        let (_, entry) = grant.0.expect("the entry is kept");
+        assert_eq!(entry.result, AttemptResult::Failed);
+        assert_eq!(entry.cause, Some(OutcomeCause::TimedOut));
+        // The capture evidence still describes what happened before delivery.
+        assert_eq!(entry.capture_ms, Some(400));
+
+        let refusal = Pending::new(
+            "me".into(),
+            filed(AttemptResult::Refused, Some(OutcomeCause::BelowThreshold)),
+        )
+        .undelivered(OutcomeCause::Cancelled);
+        let (_, entry) = refusal.0.expect("the entry is kept");
+        assert_eq!(entry.result, AttemptResult::Refused);
+        assert_eq!(entry.cause, Some(OutcomeCause::BelowThreshold));
+
+        assert!(Pending::nothing()
+            .undelivered(OutcomeCause::Cancelled)
+            .0
+            .is_none());
     }
 }

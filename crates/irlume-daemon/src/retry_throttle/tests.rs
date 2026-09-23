@@ -476,6 +476,7 @@ mod cumulative {
                 window: irlume_auth::AuthenticationWindow::for_service(None),
                 shared_unlock: None,
             }),
+            filing: None,
         }
     }
 

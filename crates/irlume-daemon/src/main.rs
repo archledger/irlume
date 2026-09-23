@@ -1040,11 +1040,6 @@ fn main() {
                             // unwind out of the worker and take down all face auth for
                             // every user.
                             let mut delivery = Delivery::attached(&reply);
-                            // Built outside the unwind boundary so a panic can
-                            // still file the attempt (ADR-0030 §5).
-                            let panicked_attempt = AttemptContext::for_request(&req, &peer, || {
-                                irlume_auth::camera_location(engine.rgb_device())
-                            });
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 dispatch_scoped_session_delivering(req, &peer, &mut engine, &scope, authorization, session.as_ref(), position.as_ref(), &mut delivery)
                             }));
@@ -1111,24 +1106,16 @@ fn main() {
                                     Response::Error("request failed".into()).into()
                                 }
                             };
-                            // A panicking request is still an attempt: filed as a
-                            // failure from the reply the client gets (ADR-0030 §5).
+                            // A panicking request is still an attempt (ADR-0030 §5):
+                            // the delivery slot survives the unwind, so an attempt
+                            // no reply took yet is filed as the synthetic failure.
+                            // A decision delivered early carries its own filing.
                             if panicked {
-                                if let Some(attempt) = panicked_attempt {
-                                    // A decision already delivered is what the
-                                    // client got, and its facts stand; only a
-                                    // panic before any reply is the synthetic
-                                    // failure.
-                                    let filed = match &delivery.delivered_response {
-                                        Some(delivered) => delivered,
-                                        None => {
-                                            note_engine_error(&irlume_common::Error::Protocol(
-                                                "request handler panicked".into(),
-                                            ));
-                                            &resp.response
-                                        }
-                                    };
-                                    attempt.file(filed, scope.capture_evidence());
+                                if let Some((attempt, scope)) = delivery.attempt.take() {
+                                    note_engine_error(&irlume_common::Error::Protocol(
+                                        "request handler panicked".into(),
+                                    ));
+                                    attempt.file(&resp.response, scope.capture_evidence());
                                 }
                             }
                             link.finish_activity();
@@ -1138,7 +1125,15 @@ fn main() {
                             // call is not sent again; the returned value only
                             // classified the operation above.
                             if !delivery.delivered {
-                                let _ = reply.send(resp);
+                                if let Err(std::sync::mpsc::SendError(resp)) = reply.send(resp) {
+                                    // The connection thread is gone: no reply
+                                    // reaches the client, so a grant is not one.
+                                    if let Some(filing) = resp.filing {
+                                        filing
+                                            .undelivered(irlume_common::OutcomeCause::Cancelled)
+                                            .commit();
+                                    }
+                                }
                             }
                             // Back to waiting for work: idle is healthy, and leaving the
                             // last job's timestamp behind would read as a wedge (#141).
@@ -1664,6 +1659,10 @@ struct FaceCompletion {
 struct WorkerReply {
     response: Response,
     completion: Option<FaceCompletion>,
+    /// The attempt record entry prepared for this reply (ADR-0030 §5),
+    /// committed once the reply is admitted and written: a grant that
+    /// never reaches the client is filed as a failure instead.
+    filing: Option<attempt_record::Pending>,
 }
 
 /// The worker's reply channel, lent to the Authenticate arm so the decision
@@ -1674,9 +1673,11 @@ struct WorkerReply {
 struct Delivery<'a> {
     sender: Option<&'a std::sync::mpsc::Sender<WorkerReply>>,
     delivered: bool,
-    /// The reply that went out early, kept so a panic after delivery is
-    /// filed against what the client received (ADR-0030 §5).
-    delivered_response: Option<Response>,
+    /// The attempt to file with the reply (ADR-0030 §5), with the scope
+    /// whose capture evidence it needs. Whichever sends the reply takes
+    /// it — the early hook or the ordinary return path — and a panic finds
+    /// it still here when no reply went out.
+    attempt: Option<(AttemptContext, diagnostics::OperationScope)>,
 }
 
 impl<'a> Delivery<'a> {
@@ -1687,7 +1688,7 @@ impl<'a> Delivery<'a> {
         Self {
             sender: None,
             delivered: false,
-            delivered_response: None,
+            attempt: None,
         }
     }
 
@@ -1695,31 +1696,39 @@ impl<'a> Delivery<'a> {
         Self {
             sender: Some(sender),
             delivered: false,
-            delivered_response: None,
+            attempt: None,
         }
     }
 
     /// Send the reply now. Returns false when there is no channel or the
     /// connection thread is gone; the caller then returns the reply as
     /// before and nothing is lost. Never sends twice.
-    fn send(&mut self, reply: WorkerReply) -> bool {
+    fn send(&mut self, mut reply: WorkerReply) -> bool {
         if self.delivered {
             return true;
         }
         let Some(sender) = self.sender else {
             return false;
         };
-        let response = reply.response.clone();
+        // The reply takes the attempt with it: filed by the connection
+        // thread once the reply is admitted (ADR-0030 §5).
+        if let Some((attempt, scope)) = self.attempt.take() {
+            reply.filing = Some(attempt.prepare(&reply.response, scope.capture_evidence()));
+        }
         match sender.send(reply) {
             Ok(()) => {
                 self.delivered = true;
-                self.delivered_response = Some(response);
                 true
             }
-            Err(_) => {
+            Err(std::sync::mpsc::SendError(reply)) => {
                 jout_warn!(
                     "irlumed: decision ready before camera release, but the connection thread is gone"
                 );
+                if let Some(filing) = reply.filing {
+                    filing
+                        .undelivered(irlume_common::OutcomeCause::Cancelled)
+                        .commit();
+                }
                 false
             }
         }
@@ -1786,6 +1795,7 @@ impl From<Response> for WorkerReply {
         Self {
             response,
             completion: None,
+            filing: None,
         }
     }
 }
@@ -1799,10 +1809,19 @@ fn is_face_grant(response: &Response) -> bool {
 
 impl WorkerReply {
     fn respond(self, stream: UnixStream) -> std::io::Result<()> {
-        let Some(completion) = self.completion.filter(|_| is_face_grant(&self.response)) else {
-            return respond(stream, &self.response);
+        let WorkerReply {
+            response,
+            completion,
+            filing,
+        } = self;
+        let Some(completion) = completion.filter(|_| is_face_grant(&response)) else {
+            let result = respond(stream, &response);
+            if let Some(filing) = filing {
+                filing.commit();
+            }
+            return result;
         };
-        let result = respond_admitted(stream, &self.response, |stream| {
+        let result = respond_admitted(stream, &response, |stream| {
             let timeout = completion
                 .window
                 .remaining()
@@ -1823,18 +1842,41 @@ impl WorkerReply {
             }
             // Last admission check, after serialization and before the first
             // byte. A partial write cannot be retracted if expiry arrives later.
-            completion.window.check().map_err(std::io::Error::other)?;
+            let expired = |e| std::io::Error::new(std::io::ErrorKind::TimedOut, e);
+            completion.window.check().map_err(expired)?;
             if let Some(binding) = &completion.shared_unlock {
                 binding.validate().map_err(std::io::Error::other)?;
             }
-            completion.window.check().map_err(std::io::Error::other)
+            completion.window.check().map_err(expired)
         });
         if result.is_ok() && completion.attempt.delivered().is_err() {
             // The admitted response cannot be retracted. Disk stays authoritative;
             // retain conservative accounting and never send a second response.
             jout_warn!("irlumed: delivered face response; retry reset was not confirmed");
         }
+        // The record says what the client got (ADR-0030 §5): a grant that
+        // was not admitted or not written is a failure, not a grant.
+        if let Some(filing) = filing {
+            match &result {
+                Ok(()) => filing.commit(),
+                Err(e) => filing.undelivered(undelivered_cause(e)).commit(),
+            }
+        }
         result
+    }
+}
+
+/// Why an admitted grant never reached the client, for its record.
+fn undelivered_cause(error: &std::io::Error) -> irlume_common::OutcomeCause {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::TimedOut => irlume_common::OutcomeCause::TimedOut,
+        ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::BrokenPipe
+        | ErrorKind::NotConnected
+        | ErrorKind::WriteZero => irlume_common::OutcomeCause::Cancelled,
+        _ => irlume_common::OutcomeCause::Other,
     }
 }
 
@@ -5605,12 +5647,23 @@ impl AttemptContext {
         })
     }
 
-    /// File the attempt from the reply: the camera snapshot is attached
+    /// File the attempt from the reply now: the camera snapshot is attached
     /// only when the attempt reached a camera; `capture` is what the
     /// operation's capture stages reported. The durable write (a lock and
     /// two syncs) runs on its own thread: the record is history and never
     /// delays the reply or the camera worker.
     fn file(self, response: &Response, capture: diagnostics::CaptureEvidence) {
+        self.prepare(response, capture).commit();
+    }
+
+    /// Prepare the entry from the reply, on the thread that built it (the
+    /// reply facts are thread-local); the caller commits it once the reply
+    /// is delivered.
+    fn prepare(
+        self,
+        response: &Response,
+        capture: diagnostics::CaptureEvidence,
+    ) -> attempt_record::Pending {
         use irlume_common::{AttemptResult, OutcomeCause};
         let facts = REPLY_FACTS.with(|cell| cell.get());
         // The site that built the reply says whether it was a decision and
@@ -5661,7 +5714,7 @@ impl AttemptContext {
                 ),
                 None => (AttemptResult::Failed, None, false),
             },
-            _ => return,
+            _ => return attempt_record::Pending::nothing(),
         };
         // The camera is named on evidence, not on the cause alone: a grant,
         // a capture route that started (even one cancelled or timed out
@@ -5711,7 +5764,7 @@ impl AttemptContext {
             },
             camera,
         };
-        attempt_record::record_in_background(self.user, filed);
+        attempt_record::Pending::new(self.user, filed)
     }
 }
 
@@ -5734,7 +5787,12 @@ fn dispatch_scoped(
 ) -> Response {
     // Returning a value is not delivery. An unacknowledged token is dropped
     // conservatively; reset tests exercise the production socket responder.
-    dispatch_scoped_session(req, peer, engine, scope, authorization, None, None).response
+    let reply = dispatch_scoped_session(req, peer, engine, scope, authorization, None, None);
+    // Tests deliver nothing: the returned reply is what the client got.
+    if let Some(filing) = reply.filing {
+        filing.commit();
+    }
+    reply.response
 }
 
 #[cfg(test)]
@@ -5775,9 +5833,12 @@ fn dispatch_scoped_session_delivering(
     delivery: &mut Delivery<'_>,
 ) -> WorkerReply {
     let mut completion = None;
-    let attempt = AttemptContext::for_request(&req, peer, || {
+    // Armed on the delivery, outside the arms: whichever path sends the
+    // reply files the attempt with it (ADR-0030 §5).
+    delivery.attempt = AttemptContext::for_request(&req, peer, || {
         irlume_auth::camera_location(engine.rgb_device())
-    });
+    })
+    .map(|attempt| (attempt, scope.clone()));
     let response = dispatch_scoped_session_inner(
         req,
         peer,
@@ -5792,14 +5853,17 @@ fn dispatch_scoped_session_delivering(
     if !is_face_grant(&response) {
         completion = None;
     }
-    // Filed after the reply is built (and, for an early delivery, after it
-    // was sent): the record is history and never delays a decision.
-    if let Some(attempt) = attempt {
-        attempt.file(&response, scope.capture_evidence());
-    }
+    // Prepared after the reply is built and committed once it is delivered
+    // (an early delivery took it already): the record is history and never
+    // delays a decision.
+    let filing = delivery
+        .attempt
+        .take()
+        .map(|(attempt, _)| attempt.prepare(&response, scope.capture_evidence()));
     WorkerReply {
         response,
         completion,
+        filing,
     }
 }
 
@@ -6270,6 +6334,7 @@ fn dispatch_scoped_session_inner(
                     let sent = delivery.send(WorkerReply {
                         response: response.clone(),
                         completion: completed.take().filter(|_| is_face_grant(&response)),
+                        filing: None,
                     });
                     if !sent {
                         // No channel (or the connection thread is gone): the
@@ -7602,6 +7667,7 @@ fn do_unseal_password_scoped(
             let sent = delivery.send(WorkerReply {
                 response: response.clone(),
                 completion: completed.take().filter(|_| is_face_grant(&response)),
+                filing: None,
             });
             if !sent {
                 *completion = completed;
@@ -7836,6 +7902,7 @@ mod tests {
                 cause: None,
             },
             completion: None,
+            filing: None,
         }
     }
 
@@ -13448,6 +13515,7 @@ mod tests {
                         let resp = WorkerReply {
                             response: Response::Error("stand-in worker".into()),
                             completion: None,
+                            filing: None,
                         };
                         job_scope.finish(irlume_common::diagnostics::CategoricalOutcome::Failed);
                         arb.finish(job_class, job_uid);

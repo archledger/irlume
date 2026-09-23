@@ -1017,7 +1017,10 @@ fn main() {
                                 // camera (ADR-0030 §5).
                                 if let Some(attempt) = AttemptContext::for_request(&req, &peer, || None) {
                                     note_pre_camera_failure(irlume_common::OutcomeCause::Cancelled);
-                                    attempt.file(&Response::Error("client left".into()), None);
+                                    attempt.file(
+                                        &Response::Error("client left".into()),
+                                        diagnostics::CaptureEvidence::NONE,
+                                    );
                                 }
                                 link.finish_activity();
                                 scope.finish(
@@ -1112,17 +1115,20 @@ fn main() {
                             // failure from the reply the client gets (ADR-0030 §5).
                             if panicked {
                                 if let Some(attempt) = panicked_attempt {
-                                    note_engine_error(&irlume_common::Error::Protocol(
-                                        "request handler panicked".into(),
-                                    ));
                                     // A decision already delivered is what the
-                                    // client got; only a panic before it is the
-                                    // synthetic failure.
-                                    let filed = delivery
-                                        .delivered_response
-                                        .as_ref()
-                                        .unwrap_or(&resp.response);
-                                    attempt.file(filed, scope.capture_ms());
+                                    // client got, and its facts stand; only a
+                                    // panic before any reply is the synthetic
+                                    // failure.
+                                    let filed = match &delivery.delivered_response {
+                                        Some(delivered) => delivered,
+                                        None => {
+                                            note_engine_error(&irlume_common::Error::Protocol(
+                                                "request handler panicked".into(),
+                                            ));
+                                            &resp.response
+                                        }
+                                    };
+                                    attempt.file(filed, scope.capture_evidence());
                                 }
                             }
                             link.finish_activity();
@@ -3261,7 +3267,7 @@ fn serve_peer(
                     // Whatever the reply shape, an authority or confirmation
                     // refusal is a policy decision before any camera.
                     note_pre_camera(irlume_common::OutcomeCause::Policy);
-                    attempt.file(&resp, None);
+                    attempt.file(&resp, diagnostics::CaptureEvidence::NONE);
                 }
                 return respond(stream, &resp);
             }
@@ -3347,7 +3353,10 @@ fn serve_peer(
                 if let Some(attempt) = refused_attempt {
                     // Contention is a failure to run, not a refusal of a face.
                     note_pre_camera_failure(irlume_common::OutcomeCause::CameraUnavailable);
-                    attempt.file(&Response::Error(refusal.message().into()), None);
+                    attempt.file(
+                        &Response::Error(refusal.message().into()),
+                        diagnostics::CaptureEvidence::NONE,
+                    );
                 }
                 return respond(stream, &Response::Error(refusal.message().into()));
             }
@@ -5597,11 +5606,11 @@ impl AttemptContext {
     }
 
     /// File the attempt from the reply: the camera snapshot is attached
-    /// only when the attempt reached a camera; `capture_ms` is what the
+    /// only when the attempt reached a camera; `capture` is what the
     /// operation's capture stages reported. The durable write (a lock and
     /// two syncs) runs on its own thread: the record is history and never
     /// delays the reply or the camera worker.
-    fn file(self, response: &Response, capture_ms: Option<u64>) {
+    fn file(self, response: &Response, capture: diagnostics::CaptureEvidence) {
         use irlume_common::{AttemptResult, OutcomeCause};
         let facts = REPLY_FACTS.with(|cell| cell.get());
         // The site that built the reply says whether it was a decision and
@@ -5649,9 +5658,10 @@ impl AttemptContext {
             _ => return,
         };
         // The camera is named on evidence, not on the cause alone: a grant,
-        // a capture stage that reported, or a failure of the camera itself.
-        // A setup refusal or a budget expiry with no capture evidence
-        // names none — the engine refuses those before any lease.
+        // a capture route that started (even one cancelled or timed out
+        // before a capture stage reported), or a failure of the camera
+        // itself. A setup refusal or a budget expiry with no capture
+        // evidence names none — the engine refuses those before any lease.
         // Identification runs through the engine's plain assessment, which
         // reports no capture stages: a verdict about a face is itself the
         // evidence that a camera captured one.
@@ -5659,7 +5669,8 @@ impl AttemptContext {
             && cause.is_some_and(OutcomeCause::is_face_verdict);
         let reached_camera = !pre_camera
             && (matches!(result, AttemptResult::Granted)
-                || capture_ms.is_some()
+                || capture.reached
+                || capture.capture_ms.is_some()
                 || face_verdict
                 || matches!(
                     cause,
@@ -5683,7 +5694,11 @@ impl AttemptContext {
             result,
             cause,
             elapsed_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            capture_ms: if reached_camera { capture_ms } else { None },
+            capture_ms: if reached_camera {
+                capture.capture_ms
+            } else {
+                None
+            },
             camera,
         };
         attempt_record::record_in_background(self.user, filed);
@@ -5770,7 +5785,7 @@ fn dispatch_scoped_session_delivering(
     // Filed after the reply is built (and, for an early delivery, after it
     // was sent): the record is history and never delays a decision.
     if let Some(attempt) = attempt {
-        attempt.file(&response, scope.capture_ms());
+        attempt.file(&response, scope.capture_evidence());
     }
     WorkerReply {
         response,

@@ -91,8 +91,9 @@ device.
    connected/absent, `⚠` needs attention. Colour reinforces, never carries
    (`NO_COLOR` keeps the glyphs).
 6. **Facts, not "yes".** A status row states the fact the person would
-   open the page for; a row that cannot state it says what to do
-   (`unknown — press r`, `needs root — sudo irlume doctor`).
+   open the page for; a row that cannot state it says why and the
+   remediation is an action row beneath it (`refresh`, `run as root`),
+   never a key inside the sentence (§1.4).
 7. **Truncate with an ellipsis; expand on Enter.** No silently cut line.
 8. **Wide terminals get a details column.** At ≥120 columns, list pages
    (Cameras, Faces, Diagnostics, Login & Apps) show the selected row's
@@ -172,9 +173,13 @@ device.
   safe facts ADR-0008 already permits (vid/pid, USB topology as role
   labels and port chain, descriptor and qualification tokens, serial
   present/absent, TPM tier and PCR policy) plus the retained
-  `elapsed_ms`/`capture_ms` of the attempt record; the raw serial and the
-  `/dev` node paths appear only for root, through the same privileged
-  boundary as the trace. Stage timings beyond those two durations exist
+  `elapsed_ms`/`capture_ms` of the attempt record. The raw serial and the
+  `/dev` node paths are gated by the **daemon**, not by the TUI: they
+  travel only in a root-only `CameraDetails` request (the same posture as
+  the trace subscription), and the any-peer `ListCameras` row carries
+  `vid:pid`, `serial_present`, the port chain and the descriptor token,
+  not the serial or the node paths — an amendment to ADR-0029 A's
+  `identity` field, which becomes root-only likewise. Stage timings beyond those two durations exist
   only while a root trace subscriber is active and are not retained; the
   pane says "record a trace (T) for stage timings" rather than promising
   them. Text is selectable and `y` copies the pane to the clipboard when a
@@ -193,8 +198,10 @@ device.
 - **Undo within the session** (`z`) for reversible changes the TUI itself
   made: rename, camera pin, policy toggles. Each such action records the
   value it wrote and its inverse; `z` confirms and sends the inverse with
-  an **expected-current-value precondition** carried in the request
-  (`RenameProfile { expected: .. }`; for the pin a new
+  an **expected-current-value precondition** carried in a **separate
+  compare-and-set variant** (`RenameProfileExpecting { expected, .. }`,
+  so an older client's plain `RenameProfile` keeps decoding; for the pin
+  a new
   `SetCamerasExpecting { expected_pair, expected_mode, .. }` that writes
   pair and mode in ADR-0029's one atomic publication only when the file
   still holds the expected ones — `SetCameraSelection` changes the mode
@@ -220,16 +227,26 @@ device.
   `biopolicy::classify` with the session state, so a greeter that serves
   both login and lock is recorded as what it was, not reclassified from
   the service name), the kind (`authenticate` or `identify`), the camera
-  as vid/pid plus the USB port chain (the reference
-  `SanitizedCameraContext` already uses, which tells two units of one
-  model apart while they are connected; never the binding identity, so no
-  serial) — **optional**, absent for an attempt refused before any camera
-  was selected (startup, retry throttling, method or policy checks), as
-  is `capture_ms` — the outcome class, the cause, `elapsed_ms` and
-  `capture_ms`. The cause is structured at both places a refusal is
+  as vid/pid plus the USB port chain **and** the share-safe
+  `descriptor_token` (the digest `SanitizedCameraContext` already carries:
+  durable across unplugging, identical only for units that share a
+  descriptor byte for byte) — the record is a history of what was attached
+  where, so the TUI maps it to a current camera by port chain and token
+  and, when neither matches a connected camera, shows the model name
+  (vid/pid) with "no longer connected" rather than attributing the attempt
+  to a replacement unit; never the binding identity, so no serial. The
+  camera fields are **optional**, absent for an attempt refused before any
+  camera was selected (startup, retry throttling, method or policy
+  checks), as is `capture_ms` — the outcome class, the cause, `elapsed_ms` and
+  `capture_ms`. The cause is structured at every place a result is
   decided: on the engine's `Outcome` (`OutcomeCause`, set where the
-  outcome is built, next to `OutcomeKind`) for attempts that reached the
-  engine, and as a daemon-level `EarlyRefusal` enum for the paths that
+  outcome is built, next to `OutcomeKind`) for attempts that reached a
+  decision; on the engine's error boundary for attempts that reached the
+  engine but ended in an error (`irlume_common::Error` gains a `cause()`
+  classification — camera unavailable, cancelled, timed out, other — so
+  the daemon maps an `Err` without reading its text); on
+  `IdentifyOutcome`, which gains the same `OutcomeCause` beside its
+  `reason`; and as a daemon-level `EarlyRefusal` enum for the paths that
   answer before the engine (`method not available`, `policy`,
   `configuration`, `retry throttled`, `daemon starting`), each recorded
   as its own cause. The vocabulary: `no face`, `liveness refused`,

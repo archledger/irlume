@@ -527,6 +527,7 @@ pub(crate) fn record_in_background(user: String, filed: Filed) {
                             crate::journal_safe(&user)
                         );
                     }
+                    writer_progress(|p| p.written += 1);
                 }
             });
         if let Err(error) = spawned {
@@ -534,7 +535,11 @@ pub(crate) fn record_in_background(user: String, filed: Filed) {
         }
         tx
     });
+    // Counted before it is queued, so a reader that follows the reply
+    // waits for it (a dropped record counts as done: nothing to wait for).
+    writer_progress(|p| p.queued += 1);
     if sender.try_send((user, filed)).is_err() {
+        writer_progress(|p| p.written += 1);
         // Journal the first drop and then every hundredth, not each one.
         let dropped = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if dropped == 1 || dropped % 100 == 0 {
@@ -542,6 +547,51 @@ pub(crate) fn record_in_background(user: String, filed: Filed) {
                 "irlumed: attempt record writer queue full; {dropped} records dropped so far"
             );
         }
+    }
+}
+
+/// How far the background writer is: what was queued, what it finished.
+#[derive(Default)]
+struct WriterProgress {
+    queued: u64,
+    written: u64,
+}
+
+static WRITER_PROGRESS: std::sync::Mutex<WriterProgress> = std::sync::Mutex::new(WriterProgress {
+    queued: 0,
+    written: 0,
+});
+static WRITER_CAUGHT_UP: std::sync::Condvar = std::sync::Condvar::new();
+
+fn writer_progress(update: impl FnOnce(&mut WriterProgress)) {
+    let mut progress = WRITER_PROGRESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    update(&mut progress);
+    drop(progress);
+    WRITER_CAUGHT_UP.notify_all();
+}
+
+/// Bound on how long a read waits for the writer to catch up.
+const READ_AFTER_WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Wait (bounded) until every record queued before now is on disk, so a
+/// status request that follows a reply sees the attempt that reply was.
+fn await_writer() {
+    let deadline = std::time::Instant::now() + READ_AFTER_WRITE_WAIT;
+    let mut progress = WRITER_PROGRESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let target = progress.queued;
+    while progress.written < target {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let (guard, _) = WRITER_CAUGHT_UP
+            .wait_timeout(progress, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        progress = guard;
     }
 }
 
@@ -553,6 +603,8 @@ pub(crate) fn record_in_background(user: String, filed: Filed) {
 /// not match a serial-bearing unit's discriminator.
 pub(crate) fn load(user: &str) -> Option<AttemptRecord> {
     let uid = account_uid(user).ok()?;
+    // Read after write: a reply already delivered has its record queued.
+    await_writer();
     let stored = store().ok()?.read(uid, user).ok()?;
     let key = key_bytes(&stored.unit_key_hex);
     let mut record = stored.record;

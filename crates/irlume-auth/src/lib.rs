@@ -5315,7 +5315,19 @@ impl Engine {
                     }
                 );
                 rgb_hard_retried = true;
-                irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)?
+                // The retry is the capture that produced the assessed frame:
+                // it reports its own timing, and the detection line below
+                // carries it.
+                let t = std::time::Instant::now();
+                let frame =
+                    irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)?;
+                rgb_ms = t.elapsed().as_millis();
+                emit_trace_stage_ms(
+                    diagnostics,
+                    irlume_common::diagnostics::TraceStage::RgbCapture,
+                    rgb_ms,
+                );
+                frame
             }
             Err(e) => return Err(e.into()),
         };
@@ -5324,12 +5336,24 @@ impl Engine {
         // `None` = sequential mode skipped IR after an RGB fault; the RGB `?`
         // above already returned, so reaching here with `None` is unreachable,
         // but capture alone rather than unwrap to stay panic-free.
+        let timed_ir_capture = |diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink| {
+            let t = std::time::Instant::now();
+            let captured = irlume_camera::capture_ir_with_stats_and_control(&self.ir_dev, &control);
+            if captured.is_ok() {
+                emit_trace_stage_ms(
+                    diagnostics,
+                    irlume_common::diagnostics::TraceStage::IrCapture,
+                    t.elapsed().as_millis(),
+                );
+            }
+            captured
+        };
         let (ir, ir_stats) = match ir_res {
             Ok(Some(f)) => f,
-            Ok(None) => irlume_camera::capture_ir_with_stats_and_control(&self.ir_dev, &control)?,
+            Ok(None) => timed_ir_capture(diagnostics)?,
             Err(e) if !held_sessions && !pair_sequential_retried => {
                 irlume_common::dlog!("assess: ir capture retry (concurrent failed: {e})");
-                irlume_camera::capture_ir_with_stats_and_control(&self.ir_dev, &control)?
+                timed_ir_capture(diagnostics)?
             }
             Err(e) => return Err(e.into()),
         };

@@ -1413,9 +1413,18 @@ impl App {
         // or a successfully observed empty enrollment (first-run account).
         // A loaded enrollment with neither (older daemon, or an unbound
         // legacy profile) stays unknown rather than claiming "not enrolled".
-        let known = self.primary_camera.is_some()
-            || !self.camera_groups.is_empty()
-            || (self.profiles_loaded && self.profiles.is_empty());
+        // A binding with neither side set is an unbound legacy primary,
+        // not evidence about any camera; and while the secondary store is
+        // unreadable, a pair that matches nothing may be an enrolled group
+        // the daemon could not summarize. Both keep the verdict unknown.
+        let bound_primary = self
+            .primary_camera
+            .as_ref()
+            .is_some_and(|binding| binding.rgb.is_some() || binding.ir.is_some());
+        let known = self.camera_store_error.is_none()
+            && (bound_primary
+                || !self.camera_groups.is_empty()
+                || (self.profiles_loaded && self.profiles.is_empty()));
         camera_role_for(
             pair.identity.as_deref(),
             self.primary_camera.as_ref(),
@@ -7519,7 +7528,17 @@ impl App {
         // without leaving the screen. Not-fetched draws as not fetched,
         // never as the default schedule and never as a daemon fault: the
         // poll simply has not run yet.
+        // A failed latest request is reported before any cached schedule:
+        // an old verdict must not read as the answer to the retry.
+        let qualification_failed = self
+            .freshness
+            .observation(Source::Qualification)
+            .last_request_failed();
         let capture = match &self.capture_mode {
+            Some(_) if qualification_failed => Span::styled(
+                "last inspection failed; press c to retry".to_string(),
+                Style::new().fg(th().warn),
+            ),
             Some(text) => Span::raw(format!(
                 "last observation ({}): {text}",
                 self.source_status(Source::Qualification)
@@ -13770,6 +13789,36 @@ mod tests {
         assert!(text.contains("3277:0059: [2Jsn"), "{text}");
         assert!(!text.contains('\x1b'), "{text}");
         app.on_key(KeyCode::Esc);
+        // A cached schedule never outranks a failed retry.
+        app.capture_mode = Some("sequential (source: test)".into());
+        let now = app.now();
+        app.freshness
+            .observation_mut(Source::Qualification)
+            .record(false, now);
+        let text = render(&mut app);
+        assert!(text.contains("last inspection failed"), "{text}");
+        app.capture_mode = None;
+        app.freshness
+            .observation_mut(Source::Qualification)
+            .invalidate();
+        // An all-None binding is an unbound primary: no camera is labelled.
+        app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
+            rgb: None,
+            ir: None,
+        });
+        app.camera_groups.clear();
+        let text = render(&mut app);
+        assert!(!text.contains("not enrolled"), "{text}");
+        assert!(!text.contains("Primary camera"), "{text}");
+        // An unreadable secondary store keeps unmatched pairs unknown.
+        app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
+            rgb: Some("3277:0059".into()),
+            ir: Some("3277:0059".into()),
+        });
+        app.camera_store_error = Some("store unreadable".into());
+        let text = render(&mut app);
+        assert!(!text.contains("not enrolled"), "{text}");
+        app.camera_store_error = None;
         // A successfully observed empty enrollment labels every camera as
         // not enrolled instead of claiming nothing.
         app.primary_camera = None;

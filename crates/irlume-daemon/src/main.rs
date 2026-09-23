@@ -1004,6 +1004,7 @@ fn main() {
                                 link,
                                 scope,
                                 enqueued_at,
+                                mut attempt,
                             } = job.payload;
                             // Queue-wait boundary: submission to this take.
                             note_queue_wait(&scope, enqueued_at);
@@ -1014,8 +1015,9 @@ fn main() {
                             if !link.claim() {
                                 // A face request whose client left while it
                                 // queued is a cancelled attempt that reached no
-                                // camera (ADR-0030 §5).
-                                if let Some(attempt) = AttemptContext::for_request(&req, &peer, || None) {
+                                // camera (ADR-0030 §5); its surface was taken
+                                // at submission, while the client still existed.
+                                if let Some(attempt) = attempt {
                                     note_pre_camera_failure(irlume_common::OutcomeCause::Cancelled);
                                     attempt.file(
                                         &Response::Error("client left".into()),
@@ -1040,6 +1042,13 @@ fn main() {
                             // unwind out of the worker and take down all face auth for
                             // every user.
                             let mut delivery = Delivery::attached(&reply);
+                            // The camera as sysfs describes it now, before the
+                            // engine runs; the attempt is armed on the delivery
+                            // outside the unwind boundary (ADR-0030 §5).
+                            if let Some(attempt) = attempt.as_mut() {
+                                attempt.camera = irlume_auth::camera_location(engine.rgb_device());
+                            }
+                            delivery.attempt = attempt.map(|attempt| (attempt, scope.clone()));
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 dispatch_scoped_session_delivering(req, &peer, &mut engine, &scope, authorization, session.as_ref(), position.as_ref(), &mut delivery)
                             }));
@@ -1893,6 +1902,10 @@ struct Queued {
     /// Submission instant, from which the worker measures the queue-wait
     /// boundary. Set immediately before `arbiter.submit`.
     enqueued_at: std::time::Instant,
+    /// The attempt this face request is (ADR-0030 §5), snapshotted at
+    /// submission while the peer's login session is still resolvable; the
+    /// worker adds the camera and files it with the reply.
+    attempt: Option<AttemptContext>,
 }
 
 /// The handshake between one connection thread and the camera worker, so work a
@@ -3375,6 +3388,7 @@ fn serve_peer(
             // §5), and only the refusal branch uses it.
             let refused_attempt = AttemptContext::for_request(&req, &peer, || None);
             let queued = Queued {
+                attempt: AttemptContext::for_request(&req, &peer, || None),
                 authorization,
                 session,
                 position,
@@ -5591,6 +5605,11 @@ fn note_outcome(cause: Option<irlume_common::OutcomeCause>) {
     });
 }
 
+/// A new request on this thread: no site has said anything yet.
+fn reset_reply_facts() {
+    REPLY_FACTS.with(|cell| cell.set(None));
+}
+
 /// A decision against a face became a prose reply.
 fn note_decided(cause: Option<irlume_common::OutcomeCause>) {
     REPLY_FACTS.with(|cell| {
@@ -5628,7 +5647,7 @@ impl AttemptContext {
         peer: &Peer,
         camera: impl FnOnce() -> Option<irlume_auth::CameraLocation>,
     ) -> Option<Self> {
-        REPLY_FACTS.with(|cell| cell.set(None));
+        reset_reply_facts();
         let (user, kind, surface) = match req {
             // The verify path and the cold-login credential-release path
             // are both face authentications.
@@ -5850,11 +5869,15 @@ fn dispatch_scoped_session_delivering(
 ) -> WorkerReply {
     let mut completion = None;
     // Armed on the delivery, outside the arms: whichever path sends the
-    // reply files the attempt with it (ADR-0030 §5).
-    delivery.attempt = AttemptContext::for_request(&req, peer, || {
-        irlume_auth::camera_location(engine.rgb_device())
-    })
-    .map(|attempt| (attempt, scope.clone()));
+    // reply files the attempt with it (ADR-0030 §5). The worker arms it
+    // from the submission snapshot; a test dispatch arms it here.
+    reset_reply_facts();
+    if delivery.attempt.is_none() {
+        delivery.attempt = AttemptContext::for_request(&req, peer, || {
+            irlume_auth::camera_location(engine.rgb_device())
+        })
+        .map(|attempt| (attempt, scope.clone()));
+    }
     let response = dispatch_scoped_session_inner(
         req,
         peer,
@@ -10624,6 +10647,7 @@ mod tests {
                 arbiter::Class::Auth,
                 0,
                 Queued {
+                    attempt: None,
                     authorization: None,
                     session: None,
                     position: None,
@@ -11059,6 +11083,7 @@ mod tests {
                         link,
                         scope,
                         enqueued_at: _,
+                        attempt: _,
                     } = job.payload;
                     assert!(link.claim());
                     let response = dispatch_scoped(req, &peer, &mut engine, &scope, authorization);
@@ -12292,6 +12317,7 @@ mod tests {
                 arbiter::Class::Auth,
                 0,
                 Queued {
+                    attempt: None,
                     authorization: None,
                     session: None,
                     position: None,

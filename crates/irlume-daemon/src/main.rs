@@ -1558,6 +1558,19 @@ fn authorized_for(peer: &Peer, target_user: &str) -> bool {
     peer.uid == 0 || uid_of(target_user).is_some_and(|u| u == peer.uid)
 }
 
+/// Whether a refusal at the door belongs in the named account's history
+/// (ADR-0030 §5): only a peer that may act for that account leaves a
+/// trace there — root, or the account itself for a verification; the
+/// credential release is root's alone. Otherwise any local user could
+/// write attempts into another account's record.
+fn peer_may_file_for(req: &Request, peer: &Peer) -> bool {
+    match (req, posture(req).user) {
+        (Request::UnsealPassword { .. }, _) => peer.uid == 0,
+        (_, Some(user)) => authorized_for(peer, user),
+        (_, None) => false,
+    }
+}
+
 /// The daemon's OWN AppArmor confinement label (e.g. "irlumed (enforce)",
 /// "irlumed (complain)", "unconfined") from /proc/self/attr, or None when
 /// AppArmor is not enabled on this boot. Reported in Health so the TUI shows the
@@ -3318,11 +3331,14 @@ fn serve_peer(
                 // no camera.
                 let scope = diagnostic_state.begin(diagnostic_operation_class(&req));
                 scope.finish(categorical_outcome(&resp));
-                if let Some(attempt) = AttemptContext::for_request(&req, &peer, || None) {
-                    // Whatever the reply shape, an authority or confirmation
-                    // refusal is a policy decision before any camera.
-                    note_pre_camera(irlume_common::OutcomeCause::Policy);
-                    attempt.file(&resp, diagnostics::CaptureEvidence::NONE);
+                if peer_may_file_for(&req, &peer) {
+                    if let Some(attempt) = AttemptContext::for_request(&req, &peer, || None) {
+                        // Whatever the reply shape, an authority or
+                        // confirmation refusal is a policy decision before
+                        // any camera.
+                        note_pre_camera(irlume_common::OutcomeCause::Policy);
+                        attempt.file(&resp, diagnostics::CaptureEvidence::NONE);
+                    }
                 }
                 return respond(stream, &resp);
             }
@@ -13687,6 +13703,33 @@ mod tests {
     /// attempt record from the reply that was sent — a pre-camera refusal
     /// with its cause and no camera — and LastAttempts serves it to the
     /// account and root, and refuses a stranger.
+    #[test]
+    fn a_refusal_at_the_door_is_filed_only_by_a_peer_who_may_act_for_the_account() {
+        let _g = env_lock();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let me = crate::users::name_for_uid(uid).expect("own account");
+        let verify = Request::Authenticate {
+            structured_errors: false,
+            user: me.clone(),
+            service: None,
+            intent_confirmation: None,
+        };
+        assert!(peer_may_file_for(&verify, &peer(0)));
+        assert!(peer_may_file_for(&verify, &peer(uid)));
+        assert!(
+            !peer_may_file_for(&verify, &peer(NOBODY)),
+            "another local user must not write into this account's record"
+        );
+        let release = Request::UnsealPassword {
+            user: me,
+            service: None,
+        };
+        assert!(peer_may_file_for(&release, &peer(0)));
+        assert!(!peer_may_file_for(&release, &peer(uid)));
+        assert!(!peer_may_file_for(&Request::Ping, &peer(0)));
+    }
+
     #[test]
     fn refused_authentication_is_filed_and_served_by_last_attempts() {
         use irlume_common::{AttemptKind, AttemptResult, OutcomeCause};

@@ -3746,11 +3746,19 @@ fn enable_ir_emitter_privacy_bounded(
 ) -> irlume_common::Result<ir_emitter::StreamMode> {
     privacy_refusal_error(device, stage, privacy_state(dev))?;
     let write_permit = permit.clone();
+    // The guard re-checks the shutter before every forward write and can
+    // only hand back prose; remember what it observed so an engaged
+    // shutter in that window is typed exactly like the first check.
+    let shutter_engaged = std::cell::Cell::new(false);
     let mut before_forward_write = || {
         write_permit
             .require_endpoint(device)
             .map_err(|error| error.to_string())?;
-        privacy_permits_ir_capture(privacy_state(dev))
+        let observed = privacy_state(dev);
+        if matches!(observed, Ok(Some(true))) {
+            shutter_engaged.set(true);
+        }
+        privacy_permits_ir_capture(observed)
     };
     ir_emitter::enable_with_lease_guarded(
         dev.handle(),
@@ -3759,7 +3767,14 @@ fn enable_ir_emitter_privacy_bounded(
         permit,
         &mut before_forward_write,
     )
-    .map_err(|why| Error::Hardware(format!("{device}: {stage}: {why}")))
+    .map_err(|why| {
+        let message = format!("{device}: {stage}: {why}");
+        if shutter_engaged.get() {
+            Error::PrivacyShutter(message)
+        } else {
+            Error::Hardware(message)
+        }
+    })
 }
 
 /// The backend classification from a `VIDIOC_QUERYCAP` answer. The V4L2

@@ -967,17 +967,34 @@ pub struct CameraPairInfo {
     /// model cannot be told apart (ADR-0024 §6).
     #[serde(default)]
     pub serial_present: bool,
+    /// The daemon's opaque handle for this pair (ADR-0030 §4): a keyed
+    /// digest of the pair's binding identity under a secret this daemon
+    /// instance drew at start, so it names the unit without revealing the
+    /// serial and means nothing off the machine or to another daemon
+    /// instance. The enrollment reply carries the same handle as
+    /// `connected_handle` on the binding it matches, which is how a client
+    /// labels roles without ever seeing the identity. Absent on older
+    /// daemons and for nodes without USB descriptors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
 }
 
 /// The primary enrollment's camera binding, by identity (`vid:pid[:serial]`
 /// per side), for the client's role labels (ADR-0029). Same shape as a
-/// camera group's pair; an unbound side is `None`.
+/// camera group's pair; an unbound side is `None`. The sides carry the
+/// full identity for a root peer and `vid:pid` for others (ADR-0030 §4);
+/// `connected_handle` is what an ordinary client correlates on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrimaryCameraBinding {
     #[serde(default)]
     pub rgb: Option<String>,
     #[serde(default)]
     pub ir: Option<String>,
+    /// The handle of the connected pair whose identity this binding names
+    /// (ADR-0030 §4), correlated by the daemon from sysfs; `None` when no
+    /// connected pair matches, or from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_handle: Option<String>,
 }
 
 /// A profile and the names of its scans, for `ListProfiles`.
@@ -1267,6 +1284,11 @@ pub struct CameraGroupSummary {
     pub stale: bool,
     pub generation: u64,
     pub profiles: Vec<CameraGroupProfileSummary>,
+    /// The handle of the connected pair this group is bound to (ADR-0030
+    /// §4), correlated by the daemon; `None` when not connected or from
+    /// an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_handle: Option<String>,
 }
 
 /// One profile's row within one camera group.
@@ -1862,6 +1884,7 @@ mod tests {
             selected: false,
             stale: false,
             generation: 3,
+            connected_handle: None,
             profiles: vec![CameraGroupProfileSummary {
                 profile: "Face Profile 1".into(),
                 scans: 10,

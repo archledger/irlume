@@ -200,6 +200,7 @@ fn camera_names_and_binding_are_additive_on_the_wire() {
         name: Some("NexiGo N930W".into()),
         identity: Some("3443:c803".into()),
         serial_present: false,
+        handle: Some("9f1c2a7b4d0e6f13".into()),
     };
     let wire = serde_json::to_string(&new).unwrap();
     let frozen: FrozenCameraPairInfo = serde_json::from_str(&wire).unwrap();
@@ -242,6 +243,7 @@ fn camera_names_and_binding_are_additive_on_the_wire() {
         primary_camera: Some(PrimaryCameraBinding {
             rgb: Some("046d:085e:e179cb54".into()),
             ir: Some("046d:085e:e179cb54".into()),
+            connected_handle: Some("9f1c2a7b4d0e6f13".into()),
         }),
     };
     let wire = serde_json::to_value(&modern).unwrap();
@@ -249,4 +251,13 @@ fn camera_names_and_binding_are_additive_on_the_wire() {
         wire["Enrollment"]["primary_camera"]["rgb"],
         "046d:085e:e179cb54"
     );
+    assert_eq!(
+        wire["Enrollment"]["primary_camera"]["connected_handle"],
+        "9f1c2a7b4d0e6f13"
+    );
+    // A binding without a handle (older daemon, or nothing connected)
+    // omits the field, and a client decodes it as None.
+    let legacy: PrimaryCameraBinding =
+        serde_json::from_str(r#"{"rgb":"046d:085e","ir":"046d:085e"}"#).unwrap();
+    assert_eq!(legacy.connected_handle, None);
 }

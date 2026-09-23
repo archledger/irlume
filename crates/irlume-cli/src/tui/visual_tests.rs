@@ -520,6 +520,7 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
             name: None,
             identity: None,
             serial_present: false,
+            handle: None,
         }];
         classified.pairs_known = true;
         classified.health.as_mut().unwrap().rgb_dev = Some("/dev/video40".into());

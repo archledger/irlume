@@ -73,6 +73,8 @@ pub fn group_summaries(
                 selected: group.pair.matches(live.rgb.as_deref(), live.ir.as_deref()),
                 stale,
                 generation: store.generation,
+                // Correlated by the daemon at response time (ADR-0030 §4).
+                connected_handle: None,
                 profiles: group
                     .profiles
                     .iter()

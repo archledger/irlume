@@ -7,6 +7,22 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- The daemon correlates camera roles itself (ADR-0030 §4, first C2
+  slice): every `ListCameras` row carries an opaque pair `handle` (a keyed
+  digest of the pair's identity under a per-instance secret, so it names
+  the unit without revealing the serial and means nothing off the
+  machine), and the enrollment reply's `primary_camera` and each camera
+  group carry `connected_handle`, the handle of the connected pair whose
+  identity matches that binding, correlated from sysfs at reply time. The
+  TUI labels rows by handle, so an ordinary account now sees `Primary
+  camera` for its own serial-bearing built-in camera instead of `role
+  unknown`; a same-model twin reads `not enrolled`. For an ordinary peer
+  the enrollment reply's binding identities are reduced to `vid:pid`
+  (root keeps the full identity). Older clients ignore the new fields;
+  against an older daemon the TUI keeps its identity rule. A camera whose
+  UVC node name repeats the product (`ASUS FHD webcam: ASUS FHD webca`)
+  is shown once, and the details header says why a role is unknown.
+
 - TUI interaction rules (ADR-0030, phase C1): `1`–`9` jump to a fixed
   section each (`1` Overview … `8` Preferences, `9` Fingerprint),
   `g`/`G` go to the first and last row, and the global letters (`r`

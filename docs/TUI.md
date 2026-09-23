@@ -141,7 +141,12 @@ string, else the node's sysfs name; `video0+video2` only when the daemon
 sends no name) with its role for the selected account — `Primary camera`,
 `Secondary camera #N` (the group's position in the store) or `not enrolled`
 — and whether it is ready or its privacy shutter is on (ADR-0029). Names are
-for people; identity is still the USB descriptor. Enter opens a details
+for people; identity is still the USB descriptor. The daemon does the
+correlation (ADR-0030 §4): each listed pair carries an opaque handle and the
+enrollment reply names the connected pair each binding matches by that
+handle, so an ordinary account gets the right label without ever seeing a
+serial; against an older daemon the TUI matches on what it can see and says
+`role unknown` where a withheld serial leaves it unsure. Enter opens a details
 panel with the identity (and a warning when the descriptor carries no
 serial, since two units of that model then cannot be told apart), the device
 nodes, connection, enrollment facts and the last capture-schedule

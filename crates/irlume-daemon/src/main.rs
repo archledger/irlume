@@ -3766,7 +3766,92 @@ fn primary_digest_now(user: &str) -> PrimaryDigest {
     }
 }
 
+/// The daemon's opaque handle for a camera pair (ADR-0030 §4): a keyed
+/// digest of the pair's binding identity under a 32-byte secret drawn
+/// once per daemon instance. Stable for the life of this instance, so
+/// `ListCameras` and the enrollment reply agree on it without shared
+/// mutable state; different after every restart, so it means nothing off
+/// the machine or to another instance; and, being keyed, it reveals
+/// nothing about the serial it is derived from.
+fn pair_handle(identity: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    static SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let secret = SECRET.get_or_init(|| {
+        use std::io::Read as _;
+        let mut secret = [0u8; 32];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut secret))
+            .expect("read 32 bytes from /dev/urandom");
+        secret
+    });
+    let mut h = Sha256::new();
+    h.update(secret);
+    h.update(b"irlume-pair-handle\0");
+    h.update(identity.as_bytes());
+    h.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// `vid:pid` of a binding identity (`vid:pid[:serial]`): what an ordinary
+/// peer receives in place of the identity (ADR-0030 §4).
+fn identity_without_serial(identity: &str) -> String {
+    match identity.match_indices(':').nth(1) {
+        Some((at, _)) => identity[..at].to_owned(),
+        None => identity.to_owned(),
+    }
+}
+
+/// The handle of the connected pair a binding names (ADR-0030 §4): the
+/// binding's bound sides must name one identity (a pair is one device)
+/// and that identity must be present in sysfs. Computed at response time
+/// from `present`, so hotplug is seen without a cache invalidation.
+fn connected_handle_for(rgb: Option<&str>, ir: Option<&str>, present: &[String]) -> Option<String> {
+    let mut sides = [rgb, ir].into_iter().flatten();
+    let first = sides.next()?;
+    if sides.any(|side| side != first) {
+        return None;
+    }
+    present
+        .iter()
+        .any(|p| p == first)
+        .then(|| pair_handle(first))
+}
+
+/// Correlate the summary's bindings with the connected pairs and, for a
+/// non-root peer, reduce the binding identities to `vid:pid` (ADR-0030
+/// §4: the serial travels to root only; the handle is what other peers
+/// correlate on). Pure over `present` so it is testable without sysfs.
+fn correlate_handles(summary: &mut EnrollmentSummary, present: &[String], root: bool) {
+    if let Some(binding) = summary.primary_camera.as_mut() {
+        binding.connected_handle =
+            connected_handle_for(binding.rgb.as_deref(), binding.ir.as_deref(), present);
+        if !root {
+            binding.rgb = binding.rgb.as_deref().map(identity_without_serial);
+            binding.ir = binding.ir.as_deref().map(identity_without_serial);
+        }
+    }
+    for group in &mut summary.camera_groups {
+        group.connected_handle =
+            connected_handle_for(group.rgb.as_deref(), group.ir.as_deref(), present);
+        if !root {
+            group.rgb = group.rgb.as_deref().map(identity_without_serial);
+            group.ir = group.ir.as_deref().map(identity_without_serial);
+        }
+    }
+}
+
 impl EnrollmentSummary {
+    /// The reply for `peer`: handles correlated against the identities
+    /// sysfs reports now (no device opens), identities redacted for a
+    /// non-root peer. The cached summary itself is never redacted.
+    fn into_response_for(mut self, peer: &Peer) -> Response {
+        let present = irlume_auth::present_device_identities();
+        correlate_handles(&mut self, &present, peer.uid == 0);
+        self.into_response()
+    }
+
     fn into_response(self) -> Response {
         Response::Enrollment {
             profiles: self.profiles,
@@ -3868,6 +3953,7 @@ fn summarize_enrollment(
                 irlume_common::PrimaryCameraBinding {
                     rgb: binding.rgb.clone(),
                     ir: binding.ir.clone(),
+                    connected_handle: None,
                 }
             }),
             primary_digest: PrimaryDigest::Absent,
@@ -4293,7 +4379,7 @@ fn dispatch_status_with_diagnostics(
                     // not be hidden by the cache: refresh the volatile
                     // facts (sysfs + two file reads, no opens/TPM).
                     refresh_camera_group_flags(user, &mut sum);
-                    sum.into_response()
+                    sum.into_response_for(peer)
                 }
                 None => return None,
             }
@@ -5468,7 +5554,7 @@ fn dispatch_scoped_session_inner(
                     sum.primary_digest =
                         PrimaryDigest::settled(digest_before, primary_digest_now(&user));
                     publish_enrollment_summary(&user, sum.clone());
-                    sum.into_response()
+                    sum.into_response_for(peer)
                 }
                 Err(e) => fail(
                     irlume_common::OperationErrorCode::OperationFailed,
@@ -6333,6 +6419,10 @@ fn dispatch_scoped_session_inner(
             irlume_auth::list_pairs()
                 .into_iter()
                 .map(|p| irlume_common::CameraPairInfo {
+                    // The opaque handle every peer may correlate on
+                    // (ADR-0030 §4); the enrollment reply carries the same
+                    // value for the binding this pair matches.
+                    handle: p.identity.as_deref().map(pair_handle),
                     // Privacy is read HERE, on the camera worker, for the
                     // same reason the enumeration is: the control read opens
                     // the node (#187).
@@ -10584,6 +10674,107 @@ mod tests {
     /// ADR-0029: a legacy rewrite of the primary sends no request, so a
     /// cached summary published against the old bytes is a miss once the
     /// file changes (the worker reloads); an unchanged file still hits.
+    /// ADR-0030 §4: the pair handle is stable within the instance, keyed
+    /// (the serial is not recoverable from it), and distinct per identity.
+    #[test]
+    fn pair_handles_are_stable_keyed_and_distinct() {
+        let a = pair_handle("046d:085e:e179cb54");
+        assert_eq!(a, pair_handle("046d:085e:e179cb54"));
+        assert_eq!(a.len(), 16);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!a.contains("e179cb54"));
+        assert_ne!(a, pair_handle("046d:085e:e179cb55"));
+        assert_ne!(a, pair_handle("046d:085e"));
+    }
+
+    /// The daemon correlates a binding with the connected pair by full
+    /// identity and hands the client the handle; an ordinary peer's copy
+    /// carries vid:pid only, root's the identities. A binding that names
+    /// two devices, or an absent one, has no connected pair.
+    #[test]
+    fn enrollment_reply_correlates_handles_and_redacts_identities_for_ordinary_peers() {
+        let summary = || EnrollmentSummary {
+            profiles: Vec::new(),
+            ir_ratio_calibrated: false,
+            camera_groups: vec![
+                irlume_common::CameraGroupSummary {
+                    id: "desk".into(),
+                    rgb: Some("3443:c803".into()),
+                    ir: Some("3443:c803".into()),
+                    connected: true,
+                    selected: false,
+                    stale: false,
+                    generation: 1,
+                    connected_handle: None,
+                    profiles: Vec::new(),
+                },
+                irlume_common::CameraGroupSummary {
+                    id: "split".into(),
+                    rgb: Some("1bcf:28c4:aa".into()),
+                    ir: Some("3443:c803".into()),
+                    connected: true,
+                    selected: false,
+                    stale: false,
+                    generation: 1,
+                    connected_handle: None,
+                    profiles: Vec::new(),
+                },
+            ],
+            camera_store_error: None,
+            primary_camera: Some(irlume_common::PrimaryCameraBinding {
+                rgb: Some("046d:085e:e179cb54".into()),
+                ir: Some("046d:085e:e179cb54".into()),
+                connected_handle: None,
+            }),
+            primary_digest: PrimaryDigest::Absent,
+        };
+        let present = vec![
+            "046d:085e:e179cb54".to_string(),
+            "1bcf:28c4:aa".to_string(),
+            "3443:c803".to_string(),
+        ];
+        let mut ordinary = summary();
+        correlate_handles(&mut ordinary, &present, false);
+        let primary = ordinary.primary_camera.as_ref().unwrap();
+        assert_eq!(
+            primary.connected_handle.as_deref(),
+            Some(pair_handle("046d:085e:e179cb54").as_str())
+        );
+        assert_eq!(primary.rgb.as_deref(), Some("046d:085e"), "serial redacted");
+        assert_eq!(primary.ir.as_deref(), Some("046d:085e"));
+        assert_eq!(
+            ordinary.camera_groups[0].connected_handle.as_deref(),
+            Some(pair_handle("3443:c803").as_str())
+        );
+        assert_eq!(
+            ordinary.camera_groups[1].connected_handle, None,
+            "two devices are not one pair"
+        );
+        assert_eq!(ordinary.camera_groups[1].rgb.as_deref(), Some("1bcf:28c4"));
+
+        let mut root = summary();
+        correlate_handles(&mut root, &present, true);
+        assert_eq!(
+            root.primary_camera.as_ref().unwrap().rgb.as_deref(),
+            Some("046d:085e:e179cb54"),
+            "root keeps the identity"
+        );
+        assert_eq!(
+            root.primary_camera.as_ref().unwrap().connected_handle,
+            ordinary.primary_camera.as_ref().unwrap().connected_handle,
+            "the same handle for every peer"
+        );
+
+        // Unplugged: no handle, the identity rule still redacts.
+        let mut gone = summary();
+        correlate_handles(&mut gone, &["3443:c803".to_string()], false);
+        assert_eq!(gone.primary_camera.as_ref().unwrap().connected_handle, None);
+        assert_eq!(
+            gone.primary_camera.as_ref().unwrap().rgb.as_deref(),
+            Some("046d:085e")
+        );
+    }
+
     #[test]
     fn cached_summary_misses_when_the_primary_file_changed() {
         let _guard = env_lock();
@@ -10602,6 +10793,7 @@ mod tests {
                 primary_camera: Some(irlume_common::PrimaryCameraBinding {
                     rgb: Some("046d:085e".into()),
                     ir: Some("046d:085e".into()),
+                    connected_handle: None,
                 }),
                 primary_digest: primary_digest_now(user),
             },
@@ -15437,6 +15629,7 @@ mod tests {
                 selected: false,
                 stale: false,
                 generation: 1,
+                connected_handle: None,
                 profiles: Vec::new(),
             }],
             camera_store_error: None,
@@ -15479,6 +15672,7 @@ mod tests {
                 selected: true,
                 stale: false,
                 generation: 1,
+                connected_handle: None,
                 profiles: Vec::new(),
             }],
             camera_store_error: None,

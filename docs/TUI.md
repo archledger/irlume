@@ -60,7 +60,8 @@ The TUI keeps a small set of global keys that no page reuses with another
 meaning (ADR-0030 §1.3): `1`–`9` jump to the sidebar sections in their
 visible order, `Tab`/`Shift-Tab` and `←`/`→` step through them, `↑`/`↓`
 and `j`/`k` move the selection, `g`/`G` go to the first and last row, `r`
-refreshes the page's observations, `i` runs Test Recognition, `v` shows or
+refreshes the current page's observations (Diagnostics re-runs its checks,
+Cameras re-lists the pairs, every other page re-polls its sources), `i` runs Test Recognition, `v` shows or
 hides the technical tools, `?` opens the help for the current page, `h`
 returns to Overview and `q` quits. Enter opens things — a row, a details
 panel, a section — and never changes state; every action that writes or

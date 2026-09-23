@@ -9,7 +9,7 @@ All notable changes to irlume are documented here. This project adheres to
 
 - TUI interaction rules (ADR-0030, phase C1): `1`–`9` jump to sections,
   `g`/`G` go to the first and last row, and the global letters (`r`
-  refresh, `i` Test Recognition, `g`) keep one meaning on every page, so
+  refresh, `i` Test Recognition) keep one meaning on every page, so
   rename on Faces moved to `n`, reseal on Password Wallet to `b`, IR-only
   and its readiness check on Preferences to `o` and `c`, and the logs on
   Diagnostics to `w`. Enter opens and never changes state; Esc closes the

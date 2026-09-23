@@ -1882,7 +1882,12 @@ impl App {
             SC_SETTINGS => &[Source::Preferences],
             SC_PAM => &[Source::Machine, Source::Apps],
             SC_REPAIR => &[Source::Health, Source::Machine, Source::Profiles],
-            SC_IDENTIFY => return "last test only · F4 current status".into(),
+            SC_IDENTIFY => {
+                return format!(
+                    "daemon {} · last test only · F4 current status",
+                    self.daemon_state_label()
+                )
+            }
             _ => &[Source::Health, Source::Profiles, Source::Machine],
         };
         // One freshness indicator (ADR-0030 §1.9): the daemon's state and
@@ -5161,6 +5166,19 @@ impl App {
                 self.log('·', "refreshing status…");
                 self.refresh();
             }
+            // ADR-0030 §1.3: r refreshes the current page's observations on
+            // every page; Diagnostics and Cameras have their own arms below.
+            (
+                SC_PROFILES | SC_KEYRING | SC_RECOVERY | SC_FINGERPRINT | SC_PAM | SC_SETTINGS
+                | SC_IDENTIFY,
+                KeyCode::Char('r'),
+            ) => {
+                self.log('·', "refreshing this page…");
+                self.refresh();
+                if self.screen == SC_KEYRING {
+                    self.refresh_keyring_diagnostic();
+                }
+            }
             // Welcome: start the uninstall challenge (capital U, so a stray
             // lower-case key can't begin it). The user must TYPE the word to
             // proceed, so it can never be triggered by accident.
@@ -5251,9 +5269,11 @@ impl App {
                 self.refresh();
                 self.refresh_keyring_diagnostic();
             }
-            (SC_REPAIR, KeyCode::Char('f')) | (SC_REPAIR, KeyCode::Enter) => {
-                self.apply_fix(self.repair_sel)
-            }
+            (SC_REPAIR, KeyCode::Char('f')) => self.apply_fix(self.repair_sel),
+            // Enter on a check row opens nothing further today (the box
+            // below already shows the selected row); it never runs the fix
+            // (ADR-0030 §1.1). The fix is [f].
+            (SC_REPAIR, KeyCode::Enter) => {}
             // View the face-auth journal to see WHY a check failed. `logs debug
             // on` (a console step) adds per-stage tracing when a number is needed.
             // Key is 'g'; 'v' is the global basic/all-tabs toggle (on_key).
@@ -6696,15 +6716,12 @@ impl App {
                     }
                 }
                 Click::Select(i) => match self.screen {
-                    // Click a Diagnostics row once to select it, again to run
-                    // its fix ([f]): mouse users never need the keyboard.
+                    // Click a Diagnostics row to select it; the fix stays
+                    // behind [f] and its confirmation (ADR-0030 §1.1: a
+                    // second click, like Enter, never runs a side effect).
                     SC_REPAIR if i < self.repair.len() => {
-                        if self.repair_sel == i {
-                            self.on_key(KeyCode::Enter);
-                        } else {
-                            self.repair_sel = i;
-                            self.page_view.set((usize::MAX, Rect::default(), 0, 0));
-                        }
+                        self.repair_sel = i;
+                        self.page_view.set((usize::MAX, Rect::default(), 0, 0));
                     }
                     SC_CAMERAS if i < self.pairs.len() => {
                         if self.cam_sel == i {
@@ -8158,7 +8175,7 @@ impl App {
                     Style::new().fg(th().warn),
                 )));
                 lines.push(Line::from(Span::styled(
-                    "    press [r] to reseal (re-bind to the current PCRs, same password).",
+                    "    press [b] to reseal (re-bind to the current PCRs, same password).",
                     Style::new().dim(),
                 )));
             }
@@ -8177,7 +8194,7 @@ impl App {
             )));
         }
         lines.push(Line::raw(""));
-        // [r] reseal is shown only once armed (re-bind needs an existing seal);
+        // [b] reseal is shown only once armed (re-bind needs an existing seal);
         // it re-enters the password and re-seals to the current PCRs, the CLI
         // `irlume reseal` a keyboard-only user would otherwise have no way to run.
         if armed {
@@ -9296,7 +9313,7 @@ impl App {
                 ("d", "Delete…"),
             ],
             SC_IDENTIFY => &[("i", "Test Recognition")],
-            // Both [r] and [p] are guarded in the handler: [r] reseals a seal that
+            // Both [b] and [p] are guarded in the handler: [b] reseals a seal that
             // must already exist, and [p] refreshes the boot-measurement policy a
             // Tier 2 seal is bound to. Advertising either where its guard cannot
             // pass offered a key that did nothing and said nothing.
@@ -16195,6 +16212,12 @@ mod tests {
         let _guard = dead_socket();
         let mut app = test_app();
         app.advanced = true;
+        app.repair = vec![check_row(
+            "Keyring seal",
+            Sev::Warn,
+            Fix::Goto(GotoFix::KeyringReseal),
+        )];
+        app.repair_sel = 0;
         for (screen, name) in SCREENS.iter().enumerate() {
             app.screen = screen;
             app.sel = 0;

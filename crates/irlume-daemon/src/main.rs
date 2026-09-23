@@ -5578,6 +5578,19 @@ fn note_pre_camera_failure(cause: irlume_common::OutcomeCause) {
     });
 }
 
+/// An engine outcome became a prose reply: a decision against a face,
+/// unless its cause says the engine could not decide (timed out, no
+/// comparable enrollment, an unmeasurable exposure).
+fn note_outcome(cause: Option<irlume_common::OutcomeCause>) {
+    REPLY_FACTS.with(|cell| {
+        cell.set(Some(ReplyFacts {
+            cause,
+            decided: !cause.is_some_and(irlume_common::OutcomeCause::is_operational),
+            pre_camera: false,
+        }))
+    });
+}
+
 /// A decision against a face became a prose reply.
 fn note_decided(cause: Option<irlume_common::OutcomeCause>) {
     REPLY_FACTS.with(|cell| {
@@ -5669,7 +5682,16 @@ impl AttemptContext {
         // The site that built the reply says whether it was a decision and
         // whether it came before any camera; the reply's shape is only the
         // fallback when no site said (an engine verdict).
-        let decided = facts.is_none_or(|f| f.decided);
+        // A site that noted its facts is believed (a throttle or a disabled
+        // method is a pre-camera refusal); otherwise an operational cause on
+        // an engine verdict (timed out, no comparable enrollment, an
+        // unmeasurable exposure) is the engine failing to decide, not a
+        // decision about the face.
+        let decided_for = |cause: &Option<OutcomeCause>| {
+            facts.map_or(!cause.is_some_and(OutcomeCause::is_operational), |f| {
+                f.decided
+            })
+        };
         let pre_camera = facts.is_some_and(|f| f.pre_camera);
         let (result, cause, pre_camera) = match response {
             Response::AuthResult {
@@ -5678,22 +5700,12 @@ impl AttemptContext {
                 cause,
                 ..
             } => (
-                attempt_record::result_of(*granted, decided),
+                attempt_record::result_of(*granted, decided_for(cause)),
                 *cause,
                 pre_camera || (*refused_by_policy && facts.is_none()),
             ),
-            // A site that noted its facts is believed (a throttle or a
-            // disabled method is a pre-camera refusal); otherwise an
-            // operational cause on an engine verdict (no comparable
-            // enrollment, an unmeasurable exposure) is the engine failing
-            // to decide, not a decision about the face.
             Response::Identified { cause, .. } => (
-                attempt_record::result_of(
-                    false,
-                    facts.map_or(!cause.is_some_and(OutcomeCause::is_operational), |f| {
-                        f.decided
-                    }),
-                ),
+                attempt_record::result_of(false, decided_for(cause)),
                 *cause,
                 pre_camera,
             ),
@@ -7797,7 +7809,7 @@ fn finish_unseal_password(
         );
         // The prose reply is the only shape an older PAM decodes; the
         // record still gets the engine's cause (ADR-0030 §5).
-        note_decided(outcome.cause);
+        note_outcome(outcome.cause);
         return Response::Error(format!("face not granted: {}", outcome.reason));
     }
     // See the UnsealKeyring path: one load, so the bytes and their kind always

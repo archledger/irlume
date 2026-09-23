@@ -1282,16 +1282,20 @@ fn bounded_face_response(
     prepare: impl FnOnce() -> Response,
     record: impl FnOnce() -> Result<(), &'static str>,
     refuse: fn(&str) -> Response,
+    // A grant invalidated at the completion boundary (window closed, peer
+    // gone, binding failed): the caller decides the reply shape, typed for
+    // a client that asked for it (ADR-0030 §5), prose otherwise.
+    boundary: impl Fn(irlume_common::Error) -> Response,
 ) -> Response {
     if !granted {
         return recorded_face_response(record, refuse, prepare);
     }
     if let Err(error) = active() {
-        return Response::Error(error.to_string());
+        return boundary(error);
     }
     let response = prepare();
     if let Err(error) = active() {
-        return Response::Error(error.to_string());
+        return boundary(error);
     }
     // A failed TPM operation never publishes a credential or clears history.
     // Prepared secret responses remain zeroizing owners on every refusal path.
@@ -1303,7 +1307,7 @@ fn bounded_face_response(
     }
     let recorded = record();
     if let Err(error) = active() {
-        return Response::Error(error.to_string());
+        return boundary(error);
     }
     match recorded {
         Ok(()) => response,
@@ -5393,6 +5397,9 @@ fn dispatch_scoped_session_delivering(
 /// reply: consumed exactly once, by the early delivery hook or by the
 /// ordinary return path.
 struct VerifyReplyInputs {
+    /// The client asked for typed errors (ADR-0030 §5): a grant lost at
+    /// the completion boundary is then typed too.
+    structured_errors: bool,
     retry_attempt: retry_throttle::FaceAttempt,
     shared_unlock: Option<std::sync::Arc<shared_unlock::Binding>>,
     window: irlume_auth::AuthenticationWindow,
@@ -5411,6 +5418,7 @@ fn verify_reply(
     completion: &mut Option<FaceCompletion>,
 ) -> Response {
     let VerifyReplyInputs {
+        structured_errors,
         retry_attempt,
         shared_unlock,
         window,
@@ -5486,6 +5494,7 @@ fn verify_reply(
             }
         },
         retry_verify_refusal,
+        |error| authentication_error(error, structured_errors),
     )
 }
 
@@ -5832,6 +5841,7 @@ fn dispatch_scoped_session_inner(
             // pair is released) or returns it the ordinary way. The retry
             // attempt and the completion binding move into whichever runs.
             let mut reply_inputs = Some(VerifyReplyInputs {
+                structured_errors,
                 retry_attempt,
                 shared_unlock: shared_unlock.clone(),
                 window,
@@ -7250,6 +7260,8 @@ fn unseal_reply(
             }
         },
         retry_unseal_refusal,
+        // Credential release has no typed-error opt-in: prose, as before.
+        |error| Response::Error(error.to_string()),
     )
 }
 
@@ -7642,6 +7654,7 @@ mod tests {
                     Ok(())
                 },
                 retry_unseal_refusal,
+                |error| Response::Error(error.to_string()),
             );
             assert_eq!(
                 matches!(response, Response::PasswordUnsealed { .. }),

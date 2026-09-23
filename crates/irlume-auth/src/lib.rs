@@ -1354,12 +1354,10 @@ fn resolve_loader<T>(
         Ok(Ok(Some(loaded))) => Ok(loaded),
         Ok(Ok(None)) => Err(LoaderExit::NotEnrolled),
         Ok(Err(e)) => Err(LoaderExit::Fallback(enrollment_unreadable(e))),
+        // The load outlived the authentication window: the budget ended,
+        // which is the typed deadline every other expiry path reports.
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            Err(LoaderExit::Fallback(irlume_common::Error::Protocol(
-                "enrollment load exceeded the authentication deadline; \
-                 falling back to password"
-                    .into(),
-            )))
+            Err(LoaderExit::Fallback(irlume_common::Error::DeadlineExpired))
         }
         // The sender is gone without a result: the loader panicked.
         // Contained by the thread boundary; the request fails closed rather
@@ -5145,15 +5143,29 @@ impl Engine {
             // The pair-failure context wraps the message; the cause is the
             // underlying refusal's (ADR-0030 §5): a shutter engaged on
             // either side stays a privacy shutter.
-            let shutter = [rgb_res.as_ref().err(), ir_res.as_ref().err()]
-                .into_iter()
-                .flatten()
-                .any(|error| matches!(error, irlume_common::Error::PrivacyShutter(_)));
-            return Err(CapturePathError::ConcurrentPair(if shutter {
-                irlume_common::Error::PrivacyShutter(message)
+            // The pair-failure context wraps the message; the class is the
+            // underlying refusal's (ADR-0030 §5), the most specific of the
+            // two sides winning: shutter, then busy, then the budget or a
+            // pre-emption, then the camera itself.
+            let sides = [rgb_res.as_ref().err(), ir_res.as_ref().err()];
+            let pick = |matches: fn(&irlume_common::Error) -> bool| {
+                sides.into_iter().flatten().any(matches)
+            };
+            use irlume_common::Error as E;
+            let classified = if pick(|e| matches!(e, E::PrivacyShutter(_))) {
+                E::PrivacyShutter(message)
+            } else if pick(|e| matches!(e, E::CameraBusy(_))) {
+                E::CameraBusy(message)
+            } else if pick(|e| matches!(e, E::DeadlineExpired)) {
+                E::DeadlineExpired
+            } else if pick(|e| matches!(e, E::Preempted(_))) {
+                E::Preempted(message)
+            } else if pick(|e| matches!(e, E::CameraUnavailable(_))) {
+                E::CameraUnavailable(message)
             } else {
-                irlume_common::Error::Hardware(message)
-            }));
+                E::Hardware(message)
+            };
+            return Err(CapturePathError::ConcurrentPair(classified));
         }
         let mut pair_sequential_retried = false;
         if pair_requires_fallback {
@@ -7440,7 +7452,10 @@ impl Engine {
             None => irlume_core::storage::list_users(),
         };
         for user in candidates {
-            let Some(enr) = irlume_core::storage::load(&user)? else {
+            // An unreadable enrollment is a setup failure here as on the
+            // authentication path.
+            let Some(enr) = irlume_core::storage::load(&user).map_err(enrollment_unreadable)?
+            else {
                 continue;
             };
             let scans = enr.rgb_scans_in(&self.embed_space);
@@ -16028,9 +16043,7 @@ mod engine_tests {
         let (tx, rx) = std::sync::mpsc::channel::<EnrollmentLoad>();
         let resolved = resolve_loader(rx.recv_timeout(std::time::Duration::from_millis(1)));
         match resolved {
-            Err(LoaderExit::Fallback(irlume_common::Error::Protocol(msg))) => {
-                assert!(msg.contains("deadline"), "{msg}");
-            }
+            Err(LoaderExit::Fallback(irlume_common::Error::DeadlineExpired)) => {}
             other => panic!("deadline expiry must fail closed to the password: {other:?}"),
         }
         drop(tx);

@@ -998,7 +998,7 @@ pub fn identify(_args: &[String]) -> ExitCode {
             cause: Some(cause),
             reason,
             ..
-        }) if !cause.is_face_verdict() => {
+        }) if cause.is_operational() => {
             println!("[identify] not run: {reason}");
             ExitCode::from(1)
         }

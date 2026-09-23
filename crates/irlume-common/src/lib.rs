@@ -974,6 +974,15 @@ impl OutcomeCause {
             OutcomeCause::NoFace | OutcomeCause::LivenessRefused | OutcomeCause::BelowThreshold
         )
     }
+
+    /// Whether the attempt did not run or could not be decided: a known
+    /// cause that is not a face verdict. `Unknown` (a newer daemon's
+    /// value) is neither, so a client falls back to the reply's `live`
+    /// rendering rather than calling a completed assessment "not run".
+    #[must_use]
+    pub fn is_operational(self) -> bool {
+        !self.is_face_verdict() && self != OutcomeCause::Unknown
+    }
 }
 
 /// Why an operation failed, in terms a caller can act on.
@@ -2786,6 +2795,9 @@ mod tests {
         );
         assert!(OutcomeCause::NoFace.is_face_verdict());
         assert!(!OutcomeCause::RetryThrottled.is_face_verdict());
+        assert!(OutcomeCause::RetryThrottled.is_operational());
+        assert!(!OutcomeCause::Unknown.is_operational());
+        assert!(!OutcomeCause::NoFace.is_operational());
         assert_eq!(
             Error::Preempted("c".into()).cause(),
             OutcomeCause::Cancelled

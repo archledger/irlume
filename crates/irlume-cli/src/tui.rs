@@ -10351,7 +10351,7 @@ fn map_identify(resp: Response) -> (bool, String) {
             cause: Some(cause),
             reason,
             ..
-        } if !cause.is_face_verdict() => (false, format!("not run: {reason}")),
+        } if cause.is_operational() => (false, format!("not run: {reason}")),
         Response::Identified {
             user: None,
             live,

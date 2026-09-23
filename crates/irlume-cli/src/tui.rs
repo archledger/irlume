@@ -1417,14 +1417,17 @@ impl App {
         // not evidence about any camera; and while the secondary store is
         // unreadable, a pair that matches nothing may be an enrolled group
         // the daemon could not summarize. Both keep the verdict unknown.
+        // Groups alone establish nothing about an unmatched pair: with an
+        // unbound (all-None) primary the authentication path accepts any
+        // pair, so only a bound primary or an observed empty enrollment
+        // lets an unmatched pair be called unenrolled. Group matches are
+        // labelled regardless.
         let bound_primary = self
             .primary_camera
             .as_ref()
             .is_some_and(|binding| binding.rgb.is_some() || binding.ir.is_some());
         let known = self.camera_store_error.is_none()
-            && (bound_primary
-                || !self.camera_groups.is_empty()
-                || (self.profiles_loaded && self.profiles.is_empty()));
+            && (bound_primary || (self.profiles_loaded && self.profiles.is_empty()));
         camera_role_for(
             pair.identity.as_deref(),
             self.primary_camera.as_ref(),
@@ -7196,6 +7199,7 @@ impl App {
                 enforce_biopolicy: None,
                 consent_overridden: false,
                 biopolicy_overridden: false,
+                forbid_external_cameras: None,
             })
     }
 
@@ -7417,6 +7421,10 @@ impl App {
         } else {
             // Name, role, kind, then the one status that matters right now
             // (ADR-0029). Nodes and USB ids live in the details panel.
+            let external_blocked = self
+                .preferences
+                .filter(|_| self.source_usable(Source::Preferences))
+                .and_then(|state| state.forbid_external_cameras);
             pairs
                 .iter()
                 .map(|p| {
@@ -7456,6 +7464,12 @@ impl App {
                         Span::styled(format!("{kind:<10}"), Style::new().dim()),
                         if priv_on {
                             Span::styled("⚠ privacy ON", Style::new().fg(th().err))
+                        } else if !p.fixed && external_blocked == Some(true) {
+                            // The daemon refuses every non-fixed camera under
+                            // this policy: "ready" would be a false promise.
+                            Span::styled("○ blocked: external cameras off", Style::new().dim())
+                        } else if !p.fixed && external_blocked.is_none() {
+                            Span::styled("◐ policy unobserved", Style::new().fg(th().warn))
                         } else if matches!(role, CameraRole::Unenrolled) {
                             // An unenrolled pair cannot sign in: "ready"
                             // would contradict the refusal it would get.
@@ -13668,6 +13682,21 @@ mod tests {
                 serial_present: false,
             },
         ];
+        // The external-camera policy is observed and off, so the external
+        // pair's status reflects its role rather than the policy (the
+        // policy cases are asserted further down).
+        app.preferences = Some(irlume_common::PreferencesState {
+            face_sensor_policy: irlume_common::config::FaceSensorPolicyObservation::DefaultDual,
+            privileged_face_consent: None,
+            enforce_biopolicy: None,
+            consent_overridden: false,
+            biopolicy_overridden: false,
+            forbid_external_cameras: Some(false),
+        });
+        let now = app.now();
+        app.freshness
+            .observation_mut(Source::Preferences)
+            .record(true, now);
         let render = |app: &mut App| {
             let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
             term.draw(|f| app.draw(f)).unwrap();
@@ -13821,6 +13850,27 @@ mod tests {
         let text = render(&mut app);
         assert!(!text.contains("not enrolled"), "{text}");
         assert!(!text.contains("Primary camera"), "{text}");
+        // An unbound primary beside a group: the group is labelled, the
+        // unmatched pair stays unknown.
+        app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
+            rgb: None,
+            ir: None,
+        });
+        app.camera_groups = vec![irlume_common::CameraGroupSummary {
+            id: "desk".into(),
+            rgb: Some("3443:c803".into()),
+            ir: Some("3443:c803".into()),
+            connected: true,
+            selected: false,
+            stale: false,
+            generation: 1,
+            profiles: Vec::new(),
+        }];
+        app.pairs[1].identity = Some("3443:c803".into());
+        let text = render(&mut app);
+        assert!(text.contains("Secondary camera #1"), "{text}");
+        assert!(!text.contains("not enrolled"), "{text}");
+        app.camera_groups.clear();
         // An unreadable secondary store keeps unmatched pairs unknown.
         app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
             rgb: Some("3277:0059".into()),
@@ -13830,6 +13880,44 @@ mod tests {
         let text = render(&mut app);
         assert!(!text.contains("not enrolled"), "{text}");
         app.camera_store_error = None;
+        // An external camera under the external-camera prohibition is
+        // never "ready"; with the policy unobserved it says so.
+        let base = app.preferences.unwrap_or(irlume_common::PreferencesState {
+            face_sensor_policy: irlume_common::config::FaceSensorPolicyObservation::DefaultDual,
+            privileged_face_consent: None,
+            enforce_biopolicy: None,
+            consent_overridden: false,
+            biopolicy_overridden: false,
+            forbid_external_cameras: None,
+        });
+        app.preferences = Some(irlume_common::PreferencesState {
+            forbid_external_cameras: Some(true),
+            ..base
+        });
+        let now = app.now();
+        app.freshness
+            .observation_mut(Source::Preferences)
+            .record(true, now);
+        app.freshness
+            .observation_mut(Source::CameraPrivacy)
+            .record(true, now);
+        let text = render(&mut app);
+        let external = text.lines().find(|l| l.contains("video4+video6")).unwrap();
+        assert!(
+            external.contains("blocked: external cameras off"),
+            "{external}"
+        );
+        app.preferences = Some(irlume_common::PreferencesState {
+            forbid_external_cameras: None,
+            ..base
+        });
+        let text = render(&mut app);
+        let external = text.lines().find(|l| l.contains("video4+video6")).unwrap();
+        assert!(external.contains("policy unobserved"), "{external}");
+        app.preferences = Some(irlume_common::PreferencesState {
+            forbid_external_cameras: Some(false),
+            ..base
+        });
         // A successfully observed empty enrollment labels every camera as
         // not enrolled instead of claiming nothing.
         app.primary_camera = None;
@@ -17488,6 +17576,7 @@ mod tests {
             enforce_biopolicy: Some(true),
             consent_overridden: false,
             biopolicy_overridden: false,
+            forbid_external_cameras: None,
         }
     }
 

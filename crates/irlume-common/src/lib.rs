@@ -1213,6 +1213,11 @@ pub struct PreferencesState {
     pub enforce_biopolicy: Option<bool>,
     pub consent_overridden: bool,
     pub biopolicy_overridden: bool,
+    /// The external-camera prohibition as the daemon observes it
+    /// (ADR-0029 A): `Some(true)` means only built-in cameras may
+    /// authenticate; `None` when unreadable or from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forbid_external_cameras: Option<bool>,
 }
 
 impl PreferencesState {
@@ -1225,6 +1230,7 @@ impl PreferencesState {
             enforce_biopolicy: config::enforce_biopolicy_visible(),
             consent_overridden: std::env::var_os("IRLUME_PRIVILEGED_FACE_CONSENT").is_some(),
             biopolicy_overridden: std::env::var_os("IRLUME_ENFORCE_BIOPOLICY").is_some(),
+            forbid_external_cameras: config::forbid_external_cameras_visible(),
         }
     }
 }

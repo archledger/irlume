@@ -2406,6 +2406,7 @@ fn preference_status_reads_daemon_instead_of_unreadable_local_settings() {
             enforce_biopolicy: Some(true),
             consent_overridden: true,
             biopolicy_overridden: true,
+            forbid_external_cameras: None,
         })
     });
     for (args, expected) in [

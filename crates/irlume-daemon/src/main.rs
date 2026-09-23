@@ -4241,12 +4241,9 @@ fn dispatch_status_with_diagnostics(
                 // A primary rewritten by a legacy writer since publication
                 // sends no request: its binding may have changed, so the
                 // cached summary is a miss and the worker reloads (ADR-0029).
-                Some(sum)
-                    if sum.primary_digest.is_some()
-                        && primary_digest_now(user) != sum.primary_digest =>
-                {
-                    return None
-                }
+                // Compared even when the file was absent at publication, so
+                // an enrollment created since is seen.
+                Some(sum) if primary_digest_now(user) != sum.primary_digest => return None,
                 Some(mut sum) => {
                     // Hotplug and legacy rewrites since publication must
                     // not be hidden by the cache: refresh the volatile
@@ -10577,6 +10574,29 @@ mod tests {
         assert!(
             dispatch_status(&request, &peer(0)).is_none(),
             "rewritten primary: cache miss, the worker reloads"
+        );
+        // An account cached as unenrolled (no file) misses once the file
+        // appears.
+        std::fs::remove_file(&path).unwrap();
+        publish_enrollment_summary(
+            user,
+            EnrollmentSummary {
+                profiles: Vec::new(),
+                ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
+                primary_camera: None,
+                primary_digest: primary_digest_now(user),
+            },
+        );
+        assert!(matches!(
+            dispatch_status(&request, &peer(0)),
+            Some(Response::Enrollment { .. })
+        ));
+        std::fs::write(&path, b"{\"user\":\"irlume-digest-user\",\"profiles\":[]}").unwrap();
+        assert!(
+            dispatch_status(&request, &peer(0)).is_none(),
+            "a primary created since publication is a cache miss"
         );
         invalidate_enrollment_summary(user);
     }

@@ -41,6 +41,12 @@ pub(crate) const BUCKET_TTL_SECS: u64 = 90 * 24 * 60 * 60;
 /// nothing off the machine and reveals nothing about the serial).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct Stored {
+    /// The account name the record belongs to. The file is keyed by uid,
+    /// and a uid can be reused after an account is deleted: a record whose
+    /// name is not the requesting account's is that other account's
+    /// history and is neither served nor appended to.
+    #[serde(default)]
+    account: String,
     #[serde(default)]
     unit_key_hex: String,
     #[serde(flatten)]
@@ -300,7 +306,18 @@ impl Store {
         proc_path(&self.dir, &format!("{uid}.json"))
     }
 
-    fn read(&self, uid: u32) -> io::Result<Stored> {
+    /// The record filed for `uid`, provided it is `user`'s: another
+    /// account's record under a reused uid reads as empty and is replaced
+    /// by the next write.
+    fn read(&self, uid: u32, user: &str) -> io::Result<Stored> {
+        let stored = self.read_any(uid)?;
+        if !stored.account.is_empty() && stored.account != user {
+            return Ok(Stored::default());
+        }
+        Ok(stored)
+    }
+
+    fn read_any(&self, uid: u32) -> io::Result<Stored> {
         let mut file = match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -355,7 +372,13 @@ impl Store {
 }
 
 fn account_uid(user: &str) -> io::Result<u32> {
-    crate::users::uid_for_name(user).ok_or_else(invalid)
+    // The name must round-trip: a uid whose current name differs is
+    // another account.
+    let uid = crate::users::uid_for_name(user).ok_or_else(invalid)?;
+    if crate::users::name_for_uid(uid).as_deref() != Some(user) {
+        return Err(invalid());
+    }
+    Ok(uid)
 }
 
 /// File an attempt for `user`. Failures are reported to the journal by the
@@ -364,7 +387,8 @@ pub(crate) fn record(user: &str, filed: Filed) -> io::Result<()> {
     let uid = account_uid(user)?;
     let store = store()?;
     let _lock = store.lock()?;
-    let mut stored = store.read(uid)?;
+    let mut stored = store.read(uid, user)?;
+    stored.account = user.to_owned();
     if stored.unit_key_hex.len() != 64 {
         let mut key = [0u8; 32];
         File::open("/dev/urandom")?.read_exact(&mut key)?;
@@ -396,7 +420,11 @@ pub(crate) fn record(user: &str, filed: Filed) -> io::Result<()> {
 /// an empty record either way.
 pub(crate) fn load(user: &str) -> Option<AttemptRecord> {
     let uid = account_uid(user).ok()?;
-    store().ok()?.read(uid).ok().map(|stored| stored.record)
+    store()
+        .ok()?
+        .read(uid, user)
+        .ok()
+        .map(|stored| stored.record)
 }
 
 #[cfg(test)]
@@ -671,6 +699,33 @@ mod tests {
         assert_eq!(again.cameras[0].attempts.len(), 2);
         assert_eq!(again.latest_authenticate.as_ref().unwrap().at, latest.at);
         assert!(again.latest_identify.is_some());
+        // A record left by a deleted account under this uid is not this
+        // account's: it reads empty and the next write replaces it.
+        let foreign = Stored {
+            account: "someone-else".into(),
+            ..Stored::default()
+        };
+        store().unwrap().write(uid, &foreign).unwrap();
+        assert_eq!(load(&me), Some(AttemptRecord::default()));
+        record(
+            &me,
+            Filed {
+                kind: AttemptKind::Authenticate,
+                surface: AttemptSurface::Login,
+                result: AttemptResult::Refused,
+                cause: Some(OutcomeCause::NoFace),
+                elapsed_ms: 10,
+                capture_ms: None,
+                camera: None,
+            },
+        )
+        .unwrap();
+        let replaced = store().unwrap().read_any(uid).unwrap();
+        assert_eq!(replaced.account, me);
+        assert!(
+            replaced.record.latest_identify.is_none(),
+            "the foreign history is gone"
+        );
         std::env::remove_var("IRLUME_STATE_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }

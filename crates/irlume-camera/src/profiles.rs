@@ -231,10 +231,17 @@ fn load_one(path: &Path) -> Result<CameraProfile, String> {
 mod tests {
     use super::*;
 
+    /// A directory of this test's own. The name carries a per-process
+    /// counter, not only a timestamp: tests run in parallel, and on a
+    /// coarse clock two of them can start in the same tick and would then
+    /// share (and delete) one directory — seen on CI as one test loading
+    /// another's files.
     fn dir() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "irlume-profiles-{}-{:x}",
+            "irlume-profiles-{}-{}-{:x}",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

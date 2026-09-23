@@ -7,6 +7,20 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- TUI interaction rules (ADR-0030, phase C1): `1`–`9` jump to sections,
+  `g`/`G` go to the first and last row, and the global letters (`r`
+  refresh, `i` Test Recognition, `g`) keep one meaning on every page, so
+  rename on Faces moved to `n`, reseal on Password Wallet to `b`, IR-only
+  and its readiness check on Preferences to `o` and `c`, and the logs on
+  Diagnostics to `w`. Enter opens and never changes state; Esc closes the
+  innermost open panel before going home. Status lines use one five-glyph
+  vocabulary (`●` `○` `◐` `✕` `⚠`) on every page, action rows lose their
+  spacer lines, the daemon's state joins the page caption so the bottom
+  bar carries the Activity log alone, the header's `advanced` marker names
+  its key, Diagnostics clips long details with an ellipsis, and at 120
+  columns or more the Cameras page shows the selected camera's details in
+  a right-hand column.
+
 - The TUI's Cameras page lists each camera by its own name with its role
   for the account — `Primary camera`, `Secondary camera #N` or `not
   enrolled` — and whether it is ready, instead of `video0+video2` and a USB

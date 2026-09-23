@@ -54,6 +54,27 @@ If a command fails or is interrupted, some changes may already have been
 applied. Review its terminal output and the refreshed status before retrying.
 An unsuccessful daemon-start command does not automatically resume enrollment.
 
+## Keys that mean the same thing on every page
+
+The TUI keeps a small set of global keys that no page reuses with another
+meaning (ADR-0030 §1.3): `1`–`9` jump to the sidebar sections in their
+visible order, `Tab`/`Shift-Tab` and `←`/`→` step through them, `↑`/`↓`
+and `j`/`k` move the selection, `g`/`G` go to the first and last row, `r`
+refreshes the page's observations, `i` runs Test Recognition, `v` shows or
+hides the technical tools, `?` opens the help for the current page, `h`
+returns to Overview and `q` quits. Enter opens things — a row, a details
+panel, a section — and never changes state; every action that writes or
+runs as root has its own letter and asks first. Esc closes the innermost
+open thing (help, a dialog, a details panel) and, with nothing open, goes to
+Overview; it never quits. Because of this rule a few page letters moved:
+rename on Faces is `n`, reseal on Password Wallet is `b`, IR-only on
+Preferences is `o` and its readiness check `c`, and the logs on Diagnostics
+are `w`. Status uses five glyphs everywhere: `●` ready or on, `○` off or
+not selected, `◐` unobserved or pending, `✕` absent or not connected, `⚠`
+needs attention; they read the same with `NO_COLOR`. At 120 columns or
+more, Cameras shows the selected camera's details in a right-hand column;
+narrower terminals open them with Enter.
+
 ## Activity and device transparency
 
 **A** expands or collapses recent Activity. **Shift+L** opens full-height
@@ -285,8 +306,8 @@ scan lists. Rename and Delete confirmations name their exact target.
 | `profiles forget-model`, `profiles eyes-open off` | F2: remove recognizer scans or clear the legacy blocker |
 | `identify` | Overview / Test Recognition |
 | `auth consent status/required/hands-free` | Preferences (`p`); F2 status |
-| `auth sensor status/dual/ir-only` | Preferences (`i`); F2 status |
-| `auth sensor preflight [--user U]` | Preferences (`r`); F2 readiness for the selected account |
+| `auth sensor status/dual/ir-only` | Preferences (`o`); F2 status |
+| `auth sensor preflight [--user U]` | Preferences (`c`); F2 readiness for the selected account |
 | `retry status/reset`, administrator `retry reset` | F2: status, password-verified reset or administrator reset |
 | `auth test` | F2: Test authentication for this account; JSON `granted` is the verdict |
 | `keyring arm/status/forget`, `reseal` | Password Wallet |

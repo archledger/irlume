@@ -1844,6 +1844,34 @@ impl App {
         lines.join("\n")
     }
 
+    /// The daemon's state in one word for the page caption: what the
+    /// bottom bar used to carry as "F4 Daemon …".
+    fn daemon_state_label(&self) -> &'static str {
+        if !self.source_usable(Source::Live) || self.live.is_none() {
+            "unavailable"
+        } else if self
+            .live
+            .as_ref()
+            .is_some_and(|live| !live.tracking_available)
+        {
+            "activity unknown"
+        } else if self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.worker.is_some() || !live.background.is_empty())
+        {
+            "working"
+        } else if self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.stage == irlume_common::live::LiveStage::Ready)
+        {
+            "ready"
+        } else {
+            "changing state"
+        }
+    }
+
     fn page_observation(&self) -> String {
         let sources: &[Source] = match self.screen {
             SC_PROFILES => &[Source::Profiles],
@@ -1857,8 +1885,12 @@ impl App {
             SC_IDENTIFY => return "last test only · F4 current status".into(),
             _ => &[Source::Health, Source::Profiles, Source::Machine],
         };
+        // One freshness indicator (ADR-0030 §1.9): the daemon's state and
+        // the observation age share this caption; the bottom line is the
+        // Activity log alone.
+        let daemon = self.daemon_state_label();
         if sources.iter().any(|source| !self.source_usable(*source)) {
-            "some observations unavailable · F4 details".into()
+            format!("daemon {daemon} · some observations unavailable · F4 details")
         } else {
             let age = sources
                 .iter()
@@ -1866,7 +1898,7 @@ impl App {
                 .map(|at| self.now().saturating_duration_since(at).as_secs())
                 .max()
                 .unwrap_or(0);
-            format!("observations ≤{age}s old · F4 details")
+            format!("daemon {daemon} · observations ≤{age}s old · F4 details")
         }
     }
 
@@ -3348,7 +3380,7 @@ impl App {
                     GotoFix::RecoveryRestore => {
                         (SC_RECOVERY, KeyCode::Char('t'), "restore the template key")
                     }
-                    GotoFix::KeyringReseal => (SC_KEYRING, KeyCode::Char('r'), "reseal the wallet"),
+                    GotoFix::KeyringReseal => (SC_KEYRING, KeyCode::Char('b'), "reseal the wallet"),
                     GotoFix::RecoveryPass => (
                         SC_RECOVERY,
                         KeyCode::Char('s'),
@@ -4891,6 +4923,16 @@ impl App {
             }
             KeyCode::Tab | KeyCode::Right => self.step(1),
             KeyCode::BackTab | KeyCode::Left => self.step(-1),
+            // ADR-0030 §1.3: digits jump to the sidebar sections in their
+            // visible order; g/G go to the first/last row of the page's list.
+            KeyCode::Char(digit @ '1'..='9') => {
+                let index = digit as usize - '1' as usize;
+                if let Some(&target) = self.visible.get(index) {
+                    self.enter_screen(target);
+                }
+            }
+            KeyCode::Char('g') => self.move_sel_to_end(false),
+            KeyCode::Char('G') => self.move_sel_to_end(true),
             KeyCode::Up | KeyCode::Char('k') if self.focused_action().is_some() => {
                 self.move_action_focus(-1)
             }
@@ -5085,6 +5127,26 @@ impl App {
         };
     }
 
+    /// First (`last == false`) or last row of the current page's list.
+    fn move_sel_to_end(&mut self, last: bool) {
+        if self.screen == SC_REPAIR {
+            self.page_view.set((usize::MAX, Rect::default(), 0, 0));
+        }
+        let len = match self.screen {
+            SC_REPAIR => self.repair.len(),
+            SC_CAMERAS => self.pairs.len(),
+            SC_WELCOME => self.hub_rows().len(),
+            _ => self.rows().len(),
+        };
+        let cur = match self.screen {
+            SC_REPAIR => &mut self.repair_sel,
+            SC_CAMERAS => &mut self.cam_sel,
+            SC_WELCOME => &mut self.hub_sel,
+            _ => &mut self.sel,
+        };
+        *cur = if last { len.saturating_sub(1) } else { 0 };
+    }
+
     fn on_action(&mut self, code: KeyCode) {
         match (self.screen, code) {
             // Hub: Enter opens the selected section (the summary IS the nav).
@@ -5195,7 +5257,7 @@ impl App {
             // View the face-auth journal to see WHY a check failed. `logs debug
             // on` (a console step) adds per-stage tracing when a number is needed.
             // Key is 'g'; 'v' is the global basic/all-tabs toggle (on_key).
-            (SC_REPAIR, KeyCode::Char('g')) => {
+            (SC_REPAIR, KeyCode::Char('w')) => {
                 self.log(
                     '→',
                     "sudo irlume logs: the daemon/PAM/keyring journal in one view",
@@ -5290,7 +5352,7 @@ impl App {
                 Some(p) => self.start_enroll(Some(p)),
                 None => self.log('·', "select a profile first (↑↓), then [a] to add scans"),
             },
-            (SC_PROFILES, KeyCode::Char('r')) => self.begin_rename(),
+            (SC_PROFILES, KeyCode::Char('n')) => self.begin_rename(),
             (SC_PROFILES, KeyCode::Char('d')) => self.begin_delete(),
             // Identify: 1:N who-is-this.
             (SC_IDENTIFY, KeyCode::Char('i')) => self.start_async(
@@ -5321,7 +5383,7 @@ impl App {
                 self.suspend = Some(Suspend::PcrlockMakePolicy);
             }
             // The CLI owns seal-kind recovery (token seals must not be re-armed here).
-            (SC_KEYRING, KeyCode::Char('r')) if self.keyring_armed == Some(true) => {
+            (SC_KEYRING, KeyCode::Char('b')) if self.keyring_armed == Some(true) => {
                 self.prepare_action(actions::Invocation { action: &actions::WALLET_RESEAL, values: Vec::new() });
             }
             (SC_KEYRING, KeyCode::Char('f')) => {
@@ -5448,7 +5510,7 @@ impl App {
                 None => self.log('·', "Bitwarden is not installed on this system"),
             },
             // Sensor selection is explicit; an unknown observation never guesses a toggle.
-            (SC_SETTINGS, KeyCode::Char('i')) => {
+            (SC_SETTINGS, KeyCode::Char('o')) => {
                 use irlume_common::config::FaceSensorPolicy;
                 match self.preference_state().face_sensor_policy.resolve() {
                     Ok(FaceSensorPolicy::IrOnlyExperimental) => self.suspend = Some(Suspend::FaceSensorPolicy(false)),
@@ -5459,7 +5521,7 @@ impl App {
                     Err(_) => self.log('·', "Sensor policy is unavailable or invalid. Open Repair and inspect the settings before changing it."),
                 }
             }
-            (SC_SETTINGS, KeyCode::Char('r')) => self.prepare_action(actions::Invocation { action: &actions::SENSOR_PREFLIGHT, values: Vec::new() }),
+            (SC_SETTINGS, KeyCode::Char('c')) => self.prepare_action(actions::Invocation { action: &actions::SENSOR_PREFLIGHT, values: Vec::new() }),
             // Settings.
             (SC_SETTINGS, KeyCode::Char('p')) => {
                 if self.preference_state().consent_overridden {
@@ -6710,7 +6772,7 @@ impl App {
         let title = Line::from(left);
         let remaining = area.width.saturating_sub(exit_width);
         let account = if self.advanced {
-            format!("advanced · {} ", self.user)
+            format!("advanced (v) · {} ", self.user)
         } else {
             format!("{} ", self.user)
         };
@@ -7297,14 +7359,14 @@ impl App {
                 &mut page_actions,
                 &[
                     (
-                        "i",
+                        "o",
                         match ir_only {
                             Some(true) => "turn IR-only off (use dual cameras)",
                             Some(false) => "turn IR-only on (experimental; asks first)",
                             None => "IR-only unavailable (inspect settings)",
                         },
                     ),
-                    ("r", "check IR-only readiness for this account"),
+                    ("c", "check IR-only readiness for this account"),
                 ],
             );
             v.push(Line::raw(
@@ -7403,7 +7465,22 @@ impl App {
         self.draw_action_paragraph(f, area, lines, &page_actions);
     }
 
+    /// The details column threshold (ADR-0030 §1.8): at this width a list
+    /// page shows the selected row's details beside the list.
+    const DETAILS_COLUMN_MIN_WIDTH: u16 = 120;
+
     fn draw_cameras(&self, f: &mut Frame, area: Rect) {
+        // Wide terminals get the selected camera's details in a right-hand
+        // column, always; narrower ones keep the Enter panel below the list.
+        // The threshold is the terminal's width, as the ADR states it.
+        let wide = f.area().width >= Self::DETAILS_COLUMN_MIN_WIDTH;
+        let (area, details_area) = if wide {
+            let [left, right] =
+                Layout::horizontal([Constraint::Percentage(56), Constraint::Min(40)]).areas(area);
+            (left, Some(right))
+        } else {
+            (area, None)
+        };
         let mut page_actions = Vec::new();
         // The active pair comes from the daemon's Health, NOT from
         // select_pair(): that helper falls through to discovery when no
@@ -7651,28 +7728,29 @@ impl App {
             }
             None => Span::styled("not fetched yet".to_string(), Style::new().dim()),
         };
-        if self.cam_details {
-            if let Some(p) = pairs.get(self.cam_sel) {
-                let configured = argb == p.rgb && air == p.ir;
-                let mut lines = self.camera_details_lines(p, configured);
-                // The schedule observation belongs to the configured pair;
-                // another camera's details do not borrow it.
-                lines.push(Line::from(vec![
-                    Span::styled("  capture schedule  ", Style::new().dim()),
-                    if configured {
-                        capture
-                    } else {
-                        Span::styled(
-                            "measured for the configured pair only; use this camera (u) to qualify it"
-                                .to_string(),
-                            Style::new().dim(),
-                        )
-                    },
-                ]));
+        let details_for = |p: &irlume_common::CameraPairInfo, with_actions: bool| {
+            let configured = argb == p.rgb && air == p.ir;
+            let mut lines = self.camera_details_lines(p, configured);
+            // The schedule observation belongs to the configured pair;
+            // another camera's details do not borrow it.
+            lines.push(Line::from(vec![
+                Span::styled("  capture schedule  ", Style::new().dim()),
+                if configured {
+                    capture.clone()
+                } else {
+                    Span::styled(
+                        "measured for the configured pair only; use this camera (u) to qualify it"
+                            .to_string(),
+                        Style::new().dim(),
+                    )
+                },
+            ]));
+            let mut actions = Vec::new();
+            if with_actions {
                 lines.push(Line::raw(""));
                 push_page_actions(
                     &mut lines,
-                    &mut page_actions,
+                    &mut actions,
                     &[
                         (
                             "u",
@@ -7684,6 +7762,27 @@ impl App {
                         ("esc", "back to the list"),
                     ],
                 );
+            }
+            (lines, actions)
+        };
+        if let Some(details_area) = details_area {
+            let lines = match pairs.get(self.cam_sel) {
+                Some(p) => details_for(p, false).0,
+                None => vec![Line::from(Span::styled(
+                    "  select a camera to see its details",
+                    Style::new().dim(),
+                ))],
+            };
+            f.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .block(Block::new().borders(ratatui::widgets::Borders::LEFT)),
+                details_area,
+            );
+        } else if self.cam_details {
+            if let Some(p) = pairs.get(self.cam_sel) {
+                let (lines, actions) = details_for(p, true);
+                page_actions = actions;
                 self.draw_action_paragraph(f, info_area, lines, &page_actions);
                 return;
             }
@@ -7725,7 +7824,7 @@ impl App {
             &mut lines,
             &mut page_actions,
             &[
-                ("r", "inspect attached candidates"),
+                ("r", "refresh the camera list"),
                 ("c", "inspect capture qualification (asks first)"),
                 ("s", "set up emitter"),
                 ("t", "tune capture (holds the camera ~1 min)"),
@@ -7802,9 +7901,9 @@ impl App {
                 )));
                 for (_, label, reaches) in &self.fp_coverage {
                     let mark = if *reaches {
-                        Span::styled("✓ ", Style::new().fg(th().ok))
+                        Span::styled("● ", Style::new().fg(th().ok))
                     } else {
-                        Span::styled("✗ ", Style::new().dim())
+                        Span::styled("○ ", Style::new().dim())
                     };
                     lines.push(Line::from(vec![
                         Span::raw("    "),
@@ -7853,9 +7952,9 @@ impl App {
             ),
             Some(r) if r.encrypted => Span::styled(
                 if r.recovery_set {
-                    "✗ encrypted, TEMPLATE KEY MISSING (restore with passphrase)"
+                    "⚠ encrypted, TEMPLATE KEY MISSING (restore with passphrase)"
                 } else {
-                    "✗ encrypted, TEMPLATE KEY MISSING (re-enroll; no recovery set)"
+                    "⚠ encrypted, TEMPLATE KEY MISSING (re-enroll; no recovery set)"
                 },
                 Style::new().fg(th().err).add_modifier(Modifier::BOLD),
             ),
@@ -8005,7 +8104,7 @@ impl App {
                 } else if tpm {
                     Span::styled("● present", Style::new().fg(th().ok))
                 } else {
-                    Span::styled("✗ none", Style::new().fg(th().err))
+                    Span::styled("✕ none", Style::new().fg(th().err))
                 },
             ]),
             Line::from(vec![
@@ -8087,7 +8186,7 @@ impl App {
                 &mut page_actions,
                 &[
                     ("a", "re-arm (new password)"),
-                    ("r", "reseal (re-bind to current PCRs)"),
+                    ("b", "reseal (re-bind to current PCRs)"),
                     ("f", "forget"),
                     ("d", "check current PCRs"),
                 ],
@@ -8376,9 +8475,9 @@ impl App {
             .iter()
             .map(|c| {
                 let (icon, color) = match c.sev {
-                    Sev::Ok => ("✓", th().ok),
+                    Sev::Ok => ("●", th().ok),
                     Sev::Warn => ("⚠", th().warn),
-                    Sev::Fail => ("✗", th().err),
+                    Sev::Fail => ("✕", th().err),
                     Sev::Unknown => ("◐", th().warn),
                 };
                 let tag = match &c.fix {
@@ -8388,6 +8487,12 @@ impl App {
                     Fix::Goto(_) => " · [f] fix",
                     Fix::Action(_) => " · [f] review action",
                 };
+                // The detail is clipped to what the row can show, with an
+                // ellipsis (ADR-0030 §1.7); the full text is in the box
+                // below for the selected row.
+                let fixed = 3 + 19 + 3 + tag.chars().count();
+                let room = (list_area.width as usize).saturating_sub(fixed);
+                let detail = clip_columns(&c.detail, room);
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         format!(" {icon} "),
@@ -8397,7 +8502,7 @@ impl App {
                         format!("{:<19} · ", c.label),
                         Style::new().add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(c.detail.clone(), Style::new().dim()),
+                    Span::styled(detail, Style::new().dim()),
                     Span::styled(tag.to_string(), Style::new().fg(th().accent)),
                 ]))
             })
@@ -8490,9 +8595,9 @@ impl App {
                     if !self.probes_landed {
                         "unknown"
                     } else if self.probes.tpm_present {
-                        "✓"
+                        "●"
                     } else {
-                        "✗"
+                        "✕"
                     }
                 ),
                 Style::new(),
@@ -8545,7 +8650,7 @@ impl App {
                 ("f", "fix selected"),
                 ("r", "re-check"),
                 ("d", "doctor"),
-                ("g", "logs"),
+                ("w", "watch logs"),
             ],
         );
         let blk = Block::bordered()
@@ -8654,7 +8759,7 @@ impl App {
         if self.pam_cache.selinux_present {
             let sel = match self.pam_cache.selinux {
                 Some(true) => Span::styled("● loaded", Style::new().fg(th().ok)),
-                Some(false) => Span::styled("✗ not loaded", Style::new().fg(th().err)),
+                Some(false) => Span::styled("✕ not loaded", Style::new().fg(th().err)),
                 None => Span::styled("unknown (needs root)", Style::new().dim()),
             };
             lines.push(Line::from(vec![
@@ -8670,7 +8775,7 @@ impl App {
             let aa = self.health.as_ref().and_then(|h| h.apparmor.as_deref());
             let val = match aa {
                 Some(l) if l.contains("unconfined") => Some(Span::styled(
-                    "✗ daemon UNCONFINED (profile installed but not loaded)",
+                    "⚠ daemon UNCONFINED (profile installed but not loaded)",
                     Style::new().fg(th().err),
                 )),
                 Some(l) if l.contains("(complain)") => Some(Span::styled(
@@ -8867,7 +8972,7 @@ impl App {
                 match self.recovery {
                     Some(r) if r.encrypted && r.key_present => onoff(true),
                     Some(r) if r.encrypted => Span::styled(
-                        "✗ key missing",
+                        "⚠ key missing",
                         Style::new().fg(th().err).add_modifier(Modifier::BOLD),
                     ),
                     Some(_) => onoff(false),
@@ -8955,30 +9060,7 @@ impl App {
             }
             (None, false, _) => " Session activity · [A] expand · [L] full history ".to_string(),
         };
-        let live_label = if !self.source_usable(Source::Live) || self.live.is_none() {
-            "unavailable"
-        } else if self
-            .live
-            .as_ref()
-            .is_some_and(|live| !live.tracking_available)
-        {
-            "activity unknown"
-        } else if self
-            .live
-            .as_ref()
-            .is_some_and(|live| live.worker.is_some() || !live.background.is_empty())
-        {
-            "working"
-        } else if self
-            .live
-            .as_ref()
-            .is_some_and(|live| live.stage == irlume_common::live::LiveStage::Ready)
-        {
-            "worker ready"
-        } else {
-            "changing state"
-        };
-        let title = format!(" [F4] Daemon {live_label} ·{history_title}");
+        let title = format!(" [F4] details ·{history_title}");
         self.hit(
             Rect::new(
                 area.x.saturating_add(1),
@@ -9195,13 +9277,13 @@ impl App {
                 ("T", "Record Trace (60s)"),
                 ("s", "Create Support Report"),
                 ("l", "Test Infrared Camera"),
-                ("g", "Show Logs"),
+                ("w", "Show Logs"),
                 ("t", "Toggle Debug Logs"),
             ],
             SC_CAMERAS => &[
                 ("enter", "Camera Details"),
                 ("u", "Use This Camera…"),
-                ("r", "Inspect Candidates"),
+                ("r", "Refresh Cameras"),
                 ("c", "Inspect Qualification"),
                 ("s", "Set Up Emitter…"),
                 ("p", "List Units"),
@@ -9210,7 +9292,7 @@ impl App {
             SC_PROFILES => &[
                 ("e", "Enroll Face…"),
                 ("a", "Improve Recognition"),
-                ("r", "Rename…"),
+                ("n", "Rename…"),
                 ("d", "Delete…"),
             ],
             SC_IDENTIFY => &[("i", "Test Recognition")],
@@ -9226,14 +9308,14 @@ impl App {
             ) {
                 (true, true) => &[
                     ("a", "Connect Wallet…"),
-                    ("r", "Reseal…"),
+                    ("b", "Reseal…"),
                     ("f", "Forget…"),
                     ("p", "Refresh PCR Policy…"),
                     ("d", "Check Current PCRs"),
                 ],
                 (true, false) => &[
                     ("a", "Connect Wallet…"),
-                    ("r", "Reseal…"),
+                    ("b", "Reseal…"),
                     ("f", "Forget…"),
                     ("d", "Check Current PCRs"),
                 ],
@@ -9261,8 +9343,8 @@ impl App {
                 ("s", "Show Status"),
             ],
             SC_SETTINGS => &[
-                ("i", "IR-only…"),
-                ("r", "Readiness…"),
+                ("o", "IR-only…"),
+                ("c", "Readiness…"),
                 ("p", "Privileged consent…"),
                 ("b", "Biopolicy…"),
             ],
@@ -9408,7 +9490,7 @@ impl App {
     /// of the CURRENT screen (tier two of the disclosure ladder).
     fn help_body(&self) -> String {
         let mut b = String::from(
-            "Global\n              F4  current daemon, camera inventory and observation age\n              F3  choose a section (click or arrows + Enter)\n              F6  focus page actions / return to page selection\n          ↑↓ + Enter/Space  choose and activate a focused action\n              F2  search more actions\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193}  select\n               v  show/hide technical tools\n               A  expand/collapse activity history\n               L  full session history and wrapped details\n         PgUp/Dn  read page with F6 focus; otherwise Activity\n               h  Overview              q  quit\n           click  rows and action chips\n        Dialogs  ↑↓ / PgUp/Dn scroll long messages\n               M  release mouse (highlight/copy)\n\nThis screen\n",
+            "Global\n              F4  current daemon, camera inventory and observation age\n              F3  choose a section (click or arrows + Enter)\n              F6  focus page actions / return to page selection\n          ↑↓ + Enter/Space  choose and activate a focused action\n              F2  search more actions\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193} / j k  select\n            1-9  jump to a section        g / G  first / last row\n               v  show/hide technical tools\n               A  expand/collapse activity history\n               L  full session history and wrapped details\n         PgUp/Dn  read page with F6 focus; otherwise Activity\n               h  Overview              q  quit\n           click  rows and action chips\n        Dialogs  ↑↓ / PgUp/Dn scroll long messages\n               M  release mouse (highlight/copy)\n\nThis screen\n",
         );
         for (k, d) in self.screen_actions() {
             b.push_str(&format!("  {k:<7} {d}\n"));
@@ -9762,8 +9844,9 @@ fn state_row(label: &str, w: usize, value: Span<'static>) -> Line<'static> {
     Line::from(vec![Span::raw(format!("  {label:<w$}")), value])
 }
 
-/// Explicit authored actions: one separated row per action. The row metadata
-/// travels with the text so labels and wrapped continuations share one target.
+/// Explicit authored actions: one row per action, no spacer rows (ADR-0030
+/// §1.4). The row metadata travels with the text so labels and wrapped
+/// continuations share one target.
 fn push_page_actions(
     lines: &mut Vec<Line<'_>>,
     actions: &mut Vec<(usize, KeyCode)>,
@@ -9781,12 +9864,6 @@ fn push_page_action(
     label: &str,
     detail: &str,
 ) {
-    if actions
-        .last()
-        .is_some_and(|(row, _)| *row + 1 == lines.len())
-    {
-        lines.push(Line::raw(""));
-    }
     if let Some(code) = footer_keycode(key) {
         actions.push((lines.len(), code));
     }
@@ -10508,7 +10585,10 @@ mod tests {
         ] {
             assert!(!text.contains(removed), "{text}");
         }
-        for key in [KeyCode::Char('c'), KeyCode::Char('g'), KeyCode::Enter] {
+        // Retired gesture keys and Enter launch nothing; `c` is now the
+        // readiness check, which arms a confirmation, so it is not in
+        // this "does nothing" set.
+        for key in [KeyCode::Char('g'), KeyCode::Char('G'), KeyCode::Enter] {
             app.on_key(key);
             assert!(app.suspend.is_none() && app.op.is_none() && app.confirm.is_none());
         }
@@ -11958,7 +12038,7 @@ mod tests {
         click_text(&mut app, "[a] re-arm");
         assert!(matches!(app.input, Some((_, _, Pending::KeyringPw(_)))));
         app.on_key(KeyCode::Esc);
-        click_text(&mut app, "[r] reseal");
+        click_text(&mut app, "[b] reseal");
         assert!(
             matches!(&app.confirm, Some((_, _, ConfirmAct::Sus(Suspend::MoreAction(invocation)))) if invocation.action.args == ["reseal"])
         );
@@ -12011,7 +12091,7 @@ mod tests {
                     ("[f] fix selected", 'f'),
                     ("[r] re-check", 'r'),
                     ("[d] doctor", 'd'),
-                    ("[g] logs", 'g'),
+                    ("[w] watch logs", 'w'),
                 ],
             ),
             (SC_IDENTIFY, vec![("[i] identify now", 'i')]),
@@ -12922,7 +13002,7 @@ mod tests {
         assert!(app.advanced, "[v] is the global view toggle");
         assert!(app.suspend.is_none(), "[v] must not open the logs view");
         app.screen = SC_REPAIR;
-        app.on_key(KeyCode::Char('g'));
+        app.on_key(KeyCode::Char('w'));
         assert!(
             matches!(app.suspend, Some(Suspend::Logs)),
             "the advertised logs key must actually reach the Repair action"
@@ -13516,7 +13596,7 @@ mod tests {
         let mut app = test_app();
         app.profiles = vec![profile("p1", &["s1", "s2"])];
         app.screen = SC_PROFILES;
-        app.on_key(KeyCode::Char('r'));
+        app.on_key(KeyCode::Char('n'));
         match &app.input {
             Some((prompt, _, Pending::RenameProfile(old))) => {
                 assert!(prompt.contains("Rename profile 'p1'"), "got: {prompt}");
@@ -13526,7 +13606,7 @@ mod tests {
         }
         app.input = None;
         app.sel = 2; // second scan
-        app.on_key(KeyCode::Char('r'));
+        app.on_key(KeyCode::Char('n'));
         match &app.input {
             Some((prompt, _, Pending::RenameScan(p, s))) => {
                 assert!(prompt.contains("Rename scan 's2'"), "got: {prompt}");
@@ -13572,10 +13652,10 @@ mod tests {
         app.input = None;
         // Reseal delegates credential handling to the shared CLI only when armed.
         app.keyring_armed = Some(false);
-        app.on_key(KeyCode::Char('r'));
+        app.on_key(KeyCode::Char('b'));
         assert!(app.input.is_none() && app.confirm.is_none());
         app.keyring_armed = Some(true);
-        app.on_key(KeyCode::Char('r'));
+        app.on_key(KeyCode::Char('b'));
         assert!(
             matches!(&app.confirm, Some((_, _, ConfirmAct::Sus(Suspend::MoreAction(invocation)))) if invocation.args("bob") == ["reseal", "--user", "bob"])
         );
@@ -13861,8 +13941,10 @@ mod tests {
         app.freshness
             .observation_mut(Source::Preferences)
             .record(true, now);
+        // Below the details-column threshold, so the Enter panel is what
+        // this test exercises (the column has its own test).
         let render = |app: &mut App| {
-            let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            let mut term = Terminal::new(TestBackend::new(119, 40)).unwrap();
             term.draw(|f| app.draw(f)).unwrap();
             rendered(&term)
         };
@@ -14160,6 +14242,51 @@ mod tests {
         let now = app.now();
         app.apply_live_snapshot(changed, now);
         assert!(app.capture_mode.is_none(), "hotplug keeps no observation");
+    }
+
+    /// ADR-0030 §1.8: at 120 columns the selected camera's details sit in a
+    /// right-hand column without Enter; at 80 they appear only after Enter.
+    #[test]
+    fn cameras_details_column_appears_only_on_wide_terminals() {
+        let mut app = live_test_app();
+        let mut snapshot = live_test_snapshot();
+        snapshot.cameras.candidates[0].endpoint_paths =
+            vec!["/dev/video0".into(), "/dev/video2".into()];
+        app.apply_live_snapshot(snapshot, app.now());
+        app.screen = SC_CAMERAS;
+        let now = app.now();
+        app.freshness
+            .observation_mut(Source::Cameras)
+            .record(true, now);
+        app.pairs = vec![irlume_common::CameraPairInfo {
+            rgb: "/dev/video0".into(),
+            ir: "/dev/video2".into(),
+            id: Some("3277:0059".into()),
+            fixed: true,
+            privacy: false,
+            name: Some("ASUS Integrated Camera".into()),
+            identity: Some("3277:0059".into()),
+            serial_present: false,
+        }];
+        let render = |app: &mut App, w: u16| {
+            let mut term = Terminal::new(TestBackend::new(w, 40)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            rendered(&term)
+        };
+        let narrow = render(&mut app, 80);
+        assert!(
+            !narrow.contains("(RGB) +"),
+            "no details before Enter at 80 cols: {narrow}"
+        );
+        let wide = render(&mut app, 140);
+        assert!(wide.contains("/dev/video0 (RGB)"), "{wide}");
+        assert!(wide.contains("connection  built-in"), "{wide}");
+        app.on_key(KeyCode::Enter);
+        let narrow = render(&mut app, 80);
+        assert!(
+            narrow.contains("(RGB) +"),
+            "Enter opens the panel at 80 cols: {narrow}"
+        );
     }
 
     #[test]
@@ -16036,6 +16163,52 @@ mod tests {
         assert!(text.contains("testuser"), "the managed user is shown");
     }
 
+    /// ADR-0030 §1.3: the global letters keep one meaning everywhere; no
+    /// page's action table reuses one of them.
+    #[test]
+    fn page_action_keys_never_collide_with_global_keys() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.advanced = true;
+        app.keyring_armed = Some(true);
+        app.keyring_policy = Some("pcrlock NV 0x1 (Tier 2)".into());
+        const GLOBAL: [&str; 10] = ["1", "j", "k", "g", "G", "r", "i", "?", "q", "v"];
+        for (screen, name) in SCREENS.iter().enumerate() {
+            app.screen = screen;
+            for (key, label) in app.screen_actions() {
+                let allowed = match *key {
+                    // `r` is the global refresh: a page may advertise it only
+                    // with that meaning; `i` only as Test Recognition.
+                    "r" => label.contains("Refresh") || label.contains("Recheck"),
+                    "i" => label.contains("Test Recognition"),
+                    other => !GLOBAL.contains(&other),
+                };
+                assert!(allowed, "screen {name} reuses global key {key} for {label}");
+            }
+        }
+    }
+
+    /// ADR-0030 §1.1: Enter opens things; it never arms a confirmation,
+    /// a prompt or a suspend on any page.
+    #[test]
+    fn enter_never_mutates_on_any_page() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.advanced = true;
+        for (screen, name) in SCREENS.iter().enumerate() {
+            app.screen = screen;
+            app.sel = 0;
+            app.on_key(KeyCode::Enter);
+            assert!(
+                app.confirm.is_none() && app.input.is_none() && app.suspend.is_none(),
+                "Enter on {name} must not arm a side effect"
+            );
+            app.confirm = None;
+            app.input = None;
+            app.suspend = None;
+        }
+    }
+
     #[test]
     fn footer_lists_each_screens_action_keys() {
         let mut app = test_app();
@@ -17825,9 +17998,9 @@ mod tests {
             assert!(row_with(&text, "Hands-free:").contains("ON"), "{text}");
             assert!(text.contains("ON — ENFORCING"), "{text}");
             if mouse {
-                click_text(&mut app, "[i] turn IR-only off");
+                click_text(&mut app, "[o] turn IR-only off");
             } else {
-                app.on_key(KeyCode::Char('i'));
+                app.on_key(KeyCode::Char('o'));
             }
             assert!(matches!(
                 app.suspend,
@@ -17837,15 +18010,15 @@ mod tests {
             app.suspend = None;
             app.preferences = Some(preference_fixture(false));
             if mouse {
-                click_text(&mut app, "[i] turn IR-only on");
+                click_text(&mut app, "[o] turn IR-only on");
             } else {
-                app.on_key(KeyCode::Char('i'));
+                app.on_key(KeyCode::Char('o'));
             }
             assert!(app.suspend.is_none());
             assert!(app.confirm.as_ref().unwrap().0.contains("not qualified"));
             app.on_key(KeyCode::Esc);
             assert!(app.suspend.is_none() && app.confirm.is_none());
-            app.on_key(KeyCode::Char('i'));
+            app.on_key(KeyCode::Char('o'));
             app.on_key(KeyCode::Char('y'));
             assert!(matches!(app.suspend, Some(Suspend::FaceSensorPolicy(true))));
         }
@@ -17877,7 +18050,7 @@ mod tests {
             assert!(app.confirm.is_none() && app.suspend.is_none());
         }
         assert!(draw_text(&app).contains("environment override"));
-        app.on_key(KeyCode::Char('r'));
+        app.on_key(KeyCode::Char('c'));
         assert!(
             matches!(&app.confirm, Some((_, _, ConfirmAct::Sus(Suspend::MoreAction(invocation)))) if invocation.args("bob") == ["auth", "sensor", "preflight", "--user", "bob"])
         );
@@ -17890,11 +18063,11 @@ mod tests {
         app.screen = SC_SETTINGS;
         let text = draw_text(&app);
         assert!(
-            text.contains("[i]"),
+            text.contains("[o]"),
             "IR-only needs an in-app control: {text}"
         );
         assert!(
-            text.contains("[r]"),
+            text.contains("[c]"),
             "readiness needs an in-app control: {text}"
         );
         assert!(!text.contains("Change as root:"), "{text}");

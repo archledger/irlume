@@ -30,8 +30,6 @@ pub enum Category {
     CameraLeaseRefused,
     CameraIoFailed,
     CameraHardwareFailed,
-    /// The camera's privacy shutter refused capture (ADR-0030 §5).
-    PrivacyShutter,
     CameraRateFillFailed(irlume_camera::RateFillFailure),
     CameraAuthorizationRefused,
     CameraPolicyRefused,
@@ -74,7 +72,6 @@ impl Category {
             Self::CameraLeaseRefused => "camera_lease_refused",
             Self::CameraIoFailed => "camera_io_failed",
             Self::CameraHardwareFailed => "camera_hardware_failed",
-            Self::PrivacyShutter => "privacy_shutter",
             Self::CameraRateFillFailed(failure) => failure.as_str(),
             Self::CameraAuthorizationRefused => "camera_authorization_refused",
             Self::CameraPolicyRefused => "camera_policy_refused",
@@ -178,7 +175,9 @@ impl From<IrFailure> for Category {
             IrFailure::CameraLeaseRefused => Self::CameraLeaseRefused,
             IrFailure::CameraIoFailed => Self::CameraIoFailed,
             IrFailure::CameraHardwareFailed => Self::CameraHardwareFailed,
-            IrFailure::PrivacyShutter => Self::PrivacyShutter,
+            // Schema 4 has no privacy category; the shutter refusal keeps
+            // the hardware class it always had in evaluation records.
+            IrFailure::PrivacyShutter => Self::CameraHardwareFailed,
             IrFailure::CameraAuthorizationRefused => Self::CameraAuthorizationRefused,
             IrFailure::CameraPolicyRefused => Self::CameraPolicyRefused,
             IrFailure::CameraCaptureFailed => Self::CameraCaptureFailed,

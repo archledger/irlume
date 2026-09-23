@@ -7188,7 +7188,14 @@ impl Engine {
                      pipeline (unknown or changed IR space, recognizer or dimension); \
                      add fresh scans to your profile to restore dark unlock"
                 };
-                return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
+                // No identity was compared: the enrollment cannot serve a
+                // dark attempt. The kind stays OtherDeny for the retry
+                // accounting; the cause says setup (ADR-0030 §5).
+                return Ok(Outcome::deny_because(
+                    OutcomeKind::OtherDeny,
+                    OutcomeCause::SetupUnavailable,
+                    reason,
+                ));
             }
             let (verdict, cues, reason) = self.gate.evaluate_ir_only(&a.signals);
             diagnostics.emit_trace(irlume_liveness::diagnostic_trace_decision(
@@ -12863,6 +12870,7 @@ mod engine_tests {
                 "dark" => {
                     assert!(!out.granted);
                     assert_eq!(out.kind, OutcomeKind::OtherDeny);
+                    assert_eq!(out.cause, Some(OutcomeCause::SetupUnavailable));
                     assert!(out.reason.contains("no enrolled IR scans are compatible"));
                 }
                 _ => {

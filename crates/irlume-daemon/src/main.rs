@@ -3726,15 +3726,33 @@ enum PrimaryDigest {
     Absent,
     Present(String),
     Unreadable,
+    /// The file changed while the summary was being built, so the digest
+    /// cannot be tied to the bytes the summary describes.
+    Unsettled,
 }
 
 impl PrimaryDigest {
     /// Whether a summary built at `self` still describes a file now at
-    /// `now`. A read failure on either side is never "unchanged".
+    /// `now`: only two absences or two equal digests. A read failure or an
+    /// unsettled build on either side is never "unchanged".
     fn unchanged(&self, now: &PrimaryDigest) -> bool {
-        !matches!(self, PrimaryDigest::Unreadable)
-            && !matches!(now, PrimaryDigest::Unreadable)
-            && self == now
+        match (self, now) {
+            (PrimaryDigest::Absent, PrimaryDigest::Absent) => true,
+            (PrimaryDigest::Present(then), PrimaryDigest::Present(now)) => then == now,
+            _ => false,
+        }
+    }
+
+    /// The digest to publish for a summary built from a load that began at
+    /// `before` and ended at `after`: the file's digest only if it did not
+    /// change in between, so a legacy writer racing the load cannot leave
+    /// a summary of the old bytes filed under the new file's digest.
+    fn settled(before: PrimaryDigest, after: PrimaryDigest) -> PrimaryDigest {
+        if before.unchanged(&after) {
+            after
+        } else {
+            PrimaryDigest::Unsettled
+        }
     }
 }
 
@@ -5428,6 +5446,7 @@ fn dispatch_scoped_session_inner(
                     Response::Error(prose)
                 }
             };
+            let digest_before = primary_digest_now(&user);
             match irlume_core::storage::load(&user) {
                 Ok(enr) => {
                     // The status path serves this snapshot from now on; the
@@ -5444,7 +5463,10 @@ fn dispatch_scoped_session_inner(
                     let (camera_groups, camera_store_error) = camera_group_rows(&user, engine);
                     sum.camera_groups = camera_groups;
                     sum.camera_store_error = camera_store_error;
-                    sum.primary_digest = primary_digest_now(&user);
+                    // Tied to the bytes the load read: a file that changed
+                    // under the load is not filed under its new digest.
+                    sum.primary_digest =
+                        PrimaryDigest::settled(digest_before, primary_digest_now(&user));
                     publish_enrollment_summary(&user, sum.clone());
                     sum.into_response()
                 }
@@ -10661,6 +10683,35 @@ mod tests {
         );
         assert!(dispatch_status(&request, &peer(0)).is_none());
         std::fs::remove_dir(&path).unwrap();
+        // A file that changed between the start and the end of a load is
+        // filed as unsettled, which never hits, so the worker reloads.
+        let before = primary_digest_now(user);
+        std::fs::write(&path, b"{\"user\":\"irlume-digest-user\",\"profiles\":[]}").unwrap();
+        let after = primary_digest_now(user);
+        assert_eq!(
+            PrimaryDigest::settled(before, after.clone()),
+            PrimaryDigest::Unsettled
+        );
+        assert_eq!(
+            PrimaryDigest::settled(after.clone(), after.clone()),
+            after.clone()
+        );
+        publish_enrollment_summary(
+            user,
+            EnrollmentSummary {
+                profiles: Vec::new(),
+                ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
+                primary_camera: None,
+                primary_digest: PrimaryDigest::Unsettled,
+            },
+        );
+        assert!(
+            dispatch_status(&request, &peer(0)).is_none(),
+            "an unsettled digest is a cache miss even for an unchanged file"
+        );
+        std::fs::remove_file(&path).unwrap();
         invalidate_enrollment_summary(user);
     }
 

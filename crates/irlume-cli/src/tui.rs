@@ -1443,26 +1443,43 @@ impl App {
             .is_some_and(|binding| binding.rgb.is_some() || binding.ir.is_some());
         let known = self.camera_store_error.is_none()
             && (bound_primary || (self.profiles_loaded && self.profiles.is_empty()));
-        // Another listed pair of the same model makes a serial-less match
-        // ambiguous (two same-model units, only one enrolled).
-        let shared_model = pair.id.as_deref().is_some_and(|id| {
-            self.pairs
-                .iter()
-                .filter(|other| other.id.as_deref() == Some(id))
-                .count()
-                > 1
-        });
         camera_role_for(
             RoleCandidate {
                 identity: pair.identity.as_deref(),
                 id: pair.id.as_deref(),
                 serial_present: pair.serial_present,
-                shared_model,
             },
             self.primary_camera.as_ref(),
             &self.camera_groups,
             known,
         )
+    }
+
+    /// Whether the enrollment matched to `role` holds no template the
+    /// daemon's loaded recognizer can use (#288): the primary's profiles by
+    /// `scans_by_recognizer[live_recognizer]`, a group's by its compatible
+    /// candidate counts. Absent facts (an older daemon) are not zero.
+    fn no_usable_scans_for(&self, role: CameraRole) -> bool {
+        match role {
+            CameraRole::Primary => {
+                !self.profiles.is_empty()
+                    && self.profiles.iter().all(|profile| {
+                        profile.live_recognizer.as_deref().is_some_and(|live| {
+                            profile.scans_by_recognizer.get(live).copied().unwrap_or(0) == 0
+                        })
+                    })
+            }
+            CameraRole::Secondary(index) => {
+                self.camera_groups.get(index - 1).is_some_and(|group| {
+                    !group.profiles.is_empty()
+                        && group.profiles.iter().all(|profile| {
+                            profile.compatible_rgb_candidates == 0
+                                && profile.compatible_ir_pairs == 0
+                        })
+                })
+            }
+            CameraRole::Unenrolled | CameraRole::Unknown => false,
+        }
     }
 
     /// The details panel for one listed pair (ADR-0029): identity, nodes,
@@ -1649,6 +1666,9 @@ impl App {
             self.invalidate_source(Source::Cameras);
             self.invalidate_source(Source::CameraPrivacy);
             self.invalidate_source(Source::Qualification);
+            // Node paths are reused across hotplug, so an observation from
+            // the previous inventory cannot be this hardware's.
+            self.capture_mode = None;
             self.freshness.cycle_mut(Worker::Cameras).invalidate();
             self.freshness.cycle_mut(Worker::Qualification).invalidate();
             self.classified_epoch = None;
@@ -7477,6 +7497,7 @@ impl App {
                     // instead of "ready".
                     let stale = matches!(role, CameraRole::Secondary(index)
                         if self.camera_groups.get(index - 1).is_some_and(|group| group.stale));
+                    let no_usable_scans = self.no_usable_scans_for(role);
                     ListItem::new(Line::from(vec![
                         Span::styled(
                             if active { " ● " } else { " ○ " },
@@ -7514,6 +7535,11 @@ impl App {
                             Span::styled("◐ role unknown", Style::new().dim())
                         } else if stale {
                             Span::styled("⚠ inactive (primary changed)", Style::new().fg(th().warn))
+                        } else if no_usable_scans {
+                            // The enrollment matches this camera but holds no
+                            // template the loaded recognizer can use: the
+                            // daemon refuses before capture, so not "ready".
+                            Span::styled("○ no usable scans", Style::new().dim())
                         } else if !self.source_usable(Source::CameraPrivacy) {
                             Span::styled("◐ privacy unobserved", Style::new().fg(th().warn))
                         } else {
@@ -9572,8 +9598,6 @@ struct RoleCandidate<'a> {
     id: Option<&'a str>,
     /// Whether the unit reports a serial (withheld from non-root peers).
     serial_present: bool,
-    /// Another listed pair shares this `vid:pid`.
-    shared_model: bool,
 }
 
 /// Whether a binding names the candidate: `Some(true)` / `Some(false)`
@@ -9598,16 +9622,14 @@ fn binding_names_candidate(
         return Some(true);
     }
     // The binding carries a serial the daemon withheld. A unit without one
-    // is definitely not it; with one, the match is only as good as the
-    // model being unique among the connected pairs — two same-model units
-    // cannot be told apart here, so neither is claimed. (ADR-0030 moves
-    // this correlation into the daemon.)
-    if !candidate.serial_present {
-        Some(false)
-    } else if candidate.shared_model {
+    // is definitely not it; with one, the client cannot tell this unit
+    // from any other of the model (the enrolled one may be unplugged and a
+    // twin attached alone), so no role is claimed: ADR-0030 moves this
+    // correlation into the daemon.
+    if candidate.serial_present {
         None
     } else {
-        Some(true)
+        Some(false)
     }
 }
 
@@ -13699,20 +13721,17 @@ mod tests {
             identity: Some(identity),
             id: None,
             serial_present: identity.matches(':').count() > 1,
-            shared_model: false,
         };
         // An ordinary account's candidate: vid:pid only.
-        let redacted = |id: &'static str, serial_present: bool, shared_model: bool| RoleCandidate {
+        let redacted = |id: &'static str, serial_present: bool| RoleCandidate {
             identity: None,
             id: Some(id),
             serial_present,
-            shared_model,
         };
         let none = RoleCandidate {
             identity: None,
             id: None,
             serial_present: false,
-            shared_model: false,
         };
         let primary = PrimaryCameraBinding {
             rgb: Some("046d:085e:e179cb54".into()),
@@ -13768,46 +13787,21 @@ mod tests {
             camera_role_for(exact("3277:0059"), None, &[], false),
             CameraRole::Unknown
         );
-        // Without the serial (a non-root peer), vid:pid matches the
-        // serial-bearing binding only while the model is unique among the
-        // connected pairs and the unit reports a serial.
+        // Without the serial (a non-root peer), a serial-bearing binding is
+        // never claimed for a unit that reports a serial: the client cannot
+        // tell it from a twin (the daemon resolves this, ADR-0030).
         assert_eq!(
-            camera_role_for(
-                redacted("046d:085e", true, false),
-                Some(&primary),
-                &groups,
-                true
-            ),
-            CameraRole::Primary
-        );
-        // Two same-model units: neither is claimed as the enrolled one.
-        assert_eq!(
-            camera_role_for(
-                redacted("046d:085e", true, true),
-                Some(&primary),
-                &groups,
-                true
-            ),
+            camera_role_for(redacted("046d:085e", true), Some(&primary), &groups, true),
             CameraRole::Unknown
         );
         // A unit without a serial cannot be a serial-bearing binding.
         assert_eq!(
-            camera_role_for(
-                redacted("046d:085e", false, false),
-                Some(&primary),
-                &groups,
-                true
-            ),
+            camera_role_for(redacted("046d:085e", false), Some(&primary), &groups, true),
             CameraRole::Unenrolled
         );
-        // A serial-less binding matches by vid:pid whatever the neighbours.
+        // A serial-less binding matches by vid:pid.
         assert_eq!(
-            camera_role_for(
-                redacted("3443:c803", false, true),
-                Some(&primary),
-                &groups,
-                true
-            ),
+            camera_role_for(redacted("3443:c803", false), Some(&primary), &groups, true),
             CameraRole::Secondary(1)
         );
     }
@@ -13889,6 +13883,35 @@ mod tests {
             !text.contains("[3277:0059]"),
             "the USB id leaves the row for the details panel: {text}"
         );
+        let primary_row = |text: &str| {
+            text.lines()
+                .find(|l| l.contains("Primary camera"))
+                .unwrap()
+                .to_string()
+        };
+        app.freshness
+            .observation_mut(Source::CameraPrivacy)
+            .record(true, now);
+        let text = render(&mut app);
+        assert!(primary_row(&text).contains("ready"), "{text}");
+        // An enrollment with no template for the loaded recognizer is
+        // refused before capture: the row must not say "ready".
+        let mut incompatible = profile("BEN", &["a"]);
+        incompatible.live_recognizer = Some("arcface-v2".into());
+        incompatible.scans_by_recognizer.insert("legacy".into(), 1);
+        app.profiles = vec![incompatible];
+        let text = render(&mut app);
+        let row = primary_row(&text);
+        assert!(
+            row.contains("no usable scans") && !row.contains("ready"),
+            "{row}"
+        );
+        // A daemon that does not report the live recognizer establishes
+        // nothing about usability.
+        app.profiles = vec![profile("BEN", &["a"])];
+        assert!(primary_row(&render(&mut app)).contains("ready"));
+        app.profiles.clear();
+
         assert!(text.contains("not fetched yet"), "{text}");
         // A qualification inspection that ran and failed is reported, not
         // left looking like a fetch that never happened.
@@ -14125,6 +14148,18 @@ mod tests {
         app.pairs[0].name = Some("ASUS Integrated Camera".into());
         let text = render(&mut app);
         assert!(text.contains("not enrolled"), "{text}");
+        // A hotplug (new inventory revision) drops the capture observation:
+        // node paths are reused, so it cannot be this hardware's.
+        app.capture_mode = Some(CaptureObservation {
+            rgb: "/dev/video40".into(),
+            ir: "/dev/video42".into(),
+            text: "sequential (source: test)".into(),
+        });
+        let mut changed = live_test_snapshot();
+        changed.cameras.revision = changed.cameras.revision.wrapping_add(1);
+        let now = app.now();
+        app.apply_live_snapshot(changed, now);
+        assert!(app.capture_mode.is_none(), "hotplug keeps no observation");
     }
 
     #[test]

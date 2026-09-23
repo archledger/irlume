@@ -96,11 +96,15 @@ impl Freshness {
 pub(super) struct Observation {
     pub last_success: Option<Instant>,
     unavailable: bool,
+    /// The most recent request for this source ran and failed (as opposed
+    /// to never having run, or having been invalidated by a context change).
+    failed: bool,
 }
 
 impl Observation {
     pub fn record(&mut self, success: bool, at: Instant) {
         self.unavailable = !success;
+        self.failed = !success;
         if success {
             self.last_success = Some(at);
         }
@@ -108,6 +112,12 @@ impl Observation {
 
     pub fn invalidate(&mut self) {
         self.unavailable = true;
+        self.failed = false;
+    }
+
+    /// The most recent request for this source ran and failed.
+    pub fn last_request_failed(self) -> bool {
+        self.failed
     }
 
     pub fn usable(self, now: Instant, max_age: Duration) -> bool {

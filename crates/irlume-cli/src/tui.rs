@@ -1286,6 +1286,12 @@ impl App {
                 }
                 self.profiles.clear();
                 self.profiles_loaded = false;
+                // The role labels on Cameras derive from these: an
+                // enrollment that became unreadable must not keep labelling
+                // pairs from the last good load (ADR-0029).
+                self.primary_camera = None;
+                self.camera_groups.clear();
+                self.camera_store_error = None;
             }
             Source::Cameras => {
                 if (self.pairs_known || !self.pairs.is_empty())
@@ -1418,7 +1424,7 @@ impl App {
     fn camera_details_lines(
         &self,
         p: &irlume_common::CameraPairInfo,
-        in_use: bool,
+        configured: bool,
     ) -> Vec<Line<'static>> {
         let role = self.camera_role(p);
         let role_text = match role {
@@ -1460,8 +1466,8 @@ impl App {
             Span::raw(format!(
                 "{}{}",
                 if p.fixed { "built-in" } else { "external USB" },
-                if in_use {
-                    " · in use by the daemon"
+                if configured {
+                    " · the daemon's configured pair"
                 } else {
                     ""
                 }
@@ -7400,6 +7406,11 @@ impl App {
                         CameraRole::Secondary(index) => format!("Secondary camera #{index}"),
                         other => other.label().to_string(),
                     };
+                    // A group whose store is stale cannot authenticate until
+                    // it is re-authorized (ADR-0024 §1.1): the row says so
+                    // instead of "ready".
+                    let stale = matches!(role, CameraRole::Secondary(index)
+                        if self.camera_groups.get(index - 1).is_some_and(|group| group.stale));
                     ListItem::new(Line::from(vec![
                         Span::styled(
                             if active { " ● " } else { " ○ " },
@@ -7423,6 +7434,8 @@ impl App {
                         Span::styled(format!("{kind:<10}"), Style::new().dim()),
                         if priv_on {
                             Span::styled("⚠ privacy ON", Style::new().fg(th().err))
+                        } else if stale {
+                            Span::styled("⚠ inactive (primary changed)", Style::new().fg(th().warn))
                         } else if !self.source_usable(Source::CameraPrivacy) {
                             Span::styled("◐ privacy unobserved", Style::new().fg(th().warn))
                         } else {
@@ -7443,7 +7456,7 @@ impl App {
         .areas(list_area);
         f.render_widget(
             Paragraph::new(section(
-                "Cameras  (● = in use · ↑↓ select · Enter details · u use this camera)",
+                "Cameras  (● = configured · ↑↓ select · Enter details · u use this camera)",
             )),
             hdr_area,
         );
@@ -7498,14 +7511,37 @@ impl App {
                 "last observation ({}): {text}",
                 self.source_status(Source::Qualification)
             )),
+            // A request that ran and failed is reported as such; only a
+            // request that was never made reads as not fetched.
+            None if self
+                .freshness
+                .observation(Source::Qualification)
+                .last_request_failed() =>
+            {
+                Span::styled(
+                    "last inspection failed; press c to retry".to_string(),
+                    Style::new().fg(th().warn),
+                )
+            }
             None => Span::styled("not fetched yet".to_string(), Style::new().dim()),
         };
         if self.cam_details {
             if let Some(p) = pairs.get(self.cam_sel) {
-                let mut lines = self.camera_details_lines(p, argb == p.rgb && air == p.ir);
+                let configured = argb == p.rgb && air == p.ir;
+                let mut lines = self.camera_details_lines(p, configured);
+                // The schedule observation belongs to the configured pair;
+                // another camera's details do not borrow it.
                 lines.push(Line::from(vec![
                     Span::styled("  capture schedule  ", Style::new().dim()),
-                    capture,
+                    if configured {
+                        capture
+                    } else {
+                        Span::styled(
+                            "measured for the configured pair only; use this camera (u) to qualify it"
+                                .to_string(),
+                            Style::new().dim(),
+                        )
+                    },
                 ]));
                 lines.push(Line::raw(""));
                 push_page_actions(
@@ -7527,7 +7563,7 @@ impl App {
             }
         }
         let mut lines = vec![Line::from(vec![
-            Span::styled("  in use ", Style::new().dim()),
+            Span::styled("  configured ", Style::new().dim()),
             Span::styled(active, active_style),
         ])];
         if let Some(p) = pairs.get(self.cam_sel) {
@@ -13583,6 +13619,18 @@ mod tests {
             "the USB id leaves the row for the details panel: {text}"
         );
         assert!(text.contains("not fetched yet"), "{text}");
+        // A qualification inspection that ran and failed is reported, not
+        // left looking like a fetch that never happened.
+        let now = app.now();
+        app.freshness
+            .observation_mut(Source::Qualification)
+            .record(false, now);
+        let text = render(&mut app);
+        assert!(text.contains("last inspection failed"), "{text}");
+        assert!(!text.contains("not fetched yet"), "{text}");
+        app.freshness
+            .observation_mut(Source::Qualification)
+            .invalidate();
         app.cam_sel = 0;
         app.on_key(KeyCode::Enter);
         let text = render(&mut app);
@@ -13617,8 +13665,43 @@ mod tests {
         );
         assert!(!text.contains("no serial:"), "{text}");
         app.on_key(KeyCode::Esc);
+        // A stale group keeps its role but the row says it is inactive.
+        app.camera_groups = vec![irlume_common::CameraGroupSummary {
+            id: "desk".into(),
+            rgb: Some("3443:c803".into()),
+            ir: Some("3443:c803".into()),
+            connected: true,
+            selected: false,
+            stale: true,
+            generation: 4,
+            profiles: Vec::new(),
+        }];
+        app.pairs[1].identity = Some("3443:c803".into());
+        let text = render(&mut app);
+        assert!(text.contains("Secondary camera #1"), "{text}");
+        assert!(text.contains("inactive (primary changed)"), "{text}");
+        // The schedule observation is shown only on the configured pair.
+        app.cam_sel = 1;
+        app.on_key(KeyCode::Enter);
+        let text = render(&mut app);
+        assert!(
+            text.contains("measured for the configured pair only"),
+            "{text}"
+        );
+        app.on_key(KeyCode::Esc);
+        app.cam_sel = 0;
+        // An unreadable enrollment stops labelling: clearing the profile
+        // source clears the roles with it.
+        app.clear_source(Source::Profiles);
+        let text = render(&mut app);
+        assert!(!text.contains("Primary camera"), "{text}");
+        assert!(!text.contains("Secondary camera"), "{text}");
         // A long or hostile name never pushes the role column off the row,
         // and control characters never reach the terminal.
+        app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
+            rgb: Some("3277:0059".into()),
+            ir: Some("3277:0059".into()),
+        });
         app.pairs[0].identity = Some("3277:0059".into());
         app.pairs[0].name =
             Some("\x1b[31mA very long camera product string that keeps going".into());
@@ -18132,7 +18215,7 @@ mod tests {
         health.ir_dev = Some("/synthetic/ir".into());
         let text = draw_text(&app);
         assert!(text.contains("/synthetic/rgb + /synthetic/ir"), "{text}");
-        assert!(text.contains("in use"), "{text}");
+        assert!(text.contains("configured"), "{text}");
         assert!(
             !text.contains("no camera hardware"),
             "local path visibility is not hardware absence"

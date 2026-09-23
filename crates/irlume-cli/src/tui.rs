@@ -5248,6 +5248,9 @@ impl App {
             }
             (SC_IDENTIFY, KeyCode::Char('r')) => {
                 self.log('·', "refreshing daemon status…");
+                // As for Faces: a poll already in flight cannot stand as
+                // this refresh; invalidating queues a replacement.
+                self.freshness.cycle_mut(Worker::Live).invalidate();
                 self.refresh_live();
             }
             // Welcome: start the uninstall challenge (capital U, so a stray
@@ -15788,6 +15791,35 @@ mod tests {
         assert!(
             !app.freshness
                 .observation(Source::Profiles)
+                .last_request_failed(),
+            "the stale reply must not be published as this refresh's result"
+        );
+    }
+
+    /// r on Test Recognition while the periodic live poll is in flight
+    /// queues a replacement rather than accepting the older reply.
+    #[test]
+    fn identify_refresh_during_a_running_poll_queues_a_replacement() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_IDENTIFY;
+        app.refresh_live();
+        assert!(app.live_load.is_some(), "premise: a poll is in flight");
+        app.on_key(KeyCode::Char('r'));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while app.live_load.is_some() && std::time::Instant::now() < deadline {
+            app.poll();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(app.live_load.is_none(), "the poll must finish");
+        drain_loads(&mut app);
+        assert!(
+            app.freshness.cycle(Worker::Live).pending(),
+            "the pre-keypress reply is discarded and a replacement is queued"
+        );
+        assert!(
+            !app.freshness
+                .observation(Source::Live)
                 .last_request_failed(),
             "the stale reply must not be published as this refresh's result"
         );

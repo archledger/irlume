@@ -2,10 +2,12 @@
 
 ## Status
 
-Proposed 2026-09-23. Implements the automatic-selection policy that ADR-0024
-§5 reserved and changes its default; amends nothing in ADR-0024's authorization
-model, in ADR-0028's IR-only resolution, or in ADR-0007's rule that identity
-is the USB descriptor, never a name. Motivated by the "System → Cameras" page
+Proposed 2026-09-23, revised the same day after two design reviews.
+Implements the automatic-selection policy that ADR-0024 §5 reserved and
+changes its default; supersedes ADR-0028 §1's "explicitly configured pair"
+rule for automatic mode only (item 5); amends nothing in ADR-0024's
+authorization model or in ADR-0007's rule that identity is the USB
+descriptor, never a name. Motivated by the "System → Cameras" page
 as it stands on 2026-09-22 and by the reference desk (a Logitech BRIO as the
 enrolled primary, a NexiGo N930W as an added camera, a built-in pair nobody
 enrolled).
@@ -51,80 +53,123 @@ a name may be shown, never matched on.
 
 ## Decision
 
-1. **Selection is per request, from the requesting account's enrollment.**
-   When an authentication request for `user` arrives and the selection mode is
-   `automatic`, the pair to open is chosen after the enrollment load (the key
-   is then held once, ADR-0025) and before capture, in this order over the
-   pairs currently connected:
-   1. the pair matching the primary binding (`GroupPair::matches`, the dual
-      path's rule; the primary keeps precedence exactly as in ADR-0024 §5);
-   2. the account's active secondary groups in store order, by strict
-      both-side equality of identities (ADR-0028 §1's rule; a one-sided group
-      never wildcards);
-   3. none connected → the request refuses to the password with the existing
-      binding-mismatch vocabulary, and the camera-free status names the cause
-      (`no enrolled camera is connected`). An unenrolled pair is never opened
-      for authentication: it cannot grant and opening it only produces a
-      confusing refusal.
-   The chosen pair is pinned for the attempt through the camera-operation
-   lease and the decision, as ADR-0024 §5 requires; hotplug during an attempt
-   changes nothing. The engine's standing pair (what diagnostics, prefetch and
-   the passive inventory report) follows the last selection.
+1. **Selection is per request, from the requesting account's enrollment,
+   before any device is opened.** The order of an authentication request
+   in `automatic` mode is: enumerate the connected candidates **camera-
+   free** (identities and nodes from sysfs, as `present_device_identities`
+   does today — no node is opened); load the enrollment (the key is then
+   held once, ADR-0025); select; only then take the camera lease and open
+   the selected pair. This reorders the dual path's current
+   lease-then-join sequence; a test asserts no open before selection.
+   Candidates are ranked among the account's enrolled pairs only:
+   1. the primary binding when **both** its sides are bound and both match
+      a connected pair (`vid:pid[:serial]` on each side). A legacy binding
+      with one side unbound is not a complete pair (ADR-0024 §2): automatic
+      mode refuses it with a status that names the cause ("primary camera
+      binding incomplete; pin the camera or re-enroll"); pinned mode keeps
+      today's behaviour for such records;
+   2. otherwise the account's active secondary groups whose pair matches a
+      connected pair by strict both-side equality (ADR-0028 §1), in the
+      canonical order of ADR-0024 §5 — sorted by the pair identity
+      (`rgb`, then `ir`), never by store position, so removing and re-adding
+      a group cannot change which of two connected cameras is chosen;
+   3. two or more groups with the same exact pair are **ambiguous**: they
+      are skipped and the status reports the ambiguity, exactly as the
+      IR-only resolver refuses them (ADR-0028); store order never decides;
+   4. **eligibility for the requested mode** is part of selection, not a
+      fallback: a candidate is eligible when its camera-scoped view can
+      serve the mode — for IR-only, when it holds compatible IR templates
+      for the live recognizer (the camera-free readiness check ADR-0028
+      already runs). The primary keeps precedence among eligible
+      candidates; an ineligible primary beside an eligible group selects
+      the group. This is the pre-capture choice ADR-0024 §5 describes,
+      distinct from the forbidden movement after a biometric or PAD
+      refusal;
+   5. nothing eligible connected → the request refuses to the password with
+      the existing vocabulary and the camera-free status names the cause
+      (`no enrolled camera is connected`, `primary camera binding
+      incomplete`, `ambiguous secondary groups`). An unenrolled pair is
+      never opened for authentication.
+   The chosen pair is pinned for the attempt through the lease and the
+   decision (ADR-0024 §5); hotplug during an attempt changes nothing. The
+   engine's standing pair follows the last selection. **Background capture
+   requalification** (which opens cameras and fires the emitter) runs only
+   for a pair that has been selected for an account or is the pinned pair;
+   in automatic mode before any selection nothing is probed.
 
-2. **`pinned` keeps today's behaviour.** `camera_selection = pinned` means the
-   pair in `cameras.conf` is the only pair authentication opens; if it is not
-   connected the request refuses to the password and the status says so. The
-   TUI calls this "Always use: <camera>". Enrollment and `--add-camera`
-   capture keep using the explicitly chosen pair in either mode — a
-   credential operation never has its camera chosen for it.
+2. **`pinned` keeps today's behaviour.** `camera_selection = pinned` means
+   the pair in `cameras.conf` is the only pair authentication opens; if it
+   is not connected the request refuses to the password and the status
+   says so. The TUI calls this "Always use: <camera>". The
+   `IRLUME_RGB_DEVICE` + `IRLUME_IR_DEVICE` environment pair remains an
+   overriding pin in **both** modes, as today; the status reports the
+   source (`environment`, `pinned`, `automatic`).
 
-3. **Default.** Fresh installs (no `cameras.conf`) run `automatic`. An existing
-   `cameras.conf` without a `mode` line is read as `pinned`, so no upgraded
-   host changes camera on its own; switching to automatic is an owner action
-   in the TUI or `irlume set-cameras --automatic`. This replaces ADR-0024 §5's
+3. **Enrollment and the first pair.** A credential operation (`enroll`,
+   `--add-camera`) never has its camera chosen by the account's
+   authorization — there is none yet, or the point is to add a new one. It
+   captures on an explicitly chosen pair: the TUI's picker (Cameras page,
+   `u` or "add this camera") or the CLI's pair arguments. A bare `enroll`
+   on a host with no pinned pair uses the documented **enrollment
+   candidate** rule — the existing discovery ranking (allowlist, built-in
+   first) — and prints which camera it is about to use before capturing,
+   so first enrollment on a fresh install works without a settings step;
+   the enrolled pair becomes the primary binding. A test covers the fresh
+   install path.
+
+4. **Default and upgrade.** A fresh install (no `cameras.conf`, or one
+   without a complete non-blank `rgb`/`ir` pair — the file may hold only
+   legacy `capture_mode.*` keys, docs/SETUP.md) runs `automatic`. A
+   `cameras.conf` holding a complete saved pair and no `mode` line is read
+   as `pinned`, so no upgraded host with a chosen pair changes camera on
+   its own; switching is an owner action. This replaces ADR-0024 §5's
    "explicitly enabled" wording for new installs only.
 
-4. **Configuration.** `cameras.conf` gains `mode=automatic|pinned` (absent =
-   pinned, item 3) and keeps `rgb`, `ir`, `rgb_id`, `ir_id` as the pinned pair
-   (present in automatic mode too, as the last explicit choice and the
-   enrollment-time pair). The writer adds one comment line per side with the
-   product name (`# rgb: Logitech BRIO`) for the person reading the file;
-   comments carry no authority and the reader ignores them. The setting is
-   root-written through the daemon like the pin today (`SetCameras` /
-   `SetCamerasIfCurrent` gain the mode; the TUI's confirm-before-write and
-   connection-change invalidation apply unchanged). `forbid_external_cameras`
-   filters the candidate set in both modes.
+5. **IR-only.** This ADR supersedes ADR-0028 §1's "explicitly configured
+   pair" rule for automatic mode: the IR-only target is the pair item 1
+   selects, resolved from the account's binding or group identity to the
+   connected nodes through sysfs, still without opening a device. The
+   preflight (`FaceSensorStatus`) and the authentication path use the same
+   resolution, so the preflight names the same camera the attempt would
+   open. Pinned mode and the environment pair keep ADR-0028 §1 as written.
 
-5. **Names and roles on the wire, display only.** `CameraPairInfo` gains
-   optional `name` (sysfs node name, then USB `product`, then absent),
-   `serial_present`, and `role` for the requesting account: `primary`,
-   `secondary { index }` (the group's 1-based store position, as ADR-0028
-   reports it — never the group id) or `unenrolled`. `ListCameras` stays
-   camera-class (it opens nodes to classify, #187); the role lookup is
-   camera-free and reuses the ADR-0028 readiness resolution. A new
-   camera-free `CameraSelectionStatus { user }` reports the mode, the pair
-   automatic would choose now (or why none), and the pinned pair's
-   connection state; the TUI's `●` marker and the KCM read this, never guess
-   from the list. All new fields are `serde(default)`; older clients ignore
-   them and older daemons omit them.
+6. **Configuration and the wire.** `cameras.conf` gains
+   `mode=automatic|pinned` (absent = item 4) and keeps `rgb`, `ir`,
+   `rgb_id`, `ir_id` as the pinned pair. The writer adds one comment line
+   per side with the product name for the person reading the file, with
+   control characters, CR and LF removed and the text bounded, so a
+   device-supplied name can never become a key line; comments carry no
+   authority. The mode is changed through a **new** request,
+   `SetCameraSelection { mode }`, which an older daemon does not know and
+   therefore answers with an error rather than a silent success; the
+   client confirms the resulting mode through `CameraSelectionStatus`
+   before reporting success. `forbid_external_cameras` filters candidates
+   in both modes.
 
-6. **The Cameras page.** Lists cameras by name with the role, built-in/external,
-   and a one-line status (ready · privacy shutter · not connected · last use);
-   the selection mode sits above the list ("Let irlume choose" / "Always use:
-   <camera>"); Enter opens a details panel with the identity (with an explicit
-   note when there is no serial, since same-model units are then
-   indistinguishable, ADR-0024 §6), the nodes, connection, enrollment facts,
-   qualification state, last use and the ADR-0023 profile; the IR-emitter,
-   tune and list-units actions act on the highlighted camera. `add as camera`
-   and `remove` move here from the Faces page (the Faces page keeps showing
-   groups; the actions are the same commands). The `capture history` line
-   distinguishes "not fetched yet" from a daemon that does not answer.
+7. **Names, identities and roles on the wire, display only.**
+   `CameraPairInfo` gains optional `name` (sysfs node name, then USB
+   `product`, control characters removed), `identity` (the full binding
+   identity `vid:pid[:serial]`, so the client can tell two serial-bearing
+   units apart; `id` keeps its `vid:pid` meaning) and `serial_present`,
+   plus the USB port chain (ADR-0030 §5). The **role** is not a daemon
+   field: it is derived by the client from the account-scoped enrollment
+   reply — `ListProfiles { user }` gains the primary binding
+   (`primary_camera`) beside the groups it already carries — so a
+   `sudo irlume tui` session labels cameras for the target account, not
+   for the root peer. A camera-free `CameraSelectionStatus { user }`
+   reports the mode and its source, the pair automatic would choose now
+   (or the cause), and the pinned pair's connection state. New fields are
+   `serde(default)`.
 
-7. **Not changed.** Identity is `vid:pid[:serial]` from the descriptor; a
-   name is never compared. No automatic movement to another pair after a
-   refusal, no pooling, no auto-rebind of an inactive store (ADR-0024 §5, §6;
-   ADR-0028 §3). Selection never opens a device that is not going to be used
-   for the attempt.
+8. **The Cameras page.** As ADR-0030 §2 and phase A: names, roles,
+   status, selection mode above the list, details on Enter (or in the
+   wide-terminal column), per-camera actions.
+
+9. **Not changed.** Identity is `vid:pid[:serial]` from the descriptor; a
+   name is never compared. No movement to another pair after a refusal,
+   no pooling, no auto-rebind of an inactive store (ADR-0024 §5, §6;
+   ADR-0028 §3). Selection never opens a device that is not going to be
+   used for the attempt.
 
 ## Consequences
 
@@ -146,33 +191,50 @@ a name may be shown, never matched on.
 
 ## Phasing
 
-- A (display, additive): `name`, `serial_present`, `role` on `CameraPairInfo`;
-  `CameraSelectionStatus` reporting the pinned pair's state; the Cameras page
-  redesign with the details panel; the "not fetched yet" wording; docs.
-  No behaviour change to selection.
-- B (automatic mode): `mode` in `cameras.conf` and the requests; per-request
-  selection in the engine with the order of item 1; `CameraSelectionStatus`
-  reporting the would-be choice; the mode control in the TUI; `set-cameras
-  --automatic`; the default of item 3.
+- A (display, additive): `name`, `identity`, `serial_present` on
+  `CameraPairInfo`; `primary_camera` on the enrollment reply; the Cameras
+  page redesign with the details panel; the "not fetched yet" wording;
+  docs. No behaviour change to selection.
+- B (automatic mode): `mode` in `cameras.conf`; camera-free candidate
+  discovery and the reordered request (select, then lease and open);
+  selection with the order, canonical sort, ambiguity and eligibility of
+  item 1; the IR-only target resolution of item 5; the enrollment candidate
+  rule of item 3; background requalification gated on a selected pair;
+  `SetCameraSelection` and `CameraSelectionStatus`; the mode control in the
+  TUI; `set-cameras --automatic`; the defaults of item 4.
 - C: add/remove actions on the Cameras page; KCM parity with the same wire
   fields.
 
 ## Acceptance tests
 
-- Selection order (pure): primary connected → primary; primary absent, one
-  active group connected → that group; two groups connected → store order;
-  group in an inactive store → skipped; nothing enrolled connected → refusal
-  naming the cause; an unenrolled pair present alone → never chosen.
+- Selection order (pure): complete primary connected and eligible →
+  primary; one-sided legacy binding → refusal naming it; primary absent or
+  ineligible for the mode, one eligible group connected → that group; two
+  eligible groups connected → the lower pair identity, unchanged after the
+  store is rewritten in another order; two groups with the same pair →
+  ambiguous, skipped and reported; group in an inactive store → skipped;
+  nothing eligible connected → refusal naming the cause; an unenrolled
+  pair present alone → never chosen.
+- Ordering: with automatic mode the camera lease and the open happen after
+  selection; a test with a spy backend asserts no node is opened before the
+  selection ran, and none at all when nothing is selected.
+- Enrollment candidate: a fresh install with no `cameras.conf` enrolls on
+  the ranked candidate and prints it; the enrolled pair becomes the
+  primary binding.
 - Pinning: a pair chosen for an attempt stays the attempt's pair when the
   inventory changes mid-attempt; the next request re-selects.
 - `pinned` mode: the pinned pair absent → refusal, the status says "not
-  connected", no other pair is opened.
-- Default: no `cameras.conf` → automatic; a `cameras.conf` without `mode` →
-  pinned; `mode=automatic` survives a `set-cameras` of a new explicit pair
-  only when passed again (an explicit pick without the flag is a pin).
+  connected", no other pair is opened; the environment pair overrides in
+  both modes and the status names `environment` as the source.
+- Default: no `cameras.conf`, or one without a complete `rgb`/`ir` pair →
+  automatic; a `cameras.conf` with a complete pair and no `mode` → pinned;
+  `set-cameras <rgb> <ir>` pins; `SetCameraSelection { automatic }` to an
+  older daemon fails visibly, never as a silent success.
+- The comment lines: a product string with CR, LF or control characters
+  never produces a key line the reader would consume.
 - Wire: a frozen copy of today's `CameraPairInfo` decodes a new daemon's
-  listing; `role` and `name` absent from an old daemon leave the TUI showing
-  the identity row it shows today.
+  listing; `name`, `identity` and `primary_camera` absent from an old daemon
+  leave the TUI showing the node row and no role.
 - Names: a node whose sysfs name is empty falls back to the USB product,
   then to the identity; the name is never used by any matching path (a test
   changes the name and asserts selection and the boundary are unaffected).

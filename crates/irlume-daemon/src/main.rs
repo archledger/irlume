@@ -1108,7 +1108,7 @@ fn main() {
                                     note_engine_error(&irlume_common::Error::Protocol(
                                         "request handler panicked".into(),
                                     ));
-                                    attempt.file(&resp.response, None);
+                                    attempt.file(&resp.response, scope.capture_ms());
                                 }
                             }
                             link.finish_activity();
@@ -1288,7 +1288,17 @@ fn recorded_face_response(
 ) -> Response {
     match record() {
         Ok(()) => complete(),
-        Err(reason) => refuse(reason),
+        Err(reason) => {
+            // The face was decided and the camera used; only the retry
+            // accounting failed. The refusal reply must not read as a
+            // pre-camera policy refusal in the record (ADR-0030 §5).
+            let refused = refuse(reason);
+            note_decided(match &refused {
+                Response::AuthResult { cause, .. } => *cause,
+                _ => Some(irlume_common::OutcomeCause::RetryThrottled),
+            });
+            refused
+        }
     }
 }
 
@@ -1366,6 +1376,7 @@ impl EarlyRefusal {
 /// The wire shape of a pre-engine refusal: policy-refused, no situation
 /// (no camera ran), and the refusal's own cause.
 fn early_refusal(refusal: EarlyRefusal, reason: impl Into<String>) -> Response {
+    note_pre_camera(refusal.cause());
     Response::AuthResult {
         granted: false,
         score: 0.0,
@@ -3065,7 +3076,6 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
                 user.clone(),
                 attempt_record::Filed {
                     at: attempt_record::unix_now(),
-                    seq: attempt_record::next_seq(),
                     kind: irlume_common::AttemptKind::Authenticate,
                     surface: attempt_surface(&user, service.as_deref(), peer),
                     result: irlume_common::AttemptResult::Failed,
@@ -3093,7 +3103,6 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
                 user.clone(),
                 attempt_record::Filed {
                     at: attempt_record::unix_now(),
-                    seq: attempt_record::next_seq(),
                     kind: irlume_common::AttemptKind::Authenticate,
                     surface: attempt_surface(&user, service.as_deref(), peer),
                     result: irlume_common::AttemptResult::Failed,
@@ -3113,7 +3122,6 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
                     name.clone(),
                     attempt_record::Filed {
                         at: attempt_record::unix_now(),
-                        seq: attempt_record::next_seq(),
                         kind: irlume_common::AttemptKind::Identify,
                         surface: irlume_common::AttemptSurface::Other,
                         result: irlume_common::AttemptResult::Failed,
@@ -5564,6 +5572,11 @@ impl AttemptContext {
         let facts = REPLY_FACTS.with(|cell| cell.get());
         // What the reply says, and whether the site that built it said the
         // attempt never reached a camera.
+        // The site that built the reply says whether it was a decision and
+        // whether it came before any camera; the reply's shape is only the
+        // fallback when no site said (an engine verdict).
+        let decided = facts.map_or(true, |f| f.decided);
+        let pre_camera = facts.map_or(false, |f| f.pre_camera);
         let (result, cause, pre_camera) = match response {
             Response::AuthResult {
                 granted,
@@ -5571,13 +5584,15 @@ impl AttemptContext {
                 cause,
                 ..
             } => (
-                attempt_record::result_of(*granted, true),
+                attempt_record::result_of(*granted, decided),
                 *cause,
-                *refused_by_policy,
+                pre_camera || (*refused_by_policy && facts.is_none()),
             ),
-            Response::Identified { cause, .. } => {
-                (attempt_record::result_of(false, true), *cause, false)
-            }
+            Response::Identified { cause, .. } => (
+                attempt_record::result_of(false, decided),
+                *cause,
+                pre_camera,
+            ),
             // The credential-release grant.
             Response::PasswordUnsealed { .. } => (AttemptResult::Granted, None, false),
             // A credential-release refusal before any capture.
@@ -5586,7 +5601,11 @@ impl AttemptContext {
                 facts.and_then(|f| f.cause).or(Some(OutcomeCause::Policy)),
                 true,
             ),
-            Response::OperationError { cause, .. } => (AttemptResult::Failed, *cause, false),
+            Response::OperationError { cause, .. } => (
+                attempt_record::result_of(false, facts.is_some_and(|f| f.decided)),
+                *cause,
+                pre_camera,
+            ),
             Response::Error(_) => match facts {
                 Some(f) => (
                     attempt_record::result_of(false, f.decided),
@@ -5597,7 +5616,6 @@ impl AttemptContext {
             },
             _ => return,
         };
-        let pre_camera = pre_camera || facts.is_some_and(|f| f.pre_camera);
         // The camera is named on evidence, not on the cause alone: a grant,
         // a capture stage that reported, or a failure of the camera itself.
         // A setup refusal or a budget expiry with no capture evidence
@@ -5622,7 +5640,6 @@ impl AttemptContext {
         let camera = if reached_camera { self.camera } else { None };
         let filed = attempt_record::Filed {
             at: attempt_record::unix_now(),
-            seq: attempt_record::next_seq(),
             kind: self.kind,
             surface: self.surface,
             result,
@@ -6280,14 +6297,19 @@ fn dispatch_scoped_session_inner(
                 // An engine failure is a typed refusal in the reply shape
                 // every identify client decodes (ADR-0030 §5); the prose
                 // stays in `reason` and the record reads the cause from it.
-                Err(e) => Response::Identified {
-                    cause: Some(e.cause()),
-                    user: None,
-                    profile: None,
-                    score: 0.0,
-                    live: false,
-                    reason: e.to_string(),
-                },
+                Err(e) => {
+                    // A failure, not a decision about a face: the record
+                    // files it as such (ADR-0030 §5).
+                    note_engine_error(&e);
+                    Response::Identified {
+                        cause: Some(e.cause()),
+                        user: None,
+                        profile: None,
+                        score: 0.0,
+                        live: false,
+                        reason: e.to_string(),
+                    }
+                }
             }
         }
         Request::SetCamerasIfCurrent { rgb, ir, expected } => set_cameras_if_current(

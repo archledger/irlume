@@ -49,20 +49,27 @@ struct Stored {
     account: String,
     #[serde(default)]
     unit_key_hex: String,
+    /// The next completion sequence for this account: assigned by the one
+    /// writer in the order attempts completed (its queue is FIFO), kept in
+    /// the file so it stays ordered across daemon restarts, and private to
+    /// the account so it says nothing about other accounts' activity.
+    #[serde(default = "first_seq")]
+    next_seq: u64,
     #[serde(flatten)]
     record: AttemptRecord,
+}
+
+fn first_seq() -> u64 {
+    1
 }
 
 /// What a recording site knows about the attempt it is filing.
 #[derive(Debug, Clone)]
 pub(crate) struct Filed {
     /// When the attempt completed (unix seconds), taken by the caller
-    /// before the write is queued so two attempts finishing close
-    /// together keep their order whatever order their writers run in.
+    /// before the write is queued; the writer assigns the order within a
+    /// second from the account's own sequence.
     pub at: u64,
-    /// Completion order within a second: a per-instance counter taken by
-    /// the caller with `at` ([`next_seq`]).
-    pub seq: u64,
     pub kind: AttemptKind,
     pub surface: AttemptSurface,
     pub result: AttemptResult,
@@ -155,13 +162,6 @@ fn session_state_from(
             SessionState::Cold
         },
     )
-}
-
-/// The next completion sequence number: monotonic for this daemon
-/// instance, so attempts filed in the same second keep their order.
-pub(crate) fn next_seq() -> u64 {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) fn unix_now() -> u64 {
@@ -438,9 +438,13 @@ pub(crate) fn record(user: &str, filed: Filed) -> io::Result<()> {
     }
     let key = key_bytes(&stored.unit_key_hex);
     let now = unix_now();
+    // Assigned here, under the lock, in the writer's FIFO order. A fresh
+    // record (the derived Default) starts at one.
+    let seq = stored.next_seq.max(1);
+    stored.next_seq = seq.wrapping_add(1).max(1);
     let entry = AttemptEntry {
         at: filed.at,
-        seq: filed.seq,
+        seq,
         kind: filed.kind,
         surface: filed.surface,
         result: filed.result,
@@ -869,7 +873,6 @@ mod tests {
             &me,
             Filed {
                 at: unix_now(),
-                seq: next_seq(),
                 kind: AttemptKind::Authenticate,
                 surface: AttemptSurface::Lock,
                 result: AttemptResult::Granted,
@@ -906,7 +909,6 @@ mod tests {
             &me,
             Filed {
                 at: unix_now(),
-                seq: next_seq(),
                 kind: AttemptKind::Identify,
                 surface: AttemptSurface::Other,
                 result: AttemptResult::Refused,
@@ -925,6 +927,11 @@ mod tests {
         let again = load(&me).unwrap();
         assert_eq!(again.cameras.len(), 1, "same unit, same bucket");
         assert_eq!(again.cameras[0].attempts.len(), 2);
+        // The sequence lives in the file: ordered across restarts, and
+        // counting only this account's attempts.
+        assert_eq!(again.cameras[0].attempts[0].seq, 2);
+        assert_eq!(again.cameras[0].attempts[1].seq, 1);
+        assert_eq!(store().unwrap().read_any(uid).unwrap().next_seq, 3);
         assert_eq!(again.latest_authenticate.as_ref().unwrap().at, latest.at);
         assert!(again.latest_identify.is_some());
         // A record left by a deleted account under this uid is not this
@@ -939,7 +946,6 @@ mod tests {
             &me,
             Filed {
                 at: unix_now(),
-                seq: next_seq(),
                 kind: AttemptKind::Authenticate,
                 surface: AttemptSurface::Login,
                 result: AttemptResult::Refused,

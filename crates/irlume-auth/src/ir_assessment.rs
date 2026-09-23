@@ -90,14 +90,20 @@ impl IrOnlyScope {
         match self {
             Self::Primary { path, digest } => match std::fs::read(path) {
                 Ok(bytes) if irlume_common::sha256_hex(&bytes) == *digest => None,
-                Ok(_) => Some(Outcome::deny(
+                // Enrollment drift at the grant boundary: the kind stays
+                // OtherDeny for retry accounting; the cause is setup.
+                Ok(_) => Some(Outcome::deny_because(
                     OutcomeKind::OtherDeny,
+                    irlume_common::OutcomeCause::SetupUnavailable,
                     "enrollment changed during authentication; use your password",
                 )),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(Outcome::deny(
-                    OutcomeKind::OtherDeny,
-                    "enrollment removed during authentication; use your password",
-                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Some(Outcome::deny_because(
+                        OutcomeKind::OtherDeny,
+                        irlume_common::OutcomeCause::SetupUnavailable,
+                        "enrollment removed during authentication; use your password",
+                    ))
+                }
                 Err(error) => Some(Outcome::deny(
                     OutcomeKind::SetupUnavailable,
                     format!("enrollment unreadable at the grant boundary: {error}"),
@@ -105,8 +111,9 @@ impl IrOnlyScope {
             },
             Self::Secondary(context) => match context.boundary_check_now_with(keys) {
                 Ok(GrantDecision::Grant) => None,
-                Ok(GrantDecision::Refuse(clause)) => Some(Outcome::deny(
+                Ok(GrantDecision::Refuse(clause)) => Some(Outcome::deny_because(
                     OutcomeKind::OtherDeny,
+                    irlume_common::OutcomeCause::SetupUnavailable,
                     format!("secondary grant refused at the boundary: {clause}"),
                 )),
                 Err(error) => Some(Outcome::deny(

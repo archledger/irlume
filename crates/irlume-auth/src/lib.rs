@@ -6923,8 +6923,11 @@ impl Engine {
             match decision {
                 Ok(irlume_core::multi_camera::commit::GrantDecision::Grant) => {}
                 Ok(irlume_core::multi_camera::commit::GrantDecision::Refuse(clause)) => {
-                    return Ok(Outcome::deny(
+                    // The pinned enrollment drifted under the attempt: the
+                    // kind stays OtherDeny, the cause is setup.
+                    return Ok(Outcome::deny_because(
                         OutcomeKind::OtherDeny,
+                        OutcomeCause::SetupUnavailable,
                         format!("secondary grant refused at the boundary: {clause}"),
                     ));
                 }
@@ -7380,16 +7383,26 @@ impl Engine {
             });
         };
         if a.verdict != Verdict::Live {
+            // The authentication classifier's distinction: an exposure the
+            // format cannot measure is a runtime limitation, not the
+            // subject failing liveness.
+            let cause = match liveness_deny_kind(a.verdict, a.deny_cause) {
+                OutcomeKind::RuntimeUnavailable => OutcomeCause::Other,
+                _ => OutcomeCause::LivenessRefused,
+            };
             return Ok(IdentifyOutcome {
                 user: None,
                 profile: None,
                 score: 0.0,
                 live: false,
                 reason: format!("liveness {:?}: {}", a.verdict, a.reason),
-                cause: Some(OutcomeCause::LivenessRefused),
+                cause: Some(cause),
             });
         }
         let mut best: Option<(f32, String, String)> = None; // (score, user, profile)
+                                                            // Whether any template was compared at all: a refusal with none is
+                                                            // a setup failure, not a recognition one (ADR-0030 §5).
+        let mut compared = false;
         let candidates: Vec<String> = match restrict {
             Some(u) => vec![u.to_string()],
             None => irlume_core::storage::list_users(),
@@ -7402,6 +7415,7 @@ impl Engine {
             if scans.is_empty() {
                 continue;
             }
+            compared = true;
             let thr = self.rgb_grant_threshold(scans.len());
             let (score, who) = scans
                 .iter()
@@ -7423,13 +7437,21 @@ impl Engine {
                 reason: "match".into(),
                 cause: None,
             }),
-            None => Ok(IdentifyOutcome {
+            None if compared => Ok(IdentifyOutcome {
                 user: None,
                 profile: None,
                 score: 0.0,
                 live: true,
                 reason: "live face, but no enrolled match".into(),
                 cause: Some(OutcomeCause::BelowThreshold),
+            }),
+            None => Ok(IdentifyOutcome {
+                user: None,
+                profile: None,
+                score: 0.0,
+                live: true,
+                reason: "live face, but no enrollment this recognizer can compare".into(),
+                cause: Some(OutcomeCause::SetupUnavailable),
             }),
         }
     }

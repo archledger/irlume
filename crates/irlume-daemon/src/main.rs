@@ -5881,7 +5881,16 @@ fn dispatch_scoped_session_inner(
         }
         Request::Identify => {
             if camera_probe_rate_limited(peer.uid) {
-                return Response::Error("rate limited; try again shortly".into());
+                // A pre-camera refusal with its own cause (ADR-0030 §5), in
+                // the reply shape every identify client already decodes.
+                return Response::Identified {
+                    user: None,
+                    profile: None,
+                    score: 0.0,
+                    live: false,
+                    reason: "rate limited; try again shortly".into(),
+                    cause: Some(irlume_common::OutcomeCause::RetryThrottled),
+                };
             }
             // 1:N identify returns an exact similarity score, so an ungated
             // socket peer could hill-climb it to tune a spoof or enumerate who
@@ -13344,6 +13353,19 @@ mod tests {
             }
             other => panic!("no-account peer must get Identified, got {other:?}"),
         }
+        // A second probe inside the rate window is a typed pre-camera
+        // refusal in the same reply shape (ADR-0030 §5).
+        match dispatch(Request::Identify, &peer(NOBODY), &mut e) {
+            Response::Identified {
+                user: None,
+                live: false,
+                cause: Some(irlume_common::OutcomeCause::RetryThrottled),
+                reason,
+                ..
+            } => assert!(reason.contains("rate limited"), "{reason}"),
+            other => panic!("throttled identify must be a typed refusal, got {other:?}"),
+        }
+        clear_camera_probe_rate_state();
         // Root keeps the full 1:N search, which needs the (absent) camera.
         match dispatch(Request::Identify, &peer(0), &mut e) {
             Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),

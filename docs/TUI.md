@@ -61,7 +61,8 @@ meaning (ADR-0030 §1.3): `1`–`9` jump to sections by a fixed table — `1`
 Overview, `2` Faces, `3` Password Wallet, `4` Recovery, `5` Login & Apps, `6`
 Diagnostics, `7` Cameras, `8` Preferences, `9` Fingerprint — whatever the
 sidebar currently shows (a hidden section's digit says why it is hidden), `Tab`/`Shift-Tab` and `←`/`→` step through them, `↑`/`↓`
-and `j`/`k` move the selection, `g`/`G` go to the first and last row, `r`
+and `j`/`k` move the selection, `g`/`G` go to the first and last row on pages
+that show a list, `r`
 refreshes the current page's observations (Diagnostics re-runs its checks,
 Cameras re-lists the pairs, every other page re-polls its sources), `i` runs Test Recognition, `v` shows or
 hides the technical tools, `?` opens the help for the current page, `h`

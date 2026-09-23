@@ -3411,7 +3411,7 @@ impl App {
             Fix::Root(root) => {
                 let (command, suspend) = match root {
                     RootFix::RestartDaemon => (
-                        "sudo systemctl enable --now irlumed",
+                        "sudo sh -c 'systemctl enable irlumed; systemctl restart irlumed' (enables the service and restarts it, so a running but outdated daemon is replaced)",
                         Suspend::RestartDaemon,
                     ),
                     RootFix::RestartFprintd => (
@@ -5160,6 +5160,9 @@ impl App {
     }
 
     /// First (`last == false`) or last row of the current page's list.
+    /// Pages without a selectable list (wallet, recovery, fingerprint,
+    /// Login & Apps, preferences, Test Recognition) are left alone: the
+    /// Faces selection is not theirs to move.
     fn move_sel_to_end(&mut self, last: bool) {
         if self.screen == SC_REPAIR {
             self.page_view.set((usize::MAX, Rect::default(), 0, 0));
@@ -5168,7 +5171,8 @@ impl App {
             SC_REPAIR => self.repair.len(),
             SC_CAMERAS => self.pairs.len(),
             SC_WELCOME => self.hub_rows().len(),
-            _ => self.rows().len(),
+            SC_PROFILES => self.rows().len(),
+            _ => return,
         };
         let cur = match self.screen {
             SC_REPAIR => &mut self.repair_sel,
@@ -5424,7 +5428,9 @@ impl App {
                 self.freshness.cycle_mut(Worker::Cameras).invalidate();
                 self.invalidate_source(Source::Cameras);
                 self.refresh_camera_listing();
-                // The role labels read the enrollment: refresh it too.
+                // The role labels read the enrollment: refresh it too, and
+                // as on Faces, a load already in flight is superseded.
+                self.freshness.cycle_mut(Worker::Profiles).invalidate();
                 self.refresh_profiles();
             }
             (SC_CAMERAS, KeyCode::Char('c')) => {
@@ -7007,10 +7013,16 @@ impl App {
         } else {
             blk
         };
+        // During enrollment the observation caption gives way to the
+        // capture flow, but the daemon's state stays visible (ADR-0030
+        // §1.9): a daemon that stops mid-capture must not vanish from view.
         let blk = if self.enroll.is_none() {
             blk.title(self.page_observation())
         } else {
-            blk
+            blk.title(format!(
+                " daemon {} · enrolling ",
+                self.daemon_state_label()
+            ))
         };
         let inner = blk.inner(area);
         f.render_widget(blk.clone(), area);
@@ -16504,6 +16516,66 @@ mod tests {
             ),
             "focused Enter on the fix chip opens its confirmation"
         );
+        // The dialog names the command that actually runs: enable AND
+        // restart, so a running but outdated daemon is replaced.
+        let (text, _, _) = app.confirm.as_ref().unwrap();
+        assert!(
+            text.contains("systemctl enable irlumed; systemctl restart irlumed"),
+            "{text}"
+        );
+    }
+
+    /// g/G move the selection only on pages that show a list; elsewhere
+    /// the Faces selection is not theirs to change.
+    #[test]
+    fn g_and_shift_g_leave_rowless_pages_alone() {
+        let mut app = test_app();
+        app.profiles = vec![profile("A", &["a"]), profile("B", &["b"])];
+        app.screen = SC_PROFILES;
+        app.sel = 0;
+        app.on_key(KeyCode::Char('G'));
+        let last = app.sel;
+        assert!(last > 0, "Faces: G reaches the last row");
+        app.on_key(KeyCode::Char('g'));
+        assert_eq!(app.sel, 0);
+        app.sel = last;
+        for screen in [
+            SC_KEYRING,
+            SC_RECOVERY,
+            SC_FINGERPRINT,
+            SC_PAM,
+            SC_SETTINGS,
+            SC_IDENTIFY,
+        ] {
+            app.screen = screen;
+            app.on_key(KeyCode::Char('g'));
+            assert_eq!(app.sel, last, "screen {screen}: g must not touch Faces");
+            app.on_key(KeyCode::Char('G'));
+            assert_eq!(app.sel, last, "screen {screen}: G must not touch Faces");
+        }
+    }
+
+    /// The daemon's state stays visible while enrollment runs.
+    #[test]
+    fn enrollment_frame_keeps_the_daemon_state_visible() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.enroll = Some(EnrollUi {
+            rx: mpsc::channel().1,
+            stop: Arc::new(AtomicBool::new(false)),
+            profile: "BEN".into(),
+            last: None,
+            count: None,
+            stalled: None,
+            captured: 1,
+            target: 5,
+            base: 0,
+            ambient_base: 0,
+            session_merge: None,
+        });
+        let text = draw_text(&app);
+        assert!(text.contains("daemon "), "{text}");
+        assert!(text.contains("enrolling"), "{text}");
     }
 
     #[test]

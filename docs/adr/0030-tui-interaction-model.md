@@ -130,11 +130,14 @@ device.
   conditions stay. It
   owns `e` add a person, `a` improve recognition, `c` add a camera, `n`
   rename, `d` delete, `i` test recognition. Test Recognition stops being a
-  page. `i` keeps running the identification diagnostic (`Identify`,
-  1:N, camera-free of any grant); identification attempts are retained in
-  the account's attempt record like authentication attempts, marked as
-  `identify`, so the beginner route's "try it" updates the last-attempt
-  line.
+  page. `i` runs the identification diagnostic through a **user-scoped**
+  request, `IdentifyFor { user }` (1:N against that account's enrollment
+  only; no grant), so what the TUI shows for the selected account is what
+  it tests and the attempt record it updates is that account's; root's
+  account-less `Identify` stays a CLI diagnostic and is not what the page
+  runs. Identification attempts are retained in the account's record
+  marked `identify`, so the beginner route's "try it" updates the
+  last-attempt line.
 - **Login & Apps** lists the surfaces present on this machine with what
   each does, and folds the absent display managers into one grey
   sentence. Actions on one row.
@@ -166,10 +169,11 @@ device.
 ### 4. Maintainer tools
 
 - **Raw facts** behind `F4`: for an ordinary account, exactly the share-
-  safe facts ADR-0008 already permits (vid/pid, USB topology, descriptor
-  and qualification tokens, serial present/absent, nodes, TPM tier and
-  PCR policy) plus the retained `elapsed_ms`/`capture_ms` of the attempt
-  record; the raw serial appears only for root, through the same privileged
+  safe facts ADR-0008 already permits (vid/pid, USB topology as role
+  labels and port chain, descriptor and qualification tokens, serial
+  present/absent, TPM tier and PCR policy) plus the retained
+  `elapsed_ms`/`capture_ms` of the attempt record; the raw serial and the
+  `/dev` node paths appear only for root, through the same privileged
   boundary as the trace. Stage timings beyond those two durations exist
   only while a root trace subscriber is active and are not retained; the
   pane says "record a trace (T) for stage timings" rather than promising
@@ -190,10 +194,14 @@ device.
   made: rename, camera pin, policy toggles. Each such action records the
   value it wrote and its inverse; `z` confirms and sends the inverse with
   an **expected-current-value precondition** carried in the request
-  (`RenameProfile { expected: .. }`, `SetCameraSelection { expected: .. }`,
-  the policy writers likewise), which the daemon checks under its own lock
-  and refuses if the value is no longer the one this session wrote; the
-  refusal names the change. No separate read-then-act.
+  (`RenameProfile { expected: .. }`; for the pin a new
+  `SetCamerasExpecting { expected_pair, expected_mode, .. }` that writes
+  pair and mode in ADR-0029's one atomic publication only when the file
+  still holds the expected ones — `SetCameraSelection` changes the mode
+  alone and `SetCamerasIfCurrent` guards the live device generation, not
+  the file; the policy writers likewise), which the daemon checks under
+  its own lock and refuses if the value is no longer the one this session
+  wrote; the refusal names the change. No separate read-then-act.
 - **Command echo**: every action that runs a CLI command logs the exact
   command to the Activity line (most do; this makes it a rule), and
   `irlume tui --print-commands` prints them to stderr as well.
@@ -218,12 +226,18 @@ device.
   serial) — **optional**, absent for an attempt refused before any camera
   was selected (startup, retry throttling, method or policy checks), as
   is `capture_ms` — the outcome class, the cause, `elapsed_ms` and
-  `capture_ms`. The cause is a **structured field on the engine's
-  `Outcome`** (`OutcomeCause`, set where the outcome is built, next to
-  `OutcomeKind`): `no face`, `liveness refused`, `below threshold`,
-  `privacy shutter`, `camera unavailable`, `not enrolled on this camera`,
-  `setup unavailable`, `cancelled`, `timed out`, `other`; the daemon
-  records it as given and never infers it from reason prose. No score,
+  `capture_ms`. The cause is structured at both places a refusal is
+  decided: on the engine's `Outcome` (`OutcomeCause`, set where the
+  outcome is built, next to `OutcomeKind`) for attempts that reached the
+  engine, and as a daemon-level `EarlyRefusal` enum for the paths that
+  answer before the engine (`method not available`, `policy`,
+  `configuration`, `retry throttled`, `daemon starting`), each recorded
+  as its own cause. The vocabulary: `no face`, `liveness refused`,
+  `below threshold`, `privacy shutter`, `camera unavailable`, `not
+  enrolled on this camera`, `setup unavailable`, `cancelled`, `timed
+  out`, `method not available`, `policy`, `configuration`, `retry
+  throttled`, `daemon starting`, `other`. The daemon records what it
+  decided and never infers a cause from reason prose. No score,
   threshold, embedding or reason prose is stored; the TUI phrases the
   cause, and for a record with no camera says "before a camera was
   chosen".

@@ -14,8 +14,9 @@ All notable changes to irlume are documented here. This project adheres to
   (with a warning when the descriptor has no serial), the nodes, the
   connection, the enrollment facts and the capture-schedule observation;
   `u` makes the selected pair the one the daemon uses. On the wire
-  `ListCameras` rows gain optional `name`, `identity` and `serial_present`,
-  and the enrollment reply gains the primary binding as `primary_camera`;
+  `ListCameras` rows gain optional `name` and `serial_present` for every
+  peer and the full `identity` (with the serial) for a root peer only, and
+  the enrollment reply gains the primary binding as `primary_camera`;
   older clients and daemons ignore or omit them. The capture-history line
   says "not fetched yet" until its first poll instead of blaming the daemon.
 

@@ -956,9 +956,11 @@ pub struct CameraPairInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// The full binding identity of the pair (`vid:pid[:serial]`), the
-    /// value enrollments and camera groups are bound to, so a client can
-    /// tell which enrolled role a listed pair holds. Absent on older
-    /// daemons and for nodes without USB descriptors.
+    /// value enrollments and camera groups are bound to. Sent to a root
+    /// peer only (the serial is device-identifying; ADR-0008 keeps the
+    /// ordinary surface at present/absent); absent for other peers, on
+    /// older daemons and for nodes without USB descriptors — a client then
+    /// matches roles on `id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
     /// The descriptor carries a serial: without one, two units of the same

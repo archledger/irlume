@@ -6295,7 +6295,10 @@ fn dispatch_scoped_session_inner(
                     id: p.id,
                     fixed: p.fixed,
                     name: p.name,
-                    identity: p.identity,
+                    // The serial-bearing identity is root-only on this
+                    // any-peer request (ADR-0030 §4 amending ADR-0029 A);
+                    // other peers get vid:pid and serial_present.
+                    identity: if peer.uid == 0 { p.identity } else { None },
                     serial_present: p.serial_present,
                 })
                 .collect(),

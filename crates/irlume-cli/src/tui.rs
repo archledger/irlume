@@ -1430,6 +1430,7 @@ impl App {
             && (bound_primary || (self.profiles_loaded && self.profiles.is_empty()));
         camera_role_for(
             pair.identity.as_deref(),
+            pair.id.as_deref(),
             self.primary_camera.as_ref(),
             &self.camera_groups,
             known,
@@ -9506,23 +9507,45 @@ fn binding_names(rgb: Option<&str>, ir: Option<&str>, identity: &str) -> bool {
     bound > 0 && sides.iter().flatten().all(|side| *side == identity)
 }
 
+/// `vid:pid` of a binding identity (`vid:pid[:serial]`), for matching a
+/// listing that withholds the serial.
+fn without_serial(identity: &str) -> &str {
+    match identity.match_indices(':').nth(1) {
+        Some((at, _)) => &identity[..at],
+        None => identity,
+    }
+}
+
 fn camera_role_for(
     identity: Option<&str>,
+    id: Option<&str>,
     primary: Option<&irlume_common::PrimaryCameraBinding>,
     groups: &[irlume_common::CameraGroupSummary],
     enrollment_known: bool,
 ) -> CameraRole {
-    let Some(identity) = identity else {
-        return CameraRole::Unknown;
+    // A root peer sees the full identity; other peers match on vid:pid,
+    // which cannot tell two serial-bearing units of one model apart — both
+    // then carry the same label, which is honest at that resolution.
+    let (identity, exact): (&str, bool) = match (identity, id) {
+        (Some(identity), _) => (identity, true),
+        (None, Some(id)) => (id, false),
+        (None, None) => return CameraRole::Unknown,
+    };
+    let names = |rgb: Option<&str>, ir: Option<&str>| {
+        if exact {
+            binding_names(rgb, ir, identity)
+        } else {
+            binding_names(rgb.map(without_serial), ir.map(without_serial), identity)
+        }
     };
     if let Some(primary) = primary {
-        if binding_names(primary.rgb.as_deref(), primary.ir.as_deref(), identity) {
+        if names(primary.rgb.as_deref(), primary.ir.as_deref()) {
             return CameraRole::Primary;
         }
     }
     if let Some(index) = groups
         .iter()
-        .position(|group| binding_names(group.rgb.as_deref(), group.ir.as_deref(), identity))
+        .position(|group| names(group.rgb.as_deref(), group.ir.as_deref()))
     {
         return CameraRole::Secondary(index + 1);
     }
@@ -13605,20 +13628,26 @@ mod tests {
             group("one-sided", None, Some("1bcf:28c4")),
         ];
         assert_eq!(
-            camera_role_for(Some("046d:085e:e179cb54"), Some(&primary), &groups, true),
+            camera_role_for(
+                Some("046d:085e:e179cb54"),
+                None,
+                Some(&primary),
+                &groups,
+                true
+            ),
             CameraRole::Primary
         );
         assert_eq!(
-            camera_role_for(Some("3443:c803"), Some(&primary), &groups, true),
+            camera_role_for(Some("3443:c803"), None, Some(&primary), &groups, true),
             CameraRole::Secondary(1)
         );
         // A one-sided group names its bound side only.
         assert_eq!(
-            camera_role_for(Some("1bcf:28c4"), Some(&primary), &groups, true),
+            camera_role_for(Some("1bcf:28c4"), None, Some(&primary), &groups, true),
             CameraRole::Secondary(2)
         );
         assert_eq!(
-            camera_role_for(Some("3277:0059"), Some(&primary), &groups, true),
+            camera_role_for(Some("3277:0059"), None, Some(&primary), &groups, true),
             CameraRole::Unenrolled
         );
         // The primary keeps precedence over a group with the same pair.
@@ -13628,17 +13657,27 @@ mod tests {
             Some("046d:085e:e179cb54"),
         )];
         assert_eq!(
-            camera_role_for(Some("046d:085e:e179cb54"), Some(&primary), &dup, true),
+            camera_role_for(Some("046d:085e:e179cb54"), None, Some(&primary), &dup, true),
             CameraRole::Primary
         );
         // No identity, or an enrollment the daemon did not describe: no claim.
         assert_eq!(
-            camera_role_for(None, Some(&primary), &groups, true),
+            camera_role_for(None, None, Some(&primary), &groups, true),
             CameraRole::Unknown
         );
         assert_eq!(
-            camera_role_for(Some("3277:0059"), None, &[], false),
+            camera_role_for(Some("3277:0059"), None, None, &[], false),
             CameraRole::Unknown
+        );
+        // Without the serial (a non-root peer), vid:pid matches the
+        // serial-bearing binding by its vid:pid.
+        assert_eq!(
+            camera_role_for(None, Some("046d:085e"), Some(&primary), &groups, true),
+            CameraRole::Primary
+        );
+        assert_eq!(
+            camera_role_for(None, Some("3443:c803"), Some(&primary), &groups, true),
+            CameraRole::Secondary(1)
         );
     }
 

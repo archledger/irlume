@@ -69,7 +69,7 @@ fn capture_cancellation_discards_a_late_delivered_frame() {
 fn capture_cancellation_is_not_a_hardware_fault_or_driver_interrupt() {
     let control = CaptureControl::new(no_progress(), Arc::new(|| true));
     assert!(matches!(map_io("synthetic", control.check_io().unwrap_err()), Error::Preempted(_)));
-    assert!(matches!(map_io("synthetic", std::io::Error::from_raw_os_error(libc::EINTR)), Error::Hardware(_)));
+    assert!(matches!(map_io("synthetic", std::io::Error::from_raw_os_error(libc::EINTR)), Error::CameraUnavailable(_)));
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn capture_deadline_precedes_dequeue_and_is_not_a_hardware_fault() {
     assert!(result.is_err(), "expired capture must not dequeue");
     assert!(matches!(map_io("synthetic", result.unwrap_err()), Error::DeadlineExpired));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert!(matches!(map_io("synthetic", std::io::ErrorKind::TimedOut.into()), Error::Hardware(_)), "a real driver timeout must retain hardware handling");
+    assert!(matches!(map_io("synthetic", std::io::ErrorKind::TimedOut.into()), Error::CameraUnavailable(_)), "a real driver timeout must retain hardware handling");
 }
 
 #[test]

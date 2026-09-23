@@ -5936,7 +5936,17 @@ fn dispatch_scoped_session_inner(
                     live: o.live,
                     reason: o.reason,
                 },
-                Err(e) => Response::Error(e.to_string()),
+                // An engine failure is a typed refusal in the reply shape
+                // every identify client decodes (ADR-0030 §5); the prose
+                // stays in `reason`.
+                Err(e) => Response::Identified {
+                    cause: Some(e.cause()),
+                    user: None,
+                    profile: None,
+                    score: 0.0,
+                    live: false,
+                    reason: e.to_string(),
+                },
             }
         }
         Request::SetCamerasIfCurrent { rgb, ir, expected } => set_cameras_if_current(
@@ -9123,6 +9133,14 @@ mod tests {
         // classified into a code: typing follows the variant, never words.
         assert!(matches!(
             authentication_error(Error::Hardware("camera busy".into()), true),
+            Response::OperationError {
+                code: OperationErrorCode::OperationFailed,
+                cause: Some(irlume_common::OutcomeCause::Other),
+                ..
+            }
+        ));
+        assert!(matches!(
+            authentication_error(Error::CameraUnavailable("gone".into()), true),
             Response::OperationError {
                 code: OperationErrorCode::OperationFailed,
                 cause: Some(irlume_common::OutcomeCause::CameraUnavailable),
@@ -13474,8 +13492,14 @@ mod tests {
         clear_camera_probe_rate_state();
         // Root keeps the full 1:N search, which needs the (absent) camera.
         match dispatch(Request::Identify, &peer(0), &mut e) {
-            Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
-            other => panic!("root identify without a camera must Error, got {other:?}"),
+            Response::Identified {
+                user: None,
+                live: false,
+                cause: Some(irlume_common::OutcomeCause::CameraUnavailable),
+                reason,
+                ..
+            } => assert!(reason.contains("no camera found"), "{reason}"),
+            other => panic!("root identify without a camera is a typed failure, got {other:?}"),
         }
     }
 

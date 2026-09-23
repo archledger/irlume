@@ -963,6 +963,19 @@ pub enum OutcomeCause {
     Unknown,
 }
 
+impl OutcomeCause {
+    /// Whether the cause is a verdict about a presented face (no face,
+    /// liveness, no match) rather than a reason the attempt did not run
+    /// or could not be decided.
+    #[must_use]
+    pub fn is_face_verdict(self) -> bool {
+        matches!(
+            self,
+            OutcomeCause::NoFace | OutcomeCause::LivenessRefused | OutcomeCause::BelowThreshold
+        )
+    }
+}
+
 /// Why an operation failed, in terms a caller can act on.
 ///
 /// Kept deliberately small. Each value has to mean the same thing for the life
@@ -1872,6 +1885,18 @@ pub enum Error {
     /// they did; the type is what the daemon classifies on.
     #[error("hardware: {0}")]
     PrivacyShutter(String),
+    /// The camera itself could not be opened or used: absent, refused by
+    /// the hardware layer, or a broken stream (ADR-0030 §5). Raised only
+    /// by the camera layer; `Hardware` stays the generic variant that
+    /// inference and other layers also use, so it never points a person
+    /// at a camera that worked. Display keeps the legacy hardware prose.
+    #[error("hardware: {0}")]
+    CameraUnavailable(String),
+    /// The account's enrollment exists but could not be read or decoded
+    /// (ADR-0030 §5): no biometric comparison happened. Wraps the storage
+    /// error's own text so the prose reply is unchanged.
+    #[error("{0}")]
+    Enrollment(String),
 }
 
 impl Error {
@@ -1882,13 +1907,18 @@ impl Error {
     pub fn cause(&self) -> OutcomeCause {
         match self {
             Error::PrivacyShutter(_) => OutcomeCause::PrivacyShutter,
-            Error::Hardware(_) | Error::CameraBusy(_) | Error::DeliveredRate(_) => {
+            Error::CameraUnavailable(_) | Error::CameraBusy(_) | Error::DeliveredRate(_) => {
                 OutcomeCause::CameraUnavailable
             }
+            Error::Enrollment(_) => OutcomeCause::SetupUnavailable,
             Error::Preempted(_) => OutcomeCause::Cancelled,
             Error::DeadlineExpired => OutcomeCause::TimedOut,
             Error::Policy(_) | Error::NotAuthorized(_) => OutcomeCause::Policy,
-            Error::Io(_) | Error::Protocol(_) | Error::Tpm(_) => OutcomeCause::Other,
+            // Generic: a hardware-layer failure that is not the camera's
+            // (inference, for one), or storage and transport faults.
+            Error::Hardware(_) | Error::Io(_) | Error::Protocol(_) | Error::Tpm(_) => {
+                OutcomeCause::Other
+            }
         }
     }
 }
@@ -2737,13 +2767,25 @@ mod tests {
             OutcomeCause::PrivacyShutter
         );
         assert_eq!(
-            Error::Hardware("no camera found".into()).cause(),
+            Error::CameraUnavailable("no camera found".into()).cause(),
             OutcomeCause::CameraUnavailable
+        );
+        // Generic hardware is not the camera's: inference raises it too.
+        assert_eq!(Error::Hardware("onnx".into()).cause(), OutcomeCause::Other);
+        assert_eq!(
+            Error::Enrollment("io: bad store".into()).cause(),
+            OutcomeCause::SetupUnavailable
+        );
+        assert_eq!(
+            Error::Enrollment("io: bad store".into()).to_string(),
+            "io: bad store"
         );
         assert_eq!(
             Error::CameraBusy("b".into()).cause(),
             OutcomeCause::CameraUnavailable
         );
+        assert!(OutcomeCause::NoFace.is_face_verdict());
+        assert!(!OutcomeCause::RetryThrottled.is_face_verdict());
         assert_eq!(
             Error::Preempted("c".into()).cause(),
             OutcomeCause::Cancelled

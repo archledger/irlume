@@ -2950,7 +2950,7 @@ fn map_io(device: &str, e: std::io::Error) -> Error {
     use std::io::ErrorKind;
     match mmap_capture::source_io(&e).raw_os_error() {
         Some(libc::EBUSY) => camera_busy_error(device, camera_holders(device)),
-        _ if e.kind() == ErrorKind::PermissionDenied => Error::Hardware(format!(
+        _ if e.kind() == ErrorKind::PermissionDenied => Error::CameraUnavailable(format!(
             "{device}: permission denied; add your user to the 'video' group (camera) and re-login"
         )),
         // These errnos are search keys, not verdicts (#340 review round).
@@ -2962,19 +2962,19 @@ fn map_io(device: &str, e: std::io::Error) -> Error {
         // as ENOSPC). So the message hands the reader the deciding
         // instrument, the kernel log, instead of naming a culprit the errno
         // alone cannot convict. No behavior branches on either arm.
-        Some(libc::EINVAL) => Error::Hardware(format!(
+        Some(libc::EINVAL) => Error::CameraUnavailable(format!(
             "{device}: {e}. The driver rejected an argument or the device's advertised \
              format/control state; this errno alone does not distinguish a firmware \
              refusal from invalid format metadata. The matching dmesg line names the \
              failing path"
         )),
-        Some(libc::EIO) | Some(libc::ENOSPC) => Error::Hardware(format!(
+        Some(libc::EIO) | Some(libc::ENOSPC) => Error::CameraUnavailable(format!(
             "{device}: {e}. Stream setup or I/O failed; the causes this errno covers \
              include UVC negotiation failure, malformed endpoint information, device \
              reset/resume, and USB bandwidth admission. Check the matching kernel log \
              line before assigning the cause"
         )),
-        _ => Error::Hardware(format!("{device}: {e}")),
+        _ => Error::CameraUnavailable(format!("{device}: {e}")),
     }
 }
 
@@ -3904,7 +3904,9 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
     // Distinguish "no camera at all" from "a node that isn't physical"; the
     // anti-injection message only makes sense when something answered to the path.
     if !std::path::Path::new(device).exists() {
-        return Err(Error::Hardware(format!("{device}: no camera found")));
+        return Err(Error::CameraUnavailable(format!(
+            "{device}: no camera found"
+        )));
     }
     // TEST ESCAPE: a comma-separated allowlist of exact device paths that may
     // bypass the physical-device pin. Exists only for the virtual-camera test
@@ -3922,13 +3924,13 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
     let node = device.strip_prefix("/dev/").unwrap_or(device);
     let link = format!("/sys/class/video4linux/{node}/device");
     let real = std::fs::canonicalize(&link).map_err(|_| {
-        Error::Hardware(format!(
+        Error::CameraUnavailable(format!(
             "{device}: no physical device in sysfs (virtual camera?); refusing to authenticate"
         ))
     })?;
     let p = real.to_string_lossy();
     if !is_physical_camera_path(&p) {
-        return Err(Error::Hardware(format!(
+        return Err(Error::CameraUnavailable(format!(
             "{device}: '{p}' is not a physical-bus camera; refusing (anti-injection)"
         )));
     }
@@ -3937,12 +3939,12 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
         match dev_dir.as_ref().and_then(|d| read_vidpid(d)) {
             Some(g) if allow.contains(&g) => {}
             Some(g) => {
-                return Err(Error::Hardware(format!(
+                return Err(Error::CameraUnavailable(format!(
                     "{device}: camera {g} not in pinned set {allow:?}; refusing"
                 )))
             }
             None => {
-                return Err(Error::Hardware(format!(
+                return Err(Error::CameraUnavailable(format!(
                     "{device}: no USB descriptor to match pin {allow:?}; refusing"
                 )))
             }
@@ -3954,7 +3956,7 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
             .and_then(|d| std::fs::read_to_string(d.join("removable")).ok())
             .map(|s| s.trim().to_string());
         if removable.as_deref() != Some("fixed") {
-            return Err(Error::Hardware(format!(
+            return Err(Error::CameraUnavailable(format!(
                 "{device}: removable='{}' (want fixed); refusing hot-plugged camera",
                 removable.as_deref().unwrap_or("?")
             )));
@@ -4533,8 +4535,10 @@ impl RgbCamera {
             .require_endpoint()
             .map_err(|error| Error::Hardware(error.to_string()))?;
         verify_pinned(device)?;
+        // Observed engaged: the typed privacy cause (ADR-0030 §5), like the
+        // IR path's boundary.
         if privacy_engaged_with_permit(device) {
-            return Err(Error::Hardware(format!(
+            return Err(Error::PrivacyShutter(format!(
                 "{device}: hardware privacy switch is ON"
             )));
         }
@@ -12113,8 +12117,9 @@ mod tests {
             let error = std::io::Error::other(site);
             assert_eq!(error.kind(), std::io::ErrorKind::Other);
             assert_eq!(error.to_string(), expected);
+            // The camera layer's own failure class (ADR-0030 §5), same prose.
             assert!(
-                matches!(map_io("synthetic", error), irlume_common::Error::Hardware(message) if message == format!("synthetic: {expected}"))
+                matches!(map_io("synthetic", error), irlume_common::Error::CameraUnavailable(message) if message == format!("synthetic: {expected}"))
             );
         }
     }
@@ -16219,17 +16224,18 @@ mod tests {
             ),
             Error::CameraBusy(_)
         ));
-        // Similar prose cannot turn an unrelated failure into a retryable busy error.
+        // Similar prose cannot turn an unrelated failure into a retryable busy
+        // error; the camera layer's failures are the camera's (ADR-0030 §5).
         assert!(matches!(
             map_io("/dev/fixture", std::io::Error::other("camera busy")),
-            Error::Hardware(_)
+            Error::CameraUnavailable(_)
         ));
         assert!(matches!(
             map_io(
                 "/dev/fixture",
                 std::io::Error::from_raw_os_error(libc::EACCES)
             ),
-            Error::Hardware(_)
+            Error::CameraUnavailable(_)
         ));
     }
 
@@ -16269,7 +16275,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             map_io("/dev/video2", boundary),
-            Error::Hardware(_)
+            Error::CameraUnavailable(_)
         ));
         // A failed emitter restore keeps the refusal's class.
         let kept = finish_privacy_teardown(

@@ -1309,6 +1309,30 @@ fn finish_loader<T>(loader: &mut Option<std::sync::mpsc::Receiver<EnrollmentLoad
 
 /// How a deferred enrollment load ended when it did not produce an
 /// enrollment the request can use.
+/// A camera lease that could not be taken or kept is the camera being
+/// unavailable to this attempt (ADR-0030 §5): held by another operation,
+/// an endpoint that is not usable, or a stale lifecycle reference. Same
+/// prose as before, the camera's own class.
+fn lease_unavailable(error: irlume_camera::lease::CameraLeaseError) -> irlume_common::Error {
+    irlume_common::Error::CameraUnavailable(error.to_string())
+}
+
+/// An enrollment that exists but cannot be read or decoded is a setup
+/// failure (ADR-0030 §5): no biometric comparison happened. The storage
+/// error's own text is kept, so the prose reply is unchanged; the typed
+/// budget, pre-emption and camera errors pass through untouched.
+fn enrollment_unreadable(error: irlume_common::Error) -> irlume_common::Error {
+    match error {
+        irlume_common::Error::DeadlineExpired
+        | irlume_common::Error::Preempted(_)
+        | irlume_common::Error::CameraBusy(_)
+        | irlume_common::Error::CameraUnavailable(_)
+        | irlume_common::Error::PrivacyShutter(_)
+        | irlume_common::Error::Enrollment(_) => error,
+        other => irlume_common::Error::Enrollment(other.to_string()),
+    }
+}
+
 #[derive(Debug)]
 enum LoaderExit {
     /// The store vanished between the pre-check and the read: the same
@@ -1329,7 +1353,7 @@ fn resolve_loader<T>(
     match recv {
         Ok(Ok(Some(loaded))) => Ok(loaded),
         Ok(Ok(None)) => Err(LoaderExit::NotEnrolled),
-        Ok(Err(e)) => Err(LoaderExit::Fallback(e)),
+        Ok(Err(e)) => Err(LoaderExit::Fallback(enrollment_unreadable(e))),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             Err(LoaderExit::Fallback(irlume_common::Error::Protocol(
                 "enrollment load exceeded the authentication deadline; \
@@ -4267,9 +4291,7 @@ impl Engine {
         operation: &irlume_camera::lease::CameraOperationSession,
         task: impl FnOnce() -> irlume_common::Result<T>,
     ) -> irlume_common::Result<T> {
-        operation
-            .run(task)
-            .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?
+        operation.run(task).map_err(lease_unavailable)?
     }
 
     /// One capture: RGB+IR → liveness verdict + (if a face) its embedding.
@@ -4303,7 +4325,7 @@ impl Engine {
             irlume_camera::lease::CameraOperationKind::Authentication,
             std::time::Duration::from_secs(2),
         )
-        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
+        .map_err(lease_unavailable)?;
         operation
             .run(|| {
                 if self.ir_available {
@@ -4312,7 +4334,7 @@ impl Engine {
                     self.assess_rgb_only()
                 }
             })
-            .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?
+            .map_err(lease_unavailable)?
     }
 
     /// Perform one bounded, production-shaped camera capture for a support
@@ -4788,9 +4810,7 @@ impl Engine {
     ) -> Result<Assessment, CapturePathError> {
         operation
             .run(|| self.assess_full_with(held, capture_mode, operation, diagnostics))
-            .map_err(|error| {
-                CapturePathError::Other(irlume_common::Error::Hardware(error.to_string()))
-            })?
+            .map_err(|error| CapturePathError::Other(lease_unavailable(error)))?
     }
 
     /// [`Self::assess_full`], optionally reusing already-streaming cameras.
@@ -6150,7 +6170,9 @@ impl Engine {
         // paths retain password fallback; a loader panic maps to an error.
         let load_started = std::time::Instant::now();
         let mut loader = PendingEnrollmentLoad {
-            receiver: match irlume_core::storage::store_is_encrypted(user)? {
+            receiver: match irlume_core::storage::store_is_encrypted(user)
+                .map_err(enrollment_unreadable)?
+            {
                 // No file at all: the instant deny, before anything else wakes.
                 None => {
                     return Ok(Outcome::deny(
@@ -6189,7 +6211,7 @@ impl Engine {
             irlume_camera::device_identity(&self.ir_dev),
         );
         let sync_enr = if loader.receiver.is_none() {
-            let loaded = irlume_core::storage::load_with_key(user);
+            let loaded = irlume_core::storage::load_with_key(user).map_err(enrollment_unreadable);
             // Completed work boundary: the plaintext store load itself,
             // before any policy decision on its content. Attempt preparation
             // starts here on this path (the deferred path starts it at its
@@ -6242,7 +6264,7 @@ impl Engine {
             Ok(op) => op,
             Err(error) => {
                 finish_loader(&mut loader.receiver);
-                return Err(irlume_common::Error::Hardware(error.to_string()));
+                return Err(lease_unavailable(error));
             }
         };
 
@@ -7564,7 +7586,7 @@ impl Engine {
             irlume_camera::lease::CameraOperationKind::Enrollment,
             std::time::Duration::from_secs(2),
         )
-        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
+        .map_err(lease_unavailable)?;
         let cams = if use_ir {
             match (operation.open_rgb(&rgb_dev), operation.open_ir(&ir_dev)) {
                 (Ok(r), Ok(i)) => Some((r, i)),
@@ -7923,13 +7945,13 @@ impl Engine {
             |session| {
                 operation
                     .run(|| session.denoised())
-                    .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?
+                    .map_err(lease_unavailable)?
             },
             |session| {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     operation
                         .run(|| session.capture_with_stats())
-                        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?
+                        .map_err(lease_unavailable)?
                 }))
                 .unwrap_or_else(|_| {
                     Err(irlume_common::Error::Hardware(
@@ -9068,7 +9090,7 @@ impl Engine {
             irlume_camera::lease::CameraOperationKind::Enrollment,
             std::time::Duration::from_secs(2),
         )
-        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
+        .map_err(lease_unavailable)?;
         if self.should_stop() || std::time::Instant::now() >= deadline {
             return Err(irlume_common::Error::Preempted(
                 "framing cancelled while waiting for camera ownership".into(),
@@ -15993,10 +16015,14 @@ mod engine_tests {
         tx.send(Err(irlume_common::Error::Io("unreadable".into())))
             .unwrap();
         drop(tx);
-        assert!(matches!(
-            resolve_loader(rx.recv_timeout(std::time::Duration::ZERO)),
-            Err(LoaderExit::Fallback(irlume_common::Error::Io(_)))
-        ));
+        // A load error is an unreadable enrollment (ADR-0030 §5), with
+        // the storage error's own text kept.
+        match resolve_loader(rx.recv_timeout(std::time::Duration::ZERO)) {
+            Err(LoaderExit::Fallback(irlume_common::Error::Enrollment(text))) => {
+                assert!(text.starts_with("io:"), "{text}");
+            }
+            other => panic!("a load error must fail closed as a setup failure: {other:?}"),
+        }
 
         // A load that outlives the authentication deadline fails closed.
         let (tx, rx) = std::sync::mpsc::channel::<EnrollmentLoad>();

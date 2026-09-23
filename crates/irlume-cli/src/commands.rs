@@ -991,13 +991,14 @@ pub fn identify(_args: &[String]) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        // A refusal before any capture is not a verdict about a face.
+        // A refusal or failure that is not a verdict about a face (throttled,
+        // camera unavailable, shutter, cancelled, setup…) says so.
         Ok(Response::Identified {
             user: None,
-            cause: Some(irlume_common::OutcomeCause::RetryThrottled),
+            cause: Some(cause),
             reason,
             ..
-        }) => {
+        }) if !cause.is_face_verdict() => {
             println!("[identify] not run: {reason}");
             ExitCode::from(1)
         }

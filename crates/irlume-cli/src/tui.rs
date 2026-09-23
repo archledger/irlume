@@ -10343,13 +10343,15 @@ fn map_identify(resp: Response) -> (bool, String) {
                 profile.unwrap_or_default()
             ),
         ),
-        // A refusal before any capture (throttled) is not a liveness verdict.
+        // A refusal or failure that is not a verdict about a face (throttled,
+        // camera unavailable, shutter, cancelled, setup…) is not a liveness
+        // verdict.
         Response::Identified {
             user: None,
-            cause: Some(irlume_common::OutcomeCause::RetryThrottled),
+            cause: Some(cause),
             reason,
             ..
-        } => (false, format!("not run: {reason}")),
+        } if !cause.is_face_verdict() => (false, format!("not run: {reason}")),
         Response::Identified {
             user: None,
             live,

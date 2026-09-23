@@ -110,17 +110,19 @@ device.
 ### 2. Pages
 
 - **Overview** leads with the account's last face attempt (§5): the
-  stored `kind` names it — "last sign-in" for an `authenticate` record,
-  "last recognition test" for an `identify` one — then when, which
-  surface (login / lock / sudo / app; none for a test), which camera by
+  stored `kind` and surface name it — for an `authenticate` record, the
+  surface's own word ("last login", "last unlock", "last admin prompt",
+  "last app sign-in", or "last authentication" when the surface is
+  `other`); "last recognition test" for an `identify` one — then when,
+  which camera by
   name, the outcome class and, for a refusal, the cause in plain words
   from the closed vocabulary of §5 (`no face seen — were you in frame?`,
   `camera shutter closed`), and the elapsed time. The record keeps the
   latest of each kind, so a recognition test never displaces the last
   real authentication: the line shows the most recent attempt labelled by
   its kind, and when the latest is a test and an authentication exists
-  the line adds "last sign-in: <outcome>, <when>". When no attempt is
-  retained the line says so. Below it the status rows of §1.6 and the one recommended
+  the line adds "last authentication: <outcome>, <when>". When no attempt
+  is retained the line says so. Below it the status rows of §1.6 and the one recommended
   next step as an action row ("wire the lock screen"), which becomes
   "Test Recognition" once everything is wired.
 - **Faces** groups a profile's scans by the camera they were captured on
@@ -172,12 +174,21 @@ device.
 - The existing first-run front door becomes a three-step route with
   "next" on every step: enroll → wire login + lock → try it, ending on
   Overview with the last-attempt line showing the try. Each step's page
-  shows only that step's action until it is done.
+  shows only that step's action until it is done. The route is chosen
+  from the detected capabilities the sidebar already uses
+  (`compute_visible`): with no usable camera it is the fingerprint route
+  (enroll a finger → wire → try it) when a reader exists, and otherwise
+  the front door says what is missing and offers Login & Apps for the
+  password path; a face step is never offered on a machine that cannot
+  complete it, and a machine with both offers face first with
+  fingerprint as the alternative on the same step.
 - Every "unavailable / unknown / needs root" line ends in the action that
   resolves it (§1.6).
 - Confirmation dialogs say what changes for the person and how to undo it
-  ("Face unlock will use the Logitech BRIO from now on; press u on another
-  camera to change"), keeping the file path as the second sentence.
+  ("Face unlock will use the Logitech BRIO from now on. To change it,
+  choose another camera on the Cameras page."), keeping the file path as
+  the second sentence; the dialog's own choices are its action row
+  (§1.4), and no key is named in the sentence.
 - Plain names: "password wallet" (already), "admin prompts" for
   sudo/polkit on first mention, recognizer and model names only in
   Diagnostics.
@@ -198,11 +209,18 @@ device.
   not the serial or the node paths — an amendment to ADR-0029 A's
   `identity` field, which becomes root-only likewise. The boundary is
   the daemon's, so it covers every any-peer carrier of node paths, not
-  only `ListCameras`: `Health`'s `rgb_dev`/`ir_dev` and `LiveStatus`'s
-  `CameraCandidate.endpoint_paths` are redacted (`None` / empty) for a
-  non-root peer in the same change, and the TUI's Cameras page reads the
-  active pair by handle (`Health` gains `active_handle`) rather than by
-  node string; root keeps the full snapshot. The transition is additive
+  only `ListCameras`: `Health`'s `rgb_dev`/`ir_dev` are redacted to
+  `None` for a non-root peer in the same change, and `LiveStatus`'s
+  `CameraCandidate` keeps its validated shape (its decoder rejects an
+  empty path list, so an empty vector is not a redaction) but carries
+  `endpoint_paths` as **opaque endpoint tokens** for a non-root peer —
+  the same bounded literal form (`/dev/`-prefixed names of the same
+  count, minted from the pair handle, never real node names) — with a
+  `redacted: true` marker (`serde(default)`), so an older client decodes
+  the snapshot unchanged and a newer one knows not to treat the tokens
+  as paths; the TUI's Cameras page reads the active pair by handle
+  (`Health` gains `active_handle`) rather than by node string; root keeps
+  the full snapshot. The transition is additive
   so the mixed-version window of a package upgrade degrades rather than
   breaks: `CameraPairInfo` keeps `rgb`/`ir` as fields that an upgraded
   daemon fills with `""` for a non-root peer (an older TUI still decodes
@@ -224,13 +242,21 @@ device.
     pair whose identity matches that binding, or `None` — so the client
     labels rows by handle and never needs the serial; two same-model units
     with different serials get the right labels because the daemon holds
-    both identities. Until this lands, ADR-0029 A's client-side match on
-    `vid:pid` is the interim and is documented as such. Stage timings beyond those two durations exist
+    both identities. In the same change the enrollment reply stops
+    carrying binding identities to ordinary peers: `primary_camera`'s
+    sides and `CameraGroupSummary.rgb`/`ir` are reduced to `vid:pid` for
+    a non-root peer (the same redaction `ListCameras` applies; the fields
+    stay present so older clients decode), and the full identities travel
+    only to root — so no any-peer reply names a serial. Until this lands,
+    ADR-0029 A's client-side match on `vid:pid` is the interim and is
+    documented as such. Stage timings beyond those two durations exist
   only while a root trace subscriber is active and are not retained; the
-  pane says "record a trace (T) for stage timings" rather than promising
-  them. Text is selectable and `y` copies the pane to the clipboard when a
-  clipboard is reachable (OSC 52 with the terminal's consent; otherwise
-  the pane prints a path).
+  pane says "stage timings are recorded by a trace" and its action row
+  offers *record a trace* (root) rather than promising them. Text is
+  selectable and the pane's action row offers *copy* when a clipboard is
+  reachable (OSC 52 with the terminal's consent; otherwise the pane
+  prints a path). The pane's keys live in its action row and the bottom
+  bar, as §1.4 requires.
 - **Support bundle** from Diagnostics prints the file path it wrote and
   offers `y` to copy it.
 - **Per-camera timing history**: the last five attempts per camera for
@@ -411,7 +437,10 @@ device.
   no score or threshold text can appear (a forbidden-word scan as in the
   attended trial tooling); a record for another account is never shown;
   after an `identify` attempt the line is labelled a recognition test and
-  the last `authenticate` record is still reported beside it.
+  the last `authenticate` record is still reported beside it; a sudo
+  attempt is labelled "last admin prompt", never a login.
+- Route: on a fingerprint-only machine the first-run route offers no
+  face step; on a machine with neither it offers Login & Apps.
 - Faces: scans group by camera role; the count line states the minimum
   and nothing about conditions; scans without `captured_at` read "date
   not recorded".
@@ -421,8 +450,10 @@ device.
   a request whose precondition no longer holds is refused by the daemon
   and the refusal names the change; an entry recorded for one account is
   gone after the switcher selects another.
-- Wire boundary: as a non-root peer, `Health`, `LiveStatus` and
-  `ListCameras` carry no `/dev` path and no serial; `IdentifyFor` for
+- Wire boundary: as a non-root peer, `Health`, `LiveStatus`,
+  `ListCameras` and `ListProfiles` carry no real `/dev` path and no
+  serial, and a redacted `LiveStatus` still decodes with the current
+  `CameraCandidate` validator; `IdentifyFor` for
   another account is refused before any enrollment load; a
   `ListCameras` row without `handle` (older daemon) renders with the
   handle-bearing actions disabled.

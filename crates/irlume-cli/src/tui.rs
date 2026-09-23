@@ -4932,12 +4932,31 @@ impl App {
             }
             KeyCode::Tab | KeyCode::Right => self.step(1),
             KeyCode::BackTab | KeyCode::Left => self.step(-1),
-            // ADR-0030 §1.3: digits jump to the sidebar sections in their
-            // visible order; g/G go to the first/last row of the page's list.
+            // ADR-0030 §1.3: digits jump to sections by a fixed table, so a
+            // digit means the same thing whatever the sidebar shows; a
+            // section this machine hides is named, not silently ignored.
             KeyCode::Char(digit @ '1'..='9') => {
-                let index = digit as usize - '1' as usize;
-                if let Some(&target) = self.visible.get(index) {
+                let target = match digit {
+                    '1' => SC_WELCOME,
+                    '2' => SC_PROFILES,
+                    '3' => SC_KEYRING,
+                    '4' => SC_RECOVERY,
+                    '5' => SC_PAM,
+                    '6' => SC_REPAIR,
+                    '7' => SC_CAMERAS,
+                    '8' => SC_SETTINGS,
+                    _ => SC_FINGERPRINT,
+                };
+                if self.visible.contains(&target) {
                     self.enter_screen(target);
+                } else {
+                    self.log(
+                        '·',
+                        format!(
+                            "{} is not shown on this machine or in this view (v toggles the technical tools)",
+                            SCREENS[target]
+                        ),
+                    );
                 }
             }
             KeyCode::Char('g') => self.move_sel_to_end(false),
@@ -9552,7 +9571,7 @@ impl App {
     /// of the CURRENT screen (tier two of the disclosure ladder).
     fn help_body(&self) -> String {
         let mut b = String::from(
-            "Global\n              F4  current daemon, camera inventory and observation age\n              F3  choose a section (click or arrows + Enter)\n              F6  focus page actions / return to page selection\n          ↑↓ + Enter/Space  choose and activate a focused action\n              F2  search more actions\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193} / j k  select\n            1-9  jump to a section        g / G  first / last row\n               v  show/hide technical tools\n               A  expand/collapse activity history\n               L  full session history and wrapped details\n         PgUp/Dn  read page with F6 focus; otherwise Activity\n               h  Overview              q  quit\n           click  rows and action chips\n        Dialogs  ↑↓ / PgUp/Dn scroll long messages\n               M  release mouse (highlight/copy)\n\nThis screen\n",
+            "Global\n              F4  current daemon, camera inventory and observation age\n              F3  choose a section (click or arrows + Enter)\n              F6  focus page actions / return to page selection\n          ↑↓ + Enter/Space  choose and activate a focused action\n              F2  search more actions\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193} / j k  select\n            1-9  section: 1 Overview 2 Faces 3 Wallet 4 Recovery 5 Login 6 Diagnostics 7 Cameras 8 Preferences 9 Fingerprint\n            g / G  first / last row\n               v  show/hide technical tools\n               A  expand/collapse activity history\n               L  full session history and wrapped details\n         PgUp/Dn  read page with F6 focus; otherwise Activity\n               h  Overview              q  quit\n           click  rows and action chips\n        Dialogs  ↑↓ / PgUp/Dn scroll long messages\n               M  release mouse (highlight/copy)\n\nThis screen\n",
         );
         for (k, d) in self.screen_actions() {
             b.push_str(&format!("  {k:<7} {d}\n"));
@@ -16255,6 +16274,35 @@ mod tests {
                 assert!(allowed, "screen {name} reuses global key {key} for {label}");
             }
         }
+    }
+
+    /// ADR-0030 §1.3: a digit reaches its fixed section whatever the
+    /// sidebar shows; a hidden section's digit explains instead of jumping.
+    #[test]
+    fn digits_reach_fixed_sections_regardless_of_sidebar_order() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.advanced = true;
+        app.visible = vec![
+            SC_WELCOME,
+            SC_PROFILES,
+            SC_KEYRING,
+            SC_RECOVERY,
+            SC_PAM,
+            SC_REPAIR,
+            SC_CAMERAS,
+            SC_SETTINGS,
+        ];
+        app.on_key(KeyCode::Char('7'));
+        assert_eq!(app.screen, SC_CAMERAS);
+        app.on_key(KeyCode::Char('2'));
+        assert_eq!(app.screen, SC_PROFILES);
+        // With Cameras hidden, 7 still means Cameras: it explains and stays.
+        app.visible = vec![SC_WELCOME, SC_PROFILES, SC_KEYRING];
+        app.on_key(KeyCode::Char('7'));
+        assert_eq!(app.screen, SC_PROFILES);
+        let (_, msg) = app.activity.last().expect("hidden section explained");
+        assert!(msg.contains("Cameras"), "{msg}");
     }
 
     /// ADR-0030 §1.1: Enter opens things; it never arms a confirmation,

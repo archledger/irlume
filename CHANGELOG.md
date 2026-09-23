@@ -7,7 +7,8 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
-- TUI interaction rules (ADR-0030, phase C1): `1`–`9` jump to sections,
+- TUI interaction rules (ADR-0030, phase C1): `1`–`9` jump to a fixed
+  section each (`1` Overview … `8` Preferences, `9` Fingerprint),
   `g`/`G` go to the first and last row, and the global letters (`r`
   refresh, `i` Test Recognition) keep one meaning on every page, so
   rename on Faces moved to `n`, reseal on Password Wallet to `b`, IR-only

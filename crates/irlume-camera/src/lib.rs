@@ -6375,7 +6375,7 @@ impl IrSession<'_> {
         // trouble here for the same reason; on the sequential branch the old
         // panic unwound out of the daemon worker.
         if self.stream.stream_mut().is_none() {
-            return Err(Error::Hardware(
+            return Err(Error::CameraUnavailable(
                 "IR stream missing after a failed recovery".into(),
             ));
         }

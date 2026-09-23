@@ -1988,9 +1988,10 @@ fn readiness_refusal(readiness: irlume_common::IrOnlyReadiness) -> Outcome {
     // names the one readiness failure that is about this camera rather
     // than the enrollment (ADR-0030 §5).
     let cause = match readiness {
-        Ready::BindingMismatch | Ready::SecondaryInactive => {
-            irlume_common::OutcomeCause::NotEnrolledOnThisCamera
-        }
+        // Only a binding that names no such camera is "not enrolled on
+        // this camera"; an added camera whose authorization went stale is
+        // enrolled but its setup needs re-authorizing.
+        Ready::BindingMismatch => irlume_common::OutcomeCause::NotEnrolledOnThisCamera,
         Ready::TargetUnavailable => irlume_common::OutcomeCause::CameraUnavailable,
         _ => irlume_common::OutcomeCause::SetupUnavailable,
     };

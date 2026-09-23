@@ -4164,7 +4164,7 @@ pub struct CameraPair {
 }
 
 /// A camera's name for people, read from sysfs without opening a device:
-/// the USB device's `product` string, else the video node's `name`. Display
+/// the video node's `name`, else the USB device's `product` string. Display
 /// only — identification stays with the descriptor ids (ADR-0007), so a
 /// changed or spoofed name changes nothing in selection or matching.
 pub fn camera_display_name(dev_dir: &std::path::Path, node: &str) -> Option<String> {
@@ -4180,12 +4180,14 @@ pub fn camera_display_name(dev_dir: &std::path::Path, node: &str) -> Option<Stri
         let text = text.trim();
         (!text.is_empty()).then(|| text.to_owned())
     };
-    std::fs::read_to_string(dev_dir.join("product"))
+    // ADR-0029: the node's sysfs name first (the driver-given name people
+    // see elsewhere), then the USB product string.
+    let node = node.strip_prefix("/dev/").unwrap_or(node);
+    std::fs::read_to_string(format!("/sys/class/video4linux/{node}/name"))
         .ok()
         .and_then(clean)
         .or_else(|| {
-            let node = node.strip_prefix("/dev/").unwrap_or(node);
-            std::fs::read_to_string(format!("/sys/class/video4linux/{node}/name"))
+            std::fs::read_to_string(dev_dir.join("product"))
                 .ok()
                 .and_then(clean)
         })
@@ -16527,11 +16529,12 @@ mod tests {
         assert_eq!(classify("/dev/null"), Role::Other);
     }
 
-    /// ADR-0029: the display name comes from the USB `product` string,
-    /// then the node's sysfs name, then nothing; it is trimmed and bounded
-    /// and never feeds identification.
+    /// ADR-0029: the display name comes from the node's sysfs name, then
+    /// the USB `product` string, then nothing; it is trimmed and bounded
+    /// and never feeds identification. The fixture has no sysfs node, so
+    /// the product fallback is what these cases exercise.
     #[test]
-    fn camera_display_name_prefers_product_then_node_name_and_bounds_it() {
+    fn camera_display_name_prefers_node_name_then_product_and_bounds_it() {
         let dir = std::env::temp_dir().join(format!("irlume-camname-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

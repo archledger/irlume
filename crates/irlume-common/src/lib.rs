@@ -1215,9 +1215,11 @@ pub struct PreferencesState {
     pub enforce_biopolicy: Option<bool>,
     pub consent_overridden: bool,
     pub biopolicy_overridden: bool,
-    /// The external-camera prohibition as the daemon observes it
-    /// (ADR-0029 A): `Some(true)` means only built-in cameras may
-    /// authenticate; `None` when unreadable or from an older daemon.
+    /// The effective external-camera prohibition as the daemon observes
+    /// it (ADR-0029 A): the `forbid_external_cameras` setting or the
+    /// legacy `IRLUME_CAMERA_REQUIRE_FIXED=1` gate. `Some(true)` means
+    /// only built-in cameras may authenticate; `None` when unreadable or
+    /// from an older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forbid_external_cameras: Option<bool>,
 }
@@ -1232,7 +1234,12 @@ impl PreferencesState {
             enforce_biopolicy: config::enforce_biopolicy_visible(),
             consent_overridden: std::env::var_os("IRLUME_PRIVILEGED_FACE_CONSENT").is_some(),
             biopolicy_overridden: std::env::var_os("IRLUME_ENFORCE_BIOPOLICY").is_some(),
-            forbid_external_cameras: config::forbid_external_cameras_visible(),
+            // The effective restriction: the setting, or the legacy
+            // IRLUME_CAMERA_REQUIRE_FIXED=1 gate the camera crate still
+            // honours before authentication.
+            forbid_external_cameras: config::forbid_external_cameras_visible().map(|forbid| {
+                forbid || std::env::var("IRLUME_CAMERA_REQUIRE_FIXED").is_ok_and(|v| v == "1")
+            }),
         }
     }
 }
@@ -1783,6 +1790,48 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+    /// The observed prohibition is the effective one: the legacy
+    /// `IRLUME_CAMERA_REQUIRE_FIXED=1` gate counts, so a client never
+    /// presents an external pair as ready when the daemon would refuse it.
+    #[test]
+    fn observed_external_camera_prohibition_includes_the_legacy_fixed_gate() {
+        let _g = super::testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-prefs-fixed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_FORBID_EXTERNAL_CAMERAS");
+        std::env::remove_var("IRLUME_CAMERA_REQUIRE_FIXED");
+
+        assert_eq!(
+            super::PreferencesState::observe().forbid_external_cameras,
+            Some(false)
+        );
+        // Only the exact legacy value engages the gate, as the camera crate
+        // reads it.
+        std::env::set_var("IRLUME_CAMERA_REQUIRE_FIXED", "yes");
+        assert_eq!(
+            super::PreferencesState::observe().forbid_external_cameras,
+            Some(false)
+        );
+        std::env::set_var("IRLUME_CAMERA_REQUIRE_FIXED", "1");
+        assert_eq!(
+            super::PreferencesState::observe().forbid_external_cameras,
+            Some(true)
+        );
+        // The setting turned off does not lift the legacy gate.
+        std::env::set_var("IRLUME_FORBID_EXTERNAL_CAMERAS", "0");
+        assert_eq!(
+            super::PreferencesState::observe().forbid_external_cameras,
+            Some(true)
+        );
+
+        std::env::remove_var("IRLUME_CAMERA_REQUIRE_FIXED");
+        std::env::remove_var("IRLUME_FORBID_EXTERNAL_CAMERAS");
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn enrollment_response_carries_camera_group_rows_optionally() {
         use super::{CameraGroupProfileSummary, CameraGroupSummary, ProfileSummary, Response};

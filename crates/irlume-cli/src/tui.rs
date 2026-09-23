@@ -546,13 +546,24 @@ impl CameraListing {
     }
 }
 
-fn gather_capture_qualification() -> Option<String> {
+/// A capture-schedule observation, bound to the pair it was measured on
+/// so a later configuration change cannot present it as another pair's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaptureObservation {
+    rgb: String,
+    ir: String,
+    text: String,
+}
+
+fn gather_capture_qualification() -> Option<CaptureObservation> {
     let Ok(Response::CaptureModeStatus {
         mode,
         source,
         qualification_state,
         qualification_reason,
         runtime_degradation,
+        rgb,
+        ir,
         ..
     }) = crate::daemon_poll(&Request::CaptureModeStatus)
     else {
@@ -565,7 +576,11 @@ fn gather_capture_qualification() -> Option<String> {
     if let Some(reason) = runtime_degradation {
         text.push_str(&format!("; degraded: {reason}"));
     }
-    Some(text)
+    Some(CaptureObservation {
+        rgb,
+        ir: ir.unwrap_or_default(),
+        text,
+    })
 }
 
 fn receive_finished<T>(receiver: &Option<mpsc::Receiver<T>>) -> Option<Result<T, ()>> {
@@ -635,7 +650,7 @@ struct App {
     camera_confirmation: Option<CameraChoice>,
     selected_camera_choice: Option<Option<CameraChoice>>,
     selected_profile_identity: Option<Option<(String, Option<String>)>>,
-    qualification_load: Option<mpsc::Receiver<Option<String>>>,
+    qualification_load: Option<mpsc::Receiver<Option<CaptureObservation>>>,
     identify_checked_at: Option<Instant>,
     screen: usize,
     sel: usize,
@@ -687,7 +702,7 @@ struct App {
     /// Current capture schedule from the daemon (`CaptureModeStatus`), for
     /// the Cameras info block — e.g. "sequential (source: measured; …)".
     /// `None` = not fetched / daemon refused: drawn as unknown, never blank.
-    capture_mode: Option<String>,
+    capture_mode: Option<CaptureObservation>,
     camera_load: Option<mpsc::Receiver<CameraListing>>,
     activity: activity::Activity,
     input: Option<(String, String, Pending)>,
@@ -1468,8 +1483,15 @@ impl App {
                 ),
                 Style::new().fg(th().warn),
             ),
+            // No identity: the daemon withholds the serial from a non-root
+            // peer (serial_present still tells whether one exists), or it
+            // predates the field.
+            (None, Some(id)) if p.serial_present => Span::styled(
+                format!("{id} · serial present (shown to root only)"),
+                Style::new().dim(),
+            ),
             (None, Some(id)) => Span::styled(
-                format!("{id} · serial state unknown (older daemon)"),
+                format!("{id} · no serial reported (none, or an older daemon)"),
                 Style::new().dim(),
             ),
             (None, None) => {
@@ -7560,9 +7582,21 @@ impl App {
                 "last inspection failed; press c to retry".to_string(),
                 Style::new().fg(th().warn),
             ),
-            Some(text) => Span::raw(format!(
-                "last observation ({}): {text}",
-                self.source_status(Source::Qualification)
+            // The observation belongs to the pair it was measured on; the
+            // health snapshot names the pair the daemon holds now, so after
+            // a camera switch it is not this pair's until re-inspected.
+            Some(observed)
+                if self.health.is_some() && (observed.rgb != argb || observed.ir != air) =>
+            {
+                Span::styled(
+                    "measured on a previous pair; press c to inspect this one".to_string(),
+                    Style::new().dim(),
+                )
+            }
+            Some(observed) => Span::raw(format!(
+                "last observation ({}): {}",
+                self.source_status(Source::Qualification),
+                observed.text
             )),
             // A request that ran and failed is reported as such; only a
             // request that was never made reads as not fetched.
@@ -13800,10 +13834,20 @@ mod tests {
         app.on_key(KeyCode::Enter);
         let text = render(&mut app);
         assert!(
-            text.contains("serial state unknown (older daemon)"),
+            text.contains("no serial reported (none, or an older daemon)"),
             "{text}"
         );
         assert!(!text.contains("no serial:"), "{text}");
+        app.on_key(KeyCode::Esc);
+        // Identity withheld from an ordinary account, serial known to exist.
+        app.pairs[0].serial_present = true;
+        app.on_key(KeyCode::Enter);
+        let text = render(&mut app);
+        assert!(
+            text.contains("serial present (shown to root only)"),
+            "{text}"
+        );
+        app.pairs[0].serial_present = false;
         app.on_key(KeyCode::Esc);
         // A stale group keeps its role but the row says it is inactive.
         app.camera_groups = vec![irlume_common::CameraGroupSummary {
@@ -13869,13 +13913,33 @@ mod tests {
         assert!(!text.contains('\x1b'), "{text}");
         app.on_key(KeyCode::Esc);
         // A cached schedule never outranks a failed retry.
-        app.capture_mode = Some("sequential (source: test)".into());
+        app.capture_mode = Some(CaptureObservation {
+            rgb: "/dev/video40".into(),
+            ir: "/dev/video42".into(),
+            text: "sequential (source: test)".into(),
+        });
         let now = app.now();
         app.freshness
             .observation_mut(Source::Qualification)
             .record(false, now);
         let text = render(&mut app);
         assert!(text.contains("last inspection failed"), "{text}");
+        // A successful observation is shown only for the pair it measured;
+        // after a camera switch it is not presented as this pair's.
+        app.freshness
+            .observation_mut(Source::Qualification)
+            .record(true, now);
+        let text = render(&mut app);
+        assert!(text.contains("sequential (source: test)"), "{text}");
+        if let Some(h) = app.health.as_mut() {
+            h.ir_dev = Some("/dev/video4".into());
+        }
+        let text = render(&mut app);
+        assert!(text.contains("measured on a previous pair"), "{text}");
+        assert!(!text.contains("sequential (source: test)"), "{text}");
+        if let Some(h) = app.health.as_mut() {
+            h.ir_dev = Some("/dev/video42".into());
+        }
         app.capture_mode = None;
         app.freshness
             .observation_mut(Source::Qualification)

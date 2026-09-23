@@ -6387,6 +6387,7 @@ fn dispatch_scoped_session_inner(
             if camera_probe_rate_limited(peer.uid) {
                 // A pre-camera refusal with its own cause (ADR-0030 §5), in
                 // the reply shape every identify client already decodes.
+                note_pre_camera(irlume_common::OutcomeCause::RetryThrottled);
                 return Response::Identified {
                     user: None,
                     profile: None,

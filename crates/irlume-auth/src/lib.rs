@@ -4953,12 +4953,24 @@ impl Engine {
         // Every one-shot capture below carries the per-window heartbeat
         // (#336); held sessions already carry theirs from `capture_scans`.
         let control = self.capture_control();
+        // Sequential roles report their timing as each finishes, so a trace
+        // consumer reconstructing the capture span adds them instead of
+        // overlapping two stages that were emitted together at the end.
+        let mut rgb_timing_emitted = false;
         let (mut rgb_res, mut rgb_ms, mut ir_res, mut ir_ms, recovered_side) =
             if let Some((rgb_s, ir_s)) = held {
                 if sequential {
                     let t = std::time::Instant::now();
                     let (rgb, rgb_recovered) = held_rgb_capture(rgb_s);
                     let rgb_ms = t.elapsed().as_millis();
+                    if rgb.is_ok() {
+                        emit_trace_stage_ms(
+                            diagnostics,
+                            irlume_common::diagnostics::TraceStage::RgbCapture,
+                            rgb_ms,
+                        );
+                        rgb_timing_emitted = true;
+                    }
                     if rgb.is_err() {
                         (rgb, rgb_ms, Ok(None), 0, rgb_recovered)
                     } else {
@@ -5016,6 +5028,14 @@ impl Engine {
                 let t = std::time::Instant::now();
                 let rgb = irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control);
                 let rgb_ms = t.elapsed().as_millis();
+                if rgb.is_ok() {
+                    emit_trace_stage_ms(
+                        diagnostics,
+                        irlume_common::diagnostics::TraceStage::RgbCapture,
+                        rgb_ms,
+                    );
+                    rgb_timing_emitted = true;
+                }
                 // Match the old short-circuit: don't fire the IR emitter after an
                 // RGB fault (privacy switch, missing node); the shared retry below
                 // surfaces the RGB error.
@@ -5074,11 +5094,13 @@ impl Engine {
                 .into());
             }
         }
-        emit_trace_stage_ms(
-            diagnostics,
-            irlume_common::diagnostics::TraceStage::RgbCapture,
-            rgb_ms,
-        );
+        if !rgb_timing_emitted {
+            emit_trace_stage_ms(
+                diagnostics,
+                irlume_common::diagnostics::TraceStage::RgbCapture,
+                rgb_ms,
+            );
+        }
         emit_trace_stage_ms(
             diagnostics,
             irlume_common::diagnostics::TraceStage::IrCapture,

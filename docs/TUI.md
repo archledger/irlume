@@ -60,7 +60,7 @@ The TUI keeps a small set of global keys that no page reuses with another
 meaning (ADR-0030 §1.3): `1`–`9` jump to sections by a fixed table — `1`
 Overview, `2` Faces, `3` Password Wallet, `4` Recovery, `5` Login & Apps, `6`
 Diagnostics, `7` Cameras, `8` Preferences, `9` Fingerprint — whatever the
-sidebar currently shows (a hidden section's digit says why it is hidden), `Tab`/`Shift-Tab` and `←`/`→` step through them, `↑`/`↓`
+sidebar currently shows (a hidden section's digit says why it is hidden: missing hardware, or the technical view being off), `Tab`/`Shift-Tab` and `←`/`→` step through them, `↑`/`↓`
 and `j`/`k` move the selection and `g`/`G` go to the first and last row on
 pages that show a list, `r`
 refreshes the current page's observations (Diagnostics re-runs its checks,

@@ -4962,13 +4962,8 @@ impl App {
                 if self.visible.contains(&target) {
                     self.enter_screen(target);
                 } else {
-                    self.log(
-                        '·',
-                        format!(
-                            "{} is not shown on this machine or in this view (v toggles the technical tools)",
-                            SCREENS[target]
-                        ),
-                    );
+                    let reason = self.hidden_section_reason(target);
+                    self.log('·', format!("{} is hidden: {reason}", SCREENS[target]));
                 }
             }
             KeyCode::Char('g') => self.move_sel_to_end(false),
@@ -5168,6 +5163,24 @@ impl App {
         } else {
             (((*cur as i32 + d) % n + n) % n) as usize
         };
+    }
+
+    /// Why a fixed-digit section is absent from the sidebar, in the terms
+    /// of `compute_visible`: a capability this machine lacks (no toggle
+    /// brings it back), or the technical view being off (v does).
+    fn hidden_section_reason(&self, target: usize) -> String {
+        let rgb = self.caps.rgb || self.reported_caps.rgb;
+        let ir = self.caps.ir_pair || self.reported_caps.ir_pair;
+        match target {
+            SC_PROFILES | SC_RECOVERY => "no camera was found on this machine".into(),
+            SC_CAMERAS | SC_IDENTIFY if !rgb => "no camera was found on this machine".into(),
+            SC_CAMERAS | SC_IDENTIFY => "it is a technical tool (v shows them)".into(),
+            SC_FINGERPRINT => "no fingerprint reader was found on this machine".into(),
+            SC_KEYRING if !ir => {
+                "it needs an IR camera pair or a fingerprint reader, and neither was found".into()
+            }
+            _ => "it is not available in this view".into(),
+        }
     }
 
     /// First (`last == false`) or last row of the current page's list.
@@ -5384,6 +5397,12 @@ impl App {
             (SC_REPAIR, KeyCode::Char('r')) => {
                 self.log('·', "re-running diagnostics…");
                 self.refresh();
+                // The camera check reads the classified pairs and their
+                // privacy switches: re-list them too, superseding a listing
+                // already in flight.
+                self.freshness.cycle_mut(Worker::Cameras).invalidate();
+                self.invalidate_source(Source::Cameras);
+                self.refresh_camera_listing();
                 self.refresh_keyring_diagnostic();
             }
             (SC_REPAIR, KeyCode::Char('f')) => self.apply_fix(self.repair_sel),
@@ -8039,7 +8058,8 @@ impl App {
         let reader = match (&self.fp.device, self.fp.available) {
             (Some(n), _) => Span::styled(format!("● {n}"), Style::new().fg(th().ok)),
             (None, true) => Span::styled("● present (unnamed)", Style::new().fg(th().ok)),
-            (None, false) => Span::styled("○ none detected", Style::new().dim()),
+            // Observed absence is ✕, not ○: nothing is switched off here.
+            (None, false) => Span::styled("✕ none detected", Style::new().dim()),
         };
         let enrolled = if !self.source_usable(Source::Fingerprint) {
             Span::styled(
@@ -9675,7 +9695,7 @@ impl App {
     /// of the CURRENT screen (tier two of the disclosure ladder).
     fn help_body(&self) -> String {
         let mut b = String::from(
-            "Global\n              F4  current daemon, camera inventory and observation age\n              F3  choose a section (click or arrows + Enter)\n              F6  focus page actions / return to page selection\n          ↑↓ + Enter/Space  choose and activate a focused action\n              F2  search more actions\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193} / j k  select\n            1-9  section: 1 Overview 2 Faces 3 Wallet 4 Recovery 5 Login 6 Diagnostics 7 Cameras 8 Preferences 9 Fingerprint\n            g / G  first / last row\n               v  show/hide technical tools\n               r  refresh this page         i  test recognition\n               A  expand/collapse activity history\n               L  full session history and wrapped details\n         PgUp/Dn  read page with F6 focus; otherwise Activity\n               h  Overview              q  quit\n           click  rows and action chips\n        Dialogs  ↑↓ / PgUp/Dn scroll long messages\n               M  release mouse (highlight/copy)\n\nThis screen\n",
+            "Global\n              F4  current daemon, camera inventory and observation age\n              F3  choose a section (click or arrows + Enter)\n              F6  focus page actions / return to page selection\n          ↑↓ + Enter/Space  choose and activate a focused action\n              F2  search more actions\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193} / j k  select (pages with a list)\n            1-9  section: 1 Overview 2 Faces 3 Wallet 4 Recovery 5 Login 6 Diagnostics 7 Cameras 8 Preferences 9 Fingerprint\n            g / G  first / last row (pages with a list)\n               v  show/hide technical tools\n               r  refresh this page         i  test recognition\n               A  expand/collapse activity history\n               L  full session history and wrapped details\n         PgUp/Dn  read page with F6 focus; otherwise Activity\n               h  Overview              q  quit\n           click  rows and action chips\n        Dialogs  ↑↓ / PgUp/Dn scroll long messages\n               M  release mouse (highlight/copy)\n\nThis screen\n",
         );
         for (k, d) in self.screen_actions() {
             b.push_str(&format!("  {k:<7} {d}\n"));
@@ -16133,7 +16153,7 @@ mod tests {
             method: "face".into(),
         };
         let text = draw_text(&app);
-        assert!(text.contains("○ none detected"));
+        assert!(text.contains("✕ none detected"));
         assert!(text.contains("No usable reader"));
         app.fp = FpInfo {
             available: true,
@@ -16565,12 +16585,33 @@ mod tests {
         assert_eq!(app.screen, SC_CAMERAS);
         app.on_key(KeyCode::Char('2'));
         assert_eq!(app.screen, SC_PROFILES);
-        // With Cameras hidden, 7 still means Cameras: it explains and stays.
+        // With Cameras hidden, 7 still means Cameras: it explains and stays,
+        // and the explanation is the actual reason. A camera exists here,
+        // so the technical view is what hides it.
         app.visible = vec![SC_WELCOME, SC_PROFILES, SC_KEYRING];
+        app.caps.rgb = true;
         app.on_key(KeyCode::Char('7'));
         assert_eq!(app.screen, SC_PROFILES);
         let (_, msg) = app.activity.last().expect("hidden section explained");
-        assert!(msg.contains("Cameras"), "{msg}");
+        assert!(
+            msg.contains("Cameras") && msg.contains("technical tool"),
+            "{msg}"
+        );
+        // A hardware-gated page names the missing hardware and never
+        // points at v.
+        app.fp_present = false;
+        app.on_key(KeyCode::Char('9'));
+        let (_, msg) = app.activity.last().unwrap();
+        assert!(
+            msg.contains("no fingerprint reader") && !msg.contains("(v"),
+            "{msg}"
+        );
+        app.caps.rgb = false;
+        app.reported_caps.rgb = false;
+        app.visible = vec![SC_WELCOME, SC_KEYRING];
+        app.on_key(KeyCode::Char('2'));
+        let (_, msg) = app.activity.last().unwrap();
+        assert!(msg.contains("no camera") && !msg.contains("(v"), "{msg}");
     }
 
     /// ADR-0030 §1.1: Enter opens things; it never arms a confirmation,

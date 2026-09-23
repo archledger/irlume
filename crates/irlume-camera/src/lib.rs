@@ -779,7 +779,7 @@ fn is_privacy_shutter_engaged(error: &std::io::Error) -> bool {
 
 /// The typed error for a refused privacy check (ADR-0030 §5): an engaged
 /// shutter is `Error::PrivacyShutter`, so the daemon can name it; an
-/// unreadable control is a hardware fault like any other.
+/// unreadable control is the camera being unusable.
 fn privacy_refusal_error(
     device: &str,
     stage: &'static str,
@@ -791,7 +791,7 @@ fn privacy_refusal_error(
         if engaged {
             Error::PrivacyShutter(message)
         } else {
-            Error::Hardware(message)
+            Error::CameraUnavailable(message)
         }
     })
 }
@@ -2880,7 +2880,7 @@ fn finish_privacy_teardown<E: std::fmt::Display>(refusal: Error, restore: Result
             // A failed restore does not change what refused the attempt.
             match refusal {
                 Error::PrivacyShutter(_) => Error::PrivacyShutter(message),
-                _ => Error::Hardware(message),
+                _ => Error::CameraUnavailable(message),
             }
         }
     }
@@ -3772,7 +3772,7 @@ fn enable_ir_emitter_privacy_bounded(
         if shutter_engaged.get() {
             Error::PrivacyShutter(message)
         } else {
-            Error::Hardware(message)
+            Error::CameraUnavailable(message)
         }
     })
 }
@@ -16260,7 +16260,7 @@ mod tests {
             Err(std::io::Error::from_raw_os_error(libc::EIO)),
         );
         assert!(
-            matches!(unreadable, Err(Error::Hardware(_))),
+            matches!(unreadable, Err(Error::CameraUnavailable(_))),
             "{unreadable:?}"
         );
         assert!(privacy_refusal_error("/dev/video2", "ir capture", Ok(Some(false))).is_ok());

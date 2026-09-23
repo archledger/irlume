@@ -3032,8 +3032,18 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             ir_scope_index: None,
         },
         // A face attempt refused because the engine is still loading is a
-        // pre-camera refusal with its own cause (ADR-0030 §5), in the
-        // reply shape every authentication client decodes.
+        // pre-camera refusal with its own cause (ADR-0030 §5). A client
+        // that asked for typed errors gets a retryable operational failure
+        // (the daemon is unavailable, no face was tested); a legacy client
+        // gets the refusal in the shape it decodes.
+        Request::Authenticate {
+            structured_errors: true,
+            ..
+        } => Response::OperationError {
+            code: irlume_common::OperationErrorCode::OperationFailed,
+            retryable: true,
+            cause: Some(EarlyRefusal::DaemonStarting.cause()),
+        },
         Request::Authenticate { .. } => early_refusal(
             EarlyRefusal::DaemonStarting,
             "irlumed is still starting (loading models); retry, or use your password",
@@ -9805,6 +9815,26 @@ mod tests {
                 ..
             } => assert!(reason.contains("still starting"), "{reason}"),
             other => panic!("a starting-time face attempt must be a typed refusal, got {other:?}"),
+        }
+        // A client that asked for typed errors is told the daemon is
+        // unavailable and to retry, not that a face test denied.
+        match dispatch_before_engine(
+            Request::Authenticate {
+                structured_errors: true,
+                user: crate::users::name_for_uid(0).unwrap_or_else(|| "root".into()),
+                service: None,
+                intent_confirmation: None,
+            },
+            &peer(0),
+        ) {
+            Response::OperationError {
+                code: irlume_common::OperationErrorCode::OperationFailed,
+                retryable: true,
+                cause: Some(irlume_common::OutcomeCause::DaemonStarting),
+            } => {}
+            other => panic!(
+                "a structured client must get a retryable operational failure, got {other:?}"
+            ),
         }
     }
 

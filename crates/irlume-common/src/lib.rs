@@ -621,7 +621,8 @@ pub enum Request {
     /// the group refuses at its grant boundary. PRIVILEGED.
     RemoveCameraGroup {
         user: String,
-        /// The immutable group id (as reported when it was enrolled).
+        /// The immutable group id (as reported when it was enrolled), or
+        /// the opaque group id a handle-correlating client was given.
         group: String,
     },
     /// List enrolled profiles + their scans for `user`.
@@ -641,6 +642,17 @@ pub enum Request {
         /// replies with the prose `Error` the new client still handles.
         #[serde(default)]
         structured_errors: bool,
+        /// The client correlates camera roles by the daemon's pair handles
+        /// (ADR-0030 §4) and does not need binding identities: a non-root
+        /// peer that sets this receives `vid:pid` binding sides and an
+        /// opaque group id in place of the store's identity-derived one
+        /// (which [`Request::RemoveCameraGroup`] accepts). A client that
+        /// omits it — one that predates handles and matches roles on the
+        /// identities itself — keeps receiving exactly what it did, so its
+        /// labels do not silently change meaning across the upgrade. Same
+        /// compatibility shape as `structured_errors`.
+        #[serde(default)]
+        handles: bool,
     },
     /// Delete a whole profile (and its scans). PRIVILEGED, same rule as Enroll.
     DeleteProfile { user: String, profile: String },
@@ -1267,7 +1279,11 @@ impl PreferencesState {
 /// connection-thread cache path serves it memory-only.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CameraGroupSummary {
-    /// The immutable group id (as reported when it was enrolled).
+    /// The group id as this peer may name it: the store's immutable id for
+    /// root and for clients that did not ask for handles; for a non-root
+    /// client that did, an opaque group handle (the store id is derived
+    /// from the camera identity, serial included). Either form is accepted
+    /// by [`Request::RemoveCameraGroup`].
     pub id: String,
     /// The bound RGB identity (`vid:pid[:serial]`), if any.
     pub rgb: Option<String>,
@@ -2526,9 +2542,11 @@ mod tests {
             Request::ListProfiles {
                 user,
                 structured_errors,
+                handles,
             } => {
                 assert_eq!(user, "alice");
                 assert!(!structured_errors, "absent field must default to opted-out");
+                assert!(!handles, "absent field: the client matches on identities");
             }
             other => panic!("expected ListProfiles, got {other:?}"),
         }
@@ -2551,6 +2569,7 @@ mod tests {
         let new_wire = serde_json::to_string(&Request::ListProfiles {
             user: "alice".into(),
             structured_errors: true,
+            handles: true,
         })
         .unwrap();
         let parsed: OldRequest =

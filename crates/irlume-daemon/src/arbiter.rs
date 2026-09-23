@@ -614,7 +614,8 @@ mod tests {
         assert_eq!(
             classify(&Request::ListProfiles {
                 user: "u".into(),
-                structured_errors: true
+                structured_errors: true,
+                handles: false,
             }),
             Class::Status
         );

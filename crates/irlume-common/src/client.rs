@@ -900,6 +900,7 @@ mod tests {
         let resp = request(&Request::ListProfiles {
             user: "alice".into(),
             structured_errors: false,
+            handles: false,
         })
         .expect("round trip");
         match resp {

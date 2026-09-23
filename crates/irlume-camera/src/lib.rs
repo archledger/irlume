@@ -4196,15 +4196,12 @@ pub fn camera_display_name(dev_dir: &std::path::Path, node: &str) -> Option<Stri
 
 /// The UVC driver names a node `"<product>: <product>"` and then cuts the
 /// whole to 31 bytes, so a built-in camera reads "ASUS FHD webcam: ASUS FHD
-/// webca". When the part after the first `": "` is a prefix of the part
-/// before it (or the reverse), one copy is enough.
+/// webca". The part before the first `": "` is the complete product; only
+/// the tail can be cut, so the name collapses to the head exactly when the
+/// tail is a prefix of it. (`Cam: Camera` is two facts and stays.)
 fn collapse_repeated_name(name: &str) -> String {
     match name.split_once(": ") {
-        Some((head, tail))
-            if !tail.is_empty() && (head.starts_with(tail) || tail.starts_with(head)) =>
-        {
-            if head.len() >= tail.len() { head } else { tail }.to_owned()
-        }
+        Some((head, tail)) if !tail.is_empty() && head.starts_with(tail) => head.to_owned(),
         _ => name.to_owned(),
     }
 }
@@ -16566,6 +16563,8 @@ mod tests {
         );
         assert_eq!(collapse_repeated_name("NexiGo N930W"), "NexiGo N930W");
         assert_eq!(collapse_repeated_name("Cam: "), "Cam: ");
+        // The head is never the cut part: a longer tail is a second fact.
+        assert_eq!(collapse_repeated_name("Cam: Camera"), "Cam: Camera");
     }
 
     #[test]

@@ -16,10 +16,13 @@ All notable changes to irlume are documented here. This project adheres to
   identity matches that binding, correlated from sysfs at reply time. The
   TUI labels rows by handle, so an ordinary account now sees `Primary
   camera` for its own serial-bearing built-in camera instead of `role
-  unknown`; a same-model twin reads `not enrolled`. For an ordinary peer
-  the enrollment reply's binding identities are reduced to `vid:pid`
-  (root keeps the full identity). Older clients ignore the new fields;
-  against an older daemon the TUI keeps its identity rule. A camera whose
+  unknown`; a same-model twin reads `not enrolled`, and after a docking
+  event roles stay unknown until the re-issued enrollment reply lands. A
+  client that opts in (`ListProfiles { handles: true }`) receives, as an
+  ordinary peer, `vid:pid` binding sides and opaque group ids (which
+  `RemoveCameraGroup` accepts) in place of the serial-bearing ones; root,
+  and clients that do not opt in, keep exactly what they received before.
+  Against an older daemon the TUI keeps its identity rule. A camera whose
   UVC node name repeats the product (`ASUS FHD webcam: ASUS FHD webca`)
   is shown once, and the details header says why a role is unknown.
 

@@ -707,6 +707,11 @@ struct App {
     /// the Cameras info block — e.g. "sequential (source: measured; …)".
     /// `None` = not fetched / daemon refused: drawn as unknown, never blank.
     capture_mode: Option<CaptureObservation>,
+    /// The camera inventory epoch the installed enrollment reply's
+    /// `connected_handle`s were correlated under (ADR-0030 §4/§6): the
+    /// daemon correlates at reply time, so handles from one inventory are
+    /// never compared with a listing from another.
+    roles_epoch: Option<CameraEpoch>,
     camera_load: Option<mpsc::Receiver<CameraListing>>,
     activity: activity::Activity,
     input: Option<(String, String, Pending)>,
@@ -1447,6 +1452,13 @@ impl App {
             .is_some_and(|binding| binding.rgb.is_some() || binding.ir.is_some());
         let known = self.camera_store_error.is_none()
             && (bound_primary || (self.profiles_loaded && self.profiles.is_empty()));
+        // Handles correlate only within one inventory: after a docking
+        // event the reply's handles belong to the previous inventory, and a
+        // camera that was absent then is not "not enrolled" now — its role
+        // is unknown until the queued reply lands.
+        if pair.handle.is_some() && self.roles_epoch != self.camera_epoch {
+            return CameraRole::Unknown;
+        }
         camera_role_for(
             RoleCandidate {
                 identity: pair.identity.as_deref(),
@@ -1682,7 +1694,9 @@ impl App {
             // the previous inventory cannot be this hardware's.
             self.capture_mode = None;
             // The daemon correlates roles at reply time (ADR-0030 §4/§6):
-            // a new inventory needs a new enrollment reply for its handles.
+            // a new inventory needs a new enrollment reply for its handles,
+            // and until it lands the installed handles are not this
+            // inventory's (`roles_epoch` keeps camera_role from using them).
             self.freshness.cycle_mut(Worker::Profiles).invalidate();
             self.freshness.cycle_mut(Worker::Cameras).invalidate();
             self.freshness.cycle_mut(Worker::Qualification).invalidate();
@@ -2100,6 +2114,7 @@ impl App {
             pairs: Vec::new(),
             pairs_known: false,
             capture_mode: None,
+            roles_epoch: None,
             camera_load: None,
             activity: activity::Activity::default(),
             input: None,
@@ -2485,6 +2500,7 @@ impl App {
                 &Request::ListProfiles {
                     user,
                     structured_errors: false,
+                    handles: true,
                 },
                 std::time::Duration::from_secs(60),
             ) {
@@ -3875,6 +3891,10 @@ impl App {
                         self.camera_groups = camera_groups;
                         self.camera_store_error = camera_store_error;
                         self.primary_camera = primary_camera;
+                        // A reply that outlived an inventory change was
+                        // discarded above, so this one was correlated
+                        // under the current epoch.
+                        self.roles_epoch = self.camera_epoch.clone();
                         if let Some(selected) = selected {
                             self.sel = self.rows().iter().position(|row| self.profile_row_name(*row) == selected).unwrap_or_else(|| {
                                 self.log('·', "the selected profile or scan was removed or renamed; select a row before acting");
@@ -12002,6 +12022,7 @@ mod tests {
             pairs: Vec::new(),
             pairs_known: false,
             capture_mode: None,
+            roles_epoch: None,
             camera_load: None,
             activity: activity::Activity::default(),
             input: None,
@@ -14524,6 +14545,36 @@ mod tests {
         app.pairs[0].name = Some("ASUS Integrated Camera".into());
         let text = render(&mut app);
         assert!(text.contains("not enrolled"), "{text}");
+        // With the daemon's handles, a docking event makes the roles unknown
+        // until the re-issued enrollment reply lands: handles from the old
+        // inventory are never compared with the new listing.
+        app.pairs[0].handle = Some("h-asus".into());
+        app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
+            rgb: Some("3277:0059".into()),
+            ir: Some("3277:0059".into()),
+            connected_handle: Some("h-asus".into()),
+        });
+        app.roles_epoch = app.camera_epoch.clone();
+        // The docking snapshot invalidates the listing (pairs are cleared
+        // until re-listed); the row under test is kept aside.
+        let asus = app.pairs[0].clone();
+        assert_eq!(app.camera_role(&asus), CameraRole::Primary);
+        let mut docked = live_test_snapshot();
+        docked.cameras.revision = docked.cameras.revision.wrapping_add(7);
+        let now = app.now();
+        app.apply_live_snapshot(docked, now);
+        assert_eq!(
+            app.camera_role(&asus),
+            CameraRole::Unknown,
+            "old handles, new inventory: no claim"
+        );
+        assert!(
+            app.freshness.cycle(Worker::Profiles).pending(),
+            "the enrollment reload is queued"
+        );
+        app.roles_epoch = app.camera_epoch.clone();
+        assert_eq!(app.camera_role(&asus), CameraRole::Primary);
+        app.primary_camera = None;
         // A hotplug (new inventory revision) drops the capture observation:
         // node paths are reused, so it cannot be this hardware's.
         app.capture_mode = Some(CaptureObservation {

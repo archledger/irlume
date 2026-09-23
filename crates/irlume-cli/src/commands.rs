@@ -721,6 +721,7 @@ pub fn status(args: &[String]) -> ExitCode {
         user: user.clone(),
         // Human output: keep the daemon's prose, it is written to be read.
         structured_errors: false,
+        handles: false,
     }) {
         Ok(Response::Enrollment {
             profiles,
@@ -953,6 +954,7 @@ pub fn detect(args: &[String]) -> ExitCode {
         daemon_request(&Request::ListProfiles {
             user,
             structured_errors: false,
+            handles: false,
         }),
         Ok(Response::Enrollment { ref profiles, .. }) if !profiles.is_empty()
     );
@@ -1718,6 +1720,7 @@ pub fn setup(args: &[String]) -> ExitCode {
         daemon_request(&Request::ListProfiles {
             user: user.clone(),
             structured_errors: false,
+            handles: false,
         }),
         Ok(Response::Enrollment { ref profiles, .. }) if !profiles.is_empty());
     if enrolled {

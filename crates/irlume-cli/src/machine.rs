@@ -481,6 +481,7 @@ pub fn status(args: &[String]) -> ExitCode {
     let enrollment = match observe(&Request::ListProfiles {
         user: user.clone(),
         structured_errors: true,
+        handles: false,
     }) {
         Some(Response::Enrollment { profiles, .. }) => {
             let scans: usize = profiles.iter().map(|p| p.scans.len()).sum();
@@ -2179,6 +2180,7 @@ pub fn profiles_list(args: &[String]) -> ExitCode {
     match crate::daemon_request(&Request::ListProfiles {
         user,
         structured_errors: true,
+        handles: false,
     }) {
         Ok(Response::Enrollment {
             profiles,

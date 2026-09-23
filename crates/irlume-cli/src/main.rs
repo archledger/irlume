@@ -588,6 +588,7 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
         None | Some("list") => Request::ListProfiles {
             user,
             structured_errors: false,
+            handles: false,
         },
         Some("add-scan") => match flag(args, "--profile") {
             Some(p) => {
@@ -4498,6 +4499,7 @@ fn doctor_run(
         match daemon_request(&irlume_common::Request::ListProfiles {
             user: user.clone(),
             structured_errors: false,
+            handles: false,
         }) {
             Ok(irlume_common::Response::Enrollment {
                 ref profiles,

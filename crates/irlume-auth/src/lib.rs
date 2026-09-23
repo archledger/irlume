@@ -5107,23 +5107,33 @@ impl Engine {
             if let Some(context_key) = capture_mode.runtime_key.as_deref() {
                 trip_runtime_capture_health(context_key, degradation);
             }
-            return Err(CapturePathError::ConcurrentPair(
-                irlume_common::Error::Hardware(format!(
-                    "held concurrent pair became unusable (rgb: {}; ir: {}; recovered-side: {recovered_side}; runtime: {}); both results must be discarded",
-                    rgb_res
-                        .as_ref()
-                        .err()
-                        .map_or("ok".to_owned(), ToString::to_string),
-                    ir_res
-                        .as_ref()
-                        .err()
-                        .map_or("ok".to_owned(), ToString::to_string),
-                    runtime_violation.map_or_else(
-                        || if missing_runtime_contract { "missing contract".to_owned() } else { "ok".to_owned() },
-                        |error| error.to_string(),
-                    ),
-                )),
-            ));
+            let message = format!(
+                "held concurrent pair became unusable (rgb: {}; ir: {}; recovered-side: {recovered_side}; runtime: {}); both results must be discarded",
+                rgb_res
+                    .as_ref()
+                    .err()
+                    .map_or("ok".to_owned(), ToString::to_string),
+                ir_res
+                    .as_ref()
+                    .err()
+                    .map_or("ok".to_owned(), ToString::to_string),
+                runtime_violation.map_or_else(
+                    || if missing_runtime_contract { "missing contract".to_owned() } else { "ok".to_owned() },
+                    |error| error.to_string(),
+                ),
+            );
+            // The pair-failure context wraps the message; the cause is the
+            // underlying refusal's (ADR-0030 §5): a shutter engaged on
+            // either side stays a privacy shutter.
+            let shutter = [rgb_res.as_ref().err(), ir_res.as_ref().err()]
+                .into_iter()
+                .flatten()
+                .any(|error| matches!(error, irlume_common::Error::PrivacyShutter(_)));
+            return Err(CapturePathError::ConcurrentPair(if shutter {
+                irlume_common::Error::PrivacyShutter(message)
+            } else {
+                irlume_common::Error::Hardware(message)
+            }));
         }
         let mut pair_sequential_retried = false;
         if pair_requires_fallback {

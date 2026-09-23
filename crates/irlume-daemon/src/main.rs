@@ -4173,18 +4173,27 @@ fn not_authorized(req: &Request, verb: &str, user: &str) -> Response {
     // only ever gets one if it asked: an older client cannot deserialize a
     // response variant it does not know, so sending one unasked breaks it
     // across the upgrade window (#93).
-    if let Request::ListProfiles {
-        structured_errors: true,
-        ..
-    } = req
-    {
-        return Response::OperationError {
+    match req {
+        Request::ListProfiles {
+            structured_errors: true,
+            ..
+        } => Response::OperationError {
             code: irlume_common::OperationErrorCode::NotAuthorized,
             retryable: false,
             cause: None,
-        };
+        },
+        // An opted-in authentication refused for the peer's authority is
+        // a policy cause (ADR-0030 §5), typed like the engine's errors.
+        Request::Authenticate {
+            structured_errors: true,
+            ..
+        } => Response::OperationError {
+            code: irlume_common::OperationErrorCode::NotAuthorized,
+            retryable: false,
+            cause: Some(irlume_common::OutcomeCause::Policy),
+        },
+        _ => Response::Error(format!("not authorized to {verb} '{user}'")),
     }
-    Response::Error(format!("not authorized to {verb} '{user}'"))
 }
 
 /// Preserve legacy replies unless the caller can understand typed errors.
@@ -9594,6 +9603,41 @@ mod tests {
             }
             other => panic!("a client that did not opt in gets prose, got {other:?}"),
         }
+        // An opted-in authentication refused for the peer's authority is
+        // a typed policy cause (ADR-0030 §5); a legacy one keeps prose.
+        let typed_auth = pregate(
+            &Request::Authenticate {
+                structured_errors: true,
+                user: SAMPLE_USER.into(),
+                service: None,
+                intent_confirmation: None,
+            },
+            &stranger,
+        );
+        assert!(
+            matches!(
+                typed_auth,
+                Some(Response::OperationError {
+                    code: irlume_common::OperationErrorCode::NotAuthorized,
+                    retryable: false,
+                    cause: Some(irlume_common::OutcomeCause::Policy),
+                })
+            ),
+            "{typed_auth:?}"
+        );
+        let prose_auth = pregate(
+            &Request::Authenticate {
+                structured_errors: false,
+                user: SAMPLE_USER.into(),
+                service: None,
+                intent_confirmation: None,
+            },
+            &stranger,
+        );
+        assert!(
+            matches!(prose_auth, Some(Response::Error(_))),
+            "{prose_auth:?}"
+        );
     }
 
     #[test]

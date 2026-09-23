@@ -991,6 +991,16 @@ pub fn identify(_args: &[String]) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+        // A refusal before any capture is not a verdict about a face.
+        Ok(Response::Identified {
+            user: None,
+            cause: Some(irlume_common::OutcomeCause::RetryThrottled),
+            reason,
+            ..
+        }) => {
+            println!("[identify] not run: {reason}");
+            ExitCode::from(1)
+        }
         Ok(Response::Identified {
             user: None,
             live,

@@ -10343,6 +10343,13 @@ fn map_identify(resp: Response) -> (bool, String) {
                 profile.unwrap_or_default()
             ),
         ),
+        // A refusal before any capture (throttled) is not a liveness verdict.
+        Response::Identified {
+            user: None,
+            cause: Some(irlume_common::OutcomeCause::RetryThrottled),
+            reason,
+            ..
+        } => (false, format!("not run: {reason}")),
         Response::Identified {
             user: None,
             live,

@@ -3047,6 +3047,7 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             attempt_record::record_in_background(
                 user.clone(),
                 attempt_record::Filed {
+                    at: attempt_record::unix_now(),
                     kind: irlume_common::AttemptKind::Authenticate,
                     surface: attempt_surface(&user, service.as_deref(), peer),
                     result: irlume_common::AttemptResult::Failed,
@@ -3074,6 +3075,7 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
                 attempt_record::record_in_background(
                     name.clone(),
                     attempt_record::Filed {
+                        at: attempt_record::unix_now(),
                         kind: irlume_common::AttemptKind::Identify,
                         surface: irlume_common::AttemptSurface::Other,
                         result: irlume_common::AttemptResult::Failed,
@@ -3189,7 +3191,7 @@ fn serve_peer(
                 let scope = diagnostic_state.begin(diagnostic_operation_class(&req));
                 scope.finish(categorical_outcome(&resp));
                 if let Some(attempt) = AttemptContext::for_request(&req, &peer, || None) {
-                    attempt.file(&resp);
+                    attempt.file(&resp, None);
                 }
                 return respond(stream, &resp);
             }
@@ -5430,8 +5432,11 @@ fn attempt_surface(
     service: Option<&str>,
     peer: &Peer,
 ) -> irlume_common::AttemptSurface {
+    // Unresolvable session state is `Other` in the record (the contract),
+    // even though policy would treat it as cold: a dual-purpose greeter
+    // must not be filed as a login on a guess.
     crate::users::uid_for_name(user)
-        .map(|uid| attempt_record::session_state_for(peer.pid, uid))
+        .and_then(|uid| attempt_record::session_state_for(peer.pid, uid))
         .map(|state| irlume_core::biopolicy::classify(service.unwrap_or(""), state))
         .map(attempt_record::surface_for)
         .unwrap_or(irlume_common::AttemptSurface::Other)
@@ -5479,10 +5484,11 @@ impl AttemptContext {
     }
 
     /// File the attempt from the reply: the camera snapshot is attached
-    /// only when the attempt reached a camera. The durable write (a lock
-    /// and two syncs) runs on its own thread: the record is history and
-    /// never delays the reply or the camera worker.
-    fn file(self, response: &Response) {
+    /// only when the attempt reached a camera; `capture_ms` is what the
+    /// operation's capture stages reported. The durable write (a lock and
+    /// two syncs) runs on its own thread: the record is history and never
+    /// delays the reply or the camera worker.
+    fn file(self, response: &Response, capture_ms: Option<u64>) {
         use irlume_common::AttemptResult;
         let (result, cause, reached_camera) = match response {
             Response::AuthResult {
@@ -5528,12 +5534,13 @@ impl AttemptContext {
         };
         let camera = if reached_camera { self.camera } else { None };
         let filed = attempt_record::Filed {
+            at: attempt_record::unix_now(),
             kind: self.kind,
             surface: self.surface,
             result,
             cause,
             elapsed_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            capture_ms: None,
+            capture_ms: if reached_camera { capture_ms } else { None },
             camera,
         };
         attempt_record::record_in_background(self.user, filed);
@@ -5620,7 +5627,7 @@ fn dispatch_scoped_session_delivering(
     // Filed after the reply is built (and, for an early delivery, after it
     // was sent): the record is history and never delays a decision.
     if let Some(attempt) = attempt {
-        attempt.file(&response);
+        attempt.file(&response, scope.capture_ms());
     }
     WorkerReply {
         response,
@@ -7560,6 +7567,9 @@ fn finish_unseal_password(
                 "irlumed: UnsealPassword: face matched for '{user}' (score {:.4}) but TPM unseal FAILED: {e}{hint}",
                 outcome.score
             );
+            // The face was granted; the release failed after it. The
+            // record files the typed cause of that failure (ADR-0030 §5).
+            LAST_ERROR_CAUSE.with(|cell| cell.set(Some(e.cause())));
             Response::Error(e.to_string())
         }
     }

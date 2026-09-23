@@ -56,6 +56,10 @@ struct Stored {
 /// What a recording site knows about the attempt it is filing.
 #[derive(Debug, Clone)]
 pub(crate) struct Filed {
+    /// When the attempt completed (unix seconds), taken by the caller
+    /// before the write is queued so two attempts finishing close
+    /// together keep their order whatever order their writers run in.
+    pub at: u64,
     pub kind: AttemptKind,
     pub surface: AttemptSurface,
     pub result: AttemptResult,
@@ -98,10 +102,14 @@ pub(crate) fn surface_for(class: irlume_core::biopolicy::OperationClass) -> Atte
 /// A greeter's or TTY's conversation runs in no such session and is cold,
 /// whatever other sessions the account has; anything unresolvable is
 /// cold, the stricter class.
+/// `None` when the state cannot be resolved (the peer's cgroup or the
+/// session's facts are unreadable): the record files such an attempt as
+/// `Other`; a policy caller that needs a fail-safe default treats `None`
+/// as cold. A peer outside any logind session resolves to cold.
 pub(crate) fn session_state_for(
     peer_pid: i32,
     target_uid: u32,
-) -> irlume_core::biopolicy::SessionState {
+) -> Option<irlume_core::biopolicy::SessionState> {
     session_state_from(
         Path::new("/proc"),
         Path::new("/run/systemd/sessions"),
@@ -115,22 +123,19 @@ fn session_state_from(
     sessions_root: &Path,
     peer_pid: i32,
     target_uid: u32,
-) -> irlume_core::biopolicy::SessionState {
+) -> Option<irlume_core::biopolicy::SessionState> {
     use irlume_core::biopolicy::SessionState;
-    let Ok(cgroup) = std::fs::read_to_string(proc_root.join(peer_pid.to_string()).join("cgroup"))
-    else {
-        return SessionState::Cold;
-    };
+    let cgroup =
+        std::fs::read_to_string(proc_root.join(peer_pid.to_string()).join("cgroup")).ok()?;
     let Some(session) = cgroup
         .split(|c: char| c == '/' || c.is_whitespace())
         .filter_map(|part| part.strip_prefix("session-")?.strip_suffix(".scope"))
         .find(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()))
     else {
-        return SessionState::Cold;
+        // Resolved: this conversation runs in no session at all.
+        return Some(SessionState::Cold);
     };
-    let Ok(facts) = std::fs::read_to_string(sessions_root.join(session)) else {
-        return SessionState::Cold;
-    };
+    let facts = std::fs::read_to_string(sessions_root.join(session)).ok()?;
     let mut uid = None;
     let mut class = None;
     for line in facts.lines() {
@@ -140,14 +145,16 @@ fn session_state_from(
             class = Some(value.trim().to_owned());
         }
     }
-    if uid == Some(target_uid) && class.as_deref() == Some("user") {
-        SessionState::Warm
-    } else {
-        SessionState::Cold
-    }
+    Some(
+        if uid == Some(target_uid) && class.as_deref() == Some("user") {
+            SessionState::Warm
+        } else {
+            SessionState::Cold
+        },
+    )
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -194,9 +201,14 @@ pub(crate) fn apply(record: &mut AttemptRecord, entry: AttemptEntry, now: u64) {
             .first()
             .is_some_and(|newest| now.saturating_sub(newest.at) <= BUCKET_TTL_SECS)
     });
-    match entry.kind {
-        AttemptKind::Authenticate => record.latest_authenticate = Some(entry.clone()),
-        AttemptKind::Identify => record.latest_identify = Some(entry.clone()),
+    // Writers run in whatever order their threads get the lock: an entry
+    // is placed by its own completion time and never displaces a newer one.
+    let latest = match entry.kind {
+        AttemptKind::Authenticate => &mut record.latest_authenticate,
+        AttemptKind::Identify => &mut record.latest_identify,
+    };
+    if latest.as_ref().is_none_or(|current| current.at <= entry.at) {
+        *latest = Some(entry.clone());
     }
     let Some(camera) = entry.camera.clone() else {
         return;
@@ -214,10 +226,22 @@ pub(crate) fn apply(record: &mut AttemptRecord, entry: AttemptEntry, now: u64) {
         },
     };
     let mut bucket = bucket;
-    bucket.attempts.insert(0, entry);
+    let slot = bucket
+        .attempts
+        .iter()
+        .position(|kept| kept.at <= entry.at)
+        .unwrap_or(bucket.attempts.len());
+    bucket.attempts.insert(slot, entry);
     bucket.attempts.truncate(PER_CAMERA);
-    // Most recently used first; the least recently used falls off.
-    record.cameras.insert(0, bucket);
+    // Most recently used first (by the newest attempt each holds); the
+    // least recently used falls off.
+    let newest = |bucket: &CameraAttempts| bucket.attempts.first().map_or(0, |a| a.at);
+    let position = record
+        .cameras
+        .iter()
+        .position(|kept| newest(kept) <= newest(&bucket))
+        .unwrap_or(record.cameras.len());
+    record.cameras.insert(position, bucket);
     record.cameras.truncate(MAX_CAMERAS);
 }
 
@@ -398,7 +422,7 @@ pub(crate) fn record(user: &str, filed: Filed) -> io::Result<()> {
     let key = key_bytes(&stored.unit_key_hex);
     let now = unix_now();
     let entry = AttemptEntry {
-        at: now,
+        at: filed.at,
         kind: filed.kind,
         surface: filed.surface,
         result: filed.result,
@@ -635,6 +659,35 @@ mod tests {
         assert!(record.cameras.iter().all(|b| b.connected == Some(false)));
     }
 
+    /// Writers may run out of order: an entry is placed by its own time
+    /// and never displaces a newer one.
+    #[test]
+    fn out_of_order_writes_keep_completion_order() {
+        let mut record = AttemptRecord::default();
+        let now = 5_000_000;
+        apply(
+            &mut record,
+            entry(now + 10, AttemptKind::Authenticate, Some("1-2")),
+            now + 10,
+        );
+        apply(
+            &mut record,
+            entry(now + 5, AttemptKind::Authenticate, Some("1-2")),
+            now + 10,
+        );
+        assert_eq!(record.latest_authenticate.as_ref().unwrap().at, now + 10);
+        assert_eq!(record.cameras[0].attempts[0].at, now + 10);
+        assert_eq!(record.cameras[0].attempts[1].at, now + 5);
+        // An older attempt on another camera does not move that bucket ahead.
+        apply(
+            &mut record,
+            entry(now + 1, AttemptKind::Authenticate, Some("1-3")),
+            now + 10,
+        );
+        assert_eq!(record.cameras[0].camera.port_chain.as_deref(), Some("1-2"));
+        assert_eq!(record.cameras[1].camera.port_chain.as_deref(), Some("1-3"));
+    }
+
     #[test]
     fn unit_discriminator_is_keyed_and_reveals_nothing() {
         let a = unit_discriminator(b"key-a", "200901010001");
@@ -708,28 +761,32 @@ mod tests {
 
         assert_eq!(
             session_state_from(&proc_root, &sessions, 100, 1000),
-            SessionState::Warm
+            Some(SessionState::Warm)
         );
         // The account having a live session elsewhere does not warm a
         // conversation that is not inside it.
         assert_eq!(
             session_state_from(&proc_root, &sessions, 200, 1000),
-            SessionState::Cold
+            Some(SessionState::Cold)
         );
         assert_eq!(
             session_state_from(&proc_root, &sessions, 300, 1000),
-            SessionState::Cold
+            Some(SessionState::Cold)
         );
         // Another account's session never warms this account.
         assert_eq!(
             session_state_from(&proc_root, &sessions, 100, 1001),
-            SessionState::Cold
+            Some(SessionState::Cold)
         );
-        // Unresolvable is cold.
-        assert_eq!(
-            session_state_from(&proc_root, &sessions, 999, 1000),
-            SessionState::Cold
-        );
+        // Unresolvable (no such process, or the session's facts gone) is
+        // no answer at all: the record files it as other.
+        assert_eq!(session_state_from(&proc_root, &sessions, 999, 1000), None);
+        std::fs::write(
+            proc_root.join("300/cgroup"),
+            "0::/user.slice/user-1000.slice/session-9.scope\n",
+        )
+        .unwrap();
+        assert_eq!(session_state_from(&proc_root, &sessions, 300, 1000), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -757,6 +814,7 @@ mod tests {
         record(
             &me,
             Filed {
+                at: unix_now(),
                 kind: AttemptKind::Authenticate,
                 surface: AttemptSurface::Lock,
                 result: AttemptResult::Granted,
@@ -792,6 +850,7 @@ mod tests {
         record(
             &me,
             Filed {
+                at: unix_now(),
                 kind: AttemptKind::Identify,
                 surface: AttemptSurface::Other,
                 result: AttemptResult::Refused,
@@ -823,6 +882,7 @@ mod tests {
         record(
             &me,
             Filed {
+                at: unix_now(),
                 kind: AttemptKind::Authenticate,
                 surface: AttemptSurface::Login,
                 result: AttemptResult::Refused,

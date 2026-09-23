@@ -146,6 +146,7 @@ impl DiagnosticState {
             operation_id: self.next_operation_id(),
             operation,
             finished: Arc::new(AtomicBool::new(false)),
+            capture_us: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -551,11 +552,24 @@ pub(crate) struct OperationScope {
     operation_id: OperationId,
     operation: OperationClass,
     finished: Arc<AtomicBool>,
+    /// Microseconds the capture stages (RGB and IR) reported for this
+    /// operation, summed, for the attempt record's `capture_ms`
+    /// (ADR-0030 §5). Zero until a capture stage timing arrived.
+    capture_us: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl OperationScope {
     pub(crate) const fn operation_id(&self) -> OperationId {
         self.operation_id
+    }
+
+    /// The capture stages' summed duration, once one reported (ADR-0030
+    /// §5); `None` when the operation never reached a capture.
+    pub(crate) fn capture_ms(&self) -> Option<u64> {
+        match self.capture_us.load(Ordering::Relaxed) {
+            0 => None,
+            us => Some(us.div_ceil(1000)),
+        }
     }
 
     #[cfg(test)]
@@ -603,6 +617,15 @@ impl DiagnosticSink for OperationScope {
     }
 
     fn emit_trace(&self, kind: TraceEventKind) {
+        if let TraceEventKind::StageTiming {
+            stage:
+                irlume_common::diagnostics::TraceStage::RgbCapture
+                | irlume_common::diagnostics::TraceStage::IrCapture,
+            elapsed_us,
+        } = &kind
+        {
+            self.capture_us.fetch_add(*elapsed_us, Ordering::Relaxed);
+        }
         if !self.finished.load(Ordering::Acquire) {
             self.state
                 .emit_trace(self.operation_id, self.operation, kind);

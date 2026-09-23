@@ -1926,7 +1926,8 @@ fn readiness_refusal(readiness: irlume_common::IrOnlyReadiness) -> Outcome {
             "IR enrollment has no camera binding; add fresh scans or use your password"
         }
         Ready::BindingMismatch => {
-            "IR camera differs from enrollment; re-enroll on this camera or use your password"
+            "the configured cameras are neither the enrolled pair nor an added camera; \
+             use an enrolled camera or add this one, or use your password"
         }
         Ready::SecondaryInactive => {
             "this camera's authorization is inactive since the primary enrollment changed; \

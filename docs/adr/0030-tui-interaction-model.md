@@ -2,7 +2,9 @@
 
 ## Status
 
-Proposed 2026-09-23, from a page-by-page review of the nine `irlume` TUI
+Proposed 2026-09-23, revised the same day after two design reviews (the
+reviewers' points are folded into §1.1, §1.3, §1.4, §2, §4, §5 and §6).
+Depends on ADR-0029, which merges first. From a page-by-page review of the nine `irlume` TUI
 screens on the reference laptop (screenshots on the shared ledger's
 project handoff, 2026-09-23) and a written pass through the tool from a
 first-hour user's seat and a maintainer's seat. Builds on ADR-0029 (camera
@@ -52,13 +54,23 @@ device.
 
 ### 1. Interaction rules, every page
 
-1. **Enter opens, never mutates.** Enter opens a row, a details panel or a
-   sub-list. Every side effect has its own letter and, when it writes or
-   runs as root, the existing confirmation dialog.
+1. **Enter opens, never mutates.** On a list row, a section or a panel,
+   Enter opens it; it never runs a side effect from a list, and a second
+   click on a selected row is the same as Enter. The one place Enter (or
+   Space) activates is an action chip explicitly focused with `F6`: there it
+   does exactly what the chip's letter does, including the chip's
+   confirmation, because the person chose the action, not the row. Every
+   side effect keeps its own letter and, when it writes or runs as root,
+   the existing confirmation dialog.
 2. **Esc closes the innermost thing** (help, overlay, details panel,
    dialog); with nothing open it goes to Overview. Never quits.
-3. **Stable keys.** Global: `1`–`9` jump to the sidebar sections in order;
-   `Tab`/`Shift-Tab` cycle them; `j`/`k` move like `↓`/`↑`; `g`/`G` first
+3. **Stable keys.** Global: `1`–`9` jump to sections by a fixed table —
+   `1` Overview, `2` Faces, `3` Password Wallet, `4` Recovery, `5` Login &
+   Apps, `6` Diagnostics, `7` Cameras, `8` Preferences, `9` Fingerprint —
+   not by sidebar position, so a digit means the same thing whether or
+   not the advanced view is on or the hardware hides a page (a hidden
+   section's digit shows it when the machine has it, else does nothing
+   and says so); `Tab`/`Shift-Tab` cycle the visible ones; `j`/`k` move like `↓`/`↑`; `g`/`G` first
    and last row; `/` filters the current list (Diagnostics, scans, login
    surfaces, activity history); `r` refreshes the page's observations;
    `i` runs Test Recognition wherever recognition is the subject; `?`
@@ -68,9 +80,12 @@ device.
    `x` un-wire, `u` use this camera, `f` fix, `e` enroll, `a` add scans,
    `c` add camera, `n` rename, `d` delete).
 4. **One action row.** Actions sit on one or two lines under the page's
-   facts: the key dim, the verb plain, an optional grey hint. The in-page
-   `[r] …` columns go away; the bottom bar is the one place keys are
-   advertised, with `F2` still opening the full list.
+   facts: the key dim, the verb plain, an optional grey hint. Keys are
+   advertised in exactly two places, which agree: the action rows (every
+   page action) and the bottom bar (the page's primary actions, `F2` for
+   the full list). Prose never embeds a key — a recommendation such as
+   "wire the lock screen" is itself an action row, not a sentence with
+   `(w)` in it.
 5. **Status vocabulary.** Five glyphs, one meaning each, on every page:
    `●` ready/on, `○` off/not selected, `◐` unobserved or pending, `✕` not
    connected/absent, `⚠` needs attention. Colour reinforces, never carries
@@ -90,19 +105,26 @@ device.
 
 ### 2. Pages
 
-- **Overview** leads with the last authentication on this machine: when,
+- **Overview** leads with the account's last authentication (§5): when,
   which surface (login / lock / sudo / app), which camera by name, the
-  outcome class and, for a refusal, the non-biometric reason in plain words
-  (`no face seen — were you in frame?`, `IR camera shutter is closed`),
-  and the elapsed time. Below it the status rows of §1.6 and the one
-  recommended next step ("You're one step away: wire the lock screen
-  (w)"), which becomes "Test Recognition (i)" once everything is wired.
+  outcome class and, for a refusal, the cause in plain words from the
+  closed vocabulary of §5 (`no face seen — were you in frame?`, `camera
+  shutter closed`), and the elapsed time. When no attempt is retained the
+  line says so. Below it the status rows of §1.6 and the one recommended
+  next step as an action row ("wire the lock screen"), which becomes
+  "Test Recognition" once everything is wired.
 - **Faces** groups a profile's scans by the camera they were captured on
   (primary / added camera #N, ADR-0029 roles), collapsed by default with a
-  count and date range, and says whether the count is enough
-  (`16 scans · enough for glasses and low light ✓`). It owns `e` add a
-  person, `a` improve recognition, `c` add a camera, `n` rename, `d`
-  delete, `i` test recognition. Test Recognition stops being a page.
+  count and, for scans that carry one, a capture date range. `FaceScan`
+  gains an optional `captured_at` (unix seconds) written for new scans;
+  older scans show "date not recorded". The count line states only what
+  is known: the number of scans and whether it meets the documented
+  minimum for recognition (`16 scans · above the minimum`); it makes no
+  claim about glasses, lighting or other conditions, which the store does
+  not record — the tips about adding scans in other conditions stay. It
+  owns `e` add a person, `a` improve recognition, `c` add a camera, `n`
+  rename, `d` delete, `i` test recognition. Test Recognition stops being a
+  page.
 - **Login & Apps** lists the surfaces present on this machine with what
   each does, and folds the absent display managers into one grey
   sentence. Actions on one row.
@@ -140,32 +162,48 @@ device.
   prints a path).
 - **Support bundle** from Diagnostics prints the file path it wrote and
   offers `y` to copy it.
-- **Per-camera timing history**: the last five attempts per camera, cold
-  or warm, elapsed and the capture stage's share, from the daemon's
-  share-safe events (§5). Shown in the camera's details.
+- **Per-camera timing history**: the last five attempts per camera for
+  the account, elapsed and the capture stage's duration (`capture_ms`,
+  §5), from the account's retained attempt records. Shown in the camera's
+  details; two connected units of the same model are told apart by the
+  USB port chain the record and the listing both carry.
 - **Simulate selection** (after ADR-0029 B): "if the BRIO were unplugged →
   NexiGo (added camera #1)", a pure function of the roles and the
   connected set; never opens a device.
 - **Undo within the session** (`z`) for reversible changes the TUI itself
-  made: rename, camera pin, policy toggles. Each such action records its
-  inverse command; `z` confirms and runs it.
+  made: rename, camera pin, policy toggles. Each such action records the
+  value it wrote and its inverse command; `z` first re-reads the current
+  value and, if it is no longer the one this session wrote (someone else
+  changed it since), refuses with that fact instead of overwriting the
+  newer change; otherwise it confirms and runs the inverse.
 - **Command echo**: every action that runs a CLI command logs the exact
   command to the Activity line (most do; this makes it a rule), and
   `irlume tui --print-commands` prints them to stderr as well.
 
-### 5. Daemon facts this needs (share-safe, non-biometric)
+### 5. Daemon facts this needs (non-biometric, account-scoped)
 
-- The last-attempt line and the timing history read the share-safe event
-  stream the daemon already keeps for `SupportSnapshot`. `OperationFinished`
-  gains optional `elapsed_ms`, `surface` (login / lock / elevation / app /
-  other, from the service class) and `camera` (the pair's `vid`/`pid` and
-  `descriptor_token`, the same share-safe reference `SanitizedCameraContext`
-  already carries — never the binding identity, since share-safe records
-  hold no serial and a test enforces that; the TUI maps vid/pid to the
-  listed camera's name, and two same-model units share a name anyway), and
-  a refusal gains its `OutcomeKind` class name. No score, threshold,
-  embedding or reason prose crosses the socket; the TUI phrases the class. A `since_ms` read of the snapshot
-  already exists and is user-scoped by the posture table.
+- The daemon's share-safe event ring (`SupportSnapshot`) is the wrong
+  carrier for authentication history: it is readable by any local peer on
+  the mode-0666 socket, is process-local, is erased on restart and is
+  bounded to 30 minutes. Nothing about attempts is added to it.
+- Instead the daemon keeps, per account, a small **attempt record**
+  file under its state directory (root-only, like the retry journal):
+  the last attempt and the last five per camera, each with the time, the
+  surface (login / lock / elevation / app / other, from the service
+  class), the camera as vid/pid plus the USB port chain (the reference
+  `SanitizedCameraContext` already uses, which tells two units of one
+  model apart while they are connected; never the binding identity, so no
+  serial), the outcome class, the cause from a closed vocabulary — `no
+  face`, `liveness refused`, `below threshold`, `privacy shutter`, `camera
+  unavailable`, `not enrolled on this camera`, `setup unavailable`,
+  `cancelled`, `timed out`, `other` — mapped in the daemon from the
+  `OutcomeKind` and the error class it already has, `elapsed_ms` and
+  `capture_ms`. No score, threshold, embedding or reason prose is stored;
+  the TUI phrases the cause.
+- A new user-scoped request `LastAttempts { user }` returns that record;
+  the posture table admits the account itself and root, as it does for
+  `FaceSensorStatus { user }`. The camera listing of ADR-0029 A gains the
+  same USB port chain so the TUI can map a record to a listed camera.
 - Nothing else: roles come from ADR-0029 A, selection from ADR-0029 B.
 
 ### 6. Machine and account
@@ -173,7 +211,10 @@ device.
 - Every page's header says whose settings it shows and whether the page is
   per account (Faces, Wallet, Recovery, Preferences' account rows) or per
   machine (Cameras' pin, Login & Apps, Diagnostics). Root sees an account
-  switcher (`Ctrl-U`) where per-account pages are shown.
+  switcher (`Ctrl-U`) where per-account pages are shown. Every per-account
+  load carries the account and a generation; a result that lands after
+  the account changed is dropped, never installed into the new account's
+  page.
 - Docking: an inventory change refreshes the Cameras page and the
   Diagnostics camera row without a keypress (the live snapshot already
   arrives; the rows re-render from it).
@@ -208,7 +249,8 @@ device.
 - C1 — interaction rules: §1.1–1.5, 1.7–1.9 (Enter rule, Esc rule, stable
   keys, one action row, status vocabulary, ellipsis/expand, details column,
   one freshness indicator) and the `?` context help. TUI only.
-- C2 — pages and the last-attempt line: §5's event fields in the daemon,
+- C2 — pages and the last-attempt line: §5's attempt record and request
+  in the daemon, `captured_at` on new scans,
   Overview, Faces (grouped scans, Test Recognition folded), Login & Apps,
   Diagnostics, Preferences by decision, Wallet/Recovery action rows, §1.6
   and §1.10 sweeps.
@@ -222,20 +264,24 @@ device.
 ## Acceptance tests
 
 - Key table: a test walks every page and asserts no page letter collides
-  with a global letter, Enter never sets `confirm`/`suspend`/`input`, and
-  Esc closes an open panel before navigating.
+  with a global letter, Enter on a row never sets
+  `confirm`/`suspend`/`input` (an F6-focused chip is the documented
+  exception), Esc closes an open panel before navigating, and each digit
+  reaches its fixed section whatever the sidebar shows.
 - Vocabulary: every status span uses one of the five glyphs; a
   `NO_COLOR` render still distinguishes the five states.
 - Layout: at 120×40 a list page renders the selected row's details in the
   right column; at 80×30 it renders them only after Enter.
-- Overview: with an `OperationFinished` carrying a refusal class, the first
-  line names the surface, the camera by name and the plain-words reason;
+- Overview: with an attempt record carrying a refusal cause, the first
+  line names the surface, the camera by name and the plain-words cause;
   no score or threshold text can appear (a forbidden-word scan as in the
-  attended trial tooling).
-- Faces: scans group by camera role; the count line says "enough" only
-  above the documented floor.
+  attended trial tooling); a record for another account is never shown.
+- Faces: scans group by camera role; the count line states the minimum
+  and nothing about conditions; scans without `captured_at` read "date
+  not recorded".
 - Login & Apps: an absent display manager never occupies a row.
 - Undo: rename then `z` restores the name through the same request path;
-  `z` with nothing to undo says so.
+  `z` with nothing to undo says so; `z` after an external change to the
+  same value refuses and names the change.
 - Command echo: every `Suspend::*` variant logs a line beginning with the
   command it runs.

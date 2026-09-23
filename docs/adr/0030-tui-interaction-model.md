@@ -177,9 +177,25 @@ device.
   `/dev` node paths are gated by the **daemon**, not by the TUI: they
   travel only in a root-only `CameraDetails` request (the same posture as
   the trace subscription), and the any-peer `ListCameras` row carries
-  `vid:pid`, `serial_present`, the port chain and the descriptor token,
+  `vid:pid`, `serial_present`, the port chain, the descriptor token and an
+  opaque **pair handle** (`handle`: a daemon-minted token for this pair in
+  this connection generation, share-safe, meaningless off the machine),
   not the serial or the node paths — an amendment to ADR-0029 A's
-  `identity` field, which becomes root-only likewise. Stage timings beyond those two durations exist
+  `identity` field, which becomes root-only likewise. Two consequences
+  for ordinary accounts, which never see nodes or serials:
+  - ADR-0029 §3's `EnrollOn` / `AddCameraGroupOn` take the pair
+    **handle**, not node names; the daemon resolves the handle to the
+    nodes and identities server-side and re-checks them under the lease as
+    §1 of that ADR requires. A handle from an older connection generation
+    is refused ("camera changed; pick it again").
+  - Roles are correlated **by the daemon, account-scoped**: the
+    user-scoped enrollment reply's `primary_camera` and each camera group
+    gain `connected_handle: Option<handle>` — the handle of the connected
+    pair whose identity matches that binding, or `None` — so the client
+    labels rows by handle and never needs the serial; two same-model units
+    with different serials get the right labels because the daemon holds
+    both identities. Until this lands, ADR-0029 A's client-side match on
+    `vid:pid` is the interim and is documented as such. Stage timings beyond those two durations exist
   only while a root trace subscriber is active and are not retained; the
   pane says "record a trace (T) for stage timings" rather than promising
   them. Text is selectable and `y` copies the pane to the clipboard when a
@@ -269,10 +285,14 @@ device.
 - Every page's header says whose settings it shows and whether the page is
   per account (Faces, Wallet, Recovery, Preferences' account rows) or per
   machine (Cameras' pin, Login & Apps, Diagnostics). Root sees an account
-  switcher (`Ctrl-U`) where per-account pages are shown. Every per-account
-  load carries the account and a generation; a result that lands after
-  the account changed is dropped, never installed into the new account's
-  page.
+  switcher (`Ctrl-U`) where per-account pages are shown. Switching
+  accounts **clears** the installed per-account rows and selections at
+  once and disables the account-bound actions (rename, delete, add scans,
+  add/remove camera, wallet, recovery) until the new account's generation
+  has loaded, so no action can be built against the old account's rows;
+  every per-account load carries the account and a generation, and a
+  result that lands after the account changed is dropped, never installed
+  into the new account's page.
 - Docking: an inventory change refreshes the Cameras page and the
   Diagnostics camera row without a keypress (the live snapshot already
   arrives; the rows re-render from it).

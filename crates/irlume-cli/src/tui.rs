@@ -1409,7 +1409,13 @@ impl App {
     /// enrollment is "known" once a profile listing arrived: before that,
     /// or from a daemon without the binding field, no role is claimed.
     fn camera_role(&self, pair: &irlume_common::CameraPairInfo) -> CameraRole {
-        let known = self.primary_camera.is_some() || !self.camera_groups.is_empty();
+        // Known once the daemon described the enrollment: a binding, groups,
+        // or a successfully observed empty enrollment (first-run account).
+        // A loaded enrollment with neither (older daemon, or an unbound
+        // legacy profile) stays unknown rather than claiming "not enrolled".
+        let known = self.primary_camera.is_some()
+            || !self.camera_groups.is_empty()
+            || (self.profiles_loaded && self.profiles.is_empty());
         camera_role_for(
             pair.identity.as_deref(),
             self.primary_camera.as_ref(),
@@ -1436,7 +1442,10 @@ impl App {
         // The full binding identity when the daemon sends it; the legacy
         // vid:pid alone from an older daemon, whose serial state is then
         // unknown rather than "none".
-        let identity = match (&p.identity, &p.id) {
+        let identity = match (
+            p.identity.as_deref().map(printable),
+            p.id.as_deref().map(printable),
+        ) {
             (Some(identity), _) if p.serial_present => {
                 Span::raw(format!("{identity} · serial present"))
             }
@@ -1806,11 +1815,13 @@ impl App {
         self.background_idle()
             && daemon_idle
             && (self.freshness.cycle(Worker::Profiles).pending()
-                || (matches!(self.screen, SC_WELCOME | SC_PROFILES | SC_REPAIR | SC_DONE)
-                    && self
-                        .freshness
-                        .cycle(Worker::Profiles)
-                        .due(now, Duration::from_secs(30))))
+                || (matches!(
+                    self.screen,
+                    SC_WELCOME | SC_PROFILES | SC_REPAIR | SC_DONE | SC_CAMERAS
+                ) && self
+                    .freshness
+                    .cycle(Worker::Profiles)
+                    .due(now, Duration::from_secs(30))))
     }
 
     fn cameras_refresh_due(&self, daemon_idle: bool) -> bool {
@@ -5164,6 +5175,8 @@ impl App {
                 self.freshness.cycle_mut(Worker::Cameras).invalidate();
                 self.invalidate_source(Source::Cameras);
                 self.refresh_camera_listing();
+                // The role labels read the enrollment: refresh it too.
+                self.refresh_profiles();
             }
             (SC_CAMERAS, KeyCode::Char('c')) => {
                 self.confirm = Some(("Inspect capture qualification? This opens camera controls when available; it does not capture frames. The result is a dated observation, not a live readiness guarantee.".into(), "Inspect", ConfirmAct::CameraQualification));
@@ -7417,7 +7430,7 @@ impl App {
                             Style::new().fg(if active { th().ok } else { Color::Reset }),
                         ),
                         Span::styled(
-                            format!("{:<26}", clip_columns(&camera_row_name(p), 26)),
+                            fit_columns(&camera_row_name(p), 26),
                             if active {
                                 Style::new().add_modifier(Modifier::BOLD)
                             } else {
@@ -9506,14 +9519,43 @@ fn camera_row_name(pair: &irlume_common::CameraPairInfo) -> String {
 }
 
 /// A name clipped to a column slot with an ellipsis, so a long USB name
-/// never pushes the role and status columns off the row.
+/// never pushes the role and status columns off the row. Measured in
+/// terminal cells, not characters: a wide (CJK, emoji) name takes two
+/// cells per character and is clipped accordingly.
 fn clip_columns(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
+    let cells = |s: &str| Span::raw(s.to_owned()).width();
+    if cells(text) <= width {
         return text.to_owned();
     }
-    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    let mut out = String::new();
+    for ch in text.chars() {
+        let mut candidate = out.clone();
+        candidate.push(ch);
+        if cells(&candidate) > width.saturating_sub(1) {
+            break;
+        }
+        out = candidate;
+    }
     out.push('…');
     out
+}
+
+/// `text` clipped to `width` cells and padded with spaces to exactly that
+/// many cells, so the next column starts where it should whatever the
+/// script.
+fn fit_columns(text: &str, width: usize) -> String {
+    let mut out = clip_columns(text, width);
+    let used = Span::raw(out.clone()).width();
+    out.extend(std::iter::repeat_n(' ', width.saturating_sub(used)));
+    out
+}
+
+/// Device-supplied text for a screen: control characters blanked so a
+/// crafted descriptor (name or serial) cannot inject terminal sequences.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 fn section(title: &str) -> Line<'static> {
@@ -13709,6 +13751,35 @@ mod tests {
         assert!(text.contains("[31mA very long camera pr…"), "{text}");
         assert!(text.contains("Primary camera"), "{text}");
         assert!(!text.contains('\x1b'), "{text}");
+        // A wide-character name is clipped by terminal cells, so the role
+        // column still lands in place.
+        app.pairs[0].name = Some("摄像头摄像头摄像头摄像头摄像头摄像头摄像头摄像头".into());
+        let text = render(&mut app);
+        // 12 wide glyphs (24 cells) + the ellipsis fit the 26-cell slot; the
+        // test backend pads each wide glyph with a spacer cell.
+        let row = text.lines().find(|l| l.contains("Primary camera")).unwrap();
+        assert!(row.contains('…'), "{row}");
+        assert_eq!(row.matches('摄').count(), 4, "{row}");
+        assert!(row.contains("Primary camera        built-in"), "{row}");
+        // A serial with control characters never reaches the terminal.
+        app.pairs[0].identity = Some("3277:0059:\x1b[2Jsn".into());
+        app.pairs[0].serial_present = true;
+        app.cam_sel = 0;
+        app.on_key(KeyCode::Enter);
+        let text = render(&mut app);
+        assert!(text.contains("3277:0059: [2Jsn"), "{text}");
+        assert!(!text.contains('\x1b'), "{text}");
+        app.on_key(KeyCode::Esc);
+        // A successfully observed empty enrollment labels every camera as
+        // not enrolled instead of claiming nothing.
+        app.primary_camera = None;
+        app.camera_groups.clear();
+        app.profiles.clear();
+        app.profiles_loaded = true;
+        app.pairs[0].identity = Some("3277:0059".into());
+        app.pairs[0].name = Some("ASUS Integrated Camera".into());
+        let text = render(&mut app);
+        assert!(text.contains("not enrolled"), "{text}");
     }
 
     #[test]

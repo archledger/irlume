@@ -181,7 +181,12 @@ device.
   the front door says what is missing and offers Login & Apps for the
   password path; a face step is never offered on a machine that cannot
   complete it, and a machine with both offers face first with
-  fingerprint as the alternative on the same step.
+  fingerprint as the alternative on the same step. The last-attempt line
+  of §5 is a face record, so only the face route ends on it; the
+  fingerprint route's "try it" runs the existing reader verification and
+  ends on Overview with a route-local line ("fingerprint test passed
+  just now", kept for this session only, never written to the attempt
+  record), and the password path ends on Login & Apps.
 - Every "unavailable / unknown / needs root" line ends in the action that
   resolves it (§1.6).
 - Confirmation dialogs say what changes for the person and how to undo it
@@ -209,22 +214,29 @@ device.
   not the serial or the node paths — an amendment to ADR-0029 A's
   `identity` field, which becomes root-only likewise. The boundary is
   the daemon's, so it covers every any-peer carrier of node paths, not
-  only `ListCameras`: `Health`'s `rgb_dev`/`ir_dev` are redacted to
-  `None` for a non-root peer in the same change, and `LiveStatus`'s
-  `CameraCandidate` keeps its validated shape (its decoder rejects an
-  empty path list, so an empty vector is not a redaction) but carries
-  `endpoint_paths` as **opaque endpoint tokens** for a non-root peer —
-  the same bounded literal form (`/dev/`-prefixed names of the same
-  count, minted from the pair handle, never real node names) — with a
-  `redacted: true` marker (`serde(default)`), so an older client decodes
-  the snapshot unchanged and a newer one knows not to treat the tokens
-  as paths; the TUI's Cameras page reads the active pair by handle
-  (`Health` gains `active_handle`) rather than by node string; root keeps
-  the full snapshot. The transition is additive
+  only `ListCameras`. For a non-root peer the daemon replaces every node
+  path — `Health`'s `rgb_dev`/`ir_dev`, `LiveStatus`'s
+  `CameraCandidate.endpoint_paths` and any other any-peer field naming a
+  node — with an **endpoint token**: a value of the same validated shape
+  (`/dev/irlume-<12 hex>`, which the candidate validator accepts and no
+  real V4L node is ever named), minted once per node per daemon instance
+  so the same node yields the same token in every response of that
+  instance. No wire field is added or removed (the candidate wire shape
+  is `deny_unknown_fields`, so a marker field would break older
+  clients), and every legacy use keeps its meaning: an older TUI's
+  `caps_from_health` still sees `rgb_dev.is_some()`, and its
+  `face_camera_presence` still finds `Health`'s configured endpoint among
+  `LiveStatus`'s candidate endpoints, because both carry the same token
+  for the same node. A newer TUI recognises a token by its reserved
+  prefix and shows no node column; root receives real paths. The Cameras
+  page reads the active pair by handle (`Health` gains `active_handle`,
+  `serde(default)`) rather than by node string. The transition is additive
   so the mixed-version window of a package upgrade degrades rather than
   breaks: `CameraPairInfo` keeps `rgb`/`ir` as fields that an upgraded
-  daemon fills with `""` for a non-root peer (an older TUI still decodes
-  the row and shows the name and role, with no node column), and gains
+  daemon fills with the same endpoint tokens for a non-root peer (an
+  older TUI still decodes the row, shows the name and role, and its
+  "configured pair" comparison against `Health` still holds because the
+  tokens agree), and gains
   `handle` with `serde(default)` (a newer TUI receiving no handle from an
   older daemon shows the row but disables the handle-bearing actions
   with "daemon older than this tool"). The same rule as ADR-0029 A's
@@ -304,11 +316,20 @@ device.
   whose newest attempt is older than 90 days pruned on the next write —
   so the file stays small however many cameras come and go; each attempt
   carries the time, the
-  surface (login / lock / elevation / app / other, from the service
-  class **as the daemon already resolved it**: the operation class from
-  `biopolicy::classify` with the session state, so a greeter that serves
-  both login and lock is recorded as what it was, not reclassified from
-  the service name), the kind (`authenticate` or `identify`), the camera
+  surface (login / lock / elevation / app / other, from the operation
+  class `biopolicy::classify` resolves **with a session state the daemon
+  establishes itself** at the authentication boundary: today the
+  authentication path classifies with `SessionState::Cold` (apart from
+  the separately bound COSMIC case), so C2 gives the daemon a trustworthy
+  signal — it asks logind whether the target account already has an
+  active or locked session when the request arrives (an existing session
+  means a warm surface: unlock or elevation; none means cold: login) —
+  and the PAM module's own view travels as an optional `session` hint on
+  `Authenticate` (`serde(default)`) that is recorded only when it agrees
+  with logind's answer; when the daemon cannot resolve the state the
+  surface is recorded as `other`, never guessed from the service name —
+  so a greeter that serves both login and lock is recorded as what it
+  was), the kind (`authenticate` or `identify`), the camera
   as vid/pid plus the USB port chain **and** the share-safe
   `descriptor_token` (the digest `SanitizedCameraContext` already carries:
   durable across unplugging, identical only for units that share a
@@ -369,12 +390,20 @@ device.
 - Docking: an inventory change refreshes the Cameras page and the
   Diagnostics camera row without a keypress (the live snapshot already
   arrives; the rows re-render from it), and because the connection
-  generation changed it also re-issues the handle-bearing loads: the
-  `ListCameras` listing (new handles) and the account's enrollment reply
-  (new `connected_handle` correlations), clears the Cameras selection and
+  generation changed it also re-issues the handle-bearing loads — the
+  pair listing (new handles) and the account's enrollment reply (new
+  `connected_handle` correlations) — clears the Cameras selection and
   any pending camera action built on an old handle, and generation-checks
   the results so a listing from before the change is dropped. Until both
   land the camera actions are disabled with "cameras changed; reloading".
+  Neither load may open a device: the handle listing is served from the
+  supervisor's passive inventory (ADR-0029 §1's camera-free discovery —
+  handles, names, vid:pid, port chain and `serial_present` all come from
+  sysfs and the cached inventory), not from the classifying
+  `ListCameras`, which opens every node and checks privacy and stays an
+  explicit action (`c`, confirmed). Until the passive listing exists, a
+  docking event re-renders from the live snapshot only and the
+  handle-bearing actions stay disabled until the person refreshes.
 - First launch after an upgrade shows one line from the changelog's
   Unreleased/latest section that affects the TUI, once.
 - User-facing strings move to one table per page so they can be reviewed
@@ -452,14 +481,22 @@ device.
   gone after the switcher selects another.
 - Wire boundary: as a non-root peer, `Health`, `LiveStatus`,
   `ListCameras` and `ListProfiles` carry no real `/dev` path and no
-  serial, and a redacted `LiveStatus` still decodes with the current
-  `CameraCandidate` validator; `IdentifyFor` for
+  serial; the endpoint token for a node is the same in `Health` and
+  `LiveStatus` within one daemon instance, and a redacted `LiveStatus`
+  decodes with the current `CameraCandidate` validator and the current
+  `deny_unknown_fields` wire types; `IdentifyFor` for
   another account is refused before any enrollment load; a
   `ListCameras` row without `handle` (older daemon) renders with the
   handle-bearing actions disabled.
 - Docking: an inventory change re-issues the listing and enrollment
   loads, drops a listing from the previous generation and clears the
-  selection.
+  selection, and opens no device (the requests it issues are not
+  camera-class).
+- Attempt surface: a lock through a dual-purpose greeter is recorded as
+  lock because logind reports an existing session for the account; with
+  logind unavailable the surface is `other`.
+- Route: the fingerprint route ends with a session-local line and writes
+  no attempt record.
 - Attempt record: a refusal before camera selection is recorded without a
   camera and rendered as "before a camera was chosen"; a lock-screen
   attempt through a dual-purpose greeter is recorded as lock, not login;

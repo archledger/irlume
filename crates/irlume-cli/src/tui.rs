@@ -5281,6 +5281,13 @@ impl App {
                     map_identify,
                 );
             }
+            (
+                SC_PROFILES | SC_KEYRING | SC_RECOVERY | SC_FINGERPRINT | SC_PAM | SC_SETTINGS
+                | SC_REPAIR | SC_CAMERAS,
+                KeyCode::Char('i'),
+            ) => {
+                self.log('·', "current camera availability is unconfirmed; inspect Cameras or Diagnostics before face enrollment/identify");
+            }
             (SC_WELCOME, KeyCode::Char('i')) if self.caps.rgb => {
                 // Only jump to the Identify tab where it exists (advanced
                 // view); in essential view stay put and let the result land

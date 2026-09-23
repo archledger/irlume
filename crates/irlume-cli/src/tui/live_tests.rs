@@ -405,35 +405,39 @@ fn live_freshness_capture_qualification_is_a_separate_explicit_request() {
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     std::env::set_var("IRLUME_SOCKET", &socket);
+    // The socket path is process-wide: a background worker left by another
+    // test can connect here first. Answer every connection with an error
+    // and return the first request that is the one under test.
     let server = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(2);
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
+        loop {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         && Instant::now() < deadline =>
                 {
-                    std::thread::sleep(Duration::from_millis(5))
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
                 }
                 Err(error) => panic!("qualification fixture accept did not finish: {error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(&stream).read_line(&mut line);
+            let _ = writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(&Response::Error("fixture: unavailable".into())).unwrap()
+            );
+            match serde_json::from_str::<Request>(&line) {
+                Ok(request @ Request::CaptureModeStatus) => return request,
+                _ if Instant::now() < deadline => continue,
+                other => panic!("qualification fixture saw no CaptureModeStatus; last: {other:?}"),
             }
-        };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let mut line = String::new();
-        std::io::BufReader::new(&stream)
-            .read_line(&mut line)
-            .unwrap();
-        let request: Request = serde_json::from_str(&line).unwrap();
-        writeln!(
-            stream,
-            "{}",
-            serde_json::to_string(&Response::Error("fixture: unavailable".into())).unwrap()
-        )
-        .unwrap();
-        request
+        }
     });
     let mut app = live_test_app();
     app.screen = SC_CAMERAS;

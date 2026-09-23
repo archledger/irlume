@@ -77,8 +77,8 @@ device.
    opens context help for the current page; `q` quits; `v` toggles the
    advanced view. A page may not reuse a global letter with another
    meaning. Page letters are verbs that read in the bottom bar (`w` wire,
-   `x` un-wire, `u` use this camera, `f` fix, `e` enroll, `a` add scans,
-   `c` add camera, `n` rename, `d` delete).
+   `x` un-wire, `u` use this camera, `p` probe cameras, `f` fix, `e`
+   enroll, `a` add scans, `c` add camera, `n` rename, `d` delete).
 4. **One action row.** Actions sit on one or two lines under the page's
    facts: the key dim, the verb plain, an optional grey hint. Keys are
    advertised in exactly two places, which agree: the action rows (every
@@ -205,9 +205,15 @@ device.
   labels and port chain, descriptor and qualification tokens, serial
   present/absent, TPM tier and PCR policy) plus the retained
   `elapsed_ms`/`capture_ms` of the attempt record. The raw serial and the
-  `/dev` node paths are gated by the **daemon**, not by the TUI: they
-  travel only in a root-only `CameraDetails` request (the same posture as
-  the trace subscription), and the any-peer `ListCameras` row carries
+  `/dev` node paths are gated by the **daemon**, not by the TUI: an
+  ordinary peer receives them from no request at all, while root, the
+  trusted side of that boundary, keeps receiving real paths in every
+  response that carries them today (`ListCameras`, `Health`,
+  `LiveStatus`), so an ADR-0029-era root TUI keeps working unchanged
+  through the upgrade; the root-only `CameraDetails` request (the same
+  posture as the trace subscription) is where the *new* TUI reads the
+  serial and the paths for the details panel, not the sole carrier. The
+  any-peer `ListCameras` row carries
   `vid:pid`, `serial_present`, the port chain, the descriptor token and an
   opaque **pair handle** (`handle`: a daemon-minted token for this pair in
   this connection generation, share-safe, meaningless off the machine),
@@ -243,11 +249,17 @@ device.
   optional fields: additive, defaulted, and the client states which side
   is older. Two consequences for ordinary accounts, which never see
   nodes or serials:
-  - ADR-0029 §3's `EnrollOn` / `AddCameraGroupOn` take the pair
-    **handle**, not node names; the daemon resolves the handle to the
-    nodes and identities server-side and re-checks them under the lease as
-    §1 of that ADR requires. A handle from an older connection generation
-    is refused ("camera changed; pick it again").
+  - The handle-bearing operations are **new variants**,
+    `EnrollOnHandle { handle, .. }` and `AddCameraGroupOnHandle { handle,
+    .. }`, beside ADR-0029 §3's pair-bearing `EnrollOn` /
+    `AddCameraGroupOn`, whose wire shape does not change: an ADR-0029-era
+    client's request still decodes, and the daemon answers it as before
+    for root and refuses it for an ordinary peer with "this tool is older
+    than the daemon; upgrade it" (the paths it names are ones that peer
+    can no longer see). The daemon resolves a handle to the nodes and
+    identities server-side and re-checks them under the lease as §1 of
+    that ADR requires; a handle from an older connection generation is
+    refused ("camera changed; pick it again").
   - Roles are correlated **by the daemon, account-scoped**: the
     user-scoped enrollment reply's `primary_camera` and each camera group
     gain `connected_handle: Option<handle>` — the handle of the connected
@@ -321,15 +333,22 @@ device.
   establishes itself** at the authentication boundary: today the
   authentication path classifies with `SessionState::Cold` (apart from
   the separately bound COSMIC case), so C2 gives the daemon a trustworthy
-  signal — it asks logind whether the target account already has an
-  active or locked session when the request arrives (an existing session
-  means a warm surface: unlock or elevation; none means cold: login) —
-  and the PAM module's own view travels as an optional `session` hint on
-  `Authenticate` (`serde(default)`) that is recorded only when it agrees
-  with logind's answer; when the daemon cannot resolve the state the
-  surface is recorded as `other`, never guessed from the service name —
-  so a greeter that serves both login and lock is recorded as what it
-  was), the kind (`authenticate` or `identify`), the camera
+  signal bound to the **requesting login, not the account**: from the
+  peer's credentials (`SO_PEERCRED` pid) it asks logind which session the
+  PAM conversation runs in (`sd_pid_get_session`), and the state is warm
+  only when that session exists, is a `user`-class session and belongs to
+  the target account — the conversation is happening inside that
+  person's own live session, so it is an unlock or an elevation; a
+  greeter's or TTY's conversation runs in no such session and is cold
+  (login), whatever other sessions the account has elsewhere. The
+  failure direction is safe: unresolvable is cold, the stricter class, so
+  a new login can never be treated as an unlock — including on a
+  convenience-tier camera. The PAM module's own view travels as an
+  optional `session` hint on `Authenticate` (`serde(default)`), recorded
+  only when it agrees; when logind is unavailable the surface is
+  recorded as `other`, never guessed from the service name — so a
+  greeter that serves both login and lock is recorded as what it was),
+  the kind (`authenticate` or `identify`), the camera
   as vid/pid plus the USB port chain **and** the share-safe
   `descriptor_token` (the digest `SanitizedCameraContext` already carries:
   durable across unplugging, identical only for units that share a
@@ -401,7 +420,8 @@ device.
   handles, names, vid:pid, port chain and `serial_present` all come from
   sysfs and the cached inventory), not from the classifying
   `ListCameras`, which opens every node and checks privacy and stays an
-  explicit action (`c`, confirmed). Until the passive listing exists, a
+  explicit, confirmed action under its own letter — `p` *probe cameras*
+  on the Cameras page (`c` stays "add camera" everywhere, per §1.3). Until the passive listing exists, a
   docking event re-renders from the live snapshot only and the
   handle-bearing actions stay disabled until the person refreshes.
 - First launch after an upgrade shows one line from the changelog's
@@ -493,8 +513,14 @@ device.
   selection, and opens no device (the requests it issues are not
   camera-class).
 - Attempt surface: a lock through a dual-purpose greeter is recorded as
-  lock because logind reports an existing session for the account; with
-  logind unavailable the surface is `other`.
+  lock because the conversation's own process is inside the account's
+  user session; a new login for an account that already has an active
+  session elsewhere is still classified cold; with logind unavailable
+  the surface is `other` and the class is cold.
+- Wire compatibility: an ADR-0029-era `EnrollOn { pair }` request still
+  decodes; root's is served, an ordinary peer's is refused by version;
+  root's `ListCameras` row carries real paths.
+- Keys: `c` on Cameras is "add camera"; the probe is `p`.
 - Route: the fingerprint route ends with a session-local line and writes
   no attempt record.
 - Attempt record: a refusal before camera selection is recorded without a

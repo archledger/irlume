@@ -116,15 +116,25 @@ device.
 - **Faces** groups a profile's scans by the camera they were captured on
   (primary / added camera #N, ADR-0029 roles), collapsed by default with a
   count and, for scans that carry one, a capture date range. `FaceScan`
-  gains an optional `captured_at` (unix seconds) written for new scans;
-  older scans show "date not recorded". The count line states only what
-  is known: the number of scans and whether it meets the documented
-  minimum for recognition (`16 scans · above the minimum`); it makes no
-  claim about glasses, lighting or other conditions, which the store does
-  not record — the tips about adding scans in other conditions stay. It
+  gains an optional `captured_at` (unix seconds) written for new scans,
+  and the enrollment reply carries it beside each scan name (an optional
+  per-scan `captured_at` on `ProfileSummary` and a per-group first/last
+  pair on `CameraGroupProfileSummary`, `serde(default)`); older scans and
+  older daemons show "date not recorded". The count line states only what
+  is known: the number of scans against the **capture target**
+  (`16 scans · capture target met`), and separately the recognizer
+  compatibility the reply already reports (`IR ready on this recognizer`,
+  or the shortfall); it never presents the count as recognition readiness,
+  and makes no claim about glasses, lighting or other conditions, which
+  the store does not record — the tips about adding scans in other
+  conditions stay. It
   owns `e` add a person, `a` improve recognition, `c` add a camera, `n`
   rename, `d` delete, `i` test recognition. Test Recognition stops being a
-  page.
+  page. `i` keeps running the identification diagnostic (`Identify`,
+  1:N, camera-free of any grant); identification attempts are retained in
+  the account's attempt record like authentication attempts, marked as
+  `identify`, so the beginner route's "try it" updates the last-attempt
+  line.
 - **Login & Apps** lists the surfaces present on this machine with what
   each does, and folds the absent display managers into one grey
   sentence. Actions on one row.
@@ -155,11 +165,17 @@ device.
 
 ### 4. Maintainer tools
 
-- **Raw facts** behind `F4`: identities with serials, nodes, qualification
-  context, TPM tier and PCR policy, the last trace's stage timings; text
-  is selectable and `y` copies the pane to the clipboard when a clipboard
-  is reachable (OSC 52 with the terminal's consent; otherwise the pane
-  prints a path).
+- **Raw facts** behind `F4`: for an ordinary account, exactly the share-
+  safe facts ADR-0008 already permits (vid/pid, USB topology, descriptor
+  and qualification tokens, serial present/absent, nodes, TPM tier and
+  PCR policy) plus the retained `elapsed_ms`/`capture_ms` of the attempt
+  record; the raw serial appears only for root, through the same privileged
+  boundary as the trace. Stage timings beyond those two durations exist
+  only while a root trace subscriber is active and are not retained; the
+  pane says "record a trace (T) for stage timings" rather than promising
+  them. Text is selectable and `y` copies the pane to the clipboard when a
+  clipboard is reachable (OSC 52 with the terminal's consent; otherwise
+  the pane prints a path).
 - **Support bundle** from Diagnostics prints the file path it wrote and
   offers `y` to copy it.
 - **Per-camera timing history**: the last five attempts per camera for
@@ -172,10 +188,12 @@ device.
   connected set; never opens a device.
 - **Undo within the session** (`z`) for reversible changes the TUI itself
   made: rename, camera pin, policy toggles. Each such action records the
-  value it wrote and its inverse command; `z` first re-reads the current
-  value and, if it is no longer the one this session wrote (someone else
-  changed it since), refuses with that fact instead of overwriting the
-  newer change; otherwise it confirms and runs the inverse.
+  value it wrote and its inverse; `z` confirms and sends the inverse with
+  an **expected-current-value precondition** carried in the request
+  (`RenameProfile { expected: .. }`, `SetCameraSelection { expected: .. }`,
+  the policy writers likewise), which the daemon checks under its own lock
+  and refuses if the value is no longer the one this session wrote; the
+  refusal names the change. No separate read-then-act.
 - **Command echo**: every action that runs a CLI command logs the exact
   command to the Activity line (most do; this makes it a rule), and
   `irlume tui --print-commands` prints them to stderr as well.
@@ -190,16 +208,25 @@ device.
   file under its state directory (root-only, like the retry journal):
   the last attempt and the last five per camera, each with the time, the
   surface (login / lock / elevation / app / other, from the service
-  class), the camera as vid/pid plus the USB port chain (the reference
+  class **as the daemon already resolved it**: the operation class from
+  `biopolicy::classify` with the session state, so a greeter that serves
+  both login and lock is recorded as what it was, not reclassified from
+  the service name), the kind (`authenticate` or `identify`), the camera
+  as vid/pid plus the USB port chain (the reference
   `SanitizedCameraContext` already uses, which tells two units of one
   model apart while they are connected; never the binding identity, so no
-  serial), the outcome class, the cause from a closed vocabulary — `no
-  face`, `liveness refused`, `below threshold`, `privacy shutter`, `camera
-  unavailable`, `not enrolled on this camera`, `setup unavailable`,
-  `cancelled`, `timed out`, `other` — mapped in the daemon from the
-  `OutcomeKind` and the error class it already has, `elapsed_ms` and
-  `capture_ms`. No score, threshold, embedding or reason prose is stored;
-  the TUI phrases the cause.
+  serial) — **optional**, absent for an attempt refused before any camera
+  was selected (startup, retry throttling, method or policy checks), as
+  is `capture_ms` — the outcome class, the cause, `elapsed_ms` and
+  `capture_ms`. The cause is a **structured field on the engine's
+  `Outcome`** (`OutcomeCause`, set where the outcome is built, next to
+  `OutcomeKind`): `no face`, `liveness refused`, `below threshold`,
+  `privacy shutter`, `camera unavailable`, `not enrolled on this camera`,
+  `setup unavailable`, `cancelled`, `timed out`, `other`; the daemon
+  records it as given and never infers it from reason prose. No score,
+  threshold, embedding or reason prose is stored; the TUI phrases the
+  cause, and for a record with no camera says "before a camera was
+  chosen".
 - A new user-scoped request `LastAttempts { user }` returns that record;
   the posture table admits the account itself and root, as it does for
   `FaceSensorStatus { user }`. The camera listing of ADR-0029 A gains the
@@ -235,8 +262,10 @@ device.
 ## Consequences
 
 - Beginners get a route and an answer to "why not"; maintainers get the
-  figures they now collect by hand. The daemon's contract grows by three
-  optional fields on an event it already emits.
+  figures they now collect by hand. The daemon's contract grows by one
+  root-only per-account attempt record and one user-scoped request (§5);
+  no existing event changes, and the any-peer support snapshot carries
+  nothing new.
 - Muscle memory forms because letters stop changing meaning; the cost is a
   one-time relearn for the few pages whose letters move (Cameras' Enter,
   Wallet's `p`).
@@ -249,8 +278,9 @@ device.
 - C1 — interaction rules: §1.1–1.5, 1.7–1.9 (Enter rule, Esc rule, stable
   keys, one action row, status vocabulary, ellipsis/expand, details column,
   one freshness indicator) and the `?` context help. TUI only.
-- C2 — pages and the last-attempt line: §5's attempt record and request
-  in the daemon, `captured_at` on new scans,
+- C2 — pages and the last-attempt line: `OutcomeCause` on the engine's
+  outcome, §5's attempt record and request in the daemon, `captured_at`
+  on new scans and on the enrollment reply,
   Overview, Faces (grouped scans, Test Recognition folded), Login & Apps,
   Diagnostics, Preferences by decision, Wallet/Recovery action rows, §1.6
   and §1.10 sweeps.
@@ -280,8 +310,13 @@ device.
   and nothing about conditions; scans without `captured_at` read "date
   not recorded".
 - Login & Apps: an absent display manager never occupies a row.
-- Undo: rename then `z` restores the name through the same request path;
-  `z` with nothing to undo says so; `z` after an external change to the
-  same value refuses and names the change.
+- Undo: rename then `z` restores the name through the same request path
+  with the expected-value precondition; `z` with nothing to undo says so;
+  a request whose precondition no longer holds is refused by the daemon
+  and the refusal names the change.
+- Attempt record: a refusal before camera selection is recorded without a
+  camera and rendered as "before a camera was chosen"; a lock-screen
+  attempt through a dual-purpose greeter is recorded as lock, not login;
+  an identification is recorded as `identify`.
 - Command echo: every `Suspend::*` variant logs a line beginning with the
   command it runs.

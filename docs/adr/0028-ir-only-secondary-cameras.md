@@ -2,7 +2,10 @@
 
 ## Status
 
-Proposed 2026-09-22. Amends ADR-0024 (multi-camera enrollment) §5 for the
+Accepted 2026-09-22; Phase 1 merged (#808) and Phase 2 completed on
+archhost 2026-09-23 (`artifacts/irlume/2026-09-23-adr28-phase2/RESULTS.md`
+on the shared ledger); the gate of §7 is removed by the change that cites
+that evidence. Amends ADR-0024 (multi-camera enrollment) §5 for the
 experimental IR-only sensor policy; changes nothing in ADR-0016's IR
 evidence rules or in the dual-sensor path. Motivated by the sensor-policy ×
 camera matrix measured on archhost on 2026-09-22
@@ -171,7 +174,9 @@ all its cameras.
    unless the validation hook `IRLUME_IR_ONLY_SECONDARY=1` is set in the
    daemon's environment; the flip that removes the gate is its own change,
    made only after the Phase 2 evidence is recorded on the shared ledger and
-   referenced from that change.
+   referenced from that change. Done: the gate and the hook are removed;
+   the `SecondaryUnvalidated` readiness remains on the wire only so a Phase
+   1 daemon's status still decodes.
 
 ## Consequences
 
@@ -208,6 +213,14 @@ all its cameras.
   store (change the primary, observe `SecondaryInactive`; remove and add the
   camera, observe readiness); the boundary revalidation exercised by
   removing the group during a capture. Then the gate-removal change.
+  Outcome (2026-09-23): NexiGo secondary granted IR-only 4/4, 5.04 s cold
+  and 4.82–4.87 s warm (the camera's IR capture is ~4.5 s of it; resolution
+  and scoring add under 250 ms); BRIO primary unchanged at 1.37 s warm;
+  `SecondaryInactive` on a one-byte primary change; boundary refusal with
+  the store removed 1.8 s into a capture; `SecondaryUnvalidated` with the
+  hook off. The remove-and-add case was skipped by decision (it re-enrolls
+  the group's scans for no measurement; the writer guard's positive path is
+  unit-covered).
 
 ## Acceptance tests
 
@@ -221,8 +234,8 @@ all its cameras.
   (the one-sided group never wildcards); two groups with identical pairs →
   `BindingMismatch`; secondary match in an inactive store →
   `SecondaryInactive`; no match → `BindingMismatch`; matched group with an
-  empty IR view → `IncompatibleEnrollment`; gate set and no validation hook
-  → `SecondaryUnvalidated`.
+  empty IR view → `IncompatibleEnrollment`; (Phase 1 only) gate set and no
+  validation hook → `SecondaryUnvalidated`.
 - Account policy: a legacy enrollment with `require_eyes_open` set is
   `IncompatibleEnrollment` on the secondary scope exactly as on the
   primary, checked on the real primary before the scoped view exists.

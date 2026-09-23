@@ -158,10 +158,13 @@ device.
 - The last-attempt line and the timing history read the share-safe event
   stream the daemon already keeps for `SupportSnapshot`. `OperationFinished`
   gains optional `elapsed_ms`, `surface` (login / lock / elevation / app /
-  other, from the service class) and `camera` (the pair's identity, so the
-  TUI maps it to a name and role), and a refusal gains its `OutcomeKind`
-  class name. No score, threshold, embedding or reason prose crosses the
-  socket; the TUI phrases the class. A `since_ms` read of the snapshot
+  other, from the service class) and `camera` (the pair's `vid`/`pid` and
+  `descriptor_token`, the same share-safe reference `SanitizedCameraContext`
+  already carries — never the binding identity, since share-safe records
+  hold no serial and a test enforces that; the TUI maps vid/pid to the
+  listed camera's name, and two same-model units share a name anyway), and
+  a refusal gains its `OutcomeKind` class name. No score, threshold,
+  embedding or reason prose crosses the socket; the TUI phrases the class. A `since_ms` read of the snapshot
   already exists and is user-scoped by the posture table.
 - Nothing else: roles come from ADR-0029 A, selection from ADR-0029 B.
 

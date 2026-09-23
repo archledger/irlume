@@ -2183,7 +2183,20 @@ impl Engine {
         self.check_request_active()?;
         let target = match irlume_camera::configured_ir_target() {
             Ok(target) => target,
-            Err(_) => return Ok(readiness_refusal(Ready::TargetUnavailable)),
+            // No camera was opened: a missing or unsupported configuration
+            // is a configuration cause; only an endpoint that cannot be
+            // used is "camera unavailable" (ADR-0030 §5).
+            Err(error) => {
+                let mut refusal = readiness_refusal(Ready::TargetUnavailable);
+                refusal.cause = Some(match error {
+                    irlume_camera::IrTargetError::Unconfigured
+                    | irlume_camera::IrTargetError::UnsupportedTopology(_) => {
+                        irlume_common::OutcomeCause::Configuration
+                    }
+                    _ => irlume_common::OutcomeCause::CameraUnavailable,
+                });
+                return Ok(refusal);
+            }
         };
         if let Some(refusal) = self.ir_model_readiness(&target) {
             return Ok(readiness_refusal(refusal));

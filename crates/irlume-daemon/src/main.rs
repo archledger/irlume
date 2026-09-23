@@ -1325,8 +1325,7 @@ enum EarlyRefusal {
     Configuration,
     /// Too many recent attempts, or the retry state is unavailable.
     RetryThrottled,
-    /// The engine is still loading.
-    #[allow(dead_code)] // answered as a prose Error today; recorded in the attempt record
+    /// The engine is still loading (answered before the worker exists).
     DaemonStarting,
 }
 
@@ -2282,10 +2281,10 @@ mod worker_engine {
             let inline = ["early_refusal(", "EarlyRefusal::"].concat();
             let sites = flat.matches(&wrapped).count() + flat.matches(&inline).count();
             assert_eq!(
-                sites, 7,
-                "the seven pre-camera refusal sites (root gate, method, \
-                 configuration, cosmic binding, convenience tier, biopolicy, \
-                 retry throttle) each name their cause"
+                sites, 8,
+                "the eight pre-camera refusal sites (daemon starting, root \
+                 gate, method, configuration, cosmic binding, convenience \
+                 tier, biopolicy, retry throttle) each name their cause"
             );
         }
 
@@ -3028,6 +3027,13 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             ir_scope: None,
             ir_scope_index: None,
         },
+        // A face attempt refused because the engine is still loading is a
+        // pre-camera refusal with its own cause (ADR-0030 §5), in the
+        // reply shape every authentication client decodes.
+        Request::Authenticate { .. } => early_refusal(
+            EarlyRefusal::DaemonStarting,
+            "irlumed is still starting (loading models); retry, or use your password",
+        ),
         _ => Response::Error(
             "irlumed is still starting (loading models); retry, or use your password".into(),
         ),
@@ -4221,11 +4227,14 @@ fn authentication_error(error: irlume_common::Error, structured: bool) -> Respon
                 retryable: false,
                 cause,
             },
-            // Every other engine failure keeps its prose reply (an older
-            // client's only decodable shape) — a typed OperationFailed
-            // would change what a structured client sees today. The cause
-            // is preserved for the attempt record (ADR-0030 §5).
-            error => Response::Error(error.to_string()),
+            // Every other engine failure: the client asked for typed
+            // errors, so it gets the code and the cause it can branch on
+            // (ADR-0030 §5); a pre-emption is worth retrying.
+            error => Response::OperationError {
+                code: irlume_common::OperationErrorCode::OperationFailed,
+                retryable: matches!(error, irlume_common::Error::Preempted(_)),
+                cause,
+            },
         }
     } else {
         Response::Error(error.to_string())
@@ -7484,7 +7493,36 @@ mod tests {
         ));
         let resp = authentication_error(irlume_common::Error::DeadlineExpired, false);
         assert!(matches!(resp, Response::Error(_)));
+        // Every other engine failure is typed too when asked for, with its
+        // cause; a pre-emption is the one worth retrying.
         let resp = authentication_error(irlume_common::Error::Io("boom".into()), true);
+        assert!(matches!(
+            resp,
+            Response::OperationError {
+                code: OperationErrorCode::OperationFailed,
+                retryable: false,
+                cause: Some(OutcomeCause::Other),
+            }
+        ));
+        let resp = authentication_error(irlume_common::Error::PrivacyShutter("s".into()), true);
+        assert!(matches!(
+            resp,
+            Response::OperationError {
+                code: OperationErrorCode::OperationFailed,
+                retryable: false,
+                cause: Some(OutcomeCause::PrivacyShutter),
+            }
+        ));
+        let resp = authentication_error(irlume_common::Error::Preempted("c".into()), true);
+        assert!(matches!(
+            resp,
+            Response::OperationError {
+                code: OperationErrorCode::OperationFailed,
+                retryable: true,
+                cause: Some(OutcomeCause::Cancelled),
+            }
+        ));
+        let resp = authentication_error(irlume_common::Error::Io("boom".into()), false);
         assert!(matches!(resp, Response::Error(_)));
     }
 
@@ -9085,7 +9123,11 @@ mod tests {
         // classified into a code: typing follows the variant, never words.
         assert!(matches!(
             authentication_error(Error::Hardware("camera busy".into()), true),
-            Response::Error(_)
+            Response::OperationError {
+                code: OperationErrorCode::OperationFailed,
+                cause: Some(irlume_common::OutcomeCause::CameraUnavailable),
+                ..
+            }
         ));
         // The variant itself, not its wording, selects the code.
         assert!(matches!(
@@ -9712,6 +9754,26 @@ mod tests {
                 "the refusal must say why, it reaches the user through PAM: {e}"
             ),
             other => panic!("a request needing the engine must be refused, got {other:?}"),
+        }
+        // A face attempt during startup is a typed pre-camera refusal with
+        // its own cause (ADR-0030 §5), still saying why.
+        match dispatch_before_engine(
+            Request::Authenticate {
+                structured_errors: false,
+                user: crate::users::name_for_uid(0).unwrap_or_else(|| "root".into()),
+                service: None,
+                intent_confirmation: None,
+            },
+            &peer(0),
+        ) {
+            Response::AuthResult {
+                granted: false,
+                refused_by_policy: true,
+                cause: Some(irlume_common::OutcomeCause::DaemonStarting),
+                reason,
+                ..
+            } => assert!(reason.contains("still starting"), "{reason}"),
+            other => panic!("a starting-time face attempt must be a typed refusal, got {other:?}"),
         }
     }
 

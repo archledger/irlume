@@ -10706,9 +10706,10 @@ mod tests {
         let object = value["PreferencesStatus"].as_object().unwrap();
         assert_eq!(
             object.len(),
-            5,
-            "only policy enums, optional bools and override flags"
+            6,
+            "only policy enums, optional bools and override flags (ADR-0029 A adds the external-camera prohibition as an optional bool)"
         );
+        assert!(object["forbid_external_cameras"].is_boolean());
     }
 
     #[test]

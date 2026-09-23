@@ -3405,44 +3405,37 @@ impl App {
                 self.on_key(key);
             }
             // Emitter setup writes the persisted UVC control, a root op now.
-            Fix::Root(RootFix::RestartDaemon) => {
-                self.log(
-                    '→',
-                    "sudo systemctl enable --now irlumed (you'll be asked for your password)",
-                );
-                self.suspend = Some(Suspend::RestartDaemon);
-            }
-            Fix::Root(RootFix::RestartFprintd) => {
-                self.log(
-                    '→',
-                    "sudo systemctl restart fprintd: releases a stale reader claim",
-                );
-                self.suspend = Some(Suspend::RestartFprintd);
-            }
-            Fix::Root(RootFix::LoginEnable) => {
-                self.log(
-                    '→',
-                    "sudo irlume login enable --apply: wires the login stack for your method",
-                );
-                self.suspend = Some(Suspend::LoginEnable);
-            }
-            Fix::Root(RootFix::FingerprintAdd) => {
-                self.log('→', "enrolling a finger (interactive)");
-                self.suspend = Some(Suspend::FingerprintAdd);
-            }
-            Fix::Root(RootFix::LoginReconcile) => {
-                self.log(
-                    '→',
-                    "sudo irlume login reconcile: re-applies the face-auth PAM wiring",
-                );
-                self.suspend = Some(Suspend::LoginReconcile);
-            }
-            Fix::Root(RootFix::SelinuxLoad) => {
-                self.log(
-                    '→',
-                    "sudo irlume selinux load (you'll be asked for your password)",
-                );
-                self.suspend = Some(Suspend::SelinuxLoad);
+            // A root fix runs as root: it is confirmed like every other
+            // root operation (ADR-0030 §1.1), whether reached by [f] or by
+            // Enter on the F6-focused chip, and the dialog names the command.
+            Fix::Root(root) => {
+                let (command, suspend) = match root {
+                    RootFix::RestartDaemon => (
+                        "sudo systemctl enable --now irlumed",
+                        Suspend::RestartDaemon,
+                    ),
+                    RootFix::RestartFprintd => (
+                        "sudo systemctl restart fprintd (releases a stale reader claim)",
+                        Suspend::RestartFprintd,
+                    ),
+                    RootFix::LoginEnable => (
+                        "sudo irlume login enable --apply (wires the login stack for your method)",
+                        Suspend::LoginEnable,
+                    ),
+                    RootFix::FingerprintAdd => {
+                        ("enroll a finger (interactive)", Suspend::FingerprintAdd)
+                    }
+                    RootFix::LoginReconcile => (
+                        "sudo irlume login reconcile (re-applies the face-auth PAM wiring)",
+                        Suspend::LoginReconcile,
+                    ),
+                    RootFix::SelinuxLoad => ("sudo irlume selinux load", Suspend::SelinuxLoad),
+                };
+                self.confirm = Some((
+                    format!("Run this fix? {command}. You'll be asked for your password."),
+                    "Fix",
+                    ConfirmAct::Sus(suspend),
+                ));
             }
         }
     }
@@ -5214,7 +5207,12 @@ impl App {
             }
             (SC_KEYRING | SC_RECOVERY | SC_SETTINGS, KeyCode::Char('r')) => {
                 self.log('·', "refreshing this page…");
-                self.invalidate_daemon_observations();
+                // Only the light sources these pages show; never the
+                // profile source, whose reload unseals through the TPM.
+                for source in [Source::Wallet, Source::Recovery, Source::Preferences] {
+                    self.invalidate_source(source);
+                }
+                self.freshness.cycle_mut(Worker::Light).invalidate();
                 self.refresh_light();
                 if self.screen == SC_KEYRING {
                     self.invalidate_keyring_diagnostic();
@@ -14581,10 +14579,19 @@ mod tests {
             app.activity.last().unwrap().1.contains("run `foo --bar`"),
             "a manual fix must echo the exact command"
         );
+        // A root fix arms the confirmation dialog; the dialog's action is
+        // the suspend (ADR-0030 §1.1: root operations always ask first).
         let suspended_by = |app: &mut App, idx: usize| {
             app.suspend = None;
             app.apply_fix(idx);
-            app.suspend.take()
+            assert!(
+                app.suspend.is_none(),
+                "a root fix never suspends before the dialog"
+            );
+            match app.confirm.take() {
+                Some((_, _, ConfirmAct::Sus(suspend))) => Some(suspend),
+                _ => None,
+            }
         };
         assert!(matches!(
             suspended_by(&mut app, 2),
@@ -16394,6 +16401,29 @@ mod tests {
             app.input = None;
             app.suspend = None;
         }
+        // The documented exception: Enter on an F6-focused chip does what
+        // the chip's letter does, and a root fix's letter opens the
+        // confirmation dialog rather than running.
+        app.screen = SC_REPAIR;
+        app.repair = vec![check_row(
+            "daemon",
+            Sev::Fail,
+            Fix::Root(RootFix::RestartDaemon),
+        )];
+        app.repair_sel = 0;
+        app.on_key(KeyCode::F(6));
+        app.on_key(KeyCode::Enter);
+        assert!(
+            app.suspend.is_none(),
+            "focused Enter never suspends into sudo directly"
+        );
+        assert!(
+            matches!(
+                app.confirm,
+                Some((_, _, ConfirmAct::Sus(Suspend::RestartDaemon)))
+            ),
+            "focused Enter on the fix chip opens its confirmation"
+        );
     }
 
     #[test]

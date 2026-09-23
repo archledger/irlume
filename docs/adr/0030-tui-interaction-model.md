@@ -242,7 +242,14 @@ device.
   daemon fills with the same endpoint tokens for a non-root peer (an
   older TUI still decodes the row, shows the name and role, and its
   "configured pair" comparison against `Health` still holds because the
-  tokens agree), and gains
+  tokens agree; and because that TUI's `u` flow submits those values to
+  `sudo irlume set-cameras` / `SetCamerasIfCurrent`, the daemon
+  **resolves endpoint tokens server-side** in every path-taking request
+  — a token minted by this instance maps back to its node before the
+  candidate is checked against the real passive inventory, so the
+  legacy pin keeps working; a token from another instance, or a value
+  that is neither a token nor a real node, is refused as unknown), and
+  gains
   `handle` with `serde(default)` (a newer TUI receiving no handle from an
   older daemon shows the row but disables the handle-bearing actions
   with "daemon older than this tool"). The same rule as ADR-0029 A's
@@ -292,7 +299,15 @@ device.
   NexiGo (added camera #1)", a pure function of the roles and the
   connected set; never opens a device.
 - **Undo within the session** (`z`) for reversible changes the TUI itself
-  made: rename, camera pin, policy toggles. Each such action records the
+  made: rename, camera pin, policy toggles. Rename is reversible only
+  because both the rename and its inverse run as ADR-0024 §4
+  **authorized transactions**: the daemon rewrites the primary, updates
+  the secondary store's profile references and publishes a new snapshot
+  binding in one transaction, so added cameras stay active through a
+  rename and through its undo; a daemon whose rename is not yet such a
+  transaction reports it, and the TUI then excludes rename from undo and
+  says why ("renaming would deactivate the added cameras until they are
+  re-authorized"). Each such action records the
   value it wrote and its inverse; `z` confirms and sends the inverse with
   an **expected-current-value precondition** carried in a **separate
   compare-and-set variant** (`RenameProfileExpecting { expected, .. }`,
@@ -357,8 +372,18 @@ device.
   port chain and the token match a connected camera, and otherwise shows
   the model name (vid/pid) with "no longer connected" (or "different
   port" when only the token matches) rather than attributing the attempt
-  to a replacement unit or to the same unit moved elsewhere; never the
-  binding identity, so no serial. The
+  to the same unit moved elsewhere; never the binding identity, so no
+  serial. What port chain plus descriptor token identify is **a unit of
+  this model at this location**: a serial-less unit replaced by an
+  identical one in the same port is indistinguishable on the wire and on
+  the USB bus alike, and the record does not pretend otherwise — the
+  history is presented as the camera *at that port* ("Logitech BRIO, rear
+  left port"), and where the unit carries a serial the record adds a
+  keyed, per-account **unit discriminator** (`HMAC(account key, serial)`,
+  truncated; the same secret ADR-0024 keys the snapshot binding with, so
+  it reveals nothing about the serial and is meaningless off the
+  machine) that a replacement with a different serial will not match,
+  and the row then says "replaced unit; earlier history". The
   camera fields are **optional**, absent for an attempt refused before any
   camera was selected (startup, retry throttling, method or policy
   checks), as is `capture_ms` — the outcome class, the cause, `elapsed_ms` and
@@ -495,7 +520,10 @@ device.
   not recorded".
 - Login & Apps: an absent display manager never occupies a row.
 - Undo: rename then `z` restores the name through the same request path
-  with the expected-value precondition; `z` with nothing to undo says so;
+  with the expected-value precondition, and an account with an added
+  camera group still has it active after both; a daemon without the
+  transactional rename makes `z` unavailable for renames with an
+  explanation; `z` with nothing to undo says so;
   a request whose precondition no longer holds is refused by the daemon
   and the refusal names the change; an entry recorded for one account is
   gone after the switcher selects another.
@@ -519,7 +547,13 @@ device.
   the surface is `other` and the class is cold.
 - Wire compatibility: an ADR-0029-era `EnrollOn { pair }` request still
   decodes; root's is served, an ordinary peer's is refused by version;
-  root's `ListCameras` row carries real paths.
+  root's `ListCameras` row carries real paths; a `SetCamerasIfCurrent`
+  carrying this instance's endpoint tokens pins the real pair, one
+  carrying foreign tokens is refused.
+- Attempt correlation: a same-model, serial-less replacement in the same
+  port inherits the port's history and is labelled by location; a
+  serial-bearing replacement does not match the discriminator and reads
+  "replaced unit".
 - Keys: `c` on Cameras is "add camera"; the probe is `p`.
 - Route: the fingerprint route ends with a session-local line and writes
   no attempt record.

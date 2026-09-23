@@ -552,20 +552,33 @@ pub(crate) struct OperationScope {
     operation_id: OperationId,
     operation: OperationClass,
     finished: Arc<AtomicBool>,
-    /// The capture span for the attempt record's `capture_ms` (ADR-0030
-    /// §5), measured as wall time between the events this scope relays:
-    /// the `CaptureSetup` timing marks capture beginning, the last
-    /// `RgbCapture`/`IrCapture` timing marks it ending. Concurrent roles
-    /// overlap and are not summed; without a setup mark the longest single
-    /// capture stage stands in.
+    /// The capture time for the attempt record's `capture_ms` (ADR-0030
+    /// §5), accumulated per capture round from the stage timings this
+    /// scope relays; see [`CaptureSpan`].
     capture: Arc<Mutex<CaptureSpan>>,
 }
 
+/// Capture time per round: a round runs from the start of its first
+/// capture stage (its event's arrival minus its own duration) to the
+/// arrival of its last, and closes when any other stage reports — so the
+/// detection, liveness and matching between retry rounds are not counted.
+/// Concurrent roles overlap within a round; sequential roles add up.
 #[derive(Default)]
 struct CaptureSpan {
-    begun: Option<std::time::Instant>,
-    ended: Option<std::time::Instant>,
+    round_start: Option<std::time::Instant>,
+    round_end: Option<std::time::Instant>,
+    closed_ms: u64,
     longest_stage_us: u64,
+}
+
+impl CaptureSpan {
+    fn close_round(&mut self) {
+        if let (Some(start), Some(end)) = (self.round_start.take(), self.round_end.take()) {
+            self.closed_ms = self.closed_ms.saturating_add(
+                u64::try_from(end.saturating_duration_since(start).as_millis()).unwrap_or(u64::MAX),
+            );
+        }
+    }
 }
 
 impl OperationScope {
@@ -573,24 +586,18 @@ impl OperationScope {
         self.operation_id
     }
 
-    /// The capture span once a capture stage reported (ADR-0030 §5):
-    /// wall time from the setup mark to the last capture stage event, at
-    /// least the longest single stage; `None` when the operation never
+    /// The capture time once a capture stage reported (ADR-0030 §5): the
+    /// closed rounds' wall time summed (a still-open round closes here),
+    /// at least the longest single stage; `None` when the operation never
     /// reached a capture.
     pub(crate) fn capture_ms(&self) -> Option<u64> {
-        let span = self.capture.lock().unwrap_or_else(|e| e.into_inner());
+        let mut span = self.capture.lock().unwrap_or_else(|e| e.into_inner());
         if span.longest_stage_us == 0 {
             return None;
         }
+        span.close_round();
         let stage_ms = span.longest_stage_us.div_ceil(1000);
-        let wall_ms = match (span.begun, span.ended) {
-            (Some(begun), Some(ended)) => {
-                u64::try_from(ended.saturating_duration_since(begun).as_millis())
-                    .unwrap_or(u64::MAX)
-            }
-            _ => 0,
-        };
-        Some(wall_ms.max(stage_ms))
+        Some(span.closed_ms.max(stage_ms))
     }
 
     #[cfg(test)]
@@ -642,13 +649,18 @@ impl DiagnosticSink for OperationScope {
             use irlume_common::diagnostics::TraceStage;
             let mut span = self.capture.lock().unwrap_or_else(|e| e.into_inner());
             match stage {
-                // Setup ends where capture begins.
-                TraceStage::CaptureSetup => span.begun = Some(std::time::Instant::now()),
                 TraceStage::RgbCapture | TraceStage::IrCapture => {
-                    span.ended = Some(std::time::Instant::now());
+                    let now = std::time::Instant::now();
+                    let started = now
+                        .checked_sub(std::time::Duration::from_micros(*elapsed_us))
+                        .unwrap_or(now);
+                    let start = span.round_start.map_or(started, |s| s.min(started));
+                    span.round_start = Some(start);
+                    span.round_end = Some(now);
                     span.longest_stage_us = span.longest_stage_us.max(*elapsed_us);
                 }
-                _ => {}
+                // Any other stage reporting means the round's capture is over.
+                _ => span.close_round(),
             }
         }
         if !self.finished.load(Ordering::Acquire) {

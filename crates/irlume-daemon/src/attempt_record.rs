@@ -217,7 +217,10 @@ pub(crate) fn apply(record: &mut AttemptRecord, entry: AttemptEntry, now: u64) {
         AttemptKind::Authenticate => &mut record.latest_authenticate,
         AttemptKind::Identify => &mut record.latest_identify,
     };
-    let order = |e: &AttemptEntry| (e.at, e.seq);
+    // The writer's sequence is the completion order; wall time only orders
+    // entries that predate the sequence (seq 0) and is otherwise display
+    // data, so a clock stepped backwards cannot freeze the record.
+    let order = |e: &AttemptEntry| (e.seq, e.at);
     if latest
         .as_ref()
         .is_none_or(|current| order(current) <= order(&entry))
@@ -250,6 +253,7 @@ pub(crate) fn apply(record: &mut AttemptRecord, entry: AttemptEntry, now: u64) {
     // Most recently used first (by the newest attempt each holds); the
     // least recently used falls off.
     let newest = |bucket: &CameraAttempts| bucket.attempts.first().map_or((0, 0), order);
+    // A clock stepped backwards must not bury a newer completion.
     let position = record
         .cameras
         .iter()

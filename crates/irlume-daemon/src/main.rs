@@ -1012,6 +1012,13 @@ fn main() {
                             // the slot first, exactly as the normal path does, so the
                             // uid is not locked out of the camera.
                             if !link.claim() {
+                                // A face request whose client left while it
+                                // queued is a cancelled attempt that reached no
+                                // camera (ADR-0030 §5).
+                                if let Some(attempt) = AttemptContext::for_request(&req, &peer, || None) {
+                                    note_pre_camera_failure(irlume_common::OutcomeCause::Cancelled);
+                                    attempt.file(&Response::Error("client left".into()), None);
+                                }
                                 link.finish_activity();
                                 scope.finish(
                                     irlume_common::diagnostics::CategoricalOutcome::Cancelled,
@@ -1108,7 +1115,14 @@ fn main() {
                                     note_engine_error(&irlume_common::Error::Protocol(
                                         "request handler panicked".into(),
                                     ));
-                                    attempt.file(&resp.response, scope.capture_ms());
+                                    // A decision already delivered is what the
+                                    // client got; only a panic before it is the
+                                    // synthetic failure.
+                                    let filed = delivery
+                                        .delivered_response
+                                        .as_ref()
+                                        .unwrap_or(&resp.response);
+                                    attempt.file(filed, scope.capture_ms());
                                 }
                             }
                             link.finish_activity();
@@ -1654,6 +1668,9 @@ struct WorkerReply {
 struct Delivery<'a> {
     sender: Option<&'a std::sync::mpsc::Sender<WorkerReply>>,
     delivered: bool,
+    /// The reply that went out early, kept so a panic after delivery is
+    /// filed against what the client received (ADR-0030 §5).
+    delivered_response: Option<Response>,
 }
 
 impl<'a> Delivery<'a> {
@@ -1664,6 +1681,7 @@ impl<'a> Delivery<'a> {
         Self {
             sender: None,
             delivered: false,
+            delivered_response: None,
         }
     }
 
@@ -1671,6 +1689,7 @@ impl<'a> Delivery<'a> {
         Self {
             sender: Some(sender),
             delivered: false,
+            delivered_response: None,
         }
     }
 
@@ -1684,9 +1703,11 @@ impl<'a> Delivery<'a> {
         let Some(sender) = self.sender else {
             return false;
         };
+        let response = reply.response.clone();
         match sender.send(reply) {
             Ok(()) => {
                 self.delivered = true;
+                self.delivered_response = Some(response);
                 true
             }
             Err(_) => {
@@ -3324,7 +3345,8 @@ fn serve_peer(
                 record_refusal(peer.uid);
                 scope.finish(irlume_common::diagnostics::CategoricalOutcome::Unavailable);
                 if let Some(attempt) = refused_attempt {
-                    note_pre_camera(irlume_common::OutcomeCause::CameraUnavailable);
+                    // Contention is a failure to run, not a refusal of a face.
+                    note_pre_camera_failure(irlume_common::OutcomeCause::CameraUnavailable);
                     attempt.file(&Response::Error(refusal.message().into()), None);
                 }
                 return respond(stream, &Response::Error(refusal.message().into()));
@@ -5493,6 +5515,18 @@ fn note_pre_camera(cause: irlume_common::OutcomeCause) {
     });
 }
 
+/// A failure before any camera (the daemon or the camera arbitration
+/// refused to run the attempt): not a decision about a face.
+fn note_pre_camera_failure(cause: irlume_common::OutcomeCause) {
+    REPLY_FACTS.with(|cell| {
+        cell.set(Some(ReplyFacts {
+            cause: Some(cause),
+            decided: false,
+            pre_camera: true,
+        }))
+    });
+}
+
 /// A decision against a face became a prose reply.
 fn note_decided(cause: Option<irlume_common::OutcomeCause>) {
     REPLY_FACTS.with(|cell| {
@@ -5570,8 +5604,6 @@ impl AttemptContext {
     fn file(self, response: &Response, capture_ms: Option<u64>) {
         use irlume_common::{AttemptResult, OutcomeCause};
         let facts = REPLY_FACTS.with(|cell| cell.get());
-        // What the reply says, and whether the site that built it said the
-        // attempt never reached a camera.
         // The site that built the reply says whether it was a decision and
         // whether it came before any camera; the reply's shape is only the
         // fallback when no site said (an engine verdict).
@@ -5620,9 +5652,15 @@ impl AttemptContext {
         // a capture stage that reported, or a failure of the camera itself.
         // A setup refusal or a budget expiry with no capture evidence
         // names none — the engine refuses those before any lease.
+        // Identification runs through the engine's plain assessment, which
+        // reports no capture stages: a verdict about a face is itself the
+        // evidence that a camera captured one.
+        let face_verdict = matches!(response, Response::Identified { .. })
+            && cause.is_some_and(OutcomeCause::is_face_verdict);
         let reached_camera = !pre_camera
             && (matches!(result, AttemptResult::Granted)
                 || capture_ms.is_some()
+                || face_verdict
                 || matches!(
                     cause,
                     Some(OutcomeCause::CameraUnavailable | OutcomeCause::PrivacyShutter)

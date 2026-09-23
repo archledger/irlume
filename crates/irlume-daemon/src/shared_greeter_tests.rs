@@ -74,6 +74,7 @@ pub(super) mod shared_greeter {
                 score: 0.9,
                 reason: "synthetic valid biometric/PAD result".into(),
                 kind: irlume_auth::OutcomeKind::Granted,
+                cause: None,
             })
         })
     }

@@ -406,6 +406,7 @@ fn identify_no_live_face_and_daemon_error() {
         score: 0.0,
         live: false,
         reason: "no face in frame".into(),
+        cause: None,
     });
     let (code, out, _) = run(&mut sb.cmd(&["identify"]), "identify");
     assert_eq!(code, 1, "no live face is a non-match (exit 1)");

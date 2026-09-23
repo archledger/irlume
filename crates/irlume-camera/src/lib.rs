@@ -703,6 +703,10 @@ enum PrivacyBoundary {
 #[derive(Debug)]
 struct PrivacyBoundaryRefusal {
     why: String,
+    /// The shutter was observed engaged (as opposed to unreadable): the
+    /// one case that is a "privacy shutter" cause rather than a camera
+    /// fault (ADR-0030 §5).
+    engaged: bool,
     #[cfg(feature = "capture-timing")]
     cause: Option<PrivacyBoundaryCause>,
 }
@@ -729,6 +733,7 @@ impl std::error::Error for PrivacyBoundaryRefusal {}
 fn privacy_boundary_error(why: String) -> std::io::Error {
     std::io::Error::other(PrivacyBoundaryRefusal {
         why,
+        engaged: true,
         #[cfg(feature = "capture-timing")]
         cause: None,
     })
@@ -746,9 +751,11 @@ fn privacy_capture_boundary(observed: std::io::Result<Option<bool>>) -> std::io:
         }),
         _ => None,
     };
+    let engaged = matches!(observed, Ok(Some(true)));
     privacy_permits_ir_capture(observed).map_err(|why| {
         std::io::Error::other(PrivacyBoundaryRefusal {
             why,
+            engaged,
             #[cfg(feature = "capture-timing")]
             cause,
         })
@@ -760,6 +767,33 @@ fn is_privacy_boundary_error(error: &std::io::Error) -> bool {
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<PrivacyBoundaryRefusal>())
         .is_some()
+}
+
+/// The boundary refused because the shutter was observed engaged.
+fn is_privacy_shutter_engaged(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<PrivacyBoundaryRefusal>())
+        .is_some_and(|refusal| refusal.engaged)
+}
+
+/// The typed error for a refused privacy check (ADR-0030 §5): an engaged
+/// shutter is `Error::PrivacyShutter`, so the daemon can name it; an
+/// unreadable control is a hardware fault like any other.
+fn privacy_refusal_error(
+    device: &str,
+    stage: &'static str,
+    observed: std::io::Result<Option<bool>>,
+) -> irlume_common::Result<()> {
+    let engaged = matches!(observed, Ok(Some(true)));
+    privacy_permits_ir_capture(observed).map_err(|why| {
+        let message = format!("{device}: {stage}: {why}");
+        if engaged {
+            Error::PrivacyShutter(message)
+        } else {
+            Error::Hardware(message)
+        }
+    })
 }
 
 #[derive(Clone)]
@@ -2839,9 +2873,16 @@ fn teardown_ir_after_privacy_refusal<S, M, E>(
 fn finish_privacy_teardown<E: std::fmt::Display>(refusal: Error, restore: Result<(), E>) -> Error {
     match restore {
         Ok(()) => refusal,
-        Err(restore) => Error::Hardware(format!(
-            "{refusal}; additionally could not restore the emitter after the privacy refusal: {restore}"
-        )),
+        Err(restore) => {
+            let message = format!(
+                "{refusal}; additionally could not restore the emitter after the privacy refusal: {restore}"
+            );
+            // A failed restore does not change what refused the attempt.
+            match refusal {
+                Error::PrivacyShutter(_) => Error::PrivacyShutter(message),
+                _ => Error::Hardware(message),
+            }
+        }
     }
 }
 
@@ -2900,6 +2941,11 @@ fn map_io(device: &str, e: std::io::Error) -> Error {
     }
     if capture_control::is_cancelled(&e) {
         return Error::Preempted("camera capture cancelled".into());
+    }
+    // An engaged shutter is its own cause (ADR-0030 §5); an unreadable
+    // privacy control falls through to the hardware arms below.
+    if is_privacy_shutter_engaged(&e) {
+        return Error::PrivacyShutter(format!("{device}: {e}"));
     }
     use std::io::ErrorKind;
     match mmap_capture::source_io(&e).raw_os_error() {
@@ -3688,8 +3734,7 @@ fn require_ir_privacy_released(
     dev: &Device,
     stage: &'static str,
 ) -> irlume_common::Result<()> {
-    privacy_permits_ir_capture(privacy_state(dev))
-        .map_err(|why| Error::Hardware(format!("{device}: {stage}: {why}")))
+    privacy_refusal_error(device, stage, privacy_state(dev))
 }
 
 fn enable_ir_emitter_privacy_bounded(
@@ -3699,8 +3744,7 @@ fn enable_ir_emitter_privacy_bounded(
     permit: lease::CameraLease,
     stage: &'static str,
 ) -> irlume_common::Result<ir_emitter::StreamMode> {
-    privacy_permits_ir_capture(privacy_state(dev))
-        .map_err(|why| Error::Hardware(format!("{device}: {stage}: {why}")))?;
+    privacy_refusal_error(device, stage, privacy_state(dev))?;
     let write_permit = permit.clone();
     let mut before_forward_write = || {
         write_permit
@@ -16172,6 +16216,53 @@ mod tests {
             ),
             Error::Hardware(_)
         ));
+    }
+
+    /// ADR-0030 §5: an engaged shutter is a typed cause; an unreadable
+    /// privacy control stays a hardware fault.
+    #[test]
+    fn privacy_refusals_are_typed_by_what_was_observed() {
+        let engaged = privacy_refusal_error("/dev/video2", "ir capture", Ok(Some(true)));
+        assert!(
+            matches!(engaged, Err(Error::PrivacyShutter(_))),
+            "{engaged:?}"
+        );
+        let text = engaged.unwrap_err().to_string();
+        assert!(
+            text.starts_with("hardware: /dev/video2: ir capture:"),
+            "{text}"
+        );
+        assert!(text.contains("privacy shutter is engaged"), "{text}");
+        let unreadable = privacy_refusal_error(
+            "/dev/video2",
+            "ir capture",
+            Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        );
+        assert!(
+            matches!(unreadable, Err(Error::Hardware(_))),
+            "{unreadable:?}"
+        );
+        assert!(privacy_refusal_error("/dev/video2", "ir capture", Ok(Some(false))).is_ok());
+        assert!(privacy_refusal_error("/dev/video2", "ir capture", Ok(None)).is_ok());
+        // The io boundary carries the same distinction into map_io.
+        let boundary = privacy_capture_boundary(Ok(Some(true))).unwrap_err();
+        assert!(matches!(
+            map_io("/dev/video2", boundary),
+            Error::PrivacyShutter(_)
+        ));
+        let boundary = privacy_capture_boundary(Err(std::io::Error::from_raw_os_error(libc::EIO)))
+            .unwrap_err();
+        assert!(matches!(
+            map_io("/dev/video2", boundary),
+            Error::Hardware(_)
+        ));
+        // A failed emitter restore keeps the refusal's class.
+        let kept = finish_privacy_teardown(
+            Error::PrivacyShutter("shut".into()),
+            Err::<(), _>("restore failed"),
+        );
+        assert!(matches!(kept, Error::PrivacyShutter(_)));
+        assert!(kept.to_string().contains("restore failed"));
     }
 
     #[test]

@@ -368,6 +368,7 @@ fn grant() -> Response {
         declined_by_gesture: false,
         refused_by_policy: false,
         situation: String::new(),
+        cause: None,
     }
 }
 
@@ -659,6 +660,7 @@ fn pamwrap_face_denial_clears_yes_before_password_fallback() {
             declined_by_gesture: false,
             refused_by_policy: false,
             situation: situation.into(),
+            cause: None,
         });
         let checker = h.token_checker("face-denial", FIXED_TEST_TOKEN);
         h.write_service(
@@ -936,6 +938,7 @@ fn pamwrap_polkit_shake_aborts_only_the_polkit_stack() {
         declined_by_gesture: d.load(Ordering::SeqCst),
         refused_by_policy: false,
         situation: String::new(),
+        cause: None,
     });
     h.write_settings(Some("service_gesture.polkit-1=1\nservice_gesture.sudo=1\n"));
 
@@ -1184,6 +1187,7 @@ fn pamwrap_wait_mode_retries_until_a_match() {
                     declined_by_gesture: false,
                     refused_by_policy: false,
                     situation: String::new(),
+                    cause: None,
                 }
             } else {
                 grant()
@@ -1640,6 +1644,7 @@ fn pamwrap_usability_situation_prompts_one_action_line() {
             declined_by_gesture: false,
             refused_by_policy: false,
             situation: "too far".into(),
+            cause: None,
         },
         _ => Response::Error("unexpected request".into()),
     });
@@ -1672,6 +1677,7 @@ fn pamwrap_attack_situation_stays_silent_at_the_prompt() {
             declined_by_gesture: false,
             refused_by_policy: false,
             situation: "spoof".into(),
+            cause: None,
         },
         _ => Response::Error("unexpected request".into()),
     });
@@ -1710,6 +1716,7 @@ fn pamwrap_removed_gesture_settings_do_not_change_privileged_confirmation() {
         declined_by_gesture: false,
         refused_by_policy: false,
         situation: String::new(),
+        cause: None,
     });
     for service in ["sudo", "polkit-1"] {
         h.write_service(service, &[h.auth_line("required", "")]);

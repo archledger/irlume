@@ -268,6 +268,8 @@ struct PairAssessmentContext<'a> {
 
 /// The authentication decision for a user.
 // Debug is diagnostic-only (tests, dlog); derives add no behavior.
+pub use irlume_common::OutcomeCause;
+
 #[derive(Debug)]
 pub struct Outcome {
     pub granted: bool,
@@ -279,6 +281,31 @@ pub struct Outcome {
     /// `reason` prose. Engine-internal: the daemon maps `Outcome` to the wire
     /// `Response` field by field, and `kind` never crosses the socket.
     pub kind: OutcomeKind,
+    /// Why the attempt did not grant, in the wire vocabulary (ADR-0030
+    /// §5): decided where the outcome is built, defaulting to the class
+    /// `kind` implies and overridden where `kind` is coarser than the
+    /// cause (a binding mismatch is `OtherDeny` but "not enrolled on this
+    /// camera"). `None` on a grant. This one does cross the socket.
+    pub cause: Option<OutcomeCause>,
+}
+
+impl OutcomeKind {
+    /// The cause an outcome of this kind carries unless the site that
+    /// built it knows better.
+    fn default_cause(self) -> Option<OutcomeCause> {
+        Some(match self {
+            OutcomeKind::Granted => return None,
+            OutcomeKind::NoFace => OutcomeCause::NoFace,
+            OutcomeKind::Uncertain
+            | OutcomeKind::RgbPadPending
+            | OutcomeKind::SpoofNoIrFace
+            | OutcomeKind::Spoof => OutcomeCause::LivenessRefused,
+            OutcomeKind::BelowThreshold => OutcomeCause::BelowThreshold,
+            OutcomeKind::SetupUnavailable => OutcomeCause::SetupUnavailable,
+            OutcomeKind::DeadlineExpired => OutcomeCause::TimedOut,
+            OutcomeKind::RuntimeUnavailable | OutcomeKind::OtherDeny => OutcomeCause::Other,
+        })
+    }
 }
 
 /// Grant/failure class of an [`Outcome`]. The
@@ -326,6 +353,15 @@ impl Outcome {
             score: 0.0,
             reason: reason.into(),
             kind,
+            cause: kind.default_cause(),
+        }
+    }
+
+    /// Refusal whose cause is finer than its kind (ADR-0030 §5).
+    fn deny_because(kind: OutcomeKind, cause: OutcomeCause, reason: impl Into<String>) -> Self {
+        Self {
+            cause: Some(cause),
+            ..Self::deny(kind, reason)
         }
     }
 
@@ -337,6 +373,7 @@ impl Outcome {
             score,
             reason: reason.into(),
             kind,
+            cause: kind.default_cause(),
         }
     }
 
@@ -348,6 +385,7 @@ impl Outcome {
             score,
             reason: reason.into(),
             kind: OutcomeKind::Granted,
+            cause: None,
         }
     }
 }
@@ -362,6 +400,8 @@ pub struct IdentifyOutcome {
     pub score: f32,
     pub live: bool,
     pub reason: String,
+    /// Why no match was found (ADR-0030 §5); `None` on a match.
+    pub cause: Option<OutcomeCause>,
 }
 
 /// One live enrollment scan, as captured by [`Engine::capture_scans`].
@@ -6080,8 +6120,9 @@ impl Engine {
         // Fingerprint mode: face is disabled so pam_fprintd drives; never engage
         // the camera, decline so the PAM stack cascades to fingerprint/password.
         if irlume_core::policy::method().face_disabled() {
-            return Ok(Outcome::deny(
+            return Ok(Outcome::deny_because(
                 OutcomeKind::OtherDeny,
+                OutcomeCause::MethodNotAvailable,
                 "face disabled (fingerprint mode)",
             ));
         }
@@ -7317,6 +7358,7 @@ impl Engine {
                 score: 0.0,
                 live: false,
                 reason: "face disabled (fingerprint mode)".into(),
+                cause: Some(OutcomeCause::MethodNotAvailable),
             });
         }
         let a = self.assess()?;
@@ -7327,6 +7369,7 @@ impl Engine {
                 score: 0.0,
                 live: false,
                 reason: format!("no RGB face: {}", a.reason),
+                cause: Some(OutcomeCause::NoFace),
             });
         };
         if a.verdict != Verdict::Live {
@@ -7336,6 +7379,7 @@ impl Engine {
                 score: 0.0,
                 live: false,
                 reason: format!("liveness {:?}: {}", a.verdict, a.reason),
+                cause: Some(OutcomeCause::LivenessRefused),
             });
         }
         let mut best: Option<(f32, String, String)> = None; // (score, user, profile)
@@ -7370,6 +7414,7 @@ impl Engine {
                 score,
                 live: true,
                 reason: "match".into(),
+                cause: None,
             }),
             None => Ok(IdentifyOutcome {
                 user: None,
@@ -7377,6 +7422,7 @@ impl Engine {
                 score: 0.0,
                 live: true,
                 reason: "live face, but no enrolled match".into(),
+                cause: Some(OutcomeCause::BelowThreshold),
             }),
         }
     }
@@ -8370,7 +8416,11 @@ impl Engine {
         }
         if let Some(bind) = &enr.camera_binding {
             if let Some(reason) = binding_mismatch_for(bind, live) {
-                return Some(Outcome::deny(OutcomeKind::OtherDeny, reason));
+                return Some(Outcome::deny_because(
+                    OutcomeKind::OtherDeny,
+                    OutcomeCause::NotEnrolledOnThisCamera,
+                    reason,
+                ));
             }
         }
         // RGB and IR matching both exclude other recognizers' embedding spaces.
@@ -9973,6 +10023,7 @@ mod tests {
             score: 0.0,
             reason: reason.into(),
             kind,
+            cause: None,
         }
     }
 
@@ -13942,6 +13993,42 @@ mod engine_tests {
         assert!(inactive_store_write_refusal(&store, b"primary v2").is_ok());
     }
 
+    /// ADR-0030 §5: every outcome carries the cause its kind implies
+    /// unless the site knew better; a grant carries none.
+    #[test]
+    fn outcome_causes_follow_the_kind_by_default() {
+        for (kind, cause) in [
+            (OutcomeKind::NoFace, OutcomeCause::NoFace),
+            (OutcomeKind::Uncertain, OutcomeCause::LivenessRefused),
+            (OutcomeKind::RgbPadPending, OutcomeCause::LivenessRefused),
+            (OutcomeKind::SpoofNoIrFace, OutcomeCause::LivenessRefused),
+            (OutcomeKind::Spoof, OutcomeCause::LivenessRefused),
+            (OutcomeKind::BelowThreshold, OutcomeCause::BelowThreshold),
+            (
+                OutcomeKind::SetupUnavailable,
+                OutcomeCause::SetupUnavailable,
+            ),
+            (OutcomeKind::DeadlineExpired, OutcomeCause::TimedOut),
+            (OutcomeKind::RuntimeUnavailable, OutcomeCause::Other),
+            (OutcomeKind::OtherDeny, OutcomeCause::Other),
+        ] {
+            assert_eq!(Outcome::deny(kind, "r").cause, Some(cause), "{kind:?}");
+            assert_eq!(
+                Outcome::deny_live(kind, 0.1, "r").cause,
+                Some(cause),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(Outcome::grant(0.9, "match").cause, None);
+        let finer = Outcome::deny_because(
+            OutcomeKind::OtherDeny,
+            OutcomeCause::MethodNotAvailable,
+            "face disabled",
+        );
+        assert_eq!(finer.kind, OutcomeKind::OtherDeny);
+        assert_eq!(finer.cause, Some(OutcomeCause::MethodNotAvailable));
+    }
+
     #[test]
     fn binding_mismatch_refuses_swapped_or_vanished_cameras() {
         let _g = env_guard();
@@ -14004,13 +14091,15 @@ mod engine_tests {
             rgb: Some("dead:beef".into()),
             ir: None,
         });
-        assert_eq!(
-            s.engine
-                .enrollment_policy_refusal_for("fixture", &enrollment, &(None, None))
-                .unwrap()
-                .kind,
-            OutcomeKind::OtherDeny
-        );
+        let mismatch = s
+            .engine
+            .enrollment_policy_refusal_for("fixture", &enrollment, &(None, None))
+            .unwrap();
+        assert_eq!(mismatch.kind, OutcomeKind::OtherDeny);
+        // ADR-0030 §5: the kind stays coarse for retry accounting; the
+        // cause names the camera.
+        assert_eq!(mismatch.cause, Some(OutcomeCause::NotEnrolledOnThisCamera));
+        assert_eq!(refusal.cause, Some(OutcomeCause::SetupUnavailable));
         enrollment.camera_binding = None;
 
         // Any one of the three profiles can supply the current model's scan.

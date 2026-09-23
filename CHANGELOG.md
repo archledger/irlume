@@ -7,6 +7,23 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Structured attempt causes (ADR-0030 §5, C2). Every refusal now names
+  why from a closed vocabulary — `no-face`, `liveness-refused`,
+  `below-threshold`, `privacy-shutter`, `camera-unavailable`,
+  `not-enrolled-on-this-camera`, `setup-unavailable`, `cancelled`,
+  `timed-out`, `method-not-available`, `policy`, `configuration`,
+  `retry-throttled`, `daemon-starting`, `other` — decided where the
+  result is decided and never inferred from prose: on the engine's
+  outcome (defaulting to what its kind implies, overridden where the
+  kind is coarser, such as a camera-binding mismatch), at the engine's
+  error boundary (`Error::cause()` on the typed variant; the privacy
+  boundary gains `Error::PrivacyShutter`, raised where the camera layer
+  observes the shutter engaged), on identification results, and for the
+  daemon's pre-camera refusals (method, policy, configuration, retry
+  throttle). On the wire `AuthResult`, `Identified` and `OperationError`
+  gain an optional `cause` (absent on a grant and from an older daemon;
+  an unknown value decodes as `unknown`).
+
 - The daemon correlates camera roles itself (ADR-0030 §4, first C2
   slice): every `ListCameras` row carries an opaque pair `handle` (a keyed
   digest of the pair's identity under a per-instance secret, so it names

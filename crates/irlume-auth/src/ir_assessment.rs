@@ -361,34 +361,69 @@ pub(super) fn assessed_outcome(
 }
 
 pub(super) fn refusal_outcome(failure: IrFailure) -> Outcome {
-    let (kind, reason) = match failure {
-        IrFailure::NoFace => (OutcomeKind::NoFace, "no face in IR"),
+    use irlume_common::OutcomeCause;
+    // The typed failure is finer than the outcome kind: the cause keeps
+    // what the kind flattens (ADR-0030 §5).
+    let (kind, cause, reason) = match failure {
+        IrFailure::NoFace => (OutcomeKind::NoFace, OutcomeCause::NoFace, "no face in IR"),
         IrFailure::PadRefused => (
             OutcomeKind::Spoof,
+            OutcomeCause::LivenessRefused,
             "IR PAD refused the presentation; use your password",
         ),
         IrFailure::LivenessRefused => (
             OutcomeKind::OtherDeny,
+            OutcomeCause::LivenessRefused,
             "IR liveness refused the presentation; use your password",
         ),
         IrFailure::IncompatibleEnrollment => (
             OutcomeKind::SetupUnavailable,
+            OutcomeCause::SetupUnavailable,
             "no compatible IR enrollment; add fresh scans or use your password",
         ),
         IrFailure::PadUnavailable | IrFailure::PadInvalid => (
             OutcomeKind::RuntimeUnavailable,
+            OutcomeCause::Other,
             "required IR PAD evidence is unavailable; use your password",
         ),
         IrFailure::DeadlineExpired => (
             OutcomeKind::DeadlineExpired,
+            OutcomeCause::TimedOut,
             "authentication deadline expired",
+        ),
+        IrFailure::Cancelled => (
+            OutcomeKind::RuntimeUnavailable,
+            OutcomeCause::Cancelled,
+            "IR assessment was cancelled; use your password",
+        ),
+        IrFailure::CameraBusy
+        | IrFailure::CameraRateRefused
+        | IrFailure::CameraLeaseTimeout
+        | IrFailure::CameraLeaseRefused
+        | IrFailure::CameraIoFailed
+        | IrFailure::CameraHardwareFailed
+        | IrFailure::CameraCaptureFailed => (
+            OutcomeKind::RuntimeUnavailable,
+            OutcomeCause::CameraUnavailable,
+            "IR assessment is unavailable; use your password",
+        ),
+        IrFailure::PrivacyShutter => (
+            OutcomeKind::RuntimeUnavailable,
+            OutcomeCause::PrivacyShutter,
+            "the camera's privacy shutter is engaged; use your password",
+        ),
+        IrFailure::CameraAuthorizationRefused | IrFailure::CameraPolicyRefused => (
+            OutcomeKind::RuntimeUnavailable,
+            OutcomeCause::Policy,
+            "IR assessment is unavailable; use your password",
         ),
         _ => (
             OutcomeKind::RuntimeUnavailable,
+            OutcomeCause::Other,
             "IR assessment is unavailable; use your password",
         ),
     };
-    Outcome::deny(kind, reason)
+    Outcome::deny_because(kind, cause, reason)
 }
 
 pub(super) struct IdentityThresholds {
@@ -425,6 +460,40 @@ impl IdentityThresholds {
 
 #[cfg(test)]
 mod tests {
+    /// ADR-0030 §5: the typed IR failure keeps its cause through the
+    /// coarse outcome kind.
+    #[test]
+    fn ir_refusals_keep_their_cause_through_the_outcome_kind() {
+        use super::pipeline::IrFailure;
+        use super::refusal_outcome;
+        use irlume_common::OutcomeCause;
+        for (failure, cause) in [
+            (IrFailure::NoFace, OutcomeCause::NoFace),
+            (IrFailure::PadRefused, OutcomeCause::LivenessRefused),
+            (IrFailure::LivenessRefused, OutcomeCause::LivenessRefused),
+            (
+                IrFailure::IncompatibleEnrollment,
+                OutcomeCause::SetupUnavailable,
+            ),
+            (IrFailure::DeadlineExpired, OutcomeCause::TimedOut),
+            (IrFailure::Cancelled, OutcomeCause::Cancelled),
+            (IrFailure::CameraBusy, OutcomeCause::CameraUnavailable),
+            (
+                IrFailure::CameraLeaseTimeout,
+                OutcomeCause::CameraUnavailable,
+            ),
+            (IrFailure::PrivacyShutter, OutcomeCause::PrivacyShutter),
+            (IrFailure::CameraPolicyRefused, OutcomeCause::Policy),
+            (IrFailure::PadUnavailable, OutcomeCause::Other),
+        ] {
+            assert_eq!(refusal_outcome(failure).cause, Some(cause), "{failure:?}");
+        }
+        assert_eq!(
+            super::pipeline::error_failure(irlume_common::Error::PrivacyShutter("s".into())),
+            IrFailure::PrivacyShutter
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1514,6 +1583,7 @@ mod pipeline {
         CameraLeaseRefused,
         CameraIoFailed,
         CameraHardwareFailed,
+        PrivacyShutter,
         CameraAuthorizationRefused,
         CameraPolicyRefused,
         CameraCaptureFailed,
@@ -1531,6 +1601,7 @@ mod pipeline {
             irlume_common::Error::DeliveredRate(_) => IrFailure::CameraRateRefused,
             irlume_common::Error::Io(_) => IrFailure::CameraIoFailed,
             irlume_common::Error::Hardware(_) => IrFailure::CameraHardwareFailed,
+            irlume_common::Error::PrivacyShutter(_) => IrFailure::PrivacyShutter,
             irlume_common::Error::NotAuthorized(_) => IrFailure::CameraAuthorizationRefused,
             irlume_common::Error::Policy(_) => IrFailure::CameraPolicyRefused,
             irlume_common::Error::Protocol(_) | irlume_common::Error::Tpm(_) => {
@@ -1903,7 +1974,17 @@ fn readiness_refusal(readiness: irlume_common::IrOnlyReadiness) -> Outcome {
         }
         _ => "experimental IR prerequisites are unavailable; use your password",
     };
-    Outcome::deny(OutcomeKind::SetupUnavailable, reason)
+    // The kind stays SetupUnavailable for the retry accounting; the cause
+    // names the one readiness failure that is about this camera rather
+    // than the enrollment (ADR-0030 §5).
+    let cause = match readiness {
+        Ready::BindingMismatch | Ready::SecondaryInactive => {
+            irlume_common::OutcomeCause::NotEnrolledOnThisCamera
+        }
+        Ready::TargetUnavailable => irlume_common::OutcomeCause::CameraUnavailable,
+        _ => irlume_common::OutcomeCause::SetupUnavailable,
+    };
+    Outcome::deny_because(OutcomeKind::SetupUnavailable, cause, reason)
 }
 
 fn target_issue(error: &irlume_camera::IrTargetError) -> irlume_common::IrTargetIssue {

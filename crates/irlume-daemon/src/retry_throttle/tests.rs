@@ -66,6 +66,7 @@ fn outcome(kind: Kind) -> irlume_auth::Outcome {
         score: if live { 0.5 } else { 0.0 },
         reason: "synthetic outcome; classify by type".into(),
         kind,
+        cause: None,
     }
 }
 fn account_one() -> Account {
@@ -468,6 +469,7 @@ mod cumulative {
                 declined_by_gesture: false,
                 refused_by_policy: false,
                 situation: String::new(),
+                cause: None,
             },
             completion: Some(crate::FaceCompletion {
                 attempt: start_attempt(f).unwrap().unwrap(),

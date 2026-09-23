@@ -1311,7 +1311,41 @@ fn bounded_face_response(
     }
 }
 
-fn retry_verify_refusal(reason: &str) -> Response {
+/// A refusal the daemon decides before the engine sees the request
+/// (ADR-0030 §5): each is its own cause, recorded as such and never
+/// inferred from the reason prose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EarlyRefusal {
+    /// Face authentication is not the configured method.
+    MethodNotAvailable,
+    /// A policy refused the service class, tier, biopolicy or the intent
+    /// confirmation, or the peer is not authorized for the account.
+    Policy,
+    /// The daemon's configuration could not be read or is invalid.
+    Configuration,
+    /// Too many recent attempts, or the retry state is unavailable.
+    RetryThrottled,
+    /// The engine is still loading.
+    #[allow(dead_code)] // answered as a prose Error today; recorded in the attempt record
+    DaemonStarting,
+}
+
+impl EarlyRefusal {
+    fn cause(self) -> irlume_common::OutcomeCause {
+        use irlume_common::OutcomeCause as Cause;
+        match self {
+            EarlyRefusal::MethodNotAvailable => Cause::MethodNotAvailable,
+            EarlyRefusal::Policy => Cause::Policy,
+            EarlyRefusal::Configuration => Cause::Configuration,
+            EarlyRefusal::RetryThrottled => Cause::RetryThrottled,
+            EarlyRefusal::DaemonStarting => Cause::DaemonStarting,
+        }
+    }
+}
+
+/// The wire shape of a pre-engine refusal: policy-refused, no situation
+/// (no camera ran), and the refusal's own cause.
+fn early_refusal(refusal: EarlyRefusal, reason: impl Into<String>) -> Response {
     Response::AuthResult {
         granted: false,
         score: 0.0,
@@ -1320,7 +1354,12 @@ fn retry_verify_refusal(reason: &str) -> Response {
         declined_by_gesture: false,
         refused_by_policy: true,
         situation: String::new(),
+        cause: Some(refusal.cause()),
     }
+}
+
+fn retry_verify_refusal(reason: &str) -> Response {
+    early_refusal(EarlyRefusal::RetryThrottled, reason)
 }
 
 fn retry_unseal_refusal(reason: &str) -> Response {
@@ -2227,13 +2266,26 @@ mod worker_engine {
                 "the wire reads the engine's getter and defaults to empty when \
                  nothing ran"
             );
+            // ADR-0030 §5: every pre-camera refusal goes through
+            // `early_refusal`, the one site that sends an empty situation
+            // and names the refusal's cause; a new refusing site must pick
+            // its cause there and update this pin.
             let empty = ["situation: String::new", "(),"].concat();
             assert_eq!(
                 flat.matches(&empty).count(),
-                5,
-                "the five pre-camera refusal sites (root gate + four policy \
-                 early-returns) each send an empty situation; a new site must \
-                 consciously pick wire-or-empty and update this pin"
+                1,
+                "only early_refusal sends an empty situation"
+            );
+            // rustfmt wraps some calls (a space follows the paren after
+            // flattening) and keeps others on one line.
+            let wrapped = ["early_refusal(", " EarlyRefusal::"].concat();
+            let inline = ["early_refusal(", "EarlyRefusal::"].concat();
+            let sites = flat.matches(&wrapped).count() + flat.matches(&inline).count();
+            assert_eq!(
+                sites, 7,
+                "the seven pre-camera refusal sites (root gate, method, \
+                 configuration, cosmic binding, convenience tier, biopolicy, \
+                 retry throttle) each name their cause"
             );
         }
 
@@ -4129,6 +4181,7 @@ fn not_authorized(req: &Request, verb: &str, user: &str) -> Response {
         return Response::OperationError {
             code: irlume_common::OperationErrorCode::NotAuthorized,
             retryable: false,
+            cause: None,
         };
     }
     Response::Error(format!("not authorized to {verb} '{user}'"))
@@ -4137,10 +4190,14 @@ fn not_authorized(req: &Request, verb: &str, user: &str) -> Response {
 /// Preserve legacy replies unless the caller can understand typed errors.
 fn authentication_error(error: irlume_common::Error, structured: bool) -> Response {
     if structured {
+        // ADR-0030 §5: the cause comes from the typed variant, never the
+        // text; it rides beside the code the client already branches on.
+        let cause = Some(error.cause());
         match error {
             irlume_common::Error::CameraBusy(_) => Response::OperationError {
                 code: irlume_common::OperationErrorCode::CameraBusy,
                 retryable: true,
+                cause,
             },
             // The budget ending is a normal outcome with the OPPOSITE retry
             // decision of a failure, and the fixed Display string carries no
@@ -4148,11 +4205,17 @@ fn authentication_error(error: irlume_common::Error, structured: bool) -> Respon
             irlume_common::Error::DeadlineExpired => Response::OperationError {
                 code: irlume_common::OperationErrorCode::DeadlineExpired,
                 retryable: false,
+                cause,
             },
             irlume_common::Error::NotAuthorized(_) => Response::OperationError {
                 code: irlume_common::OperationErrorCode::NotAuthorized,
                 retryable: false,
+                cause,
             },
+            // Every other engine failure keeps its prose reply (an older
+            // client's only decodable shape) — a typed OperationFailed
+            // would change what a structured client sees today. The cause
+            // is preserved for the attempt record (ADR-0030 §5).
             error => Response::Error(error.to_string()),
         }
     } else {
@@ -4198,15 +4261,10 @@ fn intent_confirmation_gate(req: &Request, peer: &Peer) -> Option<Response> {
         return None;
     }
 
-    Some(Response::AuthResult {
-        granted: false,
-        score: 0.0,
-        live: false,
-        reason: "privileged face authentication requires PAM conversation confirmation".into(),
-        declined_by_gesture: false,
-        refused_by_policy: true,
-        situation: String::new(),
-    })
+    Some(early_refusal(
+        EarlyRefusal::Policy,
+        "privileged face authentication requires PAM conversation confirmation",
+    ))
 }
 
 /// The gate every request passes before any arm runs, shared by the worker
@@ -4340,6 +4398,7 @@ fn dispatch_status_with_diagnostics(
             None => Response::OperationError {
                 code: irlume_common::OperationErrorCode::OperationFailed,
                 retryable: false,
+                cause: None,
             },
         });
     }
@@ -4351,6 +4410,7 @@ fn dispatch_status_with_diagnostics(
             None => Response::OperationError {
                 code: irlume_common::OperationErrorCode::OperationFailed,
                 retryable: false,
+                cause: None,
             },
         });
     }
@@ -5390,6 +5450,9 @@ fn verify_reply(
                         .to_string()
                 },
                 reason: o.reason.clone(),
+                // ADR-0030 §5: the engine decided the cause where it built
+                // the outcome; the daemon passes it on, never derives it.
+                cause: o.cause,
             }
         },
         || {
@@ -5558,6 +5621,7 @@ fn dispatch_scoped_session_inner(
             Err(_) => Response::OperationError {
                 code: irlume_common::OperationErrorCode::OperationFailed,
                 retryable: false,
+                cause: None,
             },
         },
         Request::FaceSensorStatus { user: Some(user) } => {
@@ -5587,6 +5651,7 @@ fn dispatch_scoped_session_inner(
                     Response::OperationError {
                         code,
                         retryable: false,
+                        cause: None,
                     }
                 } else {
                     Response::Error(prose)
@@ -5659,20 +5724,15 @@ fn dispatch_scoped_session_inner(
             // face must actually stand down (pam_fprintd drives; password is the
             // fallback), not just be claimed disabled by the CLI message.
             if irlume_core::policy::method().face_disabled() {
-                return Response::AuthResult {
-                    granted: false,
-                    score: 0.0,
-                    live: false,
-                    reason: "face auth disabled: the configured method is fingerprint".into(),
-                    declined_by_gesture: false,
-                    refused_by_policy: true,
-                    situation: String::new(),
-                };
+                return early_refusal(
+                    EarlyRefusal::MethodNotAvailable,
+                    "face auth disabled: the configured method is fingerprint",
+                );
             }
             let sensor_policy = match irlume_common::config::observe_face_sensor_policy().resolve()
             {
                 Ok(policy) => policy,
-                Err(error) => return retry_verify_refusal(&error.to_string()),
+                Err(error) => return early_refusal(EarlyRefusal::Configuration, error.to_string()),
             };
             let tier = face_tier(sensor_policy, engine.tier());
             // Smart-Auto tier gate: on a CONVENIENCE (RGB-only) device, a face
@@ -5696,7 +5756,7 @@ fn dispatch_scoped_session_inner(
                             shared_unlock = Some(std::sync::Arc::new(binding));
                             class = OperationClass::ScreenUnlock;
                         }
-                        Err(reason) => return retry_verify_refusal(reason),
+                        Err(reason) => return early_refusal(EarlyRefusal::Policy, reason),
                     }
                 }
                 if class != OperationClass::ScreenUnlock {
@@ -5704,17 +5764,12 @@ fn dispatch_scoped_session_inner(
                         "irlumed: convenience(RGB-only) denies face for '{}' ({class:?}) -> password",
                         journal_safe(service.as_deref().unwrap_or("?"))
                     );
-                    return Response::AuthResult {
-                        granted: false,
-                        score: 0.0,
-                        live: false,
-                        reason: format!(
+                    return early_refusal(
+                        EarlyRefusal::Policy,
+                        format!(
                             "RGB-only convenience: face limited to screen unlock (not {class:?})"
                         ),
-                        declined_by_gesture: false,
-                        refused_by_policy: true,
-                        situation: String::new(),
-                    };
+                    );
                 }
             }
             // Refresh the external-camera prohibition before any capture: the
@@ -5733,15 +5788,10 @@ fn dispatch_scoped_session_inner(
                         "irlumed: biopolicy denies verify for service '{}' -> password",
                         journal_safe(svc)
                     );
-                    return Response::AuthResult {
-                        granted: false,
-                        score: 0.0,
-                        live: false,
-                        reason: format!("biopolicy: face may not satisfy '{svc}'"),
-                        declined_by_gesture: false,
-                        refused_by_policy: true,
-                        situation: String::new(),
-                    };
+                    return early_refusal(
+                        EarlyRefusal::Policy,
+                        format!("biopolicy: face may not satisfy '{svc}'"),
+                    );
                 }
             }
             // The engine decides this, not the service name alone: a privileged
@@ -5847,10 +5897,12 @@ fn dispatch_scoped_session_inner(
                     score: 0.0,
                     live: false,
                     reason: "caller has no local account".into(),
+                    cause: Some(irlume_common::OutcomeCause::Policy),
                 }),
             };
             match scoped {
                 Ok(o) => Response::Identified {
+                    cause: o.cause,
                     user: o.user,
                     profile: o.profile,
                     score: o.score,
@@ -7295,6 +7347,7 @@ mod tests {
                 // Spelled this way on purpose: a wiring test pins the count of
                 // production `situation: String::new()` sites.
                 situation: String::from(""),
+                cause: None,
             },
             completion: None,
         }
@@ -7383,12 +7436,14 @@ mod tests {
     #[test]
     fn authentication_error_publishes_typed_codes_only_when_requested() {
         use irlume_common::OperationErrorCode;
+        use irlume_common::OutcomeCause;
         let resp = authentication_error(irlume_common::Error::DeadlineExpired, true);
         assert!(matches!(
             resp,
             Response::OperationError {
                 code: OperationErrorCode::DeadlineExpired,
-                retryable: false
+                retryable: false,
+                cause: Some(OutcomeCause::TimedOut),
             }
         ));
         let resp = authentication_error(irlume_common::Error::NotAuthorized("peer".into()), true);
@@ -7396,13 +7451,62 @@ mod tests {
             resp,
             Response::OperationError {
                 code: OperationErrorCode::NotAuthorized,
-                retryable: false
+                retryable: false,
+                cause: Some(OutcomeCause::Policy),
+            }
+        ));
+        let resp = authentication_error(irlume_common::Error::CameraBusy("held".into()), true);
+        assert!(matches!(
+            resp,
+            Response::OperationError {
+                code: OperationErrorCode::CameraBusy,
+                retryable: true,
+                cause: Some(OutcomeCause::CameraUnavailable),
             }
         ));
         let resp = authentication_error(irlume_common::Error::DeadlineExpired, false);
         assert!(matches!(resp, Response::Error(_)));
         let resp = authentication_error(irlume_common::Error::Io("boom".into()), true);
         assert!(matches!(resp, Response::Error(_)));
+    }
+
+    /// ADR-0030 §5: every pre-engine refusal names its own cause and no
+    /// situation; the cause is decided by the refusing site, not the text.
+    #[test]
+    fn early_refusals_carry_their_cause() {
+        use irlume_common::OutcomeCause;
+        for (refusal, cause) in [
+            (
+                EarlyRefusal::MethodNotAvailable,
+                OutcomeCause::MethodNotAvailable,
+            ),
+            (EarlyRefusal::Policy, OutcomeCause::Policy),
+            (EarlyRefusal::Configuration, OutcomeCause::Configuration),
+            (EarlyRefusal::RetryThrottled, OutcomeCause::RetryThrottled),
+            (EarlyRefusal::DaemonStarting, OutcomeCause::DaemonStarting),
+        ] {
+            match early_refusal(refusal, "why") {
+                Response::AuthResult {
+                    granted,
+                    refused_by_policy,
+                    situation,
+                    cause: got,
+                    ..
+                } => {
+                    assert!(!granted && refused_by_policy);
+                    assert!(situation.is_empty());
+                    assert_eq!(got, Some(cause), "{refusal:?}");
+                }
+                other => panic!("expected AuthResult, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            retry_verify_refusal("limited"),
+            Response::AuthResult {
+                cause: Some(OutcomeCause::RetryThrottled),
+                ..
+            }
+        ));
     }
 
     /// Ratchet: daemon source must emit through the leveled jout_* macros (or
@@ -8951,7 +9055,8 @@ mod tests {
             authentication_error(Error::CameraBusy("private holder detail".into()), true),
             Response::OperationError {
                 code: OperationErrorCode::CameraBusy,
-                retryable: true
+                retryable: true,
+                cause: Some(irlume_common::OutcomeCause::CameraUnavailable),
             }
         ));
         match authentication_error(Error::CameraBusy("legacy detail".into()), false) {
@@ -8969,7 +9074,8 @@ mod tests {
             authentication_error(Error::NotAuthorized("camera busy".into()), true),
             Response::OperationError {
                 code: OperationErrorCode::NotAuthorized,
-                retryable: false
+                retryable: false,
+                cause: Some(irlume_common::OutcomeCause::Policy),
             }
         ));
     }
@@ -9352,6 +9458,7 @@ mod tests {
                     declined_by_gesture,
                     refused_by_policy,
                     situation: _,
+                    cause: Some(irlume_common::OutcomeCause::Policy),
                 }) => {
                     assert!(!granted && !live && !declined_by_gesture);
                     assert_eq!(score, 0.0);
@@ -9459,6 +9566,7 @@ mod tests {
                 Some(Response::OperationError {
                     code: irlume_common::OperationErrorCode::NotAuthorized,
                     retryable: false,
+                    cause: None,
                 })
             ),
             "a client that opted in gets the code, got {typed:?}"
@@ -10066,6 +10174,7 @@ mod tests {
                     declined_by_gesture: false,
                     refused_by_policy: true,
                     situation: _,
+                    cause: Some(irlume_common::OutcomeCause::Policy),
                 } => {
                     assert_eq!(score, 0.0);
                     assert_eq!(
@@ -12826,6 +12935,7 @@ mod tests {
                 declined_by_gesture,
                 refused_by_policy,
                 situation: _,
+                cause,
             } => {
                 assert!(!granted && !live);
                 assert_eq!(score, 0.0);
@@ -12839,6 +12949,7 @@ mod tests {
                     reason,
                     "face auth disabled: the configured method is fingerprint"
                 );
+                assert_eq!(cause, Some(irlume_common::OutcomeCause::MethodNotAvailable));
             }
             other => panic!("fingerprint mode must deny via AuthResult, got {other:?}"),
         }
@@ -12936,6 +13047,7 @@ mod tests {
                             score: 0.1,
                             reason: "synthetic rejected match".into(),
                             kind: irlume_auth::OutcomeKind::BelowThreshold,
+                            cause: None,
                         },
                     )
                     .unwrap();
@@ -13001,6 +13113,7 @@ mod tests {
                     score: 0.1,
                     reason: "synthetic rejection".into(),
                     kind: irlume_auth::OutcomeKind::BelowThreshold,
+                    cause: None,
                 },
             )
             .unwrap();
@@ -13093,6 +13206,7 @@ mod tests {
                         score: 0.1,
                         reason: "synthetic rejected match".into(),
                         kind: irlume_auth::OutcomeKind::BelowThreshold,
+                        cause: None,
                     },
                 )
                 .unwrap();
@@ -13219,12 +13333,14 @@ mod tests {
                 score,
                 live,
                 reason,
+                cause,
             } => {
                 assert_eq!(user, None);
                 assert_eq!(profile, None);
                 assert_eq!(score, 0.0);
                 assert!(!live);
                 assert_eq!(reason, "caller has no local account");
+                assert_eq!(cause, Some(irlume_common::OutcomeCause::Policy));
             }
             other => panic!("no-account peer must get Identified, got {other:?}"),
         }

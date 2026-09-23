@@ -13396,6 +13396,7 @@ mod tests {
             score: 0.8125,
             live: true,
             reason: String::new(),
+            cause: None,
         });
         assert!(ok);
         assert_eq!(msg, "alice · Face Profile 1 · match score 0.812");
@@ -13405,6 +13406,7 @@ mod tests {
             score: 0.0,
             live: true,
             reason: "below threshold".into(),
+            cause: None,
         });
         assert!(!ok);
         assert_eq!(msg, "live face, no enrolled match (below threshold)");
@@ -13414,6 +13416,7 @@ mod tests {
             score: 0.0,
             live: false,
             reason: "flat depth".into(),
+            cause: None,
         });
         assert!(!ok);
         assert_eq!(msg, "no live face (flat depth)");
@@ -18056,6 +18059,7 @@ mod tests {
             score: 0.0,
             live: true,
             reason: "live face, but no enrolled match".into(),
+            cause: None,
         });
         assert!(!ok);
         assert_eq!(msg, "live face, no enrolled match");
@@ -18065,6 +18069,7 @@ mod tests {
             score: 0.0,
             live: false,
             reason: "no live face".into(),
+            cause: None,
         });
         assert_eq!(msg, "no live face");
         // An empty reason: no dangling "()" either.
@@ -18074,6 +18079,7 @@ mod tests {
             score: 0.0,
             live: true,
             reason: String::new(),
+            cause: None,
         });
         assert_eq!(msg, "live face, no enrolled match");
     }
@@ -19668,6 +19674,7 @@ mod tests {
                 score: 0.8123,
                 live: true,
                 reason: "private-reason-sentinel".into(),
+                cause: None,
             };
             let (ok, message) = mapper(response);
             assert!(!ok);

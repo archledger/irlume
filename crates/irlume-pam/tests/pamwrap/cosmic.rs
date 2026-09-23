@@ -199,6 +199,7 @@ fn cosmic_face_denial_consumes_choice_before_fresh_password() {
                 refused_by_policy: false,
                 declined_by_gesture: false,
                 situation: String::new(),
+                cause: None,
             },
             _ => panic!("unexpected request"),
         });

@@ -916,6 +916,53 @@ pub enum SelfTestKind {
     Liveness,
 }
 
+/// Why a face attempt did not grant, as the daemon decided it (ADR-0030
+/// §5): the closed vocabulary the TUI phrases and the attempt record
+/// stores. Set where the result is decided — on the engine's outcome, at
+/// its error boundary, or by the daemon before the engine — and never
+/// inferred from reason prose. Absent on a grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutcomeCause {
+    /// No usable face in frame.
+    NoFace,
+    /// The liveness gate refused (uncertain, pending evidence, or a spoof
+    /// verdict): a presentation problem, not a recognition one.
+    LivenessRefused,
+    /// A live face matched no enrolled template above the threshold.
+    BelowThreshold,
+    /// The camera's hardware privacy shutter is engaged.
+    PrivacyShutter,
+    /// The camera could not be opened or used (absent, busy, refused by
+    /// the hardware layer, or a broken stream).
+    CameraUnavailable,
+    /// The account is enrolled, but not on the configured camera.
+    NotEnrolledOnThisCamera,
+    /// The enrollment or its settings cannot serve this attempt: missing,
+    /// empty, incompatible with the loaded recognizer, or unreadable.
+    SetupUnavailable,
+    /// The attempt was cancelled or pre-empted before a decision.
+    Cancelled,
+    /// The authentication window closed before a decision.
+    TimedOut,
+    /// Face authentication is not the configured method.
+    MethodNotAvailable,
+    /// A policy refused the attempt before any capture (service class,
+    /// convenience tier, biopolicy, confirmation, authorization).
+    Policy,
+    /// The daemon's configuration could not be read or is invalid.
+    Configuration,
+    /// Too many recent attempts, or the retry state is unavailable.
+    RetryThrottled,
+    /// The daemon was still starting when the request arrived.
+    DaemonStarting,
+    /// Everything else: a refusal the vocabulary does not name.
+    Other,
+    /// A cause this build does not know (a newer daemon).
+    #[serde(other)]
+    Unknown,
+}
+
 /// Why an operation failed, in terms a caller can act on.
 ///
 /// Kept deliberately small. Each value has to mean the same thing for the life
@@ -1393,6 +1440,12 @@ pub enum Response {
         /// reaches a prompt surface.
         #[serde(default)]
         situation: String,
+        /// Why the attempt did not grant, from the closed vocabulary of
+        /// [`OutcomeCause`] (ADR-0030 §5), set on every refusal — engine
+        /// verdicts and pre-camera refusals alike, which `situation` leaves
+        /// empty. Absent on a grant and from an older daemon.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<OutcomeCause>,
     },
     Profiles(Vec<String>),
     /// Answer to [`Request::ListCameras`]: every physical camera exposing an
@@ -1433,6 +1486,10 @@ pub enum Response {
         score: f32,
         live: bool,
         reason: String,
+        /// Why no match was found, when none was (ADR-0030 §5); absent on
+        /// a match and from an older daemon.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<OutcomeCause>,
     },
     /// Structured enrollment listing. The retired eye fields remain required
     /// on the wire and are frozen at false for compatibility.
@@ -1569,6 +1626,11 @@ pub enum Response {
         /// the caller changing anything.
         #[serde(default)]
         retryable: bool,
+        /// The attempt's cause when the error ended a face attempt
+        /// (ADR-0030 §5); absent for other operations and from an older
+        /// daemon.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<OutcomeCause>,
     },
 
     // --- keyring unlock responses -------------------------------------------
@@ -1805,6 +1867,30 @@ pub enum Error {
     /// a camera fault. Callers must fall back without retrying or recording a match.
     #[error("authentication window expired; use your password")]
     DeadlineExpired,
+    /// The camera's hardware privacy shutter refused capture (ADR-0030 §5).
+    /// Display keeps the legacy hardware prose so existing readers see what
+    /// they did; the type is what the daemon classifies on.
+    #[error("hardware: {0}")]
+    PrivacyShutter(String),
+}
+
+impl Error {
+    /// The attempt cause this error decides (ADR-0030 §5), from the typed
+    /// variant alone — never from the message. Errors that are not about
+    /// the attempt's camera or budget are `Other`.
+    #[must_use]
+    pub fn cause(&self) -> OutcomeCause {
+        match self {
+            Error::PrivacyShutter(_) => OutcomeCause::PrivacyShutter,
+            Error::Hardware(_) | Error::CameraBusy(_) | Error::DeliveredRate(_) => {
+                OutcomeCause::CameraUnavailable
+            }
+            Error::Preempted(_) => OutcomeCause::Cancelled,
+            Error::DeadlineExpired => OutcomeCause::TimedOut,
+            Error::Policy(_) | Error::NotAuthorized(_) => OutcomeCause::Policy,
+            Error::Io(_) | Error::Protocol(_) | Error::Tpm(_) => OutcomeCause::Other,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -2082,7 +2168,8 @@ mod tests {
             busy,
             Response::OperationError {
                 code: OperationErrorCode::CameraBusy,
-                retryable: true
+                retryable: true,
+                cause: None,
             }
         ));
         let future: Response = serde_json::from_value(
@@ -2341,6 +2428,7 @@ mod tests {
             declined_by_gesture: true,
             refused_by_policy: false,
             situation: "too far".into(),
+            cause: None,
         };
         let mut v = serde_json::to_value(&full).expect("serialize");
         let obj = v
@@ -2586,12 +2674,88 @@ mod tests {
         let wire = r#"{"OperationError":{"code":"some-future-code","retryable":true}}"#;
         let resp: Response = serde_json::from_str(wire).expect("must decode");
         match resp {
-            Response::OperationError { code, retryable } => {
+            Response::OperationError {
+                code,
+                retryable,
+                cause,
+            } => {
                 assert_eq!(code, OperationErrorCode::Unknown);
                 assert!(retryable);
+                assert_eq!(cause, None, "absent from an older daemon");
             }
             other => panic!("expected OperationError, got {other:?}"),
         }
+    }
+
+    /// ADR-0030 §5: the cause vocabulary is stable on the wire, an
+    /// unknown value degrades to `Unknown`, a reply without it (older
+    /// daemon) decodes with `None`, and `Error::cause()` classifies on
+    /// the typed variant alone.
+    #[test]
+    fn outcome_cause_is_stable_on_the_wire_and_typed_at_the_error_boundary() {
+        assert_eq!(
+            serde_json::to_string(&OutcomeCause::NotEnrolledOnThisCamera).unwrap(),
+            "\"not-enrolled-on-this-camera\""
+        );
+        let future: OutcomeCause = serde_json::from_str("\"some-future-cause\"").unwrap();
+        assert_eq!(future, OutcomeCause::Unknown);
+        let legacy = r#"{"AuthResult":{"granted":false,"score":0.0,"live":false,"reason":"no"}}"#;
+        match serde_json::from_str::<Response>(legacy).unwrap() {
+            Response::AuthResult { cause, .. } => assert_eq!(cause, None),
+            other => panic!("{other:?}"),
+        }
+        let modern = serde_json::to_value(Response::AuthResult {
+            granted: false,
+            score: 0.0,
+            live: false,
+            reason: "no".into(),
+            refused_by_policy: true,
+            declined_by_gesture: false,
+            situation: String::new(),
+            cause: Some(OutcomeCause::RetryThrottled),
+        })
+        .unwrap();
+        assert_eq!(modern["AuthResult"]["cause"], "retry-throttled");
+        let granted = serde_json::to_value(Response::AuthResult {
+            granted: true,
+            score: 0.9,
+            live: true,
+            reason: "match".into(),
+            refused_by_policy: false,
+            declined_by_gesture: false,
+            situation: String::new(),
+            cause: None,
+        })
+        .unwrap();
+        assert!(
+            granted["AuthResult"].get("cause").is_none(),
+            "absent on a grant"
+        );
+
+        assert_eq!(
+            Error::PrivacyShutter("s".into()).cause(),
+            OutcomeCause::PrivacyShutter
+        );
+        assert_eq!(
+            Error::Hardware("no camera found".into()).cause(),
+            OutcomeCause::CameraUnavailable
+        );
+        assert_eq!(
+            Error::CameraBusy("b".into()).cause(),
+            OutcomeCause::CameraUnavailable
+        );
+        assert_eq!(
+            Error::Preempted("c".into()).cause(),
+            OutcomeCause::Cancelled
+        );
+        assert_eq!(Error::DeadlineExpired.cause(), OutcomeCause::TimedOut);
+        assert_eq!(Error::Policy("p".into()).cause(), OutcomeCause::Policy);
+        assert_eq!(Error::Io("i".into()).cause(), OutcomeCause::Other);
+        // Display keeps the hardware prose an older reader expects.
+        assert_eq!(
+            Error::PrivacyShutter("cam: shut".into()).to_string(),
+            "hardware: cam: shut"
+        );
     }
 
     #[test]
@@ -2603,6 +2767,7 @@ mod tests {
             let wire = serde_json::to_string(&Response::OperationError {
                 code,
                 retryable: false,
+                cause: None,
             })
             .unwrap();
             match serde_json::from_str::<Response>(&wire).unwrap() {

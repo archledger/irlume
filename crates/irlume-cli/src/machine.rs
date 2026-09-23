@@ -750,7 +750,9 @@ pub fn camera_diagnostics(args: &[String]) -> ExitCode {
             &success(COMMAND, json!(report), contract),
             ExitCode::SUCCESS,
         ),
-        Ok(Response::OperationError { code, retryable }) => emit(
+        Ok(Response::OperationError {
+            code, retryable, ..
+        }) => emit(
             &failure(COMMAND, error_code(code), retryable, contract),
             ExitCode::FAILURE,
         ),
@@ -2058,9 +2060,9 @@ pub fn auth_test(args: &[String]) -> ExitCode {
             // consumer must be able to tell them apart.
             ExitCode::SUCCESS,
         ),
-        Ok(Response::OperationError { code, retryable }) => {
-            stream.fail(error_code(code), retryable)
-        }
+        Ok(Response::OperationError {
+            code, retryable, ..
+        }) => stream.fail(error_code(code), retryable),
         // Daemon prose is not inspected; see `profiles_list`.
         Ok(Response::Error(_)) => stream.fail("operation-failed", false),
         Ok(_) => stream.fail("protocol-error", false),
@@ -2194,7 +2196,9 @@ pub fn profiles_list(args: &[String]) -> ExitCode {
             ),
             ExitCode::SUCCESS,
         ),
-        Ok(Response::OperationError { code, retryable }) => emit(
+        Ok(Response::OperationError {
+            code, retryable, ..
+        }) => emit(
             &failure(COMMAND, error_code(code), retryable, contract),
             ExitCode::FAILURE,
         ),

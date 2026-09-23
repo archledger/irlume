@@ -1904,6 +1904,7 @@ fn identify_reports_match_and_no_match() {
         score: 0.87,
         live: true,
         reason: "match".into(),
+        cause: None,
     });
     let (code, out, _) = run(&mut sb.cmd(&["identify"]));
     assert_eq!(code, 0);
@@ -1919,6 +1920,7 @@ fn identify_reports_match_and_no_match() {
         score: 0.1,
         live: true,
         reason: "below threshold".into(),
+        cause: None,
     });
     let (code, out, _) = run(&mut sb2.cmd(&["identify"]));
     assert_eq!(code, 1, "a live but unenrolled face is exit 1");

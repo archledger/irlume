@@ -4298,6 +4298,16 @@ impl Engine {
     /// (RGB+IR) when an IR camera is present, else RGB-only (convenience).
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn assess(&mut self) -> irlume_common::Result<Assessment> {
+        self.assess_with_diagnostics(&())
+    }
+
+    /// [`Self::assess`] reporting its capture stages to `diagnostics`, so
+    /// the caller's operation scope sees the camera the capture reached.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn assess_with_diagnostics(
+        &mut self,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<Assessment> {
         // One-shot entry: no authenticate_for/capture_scans ran to clear the
         // ViT vote ring, so repeated assess() calls must not accumulate a
         // cross-presentation vote (GLM review finding 2).
@@ -4328,9 +4338,9 @@ impl Engine {
         operation
             .run(|| {
                 if self.ir_available {
-                    self.assess_full(&selection, &operation)
+                    self.assess_full(&selection, &operation, diagnostics)
                 } else {
-                    self.assess_rgb_only()
+                    self.assess_rgb_only_with_diagnostics(diagnostics)
                 }
             })
             .map_err(lease_unavailable)?
@@ -4529,10 +4539,6 @@ impl Engine {
     /// path for devices without an IR camera. Anti-spoof here is DETERRENT-grade
     /// (well-lit + frontal + screen/glare heuristic), which is why this tier is
     /// limited to lock-screen unlock and never releases credentials.
-    fn assess_rgb_only(&mut self) -> irlume_common::Result<Assessment> {
-        self.assess_rgb_only_with_diagnostics(&())
-    }
-
     fn assess_rgb_only_with_diagnostics(
         &mut self,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
@@ -4731,8 +4737,9 @@ impl Engine {
         &mut self,
         selection: &CaptureModeSelection,
         operation: &irlume_camera::lease::CameraOperationSession,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Assessment> {
-        self.assess_full_with(None, Some(selection), operation, &())
+        self.assess_full_with(None, Some(selection), operation, diagnostics)
             .map_err(CapturePathError::into_inner)
     }
 
@@ -7416,7 +7423,16 @@ impl Engine {
     /// users' templates.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn identify(&mut self) -> irlume_common::Result<IdentifyOutcome> {
-        self.identify_impl(None)
+        self.identify_impl(None, &())
+    }
+
+    /// [`Self::identify`] reporting its capture stages to `diagnostics`.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn identify_with_diagnostics(
+        &mut self,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<IdentifyOutcome> {
+        self.identify_impl(None, diagnostics)
     }
 
     /// Identify scoped to a single enrolled user ("is this `user`?"). Same
@@ -7424,10 +7440,25 @@ impl Engine {
     /// just this one account: what a non-root peer is allowed to ask about itself.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn identify_within(&mut self, user: &str) -> irlume_common::Result<IdentifyOutcome> {
-        self.identify_impl(Some(user))
+        self.identify_impl(Some(user), &())
     }
 
-    fn identify_impl(&mut self, restrict: Option<&str>) -> irlume_common::Result<IdentifyOutcome> {
+    /// [`Self::identify_within`] reporting its capture stages to
+    /// `diagnostics`.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn identify_within_with_diagnostics(
+        &mut self,
+        user: &str,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<IdentifyOutcome> {
+        self.identify_impl(Some(user), diagnostics)
+    }
+
+    fn identify_impl(
+        &mut self,
+        restrict: Option<&str>,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<IdentifyOutcome> {
         if irlume_core::policy::method().face_disabled() {
             return Ok(IdentifyOutcome {
                 user: None,
@@ -7438,7 +7469,7 @@ impl Engine {
                 cause: Some(OutcomeCause::MethodNotAvailable),
             });
         }
-        let a = self.assess()?;
+        let a = self.assess_with_diagnostics(diagnostics)?;
         let Some(probe) = a.embedding else {
             return Ok(IdentifyOutcome {
                 user: None,

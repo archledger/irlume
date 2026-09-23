@@ -6402,9 +6402,13 @@ fn dispatch_scoped_session_inner(
             // is enrolled. Root keeps the full cross-user search (admin/test);
             // a non-root peer is scoped to its OWN account; the score then only
             // concerns a face the caller already controls, not other users'.
+            // The scope sees the capture stages, so the attempt record can
+            // name the camera a decided or failed identification reached.
             let scoped = match identify_scope(peer) {
-                IdentifyScope::Full => engine.identify(),
-                IdentifyScope::SelfOnly(name) => engine.identify_within(&name),
+                IdentifyScope::Full => engine.identify_with_diagnostics(scope),
+                IdentifyScope::SelfOnly(name) => {
+                    engine.identify_within_with_diagnostics(&name, scope)
+                }
                 IdentifyScope::NoAccount => Ok(irlume_auth::IdentifyOutcome {
                     user: None,
                     profile: None,

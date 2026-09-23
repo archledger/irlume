@@ -275,18 +275,23 @@ struct Store {
 
 #[cfg(not(test))]
 fn store() -> io::Result<Store> {
-    for path in ["/", "/var", "/var/lib"] {
+    for path in ["/", "/var"] {
         checked_dir(Path::new(path), 0, false)?;
     }
-    create_private(Path::new("/var/lib/irlume"))?;
+    let var_lib = checked_dir(Path::new("/var/lib"), 0, false)?;
+    // A new directory entry is durable only once its parent is synced;
+    // an existing one costs a read path nothing.
+    if create_private(Path::new("/var/lib/irlume"))? {
+        var_lib.sync_all()?;
+    }
     // The parent is validated before its child is followed; an existing
     // directory is accepted only when root owns it and nobody else can
     // write it.
     let parent = checked_dir(Path::new("/var/lib/irlume"), 0, false)?;
     let child = proc_path(&parent, "attempts");
-    create_private(&child)?;
-    // A directory entry is durable only once its parent is synced.
-    parent.sync_all()?;
+    if create_private(&child)? {
+        parent.sync_all()?;
+    }
     let dir = checked_dir(&child, 0, true)?;
     Ok(Store { dir, owner: 0 })
 }
@@ -298,16 +303,18 @@ fn store() -> io::Result<Store> {
     let owner = unsafe { libc::geteuid() };
     let parent = checked_dir(&parent, owner, false)?;
     let child = proc_path(&parent, "attempts");
-    create_private(&child)?;
-    parent.sync_all()?;
+    if create_private(&child)? {
+        parent.sync_all()?;
+    }
     let dir = checked_dir(&child, owner, true)?;
     Ok(Store { dir, owner })
 }
 
-fn create_private(path: &Path) -> io::Result<()> {
+/// Create a private directory; `Ok(true)` when this call created it.
+fn create_private(path: &Path) -> io::Result<bool> {
     match std::fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
         Err(e) => Err(e),
     }
 }

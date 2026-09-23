@@ -5629,8 +5629,14 @@ impl AttemptContext {
                 *cause,
                 pre_camera || (*refused_by_policy && facts.is_none()),
             ),
+            // An operational cause on an engine verdict (no comparable
+            // enrollment, an unmeasurable exposure) is the engine failing
+            // to decide, not a decision about the face.
             Response::Identified { cause, .. } => (
-                attempt_record::result_of(false, decided),
+                attempt_record::result_of(
+                    false,
+                    decided && !cause.is_some_and(OutcomeCause::is_operational),
+                ),
                 *cause,
                 pre_camera,
             ),
@@ -5663,10 +5669,14 @@ impl AttemptContext {
         // itself. A setup refusal or a budget expiry with no capture
         // evidence names none — the engine refuses those before any lease.
         // Identification runs through the engine's plain assessment, which
-        // reports no capture stages: a verdict about a face is itself the
-        // evidence that a camera captured one.
-        let face_verdict = matches!(response, Response::Identified { .. })
-            && cause.is_some_and(OutcomeCause::is_face_verdict);
+        // reports no capture stages: a verdict about a face — a match, or a
+        // refusal of one — is itself the evidence that a camera captured one.
+        let face_verdict = match response {
+            Response::Identified { user, cause, .. } => {
+                user.is_some() || cause.is_some_and(OutcomeCause::is_face_verdict)
+            }
+            _ => false,
+        };
         let reached_camera = !pre_camera
             && (matches!(result, AttemptResult::Granted)
                 || capture.reached

@@ -5682,13 +5682,17 @@ impl AttemptContext {
                 *cause,
                 pre_camera || (*refused_by_policy && facts.is_none()),
             ),
-            // An operational cause on an engine verdict (no comparable
+            // A site that noted its facts is believed (a throttle or a
+            // disabled method is a pre-camera refusal); otherwise an
+            // operational cause on an engine verdict (no comparable
             // enrollment, an unmeasurable exposure) is the engine failing
             // to decide, not a decision about the face.
             Response::Identified { cause, .. } => (
                 attempt_record::result_of(
                     false,
-                    decided && !cause.is_some_and(OutcomeCause::is_operational),
+                    facts.map_or(!cause.is_some_and(OutcomeCause::is_operational), |f| {
+                        f.decided
+                    }),
                 ),
                 *cause,
                 pre_camera,
@@ -13699,9 +13703,47 @@ mod tests {
             Response::LastAttempts(_)
         ));
         assert!(matches!(
-            dispatch(Request::LastAttempts { user: me }, &peer(NOBODY), &mut e),
+            dispatch(
+                Request::LastAttempts { user: me.clone() },
+                &peer(NOBODY),
+                &mut e
+            ),
             Response::Error(_)
         ));
+        // An account-scoped identify refused before any camera — by the
+        // disabled method, or by the probe throttle if an earlier test
+        // spent this uid's interval — is filed as decided, not failed: the
+        // site's facts win over the operational-cause fallback.
+        let identified = dispatch(Request::Identify, &peer(uid), &mut e);
+        let Response::Identified { cause, .. } = identified else {
+            panic!("expected Identified, got {identified:?}");
+        };
+        assert!(matches!(
+            cause,
+            Some(OutcomeCause::MethodNotAvailable | OutcomeCause::RetryThrottled)
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let record = loop {
+            let served = dispatch(
+                Request::LastAttempts { user: me.clone() },
+                &peer(uid),
+                &mut e,
+            );
+            let Response::LastAttempts(record) = served else {
+                panic!("expected LastAttempts, got {served:?}");
+            };
+            if record.latest_identify.is_some() || std::time::Instant::now() > deadline {
+                break record;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let latest = record
+            .latest_identify
+            .expect("the identify refusal was filed");
+        assert_eq!(latest.kind, AttemptKind::Identify);
+        assert_eq!(latest.result, AttemptResult::Refused);
+        assert_eq!(latest.cause, cause);
+        assert_eq!(latest.camera, None);
     }
 
     #[test]

@@ -3710,6 +3710,18 @@ struct EnrollmentSummary {
     /// The primary enrollment's camera binding (ADR-0029), for the
     /// client's role labels; identities only.
     primary_camera: Option<irlume_common::PrimaryCameraBinding>,
+    /// SHA-256 of the primary file's bytes when this summary was built, so
+    /// a cache hit can tell a legacy rewrite of the primary (which sends
+    /// no request) from an unchanged file.
+    primary_digest: Option<String>,
+}
+
+/// The current primary file's digest, or `None` when it is absent or
+/// unreadable: one file read, no TPM, safe on a connection thread.
+fn primary_digest_now(user: &str) -> Option<String> {
+    std::fs::read(irlume_core::multi_camera::primary_enrollment_path(user))
+        .ok()
+        .map(|bytes| irlume_common::sha256_hex(&bytes))
 }
 
 impl EnrollmentSummary {
@@ -3816,6 +3828,7 @@ fn summarize_enrollment(
                     ir: binding.ir.clone(),
                 }
             }),
+            primary_digest: None,
             profiles: enr
                 .profiles
                 .iter()
@@ -3852,6 +3865,7 @@ fn summarize_enrollment(
             camera_groups: Vec::new(),
             camera_store_error: None,
             primary_camera: None,
+            primary_digest: None,
             profiles: Vec::new(),
             ir_ratio_calibrated: false,
         },
@@ -4224,6 +4238,15 @@ fn dispatch_status_with_diagnostics(
             // publishes. Serving the real load here would put a TPM command
             // and a potential template-key WRITE on a connection thread.
             match cached_enrollment_summary(user) {
+                // A primary rewritten by a legacy writer since publication
+                // sends no request: its binding may have changed, so the
+                // cached summary is a miss and the worker reloads (ADR-0029).
+                Some(sum)
+                    if sum.primary_digest.is_some()
+                        && primary_digest_now(user) != sum.primary_digest =>
+                {
+                    return None
+                }
                 Some(mut sum) => {
                     // Hotplug and legacy rewrites since publication must
                     // not be hidden by the cache: refresh the volatile
@@ -5398,6 +5421,7 @@ fn dispatch_scoped_session_inner(
                     let (camera_groups, camera_store_error) = camera_group_rows(&user, engine);
                     sum.camera_groups = camera_groups;
                     sum.camera_store_error = camera_store_error;
+                    sum.primary_digest = primary_digest_now(&user);
                     publish_enrollment_summary(&user, sum.clone());
                     sum.into_response()
                 }
@@ -6689,6 +6713,7 @@ fn set_require_eyes_open_off(user: &str, engine: &irlume_auth::Engine) -> Respon
                 engine.ir_dim(),
             );
             let (camera_groups, camera_store_error) = camera_group_rows(user, engine);
+            summary.primary_digest = primary_digest_now(user);
             summary.camera_groups = camera_groups;
             summary.camera_store_error = camera_store_error;
             publish_enrollment_summary(user, summary);
@@ -10364,6 +10389,7 @@ mod tests {
                 camera_groups: Vec::new(),
                 camera_store_error: None,
                 primary_camera: None,
+                primary_digest: None,
             },
         );
         match dispatch_status(&req, &peer) {
@@ -10495,6 +10521,7 @@ mod tests {
                     camera_groups: Vec::new(),
                     camera_store_error: None,
                     primary_camera: None,
+                    primary_digest: None,
                 },
             );
             let response = dispatch(request, &owner, &mut engine);
@@ -10503,6 +10530,54 @@ mod tests {
             );
             assert!(cached_enrollment_summary(user).is_some());
         }
+        invalidate_enrollment_summary(user);
+    }
+
+    /// ADR-0029: a legacy rewrite of the primary sends no request, so a
+    /// cached summary published against the old bytes is a miss once the
+    /// file changes (the worker reloads); an unchanged file still hits.
+    #[test]
+    fn cached_summary_misses_when_the_primary_file_changed() {
+        let _guard = env_lock();
+        let sb = sandbox("primary-digest");
+        let _ = sb;
+        let user = "irlume-digest-user";
+        let path = irlume_core::multi_camera::primary_enrollment_path(user);
+        std::fs::write(&path, b"{\"user\":\"irlume-digest-user\",\"profiles\":[]}").unwrap();
+        publish_enrollment_summary(
+            user,
+            EnrollmentSummary {
+                profiles: Vec::new(),
+                ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
+                primary_camera: Some(irlume_common::PrimaryCameraBinding {
+                    rgb: Some("046d:085e".into()),
+                    ir: Some("046d:085e".into()),
+                }),
+                primary_digest: primary_digest_now(user),
+            },
+        );
+        let request = Request::ListProfiles {
+            user: user.into(),
+            structured_errors: false,
+        };
+        assert!(
+            matches!(
+                dispatch_status(&request, &peer(0)),
+                Some(Response::Enrollment { .. })
+            ),
+            "unchanged primary: cache hit"
+        );
+        std::fs::write(
+            &path,
+            b"{\"user\":\"irlume-digest-user\",\"profiles\":[],\"x\":1}",
+        )
+        .unwrap();
+        assert!(
+            dispatch_status(&request, &peer(0)).is_none(),
+            "rewritten primary: cache miss, the worker reloads"
+        );
         invalidate_enrollment_summary(user);
     }
 
@@ -10555,6 +10630,7 @@ mod tests {
                 camera_groups: Vec::new(),
                 camera_store_error: None,
                 primary_camera: None,
+                primary_digest: None,
             },
         );
         match dispatch(delete(), &peer(NOBODY), &mut e) {
@@ -12807,6 +12883,7 @@ mod tests {
                 camera_groups: Vec::new(),
                 camera_store_error: None,
                 primary_camera: None,
+                primary_digest: None,
             },
         );
         let sb = sandbox("summary-carryover");
@@ -13221,6 +13298,7 @@ mod tests {
                     camera_groups: Vec::new(),
                     camera_store_error: None,
                     primary_camera: None,
+                    primary_digest: None,
                 },
             );
             match dispatch(request.clone(), &peer(NOBODY), &mut e) {
@@ -13338,6 +13416,7 @@ mod tests {
                 camera_groups: Vec::new(),
                 camera_store_error: None,
                 primary_camera: None,
+                primary_digest: None,
             },
         );
         assert!(
@@ -15227,6 +15306,7 @@ mod tests {
             }],
             camera_store_error: None,
             primary_camera: None,
+            primary_digest: None,
         };
         // Published while active; a legacy writer then rewrites the primary
         // with NO request in flight: the cached row must flip to stale.
@@ -15268,6 +15348,7 @@ mod tests {
             }],
             camera_store_error: None,
             primary_camera: None,
+            primary_digest: None,
         };
         // The worker froze the row while the camera was plugged in AND
         // selected; hotplug since then: the identity is gone and the live

@@ -7456,6 +7456,12 @@ impl App {
                         Span::styled(format!("{kind:<10}"), Style::new().dim()),
                         if priv_on {
                             Span::styled("⚠ privacy ON", Style::new().fg(th().err))
+                        } else if matches!(role, CameraRole::Unenrolled) {
+                            // An unenrolled pair cannot sign in: "ready"
+                            // would contradict the refusal it would get.
+                            Span::styled("○ cannot sign in", Style::new().dim())
+                        } else if matches!(role, CameraRole::Unknown) {
+                            Span::styled("◐ role unknown", Style::new().dim())
                         } else if stale {
                             Span::styled("⚠ inactive (primary changed)", Style::new().fg(th().warn))
                         } else if !self.source_usable(Source::CameraPrivacy) {
@@ -13675,6 +13681,11 @@ mod tests {
             "unnamed pair falls back to nodes: {text}"
         );
         assert!(text.contains("not enrolled"), "{text}");
+        let unenrolled = text.lines().find(|l| l.contains("not enrolled")).unwrap();
+        assert!(
+            unenrolled.contains("cannot sign in") && !unenrolled.contains("ready"),
+            "{unenrolled}"
+        );
         assert!(
             !text.contains("[3277:0059]"),
             "the USB id leaves the row for the details panel: {text}"

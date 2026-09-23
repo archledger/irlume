@@ -215,9 +215,12 @@ pub(crate) fn apply(record: &mut AttemptRecord, entry: AttemptEntry, now: u64) {
 }
 
 /// Where the records live: `/var/lib/irlume/attempts`, root-only, or the
-/// test state directory.
+/// test state directory. Every ancestor is validated (owner, not a
+/// symlink, not group/world-writable) and the records directory is
+/// pinned by descriptor: all file operations go through it, so a
+/// redirected path after validation reaches nothing.
 struct Store {
-    dir: PathBuf,
+    dir: File,
     owner: u32,
 }
 
@@ -226,31 +229,44 @@ fn store() -> io::Result<Store> {
     for path in ["/", "/var", "/var/lib"] {
         checked_dir(Path::new(path), 0, false)?;
     }
-    let dir = PathBuf::from("/var/lib/irlume/attempts");
-    for path in [Path::new("/var/lib/irlume"), dir.as_path()] {
-        match std::fs::DirBuilder::new().mode(0o700).create(path) {
-            Ok(()) => (),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
-            Err(e) => return Err(e),
-        }
-    }
-    checked_dir(&dir, 0, true)?;
+    create_private(Path::new("/var/lib/irlume"))?;
+    // The parent is validated before its child is followed; an existing
+    // directory is accepted only when root owns it and nobody else can
+    // write it.
+    let parent = checked_dir(Path::new("/var/lib/irlume"), 0, false)?;
+    let child = proc_path(&parent, "attempts");
+    create_private(&child)?;
+    let dir = checked_dir(&child, 0, true)?;
     Ok(Store { dir, owner: 0 })
 }
 
 #[cfg(test)]
 fn store() -> io::Result<Store> {
-    let parent = std::env::var_os("IRLUME_STATE_DIR").ok_or_else(invalid)?;
-    let dir = PathBuf::from(parent).join("attempts");
-    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-        Ok(()) => (),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
-        Err(e) => return Err(e),
-    }
+    let parent = PathBuf::from(std::env::var_os("IRLUME_STATE_DIR").ok_or_else(invalid)?);
     // SAFETY: geteuid has no preconditions.
     let owner = unsafe { libc::geteuid() };
-    checked_dir(&dir, owner, true)?;
+    let parent = checked_dir(&parent, owner, false)?;
+    let child = proc_path(&parent, "attempts");
+    create_private(&child)?;
+    let dir = checked_dir(&child, owner, true)?;
     Ok(Store { dir, owner })
+}
+
+fn create_private(path: &Path) -> io::Result<()> {
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// A path that resolves through an open directory descriptor, so the
+/// directory it names is the one that was validated.
+fn proc_path(dir: &File, name: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "/proc/self/fd/{}/{name}",
+        std::os::fd::AsRawFd::as_raw_fd(dir)
+    ))
 }
 
 fn invalid() -> io::Error {
@@ -281,7 +297,7 @@ fn checked_dir(path: &Path, owner: u32, private: bool) -> io::Result<File> {
 
 impl Store {
     fn path(&self, uid: u32) -> PathBuf {
-        self.dir.join(format!("{uid}.json"))
+        proc_path(&self.dir, &format!("{uid}.json"))
     }
 
     fn read(&self, uid: u32) -> io::Result<Stored> {
@@ -307,7 +323,7 @@ impl Store {
     /// directory, then rename.
     fn write(&self, uid: u32, stored: &Stored) -> io::Result<()> {
         let bytes = serde_json::to_vec(stored).map_err(|_| invalid())?;
-        let tmp = self.dir.join(format!(".{uid}.json.tmp"));
+        let tmp = proc_path(&self.dir, &format!(".{uid}.json.tmp"));
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -319,7 +335,7 @@ impl Store {
         file.write_all(&bytes)?;
         file.sync_all()?;
         std::fs::rename(&tmp, self.path(uid))?;
-        File::open(&self.dir)?.sync_all()
+        self.dir.sync_all()
     }
 
     fn lock(&self) -> io::Result<File> {
@@ -329,7 +345,7 @@ impl Store {
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(self.dir.join(".lock"))?;
+            .open(proc_path(&self.dir, ".lock"))?;
         // SAFETY: lock owns a live descriptor.
         if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX) } != 0 {
             return Err(io::Error::last_os_error());

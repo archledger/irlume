@@ -3034,12 +3034,13 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
         },
         // A face attempt refused because the engine is still loading is a
         // pre-camera refusal with its own cause (ADR-0030 §5); the record
-        // files it too. A client that asked for typed errors gets a
-        // retryable operational failure (the daemon is unavailable, no face
-        // was tested); a legacy client gets the refusal in the shape it
-        // decodes.
+        // files it too, with its surface. A client that asked for typed
+        // errors gets a retryable operational failure (the daemon is
+        // unavailable, no face was tested); a legacy client gets the
+        // refusal in the shape it decodes.
         Request::Authenticate {
             user,
+            service,
             structured_errors,
             ..
         } => {
@@ -3047,7 +3048,7 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
                 &user,
                 attempt_record::Filed {
                     kind: irlume_common::AttemptKind::Authenticate,
-                    surface: irlume_common::AttemptSurface::Other,
+                    surface: attempt_surface(&user, service.as_deref(), peer),
                     result: irlume_common::AttemptResult::Failed,
                     cause: Some(EarlyRefusal::DaemonStarting.cause()),
                     elapsed_ms: 0,
@@ -5378,21 +5379,27 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// The surface an authentication serves (ADR-0030 §5): the operation
+/// class with the session state bound to this login; `Other` only when
+/// the account cannot be resolved. The gate keeps its own classification.
+fn attempt_surface(
+    user: &str,
+    service: Option<&str>,
+    peer: &Peer,
+) -> irlume_common::AttemptSurface {
+    crate::users::uid_for_name(user)
+        .map(|uid| attempt_record::session_state_for(peer.pid, uid))
+        .map(|state| irlume_core::biopolicy::classify(service.unwrap_or(""), state))
+        .map(attempt_record::surface_for)
+        .unwrap_or(irlume_common::AttemptSurface::Other)
+}
+
 impl AttemptContext {
     fn for_request(req: &Request, peer: &Peer) -> Option<Self> {
         LAST_ERROR_CAUSE.with(|cell| cell.set(None));
         match req {
             Request::Authenticate { user, service, .. } => {
-                // The surface, from the operation class with the session
-                // state bound to this login (ADR-0030 §5); the gate keeps
-                // its own classification.
-                let surface = crate::users::uid_for_name(user)
-                    .map(|uid| attempt_record::session_state_for(peer.pid, uid))
-                    .map(|state| {
-                        irlume_core::biopolicy::classify(service.as_deref().unwrap_or(""), state)
-                    })
-                    .map(attempt_record::surface_for)
-                    .unwrap_or(irlume_common::AttemptSurface::Other);
+                let surface = attempt_surface(user, service.as_deref(), peer);
                 Some(Self {
                     user: user.clone(),
                     kind: irlume_common::AttemptKind::Authenticate,

@@ -275,7 +275,8 @@ struct Store {
 
 fn store() -> io::Result<Store> {
     let state = irlume_common::state_dir();
-    let (parent, owner) = if state == Path::new(irlume_common::STATE_DIR) {
+    let overridden = std::env::var_os("IRLUME_STATE_DIR").is_some();
+    let (parent, owner) = if !overridden {
         for path in ["/", "/var"] {
             checked_dir(Path::new(path), 0, false)?;
         }

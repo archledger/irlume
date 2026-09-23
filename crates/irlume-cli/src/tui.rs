@@ -4787,8 +4787,12 @@ impl App {
             // worker returns, up to the 120s daemon budget. Keep a quit escape
             // hatch so a stalled probe can never trap the user; the worker result
             // is harmlessly dropped when we exit.
-            if matches!(code, KeyCode::Char('q') | KeyCode::Esc) {
+            // q remains the one escape hatch (ADR-0030 §1.2: Esc never
+            // quits); Esc says so instead of ending the session.
+            if code == KeyCode::Char('q') {
                 self.quit = true;
+            } else if code == KeyCode::Esc {
+                self.log('·', "a task is running; q quits, other keys wait for it");
             }
             return;
         }
@@ -5197,6 +5201,24 @@ impl App {
             (SC_WELCOME, KeyCode::Char('e')) if self.caps.rgb => {
                 self.screen = SC_PROFILES;
                 self.begin_enroll();
+            }
+            // ADR-0030 §1.3: i is Test Recognition on every page. Pages with
+            // their own arm (Overview, Identify) keep it; the rest route
+            // here to the same operation.
+            (
+                SC_PROFILES | SC_KEYRING | SC_RECOVERY | SC_FINGERPRINT | SC_PAM | SC_SETTINGS
+                | SC_REPAIR | SC_CAMERAS,
+                KeyCode::Char('i'),
+            ) if self.caps.rgb => {
+                if self.visible.contains(&SC_IDENTIFY) {
+                    self.screen = SC_IDENTIFY;
+                }
+                self.start_async(
+                    "Identify (1:N)",
+                    OpTag::Identify,
+                    Request::Identify,
+                    map_identify,
+                );
             }
             (SC_WELCOME, KeyCode::Char('i')) if self.caps.rgb => {
                 // Only jump to the Identify tab where it exists (advanced
@@ -6674,11 +6696,22 @@ impl App {
         if self.enroll.is_some() || self.op.is_some() {
             // Only the visible flow footer can cancel/exit. In particular,
             // normal page controls and the header never act behind a flow.
-            let flow_control = self.click_targets.borrow().iter().any(|(rect, click)| {
-                rect.contains((col, row).into()) && matches!(click, Click::Key(KeyCode::Esc))
-            });
-            if flow_control {
-                self.on_key(KeyCode::Esc);
+            // The footer registers Esc (cancel enrollment) or q (quit
+            // during a task); nothing else is clickable behind a flow.
+            let flow_control = self
+                .click_targets
+                .borrow()
+                .iter()
+                .find_map(|(rect, click)| match click {
+                    Click::Key(key @ (KeyCode::Esc | KeyCode::Char('q')))
+                        if rect.contains((col, row).into()) =>
+                    {
+                        Some(*key)
+                    }
+                    _ => None,
+                });
+            if let Some(key) = flow_control {
+                self.on_key(key);
             }
             return;
         }
@@ -7482,18 +7515,22 @@ impl App {
         self.draw_action_paragraph(f, area, lines, &page_actions);
     }
 
-    /// The details column threshold (ADR-0030 §1.8): at this width a list
-    /// page shows the selected row's details beside the list.
-    const DETAILS_COLUMN_MIN_WIDTH: u16 = 120;
+    /// The details column (ADR-0030 §1.8) appears when the content area
+    /// holds both a list that still shows its status column and a readable
+    /// details column: about 135 terminal columns with the sidebar open.
+    const CAMERA_LIST_MIN_WIDTH: u16 = 72;
+    const CAMERA_DETAILS_WIDTH: u16 = 42;
 
     fn draw_cameras(&self, f: &mut Frame, area: Rect) {
         // Wide terminals get the selected camera's details in a right-hand
         // column, always; narrower ones keep the Enter panel below the list.
-        // The threshold is the terminal's width, as the ADR states it.
-        let wide = f.area().width >= Self::DETAILS_COLUMN_MIN_WIDTH;
+        let wide = area.width >= Self::CAMERA_LIST_MIN_WIDTH + Self::CAMERA_DETAILS_WIDTH;
         let (area, details_area) = if wide {
-            let [left, right] =
-                Layout::horizontal([Constraint::Percentage(56), Constraint::Min(40)]).areas(area);
+            let [left, right] = Layout::horizontal([
+                Constraint::Fill(1),
+                Constraint::Length(Self::CAMERA_DETAILS_WIDTH),
+            ])
+            .areas(area);
             (left, Some(right))
         } else {
             (area, None)
@@ -7612,7 +7649,16 @@ impl App {
                                 _ => Style::new().fg(th().accent),
                             },
                         ),
-                        Span::styled(format!("{kind:<10}"), Style::new().dim()),
+                        // The kind column yields to the details column on
+                        // wide terminals so the status stays visible.
+                        Span::styled(
+                            if wide {
+                                String::new()
+                            } else {
+                                format!("{kind:<10}")
+                            },
+                            Style::new().dim(),
+                        ),
                         if priv_on {
                             Span::styled("⚠ privacy ON", Style::new().fg(th().err))
                         } else if !p.fixed && external_blocked == Some(true) {
@@ -9389,13 +9435,15 @@ impl App {
         // These controls replay the same state-specific keys as the keyboard.
         // Leaving a generic operation does not retract its daemon request.
         if self.enroll.is_some() || self.op.is_some() {
-            let label = if self.enroll.is_some() {
-                " cancel enrollment"
+            // Esc cancels an enrollment; during a generic task only q leaves
+            // (ADR-0030 §1.2: Esc never quits).
+            let (chip, code, label) = if self.enroll.is_some() {
+                ("esc", KeyCode::Esc, " cancel enrollment")
             } else {
-                " quit · task keeps running"
+                ("q", KeyCode::Char('q'), " quit · task keeps running")
             };
             let line = Line::from(vec![
-                key("esc"),
+                key(chip),
                 Span::raw(label),
                 Span::raw(if self.op.is_some() && area.width >= 60 {
                     " · working…"
@@ -9411,10 +9459,7 @@ impl App {
             f.render_widget(block, area);
             f.render_widget(Paragraph::new(line), inner);
             if width > 0 && inner.height > 0 {
-                self.hit(
-                    Rect::new(inner.x, inner.y, width, 1),
-                    Click::Key(KeyCode::Esc),
-                );
+                self.hit(Rect::new(inner.x, inner.y, width, 1), Click::Key(code));
             }
             return;
         }
@@ -13455,13 +13500,15 @@ mod tests {
         assert!(!app.quit);
         app.on_key(KeyCode::Char('q'));
         assert!(app.quit, "q must stay a live escape hatch during an op");
-        // A stalled op keeps the Esc exit: it is the only way out of a hung
-        // camera probe, so the op-running branch keeps Esc-quit (not home).
+        // Esc never quits (ADR-0030 §1.2), not even during a stalled op: q
+        // is the escape hatch, and Esc says so.
         let mut app = test_app();
         let (_tx, op) = fake_op();
         app.op = Some(op);
         app.on_key(KeyCode::Esc);
-        assert!(app.quit, "Esc still exits during a stalled op");
+        assert!(!app.quit, "Esc must not exit during an op; q does");
+        let (_, msg) = app.activity.last().expect("Esc explains itself");
+        assert!(msg.contains("q quits"), "{msg}");
     }
 
     #[test]
@@ -14295,9 +14342,14 @@ mod tests {
             !narrow.contains("(RGB) +"),
             "no details before Enter at 80 cols: {narrow}"
         );
-        let wide = render(&mut app, 140);
+        let wide = render(&mut app, 150);
         assert!(wide.contains("/dev/video0 (RGB)"), "{wide}");
         assert!(wide.contains("connection  built-in"), "{wide}");
+        // The status column survives beside the details column.
+        assert!(wide.contains("privacy unobserved"), "{wide}");
+        // Just under the threshold the page keeps the single column.
+        let mid = render(&mut app, 120);
+        assert!(!mid.contains("(RGB) +"), "no column at 120 cols: {mid}");
         app.on_key(KeyCode::Enter);
         let narrow = render(&mut app, 80);
         assert!(

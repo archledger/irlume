@@ -17,9 +17,10 @@ All notable changes to irlume are documented here. This project adheres to
   vocabulary (`●` `○` `◐` `✕` `⚠`) on every page, action rows lose their
   spacer lines, the daemon's state joins the page caption so the bottom
   bar carries the Activity log alone, the header's `advanced` marker names
-  its key, Diagnostics clips long details with an ellipsis, and at 120
-  columns or more the Cameras page shows the selected camera's details in
-  a right-hand column.
+  its key, Diagnostics clips long details with an ellipsis, and when the
+  content area has room for both (about 135 terminal columns) the Cameras
+  page shows the selected camera's details in a right-hand column. Esc no
+  longer quits during a running task; `q` remains the escape hatch.
 
 - The TUI's Cameras page lists each camera by its own name with its role
   for the account — `Primary camera`, `Secondary camera #N` or `not

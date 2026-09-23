@@ -72,9 +72,11 @@ rename on Faces is `n`, reseal on Password Wallet is `b`, IR-only on
 Preferences is `o` and its readiness check `c`, and the logs on Diagnostics
 are `w`. Status uses five glyphs everywhere: `●` ready or on, `○` off or
 not selected, `◐` unobserved or pending, `✕` absent or not connected, `⚠`
-needs attention; they read the same with `NO_COLOR`. At 120 columns or
-more, Cameras shows the selected camera's details in a right-hand column;
-narrower terminals open them with Enter.
+needs attention (a failed check is `✕`: the check failed, whatever the
+component's presence); they read the same with `NO_COLOR`. When the content
+area has room for both a list and a details column (about 135 terminal
+columns with the sidebar open), Cameras shows the selected camera's details
+in a right-hand column; narrower terminals open them with Enter.
 
 ## Activity and device transparency
 
@@ -181,9 +183,9 @@ daemon state. Environment overrides are identified and block misleading toggles.
 
 Click an action or use its key:
 
-- **i** switches IR-only on or restores dual-camera authentication. Enabling
+- **o** switches IR-only on or restores dual-camera authentication. Enabling
   experimental IR-only requires the displayed warning to be accepted.
-- **r** checks IR-only prerequisites for the account shown in the header,
+- **c** checks IR-only prerequisites for the account shown in the header,
   without opening a camera. Enabled policy and readiness are separate facts.
 - **p** switches hands-free privileged authentication on or restores required
   confirmation. Enabling hands-free explains its scope and asks first.

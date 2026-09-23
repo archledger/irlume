@@ -1030,6 +1030,11 @@ fn main() {
                             // unwind out of the worker and take down all face auth for
                             // every user.
                             let mut delivery = Delivery::attached(&reply);
+                            // Built outside the unwind boundary so a panic can
+                            // still file the attempt (ADR-0030 §5).
+                            let panicked_attempt = AttemptContext::for_request(&req, &peer, || {
+                                irlume_auth::camera_location(engine.rgb_device())
+                            });
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 dispatch_scoped_session_delivering(req, &peer, &mut engine, &scope, authorization, session.as_ref(), position.as_ref(), &mut delivery)
                             }));
@@ -1040,6 +1045,7 @@ fn main() {
                             // late disconnect on it must not cancel the next job.
                             link.released();
                             arbiter.finish(job.class, job.uid);
+                            let panicked = outcome.is_err();
                             let resp = match outcome {
                                 Ok(resp) => resp,
                                 Err(_) => {
@@ -1095,6 +1101,16 @@ fn main() {
                                     Response::Error("request failed".into()).into()
                                 }
                             };
+                            // A panicking request is still an attempt: filed as a
+                            // failure from the reply the client gets (ADR-0030 §5).
+                            if panicked {
+                                if let Some(attempt) = panicked_attempt {
+                                    note_engine_error(&irlume_common::Error::Protocol(
+                                        "request handler panicked".into(),
+                                    ));
+                                    attempt.file(&resp.response, None);
+                                }
+                            }
                             link.finish_activity();
                             scope.finish(categorical_outcome(&resp.response));
                             // The client may already be gone; its thread owns that.
@@ -1367,6 +1383,7 @@ fn retry_verify_refusal(reason: &str) -> Response {
 }
 
 fn retry_unseal_refusal(reason: &str) -> Response {
+    note_pre_camera(irlume_common::OutcomeCause::RetryThrottled);
     Response::Error(reason.into())
 }
 
@@ -3048,6 +3065,7 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
                 user.clone(),
                 attempt_record::Filed {
                     at: attempt_record::unix_now(),
+                    seq: attempt_record::next_seq(),
                     kind: irlume_common::AttemptKind::Authenticate,
                     surface: attempt_surface(&user, service.as_deref(), peer),
                     result: irlume_common::AttemptResult::Failed,
@@ -3070,12 +3088,32 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
                 )
             }
         }
+        Request::UnsealPassword { user, service } => {
+            attempt_record::record_in_background(
+                user.clone(),
+                attempt_record::Filed {
+                    at: attempt_record::unix_now(),
+                    seq: attempt_record::next_seq(),
+                    kind: irlume_common::AttemptKind::Authenticate,
+                    surface: attempt_surface(&user, service.as_deref(), peer),
+                    result: irlume_common::AttemptResult::Failed,
+                    cause: Some(EarlyRefusal::DaemonStarting.cause()),
+                    elapsed_ms: 0,
+                    capture_ms: None,
+                    camera: None,
+                },
+            );
+            Response::Error(
+                "irlumed is still starting (loading models); retry, or use your password".into(),
+            )
+        }
         Request::Identify => {
             if let IdentifyScope::SelfOnly(name) = identify_scope(peer) {
                 attempt_record::record_in_background(
                     name.clone(),
                     attempt_record::Filed {
                         at: attempt_record::unix_now(),
+                        seq: attempt_record::next_seq(),
                         kind: irlume_common::AttemptKind::Identify,
                         surface: irlume_common::AttemptSurface::Other,
                         result: irlume_common::AttemptResult::Failed,
@@ -3191,6 +3229,9 @@ fn serve_peer(
                 let scope = diagnostic_state.begin(diagnostic_operation_class(&req));
                 scope.finish(categorical_outcome(&resp));
                 if let Some(attempt) = AttemptContext::for_request(&req, &peer, || None) {
+                    // Whatever the reply shape, an authority or confirmation
+                    // refusal is a policy decision before any camera.
+                    note_pre_camera(irlume_common::OutcomeCause::Policy);
                     attempt.file(&resp, None);
                 }
                 return respond(stream, &resp);
@@ -3252,6 +3293,10 @@ fn serve_peer(
                 activity: activity.clone(),
                 ..ClientLink::default()
             });
+            // Built before the request moves into the job: a refusal at the
+            // door is a completed attempt that reached no camera (ADR-0030
+            // §5), and only the refusal branch uses it.
+            let refused_attempt = AttemptContext::for_request(&req, &peer, || None);
             let queued = Queued {
                 authorization,
                 session,
@@ -3270,6 +3315,10 @@ fn serve_peer(
                 // time rather than costing a thread per attempt (#142).
                 record_refusal(peer.uid);
                 scope.finish(irlume_common::diagnostics::CategoricalOutcome::Unavailable);
+                if let Some(attempt) = refused_attempt {
+                    note_pre_camera(irlume_common::OutcomeCause::CameraUnavailable);
+                    attempt.file(&Response::Error(refusal.message().into()), None);
+                }
                 return respond(stream, &Response::Error(refusal.message().into()));
             }
             if let Some(activity) = &activity {
@@ -4273,7 +4322,7 @@ fn not_authorized(req: &Request, verb: &str, user: &str) -> Response {
 
 /// Preserve legacy replies unless the caller can understand typed errors.
 fn authentication_error(error: irlume_common::Error, structured: bool) -> Response {
-    LAST_ERROR_CAUSE.with(|cell| cell.set(Some(error.cause())));
+    note_engine_error(&error);
     if structured {
         // ADR-0030 §5: the cause comes from the typed variant, never the
         // text; it rides beside the code the client already branches on.
@@ -5397,31 +5446,54 @@ struct AttemptContext {
     camera: Option<irlume_auth::CameraLocation>,
 }
 
-thread_local! {
-    /// The cause of the engine error the reply on this thread was built
-    /// from: a legacy prose `Error` reply cannot carry it, so the funnel
-    /// leaves it here for the attempt record.
-    static LAST_ERROR_CAUSE: std::cell::Cell<Option<irlume_common::OutcomeCause>> =
-        const { std::cell::Cell::new(None) };
-    /// The prose reply on this thread reports a decision against a face
-    /// (the credential-release refusal), not a failure before one.
-    static LAST_ERROR_DECIDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// What a prose reply on this thread cannot say for itself: the cause the
+/// site decided, whether it was a decision against a face rather than a
+/// failure before one, and whether it was decided before any camera.
+#[derive(Clone, Copy, Debug)]
+struct ReplyFacts {
+    cause: Option<irlume_common::OutcomeCause>,
+    decided: bool,
+    pre_camera: bool,
 }
 
-/// A cause decided before any camera was selected (ADR-0030 §5): such an
-/// attempt names no camera in the record.
-fn cause_is_pre_camera(cause: Option<irlume_common::OutcomeCause>) -> bool {
-    use irlume_common::OutcomeCause as C;
-    matches!(
-        cause,
-        Some(
-            C::MethodNotAvailable
-                | C::Policy
-                | C::Configuration
-                | C::RetryThrottled
-                | C::DaemonStarting
-        )
-    )
+thread_local! {
+    /// Facts about the reply being built on this thread, for the attempt
+    /// record (ADR-0030 §5); cleared when a face request begins.
+    static REPLY_FACTS: std::cell::Cell<Option<ReplyFacts>> = const { std::cell::Cell::new(None) };
+}
+
+/// An engine error became the reply: its typed cause, a failure, camera
+/// reachability left to the evidence.
+fn note_engine_error(error: &irlume_common::Error) {
+    REPLY_FACTS.with(|cell| {
+        cell.set(Some(ReplyFacts {
+            cause: Some(error.cause()),
+            decided: false,
+            pre_camera: false,
+        }))
+    });
+}
+
+/// A refusal decided before any camera was selected became the reply.
+fn note_pre_camera(cause: irlume_common::OutcomeCause) {
+    REPLY_FACTS.with(|cell| {
+        cell.set(Some(ReplyFacts {
+            cause: Some(cause),
+            decided: true,
+            pre_camera: true,
+        }))
+    });
+}
+
+/// A decision against a face became a prose reply.
+fn note_decided(cause: Option<irlume_common::OutcomeCause>) {
+    REPLY_FACTS.with(|cell| {
+        cell.set(Some(ReplyFacts {
+            cause,
+            decided: true,
+            pre_camera: false,
+        }))
+    });
 }
 
 /// The surface an authentication serves (ADR-0030 §5): the operation
@@ -5450,8 +5522,7 @@ impl AttemptContext {
         peer: &Peer,
         camera: impl FnOnce() -> Option<irlume_auth::CameraLocation>,
     ) -> Option<Self> {
-        LAST_ERROR_CAUSE.with(|cell| cell.set(None));
-        LAST_ERROR_DECIDED.with(|cell| cell.set(false));
+        REPLY_FACTS.with(|cell| cell.set(None));
         let (user, kind, surface) = match req {
             // The verify path and the cold-login credential-release path
             // are both face authentications.
@@ -5489,8 +5560,11 @@ impl AttemptContext {
     /// two syncs) runs on its own thread: the record is history and never
     /// delays the reply or the camera worker.
     fn file(self, response: &Response, capture_ms: Option<u64>) {
-        use irlume_common::AttemptResult;
-        let (result, cause, reached_camera) = match response {
+        use irlume_common::{AttemptResult, OutcomeCause};
+        let facts = REPLY_FACTS.with(|cell| cell.get());
+        // What the reply says, and whether the site that built it said the
+        // attempt never reached a camera.
+        let (result, cause, pre_camera) = match response {
             Response::AuthResult {
                 granted,
                 refused_by_policy,
@@ -5499,29 +5573,42 @@ impl AttemptContext {
             } => (
                 attempt_record::result_of(*granted, true),
                 *cause,
-                !*refused_by_policy && !cause_is_pre_camera(*cause),
+                *refused_by_policy,
             ),
-            Response::Identified { user, cause, .. } => (
-                attempt_record::result_of(false, true),
-                *cause,
-                user.is_some() || !cause_is_pre_camera(*cause),
-            ),
+            Response::Identified { cause, .. } => {
+                (attempt_record::result_of(false, true), *cause, false)
+            }
             // The credential-release grant.
-            Response::PasswordUnsealed { .. } => (AttemptResult::Granted, None, true),
-            Response::OperationError { cause, .. } => {
-                (AttemptResult::Failed, *cause, !cause_is_pre_camera(*cause))
-            }
-            Response::Error(_) => {
-                let cause = LAST_ERROR_CAUSE.with(|cell| cell.get());
-                let decided = LAST_ERROR_DECIDED.with(|cell| cell.get());
-                (
-                    attempt_record::result_of(false, decided),
-                    cause,
-                    !cause_is_pre_camera(cause),
-                )
-            }
+            Response::PasswordUnsealed { .. } => (AttemptResult::Granted, None, false),
+            // A credential-release refusal before any capture.
+            Response::UnsealUnavailable { .. } => (
+                AttemptResult::Refused,
+                facts.and_then(|f| f.cause).or(Some(OutcomeCause::Policy)),
+                true,
+            ),
+            Response::OperationError { cause, .. } => (AttemptResult::Failed, *cause, false),
+            Response::Error(_) => match facts {
+                Some(f) => (
+                    attempt_record::result_of(false, f.decided),
+                    f.cause,
+                    f.pre_camera,
+                ),
+                None => (AttemptResult::Failed, None, false),
+            },
             _ => return,
         };
+        let pre_camera = pre_camera || facts.is_some_and(|f| f.pre_camera);
+        // The camera is named on evidence, not on the cause alone: a grant,
+        // a capture stage that reported, or a failure of the camera itself.
+        // A setup refusal or a budget expiry with no capture evidence
+        // names none — the engine refuses those before any lease.
+        let reached_camera = !pre_camera
+            && (matches!(result, AttemptResult::Granted)
+                || capture_ms.is_some()
+                || matches!(
+                    cause,
+                    Some(OutcomeCause::CameraUnavailable | OutcomeCause::PrivacyShutter)
+                ));
         // A match on identify is not a grant of anything, but the record
         // shows a recognised face as the engine reported it.
         let result = match (self.kind, response) {
@@ -5535,6 +5622,7 @@ impl AttemptContext {
         let camera = if reached_camera { self.camera } else { None };
         let filed = attempt_record::Filed {
             at: attempt_record::unix_now(),
+            seq: attempt_record::next_seq(),
             kind: self.kind,
             surface: self.surface,
             result,
@@ -6563,6 +6651,7 @@ fn dispatch_scoped_session_inner(
             // Same method gate as Authenticate: fingerprint-configured means no
             // face-driven credential release either.
             if irlume_core::policy::method().face_disabled() {
+                note_pre_camera(irlume_common::OutcomeCause::MethodNotAvailable);
                 return Response::Error(
                     "face auth disabled: the configured method is fingerprint".into(),
                 );
@@ -6570,7 +6659,10 @@ fn dispatch_scoped_session_inner(
             let sensor_policy = match irlume_common::config::observe_face_sensor_policy().resolve()
             {
                 Ok(policy) => policy,
-                Err(error) => return Response::Error(error.to_string()),
+                Err(error) => {
+                    note_pre_camera(irlume_common::OutcomeCause::Configuration);
+                    return Response::Error(error.to_string());
+                }
             };
             let tier = face_tier(sensor_policy, engine.tier());
             // ALWAYS-ON: a polkit prompt never releases the sealed credential,
@@ -6587,6 +6679,7 @@ fn dispatch_scoped_session_inner(
                     "irlumed: UnsealPassword refused for polkit service '{}' (verify-only class)",
                     journal_safe(svc)
                 );
+                    note_pre_camera(irlume_common::OutcomeCause::Policy);
                     return Response::Error(format!(
                         "'{svc}' is verify-only: a polkit prompt never releases the credential"
                     ));
@@ -6596,6 +6689,7 @@ fn dispatch_scoped_session_inner(
             // sealed credential: no cold-login / keyring unlock by RGB-only face.
             if tier == irlume_core::biopolicy::Tier::Convenience {
                 jout_notice!("irlumed: convenience(RGB-only) refuses credential release for '{user}' -> password");
+                note_pre_camera(irlume_common::OutcomeCause::Policy);
                 return Response::UnsealUnavailable {
                     reason: "RGB-only convenience: face cannot release the login credential".into(),
                 };
@@ -6622,6 +6716,7 @@ fn dispatch_scoped_session_inner(
                     "irlumed: biopolicy denies unseal for service '{}' ({action:?}) -> password",
                     journal_safe(svc)
                 );
+                    note_pre_camera(irlume_common::OutcomeCause::Policy);
                     return Response::Error(format!(
                         "biopolicy: '{svc}' may not release the credential"
                     ));
@@ -7395,6 +7490,7 @@ fn do_unseal_password_scoped(
     jout_info!("irlumed: UnsealPassword: attempt for '{user}'");
     let t = std::time::Instant::now();
     if !irlume_core::keyring::has_sealed_password(user) {
+        note_pre_camera(irlume_common::OutcomeCause::Configuration);
         return Response::UnsealUnavailable {
             reason: format!("no sealed password for '{user}': run `irlume keyring arm`"),
         };
@@ -7467,7 +7563,7 @@ fn do_unseal_password_scoped(
                 ""
             };
             jout_warn!("irlumed: UnsealPassword: capture/auth failed for '{user}': {e}{hint}");
-            LAST_ERROR_CAUSE.with(|cell| cell.set(Some(e.cause())));
+            note_engine_error(&e);
             return Response::Error(e.to_string());
         }
     };
@@ -7506,8 +7602,12 @@ fn unseal_reply(
             }
         },
         retry_unseal_refusal,
-        // Credential release has no typed-error opt-in: prose, as before.
-        |error| Response::Error(error.to_string()),
+        // Credential release has no typed-error opt-in: prose, as before;
+        // the record still gets the typed cause (ADR-0030 §5).
+        |error| {
+            note_engine_error(&error);
+            Response::Error(error.to_string())
+        },
     )
 }
 
@@ -7529,8 +7629,7 @@ fn finish_unseal_password(
         );
         // The prose reply is the only shape an older PAM decodes; the
         // record still gets the engine's cause (ADR-0030 §5).
-        LAST_ERROR_CAUSE.with(|cell| cell.set(outcome.cause));
-        LAST_ERROR_DECIDED.with(|cell| cell.set(true));
+        note_decided(outcome.cause);
         return Response::Error(format!("face not granted: {}", outcome.reason));
     }
     // See the UnsealKeyring path: one load, so the bytes and their kind always
@@ -7569,7 +7668,7 @@ fn finish_unseal_password(
             );
             // The face was granted; the release failed after it. The
             // record files the typed cause of that failure (ADR-0030 §5).
-            LAST_ERROR_CAUSE.with(|cell| cell.set(Some(e.cause())));
+            note_engine_error(&e);
             Response::Error(e.to_string())
         }
     }

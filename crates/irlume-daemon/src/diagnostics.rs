@@ -146,7 +146,7 @@ impl DiagnosticState {
             operation_id: self.next_operation_id(),
             operation,
             finished: Arc::new(AtomicBool::new(false)),
-            capture_us: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            capture: Arc::new(Mutex::new(CaptureSpan::default())),
         }
     }
 
@@ -552,10 +552,20 @@ pub(crate) struct OperationScope {
     operation_id: OperationId,
     operation: OperationClass,
     finished: Arc<AtomicBool>,
-    /// Microseconds the capture stages (RGB and IR) reported for this
-    /// operation, summed, for the attempt record's `capture_ms`
-    /// (ADR-0030 §5). Zero until a capture stage timing arrived.
-    capture_us: Arc<std::sync::atomic::AtomicU64>,
+    /// The capture span for the attempt record's `capture_ms` (ADR-0030
+    /// §5), measured as wall time between the events this scope relays:
+    /// the `CaptureSetup` timing marks capture beginning, the last
+    /// `RgbCapture`/`IrCapture` timing marks it ending. Concurrent roles
+    /// overlap and are not summed; without a setup mark the longest single
+    /// capture stage stands in.
+    capture: Arc<Mutex<CaptureSpan>>,
+}
+
+#[derive(Default)]
+struct CaptureSpan {
+    begun: Option<std::time::Instant>,
+    ended: Option<std::time::Instant>,
+    longest_stage_us: u64,
 }
 
 impl OperationScope {
@@ -563,13 +573,24 @@ impl OperationScope {
         self.operation_id
     }
 
-    /// The capture stages' summed duration, once one reported (ADR-0030
-    /// §5); `None` when the operation never reached a capture.
+    /// The capture span once a capture stage reported (ADR-0030 §5):
+    /// wall time from the setup mark to the last capture stage event, at
+    /// least the longest single stage; `None` when the operation never
+    /// reached a capture.
     pub(crate) fn capture_ms(&self) -> Option<u64> {
-        match self.capture_us.load(Ordering::Relaxed) {
-            0 => None,
-            us => Some(us.div_ceil(1000)),
+        let span = self.capture.lock().unwrap_or_else(|e| e.into_inner());
+        if span.longest_stage_us == 0 {
+            return None;
         }
+        let stage_ms = span.longest_stage_us.div_ceil(1000);
+        let wall_ms = match (span.begun, span.ended) {
+            (Some(begun), Some(ended)) => {
+                u64::try_from(ended.saturating_duration_since(begun).as_millis())
+                    .unwrap_or(u64::MAX)
+            }
+            _ => 0,
+        };
+        Some(wall_ms.max(stage_ms))
     }
 
     #[cfg(test)]
@@ -617,14 +638,18 @@ impl DiagnosticSink for OperationScope {
     }
 
     fn emit_trace(&self, kind: TraceEventKind) {
-        if let TraceEventKind::StageTiming {
-            stage:
-                irlume_common::diagnostics::TraceStage::RgbCapture
-                | irlume_common::diagnostics::TraceStage::IrCapture,
-            elapsed_us,
-        } = &kind
-        {
-            self.capture_us.fetch_add(*elapsed_us, Ordering::Relaxed);
+        if let TraceEventKind::StageTiming { stage, elapsed_us } = &kind {
+            use irlume_common::diagnostics::TraceStage;
+            let mut span = self.capture.lock().unwrap_or_else(|e| e.into_inner());
+            match stage {
+                // Setup ends where capture begins.
+                TraceStage::CaptureSetup => span.begun = Some(std::time::Instant::now()),
+                TraceStage::RgbCapture | TraceStage::IrCapture => {
+                    span.ended = Some(std::time::Instant::now());
+                    span.longest_stage_us = span.longest_stage_us.max(*elapsed_us);
+                }
+                _ => {}
+            }
         }
         if !self.finished.load(Ordering::Acquire) {
             self.state

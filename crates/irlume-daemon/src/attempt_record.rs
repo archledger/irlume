@@ -60,6 +60,9 @@ pub(crate) struct Filed {
     /// before the write is queued so two attempts finishing close
     /// together keep their order whatever order their writers run in.
     pub at: u64,
+    /// Completion order within a second: a per-instance counter taken by
+    /// the caller with `at` ([`next_seq`]).
+    pub seq: u64,
     pub kind: AttemptKind,
     pub surface: AttemptSurface,
     pub result: AttemptResult,
@@ -154,6 +157,13 @@ fn session_state_from(
     )
 }
 
+/// The next completion sequence number: monotonic for this daemon
+/// instance, so attempts filed in the same second keep their order.
+pub(crate) fn next_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -207,7 +217,11 @@ pub(crate) fn apply(record: &mut AttemptRecord, entry: AttemptEntry, now: u64) {
         AttemptKind::Authenticate => &mut record.latest_authenticate,
         AttemptKind::Identify => &mut record.latest_identify,
     };
-    if latest.as_ref().is_none_or(|current| current.at <= entry.at) {
+    let order = |e: &AttemptEntry| (e.at, e.seq);
+    if latest
+        .as_ref()
+        .is_none_or(|current| order(current) <= order(&entry))
+    {
         *latest = Some(entry.clone());
     }
     let Some(camera) = entry.camera.clone() else {
@@ -229,13 +243,13 @@ pub(crate) fn apply(record: &mut AttemptRecord, entry: AttemptEntry, now: u64) {
     let slot = bucket
         .attempts
         .iter()
-        .position(|kept| kept.at <= entry.at)
+        .position(|kept| order(kept) <= order(&entry))
         .unwrap_or(bucket.attempts.len());
     bucket.attempts.insert(slot, entry);
     bucket.attempts.truncate(PER_CAMERA);
     // Most recently used first (by the newest attempt each holds); the
     // least recently used falls off.
-    let newest = |bucket: &CameraAttempts| bucket.attempts.first().map_or(0, |a| a.at);
+    let newest = |bucket: &CameraAttempts| bucket.attempts.first().map_or((0, 0), order);
     let position = record
         .cameras
         .iter()
@@ -267,6 +281,8 @@ fn store() -> io::Result<Store> {
     let parent = checked_dir(Path::new("/var/lib/irlume"), 0, false)?;
     let child = proc_path(&parent, "attempts");
     create_private(&child)?;
+    // A directory entry is durable only once its parent is synced.
+    parent.sync_all()?;
     let dir = checked_dir(&child, 0, true)?;
     Ok(Store { dir, owner: 0 })
 }
@@ -279,6 +295,7 @@ fn store() -> io::Result<Store> {
     let parent = checked_dir(&parent, owner, false)?;
     let child = proc_path(&parent, "attempts");
     create_private(&child)?;
+    parent.sync_all()?;
     let dir = checked_dir(&child, owner, true)?;
     Ok(Store { dir, owner })
 }
@@ -423,6 +440,7 @@ pub(crate) fn record(user: &str, filed: Filed) -> io::Result<()> {
     let now = unix_now();
     let entry = AttemptEntry {
         at: filed.at,
+        seq: filed.seq,
         kind: filed.kind,
         surface: filed.surface,
         result: filed.result,
@@ -438,24 +456,48 @@ pub(crate) fn record(user: &str, filed: Filed) -> io::Result<()> {
     store.write(uid, &stored)
 }
 
-/// File an attempt on its own thread: the write takes the store lock and
-/// syncs, which must never delay a reply or the camera worker. A failure
-/// is journaled there.
+/// Queue capacity for the background writer: attempts complete far
+/// slower than this drains; a peer spinning on refusals fills it and its
+/// later attempts are dropped (journaled), never queued without bound.
+const WRITER_QUEUE: usize = 64;
+
+/// File an attempt from the one background writer: a bounded queue and a
+/// single thread, so however fast refusals arrive the daemon holds at
+/// most `WRITER_QUEUE` pending records and one writer serialized on the
+/// store lock. A full queue drops the record and says so; the record is
+/// history and never delays a reply.
 pub(crate) fn record_in_background(user: String, filed: Filed) {
-    std::thread::Builder::new()
-        .name("irlume-attempt-record".into())
-        .spawn(move || {
-            if let Err(error) = record(&user, filed) {
-                irlume_common::jout_warn!(
-                    "irlumed: attempt record for '{}' not written: {error}",
-                    crate::journal_safe(&user)
-                );
-            }
-        })
-        .map(drop)
-        .unwrap_or_else(|error| {
-            irlume_common::jout_warn!("irlumed: attempt record thread not started: {error}");
-        });
+    static WRITER: std::sync::OnceLock<std::sync::mpsc::SyncSender<(String, Filed)>> =
+        std::sync::OnceLock::new();
+    static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sender = WRITER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(String, Filed)>(WRITER_QUEUE);
+        let spawned = std::thread::Builder::new()
+            .name("irlume-attempt-record".into())
+            .spawn(move || {
+                for (user, filed) in rx {
+                    if let Err(error) = record(&user, filed) {
+                        irlume_common::jout_warn!(
+                            "irlumed: attempt record for '{}' not written: {error}",
+                            crate::journal_safe(&user)
+                        );
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            irlume_common::jout_warn!("irlumed: attempt record writer not started: {error}");
+        }
+        tx
+    });
+    if sender.try_send((user, filed)).is_err() {
+        // Journal the first drop and then every hundredth, not each one.
+        let dropped = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if dropped == 1 || dropped % 100 == 0 {
+            irlume_common::jout_warn!(
+                "irlumed: attempt record writer queue full; {dropped} records dropped so far"
+            );
+        }
+    }
 }
 
 /// The record for `user` (empty when nothing was ever filed), or `None`
@@ -515,6 +557,7 @@ mod tests {
     fn entry(at: u64, kind: AttemptKind, camera: Option<&str>) -> AttemptEntry {
         AttemptEntry {
             at,
+            seq: 0,
             kind,
             surface: AttemptSurface::Login,
             result: AttemptResult::Refused,
@@ -686,6 +729,17 @@ mod tests {
         );
         assert_eq!(record.cameras[0].camera.port_chain.as_deref(), Some("1-2"));
         assert_eq!(record.cameras[1].camera.port_chain.as_deref(), Some("1-3"));
+        // Within one second the sequence decides: the later completion
+        // stays latest whichever writer ran first.
+        let mut later = entry(now + 20, AttemptKind::Identify, Some("1-2"));
+        later.seq = 7;
+        let mut earlier = entry(now + 20, AttemptKind::Identify, Some("1-2"));
+        earlier.seq = 6;
+        apply(&mut record, later, now + 20);
+        apply(&mut record, earlier, now + 20);
+        assert_eq!(record.latest_identify.as_ref().unwrap().seq, 7);
+        assert_eq!(record.cameras[0].attempts[0].seq, 7);
+        assert_eq!(record.cameras[0].attempts[1].seq, 6);
     }
 
     #[test]
@@ -815,6 +869,7 @@ mod tests {
             &me,
             Filed {
                 at: unix_now(),
+                seq: next_seq(),
                 kind: AttemptKind::Authenticate,
                 surface: AttemptSurface::Lock,
                 result: AttemptResult::Granted,
@@ -851,6 +906,7 @@ mod tests {
             &me,
             Filed {
                 at: unix_now(),
+                seq: next_seq(),
                 kind: AttemptKind::Identify,
                 surface: AttemptSurface::Other,
                 result: AttemptResult::Refused,
@@ -883,6 +939,7 @@ mod tests {
             &me,
             Filed {
                 at: unix_now(),
+                seq: next_seq(),
                 kind: AttemptKind::Authenticate,
                 surface: AttemptSurface::Login,
                 result: AttemptResult::Refused,

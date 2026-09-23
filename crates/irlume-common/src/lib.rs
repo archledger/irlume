@@ -1053,6 +1053,10 @@ pub struct AttemptCamera {
 pub struct AttemptEntry {
     /// Unix seconds.
     pub at: u64,
+    /// Order among attempts filed in the same second (a per-daemon-instance
+    /// counter taken at completion); zero from an older daemon.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub seq: u64,
     pub kind: AttemptKind,
     pub surface: AttemptSurface,
     pub result: AttemptResult,
@@ -1065,6 +1069,10 @@ pub struct AttemptEntry {
     /// Absent for an attempt refused before any camera was selected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera: Option<AttemptCamera>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// The attempts retained for one camera location.

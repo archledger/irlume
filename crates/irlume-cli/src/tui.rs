@@ -671,6 +671,8 @@ struct App {
     primary_camera: Option<irlume_common::PrimaryCameraBinding>,
     /// The Cameras details panel is open for the selected pair.
     cam_details: bool,
+    /// A keyring re-check was asked for while one was in flight.
+    keyring_refresh_queued: bool,
     keyring_armed: Option<bool>,
     /// Seal-tier label from envelope metadata (e.g. "pcrlock NV 0x… (Tier 2)");
     /// `None` when not armed or the daemon predates the request.
@@ -2068,6 +2070,7 @@ impl App {
             camera_store_error: None,
             primary_camera: None,
             cam_details: false,
+            keyring_refresh_queued: false,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -2579,6 +2582,10 @@ impl App {
     /// with authentication; this independent receiver cannot delay light status.
     fn refresh_keyring_diagnostic(&mut self) {
         if self.keyring_load.is_some() {
+            // The in-flight reply carries an older generation and will be
+            // discarded; run again when it lands rather than dropping the
+            // request the person just made.
+            self.keyring_refresh_queued = true;
             return;
         }
         let (tx, rx) = mpsc::channel();
@@ -3811,6 +3818,7 @@ impl App {
         }
         if let Some(result) = receive_finished(&self.keyring_load) {
             self.keyring_load = None;
+            let queued = std::mem::take(&mut self.keyring_refresh_queued);
             match result {
                 Ok((generation, reply)) if generation == self.keyring_generation => {
                     self.keyring_drift = match reply {
@@ -3826,6 +3834,9 @@ impl App {
                     self.log('!', "wallet check ended without a result; current PCR state is unavailable. Check again to retry.");
                 }
                 _ => {}
+            }
+            if queued {
+                self.refresh_keyring_diagnostic();
             }
         }
         if let Some(result) = receive_finished(&self.profiles_load) {
@@ -5191,16 +5202,47 @@ impl App {
             }
             // ADR-0030 §1.3: r refreshes the current page's observations on
             // every page; Diagnostics and Cameras have their own arms below.
-            (
-                SC_PROFILES | SC_KEYRING | SC_RECOVERY | SC_FINGERPRINT | SC_PAM | SC_SETTINGS
-                | SC_IDENTIFY,
-                KeyCode::Char('r'),
-            ) => {
+            // Each page refreshes only the observations it shows: the light
+            // status poll for the wallet/recovery/preferences facts, the
+            // machine probes for fingerprint and login wiring, the app scan
+            // for Login & Apps, the profile listing for Faces. Never the
+            // full refresh, which would also start a TPM-backed profile load
+            // the page does not need.
+            (SC_PROFILES, KeyCode::Char('r')) => {
+                self.log('·', "refreshing faces…");
+                self.refresh_profiles();
+            }
+            (SC_KEYRING | SC_RECOVERY | SC_SETTINGS, KeyCode::Char('r')) => {
                 self.log('·', "refreshing this page…");
-                self.refresh();
+                self.invalidate_daemon_observations();
+                self.refresh_light();
                 if self.screen == SC_KEYRING {
+                    self.invalidate_keyring_diagnostic();
                     self.refresh_keyring_diagnostic();
                 }
+            }
+            (SC_FINGERPRINT, KeyCode::Char('r')) => {
+                self.log('·', "refreshing this page…");
+                for source in [Source::Machine, Source::FingerprintReader, Source::Fingerprint] {
+                    self.invalidate_source(source);
+                }
+                self.freshness.cycle_mut(Worker::Machine).invalidate();
+                self.refresh_light();
+                self.request_probes();
+            }
+            (SC_PAM, KeyCode::Char('r')) => {
+                self.log('·', "refreshing this page…");
+                for source in [Source::Machine, Source::Apps] {
+                    self.invalidate_source(source);
+                }
+                self.freshness.cycle_mut(Worker::Machine).invalidate();
+                self.freshness.cycle_mut(Worker::Apps).invalidate();
+                self.request_probes();
+                self.refresh_heavy();
+            }
+            (SC_IDENTIFY, KeyCode::Char('r')) => {
+                self.log('·', "refreshing daemon status…");
+                self.refresh_live();
             }
             // Welcome: start the uninstall challenge (capital U, so a stray
             // lower-case key can't begin it). The user must TYPE the word to
@@ -6339,7 +6381,10 @@ impl App {
     /// stops working. Deliberately no sidebar — nothing to parse on run one.
     fn draw_firstrun(&self, f: &mut Frame, area: Rect) {
         let block = Block::bordered()
-            .title(" Set up face unlock ")
+            .title(format!(
+                " Set up face unlock · daemon {} ",
+                self.daemon_state_label()
+            ))
             .title_bottom(if self.focused_action().is_some() {
                 " PgUp/Dn read · F6 back "
             } else {
@@ -7001,7 +7046,7 @@ impl App {
         let chk = |ok: bool, label: &str| {
             Line::from(vec![
                 Span::styled(
-                    if ok { "  ✓ " } else { "  ○ " },
+                    if ok { "  ● " } else { "  ○ " },
                     if ok {
                         Style::new().fg(th().ok)
                     } else {
@@ -7861,7 +7906,12 @@ impl App {
                     .block(Block::new().borders(ratatui::widgets::Borders::LEFT)),
                 details_area,
             );
-        } else if self.cam_details {
+        }
+        // Enter opens the full panel below the list in either layout: on a
+        // wide terminal it is the readable, scrollable copy of the column
+        // (a short window clips the column) with the camera's actions, so
+        // the state Esc closes is always one the person can see.
+        if self.cam_details {
             if let Some(p) = pairs.get(self.cam_sel) {
                 let (lines, actions) = details_for(p, true);
                 page_actions = actions;
@@ -8768,7 +8818,7 @@ impl App {
             Some((true, who)) => {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        "  ✓ Recognized  ",
+                        "  ● Recognized  ",
                         Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(who.clone(), Style::new().fg(th().ok)),
@@ -8783,7 +8833,7 @@ impl App {
                 )));
             }
             Some((false, why)) => lines.push(Line::from(vec![
-                Span::styled("  ✗ ", Style::new().fg(th().err)),
+                Span::styled("  ✕ ", Style::new().fg(th().err)),
                 Span::styled(why.clone(), Style::new().fg(th().err)),
             ])),
             None => lines.push(Line::from(Span::styled(
@@ -9571,7 +9621,7 @@ impl App {
     /// of the CURRENT screen (tier two of the disclosure ladder).
     fn help_body(&self) -> String {
         let mut b = String::from(
-            "Global\n              F4  current daemon, camera inventory and observation age\n              F3  choose a section (click or arrows + Enter)\n              F6  focus page actions / return to page selection\n          ↑↓ + Enter/Space  choose and activate a focused action\n              F2  search more actions\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193} / j k  select\n            1-9  section: 1 Overview 2 Faces 3 Wallet 4 Recovery 5 Login 6 Diagnostics 7 Cameras 8 Preferences 9 Fingerprint\n            g / G  first / last row\n               v  show/hide technical tools\n               A  expand/collapse activity history\n               L  full session history and wrapped details\n         PgUp/Dn  read page with F6 focus; otherwise Activity\n               h  Overview              q  quit\n           click  rows and action chips\n        Dialogs  ↑↓ / PgUp/Dn scroll long messages\n               M  release mouse (highlight/copy)\n\nThis screen\n",
+            "Global\n              F4  current daemon, camera inventory and observation age\n              F3  choose a section (click or arrows + Enter)\n              F6  focus page actions / return to page selection\n          ↑↓ + Enter/Space  choose and activate a focused action\n              F2  search more actions\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193} / j k  select\n            1-9  section: 1 Overview 2 Faces 3 Wallet 4 Recovery 5 Login 6 Diagnostics 7 Cameras 8 Preferences 9 Fingerprint\n            g / G  first / last row\n               v  show/hide technical tools\n               r  refresh this page         i  test recognition\n               A  expand/collapse activity history\n               L  full session history and wrapped details\n         PgUp/Dn  read page with F6 focus; otherwise Activity\n               h  Overview              q  quit\n           click  rows and action chips\n        Dialogs  ↑↓ / PgUp/Dn scroll long messages\n               M  release mouse (highlight/copy)\n\nThis screen\n",
         );
         for (k, d) in self.screen_actions() {
             b.push_str(&format!("  {k:<7} {d}\n"));
@@ -11829,6 +11879,7 @@ mod tests {
             camera_store_error: None,
             primary_camera: None,
             cam_details: false,
+            keyring_refresh_queued: false,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -15893,12 +15944,12 @@ mod tests {
         let text = draw_text(&app);
         assert!(text.contains("alice · Face Profile 1 · match score 0.912"));
         assert!(
-            text.contains("✓ Recognized") && text.contains("not a login or a probability estimate"),
+            text.contains("● Recognized") && text.contains("not a login or a probability estimate"),
             "the hit shows a verdict without presenting similarity as a probability"
         );
         app.identify_result = Some((false, "no live face (flat depth)".into()));
         let text = draw_text(&app);
-        assert!(text.contains("✗"));
+        assert!(text.contains("✕"));
         assert!(text.contains("no live face (flat depth)"));
     }
 

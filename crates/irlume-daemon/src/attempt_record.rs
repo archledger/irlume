@@ -273,35 +273,30 @@ struct Store {
     owner: u32,
 }
 
-#[cfg(not(test))]
 fn store() -> io::Result<Store> {
-    for path in ["/", "/var"] {
-        checked_dir(Path::new(path), 0, false)?;
-    }
-    let var_lib = checked_dir(Path::new("/var/lib"), 0, false)?;
-    // A new directory entry is durable only once its parent is synced;
-    // an existing one costs a read path nothing.
-    if create_private(Path::new("/var/lib/irlume"))? {
-        var_lib.sync_all()?;
-    }
-    // The parent is validated before its child is followed; an existing
-    // directory is accepted only when root owns it and nobody else can
-    // write it.
-    let parent = checked_dir(Path::new("/var/lib/irlume"), 0, false)?;
-    let child = proc_path(&parent, "attempts");
-    if create_private(&child)? {
-        parent.sync_all()?;
-    }
-    let dir = checked_dir(&child, 0, true)?;
-    Ok(Store { dir, owner: 0 })
-}
-
-#[cfg(test)]
-fn store() -> io::Result<Store> {
-    let parent = PathBuf::from(std::env::var_os("IRLUME_STATE_DIR").ok_or_else(invalid)?);
-    // SAFETY: geteuid has no preconditions.
-    let owner = unsafe { libc::geteuid() };
-    let parent = checked_dir(&parent, owner, false)?;
+    let state = irlume_common::state_dir();
+    let (parent, owner) = if state == Path::new(irlume_common::STATE_DIR) {
+        for path in ["/", "/var"] {
+            checked_dir(Path::new(path), 0, false)?;
+        }
+        let var_lib = checked_dir(Path::new("/var/lib"), 0, false)?;
+        // A new directory entry is durable only once its parent is synced;
+        // an existing one costs a read path nothing.
+        if create_private(&state)? {
+            var_lib.sync_all()?;
+        }
+        // The parent is validated before its child is followed; an existing
+        // directory is accepted only when root owns it and nobody else can
+        // write it.
+        (checked_dir(&state, 0, false)?, 0)
+    } else {
+        // The `IRLUME_STATE_DIR` override moves every state consumer
+        // together (the enrollments live there too): the tree is the
+        // operator's, owned by the daemon's own user.
+        // SAFETY: geteuid has no preconditions.
+        let owner = unsafe { libc::geteuid() };
+        (checked_dir(&state, owner, false)?, owner)
+    };
     let child = proc_path(&parent, "attempts");
     if create_private(&child)? {
         parent.sync_all()?;

@@ -6419,14 +6419,22 @@ fn dispatch_scoped_session_inner(
                 }),
             };
             match scoped {
-                Ok(o) => Response::Identified {
-                    cause: o.cause,
-                    user: o.user,
-                    profile: o.profile,
-                    score: o.score,
-                    live: o.live,
-                    reason: o.reason,
-                },
+                Ok(o) => {
+                    // Face disabled by the method policy is decided before
+                    // any camera: the same pre-camera refusal the
+                    // Authenticate path files (ADR-0030 §5).
+                    if o.cause == Some(irlume_common::OutcomeCause::MethodNotAvailable) {
+                        note_pre_camera(irlume_common::OutcomeCause::MethodNotAvailable);
+                    }
+                    Response::Identified {
+                        cause: o.cause,
+                        user: o.user,
+                        profile: o.profile,
+                        score: o.score,
+                        live: o.live,
+                        reason: o.reason,
+                    }
+                }
                 // An engine failure is a typed refusal in the reply shape
                 // every identify client decodes (ADR-0030 §5); the prose
                 // stays in `reason` and the record reads the cause from it.

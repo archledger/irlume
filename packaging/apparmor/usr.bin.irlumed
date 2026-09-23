@@ -181,6 +181,15 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   # Per-account operation locks serialize face requests and retry recovery;
   # the directory lock above does not grant flock on these regular files.
   /var/lib/irlume/retry/*.operation rwk,
+  # The per-account attempt record (ADR-0030 §5): its directory and the
+  # lock file the writer holds; `**` alone does not grant flock.
+  /var/lib/irlume/attempts/ rwk,
+  /var/lib/irlume/attempts/.lock rwk,
+  # The session state bound to the requesting login (ADR-0030 §5): the
+  # peer's cgroup names its logind session, whose facts logind publishes.
+  /proc/[0-9]*/cgroup r,
+  /run/systemd/sessions/ r,
+  /run/systemd/sessions/* r,
   /var/lib/irlume/ rw,
   /var/lib/irlume/** rw,
 

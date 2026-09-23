@@ -4225,6 +4225,8 @@ pub struct CameraPair {
     /// The USB location (`<bus>-<port>[.<port>…]`, the device directory's
     /// sysfs name), share-safe (ADR-0030 §5); `None` off USB.
     pub port_chain: Option<String>,
+    /// First 16 hex of the descriptor fingerprint (ADR-0030 §5).
+    pub descriptor_token: Option<String>,
 }
 
 /// The share-safe location of the camera behind a node (ADR-0030 §5),
@@ -4240,10 +4242,12 @@ pub struct CameraLocation {
     pub serial: Option<String>,
 }
 
-/// See [`CameraLocation`]. Sysfs only; never authorizes capture.
+/// See [`CameraLocation`]. Sysfs only, and only the USB identity — link
+/// diagnostics that may be absent on a usable camera are not required.
+/// Never authorizes capture.
 #[must_use]
 pub fn camera_location(node: &str) -> Option<CameraLocation> {
-    let (identity, _) = uvc_descriptor::identity_and_connection_for_budget_hint(node).ok()?;
+    let identity = uvc_descriptor::identity_for_location(node).ok()?;
     let fingerprint = identity.descriptor_fingerprint();
     Some(CameraLocation {
         model: format!("{:04x}:{:04x}", identity.vid, identity.pid),
@@ -4251,6 +4255,24 @@ pub fn camera_location(node: &str) -> Option<CameraLocation> {
         descriptor_token: fingerprint.get(..16)?.to_owned(),
         serial: identity.serial,
     })
+}
+
+/// The locations of every video node sysfs lists (sysfs only, no opens),
+/// so a record's camera can be matched against what is attached now.
+#[must_use]
+pub fn connected_camera_locations() -> Vec<CameraLocation> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/video4linux") else {
+        return Vec::new();
+    };
+    let mut locations: Vec<CameraLocation> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            camera_location(&format!("/dev/{}", entry.file_name().to_string_lossy()))
+        })
+        .collect();
+    locations.sort_by(|a, b| (&a.port_chain, &a.model).cmp(&(&b.port_chain, &b.model)));
+    locations.dedup();
+    locations
 }
 
 /// `<bus>-<port>[.<port>…]` from a sysfs USB device path, or `None` when
@@ -4479,6 +4501,7 @@ fn pairs_from(nodes: &[(String, Role)]) -> Vec<CameraPair> {
             identity: device_identity(&rgbs[0]),
             serial_present,
             port_chain: id.to_str().and_then(usb_port_chain),
+            descriptor_token: camera_location(&rgbs[0]).map(|l| l.descriptor_token),
             rgb: rgbs[0].clone(),
             ir: irs[0].clone(),
             id: read_vidpid(id),

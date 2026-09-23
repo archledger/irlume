@@ -13675,6 +13675,7 @@ mod tests {
                 identity: None,
                 serial_present: false,
                 port_chain: None,
+                descriptor_token: None,
                 handle: None,
             },
             irlume_common::CameraPairInfo {
@@ -13687,6 +13688,7 @@ mod tests {
                 identity: None,
                 serial_present: false,
                 port_chain: None,
+                descriptor_token: None,
                 handle: None,
             },
         ];
@@ -14045,6 +14047,7 @@ mod tests {
             identity: None,
             serial_present: false,
             port_chain: None,
+            descriptor_token: None,
             handle: None,
         }];
         app.cam_sel = 0;
@@ -14237,6 +14240,7 @@ mod tests {
                 identity: Some("3277:0059".into()),
                 serial_present: false,
                 port_chain: None,
+                descriptor_token: None,
                 handle: None,
             },
             irlume_common::CameraPairInfo {
@@ -14249,6 +14253,7 @@ mod tests {
                 identity: Some("3443:c803".into()),
                 serial_present: false,
                 port_chain: None,
+                descriptor_token: None,
                 handle: None,
             },
         ];
@@ -14637,6 +14642,7 @@ mod tests {
             identity: Some("3277:0059".into()),
             serial_present: false,
             port_chain: None,
+            descriptor_token: None,
             handle: None,
         }];
         let render = |app: &mut App, w: u16| {
@@ -16455,6 +16461,7 @@ mod tests {
             identity: None,
             serial_present: false,
             port_chain: None,
+            descriptor_token: None,
             handle: None,
         }];
         let text = draw_text(&app);
@@ -18580,6 +18587,7 @@ mod tests {
             identity: None,
             serial_present: false,
             port_chain: None,
+            descriptor_token: None,
             handle: None,
         }];
         app.on_key(KeyCode::F(6));

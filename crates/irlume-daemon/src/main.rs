@@ -3044,8 +3044,8 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             structured_errors,
             ..
         } => {
-            if let Err(error) = attempt_record::record(
-                &user,
+            attempt_record::record_in_background(
+                user.clone(),
                 attempt_record::Filed {
                     kind: irlume_common::AttemptKind::Authenticate,
                     surface: attempt_surface(&user, service.as_deref(), peer),
@@ -3055,12 +3055,7 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
                     capture_ms: None,
                     camera: None,
                 },
-            ) {
-                jout_warn!(
-                    "irlumed: attempt record for '{}' not written: {error}",
-                    journal_safe(&user)
-                );
-            }
+            );
             if structured_errors {
                 Response::OperationError {
                     code: irlume_common::OperationErrorCode::OperationFailed,
@@ -3076,8 +3071,8 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
         }
         Request::Identify => {
             if let IdentifyScope::SelfOnly(name) = identify_scope(peer) {
-                if let Err(error) = attempt_record::record(
-                    &name,
+                attempt_record::record_in_background(
+                    name.clone(),
                     attempt_record::Filed {
                         kind: irlume_common::AttemptKind::Identify,
                         surface: irlume_common::AttemptSurface::Other,
@@ -3087,12 +3082,7 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
                         capture_ms: None,
                         camera: None,
                     },
-                ) {
-                    jout_warn!(
-                        "irlumed: attempt record for '{}' not written: {error}",
-                        journal_safe(&name)
-                    );
-                }
+                );
             }
             Response::Error(
                 "irlumed is still starting (loading models); retry, or use your password".into(),
@@ -3198,8 +3188,8 @@ fn serve_peer(
                 // no camera.
                 let scope = diagnostic_state.begin(diagnostic_operation_class(&req));
                 scope.finish(categorical_outcome(&resp));
-                if let Some(attempt) = AttemptContext::for_request(&req, &peer) {
-                    attempt.file(&resp, || None);
+                if let Some(attempt) = AttemptContext::for_request(&req, &peer, || None) {
+                    attempt.file(&resp);
                 }
                 return respond(stream, &resp);
             }
@@ -5399,6 +5389,10 @@ struct AttemptContext {
     kind: irlume_common::AttemptKind,
     surface: irlume_common::AttemptSurface,
     started: std::time::Instant,
+    /// The configured camera as sysfs described it when the request
+    /// arrived — resolved before the engine runs, so an attempt that ends
+    /// because the camera went away is still filed under that camera.
+    camera: Option<irlume_auth::CameraLocation>,
 }
 
 thread_local! {
@@ -5444,46 +5438,51 @@ fn attempt_surface(
 }
 
 impl AttemptContext {
-    fn for_request(req: &Request, peer: &Peer) -> Option<Self> {
+    /// `camera` resolves the configured camera's location now (sysfs, no
+    /// opens); a path that never reaches a camera passes `|| None`.
+    fn for_request(
+        req: &Request,
+        peer: &Peer,
+        camera: impl FnOnce() -> Option<irlume_auth::CameraLocation>,
+    ) -> Option<Self> {
         LAST_ERROR_CAUSE.with(|cell| cell.set(None));
         LAST_ERROR_DECIDED.with(|cell| cell.set(false));
-        match req {
+        let (user, kind, surface) = match req {
             // The verify path and the cold-login credential-release path
             // are both face authentications.
             Request::Authenticate { user, service, .. }
-            | Request::UnsealPassword { user, service } => {
-                let surface = attempt_surface(user, service.as_deref(), peer);
-                Some(Self {
-                    user: user.clone(),
-                    kind: irlume_common::AttemptKind::Authenticate,
-                    surface,
-                    started: std::time::Instant::now(),
-                })
-            }
+            | Request::UnsealPassword { user, service } => (
+                user.clone(),
+                irlume_common::AttemptKind::Authenticate,
+                attempt_surface(user, service.as_deref(), peer),
+            ),
             Request::Identify => {
                 // Root's account-less identify has no account to file under.
                 let IdentifyScope::SelfOnly(name) = identify_scope(peer) else {
                     return None;
                 };
-                Some(Self {
-                    user: name,
-                    kind: irlume_common::AttemptKind::Identify,
-                    surface: irlume_common::AttemptSurface::Other,
-                    started: std::time::Instant::now(),
-                })
+                (
+                    name,
+                    irlume_common::AttemptKind::Identify,
+                    irlume_common::AttemptSurface::Other,
+                )
             }
-            _ => None,
-        }
+            _ => return None,
+        };
+        Some(Self {
+            user,
+            kind,
+            surface,
+            started: std::time::Instant::now(),
+            camera: camera(),
+        })
     }
 
-    /// File the attempt from the reply. `camera` names the configured
-    /// camera when the attempt reached one; a pre-camera refusal names
-    /// none.
-    fn file(
-        self,
-        response: &Response,
-        camera: impl FnOnce() -> Option<irlume_auth::CameraLocation>,
-    ) {
+    /// File the attempt from the reply: the camera snapshot is attached
+    /// only when the attempt reached a camera. The durable write (a lock
+    /// and two syncs) runs on its own thread: the record is history and
+    /// never delays the reply or the camera worker.
+    fn file(self, response: &Response) {
         use irlume_common::AttemptResult;
         let (result, cause, reached_camera) = match response {
             Response::AuthResult {
@@ -5527,7 +5526,7 @@ impl AttemptContext {
             }
             _ => result,
         };
-        let camera = reached_camera.then(camera).flatten();
+        let camera = if reached_camera { self.camera } else { None };
         let filed = attempt_record::Filed {
             kind: self.kind,
             surface: self.surface,
@@ -5537,12 +5536,7 @@ impl AttemptContext {
             capture_ms: None,
             camera,
         };
-        if let Err(error) = attempt_record::record(&self.user, filed) {
-            jout_warn!(
-                "irlumed: attempt record for '{}' not written: {error}",
-                journal_safe(&self.user)
-            );
-        }
+        attempt_record::record_in_background(self.user, filed);
     }
 }
 
@@ -5606,7 +5600,9 @@ fn dispatch_scoped_session_delivering(
     delivery: &mut Delivery<'_>,
 ) -> WorkerReply {
     let mut completion = None;
-    let attempt = AttemptContext::for_request(&req, peer);
+    let attempt = AttemptContext::for_request(&req, peer, || {
+        irlume_auth::camera_location(engine.rgb_device())
+    });
     let response = dispatch_scoped_session_inner(
         req,
         peer,
@@ -5624,9 +5620,7 @@ fn dispatch_scoped_session_delivering(
     // Filed after the reply is built (and, for an early delivery, after it
     // was sent): the record is history and never delays a decision.
     if let Some(attempt) = attempt {
-        attempt.file(&response, || {
-            irlume_auth::camera_location(engine.rgb_device())
-        });
+        attempt.file(&response);
     }
     WorkerReply {
         response,
@@ -6844,6 +6838,7 @@ fn dispatch_scoped_session_inner(
                     identity: if peer.uid == 0 { p.identity } else { None },
                     serial_present: p.serial_present,
                     port_chain: p.port_chain,
+                    descriptor_token: p.descriptor_token,
                 })
                 .collect(),
         ),
@@ -13400,13 +13395,21 @@ mod tests {
             response,
             Response::AuthResult { granted: false, .. }
         ));
-        let served = dispatch(
-            Request::LastAttempts { user: me.clone() },
-            &peer(uid),
-            &mut e,
-        );
-        let Response::LastAttempts(record) = served else {
-            panic!("expected LastAttempts, got {served:?}");
+        // The write is off the reply path: wait for it to land.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let record = loop {
+            let served = dispatch(
+                Request::LastAttempts { user: me.clone() },
+                &peer(uid),
+                &mut e,
+            );
+            let Response::LastAttempts(record) = served else {
+                panic!("expected LastAttempts, got {served:?}");
+            };
+            if record.latest_authenticate.is_some() || std::time::Instant::now() > deadline {
+                break record;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         };
         let latest = record.latest_authenticate.expect("the refusal was filed");
         assert_eq!(latest.kind, AttemptKind::Authenticate);

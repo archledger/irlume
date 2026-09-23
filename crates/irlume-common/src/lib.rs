@@ -1073,6 +1073,13 @@ pub struct CameraAttempts {
     pub camera: AttemptCamera,
     /// Newest first, at most five.
     pub attempts: Vec<AttemptEntry>,
+    /// Whether this camera is attached now (ADR-0030 §5), decided by the
+    /// daemon when it serves the record: the same port chain and
+    /// descriptor token, and for a serial-bearing unit the same keyed
+    /// discriminator — so a same-model replacement in the same port
+    /// reads `Some(false)` ("replaced unit"). `None` from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected: Option<bool>,
 }
 
 /// An account's attempt record (ADR-0030 §5): the latest attempt of each
@@ -1157,6 +1164,12 @@ pub struct CameraPairInfo {
     /// off USB and on older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_chain: Option<String>,
+    /// First 16 hex of the pair's descriptor fingerprint, the share-safe
+    /// token the diagnostics and the attempt record carry (ADR-0030 §5):
+    /// with `port_chain` it tells a record's camera from a same-model unit
+    /// elsewhere. Absent off USB and on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descriptor_token: Option<String>,
     /// The daemon's opaque handle for this pair (ADR-0030 §4): a keyed
     /// digest of the pair's binding identity under a secret this daemon
     /// instance drew at start, so it names the unit without revealing the

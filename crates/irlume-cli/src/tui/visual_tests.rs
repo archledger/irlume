@@ -521,6 +521,7 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
             identity: None,
             serial_present: false,
             port_chain: None,
+            descriptor_token: None,
             handle: None,
         }];
         classified.pairs_known = true;

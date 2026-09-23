@@ -23,9 +23,15 @@ All notable changes to irlume are documented here. This project adheres to
   model, USB port chain, descriptor token and, for a unit with a serial, a
   keyed per-account discriminator; never a score, threshold, reason prose,
   serial or node path. A new user-scoped `LastAttempts { user }` request
-  (the account and root) returns it, camera-free. `ListCameras` rows gain
-  `port_chain` so the record maps to a listed camera. The record is
-  history: a write failure is logged and never changes a reply.
+  (the account and root, also while the daemon is starting) returns it,
+  camera-free, with each camera bucket marked `connected` — the same
+  port, descriptor token and, for a serial-bearing unit, the same keyed
+  discriminator, so a same-model replacement in the same port reads as
+  replaced. `ListCameras` rows gain `port_chain` and `descriptor_token`
+  so the record maps to a listed camera. The record is history: it is
+  written off the reply path, a write failure is logged, and it never
+  changes a reply. Packaged AppArmor profiles allow the record's lock
+  and the session-state reads.
 
 - Structured attempt causes (ADR-0030 §5, C2). Every refusal now names
   why from a closed vocabulary — `no-face`, `liveness-refused`,

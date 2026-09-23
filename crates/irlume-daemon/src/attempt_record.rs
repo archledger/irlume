@@ -210,6 +210,7 @@ pub(crate) fn apply(record: &mut AttemptRecord, entry: AttemptEntry, now: u64) {
         None => CameraAttempts {
             camera,
             attempts: Vec::new(),
+            connected: None,
         },
     };
     let mut bucket = bucket;
@@ -394,9 +395,7 @@ pub(crate) fn record(user: &str, filed: Filed) -> io::Result<()> {
         File::open("/dev/urandom")?.read_exact(&mut key)?;
         stored.unit_key_hex = key.iter().map(|b| format!("{b:02x}")).collect();
     }
-    let key: Vec<u8> = (0..32)
-        .filter_map(|i| u8::from_str_radix(&stored.unit_key_hex[i * 2..i * 2 + 2], 16).ok())
-        .collect();
+    let key = key_bytes(&stored.unit_key_hex);
     let now = unix_now();
     let entry = AttemptEntry {
         at: now,
@@ -415,16 +414,74 @@ pub(crate) fn record(user: &str, filed: Filed) -> io::Result<()> {
     store.write(uid, &stored)
 }
 
+/// File an attempt on its own thread: the write takes the store lock and
+/// syncs, which must never delay a reply or the camera worker. A failure
+/// is journaled there.
+pub(crate) fn record_in_background(user: String, filed: Filed) {
+    std::thread::Builder::new()
+        .name("irlume-attempt-record".into())
+        .spawn(move || {
+            if let Err(error) = record(&user, filed) {
+                irlume_common::jout_warn!(
+                    "irlumed: attempt record for '{}' not written: {error}",
+                    crate::journal_safe(&user)
+                );
+            }
+        })
+        .map(drop)
+        .unwrap_or_else(|error| {
+            irlume_common::jout_warn!("irlumed: attempt record thread not started: {error}");
+        });
+}
+
 /// The record for `user` (empty when nothing was ever filed), or `None`
 /// when the account or the store cannot be read; the daemon answers with
-/// an empty record either way.
+/// an empty record either way. Each camera bucket is annotated with
+/// whether that camera is attached now (ADR-0030 §5), decided here where
+/// the account's key is: a same-model replacement in the same port does
+/// not match a serial-bearing unit's discriminator.
 pub(crate) fn load(user: &str) -> Option<AttemptRecord> {
     let uid = account_uid(user).ok()?;
-    store()
-        .ok()?
-        .read(uid, user)
-        .ok()
-        .map(|stored| stored.record)
+    let stored = store().ok()?.read(uid, user).ok()?;
+    let key = key_bytes(&stored.unit_key_hex);
+    let mut record = stored.record;
+    annotate_connected(
+        &mut record,
+        &key,
+        &irlume_auth::connected_camera_locations(),
+    );
+    Some(record)
+}
+
+fn key_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len() / 2)
+        .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+        .collect()
+}
+
+/// Mark each bucket as attached or not against the cameras sysfs lists
+/// now. Pure over `connected` so it is testable without hardware.
+pub(crate) fn annotate_connected(
+    record: &mut AttemptRecord,
+    key: &[u8],
+    connected: &[irlume_auth::CameraLocation],
+) {
+    for bucket in &mut record.cameras {
+        let attached = connected.iter().any(|location| {
+            let same_location = location.model == bucket.camera.model
+                && location.port_chain == bucket.camera.port_chain
+                && Some(location.descriptor_token.as_str())
+                    == bucket.camera.descriptor_token.as_deref();
+            // A recorded discriminator must be matched by the unit that is
+            // there now; a record without one matches on location alone.
+            let same_unit = match &bucket.camera.unit {
+                Some(unit) => camera_of(location, key).unit.as_deref() == Some(unit.as_str()),
+                None => true,
+            };
+            same_location && same_unit
+        });
+        bucket.connected = Some(attached);
+    }
 }
 
 #[cfg(test)]
@@ -520,6 +577,62 @@ mod tests {
         );
         assert_eq!(record.cameras.len(), 1);
         assert_eq!(record.cameras[0].camera.port_chain.as_deref(), Some("3-1"));
+    }
+
+    /// ADR-0030 §5: a bucket is "connected" only for the same location
+    /// and, for a serial-bearing unit, the same discriminator: a
+    /// replacement in the same port reads as replaced, a move reads as
+    /// disconnected.
+    #[test]
+    fn connected_annotation_tells_replacements_and_moves_apart() {
+        let key = [3u8; 32];
+        let brio = irlume_auth::CameraLocation {
+            model: "046d:085e".into(),
+            port_chain: Some("1-2".into()),
+            descriptor_token: "0123456789abcdef".into(),
+            serial: Some("e179cb54".into()),
+        };
+        let nexigo = irlume_auth::CameraLocation {
+            model: "3443:c803".into(),
+            port_chain: Some("1-3".into()),
+            descriptor_token: "fedcba9876543210".into(),
+            serial: None,
+        };
+        let mut record = AttemptRecord::default();
+        for (i, location) in [&brio, &nexigo].into_iter().enumerate() {
+            let mut entry = entry(1000 + i as u64, AttemptKind::Authenticate, None);
+            entry.camera = Some(camera_of(location, &key));
+            apply(&mut record, entry, 1000 + i as u64);
+        }
+        annotate_connected(&mut record, &key, &[brio.clone(), nexigo.clone()]);
+        assert!(record.cameras.iter().all(|b| b.connected == Some(true)));
+        // A same-model BRIO with another serial in the same port: replaced.
+        let twin = irlume_auth::CameraLocation {
+            serial: Some("e179cb55".into()),
+            ..brio.clone()
+        };
+        annotate_connected(&mut record, &key, &[twin, nexigo.clone()]);
+        let by_port = |record: &AttemptRecord, port: &str| {
+            record
+                .cameras
+                .iter()
+                .find(|b| b.camera.port_chain.as_deref() == Some(port))
+                .unwrap()
+                .connected
+        };
+        assert_eq!(by_port(&record, "1-2"), Some(false), "replaced unit");
+        assert_eq!(by_port(&record, "1-3"), Some(true));
+        // The NexiGo (serial-less) moved to another port: not this location.
+        let moved = irlume_auth::CameraLocation {
+            port_chain: Some("2-1".into()),
+            ..nexigo.clone()
+        };
+        annotate_connected(&mut record, &key, &[brio.clone(), moved]);
+        assert_eq!(by_port(&record, "1-2"), Some(true));
+        assert_eq!(by_port(&record, "1-3"), Some(false));
+        // Nothing attached: every bucket says so.
+        annotate_connected(&mut record, &key, &[]);
+        assert!(record.cameras.iter().all(|b| b.connected == Some(false)));
     }
 
     #[test]

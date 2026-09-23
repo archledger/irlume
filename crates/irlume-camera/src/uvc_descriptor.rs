@@ -411,6 +411,24 @@ pub(crate) fn identity_and_connection_for_budget_hint(
     ))
 }
 
+/// The USB identity alone (descriptors, ids, serial, device path) for a
+/// character-device path, from sysfs, without the link diagnostics that
+/// [`identity_and_connection_for_budget_hint`] also requires: a location
+/// (ADR-0030 §5) needs the identity and nothing about the link. Never
+/// authorizes capture.
+pub(crate) fn identity_for_location(path: &str) -> std::io::Result<CameraIdentity> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.file_type().is_char_device() {
+        return Err(bad(
+            "a camera location requires a character-device path".into()
+        ));
+    }
+    let (iface_dir, dev_dir) =
+        usb_dirs_for_numbers(libc::major(metadata.rdev()), libc::minor(metadata.rdev()))?;
+    identity_from_dirs(&iface_dir, &dev_dir)
+}
+
 fn usb_dirs_for_numbers(major: u32, minor: u32) -> std::io::Result<(PathBuf, PathBuf)> {
     let node = std::fs::canonicalize(format!("/sys/dev/char/{major}:{minor}"))?;
 

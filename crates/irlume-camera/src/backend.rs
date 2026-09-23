@@ -511,6 +511,9 @@ pub(crate) mod tests {
                 ir: "/dev/spy-ir".into(),
                 id: Some("1234:5678".into()),
                 fixed: true,
+                name: Some("Spy Camera".into()),
+                identity: Some("1234:5678".into()),
+                serial_present: false,
             }]
         }
 
@@ -564,12 +567,18 @@ pub(crate) mod tests {
                 ir: "/dev/fixed-ir".into(),
                 id: Some("1111:2222".into()),
                 fixed: true,
+                name: Some("Fixture Built-in".into()),
+                identity: Some("1111:2222:fx1".into()),
+                serial_present: true,
             },
             CameraPair {
                 rgb: "/dev/usb-rgb".into(),
                 ir: "/dev/usb-ir".into(),
                 id: None,
                 fixed: false,
+                name: None,
+                identity: None,
+                serial_present: false,
             },
         ]
     }

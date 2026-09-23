@@ -105,9 +105,19 @@ without live-status support is shown as unavailable for that source.
 
 The Cameras page automatically follows connected devices. New UVC candidates
 appear from the daemon's passive connection monitor, and disconnected choices
-are removed. Enrolled secondary camera groups (ADR-0024) are listed on the
-Faces page as camera rows: `[x]` removes one, and `irlume enroll --add-camera`
-adds another. When the page is open and idle, a changed inventory triggers a
+are removed. Each pair is listed by the camera's own name (the USB product
+string, else the node's sysfs name; `video0+video2` only when the daemon
+sends no name) with its role for the selected account — `Primary camera`,
+`Secondary camera #N` (the group's position in the store) or `not enrolled`
+— and whether it is ready or its privacy shutter is on (ADR-0029). Names are
+for people; identity is still the USB descriptor. Enter opens a details
+panel with the identity (and a warning when the descriptor carries no
+serial, since two units of that model then cannot be told apart), the device
+nodes, connection, enrollment facts and the last capture-schedule
+observation; `u` makes the selected pair the one the daemon uses (confirmed,
+then `sudo irlume set-cameras`). Enrolled secondary camera groups (ADR-0024)
+are also listed on the Faces page as camera rows: `[x]` removes one, and
+`irlume enroll --add-camera` adds another. When the page is open and idle, a changed inventory triggers a
 camera-role inspection; that inspection can open device nodes to identify RGB
 and infrared endpoints. It does not repeatedly run capture qualification.
 Inspection failure is shown separately from an empty device list. Selection

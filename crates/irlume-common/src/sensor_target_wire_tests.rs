@@ -176,3 +176,77 @@ fn secondary_readiness_decodes_with_pre_change_clients() {
         }
     ));
 }
+
+/// ADR-0029: the camera listing and the enrollment binding are additive.
+/// A frozen copy of the pre-change `CameraPairInfo` decodes a new daemon's
+/// row; a new client reads an old daemon's row with the fields absent.
+#[test]
+fn camera_names_and_binding_are_additive_on_the_wire() {
+    #[derive(Debug, serde::Deserialize)]
+    struct FrozenCameraPairInfo {
+        rgb: String,
+        ir: String,
+        id: Option<String>,
+        fixed: bool,
+        #[serde(default)]
+        privacy: bool,
+    }
+    let new = CameraPairInfo {
+        rgb: "/dev/video4".into(),
+        ir: "/dev/video6".into(),
+        id: Some("3443:c803".into()),
+        fixed: false,
+        privacy: false,
+        name: Some("NexiGo N930W".into()),
+        identity: Some("3443:c803".into()),
+        serial_present: false,
+    };
+    let wire = serde_json::to_string(&new).unwrap();
+    let frozen: FrozenCameraPairInfo = serde_json::from_str(&wire).unwrap();
+    assert_eq!(
+        (frozen.rgb.as_str(), frozen.ir.as_str()),
+        ("/dev/video4", "/dev/video6")
+    );
+    assert_eq!(frozen.id.as_deref(), Some("3443:c803"));
+    assert!(!frozen.fixed && !frozen.privacy);
+    let old = r#"{"rgb":"/dev/video0","ir":"/dev/video2","id":"3277:0059","fixed":true}"#;
+    let decoded: CameraPairInfo = serde_json::from_str(old).unwrap();
+    assert!(decoded.name.is_none() && decoded.identity.is_none() && !decoded.serial_present);
+    // An unnamed pair omits the optional fields rather than sending null.
+    let unnamed = CameraPairInfo {
+        name: None,
+        identity: None,
+        ..new
+    };
+    let wire = serde_json::to_value(&unnamed).unwrap();
+    assert!(wire.get("name").is_none() && wire.get("identity").is_none());
+    // The enrollment binding is optional in both directions.
+    let legacy = serde_json::json!({"Enrollment": {
+        "profiles": [], "require_eyes_open": false,
+        "closure_calibrated": false, "ir_ratio_calibrated": false
+    }});
+    assert!(matches!(
+        serde_json::from_value::<Response>(legacy).unwrap(),
+        Response::Enrollment {
+            primary_camera: None,
+            ..
+        }
+    ));
+    let modern = Response::Enrollment {
+        profiles: Vec::new(),
+        require_eyes_open: false,
+        closure_calibrated: false,
+        ir_ratio_calibrated: false,
+        camera_groups: Vec::new(),
+        camera_store_error: None,
+        primary_camera: Some(PrimaryCameraBinding {
+            rgb: Some("046d:085e:e179cb54".into()),
+            ir: Some("046d:085e:e179cb54".into()),
+        }),
+    };
+    let wire = serde_json::to_value(&modern).unwrap();
+    assert_eq!(
+        wire["Enrollment"]["primary_camera"]["rgb"],
+        "046d:085e:e179cb54"
+    );
+}

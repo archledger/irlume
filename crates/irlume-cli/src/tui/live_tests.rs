@@ -46,13 +46,16 @@ fn live_test_pair() -> irlume_common::CameraPairInfo {
         id: None,
         fixed: false,
         privacy: false,
+        name: None,
+        identity: None,
+        serial_present: false,
     }
 }
 
 fn live_test_land_profiles(app: &mut App, profiles: Vec<ProfileSummary>) {
     let (tx, rx) = mpsc::channel();
     app.profiles_load = Some(rx);
-    tx.send(ProfilesOutcome::Loaded { profiles, camera_groups: Vec::new(), camera_store_error: None }).unwrap();
+    tx.send(ProfilesOutcome::Loaded { profiles, camera_groups: Vec::new(), camera_store_error: None, primary_camera: None }).unwrap();
     app.poll();
 }
 
@@ -278,7 +281,7 @@ fn live_freshness_inventory_loss_clears_pending_camera_confirmation() {
     live_test_land_cameras(&mut app);
     app.screen = SC_CAMERAS;
     app.cam_sel = 0;
-    app.on_key(KeyCode::Enter);
+    app.on_key(KeyCode::Char('u'));
     assert!(app.confirm.is_some());
     assert!(app.camera_confirmation.is_some());
     app.clock_override = Some(app.now() + Duration::from_secs(5));
@@ -523,6 +526,9 @@ fn live_freshness_manual_camera_refresh_preserves_identity_and_queues_one_replac
         id: None,
         fixed: false,
         privacy: false,
+        name: None,
+        identity: None,
+        serial_present: false,
     };
     app.pairs = vec![live_test_pair(), second.clone()];
     app.cam_sel = 1;

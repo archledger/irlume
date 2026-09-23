@@ -272,6 +272,7 @@ fn status_eyes_open_unarmed_plaintext_and_biopolicy_enforcing() {
             ir_ratio_calibrated: false,
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
         },
         Request::KeyringInfo { .. } => Response::KeyringInfo {
             armed: false,
@@ -314,6 +315,7 @@ fn status_empty_legacy_enrollment_keeps_the_targeted_cleanup() {
             ir_ratio_calibrated: false,
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
         },
         Request::KeyringInfo { .. } => Response::KeyringInfo {
             armed: false,
@@ -379,6 +381,7 @@ fn status_enrollment_none_and_keyring_fallback_not_armed() {
             ir_ratio_calibrated: false,
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
         },
         Request::KeyringInfo { .. } => Response::Error("no such request".into()),
         Request::HasSealedPassword { .. } => Response::HasPassword(false),
@@ -757,6 +760,7 @@ fn setup_already_enrolled_skips_reenroll_and_reports_arm_failure() {
             ir_ratio_calibrated: false,
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
         },
         Request::SealPassword { .. } => Response::Error("tpm busy".into()),
         _ => Response::Error("unexpected request".into()),
@@ -797,6 +801,7 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
             ir_ratio_calibrated: false,
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
         },
         Request::Enroll { .. } => Response::Enrolled {
             profile: "Face Profile 1".into(),
@@ -839,6 +844,7 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
             ir_ratio_calibrated: false,
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
         },
         Request::Enroll { .. } => Response::Error("camera busy".into()),
         Request::SealPassword { .. } => Response::PasswordSealed,
@@ -1065,6 +1071,7 @@ fn profiles_accepts_a_flag_before_the_subcommand() {
             ir_ratio_calibrated: false,
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
         },
         _ => Response::Error("unexpected".into()),
     });

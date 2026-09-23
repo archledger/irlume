@@ -517,6 +517,9 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
             id: Some("synthetic".into()),
             fixed: true,
             privacy: false,
+            name: None,
+            identity: None,
+            serial_present: false,
         }];
         classified.pairs_known = true;
         classified.health.as_mut().unwrap().rgb_dev = Some("/dev/video40".into());

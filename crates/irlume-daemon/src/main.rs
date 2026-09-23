@@ -3707,6 +3707,9 @@ struct EnrollmentSummary {
     ir_ratio_calibrated: bool,
     camera_groups: Vec<irlume_common::CameraGroupSummary>,
     camera_store_error: Option<String>,
+    /// The primary enrollment's camera binding (ADR-0029), for the
+    /// client's role labels; identities only.
+    primary_camera: Option<irlume_common::PrimaryCameraBinding>,
 }
 
 impl EnrollmentSummary {
@@ -3719,6 +3722,7 @@ impl EnrollmentSummary {
             ir_ratio_calibrated: self.ir_ratio_calibrated,
             camera_groups: self.camera_groups,
             camera_store_error: self.camera_store_error,
+            primary_camera: self.primary_camera,
         }
     }
 }
@@ -3806,6 +3810,12 @@ fn summarize_enrollment(
         Some(enr) => EnrollmentSummary {
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: enr.camera_binding.as_ref().map(|binding| {
+                irlume_common::PrimaryCameraBinding {
+                    rgb: binding.rgb.clone(),
+                    ir: binding.ir.clone(),
+                }
+            }),
             profiles: enr
                 .profiles
                 .iter()
@@ -3841,6 +3851,7 @@ fn summarize_enrollment(
         None => EnrollmentSummary {
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
             profiles: Vec::new(),
             ir_ratio_calibrated: false,
         },
@@ -6262,6 +6273,9 @@ fn dispatch_scoped_session_inner(
                     ir: p.ir,
                     id: p.id,
                     fixed: p.fixed,
+                    name: p.name,
+                    identity: p.identity,
+                    serial_present: p.serial_present,
                 })
                 .collect(),
         ),
@@ -9371,6 +9385,7 @@ mod tests {
                             ir_ratio_calibrated: false,
                             camera_groups: Vec::new(),
                             camera_store_error: None,
+                            primary_camera: None,
                         },
                         _ => Response::Pong,
                     };
@@ -10348,6 +10363,7 @@ mod tests {
                 ir_ratio_calibrated: true,
                 camera_groups: Vec::new(),
                 camera_store_error: None,
+                primary_camera: None,
             },
         );
         match dispatch_status(&req, &peer) {
@@ -10478,6 +10494,7 @@ mod tests {
                     ir_ratio_calibrated: false,
                     camera_groups: Vec::new(),
                     camera_store_error: None,
+                    primary_camera: None,
                 },
             );
             let response = dispatch(request, &owner, &mut engine);
@@ -10537,6 +10554,7 @@ mod tests {
                 ir_ratio_calibrated: false,
                 camera_groups: Vec::new(),
                 camera_store_error: None,
+                primary_camera: None,
             },
         );
         match dispatch(delete(), &peer(NOBODY), &mut e) {
@@ -12788,6 +12806,7 @@ mod tests {
                 ir_ratio_calibrated: false,
                 camera_groups: Vec::new(),
                 camera_store_error: None,
+                primary_camera: None,
             },
         );
         let sb = sandbox("summary-carryover");
@@ -13201,6 +13220,7 @@ mod tests {
                     ir_ratio_calibrated: false,
                     camera_groups: Vec::new(),
                     camera_store_error: None,
+                    primary_camera: None,
                 },
             );
             match dispatch(request.clone(), &peer(NOBODY), &mut e) {
@@ -13317,6 +13337,7 @@ mod tests {
                 ir_ratio_calibrated: false,
                 camera_groups: Vec::new(),
                 camera_store_error: None,
+                primary_camera: None,
             },
         );
         assert!(
@@ -15205,6 +15226,7 @@ mod tests {
                 profiles: Vec::new(),
             }],
             camera_store_error: None,
+            primary_camera: None,
         };
         // Published while active; a legacy writer then rewrites the primary
         // with NO request in flight: the cached row must flip to stale.
@@ -15245,6 +15267,7 @@ mod tests {
                 profiles: Vec::new(),
             }],
             camera_store_error: None,
+            primary_camera: None,
         };
         // The worker froze the row while the camera was plugged in AND
         // selected; hotplug since then: the identity is gone and the live

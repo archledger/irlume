@@ -950,6 +950,32 @@ pub struct CameraPairInfo {
     /// opens the device and only the daemon may do that (#187).
     #[serde(default)]
     pub privacy: bool,
+    /// The camera's own name, for people (ADR-0029): the USB `product`
+    /// string, else the RGB node's sysfs name. Display only; nothing
+    /// matches on it (ADR-0007). Absent on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The full binding identity of the pair (`vid:pid[:serial]`), the
+    /// value enrollments and camera groups are bound to, so a client can
+    /// tell which enrolled role a listed pair holds. Absent on older
+    /// daemons and for nodes without USB descriptors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// The descriptor carries a serial: without one, two units of the same
+    /// model cannot be told apart (ADR-0024 §6).
+    #[serde(default)]
+    pub serial_present: bool,
+}
+
+/// The primary enrollment's camera binding, by identity (`vid:pid[:serial]`
+/// per side), for the client's role labels (ADR-0029). Same shape as a
+/// camera group's pair; an unbound side is `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimaryCameraBinding {
+    #[serde(default)]
+    pub rgb: Option<String>,
+    #[serde(default)]
+    pub ir: Option<String>,
 }
 
 /// A profile and the names of its scans, for `ListProfiles`.
@@ -1378,6 +1404,10 @@ pub enum Response {
         camera_groups: Vec<CameraGroupSummary>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         camera_store_error: Option<String>,
+        /// The primary enrollment's camera binding (ADR-0029): absent on
+        /// older daemons and for an enrollment captured before binding.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        primary_camera: Option<PrimaryCameraBinding>,
     },
     /// Generic success ack for management operations, with a human message.
     Ok(String),
@@ -1798,6 +1828,7 @@ mod tests {
             ir_ratio_calibrated: false,
             camera_groups: vec![row],
             camera_store_error: None,
+            primary_camera: None,
         };
         let encoded = serde_json::to_value(&response).unwrap();
         assert_eq!(
@@ -2264,6 +2295,7 @@ mod tests {
             ir_ratio_calibrated: false,
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
         };
         let old: OldResponse = serde_json::from_value(
             serde_json::to_value(new).expect("serialize current enrollment response"),
@@ -2290,11 +2322,13 @@ mod tests {
             ir_ratio_calibrated,
             camera_groups,
             camera_store_error,
+            primary_camera,
         } = current
         else {
             panic!("old enrollment reply must remain Enrollment");
         };
         assert!(camera_groups.is_empty());
+        assert!(primary_camera.is_none());
         assert!(camera_store_error.is_none());
         assert!(profiles.is_empty());
         assert!(require_eyes_open);

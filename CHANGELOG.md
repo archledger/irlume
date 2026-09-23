@@ -7,6 +7,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- The TUI's Cameras page lists each camera by its own name with its role
+  for the account — `Primary camera`, `Secondary camera #N` or `not
+  enrolled` — and whether it is ready, instead of `video0+video2` and a USB
+  id (ADR-0029, phase A). Enter opens a details panel carrying the identity
+  (with a warning when the descriptor has no serial), the nodes, the
+  connection, the enrollment facts and the capture-schedule observation;
+  `u` makes the selected pair the one the daemon uses. On the wire
+  `ListCameras` rows gain optional `name`, `identity` and `serial_present`,
+  and the enrollment reply gains the primary binding as `primary_camera`;
+  older clients and daemons ignore or omit them. The capture-history line
+  says "not fetched yet" until its first poll instead of blaming the daemon.
+
 - The experimental IR-only policy resolves the configured camera pair against
   the account's added cameras as the dual path does (ADR-0028, Phase 1). A
   pair that matches an active secondary group by strict equality of both

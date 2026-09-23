@@ -4153,6 +4153,34 @@ pub struct CameraPair {
     pub id: Option<String>,
     /// Built-in (`removable=fixed`) vs an external USB camera.
     pub fixed: bool,
+    /// The camera's name for display (ADR-0029): the USB `product` string,
+    /// else the RGB node's sysfs name. Never an identity.
+    pub name: Option<String>,
+    /// The pair's binding identity (`vid:pid[:serial]`, [`device_identity`]).
+    pub identity: Option<String>,
+    /// The descriptor carries a serial (ADR-0024 §6: without one, same-model
+    /// units are indistinguishable).
+    pub serial_present: bool,
+}
+
+/// A camera's name for people, read from sysfs without opening a device:
+/// the USB device's `product` string, else the video node's `name`. Display
+/// only — identification stays with the descriptor ids (ADR-0007), so a
+/// changed or spoofed name changes nothing in selection or matching.
+pub fn camera_display_name(dev_dir: &std::path::Path, node: &str) -> Option<String> {
+    let clean = |text: String| {
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.chars().take(64).collect::<String>())
+    };
+    std::fs::read_to_string(dev_dir.join("product"))
+        .ok()
+        .and_then(clean)
+        .or_else(|| {
+            let node = node.strip_prefix("/dev/").unwrap_or(node);
+            std::fs::read_to_string(format!("/sys/class/video4linux/{node}/name"))
+                .ok()
+                .and_then(clean)
+        })
 }
 
 /// Every physical camera that exposes both an RGB and an IR node (a Hello pair),
@@ -4316,7 +4344,13 @@ fn pairs_from(nodes: &[(String, Role)]) -> Vec<CameraPair> {
         let fixed = std::fs::read_to_string(id.join("removable"))
             .map(|s| s.trim() == "fixed")
             .unwrap_or(false);
+        let serial_present = std::fs::read_to_string(id.join("serial"))
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
         out.push(CameraPair {
+            name: camera_display_name(id, &rgbs[0]),
+            identity: device_identity(&rgbs[0]),
+            serial_present,
             rgb: rgbs[0].clone(),
             ir: irs[0].clone(),
             id: read_vidpid(id),
@@ -16483,6 +16517,33 @@ mod tests {
         assert_eq!(classify("/dev/irlume-test-missing"), Role::Other);
         // /dev/null opens but answers no V4L2 format ioctls.
         assert_eq!(classify("/dev/null"), Role::Other);
+    }
+
+    /// ADR-0029: the display name comes from the USB `product` string,
+    /// then the node's sysfs name, then nothing; it is trimmed and bounded
+    /// and never feeds identification.
+    #[test]
+    fn camera_display_name_prefers_product_then_node_name_and_bounds_it() {
+        let dir = std::env::temp_dir().join(format!("irlume-camname-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // No product file, and the node does not exist in this sysfs: None.
+        assert_eq!(camera_display_name(&dir, "/dev/irlume-no-such-node"), None);
+        std::fs::write(dir.join("product"), "  Logitech BRIO \n").unwrap();
+        assert_eq!(
+            camera_display_name(&dir, "/dev/irlume-no-such-node").as_deref(),
+            Some("Logitech BRIO")
+        );
+        std::fs::write(dir.join("product"), "x".repeat(200)).unwrap();
+        assert_eq!(
+            camera_display_name(&dir, "/dev/irlume-no-such-node").map(|n| n.len()),
+            Some(64)
+        );
+        // An empty product string falls through instead of naming the
+        // camera "".
+        std::fs::write(dir.join("product"), "   \n").unwrap();
+        assert_eq!(camera_display_name(&dir, "/dev/irlume-no-such-node"), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

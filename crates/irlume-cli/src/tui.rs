@@ -673,6 +673,8 @@ struct App {
     cam_details: bool,
     /// A keyring re-check was asked for while one was in flight.
     keyring_refresh_queued: bool,
+    /// The generation the in-flight keyring request was started with.
+    keyring_running_generation: u64,
     keyring_armed: Option<bool>,
     /// Seal-tier label from envelope metadata (e.g. "pcrlock NV 0x… (Tier 2)");
     /// `None` when not armed or the daemon predates the request.
@@ -2071,6 +2073,7 @@ impl App {
             primary_camera: None,
             cam_details: false,
             keyring_refresh_queued: false,
+            keyring_running_generation: 0,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -2582,15 +2585,20 @@ impl App {
     /// with authentication; this independent receiver cannot delay light status.
     fn refresh_keyring_diagnostic(&mut self) {
         if self.keyring_load.is_some() {
-            // The in-flight reply carries an older generation and will be
-            // discarded; run again when it lands rather than dropping the
-            // request the person just made.
-            self.keyring_refresh_queued = true;
+            // An in-flight reply of an older generation will be discarded:
+            // run again when it lands rather than dropping the request the
+            // person just made. A reply of the current generation is this
+            // request's answer already; a second identical measurement on
+            // the serialized TPM queue would be waste.
+            if self.keyring_running_generation != self.keyring_generation {
+                self.keyring_refresh_queued = true;
+            }
             return;
         }
         let (tx, rx) = mpsc::channel();
         let user = self.user.clone();
         let generation = self.keyring_generation;
+        self.keyring_running_generation = generation;
         std::thread::spawn(move || {
             let reply = crate::daemon_poll(&Request::KeyringInfo { user });
             let _ = tx.send((generation, reply));
@@ -3415,7 +3423,7 @@ impl App {
                         Suspend::RestartDaemon,
                     ),
                     RootFix::RestartFprintd => (
-                        "sudo systemctl restart fprintd (releases a stale reader claim)",
+                        "sudo sh -c 'systemctl restart fprintd || pkill fprintd' (releases a stale reader claim; stops the process if the unit will not restart)",
                         Suspend::RestartFprintd,
                     ),
                     RootFix::LoginEnable => (
@@ -5131,6 +5139,8 @@ impl App {
         }
     }
 
+    /// Move the current page's selection; pages without a selectable list
+    /// are left alone (the Faces selection is not theirs to move).
     fn move_sel(&mut self, d: i32) {
         if self.screen == SC_REPAIR {
             self.page_view.set((usize::MAX, Rect::default(), 0, 0));
@@ -5139,7 +5149,8 @@ impl App {
             SC_REPAIR => self.repair.len(),
             SC_CAMERAS => self.pairs.len(),
             SC_WELCOME => self.hub_rows().len(),
-            _ => self.rows().len(),
+            SC_PROFILES => self.rows().len(),
+            _ => return,
         };
         let n = len.max(1) as i32;
         let cur = match self.screen {
@@ -5242,13 +5253,16 @@ impl App {
             }
             (SC_PAM, KeyCode::Char('r')) => {
                 self.log('·', "refreshing this page…");
-                for source in [Source::Machine, Source::Apps] {
+                // The tier explanation and the AppArmor row read Health.
+                for source in [Source::Machine, Source::Apps, Source::Health] {
                     self.invalidate_source(source);
                 }
                 self.freshness.cycle_mut(Worker::Machine).invalidate();
                 self.freshness.cycle_mut(Worker::Apps).invalidate();
+                self.freshness.cycle_mut(Worker::Light).invalidate();
                 self.request_probes();
                 self.refresh_heavy();
+                self.refresh_light();
             }
             (SC_IDENTIFY, KeyCode::Char('r')) => {
                 self.log('·', "refreshing daemon status…");
@@ -5432,6 +5446,13 @@ impl App {
                 // as on Faces, a load already in flight is superseded.
                 self.freshness.cycle_mut(Worker::Profiles).invalidate();
                 self.refresh_profiles();
+                // The configured marker reads Health and the policy status
+                // reads Preferences: both are this page's too.
+                for source in [Source::Health, Source::Preferences] {
+                    self.invalidate_source(source);
+                }
+                self.freshness.cycle_mut(Worker::Light).invalidate();
+                self.refresh_light();
             }
             (SC_CAMERAS, KeyCode::Char('c')) => {
                 self.confirm = Some(("Inspect capture qualification? This opens camera controls when available; it does not capture frames. The result is a dated observation, not a live readiness guarantee.".into(), "Inspect", ConfirmAct::CameraQualification));
@@ -5487,7 +5508,12 @@ impl App {
                 map_identify,
             ),
             // Keyring: masked in-TUI entry (goes to the root daemon; no sudo).
-            (SC_KEYRING, KeyCode::Char('d')) => self.refresh_keyring_diagnostic(),
+            // An explicit measurement is a new generation: it supersedes a
+            // check already running rather than reusing its answer.
+            (SC_KEYRING, KeyCode::Char('d')) => {
+                self.invalidate_keyring_diagnostic();
+                self.refresh_keyring_diagnostic();
+            }
             (SC_KEYRING, KeyCode::Char('a')) => {
                 self.input = Some((
                     "Login password to seal (••):".into(),
@@ -11908,6 +11934,7 @@ mod tests {
             primary_camera: None,
             cam_details: false,
             keyring_refresh_queued: false,
+            keyring_running_generation: 0,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -15768,6 +15795,84 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// A keyring check already running for the current generation is the
+    /// answer to a screen-entry request: no second identical measurement is
+    /// queued. Only a stale generation (explicit invalidation) queues one.
+    #[test]
+    fn keyring_recheck_is_queued_only_when_the_running_check_is_stale() {
+        let mut app = test_app();
+        let (_tx, rx) = mpsc::channel::<(u64, Result<Response, String>)>();
+        app.keyring_running_generation = app.keyring_generation;
+        app.keyring_load = Some(rx);
+        app.refresh_keyring_diagnostic();
+        assert!(
+            !app.keyring_refresh_queued,
+            "a current in-flight check answers this request"
+        );
+        app.invalidate_keyring_diagnostic();
+        app.refresh_keyring_diagnostic();
+        assert!(
+            app.keyring_refresh_queued,
+            "a check begun before invalidation is stale: queue a replacement"
+        );
+        app.keyring_load = None;
+    }
+
+    /// j/k, like g/G, move the selection only on pages that show a list.
+    #[test]
+    fn j_and_k_leave_rowless_pages_alone() {
+        let mut app = test_app();
+        app.profiles = vec![profile("A", &["a"]), profile("B", &["b"])];
+        app.screen = SC_PROFILES;
+        app.sel = 1;
+        for screen in [
+            SC_KEYRING,
+            SC_RECOVERY,
+            SC_FINGERPRINT,
+            SC_PAM,
+            SC_SETTINGS,
+            SC_IDENTIFY,
+        ] {
+            app.screen = screen;
+            app.on_key(KeyCode::Char('j'));
+            app.on_key(KeyCode::Down);
+            assert_eq!(app.sel, 1, "screen {screen}: j must not touch Faces");
+            app.on_key(KeyCode::Char('k'));
+            assert_eq!(app.sel, 1, "screen {screen}: k must not touch Faces");
+        }
+        app.screen = SC_PROFILES;
+        app.on_key(KeyCode::Char('j'));
+        assert_eq!(app.sel, 2, "Faces: j moves");
+    }
+
+    /// r on Cameras and on Login & Apps re-polls the light sources those
+    /// pages draw from (Health; Preferences on Cameras), not only their
+    /// own workers.
+    #[test]
+    fn cameras_and_pam_refresh_invalidate_the_light_sources_they_show() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        let now = app.now();
+        for source in [Source::Health, Source::Preferences] {
+            app.freshness.observation_mut(source).record(true, now);
+        }
+        app.screen = SC_CAMERAS;
+        app.on_key(KeyCode::Char('r'));
+        assert!(!app.source_usable(Source::Health));
+        assert!(!app.source_usable(Source::Preferences));
+        assert!(app.light_load.is_some(), "the light poll is relaunched");
+        drain_loads(&mut app);
+        let now = app.now();
+        app.freshness
+            .observation_mut(Source::Health)
+            .record(true, now);
+        app.screen = SC_PAM;
+        app.on_key(KeyCode::Char('r'));
+        assert!(!app.source_usable(Source::Health));
+        assert!(app.light_load.is_some(), "the light poll is relaunched");
+        drain_loads(&mut app);
+    }
+
     /// ADR-0030 §1.3: r on Password Wallet refreshes the machine (TPM) row
     /// it shows, not only the light wallet facts.
     #[test]
@@ -16521,6 +16626,20 @@ mod tests {
         let (text, _, _) = app.confirm.as_ref().unwrap();
         assert!(
             text.contains("systemctl enable irlumed; systemctl restart irlumed"),
+            "{text}"
+        );
+        // The fprintd fix discloses its fallback too (reached by [f]).
+        app.confirm = None;
+        app.repair = vec![check_row(
+            "reader",
+            Sev::Fail,
+            Fix::Root(RootFix::RestartFprintd),
+        )];
+        app.repair_sel = 0;
+        app.on_key(KeyCode::Char('f'));
+        let (text, _, _) = app.confirm.as_ref().expect("the fix confirms first");
+        assert!(
+            text.contains("systemctl restart fprintd || pkill fprintd"),
             "{text}"
         );
     }

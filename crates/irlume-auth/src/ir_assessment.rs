@@ -50,13 +50,6 @@ fn enrollment_readiness(
     Ready::ReadyForExperimentalAttempt
 }
 
-/// The validation hook that lifts the Phase 1 gate on the secondary scope
-/// (ADR-0028 §7): set only in the daemon's environment during hardware
-/// validation; the gate's removal is its own change.
-fn secondary_route_enabled() -> bool {
-    std::env::var_os("IRLUME_IR_ONLY_SECONDARY").is_some_and(|value| value == "1")
-}
-
 /// What an IR-only attempt scores against and the pin its grant boundary
 /// re-checks (ADR-0028 §3-4). Resolved before the camera opens; hotplug or
 /// configuration changes cannot redirect a resolved attempt (§6).
@@ -218,14 +211,13 @@ struct IrOnlyStores<'a> {
 /// precedence; a secondary refusal never falls back to another group, and
 /// no device is discovered or opened (the identities are the only input).
 /// `compatible_templates` counts the IR templates the live recognizer can
-/// score in an enrollment; `secondary_enabled` is the Phase 1 gate (§7).
+/// score in an enrollment.
 fn resolve_ir_only_scope_at(
     stores: &IrOnlyStores<'_>,
     primary: irlume_core::storage::PrimarySnapshot,
     (rgb, ir): (&str, &str),
     compatible_templates: &dyn Fn(&irlume_core::storage::Enrollment) -> usize,
     keys: &mut dyn irlume_core::template_key::TemplateKeySource,
-    secondary_enabled: bool,
 ) -> Result<IrOnlyResolution, IrOnlyRefusal> {
     use irlume_common::IrOnlyReadiness as Ready;
     use irlume_core::multi_camera::coordinator::{PinError, SecondaryAuthContext};
@@ -294,9 +286,6 @@ fn resolve_ir_only_scope_at(
         }
     };
     let index = Some(context.store_index() + 1);
-    if !secondary_enabled {
-        return Err(IrOnlyRefusal::secondary(Ready::SecondaryUnvalidated, index));
-    }
     let scoped = context.group_view().matching_enrollment(stores.user);
     if compatible_templates(&scoped) == 0 {
         return Err(IrOnlyRefusal::secondary(
@@ -901,7 +890,6 @@ mod tests {
             bytes: &[u8],
             pair: (&str, &str),
             keys: &mut RequestTemplateKey,
-            enabled: bool,
         ) -> Result<IrOnlyResolution, IrOnlyRefusal> {
             let (primary_path, secondary_path) = rig.stores();
             resolve_ir_only_scope_at(
@@ -914,7 +902,6 @@ mod tests {
                 pair,
                 &compatible,
                 keys,
-                enabled,
             )
         }
 
@@ -971,7 +958,7 @@ mod tests {
         // The primary's own pair resolves to the primary even when a group
         // duplicates it.
         let resolution =
-            resolve(&rig, primary(), &bytes, (RGB_P, IR_P), &mut no_key(), true).expect("primary");
+            resolve(&rig, primary(), &bytes, (RGB_P, IR_P), &mut no_key()).expect("primary");
         assert_eq!(resolution.scope.report(), (IrScope::Primary, None));
         match &resolution.scope {
             IrOnlyScope::Primary { path, digest } => {
@@ -993,7 +980,6 @@ mod tests {
                 &unbound_bytes,
                 (RGB_P, IR_P),
                 &mut no_key(),
-                true
             )),
             irlume_common::IrOnlyReadiness::BindingUnavailable
         );
@@ -1004,15 +990,8 @@ mod tests {
             scan.ir = None;
         }
         let foreign_bytes = rig.write_primary(&foreign, None);
-        let refusal = resolve(
-            &rig,
-            foreign,
-            &foreign_bytes,
-            (RGB_P, IR_P),
-            &mut no_key(),
-            true,
-        )
-        .unwrap_err();
+        let refusal =
+            resolve(&rig, foreign, &foreign_bytes, (RGB_P, IR_P), &mut no_key()).unwrap_err();
         assert_eq!(
             refusal.readiness,
             irlume_common::IrOnlyReadiness::IncompatibleEnrollment
@@ -1040,7 +1019,7 @@ mod tests {
         // The configured pair naming group B resolves to B: position 2,
         // scoring B's scans and nothing of the primary's.
         let resolution =
-            resolve(&rig, primary(), &bytes, (RGB_B, IR_X), &mut no_key(), true).expect("group b");
+            resolve(&rig, primary(), &bytes, (RGB_B, IR_X), &mut no_key()).expect("group b");
         assert_eq!(resolution.scope.report(), (IrScope::Secondary, Some(2)));
         let pitches: Vec<f32> = resolution.enrollment.profiles[0]
             .scans
@@ -1051,13 +1030,13 @@ mod tests {
         assert_eq!(resolution.enrollment.profiles.len(), 1);
         // Naming group A resolves to A, never the one-sided group.
         let resolution =
-            resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key(), true).expect("group a");
+            resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key()).expect("group a");
         assert_eq!(resolution.scope.report(), (IrScope::Secondary, Some(1)));
         // A configured pair carrying only the IR identity, or an RGB side no
         // group has, is BindingMismatch: the one-sided group never wildcards
         // and store order never decides.
         for pair in [("", IR_X), ("046d:0000:other", IR_X)] {
-            let refusal = resolve(&rig, primary(), &bytes, pair, &mut no_key(), true).unwrap_err();
+            let refusal = resolve(&rig, primary(), &bytes, pair, &mut no_key()).unwrap_err();
             assert_eq!(refusal.readiness, Ready::BindingMismatch, "{pair:?}");
             assert_eq!(refusal.scope, None);
         }
@@ -1069,7 +1048,6 @@ mod tests {
                 &bytes,
                 (RGB_A, "0000:0000:none"),
                 &mut no_key(),
-                true
             )),
             Ready::BindingMismatch
         );
@@ -1089,7 +1067,6 @@ mod tests {
                 &bytes,
                 (RGB_A, IR_X),
                 &mut no_key(),
-                true
             )),
             Ready::BindingMismatch
         );
@@ -1103,14 +1080,13 @@ mod tests {
             &bytes,
             None,
         );
-        let refusal =
-            resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key(), true).unwrap_err();
+        let refusal = resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key()).unwrap_err();
         assert_eq!(refusal.readiness, Ready::BindingMismatch);
         assert_eq!(refusal.scope, None);
     }
 
     #[test]
-    fn ir_only_scope_reports_inactive_unvalidated_and_incompatible_groups() {
+    fn ir_only_scope_reports_inactive_and_incompatible_groups() {
         use adr28::*;
         use irlume_common::{IrOnlyReadiness as Ready, IrScope};
         let rig = Rig::new("causes");
@@ -1123,19 +1099,13 @@ mod tests {
             &bytes,
             None,
         );
-        // The Phase 1 gate: a matched, active group without the validation
-        // hook is SecondaryUnvalidated, named with its position.
-        let refusal =
-            resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key(), false).unwrap_err();
-        assert_eq!(refusal.readiness, Ready::SecondaryUnvalidated);
-        assert_eq!(
-            (refusal.scope, refusal.scope_index),
-            (Some(IrScope::Secondary), Some(1))
-        );
+        // A matched, active group resolves without any build-level gate
+        // (ADR-0028 Phase 2 evidence recorded; the SecondaryUnvalidated
+        // readiness is retained on the wire for older daemons only).
+        assert!(resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key()).is_ok());
         // A matched group whose IR view is empty is IncompatibleEnrollment,
         // as the primary would be.
-        let refusal =
-            resolve(&rig, primary(), &bytes, (RGB_B, IR_X), &mut no_key(), true).unwrap_err();
+        let refusal = resolve(&rig, primary(), &bytes, (RGB_B, IR_X), &mut no_key()).unwrap_err();
         assert_eq!(refusal.readiness, Ready::IncompatibleEnrollment);
         assert_eq!(
             (refusal.scope, refusal.scope_index),
@@ -1146,15 +1116,8 @@ mod tests {
         let mut changed = primary();
         changed.profiles[0].scans.push(scan(0.3, true));
         let changed_bytes = rig.write_primary(&changed, None);
-        let refusal = resolve(
-            &rig,
-            changed,
-            &changed_bytes,
-            (RGB_A, IR_X),
-            &mut no_key(),
-            true,
-        )
-        .unwrap_err();
+        let refusal =
+            resolve(&rig, changed, &changed_bytes, (RGB_A, IR_X), &mut no_key()).unwrap_err();
         assert_eq!(refusal.readiness, Ready::SecondaryInactive);
         assert_eq!(
             (refusal.scope, refusal.scope_index),
@@ -1176,8 +1139,7 @@ mod tests {
             vec![group("a", Some(RGB_A), Some(IR_X), 0.5, true)],
             &bytes,
         );
-        let refusal =
-            resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key(), true).unwrap_err();
+        let refusal = resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key()).unwrap_err();
         assert_eq!(refusal.readiness, Ready::BindingMismatch);
         assert_eq!(refusal.scope, None);
     }
@@ -1212,8 +1174,8 @@ mod tests {
             serde_json::to_vec(&intent).unwrap(),
         )
         .unwrap();
-        let resolution = resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key(), true)
-            .expect("recovered");
+        let resolution =
+            resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key()).expect("recovered");
         assert_eq!(resolution.scope.report(), (IrScope::Secondary, Some(1)));
         assert!(store_path.exists(), "the journal was committed");
     }
@@ -1236,8 +1198,7 @@ mod tests {
         );
         assert!(legacy_eye_policy(&legacy).is_err());
         for pair in [(RGB_P, IR_P), (RGB_A, IR_X)] {
-            let refusal =
-                resolve(&rig, legacy.clone(), &bytes, pair, &mut no_key(), true).unwrap_err();
+            let refusal = resolve(&rig, legacy.clone(), &bytes, pair, &mut no_key()).unwrap_err();
             assert_eq!(refusal.readiness, Ready::IncompatibleEnrollment, "{pair:?}");
             assert_eq!(refusal.scope, None, "refused before any scope resolved");
         }
@@ -1254,10 +1215,10 @@ mod tests {
             &bytes,
             None,
         );
-        let primary_scope = resolve(&rig, primary(), &bytes, (RGB_P, IR_P), &mut no_key(), true)
+        let primary_scope = resolve(&rig, primary(), &bytes, (RGB_P, IR_P), &mut no_key())
             .expect("primary")
             .scope;
-        let secondary_scope = resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key(), true)
+        let secondary_scope = resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key())
             .expect("secondary")
             .scope;
         // Unchanged stores grant.
@@ -1376,7 +1337,6 @@ mod tests {
             (RGB_A, IR_X),
             &compatible,
             &mut adopted,
-            true,
         )
         .expect("secondary");
         assert!(resolution.scope.boundary_refusal(&mut adopted).is_none());
@@ -1389,7 +1349,6 @@ mod tests {
             (RGB_A, IR_X),
             &compatible,
             &mut lazy,
-            true,
         )
         .expect("secondary");
         assert!(resolution.scope.boundary_refusal(&mut lazy).is_none());
@@ -2002,7 +1961,6 @@ impl Engine {
             (target.rgb_identity(), target.identity()),
             &|enrollment| self.compatible_ir_templates(enrollment),
             keys,
-            secondary_route_enabled(),
         )
     }
 

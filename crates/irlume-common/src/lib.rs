@@ -1033,9 +1033,10 @@ pub enum IrOnlyReadiness {
     /// but the store is inactive because the primary enrollment changed
     /// since that group was authorized.
     SecondaryInactive,
-    /// ADR-0028: the configured pair resolves to a secondary group, and the
-    /// IR-only route to secondary cameras is not yet validated on this build
-    /// (Phase 2 gate).
+    /// ADR-0028 Phase 1 daemons: the configured pair resolved to a
+    /// secondary group while the route was still gated pending hardware
+    /// validation. Current daemons never send it; kept so their status
+    /// still decodes.
     SecondaryUnvalidated,
     /// A value this build does not know. Present so a newer daemon's status
     /// never makes an older client reject the whole response (ADR-0028).

@@ -68,8 +68,6 @@ preflight prints which (`scope: primary enrollment` or `scope: added camera
 #N`, the group's position in the store). An added camera whose authorization
 is inactive because the primary enrollment changed reports
 `secondary_inactive`: remove the added cameras and add back the ones you use.
-Until the route is validated on hardware, an added camera reports
-`secondary_unvalidated` and the attempt is refused.
 
 ## Bounded attempts and cleanup
 

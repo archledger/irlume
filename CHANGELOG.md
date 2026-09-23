@@ -17,11 +17,13 @@ All notable changes to irlume are documented here. This project adheres to
   requires the digest pinned at load, the secondary scope the dual path's
   grant boundary under the request key, so a reset or removal during capture
   refuses. `irlume auth sensor preflight` names the resolved scope (primary,
-  or an added camera by its position) and two new causes: the added camera's
-  store is inactive because the primary changed (`secondary_inactive`), and
-  the route is not yet validated on this build (`secondary_unvalidated`,
-  lifted only by `IRLUME_IR_ONLY_SECONDARY=1` in the daemon's environment
-  during hardware validation). On the wire `ir_readiness` keeps its old
+  or an added camera by its position) and a new cause: the added camera's
+  store is inactive because the primary changed (`secondary_inactive`).
+  Validated on the reference machine before the route was enabled: the
+  NexiGo N930W as the added camera grants IR-only in 4.8–5.0 s (6.3–6.5 s
+  on the dual path, refused in 143 ms before), the Logitech BRIO primary is
+  unchanged at 1.4 s, and the grant boundary refuses when the added camera's
+  store is removed during a capture. On the wire `ir_readiness` keeps its old
   vocabulary for older clients and the precise cause travels in
   `ir_readiness_detail`; adding a camera into a store whose other groups are
   inactive is refused until those are removed, so one addition can never

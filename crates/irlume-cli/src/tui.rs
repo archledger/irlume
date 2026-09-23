@@ -1427,13 +1427,26 @@ impl App {
             other => other.label().to_string(),
         };
         let mut lines = vec![section(&format!("{} — {role_text}", camera_row_name(p)))];
-        let identity = match (&p.id, p.serial_present) {
-            (Some(id), true) => Span::raw(format!("{id} · serial present")),
-            (Some(id), false) => Span::styled(
-                format!("{id} · no serial: another unit of this model could not be told apart"),
+        // The full binding identity when the daemon sends it; the legacy
+        // vid:pid alone from an older daemon, whose serial state is then
+        // unknown rather than "none".
+        let identity = match (&p.identity, &p.id) {
+            (Some(identity), _) if p.serial_present => {
+                Span::raw(format!("{identity} · serial present"))
+            }
+            (Some(identity), _) => Span::styled(
+                format!(
+                    "{identity} · no serial: another unit of this model could not be told apart"
+                ),
                 Style::new().fg(th().warn),
             ),
-            (None, _) => Span::styled("no USB descriptor readable".to_string(), Style::new().dim()),
+            (None, Some(id)) => Span::styled(
+                format!("{id} · serial state unknown (older daemon)"),
+                Style::new().dim(),
+            ),
+            (None, None) => {
+                Span::styled("no USB descriptor readable".to_string(), Style::new().dim())
+            }
         };
         lines.push(state_row("identity", 12, identity));
         lines.push(state_row(
@@ -7393,7 +7406,7 @@ impl App {
                             Style::new().fg(if active { th().ok } else { Color::Reset }),
                         ),
                         Span::styled(
-                            format!("{:<26}", camera_row_name(p)),
+                            format!("{:<26}", clip_columns(&camera_row_name(p), 26)),
                             if active {
                                 Style::new().add_modifier(Modifier::BOLD)
                             } else {
@@ -9433,14 +9446,38 @@ fn camera_role_for(
 }
 
 /// The name a row leads with: the camera's own name, else its node pair.
+/// Device text is scrubbed of control characters here too, so the TUI
+/// stays safe against a daemon that predates the camera crate's own
+/// scrubbing.
 fn camera_row_name(pair: &irlume_common::CameraPairInfo) -> String {
-    pair.name.clone().unwrap_or_else(|| {
-        format!(
-            "{}+{}",
-            pair.rgb.trim_start_matches("/dev/"),
-            pair.ir.trim_start_matches("/dev/")
-        )
-    })
+    pair.name
+        .as_deref()
+        .map(|name| {
+            name.chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect::<String>()
+                .trim()
+                .to_owned()
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "{}+{}",
+                pair.rgb.trim_start_matches("/dev/"),
+                pair.ir.trim_start_matches("/dev/")
+            )
+        })
+}
+
+/// A name clipped to a column slot with an ellipsis, so a long USB name
+/// never pushes the role and status columns off the row.
+fn clip_columns(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 fn section(title: &str) -> Line<'static> {
@@ -13559,6 +13596,36 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("primary enrollment"), "{text}");
+        // A serial-bearing camera shows its full identity; an older daemon's
+        // row (no identity field) never claims "no serial".
+        app.on_key(KeyCode::Esc);
+        app.pairs[1].identity = Some("3443:c803:sn0042".into());
+        app.pairs[1].serial_present = true;
+        app.pairs[0].identity = None;
+        app.pairs[0].serial_present = false;
+        app.cam_sel = 1;
+        app.on_key(KeyCode::Enter);
+        let text = render(&mut app);
+        assert!(text.contains("3443:c803:sn0042 · serial present"), "{text}");
+        app.on_key(KeyCode::Esc);
+        app.cam_sel = 0;
+        app.on_key(KeyCode::Enter);
+        let text = render(&mut app);
+        assert!(
+            text.contains("serial state unknown (older daemon)"),
+            "{text}"
+        );
+        assert!(!text.contains("no serial:"), "{text}");
+        app.on_key(KeyCode::Esc);
+        // A long or hostile name never pushes the role column off the row,
+        // and control characters never reach the terminal.
+        app.pairs[0].identity = Some("3277:0059".into());
+        app.pairs[0].name =
+            Some("\x1b[31mA very long camera product string that keeps going".into());
+        let text = render(&mut app);
+        assert!(text.contains("[31mA very long camera pr…"), "{text}");
+        assert!(text.contains("Primary camera"), "{text}");
+        assert!(!text.contains('\x1b'), "{text}");
     }
 
     #[test]

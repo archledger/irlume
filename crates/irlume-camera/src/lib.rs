@@ -4168,9 +4168,17 @@ pub struct CameraPair {
 /// only — identification stays with the descriptor ids (ADR-0007), so a
 /// changed or spoofed name changes nothing in selection or matching.
 pub fn camera_display_name(dev_dir: &std::path::Path, node: &str) -> Option<String> {
+    // Device-provided text: a descriptor may carry anything, including
+    // terminal control sequences. Only printable characters reach a screen,
+    // bounded, and never an empty or whitespace-only name.
     let clean = |text: String| {
+        let text: String = text
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(64)
+            .collect();
         let text = text.trim();
-        (!text.is_empty()).then(|| text.chars().take(64).collect::<String>())
+        (!text.is_empty()).then(|| text.to_owned())
     };
     std::fs::read_to_string(dev_dir.join("product"))
         .ok()
@@ -16543,6 +16551,13 @@ mod tests {
         // camera "".
         std::fs::write(dir.join("product"), "   \n").unwrap();
         assert_eq!(camera_display_name(&dir, "/dev/irlume-no-such-node"), None);
+        // Control characters never reach a terminal: an escape sequence in
+        // the descriptor is blanked, not rendered.
+        std::fs::write(dir.join("product"), "Cam\x1b[31m\x07era\ttext").unwrap();
+        assert_eq!(
+            camera_display_name(&dir, "/dev/irlume-no-such-node").as_deref(),
+            Some("Cam [31m era text")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

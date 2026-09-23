@@ -5575,8 +5575,8 @@ impl AttemptContext {
         // The site that built the reply says whether it was a decision and
         // whether it came before any camera; the reply's shape is only the
         // fallback when no site said (an engine verdict).
-        let decided = facts.map_or(true, |f| f.decided);
-        let pre_camera = facts.map_or(false, |f| f.pre_camera);
+        let decided = facts.is_none_or(|f| f.decided);
+        let pre_camera = facts.is_some_and(|f| f.pre_camera);
         let (result, cause, pre_camera) = match response {
             Response::AuthResult {
                 granted,

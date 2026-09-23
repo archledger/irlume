@@ -3798,6 +3798,16 @@ fn resolve_group_id(user: &str, group: &str) -> String {
     resolve_group_id_in(store.groups.iter().map(|g| g.id.as_str()), group)
 }
 
+/// A refusal that names the store id names the peer's own value instead:
+/// what the peer did not send, it does not learn from an error.
+fn scrub_group_id(message: &str, store_id: &str, as_sent: &str) -> String {
+    if store_id == as_sent {
+        message.to_owned()
+    } else {
+        message.replace(store_id, as_sent)
+    }
+}
+
 fn resolve_group_id_in<'a>(ids: impl Iterator<Item = &'a str>, group: &str) -> String {
     let mut handle_match = None;
     for id in ids {
@@ -4113,7 +4123,6 @@ fn not_authorized(req: &Request, verb: &str, user: &str) -> Response {
     // across the upgrade window (#93).
     if let Request::ListProfiles {
         structured_errors: true,
-        handles: false,
         ..
     } = req
     {
@@ -5947,13 +5956,15 @@ fn dispatch_scoped_session_inner(
             add_camera_group(engine, peer, &user, profile, want, scope)
         }
         Request::RemoveCameraGroup { user, group } => {
-            // A handle-correlating client names the group by its handle.
-            let group = resolve_group_id(&user, &group);
-            match remove_camera_group(engine, peer, &user, &group) {
+            // A handle-correlating client names the group by its handle;
+            // the store id it resolves to may carry the serial, so the
+            // replies name the group as the peer named it.
+            let store_id = resolve_group_id(&user, &group);
+            match remove_camera_group(engine, peer, &user, &store_id) {
                 Ok(()) => Response::Ok(format!(
                     "camera group '{group}' removed; in-flight use refuses at its boundary"
                 )),
-                Err(e) => Response::Error(e.to_string()),
+                Err(e) => Response::Error(scrub_group_id(&e.to_string(), &store_id, &group)),
             }
         }
         Request::TuneCaptureMode {
@@ -9436,7 +9447,9 @@ mod tests {
             &Request::ListProfiles {
                 user: SAMPLE_USER.into(),
                 structured_errors: true,
-                handles: false,
+                // The two opt-ins are independent: handles must not cost
+                // the client its typed authorization error.
+                handles: true,
             },
             &stranger,
         );
@@ -10819,6 +10832,17 @@ mod tests {
         );
         assert_eq!(resolve_group_id_in(["desk"].into_iter(), "desk"), "desk");
         assert_eq!(resolve_group_id_in(["desk"].into_iter(), "nope"), "nope");
+        // A refusal about the resolved id is reworded in the peer's terms.
+        let handle = group_handle("cam-046d-085e-e179cb54");
+        assert_eq!(
+            scrub_group_id(
+                "no such camera group 'cam-046d-085e-e179cb54'",
+                "cam-046d-085e-e179cb54",
+                &handle
+            ),
+            format!("no such camera group '{handle}'")
+        );
+        assert_eq!(scrub_group_id("kept", "same", "same"), "kept");
 
         // A client that did not ask for handles keeps the identities it
         // matches on (and the store ids), handles included for free.

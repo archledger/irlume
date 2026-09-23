@@ -37,7 +37,8 @@ pub use irlume_camera::{camera_inventory_snapshot, initialize_camera_monitor};
 /// camera-class `ListCameras` arm: clients must not enumerate for themselves
 /// (#187), so this is the only path to a listing.
 pub use irlume_camera::{
-    camera_rate_diagnostics, list_pairs, privacy_engaged, set_forbid_external_cameras, CameraPair,
+    camera_location, camera_rate_diagnostics, list_pairs, privacy_engaged,
+    set_forbid_external_cameras, CameraLocation, CameraPair,
 };
 /// Auto-select the RGB+IR camera pair (built-in or external Hello webcam), plus
 /// the stable per-device identity the daemon records alongside a persisted pair

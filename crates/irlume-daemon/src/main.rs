@@ -59,6 +59,7 @@ pub(crate) mod test_support {
 }
 
 mod arbiter;
+mod attempt_record;
 mod diagnostics;
 mod enrollment_session;
 mod live;
@@ -3032,22 +3033,46 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             ir_scope_index: None,
         },
         // A face attempt refused because the engine is still loading is a
-        // pre-camera refusal with its own cause (ADR-0030 §5). A client
-        // that asked for typed errors gets a retryable operational failure
-        // (the daemon is unavailable, no face was tested); a legacy client
-        // gets the refusal in the shape it decodes.
+        // pre-camera refusal with its own cause (ADR-0030 §5); the record
+        // files it too. A client that asked for typed errors gets a
+        // retryable operational failure (the daemon is unavailable, no face
+        // was tested); a legacy client gets the refusal in the shape it
+        // decodes.
         Request::Authenticate {
-            structured_errors: true,
+            user,
+            structured_errors,
             ..
-        } => Response::OperationError {
-            code: irlume_common::OperationErrorCode::OperationFailed,
-            retryable: true,
-            cause: Some(EarlyRefusal::DaemonStarting.cause()),
-        },
-        Request::Authenticate { .. } => early_refusal(
-            EarlyRefusal::DaemonStarting,
-            "irlumed is still starting (loading models); retry, or use your password",
-        ),
+        } => {
+            if let Err(error) = attempt_record::record(
+                &user,
+                attempt_record::Filed {
+                    kind: irlume_common::AttemptKind::Authenticate,
+                    surface: irlume_common::AttemptSurface::Other,
+                    result: irlume_common::AttemptResult::Failed,
+                    cause: Some(EarlyRefusal::DaemonStarting.cause()),
+                    elapsed_ms: 0,
+                    capture_ms: None,
+                    camera: None,
+                },
+            ) {
+                jout_warn!(
+                    "irlumed: attempt record for '{}' not written: {error}",
+                    journal_safe(&user)
+                );
+            }
+            if structured_errors {
+                Response::OperationError {
+                    code: irlume_common::OperationErrorCode::OperationFailed,
+                    retryable: true,
+                    cause: Some(EarlyRefusal::DaemonStarting.cause()),
+                }
+            } else {
+                early_refusal(
+                    EarlyRefusal::DaemonStarting,
+                    "irlumed is still starting (loading models); retry, or use your password",
+                )
+            }
+        }
         _ => Response::Error(
             "irlumed is still starting (loading models); retry, or use your password".into(),
         ),
@@ -3681,6 +3706,13 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             user: user.as_deref(),
             enrollment: Reads,
         },
+        // The attempt record is the account's own non-biometric history
+        // (ADR-0030 §5): the account and root, like FaceSensorStatus.
+        LastAttempts { user } => RequestPosture {
+            privilege: RootOrTarget { verb: "query" },
+            user: Some(user.as_str()),
+            enrollment: Reads,
+        },
         Ping
         | PreferencesStatus
         | Health
@@ -4218,6 +4250,7 @@ fn not_authorized(req: &Request, verb: &str, user: &str) -> Response {
 
 /// Preserve legacy replies unless the caller can understand typed errors.
 fn authentication_error(error: irlume_common::Error, structured: bool) -> Response {
+    LAST_ERROR_CAUSE.with(|cell| cell.set(Some(error.cause())));
     if structured {
         // ADR-0030 §5: the cause comes from the typed variant, never the
         // text; it rides beside the code the client already branches on.
@@ -4455,6 +4488,10 @@ fn dispatch_status_with_diagnostics(
             Response::PreferencesStatus(irlume_common::PreferencesState::observe())
         }
         Request::FaceSensorStatus { user: Some(_) } => return None,
+        // Root-only file under the state directory; no engine, no camera.
+        Request::LastAttempts { user } => {
+            Response::LastAttempts(attempt_record::load(user).unwrap_or_default())
+        }
         Request::FaceSensorStatus { user: None } => Response::FaceSensorStatus {
             policy: irlume_common::config::observe_face_sensor_policy(),
             ir_readiness: None,
@@ -5208,6 +5245,7 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | SetCamerasIfCurrent { .. }
         | FaceSensorStatus { .. }
         | PreferencesStatus
+        | LastAttempts { .. }
         | ListProfiles { .. }
         | DeleteProfile { .. }
         | DeleteScan { .. }
@@ -5323,6 +5361,120 @@ fn set_cameras_if_current(
     set_camera_devices(rgb, ir, engine)
 }
 
+/// What the attempt record needs from a request before it is served
+/// (ADR-0030 §5); filed from the reply that was actually sent.
+struct AttemptContext {
+    user: String,
+    kind: irlume_common::AttemptKind,
+    surface: irlume_common::AttemptSurface,
+    started: std::time::Instant,
+}
+
+thread_local! {
+    /// The cause of the engine error the reply on this thread was built
+    /// from: a legacy prose `Error` reply cannot carry it, so the funnel
+    /// leaves it here for the attempt record.
+    static LAST_ERROR_CAUSE: std::cell::Cell<Option<irlume_common::OutcomeCause>> =
+        const { std::cell::Cell::new(None) };
+}
+
+impl AttemptContext {
+    fn for_request(req: &Request, peer: &Peer) -> Option<Self> {
+        LAST_ERROR_CAUSE.with(|cell| cell.set(None));
+        match req {
+            Request::Authenticate { user, service, .. } => {
+                // The surface, from the operation class with the session
+                // state bound to this login (ADR-0030 §5); the gate keeps
+                // its own classification.
+                let surface = crate::users::uid_for_name(user)
+                    .map(|uid| attempt_record::session_state_for(peer.pid, uid))
+                    .map(|state| {
+                        irlume_core::biopolicy::classify(service.as_deref().unwrap_or(""), state)
+                    })
+                    .map(attempt_record::surface_for)
+                    .unwrap_or(irlume_common::AttemptSurface::Other);
+                Some(Self {
+                    user: user.clone(),
+                    kind: irlume_common::AttemptKind::Authenticate,
+                    surface,
+                    started: std::time::Instant::now(),
+                })
+            }
+            Request::Identify => {
+                // Root's account-less identify has no account to file under.
+                let IdentifyScope::SelfOnly(name) = identify_scope(peer) else {
+                    return None;
+                };
+                Some(Self {
+                    user: name,
+                    kind: irlume_common::AttemptKind::Identify,
+                    surface: irlume_common::AttemptSurface::Other,
+                    started: std::time::Instant::now(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn file(self, response: &Response, engine: &irlume_auth::Engine) {
+        use irlume_common::AttemptResult;
+        // What the reply says; a pre-camera refusal names no camera.
+        let (result, cause, reached_camera) = match response {
+            Response::AuthResult {
+                granted,
+                refused_by_policy,
+                cause,
+                ..
+            } => (
+                attempt_record::result_of(*granted, true),
+                *cause,
+                !*refused_by_policy,
+            ),
+            Response::Identified { user, cause, .. } => (
+                attempt_record::result_of(false, true),
+                *cause,
+                // A no-account or method refusal never opened a camera.
+                user.is_some() || !matches!(cause, Some(irlume_common::OutcomeCause::Policy)),
+            ),
+            Response::OperationError { cause, .. } => (AttemptResult::Failed, *cause, true),
+            Response::Error(_) => (
+                AttemptResult::Failed,
+                LAST_ERROR_CAUSE.with(|cell| cell.get()),
+                true,
+            ),
+            _ => return,
+        };
+        // A match on identify is not a grant of anything, but the record
+        // shows a recognised face as the engine reported it.
+        let result = match (self.kind, response) {
+            (irlume_common::AttemptKind::Identify, Response::Identified { user, .. })
+                if user.is_some() =>
+            {
+                AttemptResult::Granted
+            }
+            _ => result,
+        };
+        let camera = reached_camera
+            .then(|| irlume_auth::camera_location(engine.rgb_device()))
+            .flatten();
+        let filed = attempt_record::Filed {
+            kind: self.kind,
+            surface: self.surface,
+            result,
+            cause,
+            elapsed_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            capture_ms: None,
+            camera,
+        };
+        if let Err(error) = attempt_record::record(&self.user, filed) {
+            jout_warn!(
+                "irlumed: attempt record for '{}' not written: {error}",
+                journal_safe(&self.user)
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
     let state = diagnostics::DiagnosticState::default();
@@ -5383,6 +5535,7 @@ fn dispatch_scoped_session_delivering(
     delivery: &mut Delivery<'_>,
 ) -> WorkerReply {
     let mut completion = None;
+    let attempt = AttemptContext::for_request(&req, peer);
     let response = dispatch_scoped_session_inner(
         req,
         peer,
@@ -5396,6 +5549,11 @@ fn dispatch_scoped_session_delivering(
     );
     if !is_face_grant(&response) {
         completion = None;
+    }
+    // Filed after the reply is built (and, for an early delivery, after it
+    // was sent): the record is history and never delays a decision.
+    if let Some(attempt) = attempt {
+        attempt.file(&response, engine);
     }
     WorkerReply {
         response,
@@ -5642,6 +5800,7 @@ fn dispatch_scoped_session_inner(
         | Request::Health
         | Request::FaceSensorStatus { user: None }
         | Request::PreferencesStatus
+        | Request::LastAttempts { .. }
         | Request::HasSealedPassword { .. }
         | Request::KeyringMetadata { .. }
         | Request::RecoveryStatus { .. }
@@ -6611,6 +6770,7 @@ fn dispatch_scoped_session_inner(
                     // other peers get vid:pid and serial_present.
                     identity: if peer.uid == 0 { p.identity } else { None },
                     serial_present: p.serial_present,
+                    port_chain: p.port_chain,
                 })
                 .collect(),
         ),
@@ -8705,7 +8865,7 @@ mod tests {
     }
 
     /// Exclusive. For a test that MUTATES the environment.
-    fn env_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
+    pub(crate) fn env_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
         crate::test_support::env_write()
     }
 
@@ -8761,8 +8921,9 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 13] = [
+        let sources: [(&str, &str); 14] = [
             ("main.rs", include_str!("main.rs")),
+            ("attempt_record.rs", include_str!("attempt_record.rs")),
             ("shared_unlock.rs", include_str!("shared_unlock.rs")),
             (
                 "shared_greeter_tests.rs",
@@ -9275,6 +9436,7 @@ mod tests {
             },
         CaptureModeStatus => Request::CaptureModeStatus,
         FaceSensorStatus => Request::FaceSensorStatus { user: Some(u()) },
+        LastAttempts => Request::LastAttempts { user: u() },
         PreferencesStatus => Request::PreferencesStatus,
         SelfTest => Request::SelfTest {
             kind: irlume_common::SelfTestKind::Liveness,
@@ -13129,6 +13291,61 @@ mod tests {
             }
             other => panic!("fingerprint mode must deny via AuthResult, got {other:?}"),
         }
+    }
+
+    /// ADR-0030 §5: a refused authentication is filed in the account's
+    /// attempt record from the reply that was sent — a pre-camera refusal
+    /// with its cause and no camera — and LastAttempts serves it to the
+    /// account and root, and refuses a stranger.
+    #[test]
+    fn refused_authentication_is_filed_and_served_by_last_attempts() {
+        use irlume_common::{AttemptKind, AttemptResult, OutcomeCause};
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("auth-record");
+        std::fs::write(sb.dir.join("method"), "fingerprint").unwrap();
+        std::env::set_var("IRLUME_METHOD_CONF", sb.dir.join("method"));
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let me = crate::users::name_for_uid(uid).expect("own account");
+        let response = dispatch(
+            Request::Authenticate {
+                structured_errors: false,
+                user: me.clone(),
+                service: Some("kde".into()),
+                intent_confirmation: None,
+            },
+            &peer(0),
+            &mut e,
+        );
+        assert!(matches!(
+            response,
+            Response::AuthResult { granted: false, .. }
+        ));
+        let served = dispatch(
+            Request::LastAttempts { user: me.clone() },
+            &peer(uid),
+            &mut e,
+        );
+        let Response::LastAttempts(record) = served else {
+            panic!("expected LastAttempts, got {served:?}");
+        };
+        let latest = record.latest_authenticate.expect("the refusal was filed");
+        assert_eq!(latest.kind, AttemptKind::Authenticate);
+        assert_eq!(latest.result, AttemptResult::Refused);
+        assert_eq!(latest.cause, Some(OutcomeCause::MethodNotAvailable));
+        assert_eq!(latest.camera, None, "refused before a camera was chosen");
+        assert!(record.latest_identify.is_none());
+        assert!(record.cameras.is_empty());
+        // Root may read it too; another account may not.
+        assert!(matches!(
+            dispatch(Request::LastAttempts { user: me.clone() }, &peer(0), &mut e),
+            Response::LastAttempts(_)
+        ));
+        assert!(matches!(
+            dispatch(Request::LastAttempts { user: me }, &peer(NOBODY), &mut e),
+            Response::Error(_)
+        ));
     }
 
     #[test]

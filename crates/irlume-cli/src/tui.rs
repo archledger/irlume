@@ -13674,6 +13674,7 @@ mod tests {
                 name: None,
                 identity: None,
                 serial_present: false,
+                port_chain: None,
                 handle: None,
             },
             irlume_common::CameraPairInfo {
@@ -13685,6 +13686,7 @@ mod tests {
                 name: None,
                 identity: None,
                 serial_present: false,
+                port_chain: None,
                 handle: None,
             },
         ];
@@ -14042,6 +14044,7 @@ mod tests {
             name: None,
             identity: None,
             serial_present: false,
+            port_chain: None,
             handle: None,
         }];
         app.cam_sel = 0;
@@ -14233,6 +14236,7 @@ mod tests {
                 name: Some("ASUS Integrated Camera".into()),
                 identity: Some("3277:0059".into()),
                 serial_present: false,
+                port_chain: None,
                 handle: None,
             },
             irlume_common::CameraPairInfo {
@@ -14244,6 +14248,7 @@ mod tests {
                 name: None,
                 identity: Some("3443:c803".into()),
                 serial_present: false,
+                port_chain: None,
                 handle: None,
             },
         ];
@@ -14631,6 +14636,7 @@ mod tests {
             name: Some("ASUS Integrated Camera".into()),
             identity: Some("3277:0059".into()),
             serial_present: false,
+            port_chain: None,
             handle: None,
         }];
         let render = |app: &mut App, w: u16| {
@@ -16448,6 +16454,7 @@ mod tests {
             name: None,
             identity: None,
             serial_present: false,
+            port_chain: None,
             handle: None,
         }];
         let text = draw_text(&app);
@@ -18572,6 +18579,7 @@ mod tests {
             name: None,
             identity: None,
             serial_present: false,
+            port_chain: None,
             handle: None,
         }];
         app.on_key(KeyCode::F(6));

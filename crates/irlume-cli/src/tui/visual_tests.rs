@@ -520,6 +520,7 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
             name: None,
             identity: None,
             serial_present: false,
+            port_chain: None,
             handle: None,
         }];
         classified.pairs_known = true;

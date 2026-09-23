@@ -92,6 +92,7 @@ pub fn classify(req: &Request) -> Class {
         Ping
         | Health
         | PreferencesStatus
+        | LastAttempts { .. }
         | FaceSensorStatus { user: None }
         | HasSealedPassword { .. }
         | KeyringMetadata { .. }

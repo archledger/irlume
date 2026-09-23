@@ -49,6 +49,7 @@ fn live_test_pair() -> irlume_common::CameraPairInfo {
         name: None,
         identity: None,
         serial_present: false,
+        port_chain: None,
         handle: None,
     }
 }
@@ -534,6 +535,7 @@ fn live_freshness_manual_camera_refresh_preserves_identity_and_queues_one_replac
         name: None,
         identity: None,
         serial_present: false,
+        port_chain: None,
         handle: None,
     };
     app.pairs = vec![live_test_pair(), second.clone()];

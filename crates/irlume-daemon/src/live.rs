@@ -374,6 +374,7 @@ pub(crate) fn request_kind(req: &Request) -> Option<(LiveOperationKind, bool)> {
         | Ping
         | Health
         | PreferencesStatus
+        | LastAttempts { .. }
         | FaceSensorStatus { user: None }
         | HasSealedPassword { .. }
         | KeyringMetadata { .. }

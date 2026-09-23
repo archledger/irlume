@@ -723,6 +723,11 @@ pub enum Request {
     CaptureModeStatus,
     /// Camera-free sensor policy; a user explicitly requests enrollment preflight.
     FaceSensorStatus { user: Option<String> },
+    /// The account's retained face-attempt record (ADR-0030 §5): the latest
+    /// attempt of each kind and the last few per camera, non-biometric.
+    /// Root or the account itself; answered from the daemon's state
+    /// directory without touching the engine or a camera.
+    LastAttempts { user: String },
     /// Camera-free, non-secret machine preferences as observed by the daemon.
     PreferencesStatus,
     /// Liveness/alignment self-test (no auth side effects). See PAD self-testing.
@@ -985,6 +990,105 @@ impl OutcomeCause {
     }
 }
 
+/// What kind of face attempt a record entry describes (ADR-0030 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AttemptKind {
+    /// A verification for a service (login, unlock, elevation, an app).
+    Authenticate,
+    /// A 1:N recognition test; never a grant.
+    Identify,
+}
+
+/// The surface an authentication served, from the operation class the
+/// daemon resolved with the session state it established itself
+/// (ADR-0030 §5); `Other` when it could not be resolved, never guessed
+/// from the service name. Absent meaning for an `Identify` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AttemptSurface {
+    Login,
+    Lock,
+    Elevation,
+    App,
+    Other,
+}
+
+/// How an attempt ended: granted, refused by a decision, or failed before
+/// one (a camera or daemon fault). The cause says why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AttemptResult {
+    Granted,
+    Refused,
+    Failed,
+}
+
+/// The camera an attempt used, as a share-safe location (ADR-0030 §5):
+/// the model, the USB port it was attached to and the descriptor digest
+/// — never a serial or a node path. A unit that carries a serial adds a
+/// keyed discriminator (a digest under a per-account secret the record
+/// keeps) so a same-model replacement in the same port does not inherit
+/// its history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptCamera {
+    /// `vid:pid`.
+    pub model: String,
+    /// `<bus>-<port>[.<port>…]` as sysfs names the device; `None` when
+    /// the camera is not on a USB bus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_chain: Option<String>,
+    /// First 16 hex of the descriptor fingerprint, the same token the
+    /// diagnostics carry; identical only for byte-identical descriptors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descriptor_token: Option<String>,
+    /// Keyed per-account unit discriminator when the unit has a serial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+}
+
+/// One retained attempt (ADR-0030 §5). No score, threshold, embedding or
+/// reason prose: the outcome class, the cause and the two durations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptEntry {
+    /// Unix seconds.
+    pub at: u64,
+    pub kind: AttemptKind,
+    pub surface: AttemptSurface,
+    pub result: AttemptResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<OutcomeCause>,
+    pub elapsed_ms: u64,
+    /// The capture stage's duration when the attempt reached a camera.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_ms: Option<u64>,
+    /// Absent for an attempt refused before any camera was selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<AttemptCamera>,
+}
+
+/// The attempts retained for one camera location.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CameraAttempts {
+    pub camera: AttemptCamera,
+    /// Newest first, at most five.
+    pub attempts: Vec<AttemptEntry>,
+}
+
+/// An account's attempt record (ADR-0030 §5): the latest attempt of each
+/// kind, so a recognition test never displaces the last authentication,
+/// and the last five attempts per camera over at most eight cameras.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_authenticate: Option<AttemptEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_identify: Option<AttemptEntry>,
+    /// Most recently used camera first.
+    #[serde(default)]
+    pub cameras: Vec<CameraAttempts>,
+}
+
 /// Why an operation failed, in terms a caller can act on.
 ///
 /// Kept deliberately small. Each value has to mean the same thing for the life
@@ -1048,6 +1152,11 @@ pub struct CameraPairInfo {
     /// model cannot be told apart (ADR-0024 §6).
     #[serde(default)]
     pub serial_present: bool,
+    /// `<bus>-<port>[.<port>…]`, the USB location the pair is attached to
+    /// (ADR-0030 §5), so an attempt record maps to a listed camera; absent
+    /// off USB and on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_chain: Option<String>,
     /// The daemon's opaque handle for this pair (ADR-0030 §4): a keyed
     /// digest of the pair's binding identity under a secret this daemon
     /// instance drew at start, so it names the unit without revealing the
@@ -1397,6 +1506,8 @@ pub struct CameraGroupProfileSummary {
 pub enum Response {
     /// Reply only to the explicit preferences request; older clients are unchanged.
     PreferencesStatus(PreferencesState),
+    /// The account's attempt record (`LastAttempts`).
+    LastAttempts(AttemptRecord),
     /// Camera-free policy observation. Readiness is absent for ordinary status.
     FaceSensorStatus {
         policy: config::FaceSensorPolicyObservation,

@@ -7,6 +7,26 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- The per-account attempt record (ADR-0030 §5, C2). The daemon files
+  every face attempt in a root-only record under its state directory
+  (`/var/lib/irlume/attempts/<uid>.json`): the latest attempt of each
+  kind (`authenticate`, `identify`, kept apart so a recognition test never
+  displaces the last real authentication) and the last five attempts per
+  camera, bounded as a whole — at most eight camera buckets, the least
+  recently used evicted, buckets idle for ninety days pruned on write.
+  Each entry carries the time, the surface (login / lock / elevation /
+  app / other, from the operation class resolved with a session state the
+  daemon establishes for the *requesting login*: warm only when the PAM
+  conversation's own process sits in a `user`-class logind session of the
+  target account; anything unresolvable is cold), the outcome class, the
+  cause, the elapsed time, and the camera as a share-safe location —
+  model, USB port chain, descriptor token and, for a unit with a serial, a
+  keyed per-account discriminator; never a score, threshold, reason prose,
+  serial or node path. A new user-scoped `LastAttempts { user }` request
+  (the account and root) returns it, camera-free. `ListCameras` rows gain
+  `port_chain` so the record maps to a listed camera. The record is
+  history: a write failure is logged and never changes a reply.
+
 - Structured attempt causes (ADR-0030 §5, C2). Every refusal now names
   why from a closed vocabulary — `no-face`, `liveness-refused`,
   `below-threshold`, `privacy-shutter`, `camera-unavailable`,

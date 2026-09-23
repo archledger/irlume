@@ -200,6 +200,7 @@ fn camera_names_and_binding_are_additive_on_the_wire() {
         name: Some("NexiGo N930W".into()),
         identity: Some("3443:c803".into()),
         serial_present: false,
+        port_chain: None,
         handle: Some("9f1c2a7b4d0e6f13".into()),
     };
     let wire = serde_json::to_string(&new).unwrap();

@@ -7467,7 +7467,7 @@ impl App {
                         } else if !p.fixed && external_blocked == Some(true) {
                             // The daemon refuses every non-fixed camera under
                             // this policy: "ready" would be a false promise.
-                            Span::styled("○ blocked: external cameras off", Style::new().dim())
+                            Span::styled("○ blocked by policy", Style::new().dim())
                         } else if !p.fixed && external_blocked.is_none() {
                             Span::styled("◐ policy unobserved", Style::new().fg(th().warn))
                         } else if matches!(role, CameraRole::Unenrolled) {
@@ -13903,10 +13903,7 @@ mod tests {
             .record(true, now);
         let text = render(&mut app);
         let external = text.lines().find(|l| l.contains("video4+video6")).unwrap();
-        assert!(
-            external.contains("blocked: external cameras off"),
-            "{external}"
-        );
+        assert!(external.contains("blocked by policy"), "{external}");
         app.preferences = Some(irlume_common::PreferencesState {
             forbid_external_cameras: None,
             ..base

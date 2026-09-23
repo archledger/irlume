@@ -3710,18 +3710,42 @@ struct EnrollmentSummary {
     /// The primary enrollment's camera binding (ADR-0029), for the
     /// client's role labels; identities only.
     primary_camera: Option<irlume_common::PrimaryCameraBinding>,
-    /// SHA-256 of the primary file's bytes when this summary was built, so
-    /// a cache hit can tell a legacy rewrite of the primary (which sends
-    /// no request) from an unchanged file.
-    primary_digest: Option<String>,
+    /// The primary file's state when this summary was built, so a cache
+    /// hit can tell a legacy rewrite of the primary (which sends no
+    /// request) from an unchanged file.
+    primary_digest: PrimaryDigest,
 }
 
-/// The current primary file's digest, or `None` when it is absent or
-/// unreadable: one file read, no TPM, safe on a connection thread.
-fn primary_digest_now(user: &str) -> Option<String> {
-    std::fs::read(irlume_core::multi_camera::primary_enrollment_path(user))
-        .ok()
-        .map(|bytes| irlume_common::sha256_hex(&bytes))
+/// The primary enrollment file as one cheap read sees it: absent, present
+/// with the SHA-256 of its bytes, or unreadable. Absent and unreadable are
+/// distinct so a file that appears in an unreadable form (a directory, a
+/// permission or I/O failure) is never mistaken for "still absent" and
+/// the failure reaches the worker, which reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PrimaryDigest {
+    Absent,
+    Present(String),
+    Unreadable,
+}
+
+impl PrimaryDigest {
+    /// Whether a summary built at `self` still describes a file now at
+    /// `now`. A read failure on either side is never "unchanged".
+    fn unchanged(&self, now: &PrimaryDigest) -> bool {
+        !matches!(self, PrimaryDigest::Unreadable)
+            && !matches!(now, PrimaryDigest::Unreadable)
+            && self == now
+    }
+}
+
+/// The current primary file's state: one file read, no TPM, safe on a
+/// connection thread.
+fn primary_digest_now(user: &str) -> PrimaryDigest {
+    match std::fs::read(irlume_core::multi_camera::primary_enrollment_path(user)) {
+        Ok(bytes) => PrimaryDigest::Present(irlume_common::sha256_hex(&bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PrimaryDigest::Absent,
+        Err(_) => PrimaryDigest::Unreadable,
+    }
 }
 
 impl EnrollmentSummary {
@@ -3828,7 +3852,7 @@ fn summarize_enrollment(
                     ir: binding.ir.clone(),
                 }
             }),
-            primary_digest: None,
+            primary_digest: PrimaryDigest::Absent,
             profiles: enr
                 .profiles
                 .iter()
@@ -3865,7 +3889,7 @@ fn summarize_enrollment(
             camera_groups: Vec::new(),
             camera_store_error: None,
             primary_camera: None,
-            primary_digest: None,
+            primary_digest: PrimaryDigest::Absent,
             profiles: Vec::new(),
             ir_ratio_calibrated: false,
         },
@@ -4243,7 +4267,9 @@ fn dispatch_status_with_diagnostics(
                 // cached summary is a miss and the worker reloads (ADR-0029).
                 // Compared even when the file was absent at publication, so
                 // an enrollment created since is seen.
-                Some(sum) if primary_digest_now(user) != sum.primary_digest => return None,
+                Some(sum) if !sum.primary_digest.unchanged(&primary_digest_now(user)) => {
+                    return None
+                }
                 Some(mut sum) => {
                     // Hotplug and legacy rewrites since publication must
                     // not be hidden by the cache: refresh the volatile
@@ -10389,7 +10415,7 @@ mod tests {
                 camera_groups: Vec::new(),
                 camera_store_error: None,
                 primary_camera: None,
-                primary_digest: None,
+                primary_digest: PrimaryDigest::Absent,
             },
         );
         match dispatch_status(&req, &peer) {
@@ -10521,7 +10547,7 @@ mod tests {
                     camera_groups: Vec::new(),
                     camera_store_error: None,
                     primary_camera: None,
-                    primary_digest: None,
+                    primary_digest: PrimaryDigest::Absent,
                 },
             );
             let response = dispatch(request, &owner, &mut engine);
@@ -10601,6 +10627,40 @@ mod tests {
             dispatch_status(&request, &peer(0)).is_none(),
             "a primary created since publication is a cache miss"
         );
+        // A path that appears in an unreadable form (here a directory) is
+        // not "still absent": the cache misses so the worker reports it.
+        std::fs::remove_file(&path).unwrap();
+        publish_enrollment_summary(
+            user,
+            EnrollmentSummary {
+                profiles: Vec::new(),
+                ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
+                primary_camera: None,
+                primary_digest: primary_digest_now(user),
+            },
+        );
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(primary_digest_now(user), PrimaryDigest::Unreadable);
+        assert!(
+            dispatch_status(&request, &peer(0)).is_none(),
+            "an unreadable primary is a cache miss"
+        );
+        // And a summary built while it was unreadable never becomes a hit.
+        publish_enrollment_summary(
+            user,
+            EnrollmentSummary {
+                profiles: Vec::new(),
+                ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
+                primary_camera: None,
+                primary_digest: primary_digest_now(user),
+            },
+        );
+        assert!(dispatch_status(&request, &peer(0)).is_none());
+        std::fs::remove_dir(&path).unwrap();
         invalidate_enrollment_summary(user);
     }
 
@@ -10653,7 +10713,7 @@ mod tests {
                 camera_groups: Vec::new(),
                 camera_store_error: None,
                 primary_camera: None,
-                primary_digest: None,
+                primary_digest: PrimaryDigest::Absent,
             },
         );
         match dispatch(delete(), &peer(NOBODY), &mut e) {
@@ -12907,7 +12967,7 @@ mod tests {
                 camera_groups: Vec::new(),
                 camera_store_error: None,
                 primary_camera: None,
-                primary_digest: None,
+                primary_digest: PrimaryDigest::Absent,
             },
         );
         let sb = sandbox("summary-carryover");
@@ -13322,7 +13382,7 @@ mod tests {
                     camera_groups: Vec::new(),
                     camera_store_error: None,
                     primary_camera: None,
-                    primary_digest: None,
+                    primary_digest: PrimaryDigest::Absent,
                 },
             );
             match dispatch(request.clone(), &peer(NOBODY), &mut e) {
@@ -13440,7 +13500,7 @@ mod tests {
                 camera_groups: Vec::new(),
                 camera_store_error: None,
                 primary_camera: None,
-                primary_digest: None,
+                primary_digest: PrimaryDigest::Absent,
             },
         );
         assert!(
@@ -15330,7 +15390,7 @@ mod tests {
             }],
             camera_store_error: None,
             primary_camera: None,
-            primary_digest: None,
+            primary_digest: PrimaryDigest::Absent,
         };
         // Published while active; a legacy writer then rewrites the primary
         // with NO request in flight: the cached row must flip to stale.
@@ -15372,7 +15432,7 @@ mod tests {
             }],
             camera_store_error: None,
             primary_camera: None,
-            primary_digest: None,
+            primary_digest: PrimaryDigest::Absent,
         };
         // The worker froze the row while the camera was plugged in AND
         // selected; hotplug since then: the identity is gone and the live

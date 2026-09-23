@@ -100,18 +100,27 @@ device.
    details in a right-hand column; narrower terminals keep the Enter
    panel. Same content, one code path.
 9. **One freshness indicator.** The page header keeps "observations ≤Ns
-   old · F4 details"; the bottom line keeps the Activity log only.
+   old · F4 details"; the bottom line keeps the Activity log only. The
+   header's `F4` is the one exemption from §1.4: it is not prose but the
+   freshness chip's own action, the same key the bottom bar lists, and
+   no other key may appear in a header.
 10. **Identifiers live in details or Diagnostics.** Node paths, NV handles,
     context hashes and vid:pid never appear on a Setup page's first line.
 
 ### 2. Pages
 
-- **Overview** leads with the account's last authentication (§5): when,
-  which surface (login / lock / sudo / app), which camera by name, the
-  outcome class and, for a refusal, the cause in plain words from the
-  closed vocabulary of §5 (`no face seen — were you in frame?`, `camera
-  shutter closed`), and the elapsed time. When no attempt is retained the
-  line says so. Below it the status rows of §1.6 and the one recommended
+- **Overview** leads with the account's last face attempt (§5): the
+  stored `kind` names it — "last sign-in" for an `authenticate` record,
+  "last recognition test" for an `identify` one — then when, which
+  surface (login / lock / sudo / app; none for a test), which camera by
+  name, the outcome class and, for a refusal, the cause in plain words
+  from the closed vocabulary of §5 (`no face seen — were you in frame?`,
+  `camera shutter closed`), and the elapsed time. The record keeps the
+  latest of each kind, so a recognition test never displaces the last
+  real authentication: the line shows the most recent attempt labelled by
+  its kind, and when the latest is a test and an authentication exists
+  the line adds "last sign-in: <outcome>, <when>". When no attempt is
+  retained the line says so. Below it the status rows of §1.6 and the one recommended
   next step as an action row ("wire the lock screen"), which becomes
   "Test Recognition" once everything is wired.
 - **Faces** groups a profile's scans by the camera they were captured on
@@ -136,9 +145,15 @@ device.
   only; no grant), so what the TUI shows for the selected account is what
   it tests and the attempt record it updates is that account's; root's
   account-less `Identify` stays a CLI diagnostic and is not what the page
-  runs. Identification attempts are retained in the account's record
-  marked `identify`, so the beginner route's "try it" updates the
-  last-attempt line.
+  runs. `IdentifyFor { user }` sits in the posture table as
+  root-or-target, exactly like `LastAttempts { user }` and
+  `FaceSensorStatus { user }`: the daemon checks the peer against the
+  named account before it loads any enrollment or opens a camera, so no
+  local user can run recognition against another account, learn its
+  result or touch its attempt record. Identification attempts are
+  retained in the account's record marked `identify`, so the beginner
+  route's "try it" updates the last-attempt line without replacing the
+  last authentication (Overview, above).
 - **Login & Apps** lists the surfaces present on this machine with what
   each does, and folds the absent display managers into one grey
   sentence. Actions on one row.
@@ -181,8 +196,23 @@ device.
   opaque **pair handle** (`handle`: a daemon-minted token for this pair in
   this connection generation, share-safe, meaningless off the machine),
   not the serial or the node paths — an amendment to ADR-0029 A's
-  `identity` field, which becomes root-only likewise. Two consequences
-  for ordinary accounts, which never see nodes or serials:
+  `identity` field, which becomes root-only likewise. The boundary is
+  the daemon's, so it covers every any-peer carrier of node paths, not
+  only `ListCameras`: `Health`'s `rgb_dev`/`ir_dev` and `LiveStatus`'s
+  `CameraCandidate.endpoint_paths` are redacted (`None` / empty) for a
+  non-root peer in the same change, and the TUI's Cameras page reads the
+  active pair by handle (`Health` gains `active_handle`) rather than by
+  node string; root keeps the full snapshot. The transition is additive
+  so the mixed-version window of a package upgrade degrades rather than
+  breaks: `CameraPairInfo` keeps `rgb`/`ir` as fields that an upgraded
+  daemon fills with `""` for a non-root peer (an older TUI still decodes
+  the row and shows the name and role, with no node column), and gains
+  `handle` with `serde(default)` (a newer TUI receiving no handle from an
+  older daemon shows the row but disables the handle-bearing actions
+  with "daemon older than this tool"). The same rule as ADR-0029 A's
+  optional fields: additive, defaulted, and the client states which side
+  is older. Two consequences for ordinary accounts, which never see
+  nodes or serials:
   - ADR-0029 §3's `EnrollOn` / `AddCameraGroupOn` take the pair
     **handle**, not node names; the daemon resolves the handle to the
     nodes and identities server-side and re-checks them under the lease as
@@ -224,7 +254,12 @@ device.
   alone and `SetCamerasIfCurrent` guards the live device generation, not
   the file; the policy writers likewise), which the daemon checks under
   its own lock and refuses if the value is no longer the one this session
-  wrote; the refusal names the change. No separate read-then-act.
+  wrote; the refusal names the change. No separate read-then-act. Every
+  undo entry records the account it belongs to (the pin and the policy
+  toggles are per machine and record none); switching accounts (§6)
+  drops the account-bound entries at once, so `z` can never send Alice's
+  inverse while the page says Bob, and an entry is only ever offered
+  while its account is the selected one.
 - **Command echo**: every action that runs a CLI command logs the exact
   command to the Activity line (most do; this makes it a rule), and
   `irlume tui --print-commands` prints them to stderr as well.
@@ -237,7 +272,12 @@ device.
   bounded to 30 minutes. Nothing about attempts is added to it.
 - Instead the daemon keeps, per account, a small **attempt record**
   file under its state directory (root-only, like the retry journal):
-  the last attempt and the last five per camera, each with the time, the
+  the latest attempt of each kind and the last five per camera, bounded
+  as a whole — at most eight camera buckets per account, the least
+  recently used bucket evicted when a ninth camera appears, and a bucket
+  whose newest attempt is older than 90 days pruned on the next write —
+  so the file stays small however many cameras come and go; each attempt
+  carries the time, the
   surface (login / lock / elevation / app / other, from the service
   class **as the daemon already resolved it**: the operation class from
   `biopolicy::classify` with the session state, so a greeter that serves
@@ -247,10 +287,12 @@ device.
   `descriptor_token` (the digest `SanitizedCameraContext` already carries:
   durable across unplugging, identical only for units that share a
   descriptor byte for byte) — the record is a history of what was attached
-  where, so the TUI maps it to a current camera by port chain and token
-  and, when neither matches a connected camera, shows the model name
-  (vid/pid) with "no longer connected" rather than attributing the attempt
-  to a replacement unit; never the binding identity, so no serial. The
+  where, so the TUI maps it to a current camera only when **both** the
+  port chain and the token match a connected camera, and otherwise shows
+  the model name (vid/pid) with "no longer connected" (or "different
+  port" when only the token matches) rather than attributing the attempt
+  to a replacement unit or to the same unit moved elsewhere; never the
+  binding identity, so no serial. The
   camera fields are **optional**, absent for an attempt refused before any
   camera was selected (startup, retry throttling, method or policy
   checks), as is `capture_ms` — the outcome class, the cause, `elapsed_ms` and
@@ -259,8 +301,13 @@ device.
   outcome is built, next to `OutcomeKind`) for attempts that reached a
   decision; on the engine's error boundary for attempts that reached the
   engine but ended in an error (`irlume_common::Error` gains a `cause()`
-  classification — camera unavailable, cancelled, timed out, other — so
-  the daemon maps an `Err` without reading its text); on
+  classification — privacy shutter, camera unavailable, cancelled, timed
+  out, other — so the daemon maps an `Err` without reading its text; the
+  privacy boundary, which today reaches the engine as
+  `Error::Hardware(String)` prose, gets its own typed variant
+  `Error::PrivacyShutter` raised where the camera layer detects the
+  refusal, so `privacy shutter` is a cause the classifier can assign and
+  the Overview line can name); on
   `IdentifyOutcome`, which gains the same `OutcomeCause` beside its
   `reason`; and as a daemon-level `EarlyRefusal` enum for the paths that
   answer before the engine (`method not available`, `policy`,
@@ -295,7 +342,13 @@ device.
   into the new account's page.
 - Docking: an inventory change refreshes the Cameras page and the
   Diagnostics camera row without a keypress (the live snapshot already
-  arrives; the rows re-render from it).
+  arrives; the rows re-render from it), and because the connection
+  generation changed it also re-issues the handle-bearing loads: the
+  `ListCameras` listing (new handles) and the account's enrollment reply
+  (new `connected_handle` correlations), clears the Cameras selection and
+  any pending camera action built on an old handle, and generation-checks
+  the results so a listing from before the change is dropped. Until both
+  land the camera actions are disabled with "cameras changed; reloading".
 - First launch after an upgrade shows one line from the changelog's
   Unreleased/latest section that affects the TUI, once.
 - User-facing strings move to one table per page so they can be reviewed
@@ -356,7 +409,9 @@ device.
 - Overview: with an attempt record carrying a refusal cause, the first
   line names the surface, the camera by name and the plain-words cause;
   no score or threshold text can appear (a forbidden-word scan as in the
-  attended trial tooling); a record for another account is never shown.
+  attended trial tooling); a record for another account is never shown;
+  after an `identify` attempt the line is labelled a recognition test and
+  the last `authenticate` record is still reported beside it.
 - Faces: scans group by camera role; the count line states the minimum
   and nothing about conditions; scans without `captured_at` read "date
   not recorded".
@@ -364,10 +419,24 @@ device.
 - Undo: rename then `z` restores the name through the same request path
   with the expected-value precondition; `z` with nothing to undo says so;
   a request whose precondition no longer holds is refused by the daemon
-  and the refusal names the change.
+  and the refusal names the change; an entry recorded for one account is
+  gone after the switcher selects another.
+- Wire boundary: as a non-root peer, `Health`, `LiveStatus` and
+  `ListCameras` carry no `/dev` path and no serial; `IdentifyFor` for
+  another account is refused before any enrollment load; a
+  `ListCameras` row without `handle` (older daemon) renders with the
+  handle-bearing actions disabled.
+- Docking: an inventory change re-issues the listing and enrollment
+  loads, drops a listing from the previous generation and clears the
+  selection.
 - Attempt record: a refusal before camera selection is recorded without a
   camera and rendered as "before a camera was chosen"; a lock-screen
   attempt through a dual-purpose greeter is recorded as lock, not login;
-  an identification is recorded as `identify`.
+  an identification is recorded as `identify`; a shutter refusal during
+  capture is recorded as `privacy shutter`, never `other`; a record
+  whose token matches a connected camera on a different port chain
+  renders "different port", not the connected camera's name; a ninth
+  camera evicts the least recently used bucket and the file never holds
+  more than eight.
 - Command echo: every `Suspend::*` variant logs a line beginning with the
   command it runs.

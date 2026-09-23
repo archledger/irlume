@@ -4312,6 +4312,10 @@ impl Engine {
         // ViT vote ring, so repeated assess() calls must not accumulate a
         // cross-presentation vote (GLM review finding 2).
         self.vit_scores.clear();
+        // The setup interval runs from here to the start of the capture
+        // route; a caller's scope learns the camera was reached from that
+        // mark even when the capture is cancelled before a stage reports.
+        self.begin_capture_setup();
         // Resolve the capture-mode selection through the qualification store
         // BEFORE acquiring the streaming operation, exactly as
         // authenticate_for does at its own entry: without this the one-shot
@@ -4335,6 +4339,7 @@ impl Engine {
             std::time::Duration::from_secs(2),
         )
         .map_err(lease_unavailable)?;
+        self.emit_capture_setup(diagnostics);
         operation
             .run(|| {
                 if self.ir_available {

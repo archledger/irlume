@@ -512,34 +512,8 @@ const WRITER_QUEUE: usize = 64;
 /// store lock. A full queue drops the record and says so; the record is
 /// history and never delays a reply.
 pub(crate) fn record_in_background(user: String, filed: Filed) {
-    static WRITER: std::sync::OnceLock<std::sync::mpsc::SyncSender<(String, Filed)>> =
-        std::sync::OnceLock::new();
     static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sender = WRITER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(String, Filed)>(WRITER_QUEUE);
-        let spawned = std::thread::Builder::new()
-            .name("irlume-attempt-record".into())
-            .spawn(move || {
-                for (user, filed) in rx {
-                    if let Err(error) = record(&user, filed) {
-                        irlume_common::jout_warn!(
-                            "irlumed: attempt record for '{}' not written: {error}",
-                            crate::journal_safe(&user)
-                        );
-                    }
-                    writer_progress(|p| p.written += 1);
-                }
-            });
-        if let Err(error) = spawned {
-            irlume_common::jout_warn!("irlumed: attempt record writer not started: {error}");
-        }
-        tx
-    });
-    // Counted before it is queued, so a reader that follows the reply
-    // waits for it (a dropped record counts as done: nothing to wait for).
-    writer_progress(|p| p.queued += 1);
-    if sender.try_send((user, filed)).is_err() {
-        writer_progress(|p| p.written += 1);
+    if writer().try_send(Job::File(user, filed)).is_err() {
         // Journal the first drop and then every hundredth, not each one.
         let dropped = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if dropped == 1 || dropped % 100 == 0 {
@@ -550,26 +524,44 @@ pub(crate) fn record_in_background(user: String, filed: Filed) {
     }
 }
 
-/// How far the background writer is: what was queued, what it finished.
-#[derive(Default)]
-struct WriterProgress {
-    queued: u64,
-    written: u64,
+/// The writer's work, in queue order.
+enum Job {
+    File(String, Filed),
+    /// A reader's fence: acknowledged once everything queued before it
+    /// is on disk.
+    Barrier(std::sync::mpsc::SyncSender<()>),
 }
 
-static WRITER_PROGRESS: std::sync::Mutex<WriterProgress> = std::sync::Mutex::new(WriterProgress {
-    queued: 0,
-    written: 0,
-});
-static WRITER_CAUGHT_UP: std::sync::Condvar = std::sync::Condvar::new();
-
-fn writer_progress(update: impl FnOnce(&mut WriterProgress)) {
-    let mut progress = WRITER_PROGRESS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    update(&mut progress);
-    drop(progress);
-    WRITER_CAUGHT_UP.notify_all();
+fn writer() -> &'static std::sync::mpsc::SyncSender<Job> {
+    static WRITER: std::sync::OnceLock<std::sync::mpsc::SyncSender<Job>> =
+        std::sync::OnceLock::new();
+    WRITER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(WRITER_QUEUE);
+        let spawned = std::thread::Builder::new()
+            .name("irlume-attempt-record".into())
+            .spawn(move || {
+                for job in rx {
+                    match job {
+                        Job::File(user, filed) => {
+                            if let Err(error) = record(&user, filed) {
+                                irlume_common::jout_warn!(
+                                    "irlumed: attempt record for '{}' not written: {error}",
+                                    crate::journal_safe(&user)
+                                );
+                            }
+                        }
+                        // The reader may have given up: nobody to tell.
+                        Job::Barrier(ack) => {
+                            let _ = ack.try_send(());
+                        }
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            irlume_common::jout_warn!("irlumed: attempt record writer not started: {error}");
+        }
+        tx
+    })
 }
 
 /// Bound on how long a read waits for the writer to catch up.
@@ -577,22 +569,30 @@ const READ_AFTER_WRITE_WAIT: std::time::Duration = std::time::Duration::from_sec
 
 /// Wait (bounded) until every record queued before now is on disk, so a
 /// status request that follows a reply sees the attempt that reply was.
+/// The fence travels through the writer's own FIFO queue, so it cannot
+/// be satisfied before the records ahead of it, however many arrive or
+/// are dropped meanwhile.
 fn await_writer() {
     let deadline = std::time::Instant::now() + READ_AFTER_WRITE_WAIT;
-    let mut progress = WRITER_PROGRESS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let target = progress.queued;
-    while progress.written < target {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            break;
+    let (ack, done) = std::sync::mpsc::sync_channel::<()>(1);
+    let mut fence = Job::Barrier(ack);
+    // A full queue is a burst of records still being written: wait for a
+    // slot rather than reading past them.
+    loop {
+        match writer().try_send(fence) {
+            Ok(()) => break,
+            Err(std::sync::mpsc::TrySendError::Full(job)) => {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                fence = job;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
         }
-        let (guard, _) = WRITER_CAUGHT_UP
-            .wait_timeout(progress, remaining)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        progress = guard;
     }
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let _ = done.recv_timeout(remaining);
 }
 
 /// The record for `user` (empty when nothing was ever filed), or `None`

@@ -466,9 +466,14 @@ impl SecondaryStore {
         }
     }
 
-    /// Resolves the group whose COMPLETE pair matches the live pair, if
-    /// any. Ambiguity is impossible by construction (duplicate ids are
-    /// rejected), and a hybrid of two groups' endpoints never matches.
+    /// Resolves the first group, in store order, whose bound sides equal
+    /// the live pair under [`GroupPair::matches`]. An unbound side is not
+    /// checked, so a one-sided group matches every live pair that carries
+    /// its bound side, a hybrid included; only a hybrid of two complete
+    /// groups' endpoints never matches. Store validation does not forbid
+    /// two groups with one pair; when several groups match, the first in
+    /// store order wins. [`selection`] ranks groups for automatic camera
+    /// selection without letting store order decide.
     #[must_use]
     pub fn group_for_pair(
         &self,
@@ -851,6 +856,7 @@ pub(crate) fn save_secondary_with_key(
 pub mod authz;
 pub mod commit;
 pub mod coordinator;
+pub mod selection;
 pub mod views;
 
 #[cfg(test)]

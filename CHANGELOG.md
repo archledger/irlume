@@ -7,6 +7,28 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Camera selection order as a pure function (ADR-0029 §1, §3). For
+  one account it picks the connected camera to use when camera
+  selection is automatic: the primary camera when both of its sides
+  are bound and it is connected, otherwise the account's added
+  cameras in the order of their camera identities, never the order
+  they were added in; a primary that cannot serve the requested mode
+  gives way to an added camera that can. Two added cameras that share
+  one pair, two connected cameras that cannot be told apart (same
+  model, no serial), an inactive added-camera store and an external
+  camera under the external-camera prohibition are skipped and
+  reported. A camera the account is not enrolled on is never chosen,
+  and when nothing usable is connected the answer says why. An
+  account whose primary camera binding is incomplete (enrolled before
+  bindings existed, or on a camera without an IR node) is not
+  refused: unless one of its added cameras is chosen, the answer is
+  that automatic selection does not apply, and the account keeps the
+  camera the daemon uses today. A second function ranks the cameras a
+  first enrollment may use: the `IRLUME_CAMERA_PIN` allowlist, then
+  built-in cameras, then the camera identity, never the `/dev/video`
+  number. Nothing calls either function yet: camera selection is
+  unchanged.
+
 - `irlumed` checks `cameras.conf` at start against the stricter
   grammar of ADR-0029 and logs a warning for a file it cannot read, a
   camera key set on more than one line or holding a line break or a

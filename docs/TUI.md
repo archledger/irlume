@@ -310,7 +310,8 @@ daemon`, `daemon did not report it` or `no answer yet`. The TPM row says
 whether the system checks are pending, did not finish or are out of date. An
 action row under the facts then offers refresh (`r`) and, while the daemon is
 down or refuses this account, Diagnostics (`6`), whose Daemon check carries
-the fix.
+the fix. F6 reaches these actions while the row is shown, before the page's
+own actions.
 
 ## Diagnostics
 

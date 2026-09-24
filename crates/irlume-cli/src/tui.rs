@@ -841,8 +841,9 @@ struct App {
     more_actions: Option<(String, usize)>,
     /// The compact section chooser uses the same visible navigation order.
     sections: Option<usize>,
-    /// Screen and selected action index; stale focus never carries to a new page.
-    action_focus: Option<(usize, usize)>,
+    /// Screen and focused action's key; stale focus never carries to a new
+    /// page, and an action that leaves the walk takes the focus with it.
+    action_focus: Option<(usize, &'static str)>,
     /// Reveal a newly focused action once, leaving subsequent wheel scroll free.
     action_reveal: std::cell::Cell<bool>,
     /// Selected row of the Welcome hub (Enter jumps to its screen).
@@ -5261,7 +5262,9 @@ impl App {
                 self.action_focus = if self.focused_action().is_some() {
                     None
                 } else {
-                    Some((self.screen, 0))
+                    self.focus_actions()
+                        .first()
+                        .map(|&(key, _)| (self.screen, key))
                 };
                 self.action_reveal.set(true);
             }
@@ -5347,30 +5350,45 @@ impl App {
     fn focused_action(&self) -> Option<(&'static str, &'static str)> {
         self.action_focus
             .filter(|(screen, _)| *screen == self.screen)
-            .and_then(|(_, index)| self.focus_actions().get(index).copied())
+            .and_then(|(_, focused)| {
+                self.focus_actions()
+                    .into_iter()
+                    .find(|&(key, _)| key == focused)
+            })
     }
 
-    fn focus_actions(&self) -> &'static [(&'static str, &'static str)] {
+    /// The actions F6 walks, in the page's reading order: the remedy row
+    /// under unknown facts while the page draws it (ADR-0030 §1.6), then
+    /// the page's own actions. The remedies' keys are global (`r`, `6`),
+    /// which the [?] overlay's global list names, so `screen_actions`, and
+    /// with it the unfocused bottom bar and the overlay's page list, keep
+    /// to the page's own actions.
+    fn focus_actions(&self) -> Vec<(&'static str, &'static str)> {
         if self.is_first_run() {
-            &[("e", "Scan my face")]
-        } else {
-            self.screen_actions()
+            return vec![("e", "Scan my face")];
         }
+        self.unanswered_remedy()
+            .iter()
+            .map(|&(key, _, name)| (key, name))
+            .chain(self.screen_actions().iter().copied())
+            .collect()
     }
 
+    /// Steps the focus one action along the walk, stopping at either end.
+    /// The focus names its action by key, so a remedy row that appears or
+    /// leaves above it never moves it onto a different action.
     fn move_action_focus(&mut self, direction: i32) {
-        if let Some((screen, index)) = &mut self.action_focus {
-            if *screen == self.screen {
-                *index = if direction < 0 {
-                    index.saturating_sub(1)
-                } else {
-                    index.saturating_add(1)
-                };
-            }
-        }
-        let last = self.focus_actions().len().saturating_sub(1);
-        if let Some((_, index)) = &mut self.action_focus {
-            *index = (*index).min(last);
+        let actions = self.focus_actions();
+        let position = self
+            .focused_action()
+            .and_then(|(focused, _)| actions.iter().position(|&(key, _)| key == focused));
+        if let Some(index) = position {
+            let index = if direction < 0 {
+                index.saturating_sub(1)
+            } else {
+                index.saturating_add(1).min(actions.len().saturating_sub(1))
+            };
+            self.action_focus = actions.get(index).map(|&(key, _)| (self.screen, key));
         }
         self.action_reveal.set(true);
     }
@@ -8841,21 +8859,46 @@ impl App {
         }
     }
 
+    /// The remedy the current page draws under its facts while one of them
+    /// is unknown (ADR-0030 §1.6), each action as its key, its label on the
+    /// row and its name in the bottom bar; none while every fact is known.
+    /// Refresh, and Diagnostics, whose Daemon check carries the fix, while
+    /// the daemon is down or refuses this account. The row and the F6 walk
+    /// (`focus_actions`) both read this, so a remedy is focusable exactly
+    /// when it is drawn.
+    fn unanswered_remedy(&self) -> &'static [(&'static str, &'static str, &'static str)] {
+        use crate::commands::DaemonReach as R;
+        let unknown = match self.screen {
+            // The wallet's state and binding, or the TPM row.
+            SC_KEYRING => self.keyring_armed.is_none() || !self.source_usable(Source::Machine),
+            SC_RECOVERY => self.recovery.is_none(),
+            _ => false,
+        };
+        match self.daemon_reach {
+            _ if !unknown => &[],
+            R::Down | R::AccessDenied => &[
+                ("r", "refresh", "Refresh Status"),
+                ("6", "open Diagnostics", "Open Diagnostics"),
+            ],
+            R::Starting | R::Running => &[("r", "refresh", "Refresh Status")],
+        }
+    }
+
     /// The action row under a page's facts while one of them is unknown
-    /// (ADR-0030 §1.6): refresh, and Diagnostics, whose Daemon check
-    /// carries the fix, while the daemon is down or refuses this account.
+    /// (ADR-0030 §1.6), from `unanswered_remedy`; nothing while every fact
+    /// is known.
     fn push_unanswered_remedy(
         &self,
         lines: &mut Vec<Line<'_>>,
         targets: &mut Vec<PageTarget>,
         width: u16,
     ) {
-        use crate::commands::DaemonReach as R;
-        let items: &[(&str, &str)] = match self.daemon_reach {
-            R::Down | R::AccessDenied => &[("r", "refresh"), ("6", "open Diagnostics")],
-            R::Starting | R::Running => &[("r", "refresh")],
-        };
-        push_action_row(lines, targets, items, width);
+        let items: Vec<(&str, &str)> = self
+            .unanswered_remedy()
+            .iter()
+            .map(|&(key, label, _)| (key, label))
+            .collect();
+        push_action_row(lines, targets, &items, width);
     }
 
     fn draw_recovery(&self, f: &mut Frame, area: Rect) {
@@ -8902,9 +8945,7 @@ impl App {
         ];
         // An unanswered status reads unknown with its reason in the rows
         // above; the remedy is this action row (ADR-0030 §1.6).
-        if self.recovery.is_none() {
-            self.push_unanswered_remedy(&mut lines, &mut targets, area.width);
-        }
+        self.push_unanswered_remedy(&mut lines, &mut targets, area.width);
         lines.extend([
             Line::raw(""),
             Line::from(Span::styled(
@@ -9067,9 +9108,7 @@ impl App {
         // A fact above that reads unknown says why; its remedy is this
         // action row (ADR-0030 §1.6). `r` here re-reads the wallet and the
         // machine checks and re-runs the PCR check.
-        if self.keyring_armed.is_none() || !self.source_usable(Source::Machine) {
-            self.push_unanswered_remedy(&mut lines, &mut targets, area.width);
-        }
+        self.push_unanswered_remedy(&mut lines, &mut targets, area.width);
         lines.push(Line::raw(""));
         // The unlock trigger depends on this box's hardware.
         if self.caps.ir_pair {
@@ -23032,6 +23071,222 @@ mod tests {
         // A poll that sees it running and still gets no facts: its answer.
         app.apply_light(light(R::Running));
         assert_reason(&mut app, "daemon did not report it");
+    }
+
+    /// ADR-0030 §1.4 and §1.6 with F6: the remedy row under an unknown
+    /// Wallet or Recovery fact is in the F6 walk exactly while the page
+    /// draws it, ahead of the page's actions as it stands above them. The
+    /// focused remedy's words are highlighted, the bottom bar names it and
+    /// Enter does what its key does.
+    #[test]
+    fn f6_reaches_the_unanswered_remedy_exactly_while_it_is_drawn() {
+        use crate::commands::DaemonReach as R;
+        let _guard = dead_socket();
+        // The remedy keys the page draws, top to bottom, left to right.
+        let drawn = |app: &App| -> String {
+            page_keys(app, 120, 50)
+                .into_iter()
+                .map(|(key, _, _)| key)
+                .filter(|key| "r6".contains(*key))
+                .collect()
+        };
+        // Every key the F6 walk reaches, in order: F6, then Down until the
+        // focus stops moving; F6 again leaves the walk.
+        let walk = |app: &mut App| -> Vec<&'static str> {
+            app.on_key(KeyCode::F(6));
+            let mut keys: Vec<&'static str> = app
+                .focused_action()
+                .map(|(key, _)| key)
+                .into_iter()
+                .collect();
+            loop {
+                let before = app.action_focus;
+                app.on_key(KeyCode::Down);
+                if app.action_focus == before {
+                    break;
+                }
+                keys.extend(app.focused_action().map(|(key, _)| key));
+            }
+            app.on_key(KeyCode::F(6));
+            assert!(app.focused_action().is_none());
+            keys
+        };
+        // The page draws `remedy`, and the walk is that remedy, then the
+        // page's own actions.
+        let check = |app: &mut App, remedy: &str| {
+            assert_eq!(drawn(app), remedy, "{}", draw_text(app));
+            let expected: Vec<String> = remedy
+                .chars()
+                .map(String::from)
+                .chain(app.screen_actions().iter().map(|(key, _)| key.to_string()))
+                .collect();
+            assert_eq!(walk(app), expected, "{}", draw_text(app));
+        };
+        let unanswered = [
+            (R::Down, "r6"),
+            (R::AccessDenied, "r6"),
+            (R::Starting, "r"),
+            (R::Running, "r"),
+        ];
+        let mut app = test_app();
+        app.screen = SC_KEYRING;
+        // The [?] overlay's global list names both remedy keys.
+        let help = app.help_body();
+        assert!(help.contains("r  refresh this page"), "{help}");
+        assert!(help.contains("6 Diagnostics"), "{help}");
+        for (reach, remedy) in unanswered {
+            app.daemon_reach = reach;
+            check(&mut app, remedy);
+        }
+        // The wallet answered but the TPM row is unknown: still drawn.
+        app.daemon_up = true;
+        app.daemon_reach = R::Running;
+        app.keyring_armed = Some(true);
+        app.keyring_kind = Some(irlume_common::KeyringSecretKind::LoginPassword);
+        app.keyring_policy = Some("pcrlock NV 0x1a2b (Tier 2)".into());
+        app.freshness.observation_mut(Source::Machine).invalidate();
+        check(&mut app, "r");
+        // Every fact known: no remedy is drawn and F6 never lands on one,
+        // whatever the daemon's reachability says now.
+        app.freshness
+            .observation_mut(Source::Machine)
+            .record(true, Instant::now());
+        for reach in [R::Running, R::Down, R::AccessDenied] {
+            app.daemon_reach = reach;
+            check(&mut app, "");
+        }
+        let mut app = test_app();
+        app.screen = SC_RECOVERY;
+        for (reach, remedy) in unanswered {
+            app.daemon_reach = reach;
+            check(&mut app, remedy);
+        }
+        app.recovery = Some(RecoveryInfo {
+            encrypted: true,
+            key_present: true,
+            recovery_set: true,
+            tpm_present: true,
+        });
+        for reach in [R::Running, R::Down, R::AccessDenied] {
+            app.daemon_reach = reach;
+            check(&mut app, "");
+        }
+
+        // Focused, a remedy's words are highlighted and nothing else on the
+        // page's action rows; the bottom bar names it. The reported IR pair
+        // keeps the Wallet a visible section when this machine's own checks
+        // land.
+        let mut app = test_app();
+        app.reported_caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.screen = SC_KEYRING;
+        for (downs, key, words, name) in [
+            (0, 'r', "[r] refresh", "Refresh Status"),
+            (1, '6', "[6] open Diagnostics", "Open Diagnostics"),
+        ] {
+            app.on_key(KeyCode::F(6));
+            for _ in 0..downs {
+                app.on_key(KeyCode::Down);
+            }
+            assert_eq!(app.focused_action().map(|action| action.1), Some(name));
+            let keys = page_keys(&app, 120, 50);
+            let cell = |wanted: char| {
+                keys.iter()
+                    .find(|(key, _, _)| *key == wanted)
+                    .map(|&(_, x, y)| (x, y))
+                    .unwrap_or_else(|| panic!("[{wanted}] is drawn"))
+            };
+            let mut term = Terminal::new(TestBackend::new(120, 50)).unwrap();
+            term.draw(|frame| app.draw(frame)).unwrap();
+            let buffer = term.backend().buffer();
+            let reversed =
+                |(x, y): (u16, u16)| buffer[(x, y)].modifier.contains(Modifier::REVERSED);
+            let (x, y) = cell(key);
+            let width = u16::try_from(words.len()).unwrap();
+            assert!((x..x + width).all(|x| reversed((x, y))), "{words}");
+            assert!(!reversed((x - 1, y)), "{words}");
+            for other in ['r', '6', 'a', 'f'] {
+                if other != key {
+                    assert!(!reversed(cell(other)), "[{other}] with {words} focused");
+                }
+            }
+            let text = rendered(&term);
+            assert!(row_with(&text, "controls").contains(name), "{text}");
+            app.on_key(KeyCode::F(6));
+        }
+        // Enter on `r` re-reads the wallet and the machine checks; on `6`
+        // it opens Diagnostics, where the Wallet's focus does not follow.
+        app.on_key(KeyCode::F(6));
+        assert_eq!(app.focused_action(), Some(("r", "Refresh Status")));
+        app.on_key(KeyCode::Enter);
+        assert!(app.light_load.is_some(), "the wallet's refresh re-reads it");
+        assert!(
+            app.probes_load.is_some(),
+            "the wallet's refresh re-reads the machine snapshot"
+        );
+        assert_eq!(app.screen, SC_KEYRING);
+        drain_loads(&mut app);
+        assert_eq!(drawn(&app), "r6");
+        app.on_key(KeyCode::Down);
+        assert_eq!(app.focused_action(), Some(("6", "Open Diagnostics")));
+        app.on_key(KeyCode::Enter);
+        assert_eq!(app.screen, SC_REPAIR);
+        assert!(app.focused_action().is_none());
+        drain_loads(&mut app);
+        // The focus follows its action, not its place in the walk. The
+        // daemon fixed from Diagnostics and the wallet known, the row has
+        // gone on the way back, and `6` takes the focus with it rather than
+        // leaving it on the action that moved up into its place (Forget).
+        app.daemon_up = true;
+        app.daemon_reach = R::Running;
+        app.keyring_armed = Some(false);
+        app.keyring_kind = Some(irlume_common::KeyringSecretKind::LoginPassword);
+        app.freshness
+            .observation_mut(Source::Machine)
+            .record(true, Instant::now());
+        app.on_key(KeyCode::Char('3'));
+        assert_eq!(app.screen, SC_KEYRING);
+        assert_eq!(drawn(&app), "");
+        assert!(app.focused_action().is_none());
+        app.on_key(KeyCode::Enter);
+        assert!(app.confirm.is_none() && app.input.is_none() && app.suspend.is_none());
+        drain_loads(&mut app);
+        // A known wallet with `a` focused: `r` clears the wallet and marks
+        // the machine checks stale, so the row reappears above the focus
+        // until the reload lands, and the focus stays on Connect Wallet.
+        app.daemon_up = true;
+        app.daemon_reach = R::Running;
+        app.keyring_armed = Some(true);
+        app.keyring_policy = Some("pcrlock NV 0x1a2b (Tier 2)".into());
+        app.freshness
+            .observation_mut(Source::Machine)
+            .record(true, Instant::now());
+        assert_eq!(drawn(&app), "");
+        app.on_key(KeyCode::F(6));
+        assert_eq!(app.focused_action(), Some(("a", "Connect Wallet…")));
+        app.on_key(KeyCode::Char('r'));
+        assert_eq!(drawn(&app), "r");
+        assert_eq!(app.focused_action(), Some(("a", "Connect Wallet…")));
+        drain_loads(&mut app);
+        // Recovery's remedy runs the same way.
+        let mut app = test_app();
+        app.reported_caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.screen = SC_RECOVERY;
+        app.on_key(KeyCode::F(6));
+        assert_eq!(app.focused_action(), Some(("r", "Refresh Status")));
+        app.on_key(KeyCode::Enter);
+        assert!(app.light_load.is_some(), "Recovery's refresh re-reads it");
+        drain_loads(&mut app);
+        app.on_key(KeyCode::Down);
+        assert_eq!(app.focused_action(), Some(("6", "Open Diagnostics")));
+        app.on_key(KeyCode::Enter);
+        assert_eq!(app.screen, SC_REPAIR);
+        drain_loads(&mut app);
     }
 
     #[test]

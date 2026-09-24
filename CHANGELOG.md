@@ -40,8 +40,9 @@ All notable changes to irlume are documented here. This project adheres to
   answered reads unknown with the reason ("daemon not answering",
   "daemon still starting", "this account may not connect to the
   daemon", "daemon did not report it" or "no answer yet"), and an
-  action row under the facts offers refresh and, while the daemon is
-  down or refuses the account, Diagnostics; it replaces Recovery's
+  action row under the facts, which F6 reaches ahead of the page's
+  own actions, offers refresh and, while the daemon is down or
+  refuses the account, Diagnostics; it replaces Recovery's
   "start irlumed from Diagnostics" sentence. The TPM row says whether
   system checks are pending, did not finish or are out of date, the PCR
   check reads "unknown (not checked yet)" until a check runs (opening

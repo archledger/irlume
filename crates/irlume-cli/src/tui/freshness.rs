@@ -20,10 +20,12 @@ pub(super) enum Source {
     FingerprintReader,
     Fingerprint,
     Apps,
+    /// The account's attempt record (`LastAttempts`, ADR-0030 §5).
+    Attempts,
 }
 
 impl Source {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Live,
         Self::Health,
         Self::Preferences,
@@ -37,6 +39,7 @@ impl Source {
         Self::FingerprintReader,
         Self::Fingerprint,
         Self::Apps,
+        Self::Attempts,
     ];
 
     pub fn max_age(self) -> Duration {
@@ -48,7 +51,9 @@ impl Source {
             | Self::Recovery
             | Self::CameraPrivacy => 20,
             Self::Profiles => 60,
-            Self::Machine | Self::FingerprintReader | Self::Fingerprint => 30,
+            // The Overview reloads the record every 15 s while it is shown,
+            // so an attempt made at the lock screen meanwhile still appears.
+            Self::Machine | Self::FingerprintReader | Self::Fingerprint | Self::Attempts => 30,
             Self::Apps => 10,
             // Classification is bound to a still-current passive inventory
             // epoch; qualification is an explicitly historical observation.
@@ -66,12 +71,13 @@ pub(super) enum Worker {
     Qualification,
     Machine,
     Apps,
+    Attempts,
 }
 
 #[derive(Default)]
 pub(super) struct Freshness {
-    observations: [Observation; 13],
-    cycles: [RefreshCycle; 7],
+    observations: [Observation; 14],
+    cycles: [RefreshCycle; 8],
 }
 
 impl Freshness {
@@ -167,6 +173,12 @@ impl RefreshCycle {
     pub fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.pending = true;
+    }
+
+    /// The generation a request begun now belongs to, for a worker whose
+    /// reply carries it back so a stale reply is recognizable on its own.
+    pub fn generation(self) -> u64 {
+        self.generation
     }
 
     pub fn finish(&mut self, now: Instant) -> bool {

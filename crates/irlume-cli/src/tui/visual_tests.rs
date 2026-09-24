@@ -16,6 +16,8 @@ fn visual_fixture(screen: usize) -> App {
     app.reported_caps = app.caps;
     let now = Instant::now();
     app.clock_override = Some(now);
+    app.wall_override = Some(VISUAL_WALL);
+    app.attempts = Some(AttemptsReply::Loaded(Box::new(visual_attempt_record())));
     let live = visual_live_snapshot("ready", true);
     app.live_epoch = Some((live.daemon_instance, live.state_revision));
     app.camera_epoch = Some(CameraEpoch {
@@ -90,6 +92,40 @@ fn visual_fixture(screen: usize) -> App {
     app
 }
 
+/// 2026-09-23 12:00:00 UTC: the synthetic wall clock for attempt times.
+const VISUAL_WALL: u64 = 1_790_164_800;
+
+/// A synthetic attempt record: an unlock refused two hours ago on a named,
+/// attached camera. No daemon was asked.
+fn visual_attempt_record() -> irlume_common::AttemptRecord {
+    let camera = irlume_common::AttemptCamera {
+        model: "0000:0000".into(),
+        port_chain: Some("1-2".into()),
+        descriptor_token: Some("0011223344556677".into()),
+        unit: None,
+    };
+    irlume_common::AttemptRecord {
+        latest_authenticate: Some(irlume_common::AttemptEntry {
+            at: VISUAL_WALL - 2 * 3600,
+            seq: 3,
+            kind: irlume_common::AttemptKind::Authenticate,
+            surface: irlume_common::AttemptSurface::Lock,
+            result: irlume_common::AttemptResult::Refused,
+            cause: Some(irlume_common::OutcomeCause::LivenessRefused),
+            elapsed_ms: 2400,
+            capture_ms: Some(900),
+            camera: Some(camera.clone()),
+        }),
+        latest_identify: None,
+        cameras: vec![irlume_common::CameraAttempts {
+            camera,
+            attempts: Vec::new(),
+            connected: Some(true),
+            name: Some("Synthetic sample camera".into()),
+        }],
+    }
+}
+
 fn visual_assert_no_work(app: &App) {
     visual_assert_expected_work(app, None);
 }
@@ -118,6 +154,7 @@ fn visual_assert_expected_state(
             && app.camera_load.is_none()
             && app.heavy_load.is_none()
             && app.keyring_load.is_none()
+            && app.attempts_load.is_none()
     );
 }
 
@@ -568,6 +605,61 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
             height,
         ));
     }
+    for (width, height) in [(80, 24), (100, 30), (120, 40)] {
+        // The Overview's attempt block in each state it can take (ADR-0030
+        // §2): only in-memory records, never a LastAttempts request.
+        let mut test_after_unlock = visual_attempt_record();
+        let mut test = test_after_unlock.latest_authenticate.clone().unwrap();
+        test.kind = irlume_common::AttemptKind::Identify;
+        test.surface = irlume_common::AttemptSurface::Other;
+        test.result = irlume_common::AttemptResult::Granted;
+        test.cause = None;
+        test.at = VISUAL_WALL - 30;
+        test.seq = 4;
+        test_after_unlock.latest_identify = Some(test);
+        let mut before_camera = visual_attempt_record();
+        let entry = before_camera.latest_authenticate.as_mut().unwrap();
+        entry.surface = irlume_common::AttemptSurface::Login;
+        entry.cause = Some(irlume_common::OutcomeCause::RetryThrottled);
+        entry.camera = None;
+        entry.capture_ms = None;
+        let mut gone = visual_attempt_record();
+        gone.cameras[0].connected = Some(false);
+        for (label, reply) in [
+            (
+                "Synthetic recognition test after an unlock",
+                Some(AttemptsReply::Loaded(Box::new(test_after_unlock))),
+            ),
+            (
+                "Synthetic attempt before a camera was chosen",
+                Some(AttemptsReply::Loaded(Box::new(before_camera))),
+            ),
+            (
+                "Synthetic attempt on a camera no longer connected",
+                Some(AttemptsReply::Loaded(Box::new(gone))),
+            ),
+            (
+                "Synthetic attempt record from an older daemon",
+                Some(AttemptsReply::OlderDaemon),
+            ),
+            ("Synthetic attempt record checking", None),
+        ] {
+            let mut app = visual_fixture(SC_WELCOME);
+            app.attempts = reply;
+            let frame = visual_frame(&app, label, width, height);
+            let text: String = frame["cells"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|cell| cell[0].as_str().unwrap())
+                .collect();
+            assert!(
+                text.contains("Last ") || text.contains("No face attempt"),
+                "{label} at {width}x{height}"
+            );
+            frames.push(frame);
+        }
+    }
     for (width, height) in [(40, 12), (79, 24), (80, 23), (30, 8), (20, 6)] {
         let app = visual_fixture(SC_SETTINGS);
         let frame = visual_frame(&app, "Window too small", width, height);
@@ -583,7 +675,7 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
         assert!(app.click_targets.borrow().is_empty());
         frames.push(frame);
     }
-    assert_eq!(frames.len(), SCREENS.len() * 3 + 95);
+    assert_eq!(frames.len(), SCREENS.len() * 3 + 110);
     if let Some(output) = std::env::var_os("IRLUME_TUI_GALLERY_DIR") {
         let directory = std::path::PathBuf::from(output);
         assert!(
@@ -601,6 +693,7 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
             "activity_source_sha256": sha2::Sha256::digest(include_bytes!("activity.rs")).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
             "actions_source_sha256": sha2::Sha256::digest(include_bytes!("actions.rs")).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
             "freshness_source_sha256": sha2::Sha256::digest(include_bytes!("freshness.rs")).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            "attempts_source_sha256": sha2::Sha256::digest(include_bytes!("attempts.rs")).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
             "frames":frames,
         });
         let mut file = std::fs::OpenOptions::new()

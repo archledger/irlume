@@ -7,6 +7,29 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- The Overview leads with the account's last face attempt (ADR-0030 §2,
+  C2). The TUI reads the attempt record with `LastAttempts` for the
+  account it shows, on its own worker with a 4 s budget: on entering
+  Overview (Esc and `h` included), after every action, on `r`, and every
+  15 seconds while Overview is open and idle. A reply for another
+  account or from before an invalidation (including a camera docking
+  change) is dropped. The line names the surface ("Last unlock", "Last
+  admin prompt", "Last recognition test" and so on), when, the camera by
+  its recorded name (with "no longer connected", "different port" or
+  "replaced unit" from the record and a current camera listing; Overview
+  never requests the listing itself), the outcome, the cause in plain
+  words from one closed table, and the elapsed time; after a recognition
+  test the last authentication is reported beside it. It never shows a
+  score or a threshold. An empty record, an older daemon, a peer that
+  may not read the record and a daemon that does not answer each read as
+  such. Dates older than two weeks use the zone offset in force at the
+  attempt. When the attempt does not fit on one line, the outcome and
+  cause keep the first line and the camera moves to its own line if a
+  row is to spare, otherwise its name, then the elapsed time, then the
+  camera give way; any Overview line still too wide ends in an ellipsis,
+  and on a short window spacing gives way so the recommended action
+  stays on screen.
+
 - Daemon facts for the Overview and Faces pages (ADR-0030 §2, C2). A new
   `IdentifyFor { user }` request runs the 1:N recognition test against one
   account's enrollment only. It is root-or-target: the daemon refuses any

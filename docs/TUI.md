@@ -85,6 +85,63 @@ actions below the list (the readable copy on a short window), and narrower
 terminals have only the Enter panel. `r` on a page refreshes only what
 that page shows.
 
+## Overview
+
+Overview leads with your account's last face attempt, read from the
+daemon's attempt record (ADR-0030 §2, §5):
+
+```
+Last unlock · 2 h ago · Logitech BRIO · refused: not recognized as an enrolled face · 1.4 s
+```
+
+The first words name what the attempt was for: **Last login**, **Last
+unlock**, **Last admin prompt** (sudo and other administrator prompts),
+**Last app sign-in**, or **Last authentication** when the daemon could not
+tell the surface; a recognition test reads **Last recognition test**. Then
+come when it happened (`just now`, `N min ago`, `N h ago`, `N days ago`,
+then a date), the camera by its name, the outcome (`granted`, `refused` or
+`did not complete`), for a refusal or a failure the reason in plain words,
+and how long the attempt took. The reasons come from one closed list: no
+face seen (were you in frame?), the liveness check did not pass, not
+recognized as an enrolled face, camera shutter closed, camera unavailable,
+not enrolled on this camera, nothing enrolled to compare with, cancelled,
+timed out, face unlock is not the configured method, refused by policy,
+configuration problem, too many attempts; wait a moment, the daemon was
+still starting, or no reason recorded. The line never shows a score or a
+threshold.
+
+A recognition test never hides the last real sign-in: when the test is the
+most recent attempt, a second line reports the last authentication, for
+example `Last unlock: granted, 3 h ago`.
+
+The camera is named as the record saw it. A camera that is no longer
+attached reads `no longer connected`. When the Cameras page's current
+listing shows a unit with the same descriptor at another USB port, the line
+says `different port`, and another unit in the same port reads `replaced
+unit`; the attempt is never attributed to the connected camera by its name.
+An attempt refused before a camera was chosen (for example while retries
+were throttled) says `before a camera was chosen`. Overview never lists the
+cameras itself, because that listing opens devices.
+
+Without a record the line says why: `Last attempt: checking…` while it
+loads; `No face attempt retained yet` for an empty record, which also covers
+a record the daemon could not read, so it never claims that you have not
+tried; `this daemon predates the attempt record` for an older daemon;
+`readable only by root or ACCOUNT` when the TUI runs as someone the daemon
+does not let read that account's record; and `unavailable (daemon not
+answering)`. A machine without a face camera shows no attempt line. The
+line is reloaded on entering Overview (by any route, including Esc and
+`h`), after every action, on `r`, and every 15 seconds while Overview is
+open and idle, so an unlock at the lock screen appears without a keypress.
+
+When the attempt does not fit on one line, the outcome and the reason keep
+the first line and the camera moves to a line of its own (`on Logitech
+BRIO, no longer connected`) if the window has a row to spare. Without one,
+the camera's name is shortened first, then the elapsed time and then the
+camera are left out; any Overview line still too wide ends in `…`. On a
+short window the blank rows and the "Recommended method" label give way, so
+the recommended action stays on screen.
+
 ## Activity and device transparency
 
 **A** expands or collapses recent Activity. **Shift+L** opens full-height

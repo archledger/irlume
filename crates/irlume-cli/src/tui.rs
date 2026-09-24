@@ -12,8 +12,10 @@
 
 mod actions;
 mod activity;
+mod attempts;
 mod freshness;
 mod launch;
+use attempts::AttemptsReply;
 use freshness::{Freshness, Source, Worker};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -141,6 +143,13 @@ const GUIDE_MISS_LIMIT: u32 = 3;
 const HEAVY_REFRESH_MS: u64 = 10_000;
 /// Light auto-refresh cadence in ms (daemon ping + camera nodes; sub-millisecond).
 const LIGHT_REFRESH_MS: u64 = 2500;
+/// How often the Overview re-reads the attempt record while it is shown and
+/// idle: an attempt at the lock screen does not advance the daemon's state
+/// revision, so nothing else would bring it in.
+const ATTEMPTS_REFRESH_SECS: u64 = 15;
+/// Reply budget for `LastAttempts`: the daemon may wait up to 2 s for its
+/// record writer before it reads, beyond the 1.5 s status-poll budget.
+const ATTEMPTS_BUDGET_SECS: u64 = 4;
 /// Post-suspend daemon wait: up to `DAEMON_WAIT_TRIES` polls spaced
 /// `DAEMON_WAIT_POLL_MS` ms apart (10 s total), covering irlumed's ONNX model
 /// load before it binds its socket.
@@ -640,7 +649,10 @@ struct App {
     user: String,
     freshness: Freshness,
     clock_override: Option<Instant>,
-    usable_sources: [bool; 13],
+    /// Unix seconds standing in for the wall clock, which only the attempt
+    /// line's "when" reads; tests pin it (and with it the zone, to UTC).
+    wall_override: Option<u64>,
+    usable_sources: [bool; 14],
     show_live: bool,
     live: Option<irlume_common::live::LiveStatusSnapshot>,
     live_load: Option<mpsc::Receiver<Result<irlume_common::live::LiveStatusSnapshot, String>>>,
@@ -689,6 +701,14 @@ struct App {
     /// daemon. Routes the disarm key: a token disarm needs the CLI's re-key
     /// flow, and a bare `ForgetPassword` on it would strand the keyring.
     keyring_kind: Option<irlume_common::KeyringSecretKind>,
+    /// What the daemon answered for this account's attempt record
+    /// (`LastAttempts`, ADR-0030 §5), led with on Overview. `None` until an
+    /// answer for the current account and generation lands.
+    attempts: Option<AttemptsReply>,
+    /// An in-flight `LastAttempts`, tagged with the account and the
+    /// `Worker::Attempts` generation it was asked for, so a reply for
+    /// another account or from before an invalidation is never installed.
+    attempts_load: Option<mpsc::Receiver<(String, u64, AttemptsReply)>>,
     nodes: Vec<(String, irlume_camera::Role)>,
     /// Cached camera pairs, refreshed on the slow timer so the Cameras tab and
     /// move_sel don't re-probe the hardware on every keystroke and frame.
@@ -1347,6 +1367,7 @@ impl App {
                 self.heavy = None;
                 self.heavy_known = false;
             }
+            Source::Attempts => self.attempts = None,
         }
     }
 
@@ -1363,10 +1384,16 @@ impl App {
             Source::Recovery,
             Source::Profiles,
             Source::Qualification,
+            Source::Attempts,
         ] {
             self.invalidate_source(source);
         }
-        for worker in [Worker::Light, Worker::Profiles, Worker::Qualification] {
+        for worker in [
+            Worker::Light,
+            Worker::Profiles,
+            Worker::Qualification,
+            Worker::Attempts,
+        ] {
             self.freshness.cycle_mut(worker).invalidate();
         }
         self.invalidate_keyring_diagnostic();
@@ -1655,6 +1682,7 @@ impl App {
         now: Instant,
     ) {
         let epoch = (snapshot.daemon_instance, snapshot.state_revision);
+        let first_snapshot = self.live_epoch.is_none();
         if self
             .live_epoch
             .as_ref()
@@ -1700,6 +1728,22 @@ impl App {
             self.freshness.cycle_mut(Worker::Profiles).invalidate();
             self.freshness.cycle_mut(Worker::Cameras).invalidate();
             self.freshness.cycle_mut(Worker::Qualification).invalidate();
+            // Whether each recorded camera is attached is decided when the
+            // daemon serves the record (ADR-0030 §5), so a record from the
+            // previous inventory may place a camera where it no longer is.
+            // The first snapshot observes the inventory rather than a change
+            // to it: the record asked for beside it at startup was served
+            // against the same cameras. A read that got no answer (a daemon
+            // that has only now come up) is still asked again.
+            if !first_snapshot
+                || self
+                    .freshness
+                    .observation(Source::Attempts)
+                    .last_request_failed()
+            {
+                self.invalidate_source(Source::Attempts);
+                self.freshness.cycle_mut(Worker::Attempts).invalidate();
+            }
             self.classified_epoch = None;
             self.camera_epoch = camera_epoch;
         }
@@ -1866,6 +1910,7 @@ impl App {
             (Source::FingerprintReader, "Fingerprint reader"),
             (Source::Fingerprint, "Fingerprint enrollment"),
             (Source::Apps, "Applications"),
+            (Source::Attempts, "Last attempt"),
         ] {
             lines.push(format!("{label}: {}", self.source_status(source)));
         }
@@ -1911,6 +1956,12 @@ impl App {
             SC_SETTINGS => &[Source::Preferences],
             SC_PAM => &[Source::Machine, Source::Apps],
             SC_REPAIR => &[Source::Health, Source::Machine, Source::Profiles],
+            SC_WELCOME if self.shows_attempts() => &[
+                Source::Health,
+                Source::Profiles,
+                Source::Machine,
+                Source::Attempts,
+            ],
             SC_IDENTIFY => {
                 return format!(
                     "daemon {} · last test only · F4 current status",
@@ -1958,6 +2009,19 @@ impl App {
                     .due(now, Duration::from_secs(30))))
     }
 
+    /// The record does not advance the daemon's state revision, so an
+    /// attempt made at the lock screen while the TUI is open reaches the
+    /// Overview only by asking again: every 15 s while it is shown and idle.
+    fn attempts_refresh_due(&self, now: Instant) -> bool {
+        self.background_idle()
+            && self.screen == SC_WELCOME
+            && self.attempts_load.is_none()
+            && self
+                .freshness
+                .cycle(Worker::Attempts)
+                .due(now, Duration::from_secs(ATTEMPTS_REFRESH_SECS))
+    }
+
     fn cameras_refresh_due(&self, daemon_idle: bool) -> bool {
         daemon_idle
             && self.background_idle()
@@ -1996,6 +2060,9 @@ impl App {
         }
         if self.freshness.cycle(Worker::Apps).due(now, Self::HEAVY_TTL) {
             self.refresh_heavy();
+        }
+        if self.attempts_refresh_due(now) {
+            self.refresh_attempts();
         }
         let daemon_idle = self
             .live
@@ -2076,7 +2143,8 @@ impl App {
             user,
             freshness: Freshness::default(),
             clock_override: None,
-            usable_sources: [false; 13],
+            wall_override: None,
+            usable_sources: [false; 14],
             show_live: false,
             live: None,
             live_load: None,
@@ -2106,6 +2174,8 @@ impl App {
             keyring_load: None,
             keyring_generation: 0,
             keyring_kind: None,
+            attempts: None,
+            attempts_load: None,
             // EMPTY at construction (#187 review caught this one): App::new
             // ran before any daemon contact, so probing here opened every
             // node while the daemon might be mid-authentication. The light
@@ -2600,6 +2670,30 @@ impl App {
         self.refresh_profiles();
         self.request_probes();
         self.refresh_heavy();
+        self.refresh_attempts();
+    }
+
+    /// Ask for the account's attempt record (ADR-0030 §5) on its own
+    /// receiver. Not part of the light poll and not on `daemon_poll`'s short
+    /// budget: the daemon may hold the read up to 2 s behind its record
+    /// writer, so a busy moment would read as "not answering".
+    fn refresh_attempts(&mut self) {
+        if self.attempts_load.is_some() {
+            return;
+        }
+        let cycle = self.freshness.cycle_mut(Worker::Attempts);
+        cycle.begin();
+        let generation = cycle.generation();
+        let user = self.user.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let reply = irlume_common::client::request_with_timeout(
+                &Request::LastAttempts { user: user.clone() },
+                Duration::from_secs(ATTEMPTS_BUDGET_SECS),
+            );
+            let _ = tx.send((user, generation, AttemptsReply::decode(reply)));
+        });
+        self.attempts_load = Some(rx);
     }
 
     fn invalidate_keyring_diagnostic(&mut self) {
@@ -3867,6 +3961,42 @@ impl App {
                 self.refresh_keyring_diagnostic();
             }
         }
+        if let Some(result) = receive_finished(&self.attempts_load) {
+            self.attempts_load = None;
+            let current = self.freshness.cycle_mut(Worker::Attempts).finish(now);
+            let generation = self.freshness.cycle(Worker::Attempts).generation();
+            match result {
+                Ok((user, asked, reply)) if current && asked == generation && user == self.user => {
+                    let answered = reply != AttemptsReply::Unavailable;
+                    self.freshness
+                        .observation_mut(Source::Attempts)
+                        .record(answered, now);
+                    if answered {
+                        self.attempts = Some(reply);
+                    } else {
+                        self.clear_source(Source::Attempts);
+                    }
+                }
+                // Asked for another account or before an invalidation: never
+                // installed (ADR-0030 §6). `finish` already queued the
+                // replacement for an invalidated request; this queues it for
+                // an account change.
+                Ok(_) => {
+                    if current {
+                        self.freshness.cycle_mut(Worker::Attempts).invalidate();
+                    }
+                }
+                Err(()) => {
+                    if current {
+                        self.freshness
+                            .observation_mut(Source::Attempts)
+                            .record(false, now);
+                        self.clear_source(Source::Attempts);
+                        self.log('!', "last-attempt check ended without a result; the attempt record is unavailable. Refresh to retry.");
+                    }
+                }
+            }
+        }
         if let Some(result) = receive_finished(&self.profiles_load) {
             self.profiles_load = None;
             if self.freshness.cycle_mut(Worker::Profiles).finish(now) {
@@ -4627,8 +4757,11 @@ impl App {
     /// nothing-to-close, so the reflexive "back out" key lands somewhere
     /// predictable instead of exiting the app.
     fn go_home(&mut self) {
-        if self.visible.contains(&SC_WELCOME) {
+        if self.visible.contains(&SC_WELCOME) && self.screen != SC_WELCOME {
             self.screen = SC_WELCOME;
+            // Entering Overview re-reads the attempt it leads with, however
+            // it was reached (enter_screen does the same).
+            self.refresh_attempts();
         }
     }
 
@@ -5102,6 +5235,9 @@ impl App {
         }
         if self.screen == SC_REPAIR || self.screen == SC_KEYRING {
             self.refresh_keyring_diagnostic();
+        }
+        if self.screen == SC_WELCOME {
+            self.refresh_attempts();
         }
     }
 
@@ -8535,6 +8671,59 @@ impl App {
         }
     }
 
+    /// Whether the Overview leads with the attempt record: only where face
+    /// authentication can happen at all (the same camera notion as the
+    /// navigation), since the record is a face record (ADR-0030 §3).
+    fn shows_attempts(&self) -> bool {
+        self.caps.rgb || self.reported_caps.rgb
+    }
+
+    /// Unix seconds now, for the attempt line's "when".
+    fn wall_now(&self) -> u64 {
+        self.wall_override.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs())
+        })
+    }
+
+    /// The local zone's offset from UTC at `at` (unix seconds), for the
+    /// attempt line's dates. A pinned wall clock pins the zone too, so tests
+    /// read the same dates in every time zone.
+    fn utc_offset(&self, at: u64) -> i64 {
+        if self.wall_override.is_some() {
+            0
+        } else {
+            local_utc_offset(at).unwrap_or(0)
+        }
+    }
+
+    /// The Overview's attempt block (ADR-0030 §2) for a pane `width` cells
+    /// wide, the camera on a `spare_row` of its own when it needs one;
+    /// `None` on a machine without face authentication.
+    fn attempt_lines(&self, width: usize, spare_row: bool) -> Option<Vec<String>> {
+        if !self.shows_attempts() {
+            return None;
+        }
+        // Only a listing that is still current places a camera; the
+        // Overview never asks for one (ADR-0030 §6: it opens devices).
+        let listed = self
+            .source_usable(Source::Cameras)
+            .then_some(self.pairs.as_slice());
+        Some(attempts::block(
+            self.attempts.as_ref(),
+            self.freshness
+                .observation(Source::Attempts)
+                .last_request_failed(),
+            &self.user,
+            self.wall_now(),
+            &|at| self.utc_offset(at),
+            listed,
+            width,
+            spare_row,
+        ))
+    }
+
     fn draw_welcome(&self, f: &mut Frame, area: Rect) {
         let scans: usize = self.profiles.iter().map(|p| p.scans.len()).sum();
         let fails = self.repair.iter().filter(|c| c.sev == Sev::Fail).count();
@@ -8614,18 +8803,62 @@ impl App {
                 th().accent,
             )
         };
-        let mut lines = vec![
-            Line::from(Span::styled(
-                format!("  {headline}"),
-                Style::new().fg(color).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(format!("  {detail}"), Style::new().dim())),
-            Line::raw(""),
-            section("Status  (↑↓ select · Enter open)"),
-        ];
-        let at = lines.len();
+        // ADR-0030 §2: the Overview leads with the account's last face
+        // attempt, and the one recommended step stays on screen under it. A
+        // pane too short for every row at full spacing (`needed`; 13 rows at
+        // 80x24) sheds the blank rows, then the "Recommended method" label,
+        // before any row that carries content. Click targets take each row's
+        // final place.
+        let width = usize::from(area.width);
         let rows = self.hub_rows();
-        let n = rows.len();
+        let needed = |block: &Option<Vec<String>>| {
+            block.as_ref().map_or(0, |block| block.len() + 1) + rows.len() + 8
+        };
+        // The camera takes a row of its own only when the pane has one to
+        // spare at full spacing.
+        let mut block = self.attempt_lines(width, false);
+        if needed(&block) < usize::from(area.height) {
+            block = self.attempt_lines(width, true);
+        }
+        let needed = needed(&block);
+        let mut excess = needed.saturating_sub(usize::from(area.height));
+        let mut keep = || {
+            if excess == 0 {
+                return true;
+            }
+            excess -= 1;
+            false
+        };
+        let gap_after_block = block.is_some() && keep();
+        let gap_before_status = keep();
+        let gap_before_action = keep();
+        let method_label = keep();
+        let mut lines = Vec::new();
+        if let Some(block) = block {
+            for (index, text) in block.into_iter().enumerate() {
+                let style = if index == 0 {
+                    Style::new()
+                } else {
+                    Style::new().dim()
+                };
+                lines.push(Line::from(Span::styled(text, style)));
+            }
+            if gap_after_block {
+                lines.push(Line::raw(""));
+            }
+        }
+        lines.push(Line::from(Span::styled(
+            format!("  {headline}"),
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  {detail}"),
+            Style::new().dim(),
+        )));
+        if gap_before_status {
+            lines.push(Line::raw(""));
+        }
+        lines.push(section("Status  (↑↓ select · Enter open)"));
         for (i, (label, ok, _)) in rows.into_iter().enumerate() {
             let selected = i == self.hub_sel;
             let mut style = Style::new();
@@ -8643,45 +8876,47 @@ impl App {
                 onoff_opt(ok)
             };
             let marker = if selected { '▸' } else { ' ' };
-            lines.insert(
-                at + i,
-                Line::from(vec![
-                    Span::styled(format!("  {marker} {label:<20}"), style),
-                    badge,
-                ]),
-            );
-            let y = area.y.saturating_add((at + i) as u16);
+            let y = area.y.saturating_add(lines.len() as u16);
             if y < area.y.saturating_add(area.height) {
                 self.hit(Rect::new(area.x, y, area.width, 1), Click::Hub(i));
             }
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {marker} {label:<20}"), style),
+                badge,
+            ]));
         }
-        lines.insert(at + n, Line::raw(""));
+        if gap_before_action {
+            lines.push(Line::raw(""));
+        }
         let (key, label) = self.overview_primary();
-        lines.insert(
-            at + n + 1,
-            Line::from(Span::styled("  Recommended method", Style::new().dim())),
-        );
-        lines.insert(
-            at + n + 2,
-            Line::from(Span::styled(
-                format!("  {}", self.recommended()),
-                Style::new().fg(th().ok),
-            )),
-        );
-        lines.insert(
-            at + n + 3,
-            Line::from(vec![
-                Span::styled(format!("  {key} "), th().chip),
-                Span::styled(label, Style::new().add_modifier(Modifier::BOLD)),
-            ]),
-        );
-        let action_y = area.y.saturating_add((at + n + 3) as u16);
+        if method_label {
+            lines.push(Line::from(Span::styled(
+                "  Recommended method",
+                Style::new().dim(),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("  {}", self.recommended()),
+            Style::new().fg(th().ok),
+        )));
+        let action_y = area.y.saturating_add(lines.len() as u16);
         if action_y < area.y.saturating_add(area.height) {
             self.hit(
                 Rect::new(area.x, action_y, area.width, 1),
                 Click::Key(footer_keycode(key).expect("overview actions use one key")),
             );
         }
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {key} "), th().chip),
+            Span::styled(label, Style::new().add_modifier(Modifier::BOLD)),
+        ]));
+        // The Paragraph does not wrap (the hit rows above rely on one line
+        // per row), so a line wider than the pane ends in an ellipsis rather
+        // than being cut silently (ADR-0030 §1.7).
+        let lines: Vec<Line> = lines
+            .into_iter()
+            .map(|line| clip_line(line, width))
+            .collect();
         f.render_widget(Paragraph::new(lines), area);
     }
 
@@ -10052,6 +10287,61 @@ fn clip_columns(text: &str, width: usize) -> String {
     out
 }
 
+/// A styled line clipped to `width` cells, ending in an ellipsis when it
+/// was wider (ADR-0030 §1.7): [`clip_columns`] across spans, each kept
+/// span keeping its style.
+fn clip_line(mut line: Line<'_>, width: usize) -> Line<'_> {
+    if line.width() <= width {
+        return line;
+    }
+    let mut room = width.saturating_sub(1);
+    let mut kept = Vec::new();
+    for span in std::mem::take(&mut line.spans) {
+        let cells = span.width();
+        if cells <= room {
+            room -= cells;
+            kept.push(span);
+            continue;
+        }
+        let mut text = String::new();
+        for ch in span.content.chars() {
+            let mut candidate = text.clone();
+            candidate.push(ch);
+            if Span::raw(candidate.clone()).width() > room {
+                break;
+            }
+            text = candidate;
+        }
+        text.push('…');
+        kept.push(Span::styled(text, span.style));
+        break;
+    }
+    line.spans = kept;
+    line
+}
+
+/// The local zone's offset from UTC at `at` (unix seconds), in seconds
+/// east, for dates a person reads; `None` when the C library cannot say.
+fn local_utc_offset(at: u64) -> Option<i64> {
+    let at = libc::time_t::try_from(at).ok()?;
+    let mut broken_down = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: `at` is a live local and `broken_down` is writable storage for
+    // exactly one `tm`; `localtime_r` keeps neither pointer.
+    let result = unsafe { libc::localtime_r(&at, broken_down.as_mut_ptr()) };
+    if result.is_null() {
+        return None;
+    }
+    // SAFETY: `localtime_r` returned its non-null destination pointer, so it
+    // initialized the `tm` before this read.
+    let broken_down = unsafe { broken_down.assume_init() };
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "`c_long` is 32 bits on some targets"
+    )]
+    let offset = broken_down.tm_gmtoff as i64;
+    Some(offset)
+}
+
 /// `text` clipped to `width` cells and padded with spaces to exactly that
 /// many cells, so the next column starts where it should whatever the
 /// script.
@@ -10866,7 +11156,8 @@ mod tests {
 
     /// Make navigation side-effect-free in tests: `enter_screen` fires
     /// refresh workers (light poll, probes, profiles, cameras, keyring
-    /// diagnostic) that send REAL daemon requests on background threads,
+    /// diagnostic, attempt record) that send REAL daemon requests on
+    /// background threads,
     /// which can outlive this test's isolation window and land on a later
     /// test's mock socket (observed as its server loop breaking early).
     /// Pre-filling each worker receiver makes every refresh early-return.
@@ -10881,6 +11172,8 @@ mod tests {
         app.camera_load = Some(r);
         let (_t, r) = mpsc::channel();
         app.keyring_load = Some(r);
+        let (_t, r) = mpsc::channel();
+        app.attempts_load = Some(r);
     }
 
     /// The single-instance guard's listener: a later `irlume tui --page X`
@@ -11996,7 +12289,8 @@ mod tests {
         let mut app = App {
             freshness: Freshness::default(),
             clock_override: None,
-            usable_sources: [false; 13],
+            wall_override: None,
+            usable_sources: [false; 14],
             show_live: false,
             live: None,
             live_load: None,
@@ -12027,6 +12321,8 @@ mod tests {
             keyring_load: None,
             keyring_generation: 0,
             keyring_kind: None,
+            attempts: None,
+            attempts_load: None,
             nodes: Vec::new(),
             pairs: Vec::new(),
             pairs_known: false,
@@ -12203,7 +12499,8 @@ mod tests {
             || app.profiles_load.is_some()
             || app.camera_load.is_some()
             || app.heavy_load.is_some()
-            || app.keyring_load.is_some())
+            || app.keyring_load.is_some()
+            || app.attempts_load.is_some())
             && std::time::Instant::now() < deadline
         {
             app.poll();
@@ -12215,7 +12512,8 @@ mod tests {
                 && app.profiles_load.is_none()
                 && app.camera_load.is_none()
                 && app.heavy_load.is_none()
-                && app.keyring_load.is_none(),
+                && app.keyring_load.is_none()
+                && app.attempts_load.is_none(),
             "background loads must finish before releasing the test socket"
         );
     }
@@ -13709,6 +14007,9 @@ mod tests {
         // back out and lost the whole TUI). It lands on Overview instead.
         let mut app = test_app();
         app.screen = SC_KEYRING;
+        // Landing on Overview re-reads the attempt record; keep it off the
+        // real socket.
+        inert_workers(&mut app);
         app.on_key(KeyCode::Esc);
         assert!(!app.quit, "Esc must never exit the TUI");
         assert_eq!(app.screen, SC_WELCOME, "Esc goes home when nothing is open");
@@ -13741,6 +14042,10 @@ mod tests {
         assert!(
             app.activity.iter().any(|(_, m)| m.contains("refreshing")),
             "[r] must announce the refresh in Activity"
+        );
+        assert!(
+            app.attempts_load.is_some(),
+            "[r] re-reads the attempt record the Overview leads with"
         );
         assert!(!app.daemon_up, "the dead socket means daemon down");
         drain_loads(&mut app);
@@ -15593,6 +15898,761 @@ mod tests {
             text.contains("Password remains available"),
             "got no fallback tier"
         );
+    }
+
+    // ---- Overview: the last attempt (ADR-0030 §2, §5) -----------------------
+
+    /// 2026-09-23 12:00:00 UTC, the wall clock the attempt tests pin.
+    const ATTEMPT_NOW: u64 = 1_790_164_800;
+
+    fn attempt_camera() -> irlume_common::AttemptCamera {
+        irlume_common::AttemptCamera {
+            model: "046d:085e".into(),
+            port_chain: Some("1-2".into()),
+            descriptor_token: Some("0011223344556677".into()),
+            unit: None,
+        }
+    }
+
+    /// A two-hour-old attempt on [`attempt_camera`].
+    fn attempt(
+        kind: irlume_common::AttemptKind,
+        surface: irlume_common::AttemptSurface,
+        result: irlume_common::AttemptResult,
+        cause: Option<irlume_common::OutcomeCause>,
+    ) -> irlume_common::AttemptEntry {
+        irlume_common::AttemptEntry {
+            at: ATTEMPT_NOW - 2 * 3600,
+            seq: 1,
+            kind,
+            surface,
+            result,
+            cause,
+            elapsed_ms: 1234,
+            capture_ms: Some(400),
+            camera: Some(attempt_camera()),
+        }
+    }
+
+    /// An authentication record whose camera bucket is named and attached.
+    fn attempt_record(entry: irlume_common::AttemptEntry) -> irlume_common::AttemptRecord {
+        irlume_common::AttemptRecord {
+            latest_authenticate: Some(entry),
+            latest_identify: None,
+            cameras: vec![irlume_common::CameraAttempts {
+                camera: attempt_camera(),
+                attempts: Vec::new(),
+                connected: Some(true),
+                name: Some("Synthetic Desk Camera".into()),
+            }],
+        }
+    }
+
+    /// Overview on a face-camera machine with `record` installed as this
+    /// account's current answer.
+    fn attempts_app(record: irlume_common::AttemptRecord) -> App {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.reported_caps = app.caps;
+        app.daemon_up = true;
+        app.screen = SC_WELCOME;
+        app.wall_override = Some(ATTEMPT_NOW);
+        app.attempts = Some(AttemptsReply::Loaded(Box::new(record)));
+        app
+    }
+
+    /// The Overview's content pane only (not the Activity strip, the header
+    /// or the footer), one trimmed string per row inside its border, from
+    /// its first non-blank row.
+    fn overview_content(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let [_, _, body, _, _] = app.frame_rows(Rect::new(0, 0, width, height));
+        let content = app.body_split(body).1;
+        let buffer = term.backend().buffer();
+        let rows: Vec<String> = (content.y + 1..content.bottom().saturating_sub(1))
+            .map(|y| {
+                (content.x + 1..content.right().saturating_sub(1))
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim()
+                    .to_owned()
+            })
+            .collect();
+        rows.into_iter().skip_while(|row| row.is_empty()).collect()
+    }
+
+    fn assert_no_matcher_vocabulary(rows: &[String]) {
+        for row in rows {
+            let lower = row.to_lowercase();
+            for word in attempts::FORBIDDEN_WORDS {
+                assert!(!lower.contains(word), "{word:?} in {row:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn overview_leads_with_the_surface_camera_name_and_plain_cause() {
+        use irlume_common::{AttemptKind as K, AttemptResult as R, AttemptSurface as S};
+        let app = attempts_app(attempt_record(attempt(
+            K::Authenticate,
+            S::Lock,
+            R::Refused,
+            Some(irlume_common::OutcomeCause::BelowThreshold),
+        )));
+        let rows = overview_content(&app, 160, 40);
+        assert_eq!(
+            rows[0],
+            "Last unlock · 2 h ago · Synthetic Desk Camera · refused: not recognized as an enrolled face · 1.2 s",
+            "{rows:#?}"
+        );
+        // The existing headline and status rows follow the block.
+        let headline = rows
+            .iter()
+            .position(|row| row.contains("Irlume needs attention") || row.contains("Checking"))
+            .expect("headline");
+        assert_eq!(headline, 2, "{rows:#?}");
+        assert!(rows.iter().any(|row| row.starts_with("Status")));
+        assert_no_matcher_vocabulary(&rows);
+    }
+
+    #[test]
+    fn a_sudo_attempt_reads_last_admin_prompt_never_a_login() {
+        use irlume_common::{AttemptKind as K, AttemptResult as R, AttemptSurface as S};
+        let app = attempts_app(attempt_record(attempt(
+            K::Authenticate,
+            S::Elevation,
+            R::Granted,
+            None,
+        )));
+        let rows = overview_content(&app, 160, 40);
+        assert!(
+            rows[0].starts_with("Last admin prompt · 2 h ago"),
+            "{rows:#?}"
+        );
+        assert!(!rows[0].to_lowercase().contains("login"), "{}", rows[0]);
+        assert!(
+            rows[0].ends_with("· granted · 1.2 s"),
+            "a grant has no cause"
+        );
+    }
+
+    #[test]
+    fn a_recognition_test_is_labelled_and_the_last_authentication_stays_beside_it() {
+        use irlume_common::{AttemptKind as K, AttemptResult as R, AttemptSurface as S};
+        let mut unlock = attempt(K::Authenticate, S::Lock, R::Granted, None);
+        unlock.at = ATTEMPT_NOW - 3 * 3600;
+        unlock.seq = 8;
+        let mut test = attempt(
+            K::Identify,
+            S::Other,
+            R::Refused,
+            Some(irlume_common::OutcomeCause::NoFace),
+        );
+        test.at = ATTEMPT_NOW - 60;
+        test.seq = 9;
+        let mut record = attempt_record(unlock);
+        record.latest_identify = Some(test);
+        let rows = overview_content(&attempts_app(record.clone()), 160, 40);
+        assert_eq!(
+            rows[0],
+            "Last recognition test · 1 min ago · Synthetic Desk Camera · refused: no face seen (were you in frame?) · 1.2 s"
+        );
+        assert_eq!(rows[1], "Last unlock: granted, 3 h ago");
+
+        // An authentication after the test leads, and the test is not shown.
+        record.latest_authenticate.as_mut().unwrap().seq = 10;
+        let rows = overview_content(&attempts_app(record), 160, 40);
+        assert!(rows[0].starts_with("Last unlock · 3 h ago"), "{rows:#?}");
+        assert!(
+            !rows.iter().any(|row| row.contains("recognition test")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_before_a_camera_was_selected_says_so() {
+        use irlume_common::{AttemptKind as K, AttemptResult as R, AttemptSurface as S};
+        let mut throttled = attempt(
+            K::Authenticate,
+            S::Login,
+            R::Refused,
+            Some(irlume_common::OutcomeCause::RetryThrottled),
+        );
+        throttled.camera = None;
+        throttled.capture_ms = None;
+        let rows = overview_content(&attempts_app(attempt_record(throttled)), 160, 40);
+        assert_eq!(
+            rows[0],
+            "Last login · 2 h ago · before a camera was chosen · refused: too many attempts; wait a moment · 1.2 s"
+        );
+    }
+
+    #[test]
+    fn a_camera_listed_at_another_port_reads_different_port_not_its_name() {
+        use irlume_common::{AttemptKind as K, AttemptResult as R, AttemptSurface as S};
+        let mut record = attempt_record(attempt(K::Authenticate, S::Lock, R::Granted, None));
+        record.cameras[0].connected = Some(false);
+        let mut app = attempts_app(record);
+        // The same model's token at another port, as a current listing
+        // (landed earlier on Cameras) shows it.
+        let mut moved = live_test_pair();
+        moved.name = Some("Synthetic Dock Camera".into());
+        moved.port_chain = Some("3-1.4".into());
+        moved.descriptor_token = Some("0011223344556677".into());
+        app.pairs = vec![moved.clone()];
+        app.pairs_known = true;
+        let rows = overview_content(&app, 160, 40);
+        assert!(
+            rows[0].contains("· Synthetic Desk Camera, different port ·"),
+            "{rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("Synthetic Dock Camera")),
+            "{rows:#?}"
+        );
+
+        // A listing that is no longer current places nothing.
+        app.freshness.observation_mut(Source::Cameras).invalidate();
+        app.pairs = vec![moved];
+        let rows = overview_content(&app, 160, 40);
+        assert!(
+            rows[0].contains("· Synthetic Desk Camera, no longer connected ·"),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn overview_attempt_states_without_a_record_say_why() {
+        let states = [
+            (None, false, "Last attempt: checking…"),
+            (
+                None,
+                true,
+                "Last attempt: unavailable (daemon not answering)",
+            ),
+            (
+                Some(AttemptsReply::Loaded(Box::default())),
+                false,
+                "No face attempt retained yet",
+            ),
+            (
+                Some(AttemptsReply::OlderDaemon),
+                false,
+                "Last attempt: this daemon predates the attempt record",
+            ),
+            (
+                Some(AttemptsReply::NotPermitted),
+                false,
+                "Last attempt: readable only by root or testuser",
+            ),
+        ];
+        for (reply, failed, expected) in states {
+            let mut app = attempts_app(irlume_common::AttemptRecord::default());
+            app.attempts = reply;
+            if failed {
+                let now = app.now();
+                app.freshness
+                    .observation_mut(Source::Attempts)
+                    .record(false, now);
+            }
+            let rows = overview_content(&app, 160, 40);
+            assert_eq!(rows[0], expected, "{rows:#?}");
+            // Never a claim that the account has not tried.
+            assert!(!rows[0].contains("never"), "{}", rows[0]);
+            assert_no_matcher_vocabulary(&rows);
+        }
+
+        // A machine without face authentication has no attempt block: the
+        // record is a face record.
+        let mut fingerprint_only = attempts_app(irlume_common::AttemptRecord::default());
+        fingerprint_only.caps = irlume_camera::Caps {
+            ir_pair: false,
+            rgb: false,
+        };
+        fingerprint_only.reported_caps = fingerprint_only.caps;
+        let rows = overview_content(&fingerprint_only, 160, 40);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("attempt") || row.contains("Last ")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn overview_content_never_shows_matcher_vocabulary() {
+        use irlume_common::{AttemptKind as K, AttemptResult as R, AttemptSurface as S};
+        let causes = attempts::ALL_CAUSES.iter().copied().map(Some).chain([None]);
+        for cause in causes {
+            for result in [R::Refused, R::Failed] {
+                for (kind, surface) in [(K::Authenticate, S::Lock), (K::Identify, S::Other)] {
+                    let entry = attempt(kind, surface, result, cause);
+                    let mut record = attempt_record(entry.clone());
+                    if kind == K::Identify {
+                        record.latest_identify = Some(entry);
+                        record.latest_authenticate =
+                            Some(attempt(K::Authenticate, S::Elevation, R::Refused, cause));
+                        record.latest_identify.as_mut().unwrap().seq = 2;
+                    }
+                    let rows = overview_content(&attempts_app(record), 200, 40);
+                    assert!(
+                        rows[0].contains(attempts::cause_phrase(cause)),
+                        "{cause:?}: {rows:#?}"
+                    );
+                    assert_no_matcher_vocabulary(&rows);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_overview_lines_end_in_an_ellipsis_and_rows_stay_clickable() {
+        use irlume_common::{AttemptKind as K, AttemptResult as R, AttemptSurface as S};
+        let _guard = dead_socket();
+        let mut record = attempt_record(attempt(
+            K::Authenticate,
+            S::App,
+            R::Refused,
+            Some(irlume_common::OutcomeCause::NotEnrolledOnThisCamera),
+        ));
+        record.cameras[0].name = Some("Synthetic camera with a very long product name".into());
+        record.cameras[0].connected = Some(false);
+        let mut app = attempts_app(record);
+        app.profiles_loaded = true;
+        app.profiles = vec![profile("me", &["scan-1"])];
+        app.recompute_visible();
+        let area = Rect::new(0, 0, 80, 30);
+        let rows = overview_content(&app, area.width, area.height);
+        // At 80 columns what happened and why keep the first line
+        // (ADR-0030 §2); with a row to spare the camera moves to its own
+        // line whole, where the unit is now included.
+        assert_eq!(
+            rows[0], "Last app sign-in · 2 h ago · refused: not enrolled on this camera",
+            "{rows:#?}"
+        );
+        assert_eq!(
+            rows[1], "on Synthetic camera with a very long product name, no longer connected",
+            "{rows:#?}"
+        );
+        // Wider, the elapsed time fits beside the cause again.
+        let rows = overview_content(&app, 140, 30);
+        assert_eq!(
+            rows[0], "Last app sign-in · 2 h ago · refused: not enrolled on this camera · 1.2 s",
+            "{rows:#?}"
+        );
+        assert_eq!(
+            rows[1], "on Synthetic camera with a very long product name, no longer connected",
+            "{rows:#?}"
+        );
+        // Without a row to spare (80x24 with every status row) the name
+        // shortens, then the camera gives way: the pure helper's test covers
+        // each step.
+        // A line that still does not fit says so.
+        let rows = overview_content(&app, area.width, area.height);
+        let detail = rows
+            .iter()
+            .find(|row| row.starts_with("Current daemon work state"))
+            .expect("the headline's detail");
+        assert!(detail.ends_with('…'), "a cut line must say so: {rows:#?}");
+
+        // The status rows and the action chip moved down by the block; each
+        // click target still sits on its own row.
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let text = rendered(&term);
+        let screen: Vec<&str> = text.lines().collect();
+        let targets = app.click_targets.borrow().clone();
+        let hubs: Vec<(Rect, usize)> = targets
+            .iter()
+            .filter_map(|(rect, click)| match click {
+                Click::Hub(i) => Some((*rect, *i)),
+                _ => None,
+            })
+            .collect();
+        assert!(!hubs.is_empty());
+        let rows = app.hub_rows();
+        for (rect, index) in &hubs {
+            let (label, _, _) = rows[*index];
+            assert!(
+                screen[usize::from(rect.y)].contains(label),
+                "status row {label} is not under its target: {}",
+                screen[usize::from(rect.y)]
+            );
+        }
+        let (_, action) = app.overview_primary();
+        let pane = hubs[0].0;
+        let chip = targets
+            .iter()
+            .find_map(|(rect, click)| {
+                (matches!(click, Click::Key(_)) && rect.x == pane.x && rect.width == pane.width)
+                    .then_some(*rect)
+            })
+            .expect("the recommended action is clickable");
+        assert!(screen[usize::from(chip.y)].contains(action), "{text}");
+        let (row, index) = hubs[0];
+        app.on_click(row.x, row.y, Rect::new(0, 0, 120, 40));
+        assert_eq!(app.screen, rows[index].2);
+        drain_loads(&mut app);
+    }
+
+    /// At 80x24 the pane has 13 rows. The attempt block must not push the
+    /// one recommended step off the Overview (ADR-0030 §2, §1.7): spacing
+    /// and the "Recommended method" label give way; the recommendation, its
+    /// action chip and every status row stay, each under its click target.
+    #[test]
+    fn at_80x24_the_attempt_block_keeps_the_recommended_action_on_screen() {
+        use irlume_common::{AttemptKind as K, AttemptResult as R, AttemptSurface as S};
+        for fingerprint in [false, true] {
+            let mut record = attempt_record(attempt(
+                K::Authenticate,
+                S::Lock,
+                R::Refused,
+                Some(irlume_common::OutcomeCause::BelowThreshold),
+            ));
+            if fingerprint {
+                // The fullest Overview: six status rows under a two-line
+                // block (a recognition test after an unlock).
+                let mut test = attempt(K::Identify, S::Other, R::Granted, None);
+                test.seq = 2;
+                record.latest_identify = Some(test);
+            }
+            let mut app = attempts_app(record);
+            app.profiles_loaded = true;
+            app.profiles = vec![profile("me", &["scan-1"])];
+            app.fp_present = fingerprint;
+            app.recompute_visible();
+            let hub_rows = app.hub_rows();
+            assert_eq!(hub_rows.len(), if fingerprint { 6 } else { 5 });
+            let (width, height) = (80, 24);
+            let rows = overview_content(&app, width, height);
+            assert!(rows[0].starts_with("Last "), "{rows:#?}");
+
+            let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            let text = rendered(&term);
+            let screen: Vec<&str> = text.lines().collect();
+            let targets = app.click_targets.borrow().clone();
+            let hubs: Vec<(Rect, usize)> = targets
+                .iter()
+                .filter_map(|(rect, click)| match click {
+                    Click::Hub(i) => Some((*rect, *i)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(hubs.len(), hub_rows.len(), "{text}");
+            for (rect, index) in &hubs {
+                assert!(
+                    screen[usize::from(rect.y)].contains(hub_rows[*index].0),
+                    "{text}"
+                );
+            }
+            let pane = hubs[0].0;
+            let recommended =
+                clip_columns(&format!("  {}", app.recommended()), usize::from(pane.width));
+            assert!(
+                rows.iter().any(|row| row == recommended.trim()),
+                "{rows:#?}"
+            );
+            let (_, action) = app.overview_primary();
+            let chip = targets
+                .iter()
+                .find_map(|(rect, click)| {
+                    (matches!(click, Click::Key(_)) && rect.x == pane.x && rect.width == pane.width)
+                        .then_some(*rect)
+                })
+                .expect("the recommended action is clickable");
+            assert!(screen[usize::from(chip.y)].contains(action), "{text}");
+        }
+    }
+
+    #[test]
+    fn clip_line_keeps_styles_and_marks_the_cut() {
+        let bold = Style::new().add_modifier(Modifier::BOLD);
+        let line = Line::from(vec![Span::raw("abc"), Span::styled("defgh", bold)]);
+        let fitted = clip_line(line.clone(), 8);
+        assert_eq!(fitted.to_string(), "abcdefgh");
+        let clipped = clip_line(line.clone(), 5);
+        assert_eq!(clipped.to_string(), "abcd…");
+        assert_eq!(clipped.spans[1].style, bold);
+        // A span that exactly fills the width is cut when more follow.
+        assert_eq!(clip_line(line.clone(), 3).to_string(), "ab…");
+        assert_eq!(clip_line(Line::raw("漢字漢字"), 5).to_string(), "漢字…");
+        assert_eq!(clip_line(line, 0).to_string(), "…");
+    }
+
+    #[test]
+    fn attempt_replies_for_another_account_or_generation_are_dropped() {
+        let mut app = test_app();
+        let record = || {
+            AttemptsReply::Loaded(Box::new(attempt_record(attempt(
+                irlume_common::AttemptKind::Authenticate,
+                irlume_common::AttemptSurface::Lock,
+                irlume_common::AttemptResult::Granted,
+                None,
+            ))))
+        };
+        let land = |app: &mut App, user: &str, generation: u64| {
+            let (tx, rx) = mpsc::channel();
+            app.attempts_load = Some(rx);
+            tx.send((user.to_owned(), generation, record())).unwrap();
+            app.poll();
+        };
+
+        // Another account's record is never shown; this account's is queued.
+        let generation = app.freshness.cycle(Worker::Attempts).generation();
+        land(&mut app, "someone-else", generation);
+        assert!(app.attempts.is_none());
+        assert!(app.freshness.cycle(Worker::Attempts).pending());
+
+        // A reply tagged with an older generation.
+        let generation = app.freshness.cycle(Worker::Attempts).generation();
+        land(&mut app, "testuser", generation.wrapping_sub(1));
+        assert!(app.attempts.is_none());
+
+        // A request begun before an invalidation (a finished operation).
+        assert!(app.freshness.cycle_mut(Worker::Attempts).begin());
+        let asked = app.freshness.cycle(Worker::Attempts).generation();
+        app.invalidate_daemon_observations();
+        land(&mut app, "testuser", asked);
+        assert!(app.attempts.is_none());
+        assert!(app.freshness.cycle(Worker::Attempts).pending());
+
+        // The current account's current answer is installed.
+        let generation = app.freshness.cycle(Worker::Attempts).generation();
+        land(&mut app, "testuser", generation);
+        assert_eq!(app.attempts, Some(record()));
+        assert!(app.source_usable(Source::Attempts));
+
+        // "Unavailable" is a failed observation, not an installed answer.
+        let generation = app.freshness.cycle(Worker::Attempts).generation();
+        let (tx, rx) = mpsc::channel();
+        app.attempts_load = Some(rx);
+        tx.send(("testuser".into(), generation, AttemptsReply::Unavailable))
+            .unwrap();
+        app.poll();
+        assert!(app.attempts.is_none());
+        assert!(app
+            .freshness
+            .observation(Source::Attempts)
+            .last_request_failed());
+    }
+
+    #[test]
+    fn a_docking_change_invalidates_the_attempt_record() {
+        let mut app = live_test_app();
+        app.attempts = Some(AttemptsReply::Loaded(Box::default()));
+        let mut docked = live_test_snapshot();
+        docked.cameras.revision = 2;
+        app.apply_live_snapshot(docked, app.now());
+        assert!(app.attempts.is_none());
+        assert!(!app.source_usable(Source::Attempts));
+        assert!(app.freshness.cycle(Worker::Attempts).pending());
+    }
+
+    /// The first snapshot observes the camera inventory; it is not a dock
+    /// change, so the record asked for beside it at startup stands.
+    #[test]
+    fn the_first_live_snapshot_keeps_the_attempt_record_asked_for_beside_it() {
+        let record = || {
+            AttemptsReply::Loaded(Box::new(attempt_record(attempt(
+                irlume_common::AttemptKind::Authenticate,
+                irlume_common::AttemptSurface::Lock,
+                irlume_common::AttemptResult::Granted,
+                None,
+            ))))
+        };
+        let land = |app: &mut App, generation: u64| {
+            let (tx, rx) = mpsc::channel();
+            app.attempts_load = Some(rx);
+            tx.send(("testuser".to_owned(), generation, record()))
+                .unwrap();
+            app.poll();
+        };
+        let started = || {
+            let mut app = test_app();
+            app.clock_override = Some(Instant::now());
+            assert!(app.freshness.cycle_mut(Worker::Attempts).begin());
+            app
+        };
+
+        // The startup read lands after the first snapshot: installed.
+        let mut app = started();
+        let asked = app.freshness.cycle(Worker::Attempts).generation();
+        app.apply_live_snapshot(live_test_snapshot(), app.now());
+        land(&mut app, asked);
+        assert_eq!(app.attempts, Some(record()));
+        assert!(!app.freshness.cycle(Worker::Attempts).pending());
+
+        // It landed before the first snapshot: still shown after it.
+        let mut app = started();
+        let asked = app.freshness.cycle(Worker::Attempts).generation();
+        land(&mut app, asked);
+        app.apply_live_snapshot(live_test_snapshot(), app.now());
+        assert_eq!(app.attempts, Some(record()));
+        assert!(app.source_usable(Source::Attempts));
+        assert!(!app.freshness.cycle(Worker::Attempts).pending());
+
+        // A read that got no answer is asked again once the daemon answers.
+        let mut app = test_app();
+        let now = Instant::now();
+        app.clock_override = Some(now);
+        app.freshness
+            .observation_mut(Source::Attempts)
+            .record(false, now);
+        app.apply_live_snapshot(live_test_snapshot(), now);
+        assert!(app.freshness.cycle(Worker::Attempts).pending());
+    }
+
+    #[test]
+    fn overview_rereads_the_attempt_record_on_entry_and_every_15_s_while_idle() {
+        let mut app = live_test_app();
+        let now = app.now();
+        app.screen = SC_WELCOME;
+        app.freshness.cycle_mut(Worker::Attempts).begin();
+        app.freshness.cycle_mut(Worker::Attempts).finish(now);
+        assert!(!app.attempts_refresh_due(now + Duration::from_secs(14)));
+        assert!(app.attempts_refresh_due(now + Duration::from_secs(15)));
+        let later = now + Duration::from_secs(60);
+        app.screen = SC_PROFILES;
+        assert!(
+            !app.attempts_refresh_due(later),
+            "only while Overview is shown"
+        );
+        app.screen = SC_WELCOME;
+        let (_sender, op) = fake_op();
+        app.op = Some(op);
+        assert!(!app.attempts_refresh_due(later), "only while idle");
+        app.op = None;
+        let (_sender, rx) = mpsc::channel();
+        app.attempts_load = Some(rx);
+        assert!(!app.attempts_refresh_due(later), "one request at a time");
+        app.attempts_load = None;
+        // An invalidation is due at once.
+        app.freshness.cycle_mut(Worker::Attempts).finish(now);
+        app.freshness.cycle_mut(Worker::Attempts).invalidate();
+        assert!(app.attempts_refresh_due(now));
+
+        // Entering Overview asks at once; a daemon that does not answer
+        // reads as unavailable, not as an empty record.
+        let _guard = dead_socket();
+        let mut app = test_app();
+        // The daemon's configuration names a face camera.
+        app.reported_caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.screen = SC_SETTINGS;
+        app.enter_screen(SC_WELCOME);
+        assert!(app.attempts_load.is_some());
+        drain_loads(&mut app);
+        assert!(app.attempts.is_none());
+        let text = draw_text(&app);
+        assert!(
+            text.contains("Last attempt: unavailable (daemon not answering)"),
+            "{text}"
+        );
+
+        // Esc and `h` go home without enter_screen; they ask at once too,
+        // not when the 15 s cadence next comes round.
+        for key in [KeyCode::Esc, KeyCode::Char('h')] {
+            app.screen = SC_KEYRING;
+            app.on_key(key);
+            assert_eq!(app.screen, SC_WELCOME, "{key:?}");
+            assert!(app.attempts_load.is_some(), "{key:?}");
+            drain_loads(&mut app);
+        }
+
+        // The refresh tick itself asks again 15 s after the last read, with
+        // the other workers fresh so only this one runs.
+        let read_at = Instant::now();
+        app.freshness.cycle_mut(Worker::Attempts).begin();
+        app.freshness.cycle_mut(Worker::Attempts).finish(read_at);
+        for (seconds, due) in [(14, false), (15, true)] {
+            app.clock_override = Some(read_at + Duration::from_secs(seconds));
+            let now = app.now();
+            for worker in [Worker::Live, Worker::Light, Worker::Machine, Worker::Apps] {
+                app.freshness.cycle_mut(worker).begin();
+                app.freshness.cycle_mut(worker).finish(now);
+            }
+            app.refresh_due(now);
+            assert_eq!(app.attempts_load.is_some(), due, "{seconds} s");
+        }
+        assert!(app.live_load.is_none() && app.light_load.is_none());
+        drain_loads(&mut app);
+    }
+
+    /// The worker asks for the TUI's account, not the peer's, and waits
+    /// longer than the status poll's 1.5 s: the daemon may hold the read
+    /// behind its record writer for up to 2 s.
+    #[test]
+    fn the_attempts_worker_asks_for_the_tui_account_within_its_own_budget() {
+        use std::io::{BufRead, Write};
+        let _guard = dead_socket();
+        let record = attempt_record(attempt(
+            irlume_common::AttemptKind::Authenticate,
+            irlume_common::AttemptSurface::Lock,
+            irlume_common::AttemptResult::Granted,
+            None,
+        ));
+        for (index, (reply, delay, expected)) in [
+            (
+                // Past the daemon's 2 s writer wait, so a budget of 2 s or
+                // less (or daemon_poll's 1.5 s) cannot pass.
+                Response::LastAttempts(record.clone()),
+                Duration::from_millis(2300),
+                AttemptsReply::Loaded(Box::new(record)),
+            ),
+            (
+                Response::Error("bad request".into()),
+                Duration::ZERO,
+                AttemptsReply::OlderDaemon,
+            ),
+            (
+                Response::Error("not authorized to query 'alice'".into()),
+                Duration::ZERO,
+                AttemptsReply::NotPermitted,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = std::env::temp_dir().join(format!(
+                "irlume-tui-attempts-{}-{index}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            std::env::set_var("IRLUME_SOCKET", &path);
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&socket)
+                    .read_line(&mut line)
+                    .unwrap();
+                std::thread::sleep(delay);
+                writeln!(socket, "{}", serde_json::to_string(&reply).unwrap()).unwrap();
+                serde_json::from_str::<Request>(&line).unwrap()
+            });
+            let mut app = test_app();
+            app.user = "alice".into();
+            app.refresh_attempts();
+            drain_loads(&mut app);
+            let request = server.join().unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert!(
+                matches!(&request, Request::LastAttempts { user } if user == "alice"),
+                "{request:?}"
+            );
+            assert_eq!(app.attempts, Some(expected));
+            assert!(app.source_usable(Source::Attempts));
+        }
     }
 
     #[test]

@@ -314,6 +314,36 @@ fn apply_kv_updates(existing: &str, updates: &[(&str, &str)]) -> String {
     out
 }
 
+/// Read `path` as text only when it is a regular file. It is opened
+/// non-blocking, so a FIFO without a writer answers at once instead of
+/// blocking the reader (irlumed at start, before any camera is chosen); a
+/// directory keeps `IsADirectory`, and any other file that is not a regular
+/// one is refused with `InvalidInput`.
+fn read_regular_file(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::IsADirectory,
+            "it is a directory",
+        ));
+    }
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
 /// Longest key a config writer accepts, in bytes.
 const MAX_CONFIG_KEY_BYTES: usize = 1024;
 /// Longest value a config writer accepts, in bytes.
@@ -415,7 +445,7 @@ pub fn write_kvs(file: &str, updates: &[(&str, &str)]) -> std::io::Result<()> {
     }
     // Only a missing file reads as empty; any other failure established
     // nothing about the other lines, so rewriting from empty would drop them.
-    let existing = match std::fs::read_to_string(&path) {
+    let existing = match read_regular_file(&path) {
         Ok(text) => text,
         // A dangling symbolic link reads as NotFound too, but the name exists:
         // publishing would replace the link, for example one to a volume not
@@ -802,7 +832,7 @@ pub fn observe_camera_conf() -> CameraConfObservation {
         },
         ignored: Vec::new(),
     };
-    match std::fs::read_to_string(&path) {
+    match read_regular_file(&path) {
         Ok(text) => parse_camera_conf(&text),
         // The name itself exists and only its target is missing: a dangling
         // symlink, for example to a volume not mounted yet. A pinned host must
@@ -1637,6 +1667,54 @@ mod tests {
             KvObservation::Absent
         ));
 
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A FIFO in the file's place (no writer) is refused at once by the
+    /// observer and the writer, instead of blocking irlumed's start or a
+    /// write, and it is left in place.
+    #[test]
+    fn config_readers_refuse_a_fifo_without_blocking() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        let path = config_path("cameras.conf");
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let observed = observe_camera_conf().selection;
+            let written = write_kv("cameras.conf", "rgb_id", "a");
+            let _ = tx.send((observed, written));
+        });
+        let (observed, written) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("reading a FIFO must not block");
+        assert!(
+            matches!(
+                observed,
+                CameraSelectionObservation::Unreadable {
+                    kind: std::io::ErrorKind::InvalidInput,
+                    ref detail,
+                } if detail == "not a regular file"
+            ),
+            "{observed:?}"
+        );
+        let error = written.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+        assert!(
+            error.to_string().contains("refusing to rewrite it"),
+            "{error}"
+        );
+        use std::os::unix::fs::FileTypeExt;
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_fifo());
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }

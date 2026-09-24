@@ -5561,6 +5561,9 @@ fn camera_conf_unreadable_hint(kind: std::io::ErrorKind, path: &std::path::Path)
             "it is not UTF-8 text; correct or remove the lines that are not".into()
         }
         std::io::ErrorKind::IsADirectory => "it is a directory, not a file; move it aside".into(),
+        std::io::ErrorKind::InvalidInput => {
+            "it is not a regular file (a pipe, socket or device); replace it with the file".into()
+        }
         std::io::ErrorKind::NotFound => "it is a symbolic link to a file that does not exist; \
                                          restore the target or replace the link with the file"
             .into(),
@@ -17372,8 +17375,13 @@ mod tests {
             ),
             (
                 ErrorKind::IsADirectory,
-                "Is a directory (os error 21)",
+                "it is a directory",
                 "it is a directory, not a file; move it aside",
+            ),
+            (
+                ErrorKind::InvalidInput,
+                "not a regular file",
+                "it is not a regular file (a pipe, socket or device); replace it with the file",
             ),
             (
                 ErrorKind::NotFound,

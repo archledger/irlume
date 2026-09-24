@@ -641,18 +641,27 @@ live in them; sealed envelopes are stored separately (see
 | File | Holds | Written by |
 |---|---|---|
 | `/etc/irlume/settings.conf` | `face_sensor_policy=ir-only-experimental` is the explicit experimental IR-only opt-in; absence selects dual, while malformed or unreadable policy fails closed. `privileged_face_consent=0` is the machine owner's waiver of the literal `yes` on privileged services, so the scan starts when the privileged PAM prompt appears, with no per-attempt word (default on: the confirmation is required, and an unreadable settings file keeps it). `privileged_grouped_pad_evidence=1` lets privileged services (`sudo`/`su`/`doas` and polkit) use the bounded sequential PAD collection the greeter and lock screen already use, with the login grace window that collection requires, for a camera pair that cannot capture RGB and IR concurrently (default off; it widens which services may collect the evidence, never how much evidence a grant needs; the longer budget applies only to requests that can use that collection, an explicit `IRLUME_GRACE_MS` still wins, and credential release is unchanged). `enforce_biopolicy=1` opts into operation-class gating; `forbid_external_cameras=1` restricts face authentication to cameras the kernel reports as `removable: fixed` (internal only; `removable: unknown` fails closed to the password, mirroring Windows ShouldForbidExternalCameras post-CVE-2021-34466); the legacy `third_party_pad` / `third_party_recognizer` keys are ignored with a startup notice (the third-party lane was removed, ADR-0015). Head-gesture settings are retired and ignored; see [migration notes](HEAD-GESTURE-REMOVAL.md) | `sudo irlume auth sensor ...` for the sensor policy; TUI Settings for the other listed settings |
-| `/etc/irlume/cameras.conf` | `rgb=` / `ir=` device nodes of the active camera pair | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
+| `/etc/irlume/cameras.conf` | the pinned camera pair: `rgb=` / `ir=` device nodes, and `rgb_id=` / `ir_id=` USB identities (`vid:pid[:serial]`) that find the pair again when the nodes are renumbered. Legacy `capture_mode.*` lines are kept and no longer read. At start `irlumed` logs a warning for a camera key set on more than one line or holding a line break or control character, a line without `=`, an unrecognized key, or a file it cannot read | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
 | `/etc/irlume/method` | one line: the active auth method (`auto`, `face`, `fingerprint`, or `both` = face OR fingerprint) | `irlume fingerprint enable/disable` |
 | `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter | `irlume ir-setup` |
 | `/var/lib/irlume/ir-emitter-journal/` | one record per camera, holding the bytes a control held before `ir-setup` changed it. Written before the change and removed once the control reads back as restored, so a crash, a kill or a power loss mid-setup leaves something that can undo it. Root-only | `irlume ir-setup`, cleared by it or by the next capture |
+
+Writes to `settings.conf` and `cameras.conf` refuse to replace a file that
+exists but cannot be read, since its other lines would be lost, and refuse a
+key or value that contains a line break or a control character or is too long
+(1024 bytes for a key, 4096 for a value). The file is left as it was and the
+command names the cause.
 
 During the one-release migration window, a stored legacy eyes-open policy also
 fails closed. Clear it with `irlume profiles eyes-open off`; no current setup
 path enables it.
 
-Camera selection precedence: the `IRLUME_RGB_DEVICE`+`IRLUME_IR_DEVICE` env
-pair (both set), then `cameras.conf`, then auto-detection, then the compiled
-defaults (`/dev/video0`+`/dev/video2`).
+Camera selection precedence under the default dual sensor policy: the
+`IRLUME_RGB_DEVICE`+`IRLUME_IR_DEVICE` env pair (both set), then the pair
+saved in `cameras.conf` (found again by its USB identity when the nodes are
+renumbered), then auto-detection. There is no node-number default: when no
+pair is found, the RGB-only convenience tier uses the first RGB camera
+discovered.
 
 ### Daemon environment variables
 

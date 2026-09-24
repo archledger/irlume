@@ -7,6 +7,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `irlumed` checks `cameras.conf` at start against the stricter
+  grammar of ADR-0029 and logs a warning for a file it cannot read, a
+  camera key set on more than one line or holding a line break or a
+  control character, a line without `=`, and a key it does not
+  recognize (legacy `capture_mode.*` lines stay silent). `set-cameras`
+  also names a camera setting problem that remains after it saves the
+  pair. This release still selects cameras exactly as before.
+
 - Diagnostics expands the selected check in place (ADR-0030 §2, §1.7,
   §1.8, C2). Each check is one row whose diagnosis ends in an ellipsis
   when it does not fit. Enter, or a second click on the selected row,
@@ -230,6 +238,24 @@ All notable changes to irlume are documented here. This project adheres to
   requests schema 4 and an older daemon refuses it as before.
 
 ### Fixed
+
+- `set-cameras` no longer rebuilds `/etc/irlume/cameras.conf` from
+  nothing when the file exists but cannot be read. A file holding
+  bytes that are not UTF-8, or one whose read failed with an I/O
+  error, was replaced by the new pair alone, which dropped every other
+  line, comments included. Any read failure, including an SELinux
+  denial or a directory in the file's place, now stops `set-cameras`
+  before it changes the camera in use, names the cause and leaves the
+  file as it was. Writes to `settings.conf` go through the same check.
+
+- `set-cameras` refuses a camera whose USB serial contains a line
+  break or a control character, before it changes the camera in use,
+  instead of saving the serial to `cameras.conf`, where its second
+  half could have been read as a setting line of its own. Camera paths
+  with a Unicode line separator or longer than 4096 bytes are refused
+  the same way. Every config write refuses a key or value that would
+  not read back as the same single line (keys up to 1024 bytes, values
+  up to 4096).
 
 - An engine rebuilt after a caught request panic keeps the camera pair
   the daemon was using. The rebuild bound the pair chosen at startup, so

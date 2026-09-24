@@ -696,6 +696,19 @@ fn main() {
             // fallback: a camera-less or RGB-only machine has no pair, and the
             // convenience tier falls back to the first discoverable RGB node.
             let startup_policy = irlume_common::config::observe_face_sensor_policy();
+            // cameras.conf observed on its own read, apart from selection, so a
+            // file that cannot be read or breaks the camera-key grammar
+            // (ADR-0029 §4) is reported even when the environment pair or the
+            // sensor policy means selection never reads it. Nothing here
+            // changes which camera is chosen.
+            let camera_conf =
+                irlume_common::config::config_path(irlume_common::config::CAMERAS_CONF);
+            for warning in camera_conf_startup_warnings(
+                &irlume_common::config::observe_camera_conf(),
+                &camera_conf,
+            ) {
+                jout_warn!("{warning}");
+            }
             let devices = select_engine_devices(startup_policy);
             let (rgb_dev, ir_dev) = (devices.rgb, devices.ir);
             if !permits_background_requalification(startup_policy) {
@@ -5534,32 +5547,127 @@ fn categorical_outcome(response: &Response) -> irlume_common::diagnostics::Categ
 fn camera_path_is_serializable(path: &str) -> bool {
     path.is_empty()
         || (std::path::Path::new(path).is_absolute()
-            && path.trim() == path
-            && !path.chars().any(char::is_control))
+            && irlume_common::config::config_value_is_serializable(path))
+}
+
+/// What to do about a `cameras.conf` that exists but cannot be read, by cause.
+fn camera_conf_unreadable_hint(kind: std::io::ErrorKind, path: &std::path::Path) -> String {
+    match kind {
+        std::io::ErrorKind::PermissionDenied => format!(
+            "check its SELinux label (restorecon -v {}) and the journal for an AppArmor denial",
+            path.display()
+        ),
+        std::io::ErrorKind::InvalidData => {
+            "it is not UTF-8 text; correct or remove the lines that are not".into()
+        }
+        std::io::ErrorKind::IsADirectory => "it is a directory, not a file; move it aside".into(),
+        std::io::ErrorKind::NotFound => "it is a symbolic link to a file that does not exist; \
+                                         restore the target or replace the link with the file"
+            .into(),
+        _ => "check the disk and the file system it is on".into(),
+    }
+}
+
+/// The journal lines for one startup observation of `cameras.conf`: the
+/// unreadable or malformed state first, then the ignored lines in file order,
+/// at most five named and the rest counted.
+fn camera_conf_startup_warnings(
+    observation: &irlume_common::config::CameraConfObservation,
+    path: &std::path::Path,
+) -> Vec<String> {
+    use irlume_common::config::CameraSelectionObservation::{Malformed, Unreadable};
+    const NAMED: usize = 5;
+    let shown = path.display();
+    let mut lines = Vec::new();
+    match &observation.selection {
+        Unreadable { kind, detail } => lines.push(format!(
+            "irlumed: {shown} exists but cannot be read ({detail}); a camera pair saved in it \
+             is not used; {}",
+            camera_conf_unreadable_hint(*kind, path)
+        )),
+        Malformed { line, problem } => lines.push(format!(
+            "irlumed: {shown} line {line}: {problem}; this release still reads the saved pair \
+             as before; correct or remove that line"
+        )),
+        _ => {}
+    }
+    for ignored in observation.ignored.iter().take(NAMED) {
+        lines.push(format!(
+            "irlumed: {shown} line {} is ignored: {}",
+            ignored.line, ignored.reason
+        ));
+    }
+    match observation.ignored.len().saturating_sub(NAMED) {
+        0 => {}
+        1 => lines.push(format!("irlumed: {shown}: 1 more line is ignored")),
+        more => lines.push(format!("irlumed: {shown}: {more} more lines are ignored")),
+    }
+    lines
 }
 
 /// Shared mutation after request posture and any continuity guard have passed.
 fn set_camera_devices(rgb: &str, ir: &str, engine: &mut irlume_auth::Engine) -> Response {
+    set_camera_devices_with(rgb, ir, engine, irlume_auth::device_identity)
+}
+
+/// [`set_camera_devices`] over an injected identity source, so a device serial
+/// that cannot be saved is testable without a camera.
+fn set_camera_devices_with(
+    rgb: &str,
+    ir: &str,
+    engine: &mut irlume_auth::Engine,
+    identity: impl Fn(&str) -> Option<String>,
+) -> Response {
+    use irlume_common::config::{
+        config_value_is_serializable, observe_camera_conf, CameraSelectionObservation,
+    };
     // Root only (posture table): this persists to /etc and repoints the
     // camera the daemon trusts, and an attacker who could set it to a
     // v4l2loopback node feeds recorded video into the match path
     // (spoof) or bricks face auth (DoS).
     if !camera_path_is_serializable(rgb) || !camera_path_is_serializable(ir) {
-        return Response::Error(
-            "camera paths must be empty or absolute, without control characters or surrounding whitespace"
-                .into(),
-        );
+        return Response::Error(format!(
+            "camera paths must be empty or absolute, at most {} bytes, without line breaks, \
+             control characters or surrounding whitespace",
+            irlume_common::config::MAX_CONFIG_VALUE_BYTES
+        ));
     }
-    engine.set_devices(rgb, ir);
-    publish_engine_camera_selection(engine);
-    let mut msg = format!("cameras set to rgb={rgb} ir={ir}");
+    let conf = irlume_common::config::config_path(irlume_common::config::CAMERAS_CONF);
+    // An unreadable file would make the save below fail (`write_kvs` refuses
+    // to rebuild it), leaving a live-only switch that the next start forgets.
+    // If the file turns unreadable after this check, `write_kvs` still refuses
+    // and the reply below says "live only"; the file is never wiped.
+    if let CameraSelectionObservation::Unreadable { kind, detail } = observe_camera_conf().selection
+    {
+        return Response::Error(format!(
+            "{} exists but cannot be read ({detail}); cameras not changed; {}",
+            conf.display(),
+            camera_conf_unreadable_hint(kind, &conf)
+        ));
+    }
     // Record each node's stable device identity (vid:pid:serial) next to
     // its path so select_pair can survive a udev renumber: after an
     // upgrade shuffles /dev/videoN, the identity re-anchors the pin to the
     // right sensor instead of trusting a now-stale number. An empty value
     // clears a stale id when the current node has no USB descriptor.
-    let rgb_id = irlume_auth::device_identity(rgb).unwrap_or_default();
-    let ir_id = irlume_auth::device_identity(ir).unwrap_or_default();
+    let rgb_id = identity(rgb).unwrap_or_default();
+    let ir_id = identity(ir).unwrap_or_default();
+    // The identity comes from the device's own sysfs `serial`, so it is
+    // checked like any other saved value, before the live engine changes.
+    for (side, id) in [("RGB", &rgb_id), ("IR", &ir_id)] {
+        if !config_value_is_serializable(id) {
+            return Response::Error(format!(
+                "the {side} camera's USB identity has a line break or control character, or is \
+                 over {} bytes, so it cannot be saved in {}; cameras not changed; set \
+                 IRLUME_RGB_DEVICE and IRLUME_IR_DEVICE on the service instead",
+                irlume_common::config::MAX_CONFIG_VALUE_BYTES,
+                conf.display()
+            ));
+        }
+    }
+    engine.set_devices(rgb, ir);
+    publish_engine_camera_selection(engine);
+    let mut msg = format!("cameras set to rgb={rgb} ir={ir}");
     // One publication, under the file's own lock. The four writes were
     // individually atomic and collectively not: a reader racing the
     // sequence could see one camera's RGB path beside another's IR path,
@@ -5567,8 +5675,18 @@ fn set_camera_devices(rgb: &str, ir: &str, engine: &mut irlume_auth::Engine) -> 
     // unlocked rewrite could erase a locked writer's keys (#365, #374).
     // `write_camera_pin` now takes the lock AND builds the whole file
     // once, so the pin lands whole or not at all.
-    if let Err(e) = irlume_common::config::write_camera_pin(rgb, ir, &rgb_id, &ir_id) {
-        msg = format!("{msg} (live only; could not persist: {e})");
+    match irlume_common::config::write_camera_pin(rgb, ir, &rgb_id, &ir_id) {
+        Err(e) => msg = format!("{msg} (live only; could not persist: {e})"),
+        // The save rewrote all four pin keys, so a problem that survives it
+        // is in `mode` (ADR-0029 §4); ignored lines are left to the startup
+        // warnings.
+        Ok(()) => {
+            if let CameraSelectionObservation::Malformed { line, problem } =
+                observe_camera_conf().selection
+            {
+                msg = format!("{msg} ({} line {line}: {problem})", conf.display());
+            }
+        }
     }
     jout_info!("irlumed: {msg}");
     Response::Ok(msg)
@@ -16731,20 +16849,32 @@ mod tests {
 
     #[test]
     fn set_cameras_syntax_preserves_empty_stable_and_custom_paths() {
+        // 4096 bytes is the longest value the config writer saves.
+        let (longest, too_long) = (
+            format!("/{}", "a".repeat(4095)),
+            format!("/{}", "a".repeat(4096)),
+        );
         for path in [
             "",
             "/dev/video0",
             "/dev/v4l/by-id/usb-camera-video-index0",
             "/custom/camera with spaces",
             "/custom/camera=ir",
+            &longest,
         ] {
             assert!(camera_path_is_serializable(path), "{path:?}");
         }
+        // The Unicode separators are interior: a trailing one is already
+        // refused as surrounding whitespace.
         for path in [
             "video0",
             " /dev/video0",
             "/dev/video0\n",
             "/dev/video0\u{85}",
+            "/dev/vid\u{2028}eo0",
+            "/dev/vid\u{2029}eo0",
+            "/dev/vid\teo0",
+            &too_long,
         ] {
             assert!(!camera_path_is_serializable(path), "{path:?}");
         }
@@ -16884,6 +17014,8 @@ mod tests {
         );
         let pin_path = irlume_common::config::config_path("cameras.conf");
         let pin_before = std::fs::read(&pin_path).unwrap();
+        let bits_before = engine_bits().lock().unwrap().clone();
+        let too_long = format!("/{}", "a".repeat(4096));
         for invalid in [
             "/dev/video0\ncapture_mode=concurrent",
             "/dev/video0\r",
@@ -16891,6 +17023,8 @@ mod tests {
             " /dev/video0",
             "/dev/video0 ",
             "video0",
+            "/dev/vid\u{2028}eo0",
+            &too_long,
         ] {
             for (bad_rgb, bad_ir) in [(invalid, ir), (rgb, invalid)] {
                 let response = dispatch(
@@ -16901,14 +17035,455 @@ mod tests {
                     &peer(0),
                     &mut e,
                 );
-                assert!(matches!(response, Response::Error(_)));
-                assert_eq!((e.rgb_device(), e.ir_device()), (rgb, ir));
+                match response {
+                    Response::Error(msg) => assert_eq!(
+                        msg,
+                        "camera paths must be empty or absolute, at most 4096 bytes, without \
+                         line breaks, control characters or surrounding whitespace",
+                        "{bad_rgb:?} {bad_ir:?}"
+                    ),
+                    other => panic!("an invalid camera path must be refused, got {other:?}"),
+                }
+                assert_camera_selection_unchanged(&e, (rgb, ir), &bits_before);
                 assert_eq!(std::fs::read(&pin_path).unwrap(), pin_before);
             }
         }
         // Restore the shared engine's baseline devices.
         e.set_devices(NO_RGB, NO_IR);
         publish_engine_bits_raw(previous_bits);
+    }
+
+    /// The engine still holds `pair`, and the published selection is the one
+    /// in `bits`, so a refused SetCameras changed neither.
+    fn assert_camera_selection_unchanged(
+        e: &irlume_auth::Engine,
+        pair: (&str, &str),
+        bits: &EngineBits,
+    ) {
+        assert_eq!((e.rgb_device(), e.ir_device()), pair);
+        let now = engine_bits().lock().unwrap();
+        assert_eq!(now.rgb_dev, bits.rgb_dev);
+        assert_eq!(now.ir_dev, bits.ir_dev);
+        assert_eq!(now.tier, bits.tier);
+    }
+
+    /// A `cameras.conf` that exists but cannot be read stops SetCameras
+    /// before the live engine changes: the save would be refused, and a
+    /// live-only switch is forgotten at the next start. The reply names the
+    /// cause, and nothing is written, not even the lock sidecar.
+    #[test]
+    fn set_cameras_refuses_an_unreadable_cameras_conf_before_changing_the_engine() {
+        let _g = env_lock();
+        let mut e = engine();
+        let previous_bits = engine_bits().lock().unwrap().clone();
+        let sb = sandbox("setcam-unreadable");
+        let (rgb, ir) = ("/dev/irlume-test-alt-rgb", "/dev/irlume-test-alt-ir");
+        let path = irlume_common::config::config_path("cameras.conf");
+        let lock = irlume_common::config::config_path("cameras.conf.lock");
+        assert_eq!((e.rgb_device(), e.ir_device()), (NO_RGB, NO_IR));
+        let prefix = format!("{} exists but cannot be read (", path.display());
+        let refusal = |e: &mut irlume_auth::Engine| match dispatch(
+            Request::SetCameras {
+                rgb: rgb.into(),
+                ir: ir.into(),
+            },
+            &peer(0),
+            e,
+        ) {
+            Response::Error(msg) => {
+                assert!(msg.starts_with(&prefix), "{msg}");
+                msg
+            }
+            other => panic!("an unreadable cameras.conf must be refused, got {other:?}"),
+        };
+
+        let seed: &[u8] = b"rgb=/dev/irlume-test-old-rgb\nir=/dev/irlume-test-old-ir\n\xff\n";
+        std::fs::write(&path, seed).unwrap();
+        let msg = refusal(&mut e);
+        assert!(
+            msg.ends_with(
+                "; cameras not changed; it is not UTF-8 text; correct or remove the lines that are not"
+            ),
+            "{msg}"
+        );
+        assert_camera_selection_unchanged(&e, (NO_RGB, NO_IR), &previous_bits);
+        assert_eq!(std::fs::read(&path).unwrap(), seed);
+        assert!(!lock.exists(), "refused before any write");
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let msg = refusal(&mut e);
+        assert!(
+            msg.ends_with("; cameras not changed; it is a directory, not a file; move it aside"),
+            "{msg}"
+        );
+        assert!(path.is_dir());
+        assert_camera_selection_unchanged(&e, (NO_RGB, NO_IR), &previous_bits);
+
+        std::fs::remove_dir(&path).unwrap();
+        std::os::unix::fs::symlink(sb.dir.join("absent-target"), &path).unwrap();
+        let msg = refusal(&mut e);
+        assert!(
+            msg.ends_with(
+                "; cameras not changed; it is a symbolic link to a file that does not exist; \
+                 restore the target or replace the link with the file"
+            ),
+            "{msg}"
+        );
+        assert!(std::fs::symlink_metadata(&path).is_ok(), "the link is kept");
+        assert_camera_selection_unchanged(&e, (NO_RGB, NO_IR), &previous_bits);
+        assert!(!lock.exists(), "refused before any write");
+
+        e.set_devices(NO_RGB, NO_IR);
+        publish_engine_bits_raw(previous_bits);
+    }
+
+    /// A device serial with a line break or control character is refused
+    /// before the live engine changes, instead of being saved where its
+    /// second half would read as a setting of its own. Driven through the
+    /// same helper dispatch uses, with the identity source injected.
+    #[test]
+    fn set_cameras_refuses_a_usb_identity_that_cannot_be_saved() {
+        let _g = env_lock();
+        let mut e = engine();
+        let previous_bits = engine_bits().lock().unwrap().clone();
+        let sb = sandbox("setcam-identity");
+        let _ = &sb;
+        let (rgb, ir) = ("/dev/irlume-test-alt-rgb", "/dev/irlume-test-alt-ir");
+        let path = irlume_common::config::config_path("cameras.conf");
+        let lock = irlume_common::config::config_path("cameras.conf.lock");
+        assert_eq!((e.rgb_device(), e.ir_device()), (NO_RGB, NO_IR));
+        let refusal = |side: &str| {
+            format!(
+                "the {side} camera's USB identity has a line break or control character, or is \
+                 over 4096 bytes, so it cannot be saved in {}; cameras not changed; set \
+                 IRLUME_RGB_DEVICE and IRLUME_IR_DEVICE on the service instead",
+                path.display()
+            )
+        };
+
+        match set_camera_devices_with(rgb, ir, &mut e, |p: &str| {
+            (p == rgb).then(|| "046d:085e:x\nmode=automatic".to_owned())
+        }) {
+            Response::Error(msg) => assert_eq!(msg, refusal("RGB")),
+            other => panic!("an RGB identity with a line break must be refused, got {other:?}"),
+        }
+        assert_camera_selection_unchanged(&e, (NO_RGB, NO_IR), &previous_bits);
+        match set_camera_devices_with(rgb, ir, &mut e, |p: &str| {
+            (p == ir).then(|| "046d:085e:x\u{2028}y".to_owned())
+        }) {
+            Response::Error(msg) => assert_eq!(msg, refusal("IR")),
+            other => panic!("an IR identity with U+2028 must be refused, got {other:?}"),
+        }
+        assert_camera_selection_unchanged(&e, (NO_RGB, NO_IR), &previous_bits);
+        assert!(!path.exists() && !lock.exists(), "nothing may be written");
+
+        // What the injected source returns is what gets saved.
+        match set_camera_devices_with(rgb, ir, &mut e, |p: &str| {
+            Some(
+                if p == rgb {
+                    "046d:085e:a1"
+                } else {
+                    "046d:085e:b2"
+                }
+                .to_owned(),
+            )
+        }) {
+            Response::Ok(msg) => assert_eq!(msg, format!("cameras set to rgb={rgb} ir={ir}")),
+            other => panic!("savable identities must be accepted, got {other:?}"),
+        }
+        let pin = irlume_common::config::read_camera_pin();
+        assert_eq!(pin.rgb_id.as_deref(), Some("046d:085e:a1"));
+        assert_eq!(pin.ir_id.as_deref(), Some("046d:085e:b2"));
+
+        e.set_devices(NO_RGB, NO_IR);
+        publish_engine_bits_raw(previous_bits);
+    }
+
+    /// SetCameras rewrites all four pin keys, so a pin key repeated by hand
+    /// is repaired by the save and the reply carries no note.
+    #[test]
+    fn set_cameras_rewrites_duplicate_pin_lines() {
+        use irlume_common::config::{
+            observe_camera_conf, CameraConfObservation, CameraConfProblem,
+            CameraSelectionObservation, PinnedPair,
+        };
+        let _g = env_lock();
+        let mut e = engine();
+        let previous_bits = engine_bits().lock().unwrap().clone();
+        let sb = sandbox("setcam-duplicate");
+        let _ = &sb;
+        let (rgb, ir) = ("/dev/irlume-test-alt-rgb", "/dev/irlume-test-alt-ir");
+        let path = irlume_common::config::config_path("cameras.conf");
+
+        std::fs::write(&path, "rgb=/dev/a\nrgb=/dev/b\nir=/dev/c\n").unwrap();
+        assert_eq!(
+            observe_camera_conf().selection,
+            CameraSelectionObservation::Malformed {
+                line: 2,
+                problem: CameraConfProblem::DuplicateKey("rgb"),
+            }
+        );
+        match dispatch(
+            Request::SetCameras {
+                rgb: rgb.into(),
+                ir: ir.into(),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Ok(msg) => assert_eq!(msg, format!("cameras set to rgb={rgb} ir={ir}")),
+            other => panic!("root SetCameras must succeed, got {other:?}"),
+        }
+        assert_eq!(
+            observe_camera_conf(),
+            CameraConfObservation {
+                selection: CameraSelectionObservation::Pinned {
+                    pair: PinnedPair {
+                        rgb: rgb.into(),
+                        ir: ir.into(),
+                        rgb_id: None,
+                        ir_id: None,
+                    },
+                    explicit: false,
+                },
+                ignored: vec![],
+            }
+        );
+
+        e.set_devices(NO_RGB, NO_IR);
+        publish_engine_bits_raw(previous_bits);
+    }
+
+    /// A camera-key problem the save cannot repair (it lives in `mode`,
+    /// which SetCameras never writes) is named after the success text;
+    /// ignored lines are left to the startup warnings.
+    #[test]
+    fn set_cameras_names_a_problem_it_did_not_repair() {
+        let _g = env_lock();
+        let mut e = engine();
+        let previous_bits = engine_bits().lock().unwrap().clone();
+        let sb = sandbox("setcam-unrepaired");
+        let _ = &sb;
+        let (rgb, ir) = ("/dev/irlume-test-alt-rgb", "/dev/irlume-test-alt-ir");
+        let path = irlume_common::config::config_path("cameras.conf");
+
+        for (seed, (set_rgb, set_ir), expected) in [
+            (
+                "mode=sometimes\n",
+                (rgb, ir),
+                format!(
+                    "cameras set to rgb={rgb} ir={ir} ({} line 1: 'mode' is neither 'automatic' nor 'pinned')",
+                    path.display()
+                ),
+            ),
+            (
+                "mode=pinned\n",
+                ("", ""),
+                format!(
+                    "cameras set to rgb= ir= ({} line 1: 'mode=pinned' needs both 'rgb' and 'ir')",
+                    path.display()
+                ),
+            ),
+            (
+                "fps=30\nnotes\n",
+                (rgb, ir),
+                format!("cameras set to rgb={rgb} ir={ir}"),
+            ),
+        ] {
+            std::fs::write(&path, seed).unwrap();
+            match dispatch(
+                Request::SetCameras {
+                    rgb: set_rgb.into(),
+                    ir: set_ir.into(),
+                },
+                &peer(0),
+                &mut e,
+            ) {
+                Response::Ok(msg) => assert_eq!(msg, expected, "{seed:?}"),
+                other => panic!("root SetCameras must succeed on {seed:?}, got {other:?}"),
+            }
+        }
+
+        e.set_devices(NO_RGB, NO_IR);
+        publish_engine_bits_raw(previous_bits);
+    }
+
+    #[test]
+    fn camera_conf_startup_warnings_name_each_problem() {
+        use irlume_common::config::{
+            CameraConfObservation, CameraConfProblem, CameraSelectionObservation, IgnoredLine,
+            IgnoredLineReason, PinnedPair,
+        };
+        use std::io::ErrorKind;
+        let path = std::path::Path::new("/etc/irlume/cameras.conf");
+        let warnings = |selection, ignored| {
+            camera_conf_startup_warnings(&CameraConfObservation { selection, ignored }, path)
+        };
+        let pair = PinnedPair {
+            rgb: "/dev/video0".into(),
+            ir: "/dev/video2".into(),
+            rgb_id: None,
+            ir_id: None,
+        };
+        let pinned = || CameraSelectionObservation::Pinned {
+            pair: pair.clone(),
+            explicit: false,
+        };
+        let skip = |line, reason| IgnoredLine { line, reason };
+
+        for quiet in [
+            CameraSelectionObservation::Fresh,
+            pinned(),
+            CameraSelectionObservation::Automatic {
+                retained: Some(pair.clone()),
+            },
+            CameraSelectionObservation::Automatic { retained: None },
+        ] {
+            assert!(warnings(quiet.clone(), vec![]).is_empty(), "{quiet:?}");
+        }
+
+        // One line per unreadable file, with the hint for its cause.
+        let unreadable = |kind, detail: &str| {
+            warnings(
+                CameraSelectionObservation::Unreadable {
+                    kind,
+                    detail: detail.into(),
+                },
+                vec![],
+            )
+        };
+        assert_eq!(
+            unreadable(
+                ErrorKind::PermissionDenied,
+                "Permission denied (os error 13)"
+            ),
+            vec![
+                "irlumed: /etc/irlume/cameras.conf exists but cannot be read (Permission denied \
+                 (os error 13)); a camera pair saved in it is not used; check its SELinux label \
+                 (restorecon -v /etc/irlume/cameras.conf) and the journal for an AppArmor denial"
+            ]
+        );
+        for (kind, detail, hint) in [
+            (
+                ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+                "it is not UTF-8 text; correct or remove the lines that are not",
+            ),
+            (
+                ErrorKind::IsADirectory,
+                "Is a directory (os error 21)",
+                "it is a directory, not a file; move it aside",
+            ),
+            (
+                ErrorKind::NotFound,
+                "No such file or directory (os error 2)",
+                "it is a symbolic link to a file that does not exist; restore the target or \
+                 replace the link with the file",
+            ),
+            (
+                std::io::Error::from_raw_os_error(5).kind(),
+                "Input/output error (os error 5)",
+                "check the disk and the file system it is on",
+            ),
+        ] {
+            assert_eq!(
+                unreadable(kind, detail),
+                vec![format!(
+                    "irlumed: /etc/irlume/cameras.conf exists but cannot be read ({detail}); a \
+                     camera pair saved in it is not used; {hint}"
+                )],
+                "{kind:?}"
+            );
+        }
+
+        assert_eq!(
+            warnings(
+                CameraSelectionObservation::Malformed {
+                    line: 3,
+                    problem: CameraConfProblem::DuplicateKey("rgb"),
+                },
+                vec![],
+            ),
+            vec![
+                "irlumed: /etc/irlume/cameras.conf line 3: 'rgb' is set on more than one line; \
+                 this release still reads the saved pair as before; correct or remove that line"
+            ]
+        );
+
+        // Five ignored lines are named, the rest counted.
+        let ignored = |count: usize| {
+            (1..=count)
+                .map(|line| {
+                    skip(
+                        line,
+                        if line % 2 == 1 {
+                            IgnoredLineReason::NoSeparator
+                        } else {
+                            IgnoredLineReason::UnknownKey
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let six = warnings(pinned(), ignored(6));
+        assert_eq!(
+            six,
+            vec![
+                "irlumed: /etc/irlume/cameras.conf line 1 is ignored: it has no '='",
+                "irlumed: /etc/irlume/cameras.conf line 2 is ignored: its key is not one irlume recognizes",
+                "irlumed: /etc/irlume/cameras.conf line 3 is ignored: it has no '='",
+                "irlumed: /etc/irlume/cameras.conf line 4 is ignored: its key is not one irlume recognizes",
+                "irlumed: /etc/irlume/cameras.conf line 5 is ignored: it has no '='",
+                "irlumed: /etc/irlume/cameras.conf: 1 more line is ignored",
+            ]
+        );
+        let eight = warnings(pinned(), ignored(8));
+        assert_eq!(eight.len(), 6);
+        assert_eq!(eight[..5], six[..5]);
+        assert_eq!(
+            eight[5],
+            "irlumed: /etc/irlume/cameras.conf: 3 more lines are ignored"
+        );
+
+        // The state line comes first, then the ignored lines in file order.
+        assert_eq!(
+            warnings(
+                CameraSelectionObservation::Malformed {
+                    line: 2,
+                    problem: CameraConfProblem::InvalidMode,
+                },
+                vec![
+                    skip(1, IgnoredLineReason::NoSeparator),
+                    skip(4, IgnoredLineReason::UnknownKey),
+                ],
+            ),
+            vec![
+                "irlumed: /etc/irlume/cameras.conf line 2: 'mode' is neither 'automatic' nor \
+                 'pinned'; this release still reads the saved pair as before; correct or remove \
+                 that line",
+                "irlumed: /etc/irlume/cameras.conf line 1 is ignored: it has no '='",
+                "irlumed: /etc/irlume/cameras.conf line 4 is ignored: its key is not one irlume recognizes",
+            ]
+        );
+    }
+
+    /// The startup observation of `cameras.conf` runs before the policy and
+    /// environment branches of selection, so an unreadable file is reported
+    /// even when selection never reads it (ADR-0029 §4).
+    #[test]
+    fn startup_observes_cameras_conf_before_selecting_devices() {
+        let source = include_str!("main.rs");
+        let startup = source
+            .split("let startup_policy = irlume_common::config::observe_face_sensor_policy();")
+            .nth(1)
+            .unwrap()
+            .split("let devices = select_engine_devices(startup_policy);")
+            .next()
+            .unwrap();
+        assert!(startup.contains("observe_camera_conf()"));
+        assert!(startup.contains("camera_conf_startup_warnings("));
+        assert!(startup.contains("jout_warn!"));
     }
 
     #[test]

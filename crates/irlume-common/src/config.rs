@@ -5,15 +5,19 @@
 //! `IRLUME_CONFIG_DIR`), e.g. `cameras.conf`, `settings.conf`. Blank lines and
 //! `#` comments are ignored. These hold operator-tunable knobs the setup flow
 //! writes and the daemon reads; secrets never live here (those are sealed
-//! envelopes elsewhere).
+//! envelopes elsewhere). Writers refuse a key or value that would not read
+//! back as the same single line, and never rebuild a file they could not read.
 
 use std::path::PathBuf;
 
 /// Default config root.
 pub const CONFIG_ROOT: &str = "/etc/irlume";
 
-/// The config file that pins the camera pair (`rgb`, `ir`, `rgb_id`, `ir_id`)
-/// plus the per-camera capture mode. Named in one place so the reader
+/// The config file that pins the camera pair (`rgb`, `ir`, `rgb_id`, `ir_id`).
+/// It may also hold legacy `capture_mode.*` lines, which no production path
+/// reads any more (capture qualification lives in the state directory), and
+/// `mode`, reserved for ADR-0029: [`observe_camera_conf`] parses it, nothing
+/// acts on it yet. Named in one place so the reader
 /// ([`read_camera_pin`]) and the writer ([`write_camera_pin`]) cannot disagree
 /// on which file holds the pin.
 pub const CAMERAS_CONF: &str = "cameras.conf";
@@ -310,9 +314,74 @@ fn apply_kv_updates(existing: &str, updates: &[(&str, &str)]) -> String {
     out
 }
 
+/// Longest key a config writer accepts, in bytes.
+const MAX_CONFIG_KEY_BYTES: usize = 1024;
+/// Longest value a config writer accepts, in bytes.
+pub const MAX_CONFIG_VALUE_BYTES: usize = 4096;
+
+/// A character after which a line-based reader could see a different line:
+/// every `char::is_control` (C0, DEL and C1, NEL U+0085 included) plus the
+/// Unicode line and paragraph separators, which are not control characters.
+fn breaks_a_line(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+}
+
+/// Whether `key` reads back as itself: the readers trim each line, skip one
+/// that starts with `#`, and split at the first `=`.
+fn config_key_is_serializable(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_CONFIG_KEY_BYTES
+        && key.trim() == key
+        && !key.starts_with('#')
+        && !key.contains('=')
+        && !key.chars().any(breaks_a_line)
+}
+
+/// Whether `value` reads back as itself after `key=` on one line. Empty is
+/// allowed: it clears the key, which every reader then sees as absent.
+#[must_use]
+pub fn config_value_is_serializable(value: &str) -> bool {
+    value.len() <= MAX_CONFIG_VALUE_BYTES
+        && value.trim() == value
+        && !value.chars().any(breaks_a_line)
+}
+
+/// Refuse, before any I/O, an update that would not read back as the same
+/// single line. Neither message echoes the key or the value: a key can embed a
+/// device serial, and the text is what failed the check.
+fn check_updates(path: &std::path::Path, updates: &[(&str, &str)]) -> std::io::Result<()> {
+    for (key, value) in updates {
+        if !config_key_is_serializable(key) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to write {}: a key must be non-empty, at most \
+                     {MAX_CONFIG_KEY_BYTES} bytes, without line breaks, control characters, \
+                     '=' or surrounding whitespace, and must not start with '#'",
+                    path.display()
+                ),
+            ));
+        }
+        if !config_value_is_serializable(value) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to write {}: a value must be at most \
+                     {MAX_CONFIG_VALUE_BYTES} bytes, without line breaks, control characters \
+                     or surrounding whitespace",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Insert or update `key=value`, preserving every other line (including
 /// comments) and dropping duplicate keys. Creates the file at 0600 if absent.
-#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+///
+/// # Errors
+/// As [`write_kvs`].
 pub fn write_kv(file: &str, key: &str, val: &str) -> std::io::Result<()> {
     write_kvs(file, &[(key, val)])
 }
@@ -330,13 +399,35 @@ pub fn write_kv(file: &str, key: &str, val: &str) -> std::io::Result<()> {
 /// [`crate::write_0600_atomic`] rename means a reader sees either the complete
 /// old file or the complete new one, and a failure rolls the whole group back
 /// because nothing was renamed. See [`write_camera_pin`].
-#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+///
+/// # Errors
+/// `InvalidInput`, before any I/O, when a key or value would not read back as
+/// the same single line (see [`config_value_is_serializable`]). The read
+/// error's kind when the file exists but cannot be read: it is never rebuilt
+/// from empty, which would drop its other lines. Otherwise a failure to create
+/// the directory or to publish the file.
 pub fn write_kvs(file: &str, updates: &[(&str, &str)]) -> std::io::Result<()> {
     let path = config_path(file);
+    check_updates(&path, updates)?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    // Only a missing file reads as empty; any other failure established
+    // nothing about the other lines, so rewriting from empty would drop them.
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "{} exists but cannot be read ({e}); refusing to rewrite it, which would \
+                     drop its other lines",
+                    path.display()
+                ),
+            ))
+        }
+    };
     let out = apply_kv_updates(&existing, updates);
 
     // Published atomically, not truncated in place. Truncate-then-write means a
@@ -410,18 +501,21 @@ pub fn read_camera_pin() -> CameraPin {
 /// acquisition on the path.
 ///
 /// # Errors
-/// Propagates a failure to take the lock, and the failed write.
+/// `InvalidInput` for a value that would not read back as one line, before
+/// the lock is taken; then a failure to take the lock, and the failed write,
+/// including the refusal to rewrite a `cameras.conf` that cannot be read.
 pub fn write_camera_pin(rgb: &str, ir: &str, rgb_id: &str, ir_id: &str) -> std::io::Result<()> {
+    let updates = [
+        ("rgb", rgb),
+        ("ir", ir),
+        ("rgb_id", rgb_id),
+        ("ir_id", ir_id),
+    ];
+    // Checked before the lock too, so a refused value creates neither the
+    // config directory nor the lock sidecar; `write_kvs` checks again.
+    check_updates(&config_path(CAMERAS_CONF), &updates)?;
     let _guard = lock_exclusive(CAMERAS_CONF)?;
-    write_kvs(
-        CAMERAS_CONF,
-        &[
-            ("rgb", rgb),
-            ("ir", ir),
-            ("rgb_id", rgb_id),
-            ("ir_id", ir_id),
-        ],
-    )
+    write_kvs(CAMERAS_CONF, &updates)
 }
 
 #[cfg(test)]
@@ -461,6 +555,246 @@ mod camera_pin_tests {
 
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A complete saved camera pair: both node paths non-blank.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedPair {
+    /// The saved RGB node path.
+    pub rgb: String,
+    /// The saved IR node path.
+    pub ir: String,
+    /// The RGB node's device identity; `None` when blank or absent.
+    pub rgb_id: Option<String>,
+    /// The IR node's device identity; `None` when blank or absent.
+    pub ir_id: Option<String>,
+}
+
+/// Why a readable `cameras.conf` breaks the strict grammar of its camera
+/// selection keys (ADR-0029 §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraConfProblem {
+    /// The key is on more than one line; blank values count.
+    DuplicateKey(&'static str),
+    /// The key's value would not read back as one line.
+    UnsafeValue(&'static str),
+    /// `mode` holds something other than `automatic` or `pinned`.
+    InvalidMode,
+    /// `mode=pinned` without a complete pair.
+    PinnedWithoutPair,
+}
+
+impl std::fmt::Display for CameraConfProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateKey(key) => write!(f, "'{key}' is set on more than one line"),
+            Self::UnsafeValue(key) => write!(
+                f,
+                "the value of '{key}' has a line break or control character, or is over \
+                 {MAX_CONFIG_VALUE_BYTES} bytes"
+            ),
+            Self::InvalidMode => f.write_str("'mode' is neither 'automatic' nor 'pinned'"),
+            Self::PinnedWithoutPair => f.write_str("'mode=pinned' needs both 'rgb' and 'ir'"),
+        }
+    }
+}
+
+/// What one strict read of `cameras.conf` establishes about camera selection
+/// (ADR-0029 §4). `Unreadable` and `Malformed` are never `Fresh`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CameraSelectionObservation {
+    /// No file, or a readable one with no complete pair and no `mode` line.
+    Fresh,
+    /// A complete pair; `explicit` when a `mode=pinned` line was present.
+    Pinned { pair: PinnedPair, explicit: bool },
+    /// `mode=automatic`; `retained` is the complete pair kept beside it.
+    Automatic { retained: Option<PinnedPair> },
+    /// The file exists but could not be read. `detail` is the I/O error's
+    /// text (the OS message; never file content).
+    Unreadable {
+        kind: std::io::ErrorKind,
+        detail: String,
+    },
+    /// The file was read but breaks the grammar; `line` is 1-based.
+    Malformed {
+        line: usize,
+        problem: CameraConfProblem,
+    },
+}
+
+/// Why the grammar skipped a line. Skipped lines are reported, never an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IgnoredLineReason {
+    /// A non-blank, non-comment line without `=`.
+    NoSeparator,
+    /// A key that is neither a selection key nor a legacy `capture_mode.*` key.
+    UnknownKey,
+}
+
+impl std::fmt::Display for IgnoredLineReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoSeparator => "it has no '='",
+            Self::UnknownKey => "its key is not one irlume recognizes",
+        })
+    }
+}
+
+/// One skipped line of `cameras.conf`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IgnoredLine {
+    /// The 1-based line number.
+    pub line: usize,
+    /// Why the grammar skipped it.
+    pub reason: IgnoredLineReason,
+}
+
+/// One strict read of `cameras.conf`: the selection state and every skipped
+/// line, in file order (always empty for `Fresh` from a missing file and for
+/// `Unreadable`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CameraConfObservation {
+    /// What the file establishes about camera selection.
+    pub selection: CameraSelectionObservation,
+    /// Every skipped line, in file order.
+    pub ignored: Vec<IgnoredLine>,
+}
+
+/// The keys the strict grammar governs, in the order [`parse_camera_conf`]
+/// records their first occurrence.
+const CAMERA_SELECTION_KEYS: [&str; 5] = ["rgb", "ir", "rgb_id", "ir_id", "mode"];
+
+/// The legacy per-camera capture-mode keys. Besides the pin they are the only
+/// keys irlume has written to `cameras.conf`, so they are known and silent.
+fn is_legacy_capture_mode_key(key: &str) -> bool {
+    key.starts_with("capture_mode.") || key.starts_with("capture_mode_origin.")
+}
+
+/// Classify `cameras.conf` text under the strict grammar. Pure; never
+/// returns `Unreadable`.
+///
+/// Lines are trimmed and split at the first `=` exactly as [`read_kvs`] does.
+/// A repeated selection key, an unsafe value and an invalid `mode` are
+/// checked in that order on each line, and the first problem in file order is
+/// the result; `mode=pinned` without a complete pair is judged only once the
+/// whole file had no line problem. Scanning always runs to the end, so
+/// `ignored` lists every skipped line.
+#[must_use]
+pub fn parse_camera_conf(text: &str) -> CameraConfObservation {
+    use CameraSelectionObservation::{Automatic, Fresh, Malformed, Pinned};
+    // First occurrence of each selection key, indexed like
+    // CAMERA_SELECTION_KEYS, recorded whether or not its line had a problem.
+    let mut seen: [Option<(usize, &str)>; 5] = [None; 5];
+    let mut problem: Option<(usize, CameraConfProblem)> = None;
+    let mut ignored = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let number = index + 1;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            ignored.push(IgnoredLine {
+                line: number,
+                reason: IgnoredLineReason::NoSeparator,
+            });
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim());
+        if is_legacy_capture_mode_key(key) {
+            continue;
+        }
+        let Some(slot) = CAMERA_SELECTION_KEYS.iter().position(|k| *k == key) else {
+            ignored.push(IgnoredLine {
+                line: number,
+                reason: IgnoredLineReason::UnknownKey,
+            });
+            continue;
+        };
+        let name = CAMERA_SELECTION_KEYS[slot];
+        let found = if seen[slot].is_some() {
+            Some(CameraConfProblem::DuplicateKey(name))
+        } else if !config_value_is_serializable(value) {
+            Some(CameraConfProblem::UnsafeValue(name))
+        } else if name == "mode" && !matches!(value, "automatic" | "pinned") {
+            Some(CameraConfProblem::InvalidMode)
+        } else {
+            None
+        };
+        if seen[slot].is_none() {
+            seen[slot] = Some((number, value));
+        }
+        if problem.is_none() {
+            problem = found.map(|p| (number, p));
+        }
+    }
+    if let Some((line, problem)) = problem {
+        return CameraConfObservation {
+            selection: Malformed { line, problem },
+            ignored,
+        };
+    }
+    let value = |slot: usize| seen[slot].map(|(_, v)| v).filter(|v| !v.is_empty());
+    let pair = match (value(0), value(1)) {
+        (Some(rgb), Some(ir)) => Some(PinnedPair {
+            rgb: rgb.to_owned(),
+            ir: ir.to_owned(),
+            rgb_id: value(2).map(str::to_owned),
+            ir_id: value(3).map(str::to_owned),
+        }),
+        _ => None,
+    };
+    let selection = match (seen[4], pair) {
+        (None, Some(pair)) => Pinned {
+            pair,
+            explicit: false,
+        },
+        (None, None) => Fresh,
+        (Some((_, "automatic")), retained) => Automatic { retained },
+        // Any other value was already an InvalidMode problem, so this is
+        // `pinned`.
+        (Some(_), Some(pair)) => Pinned {
+            pair,
+            explicit: true,
+        },
+        (Some((line, _)), None) => Malformed {
+            line,
+            problem: CameraConfProblem::PinnedWithoutPair,
+        },
+    };
+    CameraConfObservation { selection, ignored }
+}
+
+/// One read of `cameras.conf`, classified. Does not log. The file is 0600, so
+/// a caller without read access sees `Unreadable`; only the daemon's
+/// observation is authoritative.
+#[must_use]
+pub fn observe_camera_conf() -> CameraConfObservation {
+    let path = config_path(CAMERAS_CONF);
+    let unreadable = |e: &std::io::Error| CameraConfObservation {
+        selection: CameraSelectionObservation::Unreadable {
+            kind: e.kind(),
+            detail: e.to_string(),
+        },
+        ignored: Vec::new(),
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => parse_camera_conf(&text),
+        // The name itself exists and only its target is missing: a dangling
+        // symlink, for example to a volume not mounted yet. A pinned host must
+        // not read as fresh because of that (ADR-0029 §4).
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(&path).is_ok() =>
+        {
+            unreadable(&e)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CameraConfObservation {
+            selection: CameraSelectionObservation::Fresh,
+            ignored: Vec::new(),
+        },
+        Err(e) => unreadable(&e),
     }
 }
 
@@ -687,7 +1021,13 @@ mod tests {
             ("2", true),
             ("", true),
         ] {
-            write_kv("settings.conf", "privileged_face_consent", value).unwrap();
+            // Seeded by hand: the writers refuse the spaces around " OFF ",
+            // which a hand-edited file can still hold and the reader trims.
+            std::fs::write(
+                dir.join("settings.conf"),
+                format!("privileged_face_consent={value}\n"),
+            )
+            .unwrap();
             assert_eq!(
                 privileged_face_consent_required(),
                 required,
@@ -1109,6 +1449,641 @@ mod tests {
             saw_a && saw_b,
             "the writer must have raced the reader (saw_a={saw_a}, saw_b={saw_b}, reads={reads})"
         );
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whether the test runs as root, which reads through mode bits.
+    fn running_as_root() -> bool {
+        // SAFETY: `geteuid` takes no arguments, reads only the calling process's own
+        // credentials, and is specified as always succeeding, so it has no
+        // preconditions for the caller to uphold.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// The writers' line rules: what reads back as the same single line is
+    /// accepted, anything a line-based reader could split or trim is refused.
+    /// Lengths are bytes, not characters.
+    #[test]
+    fn config_line_rules_accept_one_line_and_refuse_the_rest() {
+        let (key_1024, key_1025) = ("a".repeat(1024), "a".repeat(1025));
+        for key in [
+            "",
+            " rgb",
+            "rgb ",
+            "#rgb",
+            "a=b",
+            "rgb\nir",
+            "k\rx",
+            "k\tx",
+            "k\u{85}x",
+            "k\u{2028}x",
+            "k\u{2029}x",
+            &key_1025,
+        ] {
+            assert!(!config_key_is_serializable(key), "{key:?}");
+        }
+        for key in [
+            "rgb",
+            "key with spaces",
+            "a#b",
+            &key_1024,
+            "capture_mode.3277:0059:200901010001+3277:0059:200901010001",
+            "capture_mode_origin.046d:085e:abc+046d:085e:def",
+        ] {
+            assert!(config_key_is_serializable(key), "{key:?}");
+        }
+
+        let (value_4096, value_4097) = ("a".repeat(4096), "a".repeat(4097));
+        // Two bytes per character: 2048 fit, 2049 are 4098 bytes.
+        let (wide_4096, wide_4098) = ("é".repeat(2048), "é".repeat(2049));
+        for value in [
+            "x\nmode=automatic",
+            "\rrgb=/dev/x",
+            "x\u{85}y",
+            "x\u{2028}y",
+            "x\u{2029}",
+            " x",
+            "x ",
+            "a\0b",
+            "a\tb",
+            &value_4097,
+            &wide_4098,
+        ] {
+            assert!(!config_value_is_serializable(value), "{value:?}");
+        }
+        for value in [
+            "",
+            "auto-switch 1786320000",
+            "046d:085e:e179cb54",
+            "/dev/video0",
+            "/custom/camera with spaces",
+            "a=b",
+            "#x",
+            &value_4096,
+            &wide_4096,
+        ] {
+            assert!(config_value_is_serializable(value), "{value:?}");
+        }
+    }
+
+    /// A refused key or value is refused before any I/O, names neither the
+    /// key nor the value, and leaves the file as it was; a group is all or
+    /// nothing.
+    #[test]
+    fn write_kvs_refuses_keys_and_values_that_would_not_read_back() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-lines-in-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        let path = config_path("cameras.conf");
+        let seed = b"# note\nrgb=/dev/video0\n";
+        std::fs::write(&path, seed).unwrap();
+
+        let key_prefix = format!("refusing to write {}: a key must", path.display());
+        for key in ["capture_mode.x\nrgb=/dev/video9+y", "#rgb", ""] {
+            let error = write_kv("cameras.conf", key, "v").unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{key:?}");
+            let message = error.to_string();
+            assert!(message.starts_with(&key_prefix), "{message}");
+            assert!(message.contains("1024 bytes"), "{message}");
+            assert!(!message.contains("video9"), "{message}");
+            assert_eq!(std::fs::read(&path).unwrap(), seed, "{key:?}");
+        }
+
+        let value_prefix = format!("refusing to write {}: a value must", path.display());
+        let long = "a".repeat(4097);
+        for value in ["x\nmode=automatic", "x\u{2028}y", &long] {
+            let error = write_kv("cameras.conf", "rgb_id", value).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{value:?}");
+            let message = error.to_string();
+            assert!(message.starts_with(&value_prefix), "{message}");
+            assert!(message.contains("4096 bytes"), "{message}");
+            assert!(
+                message.contains("line breaks, control characters"),
+                "{message}"
+            );
+            assert!(!message.contains("mode=automatic"), "{message}");
+            assert!(!message.contains("aaaaaaaa"), "{message}");
+            assert!(!message.contains('\u{2028}'), "{message}");
+            assert_eq!(std::fs::read(&path).unwrap(), seed, "{value:?}");
+        }
+
+        // Each pair's key is checked before its value, and the first failing
+        // pair in `updates` order is the one reported.
+        let error = write_kv("cameras.conf", "#k", "x\ny").unwrap_err();
+        assert!(error.to_string().starts_with(&key_prefix), "{error}");
+        let error = write_kvs("cameras.conf", &[("ir", "a\nb"), ("#k", "v")]).unwrap_err();
+        assert!(error.to_string().starts_with(&value_prefix), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), seed);
+
+        // One bad update refuses the whole group.
+        let error =
+            write_kvs("cameras.conf", &[("ir", "/dev/video2"), ("ir_id", "a\nb")]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(&path).unwrap(), seed);
+        assert!(matches!(
+            observe_kv("cameras.conf", "ir"),
+            KvObservation::Absent
+        ));
+
+        // Refused before the config directory is created.
+        let absent = dir.join("absent");
+        std::env::set_var("IRLUME_CONFIG_DIR", &absent);
+        let error = write_kv("cameras.conf", "rgb_id", "x\ny").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!absent.exists());
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        // What the rules accept reads back as written; an empty value clears.
+        write_kv("cameras.conf", "k", "auto-switch 1786320000").unwrap();
+        assert!(matches!(
+            observe_kv("cameras.conf", "k"),
+            KvObservation::Value(v) if v == "auto-switch 1786320000"
+        ));
+        write_kv("cameras.conf", "k", "a=b").unwrap();
+        assert!(matches!(
+            observe_kv("cameras.conf", "k"),
+            KvObservation::Value(v) if v == "a=b"
+        ));
+        write_kv("cameras.conf", "k", "").unwrap();
+        assert!(matches!(
+            observe_kv("cameras.conf", "k"),
+            KvObservation::Absent
+        ));
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that exists but cannot be read is never rebuilt from empty,
+    /// which would drop its other lines; the error keeps the read's kind.
+    #[test]
+    fn write_kvs_refuses_to_rebuild_an_unreadable_file() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-norebuild-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        let path = config_path("cameras.conf");
+
+        // Bytes that are not UTF-8, after lines worth keeping.
+        let seed: &[u8] = b"# operator notes\ncapture_mode.046d:085e:abc+046d:085e:def=sequential\nrgb=/dev/video0\n\xff\n";
+        std::fs::write(&path, seed).unwrap();
+        let prefix = format!("{} exists but cannot be read (", path.display());
+        for error in [
+            write_kv("cameras.conf", "rgb_id", "a").unwrap_err(),
+            write_camera_pin("/dev/video4", "/dev/video6", "", "").unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+            let message = error.to_string();
+            assert!(message.starts_with(&prefix), "{message}");
+            assert!(message.contains("refusing to rewrite it"), "{message}");
+            assert_eq!(std::fs::read(&path).unwrap(), seed);
+        }
+
+        // A directory in the file's place.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = write_kv("cameras.conf", "rgb_id", "a").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::IsADirectory, "{error}");
+        // An unsafe value is refused as such, before the read.
+        let error = write_kv("cameras.conf", "rgb_id", "x\ny").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+        assert!(path.is_dir());
+        std::fs::remove_dir(&path).unwrap();
+
+        // Unreadable to an unprivileged caller. This exercises the kind
+        // mapping only: the daemon keeps CAP_DAC_OVERRIDE, so mode bits never
+        // make the file unreadable to it, and root reads through them here.
+        if !running_as_root() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&path, "rgb=/dev/video0\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let error = write_kv("cameras.conf", "rgb_id", "a").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{error}"
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"rgb=/dev/video0\n");
+        }
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pin writer checks its values before it takes the lock, so a
+    /// refused identity creates no config directory, file or lock sidecar,
+    /// and a refused repin leaves the saved pin in place.
+    #[test]
+    fn write_camera_pin_validates_before_taking_the_lock() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-pincheck-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        let error = write_camera_pin(
+            "/dev/video0",
+            "/dev/video2",
+            "046d:085e:x\nmode=automatic",
+            "",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!dir.exists(), "no directory, file or lock may be created");
+
+        write_camera_pin("/dev/video0", "/dev/video2", "046d:085e:a", "").unwrap();
+        let path = config_path("cameras.conf");
+        let saved = std::fs::read(&path).unwrap();
+        let error = write_camera_pin(
+            "/dev/video4",
+            "/dev/video6",
+            "",
+            "046d:085e:b\u{2028}ir=/dev/x",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        match observe_camera_conf().selection {
+            CameraSelectionObservation::Pinned { pair, .. } => {
+                assert_eq!(pair.rgb, "/dev/video0");
+                assert_eq!(pair.rgb_id.as_deref(), Some("046d:085e:a"));
+            }
+            other => panic!("the saved pin must stand, got {other:?}"),
+        }
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The strict `cameras.conf` grammar (ADR-0029 §4), one labeled row per
+    /// case, each asserting the selection and every ignored line.
+    #[test]
+    fn parse_camera_conf_follows_the_grammar() {
+        use CameraConfProblem::{DuplicateKey, InvalidMode, PinnedWithoutPair, UnsafeValue};
+        use CameraSelectionObservation::{Automatic, Fresh, Malformed, Pinned};
+        use IgnoredLineReason::{NoSeparator, UnknownKey};
+        let pair = |rgb: &str, ir: &str| PinnedPair {
+            rgb: rgb.into(),
+            ir: ir.into(),
+            rgb_id: None,
+            ir_id: None,
+        };
+        let video = pair("/dev/video0", "/dev/video2");
+        let pinned = |pair: PinnedPair| Pinned {
+            pair,
+            explicit: false,
+        };
+        let bad = |line, problem| Malformed { line, problem };
+        let skip = |line, reason| IgnoredLine { line, reason };
+        let over_long = format!("rgb={}\n", "a".repeat(4097));
+        let rows: Vec<(&str, &str, CameraSelectionObservation, Vec<IgnoredLine>)> = vec![
+            // Basic readings.
+            ("empty", "", Fresh, vec![]),
+            ("comments only", "# a\n\n  # b\n", Fresh, vec![]),
+            (
+                "legacy capture-mode lines",
+                "capture_mode.a+b=sequential\ncapture_mode_origin.a+b=auto-switch 1\ncapture_mode.a=concurrent\n",
+                Fresh,
+                vec![],
+            ),
+            ("one-sided", "rgb=/dev/video0\n", Fresh, vec![]),
+            ("blank pair", "rgb=\nir=\n", Fresh, vec![]),
+            (
+                "pair, no ids",
+                "rgb=/dev/video0\nir=/dev/video2\n",
+                pinned(video.clone()),
+                vec![],
+            ),
+            (
+                "pair with ids",
+                "rgb=/dev/video0\nir=/dev/video2\nrgb_id=046d:085e:e179cb54\nir_id=3443:c803\n",
+                pinned(PinnedPair {
+                    rgb_id: Some("046d:085e:e179cb54".into()),
+                    ir_id: Some("3443:c803".into()),
+                    ..video.clone()
+                }),
+                vec![],
+            ),
+            (
+                "blank ids",
+                "rgb=/dev/video0\nir=/dev/video2\nrgb_id=\nir_id= \n",
+                pinned(video.clone()),
+                vec![],
+            ),
+            (
+                "spacing and CRLF",
+                "  rgb = /dev/video0 \r\nir=/dev/video2\r\n",
+                pinned(video.clone()),
+                vec![],
+            ),
+            (
+                "value holding =",
+                "rgb=/custom/camera=ir\nir=/dev/video2\n",
+                pinned(pair("/custom/camera=ir", "/dev/video2")),
+                vec![],
+            ),
+            ("commented pin", "# rgb=/dev/x\n", Fresh, vec![]),
+            // `mode` values.
+            (
+                "explicit pin",
+                "mode=pinned\nrgb=/dev/video0\nir=/dev/video2\n",
+                Pinned {
+                    pair: video.clone(),
+                    explicit: true,
+                },
+                vec![],
+            ),
+            (
+                "pinned, no pair",
+                "mode=pinned\n",
+                bad(1, PinnedWithoutPair),
+                vec![],
+            ),
+            (
+                "pinned, one side",
+                "rgb=/dev/video0\nmode=pinned\n",
+                bad(2, PinnedWithoutPair),
+                vec![],
+            ),
+            (
+                "automatic, no pair",
+                "mode=automatic\n",
+                Automatic { retained: None },
+                vec![],
+            ),
+            (
+                "automatic with pair",
+                "mode=automatic\nrgb=/dev/video0\nir=/dev/video2\n",
+                Automatic {
+                    retained: Some(video.clone()),
+                },
+                vec![],
+            ),
+            ("unknown value", "mode=auto\n", bad(1, InvalidMode), vec![]),
+            ("blank value", "mode=\n", bad(1, InvalidMode), vec![]),
+            ("capitalized value", "mode=Pinned\n", bad(1, InvalidMode), vec![]),
+            // Duplicates and unsafe values.
+            (
+                "duplicate rgb",
+                "rgb=/dev/a\nrgb=/dev/b\nir=/dev/c\n",
+                bad(2, DuplicateKey("rgb")),
+                vec![],
+            ),
+            (
+                "duplicate blank id",
+                "rgb_id=\nrgb_id=\n",
+                bad(2, DuplicateKey("rgb_id")),
+                vec![],
+            ),
+            (
+                "duplicate mode",
+                "mode=pinned\nmode=pinned\n",
+                bad(2, DuplicateKey("mode")),
+                vec![],
+            ),
+            ("interior CR", "ir=/dev/a\rb\n", bad(1, UnsafeValue("ir")), vec![]),
+            ("interior tab", "ir=/dev/a\tb\n", bad(1, UnsafeValue("ir")), vec![]),
+            (
+                "U+2028 in an id",
+                "rgb_id=046d:085e:x\u{2028}y\n",
+                bad(1, UnsafeValue("rgb_id")),
+                vec![],
+            ),
+            (
+                "NEL in an id",
+                "rgb_id=046d:085e:x\u{85}y\n",
+                bad(1, UnsafeValue("rgb_id")),
+                vec![],
+            ),
+            ("over-long value", &over_long, bad(1, UnsafeValue("rgb")), vec![]),
+            // Ignored lines.
+            (
+                "no separator",
+                "rgb /dev/video0\nir=/dev/video2\n",
+                Fresh,
+                vec![skip(1, NoSeparator)],
+            ),
+            (
+                "unknown key",
+                "fps=30\nrgb=/dev/video0\nir=/dev/video2\n",
+                pinned(video.clone()),
+                vec![skip(1, UnknownKey)],
+            ),
+            ("empty key", "=x\n", Fresh, vec![skip(1, UnknownKey)]),
+            (
+                "key case",
+                "Mode=pinned\nrgb=/dev/video0\nir=/dev/video2\n",
+                pinned(video.clone()),
+                vec![skip(1, UnknownKey)],
+            ),
+            // Order when there is more than one problem.
+            (
+                "unsafe beats invalid mode",
+                "mode=auto\u{2028}x\n",
+                bad(1, UnsafeValue("mode")),
+                vec![],
+            ),
+            (
+                "duplicate beats unsafe",
+                "rgb=/dev/a\nrgb=/dev/b\tc\n",
+                bad(2, DuplicateKey("rgb")),
+                vec![],
+            ),
+            (
+                "first line wins",
+                "notes\nmode=x\nrgb=/dev/a\nrgb=/dev/b\n",
+                bad(2, InvalidMode),
+                vec![skip(1, NoSeparator)],
+            ),
+            (
+                "line problem beats PinnedWithoutPair",
+                "mode=pinned\nrgb=/dev/a\nrgb=/dev/b\n",
+                bad(3, DuplicateKey("rgb")),
+                vec![],
+            ),
+            (
+                "scan continues",
+                "rgb=/dev/a\nrgb=/dev/b\nnotes\nfps=1\n",
+                bad(2, DuplicateKey("rgb")),
+                vec![skip(3, NoSeparator), skip(4, UnknownKey)],
+            ),
+        ];
+        for (label, input, selection, ignored) in rows {
+            assert_eq!(
+                parse_camera_conf(input),
+                CameraConfObservation { selection, ignored },
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn camera_conf_problem_and_ignored_line_texts() {
+        for (problem, text) in [
+            (
+                CameraConfProblem::DuplicateKey("rgb"),
+                "'rgb' is set on more than one line",
+            ),
+            (
+                CameraConfProblem::UnsafeValue("ir_id"),
+                "the value of 'ir_id' has a line break or control character, or is over 4096 bytes",
+            ),
+            (
+                CameraConfProblem::InvalidMode,
+                "'mode' is neither 'automatic' nor 'pinned'",
+            ),
+            (
+                CameraConfProblem::PinnedWithoutPair,
+                "'mode=pinned' needs both 'rgb' and 'ir'",
+            ),
+        ] {
+            assert_eq!(problem.to_string(), text);
+        }
+        assert_eq!(IgnoredLineReason::NoSeparator.to_string(), "it has no '='");
+        assert_eq!(
+            IgnoredLineReason::UnknownKey.to_string(),
+            "its key is not one irlume recognizes"
+        );
+    }
+
+    /// Only a missing file is fresh. Every file that exists but cannot be
+    /// read, a dangling symbolic link included, is its own state (ADR-0029
+    /// §4), so a pinned host never reads as fresh because of a read error.
+    #[test]
+    fn observe_camera_conf_reads_absent_as_fresh_and_read_errors_as_unreadable() {
+        use std::io::ErrorKind;
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-camobs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        let path = config_path("cameras.conf");
+        let unreadable = |want: ErrorKind| match observe_camera_conf() {
+            CameraConfObservation {
+                selection: CameraSelectionObservation::Unreadable { kind, detail },
+                ignored,
+            } => {
+                assert_eq!(kind, want);
+                assert!(!detail.is_empty());
+                assert!(ignored.is_empty());
+            }
+            other => panic!("expected Unreadable {want:?}, got {other:?}"),
+        };
+
+        assert_eq!(
+            observe_camera_conf(),
+            CameraConfObservation {
+                selection: CameraSelectionObservation::Fresh,
+                ignored: vec![],
+            }
+        );
+
+        let text = "# notes\nfps=30\nrgb=/dev/video0\nir=/dev/video2\n";
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(observe_camera_conf(), parse_camera_conf(text));
+        std::fs::remove_file(&path).unwrap();
+
+        std::fs::create_dir(&path).unwrap();
+        unreadable(ErrorKind::IsADirectory);
+        std::fs::remove_dir(&path).unwrap();
+
+        std::fs::write(&path, b"rgb=/dev/video0\n\xff\n").unwrap();
+        unreadable(ErrorKind::InvalidData);
+
+        if !running_as_root() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            unreadable(ErrorKind::PermissionDenied);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::fs::remove_file(&path).unwrap();
+
+        // A link whose target is missing: the name exists, so not fresh.
+        std::os::unix::fs::symlink(dir.join("absent-target"), &path).unwrap();
+        unreadable(ErrorKind::NotFound);
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every file irlume itself writes observes as a plain pin with no
+    /// ignored line, and the observation names the same pair
+    /// [`read_camera_pin`] returns.
+    #[test]
+    fn camera_conf_observation_agrees_with_read_camera_pin_on_files_irlume_writes() {
+        fn agrees(label: &str) {
+            let observed = observe_camera_conf();
+            assert!(observed.ignored.is_empty(), "{label}: {observed:?}");
+            let CameraSelectionObservation::Pinned {
+                pair,
+                explicit: false,
+            } = observed.selection
+            else {
+                panic!("{label}: {:?}", observed.selection);
+            };
+            let pin = read_camera_pin();
+            assert_eq!(Some(pair.rgb), pin.rgb, "{label}");
+            assert_eq!(Some(pair.ir), pin.ir, "{label}");
+            assert_eq!(pair.rgb_id, pin.rgb_id, "{label}");
+            assert_eq!(pair.ir_id, pin.ir_id, "{label}");
+        }
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-camagree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        let path = config_path("cameras.conf");
+
+        write_camera_pin(
+            "/dev/video0",
+            "/dev/video2",
+            "046d:085e:e179cb54",
+            "3443:c803",
+        )
+        .unwrap();
+        agrees("new file");
+
+        std::fs::write(
+            &path,
+            "# operator notes\ncapture_mode.046d:085e:abc+046d:085e:def=sequential\ncapture_mode_origin.046d:085e:abc+046d:085e:def=auto-switch 1786320000\n",
+        )
+        .unwrap();
+        write_camera_pin("/dev/video4", "/dev/video6", "", "").unwrap();
+        agrees("pin beside legacy capture-mode lines");
+
+        write_kv(
+            "cameras.conf",
+            "capture_mode.3277:0059:200901010001+3277:0059:200901010001",
+            "concurrent",
+        )
+        .unwrap();
+        agrees("legacy capture-mode writer");
+
+        std::fs::write(&path, "rgb=/dev/a\nrgb=/dev/b\nir=/dev/c\n").unwrap();
+        assert_eq!(
+            observe_camera_conf().selection,
+            CameraSelectionObservation::Malformed {
+                line: 2,
+                problem: CameraConfProblem::DuplicateKey("rgb"),
+            }
+        );
+        write_camera_pin("/dev/video0", "/dev/video2", "", "").unwrap();
+        agrees("repin collapses a duplicate");
+
+        write_camera_pin("", "", "", "").unwrap();
+        assert_eq!(
+            observe_camera_conf(),
+            CameraConfObservation {
+                selection: CameraSelectionObservation::Fresh,
+                ignored: vec![],
+            }
+        );
+        assert_eq!(read_camera_pin(), CameraPin::default());
 
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);

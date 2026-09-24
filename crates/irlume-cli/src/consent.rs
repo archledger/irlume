@@ -75,8 +75,8 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
     let update = || -> std::io::Result<()> {
         let _lock = config::lock_exclusive("settings.conf")?;
-        // write_kv preserves unrelated values, but its legacy read-error
-        // fallback is empty content. Never use that fallback for this control.
+        // write_kv also refuses to rewrite a file it cannot read; this check
+        // answers first, with the read error for this key.
         if let config::KvObservation::Unknown(error) =
             config::observe_kv("settings.conf", "privileged_face_consent")
         {

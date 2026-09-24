@@ -3576,7 +3576,8 @@ pub struct NodeScan {
     pub classified: Vec<(String, Role)>,
     /// Nodes that answered and advertised no capture format: the metadata
     /// interface of a streaming node (#575). Informational; no camera-picking
-    /// caller consumes this bucket.
+    /// caller consumes this bucket. The supervisor records these as
+    /// `Role::Other` for the camera-free pairing view (ADR-0029 §1).
     pub other: Vec<String>,
     pub unreadable: Vec<Unreadable>,
     /// Nodes refused before format enumeration because their format list is
@@ -3624,10 +3625,6 @@ fn uvc_scan(with_holders: bool) -> NodeScan {
         file_node(&mut scan, path, outcome);
     }
     scan
-}
-
-fn uvc_discover_nodes() -> Vec<(String, Role)> {
-    uvc_scan(false).classified
 }
 
 /// Classify every video node, keeping the failures and naming what holds a
@@ -4567,8 +4564,12 @@ pub fn camera_rate_diagnostics(
     })
 }
 
-pub(crate) fn uvc_list_pairs() -> Vec<CameraPair> {
-    pairs_from(&uvc_discover_nodes())
+/// The discovery scan and the pairs over its classified nodes, so the
+/// supervisor can keep the whole scan while pairing callers get the pairs.
+pub(crate) fn uvc_pairing_scan() -> (NodeScan, Vec<CameraPair>) {
+    let scan = uvc_scan(false);
+    let pairs = pairs_from(&scan.classified);
+    (scan, pairs)
 }
 
 /// The pair list over classified nodes the caller already holds, so the

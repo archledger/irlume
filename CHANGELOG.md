@@ -7,6 +7,41 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Faces groups each profile's scans by the camera that captured them
+  (ADR-0030 §2, C2). The profile's line counts its scans against the
+  capture target ("12 scans · capture target met", "3 of 10 scans
+  (capture target)") and says nothing about readiness or conditions. The
+  primary camera's group stays collapsed until Enter or a second click
+  on it or on its profile opens it; it then lists each scan with the
+  local day it was captured, or "date not recorded" for older scans and
+  older daemons. Each added camera the profile has scans on is one row
+  with its count, calibration, capture dates and connection, and `d`
+  removes that camera group after a confirmation; an added camera left
+  behind by a renamed or deleted profile is listed after the profiles
+  and can still be removed. The raw group id no longer appears, on the
+  row or in Activity, and the "[x]" tip, which had no key behind it, is
+  gone. When the added cameras cannot be read, Faces says so under the
+  list, naming the kind of failure but never the store's detail. The
+  Cameras page tells how to add a camera that is not enrolled for the
+  account: enroll a face first, or make it the daemon's camera and run
+  `irlume enroll --add-camera` (with `--name` when the account has
+  several profiles). `i` runs the recognition test with `IdentifyFor`
+  for the account the TUI shows, on any page, and stays on that page;
+  once the profile list has been read and is empty, it says so and
+  opens no camera. The result names the matching profile, or gives the
+  outcome and cause in the Overview's words, never a score or a
+  threshold, and shows in Activity, under the Faces list and on the
+  Overview's last-attempt line. A test the daemon turns away unrun,
+  such as for a busy camera, reads "did not complete" with the daemon's
+  reason ("did not complete: the daemon was still starting" while it
+  loads its models); a throttled test, or one where face unlock is not
+  the configured method, reads "refused" as on the Overview, and an
+  older daemon's refusal reads as needing a newer irlumed. The Test
+  Recognition page is folded into `i`: it leaves the sidebar, so `v`
+  now only lists Cameras before the daemon reports its camera
+  inventory, and `irlume tui --page identify` still opens Faces for
+  existing launchers while the usage text no longer lists it.
+
 - The Overview leads with the account's last face attempt (ADR-0030 §2,
   C2). The TUI reads the attempt record with `LastAttempts` for the
   account it shows, on its own worker with a 4 s budget: on entering
@@ -127,8 +162,8 @@ All notable changes to irlume are documented here. This project adheres to
   longer quits during a running task; `q` remains the escape hatch.
 
 - The TUI's Cameras page lists each camera by its own name with its role
-  for the account — `Primary camera`, `Secondary camera #N` or `not
-  enrolled` — and whether it is ready, instead of `video0+video2` and a USB
+  for the account (`Primary camera`, `Added camera #N` or `not enrolled`)
+  and whether it is ready, instead of `video0+video2` and a USB
   id (ADR-0029, phase A). Enter opens a details panel carrying the identity
   (with a warning when the descriptor has no serial), the nodes, the
   connection, the enrollment facts and the capture-schedule observation;

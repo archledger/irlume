@@ -13,6 +13,7 @@
 mod actions;
 mod activity;
 mod attempts;
+mod dates;
 mod freshness;
 mod launch;
 use attempts::AttemptsReply;
@@ -81,12 +82,11 @@ fn window_fits(area: Rect) -> bool {
 }
 
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const SCREENS: [&str; 11] = [
+const SCREENS: [&str; 10] = [
     "Overview",
     "Diagnostics",
     "Cameras",
     "Faces",
-    "Test Recognition",
     "Password Wallet",
     "Recovery",
     "Fingerprint",
@@ -99,16 +99,15 @@ const SC_WELCOME: usize = 0;
 const SC_REPAIR: usize = 1;
 const SC_CAMERAS: usize = 2;
 const SC_PROFILES: usize = 3;
-const SC_IDENTIFY: usize = 4;
-const SC_KEYRING: usize = 5;
-const SC_RECOVERY: usize = 6;
-const SC_FINGERPRINT: usize = 7;
-const SC_PAM: usize = 8;
-const SC_SETTINGS: usize = 9;
-const SC_DONE: usize = 10;
+const SC_KEYRING: usize = 4;
+const SC_RECOVERY: usize = 5;
+const SC_FINGERPRINT: usize = 6;
+const SC_PAM: usize = 7;
+const SC_SETTINGS: usize = 8;
+const SC_DONE: usize = 9;
 /// User-facing navigation order. Group headings in the sidebar use this same
 /// order, so Tab never walks a different information architecture than the eye.
-const NAV_ORDER: [usize; 10] = [
+const NAV_ORDER: [usize; 9] = [
     SC_WELCOME,
     SC_PROFILES,
     SC_FINGERPRINT,
@@ -117,7 +116,6 @@ const NAV_ORDER: [usize; 10] = [
     SC_PAM,
     SC_REPAIR,
     SC_CAMERAS,
-    SC_IDENTIFY,
     SC_SETTINGS,
 ];
 const ACT_H: usize = 5; // visible rows in the expanded Activity panel
@@ -194,13 +192,31 @@ enum Click {
     Select(usize),
 }
 
-#[derive(Clone, Copy)]
+/// One row of the Faces list (ADR-0030 §2): a profile, then its scans
+/// grouped by the camera that captured them. The primary camera's group is
+/// collapsed until opened; an added camera's group (ADR-0024) reports
+/// counts, not scan names, so it is one row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Row {
     Profile(usize),
+    /// The profile's scans on the primary camera, as a group.
+    PrimaryCamera(usize),
+    /// One primary scan, shown while its group is expanded.
     Scan(usize, usize),
-    /// One secondary camera group (ADR-0024), then its per-profile rows.
-    CameraGroup(usize),
-    CameraGroupProfile(usize, usize),
+    /// A camera group and its entry for one profile: listed under that
+    /// profile, or after every profile when none has the entry's name.
+    AddedCamera(usize, usize),
+}
+
+/// What a Faces row is, by name rather than position, so a reload keeps
+/// the selection on the same thing, and never on another kind of row that
+/// happens to share a name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FaceRowId {
+    Profile(String),
+    PrimaryCamera(String),
+    Scan { profile: String, scan: String },
+    AddedCamera { group: String, profile: String },
 }
 
 enum Pending {
@@ -649,8 +665,10 @@ struct App {
     user: String,
     freshness: Freshness,
     clock_override: Option<Instant>,
-    /// Unix seconds standing in for the wall clock, which only the attempt
-    /// line's "when" reads; tests pin it (and with it the zone, to UTC).
+    /// Unix seconds standing in for the wall clock, which the Overview's
+    /// attempt line and the Faces recognition-test line read; tests pin it,
+    /// and with it the zone (to UTC) for every local date the TUI prints,
+    /// the Faces capture dates included.
     wall_override: Option<u64>,
     usable_sources: [bool; 14],
     show_live: bool,
@@ -661,7 +679,14 @@ struct App {
     classified_epoch: Option<CameraEpoch>,
     camera_confirmation: Option<CameraChoice>,
     selected_camera_choice: Option<Option<CameraChoice>>,
-    selected_profile_identity: Option<Option<(String, Option<String>)>>,
+    selected_profile_identity: Option<Option<FaceRowId>>,
+    /// Profiles whose primary camera group is expanded on Faces, by name.
+    /// Collapsed by default; opening one changes nothing but the view.
+    faces_expanded: std::collections::BTreeSet<String>,
+    /// The expansion `clear_source(Profiles)` put aside with the selection,
+    /// and the account it was for: the next listing of that account opens
+    /// the same profiles again.
+    faces_expanded_parked: Option<(String, std::collections::BTreeSet<String>)>,
     qualification_load: Option<mpsc::Receiver<Option<CaptureObservation>>>,
     identify_checked_at: Option<Instant>,
     screen: usize,
@@ -770,7 +795,8 @@ struct App {
     /// Enrollment intent parked while the daemon fix runs; resumed (once) as
     /// soon as the daemon answers after the suspended sudo step.
     resume_enroll: Option<ResumeEnroll>,
-    /// Last 1:N identify result, shown as a card on the Identify screen.
+    /// This session's last recognition test result, (recognized, words),
+    /// shown under the Faces list.
     identify_result: Option<(bool, String)>,
     /// Last IR liveness self-test result, shown on the Repair screen.
     /// Repair-tab diagnostics + selection.
@@ -815,7 +841,7 @@ struct App {
     /// e.g. a fingerprint-only desktop hides the camera/face screens entirely.
     visible: Vec<usize>,
     /// `[v]` advanced view: also show the diagnostic/tuning screens
-    /// (Cameras, Identify, Settings, and Repair even when healthy).
+    /// (Cameras, Settings, and Repair even when healthy).
     advanced: bool,
     /// Detected face-hardware capabilities (drives `visible` + the recommendation).
     caps: irlume_camera::Caps,
@@ -1328,6 +1354,12 @@ impl App {
                 {
                     self.selected_profile_identity = Some(self.selected_profile_row());
                 }
+                // Nothing stays expanded while nothing is listed; the next
+                // listing of this account restores it by name.
+                let expanded = std::mem::take(&mut self.faces_expanded);
+                if self.faces_expanded_parked.is_none() {
+                    self.faces_expanded_parked = Some((self.user.clone(), expanded));
+                }
                 self.profiles.clear();
                 self.profiles_loaded = false;
                 // The role labels on Cameras derive from these: an
@@ -1536,7 +1568,7 @@ impl App {
     ) -> Vec<Line<'static>> {
         let role = self.camera_role(p);
         let role_text = match role {
-            CameraRole::Secondary(index) => format!("Secondary camera #{index}"),
+            CameraRole::Secondary(index) => format!("Added camera #{index}"),
             // Unknown for one of three reasons the details can name.
             CameraRole::Unknown
                 if p.identity.is_none() && p.serial_present && p.handle.is_none() =>
@@ -1617,10 +1649,31 @@ impl App {
                     }
                 ))
             }
-            CameraRole::Unenrolled => Span::styled(
-                "not enrolled for this account · add it from Faces".to_string(),
-                Style::new().dim(),
-            ),
+            // `irlume enroll --add-camera` adds the daemon's configured pair
+            // to an existing enrollment, for the one profile it names when
+            // there are several, so the advice depends on all three.
+            CameraRole::Unenrolled => {
+                let add = format!(
+                    "`irlume enroll --add-camera{}`",
+                    if self.profiles.len() > 1 {
+                        " --name <profile>"
+                    } else {
+                        ""
+                    }
+                );
+                Span::styled(
+                    if self.profiles_loaded && self.profiles.is_empty() {
+                        "not enrolled for this account · enroll a face on Faces first".to_string()
+                    } else if configured {
+                        format!("not enrolled for this account · add it with {add}")
+                    } else {
+                        format!(
+                            "not enrolled for this account · make it the daemon's camera, then add it with {add}"
+                        )
+                    },
+                    Style::new().dim(),
+                )
+            }
             CameraRole::Unknown => Span::styled("unknown".to_string(), Style::new().dim()),
         };
         lines.push(state_row("enrolled", 12, enrolled));
@@ -1962,12 +2015,6 @@ impl App {
                 Source::Machine,
                 Source::Attempts,
             ],
-            SC_IDENTIFY => {
-                return format!(
-                    "daemon {} · last test only · F4 current status",
-                    self.daemon_state_label()
-                )
-            }
             _ => &[Source::Health, Source::Profiles, Source::Machine],
         };
         // One freshness indicator (ADR-0030 §1.9): the daemon's state and
@@ -2154,6 +2201,8 @@ impl App {
             camera_confirmation: None,
             selected_camera_choice: None,
             selected_profile_identity: None,
+            faces_expanded: Default::default(),
+            faces_expanded_parked: None,
             qualification_load: None,
             identify_checked_at: None,
             screen,
@@ -2268,7 +2317,7 @@ impl App {
                 // Essential face path requires a camera.
                 SC_PROFILES | SC_RECOVERY => caps.rgb,
                 // Diagnostics/tuning: advanced view only.
-                SC_CAMERAS | SC_IDENTIFY => advanced && caps.rgb,
+                SC_CAMERAS => advanced && caps.rgb,
                 // Settings holds user preferences (biopolicy, consent),
                 // not diagnostics, so it is always
                 // reachable; hiding config behind "advanced" both buries it and
@@ -2318,7 +2367,7 @@ impl App {
             let insert_at = self
                 .visible
                 .iter()
-                .position(|screen| *screen == SC_IDENTIFY || *screen == SC_SETTINGS)
+                .position(|screen| *screen == SC_SETTINGS)
                 .unwrap_or(self.visible.len());
             self.visible.insert(insert_at, SC_CAMERAS);
         }
@@ -3569,42 +3618,63 @@ impl App {
         }
     }
 
+    /// The Faces rows (ADR-0030 §2): each profile, its primary camera
+    /// group and, while that is expanded, its scans; then each added camera
+    /// it has scans on. Added-camera entries whose profile is no longer
+    /// listed (a rename or a delete left them) follow every profile, so they
+    /// can still be seen and removed.
     fn rows(&self) -> Vec<Row> {
-        let mut v = Vec::new();
-        for (pi, p) in self.profiles.iter().enumerate() {
-            v.push(Row::Profile(pi));
-            for si in 0..p.scans.len() {
-                v.push(Row::Scan(pi, si));
+        let owner = |profile: &str| self.profiles.iter().position(|p| p.name == profile);
+        let added = || {
+            self.camera_groups
+                .iter()
+                .enumerate()
+                .flat_map(|(gi, group)| {
+                    group
+                        .profiles
+                        .iter()
+                        .enumerate()
+                        .map(move |(gpi, entry)| (gi, gpi, entry.profile.as_str()))
+                })
+        };
+        let mut rows = Vec::new();
+        for (pi, profile) in self.profiles.iter().enumerate() {
+            rows.push(Row::Profile(pi));
+            rows.push(Row::PrimaryCamera(pi));
+            if self.faces_expanded.contains(&profile.name) {
+                rows.extend((0..profile.scans.len()).map(|si| Row::Scan(pi, si)));
             }
+            rows.extend(
+                added()
+                    .filter(|(_, _, name)| owner(name) == Some(pi))
+                    .map(|(gi, gpi, _)| Row::AddedCamera(gi, gpi)),
+            );
         }
-        for (gi, group) in self.camera_groups.iter().enumerate() {
-            v.push(Row::CameraGroup(gi));
-            for pri in 0..group.profiles.len() {
-                v.push(Row::CameraGroupProfile(gi, pri));
-            }
-        }
-        v
+        rows.extend(
+            added()
+                .filter(|(_, _, name)| owner(name).is_none())
+                .map(|(gi, gpi, _)| Row::AddedCamera(gi, gpi)),
+        );
+        rows
     }
 
-    fn profile_row_name(&self, row: Row) -> (String, Option<String>) {
+    fn face_row_id(&self, row: Row) -> FaceRowId {
         match row {
-            Row::Profile(pi) => (self.profiles[pi].name.clone(), None),
-            Row::Scan(pi, si) => (
-                self.profiles[pi].name.clone(),
-                Some(self.profiles[pi].scans[si].clone()),
-            ),
-            Row::CameraGroup(gi) => (self.camera_groups[gi].id.clone(), None),
-            Row::CameraGroupProfile(gi, pri) => (
-                self.camera_groups[gi].id.clone(),
-                Some(self.camera_groups[gi].profiles[pri].profile.clone()),
-            ),
+            Row::Profile(pi) => FaceRowId::Profile(self.profiles[pi].name.clone()),
+            Row::PrimaryCamera(pi) => FaceRowId::PrimaryCamera(self.profiles[pi].name.clone()),
+            Row::Scan(pi, si) => FaceRowId::Scan {
+                profile: self.profiles[pi].name.clone(),
+                scan: self.profiles[pi].scans[si].clone(),
+            },
+            Row::AddedCamera(gi, gpi) => FaceRowId::AddedCamera {
+                group: self.camera_groups[gi].id.clone(),
+                profile: self.camera_groups[gi].profiles[gpi].profile.clone(),
+            },
         }
     }
 
-    fn selected_profile_row(&self) -> Option<(String, Option<String>)> {
-        self.rows()
-            .get(self.sel)
-            .map(|row| self.profile_row_name(*row))
+    fn selected_profile_row(&self) -> Option<FaceRowId> {
+        self.rows().get(self.sel).map(|row| self.face_row_id(*row))
     }
 
     fn next_profile_name(&self) -> String {
@@ -3624,7 +3694,7 @@ impl App {
         label: impl Into<String>,
         tag: OpTag,
         req: Request,
-        map: fn(Response) -> (bool, String),
+        map: impl FnOnce(Response) -> (bool, String) + Send + 'static,
     ) {
         let label = label.into();
         self.log('→', format!("daemon: {label}\n{}", request_effect(&req)));
@@ -4021,13 +4091,26 @@ impl App {
                         self.camera_groups = camera_groups;
                         self.camera_store_error = camera_store_error;
                         self.primary_camera = primary_camera;
+                        // What was open stays open, by profile name, and
+                        // only for the account it was opened on.
+                        if let Some((user, expanded)) = self.faces_expanded_parked.take() {
+                            if user == self.user {
+                                self.faces_expanded.extend(expanded);
+                            }
+                        }
+                        let profiles = &self.profiles;
+                        self.faces_expanded
+                            .retain(|name| profiles.iter().any(|profile| profile.name == *name));
                         // A reply that outlived an inventory change was
                         // discarded above, so this one was correlated
                         // under the current epoch.
                         self.roles_epoch = self.camera_epoch.clone();
                         if let Some(selected) = selected {
-                            self.sel = self.rows().iter().position(|row| self.profile_row_name(*row) == selected).unwrap_or_else(|| {
-                                self.log('·', "the selected profile or scan was removed or renamed; select a row before acting");
+                            self.sel = self.rows().iter().position(|row| self.face_row_id(*row) == selected).unwrap_or_else(|| {
+                                self.log('·', match selected {
+                                    FaceRowId::AddedCamera { .. } => "the selected added camera is no longer listed; select a row before acting",
+                                    _ => "the selected profile or scan was removed or renamed; select a row before acting",
+                                });
                                 self.rows().len()
                             });
                         }
@@ -5013,6 +5096,15 @@ impl App {
                         // Async so the UI keeps animating; poll() logs the
                         // result (✓/error banner) and refreshes. map_confirm
                         // handles the Ok acks and PasswordForgotten.
+                        // Its replies name the group by id, which never shows.
+                        ConfirmAct::Daemon(req @ Request::RemoveCameraGroup { .. }) => {
+                            let Request::RemoveCameraGroup { group, .. } = &req else {
+                                unreachable!("matched above");
+                            };
+                            let group = group.clone();
+                            let map = move |resp| map_camera_removed(resp, &group);
+                            self.start_async("Remove Added Camera", OpTag::Generic, req, map)
+                        }
                         ConfirmAct::Daemon(req) => {
                             self.start_async("(confirmed)", OpTag::Generic, req, map_confirm)
                         }
@@ -5340,8 +5432,8 @@ impl App {
         let ir = self.caps.ir_pair || self.reported_caps.ir_pair;
         match target {
             SC_PROFILES | SC_RECOVERY => "no camera was found on this machine".into(),
-            SC_CAMERAS | SC_IDENTIFY if !rgb => "no camera was found on this machine".into(),
-            SC_CAMERAS | SC_IDENTIFY => "it is a technical tool (v shows them)".into(),
+            SC_CAMERAS if !rgb => "no camera was found on this machine".into(),
+            SC_CAMERAS => "it is a technical tool (v shows them)".into(),
             SC_FINGERPRINT => "no fingerprint reader was found on this machine".into(),
             SC_KEYRING if !ir => {
                 "it needs an IR camera pair or a fingerprint reader, and neither was found".into()
@@ -5352,8 +5444,8 @@ impl App {
 
     /// First (`last == false`) or last row of the current page's list.
     /// Pages without a selectable list (wallet, recovery, fingerprint,
-    /// Login & Apps, preferences, Test Recognition) are left alone: the
-    /// Faces selection is not theirs to move.
+    /// Login & Apps, preferences) are left alone: the Faces selection is
+    /// not theirs to move.
     fn move_sel_to_end(&mut self, last: bool) {
         if self.screen == SC_REPAIR {
             self.page_view.set((usize::MAX, Rect::default(), 0, 0));
@@ -5444,13 +5536,6 @@ impl App {
                 self.refresh_heavy();
                 self.refresh_light();
             }
-            (SC_IDENTIFY, KeyCode::Char('r')) => {
-                self.log('·', "refreshing daemon status…");
-                // As for Faces: a poll already in flight cannot stand as
-                // this refresh; invalidating queues a replacement.
-                self.freshness.cycle_mut(Worker::Live).invalidate();
-                self.refresh_live();
-            }
             // Welcome: start the uninstall challenge (capital U, so a stray
             // lower-case key can't begin it). The user must TYPE the word to
             // proceed, so it can never be triggered by accident.
@@ -5462,52 +5547,26 @@ impl App {
                 ));
             }
             // Welcome quick-launch: jump to Profiles and start enrollment.
-            // Gate on the CAMERA, not tab visibility: Identify is an
-            // advanced-view tab, so a visibility gate made [i] a silent
-            // no-op (then claim "no camera") in the default essential view
-            // on a camera-equipped machine.
+            // Gate on the CAMERA, not tab visibility: a visibility gate made
+            // a camera key a silent no-op (then claim "no camera") in the
+            // default essential view on a camera-equipped machine.
             (SC_WELCOME, KeyCode::Char('e')) if self.caps.rgb => {
                 self.screen = SC_PROFILES;
                 self.begin_enroll();
             }
-            // ADR-0030 §1.3: i is Test Recognition on every page. Pages with
-            // their own arm (Overview, Identify) keep it; the rest route
-            // here to the same operation.
+            // ADR-0030 §1.3: i is Test Recognition on every page, and it
+            // stays on the page it was pressed on.
             (
-                SC_PROFILES | SC_KEYRING | SC_RECOVERY | SC_FINGERPRINT | SC_PAM | SC_SETTINGS
-                | SC_REPAIR | SC_CAMERAS,
+                SC_WELCOME | SC_PROFILES | SC_KEYRING | SC_RECOVERY | SC_FINGERPRINT | SC_PAM
+                | SC_SETTINGS | SC_REPAIR | SC_CAMERAS,
                 KeyCode::Char('i'),
-            ) if self.caps.rgb => {
-                if self.visible.contains(&SC_IDENTIFY) {
-                    self.screen = SC_IDENTIFY;
-                }
-                self.start_async(
-                    "Identify (1:N)",
-                    OpTag::Identify,
-                    Request::Identify,
-                    map_identify,
-                );
-            }
+            ) if self.caps.rgb => self.test_recognition(),
             (
                 SC_PROFILES | SC_KEYRING | SC_RECOVERY | SC_FINGERPRINT | SC_PAM | SC_SETTINGS
                 | SC_REPAIR | SC_CAMERAS,
                 KeyCode::Char('i'),
             ) => {
                 self.log('·', "current camera availability is unconfirmed; inspect Cameras or Diagnostics before face enrollment/identify");
-            }
-            (SC_WELCOME, KeyCode::Char('i')) if self.caps.rgb => {
-                // Only jump to the Identify tab where it exists (advanced
-                // view); in essential view stay put and let the result land
-                // in Activity.
-                if self.visible.contains(&SC_IDENTIFY) {
-                    self.screen = SC_IDENTIFY;
-                }
-                self.start_async(
-                    "Identify (1:N)",
-                    OpTag::Identify,
-                    Request::Identify,
-                    map_identify,
-                );
             }
             (SC_WELCOME, KeyCode::Char('e' | 'i')) => {
                 self.log('·', "current camera availability is unconfirmed; inspect Cameras or Diagnostics before face enrollment/identify");
@@ -5686,13 +5745,7 @@ impl App {
             },
             (SC_PROFILES, KeyCode::Char('n')) => self.begin_rename(),
             (SC_PROFILES, KeyCode::Char('d')) => self.begin_delete(),
-            // Identify: 1:N who-is-this.
-            (SC_IDENTIFY, KeyCode::Char('i')) => self.start_async(
-                "Identify (1:N)",
-                OpTag::Identify,
-                Request::Identify,
-                map_identify,
-            ),
+            (SC_PROFILES, KeyCode::Enter) => self.toggle_face_group(),
             // Keyring: masked in-TUI entry (goes to the root daemon; no sudo).
             // An explicit measurement is a new generation: it supersedes a
             // check already running rather than reusing its answer.
@@ -5967,10 +6020,64 @@ impl App {
         ));
     }
 
+    /// The recognition test for the account the TUI shows (ADR-0030 §2):
+    /// `IdentifyFor` that account, never the account-less `Identify`, which
+    /// as root searches every account and files no attempt. The result
+    /// lands in Activity, on Faces and, through the attempt record the
+    /// refresh after it reloads, on Overview.
+    fn test_recognition(&mut self) {
+        // The engine opens the camera before it finds nothing to compare
+        // with, so an observed empty enrollment answers here.
+        if self.profiles_loaded && self.profiles.is_empty() {
+            self.log('·', "enroll a face first; there is nothing to recognize");
+            return;
+        }
+        self.start_async(
+            "Test Recognition",
+            OpTag::Identify,
+            Request::IdentifyFor {
+                user: self.user.clone(),
+            },
+            map_identify,
+        );
+    }
+
+    /// The profile the selected Faces row belongs to: any row under a
+    /// profile, its added cameras included. An added camera whose profile
+    /// is no longer listed belongs to none.
     fn sel_profile(&self) -> Option<String> {
         match self.rows().get(self.sel)? {
-            Row::Profile(pi) | Row::Scan(pi, _) => Some(self.profiles[*pi].name.clone()),
-            Row::CameraGroup(_) | Row::CameraGroupProfile(_, _) => None,
+            Row::Profile(pi) | Row::PrimaryCamera(pi) | Row::Scan(pi, _) => {
+                Some(self.profiles[*pi].name.clone())
+            }
+            Row::AddedCamera(gi, gpi) => {
+                let name = &self.camera_groups[*gi].profiles[*gpi].profile;
+                self.profiles
+                    .iter()
+                    .any(|profile| profile.name == *name)
+                    .then(|| name.clone())
+            }
+        }
+    }
+
+    /// Enter on Faces opens or closes the selected profile's primary camera
+    /// group (ADR-0030 §1.1): the view changes, nothing else does. A profile
+    /// opens to the scans it holds, as its primary camera row does; every
+    /// other row says why it opens nothing, since Enter is advertised here.
+    fn toggle_face_group(&mut self) {
+        match self.rows().get(self.sel).copied() {
+            Some(Row::Profile(pi) | Row::PrimaryCamera(pi)) => {
+                let name = self.profiles[pi].name.clone();
+                if !self.faces_expanded.remove(&name) {
+                    self.faces_expanded.insert(name);
+                }
+            }
+            Some(Row::AddedCamera(_, _)) => self.log(
+                '·',
+                "an added camera reports how many scans it holds, not their names",
+            ),
+            Some(Row::Scan(_, _)) => self.log('·', "a scan has nothing more to open"),
+            None => self.log('·', "select a profile to show or hide its scans"),
         }
     }
 
@@ -5996,9 +6103,10 @@ impl App {
                 ));
             }
             // Camera rows name nothing in profile space.
-            Some(Row::CameraGroup(_) | Row::CameraGroupProfile(_, _)) => {
-                self.log('·', "camera groups are renamed by re-adding the camera")
-            }
+            Some(Row::PrimaryCamera(_) | Row::AddedCamera(_, _)) => self.log(
+                '·',
+                "a camera has no name here; select a profile or scan to rename",
+            ),
             // Nothing selected (an empty profile list, or a selection left by
             // a list that shrank). [r] is advertised, so say why it did nothing.
             None => self.log('·', "select a profile or scan to rename"),
@@ -6035,13 +6143,22 @@ impl App {
                     }),
                 ));
             }
-            // A camera group selection deletes the GROUP (its binding,
-            // scans and calibration go together, ADR-0024 §4.2).
-            Some(Row::CameraGroup(gi)) => {
+            // The primary camera's scans go with the profile, or one scan
+            // at a time.
+            Some(Row::PrimaryCamera(_)) => self.log(
+                '·',
+                "select the profile or one of its scans to delete; the primary camera stays",
+            ),
+            // An added camera removes the whole GROUP (its binding, scans
+            // and calibration go together, ADR-0024 §4.2), for every
+            // profile on it.
+            Some(Row::AddedCamera(gi, _)) => {
                 let group = self.camera_groups[gi].id.clone();
                 self.confirm = Some((
                     format!(
-                        "Remove camera group '{group}' (its scans and calibration)? OS approval is required for non-root users."
+                        "Remove added camera #{} for {}? Its scans are deleted; the primary camera is unchanged. OS approval is required for non-root users.",
+                        gi + 1,
+                        self.user
                     ),
                     "Remove",
                     ConfirmAct::Daemon(Request::RemoveCameraGroup {
@@ -6049,9 +6166,6 @@ impl App {
                         group,
                     }),
                 ));
-            }
-            Some(Row::CameraGroupProfile(_, _)) => {
-                self.log('·', "select the group line to remove an enrolled camera");
             }
             // Same as the rename above: an advertised key must answer.
             None => self.log('·', "select a profile or scan to delete"),
@@ -6684,7 +6798,7 @@ impl App {
                 ],
             ),
             ("System", &[SC_REPAIR, SC_CAMERAS]),
-            ("Advanced", &[SC_IDENTIFY, SC_SETTINGS]),
+            ("Advanced", &[SC_SETTINGS]),
         ];
         let mut rows: Vec<SidebarRow> = Vec::new();
         for (name, members) in groups {
@@ -7061,7 +7175,14 @@ impl App {
                             self.cam_sel = i;
                         }
                     }
-                    SC_PROFILES if i < self.rows().len() => self.sel = i,
+                    // A second click on the selected row is Enter.
+                    SC_PROFILES if i < self.rows().len() => {
+                        if self.sel == i {
+                            self.on_key(KeyCode::Enter);
+                        } else {
+                            self.sel = i;
+                        }
+                    }
                     _ => {}
                 },
             }
@@ -7171,7 +7292,6 @@ impl App {
                 SC_REPAIR => "System health, clear explanations, and focused repairs.",
                 SC_CAMERAS => "The cameras your face can sign in with; names are for you, the USB identity is what is checked.",
                 SC_PROFILES => "Manage enrolled faces and improve recognition over time.",
-                SC_IDENTIFY => "Test recognition without changing enrollment.",
                 SC_KEYRING => match self.keyring_armed {
                     Some(true) => "Face or fingerprint login can open the password wallet.",
                     Some(false) => "Connect biometric login to the password wallet.",
@@ -7247,7 +7367,6 @@ impl App {
             SC_REPAIR => self.draw_repair(f, inner),
             SC_CAMERAS => self.draw_cameras(f, inner),
             SC_PROFILES => self.draw_profiles(f, inner),
-            SC_IDENTIFY => self.draw_identify(f, inner),
             SC_KEYRING => self.draw_keyring(f, inner),
             SC_RECOVERY => self.draw_recovery(f, inner),
             SC_FINGERPRINT => self.draw_fingerprint(f, inner),
@@ -7386,7 +7505,53 @@ impl App {
     }
 
     fn draw_profiles(&self, f: &mut Frame, area: Rect) {
-        if self.profiles.is_empty() {
+        // Whether the added cameras could be read, and this session's last
+        // recognition test, sit under the list, not in it: a full list
+        // cannot push them off the pane (the List draws nothing after the
+        // selected row once it scrolls), and they stay while the listing
+        // reloads after the test or cannot be read. Each wraps under its
+        // own start, so neither the cause nor the time is cut.
+        let inner = area.width.saturating_sub(2);
+        let mut footer = Vec::new();
+        // Without the added-camera store every profile would look as if
+        // it had its primary camera only (ADR-0030 §1.6).
+        if let Some(err) = &self.camera_store_error {
+            let mut facts = vec!["⚠ added cameras could not be read".to_string()];
+            facts.extend(camera_store_cause(err).map(String::from));
+            footer.extend(fact_lines(
+                &facts,
+                usize::from(inner),
+                Style::new().fg(th().warn),
+            ));
+        }
+        footer.extend(self.recognition_test_line());
+        let area = if footer.is_empty() {
+            area
+        } else {
+            let footer = Paragraph::new(footer).wrap(Wrap { trim: false });
+            let height = u16::try_from(footer.line_count(inner))
+                .unwrap_or(u16::MAX)
+                .min(area.height / 2);
+            let [list, _, strip] = Layout::vertical([
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(height),
+            ])
+            .areas(area);
+            f.render_widget(
+                footer,
+                Rect {
+                    x: strip.x.saturating_add(2),
+                    width: inner,
+                    ..strip
+                },
+            );
+            list
+        };
+        let rows = self.rows();
+        // An added camera whose profile is gone still lists (and can be
+        // removed) with no profile beside it.
+        if rows.is_empty() {
             // The list loads in the background (a TPM unseal, seconds on slow
             // TPMs). Until it lands, an empty list is "not loaded yet", and
             // saying "no profiles" would tell an enrolled user their face is
@@ -7412,93 +7577,24 @@ impl App {
             f.render_widget(Paragraph::new(msg).wrap(Wrap { trim: false }).dim(), area);
             return;
         }
-        let rows = self.rows();
+        let width = usize::from(area.width);
+        let utc_offset = |at| self.utc_offset(at);
         let items: Vec<ListItem> = rows
             .iter()
-            .map(|r| match r {
-                Row::Profile(pi) => {
-                    let p = &self.profiles[*pi];
-                    // Same rule as the CLI listing (#288): only the loaded
-                    // recognizer's scans can match, so a bare total would let
-                    // a profile look usable when none of it is. The breakdown
-                    // appears when the total would mislead; an old daemon
-                    // reports neither field and keeps the flat count.
-                    let live = p.live_recognizer.as_deref();
-                    let live_count = live
-                        .and_then(|l| p.scans_by_recognizer.get(l).copied())
-                        .unwrap_or(0);
-                    let misleading = p.scans_by_recognizer.len() > 1
-                        || (live.is_some() && live_count != p.scans.len());
-                    let count = if misleading {
-                        format!(
-                            "   ({} scans, {} for the loaded recognizer)",
-                            p.scans.len(),
-                            live_count
-                        )
-                    } else {
-                        format!("   ({} scans)", p.scans.len())
-                    };
-                    let mut item = vec![Line::from(vec![
-                        Span::styled(
-                            format!("● {}", p.name),
-                            Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(count, Style::new().dim()),
-                    ])];
-                    if misleading && live_count == 0 {
-                        item.push(Line::from(Span::styled(
-                            "     none of these match the loaded recognizer; add scans with [a] Improve Recognition",
-                            Style::new().fg(th().warn),
-                        )));
-                    }
-                    for line in crate::profile_ir::lines(p) {
-                        item.push(Line::from(Span::styled(format!("     {line}"), Style::new().dim())));
-                    }
-                    if crate::profile_ir::needs_capture(p) {
-                        item.push(Line::from("     [a] Improve Recognition with an IR camera."));
-                    }
-                    ListItem::new(item)
-                }
-                Row::Scan(pi, si) => ListItem::new(Line::from(Span::raw(format!(
-                    "     ↳ {}",
-                    self.profiles[*pi].scans[*si]
-                )))),
-                Row::CameraGroup(gi) => {
-                    let g = &self.camera_groups[*gi];
-                    let mut flags = Vec::new();
-                    if g.selected {
-                        flags.push("selected");
-                    }
-                    flags.push(if g.connected { "connected" } else { "disconnected" });
-                    if g.stale {
-                        flags.push("stale: primary changed, re-add the camera");
-                    }
-                    ListItem::new(Line::from(vec![
-                        Span::styled(
-                            format!("▣ camera {}", g.id),
-                            Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(format!("   [{}]", flags.join(", ")), Style::new().dim()),
-                    ]))
-                }
-                Row::CameraGroupProfile(gi, pri) => {
-                    let row = &self.camera_groups[*gi].profiles[*pri];
-                    let calib = if row.calibrated {
-                        "calibrated"
-                    } else if row.calibration_fittable {
-                        "uncalibrated"
-                    } else {
-                        "no IR calibration"
-                    };
-                    ListItem::new(Line::from(Span::styled(
-                        format!(
-                            "     ↳ {}: {} scans, {calib}",
-                            row.profile, row.scans
-                        ),
-                        Style::new().dim(),
-                    )))
-                }
+            .map(|row| {
+                let lines = self.face_row_lines(*row, width, &utc_offset);
+                ListItem::new(
+                    lines
+                        .into_iter()
+                        .map(|line| clip_line(line, width))
+                        .collect::<Vec<_>>(),
+                )
             })
+            .collect();
+        // Every row's height, from the items as drawn, for the hit targets.
+        let heights: Vec<u16> = items
+            .iter()
+            .map(|item| u16::try_from(item.height()).unwrap_or(u16::MAX))
             .collect();
         // Windows-Hello-style enrollment guidance (selection never reaches
         // these: `sel` is clamped to the real rows above).
@@ -7510,11 +7606,6 @@ impl App {
         items.push(ListItem::new(
             "  [e] Add a person; [a] improve the selected person's recognition.",
         ));
-        if !self.camera_groups.is_empty() {
-            items.push(ListItem::new(
-                "  [x] on a camera row removes that enrolled camera; enroll another with `irlume enroll --add-camera`.",
-            ));
-        }
         items.push(ListItem::new(
             "  Each enrolled person can authenticate as this account.",
         ));
@@ -7547,39 +7638,186 @@ impl App {
         );
         // Hit targets must use the offset chosen by the rendered List. Long
         // profiles scroll; row zero in the viewport is not row zero in storage.
+        // The List draws only rows that fit whole, so a row cut by the
+        // bottom edge is blank there and has nothing to click. A List that
+        // scrolled (the state starts at offset 0 each frame) ends at the
+        // selected row and leaves the lines under it blank.
+        let last = if st.offset() > 0 { st.selected() } else { None };
+        let bottom = area.y.saturating_add(area.height);
         let mut row_y = area.y;
-        for (i, row) in rows.iter().enumerate().skip(st.offset()) {
-            let height = match row {
-                Row::Profile(pi) => {
-                    let p = &self.profiles[*pi];
-                    let live_count = p
-                        .live_recognizer
-                        .as_deref()
-                        .and_then(|l| p.scans_by_recognizer.get(l).copied())
-                        .unwrap_or(0);
-                    let misleading = p.scans_by_recognizer.len() > 1
-                        || (p.live_recognizer.is_some() && live_count != p.scans.len());
-                    1 + u16::from(misleading && live_count == 0)
-                        + crate::profile_ir::lines(p).len() as u16
-                        + u16::from(crate::profile_ir::needs_capture(p))
-                }
-                Row::Scan(_, _) => 1,
-                Row::CameraGroup(_) => 1,
-                Row::CameraGroupProfile(_, _) => 1,
-            };
-            if row_y < area.y.saturating_add(area.height) {
-                self.hit(
-                    Rect::new(
-                        area.x,
-                        row_y,
-                        area.width,
-                        height.min(area.y.saturating_add(area.height).saturating_sub(row_y)),
-                    ),
-                    Click::Select(i),
-                );
+        for (i, height) in heights.iter().copied().enumerate().skip(st.offset()) {
+            if row_y.saturating_add(height) > bottom || last.is_some_and(|last| i > last) {
+                break;
             }
+            self.hit(
+                Rect::new(area.x, row_y, area.width, height),
+                Click::Select(i),
+            );
             row_y = row_y.saturating_add(height);
         }
+    }
+
+    /// One Faces row's lines within `width` cells where they can be
+    /// (ADR-0030 §2): the facts of a row are " · "-separated, and a fact
+    /// that does not fit moves whole to an indented line of its own.
+    fn face_row_lines(
+        &self,
+        row: Row,
+        width: usize,
+        utc_offset: &dyn Fn(u64) -> i64,
+    ) -> Vec<Line<'static>> {
+        match row {
+            Row::Profile(pi) => {
+                let p = &self.profiles[pi];
+                // Only the loaded recognizer's scans can match (#288); a
+                // reply from before per-recognizer counts has the total only.
+                let live = p.live_recognizer.as_deref();
+                let live_count = match live {
+                    Some(live) => p.scans_by_recognizer.get(live).copied().unwrap_or(0),
+                    None => p.scans.len(),
+                };
+                let misleading = p.scans_by_recognizer.len() > 1
+                    || (live.is_some() && live_count != p.scans.len());
+                let count = capture_count(live_count, live_count >= ENROLL_SCANS, misleading);
+                let name = format!("● {}", printable(&p.name));
+                let name_style = Style::new().fg(th().accent).add_modifier(Modifier::BOLD);
+                let mut lines = if Span::raw(format!("{name} · {count}")).width() <= width {
+                    vec![Line::from(vec![
+                        Span::styled(name, name_style),
+                        Span::styled(format!(" · {count}"), Style::new().dim()),
+                    ])]
+                } else {
+                    vec![
+                        Line::from(Span::styled(name, name_style)),
+                        Line::from(Span::styled(format!("     {count}"), Style::new().dim())),
+                    ]
+                };
+                if misleading && live_count == 0 {
+                    lines.push(Line::from(Span::styled(
+                        "     none of these match the loaded recognizer; add scans with [a] Improve Recognition",
+                        Style::new().fg(th().warn),
+                    )));
+                }
+                for line in crate::profile_ir::lines(p) {
+                    lines.push(Line::from(Span::styled(
+                        format!("     {line}"),
+                        Style::new().dim(),
+                    )));
+                }
+                if crate::profile_ir::needs_capture(p) {
+                    lines.push(Line::from(
+                        "     [a] Improve Recognition with an IR camera.",
+                    ));
+                }
+                lines
+            }
+            Row::PrimaryCamera(pi) => {
+                let p = &self.profiles[pi];
+                let glyph = if self.faces_expanded.contains(&p.name) {
+                    "▾"
+                } else {
+                    "▸"
+                };
+                let mut facts = vec![
+                    format!("  {glyph} primary camera"),
+                    scan_count(p.scans.len()),
+                ];
+                if !p.scans.is_empty() {
+                    facts.push(match dates::aligned(&p.scan_captured_at, p.scans.len()) {
+                        Some(captured) => dates::scan_dates(captured, utc_offset),
+                        None => dates::UNDATED.into(),
+                    });
+                }
+                fact_lines(&facts, width, Style::new())
+            }
+            Row::Scan(pi, si) => {
+                let p = &self.profiles[pi];
+                let date = dates::aligned(&p.scan_captured_at, p.scans.len())
+                    .and_then(|captured| captured[si])
+                    .map_or_else(
+                        || dates::UNDATED.into(),
+                        |at| dates::capture_range(at, at, utc_offset),
+                    );
+                fact_lines(
+                    &[format!("      ↳ {}", printable(&p.scans[si])), date],
+                    width,
+                    Style::new(),
+                )
+            }
+            Row::AddedCamera(gi, gpi) => {
+                let group = &self.camera_groups[gi];
+                let entry = &group.profiles[gpi];
+                let mut facts = vec![format!("  ▣ added camera #{}", gi + 1)];
+                if !self.profiles.iter().any(|p| p.name == entry.profile) {
+                    // The name gives way to the status: on a line of its
+                    // own the fact always ends in "no longer present".
+                    let room = width.saturating_sub(6 + "profile '' no longer present".len());
+                    facts.push(format!(
+                        "profile '{}' no longer present",
+                        clip_columns(&printable(&entry.profile), room)
+                    ));
+                }
+                facts.push(capture_count(entry.scans, entry.capture_target_met, false));
+                facts.push(
+                    if entry.calibrated {
+                        "calibrated"
+                    } else if entry.calibration_fittable {
+                        "uncalibrated"
+                    } else {
+                        "no IR calibration"
+                    }
+                    .into(),
+                );
+                facts.push(dates::group_dates(
+                    entry.first_captured_at,
+                    entry.last_captured_at,
+                    utc_offset,
+                ));
+                let mut state = String::from(if group.connected {
+                    "connected"
+                } else {
+                    "not connected"
+                });
+                if group.selected {
+                    state.push_str(", selected");
+                }
+                if group.stale {
+                    state.push_str(", stale: re-add it");
+                }
+                facts.push(state);
+                // A stale group cannot authenticate until it is added again
+                // (ADR-0024 §1.1).
+                let style = if group.stale {
+                    Style::new().fg(th().warn)
+                } else {
+                    Style::new()
+                };
+                fact_lines(&facts, width, style)
+            }
+        }
+    }
+
+    /// This session's last recognition test, for the Faces page (ADR-0030
+    /// §2): a line under the list, not a row, so no key can act on it. The
+    /// label already says what was tested, so a result that starts by
+    /// saying so again ("recognition test needs a newer irlumed") drops it.
+    fn recognition_test_line(&self) -> Option<Line<'static>> {
+        let (recognized, text) = self.identify_result.as_ref()?;
+        let age = self
+            .now()
+            .saturating_duration_since(self.identify_checked_at?)
+            .as_secs();
+        let now = self.wall_now();
+        let when = attempts::relative_time(now.saturating_sub(age), now, &|at| self.utc_offset(at));
+        let text = text.strip_prefix("recognition test ").unwrap_or(text);
+        Some(Line::from(vec![
+            Span::raw("Last recognition test: "),
+            Span::styled(
+                printable(text),
+                Style::new().fg(if *recognized { th().ok } else { th().warn }),
+            ),
+            Span::styled(format!(" · {when}"), Style::new().dim()),
+        ]))
     }
 
     fn draw_action_paragraph(
@@ -7924,7 +8162,7 @@ impl App {
                     let priv_on = p.privacy && self.source_usable(Source::CameraPrivacy);
                     let role = self.camera_role(p);
                     let role_text = match role {
-                        CameraRole::Secondary(index) => format!("Secondary camera #{index}"),
+                        CameraRole::Secondary(index) => format!("Added camera #{index}"),
                         other => other.label().to_string(),
                     };
                     // A group whose store is stale cannot authenticate until
@@ -8678,7 +8916,8 @@ impl App {
         self.caps.rgb || self.reported_caps.rgb
     }
 
-    /// Unix seconds now, for the attempt line's "when".
+    /// Unix seconds now, for the "when" of the attempt line and of the
+    /// Faces recognition-test line.
     fn wall_now(&self) -> u64 {
         self.wall_override.unwrap_or_else(|| {
             std::time::SystemTime::now()
@@ -8688,8 +8927,9 @@ impl App {
     }
 
     /// The local zone's offset from UTC at `at` (unix seconds), for the
-    /// attempt line's dates. A pinned wall clock pins the zone too, so tests
-    /// read the same dates in every time zone.
+    /// attempt line's dates, the Faces capture dates and the recognition-test
+    /// line. A pinned wall clock pins the zone too, so tests read the same
+    /// dates in every time zone.
     fn utc_offset(&self, at: u64) -> i64 {
         if self.wall_override.is_some() {
             0
@@ -9132,58 +9372,6 @@ impl App {
         let inner = blk.inner(info_area);
         f.render_widget(blk, info_area);
         self.draw_action_paragraph(f, inner, lines, &page_actions);
-    }
-
-    fn draw_identify(&self, f: &mut Frame, area: Rect) {
-        let mut page_actions = Vec::new();
-        let mut lines = vec![
-            section("1:N identify (\"who is this?\")"),
-            Line::from(Span::styled(
-                "  Capture once and match against your enrollment (every user when",
-                Style::new().dim(),
-            )),
-            Line::from(Span::styled(
-                "  run as root). Liveness-gated, RGB primary; a diagnostic, not unlock.",
-                Style::new().dim(),
-            )),
-            Line::raw(""),
-        ];
-        if let Some(at) = self.identify_checked_at {
-            lines.push(Line::raw(format!(
-                "  Last recognition test: {}s ago",
-                self.now().saturating_duration_since(at).as_secs()
-            )));
-        }
-        match &self.identify_result {
-            Some((true, who)) => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "  ● Recognized  ",
-                        Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(who.clone(), Style::new().fg(th().ok)),
-                ]));
-                lines.push(Line::from(Span::styled(
-                    "    The match score cleared the configured threshold.",
-                    Style::new().dim(),
-                )));
-                lines.push(Line::from(Span::styled(
-                    "    This is a diagnostic check, not a login or a probability estimate.",
-                    Style::new().dim(),
-                )));
-            }
-            Some((false, why)) => lines.push(Line::from(vec![
-                Span::styled("  ✕ ", Style::new().fg(th().err)),
-                Span::styled(why.clone(), Style::new().fg(th().err)),
-            ])),
-            None => lines.push(Line::from(Span::styled(
-                "  press [i] and look at the camera",
-                Style::new().dim(),
-            ))),
-        }
-        lines.push(Line::raw(""));
-        push_page_actions(&mut lines, &mut page_actions, &[("i", "identify now")]);
-        self.draw_action_paragraph(f, area, lines, &page_actions);
     }
 
     fn draw_pam(&self, f: &mut Frame, area: Rect) {
@@ -9766,8 +9954,9 @@ impl App {
                 ("a", "Improve Recognition"),
                 ("n", "Rename…"),
                 ("d", "Delete…"),
+                ("i", "Test Recognition"),
+                ("enter", "Show or Hide Scans"),
             ],
-            SC_IDENTIFY => &[("i", "Test Recognition")],
             // Both [b] and [p] are guarded in the handler: [b] reseals a seal that
             // must already exist, and [p] refreshes the boot-measurement policy a
             // Tier 2 seal is bound to. Advertising either where its guard cannot
@@ -10102,8 +10291,9 @@ fn footer_keycode(k: &str) -> Option<KeyCode> {
 
 /// Which enrolled role a listed camera pair holds for the account whose
 /// enrollment the TUI shows (ADR-0029): the primary binding, an added
-/// camera group by its 1-based store position, or none. Labels only —
-/// the daemon decides which store an attempt scores against.
+/// camera group by its 1-based store position (the "Added camera #N" of
+/// Cameras and Faces alike), or none. Labels only: the daemon decides
+/// which store an attempt scores against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CameraRole {
     Primary,
@@ -10117,7 +10307,7 @@ impl CameraRole {
     fn label(self) -> &'static str {
         match self {
             CameraRole::Primary => "Primary camera",
-            CameraRole::Secondary(_) => "Secondary camera",
+            CameraRole::Secondary(_) => "Added camera",
             CameraRole::Unenrolled => "not enrolled",
             CameraRole::Unknown => "",
         }
@@ -10287,6 +10477,58 @@ fn clip_columns(text: &str, width: usize) -> String {
     out
 }
 
+/// "1 scan", "3 scans".
+fn scan_count(scans: usize) -> String {
+    if scans == 1 {
+        "1 scan".into()
+    } else {
+        format!("{scans} scans")
+    }
+}
+
+/// A scan count against the capture target (ADR-0030 §2): what is stored,
+/// never whether recognition is ready, and nothing about glasses or
+/// lighting, which the store does not record. `live_only` marks a count
+/// that is the loaded recognizer's share of scans made by several.
+fn capture_count(scans: usize, target_met: bool, live_only: bool) -> String {
+    let which = if live_only {
+        " for the loaded recognizer"
+    } else {
+        ""
+    };
+    if target_met {
+        format!("{}{which} · capture target met", scan_count(scans))
+    } else {
+        format!("{scans} of {ENROLL_SCANS} scans{which} (capture target)")
+    }
+}
+
+/// `facts` joined by " · " into lines at most `width` cells wide where
+/// they fit: a fact that does not fit moves whole to the next line,
+/// indented under the first. What still does not fit is for [`clip_line`]
+/// to end in an ellipsis.
+fn fact_lines(facts: &[String], width: usize, style: Style) -> Vec<Line<'static>> {
+    let indent = facts
+        .first()
+        .map_or(0, |first| first.len() - first.trim_start().len());
+    let indent = " ".repeat(indent + 4);
+    let mut lines: Vec<String> = Vec::new();
+    for fact in facts {
+        match lines.last_mut() {
+            Some(line) if Span::raw(format!("{line} · {fact}")).width() <= width => {
+                line.push_str(" · ");
+                line.push_str(fact);
+            }
+            Some(_) => lines.push(format!("{indent}{fact}")),
+            None => lines.push(fact.clone()),
+        }
+    }
+    lines
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, style)))
+        .collect()
+}
+
 /// A styled line clipped to `width` cells, ending in an ellipsis when it
 /// was wider (ADR-0030 §1.7): [`clip_columns`] across spans, each kept
 /// span keeping its style.
@@ -10350,6 +10592,27 @@ fn fit_columns(text: &str, width: usize) -> String {
     let used = Span::raw(out.clone()).width();
     out.extend(std::iter::repeat_n(' ', width.saturating_sub(used)));
     out
+}
+
+/// Why the added cameras could not be read, in fixed words, from the kind
+/// of the daemon's store error. The error's detail can name a camera group
+/// by its internal id, which carries the camera's serial, and is never
+/// shown (ADR-0030 §1.10); a kind this client does not know adds nothing.
+fn camera_store_cause(err: &str) -> Option<&'static str> {
+    // The key failures are "invalid" store errors too, so they go first.
+    if err.contains("template key is unavailable") {
+        Some("the account's template key is unavailable")
+    } else if err.starts_with("cannot read secondary store") {
+        Some("the file could not be read")
+    } else if err.starts_with("unsupported secondary store version") {
+        Some("the file's format version is not supported")
+    } else if err.starts_with("corrupt secondary store") {
+        Some("the file is damaged")
+    } else if err.starts_with("invalid secondary store") {
+        Some("the file failed its checks")
+    } else {
+        None
+    }
 }
 
 /// Device-supplied text for a screen: control characters blanked so a
@@ -10559,8 +10822,8 @@ fn tflite_fallback_check(
 /// records intent here; only the later response can establish an outcome.
 fn request_effect(request: &Request) -> &'static str {
     match request {
-        Request::Identify => {
-            "Requests a camera capture and compares it with enrolled faces. This recognition test does not change login wiring."
+        Request::IdentifyFor { .. } => {
+            "Requests a camera capture and compares it with this account's enrolled faces only. This recognition test signs nothing in and does not change login wiring."
         }
         Request::SetupIrEmitter { dry_run: true } => {
             "Inspects the IR emitter controls without applying their configuration."
@@ -10572,6 +10835,9 @@ fn request_effect(request: &Request) -> &'static str {
             "Requests deletion of the selected face profile and its saved scans."
         }
         Request::DeleteScan { .. } => "Requests deletion of the selected saved face scan.",
+        Request::RemoveCameraGroup { .. } => {
+            "Requests removal of the selected added camera with its scans and calibration; the primary camera is unchanged."
+        }
         Request::RenameProfile { .. } | Request::RenameScan { .. } => {
             "Requests a new name for the selected saved profile or scan; no new capture."
         }
@@ -10603,70 +10869,93 @@ fn map_ok(resp: Response) -> (bool, String) {
     }
 }
 
-/// Does `reason` carry any word the summary line does not already say?
-/// Word-set based, not equality: daemons phrase the echo with connectives
-/// ("live face, BUT no enrolled match"), so an exact compare never fires.
-fn reason_adds_information(summary: &str, reason: &str) -> bool {
-    let words = |s: &str| -> Vec<String> {
-        s.split(|c: char| !c.is_alphanumeric())
-            .filter(|w| !w.is_empty())
-            .map(str::to_lowercase)
-            .collect()
-    };
-    let known = words(summary);
-    words(reason)
-        .iter()
-        .any(|w| w != "but" && !known.contains(w))
-}
-
+/// A recognition test's result in plain words (ADR-0030 §2): who matched,
+/// or the outcome and why nothing matched, in the Overview's words and from
+/// its one cause table. It never shows how the matcher measured: no score,
+/// no threshold.
 fn map_identify(resp: Response) -> (bool, String) {
+    use irlume_common::{AttemptResult, OutcomeCause};
     match resp {
+        // The account is the one the page shows; the profile names who.
         Response::Identified {
-            user: Some(u),
+            user: Some(_),
             profile,
-            score,
             ..
         } => (
             true,
-            format!(
-                "{u} · {} · match score {score:.3}",
-                profile.unwrap_or_default()
-            ),
+            match profile {
+                Some(profile) => format!("recognized: {profile}"),
+                None => "recognized".into(),
+            },
         ),
-        // A refusal or failure that is not a verdict about a face (throttled,
-        // camera unavailable, shutter, cancelled, setup…) is not a liveness
-        // verdict.
-        Response::Identified {
-            user: None,
-            cause: Some(cause),
-            reason,
-            ..
-        } if cause.is_operational() => (false, format!("not run: {reason}")),
-        Response::Identified {
-            user: None,
-            live,
-            reason,
-            ..
-        } => {
-            let summary = if live {
-                "live face, no enrolled match"
+        // As the daemon files the same reply in the attempt record: a face
+        // verdict, or a cause this client cannot place, was a decision
+        // against a face, and so were the probe throttle and a face method
+        // that is not configured, which it decides before any camera. Any
+        // other cause stopped the test first: it did not complete.
+        Response::Identified { cause, .. } => {
+            let decided = matches!(
+                cause,
+                Some(OutcomeCause::RetryThrottled | OutcomeCause::MethodNotAvailable)
+            ) || !cause.is_some_and(OutcomeCause::is_operational);
+            let outcome = attempts::outcome(if decided {
+                AttemptResult::Refused
             } else {
-                "no live face"
-            };
-            // The daemon's reason often restates the summary ("live face, but
-            // no enrolled match"), which rendered as "live face, no enrolled
-            // match (live face, but no enrolled match)". Append it only when
-            // it says something the summary does not.
+                AttemptResult::Failed
+            });
             (
                 false,
-                if reason_adds_information(summary, &reason) {
-                    format!("{summary} ({reason})")
-                } else {
-                    summary.to_string()
-                },
+                format!("{outcome}: {}", attempts::cause_phrase(cause)),
             )
         }
-        Response::Error(e) => (false, e),
+        // What a daemon without `IdentifyFor` answers any unknown request.
+        Response::Error(e) if e == "bad request" => (
+            false,
+            "recognition test needs a newer irlumed; restart it after the upgrade".into(),
+        ),
+        // A daemon still loading its models answers in a login's words
+        // ("use your password") and files the test as not completed
+        // because it was still starting: the Overview's words for it.
+        Response::Error(e) if e.starts_with("irlumed is still starting") => (
+            false,
+            format!(
+                "{}: {}",
+                attempts::outcome(AttemptResult::Failed),
+                attempts::cause_phrase(Some(OutcomeCause::DaemonStarting))
+            ),
+        ),
+        // Any other refusal (the camera busy, the account not allowed) ran
+        // no test; the daemon's own words say why and when to retry.
+        Response::Error(e) => (
+            false,
+            format!("{}: {e}", attempts::outcome(AttemptResult::Failed)),
+        ),
+        _ => (false, unexpected_response()),
+    }
+}
+
+/// Removing an added camera (ADR-0024). The daemon names the group by the
+/// id it was sent (`group`), which is never shown (ADR-0030 §1.10): its
+/// acknowledgement and its "no such group" refusal (`protocol: no camera
+/// group '<id>' is enrolled` on the wire) read in the TUI's words, and any
+/// other refusal has the id replaced.
+fn map_camera_removed(resp: Response, group: &str) -> (bool, String) {
+    match resp {
+        Response::Ok(_) => (
+            true,
+            "added camera removed with its scans and calibration; the primary camera is unchanged"
+                .into(),
+        ),
+        Response::Error(e) if e.contains("no camera group '") => (
+            false,
+            "that added camera is no longer enrolled; nothing was removed".into(),
+        ),
+        Response::Error(e) if group.is_empty() => (false, e),
+        Response::Error(e) => (
+            false,
+            e.replace(&format!("'{group}'"), "this added camera")
+                .replace(group, "this added camera"),
+        ),
         _ => (false, unexpected_response()),
     }
 }
@@ -11856,11 +12145,15 @@ mod tests {
         assert!(app.op.is_some(), "the click must not disturb the operation");
     }
 
+    /// Every Faces hit target lands on the row drawn there, whatever the
+    /// row's height: profile guidance lines, facts that wrap on a narrow
+    /// pane, expanded groups and a scrolled list (ADR-0030 §2).
     #[test]
     fn profile_ir_guidance_renders_and_mouse_rows_follow_scrolled_heights() {
-        for (height, selected) in [(20, 0), (8, 3)] {
+        for (width, height, last) in [(80, 24, false), (80, 8, true), (44, 12, true)] {
             let mut app = test_app();
             app.screen = SC_PROFILES;
+            app.wall_override = Some(1_790_164_800);
             app.profiles = vec![profile("one", &["scan-one"]), profile("two", &["scan-two"])];
             app.profiles[0].ir = Some(irlume_common::ProfileIrSummary {
                 compatible_scans: 2,
@@ -11868,12 +12161,20 @@ mod tests {
                 calibration_withheld: true,
                 ..Default::default()
             });
-            app.sel = selected;
-            let area = Rect::new(0, 0, 80, height);
-            let mut term = Terminal::new(TestBackend::new(80, height)).unwrap();
+            app.profiles[1].scan_captured_at = vec![Some(1_790_164_800)];
+            app.camera_groups = vec![camera_group(
+                "group-a",
+                &[("one", 4), ("gone", 2)],
+                Some(1_790_164_800),
+            )];
+            app.faces_expanded = ["one".to_string(), "two".to_string()].into();
+            let rows = app.rows();
+            app.sel = if last { rows.len() - 1 } else { 0 };
+            let area = Rect::new(0, 0, width, height);
+            let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
             term.draw(|f| app.draw_profiles(f, area)).unwrap();
             let text = rendered(&term);
-            if selected == 0 {
+            if !last {
                 for line in crate::profile_ir::lines(&app.profiles[0]) {
                     assert!(text.contains(&line), "missing {line}: {text}");
                 }
@@ -11882,17 +12183,36 @@ mod tests {
             let mut checked = 0;
             for (rect, click) in app.click_targets.borrow().iter() {
                 if let Click::Select(i) = click {
-                    let label = ["● one", "↳ scan-one", "● two", "↳ scan-two"][*i];
+                    let label = match rows[*i] {
+                        Row::Profile(pi) => format!("● {}", app.profiles[pi].name),
+                        Row::PrimaryCamera(_) => "▾ primary camera".into(),
+                        Row::Scan(pi, si) => format!("↳ {}", app.profiles[pi].scans[si]),
+                        Row::AddedCamera(..) => "▣ added camera #1".into(),
+                    };
                     let row = text.lines().nth(rect.y as usize).unwrap();
                     assert!(
-                        row.contains(label),
-                        "hit {i} points at {row:?}, expected {label}"
+                        row.contains(&label),
+                        "{width}x{height}: hit {i} points at {row:?}, expected {label}\n{text}"
                     );
                     assert!(rect.y + rect.height <= height);
                     checked += 1;
                 }
             }
-            assert!(checked > 0);
+            assert!(checked > 1, "{width}x{height}\n{text}");
+            if width < 80 {
+                // The added camera's facts wrap rather than run off the pane,
+                // and its hit target covers every line it takes.
+                let added = app
+                    .click_targets
+                    .borrow()
+                    .iter()
+                    .find_map(|(rect, click)| {
+                        matches!(click, Click::Select(i) if rows[*i] == Row::AddedCamera(0, 1))
+                            .then_some(*rect)
+                    })
+                    .expect("the last row is on screen");
+                assert!(added.height > 1, "{text}");
+            }
         }
     }
 
@@ -11912,6 +12232,28 @@ mod tests {
             .expect("the second profile is clickable");
         app.on_click(profile_row.x, profile_row.y, area);
         assert_eq!(app.sel, 2, "profile row click updates selection");
+        // A second click on the selected row is Enter: on a primary camera
+        // row it opens the group, and again closes it; never more.
+        term.draw(|f| app.draw(f)).unwrap();
+        let camera_row = app
+            .click_targets
+            .borrow()
+            .iter()
+            .find_map(|(rect, click)| matches!(click, Click::Select(3)).then_some(*rect))
+            .expect("the second profile's camera row is clickable");
+        app.on_click(camera_row.x, camera_row.y, area);
+        assert_eq!(app.sel, 3);
+        assert!(
+            app.faces_expanded.is_empty(),
+            "the first click only selects"
+        );
+        app.on_click(camera_row.x, camera_row.y, area);
+        assert!(app.faces_expanded.contains("two"));
+        assert_eq!(app.rows()[4], Row::Scan(1, 0));
+        term.draw(|f| app.draw(f)).unwrap();
+        app.on_click(camera_row.x, camera_row.y, area);
+        assert!(app.faces_expanded.is_empty());
+        assert!(app.confirm.is_none() && app.input.is_none() && app.op.is_none());
 
         app.screen = SC_REPAIR;
         app.run_checks();
@@ -12051,7 +12393,8 @@ mod tests {
         app.caps.rgb = true;
         app.screen = SC_PROFILES;
         app.profiles = vec![profile("Alice", &["a1"]), profile("Bob", &["b1"])];
-        app.sel = 3; // Bob's b1 scan
+        app.faces_expanded = ["Alice".to_string(), "Bob".to_string()].into();
+        app.sel = 5; // Bob's b1 scan
         let (tx, rx) = mpsc::channel();
         app.profiles_load = Some(rx);
         tx.send(ProfilesOutcome::Loaded {
@@ -12062,6 +12405,8 @@ mod tests {
         })
         .unwrap();
         app.poll();
+        // Alice's new scan moved Bob's down a row; the selection followed.
+        assert_eq!(app.sel, 6);
         app.begin_delete();
         assert!(
             matches!(app.confirm, Some((_, _, ConfirmAct::Daemon(Request::DeleteScan { ref profile, ref scan, .. }))) if profile == "Bob" && scan == "b1")
@@ -12118,7 +12463,8 @@ mod tests {
         let scans: Vec<_> = (0..30).map(|n| format!("scan-{n:02}")).collect();
         let names: Vec<_> = scans.iter().map(String::as_str).collect();
         app.profiles = vec![profile("Alice", &names)];
-        app.sel = 25;
+        app.faces_expanded.insert("Alice".into());
+        app.sel = 27; // scan-25, below the viewport's first rows
         let area = Rect::new(0, 0, 70, 8);
         let mut terminal = Terminal::new(TestBackend::new(70, 8)).unwrap();
         terminal.draw(|f| app.draw_profiles(f, area)).unwrap();
@@ -12300,6 +12646,8 @@ mod tests {
             camera_confirmation: None,
             selected_camera_choice: None,
             selected_profile_identity: None,
+            faces_expanded: Default::default(),
+            faces_expanded_parked: None,
             qualification_load: None,
             identify_checked_at: None,
             user: "testuser".into(),
@@ -12477,6 +12825,23 @@ mod tests {
         drain_loads(app);
     }
 
+    /// Drive poll() until the live-status worker a refresh started has
+    /// answered. `drain_loads` leaves it running, and it reads IRLUME_SOCKET
+    /// at request time, so without this it can take the next mock socket's
+    /// only connection, or reach a real daemon once the guard is dropped.
+    fn wait_live_done(app: &mut App) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while app.live_load.is_some() && std::time::Instant::now() < deadline {
+            app.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            app.live_load.is_none(),
+            "the live poll must finish before the next socket"
+        );
+        drain_loads(app);
+    }
+
     /// Drive poll() until the guided-enroll worker ends (dead socket → Err).
     fn wait_enroll_done(app: &mut App) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -12541,6 +12906,41 @@ mod tests {
             live_recognizer: None,
             ir: None,
             scan_captured_at: Vec::new(),
+        }
+    }
+
+    /// An added camera group (ADR-0024) with one entry per (profile,
+    /// scans), each captured at `captured_at` (undated when `None`).
+    fn camera_group(
+        id: &str,
+        entries: &[(&str, usize)],
+        captured_at: Option<u64>,
+    ) -> irlume_common::CameraGroupSummary {
+        irlume_common::CameraGroupSummary {
+            id: id.into(),
+            rgb: Some("0000:0001".into()),
+            ir: Some("0000:0001".into()),
+            connected: true,
+            selected: false,
+            stale: false,
+            generation: 1,
+            profiles: entries
+                .iter()
+                .map(
+                    |(profile, scans)| irlume_common::CameraGroupProfileSummary {
+                        profile: (*profile).into(),
+                        scans: *scans,
+                        capture_target_met: *scans >= ENROLL_SCANS,
+                        calibration_fittable: false,
+                        compatible_rgb_candidates: *scans,
+                        compatible_ir_pairs: 0,
+                        calibrated: false,
+                        first_captured_at: captured_at,
+                        last_captured_at: captured_at,
+                    },
+                )
+                .collect(),
+            connected_handle: None,
         }
     }
 
@@ -12666,7 +13066,6 @@ mod tests {
                     ("[w] watch logs", 'w'),
                 ],
             ),
-            (SC_IDENTIFY, vec![("[i] identify now", 'i')]),
             (SC_SETTINGS, vec![("[p]", 'p'), ("[b]", 'b')]),
             (SC_DONE, vec![("[r] refresh", 'r'), ("[q] quit", 'q')]),
             (SC_KEYRING, vec![("[p] refresh pcrlock", 'p')]),
@@ -13697,39 +14096,140 @@ mod tests {
         assert!(msg.contains("unexpected"), "got: {msg}");
     }
 
+    /// A recognition test reads as who matched or, in the Overview's
+    /// words, the outcome and why nothing did; how the matcher measured
+    /// never shows, not even when the daemon's reason prose carries it
+    /// (ADR-0030 §2).
     #[test]
-    fn map_identify_formats_match_and_both_miss_reasons() {
-        let (ok, msg) = map_identify(Response::Identified {
-            user: Some("alice".into()),
-            profile: Some("Face Profile 1".into()),
+    fn map_identify_names_the_profile_or_the_cause_and_never_the_score() {
+        use irlume_common::OutcomeCause as C;
+        let identified = |user: Option<&str>, cause, reason: &str| Response::Identified {
+            user: user.map(Into::into),
+            profile: user.map(|_| "Face Profile 1".into()),
             score: 0.8125,
             live: true,
-            reason: String::new(),
-            cause: None,
-        });
-        assert!(ok);
-        assert_eq!(msg, "alice · Face Profile 1 · match score 0.812");
-        let (ok, msg) = map_identify(Response::Identified {
-            user: None,
-            profile: None,
-            score: 0.0,
-            live: true,
-            reason: "below threshold".into(),
-            cause: None,
-        });
+            reason: reason.into(),
+            cause,
+        };
+        assert_eq!(
+            map_identify(identified(Some("alice"), None, "")),
+            (true, "recognized: Face Profile 1".into())
+        );
+        let mut texts = vec![map_identify(identified(Some("alice"), None, "")).1];
+        for cause in attempts::ALL_CAUSES.iter().copied().map(Some).chain([None]) {
+            let (ok, text) = map_identify(identified(
+                None,
+                cause,
+                "score 0.412 below threshold 0.500 (cosine similarity)",
+            ));
+            assert!(!ok);
+            // The daemon's filing of each cause, written out: a face
+            // verdict, a cause this client cannot place and the two
+            // refusals it decides before any camera were decisions; the
+            // rest stopped the test first. Either way the outcome is said,
+            // not left to colour (§1.5). No wildcard: a new cause does not
+            // compile until it is placed here.
+            let outcome = match cause {
+                None
+                | Some(
+                    C::NoFace
+                    | C::LivenessRefused
+                    | C::BelowThreshold
+                    | C::RetryThrottled
+                    | C::MethodNotAvailable
+                    | C::Unknown,
+                ) => "refused",
+                Some(
+                    C::PrivacyShutter
+                    | C::CameraUnavailable
+                    | C::NotEnrolledOnThisCamera
+                    | C::SetupUnavailable
+                    | C::Cancelled
+                    | C::TimedOut
+                    | C::Policy
+                    | C::Configuration
+                    | C::DaemonStarting
+                    | C::Other,
+                ) => "did not complete",
+            };
+            assert_eq!(
+                text,
+                format!("{outcome}: {}", attempts::cause_phrase(cause)),
+                "{cause:?}"
+            );
+            texts.push(text);
+        }
+        assert_eq!(
+            map_identify(identified(
+                None,
+                Some(irlume_common::OutcomeCause::BelowThreshold),
+                ""
+            ))
+            .1,
+            "refused: not recognized as an enrolled face"
+        );
+        // An engine that could not measure the capture sends `Other`: the
+        // test did not complete, whatever the reason prose says.
+        assert_eq!(
+            map_identify(identified(
+                None,
+                Some(irlume_common::OutcomeCause::Other),
+                ""
+            ))
+            .1,
+            "did not complete: no reason recorded"
+        );
+        // The probe throttle and a face method that is not configured are
+        // refusals the daemon decides before any camera and files as such,
+        // as the Overview then shows them; a camera that cannot be used
+        // did not let the test run.
+        for (cause, expected) in [
+            (
+                C::RetryThrottled,
+                "refused: too many attempts; wait a moment",
+            ),
+            (
+                C::MethodNotAvailable,
+                "refused: face unlock is not the configured method",
+            ),
+            (C::CameraUnavailable, "did not complete: camera unavailable"),
+        ] {
+            assert_eq!(map_identify(identified(None, Some(cause), "")).1, expected);
+        }
+        // An older daemon cannot parse IdentifyFor and says only this.
+        let (ok, text) = map_identify(Response::Error("bad request".into()));
         assert!(!ok);
-        assert_eq!(msg, "live face, no enrolled match (below threshold)");
-        let (ok, msg) = map_identify(Response::Identified {
-            user: None,
-            profile: None,
-            score: 0.0,
-            live: false,
-            reason: "flat depth".into(),
-            cause: None,
-        });
+        assert_eq!(
+            text,
+            "recognition test needs a newer irlumed; restart it after the upgrade"
+        );
+        texts.push(text);
+        // A daemon still loading its models refuses in a login's words and
+        // files the test as not completed because it was starting.
+        let (ok, text) = map_identify(Response::Error(
+            "irlumed is still starting (loading models); retry, or use your password".into(),
+        ));
         assert!(!ok);
-        assert_eq!(msg, "no live face (flat depth)");
-        assert!(!map_identify(Response::Error("e".into())).0);
+        assert_eq!(text, "did not complete: the daemon was still starting");
+        texts.push(text);
+        // Any other refusal ran no test and is the daemon's own words.
+        for refusal in [
+            "camera busy: this account already has a camera operation in flight",
+            "camera busy: an authentication has priority; retry in a moment",
+            "not authorized to test recognition for 'alice'",
+        ] {
+            assert_eq!(
+                map_identify(Response::Error(refusal.into())),
+                (false, format!("did not complete: {refusal}"))
+            );
+        }
+        assert!(!map_identify(Response::Pong).0);
+        for text in texts {
+            let lower = text.to_lowercase();
+            for word in attempts::FORBIDDEN_WORDS {
+                assert!(!lower.contains(word), "{text}");
+            }
+        }
     }
 
     #[test]
@@ -13739,6 +14239,55 @@ mod tests {
         assert!(ok);
         assert!(msg.contains("disarmed"), "got: {msg}");
         assert!(!map_confirm(Response::Error("e".into())).0);
+    }
+
+    /// The daemon's replies to a camera removal name the group by its id,
+    /// which the TUI never shows; any other refusal is its own words.
+    #[test]
+    fn map_camera_removed_never_echoes_the_group_id() {
+        let id = "abc123";
+        let (ok, text) = map_camera_removed(
+            Response::Ok(format!(
+                "camera group '{id}' removed; in-flight use refuses at its boundary"
+            )),
+            id,
+        );
+        assert!(ok);
+        assert!(!text.contains(id) && !text.contains("in-flight"), "{text}");
+        // The daemon sends Error::Protocol's display, "protocol: ...".
+        for wire in [
+            format!("protocol: no camera group '{id}' is enrolled"),
+            format!("no camera group '{id}' is enrolled"),
+        ] {
+            assert_eq!(
+                map_camera_removed(Response::Error(wire), id),
+                (
+                    false,
+                    "that added camera is no longer enrolled; nothing was removed".into()
+                )
+            );
+        }
+        // Any other refusal keeps its words, never the id.
+        assert_eq!(
+            map_camera_removed(
+                Response::Error(format!(
+                    "policy: group '{id}' changed; authorize {id} again"
+                )),
+                id
+            ),
+            (
+                false,
+                "policy: group this added camera changed; authorize this added camera again".into()
+            )
+        );
+        assert_eq!(
+            map_camera_removed(
+                Response::Error("protocol: no secondary cameras are enrolled".into()),
+                id
+            ),
+            (false, "protocol: no secondary cameras are enrolled".into())
+        );
+        assert!(!map_camera_removed(Response::Pong, id).0);
     }
 
     #[test]
@@ -13786,23 +14335,136 @@ mod tests {
         assert_eq!(app.next_profile_name(), "Face Profile 4");
     }
 
+    /// ADR-0030 acceptance (Faces): scans group by camera role. Each
+    /// profile has its primary camera group, collapsed until opened, then
+    /// the added cameras it has scans on; an added camera left by a profile
+    /// that is gone follows every profile. `a` on any row of a profile
+    /// targets that profile.
     #[test]
-    fn rows_interleave_profiles_and_scans_and_sel_profile_resolves_owner() {
+    fn faces_rows_group_scans_by_camera_role() {
         let mut app = test_app();
         app.profiles = vec![profile("a", &["s1", "s2"]), profile("b", &["t1"])];
+        app.camera_groups = vec![
+            camera_group("group-1", &[("b", 3), ("gone", 2)], None),
+            camera_group("group-2", &[("a", 12)], None),
+        ];
+        assert_eq!(
+            app.rows(),
+            [
+                Row::Profile(0),
+                Row::PrimaryCamera(0),
+                Row::AddedCamera(1, 0),
+                Row::Profile(1),
+                Row::PrimaryCamera(1),
+                Row::AddedCamera(0, 0),
+                Row::AddedCamera(0, 1),
+            ],
+            "collapsed: no scan rows"
+        );
+        app.faces_expanded.insert("a".into());
         let rows = app.rows();
-        assert_eq!(rows.len(), 5, "2 profiles + 3 scans");
-        assert!(matches!(rows[0], Row::Profile(0)));
-        assert!(matches!(rows[1], Row::Scan(0, 0)));
-        assert!(matches!(rows[2], Row::Scan(0, 1)));
-        assert!(matches!(rows[3], Row::Profile(1)));
-        assert!(matches!(rows[4], Row::Scan(1, 0)));
-        app.sel = 2; // scan s2 → owner is profile 'a'
-        assert_eq!(app.sel_profile().as_deref(), Some("a"));
-        app.sel = 3;
-        assert_eq!(app.sel_profile().as_deref(), Some("b"));
-        app.sel = 99;
-        assert_eq!(app.sel_profile(), None);
+        assert_eq!(
+            rows[..5],
+            [
+                Row::Profile(0),
+                Row::PrimaryCamera(0),
+                Row::Scan(0, 0),
+                Row::Scan(0, 1),
+                Row::AddedCamera(1, 0),
+            ]
+        );
+        assert_eq!(rows.len(), 9);
+        for (sel, owner) in [
+            (0, Some("a")),
+            (1, Some("a")),
+            (3, Some("a")),
+            (4, Some("a")),
+            (5, Some("b")),
+            (7, Some("b")),
+            // The orphan belongs to no listed profile.
+            (8, None),
+            (99, None),
+        ] {
+            app.sel = sel;
+            assert_eq!(app.sel_profile().as_deref(), owner, "row {sel}");
+        }
+        app.screen = SC_PROFILES;
+        app.sel = 8;
+        app.on_key(KeyCode::Char('a'));
+        assert!(app.enroll.is_none() && app.input.is_none());
+        let (_, msg) = app.activity.last().expect("a hint is logged");
+        assert!(msg.contains("select a profile first"), "{msg}");
+        let text = {
+            app.profiles_loaded = true;
+            draw_text(&app)
+        };
+        assert!(
+            row_with(&text, "added camera #2").contains("12 scans · capture target met"),
+            "{text}"
+        );
+        assert!(
+            row_with(&text, "no longer present").contains("▣ added camera #1 · profile 'gone' no longer present · 2 of 10 scans (capture target)"),
+            "{text}"
+        );
+        // The raw group id is for the request, never the row (§1.10), and
+        // the old [x] tip had no key behind it.
+        assert!(
+            !text.contains("group-1") && !text.contains("group-2"),
+            "{text}"
+        );
+        assert!(!text.contains("[x]"), "{text}");
+    }
+
+    /// ADR-0030 acceptance (Faces): the count line states the scans against
+    /// the capture target, and nothing about readiness or conditions (the
+    /// tips below it keep that advice).
+    #[test]
+    fn the_count_line_states_the_capture_target_and_nothing_about_conditions() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.profiles_loaded = true;
+        let names: Vec<String> = (0..12).map(|n| format!("s{n}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut live = profile("Many", &names);
+        live.live_recognizer = Some("arcface".into());
+        live.scans_by_recognizer = [("arcface".to_string(), 12)].into();
+        app.profiles = vec![live, profile("Few", &["s1", "s2", "s3"])];
+        let text = draw_text(&app);
+        let many = row_with(&text, "● Many");
+        let few = row_with(&text, "● Few");
+        assert!(
+            many.contains("● Many · 12 scans · capture target met"),
+            "{many}"
+        );
+        assert!(
+            few.contains("● Few · 3 of 10 scans (capture target)"),
+            "{few}"
+        );
+        for line in [many, few] {
+            let count = line
+                .trim()
+                .split(" · ")
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let lower = count.to_lowercase();
+            assert!(lower.contains("capture target"), "{line}");
+            for word in [
+                "ready",
+                "glasses",
+                "light",
+                "lighting",
+                "sun",
+                "condition",
+                "angle",
+                "score",
+                "threshold",
+            ] {
+                assert!(!lower.contains(word), "{word} in {line}");
+            }
+        }
+        // The advice about conditions stays, as the tips' own words.
+        assert!(text.contains("glasses, low light"), "{text}");
     }
 
     // ---- tab visibility & navigation --------------------------------------
@@ -13909,7 +14571,10 @@ mod tests {
         assert_eq!(app.screen, SC_PROFILES, "Tab skips the hidden Repair tab");
         assert_eq!(app.sel, 0, "changing tab resets the selection");
         app.on_key(KeyCode::Right);
-        assert_eq!(app.screen, SC_RECOVERY, "Cameras/Identify stay hidden");
+        assert_eq!(
+            app.screen, SC_RECOVERY,
+            "Cameras stays hidden in the essential view"
+        );
         app.on_key(KeyCode::BackTab);
         app.on_key(KeyCode::Left);
         assert_eq!(app.screen, SC_WELCOME);
@@ -13926,15 +14591,16 @@ mod tests {
     #[test]
     fn recompute_visible_snaps_to_nearest_surviving_screen() {
         let mut app = test_app();
-        app.advanced = true;
+        app.fp_present = true;
         app.recompute_visible();
-        // Identify is advanced-only; leaving advanced view must snap off it.
-        app.screen = SC_IDENTIFY;
-        app.advanced = false;
+        // Fingerprint shows only with a reader; losing it must snap off it.
+        app.screen = SC_FINGERPRINT;
+        assert!(app.visible.contains(&SC_FINGERPRINT));
+        app.fp_present = false;
         app.recompute_visible();
         assert_ne!(
-            app.screen, SC_IDENTIFY,
-            "leaving advanced view must land on a still-visible step"
+            app.screen, SC_FINGERPRINT,
+            "losing the reader must land on a still-visible step"
         );
         assert!(
             app.visible.contains(&app.screen),
@@ -13945,14 +14611,16 @@ mod tests {
     #[test]
     fn move_sel_wraps_within_each_screens_list() {
         let mut app = test_app();
-        app.profiles = vec![profile("a", &["s1", "s2"])]; // 3 rows
+        app.profiles = vec![profile("a", &["s1", "s2"])];
+        // Profile, primary camera and, expanded, two scans: 4 rows.
+        app.faces_expanded.insert("a".into());
         app.screen = SC_PROFILES;
         app.on_key(KeyCode::Up);
-        assert_eq!(app.sel, 2, "Up from the top wraps to the last row");
+        assert_eq!(app.sel, 3, "Up from the top wraps to the last row");
         app.on_key(KeyCode::Char('j'));
         assert_eq!(app.sel, 0, "j from the bottom wraps to the top");
         app.on_key(KeyCode::Char('k'));
-        assert_eq!(app.sel, 2);
+        assert_eq!(app.sel, 3);
         app.screen = SC_REPAIR;
         app.repair = vec![
             check_row("a", Sev::Ok, Fix::None),
@@ -13960,7 +14628,7 @@ mod tests {
         ];
         app.on_key(KeyCode::Down);
         assert_eq!(app.repair_sel, 1, "Repair has its own selection");
-        assert_eq!(app.sel, 2, "the profile selection must not move");
+        assert_eq!(app.sel, 3, "the profile selection must not move");
         app.on_key(KeyCode::Down);
         assert_eq!(app.repair_sel, 0);
         app.screen = SC_CAMERAS;
@@ -14085,43 +14753,278 @@ mod tests {
         }
     }
 
+    /// `i` runs the recognition test where it is pressed (ADR-0030 §2):
+    /// there is no Test Recognition page to jump to, in either view.
     #[test]
-    fn welcome_identify_stays_put_in_essential_view_and_jumps_in_advanced() {
+    fn test_recognition_stays_on_the_page_it_was_pressed_on() {
         let _sock = dead_socket();
+        for (screen, advanced) in [
+            (SC_WELCOME, false),
+            (SC_WELCOME, true),
+            (SC_PROFILES, false),
+            (SC_PROFILES, true),
+            (SC_CAMERAS, true),
+        ] {
+            let mut app = test_app();
+            app.caps = irlume_camera::Caps {
+                ir_pair: false,
+                rgb: true,
+            };
+            app.advanced = advanced;
+            app.recompute_visible();
+            app.screen = screen;
+            app.on_key(KeyCode::Char('i'));
+            assert_eq!(app.screen, screen, "advanced {advanced}: stay put");
+            assert!(app.op.is_some(), "the recognition test must start");
+            // (The refresh at op completion re-derives the camera from this
+            // machine's hardware, which may hide camera pages; the key's
+            // own effect is what this checks.)
+            wait_op_done(&mut app);
+            wait_live_done(&mut app);
+            let (ok, _) = app
+                .identify_result
+                .as_ref()
+                .expect("the op result must land for the Faces line");
+            assert!(!ok, "a dead socket cannot recognize anyone");
+            assert!(
+                app.error.is_none(),
+                "a recognition test miss is a result, not the error modal"
+            );
+        }
+    }
+
+    /// `i` asks for the recognition test of the account the TUI shows,
+    /// `IdentifyFor { user }`, never the account-less `Identify` (ADR-0030
+    /// §2); the reply is mapped for the Faces line, and an older daemon's
+    /// "bad request" reads as needing a newer irlumed.
+    #[test]
+    fn test_recognition_sends_identify_for_the_shown_account() {
+        use std::io::{BufRead, Write};
+        let _guard = dead_socket();
+        for (index, (reply, expected)) in [
+            (
+                Response::Error("bad request".into()),
+                (
+                    false,
+                    "recognition test needs a newer irlumed; restart it after the upgrade",
+                ),
+            ),
+            (
+                Response::Identified {
+                    user: Some("alice".into()),
+                    profile: Some("Face Profile 1".into()),
+                    score: 0.9,
+                    live: true,
+                    reason: String::new(),
+                    cause: None,
+                },
+                (true, "recognized: Face Profile 1"),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = std::env::temp_dir().join(format!(
+                "irlume-tui-identify-for-{}-{index}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            std::env::set_var("IRLUME_SOCKET", &path);
+            let socket_path = path.clone();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                // One request only: the refresh after the test then finds
+                // no socket and fails fast instead of queueing here.
+                drop(listener);
+                std::fs::remove_file(&socket_path).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&socket)
+                    .read_line(&mut line)
+                    .unwrap();
+                writeln!(socket, "{}", serde_json::to_string(&reply).unwrap()).unwrap();
+                serde_json::from_str::<Request>(&line).unwrap()
+            });
+            let mut app = test_app();
+            app.user = "alice".into();
+            app.caps.rgb = true;
+            app.screen = SC_PROFILES;
+            app.profiles_loaded = true;
+            app.profiles = vec![profile("Face Profile 1", &["scan"])];
+            assert!(app.attempts_load.is_none());
+            app.on_key(KeyCode::Char('i'));
+            assert_eq!(app.screen, SC_PROFILES);
+            let request = server.join().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while app.op.is_some() && Instant::now() < deadline {
+                app.poll();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(app.op.is_none(), "async op never finished");
+            // The poll that lands the result refreshes, and that re-reads
+            // the attempt record, so Overview's last-attempt line shows the
+            // test.
+            assert!(
+                app.attempts_load.is_some(),
+                "the refresh after the test re-reads the attempt record for Overview"
+            );
+            assert!(
+                app.activity
+                    .iter()
+                    .any(|(_, m)| m.contains("this account's enrolled faces only")),
+                "Activity names the account-scoped request"
+            );
+            drain_loads(&mut app);
+            wait_live_done(&mut app);
+            assert!(
+                matches!(&request, Request::IdentifyFor { user } if user == "alice"),
+                "{request:?}"
+            );
+            assert_eq!(
+                app.identify_result,
+                Some((expected.0, expected.1.to_string()))
+            );
+            assert!(app.error.is_none(), "{:?}", app.error);
+        }
+    }
+
+    /// Removing an added camera never shows the group's id (ADR-0030
+    /// §1.10): the daemon names the group by the id it was sent, in its
+    /// acknowledgement and in its "no such group" refusal, and neither
+    /// reaches Activity or the error banner as is. A reload that no longer
+    /// lists the camera says so in a camera's words.
+    #[test]
+    fn removing_an_added_camera_never_shows_its_id() {
+        use std::io::{BufRead, Write};
+        let _guard = dead_socket();
+        // The store id a root peer sees carries the camera's identity.
+        let id = "cam-046d-085e-SERIAL";
+        for (index, (reply, refusal)) in [
+            (
+                Response::Ok(format!(
+                    "camera group '{id}' removed; in-flight use refuses at its boundary"
+                )),
+                None,
+            ),
+            // As the daemon sends it: Error::Protocol's display.
+            (
+                Response::Error(format!("protocol: no camera group '{id}' is enrolled")),
+                Some("that added camera is no longer enrolled; nothing was removed"),
+            ),
+            (
+                Response::Error(format!("policy: the authorization for '{id}' was consumed")),
+                Some("policy: the authorization for this added camera was consumed"),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let removed = refusal.is_none();
+            let path = std::env::temp_dir().join(format!(
+                "irlume-tui-remove-added-{}-{index}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            std::env::set_var("IRLUME_SOCKET", &path);
+            let socket_path = path.clone();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                // One request only: the refresh after it then finds no
+                // socket and fails fast instead of queueing here.
+                drop(listener);
+                std::fs::remove_file(&socket_path).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&socket)
+                    .read_line(&mut line)
+                    .unwrap();
+                writeln!(socket, "{}", serde_json::to_string(&reply).unwrap()).unwrap();
+                serde_json::from_str::<Request>(&line).unwrap()
+            });
+            let mut app = test_app();
+            app.screen = SC_PROFILES;
+            app.profiles_loaded = true;
+            app.profiles = vec![profile("A", &["a1"])];
+            app.camera_groups = vec![camera_group(id, &[("A", 3)], None)];
+            app.sel = 2;
+            assert_eq!(app.rows()[2], Row::AddedCamera(0, 0));
+            app.on_key(KeyCode::Char('d'));
+            app.on_key(KeyCode::Char('y'));
+            let request = server.join().unwrap();
+            wait_op_done(&mut app);
+            wait_live_done(&mut app);
+            assert!(
+                matches!(&request, Request::RemoveCameraGroup { user, group } if user == "testuser" && group == id),
+                "{request:?}"
+            );
+            if removed {
+                assert!(app.error.is_none(), "{:?}", app.error);
+                assert!(
+                    app.activity.iter().any(|(icon, m)| *icon == '✓'
+                        && m == "added camera removed with its scans and calibration; the primary camera is unchanged"),
+                    "the removal is acknowledged in the TUI's words"
+                );
+                // The next listing no longer has the camera the person
+                // had selected, and says so as a camera.
+                let (tx, rx) = mpsc::channel();
+                app.profiles_load = Some(rx);
+                tx.send(ProfilesOutcome::Loaded {
+                    profiles: vec![profile("A", &["a1"])],
+                    camera_groups: Vec::new(),
+                    camera_store_error: None,
+                    primary_camera: None,
+                })
+                .unwrap();
+                app.poll();
+                let (_, msg) = app.activity.last().expect("the lost selection is logged");
+                assert_eq!(
+                    msg,
+                    "the selected added camera is no longer listed; select a row before acting"
+                );
+            } else {
+                assert_eq!(app.error.as_deref(), refusal);
+            }
+            for text in app
+                .activity
+                .iter()
+                .map(|(_, m)| m.as_str())
+                .chain(app.error.as_deref())
+            {
+                assert!(
+                    !text.contains("cam-046d") && !text.contains("SERIAL"),
+                    "the group id reached the screen: {text}"
+                );
+            }
+        }
+    }
+
+    /// With an observed empty enrollment there is nothing to recognize:
+    /// `i` says so and sends nothing (the engine would open the camera
+    /// first). An unobserved enrollment is not an empty one.
+    #[test]
+    fn test_recognition_without_an_enrollment_explains_and_sends_nothing() {
+        let _guard = dead_socket();
+        for screen in [SC_WELCOME, SC_PROFILES, SC_REPAIR] {
+            let mut app = test_app();
+            app.caps.rgb = true;
+            app.screen = screen;
+            app.profiles_loaded = true;
+            app.on_key(KeyCode::Char('i'));
+            assert!(app.op.is_none(), "screen {screen}: nothing is sent");
+            let (_, msg) = app.activity.last().expect("the reason is logged");
+            assert_eq!(msg, "enroll a face first; there is nothing to recognize");
+        }
         let mut app = test_app();
-        app.caps = irlume_camera::Caps {
-            ir_pair: false,
-            rgb: true,
-        };
-        app.recompute_visible();
+        app.caps.rgb = true;
+        app.screen = SC_PROFILES;
         app.on_key(KeyCode::Char('i'));
-        assert_eq!(
-            app.screen, SC_WELCOME,
-            "essential view has no Identify tab; stay put"
-        );
-        assert!(app.op.is_some(), "the 1:N identify op must still start");
-        wait_op_done(&mut app);
-        let (ok, _) = app
-            .identify_result
-            .as_ref()
-            .expect("the op result must land on the Identify card");
-        assert!(!ok, "a dead socket cannot identify anyone");
-        assert!(
-            app.error.is_none(),
-            "an identify miss shows on the card, not the error modal"
-        );
-        // Advanced view: the tab exists, so [i] jumps there. (The refresh at op
-        // completion re-derived caps from real hardware; pin them back so this
-        // half is deterministic on camera-less machines too.)
-        app.caps = irlume_camera::Caps {
-            ir_pair: false,
-            rgb: true,
-        };
-        app.advanced = true;
-        app.recompute_visible();
-        app.screen = SC_WELCOME;
-        app.on_key(KeyCode::Char('i'));
-        assert_eq!(app.screen, SC_IDENTIFY);
+        assert!(app.op.is_some(), "an unanswered listing is not empty");
         wait_op_done(&mut app);
     }
 
@@ -14186,7 +15089,24 @@ mod tests {
     fn profiles_rename_and_delete_target_the_selected_row() {
         let mut app = test_app();
         app.profiles = vec![profile("p1", &["s1", "s2"])];
+        app.camera_groups = vec![
+            camera_group("group-7", &[("p1", 4)], None),
+            // Left by a profile renamed or deleted since.
+            camera_group("group-9", &[("old name", 2)], None),
+        ];
+        app.faces_expanded.insert("p1".into());
         app.screen = SC_PROFILES;
+        assert_eq!(
+            app.rows(),
+            [
+                Row::Profile(0),
+                Row::PrimaryCamera(0),
+                Row::Scan(0, 0),
+                Row::Scan(0, 1),
+                Row::AddedCamera(0, 0),
+                Row::AddedCamera(1, 0),
+            ]
+        );
         app.on_key(KeyCode::Char('n'));
         match &app.input {
             Some((prompt, _, Pending::RenameProfile(old))) => {
@@ -14196,7 +15116,7 @@ mod tests {
             _ => panic!("expected the rename-profile prompt"),
         }
         app.input = None;
-        app.sel = 2; // second scan
+        app.sel = 3; // second scan
         app.on_key(KeyCode::Char('n'));
         match &app.input {
             Some((prompt, _, Pending::RenameScan(p, s))) => {
@@ -14206,6 +15126,14 @@ mod tests {
             _ => panic!("expected the rename-scan prompt"),
         }
         app.input = None;
+        // Camera rows name no profile or scan: n explains itself.
+        for sel in [1, 4, 5] {
+            app.sel = sel;
+            app.on_key(KeyCode::Char('n'));
+            assert!(app.input.is_none(), "row {sel}");
+            let (_, msg) = app.activity.last().expect("n explains itself");
+            assert!(msg.contains("select a profile or scan"), "{msg}");
+        }
         app.sel = 0;
         app.on_key(KeyCode::Char('d'));
         match &app.confirm {
@@ -14218,7 +15146,7 @@ mod tests {
             _ => panic!("expected the delete-profile confirm"),
         }
         app.confirm = None;
-        app.sel = 1;
+        app.sel = 2;
         app.on_key(KeyCode::Char('d'));
         match &app.confirm {
             Some((q, _, ConfirmAct::Daemon(Request::DeleteScan { profile, scan, .. }))) => {
@@ -14227,6 +15155,702 @@ mod tests {
             }
             _ => panic!("expected the delete-scan confirm"),
         }
+        app.confirm = None;
+        // The primary camera is not removable on its own.
+        app.sel = 1;
+        app.on_key(KeyCode::Char('d'));
+        assert!(app.confirm.is_none());
+        // An added camera removes its whole group behind the confirmation,
+        // by the id the daemon gave and never shows.
+        for (sel, number, id) in [(4, 1, "group-7"), (5, 2, "group-9")] {
+            app.sel = sel;
+            app.on_key(KeyCode::Char('d'));
+            match &app.confirm {
+                Some((q, _, ConfirmAct::Daemon(Request::RemoveCameraGroup { user, group }))) => {
+                    assert_eq!(
+                        q,
+                        &format!("Remove added camera #{number} for testuser? Its scans are deleted; the primary camera is unchanged. OS approval is required for non-root users.")
+                    );
+                    assert_eq!((user.as_str(), group.as_str()), ("testuser", id));
+                }
+                _ => panic!("expected the remove-camera confirm for row {sel}"),
+            }
+            app.confirm = None;
+        }
+        // Enter on an added camera opens nothing (it carries counts, not
+        // scan names) and says so; it never arms anything.
+        app.sel = 4;
+        app.on_key(KeyCode::Enter);
+        assert!(app.confirm.is_none() && app.input.is_none());
+        assert_eq!(app.faces_expanded.len(), 1);
+        let (_, msg) = app.activity.last().expect("Enter explains itself");
+        assert!(msg.contains("not their names"), "{msg}");
+    }
+
+    /// Selection identity names the kind of row, so an added camera whose
+    /// group id equals a profile's name, and whose profile is named like a
+    /// scan, is never taken for that profile or scan across a reload: the
+    /// reordered listing puts both of them ahead of the camera, and `d`
+    /// still removes the camera.
+    #[test]
+    fn a_reload_keeps_the_selection_on_the_same_kind_of_row() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        // The daemon reports a camera, so Faces stays visible when the
+        // listing lands (a poll re-derives `caps` from live state).
+        app.reported_caps.rgb = true;
+        app.recompute_visible();
+        app.screen = SC_PROFILES;
+        app.profiles = vec![profile("Alice", &["a1"]), profile("Bob", &["Alice"])];
+        app.camera_groups = vec![camera_group("Bob", &[("Alice", 3)], None)];
+        app.faces_expanded = ["Bob".to_string()].into();
+        app.sel = 2; // Alice's added camera, whose group id reads "Bob"
+        assert_eq!(app.rows()[2], Row::AddedCamera(0, 0));
+        let (tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        tx.send(ProfilesOutcome::Loaded {
+            profiles: vec![profile("Bob", &["Alice"]), profile("Alice", &["a1"])],
+            camera_groups: vec![camera_group("Bob", &[("Alice", 3)], None)],
+            camera_store_error: None,
+            primary_camera: None,
+        })
+        .unwrap();
+        app.poll();
+        // Profile "Bob" (0) and Bob's scan "Alice" (2) now come first.
+        assert_eq!(
+            app.rows(),
+            [
+                Row::Profile(0),
+                Row::PrimaryCamera(0),
+                Row::Scan(0, 0),
+                Row::Profile(1),
+                Row::PrimaryCamera(1),
+                Row::AddedCamera(0, 0),
+            ]
+        );
+        assert_eq!(app.sel, 5);
+        assert_eq!(app.rows()[app.sel], Row::AddedCamera(0, 0));
+        app.on_key(KeyCode::Char('d'));
+        assert!(
+            matches!(&app.confirm, Some((_, _, ConfirmAct::Daemon(Request::RemoveCameraGroup { group, .. }))) if group == "Bob"),
+            "the camera, not the profile or scan named like it"
+        );
+    }
+
+    /// `d` on an added camera removes the group the person selected, by
+    /// its id, after a reload that reorders the groups or drops one ahead
+    /// of it; the prompt's number follows the camera's new place.
+    #[test]
+    fn delete_targets_the_selected_added_camera_after_groups_move() {
+        let _guard = dead_socket();
+        let reordered = vec![
+            camera_group("g2", &[("A", 4)], None),
+            camera_group("g1", &[("A", 3)], None),
+        ];
+        let removed = vec![camera_group("g2", &[("A", 4)], None)];
+        for landed in [reordered, removed] {
+            let mut app = test_app();
+            // The daemon reports a camera, so Faces stays visible when the
+            // listing lands (a poll re-derives `caps` from live state).
+            app.reported_caps.rgb = true;
+            app.recompute_visible();
+            app.screen = SC_PROFILES;
+            app.profiles = vec![profile("A", &["a1"])];
+            app.camera_groups = vec![
+                camera_group("g1", &[("A", 3)], None),
+                camera_group("g2", &[("A", 4)], None),
+            ];
+            app.sel = 3; // g2's row
+            assert_eq!(app.rows()[3], Row::AddedCamera(1, 0));
+            let (tx, rx) = mpsc::channel();
+            app.profiles_load = Some(rx);
+            tx.send(ProfilesOutcome::Loaded {
+                profiles: vec![profile("A", &["a1"])],
+                camera_groups: landed,
+                camera_store_error: None,
+                primary_camera: None,
+            })
+            .unwrap();
+            app.poll();
+            assert_eq!(app.rows()[app.sel], Row::AddedCamera(0, 0));
+            app.on_key(KeyCode::Char('d'));
+            match &app.confirm {
+                Some((q, _, ConfirmAct::Daemon(Request::RemoveCameraGroup { user, group }))) => {
+                    assert_eq!((user.as_str(), group.as_str()), (app.user.as_str(), "g2"));
+                    assert!(q.contains("added camera #1"), "{q}");
+                }
+                _ => panic!("expected the remove-camera confirm"),
+            }
+        }
+    }
+
+    /// Enter on Faces (ADR-0030 §1.1) opens or closes a profile's primary
+    /// camera group from the profile or from that group's row; the rows it
+    /// cannot open say why, since Enter is advertised on this page.
+    #[test]
+    fn enter_on_faces_shows_or_hides_scans_and_explains_the_rest() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.profiles = vec![profile("A", &["a1", "a2"])];
+        app.sel = app.rows().len();
+        app.on_key(KeyCode::Enter);
+        let (_, msg) = app.activity.last().expect("Enter explains itself");
+        assert_eq!(msg, "select a profile to show or hide its scans");
+        app.sel = 0;
+        app.on_key(KeyCode::Enter);
+        assert!(app.faces_expanded.contains("A"));
+        assert_eq!(app.rows()[2..], [Row::Scan(0, 0), Row::Scan(0, 1)]);
+        assert_eq!(app.sel, 0, "the selection stays on the profile");
+        app.on_key(KeyCode::Enter);
+        assert!(app.faces_expanded.is_empty());
+        app.faces_expanded.insert("A".into());
+        app.sel = 3;
+        app.on_key(KeyCode::Enter);
+        assert!(app.faces_expanded.contains("A"), "a scan closes nothing");
+        let (_, msg) = app.activity.last().expect("Enter explains itself");
+        assert_eq!(msg, "a scan has nothing more to open");
+        // The advertised chip, focused with F6, does what Enter does.
+        app.sel = 1;
+        app.on_key(KeyCode::F(6));
+        let chip = app
+            .screen_actions()
+            .iter()
+            .position(|(key, _)| *key == "enter")
+            .expect("Faces advertises Enter");
+        for _ in 0..chip {
+            app.on_key(KeyCode::Down);
+        }
+        assert_eq!(app.focused_action(), Some(("enter", "Show or Hide Scans")));
+        app.on_key(KeyCode::Enter);
+        assert!(app.faces_expanded.is_empty());
+        assert!(app.confirm.is_none() && app.input.is_none() && app.suspend.is_none());
+    }
+
+    /// ADR-0030 acceptance (Faces): an added camera's row states its
+    /// calibration and its connection, and a stale one, which cannot
+    /// authenticate until it is added again, says so in words and colour.
+    #[test]
+    fn faces_added_camera_rows_state_calibration_and_connection() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.profiles_loaded = true;
+        app.profiles = vec![profile("A", &["a1"])];
+        let mut calibrated = camera_group("g1", &[("A", 2)], None);
+        calibrated.profiles[0].calibrated = true;
+        let mut fittable = camera_group("g2", &[("A", 2)], None);
+        fittable.profiles[0].calibration_fittable = true;
+        fittable.connected = false;
+        fittable.selected = true;
+        let mut stale = camera_group("g3", &[("A", 2)], None);
+        stale.stale = true;
+        app.camera_groups = vec![calibrated, fittable, stale];
+        // Wide enough that no row wraps.
+        let area = Rect::new(0, 0, 160, 20);
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| app.draw_profiles(f, area)).unwrap();
+        let text = rendered(&term);
+        let first = row_with(&text, "added camera #1");
+        assert!(first.contains(" · calibrated · "), "{first}");
+        assert!(first.trim_end().ends_with(" · connected"), "{first}");
+        let second = row_with(&text, "added camera #2");
+        assert!(second.contains(" · uncalibrated · "), "{second}");
+        assert!(
+            second.trim_end().ends_with(" · not connected, selected"),
+            "{second}"
+        );
+        let third = row_with(&text, "added camera #3");
+        assert!(third.contains(" · no IR calibration · "), "{third}");
+        assert!(
+            third.trim_end().ends_with(" · connected, stale: re-add it"),
+            "{third}"
+        );
+        let fg = |needle: &str| {
+            let y = text.lines().position(|line| line.contains(needle)).unwrap();
+            // The "a" of "added camera".
+            term.backend().buffer()[(4, y as u16)].fg
+        };
+        assert_eq!(fg("added camera #3"), th().warn);
+        if th().warn != Color::Reset {
+            assert_ne!(fg("added camera #1"), th().warn);
+        }
+    }
+
+    /// An added camera left behind by the account's only profile (deleted
+    /// or renamed away) is still listed, and removable, with no profile
+    /// beside it: the page is not "no face profiles yet".
+    #[test]
+    fn faces_lists_an_added_camera_whose_profile_is_gone_with_no_profiles() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.profiles_loaded = true;
+        app.camera_groups = vec![camera_group("g", &[("gone", 2)], None)];
+        assert_eq!(app.rows(), [Row::AddedCamera(0, 0)]);
+        let text = draw_text(&app);
+        assert!(
+            row_with(&text, "added camera #1")
+                .contains("▣ added camera #1 · profile 'gone' no longer present"),
+            "{text}"
+        );
+        assert!(!text.contains("No face profiles yet"), "{text}");
+        assert!(!text.contains("Press [e] to enroll"), "{text}");
+        assert!(
+            app.click_targets
+                .borrow()
+                .iter()
+                .any(|(_, click)| matches!(click, Click::Select(0))),
+            "the row can be clicked"
+        );
+        app.sel = 0;
+        app.on_key(KeyCode::Char('d'));
+        assert!(
+            matches!(
+                &app.confirm,
+                Some((_, _, ConfirmAct::Daemon(Request::RemoveCameraGroup { user, group })))
+                    if user == "testuser" && group == "g"
+            ),
+            "the camera is removable"
+        );
+    }
+
+    /// A long profile name on an added camera left behind gives way to the
+    /// status: the row still says the profile is no longer present.
+    #[test]
+    fn an_orphan_added_camera_keeps_its_status_whatever_the_name() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.profiles_loaded = true;
+        app.profiles = vec![profile("Face Profile 1", &["s1"])];
+        let name = "A profile renamed long ago with a long descriptive name";
+        app.camera_groups = vec![camera_group("g", &[(name, 2)], None)];
+        let area = Rect::new(0, 0, 72, 20);
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| app.draw_profiles(f, area)).unwrap();
+        let text = rendered(&term);
+        let status = row_with(&text, "no longer present");
+        assert!(status.contains("profile 'A profile renamed"), "{text}");
+        assert!(status.contains("…' no longer present"), "{text}");
+    }
+
+    /// When the added cameras cannot be read, Faces says so under the list,
+    /// so the profiles do not read as primary-only (ADR-0030 §1.6); the
+    /// line is not a row, and it gives the kind of failure in fixed words:
+    /// the daemon's detail can carry a group's internal id (§1.10).
+    #[test]
+    fn faces_says_when_the_added_cameras_could_not_be_read() {
+        use irlume_core::multi_camera::SecondaryStoreError;
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.profiles_loaded = true;
+        app.profiles = vec![profile("A", &["a1"])];
+        let area = Rect::new(0, 0, 80, 20);
+        let targets = |app: &App| {
+            app.click_targets.borrow_mut().clear();
+            let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            term.draw(|f| app.draw_profiles(f, area)).unwrap();
+            let targets: Vec<(Rect, usize)> = app
+                .click_targets
+                .borrow()
+                .iter()
+                .filter_map(|(rect, click)| match click {
+                    Click::Select(i) => Some((*rect, *i)),
+                    _ => None,
+                })
+                .collect();
+            (rendered(&term), targets)
+        };
+        let (text, before) = targets(&app);
+        assert!(!text.contains("could not be read"), "{text}");
+        // What the daemon sends: the store error's own text.
+        app.camera_store_error = Some(
+            SecondaryStoreError::Invalid("group cam-046d-085e-sn0042 has no profile scans".into())
+                .to_string(),
+        );
+        let (text, after) = targets(&app);
+        assert!(
+            row_with(&text, "added cameras could not be read")
+                .contains("⚠ added cameras could not be read · the file failed its checks"),
+            "{text}"
+        );
+        for raw in ["cam-", "sn0042", "secondary"] {
+            assert!(!text.contains(raw), "{raw}: {text}");
+        }
+        assert_eq!(before, after, "the warning is not a row");
+        assert_eq!(app.rows().len(), 2);
+        // Under the rows, which keep their lines and their targets.
+        let warn_y = u16::try_from(
+            text.lines()
+                .position(|l| l.contains("added cameras could not be read"))
+                .expect("warning drawn"),
+        )
+        .unwrap();
+        assert!(
+            after.iter().all(|(r, _)| r.y + r.height <= warn_y),
+            "the warning follows the rows: {text}"
+        );
+        assert!(
+            text.lines()
+                .nth(usize::from(after[0].0.y))
+                .unwrap()
+                .contains("● A"),
+            "{text}"
+        );
+        // Each kind of store error in its own words, never the detail.
+        for (error, cause) in [
+            (
+                SecondaryStoreError::Invalid(
+                    "the account template key is unavailable: unseal failed".into(),
+                ),
+                "the account's template key is unavailable",
+            ),
+            (
+                SecondaryStoreError::Invalid(
+                    "the secondary store is encrypted and its template key is unavailable".into(),
+                ),
+                "the account's template key is unavailable",
+            ),
+            (
+                SecondaryStoreError::Io("Permission denied (os error 13)".into()),
+                "the file could not be read",
+            ),
+            (
+                SecondaryStoreError::IncompatibleVersion(99),
+                "the file's format version is not supported",
+            ),
+            (
+                SecondaryStoreError::Corrupt("expected value at line 1 column 1".into()),
+                "the file is damaged",
+            ),
+        ] {
+            app.camera_store_error = Some(error.to_string());
+            let (text, _) = targets(&app);
+            assert!(
+                row_with(&text, "added cameras could not be read")
+                    .contains(&format!("⚠ added cameras could not be read · {cause}")),
+                "{error}: {text}"
+            );
+            assert!(!text.contains("secondary"), "{error}: {text}");
+        }
+        app.camera_store_error = Some("an error this client does not know".into());
+        let (text, _) = targets(&app);
+        assert_eq!(
+            row_with(&text, "added cameras could not be read").trim(),
+            "⚠ added cameras could not be read",
+            "{text}"
+        );
+    }
+
+    /// The store warning is not a List item, so no list can hide it: at
+    /// the smallest terminal, with a profile's ten scans open and filling
+    /// the pane, it is on screen whatever the selection, and so it is with
+    /// a recognition result under three profiles, and on an empty list.
+    #[test]
+    fn the_added_camera_warning_stays_on_screen_under_a_full_faces_list() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.profiles_loaded = true;
+        app.clock_override = Some(Instant::now());
+        app.wall_override = Some(1_790_164_800);
+        app.camera_store_error = Some(
+            irlume_core::multi_camera::SecondaryStoreError::Invalid(
+                "the account template key is unavailable: unseal failed".into(),
+            )
+            .to_string(),
+        );
+        let on_screen = |app: &mut App, sel: usize| {
+            app.sel = sel;
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            rendered(&term).contains("added cameras could not be read")
+        };
+        let ten: Vec<String> = (1..=10).map(|n| format!("s{n}")).collect();
+        let ten: Vec<&str> = ten.iter().map(String::as_str).collect();
+        app.profiles = vec![profile("A", &ten)];
+        app.faces_expanded = ["A".to_string()].into();
+        let rows = app.rows().len();
+        assert_eq!(rows, 12);
+        // `rows` is no selection.
+        for sel in [0, 5, rows - 1, rows] {
+            assert!(on_screen(&mut app, sel), "sel {sel}");
+        }
+        app.faces_expanded.clear();
+        app.profiles = ["A", "B", "C"]
+            .into_iter()
+            .map(|name| profile(name, &["s1"]))
+            .collect();
+        app.identify_result = Some(map_identify(Response::Error("bad request".into())));
+        app.identify_checked_at = Some(app.now());
+        let rows = app.rows().len();
+        for sel in 0..=rows {
+            assert!(on_screen(&mut app, sel), "sel {sel}");
+        }
+        app.profiles.clear();
+        assert!(app.rows().is_empty());
+        assert!(on_screen(&mut app, 0));
+    }
+
+    /// A List that scrolled to its selection ends at that row, and the
+    /// lines a taller row it scrolled past freed stay blank: they select
+    /// nothing, as rows the person cannot see.
+    #[test]
+    fn a_scrolled_faces_list_has_no_hit_target_under_the_selection() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.profiles_loaded = true;
+        let nine: Vec<String> = (1..=9).map(|n| format!("a{n}")).collect();
+        let nine: Vec<&str> = nine.iter().map(String::as_str).collect();
+        app.profiles = vec![profile("A", &nine), profile("B", &["b1"])];
+        app.faces_expanded = ["A".to_string()].into();
+        let rows = app.rows();
+        assert_eq!(rows[11], Row::Profile(1));
+        assert_eq!(rows[12], Row::PrimaryCamera(1));
+        app.sel = 11;
+        // A (two lines), its primary camera and nine scans take 12 lines,
+        // and B two more: the List drops A to show B and leaves the last
+        // of the 13 lines blank, where B's primary camera would fit.
+        let area = Rect::new(0, 0, 74, 13);
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| app.draw_profiles(f, area)).unwrap();
+        let text = rendered(&term);
+        assert!(text.lines().nth(10).unwrap().contains("● B"), "{text}");
+        assert_eq!(text.lines().nth(12).unwrap().trim(), "", "{text}");
+        let selects: Vec<usize> = app
+            .click_targets
+            .borrow()
+            .iter()
+            .filter_map(|(_, click)| match click {
+                Click::Select(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(selects, (1..=11).collect::<Vec<_>>(), "{text}");
+        app.on_click(1, 12, area);
+        assert_eq!(app.sel, 11, "a blank line selects nothing");
+    }
+
+    /// The Faces list draws only rows that fit whole, so a row cut by the
+    /// bottom edge is blank there and has no hit target: a click on that
+    /// line never selects a row the person cannot see.
+    #[test]
+    fn a_faces_row_cut_by_the_bottom_edge_has_no_hit_target() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.profiles_loaded = true;
+        app.profiles = vec![profile("A", &["a1"]), profile("B", &["b1"])];
+        app.camera_groups = vec![
+            camera_group("g1", &[("A", 4)], None),
+            camera_group("g2", &[("B", 4)], None),
+        ];
+        app.sel = 0;
+        // At 60 columns a profile takes two lines (its IR compatibility
+        // line), its primary camera one and its added camera two: B's
+        // profile starts on the last line of 6 and does not fit.
+        let area = Rect::new(0, 0, 60, 6);
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| app.draw_profiles(f, area)).unwrap();
+        let text = rendered(&term);
+        assert_eq!(app.rows()[3], Row::Profile(1));
+        assert!(
+            text.lines().nth(4).unwrap().contains("no IR calibration"),
+            "{text}"
+        );
+        assert_eq!(text.lines().nth(5).unwrap().trim(), "", "{text}");
+        let selects: Vec<usize> = app
+            .click_targets
+            .borrow()
+            .iter()
+            .filter_map(|(_, click)| match click {
+                Click::Select(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(selects, [0, 1, 2], "{text}");
+        let clicked = app.sel;
+        app.on_click(1, 5, area);
+        assert_eq!(app.sel, clicked, "a blank line selects nothing");
+    }
+
+    /// The recognition test's result stays on Faces while the listing
+    /// reloads after it, and when that reload fails: the page's copy of the
+    /// result does not depend on the list (ADR-0030 §2).
+    #[test]
+    fn the_recognition_result_stays_on_faces_while_the_list_reloads_or_fails() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.profiles_loaded = true;
+        app.profiles = vec![profile("Alice", &["scan-a"])];
+        app.clock_override = Some(Instant::now());
+        app.wall_override = Some(1_790_164_800);
+        let (tx, op) = fake_op();
+        app.op = Some(op);
+        tx.send((true, "recognized: Alice".into())).unwrap();
+        app.poll();
+        assert!(app.op.is_none());
+        let area = Rect::new(0, 0, 80, 20);
+        let render = |app: &App| {
+            let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            term.draw(|f| app.draw_profiles(f, area)).unwrap();
+            rendered(&term)
+        };
+        // The refresh after the test is reading the list again.
+        assert!(app.profiles_load.is_some() && app.rows().is_empty());
+        let text = render(&app);
+        assert!(text.contains("Loading profiles"), "{text}");
+        assert!(
+            text.contains("Last recognition test: recognized: Alice · just now"),
+            "{text}"
+        );
+        // The dead socket fails that reload: the result stays. The live
+        // poll the refresh started lands first, while the guard holds.
+        wait_live_done(&mut app);
+        let text = render(&app);
+        assert!(text.contains("Profile list not read yet"), "{text}");
+        assert!(
+            text.contains("Last recognition test: recognized: Alice"),
+            "{text}"
+        );
+        app.enroll_error = Some("enrollment unreadable".into());
+        let text = render(&app);
+        assert!(text.contains("Profile list unreadable"), "{text}");
+        assert!(
+            text.contains("Last recognition test: recognized: Alice"),
+            "{text}"
+        );
+    }
+
+    /// Expansion is keyed by profile name: it survives a reload that moves
+    /// the profile, and even one that went through `clear_source`, but not
+    /// a listing of another account, nor a profile that is gone.
+    #[test]
+    fn expansion_survives_a_reload_by_profile_name() {
+        let _guard = dead_socket();
+        let land = |app: &mut App, profiles: Vec<ProfileSummary>| {
+            let (tx, rx) = mpsc::channel();
+            app.profiles_load = Some(rx);
+            tx.send(ProfilesOutcome::Loaded {
+                profiles,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
+                primary_camera: None,
+            })
+            .unwrap();
+            app.poll();
+        };
+        let mut app = test_app();
+        // The daemon reports a camera, so Faces stays visible when the
+        // listing lands (a poll re-derives `caps` from live state).
+        app.reported_caps.rgb = true;
+        app.recompute_visible();
+        app.screen = SC_PROFILES;
+        land(&mut app, vec![profile("A", &["a1"]), profile("B", &["b1"])]);
+        app.sel = 3; // B's primary camera
+        app.on_key(KeyCode::Enter);
+        assert!(app.faces_expanded.contains("B"));
+        land(&mut app, vec![profile("B", &["b1"]), profile("A", &["a1"])]);
+        assert_eq!(
+            app.rows()[..3],
+            [Row::Profile(0), Row::PrimaryCamera(0), Row::Scan(0, 0)]
+        );
+        assert_eq!(
+            app.rows()[app.sel],
+            Row::PrimaryCamera(0),
+            "the selection followed"
+        );
+        // A full refresh clears the listing and with it what is open; the
+        // next listing of this account opens it again.
+        app.clear_source(Source::Profiles);
+        assert!(app.rows().is_empty() && app.faces_expanded.is_empty());
+        land(&mut app, vec![profile("B", &["b1"])]);
+        assert!(app.faces_expanded.contains("B"));
+        // A profile that is gone takes its expansion with it.
+        land(&mut app, vec![profile("A", &["a1"])]);
+        assert!(app.faces_expanded.is_empty());
+        land(&mut app, vec![profile("B", &["b1"])]);
+        assert!(app.faces_expanded.is_empty(), "B was reopened by nobody");
+        // Opened for one account, never for another.
+        app.sel = 1;
+        app.on_key(KeyCode::Enter);
+        assert!(app.faces_expanded.contains("B"));
+        app.clear_source(Source::Profiles);
+        app.user = "someone-else".into();
+        land(&mut app, vec![profile("B", &["b1"])]);
+        assert!(app.faces_expanded.is_empty());
+    }
+
+    /// ADR-0030 acceptance (Faces): scans without a capture time read "date
+    /// not recorded"; dated ones read their local day, a group its range.
+    #[test]
+    fn scans_without_captured_at_read_date_not_recorded() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.profiles_loaded = true;
+        app.wall_override = Some(1_790_251_200);
+        // 2026-03-03 12:00 and 2026-09-24 12:00 UTC.
+        let (march, september) = (1_790_251_200 - 205 * 86_400, 1_790_251_200);
+        let mut dated = profile("Dated", &["d1", "d2", "d3"]);
+        dated.scan_captured_at = vec![Some(march), None, Some(september)];
+        let mut older = profile("Older", &["o1", "o2"]);
+        // A list that does not line up with the scans dates none of them.
+        older.scan_captured_at = vec![Some(september)];
+        app.profiles = vec![dated, older, profile("Undated", &["u1"])];
+        app.camera_groups = vec![
+            camera_group("g1", &[("Dated", 4)], Some(september)),
+            camera_group("g2", &[("Undated", 4)], None),
+        ];
+        app.faces_expanded = [
+            "Dated".to_string(),
+            "Older".to_string(),
+            "Undated".to_string(),
+        ]
+        .into();
+        let text = draw_text(&app);
+        let primary: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("primary camera"))
+            .collect();
+        assert!(
+            primary[0].contains("▾ primary camera · 3 scans · Mar 3 to Sep 24, 2026 · 1 undated"),
+            "{text}"
+        );
+        assert!(
+            primary[1].contains("▾ primary camera · 2 scans · date not recorded"),
+            "{text}"
+        );
+        assert!(
+            primary[2].contains("▾ primary camera · 1 scan · date not recorded"),
+            "{text}"
+        );
+        assert!(
+            row_with(&text, "↳ d1").contains("↳ d1 · Mar 3, 2026"),
+            "{text}"
+        );
+        assert!(
+            row_with(&text, "↳ d2").contains("↳ d2 · date not recorded"),
+            "{text}"
+        );
+        assert!(
+            row_with(&text, "↳ d3").contains("↳ d3 · Sep 24, 2026"),
+            "{text}"
+        );
+        for scan in ["↳ o1", "↳ o2", "↳ u1"] {
+            assert!(
+                row_with(&text, scan).contains("date not recorded"),
+                "{text}"
+            );
+        }
+        assert!(
+            row_with(&text, "added camera #1").contains("Sep 24, 2026"),
+            "{text}"
+        );
+        assert!(
+            row_with(&text, "added camera #2").contains("date not recorded"),
+            "{text}"
+        );
+        // Collapsed, the group still carries its dates.
+        app.faces_expanded.clear();
+        let text = draw_text(&app);
+        assert!(row_with(&text, "▸ primary camera · 3 scans").contains("Mar 3 to Sep 24, 2026"));
+        assert!(!text.contains("↳ d1"), "{text}");
     }
 
     #[test]
@@ -14669,6 +16293,59 @@ mod tests {
         app.on_key(KeyCode::Enter);
         let text = render(&mut app);
         assert!(text.contains("3443:c803:sn0042 · serial present"), "{text}");
+        // A pair not enrolled for the account names how to add it; Faces
+        // has no key for that yet. `irlume enroll --add-camera` adds the
+        // daemon's configured pair, and this one is not it.
+        // The panel's words, as they wrap, without the sidebar's.
+        let flat = |text: &str| {
+            text.lines()
+                .map(|line| line.split_once("││").map_or(line, |(_, pane)| pane))
+                .flat_map(str::split_whitespace)
+                .filter(|word| *word != "│")
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert!(
+            flat(&text).contains(
+                "not enrolled for this account · make it the daemon's camera, then add it with `irlume enroll --add-camera`"
+            ),
+            "{text}"
+        );
+        // The configured pair is the one the command adds, for the profile
+        // it names when the account has several.
+        let health = app.health.clone();
+        if let Some(health) = app.health.as_mut() {
+            health.rgb_dev = Some("/dev/video4".into());
+            health.ir_dev = Some("/dev/video6".into());
+        }
+        let text = render(&mut app);
+        assert!(
+            flat(&text).contains(
+                "not enrolled for this account · add it with `irlume enroll --add-camera`"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("--name"), "{text}");
+        app.profiles = vec![profile("A", &["a1"]), profile("B", &["b1"])];
+        let text = render(&mut app);
+        assert!(
+            flat(&text).contains(
+                "not enrolled for this account · add it with `irlume enroll --add-camera --name <profile>`"
+            ),
+            "{text}"
+        );
+        // With nothing enrolled the command has no enrollment to add to:
+        // a face comes first.
+        app.profiles.clear();
+        app.profiles_loaded = true;
+        let text = render(&mut app);
+        assert!(
+            flat(&text).contains("not enrolled for this account · enroll a face on Faces first"),
+            "{text}"
+        );
+        assert!(!text.contains("--add-camera"), "{text}");
+        app.profiles_loaded = false;
+        app.health = health;
         app.on_key(KeyCode::Esc);
         app.cam_sel = 0;
         app.on_key(KeyCode::Enter);
@@ -14703,7 +16380,7 @@ mod tests {
         }];
         app.pairs[1].identity = Some("3443:c803".into());
         let text = render(&mut app);
-        assert!(text.contains("Secondary camera #1"), "{text}");
+        assert!(text.contains("Added camera #1"), "{text}");
         assert!(text.contains("inactive (primary changed)"), "{text}");
         // The schedule observation is shown only on the configured pair.
         app.cam_sel = 1;
@@ -14720,7 +16397,7 @@ mod tests {
         app.clear_source(Source::Profiles);
         let text = render(&mut app);
         assert!(!text.contains("Primary camera"), "{text}");
-        assert!(!text.contains("Secondary camera"), "{text}");
+        assert!(!text.contains("Added camera"), "{text}");
         // A long or hostile name never pushes the role column off the row,
         // and control characters never reach the terminal.
         app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
@@ -14816,7 +16493,7 @@ mod tests {
         }];
         app.pairs[1].identity = Some("3443:c803".into());
         let text = render(&mut app);
-        assert!(text.contains("Secondary camera #1"), "{text}");
+        assert!(text.contains("Added camera #1"), "{text}");
         assert!(!text.contains("not enrolled"), "{text}");
         app.camera_groups.clear();
         // An unreadable secondary store keeps unmatched pairs unknown.
@@ -16667,13 +18344,21 @@ mod tests {
         assert!(text.contains("Press [e] to enroll"));
         app.profiles = vec![profile("Alice", &["scan-a", "scan-b"])];
         let text = draw_text(&app);
-        assert!(text.contains("● Alice"));
-        assert!(text.contains("(2 scans)"));
-        assert!(text.contains("↳ scan-a"), "scans render under the profile");
+        assert!(
+            text.contains("● Alice · 2 of 10 scans (capture target)"),
+            "{text}"
+        );
+        assert!(text.contains("▸ primary camera · 2 scans"), "{text}");
+        assert!(!text.contains("↳ scan-a"), "collapsed by default: {text}");
         assert!(
             text.contains("Improve Recognition"),
             "the add-scan guidance is missing"
         );
+        app.sel = 1;
+        app.on_key(KeyCode::Enter);
+        let text = draw_text(&app);
+        assert!(text.contains("▾ primary camera · 2 scans"), "{text}");
+        assert!(text.contains("↳ scan-a"), "scans render under their camera");
     }
 
     #[test]
@@ -16690,7 +18375,10 @@ mod tests {
         p.live_recognizer = Some(live_space.into());
         app.profiles = vec![p];
         let text = draw_text(&app);
-        assert!(text.contains("(2 scans)"), "{text}");
+        assert!(
+            text.contains("● Alice · 2 of 10 scans (capture target)"),
+            "{text}"
+        );
         assert!(!text.contains("for the loaded recognizer"), "{text}");
         // No scan lives in the loaded space: the count says so, and the row
         // grows the warning naming the fix.
@@ -16700,9 +18388,11 @@ mod tests {
         app.profiles = vec![p];
         let text = draw_text(&app);
         assert!(
-            text.contains("(2 scans, 0 for the loaded recognizer)"),
+            text.contains("● Alice · 0 of 10 scans for the loaded recognizer (capture target)"),
             "{text}"
         );
+        // The camera group still holds both stored scans.
+        assert!(text.contains("▸ primary camera · 2 scans"), "{text}");
         assert!(
             text.contains("none of these match the loaded recognizer"),
             "{text}"
@@ -16711,7 +18401,10 @@ mod tests {
         // flat count stands rather than a false all-clear or a false warning.
         app.profiles = vec![profile("Alice", &["scan-a", "scan-b"])];
         let text = draw_text(&app);
-        assert!(text.contains("(2 scans)"), "{text}");
+        assert!(
+            text.contains("● Alice · 2 of 10 scans (capture target)"),
+            "{text}"
+        );
         assert!(!text.contains("for the loaded recognizer"), "{text}");
     }
 
@@ -17069,14 +18762,7 @@ mod tests {
         app.profiles = vec![profile("A", &["a"]), profile("B", &["b"])];
         app.screen = SC_PROFILES;
         app.sel = 1;
-        for screen in [
-            SC_KEYRING,
-            SC_RECOVERY,
-            SC_FINGERPRINT,
-            SC_PAM,
-            SC_SETTINGS,
-            SC_IDENTIFY,
-        ] {
+        for screen in [SC_KEYRING, SC_RECOVERY, SC_FINGERPRINT, SC_PAM, SC_SETTINGS] {
             app.screen = screen;
             app.on_key(KeyCode::Char('j'));
             app.on_key(KeyCode::Down);
@@ -17152,35 +18838,6 @@ mod tests {
         assert!(
             !app.freshness
                 .observation(Source::Profiles)
-                .last_request_failed(),
-            "the stale reply must not be published as this refresh's result"
-        );
-    }
-
-    /// r on Test Recognition while the periodic live poll is in flight
-    /// queues a replacement rather than accepting the older reply.
-    #[test]
-    fn identify_refresh_during_a_running_poll_queues_a_replacement() {
-        let _guard = dead_socket();
-        let mut app = test_app();
-        app.screen = SC_IDENTIFY;
-        app.refresh_live();
-        assert!(app.live_load.is_some(), "premise: a poll is in flight");
-        app.on_key(KeyCode::Char('r'));
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while app.live_load.is_some() && std::time::Instant::now() < deadline {
-            app.poll();
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(app.live_load.is_none(), "the poll must finish");
-        drain_loads(&mut app);
-        assert!(
-            app.freshness.cycle(Worker::Live).pending(),
-            "the pre-keypress reply is discarded and a replacement is queued"
-        );
-        assert!(
-            !app.freshness
-                .observation(Source::Live)
                 .last_request_failed(),
             "the stale reply must not be published as this refresh's result"
         );
@@ -17395,23 +19052,100 @@ mod tests {
         );
     }
 
+    /// The recognition test's result lives on Faces as a line under the
+    /// list (ADR-0030 §2): its words and when, never a selectable row.
     #[test]
-    fn identify_screen_renders_hit_miss_and_idle_states() {
+    fn faces_shows_the_last_recognition_test_under_the_list() {
         let mut app = test_app();
-        app.screen = SC_IDENTIFY;
+        app.screen = SC_PROFILES;
+        app.profiles_loaded = true;
+        app.profiles = vec![profile("Alice", &["scan-a"])];
+        app.clock_override = Some(Instant::now());
+        app.wall_override = Some(1_790_164_800);
+        let rows = app.rows().len();
+        assert!(!draw_text(&app).contains("Last recognition test"));
+        app.identify_result = Some(map_identify(Response::Identified {
+            user: Some("testuser".into()),
+            profile: Some("Alice".into()),
+            score: 0.912,
+            live: true,
+            reason: String::new(),
+            cause: None,
+        }));
+        app.identify_checked_at = Some(app.now());
         let text = draw_text(&app);
-        assert!(text.contains("press [i] and look at the camera"));
-        app.identify_result = Some((true, "alice · Face Profile 1 · match score 0.912".into()));
-        let text = draw_text(&app);
-        assert!(text.contains("alice · Face Profile 1 · match score 0.912"));
         assert!(
-            text.contains("● Recognized") && text.contains("not a login or a probability estimate"),
-            "the hit shows a verdict without presenting similarity as a probability"
+            row_with(&text, "Last recognition test").contains("recognized: Alice · just now"),
+            "{text}"
         );
-        app.identify_result = Some((false, "no live face (flat depth)".into()));
+        assert_eq!(app.rows().len(), rows, "the result line is not a row");
+        app.identify_result = Some(map_identify(Response::Identified {
+            user: None,
+            profile: None,
+            score: 0.2,
+            live: true,
+            reason: "score 0.200 below threshold 0.500".into(),
+            cause: Some(irlume_common::OutcomeCause::BelowThreshold),
+        }));
+        app.identify_checked_at = Some(app.now() - Duration::from_secs(150));
         let text = draw_text(&app);
-        assert!(text.contains("✕"));
-        assert!(text.contains("no live face (flat depth)"));
+        let line = row_with(&text, "Last recognition test");
+        assert!(
+            line.contains("refused: not recognized as an enrolled face · 3 min ago"),
+            "{line}"
+        );
+        for word in attempts::FORBIDDEN_WORDS {
+            assert!(!text.to_lowercase().contains(word), "{word}: {text}");
+        }
+    }
+
+    /// At 80 columns, with more rows than the pane holds, the recognition
+    /// result stays on screen under the list and wraps rather than losing
+    /// its end: the fix for an older daemon and the time both show, and
+    /// the label is not repeated by the text.
+    #[test]
+    fn the_recognition_result_is_whole_under_a_full_faces_list_at_80_columns() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.profiles_loaded = true;
+        app.profiles = ["A", "B", "C"]
+            .into_iter()
+            .map(|name| profile(name, &["s1", "s2", "s3", "s4", "s5"]))
+            .collect();
+        app.faces_expanded = ["A", "B", "C"].into_iter().map(String::from).collect();
+        app.clock_override = Some(Instant::now());
+        app.wall_override = Some(1_790_164_800);
+        app.identify_result = Some(map_identify(Response::Error("bad request".into())));
+        app.identify_checked_at = Some(app.now());
+        for sel in [0, app.rows().len() - 1] {
+            app.sel = sel;
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            let text = rendered(&term);
+            assert!(
+                !text.contains("One profile per person"),
+                "the list is full: {text}"
+            );
+            let start = text
+                .lines()
+                .position(|line| line.contains("Last recognition test: needs a newer irlumed;"))
+                .unwrap_or_else(|| panic!("the result is on screen:\n{text}"));
+            let result = text
+                .lines()
+                .skip(start)
+                .take(3)
+                .flat_map(str::split_whitespace)
+                .filter(|word| *word != "│")
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                result.contains(
+                    "Last recognition test: needs a newer irlumed; restart it after the upgrade · just now"
+                ),
+                "{text}"
+            );
+            assert!(!text.contains("…"), "nothing is cut: {text}");
+        }
     }
 
     #[test]
@@ -17866,6 +19600,26 @@ mod tests {
             app.input = None;
             app.suspend = None;
         }
+        // Faces again with a row of every kind: a profile, its primary
+        // camera, a scan, its added camera and one whose profile is gone.
+        app.screen = SC_PROFILES;
+        app.profiles = vec![profile("A", &["a"])];
+        app.camera_groups = vec![camera_group("g", &[("A", 2), ("gone", 1)], None)];
+        let expanded: std::collections::BTreeSet<String> = ["A".to_string()].into();
+        app.faces_expanded = expanded.clone();
+        let rows = app.rows();
+        assert_eq!(rows.len(), 5, "{rows:?}");
+        for (sel, row) in rows.iter().enumerate() {
+            // Enter on a profile or its camera closes the group, which
+            // changes the rows; each press starts from the same list.
+            app.faces_expanded = expanded.clone();
+            app.sel = sel;
+            app.on_key(KeyCode::Enter);
+            assert!(
+                app.confirm.is_none() && app.input.is_none() && app.suspend.is_none(),
+                "Enter on Faces row {row:?} must not arm a side effect"
+            );
+        }
         // The documented exception: Enter on an F6-focused chip does what
         // the chip's letter does, and a root fix's letter opens the
         // confirmation dialog rather than running.
@@ -17926,14 +19680,7 @@ mod tests {
         app.on_key(KeyCode::Char('g'));
         assert_eq!(app.sel, 0);
         app.sel = last;
-        for screen in [
-            SC_KEYRING,
-            SC_RECOVERY,
-            SC_FINGERPRINT,
-            SC_PAM,
-            SC_SETTINGS,
-            SC_IDENTIFY,
-        ] {
+        for screen in [SC_KEYRING, SC_RECOVERY, SC_FINGERPRINT, SC_PAM, SC_SETTINGS] {
             app.screen = screen;
             app.on_key(KeyCode::Char('g'));
             assert_eq!(app.sel, last, "screen {screen}: g must not touch Faces");
@@ -17981,12 +19728,11 @@ mod tests {
         };
         // Footer = primary action only (trimmed, three-tier disclosure);
         // the [?] overlay must list EVERY action of the screen.
-        let cases: [(usize, &str, &str); 11] = [
+        let cases: [(usize, &str, &str); 10] = [
             (SC_WELCOME, "Enroll Face", "Uninstall"),
             (SC_REPAIR, "Fix Selected Issue", "Toggle Debug Logs"),
             (SC_CAMERAS, "Camera Details", "Use This Camera"),
-            (SC_PROFILES, "Enroll Face", "Delete"),
-            (SC_IDENTIFY, "Test Recognition", "Test Recognition"),
+            (SC_PROFILES, "Enroll Face", "Test Recognition"),
             (SC_KEYRING, "Connect Wallet", "Forget"),
             (SC_RECOVERY, "Set Recovery", "Forget"),
             (SC_FINGERPRINT, "Enroll Finger", "Reset"),
@@ -19130,43 +20876,6 @@ mod tests {
         );
         // And no armed-state consequence line off an unanswered question.
         assert!(!text.contains("Not armed;"), "{text}");
-    }
-
-    #[test]
-    fn identify_deny_reasons_that_echo_the_summary_are_not_repeated() {
-        // The daemon's deny reason restates the summary with a connective;
-        // appending it rendered "live face, no enrolled match (live face,
-        // but no enrolled match)". Informative reasons keep their
-        // parenthetical (pinned by map_identify_formats_match_and_both_miss_reasons).
-        let (ok, msg) = map_identify(Response::Identified {
-            user: None,
-            profile: None,
-            score: 0.0,
-            live: true,
-            reason: "live face, but no enrolled match".into(),
-            cause: None,
-        });
-        assert!(!ok);
-        assert_eq!(msg, "live face, no enrolled match");
-        let (_, msg) = map_identify(Response::Identified {
-            user: None,
-            profile: None,
-            score: 0.0,
-            live: false,
-            reason: "no live face".into(),
-            cause: None,
-        });
-        assert_eq!(msg, "no live face");
-        // An empty reason: no dangling "()" either.
-        let (_, msg) = map_identify(Response::Identified {
-            user: None,
-            profile: None,
-            score: 0.0,
-            live: true,
-            reason: String::new(),
-            cause: None,
-        });
-        assert_eq!(msg, "live face, no enrolled match");
     }
 
     #[test]
@@ -20483,6 +22192,14 @@ mod tests {
         app.screen = SC_WELCOME;
         assert!(
             app.help_body().contains("Open Selected Section"),
+            "{}",
+            app.help_body()
+        );
+        // Faces: Enter shows or hides a profile's scans, which are
+        // collapsed by default and the only way to a single scan.
+        app.screen = SC_PROFILES;
+        assert!(
+            app.help_body().contains("Show or Hide Scans"),
             "{}",
             app.help_body()
         );

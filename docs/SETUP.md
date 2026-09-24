@@ -31,10 +31,11 @@ message; enlarge the terminal to return to the same page or dialog.
 The TUI opens as a settings app with stable, grouped navigation and an
 **Overview** that shows live status plus the next recommended action. Use the
 sidebar or click a status row to jump directly to a section; `Tab`/`⇧Tab` and
-`←`/`→` move between sections without a mouse. `[v]` reveals technical tools
-(Cameras and Test Recognition), `[A]` expands recent activity, and `[?]` shows
-every action for the current section. Footer actions, selectable rows, and the
-sidebar can all be clicked.
+`←`/`→` move between sections without a mouse. `[v]` lists the technical
+Cameras section before the daemon reports its cameras, `[i]` tests recognition
+for your account from any section, `[A]` expands recent activity, and `[?]`
+shows every action for the current section. Footer actions, selectable rows,
+and the sidebar can all be clicked.
 
 **F3** opens a section chooser, **F4** opens Current observations, and **F6**
 focuses page actions for keyboard use. The observations panel shows each source's

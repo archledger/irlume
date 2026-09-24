@@ -331,9 +331,48 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
             height,
         ));
 
+        // Faces grouped by camera (ADR-0030 §2): an open group with dated
+        // and undated scans, a selected added camera, a stale one, one whose
+        // profile is gone, and the last recognition test under the list.
+        let mut faces = visual_fixture(SC_PROFILES);
+        faces.faces_expanded = ["Synthetic daily profile".to_string()].into();
+        faces.profiles[0].scan_captured_at =
+            vec![Some(VISUAL_WALL - 205 * 86_400), None, Some(VISUAL_WALL)];
+        let mut added = camera_group(
+            "synthetic-group-a",
+            &[("Synthetic daily profile", 4)],
+            Some(VISUAL_WALL),
+        );
+        added.selected = true;
+        added.profiles[0].calibrated = true;
+        let mut stale = camera_group(
+            "synthetic-group-b",
+            &[("Synthetic alternate profile", 2)],
+            None,
+        );
+        stale.stale = true;
+        let orphan = camera_group(
+            "synthetic-group-c",
+            &[("Synthetic profile renamed long ago with a long descriptive name", 3)],
+            None,
+        );
+        faces.camera_groups = vec![added, stale, orphan];
+        faces.identify_result = Some(map_identify(Response::Error("bad request".into())));
+        faces.identify_checked_at = faces.clock_override;
+        let frame = visual_frame(&faces, "Faces grouped by camera", width, height);
+        let text: String = frame["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|cell| cell[0].as_str().unwrap())
+            .collect();
+        assert!(text.contains("added camera #1"), "{width}x{height}");
+        assert!(!text.contains("synthetic-group"), "{width}x{height}");
+        frames.push(frame);
+
         // Only a channel and Op value: fake_op spawns no worker, and no poll
         // is performed. The busy label must survive all history-only keys.
-        let mut busy = visual_fixture(SC_IDENTIFY);
+        let mut busy = visual_fixture(SC_PROFILES);
         let (_sender, mut op) = fake_op();
         op.label = "Synthetic pending request; no operation is running".into();
         busy.op = Some(op);
@@ -675,7 +714,7 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
         assert!(app.click_targets.borrow().is_empty());
         frames.push(frame);
     }
-    assert_eq!(frames.len(), SCREENS.len() * 3 + 110);
+    assert_eq!(frames.len(), SCREENS.len() * 3 + 113);
     if let Some(output) = std::env::var_os("IRLUME_TUI_GALLERY_DIR") {
         let directory = std::path::PathBuf::from(output);
         assert!(

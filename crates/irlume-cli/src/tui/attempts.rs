@@ -5,6 +5,7 @@
 //! record phrased for people, independent of I/O and drawing. Every function
 //! takes the clock it reads, so the phrasing is the same in tests and live.
 
+use super::dates::{civil_date, MONTHS};
 use irlume_common::{
     AttemptEntry, AttemptKind, AttemptRecord, AttemptResult, AttemptSurface, CameraPairInfo,
     OutcomeCause, Response,
@@ -89,10 +90,6 @@ pub(crate) fn cause_phrase(cause: Option<OutcomeCause>) -> &'static str {
     }
 }
 
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
 /// When an attempt happened, relative to `now` (both unix seconds). Older
 /// than two weeks it is a local date, with the year when that is not the
 /// current one. `utc_offset` gives the local zone's offset east of UTC at a
@@ -123,31 +120,6 @@ pub(super) fn relative_time(at: u64, now: u64, utc_offset: &dyn Fn(u64) -> i64) 
             format!("{month} {day}, {year}")
         }
     }
-}
-
-/// The calendar date of `at` (unix seconds) in the zone `utc_offset`
-/// seconds east of UTC: (year, month 1-12, day 1-31). The proleptic
-/// Gregorian conversion from days since the epoch (H. Hinnant's
-/// `civil_from_days`).
-fn civil_date(at: u64, utc_offset: i64) -> (i64, usize, i64) {
-    let local = i64::try_from(at)
-        .unwrap_or(i64::MAX)
-        .saturating_add(utc_offset);
-    let days = local.div_euclid(86_400) + 719_468;
-    let era = days.div_euclid(146_097);
-    let day_of_era = days.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
-    } else {
-        shifted_month - 9
-    };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    (year, usize::try_from(month).unwrap_or(1), day)
 }
 
 /// An attempt's duration to a tenth of a second: "0.9 s", "12.5 s".
@@ -683,11 +655,6 @@ mod tests {
             }
         };
         assert_eq!(relative_time(1_772_425_800, NOW, &new_york), "Mar 1");
-        assert_eq!(civil_date(0, 0), (1970, 1, 1));
-        assert_eq!(civil_date(951_782_400, 0), (2000, 2, 29));
-        assert_eq!(civil_date(NOW, 0), (2026, 9, 23));
-        assert_eq!(civil_date(NOW + 12 * 3600, 0), (2026, 9, 24));
-        assert_eq!(civil_date(NOW + 12 * 3600, -1), (2026, 9, 23));
     }
 
     #[test]

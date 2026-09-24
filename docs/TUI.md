@@ -18,13 +18,14 @@ on a supported narrow terminal where the sidebar is hidden. **F6 switches page/a
 focus**: use Up/Down to select a control and Enter or Space to activate it. The
 focused action scrolls into view and uses the same confirmation as its mouse
 button or shortcut. PageUp/PageDown reads the page while actions have focus;
-otherwise it scrolls Activity. `?` shows this screen's shortcuts. `v` reveals technical
-sections. **F2 opens More actions**
+otherwise it scrolls Activity. `?` shows this screen's shortcuts. The
+technical Cameras section appears once the daemon reports its camera
+inventory; `v` lists it before that. **F2 opens More actions**
 from any idle screen. Type a task or CLI command to filter the list, use Up/Down
 to select, and Enter to open it. Esc closes the list or cancels a field.
 
 Mouse users can click the sidebar, status rows and action buttons, including
-in-page Wallet, Recovery, Login, Fingerprint, Cameras, Diagnostics, Identify,
+in-page Wallet, Recovery, Login, Fingerprint, Cameras, Diagnostics,
 Preferences and completion actions. Each action has a separated row; its label
 and wrapped explanation activate the same keyboard command. Blank space and
 ordinary explanatory text do not activate commands. In More
@@ -64,8 +65,11 @@ sidebar currently shows (a hidden section's digit says why it is hidden: missing
 and `j`/`k` move the selection and `g`/`G` go to the first and last row on
 pages that show a list, `r`
 refreshes the current page's observations (Diagnostics re-runs its checks,
-Cameras re-lists the pairs, every other page re-polls its sources), `i` runs Test Recognition, `v` shows or
-hides the technical tools, `?` opens the help for the current page, `h`
+Cameras re-lists the pairs, every other page re-polls its sources), `i`
+runs the recognition test for the account in the header and stays on the
+page, `v` toggles the advanced view, which lists Cameras even before the
+daemon's camera inventory does, `?` opens the help for the current page,
+`h`
 returns to Overview and `q` quits. Enter opens things — a row, a details
 panel, a section — and never changes state; every action that writes or
 runs as root has its own letter and asks first. Esc closes the innermost
@@ -76,8 +80,8 @@ Preferences is `o` and its readiness check `c`, and the logs on Diagnostics
 are `w`. Status uses five glyphs everywhere: `●` ready or on, `○` off or
 not selected, `◐` unobserved or pending, `✕` absent or not connected, `⚠`
 needs attention (a failed check is `✕`: the check failed, whatever the
-component's presence); the same glyphs mark a Test Recognition result and
-the enrollment checklist, and they read the same with `NO_COLOR`. When the content
+component's presence); the same glyphs mark the enrollment checklist,
+and they read the same with `NO_COLOR`. When the content
 area has room for both a list and a details column (about 135 terminal
 columns with the sidebar open), Cameras shows the selected camera's details
 in a right-hand column; Enter still opens the full panel with the camera's
@@ -196,7 +200,7 @@ appear from the daemon's passive connection monitor, and disconnected choices
 are removed. Each pair is listed by the camera's own name (the USB product
 string, else the node's sysfs name; `video0+video2` only when the daemon
 sends no name) with its role for the selected account — `Primary camera`,
-`Secondary camera #N` (the group's position in the store) or `not enrolled`
+`Added camera #N` (the group's position in the store) or `not enrolled`
 — and whether it is ready or its privacy shutter is on (ADR-0029). Names are
 for people; identity is still the USB descriptor. The daemon does the
 correlation (ADR-0030 §4): each listed pair carries an opaque handle and the
@@ -208,9 +212,15 @@ panel with the identity (and a warning when the descriptor carries no
 serial, since two units of that model then cannot be told apart), the device
 nodes, connection, enrollment facts and the last capture-schedule
 observation; `u` makes the selected pair the one the daemon uses (confirmed,
-then `sudo irlume set-cameras`). Enrolled secondary camera groups (ADR-0024)
-are also listed on the Faces page as camera rows: `[x]` removes one, and
-`irlume enroll --add-camera` adds another. When the page is open and idle, a changed inventory triggers a
+then `sudo irlume set-cameras`). Added cameras (ADR-0024) are also listed
+on the Faces page, by the same number, under each profile with scans on
+them; `d` there removes one (see [Faces](#faces)), and a pair marked
+`not enrolled` says in its details how to add it: with no face enrolled,
+enroll one on Faces first; otherwise `irlume enroll --add-camera` (with
+`--name <profile>` when the account has several profiles) adds the
+daemon's configured pair, so a pair that is not configured is first made
+the daemon's camera with `u`.
+When the page is open and idle, a changed inventory triggers a
 camera-role inspection; that inspection can open device nodes to identify RGB
 and infrared endpoints. It does not repeatedly run capture qualification.
 Inspection failure is shown separately from an empty device list. Selection
@@ -295,6 +305,89 @@ remain instructions. Recheck, Full Diagnostics, logs, support reports and explic
 camera tests remain available. The default support report does not capture
 camera data; an IR test or camera probe still requires an explicit action.
 
+## Faces
+
+Faces lists each profile, then its scans grouped by the camera that
+captured them (ADR-0030 §2):
+
+```
+● Alice · 3 of 10 scans (capture target)
+  ▾ primary camera · 3 scans · Mar 3 to Sep 24, 2026 · 1 undated
+      ↳ Face Scan 1 · date not recorded
+      ↳ Face Scan 2 · Mar 3, 2026
+      ↳ Face Scan 3 · Sep 24, 2026
+  ▣ added camera #1 · 10 scans · capture target met · calibrated · Sep 24, 2026 · connected, selected
+● Bob · 12 scans · capture target met
+  ▸ primary camera · 12 scans · Sep 24, 2026
+```
+
+The profile's line counts its scans against the capture target, the 10
+scans an enrollment collects. The count is of the scans for the loaded
+recognizer, since only those can match; when that is not every stored
+scan, the line says `for the loaded recognizer`. The count states what is
+stored: it never says recognition is ready and says nothing about glasses
+or lighting, which the tips under the list still cover. The profile's IR
+compatibility lines follow it (see [IR compatibility in
+Faces](#ir-compatibility-in-faces)).
+
+The primary camera's group is collapsed (`▸`) with its scan count and
+capture dates. Enter on it or on its profile, or a second click on the
+selected row, opens it (`▾`) to list each scan with the local day it was
+captured; Enter again closes it. Opening a group changes only the view. A
+range carries the year on both ends when they differ. Scans from before
+capture dates, and every scan an older daemon reports, read
+`date not recorded`, and a group with some undated scans says how many.
+
+Each added camera (ADR-0024) the profile has scans on follows as one row,
+numbered as on the Cameras page. Its facts are the scans against the
+capture target, the camera's IR calibration (`calibrated`, `uncalibrated`
+or `no IR calibration`), the capture dates, `connected` or
+`not connected`, `selected` when it is the pair the daemon would use, and
+`stale: re-add it` when the primary enrollment changed after it was added
+(a stale camera cannot authenticate until it is added again). An added
+camera reports counts, not scan names, so it does not open. `d` on it
+removes that camera group, with its scans and calibration for every
+profile on it, after a confirmation naming the camera and the account
+(OS approval follows for non-root users); the primary camera is
+unchanged. An added camera whose profile is gone (renamed or deleted
+since) is listed after all the profiles with
+`profile 'NAME' no longer present` and can still be removed. The group's
+internal id is never shown, on the row or in Activity. When the added
+cameras cannot be read, a `⚠` line under the list says so, with the kind
+of failure (the file could not be read, is damaged, failed its checks or
+has an unsupported format version, or the account's template key is
+unavailable) but not the store's detail, so no profile looks as if it
+had its primary camera only.
+
+`e` adds a person, and `a` improves recognition for the profile of the
+selected row (the profile, its camera rows or one of its scans). `n`
+renames the selected profile or scan (a camera row has no name to change),
+and `d` deletes the selected profile or scan; the primary camera's scans go
+with their profile or one at a time.
+
+`i` runs the recognition test on any page, for the account in the header:
+one capture compared with that account's enrolled faces only. The TUI stays
+on the page where you pressed it; there is no Test Recognition page, and
+`irlume tui --page identify` opens Faces. The result shows in Activity, as
+a `Last recognition test` line under the Faces list with how long ago it
+ran, and on Overview's last-attempt line. A match names the profile
+(`recognized: Alice`); a miss gives the outcome and the reason in
+Overview's words, such as `refused: not recognized as an enrolled face`,
+or `did not complete: camera unavailable` when the test could not run.
+When the daemon turns the test away unrun, for example for a busy camera,
+the result reads `did not complete:` with the daemon's own reason, or
+`did not complete: the daemon was still starting` while it loads its
+models; a test refused for too many attempts, or because face unlock is
+not the configured method, reads `refused:` with that reason, as on
+Overview. No result shows a score or a threshold. The Faces line stays
+at the foot of the page while the list reloads after the test, and wraps
+rather than losing its end. Once the Faces list has been read and holds
+no face, `i` says so and opens no camera; while the list is still
+loading, `i` runs the test, and the camera opens before the daemon finds
+nothing to compare with.
+Against a daemon older than the TUI, the result reads
+`recognition test needs a newer irlumed; restart it after the upgrade`.
+
 ## Several people on one account
 
 A profile represents one person. An account supports up to **three people**;
@@ -356,8 +449,10 @@ This is a check against known profiles, not a guarantee that every unrecognized
 person will be classified correctly. Only the intended person should be in
 view during an enrollment or improvement session.
 
-Selection follows a profile and scan by name when the list refreshes. If that
-item disappears or is renamed elsewhere, selection clears until you choose a
+Selection follows a profile, camera row or scan by name when the list
+refreshes, and an opened primary camera group stays open for as long as
+its profile is listed for the same account. If the selected item
+disappears or is renamed elsewhere, selection clears until you choose a
 row again. Mouse selection follows the visible rows even in long, scrolled
 scan lists. Rename and Delete confirmations name their exact target.
 
@@ -370,13 +465,13 @@ scan lists. Rename and Delete confirmations name their exact target.
 | `deps`, `version` | F2: runtime dependencies and version |
 | `enroll` | Faces: Enroll Face (`e`); matching faces offer improvement |
 | `enroll --scans`, `enroll --reset` | F2: chosen scan count or Replace face enrollment |
-| `enroll --add-camera` | Faces lists every enrolled camera group; adding a second camera is the CLI command (`[x]` on a camera row removes one) |
+| `enroll --add-camera` | Faces lists each added camera under the profiles with scans on it; Cameras' details for a `not enrolled` pair say how to add it with the CLI command |
 | `profiles list` | Faces; F2 lists full recognizer tags |
 | `profiles add-scan` | Faces: Improve Recognition (`a`); F2 accepts a chosen scan count |
-| `profiles remove-camera --group ID` | Faces: `[x]` on an enrolled camera row removes that camera group (with confirmation) |
+| `profiles remove-camera --group ID` | Faces: Delete (`d`) on an added camera row removes that camera group (with confirmation) |
 | `profiles rename`, `profiles delete` | Faces: select profile/scan, then Rename/Delete; F2 also works without camera navigation |
 | `profiles forget-model`, `profiles eyes-open off` | F2: remove recognizer scans or clear the legacy blocker |
-| `identify` | Overview / Test Recognition |
+| `identify` | Test Recognition (`i`) on any page, for the account in the header only; root's search of every account stays in the CLI |
 | `auth consent status/required/hands-free` | Preferences (`p`); F2 status |
 | `auth sensor status/dual/ir-only` | Preferences (`o`); F2 status |
 | `auth sensor preflight [--user U]` | Preferences (`c`); F2 readiness for the selected account |

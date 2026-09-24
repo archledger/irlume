@@ -112,16 +112,24 @@ fn live_freshness_partial_status_failure_cannot_borrow_sibling_success() {
 fn live_freshness_profile_identity_survives_invalidation_and_reorder() {
     let mut app = live_test_app();
     app.profiles = vec![profile("Alice", &["a"]), profile("Bob", &["b"])];
-    app.sel = 3; // Bob's scan, not its numeric position after the next load.
+    app.faces_expanded.insert("Bob".into());
+    app.sel = 4; // Bob's scan, not its numeric position after the next load.
+    assert_eq!(app.rows()[4], Row::Scan(1, 0));
     app.invalidate_source(Source::Profiles);
     assert!(app.profiles.is_empty());
+    assert!(app.faces_expanded.is_empty(), "nothing listed, nothing open");
     live_test_land_profiles(
         &mut app,
         vec![profile("Bob", &["b"]), profile("Alice", &["a"])],
     );
+    // Bob's group is open again by name, so his scan is there to select.
+    assert_eq!(app.sel, 2);
     assert_eq!(
         app.selected_profile_row(),
-        Some(("Bob".into(), Some("b".into())))
+        Some(FaceRowId::Scan {
+            profile: "Bob".into(),
+            scan: "b".into()
+        })
     );
     app.invalidate_source(Source::Profiles);
     live_test_land_profiles(&mut app, vec![profile("Alice", &["a"])]);

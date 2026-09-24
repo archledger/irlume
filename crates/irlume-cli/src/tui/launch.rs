@@ -12,22 +12,24 @@
 //! vocabulary is `goto:<page>` and `focus:`, and nothing else.
 
 use super::{
-    SC_CAMERAS, SC_FINGERPRINT, SC_IDENTIFY, SC_KEYRING, SC_PAM, SC_PROFILES, SC_RECOVERY,
-    SC_REPAIR, SC_SETTINGS, SC_WELCOME,
+    SC_CAMERAS, SC_FINGERPRINT, SC_KEYRING, SC_PAM, SC_PROFILES, SC_RECOVERY, SC_REPAIR,
+    SC_SETTINGS, SC_WELCOME,
 };
 use std::os::unix::net::UnixListener;
 
 /// CLI page names, mapped to screen indices. The names the System Settings
 /// module's launch buttons use (`faces`, `cameras`, `wallet`, `recovery`,
 /// `diagnostics`) are the load-bearing subset; the rest complete the
-/// registry so every screen is reachable.
+/// registry so every screen is reachable. `identify` named the Test
+/// Recognition page, which is now Faces' `i` (ADR-0030 §2): it still
+/// resolves, to Faces, for launchers and handoffs written before, but no
+/// longer appears in the usage text.
 pub(crate) fn resolve_page(name: &str) -> Option<usize> {
     match name {
         "overview" => Some(SC_WELCOME),
         "diagnostics" => Some(SC_REPAIR),
         "cameras" => Some(SC_CAMERAS),
-        "faces" => Some(SC_PROFILES),
-        "identify" => Some(SC_IDENTIFY),
+        "faces" | "identify" => Some(SC_PROFILES),
         "wallet" => Some(SC_KEYRING),
         "recovery" => Some(SC_RECOVERY),
         "fingerprint" => Some(SC_FINGERPRINT),
@@ -38,12 +40,11 @@ pub(crate) fn resolve_page(name: &str) -> Option<usize> {
 }
 
 /// Every accepted page name, for usage text and tests.
-pub(crate) const PAGE_NAMES: [&str; 10] = [
+pub(crate) const PAGE_NAMES: [&str; 9] = [
     "overview",
     "diagnostics",
     "cameras",
     "faces",
-    "identify",
     "wallet",
     "recovery",
     "fingerprint",
@@ -129,7 +130,6 @@ pub(crate) fn page_name(page: usize) -> Option<&'static str> {
         SC_REPAIR => "diagnostics",
         SC_CAMERAS => "cameras",
         SC_PROFILES => "faces",
-        SC_IDENTIFY => "identify",
         SC_KEYRING => "wallet",
         SC_RECOVERY => "recovery",
         SC_FINGERPRINT => "fingerprint",
@@ -469,7 +469,6 @@ mod tests {
             ("diagnostics", SC_REPAIR),
             ("cameras", SC_CAMERAS),
             ("faces", SC_PROFILES),
-            ("identify", SC_IDENTIFY),
             ("wallet", SC_KEYRING),
             ("recovery", SC_RECOVERY),
             ("fingerprint", SC_FINGERPRINT),
@@ -478,9 +477,33 @@ mod tests {
         ];
         for (name, screen) in expected {
             assert_eq!(resolve_page(name), Some(screen), "{name}");
+            assert_eq!(page_name(screen), Some(name), "{name}");
         }
         assert_eq!(resolve_page("nope"), None);
-        assert_eq!(PAGE_NAMES.len(), 10);
+        assert_eq!(PAGE_NAMES.len(), 9);
+        assert_eq!(PAGE_NAMES, expected.map(|(name, _)| name));
+    }
+
+    /// The Test Recognition page is Faces' `i` now (ADR-0030 §2); its old
+    /// name keeps working for launchers and handoffs in the wild, and lands
+    /// on Faces, but is not advertised.
+    #[test]
+    fn the_retired_identify_page_name_lands_on_faces() {
+        assert_eq!(resolve_page("identify"), Some(SC_PROFILES));
+        assert_eq!(
+            parse_launch(&argv(&["--page", "identify"]))
+                .expect("identify still parses")
+                .page,
+            Some(SC_PROFILES)
+        );
+        assert_eq!(
+            parse_handoff("goto:identify\n"),
+            Some(Navigation::Goto(SC_PROFILES))
+        );
+        assert!(!PAGE_NAMES.contains(&"identify"));
+        assert!(!usage().contains("identify"), "{}", usage());
+        // A later launch hands the page off under its current name.
+        assert_eq!(handoff_message(Some(SC_PROFILES)), "goto:faces\n");
     }
 
     #[test]

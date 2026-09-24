@@ -32,6 +32,10 @@ pub(super) fn required(req: &Request, peer: &Peer) -> bool {
 }
 
 // Approval policy is independent of enrollment cache invalidation semantics.
+// No wildcard arm, as in `posture`: a new Request variant does not compile
+// until whoever adds it says whether a non-root peer needs OS approval for
+// it. A wildcard let any new variant, a trust-adding one included, skip the
+// approval without a compiler error.
 fn approval_operation(req: &Request) -> Option<(&'static str, &'static str)> {
     Some(match req {
         Request::Enroll { reset: true, .. } => (ACTION, "replace enrolled faces"),
@@ -58,7 +62,51 @@ fn approval_operation(req: &Request) -> Option<(&'static str, &'static str)> {
             "org.irlume.recovery-manage",
             "erase the recovery passphrase",
         ),
-        _ => return None,
+        // Everything else: no per-request OS approval. A variant whose
+        // posture is AddsTrust never belongs here; the request catalog walk
+        // in main.rs tests fails if one does.
+        Request::Authenticate { .. }
+        | Request::Identify
+        | Request::SetCameras { .. }
+        | Request::SetCamerasIfCurrent { .. }
+        | Request::ListProfiles { .. }
+        | Request::DeleteScan { .. }
+        | Request::RenameProfile { .. }
+        | Request::RenameScan { .. }
+        | Request::SetRequireEyesOpen { .. }
+        | Request::CaptureEarMedian { .. }
+        | Request::SetClosureCalibration { .. }
+        | Request::SetupIrEmitter { .. }
+        | Request::TuneCaptureMode { .. }
+        | Request::CaptureModeStatus
+        | Request::FaceSensorStatus { .. }
+        | Request::LastAttempts { .. }
+        | Request::IdentifyFor { .. }
+        | Request::PreferencesStatus
+        | Request::SelfTest { .. }
+        | Request::ListCameras
+        | Request::CameraDiagnostics
+        | Request::SupportSnapshot { .. }
+        | Request::LiveStatus
+        | Request::SupportProbe { .. }
+        | Request::TraceSubscribe { .. }
+        | Request::Ping
+        | Request::Health
+        | Request::PositionSample { .. }
+        | Request::PositionSession { .. }
+        | Request::SealPassword { .. }
+        | Request::UnsealPassword { .. }
+        | Request::UnsealKeyring { .. }
+        | Request::HasSealedPassword { .. }
+        | Request::KeyringMetadata { .. }
+        | Request::KeyringInfo { .. }
+        | Request::ForgetPassword { .. }
+        | Request::ReleaseTokenForDisarm { .. }
+        | Request::ResealPassword { .. }
+        | Request::RecoveryRestore { .. }
+        | Request::RecoveryStatus { .. }
+        | Request::RetryStatus { .. }
+        | Request::RetryReset { .. } => return None,
     })
 }
 

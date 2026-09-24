@@ -231,6 +231,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- An engine rebuilt after a caught request panic keeps the camera pair
+  the daemon was using. The rebuild bound the pair chosen at startup, so
+  after a runtime camera switch (`set-cameras`, which the TUI's camera
+  picker runs) one panic silently moved face authentication, and the
+  camera and tier that `Health` reports, back to the startup pair while
+  `cameras.conf` still named the new one. The fresh engine now takes the
+  old engine's pair, with the tier recomputed from that pair's IR node,
+  before it serves a request or is reported. Model verification and the
+  refusal of the request that panicked are unchanged.
+
 - On the concurrent capture path the authentication decision is handed to
   the connection thread before the two camera streams are torn down
   (ADR-0027). The teardown costs 1.0–1.2 s on the NexiGo N930W after the

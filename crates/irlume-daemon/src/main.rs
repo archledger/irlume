@@ -545,6 +545,20 @@ fn rebuild_engine_from_config(
     build_engine_from_config(config, recognizer)
 }
 
+/// Put the camera pair `old` was using onto `fresh`, an engine rebuilt after
+/// a caught panic. The rebuild binds [`EngineBuildConfig`]'s devices, which
+/// are the pair startup selected; a runtime SetCameras changes the running
+/// engine and cameras.conf, never that config, so without this, one panic
+/// silently moved authentication back to the startup pair. `set_devices`
+/// recomputes the tier from the carried IR node, as the switch itself did.
+fn carry_camera_pair(
+    mut fresh: irlume_auth::Engine,
+    old: &irlume_auth::Engine,
+) -> irlume_auth::Engine {
+    fresh.set_devices(old.rgb_device(), old.ir_device());
+    fresh
+}
+
 fn main() {
     // FIRST, before models load. The watchdog deadline starts ticking the moment
     // systemd execs us, and loading the ONNX sessions takes tens of seconds on a
@@ -801,6 +815,9 @@ fn main() {
             // a caught panic, so a fresh request never runs against ONNX sessions left in
             // an unproven state by an unwind. It owns its inputs so it can move to the
             // worker thread, and it is Fn, so startup calls it before that move.
+            // The devices it binds are the pair startup selected; a runtime camera
+            // switch changes the engine, never this config, so the worker carries the
+            // old engine's pair onto a rebuilt one (`carry_camera_pair`).
             //
             // `recognizer` is what startup already read, hashed and verified
             // (#346); None requests a fresh manifest check for a post-panic
@@ -1095,6 +1112,11 @@ fn main() {
                                     note_worker_progress();
                                     match build_engine(None) {
                                         Ok((fresh, rgb_pad_status, ir_pad_status)) => {
+                                            // The rebuild bound the startup pair.
+                                            // Keep the pair this engine was using,
+                                            // which a runtime SetCameras may have
+                                            // changed, before anything sees it.
+                                            let fresh = carry_camera_pair(fresh, &engine);
                                             // Back through `attach`, because a bare
                                             // Engine has no stop signal and assigning
                                             // one here is exactly what #359 was.
@@ -8941,7 +8963,7 @@ mod tests {
     }
 
     #[test]
-    fn panic_rebuild_republishes_both_pad_statuses() {
+    fn panic_rebuild_carries_the_camera_pair_and_republishes_both_pad_statuses() {
         let source = include_str!("main.rs");
         let rebuild = &source[source.find("match build_engine(None)").unwrap()
             ..source.find("Response::Error(\"request failed\"").unwrap()];
@@ -8950,6 +8972,116 @@ mod tests {
         assert!(rebuild.contains("rgb_pad_status,"));
         assert!(rebuild.contains("ir_pad_status,"));
         assert!(rebuild.contains("publish_engine_bits"));
+        // The pair a runtime camera switch chose is on the fresh engine
+        // before it is attached or published.
+        let carried = rebuild
+            .find("carry_camera_pair(fresh, &engine)")
+            .expect("the rebuild must carry the old engine's camera pair");
+        assert!(carried < rebuild.find("WorkerEngine::attach(fresh").unwrap());
+        assert!(carried < rebuild.find("publish_engine_bits").unwrap());
+    }
+
+    /// A post-panic rebuild binds the startup config's pair. After a runtime
+    /// camera switch the running engine and cameras.conf name another pair,
+    /// and the engine that replaces it must stay on that pair, tier included,
+    /// instead of silently returning to the startup one.
+    #[test]
+    fn panic_rebuild_keeps_the_pair_a_runtime_camera_switch_chose() {
+        let _g = env_lock();
+        ort_init();
+        let mut e = engine();
+        let previous_bits = engine_bits().lock().unwrap().clone();
+        let sb = sandbox("rebuild-pair");
+        // The shared engine's initializer forces IR off for the process, and
+        // another test may have cleared that since. Lift it under the
+        // exclusive lock so the tier follows the IR node, and put back
+        // exactly what was there.
+        let forced_off = std::env::var_os("IRLUME_FORCE_NO_IR");
+        std::env::remove_var("IRLUME_FORCE_NO_IR");
+        let absent = |name: &str| sb.dir.join(name).to_string_lossy().into_owned();
+        let (startup_rgb, startup_ir) = (
+            "/dev/irlume-test-startup-rgb",
+            "/dev/irlume-test-startup-ir",
+        );
+        let config = EngineBuildConfig {
+            det: model_path("face_detection_yunet_2023mar.onnx"),
+            model: model_path("glintr100.onnx"),
+            adapter: absent("absent-adapter.onnx"),
+            adapter_required: false,
+            mesh: absent("absent-mesh.onnx"),
+            blaze: absent("absent-blaze.onnx"),
+            vit_pad: absent("absent-liveness_vit.onnx"),
+            pad_ir: absent("absent-flir.onnx"),
+            rgb_dev: startup_rgb.into(),
+            ir_dev: startup_ir.into(),
+        };
+        // The runtime switch, through the request a client sends. /dev/null
+        // exists, so the tier follows it to secure.
+        let (rgb, ir) = ("/dev/irlume-test-alt-rgb", "/dev/null");
+        match dispatch(
+            Request::SetCameras {
+                rgb: rgb.into(),
+                ir: ir.into(),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Ok(msg) => assert_eq!(msg, format!("cameras set to rgb={rgb} ir={ir}")),
+            other => panic!("root SetCameras must succeed, got {other:?}"),
+        }
+        assert_eq!(e.tier(), irlume_auth::Tier::Secure);
+
+        let (fresh, rgb_pad, ir_pad) =
+            rebuild_engine_from_config(&config).expect("the rebuild loads");
+        // What the rebuild alone gives: the startup pair, the revert.
+        assert_eq!(
+            (fresh.rgb_device(), fresh.ir_device()),
+            (startup_rgb, startup_ir)
+        );
+        assert_eq!(fresh.tier(), irlume_auth::Tier::Convenience);
+        // Published as it stands, Health would report that revert.
+        publish_engine_bits(&fresh, rgb_pad, ir_pad);
+        assert!(matches!(
+            dispatch_status(&Request::Health, &peer(0)),
+            Some(Response::Health { ref tier, rgb_dev: Some(ref r), ir_dev: Some(ref i), .. })
+                if tier == "convenience" && r == startup_rgb && i == startup_ir
+        ));
+
+        let fresh = carry_camera_pair(fresh, &e);
+        assert_eq!((fresh.rgb_device(), fresh.ir_device()), (rgb, ir));
+        assert_eq!(
+            (
+                irlume_common::config::read_kv("cameras.conf", "rgb"),
+                irlume_common::config::read_kv("cameras.conf", "ir"),
+            ),
+            (Some(rgb.to_owned()), Some(ir.to_owned())),
+            "the rebuilt engine and cameras.conf name the same pair"
+        );
+        assert_eq!(
+            fresh.tier(),
+            irlume_auth::Tier::Secure,
+            "the tier follows the carried IR node"
+        );
+        // What the worker publishes next reaches status requests.
+        publish_engine_bits(&fresh, rgb_pad, ir_pad);
+        assert!(matches!(
+            dispatch_status(&Request::Health, &peer(0)),
+            Some(Response::Health { ref tier, rgb_dev: Some(ref r), ir_dev: Some(ref i), .. })
+                if tier == "secure" && r == rgb && i == ir
+        ));
+        // A blank runtime pair is carried as the engine held it: what a
+        // blank pair means is not the rebuild's decision.
+        e.set_devices("", "");
+        let fresh = carry_camera_pair(fresh, &e);
+        assert_eq!((fresh.rgb_device(), fresh.ir_device()), ("", ""));
+
+        match forced_off {
+            Some(value) => std::env::set_var("IRLUME_FORCE_NO_IR", value),
+            None => std::env::remove_var("IRLUME_FORCE_NO_IR"),
+        }
+        // Restore the shared engine's baseline devices.
+        e.set_devices(NO_RGB, NO_IR);
+        publish_engine_bits_raw(previous_bits);
     }
 
     // Startup asks for one model and gets back exactly that file's bytes with
@@ -10141,6 +10273,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `AddsTrust` promises a per-request OS authorization, and
+    /// `operation_authorization::required` enforces it from its own
+    /// hand-written match. Walking the catalog turns a trust-adding variant
+    /// that match does not name into a failing test, not a polkit bypass for
+    /// every non-root peer. Root administers without approval.
+    #[test]
+    fn every_trust_adding_request_needs_os_approval_for_a_non_root_peer() {
+        let (owner, root) = (peer(NOBODY), peer(0));
+        // The catalog holds one shape per variant; the approval labels read
+        // these fields, so their other forms are walked too.
+        let label_shapes = [
+            Request::Enroll {
+                user: SAMPLE_USER.into(),
+                profile: None,
+                scans: None,
+                reset: true,
+            },
+            Request::EnrollmentSession {
+                user: SAMPLE_USER.into(),
+                profile: None,
+                scans: 10,
+                improve: true,
+            },
+        ];
+        let mut trust_adding = 0;
+        for req in request_samples().into_iter().chain(label_shapes) {
+            assert!(
+                !operation_authorization::required(&req, &root),
+                "{} asks root for OS approval",
+                variant_name(&req)
+            );
+            if posture(&req).enrollment == EnrollmentEffect::AddsTrust {
+                trust_adding += 1;
+                assert!(
+                    operation_authorization::required(&req, &owner),
+                    "{} adds trusted templates, but a non-root peer would reach it without OS approval",
+                    variant_name(&req)
+                );
+            }
+        }
+        assert!(trust_adding > 0, "the walk found no trust-adding request");
+    }
+
+    /// The approval set as it stood when `approval_operation` lost its
+    /// wildcard. Naming every other variant changed none of it; a variant
+    /// joins this list on purpose, with its own label and test.
+    #[test]
+    fn os_approval_covers_exactly_the_enrollment_and_recovery_changes() {
+        let owner = peer(NOBODY);
+        let approved: Vec<&str> = named_samples(SAMPLE_USER)
+            .into_iter()
+            .filter(|(_, req)| operation_authorization::required(req, &owner))
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            approved,
+            [
+                "EnrollmentSession",
+                "Enroll",
+                "AddCameraGroup",
+                "RemoveCameraGroup",
+                "AddScan",
+                "DeleteProfile",
+                "ForgetRecognizer",
+                "RecoverySetup",
+                "RecoveryForget",
+            ]
+        );
     }
 
     #[test]

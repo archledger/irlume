@@ -28,6 +28,30 @@ All notable changes to irlume are documented here. This project adheres to
   built-in cameras, then the camera identity, never the `/dev/video`
   number. Nothing calls either function yet: camera selection is
   unchanged.
+- Password Wallet and Recovery put their actions on one row (ADR-0030
+  §2, §1.4, §1.6, §1.10, C2). Each action on the row is a click target
+  only where its words are, F6 highlights only the focused one, and a
+  window too narrow for every action continues the row below without
+  splitting one; the Wallet's row follows the order F6 walks, so `p`
+  now comes before `d`. The Wallet's binding row names the seal's tier,
+  for example "Tier 2 · pcrlock", and no longer shows the pcrlock NV
+  index: F4 lists the full seal policy under the wallet's observation
+  age, and Diagnostics still shows it. A fact the daemon has not
+  answered reads unknown with the reason ("daemon not answering",
+  "daemon still starting", "this account may not connect to the
+  daemon", "daemon did not report it" or "no answer yet"), and an
+  action row under the facts offers refresh and, while the daemon is
+  down or refuses the account, Diagnostics; it replaces Recovery's
+  "start irlumed from Diagnostics" sentence. The TPM row says whether
+  system checks are pending, did not finish or are out of date, the PCR
+  check reads "unknown (not checked yet)" until a check runs (opening
+  the page, `r` or `d`), and an unarmed wallet's binding reads "not
+  armed; tier decided at arm time" instead of "policy unreported by
+  daemon". The pages' texts no longer name keys. What each key does is
+  unchanged: `b` needs an armed seal, `p` a Tier 2 seal, `f` on a GNOME
+  keyring token or an unreported seal kind still runs the CLI's re-key
+  flow, and Recovery's passphrases stay masked and its forget still
+  asks first.
 
 - `irlumed` checks `cameras.conf` at start against the stricter
   grammar of ADR-0029 and logs a warning for a file it cannot read, a

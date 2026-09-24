@@ -57,6 +57,7 @@ fn visual_fixture(screen: usize) -> App {
         method: "face".into(),
     };
     app.keyring_armed = Some(true);
+    app.keyring_policy = Some("pcrlock NV 0x1c00002 (Tier 2)".into());
     app.recovery = Some(RecoveryInfo {
         encrypted: true,
         recovery_set: false,

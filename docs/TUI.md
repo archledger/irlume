@@ -26,8 +26,10 @@ to select, and Enter to open it. Esc closes the list or cancels a field.
 
 Mouse users can click the sidebar, status rows and action buttons, including
 in-page Wallet, Recovery, Login, Fingerprint, Cameras, Diagnostics,
-Preferences and completion actions. Each action has a separated row; its label
-and wrapped explanation activate the same keyboard command. Blank space and
+Preferences and completion actions. An action alone on its row activates from
+its label and wrapped explanation alike. Where several actions share a row
+(Password Wallet and Recovery), each activates only from its own words, and
+the space between them does nothing. Blank space and
 ordinary explanatory text do not activate commands. In More
 actions, click a row to select it and read its description, then click **Open**.
 Dialogs have separate **Continue**, **Confirm**, **Cancel** or **Close** buttons;
@@ -283,6 +285,32 @@ retry reset. Password Wallet's Reseal uses the same seal-type handling as the CL
 Forget uses the safe password-rekey flow for token or unknown seals; it refuses
 an unsuccessful inspection. Force-forget remains a separate, explicitly warned
 action. No command needs to be typed for these workflows.
+
+## Password Wallet and Recovery
+
+Password Wallet shows whether a secret is sealed for your login and which
+secret it is, the last explicit PCR check, the TPM, and the seal's binding by
+its tier: `Tier 2 · pcrlock`, `Tier 1 · signed policy` or `Tier 3 · literal
+PCRs`. The page never shows the pcrlock NV index; F4's **Current
+observations** lists the full seal policy under the wallet's observation age,
+and Diagnostics shows it as the PCR policy. The page's actions share one row,
+in the order F6 walks them: arm or re-arm (`a`), reseal (`b`, once armed),
+forget (`f`), refresh the pcrlock policy (`p`, Tier 2 seals only) and check the
+current PCRs (`d`, once armed). A window too narrow for all of them continues
+the row below. Forget on a GNOME keyring token, or on a seal whose kind the
+daemon does not report, runs the CLI's re-key flow first.
+
+Recovery shows whether the face templates are encrypted and whether a recovery
+passphrase is set. Its actions share one row too: set (`s`), restore (`t`) and
+forget (`f`). Passphrases are typed into a masked field, and forget asks first.
+
+A fact the daemon has not answered reads unknown with the reason: `daemon not
+answering`, `daemon still starting`, `this account may not connect to the
+daemon`, `daemon did not report it` or `no answer yet`. The TPM row says
+whether the system checks are pending, did not finish or are out of date. An
+action row under the facts then offers refresh (`r`) and, while the daemon is
+down or refuses this account, Diagnostics (`6`), whose Daemon check carries
+the fix.
 
 ## Diagnostics
 

@@ -195,6 +195,30 @@ enum Click {
     Select(usize),
 }
 
+/// A click target on one line of a page paragraph (ADR-0030 §1.4).
+#[derive(Clone, Copy)]
+struct PageTarget {
+    /// The line's index in the paragraph.
+    line: usize,
+    /// The cells `start..end` of the line the target covers, for a row
+    /// that carries several actions; `None` covers the whole line and
+    /// every row it wraps to.
+    columns: Option<(u16, u16)>,
+    /// What a click there does.
+    click: Click,
+}
+
+impl PageTarget {
+    /// A whole line: a list row, or an action alone on its row.
+    fn whole(line: usize, click: Click) -> Self {
+        Self {
+            line,
+            columns: None,
+            click,
+        }
+    }
+}
+
 /// One row of the Faces list (ADR-0030 §2): a profile, then its scans
 /// grouped by the camera that captured them. The primary camera's group is
 /// collapsed until opened; an added camera's group (ADR-0024) reports
@@ -869,6 +893,11 @@ struct App {
     daemon_up: bool,
     /// The four-way classification behind `daemon_up`; see `LightState::reach`.
     daemon_reach: crate::commands::DaemonReach,
+    /// `daemon_reach` as the last light poll saw it. The live snapshot also
+    /// moves `daemon_reach`, but only the light poll records the Wallet and
+    /// Recovery reads, so a failed read is the running daemon's answer only
+    /// when this poll saw it running.
+    light_reach: crate::commands::DaemonReach,
     /// Last ListProfiles error (corrupt enrollment / missing template key);
     /// distinguishes "file broken" from "no profiles" on the Repair tab.
     enroll_error: Option<String>,
@@ -2016,6 +2045,13 @@ impl App {
             (Source::Attempts, "Last attempt"),
         ] {
             lines.push(format!("{label}: {}", self.source_status(source)));
+            // The seal's policy in full, NV index included, under the age
+            // of the read it came from: the Wallet page names only its tier
+            // (ADR-0030 §1.10, §2). Daemon text, so control characters are
+            // blanked: a line break would forge a line in this list.
+            if let (Source::Wallet, Some(policy)) = (source, self.keyring_policy.as_deref()) {
+                lines.push(format!("Wallet seal policy: {}", printable(policy)));
+            }
         }
         lines.push("\nSession action history is separate (L). PCR and recognition results are explicit historical checks, not live guarantees.".into());
         lines.join("\n")
@@ -2321,6 +2357,7 @@ impl App {
             error: None,
             daemon_up: false,
             daemon_reach: crate::commands::DaemonReach::Down,
+            light_reach: crate::commands::DaemonReach::Down,
             enroll_error: None,
             health: None,
             preferences: None,
@@ -2602,6 +2639,7 @@ impl App {
         }
         self.daemon_up = l.daemon_up;
         self.daemon_reach = l.reach;
+        self.light_reach = l.reach;
         // Daemon down/unresponsive: show the down state; the local probes
         // still land via the heavy sweep so Repair can diagnose.
         self.health = l.health;
@@ -7909,9 +7947,9 @@ impl App {
         lines: Vec<Line<'_>>,
         actions: &[(usize, KeyCode)],
     ) {
-        let targets: Vec<(usize, Click)> = actions
+        let targets: Vec<PageTarget> = actions
             .iter()
-            .map(|&(row, key)| (row, Click::Key(key)))
+            .map(|&(row, key)| PageTarget::whole(row, Click::Key(key)))
             .collect();
         self.draw_page_paragraph(f, area, lines, &targets, None);
     }
@@ -7919,15 +7957,18 @@ impl App {
     /// A page's lines in one wrapped, scrolling paragraph: the page view
     /// the wheel and PgUp/PgDn read. `targets` says what a click on a line
     /// does: an action row's key, or selecting the list row the line
-    /// draws; other lines never act. `reveal` is a line range (a selected
-    /// row and what it has open) to bring into view on this frame with the
-    /// least movement; a range taller than the page shows its start.
+    /// draws, over the whole line or, on a row that carries several
+    /// actions, over each action's own cells (ADR-0030 §1.4); other lines
+    /// never act. The F6-focused action is highlighted the same way, its
+    /// line or its cells. `reveal` is a line range (a selected row and what
+    /// it has open) to bring into view on this frame with the least
+    /// movement; a range taller than the page shows its start.
     fn draw_page_paragraph(
         &self,
         f: &mut Frame,
         area: Rect,
         lines: Vec<Line<'_>>,
-        targets: &[(usize, Click)],
+        targets: &[PageTarget],
         reveal: Option<std::ops::Range<usize>>,
     ) {
         let heights: Vec<u16> = lines
@@ -7965,9 +8006,10 @@ impl App {
         let focused_key = self
             .focused_action()
             .and_then(|(key, _)| footer_keycode(key));
-        let focused_row = targets.iter().find_map(|(row, target)| {
-            matches!(target, Click::Key(key) if Some(*key) == focused_key).then_some(*row)
-        });
+        let focused = targets
+            .iter()
+            .find(|target| matches!(target.click, Click::Key(key) if Some(key) == focused_key));
+        let focused_row = focused.map(|target| target.line);
         if self.action_reveal.replace(false) {
             if let Some(row) = focused_row {
                 let start = heights
@@ -8000,18 +8042,38 @@ impl App {
                     area.width,
                     height.saturating_sub(skipped).min(area.bottom() - y),
                 );
+                let line = match focused.filter(|target| target.line == index) {
+                    // A row of several actions highlights only the focused
+                    // action's cells.
+                    Some(PageTarget {
+                        columns: Some(columns),
+                        ..
+                    }) => highlight_columns(line, *columns),
+                    Some(_) => line.style(selected_style()),
+                    None => line,
+                };
                 f.render_widget(
-                    Paragraph::new(if focused_row == Some(index) {
-                        line.style(selected_style())
-                    } else {
-                        line
-                    })
-                    .wrap(Wrap { trim: false })
-                    .scroll((skipped, 0)),
+                    Paragraph::new(line)
+                        .wrap(Wrap { trim: false })
+                        .scroll((skipped, 0)),
                     rect,
                 );
-                if let Some((_, target)) = targets.iter().find(|(row, _)| *row == index) {
-                    self.hit(rect, *target);
+                for target in targets.iter().filter(|target| target.line == index) {
+                    match target.columns {
+                        None => self.hit(rect, target.click),
+                        // Cells are exact on a line drawn as one row, which
+                        // `push_action_row` keeps its shared rows to.
+                        Some((start, end)) if height == 1 && start < area.width => self.hit(
+                            Rect::new(
+                                area.x.saturating_add(start),
+                                rect.y,
+                                end.min(area.width).saturating_sub(start),
+                                1,
+                            ),
+                            target.click,
+                        ),
+                        Some(_) => {}
+                    }
                 }
             }
             offset = end;
@@ -8756,12 +8818,58 @@ impl App {
         self.draw_action_paragraph(f, area, lines, &page_actions);
     }
 
+    /// Why a fact `source` carries is unknown, in the row that shows it
+    /// (ADR-0030 §1.6): the daemon's reachability at the last status poll
+    /// and, with the daemon running, whether its last answer left the fact
+    /// out or no answer has landed since the page was refreshed. A failed
+    /// read counts as the daemon's answer only when the light poll that
+    /// made it saw the daemon running; one made while it was down reads as
+    /// no answer yet.
+    fn unanswered_reason(&self, source: Source) -> &'static str {
+        use crate::commands::DaemonReach as R;
+        match self.daemon_reach {
+            R::Down => "daemon not answering",
+            R::Starting => "daemon still starting",
+            R::AccessDenied => "this account may not connect to the daemon",
+            R::Running
+                if self.light_reach == R::Running
+                    && self.freshness.observation(source).last_request_failed() =>
+            {
+                "daemon did not report it"
+            }
+            R::Running => "no answer yet",
+        }
+    }
+
+    /// The action row under a page's facts while one of them is unknown
+    /// (ADR-0030 §1.6): refresh, and Diagnostics, whose Daemon check
+    /// carries the fix, while the daemon is down or refuses this account.
+    fn push_unanswered_remedy(
+        &self,
+        lines: &mut Vec<Line<'_>>,
+        targets: &mut Vec<PageTarget>,
+        width: u16,
+    ) {
+        use crate::commands::DaemonReach as R;
+        let items: &[(&str, &str)] = match self.daemon_reach {
+            R::Down | R::AccessDenied => &[("r", "refresh"), ("6", "open Diagnostics")],
+            R::Starting | R::Running => &[("r", "refresh")],
+        };
+        push_action_row(lines, targets, items, width);
+    }
+
     fn draw_recovery(&self, f: &mut Frame, area: Rect) {
-        let mut page_actions = Vec::new();
+        let mut targets = Vec::new();
         // None = RecoveryStatus never answered. The old default here claimed
         // "plaintext at rest" and "No TPM" about templates that are encrypted
         // on a TPM machine, one Tab away from the Keyring tab saying "TPM
         // ● present"; a failed read establishes nothing (docs/MACHINE-API.md).
+        let unknown = || {
+            Span::styled(
+                format!("◐ unknown ({})", self.unanswered_reason(Source::Recovery)),
+                Style::new().fg(th().warn),
+            )
+        };
         let enc = match self.recovery {
             Some(r) if r.encrypted && r.key_present => Span::styled(
                 "● encrypted",
@@ -8776,10 +8884,7 @@ impl App {
                 Style::new().fg(th().err).add_modifier(Modifier::BOLD),
             ),
             Some(_) => Span::styled("○ plaintext at rest", Style::new().dim()),
-            None => Span::styled(
-                "◐ unknown (observation unavailable)",
-                Style::new().fg(th().warn),
-            ),
+            None => unknown(),
         };
         let rec = match self.recovery {
             Some(r) if r.recovery_set => Span::styled(
@@ -8787,16 +8892,20 @@ impl App {
                 Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
             ),
             Some(_) => Span::styled("○ not set", Style::new().dim()),
-            None => Span::styled(
-                "◐ unknown (observation unavailable)",
-                Style::new().fg(th().warn),
-            ),
+            None => unknown(),
         };
         let mut lines = vec![
             section("Recovery + template encryption"),
             Line::raw(format!("  {}", self.source_status(Source::Recovery))),
             state_row("templates", 12, enc),
             state_row("passphrase", 12, rec),
+        ];
+        // An unanswered status reads unknown with its reason in the rows
+        // above; the remedy is this action row (ADR-0030 §1.6).
+        if self.recovery.is_none() {
+            self.push_unanswered_remedy(&mut lines, &mut targets, area.width);
+        }
+        lines.extend([
             Line::raw(""),
             Line::from(Span::styled(
                 "  A recovery passphrase backs up the face-template key, the manual",
@@ -8807,7 +8916,7 @@ impl App {
                 Style::new().dim(),
             )),
             Line::raw(""),
-        ];
+        ]);
         match self.recovery {
             Some(r) if !r.tpm_present => {
                 lines.push(Line::from(Span::styled(
@@ -8817,7 +8926,7 @@ impl App {
             }
             Some(r) if r.encrypted && !r.key_present => {
                 lines.push(Line::raw(if r.recovery_set {
-                    "  Restore the existing backup with [t]; the passphrase is entered privately."
+                    "  Restore the existing backup; the passphrase is entered privately."
                 } else {
                     "  No template key or recovery backup remains. Open Faces to re-enroll."
                 }));
@@ -8828,25 +8937,20 @@ impl App {
                     Style::new().fg(th().err),
                 )));
             }
-            Some(_) => {}
-            None => {
-                lines.push(Line::from(Span::styled(
-                    "  Nothing here has been read; start irlumed from Diagnostics to see it.",
-                    Style::new().dim(),
-                )));
-            }
+            Some(_) | None => {}
         }
         lines.push(Line::raw(""));
-        push_page_actions(
+        push_action_row(
             &mut lines,
-            &mut page_actions,
+            &mut targets,
             &[("s", "set passphrase"), ("t", "restore"), ("f", "forget")],
+            area.width,
         );
-        self.draw_action_paragraph(f, area, lines, &page_actions);
+        self.draw_page_paragraph(f, area, lines, &targets, None);
     }
 
     fn draw_keyring(&self, f: &mut Frame, area: Rect) {
-        let mut page_actions = Vec::new();
+        let mut targets = Vec::new();
         let armed = self.keyring_armed.unwrap_or(false);
         let status = match self.keyring_armed {
             Some(true) => Span::styled(
@@ -8854,7 +8958,10 @@ impl App {
                 Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
             ),
             Some(false) => Span::styled("○ not armed", Style::new().dim()),
-            None => Span::styled("unknown (observation unavailable)", Style::new().dim()),
+            None => Span::styled(
+                format!("◐ unknown ({})", self.unanswered_reason(Source::Wallet)),
+                Style::new().fg(th().warn),
+            ),
         };
         let tpm = self.probes.tpm_present;
         let mut lines = vec![
@@ -8889,7 +8996,7 @@ impl App {
             let drift = match (self.keyring_checked_at, self.keyring_drift) {
                 (_, _) if self.keyring_load.is_some() => "checking…".into(),
                 (Some(at), Some(drifted)) => format!(
-                    "{} at last explicit check ({}s ago); [d] checks again",
+                    "{} at last explicit check ({}s ago)",
                     if drifted {
                         "drifted since sealing"
                     } else {
@@ -8897,39 +9004,73 @@ impl App {
                     },
                     at.elapsed().as_secs(),
                 ),
-                _ => "unknown; [d] checks current PCRs".into(),
+                // The check ran and the daemon gave no verdict.
+                (Some(at), None) => format!(
+                    "unknown (the check {}s ago gave no verdict)",
+                    at.elapsed().as_secs()
+                ),
+                (None, _) => "unknown (not checked yet)".into(),
             };
             lines.push(Line::from(vec![
                 Span::raw("  PCR check "),
                 Span::styled(drift, Style::new().dim()),
             ]));
         }
-        // Show the envelope's actual policy tier when the daemon reports it.
-        // The static text is the pre-KeyringInfo default; it only applies once
-        // the daemon has ANSWERED (an old daemon, or a fresh arm landing on
-        // the literal tier). Unanswered, it read as this machine's binding.
+        // The envelope's policy tier when the daemon reports it, in words:
+        // its text also carries the pcrlock NV index, an identifier, which
+        // F4 lists instead (ADR-0030 §1.10). The static text is the
+        // pre-KeyringInfo default; it only applies once the daemon has
+        // ANSWERED (an old daemon, or a fresh arm landing on the literal
+        // tier). Unanswered, it read as this machine's binding.
         let binding = match (&self.keyring_policy, self.keyring_armed) {
-            (Some(p), _) => p.clone(),
-            (None, None) => "unknown (observation unavailable)".to_string(),
-            (None, Some(_)) => "policy unreported by daemon".to_string(),
+            (Some(p), _) => Span::styled(
+                seal_tier_label(p).unwrap_or_else(|| {
+                    "tier not recognized; full text under current observations".into()
+                }),
+                Style::new().dim(),
+            ),
+            (None, None) => Span::styled(
+                format!("◐ unknown ({})", self.unanswered_reason(Source::Wallet)),
+                Style::new().fg(th().warn),
+            ),
+            (None, Some(true)) => Span::styled("policy unreported by daemon", Style::new().dim()),
+            (None, Some(false)) => {
+                Span::styled("not armed; tier decided at arm time", Style::new().dim())
+            }
         };
         lines.extend([
             Line::from(vec![
                 Span::raw("  TPM      "),
                 if !self.source_usable(Source::Machine) {
-                    Span::styled("◐ unknown", Style::new().fg(th().warn))
+                    Span::styled(
+                        if self
+                            .freshness
+                            .observation(Source::Machine)
+                            .last_request_failed()
+                        {
+                            "◐ unknown (system checks did not finish)"
+                        } else if self.probes_landed {
+                            "◐ unknown (system checks out of date)"
+                        } else {
+                            "◐ unknown (system checks pending)"
+                        },
+                        Style::new().fg(th().warn),
+                    )
                 } else if tpm {
                     Span::styled("● present", Style::new().fg(th().ok))
                 } else {
                     Span::styled("✕ none", Style::new().fg(th().err))
                 },
             ]),
-            Line::from(vec![
-                Span::raw("  binding  "),
-                Span::styled(binding, Style::new().dim()),
-            ]),
-            Line::raw(""),
+            Line::from(vec![Span::raw("  binding  "), binding]),
         ]);
+        // A fact above that reads unknown says why; its remedy is this
+        // action row (ADR-0030 §1.6). `r` here re-reads the wallet and the
+        // machine checks and re-runs the PCR check.
+        if self.keyring_armed.is_none() || !self.source_usable(Source::Machine) {
+            self.push_unanswered_remedy(&mut lines, &mut targets, area.width);
+        }
+        lines.push(Line::raw(""));
         // The unlock trigger depends on this box's hardware.
         if self.caps.ir_pair {
             lines.push(Line::from(Span::styled(
@@ -8951,31 +9092,43 @@ impl App {
             )));
         }
         lines.push(Line::raw(""));
+        let tier2 = self
+            .keyring_policy
+            .as_deref()
+            .is_some_and(|p| p.contains("Tier 2"));
         if armed {
-            let tier2 = self
-                .keyring_policy
-                .as_deref()
-                .is_some_and(|p| p.contains("Tier 2"));
             if tier2 {
                 lines.push(Line::from(Span::styled(
                     "  Tier 2 seal (survives kernel updates). After a firmware or Secure",
                     Style::new().dim(),
                 )));
                 lines.push(Line::from(Span::styled(
-                    "  Boot change, the boot measurements move; press [p] to refresh the",
+                    "  Boot change, the boot measurements move; refreshing the pcrlock",
                     Style::new().dim(),
                 )));
                 lines.push(Line::from(Span::styled(
-                    "  pcrlock policy so face-unlock keeps working (no re-arm needed).",
+                    "  policy keeps face unlock working (no re-arm needed).",
+                    Style::new().dim(),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  Resealing re-binds the same password to the current TPM state.",
                     Style::new().dim(),
                 )));
             } else {
                 lines.push(Line::from(Span::styled(
-                    "  ⚠ if a firmware/dbx update moves the bound PCRs, unseal fails →",
+                    "  ⚠ if a firmware/dbx update moves the bound PCRs, unseal fails;",
                     Style::new().fg(th().warn),
                 )));
                 lines.push(Line::from(Span::styled(
-                    "    press [b] to reseal (re-bind to the current PCRs, same password).",
+                    "    resealing re-binds to the current PCRs with the same password.",
+                    Style::new().dim(),
+                )));
+            }
+            // The action row's labels are short; the prose says what re-arm
+            // is for. Only a sealed login password goes stale when it changes.
+            if self.keyring_kind == Some(irlume_common::KeyringSecretKind::LoginPassword) {
+                lines.push(Line::from(Span::styled(
+                    "  Re-arm after a login password change so the new password is sealed.",
                     Style::new().dim(),
                 )));
             }
@@ -8994,40 +9147,28 @@ impl App {
             )));
         }
         lines.push(Line::raw(""));
-        // [b] reseal is shown only once armed (re-bind needs an existing seal);
-        // it re-enters the password and re-seals to the current PCRs, the CLI
-        // `irlume reseal` a keyboard-only user would otherwise have no way to run.
-        if armed {
-            push_page_actions(
-                &mut lines,
-                &mut page_actions,
-                &[
-                    ("a", "re-arm (new password)"),
-                    ("b", "reseal (re-bind to current PCRs)"),
-                    ("f", "forget"),
-                    ("d", "check current PCRs"),
-                ],
-            );
-        } else {
-            push_page_actions(
-                &mut lines,
-                &mut page_actions,
-                &[("a", "arm (enter your login password)"), ("f", "forget")],
-            );
-        }
-        if armed
-            && self
-                .keyring_policy
-                .as_deref()
-                .is_some_and(|p| p.contains("Tier 2"))
-        {
-            push_page_actions(
-                &mut lines,
-                &mut page_actions,
-                &[("p", "refresh pcrlock policy")],
-            );
-        }
-        self.draw_action_paragraph(f, area, lines, &page_actions);
+        // One action row (ADR-0030 §1.4), in `screen_actions`' order so the
+        // F6 walk moves left to right. Reseal and the PCR check need a seal
+        // that exists, so `b` and `d` show once armed; `p` refreshes the
+        // policy a Tier 2 seal is bound to. The handlers keep their guards.
+        let actions: &[(&str, &str)] = match (armed, tier2) {
+            (true, true) => &[
+                ("a", "re-arm"),
+                ("b", "reseal"),
+                ("f", "forget"),
+                ("p", "refresh pcrlock"),
+                ("d", "check PCRs"),
+            ],
+            (true, false) => &[
+                ("a", "re-arm"),
+                ("b", "reseal"),
+                ("f", "forget"),
+                ("d", "check PCRs"),
+            ],
+            (false, _) => &[("a", "arm with your login password"), ("f", "forget")],
+        };
+        push_action_row(&mut lines, &mut targets, actions, area.width);
+        self.draw_page_paragraph(f, area, lines, &targets, None);
     }
 
     /// How many enrolled scans the LOADED recognizer can match, or `None`
@@ -9450,7 +9591,7 @@ impl App {
         for (i, c) in self.repair.iter().enumerate() {
             let start = lines.len();
             let open = i == selected && self.repair_expanded;
-            targets.push((start, Click::Select(i)));
+            targets.push(PageTarget::whole(start, Click::Select(i)));
             lines.push(repair_row(c, width, open, i == selected));
             if open {
                 // The diagnosis under the row is explanatory text and never
@@ -9461,7 +9602,7 @@ impl App {
                 targets.extend(
                     actions
                         .into_iter()
-                        .map(|(row, key)| (offset + row, Click::Key(key))),
+                        .map(|(row, key)| PageTarget::whole(offset + row, Click::Key(key))),
                 );
             }
             if i == selected && reveal_selected {
@@ -9505,10 +9646,11 @@ impl App {
         ]));
         // The seal tier is a three-rung ladder (signed PCR-11 > pcrlock NV >
         // literal PCR-7; see irlume-core/src/pcrsig.rs). The daemon's
-        // KeyringInfo names the armed envelope's actual rung, which is what
-        // the Keyring tab shows; a local artifact probe can only prove Tier 1
-        // availability, so without an answer this line told every Tier-2
-        // pcrlock user their seal sat on the weakest tier.
+        // KeyringInfo names the armed envelope's actual rung, shown here in
+        // full while the Wallet page names only its tier; a local artifact
+        // probe can only prove Tier 1 availability, so without an answer
+        // this line told every Tier-2 pcrlock user their seal sat on the
+        // weakest tier.
         lines.push(Line::from(vec![
             Span::styled("  PCR policy ", Style::new().dim()),
             Span::styled(
@@ -9560,7 +9702,7 @@ impl App {
         targets.extend(
             page_actions
                 .into_iter()
-                .map(|(row, key)| (row, Click::Key(key))),
+                .map(|(row, key)| PageTarget::whole(row, Click::Key(key))),
         );
         self.draw_page_paragraph(f, area, lines, &targets, reveal);
     }
@@ -10988,6 +11130,86 @@ fn push_page_action(
     lines.push(Line::from(spans));
 }
 
+/// Append the action `[key] label` to `spans`, the row that becomes line
+/// `line` of a page paragraph, with a click target on the cells it
+/// occupies (ADR-0030 §1.4): several actions, or a fact and its action,
+/// can share a row, and each acts only where its words are. The row must
+/// fit the page's width: a row that wraps gets no column target.
+fn append_row_action(
+    spans: &mut Vec<Span<'_>>,
+    targets: &mut Vec<PageTarget>,
+    line: usize,
+    key: &str,
+    label: &str,
+) {
+    let start = spans.iter().map(Span::width).sum::<usize>();
+    let action = Span::styled(format!("[{key}] {label}"), Style::new().fg(th().accent));
+    let end = start + action.width();
+    if let Some(code) = footer_keycode(key) {
+        let cell = |x: usize| u16::try_from(x).unwrap_or(u16::MAX);
+        targets.push(PageTarget {
+            line,
+            columns: Some((cell(start), cell(end))),
+            click: Click::Key(code),
+        });
+    }
+    spans.push(action);
+}
+
+/// A page's actions on one row (ADR-0030 §1.4): `[key] label` two spaces
+/// apart, each a click target on its own cells. An action the row cannot
+/// hold within `width` starts a further row rather than being cut; one
+/// wider than `width` on its own takes a row alone, which wraps and acts
+/// as a whole, as a `push_page_action` row does.
+fn push_action_row(
+    lines: &mut Vec<Line<'_>>,
+    targets: &mut Vec<PageTarget>,
+    items: &[(&str, &str)],
+    width: u16,
+) {
+    let width = usize::from(width);
+    let mut row: Vec<Span<'static>> = Vec::new();
+    let mut row_targets = Vec::new();
+    for (key, label) in items {
+        let needed = Span::raw(format!("  [{key}] {label}")).width();
+        let used = row.iter().map(Span::width).sum::<usize>();
+        if !row.is_empty() && used + needed > width {
+            lines.push(Line::from(std::mem::take(&mut row)));
+            targets.append(&mut row_targets);
+        }
+        if row.is_empty() && needed > width {
+            let mut alone = Vec::new();
+            push_page_action(lines, &mut alone, key, label, "");
+            targets.extend(
+                alone
+                    .into_iter()
+                    .map(|(line, code)| PageTarget::whole(line, Click::Key(code))),
+            );
+            continue;
+        }
+        row.push(Span::raw("  "));
+        append_row_action(&mut row, &mut row_targets, lines.len(), key, label);
+    }
+    if !row.is_empty() {
+        lines.push(Line::from(row));
+        targets.append(&mut row_targets);
+    }
+}
+
+/// Highlight one action on a row that carries several (ADR-0030 §1.4):
+/// only the spans inside `columns`, the cells its words occupy.
+fn highlight_columns(mut line: Line<'_>, (start, end): (u16, u16)) -> Line<'_> {
+    let mut x = 0usize;
+    for span in &mut line.spans {
+        let width = span.width();
+        if x >= usize::from(start) && x + width <= usize::from(end) {
+            span.style = span.style.patch(selected_style());
+        }
+        x += width;
+    }
+    line
+}
+
 /// Human label for the stored auth method string (`Method::as_str()`): the raw
 /// `"both"` reads as opaque, so spell out the coexistence.
 fn method_label(method: &str) -> String {
@@ -10998,6 +11220,26 @@ fn method_label(method: &str) -> String {
         "face" => "face".to_string(),
         other => other.to_string(),
     }
+}
+
+/// The Wallet's binding in words (ADR-0030 §1.10): the seal's tier and how
+/// it binds, from the daemon's policy text (`PolicyKind::describe` in
+/// irlume-core), without the NV index that text carries for a pcrlock
+/// seal. `None` for text that names no tier.
+fn seal_tier_label(policy: &str) -> Option<String> {
+    let tier = ["Tier 1", "Tier 2", "Tier 3"]
+        .into_iter()
+        .find(|tier| policy.contains(tier))?;
+    let how = if policy.contains("pcrlock") {
+        "pcrlock"
+    } else if policy.contains("PolicyAuthorize") {
+        "signed policy"
+    } else if policy.contains("PolicyPCR") {
+        "literal PCRs"
+    } else {
+        return Some(tier.to_string());
+    };
+    Some(format!("{tier} · {how}"))
 }
 
 /// "N profile(s), M scan(s)" or a dim "none". `live` is how many of those
@@ -13010,6 +13252,7 @@ mod tests {
             error: None,
             daemon_up: false,
             daemon_reach: crate::commands::DaemonReach::Down,
+            light_reach: crate::commands::DaemonReach::Down,
             enroll_error: None,
             health: None,
             preferences: None,
@@ -17967,16 +18210,24 @@ mod tests {
         rows.into_iter().skip_while(|row| row.is_empty()).collect()
     }
 
-    /// The Diagnostics list pane and details column at `width`x`height`:
-    /// the page's own split of the content frame (`draw_content`).
-    fn diagnostics_rects(app: &App, width: u16, height: u16) -> (Rect, Option<Rect>) {
+    /// The content frame's inner area at `width`x`height`, where a page
+    /// draws (`draw_content`, with its top padding of one row).
+    fn page_area(app: &App, width: u16, height: u16) -> Rect {
         let content = app
             .body_split(app.frame_rows(Rect::new(0, 0, width, height))[2])
             .1;
-        let inner = Block::bordered()
+        Block::bordered()
             .padding(ratatui::widgets::Padding::new(2, 2, 1, 0))
-            .inner(content);
-        App::details_split(inner, App::DIAGNOSTICS_LIST_MIN_WIDTH)
+            .inner(content)
+    }
+
+    /// The Diagnostics list pane and details column at `width`x`height`:
+    /// the page's own split of the content frame (`draw_content`).
+    fn diagnostics_rects(app: &App, width: u16, height: u16) -> (Rect, Option<Rect>) {
+        App::details_split(
+            page_area(app, width, height),
+            App::DIAGNOSTICS_LIST_MIN_WIDTH,
+        )
     }
 
     /// The Diagnostics page as drawn at `width`x`height`: the list pane's
@@ -19044,7 +19295,7 @@ mod tests {
         assert!(draw_text(&app).contains("at last explicit check"));
         app.invalidate_keyring_diagnostic();
         assert_eq!(app.keyring_drift, None);
-        assert!(draw_text(&app).contains("unknown; [d]"));
+        assert!(draw_text(&app).contains("unknown (not checked yet)"));
         let (tx, rx) = mpsc::channel();
         app.keyring_load = Some(rx);
         tx.send((
@@ -19304,7 +19555,7 @@ mod tests {
         app.screen = SC_KEYRING;
         // Daemon unreachable: unknown, never a fake "not armed".
         let text = draw_text(&app);
-        assert!(text.contains("unknown (observation unavailable)"));
+        assert!(text.contains("◐ unknown (daemon not answering)"));
         // Not armed on a fingerprint box: names the fingerprint trigger.
         app.keyring_armed = Some(false);
         app.fp_present = true;
@@ -19325,21 +19576,60 @@ mod tests {
         let text = draw_text(&app);
         assert!(text.contains("● armed"));
         assert!(text.contains("drifted since sealing"));
-        assert!(text.contains("pcrlock NV 0x1a2b (Tier 2)"));
+        assert!(row_with(&text, "binding").contains("Tier 2 · pcrlock"));
+        assert!(!text.contains("0x1a2b"));
         assert!(
-            text.contains("press [p]") && text.contains("pcrlock policy"),
+            text.contains("[p] refresh pcrlock")
+                && text.contains("refreshing the pcrlock")
+                && !text.contains("press ["),
             "Tier 2 offers the [p] pcrlock-refresh action, not the re-arm warning"
         );
         assert!(text.contains("At a face login"));
         // Missing policy is unavailable, never an invented PCR-7 binding.
         app.keyring_policy = None;
         assert!(draw_text(&app).contains("policy unreported by daemon"));
-        // Explicit observed PCR-7 binding retains its warning.
+        // An unrecognized policy keeps its reseal advice; its text is in F4.
         app.keyring_policy = Some("PCR-7 (Secure Boot state)".into());
         app.keyring_drift = None;
         let text = draw_text(&app);
-        assert!(text.contains("PCR-7 (Secure Boot state)"));
+        assert!(row_with(&text, "binding").contains("tier not recognized"));
         assert!(text.contains("firmware/dbx update"));
+    }
+
+    /// ADR-0030 §2: the Wallet's action labels are short, so its prose
+    /// keeps what they used to say: what resealing does on every tier,
+    /// and that re-arming seals a changed login password. It names no key.
+    #[test]
+    fn wallet_prose_keeps_what_the_short_action_labels_dropped() {
+        use irlume_common::KeyringSecretKind as K;
+        let mut app = test_app();
+        app.screen = SC_KEYRING;
+        app.daemon_up = true;
+        app.daemon_reach = crate::commands::DaemonReach::Running;
+        app.keyring_armed = Some(true);
+        for policy in ["pcrlock NV 0x1a2b (Tier 2)", "literal PolicyPCR (Tier 3)"] {
+            app.keyring_policy = Some(policy.into());
+            for kind in [K::LoginPassword, K::KdeWalletKey, K::GnomeKeyringToken] {
+                app.keyring_kind = Some(kind);
+                for (width, height) in [(80, 60), (120, 60)] {
+                    let text = draw_text_at(&app, width, height);
+                    assert!(text.contains("esealing re-binds"), "{text}");
+                    assert_eq!(
+                        text.contains("Re-arm after a login password change"),
+                        kind == K::LoginPassword,
+                        "{text}"
+                    );
+                    assert!(!text.contains("press "), "{text}");
+                }
+            }
+        }
+        // Nothing sealed: nothing to reseal or re-arm.
+        app.keyring_armed = Some(false);
+        app.keyring_policy = None;
+        app.keyring_kind = None;
+        let text = draw_text(&app);
+        assert!(!text.contains("esealing re-binds"), "{text}");
+        assert!(!text.contains("Re-arm after"), "{text}");
     }
 
     #[test]
@@ -19592,6 +19882,44 @@ mod tests {
             .iter()
             .find(|(_, click)| wanted(*click))
             .map(|(rect, _)| *rect)
+    }
+
+    /// Every `[k]` the page draws at `width`x`height` (one ASCII letter or
+    /// digit in brackets), as the key and the cell of its `[`. The frame's
+    /// click targets stay in `app.click_targets`.
+    fn page_keys(app: &App, width: u16, height: u16) -> Vec<(char, u16, u16)> {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let area = page_area(app, width, height);
+        let buffer = term.backend().buffer();
+        let mut keys = Vec::new();
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right().saturating_sub(2) {
+                let mut key = buffer[(x + 1, y)].symbol().chars();
+                if let (Some(k), None) = (key.next(), key.next()) {
+                    if k.is_ascii_alphanumeric()
+                        && buffer[(x, y)].symbol() == "["
+                        && buffer[(x + 2, y)].symbol() == "]"
+                    {
+                        keys.push((k, x, y));
+                    }
+                }
+            }
+        }
+        keys
+    }
+
+    /// The key of the click target `on_click` would use at a cell (the
+    /// first containing it); `None` for no target or a non-key target.
+    fn key_at(app: &App, x: u16, y: u16) -> Option<KeyCode> {
+        app.click_targets
+            .borrow()
+            .iter()
+            .find(|(rect, _)| rect.contains((x, y).into()))
+            .and_then(|(_, click)| match click {
+                Click::Key(key) => Some(*key),
+                _ => None,
+            })
     }
 
     /// ADR-0030 acceptance "Layout": at 120 columns the selected check's
@@ -21933,8 +22261,9 @@ mod tests {
         assert!(!text.contains("plaintext at rest"), "{text}");
         assert!(!text.contains("No TPM on this host"), "{text}");
         assert!(!text.contains("○ not set"), "{text}");
+        assert!(text.contains("◐ unknown (daemon not answering)"), "{text}");
         assert!(
-            text.contains("◐ unknown (observation unavailable)"),
+            text.contains("[r] refresh") && text.contains("[6] open Diagnostics"),
             "{text}"
         );
     }
@@ -22025,8 +22354,8 @@ mod tests {
             row_with(&text, "PCR policy").contains("unknown (observation unavailable)"),
             "{text}"
         );
-        // The daemon's KeyringInfo names the rung: show it verbatim, exactly
-        // as the Keyring tab does.
+        // The daemon's KeyringInfo names the rung: Diagnostics shows it
+        // verbatim (the Wallet page names only the tier).
         app.daemon_up = true;
         app.keyring_armed = Some(true);
         app.keyring_policy = Some("pcrlock NV 0x1a2b (Tier 2)".into());
@@ -22064,11 +22393,645 @@ mod tests {
         // The pre-KeyringInfo default described a binding nobody read.
         assert!(!text.contains("PCR-7 (Secure Boot state)"), "{text}");
         assert!(
-            row_with(&text, "binding").contains("unknown (observation unavailable)"),
+            row_with(&text, "binding").contains("◐ unknown (daemon not answering)"),
             "{text}"
         );
         // And no armed-state consequence line off an unanswered question.
         assert!(!text.contains("Not armed;"), "{text}");
+    }
+
+    /// ADR-0030 §1.10: the Wallet names the seal's tier from the daemon's
+    /// own policy text (irlume-core's `describe`), never the NV index it
+    /// carries for a pcrlock seal.
+    #[test]
+    fn seal_tier_label_names_each_tier_without_the_nv_index() {
+        use irlume_core::envelope::PolicyKind;
+        for (policy, label) in [
+            (
+                PolicyKind::PcrlockNv {
+                    nv_index: 0x1c00002,
+                },
+                "Tier 2 · pcrlock",
+            ),
+            (
+                PolicyKind::Authorized {
+                    pubkey_pem: "PEM".into(),
+                    policy_ref: Vec::new(),
+                },
+                "Tier 1 · signed policy",
+            ),
+            (PolicyKind::PcrLiteral, "Tier 3 · literal PCRs"),
+        ] {
+            let text = policy.describe();
+            let named = seal_tier_label(&text);
+            assert_eq!(named.as_deref(), Some(label), "{text}");
+            assert!(!named.unwrap_or_default().contains("0x"), "{text}");
+        }
+        assert_eq!(seal_tier_label("Tier 2").as_deref(), Some("Tier 2"));
+        assert_eq!(seal_tier_label("PCR-7 (Secure Boot state)"), None);
+    }
+
+    /// ADR-0030 §2 and §1.10: the Wallet's binding row names the seal's
+    /// tier and never the pcrlock NV index; F4 lists the full policy under
+    /// the wallet's observation age (§4), with daemon text sanitized.
+    #[test]
+    fn wallet_binding_names_the_tier_and_f4_holds_the_nv_index() {
+        let mut app = test_app();
+        app.screen = SC_KEYRING;
+        app.daemon_up = true;
+        app.daemon_reach = crate::commands::DaemonReach::Running;
+        app.keyring_armed = Some(true);
+        app.keyring_kind = Some(irlume_common::KeyringSecretKind::LoginPassword);
+        app.keyring_policy = Some("pcrlock NV 0x1a2b (Tier 2)".into());
+        for text in [draw_text(&app), draw_text_at(&app, 80, 60)] {
+            assert!(
+                row_with(&text, "  binding  ").contains("Tier 2 · pcrlock"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("0x1a2b") && !text.contains("pcrlock NV"),
+                "{text}"
+            );
+        }
+        let details = app.live_details();
+        let lines: Vec<&str> = details.lines().collect();
+        let age = lines
+            .iter()
+            .position(|line| line.starts_with("Wallet metadata:"))
+            .expect("the wallet's observation age");
+        assert_eq!(
+            lines.get(age + 1).copied(),
+            Some("Wallet seal policy: pcrlock NV 0x1a2b (Tier 2)"),
+            "{details}"
+        );
+        app.show_live = true;
+        let text = draw_text(&app);
+        assert!(
+            text.contains("Wallet seal policy: pcrlock NV 0x1a2b (Tier 2)"),
+            "{text}"
+        );
+        app.show_live = false;
+        // Text that names no tier: the row says so and F4 holds the text.
+        app.keyring_policy = Some("PCR-7 (Secure Boot state)".into());
+        let text = draw_text(&app);
+        assert!(
+            row_with(&text, "  binding  ")
+                .contains("tier not recognized; full text under current observations"),
+            "{text}"
+        );
+        assert!(!text.contains("PCR-7 (Secure Boot state)"), "{text}");
+        assert!(app
+            .live_details()
+            .contains("Wallet seal policy: PCR-7 (Secure Boot state)"));
+        // An unarmed wallet has no policy to leave unreported.
+        app.keyring_armed = Some(false);
+        app.keyring_policy = None;
+        let text = draw_text(&app);
+        let binding = row_with(&text, "  binding  ");
+        assert!(
+            binding.contains("not armed; tier decided at arm time"),
+            "{text}"
+        );
+        assert!(!binding.contains("policy unreported"), "{text}");
+        assert!(!app.live_details().contains("Wallet seal policy"));
+        // A line break in daemon text cannot forge a line in F4's list.
+        app.keyring_armed = Some(true);
+        app.keyring_policy = Some("pcrlock NV 0x1a2b (Tier 2)\nFaces: forged".into());
+        let details = app.live_details();
+        assert!(
+            details
+                .lines()
+                .any(|line| line == "Wallet seal policy: pcrlock NV 0x1a2b (Tier 2) Faces: forged"),
+            "{details}"
+        );
+        assert!(
+            !details
+                .lines()
+                .any(|line| line.starts_with("Faces: forged")),
+            "{details}"
+        );
+        let text = draw_text(&app);
+        assert!(
+            row_with(&text, "  binding  ").contains("Tier 2 · pcrlock"),
+            "{text}"
+        );
+    }
+
+    /// The row helper (ADR-0030 §1.4): actions share a row two spaces
+    /// apart; one the row cannot hold starts the next row whole, and one
+    /// wider than the page takes a row alone and acts as a whole. Each
+    /// shared action is a click target on its own cells only.
+    #[test]
+    fn push_action_row_keeps_actions_whole_and_targets_each_by_column() {
+        let items = [
+            ("a", "alpha"),
+            ("b", "bravo"),
+            ("c", "a label far too long for the row"),
+        ];
+        // Each target as (line, columns, key).
+        let summary = |targets: &[PageTarget]| {
+            targets
+                .iter()
+                .map(|target| match target.click {
+                    Click::Key(KeyCode::Char(key)) => (target.line, target.columns, key),
+                    _ => panic!("an action row's target is its key"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let text = |line: &Line<'_>| -> String {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        let (mut lines, mut targets) = (Vec::new(), Vec::new());
+        push_action_row(&mut lines, &mut targets, &items, 22);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(text(&lines[0]), "  [a] alpha  [b] bravo");
+        assert_eq!(
+            summary(&targets),
+            [
+                (0, Some((2, 11)), 'a'),
+                (0, Some((13, 22)), 'b'),
+                (1, None, 'c')
+            ]
+        );
+        // One cell narrower: `b` moves to the next row whole.
+        let (mut narrow, mut narrow_targets) = (Vec::new(), Vec::new());
+        push_action_row(&mut narrow, &mut narrow_targets, &items, 21);
+        assert_eq!(narrow.len(), 3);
+        assert_eq!(text(&narrow[1]), "  [b] bravo");
+        assert_eq!(
+            summary(&narrow_targets),
+            [
+                (0, Some((2, 11)), 'a'),
+                (1, Some((2, 11)), 'b'),
+                (2, None, 'c')
+            ]
+        );
+        // Drawn: each shared action acts on its own cells, the gap does
+        // not, and the wide action acts on every row it wraps to.
+        let app = test_app();
+        let mut term = Terminal::new(TestBackend::new(22, 6)).unwrap();
+        term.draw(|f| app.draw_page_paragraph(f, f.area(), lines, &targets, None))
+            .unwrap();
+        let key = |wanted: char| move |click: Click| matches!(click, Click::Key(KeyCode::Char(key)) if key == wanted);
+        assert_eq!(target_rect(&app, key('a')), Some(Rect::new(2, 0, 9, 1)));
+        assert_eq!(target_rect(&app, key('b')), Some(Rect::new(13, 0, 9, 1)));
+        let wide = target_rect(&app, key('c')).expect("the wide action");
+        assert_eq!((wide.x, wide.y, wide.width), (0, 1, 22));
+        assert!(wide.height >= 2, "{wide:?}");
+        assert_eq!(key_at(&app, 11, 0), None);
+        assert_eq!(key_at(&app, 12, 0), None);
+        // Drawn one cell narrower, the shared row wraps: no column target.
+        let (mut wrapped, mut wrapped_targets) = (Vec::new(), Vec::new());
+        push_action_row(&mut wrapped, &mut wrapped_targets, &items, 22);
+        let app = test_app();
+        let mut term = Terminal::new(TestBackend::new(21, 6)).unwrap();
+        term.draw(|f| app.draw_page_paragraph(f, f.area(), wrapped, &wrapped_targets, None))
+            .unwrap();
+        assert_eq!(target_rect(&app, key('a')), None);
+        assert_eq!(target_rect(&app, key('b')), None);
+        assert!(target_rect(&app, key('c')).is_some());
+    }
+
+    /// ADR-0030 §1.4 and §2: Password Wallet's and Recovery's actions
+    /// share one row in `screen_actions`' order, each a click target on
+    /// its own cells; a window too narrow for all of them continues the
+    /// row below without splitting an action.
+    #[test]
+    fn wallet_and_recovery_actions_share_one_row_with_a_target_per_action() {
+        // The page's keys among `wanted`, left to right, each acting at its
+        // `[` and its `]` and not in the cell before it (a gap or the
+        // indent).
+        let row_keys = |app: &App, width: u16, height: u16, wanted: &str| {
+            let found: Vec<(char, u16, u16)> = page_keys(app, width, height)
+                .into_iter()
+                .filter(|(key, _, _)| wanted.contains(*key))
+                .collect();
+            for &(key, x, y) in &found {
+                let at = format!("[{key}] at {width}x{height}");
+                assert_eq!(key_at(app, x, y), Some(KeyCode::Char(key)), "{at}");
+                assert_eq!(key_at(app, x + 2, y), Some(KeyCode::Char(key)), "{at}");
+                assert_eq!(key_at(app, x - 1, y), None, "{at}");
+            }
+            found
+        };
+        let keys = |found: &[(char, u16, u16)]| -> String {
+            found.iter().map(|(key, _, _)| key).collect()
+        };
+        let one_row = |found: &[(char, u16, u16)]| found.iter().all(|(_, _, y)| *y == found[0].2);
+        let order = |app: &App| -> String {
+            app.screen_actions()
+                .iter()
+                .filter(|(key, _)| key.chars().count() == 1)
+                .filter_map(|(key, _)| key.chars().next())
+                .collect()
+        };
+        let mut app = test_app();
+        app.screen = SC_KEYRING;
+        app.daemon_up = true;
+        app.daemon_reach = crate::commands::DaemonReach::Running;
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.keyring_armed = Some(true);
+        app.keyring_kind = Some(irlume_common::KeyringSecretKind::LoginPassword);
+        app.keyring_policy = Some("pcrlock NV 0x1a2b (Tier 2)".into());
+        assert_eq!(order(&app), "abfpd");
+        for (width, height) in [(80, 60), (120, 60)] {
+            let found = row_keys(&app, width, height, "abfpd");
+            assert_eq!(keys(&found), "abfpd", "{width}x{height}");
+            assert!(one_row(&found), "{width}x{height}: {found:?}");
+        }
+        // 72 cells at 100 columns: `d` continues whole on the next row.
+        let found = row_keys(&app, 100, 60, "abfpd");
+        assert_eq!(keys(&found), "abfpd");
+        assert!(one_row(&found[..4]), "{found:?}");
+        assert_eq!(
+            (found[4].1, found[4].2),
+            (found[0].1, found[0].2 + 1),
+            "{found:?}"
+        );
+        // A click in the gap before `b` does nothing.
+        let found = row_keys(&app, 120, 60, "abfpd");
+        let (_, x, y) = found[1];
+        app.on_click(x - 1, y, Rect::new(0, 0, 120, 60));
+        assert!(app.confirm.is_none() && app.input.is_none());
+        assert!(app.suspend.is_none() && app.op.is_none());
+        assert_eq!(app.screen, SC_KEYRING);
+        // Not armed: arm and forget.
+        app.keyring_armed = Some(false);
+        app.keyring_policy = None;
+        assert_eq!(order(&app), "af");
+        for (width, height) in [(80, 60), (120, 60)] {
+            let found = row_keys(&app, width, height, "abfpd");
+            assert_eq!(keys(&found), "af", "{width}x{height}");
+            assert!(one_row(&found), "{width}x{height}: {found:?}");
+        }
+        app.screen = SC_RECOVERY;
+        app.recovery = Some(RecoveryInfo {
+            encrypted: true,
+            key_present: true,
+            recovery_set: true,
+            tpm_present: true,
+        });
+        assert_eq!(order(&app), "stf");
+        for (width, height) in [(80, 60), (120, 60)] {
+            let found = row_keys(&app, width, height, "stf");
+            assert_eq!(keys(&found), "stf", "{width}x{height}");
+            assert!(one_row(&found), "{width}x{height}: {found:?}");
+        }
+    }
+
+    /// ADR-0030 §1.4 with F6: on a shared row only the focused action's
+    /// words are highlighted, and Enter replays its key.
+    #[test]
+    fn a_focused_action_on_a_shared_row_highlights_only_its_words() {
+        let mut app = test_app();
+        app.screen = SC_RECOVERY;
+        app.daemon_reach = crate::commands::DaemonReach::Running;
+        app.recovery = Some(RecoveryInfo {
+            encrypted: true,
+            key_present: true,
+            recovery_set: true,
+            tpm_present: true,
+        });
+        app.on_key(KeyCode::F(6));
+        app.on_key(KeyCode::Down);
+        assert_eq!(app.focused_action().map(|action| action.0), Some("t"));
+        let keys = page_keys(&app, 120, 40);
+        let cell = |wanted: char| {
+            keys.iter()
+                .find(|(key, _, _)| *key == wanted)
+                .map(|&(_, x, y)| (x, y))
+                .unwrap_or_else(|| panic!("[{wanted}] is drawn"))
+        };
+        let (s, t, f) = (cell('s'), cell('t'), cell('f'));
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = term.backend().buffer();
+        let reversed = |(x, y): (u16, u16)| buffer[(x, y)].modifier.contains(Modifier::REVERSED);
+        let words = u16::try_from("[t] restore".len()).unwrap();
+        assert!((t.0..t.0 + words).all(|x| reversed((x, t.1))));
+        assert!(!reversed(s));
+        assert!(!reversed((t.0 - 1, t.1)));
+        assert!(!reversed(f));
+        app.on_key(KeyCode::Enter);
+        match &app.input {
+            Some((_, _, pending @ Pending::RecoveryRestorePw)) => assert!(pending.masked()),
+            _ => panic!("the focused action replays `t`"),
+        }
+    }
+
+    /// ADR-0030 §1.4: Password Wallet's and Recovery's texts name no key;
+    /// every key drawn on those pages is its own action.
+    #[test]
+    fn wallet_and_recovery_prose_names_no_keys() {
+        use crate::commands::DaemonReach as R;
+        use irlume_common::KeyringSecretKind as K;
+        let page = |screen: usize, reach: R| {
+            let mut app = test_app();
+            app.screen = screen;
+            app.daemon_reach = reach;
+            app.daemon_up = reach == R::Running;
+            app
+        };
+        let armed = |policy: &str, kind: K, checked: bool| {
+            let mut app = page(SC_KEYRING, R::Running);
+            app.keyring_armed = Some(true);
+            app.keyring_kind = Some(kind);
+            app.keyring_policy = Some(policy.into());
+            if checked {
+                app.keyring_drift = Some(true);
+                app.keyring_checked_at = Some(Instant::now());
+            }
+            app
+        };
+        let mut fixtures = vec![page(SC_KEYRING, R::Down)];
+        let mut unarmed = page(SC_KEYRING, R::Running);
+        unarmed.keyring_armed = Some(false);
+        unarmed.fp_present = true;
+        fixtures.push(unarmed);
+        fixtures.push(armed("pcrlock NV 0x1a2b (Tier 2)", K::LoginPassword, true));
+        fixtures.push(armed("literal PolicyPCR (Tier 3)", K::LoginPassword, false));
+        fixtures.push(armed(
+            "literal PolicyPCR (Tier 3)",
+            K::GnomeKeyringToken,
+            false,
+        ));
+        fixtures.push(page(SC_RECOVERY, R::Down));
+        for (encrypted, key_present, recovery_set, tpm_present) in [
+            (false, false, false, false),
+            (true, false, true, true),
+            (true, true, false, true),
+            (true, true, true, true),
+        ] {
+            let mut app = page(SC_RECOVERY, R::Running);
+            app.recovery = Some(RecoveryInfo {
+                encrypted,
+                key_present,
+                recovery_set,
+                tpm_present,
+            });
+            fixtures.push(app);
+        }
+        for app in &fixtures {
+            for (width, height) in [(80, 60), (120, 60)] {
+                for (key, x, y) in page_keys(app, width, height) {
+                    assert_eq!(
+                        key_at(app, x, y),
+                        Some(KeyCode::Char(key)),
+                        "[{key}] at {width}x{height} is not an action:\n{}",
+                        draw_text_at(app, width, height)
+                    );
+                }
+                let text = draw_text_at(app, width, height);
+                assert!(!text.contains("press "), "{text}");
+            }
+        }
+    }
+
+    /// ADR-0030 §1.6 and §3: an unknown Wallet or Recovery fact says why,
+    /// and an action row under the facts offers the remedy: refresh, and
+    /// Diagnostics while the daemon is down or refuses this account.
+    #[test]
+    fn wallet_and_recovery_unknown_rows_give_a_reason_and_an_action() {
+        use crate::commands::DaemonReach as R;
+        let _guard = dead_socket();
+        let view = |app: &App| (draw_text_at(app, 120, 50), page_keys(app, 120, 50));
+        // The keys drawn on the frame row directly under the first row
+        // holding `needle`.
+        let keys_under = |text: &str, keys: &[(char, u16, u16)], needle: &str| -> String {
+            let row = text
+                .lines()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no line contains '{needle}':\n{text}"));
+            keys.iter()
+                .filter(|(_, _, y)| usize::from(*y) == row + 1)
+                .map(|(key, _, _)| key)
+                .collect()
+        };
+        let remedy_drawn =
+            |keys: &[(char, u16, u16)]| keys.iter().any(|(key, _, _)| "r6".contains(*key));
+        let mut app = test_app();
+        app.screen = SC_KEYRING;
+        let (text, keys) = view(&app);
+        for needle in ["  state  ", "  binding  "] {
+            assert!(
+                row_with(&text, needle).contains("◐ unknown (daemon not answering)"),
+                "{text}"
+            );
+        }
+        assert_eq!(keys_under(&text, &keys, "  binding  "), "r6", "{text}");
+        for &(key, x, y) in keys.iter().filter(|(key, _, _)| "r6".contains(*key)) {
+            assert_eq!(key_at(&app, x, y), Some(KeyCode::Char(key)));
+        }
+        for (reach, reason, remedy) in [
+            (R::Starting, "daemon still starting", "r"),
+            (
+                R::AccessDenied,
+                "this account may not connect to the daemon",
+                "r6",
+            ),
+            (R::Running, "no answer yet", "r"),
+        ] {
+            app.daemon_reach = reach;
+            let (text, keys) = view(&app);
+            for needle in ["  state  ", "  binding  "] {
+                assert!(
+                    row_with(&text, needle).contains(&format!("◐ unknown ({reason})")),
+                    "{text}"
+                );
+            }
+            assert_eq!(keys_under(&text, &keys, "  binding  "), remedy, "{text}");
+        }
+        // The daemon answered without the wallet's facts.
+        app.light_reach = R::Running;
+        app.freshness
+            .observation_mut(Source::Wallet)
+            .record(false, Instant::now());
+        let (text, keys) = view(&app);
+        for needle in ["  state  ", "  binding  "] {
+            assert!(
+                row_with(&text, needle).contains("◐ unknown (daemon did not report it)"),
+                "{text}"
+            );
+        }
+        assert_eq!(keys_under(&text, &keys, "  binding  "), "r", "{text}");
+
+        // The TPM row says why the system checks give no answer.
+        let mut app = test_app();
+        app.screen = SC_KEYRING;
+        app.daemon_up = true;
+        app.daemon_reach = R::Running;
+        app.keyring_armed = Some(true);
+        app.keyring_kind = Some(irlume_common::KeyringSecretKind::LoginPassword);
+        app.keyring_policy = Some("pcrlock NV 0x1a2b (Tier 2)".into());
+        app.freshness.observation_mut(Source::Machine).invalidate();
+        for (landed, reason) in [
+            (false, "system checks pending"),
+            (true, "system checks out of date"),
+        ] {
+            app.probes_landed = landed;
+            let (text, keys) = view(&app);
+            assert!(
+                row_with(&text, "  TPM   ").contains(&format!("◐ unknown ({reason})")),
+                "{text}"
+            );
+            assert_eq!(keys_under(&text, &keys, "  binding  "), "r", "{text}");
+        }
+        app.freshness
+            .observation_mut(Source::Machine)
+            .record(false, Instant::now());
+        for landed in [false, true] {
+            app.probes_landed = landed;
+            let (text, keys) = view(&app);
+            assert!(
+                row_with(&text, "  TPM   ").contains("◐ unknown (system checks did not finish)"),
+                "{text}"
+            );
+            assert_eq!(keys_under(&text, &keys, "  binding  "), "r", "{text}");
+        }
+        app.freshness
+            .observation_mut(Source::Machine)
+            .record(true, Instant::now());
+        let (text, keys) = view(&app);
+        assert!(!remedy_drawn(&keys), "{text}");
+        // A known state needs no remedy, with or without a reported policy.
+        for (armed, policy) in [(Some(false), None), (Some(true), None)] {
+            app.keyring_armed = armed;
+            app.keyring_policy = policy;
+            let (text, keys) = view(&app);
+            assert!(!remedy_drawn(&keys), "{text}");
+        }
+        app.keyring_policy = Some("pcrlock NV 0x1a2b (Tier 2)".into());
+
+        // The PCR check says why it has no verdict until a check runs;
+        // `d` runs one.
+        app.keyring_checked_at = None;
+        let (text, keys) = view(&app);
+        assert!(
+            row_with(&text, "PCR check").contains("unknown (not checked yet)"),
+            "{text}"
+        );
+        assert!(keys.iter().any(|(key, _, _)| *key == 'd'), "{text}");
+        app.keyring_checked_at = Some(Instant::now());
+        app.keyring_drift = None;
+        let text = draw_text(&app);
+        assert!(
+            row_with(&text, "PCR check").contains("gave no verdict"),
+            "{text}"
+        );
+
+        // Recovery.
+        let mut app = test_app();
+        app.screen = SC_RECOVERY;
+        let (text, keys) = view(&app);
+        for needle in ["  templates  ", "  passphrase  "] {
+            assert!(
+                row_with(&text, needle).contains("◐ unknown (daemon not answering)"),
+                "{text}"
+            );
+        }
+        assert_eq!(keys_under(&text, &keys, "  passphrase  "), "r6", "{text}");
+        assert!(!text.contains("Nothing here has been read"), "{text}");
+        app.daemon_reach = R::Running;
+        app.light_reach = R::Running;
+        app.freshness
+            .observation_mut(Source::Recovery)
+            .record(false, Instant::now());
+        let (text, keys) = view(&app);
+        for needle in ["  templates  ", "  passphrase  "] {
+            assert!(
+                row_with(&text, needle).contains("◐ unknown (daemon did not report it)"),
+                "{text}"
+            );
+        }
+        assert_eq!(keys_under(&text, &keys, "  passphrase  "), "r", "{text}");
+        app.recovery = Some(RecoveryInfo {
+            encrypted: true,
+            key_present: true,
+            recovery_set: true,
+            tpm_present: true,
+        });
+        let (text, keys) = view(&app);
+        assert!(!remedy_drawn(&keys), "{text}");
+
+        // Clicks: `r` refreshes the Wallet, machine checks included; `6`
+        // opens Diagnostics. Targets are rebuilt every frame, so each click
+        // follows a draw. The reported IR pair keeps the Wallet a visible
+        // section when this machine's own checks land.
+        let cell = |keys: &[(char, u16, u16)], wanted: char| {
+            keys.iter()
+                .find(|(key, _, _)| *key == wanted)
+                .map(|&(_, x, y)| (x, y))
+                .unwrap_or_else(|| panic!("[{wanted}] is drawn"))
+        };
+        let mut app = test_app();
+        app.reported_caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.screen = SC_KEYRING;
+        let (x, y) = cell(&page_keys(&app, 120, 50), 'r');
+        app.on_click(x, y, Rect::new(0, 0, 120, 50));
+        assert!(
+            app.probes_load.is_some(),
+            "the wallet's refresh re-reads the machine snapshot"
+        );
+        drain_loads(&mut app);
+        let (x, y) = cell(&page_keys(&app, 120, 50), '6');
+        app.on_click(x, y, Rect::new(0, 0, 120, 50));
+        assert_eq!(app.screen, SC_REPAIR);
+        drain_loads(&mut app);
+    }
+
+    /// A Wallet or Recovery read that failed while the daemon was down is
+    /// no answer from the daemon that has since come up: until a light poll
+    /// sees it running, the facts wait for one instead of blaming it.
+    #[test]
+    fn a_read_made_while_the_daemon_was_down_is_not_its_answer() {
+        use crate::commands::DaemonReach as R;
+        let _guard = dead_socket();
+        let light = |reach: R| LightState {
+            observed_at: [None; 4],
+            daemon_up: reach == R::Running,
+            reach,
+            health: None,
+            preferences: None,
+            keyring_armed: None,
+            keyring_policy: None,
+            keyring_kind: None,
+            recovery: None,
+        };
+        let assert_reason = |app: &mut App, reason: &str| {
+            for (screen, needles) in [
+                (SC_KEYRING, ["  state  ", "  binding  "]),
+                (SC_RECOVERY, ["  templates  ", "  passphrase  "]),
+            ] {
+                app.screen = screen;
+                let text = draw_text(app);
+                for needle in needles {
+                    assert!(
+                        row_with(&text, needle).contains(&format!("◐ unknown ({reason})")),
+                        "{text}"
+                    );
+                }
+            }
+        };
+        let mut app = test_app();
+        app.apply_light(light(R::Down));
+        assert_reason(&mut app, "daemon not answering");
+        // irlumed starts outside the TUI; its first live snapshot lands
+        // before the next light poll.
+        app.apply_live_snapshot(live_test_snapshot(), Instant::now());
+        assert_eq!(app.daemon_reach, R::Running);
+        assert_reason(&mut app, "no answer yet");
+        // A poll that sees it running and still gets no facts: its answer.
+        app.apply_light(light(R::Running));
+        assert_reason(&mut app, "daemon did not report it");
     }
 
     #[test]

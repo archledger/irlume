@@ -125,6 +125,9 @@ const ACTIVITY_EXPANDED_ROWS: u16 = 7;
 /// collapses to full-width content and the header carries the step position
 /// (login greeters / TTYs / SSH at 80 columns).
 const SIDEBAR_MIN_COLS: u16 = 90;
+/// A click on the same cell within this many ms of the last one is the
+/// second click of a double click.
+const DOUBLE_CLICK_MS: u64 = 500;
 
 const MAX_PROFILES: usize = irlume_core::storage::MAX_PROFILES;
 const ENROLL_SCANS: usize = irlume_core::storage::DEFAULT_ENROLL_SCANS;
@@ -379,6 +382,26 @@ enum GotoFix {
     KeyringArm,
 }
 
+impl GotoFix {
+    /// The screen that owns the fix, the key its own flow answers to there,
+    /// and what it does, in the words the fix's action row and Activity use.
+    fn route(self) -> (usize, KeyCode, &'static str) {
+        match self {
+            GotoFix::Enroll => (SC_PROFILES, KeyCode::Char('e'), "enroll a face"),
+            GotoFix::RecoveryRestore => {
+                (SC_RECOVERY, KeyCode::Char('t'), "restore the template key")
+            }
+            GotoFix::KeyringReseal => (SC_KEYRING, KeyCode::Char('b'), "reseal the wallet"),
+            GotoFix::RecoveryPass => (
+                SC_RECOVERY,
+                KeyCode::Char('s'),
+                "set the recovery passphrase",
+            ),
+            GotoFix::KeyringArm => (SC_KEYRING, KeyCode::Char('a'), "arm the keyring seal"),
+        }
+    }
+}
+
 /// The root-op fixes `apply_fix` knows how to run. A dedicated enum (not a
 /// string id) so a check row can only name a fix that has a handler.
 #[derive(Clone, Copy)]
@@ -391,6 +414,21 @@ enum RootFix {
     LoginEnable,
     FingerprintAdd,
     SelinuxLoad,
+}
+
+impl RootFix {
+    /// What the fix does, for its action row; the confirmation `apply_fix`
+    /// opens names the exact command.
+    fn label(self) -> &'static str {
+        match self {
+            RootFix::LoginReconcile => "re-apply the login wiring",
+            RootFix::RestartDaemon => "start or restart the daemon",
+            RootFix::RestartFprintd => "restart the fingerprint service",
+            RootFix::LoginEnable => "wire login for your method",
+            RootFix::FingerprintAdd => "enroll a finger",
+            RootFix::SelinuxLoad => "load the SELinux policy",
+        }
+    }
 }
 
 /// A parked enrollment intent: what to resume after the daemon fix brings
@@ -802,6 +840,18 @@ struct App {
     /// Repair-tab diagnostics + selection.
     repair: Vec<Check>,
     repair_sel: usize,
+    /// The selected Diagnostics check is open in place (ADR-0030 §1.7):
+    /// its full diagnosis and its fix under the row. Enter, a second click
+    /// and Esc change it; it follows the selection, like the Cameras panel.
+    repair_expanded: bool,
+    /// Bring the selected Diagnostics check into view on the next frame,
+    /// once. Set when the selection or the expansion changes, so the wheel
+    /// stays free to read the page in between.
+    repair_reveal: std::cell::Cell<bool>,
+    /// The last click on a Diagnostics row: its cell, when, and the check
+    /// it selected or toggled. Selecting moves the open check, so a repeat
+    /// click on that cell stays on that check (ADR-0030 §1.1).
+    repair_click: Option<(u16, u16, Instant, usize)>,
     /// Cameras-tab pair selection.
     cam_sel: usize,
     /// Cached Bitwarden observation. `heavy_known` distinguishes an unobserved
@@ -2260,6 +2310,9 @@ impl App {
             identify_result: None,
             repair: Vec::new(),
             repair_sel: 0,
+            repair_expanded: false,
+            repair_reveal: std::cell::Cell::new(false),
+            repair_click: None,
             cam_sel: 0,
             heavy: None,
             heavy_known: false,
@@ -2802,7 +2855,7 @@ impl App {
                 R::Running => (Sev::Ok, "running, socket reachable".into(), Fix::None),
                 R::Starting => (
                     Sev::Warn,
-                    "starting (loading models); re-run checks with [r] in a few seconds".into(),
+                    "starting (loading models); re-check in a few seconds".into(),
                     Fix::None,
                 ),
                 R::AccessDenied => (
@@ -3117,7 +3170,7 @@ impl App {
                 } else if wired {
                     "module not loaded: greeter can't reach the daemon".into()
                 } else {
-                    "loads automatically when you connect Login & Apps ([w])".into()
+                    "loads automatically when you connect Login & Apps".into()
                 },
                 if labeled {
                     Fix::None
@@ -3132,7 +3185,7 @@ impl App {
             // File present but unreadable; never silently read as "not enrolled".
             v.push(mk("Enrollment", Sev::Fail,
                 format!("enrollment unreadable: {err}"),
-                Fix::Manual("restore the backup, or re-enroll (Profiles → [e]); if encrypted, the template key may be missing".into())));
+                Fix::Manual("restore the backup, or re-enroll on the Faces page; if encrypted, the template key may be missing".into())));
         } else if self.profiles_load.is_some() && self.profiles.is_empty() {
             // The list is still loading in the background (a slow TPM makes
             // this take seconds): "no face enrolled" would be a claim about
@@ -3321,7 +3374,7 @@ impl App {
                     "method is face-only but a fingerprint reader is also wired; both will unlock"
                         .into(),
                     Fix::Manual(
-                        "[e] in Fingerprint (face OR fingerprint), or [d] to disable".into(),
+                        "on the Fingerprint page, choose face OR fingerprint, or remove fingerprint from login".into(),
                     ),
                 ));
             }
@@ -3438,7 +3491,7 @@ impl App {
             v.push(mk(
                 "Keyring seal",
                 Sev::Warn,
-                format!("PCRs drifted since sealing at last explicit check{age}; [r] rechecks before repair"),
+                format!("PCRs drifted since sealing at last explicit check{age}; re-check before repairing"),
                 Fix::Goto(GotoFix::KeyringReseal),
             ));
         }
@@ -3553,7 +3606,7 @@ impl App {
                 } else if self.repair[idx].sev == Sev::Unknown {
                     "this check has not completed; wait or re-check"
                 } else {
-                    "no automatic repair; review the selected diagnosis and Full Diagnostics"
+                    "no automatic repair; review the selected check's details and Full Diagnostics"
                 },
             ),
             Fix::Action(action) => self.prepare_action(actions::Invocation {
@@ -3565,19 +3618,7 @@ impl App {
             // (with all of its gating), so the fix is the same flow the user
             // would have driven by hand — one key earlier.
             Fix::Goto(g) => {
-                let (screen, key, what) = match g {
-                    GotoFix::Enroll => (SC_PROFILES, KeyCode::Char('e'), "enroll a face"),
-                    GotoFix::RecoveryRestore => {
-                        (SC_RECOVERY, KeyCode::Char('t'), "restore the template key")
-                    }
-                    GotoFix::KeyringReseal => (SC_KEYRING, KeyCode::Char('b'), "reseal the wallet"),
-                    GotoFix::RecoveryPass => (
-                        SC_RECOVERY,
-                        KeyCode::Char('s'),
-                        "set the recovery passphrase",
-                    ),
-                    GotoFix::KeyringArm => (SC_KEYRING, KeyCode::Char('a'), "arm the keyring seal"),
-                };
+                let (screen, key, what) = g.route();
                 self.log('→', format!("opening {what}…"));
                 self.enter_screen(screen);
                 self.on_key(key);
@@ -4849,6 +4890,8 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode) {
+        // A key between two clicks ends a double click.
+        self.repair_click = None;
         // A long dialog owns its reading keys. They never dismiss/approve the
         // dialog or scroll the Activity behind it. Text-entry keeps its keys.
         if self.input.is_none() && self.dialog_open() {
@@ -5158,6 +5201,13 @@ impl App {
             KeyCode::Esc if self.screen == SC_CAMERAS && self.cam_details => {
                 self.cam_details = false;
             }
+            // An open Diagnostics check is "something open" too.
+            KeyCode::Esc
+                if self.screen == SC_REPAIR && self.repair_expanded && !self.repair.is_empty() =>
+            {
+                self.repair_expanded = false;
+                self.repair_reveal.set(true);
+            }
             KeyCode::Esc => self.go_home(),
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::F(2) => self.more_actions = Some((String::new(), 0)),
@@ -5331,6 +5381,9 @@ impl App {
         if self.screen == SC_WELCOME {
             self.refresh_attempts();
         }
+        if self.screen == SC_REPAIR {
+            self.repair_reveal.set(true);
+        }
     }
 
     /// Serves pending handoff connections from the single-instance guard's
@@ -5397,7 +5450,8 @@ impl App {
     /// are left alone (the Faces selection is not theirs to move).
     fn move_sel(&mut self, d: i32) {
         if self.screen == SC_REPAIR {
-            self.page_view.set((usize::MAX, Rect::default(), 0, 0));
+            // Bring the newly selected check, and what it has open, into view.
+            self.repair_reveal.set(true);
         }
         let len = match self.screen {
             SC_REPAIR => self.repair.len(),
@@ -5448,7 +5502,8 @@ impl App {
     /// not theirs to move.
     fn move_sel_to_end(&mut self, last: bool) {
         if self.screen == SC_REPAIR {
-            self.page_view.set((usize::MAX, Rect::default(), 0, 0));
+            // Bring the newly selected check, and what it has open, into view.
+            self.repair_reveal.set(true);
         }
         let len = match self.screen {
             SC_REPAIR => self.repair.len(),
@@ -5632,10 +5687,17 @@ impl App {
                 self.refresh_keyring_diagnostic();
             }
             (SC_REPAIR, KeyCode::Char('f')) => self.apply_fix(self.repair_sel),
-            // Enter on a check row opens nothing further today (the box
-            // below already shows the selected row); it never runs the fix
-            // (ADR-0030 §1.1). The fix is [f].
-            (SC_REPAIR, KeyCode::Enter) => {}
+            // Enter opens or closes the selected check in place (ADR-0030
+            // §1.1, §1.7): its full diagnosis and its fix's action row. It
+            // never runs the fix; that is `f`, with its confirmation.
+            (SC_REPAIR, KeyCode::Enter) => {
+                if self.repair.get(self.repair_sel).is_some() {
+                    self.repair_expanded = !self.repair_expanded;
+                    self.repair_reveal.set(true);
+                } else {
+                    self.log('·', "no check is selected to show");
+                }
+            }
             // View the face-auth journal to see WHY a check failed. `logs debug
             // on` (a console step) adds per-stage tracing when a number is needed.
             // Key is 'g'; 'v' is the global basic/all-tabs toggle (on_key).
@@ -5996,6 +6058,7 @@ impl App {
         self.recompute_visible(); // daemon down ⇒ Repair earns its tab back
         self.screen = SC_REPAIR;
         self.repair_sel = 0; // the Daemon row is always first
+        self.repair_reveal.set(true);
         self.resume_enroll = Some(resume);
         self.suspend = Some(Suspend::RestartDaemon);
         false
@@ -7006,29 +7069,26 @@ impl App {
             self.page_view.set((screen, bounds, next, max));
             return;
         }
+        // Diagnostics' rows are inside its page view, so the wheel reads
+        // that page rather than moving its selection.
         let (selected, len) = match self.screen {
             SC_PROFILES => {
                 let len = self.rows().len();
                 (&mut self.sel, len)
             }
             SC_CAMERAS => (&mut self.cam_sel, self.pairs.len()),
-            SC_REPAIR => (&mut self.repair_sel, self.repair.len()),
             SC_WELCOME => {
                 let len = self.hub_rows().len();
                 (&mut self.hub_sel, len)
             }
             _ => return,
         };
-        let previous = *selected;
         *selected = if direction < 0 {
             selected.saturating_sub(1)
         } else {
             selected.saturating_add(1)
         }
         .min(len.saturating_sub(1));
-        if self.screen == SC_REPAIR && *selected != previous {
-            self.page_view.set((usize::MAX, Rect::default(), 0, 0));
-        }
     }
 
     /// Map a mouse click (or touchscreen tap, delivered as the same left-click)
@@ -7036,6 +7096,7 @@ impl App {
     /// first-run button replays its key. Clicks while a modal/flow owns the
     /// screen are ignored.
     fn on_click(&mut self, col: u16, row: u16, area: Rect) {
+        let last_click = self.repair_click.take();
         if self.activity_history_open && !self.dialog_open() {
             let key = self
                 .click_targets
@@ -7136,14 +7197,29 @@ impl App {
         {
             return;
         }
+        // Selecting a Diagnostics check moves the open check, so the second
+        // click of a double click can land on another row or on a fix's
+        // action row. It stays on the check the first click selected: a
+        // second click is Enter, never a fix (ADR-0030 §1.1).
+        let repeat = last_click
+            .filter(|&(x, y, at, _)| {
+                self.screen == SC_REPAIR
+                    && (x, y) == (col, row)
+                    && self.now().saturating_duration_since(at)
+                        <= Duration::from_millis(DOUBLE_CLICK_MS)
+            })
+            .map(|(_, _, _, i)| Click::Select(i));
         // Content regions registered during render (footer chips, first-run
         // button). Copy out before acting so the RefCell borrow is released.
-        let hit = self
-            .click_targets
-            .borrow()
-            .iter()
-            .find(|(r, _)| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height)
-            .map(|(_, c)| *c);
+        let hit = repeat.or_else(|| {
+            self.click_targets
+                .borrow()
+                .iter()
+                .find(|(r, _)| {
+                    col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+                })
+                .map(|(_, c)| *c)
+        });
         if let Some(c) = hit {
             // A pointer-selected row or action owns the click. In particular,
             // an existing row's Enter must not activate a different F6 action.
@@ -7161,12 +7237,18 @@ impl App {
                     }
                 }
                 Click::Select(i) => match self.screen {
-                    // Click a Diagnostics row to select it; the fix stays
-                    // behind [f] and its confirmation (ADR-0030 §1.1: a
-                    // second click, like Enter, never runs a side effect).
+                    // A second click on the selected check is Enter: it
+                    // opens or closes the check in place, never its fix
+                    // (ADR-0030 §1.1; the fix stays behind `f` and its
+                    // confirmation).
                     SC_REPAIR if i < self.repair.len() => {
-                        self.repair_sel = i;
-                        self.page_view.set((usize::MAX, Rect::default(), 0, 0));
+                        if self.repair_sel == i {
+                            self.on_key(KeyCode::Enter);
+                        } else {
+                            self.repair_sel = i;
+                            self.repair_reveal.set(true);
+                        }
+                        self.repair_click = Some((col, row, self.now(), i));
                     }
                     SC_CAMERAS if i < self.pairs.len() => {
                         if self.cam_sel == i {
@@ -7827,6 +7909,27 @@ impl App {
         lines: Vec<Line<'_>>,
         actions: &[(usize, KeyCode)],
     ) {
+        let targets: Vec<(usize, Click)> = actions
+            .iter()
+            .map(|&(row, key)| (row, Click::Key(key)))
+            .collect();
+        self.draw_page_paragraph(f, area, lines, &targets, None);
+    }
+
+    /// A page's lines in one wrapped, scrolling paragraph: the page view
+    /// the wheel and PgUp/PgDn read. `targets` says what a click on a line
+    /// does: an action row's key, or selecting the list row the line
+    /// draws; other lines never act. `reveal` is a line range (a selected
+    /// row and what it has open) to bring into view on this frame with the
+    /// least movement; a range taller than the page shows its start.
+    fn draw_page_paragraph(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        lines: Vec<Line<'_>>,
+        targets: &[(usize, Click)],
+        reveal: Option<std::ops::Range<usize>>,
+    ) {
         let heights: Vec<u16> = lines
             .iter()
             .map(|line| {
@@ -7844,12 +7947,27 @@ impl App {
         } else {
             0
         };
+        let row_of = |line: usize| {
+            heights
+                .iter()
+                .take(line)
+                .fold(0u16, |sum, height| sum.saturating_add(*height))
+        };
+        if let Some(range) = reveal {
+            let (start, end) = (row_of(range.start), row_of(range.end));
+            if start < scroll || end.saturating_sub(start) > area.height {
+                scroll = start;
+            } else if end > scroll.saturating_add(area.height) {
+                scroll = end.saturating_sub(area.height);
+            }
+            scroll = scroll.min(max);
+        }
         let focused_key = self
             .focused_action()
             .and_then(|(key, _)| footer_keycode(key));
-        let focused_row = actions
-            .iter()
-            .find_map(|(row, key)| (Some(*key) == focused_key).then_some(*row));
+        let focused_row = targets.iter().find_map(|(row, target)| {
+            matches!(target, Click::Key(key) if Some(*key) == focused_key).then_some(*row)
+        });
         if self.action_reveal.replace(false) {
             if let Some(row) = focused_row {
                 let start = heights
@@ -7892,8 +8010,8 @@ impl App {
                     .scroll((skipped, 0)),
                     rect,
                 );
-                if let Some((_, key)) = actions.iter().find(|(row, _)| *row == index) {
-                    self.hit(rect, Click::Key(*key));
+                if let Some((_, target)) = targets.iter().find(|(row, _)| *row == index) {
+                    self.hit(rect, *target);
                 }
             }
             offset = end;
@@ -8057,26 +8175,119 @@ impl App {
         self.draw_action_paragraph(f, area, lines, &page_actions);
     }
 
-    /// The details column (ADR-0030 §1.8) appears when the content area
-    /// holds both a list that still shows its status column and a readable
-    /// details column: about 135 terminal columns with the sidebar open.
+    /// Width of the right-hand details column on list pages (ADR-0030 §1.8).
+    const DETAILS_COLUMN_WIDTH: u16 = 42;
+    /// Cameras rows keep their status column beside the details column
+    /// from here: 142 terminal columns with the sidebar (22) and the
+    /// content frame (6).
     const CAMERA_LIST_MIN_WIDTH: u16 = 72;
-    const CAMERA_DETAILS_WIDTH: u16 = 42;
+    /// Diagnostics rows beside the details column: a 120-column terminal
+    /// leaves the content 92 columns with the sidebar open, 50 for the
+    /// rows and 42 for the column, the width ADR-0030 §1.8 names.
+    const DIAGNOSTICS_LIST_MIN_WIDTH: u16 = 50;
+
+    /// Split a list page's content into the list and, when `area` holds
+    /// both `list_min` columns for the rows and the details column, a
+    /// right-hand details column (ADR-0030 §1.8). Each page passes what its
+    /// rows need, so the column appears only where the rows keep what they
+    /// must show.
+    fn details_split(area: Rect, list_min: u16) -> (Rect, Option<Rect>) {
+        if area.width < list_min.saturating_add(Self::DETAILS_COLUMN_WIDTH) {
+            return (area, None);
+        }
+        let [list, details] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(Self::DETAILS_COLUMN_WIDTH),
+        ])
+        .areas(area);
+        (list, Some(details))
+    }
+
+    /// Draw a list page's details column (ADR-0030 §1.8): the selected
+    /// row's `lines`, wrapped behind a rule on the left, with the action
+    /// rows `actions` names clickable and the F6-focused one highlighted as
+    /// on the page. The column does not scroll: content taller than the
+    /// column ends in an ellipsis row (§1.7), and what Enter opens on the
+    /// page is the readable copy. Returns whether every action row, and
+    /// every row `required` names (a remedy with no key of its own), was
+    /// drawn whole, so the page can keep its own copy of one the column cut.
+    fn draw_details_column(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        lines: Vec<Line<'_>>,
+        actions: &[(usize, KeyCode)],
+        required: &[usize],
+    ) -> bool {
+        let block = Block::new().borders(ratatui::widgets::Borders::LEFT);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let heights: Vec<u16> = lines
+            .iter()
+            .map(|line| {
+                Paragraph::new(line.clone())
+                    .wrap(Wrap { trim: false })
+                    .line_count(inner.width)
+                    .min(u16::MAX as usize) as u16
+            })
+            .collect();
+        let total = heights.iter().fold(0u16, |sum, h| sum.saturating_add(*h));
+        let room = if total <= inner.height || inner.height == 0 {
+            inner.height
+        } else {
+            // The last row says there is more; Enter opens it on the page.
+            let room = inner.height.saturating_sub(1);
+            f.render_widget(
+                Paragraph::new(Span::styled("  …", Style::new().dim())),
+                Rect::new(inner.x, inner.y.saturating_add(room), inner.width, 1),
+            );
+            room
+        };
+        let focused_key = self
+            .focused_action()
+            .and_then(|(key, _)| footer_keycode(key));
+        let mut whole = 0;
+        let mut required_whole = 0;
+        let mut used = 0u16;
+        for (index, (line, height)) in lines.into_iter().zip(heights).enumerate() {
+            if used >= room {
+                break;
+            }
+            let rect = Rect::new(
+                inner.x,
+                inner.y.saturating_add(used),
+                inner.width,
+                height.min(room - used),
+            );
+            let key = actions
+                .iter()
+                .find(|(row, _)| *row == index)
+                .map(|(_, key)| *key);
+            let line = if key.is_some() && key == focused_key {
+                line.style(selected_style())
+            } else {
+                line
+            };
+            f.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), rect);
+            // Only a whole action row acts: a cut one would click a fix
+            // whose words the column does not show.
+            if let Some(key) = key.filter(|_| rect.height == height) {
+                self.hit(rect, Click::Key(key));
+                whole += 1;
+            }
+            if required.contains(&index) && rect.height == height {
+                required_whole += 1;
+            }
+            used = used.saturating_add(rect.height);
+        }
+        whole == actions.len() && required_whole == required.len()
+    }
 
     fn draw_cameras(&self, f: &mut Frame, area: Rect) {
         // Wide terminals get the selected camera's details in a right-hand
         // column, always; narrower ones keep the Enter panel below the list.
-        let wide = area.width >= Self::CAMERA_LIST_MIN_WIDTH + Self::CAMERA_DETAILS_WIDTH;
-        let (area, details_area) = if wide {
-            let [left, right] = Layout::horizontal([
-                Constraint::Fill(1),
-                Constraint::Length(Self::CAMERA_DETAILS_WIDTH),
-            ])
-            .areas(area);
-            (left, Some(right))
-        } else {
-            (area, None)
-        };
+        let (area, details_area) = Self::details_split(area, Self::CAMERA_LIST_MIN_WIDTH);
+        let wide = details_area.is_some();
         let mut page_actions = Vec::new();
         // The active pair comes from the daemon's Health, NOT from
         // select_pair(): that helper falls through to discovery when no
@@ -8378,12 +8589,7 @@ impl App {
                     Style::new().dim(),
                 ))],
             };
-            f.render_widget(
-                Paragraph::new(lines)
-                    .wrap(Wrap { trim: false })
-                    .block(Block::new().borders(ratatui::widgets::Borders::LEFT)),
-                details_area,
-            );
+            self.draw_details_column(f, details_area, lines, &[], &[]);
         }
         // Enter opens the full panel below the list in either layout: on a
         // wide terminal it is the readable, scrollable copy of the column
@@ -9160,89 +9366,112 @@ impl App {
         f.render_widget(Paragraph::new(lines), area);
     }
 
-    /// Diagnostic + repair: a live checklist (✓/⚠/✗) of everything irlume needs
-    /// to run, with one-key fixes, plus platform trust anchors and a live IR PAD
-    /// self-test. Covers the `irlume doctor`/`diag`/`deps` checks that have a
-    /// remediation or that a TUI-only user would otherwise miss (daemon, models,
-    /// cameras, SELinux/AppArmor, wiring drift, keyring drift, login-keyring
-    /// locked, recovery, TPM). The full text
-    /// readout (incl. info-only lines) is one key away via the `[d]` key. Some
-    /// advisory-only doctor lines (fingerprint
-    /// vendor-stack, polkit sandbox, install hygiene) stay in `doctor`.
+    /// Diagnostics (ADR-0030 §2): the counts, one row per check (●/⚠/✕/◐)
+    /// of everything irlume needs to run, then the platform trust anchors
+    /// and the page's actions, in one scrolling page. The selected check
+    /// opens in place on Enter (its full diagnosis, then its fix as an
+    /// action row); at 120 columns or wider the same details also stand in
+    /// a right-hand column (§1.8). Covers the `irlume doctor`/`diag`/`deps`
+    /// checks that have a remediation or that a TUI-only user would
+    /// otherwise miss (daemon, models, cameras, SELinux/AppArmor, wiring
+    /// drift, keyring drift, login-keyring locked, recovery, TPM). Some
+    /// advisory-only doctor lines (fingerprint vendor-stack, polkit sandbox,
+    /// install hygiene) stay in `doctor`, which the page's actions open.
     fn draw_repair(&self, f: &mut Frame, area: Rect) {
-        let mut page_actions = Vec::new();
-        let [list_area, info_area] = Layout::vertical([
-            Constraint::Min(4),
-            Constraint::Length((area.height.saturating_mul(3) / 5).clamp(8, 26)),
-        ])
-        .areas(area);
-
-        // ---- checklist --------------------------------------------------
+        let (area, details_area) = Self::details_split(area, Self::DIAGNOSTICS_LIST_MIN_WIDTH);
+        let width = usize::from(area.width);
+        let reveal_selected = self.repair_reveal.replace(false);
+        let selected = self.repair_sel.min(self.repair.len().saturating_sub(1));
+        let check = self.repair.get(selected);
         let ok = self.repair.iter().filter(|c| c.sev == Sev::Ok).count();
         let fail = self.repair.iter().filter(|c| c.sev == Sev::Fail).count();
         let warn = self.repair.iter().filter(|c| c.sev == Sev::Warn).count();
         let unknown = self.repair.iter().filter(|c| c.sev == Sev::Unknown).count();
-        let items: Vec<ListItem> = self
-            .repair
-            .iter()
-            .map(|c| {
-                let (icon, color) = match c.sev {
-                    Sev::Ok => ("●", th().ok),
-                    Sev::Warn => ("⚠", th().warn),
-                    Sev::Fail => ("✕", th().err),
-                    Sev::Unknown => ("◐", th().warn),
-                };
-                let tag = match &c.fix {
-                    Fix::None => "",
-                    Fix::Manual(_) => " · manual",
-                    Fix::Root(_) => " · [f] fix (sudo)",
-                    Fix::Goto(_) => " · [f] fix",
-                    Fix::Action(_) => " · [f] review action",
-                };
-                // The detail is clipped to what the row can show, with an
-                // ellipsis (ADR-0030 §1.7); the full text is in the box
-                // below for the selected row.
-                let fixed = 3 + 19 + 3 + tag.chars().count();
-                let room = (list_area.width as usize).saturating_sub(fixed);
-                let detail = clip_columns(&c.detail, room);
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!(" {icon} "),
-                        Style::new().fg(color).add_modifier(Modifier::BOLD),
+
+        // ---- details column ---------------------------------------------
+        // Drawn first, so the page knows whether the column holds the fix.
+        // An open check carries its fix under its row instead, so the fix's
+        // action row is drawn once.
+        let column_holds_fix = match details_area {
+            Some(column) => {
+                let (lines, actions, manual) = match check {
+                    Some(c) => {
+                        let (details, actions, manual) =
+                            repair_details(c, fail, !self.repair_expanded);
+                        let mut lines = vec![section(&c.label)];
+                        lines.extend(details);
+                        let actions: Vec<(usize, KeyCode)> = actions
+                            .into_iter()
+                            .map(|(row, key)| (row + 1, key))
+                            .collect();
+                        (lines, actions, manual.map(|row| row + 1))
+                    }
+                    None => (
+                        vec![Line::from(Span::styled(
+                            "  no check selected",
+                            Style::new().dim(),
+                        ))],
+                        Vec::new(),
+                        None,
                     ),
-                    Span::styled(
-                        format!("{:<19} · ", c.label),
-                        Style::new().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(detail, Style::new().dim()),
-                    Span::styled(tag.to_string(), Style::new().fg(th().accent)),
-                ]))
-            })
-            .collect();
-        let mut st = ListState::default().with_selected(Some(
-            self.repair_sel.min(self.repair.len().saturating_sub(1)),
-        ));
-        f.render_stateful_widget(
-            List::new(items).highlight_style(selected_style()),
-            list_area,
-            &mut st,
-        );
-        for (row, i) in (st.offset()..self.repair.len())
-            .take(list_area.height as usize)
-            .enumerate()
-        {
-            self.hit(
-                Rect::new(
-                    list_area.x,
-                    list_area.y.saturating_add(row as u16),
-                    list_area.width,
-                    1,
-                ),
-                Click::Select(i),
-            );
+                };
+                // A manual instruction the column cuts is shown nowhere, so
+                // the page keeps `f`, which echoes it to Activity.
+                self.draw_details_column(f, column, lines, &actions, manual.as_slice())
+            }
+            None => false,
+        };
+
+        // ---- counts and checklist ---------------------------------------
+        let mut lines = vec![Line::from(vec![
+            Span::styled(format!("  {ok} ok"), Style::new().fg(th().ok)),
+            Span::styled(format!("   {warn} warn"), Style::new().fg(th().warn)),
+            Span::styled(format!("   {fail} fail"), Style::new().fg(th().err)),
+            Span::styled(format!("   {unknown} unknown"), Style::new().fg(th().warn)),
+        ])];
+        // The line under the counts is always there, and the refresh note
+        // fits one row beside the details column: the periodic refresh
+        // never moves the rows under the pointer.
+        lines.push(if !self.probes_landed {
+            Line::raw("  System checks pending; setup state is not fully established.")
+        } else if self.probes_load.is_some() {
+            Line::raw("  Refreshing; showing the last completed checks.")
+        } else {
+            Line::raw("")
+        });
+        let mut targets = Vec::new();
+        let mut reveal = None;
+        if self.repair.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No checks have run yet.",
+                Style::new().dim(),
+            )));
+        }
+        for (i, c) in self.repair.iter().enumerate() {
+            let start = lines.len();
+            let open = i == selected && self.repair_expanded;
+            targets.push((start, Click::Select(i)));
+            lines.push(repair_row(c, width, open, i == selected));
+            if open {
+                // The diagnosis under the row is explanatory text and never
+                // acts; only the fix's action row does.
+                let offset = lines.len();
+                let (details, actions, _) = repair_details(c, fail, true);
+                lines.extend(details);
+                targets.extend(
+                    actions
+                        .into_iter()
+                        .map(|(row, key)| (offset + row, Click::Key(key))),
+                );
+            }
+            if i == selected && reveal_selected {
+                // The first check also brings the counts into view.
+                let first = if i == 0 { 0 } else { start };
+                reveal = Some(first..lines.len());
+            }
         }
 
-        // ---- info / platform / live test --------------------------------
+        // ---- platform ---------------------------------------------------
         let (sb_present, sb_enabled, sb_setup) = self.probes.secureboot;
         let sb = if !self.probes_landed {
             ("unknown", th().warn)
@@ -9255,49 +9484,6 @@ impl App {
         } else {
             ("n/a", th().warn)
         };
-        let mut lines = vec![Line::from(vec![
-            Span::styled(format!("  {ok} ok"), Style::new().fg(th().ok)),
-            Span::styled(format!("   {warn} warn"), Style::new().fg(th().warn)),
-            Span::styled(format!("   {fail} fail"), Style::new().fg(th().err)),
-            Span::styled(format!("   {unknown} unknown"), Style::new().fg(th().warn)),
-        ])];
-        lines.push(Line::raw(""));
-        if !self.probes_landed {
-            lines.push(Line::raw(
-                "  System checks pending; setup state is not fully established.",
-            ));
-        } else if self.probes_load.is_some() {
-            lines.push(Line::raw(
-                "  Refreshing; showing the last completed system checks.",
-            ));
-        }
-        if let Some(c) = self.repair.get(self.repair_sel) {
-            lines.push(section(&c.label));
-            lines.push(Line::raw(format!("  {}", c.detail)));
-            let hint = match &c.fix {
-                Fix::None if c.sev == Sev::Unknown => {
-                    "This check has not completed; wait or re-check.".to_string()
-                }
-                Fix::None if c.sev != Sev::Ok => {
-                    "No automatic repair for this row; use its explanation and Full Diagnostics."
-                        .to_string()
-                }
-                Fix::None if fail > 0 => {
-                    "this row is fine; ↑↓ select a failing row for its fix".to_string()
-                }
-                Fix::None => "no action needed".to_string(),
-                Fix::Manual(cmd) => format!("manual: {cmd}"),
-                Fix::Root(_) => "press [f]: irlume runs the fix with sudo".to_string(),
-                Fix::Goto(_) => "press [f]: opens the fixing flow here in the TUI".to_string(),
-                Fix::Action(_) => "press [f]: review and run the guided action here".to_string(),
-            };
-            lines.push(Line::from(vec![
-                Span::styled("  → ", Style::new().fg(th().accent)),
-                Span::styled(hint, Style::new()),
-            ]));
-        }
-        // Breathing room between the selected-row hint block and the platform
-        // facts (readability pass: the box read as one clumped paragraph).
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
             Span::styled("  platform  ", Style::new().dim()),
@@ -9341,12 +9527,15 @@ impl App {
             ),
         ]));
         lines.push(Line::raw(""));
+
+        // ---- actions ----------------------------------------------------
+        let mut page_actions = Vec::new();
         push_page_action(
             &mut lines,
             &mut page_actions,
             "l",
             "IR test",
-            "press [l] to run the IR PAD self-test (sudo; look at the camera)",
+            "runs the IR PAD self-test with sudo; look at the camera",
         );
         push_page_action(
             &mut lines,
@@ -9355,23 +9544,25 @@ impl App {
             "Create Support Report",
             "read-only; captures no camera data",
         );
+        // The selected check's details carry its fix row, or say what to
+        // do when nothing runs, wherever they show: under the open row, or
+        // in a details column that drew the fix row, or the manual
+        // instruction, whole.
+        let fix_shown = check.is_some() && (self.repair_expanded || column_holds_fix);
+        if !fix_shown {
+            push_page_action(&mut lines, &mut page_actions, "f", "fix selected", "");
+        }
         push_page_actions(
             &mut lines,
             &mut page_actions,
-            &[
-                ("f", "fix selected"),
-                ("r", "re-check"),
-                ("d", "doctor"),
-                ("w", "watch logs"),
-            ],
+            &[("r", "re-check"), ("d", "doctor"), ("w", "watch logs")],
         );
-        let blk = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().dim())
-            .title(" diagnosis ");
-        let inner = blk.inner(info_area);
-        f.render_widget(blk, info_area);
-        self.draw_action_paragraph(f, inner, lines, &page_actions);
+        targets.extend(
+            page_actions
+                .into_iter()
+                .map(|(row, key)| (row, Click::Key(key))),
+        );
+        self.draw_page_paragraph(f, area, lines, &targets, reveal);
     }
 
     fn draw_pam(&self, f: &mut Frame, area: Rect) {
@@ -9939,6 +10130,7 @@ impl App {
                 ("l", "Test Infrared Camera"),
                 ("w", "Show Logs"),
                 ("t", "Toggle Debug Logs"),
+                ("enter", "Show or Hide Details"),
             ],
             SC_CAMERAS => &[
                 ("enter", "Camera Details"),
@@ -10453,6 +10645,111 @@ fn camera_row_name(pair: &irlume_common::CameraPairInfo) -> String {
                 pair.ir.trim_start_matches("/dev/")
             )
         })
+}
+
+/// One Diagnostics row (ADR-0030 §2): status glyph, name, the diagnosis
+/// cut to the row with an ellipsis (§1.7) and, in words, whether a fix
+/// exists; the fix's key is on its action row and in the bottom bar
+/// (§1.4). An open row leaves its diagnosis to the lines under it. The
+/// selected row is padded to `width` so its highlight spans the row.
+fn repair_row(check: &Check, width: usize, open: bool, selected: bool) -> Line<'static> {
+    let (icon, color) = match check.sev {
+        Sev::Ok => ("●", th().ok),
+        Sev::Warn => ("⚠", th().warn),
+        Sev::Fail => ("✕", th().err),
+        Sev::Unknown => ("◐", th().warn),
+    };
+    let tag = match &check.fix {
+        Fix::None => "",
+        Fix::Manual(_) => " · manual",
+        Fix::Root(_) => " · fix (sudo)",
+        Fix::Goto(_) => " · fix",
+        Fix::Action(_) => " · guided action",
+    };
+    let label = if open {
+        format!("{:<19}", check.label)
+    } else {
+        format!("{:<19} · ", check.label)
+    };
+    let mut spans = vec![
+        Span::styled(
+            format!(" {icon} "),
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(label, Style::new().add_modifier(Modifier::BOLD)),
+    ];
+    if !open {
+        // Measured, not assumed: a name longer than 19 cells never pushes
+        // the tag off the row.
+        let used = spans.iter().map(Span::width).sum::<usize>() + Span::raw(tag).width();
+        spans.push(Span::styled(
+            clip_columns(&check.detail, width.saturating_sub(used)),
+            Style::new().dim(),
+        ));
+    }
+    spans.push(Span::styled(tag, Style::new().fg(th().accent)));
+    let mut line = clip_line(Line::from(spans), width);
+    if selected {
+        let pad = width.saturating_sub(line.width());
+        line.spans.push(Span::raw(" ".repeat(pad)));
+        line = line.style(selected_style());
+    }
+    line
+}
+
+/// What a Diagnostics row opens to, in place and in the details column
+/// (ADR-0030 §1.7, §1.8): the full diagnosis, then the fix as an action
+/// row (with `with_actions`) or, when nothing runs, what to do instead.
+/// Returns the lines, the action rows among them and the row of a manual
+/// fix's instruction, the remedy a details column must show whole.
+fn repair_details(
+    check: &Check,
+    fail: usize,
+    with_actions: bool,
+) -> (Vec<Line<'static>>, Vec<(usize, KeyCode)>, Option<usize>) {
+    let mut lines = vec![Line::raw(format!("  {}", check.detail))];
+    let mut actions = Vec::new();
+    let manual = matches!(check.fix, Fix::Manual(_)).then_some(lines.len());
+    let note = |text: &str| Line::from(Span::styled(format!("  {text}"), Style::new().dim()));
+    match &check.fix {
+        Fix::None => lines.push(note(match check.sev {
+            Sev::Unknown => "This check has not completed; wait or re-check.",
+            Sev::Ok if fail > 0 => {
+                "No action needed for this check; the failed checks are marked ✕."
+            }
+            Sev::Ok => "No action needed.",
+            Sev::Warn | Sev::Fail => {
+                "No automatic repair for this check; use its explanation and Full Diagnostics."
+            }
+        })),
+        Fix::Manual(cmd) => lines.push(Line::from(vec![
+            Span::styled("  manual: ", Style::new().dim()),
+            Span::raw(cmd.clone()),
+        ])),
+        _ if !with_actions => {}
+        Fix::Root(root) => push_page_action(
+            &mut lines,
+            &mut actions,
+            "f",
+            root.label(),
+            "asks first; may ask for your password",
+        ),
+        Fix::Goto(goto) => push_page_action(
+            &mut lines,
+            &mut actions,
+            "f",
+            goto.route().2,
+            "opens the guided flow here",
+        ),
+        Fix::Action(action) => push_page_action(
+            &mut lines,
+            &mut actions,
+            "f",
+            action.label,
+            "shows the command and asks first",
+        ),
+    }
+    (lines, actions, manual)
 }
 
 /// A name clipped to a column slot with an ellipsis, so a long USB name
@@ -12702,6 +12999,9 @@ mod tests {
             identify_result: None,
             repair: Vec::new(),
             repair_sel: 0,
+            repair_expanded: false,
+            repair_reveal: std::cell::Cell::new(false),
+            repair_click: None,
             cam_sel: 0,
             heavy: None,
             heavy_known: true,
@@ -13190,9 +13490,13 @@ mod tests {
             .collect();
         app.repair_sel = 29;
         let text = draw_text(&app);
+        // The details column (x 75 on) repeats the selected check's name.
         let y = text
             .lines()
-            .position(|line| line.contains("check-29"))
+            .position(|line| {
+                line.find("check-29")
+                    .is_some_and(|at| line[..at].chars().count() < 75)
+            })
             .unwrap();
         assert!(
             app.click_targets
@@ -16755,7 +17059,8 @@ mod tests {
     fn diagnostics_offers_only_the_read_only_support_report() {
         let mut app = test_app();
         app.screen = SC_REPAIR;
-        let text = draw_text(&app);
+        // The 50-column list beside the details column wraps the row.
+        let text = joined(&diagnostics_panes(&app, 120, 50).0);
         assert!(text.contains("Create Support Report"));
         assert!(text.contains("read-only; captures no camera data"));
 
@@ -17660,6 +17965,57 @@ mod tests {
             })
             .collect();
         rows.into_iter().skip_while(|row| row.is_empty()).collect()
+    }
+
+    /// The Diagnostics list pane and details column at `width`x`height`:
+    /// the page's own split of the content frame (`draw_content`).
+    fn diagnostics_rects(app: &App, width: u16, height: u16) -> (Rect, Option<Rect>) {
+        let content = app
+            .body_split(app.frame_rows(Rect::new(0, 0, width, height))[2])
+            .1;
+        let inner = Block::bordered()
+            .padding(ratatui::widgets::Padding::new(2, 2, 1, 0))
+            .inner(content);
+        App::details_split(inner, App::DIAGNOSTICS_LIST_MIN_WIDTH)
+    }
+
+    /// The Diagnostics page as drawn at `width`x`height`: the list pane's
+    /// rows and the details column's rows (empty when there is none), read
+    /// from the buffer through the page's own split.
+    fn diagnostics_panes(app: &App, width: u16, height: u16) -> (Vec<String>, Vec<String>) {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let (list, details) = diagnostics_rects(app, width, height);
+        let buffer = term.backend().buffer();
+        let rows = |rect: Rect| -> Vec<String> {
+            (rect.y..rect.bottom())
+                .map(|y| {
+                    (rect.x..rect.right())
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect()
+        };
+        // The column's text starts past its rule.
+        let details = details.map_or_else(Vec::new, |column| {
+            rows(Rect::new(
+                column.x + 1,
+                column.y,
+                column.width - 1,
+                column.height,
+            ))
+        });
+        (rows(list), details)
+    }
+
+    /// Rows joined and whitespace collapsed, for phrases that wrap.
+    fn joined(rows: &[String]) -> String {
+        rows.iter()
+            .flat_map(|row| row.split_whitespace())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn assert_no_matcher_vocabulary(rows: &[String]) {
@@ -19167,24 +19523,717 @@ mod tests {
         assert!(text.contains("1 warn"));
         assert!(text.contains("1 fail"));
         assert!(text.contains("Daemon (irlumed)"));
+        assert!(text.contains("· fix (sudo)"), "root fixes are tagged");
         assert!(
-            text.contains("· [f] fix (sudo)"),
-            "root fixes advertise [f]"
+            !text.contains("[f] fix (sudo)"),
+            "a row tag names no key (ADR-0030 §1.4)"
         );
         assert!(text.contains("· manual"), "manual fixes are tagged");
+        assert!(!text.contains("press ["), "hints name no keys: {text}");
+        // What each row opens to (ADR-0030 §1.7).
+        app.repair_expanded = true;
+        let opened = |app: &App| joined(&diagnostics_panes(app, 80, 40).0);
+        let text = opened(&app);
         assert!(
-            text.contains("this row is fine"),
-            "an Ok row selected while another row fails must redirect"
+            text.contains("No action needed for this check; the failed checks are marked ✕"),
+            "an Ok row selected while another row fails must redirect: {text}"
+        );
+        // The IR self-test runs in the terminal via sudo; its action row
+        // says so.
+        assert!(
+            text.contains("runs the IR PAD self-test with sudo; look at the camera"),
+            "{text}"
         );
         app.repair_sel = 1;
-        let text = draw_text(&app);
-        assert!(text.contains("manual: install the package"));
+        let text = opened(&app);
+        assert!(text.contains("manual: install the package"), "{text}");
         app.repair_sel = 2;
-        let text = draw_text(&app);
-        assert!(text.contains("press [f]: irlume runs the fix with sudo"));
-        // The IR self-test prompt (the result now shows in the terminal, run
-        // via sudo, so the card is a static "press [l]" prompt).
-        assert!(text.contains("press [l] to run the IR PAD self-test"));
+        let text = opened(&app);
+        assert!(text.contains("[f] load the SELinux policy"), "{text}");
+        assert!(text.contains("asks first"), "{text}");
+    }
+
+    /// Diagnostics with a failing check selected whose root fix has an
+    /// action row and whose diagnosis ends in a word no row can show.
+    fn diagnostics_fixture() -> App {
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        app.repair = vec![
+            check_row("Daemon (irlumed)", Sev::Ok, Fix::None),
+            Check {
+                label: "SELinux policy".into(),
+                sev: Sev::Fail,
+                detail:
+                    "policy module missing; the greeter cannot reach the daemon DETAIL_TAIL_WORD"
+                        .into(),
+                fix: Fix::Root(RootFix::SelinuxLoad),
+            },
+            check_row(
+                "Models",
+                Sev::Warn,
+                Fix::Manual("install the package".into()),
+            ),
+        ];
+        app.repair_sel = 1;
+        app
+    }
+
+    /// The whole frame at `width`x`height`, flattened.
+    fn draw_text_at(app: &App, width: u16, height: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        rendered(&term)
+    }
+
+    /// Where the last frame put the first click target `wanted` accepts.
+    fn target_rect(app: &App, wanted: impl Fn(Click) -> bool) -> Option<Rect> {
+        app.click_targets
+            .borrow()
+            .iter()
+            .find(|(_, click)| wanted(*click))
+            .map(|(rect, _)| *rect)
+    }
+
+    /// ADR-0030 acceptance "Layout": at 120 columns the selected check's
+    /// diagnosis and fix sit in a right-hand column without Enter; below
+    /// that, Enter opens them in place.
+    #[test]
+    fn diagnostics_details_sit_in_the_right_column_at_120_and_open_on_enter_at_80() {
+        let mut app = diagnostics_fixture();
+        let (list, details) = diagnostics_panes(&app, 120, 40);
+        let column = joined(&details);
+        assert!(column.contains("DETAIL_TAIL_WORD"), "{column}");
+        assert!(column.contains("[f] load the SELinux policy"), "{column}");
+        assert!(!joined(&list).contains("DETAIL_TAIL_WORD"), "{list:?}");
+        let column_rect = diagnostics_rects(&app, 120, 40)
+            .1
+            .expect("a details column at 120 columns");
+        assert!(
+            app.click_targets.borrow().iter().any(|(rect, click)| {
+                column_rect.contains((rect.x, rect.y).into())
+                    && matches!(click, Click::Key(KeyCode::Char('f')))
+            }),
+            "the column's fix row is clickable"
+        );
+        assert!(!app.repair_expanded);
+
+        let (list, details) = diagnostics_panes(&app, 119, 40);
+        assert!(details.is_empty(), "no column under 120 columns");
+        assert!(!joined(&list).contains("DETAIL_TAIL_WORD"));
+        let text = draw_text_at(&app, 119, 40);
+        assert!(!text.contains("DETAIL_TAIL_WORD"), "{text}");
+
+        let text = draw_text_at(&app, 80, 30);
+        assert!(!text.contains("DETAIL_TAIL_WORD"), "{text}");
+        app.on_key(KeyCode::Enter);
+        assert!(app.repair_expanded);
+        assert!(app.confirm.is_none() && app.input.is_none() && app.suspend.is_none());
+        let (list, _) = diagnostics_panes(&app, 80, 30);
+        let text = joined(&list);
+        assert!(
+            text.contains(
+                "policy module missing; the greeter cannot reach the daemon DETAIL_TAIL_WORD"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("[f] load the SELinux policy"), "{text}");
+        let list_rect = diagnostics_rects(&app, 80, 30).0;
+        let y = list
+            .iter()
+            .position(|row| row.contains("[f] load the SELinux policy"))
+            .unwrap() as u16;
+        assert!(
+            app.click_targets.borrow().iter().any(|(rect, click)| {
+                rect.contains((list_rect.x + 2, list_rect.y + y).into())
+                    && matches!(click, Click::Key(KeyCode::Char('f')))
+            }),
+            "the open check's fix row is clickable"
+        );
+    }
+
+    /// ADR-0030 §1.7: a row cut to its width ends in an ellipsis, and
+    /// Enter shows the whole diagnosis.
+    #[test]
+    fn diagnostics_truncated_row_ends_in_an_ellipsis_and_expands_on_enter() {
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        let detail = "Long diagnostic explanation. ".repeat(4) + "ELLIPSIS_TAIL";
+        app.repair = vec![Check {
+            label: "Camera prerequisite".into(),
+            sev: Sev::Fail,
+            detail: detail.clone(),
+            fix: Fix::None,
+        }];
+        let row = |app: &App| {
+            diagnostics_panes(app, 80, 30)
+                .0
+                .into_iter()
+                .find(|row| row.contains("Camera prerequisite"))
+                .expect("the check's row")
+        };
+        let closed = row(&app);
+        assert!(closed.contains('…'), "{closed}");
+        assert!(!closed.contains("ELLIPSIS_TAIL"), "{closed}");
+        app.on_key(KeyCode::Enter);
+        let open = row(&app);
+        assert!(!open.contains('…'), "{open}");
+        let text = joined(&diagnostics_panes(&app, 80, 30).0);
+        assert!(text.contains(&detail), "{text}");
+        assert!(
+            text.contains("No automatic repair for this check"),
+            "{text}"
+        );
+        app.on_key(KeyCode::Enter);
+        assert!(row(&app).contains('…'));
+    }
+
+    /// A check with nothing to run says so without claiming a pass: only a
+    /// passed check needs no action. An unavailable automatic fix does not
+    /// imply a pass (docs/TUI.md).
+    #[test]
+    fn diagnostics_check_without_a_fix_claims_no_pass_it_has_not_earned() {
+        let no_repair =
+            "No automatic repair for this check; use its explanation and Full Diagnostics.";
+        for (sev, note) in [
+            (
+                Sev::Unknown,
+                "This check has not completed; wait or re-check.",
+            ),
+            (Sev::Warn, no_repair),
+            (Sev::Fail, no_repair),
+            (Sev::Ok, "No action needed."),
+        ] {
+            let mut app = test_app();
+            app.screen = SC_REPAIR;
+            app.repair = vec![check_row("x", sev, Fix::None)];
+            app.repair_expanded = true;
+            let text = joined(&diagnostics_panes(&app, 80, 30).0);
+            assert!(text.contains(note), "{note}: {text}");
+            if sev != Sev::Ok {
+                assert!(
+                    !text.to_lowercase().contains("no action needed"),
+                    "{note}: {text}"
+                );
+            }
+        }
+    }
+
+    /// ADR-0030 §1.1: a second click on the selected check is Enter. It
+    /// opens or closes the check, never its fix, and the explanation under
+    /// an open check never acts.
+    #[test]
+    fn diagnostics_second_click_on_the_selected_row_is_enter() {
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        app.repair = vec![
+            check_row("a", Sev::Ok, Fix::None),
+            check_row("b", Sev::Fail, Fix::Root(RootFix::RestartDaemon)),
+        ];
+        app.repair_sel = 0;
+        let area = Rect::new(0, 0, 80, 30);
+        let click_row = |app: &mut App| {
+            draw_text_at(app, 80, 30);
+            let rect = target_rect(app, |click| matches!(click, Click::Select(1)))
+                .expect("the second check's row");
+            app.on_click(rect.x, rect.y, area);
+        };
+        let click_on = |app: &mut App, text: &str| {
+            let screen = draw_text_at(app, 80, 30);
+            let (y, x) = screen
+                .lines()
+                .enumerate()
+                .find_map(|(y, line)| {
+                    line.find(text)
+                        .map(|byte| (y, line[..byte].chars().count()))
+                })
+                .unwrap_or_else(|| panic!("missing {text:?}:\n{screen}"));
+            app.on_click(x as u16, y as u16, area);
+        };
+        click_row(&mut app);
+        assert_eq!(app.repair_sel, 1);
+        assert!(!app.repair_expanded, "a first click only selects");
+        click_row(&mut app);
+        assert!(app.repair_expanded, "a second click opens the check");
+        assert!(
+            app.confirm.is_none()
+                && app.input.is_none()
+                && app.suspend.is_none()
+                && app.op.is_none()
+        );
+        click_on(&mut app, "b detail");
+        assert!(app.repair_expanded, "explanatory text never acts");
+        assert_eq!(app.repair_sel, 1);
+        click_on(&mut app, "[f] start or restart the daemon");
+        assert!(matches!(
+            app.confirm,
+            Some((_, _, ConfirmAct::Sus(Suspend::RestartDaemon)))
+        ));
+        assert!(app.suspend.is_none(), "the root fix asks first");
+        app.on_key(KeyCode::Esc);
+        assert!(app.confirm.is_none());
+        click_row(&mut app);
+        assert!(!app.repair_expanded, "a second click closes it again");
+    }
+
+    /// ADR-0030 §1.1: selecting a check below an open one closes that one
+    /// and moves the rows, so the fix's action row slides under the
+    /// pointer. The second click of a double click stays on the check the
+    /// first selected; a later, deliberate click on the fix row still acts.
+    #[test]
+    fn diagnostics_double_click_below_an_open_check_never_runs_its_fix() {
+        let area = Rect::new(0, 0, 80, 30);
+        let t0 = Instant::now();
+        for (fix, late) in [
+            (Fix::Root(RootFix::RestartDaemon), false),
+            (Fix::Goto(GotoFix::Enroll), false),
+            (Fix::Root(RootFix::RestartDaemon), true),
+        ] {
+            let mut app = test_app();
+            inert_workers(&mut app);
+            app.screen = SC_REPAIR;
+            app.daemon_up = false;
+            app.repair = vec![
+                check_row("a", Sev::Ok, Fix::None),
+                check_row("b", Sev::Fail, fix),
+            ];
+            app.repair_sel = 0;
+            app.repair_expanded = true;
+            app.clock_override = Some(t0);
+            draw_text_at(&app, 80, 30);
+            let rect = target_rect(&app, |click| matches!(click, Click::Select(1)))
+                .expect("the second check's row");
+            app.on_click(rect.x, rect.y, area);
+            assert_eq!(app.repair_sel, 1);
+            draw_text_at(&app, 80, 30);
+            let under = app
+                .click_targets
+                .borrow()
+                .iter()
+                .find(|(target, _)| target.contains((rect.x, rect.y).into()))
+                .map(|(_, click)| *click);
+            assert!(
+                matches!(under, Some(Click::Key(KeyCode::Char('f')))),
+                "the fix row moved under the pointer"
+            );
+            if late {
+                app.clock_override = Some(t0 + Duration::from_millis(DOUBLE_CLICK_MS + 1));
+            }
+            app.on_click(rect.x, rect.y, area);
+            if late {
+                assert!(
+                    matches!(
+                        app.confirm,
+                        Some((_, _, ConfirmAct::Sus(Suspend::RestartDaemon)))
+                    ),
+                    "a deliberate click on the fix row asks first"
+                );
+            } else {
+                assert!(
+                    app.confirm.is_none() && app.input.is_none() && app.suspend.is_none(),
+                    "a double click never reaches a fix"
+                );
+                assert_eq!((app.screen, app.repair_sel), (SC_REPAIR, 1));
+            }
+        }
+    }
+
+    /// The periodic machine refresh never moves the Diagnostics rows: its
+    /// note stands in a line that is always there, one row high beside
+    /// the details column too.
+    #[test]
+    fn diagnostics_refresh_note_never_moves_the_rows() {
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        app.probes_landed = true;
+        app.repair = vec![
+            check_row("a", Sev::Ok, Fix::None),
+            check_row("b", Sev::Ok, Fix::None),
+        ];
+        for (width, height) in [(80, 30), (120, 40)] {
+            let first_row = |app: &App| {
+                draw_text_at(app, width, height);
+                target_rect(app, |click| matches!(click, Click::Select(0)))
+                    .expect("the first check's row")
+                    .y
+            };
+            app.probes_load = None;
+            let idle = first_row(&app);
+            let (_tx, rx) = mpsc::channel();
+            app.probes_load = Some(rx);
+            assert_eq!(first_row(&app), idle, "{width}x{height}");
+            let text = joined(&diagnostics_panes(&app, width, height).0);
+            assert!(text.contains("Refreshing"), "{text}");
+        }
+    }
+
+    /// ADR-0030 §1.2: Esc closes the open check before it goes home.
+    #[test]
+    fn diagnostics_esc_closes_the_open_check_before_going_home() {
+        let mut app = test_app();
+        inert_workers(&mut app);
+        app.screen = SC_REPAIR;
+        app.repair = vec![check_row("a", Sev::Warn, Fix::None)];
+        app.on_key(KeyCode::Enter);
+        assert!(app.repair_expanded);
+        app.on_key(KeyCode::Esc);
+        assert!(!app.repair_expanded);
+        assert_eq!(app.screen, SC_REPAIR);
+        app.on_key(KeyCode::Esc);
+        assert_eq!(app.screen, SC_WELCOME);
+    }
+
+    /// While a check is open, moving the selection, by key or by click,
+    /// opens the newly selected check instead.
+    #[test]
+    fn diagnostics_open_check_follows_the_selection() {
+        let mut app = diagnostics_fixture();
+        app.repair_sel = 0;
+        app.on_key(KeyCode::Enter);
+        app.on_key(KeyCode::Down);
+        assert_eq!(app.repair_sel, 1);
+        assert!(app.repair_expanded);
+        let text = joined(&diagnostics_panes(&app, 80, 30).0);
+        assert!(text.contains("DETAIL_TAIL_WORD"), "{text}");
+        let rect = target_rect(&app, |click| matches!(click, Click::Select(2)))
+            .expect("the third check's row");
+        app.on_click(rect.x, rect.y, Rect::new(0, 0, 80, 30));
+        assert_eq!(app.repair_sel, 2);
+        assert!(app.repair_expanded);
+        let text = joined(&diagnostics_panes(&app, 80, 30).0);
+        assert!(text.contains("manual: install the package"), "{text}");
+    }
+
+    /// The selected row is highlighted across the list, which below 120
+    /// columns is the one sign of the check Enter and `f` act on; the
+    /// F6-focused fix row in the details column is highlighted as on the
+    /// page.
+    #[test]
+    fn diagnostics_highlights_the_selected_row_and_the_focused_column_fix() {
+        let draw = |app: &App, width: u16, height: u16| {
+            let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            term.backend().buffer().clone()
+        };
+        let reversed = |buffer: &ratatui::buffer::Buffer, x: u16, y: u16| {
+            buffer[(x, y)].modifier.contains(Modifier::REVERSED)
+        };
+        // The short Daemon row: the highlight is padded to the list's width.
+        let mut app = diagnostics_fixture();
+        app.repair_sel = 0;
+        let buffer = draw(&app, 80, 30);
+        let list = diagnostics_rects(&app, 80, 30).0;
+        let row =
+            target_rect(&app, |click| matches!(click, Click::Select(0))).expect("the selected row");
+        let other =
+            target_rect(&app, |click| matches!(click, Click::Select(1))).expect("another row");
+        assert!((list.x..list.right()).all(|x| reversed(&buffer, x, row.y)));
+        assert!(!reversed(&buffer, list.x + 3, other.y));
+
+        let mut app = diagnostics_fixture();
+        app.on_key(KeyCode::F(6));
+        assert_eq!(app.focused_action().map(|action| action.0), Some("f"));
+        let buffer = draw(&app, 120, 40);
+        let column = diagnostics_rects(&app, 120, 40)
+            .1
+            .expect("a details column at 120 columns");
+        let fix = app
+            .click_targets
+            .borrow()
+            .iter()
+            .find(|(rect, click)| {
+                matches!(click, Click::Key(KeyCode::Char('f')))
+                    && column.contains((rect.x, rect.y).into())
+            })
+            .map(|(rect, _)| *rect)
+            .expect("the column's fix row");
+        assert!(reversed(&buffer, fix.x + 2, fix.y));
+    }
+
+    /// The advertised Enter chip, focused with F6, opens the check; it
+    /// never arms the fix's confirmation. `f` stays first, where F6 starts.
+    #[test]
+    fn diagnostics_focused_enter_chip_opens_the_check() {
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        app.repair = vec![check_row(
+            "daemon",
+            Sev::Fail,
+            Fix::Root(RootFix::RestartDaemon),
+        )];
+        app.repair_sel = 0;
+        assert_eq!(app.screen_actions()[0].0, "f");
+        // Enter comes last, so the 120-column bottom bar keeps `r`.
+        assert_eq!(
+            app.screen_actions().last().map(|action| action.0),
+            Some("enter")
+        );
+        let frame = draw_text_at(&app, 120, 40);
+        let bar = row_with(&frame, "Fix Selected Issue");
+        assert!(bar.contains("r  Recheck"), "{bar}");
+        app.on_key(KeyCode::F(6));
+        let chip = app
+            .screen_actions()
+            .iter()
+            .position(|(key, _)| *key == "enter")
+            .expect("Diagnostics advertises Enter");
+        for _ in 0..chip {
+            app.on_key(KeyCode::Down);
+        }
+        assert_eq!(
+            app.focused_action(),
+            Some(("enter", "Show or Hide Details"))
+        );
+        app.on_key(KeyCode::Enter);
+        assert!(app.repair_expanded);
+        assert!(app.confirm.is_none() && app.input.is_none() && app.suspend.is_none());
+    }
+
+    /// The selected check's fix row is drawn once, wherever it stands: the
+    /// page's `[f] fix selected` when nothing else shows it, else under
+    /// the open check or in the details column, and back on the page when
+    /// a short window cuts it from the column.
+    #[test]
+    fn diagnostics_fix_action_row_is_drawn_once() {
+        // The `f` targets inside the content (not the bottom bar's chip),
+        // each with the text of its first row.
+        let fix_rows = |app: &App, width: u16, height: u16| {
+            let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            let (list, details) = diagnostics_rects(app, width, height);
+            let content = details.map_or(list, |column| list.union(column));
+            let buffer = term.backend().buffer();
+            app.click_targets
+                .borrow()
+                .iter()
+                .filter(|(rect, click)| {
+                    matches!(click, Click::Key(KeyCode::Char('f')))
+                        && content.contains((rect.x, rect.y).into())
+                })
+                .map(|(rect, _)| {
+                    let text = (rect.x..rect.right())
+                        .map(|x| buffer[(x, rect.y)].symbol())
+                        .collect::<String>();
+                    (*rect, text)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut app = diagnostics_fixture();
+        for (width, height, open, label) in [
+            (80, 30, false, "[f] fix selected"),
+            (80, 30, true, "[f] load the SELinux policy"),
+            (120, 40, false, "[f] load the SELinux policy"),
+            (120, 40, true, "[f] load the SELinux policy"),
+        ] {
+            app.repair_expanded = open;
+            app.repair_reveal.set(true);
+            let rows = fix_rows(&app, width, height);
+            assert_eq!(rows.len(), 1, "{width}x{height} open={open}: {rows:?}");
+            assert!(
+                rows[0].1.contains(label),
+                "{width}x{height} open={open}: {rows:?}"
+            );
+        }
+        // A check with nothing to run has no fix row while its details show.
+        app.repair_sel = 0;
+        for (width, height, open) in [(80, 30, true), (120, 40, false)] {
+            app.repair_expanded = open;
+            app.repair_reveal.set(true);
+            let rows = fix_rows(&app, width, height);
+            assert!(rows.is_empty(), "{width}x{height} open={open}: {rows:?}");
+        }
+        // A short wide window cuts the fix from the column; the page keeps
+        // its own.
+        app.repair_sel = 1;
+        app.repair_expanded = false;
+        app.repair[1].detail = "policy module missing; ".repeat(24);
+        let (_, details) = diagnostics_panes(&app, 120, 24);
+        assert_eq!(
+            details.last().map(|row| row.trim()),
+            Some("…"),
+            "{details:?}"
+        );
+        let column = diagnostics_rects(&app, 120, 24)
+            .1
+            .expect("a details column at 120 columns");
+        assert!(
+            fix_rows(&app, 120, 24)
+                .iter()
+                .all(|(rect, _)| !column.contains((rect.x, rect.y).into())),
+            "a cut fix row in the column never acts"
+        );
+        let area = Rect::new(0, 0, 120, 24);
+        let scroll_to_end = |app: &mut App| {
+            for _ in 0..200 {
+                let (_, bounds, scroll, max) = app.page_view.get();
+                if scroll == max {
+                    break;
+                }
+                app.on_scroll(bounds.x, bounds.y, area, 1);
+            }
+        };
+        scroll_to_end(&mut app);
+        let rows = fix_rows(&app, 120, 24);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].1.contains("[f] fix selected"), "{rows:?}");
+        assert!(joined(&diagnostics_panes(&app, 120, 24).0).contains("[f] fix selected"));
+        // A manual fix's instruction is its remedy: a column that shows it
+        // whole needs no `f` row, and one that cuts it leaves the page's,
+        // which echoes the instruction.
+        app.repair_sel = 2;
+        app.repair_reveal.set(true);
+        let rows = fix_rows(&app, 120, 40);
+        assert!(rows.is_empty(), "{rows:?}");
+        app.repair[2].detail = "models missing; ".repeat(40);
+        app.repair[2].fix = Fix::Manual("install the irlume package MANUAL_TAIL".into());
+        app.repair_reveal.set(true);
+        let (list, details) = diagnostics_panes(&app, 120, 24);
+        assert!(
+            !joined(&list).contains("MANUAL_TAIL") && !joined(&details).contains("MANUAL_TAIL"),
+            "{details:?}"
+        );
+        scroll_to_end(&mut app);
+        let rows = fix_rows(&app, 120, 24);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].1.contains("[f] fix selected"), "{rows:?}");
+    }
+
+    /// ADR-0030 §1.4: keys are on action rows and in the bottom bar, never
+    /// in a row tag, a hint or a check's text.
+    #[test]
+    fn diagnostics_prose_names_no_keys() {
+        // Byte offsets of every `[x]` key, x an ASCII letter.
+        let keys = |text: &str| -> Vec<usize> {
+            let bytes = text.as_bytes();
+            (0..bytes.len().saturating_sub(2))
+                .filter(|&at| {
+                    bytes[at] == b'['
+                        && bytes[at + 1].is_ascii_alphabetic()
+                        && bytes[at + 2] == b']'
+                })
+                .collect()
+        };
+        let checks = vec![
+            check_row("Fine", Sev::Ok, Fix::None),
+            check_row("Pending", Sev::Unknown, Fix::None),
+            check_row("Advisory", Sev::Warn, Fix::None),
+            check_row("By hand", Sev::Warn, Fix::Manual("run the command".into())),
+            check_row("As root", Sev::Fail, Fix::Root(RootFix::RestartDaemon)),
+            check_row("Wallet", Sev::Warn, Fix::Goto(GotoFix::KeyringReseal)),
+            check_row("SELinux", Sev::Warn, Fix::Action(&actions::SELINUX_STATUS)),
+        ];
+        for selected in 0..checks.len() {
+            let mut app = test_app();
+            app.screen = SC_REPAIR;
+            app.repair = checks.clone();
+            app.repair_sel = selected;
+            for (width, height, open) in [(80, 30, true), (120, 40, false)] {
+                app.repair_expanded = open;
+                app.repair_reveal.set(true);
+                let (list, details) = diagnostics_panes(&app, width, height);
+                for row in list.iter().chain(&details) {
+                    if let Some(&first) = keys(row).first() {
+                        assert!(
+                            keys(row).len() == 1 && row[..first].trim().is_empty(),
+                            "a key outside an action row: {row:?}"
+                        );
+                    }
+                    assert!(
+                        !row.contains("press ") && !row.contains("↑↓"),
+                        "a key in prose: {row:?}"
+                    );
+                }
+            }
+        }
+        // The checks' own texts, which the rows open to.
+        let source = include_str!("tui.rs");
+        let start = source
+            .find("    fn run_checks(&mut self)")
+            .expect("run_checks");
+        let body = &source[start..];
+        let end = body[1..].find("\n    fn ").map_or(body.len(), |at| at + 1);
+        for line in body[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+        {
+            assert!(keys(line).is_empty(), "a check text names a key: {line}");
+        }
+    }
+
+    /// ADR-0030 §1.7, §1.8: a details column taller than its room ends in
+    /// an ellipsis row, and an action row it cuts or leaves out never acts.
+    #[test]
+    fn details_column_ends_in_an_ellipsis_when_it_overflows() {
+        let area = Rect::new(0, 0, 43, 6);
+        let draw = |lines: Vec<Line<'static>>, actions: &[(usize, KeyCode)]| {
+            let app = test_app();
+            let mut term = Terminal::new(TestBackend::new(43, 6)).unwrap();
+            let mut whole = None;
+            term.draw(|f| whole = Some(app.draw_details_column(f, area, lines, actions, &[])))
+                .unwrap();
+            let buffer = term.backend().buffer();
+            // Past the column's rule.
+            let rows: Vec<String> = (0..6)
+                .map(|y| {
+                    (1..43)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect();
+            let targets: Vec<Rect> = app
+                .click_targets
+                .borrow()
+                .iter()
+                .filter(|(_, click)| matches!(click, Click::Key(KeyCode::Char('f'))))
+                .map(|(rect, _)| *rect)
+                .collect();
+            (whole.expect("drawn"), rows, targets)
+        };
+        let words = |action_at: usize, action: &str| -> Vec<Line<'static>> {
+            (0..10)
+                .map(|i| {
+                    if i == action_at {
+                        Line::raw(action.to_owned())
+                    } else {
+                        Line::raw(format!("  word{i}"))
+                    }
+                })
+                .collect()
+        };
+        // An action row past the room is not drawn and has no target.
+        let (whole, rows, targets) = draw(words(7, "  [f] fix"), &[(7, KeyCode::Char('f'))]);
+        assert!(!whole);
+        for (i, row) in rows.iter().take(5).enumerate() {
+            assert_eq!(row, &format!("  word{i}"));
+        }
+        assert_eq!(rows[5], "  …");
+        assert!(targets.is_empty());
+        // An action row two rows tall with one row left is cut: its first
+        // row shows, it has no target.
+        let long = "  [f] load the SELinux policy  asks first; may ask for your password";
+        let (whole, rows, targets) = draw(words(4, long), &[(4, KeyCode::Char('f'))]);
+        assert!(!whole);
+        for (i, row) in rows.iter().take(4).enumerate() {
+            assert_eq!(row, &format!("  word{i}"));
+        }
+        assert!(
+            rows[4].starts_with("  [f] load the SELinux policy"),
+            "{rows:?}"
+        );
+        assert_eq!(rows[5], "  …");
+        assert!(targets.is_empty());
+        // Content that fits has no ellipsis and a whole, clickable action.
+        let lines = vec![
+            Line::raw("  word0"),
+            Line::raw("  word1"),
+            Line::raw("  [f] fix"),
+            Line::raw("  word3"),
+        ];
+        let (whole, rows, targets) = draw(lines, &[(2, KeyCode::Char('f'))]);
+        assert!(whole);
+        assert!(rows.iter().all(|row| !row.contains('…')), "{rows:?}");
+        assert_eq!(targets, vec![Rect::new(1, 2, 42, 1)]);
     }
 
     #[test]
@@ -20441,30 +21490,162 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn diagnostics_wheel_selection_restarts_the_selected_explanation() {
+    /// Diagnostics with forty passed checks, more than an 80x30 page shows.
+    fn forty_checks() -> App {
         let mut app = test_app();
         app.screen = SC_REPAIR;
-        app.repair = vec![
-            check_row("First", Sev::Warn, Fix::None),
-            check_row("Second", Sev::Warn, Fix::None),
-        ];
-        app.repair[0].detail = "Long first diagnosis. ".repeat(80);
-        let area = Rect::new(0, 0, 120, 50);
-        let text = draw_text(&app);
-        let y = text
-            .lines()
-            .position(|line| line.contains("First"))
-            .unwrap() as u16;
-        let (screen, bounds, _, max) = app.page_view.get();
+        app.repair = (0..40)
+            .map(|i| check_row(&format!("check-{i:02}"), Sev::Ok, Fix::None))
+            .collect();
+        app
+    }
+
+    /// Moving the selection brings the selected check into view, and the
+    /// wheel reads the page without moving the selection; an open check
+    /// taller than the page shows its start.
+    #[test]
+    fn diagnostics_selection_scrolls_into_view_and_the_wheel_reads_the_page() {
+        let mut app = forty_checks();
+        let area = Rect::new(0, 0, 80, 30);
+        // Past the fold, the page moves the least: the selected check
+        // stands on the last row.
+        let _ = diagnostics_panes(&app, 80, 30);
+        for _ in 0..25 {
+            app.on_key(KeyCode::Down);
+        }
+        assert_eq!(app.repair_sel, 25);
+        let (list, _) = diagnostics_panes(&app, 80, 30);
         assert!(
-            max > 0,
-            "the first diagnosis must have real scroll overflow"
+            list.last().is_some_and(|row| row.contains("check-25")),
+            "{list:?}"
         );
-        app.page_view.set((screen, bounds, max.min(3), max));
-        app.on_scroll(30, y, area, 1);
-        assert_eq!(app.repair_sel, 1);
-        assert_eq!(app.page_view.get().2, 0);
+        app.on_key(KeyCode::Char('G'));
+        let (list, _) = diagnostics_panes(&app, 80, 30);
+        let list_rect = diagnostics_rects(&app, 80, 30).0;
+        let y = list
+            .iter()
+            .position(|row| row.contains("check-39"))
+            .unwrap_or_else(|| panic!("the last check is in view: {list:?}"))
+            as u16;
+        let row = target_rect(&app, |click| matches!(click, Click::Select(39)))
+            .expect("the last check's row");
+        assert_eq!(row.y, list_rect.y + y, "its target sits on its row");
+        let (_, bounds, scroll, _) = app.page_view.get();
+        assert!(scroll > 0, "the page scrolled to the selection");
+        app.on_scroll(bounds.x, bounds.y, area, -1);
+        assert_eq!(
+            app.page_view.get().2,
+            scroll - 1,
+            "the wheel reads the page"
+        );
+        assert_eq!(app.repair_sel, 39, "the wheel leaves the selection");
+        app.on_key(KeyCode::Char('g'));
+        let text = joined(&diagnostics_panes(&app, 80, 30).0);
+        assert!(
+            text.contains("check-00") && text.contains("40 ok"),
+            "{text}"
+        );
+        app.repair[39].detail = "Long diagnosis. ".repeat(120);
+        app.on_key(KeyCode::Char('G'));
+        app.on_key(KeyCode::Enter);
+        let (list, _) = diagnostics_panes(&app, 80, 30);
+        assert!(list[0].contains("check-39"), "{list:?}");
+        assert!(app.page_view.get().3 > 0);
+    }
+
+    /// Opening a check on the page's last row brings what it opens to into
+    /// view.
+    #[test]
+    fn diagnostics_enter_brings_the_open_check_into_view() {
+        let mut app = forty_checks();
+        app.repair_sel = 18;
+        app.repair_reveal.set(true);
+        let (list, _) = diagnostics_panes(&app, 80, 30);
+        assert!(
+            list.last().is_some_and(|row| row.contains("check-18")),
+            "{list:?}"
+        );
+        app.on_key(KeyCode::Enter);
+        let text = joined(&diagnostics_panes(&app, 80, 30).0);
+        assert!(text.contains("No action needed."), "{text}");
+    }
+
+    /// Arriving on Diagnostics brings the selected check into view: the
+    /// page view belonged to the other page.
+    #[test]
+    fn diagnostics_arrival_brings_the_selected_check_into_view() {
+        let mut app = forty_checks();
+        inert_workers(&mut app);
+        app.repair_sel = 30;
+        app.enter_screen(SC_WELCOME);
+        let _ = draw_text_at(&app, 80, 30);
+        app.enter_screen(SC_REPAIR);
+        let (list, _) = diagnostics_panes(&app, 80, 30);
+        assert!(list.iter().any(|row| row.contains("check-30")), "{list:?}");
+    }
+
+    /// Closing a long open check read to its end brings the check back
+    /// into view.
+    #[test]
+    fn diagnostics_esc_brings_the_closed_check_into_view() {
+        let mut app = forty_checks();
+        inert_workers(&mut app);
+        app.repair[5].detail = "Long diagnosis. ".repeat(120);
+        app.repair_sel = 5;
+        app.on_key(KeyCode::Enter);
+        let _ = diagnostics_panes(&app, 80, 30);
+        let area = Rect::new(0, 0, 80, 30);
+        for _ in 0..200 {
+            let (_, bounds, scroll, max) = app.page_view.get();
+            if scroll == max {
+                break;
+            }
+            app.on_scroll(bounds.x, bounds.y, area, 1);
+        }
+        app.on_key(KeyCode::Esc);
+        assert!(!app.repair_expanded);
+        let (list, _) = diagnostics_panes(&app, 80, 30);
+        assert!(list.iter().any(|row| row.contains("check-05")), "{list:?}");
+    }
+
+    /// A click that selects the check on the page's last row, while a
+    /// check is open, brings what the selected check opens to into view.
+    #[test]
+    fn diagnostics_first_click_brings_the_selected_check_into_view() {
+        let mut app = forty_checks();
+        app.repair_sel = 0;
+        app.repair_expanded = true;
+        app.repair_reveal.set(true);
+        let (list, _) = diagnostics_panes(&app, 80, 30);
+        let last = list
+            .iter()
+            .rev()
+            .find_map(|row| {
+                let at = row.find("check-")?;
+                row.get(at + 6..at + 8)?.parse::<usize>().ok()
+            })
+            .expect("a check's row on the page");
+        app.repair[last].detail = "Long diagnosis. ".repeat(30) + "CLICK_TAIL";
+        let rect = target_rect(&app, |click| matches!(click, Click::Select(i) if i == last))
+            .expect("the last check's row");
+        app.on_click(rect.x, rect.y, Rect::new(0, 0, 80, 30));
+        assert_eq!(app.repair_sel, last);
+        let text = joined(&diagnostics_panes(&app, 80, 30).0);
+        assert!(text.contains("CLICK_TAIL"), "{text}");
+    }
+
+    /// ADR-0030 §1.8: the wheel over the details column neither moves the
+    /// selection nor scrolls the page.
+    #[test]
+    fn diagnostics_wheel_over_the_details_column_does_nothing() {
+        let mut app = diagnostics_fixture();
+        let _ = diagnostics_panes(&app, 120, 40);
+        let column = diagnostics_rects(&app, 120, 40)
+            .1
+            .expect("a details column at 120 columns");
+        let before = (app.repair_sel, app.page_view.get().2);
+        app.on_scroll(column.x + 2, column.y + 1, Rect::new(0, 0, 120, 40), 1);
+        assert_eq!((app.repair_sel, app.page_view.get().2), before);
     }
 
     #[test]
@@ -20549,9 +21730,15 @@ mod tests {
         }];
         let text = draw_text(&app);
         assert!(text.contains("DIAGNOSTIC_TAIL_READABLE"), "{text}");
+        // Joined, so a phrase the column wraps is still read whole.
+        let column = joined(&diagnostics_panes(&app, 120, 50).1);
         assert!(
-            !text.contains("this row is fine") && !text.contains("no action needed"),
-            "{text}"
+            column.contains("No automatic repair for this check"),
+            "{column}"
+        );
+        assert!(
+            !column.to_lowercase().contains("no action needed"),
+            "{column}"
         );
     }
 
@@ -20600,7 +21787,13 @@ mod tests {
         app.repair = vec![row];
         for screen in [SC_REPAIR, SC_KEYRING] {
             app.screen = screen;
-            let text = draw_text(&app);
+            let text = if screen == SC_REPAIR {
+                // The check's full diagnosis is what its row opens to.
+                app.repair_expanded = true;
+                joined(&diagnostics_panes(&app, 80, 40).0)
+            } else {
+                draw_text(&app)
+            };
             assert!(text.contains("last explicit check"), "{text}");
             assert!(text.contains("3600s ago"), "{text}");
             assert!(!text.contains("won't auto-unlock"), "{text}");
@@ -22098,11 +23291,27 @@ mod tests {
         app.nodes.clear();
         app.screen = SC_REPAIR;
         app.run_checks();
+        // The Cameras check, opened to its full diagnosis.
+        let cameras = |app: &mut App| {
+            app.repair_sel = app
+                .repair
+                .iter()
+                .position(|c| c.label == "Cameras")
+                .expect("a Cameras check");
+            app.repair_expanded = true;
+            app.repair_reveal.set(true);
+            joined(&diagnostics_panes(app, 80, 40).0)
+        };
         let text = draw_text(&app);
         assert!(
-            !text.contains("no camera: face auth unavailable"),
+            !text.contains("no camera: face auth unavailable")
+                && app
+                    .repair
+                    .iter()
+                    .all(|c| !c.detail.contains("no camera: face auth unavailable")),
             "an unprobed list is not an absent camera: {text}"
         );
+        let text = cameras(&mut app);
         assert!(
             text.contains("cannot check the cameras while the daemon is down"),
             "it must say what it actually knows: {text}"
@@ -22111,7 +23320,7 @@ mod tests {
         // When a scan HAS classified nodes, the real verdicts still apply.
         app.nodes = vec![("/dev/video0".into(), irlume_camera::Role::Rgb)];
         app.run_checks();
-        let text = draw_text(&app);
+        let text = cameras(&mut app);
         assert!(
             text.contains("RGB-only") || text.contains("convenience"),
             "a classified RGB-only machine keeps its verdict: {text}"

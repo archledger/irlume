@@ -7,6 +7,24 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Diagnostics expands the selected check in place (ADR-0030 §2, §1.7,
+  §1.8, C2). Each check is one row whose diagnosis ends in an ellipsis
+  when it does not fit. Enter, or a second click on the selected row,
+  opens the full diagnosis under it, then the fix as an action row
+  that says what the fix does, or what to do when there is no
+  automatic repair; Enter again or Esc closes it, and the open row
+  follows the selection. Opening a row never changes anything: `f`
+  still runs the fix, and a fix that runs as root still asks first.
+  At 120 columns or wider the selected check's diagnosis and fix also
+  stand in a right-hand details column, the one Cameras already had,
+  now drawn by one helper for both pages; a details column taller than
+  the window ends in an ellipsis. The boxed "diagnosis" panel is gone:
+  the counts lead the page, the TPM, Secure Boot and PCR policy facts
+  follow the list, and the whole page scrolls with the mouse wheel,
+  which no longer moves the selection there; moving the selection
+  brings the selected check into view. Rows, hints and check texts no
+  longer name keys: the action rows and the bottom bar do.
+
 - Faces groups each profile's scans by the camera that captured them
   (ADR-0030 §2, C2). The profile's line counts its scans against the
   capture target ("12 scans · capture target met", "3 of 10 scans

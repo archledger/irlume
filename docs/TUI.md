@@ -34,11 +34,11 @@ Dialogs have separate **Continue**, **Confirm**, **Cancel** or **Close** buttons
 clicking outside a dialog does nothing. Typed confirmations still require the
 exact requested text.
 
-The mouse wheel moves through the list under the pointer (Faces, Cameras,
-Diagnostics or More actions). Over Activity it scrolls the activity history.
+The mouse wheel moves through the list under the pointer (Faces, Cameras or
+More actions). Over Activity it scrolls the activity history.
 The wheel also scrolls longer information/action panels, including Wallet,
-Recovery and Login. Long dialogs scroll within their own body while the buttons
-remain visible.
+Recovery, Login and Diagnostics. Long dialogs scroll within their own body while
+the buttons remain visible.
 Use Up/Down to scroll long non-text dialogs without activating their buttons.
 Press `M` to release mouse capture for the terminal's text selection and copy
 controls; press it again to resume mouse navigation.
@@ -81,13 +81,15 @@ are `w`. Status uses five glyphs everywhere: `●` ready or on, `○` off or
 not selected, `◐` unobserved or pending, `✕` absent or not connected, `⚠`
 needs attention (a failed check is `✕`: the check failed, whatever the
 component's presence); the same glyphs mark the enrollment checklist,
-and they read the same with `NO_COLOR`. When the content
-area has room for both a list and a details column (about 135 terminal
-columns with the sidebar open), Cameras shows the selected camera's details
-in a right-hand column; Enter still opens the full panel with the camera's
-actions below the list (the readable copy on a short window), and narrower
-terminals have only the Enter panel. `r` on a page refreshes only what
-that page shows.
+and they read the same with `NO_COLOR`. Wide terminals get a details column
+(ADR-0030 §1.8): with the sidebar open, Diagnostics shows the selected check's
+details in a right-hand column from 120 terminal columns, and Cameras shows the
+selected camera's from 142, where its rows keep room for their status. Enter
+still opens the full details on the page itself, in place on Diagnostics and as
+a panel with the camera's actions below the list on Cameras: the readable copy
+on a short window, where a details column that does not fit ends in an
+ellipsis. Narrower terminals have only the Enter details. `r` on a page
+refreshes only what that page shows.
 
 ## Overview
 
@@ -284,13 +286,22 @@ action. No command needs to be typed for these workflows.
 
 ## Diagnostics
 
-Select a check with the mouse or arrow keys to read its full, wrapped diagnosis.
-The details panel adapts to terminal height and scrolls with the mouse wheel;
-changing the selection returns to the start of the explanation. Passed,
-warning, failed and unknown checks are counted separately. Pending system
-checks are labeled, and an unavailable automatic fix does not imply a pass.
+The page opens with the number of passed, warning, failed and unknown checks,
+then one row per check: its status, its name, the start of its diagnosis
+(ending in an ellipsis when the row cannot hold it) and whether an automatic
+fix exists. Enter, or a second click on the selected row, expands that row in
+place: the full, wrapped diagnosis, then its fix as an action row, or what to
+do when there is no automatic repair. Enter again or Esc closes it, and while
+it is open, moving the selection opens the next check instead. Expanding never
+changes anything. At 120 columns or wider the selected check's diagnosis and
+fix also stand in a right-hand column without Enter. The platform facts (TPM,
+Secure Boot, boot mode and the seal's PCR policy) follow the list, then the
+page's actions. The whole page scrolls with the mouse wheel, and moving the
+selection brings the selected check into view. Pending system checks are
+labeled, and an unavailable automatic fix does not imply a pass.
 
-**Fix Selected Issue** (`f`) starts the appropriate existing workflow. A daemon
+**Fix Selected Issue** (`f`, or a click on the fix's action row) starts the
+appropriate existing workflow, and a fix that runs as root asks first. A daemon
 that is loading models or denying this account access is not offered a restart
 from the Cameras row. Access-denied inspection opens the read-only SELinux
 status action. Fingerprint-only wiring repair preserves the selected method.

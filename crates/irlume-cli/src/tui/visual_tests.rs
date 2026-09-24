@@ -294,6 +294,7 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
         ("Current observations F4", SC_SETTINGS, KeyCode::F(4)),
         ("Preferences action focus F6", SC_SETTINGS, KeyCode::F(6)),
         ("Full Activity Shift+L", SC_WELCOME, KeyCode::Char('L')),
+        ("Diagnostics check open", SC_REPAIR, KeyCode::Enter),
     ] {
         for (width, height) in [(80, 24), (100, 30), (120, 40)] {
             let mut app = visual_fixture(screen);
@@ -307,6 +308,7 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
                 KeyCode::F(4) => assert!(app.show_live),
                 KeyCode::F(6) => assert!(app.focused_action().is_some()),
                 KeyCode::Char('L') => assert!(app.activity_history_open),
+                KeyCode::Enter => assert!(app.repair_expanded),
                 _ => unreachable!(),
             }
             frames.push(visual_frame(&app, label, width, height));
@@ -714,7 +716,7 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
         assert!(app.click_targets.borrow().is_empty());
         frames.push(frame);
     }
-    assert_eq!(frames.len(), SCREENS.len() * 3 + 113);
+    assert_eq!(frames.len(), SCREENS.len() * 3 + 116);
     if let Some(output) = std::env::var_os("IRLUME_TUI_GALLERY_DIR") {
         let directory = std::path::PathBuf::from(output);
         assert!(

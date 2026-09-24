@@ -25,6 +25,8 @@ Ways to help, in rough order of usefulness right now:
 How the project is run (who merges, how releases are signed and published) is
 documented in [`GOVERNANCE.md`](GOVERNANCE.md).
 
+Using a coding agent? Point it, and yourself, at [`AGENTS.md`](AGENTS.md).
+
 ## Developer Certificate of Origin (DCO)
 
 We use the [DCO](https://developercertificate.org/) instead of a CLA. It's a
@@ -41,6 +43,10 @@ you certify the DCO. That's it: no forms, no rights assignment.
 The check wants **exactly one** `Signed-off-by` trailer per commit. If you
 rebase or cherry-pick and the trailer gets duplicated, the build fails until it
 is back to one; `git commit --amend -s --no-edit` fixes a missing one.
+
+Commits carry no AI co-author trailers and no "Generated with" lines. If an AI
+tool helped, say briefly how in the PR description; you are responsible for
+every line under your sign-off.
 
 ## Pull request process
 

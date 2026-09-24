@@ -240,13 +240,14 @@ All notable changes to irlume are documented here. This project adheres to
 ### Fixed
 
 - `set-cameras` no longer rebuilds `/etc/irlume/cameras.conf` from
-  nothing when the file exists but cannot be read. A file holding
-  bytes that are not UTF-8, or one whose read failed with an I/O
-  error, was replaced by the new pair alone, which dropped every other
-  line, comments included. Any read failure, including an SELinux
-  denial or a directory in the file's place, now stops `set-cameras`
-  before it changes the camera in use, names the cause and leaves the
-  file as it was. Writes to `settings.conf` go through the same check.
+  nothing when the file exists but cannot be read. A file holding bytes
+  that are not UTF-8, or one whose read failed with an I/O error, was
+  replaced by the new pair alone, which dropped every other line,
+  comments included. Any read failure, including an SELinux denial, a
+  directory in the file's place or a symbolic link to a missing file,
+  now stops `set-cameras` before it changes the camera in use, names the
+  cause and leaves the file as it was. Writes to `settings.conf` go
+  through the same check.
 
 - `set-cameras` refuses a camera whose USB serial contains a line
   break or a control character, before it changes the camera in use,

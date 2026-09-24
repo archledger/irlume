@@ -403,8 +403,9 @@ pub fn write_kv(file: &str, key: &str, val: &str) -> std::io::Result<()> {
 /// # Errors
 /// `InvalidInput`, before any I/O, when a key or value would not read back as
 /// the same single line (see [`config_value_is_serializable`]). The read
-/// error's kind when the file exists but cannot be read: it is never rebuilt
-/// from empty, which would drop its other lines. Otherwise a failure to create
+/// error's kind when the file exists but cannot be read, a symbolic link to a
+/// missing file included: it is never rebuilt from empty, which would drop its
+/// other lines, or the link. Otherwise a failure to create
 /// the directory or to publish the file.
 pub fn write_kvs(file: &str, updates: &[(&str, &str)]) -> std::io::Result<()> {
     let path = config_path(file);
@@ -416,6 +417,22 @@ pub fn write_kvs(file: &str, updates: &[(&str, &str)]) -> std::io::Result<()> {
     // nothing about the other lines, so rewriting from empty would drop them.
     let existing = match std::fs::read_to_string(&path) {
         Ok(text) => text,
+        // A dangling symbolic link reads as NotFound too, but the name exists:
+        // publishing would replace the link, for example one to a volume not
+        // mounted yet, with a file holding only these keys.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(&path).is_ok() =>
+        {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "{} is a symbolic link to a file that does not exist; refusing to replace \
+                     the link",
+                    path.display()
+                ),
+            ))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
             return Err(std::io::Error::new(
@@ -688,9 +705,9 @@ pub fn parse_camera_conf(text: &str) -> CameraConfObservation {
     let mut seen: [Option<(usize, &str)>; 5] = [None; 5];
     let mut problem: Option<(usize, CameraConfProblem)> = None;
     let mut ignored = Vec::new();
-    for (index, line) in text.lines().enumerate() {
+    for (index, raw) in text.lines().enumerate() {
         let number = index + 1;
-        let line = line.trim();
+        let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -713,9 +730,15 @@ pub fn parse_camera_conf(text: &str) -> CameraConfObservation {
             continue;
         };
         let name = CAMERA_SELECTION_KEYS[slot];
+        // The value as written: `trim` also strips U+2028, U+2029 and NEL,
+        // which would let a separator at either end of the value pass. Spaces
+        // and tabs around it are a hand edit's layout, not a line break.
+        let written = raw.split_once('=').map_or("", |(_, v)| v);
         let found = if seen[slot].is_some() {
             Some(CameraConfProblem::DuplicateKey(name))
-        } else if !config_value_is_serializable(value) {
+        } else if !config_value_is_serializable(value)
+            || written.chars().any(|c| c != '\t' && breaks_a_line(c))
+        {
             Some(CameraConfProblem::UnsafeValue(name))
         } else if name == "mode" && !matches!(value, "automatic" | "pinned") {
             Some(CameraConfProblem::InvalidMode)
@@ -1644,6 +1667,24 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), seed);
         }
 
+        // A symbolic link to a file that does not exist is not an absent
+        // file: the link stays, and nothing is written through it.
+        std::fs::remove_file(&path).unwrap();
+        let target = dir.join("not-mounted-yet").join("cameras.conf");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        for error in [
+            write_kv("cameras.conf", "rgb_id", "a").unwrap_err(),
+            write_camera_pin("/dev/video4", "/dev/video6", "", "").unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+            assert!(
+                error.to_string().contains("refusing to replace the link"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read_link(&path).unwrap(), target);
+            assert!(!target.exists());
+        }
+
         // A directory in the file's place.
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
@@ -1861,6 +1902,32 @@ mod tests {
                 vec![],
             ),
             ("over-long value", &over_long, bad(1, UnsafeValue("rgb")), vec![]),
+            // `trim` strips these at the ends; the value as written still
+            // holds a line break.
+            (
+                "U+2028 after a value",
+                "rgb=/dev/video0\u{2028}\nir=/dev/video2\n",
+                bad(1, UnsafeValue("rgb")),
+                vec![],
+            ),
+            (
+                "U+2029 before a value",
+                "rgb=/dev/video0\nir=\u{2029}/dev/video2\n",
+                bad(2, UnsafeValue("ir")),
+                vec![],
+            ),
+            (
+                "NEL after a mode",
+                "rgb=/dev/video0\nir=/dev/video2\nmode=pinned\u{85}\n",
+                bad(3, UnsafeValue("mode")),
+                vec![],
+            ),
+            (
+                "spaces and tabs around values",
+                "rgb = /dev/video0\t\n\tir=\t/dev/video2 \n",
+                pinned(video.clone()),
+                vec![],
+            ),
             // Ignored lines.
             (
                 "no separator",

@@ -1441,9 +1441,10 @@ fn camera_probe_rate_state() -> &'static CameraProbeRateState {
 /// PAM/greeter trust boundary and must never be delayed by an unprivileged
 /// convenience request.
 ///
-/// Covers `Identify` and the dry-run emitter probe: both open the shared camera
-/// node, neither has an interactive frame-rate requirement, and both are now
-/// reachable by any local uid. Deliberately NOT applied to `Authenticate` (the
+/// Covers `Identify`, `IdentifyFor` (one interval per uid for both) and the
+/// dry-run emitter probe: all open the shared camera node, none has an
+/// interactive frame-rate requirement, and each is reachable by a local uid
+/// that is not root. Deliberately NOT applied to `Authenticate` (the
 /// real login path, throttled instead by consecutive-failure strikes) or to
 /// `PositionSample` (the framing guide needs continuous samples to give live
 /// feedback, so an interval here would break enrollment).
@@ -3211,8 +3212,9 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
                 "irlumed is still starting (loading models); retry, or use your password".into(),
             )
         }
-        Request::Identify => {
-            if let IdentifyScope::SelfOnly(name) = identify_scope(peer) {
+        // Past pregate, so an `IdentifyFor` peer may act for the account.
+        Request::Identify | Request::IdentifyFor { .. } => {
+            if let Some(name) = identify_account(&req, peer) {
                 attempt_record::record_in_background(
                     name.clone(),
                     attempt_record::Filed {
@@ -3619,7 +3621,8 @@ fn valid_username(u: &str) -> bool {
 enum Privilege {
     /// Any peer that can open the socket. Some of these arms still narrow what
     /// the peer GETS by uid instead of refusing it (`Identify` searches only
-    /// the peer's own account, `PositionSample` drops a band hint for an
+    /// the peer's own account, while the account-scoped `IdentifyFor` is
+    /// `RootOrTarget`; `PositionSample` drops a band hint for an
     /// account the peer may not act for) or charge the camera-probe interval.
     /// Neither refuses the request, so neither is a privilege requirement.
     AnyPeer,
@@ -3893,6 +3896,17 @@ fn posture(req: &Request) -> RequestPosture<'_> {
         // (ADR-0030 §5): the account and root, like FaceSensorStatus.
         LastAttempts { user } => RequestPosture {
             privilege: RootOrTarget { verb: "query" },
+            user: Some(user.as_str()),
+            enrollment: Reads,
+        },
+        // A recognition test against one account's enrollment (ADR-0030 §2):
+        // the account and root, checked here before the request is queued,
+        // so a refused peer never reaches the camera, the enrollment or the
+        // account's attempt record.
+        IdentifyFor { user } => RequestPosture {
+            privilege: RootOrTarget {
+                verb: "test recognition for",
+            },
             user: Some(user.as_str()),
             enrollment: Reads,
         },
@@ -4316,6 +4330,14 @@ fn summarize_enrollment(
                         });
                         *scans_by_recognizer.entry(space).or_insert(0) += 1;
                     }
+                    // Index for index with `scans`, and only when some scan
+                    // is dated (ADR-0030 §2): an undated enrollment's reply
+                    // stays exactly what an older client already reads.
+                    let scan_captured_at = if p.scans.iter().any(|s| s.captured_at.is_some()) {
+                        p.scans.iter().map(|s| s.captured_at).collect()
+                    } else {
+                        Vec::new()
+                    };
                     irlume_common::ProfileSummary {
                         name: p.name.clone(),
                         scans: p.scans.iter().map(|s| s.name.clone()).collect(),
@@ -4327,6 +4349,7 @@ fn summarize_enrollment(
                             live_ir_space,
                             ir_dim,
                         )),
+                        scan_captured_at,
                     }
                 })
                 .collect(),
@@ -5416,7 +5439,7 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | RemoveCameraGroup { .. }
         | PositionSample { .. }
         | PositionSession { .. } => OperationClass::Enrollment,
-        Identify => OperationClass::Identification,
+        Identify | IdentifyFor { .. } => OperationClass::Identification,
         TuneCaptureMode { .. } => OperationClass::CaptureQualification,
         SupportProbe { .. } => OperationClass::SupportProbe,
         SetupIrEmitter { .. }
@@ -5673,11 +5696,16 @@ impl AttemptContext {
                 irlume_common::AttemptKind::Authenticate,
                 attempt_surface(user, service.as_deref(), peer),
             ),
-            Request::Identify => {
+            Request::Identify | Request::IdentifyFor { .. } => {
                 // Root's account-less identify has no account to file under.
-                let IdentifyScope::SelfOnly(name) = identify_scope(peer) else {
+                let name = identify_account(req, peer)?;
+                // The posture table refuses a peer that may not act for the
+                // named account before any context is built on the serving
+                // path; a context built before that check (the direct
+                // dispatch path) must not file into another account either.
+                if matches!(req, Request::IdentifyFor { .. }) && !authorized_for(peer, &name) {
                     return None;
-                };
+                }
                 (
                     name,
                     irlume_common::AttemptKind::Identify,
@@ -6438,75 +6466,8 @@ fn dispatch_scoped_session_inner(
                 Err(e) => authentication_error(e, structured_errors),
             }
         }
-        Request::Identify => {
-            if camera_probe_rate_limited(peer.uid) {
-                // A pre-camera refusal with its own cause (ADR-0030 §5), in
-                // the reply shape every identify client already decodes.
-                note_pre_camera(irlume_common::OutcomeCause::RetryThrottled);
-                return Response::Identified {
-                    user: None,
-                    profile: None,
-                    score: 0.0,
-                    live: false,
-                    reason: "rate limited; try again shortly".into(),
-                    cause: Some(irlume_common::OutcomeCause::RetryThrottled),
-                };
-            }
-            // 1:N identify returns an exact similarity score, so an ungated
-            // socket peer could hill-climb it to tune a spoof or enumerate who
-            // is enrolled. Root keeps the full cross-user search (admin/test);
-            // a non-root peer is scoped to its OWN account; the score then only
-            // concerns a face the caller already controls, not other users'.
-            // The scope sees the capture stages, so the attempt record can
-            // name the camera a decided or failed identification reached.
-            let scoped = match identify_scope(peer) {
-                IdentifyScope::Full => engine.identify_with_diagnostics(scope),
-                IdentifyScope::SelfOnly(name) => {
-                    engine.identify_within_with_diagnostics(&name, scope)
-                }
-                IdentifyScope::NoAccount => Ok(irlume_auth::IdentifyOutcome {
-                    user: None,
-                    profile: None,
-                    score: 0.0,
-                    live: false,
-                    reason: "caller has no local account".into(),
-                    cause: Some(irlume_common::OutcomeCause::Policy),
-                }),
-            };
-            match scoped {
-                Ok(o) => {
-                    // Face disabled by the method policy is decided before
-                    // any camera: the same pre-camera refusal the
-                    // Authenticate path files (ADR-0030 §5).
-                    if o.cause == Some(irlume_common::OutcomeCause::MethodNotAvailable) {
-                        note_pre_camera(irlume_common::OutcomeCause::MethodNotAvailable);
-                    }
-                    Response::Identified {
-                        cause: o.cause,
-                        user: o.user,
-                        profile: o.profile,
-                        score: o.score,
-                        live: o.live,
-                        reason: o.reason,
-                    }
-                }
-                // An engine failure is a typed refusal in the reply shape
-                // every identify client decodes (ADR-0030 §5); the prose
-                // stays in `reason` and the record reads the cause from it.
-                Err(e) => {
-                    // A failure, not a decision about a face: the record
-                    // files it as such (ADR-0030 §5).
-                    note_engine_error(&e);
-                    Response::Identified {
-                        cause: Some(e.cause()),
-                        user: None,
-                        profile: None,
-                        score: 0.0,
-                        live: false,
-                        reason: e.to_string(),
-                    }
-                }
-            }
+        identify @ (Request::Identify | Request::IdentifyFor { .. }) => {
+            identify_reply(&identify, peer, engine, scope)
         }
         Request::SetCamerasIfCurrent { rgb, ir, expected } => set_cameras_if_current(
             &rgb,
@@ -7314,16 +7275,19 @@ fn dispatch_scoped_session_inner(
     }
 }
 
-/// How a peer's 1:N Identify is scoped. Root keeps the full cross-user search;
-/// any other peer is confined to its own account (or to nothing at all), so
-/// the returned similarity score never concerns a face the caller does not
-/// already control.
+/// How a 1:N identification is scoped. For `Identify`, root keeps the full
+/// cross-user search and any other peer is confined to its own account (or to
+/// nothing at all), so the returned similarity score never concerns a face the
+/// caller does not already control. `IdentifyFor` always searches the one
+/// account it names, which the posture table has confined to root or that
+/// account before the request was queued.
 #[derive(Debug, PartialEq, Eq)]
 enum IdentifyScope {
-    /// Full cross-user search (root only).
+    /// Full cross-user search (root's `Identify` only).
     Full,
-    /// Scoped to the peer's own username.
-    SelfOnly(String),
+    /// One account's enrollment: the peer's own for `Identify`, the named
+    /// account for `IdentifyFor`.
+    Account(String),
     /// The peer resolves to no local account; identify matches no one.
     NoAccount,
 }
@@ -7333,8 +7297,113 @@ fn identify_scope(peer: &Peer) -> IdentifyScope {
         return IdentifyScope::Full;
     }
     match users::name_for_uid(peer.uid) {
-        Some(name) => IdentifyScope::SelfOnly(name),
+        Some(name) => IdentifyScope::Account(name),
         None => IdentifyScope::NoAccount,
+    }
+}
+
+/// What a 1:N identification searches: the peer's scope for `Identify`
+/// ([`identify_scope`]), and for `IdentifyFor` always the one account it
+/// names, never a cross-user search. `None` for every other request. The
+/// worker searches exactly this and the record files under its account
+/// ([`identify_account`]), so the two cannot drift apart.
+fn identify_target(req: &Request, peer: &Peer) -> Option<IdentifyScope> {
+    match req {
+        Request::Identify => Some(identify_scope(peer)),
+        Request::IdentifyFor { user } => Some(IdentifyScope::Account(user.clone())),
+        _ => None,
+    }
+}
+
+/// The account a 1:N identification is filed under: the one its target
+/// searches. `None` for root's cross-user search, a peer with no account,
+/// and every other request.
+fn identify_account(req: &Request, peer: &Peer) -> Option<String> {
+    match identify_target(req, peer)? {
+        IdentifyScope::Account(name) => Some(name),
+        IdentifyScope::Full | IdentifyScope::NoAccount => None,
+    }
+}
+
+/// Run one 1:N identification (`Identify` or `IdentifyFor`) and answer it in
+/// the reply shape every identify client decodes, noting the attempt's cause
+/// for the record (ADR-0030 §5).
+fn identify_reply(
+    req: &Request,
+    peer: &Peer,
+    engine: &mut irlume_auth::Engine,
+    scope: &diagnostics::OperationScope,
+) -> Response {
+    if camera_probe_rate_limited(peer.uid) {
+        // A pre-camera refusal with its own cause (ADR-0030 §5), in
+        // the reply shape every identify client already decodes.
+        note_pre_camera(irlume_common::OutcomeCause::RetryThrottled);
+        return Response::Identified {
+            user: None,
+            profile: None,
+            score: 0.0,
+            live: false,
+            reason: "rate limited; try again shortly".into(),
+            cause: Some(irlume_common::OutcomeCause::RetryThrottled),
+        };
+    }
+    // 1:N identify returns an exact similarity score, so an ungated
+    // socket peer could hill-climb it to tune a spoof or enumerate who
+    // is enrolled. Root keeps the full cross-user search (admin/test);
+    // a non-root peer is scoped to its OWN account, and `IdentifyFor` to
+    // the account the posture table let this peer name; the score then
+    // only concerns a face the caller already controls, not other users'.
+    // The scope sees the capture stages, so the attempt record can
+    // name the camera a decided or failed identification reached. The
+    // target is resolved after the throttle: a refused probe costs no
+    // account lookup. Only the two identify requests reach here; anything
+    // else would search no one.
+    let target = identify_target(req, peer).unwrap_or(IdentifyScope::NoAccount);
+    let scoped = match target {
+        IdentifyScope::Full => engine.identify_with_diagnostics(scope),
+        IdentifyScope::Account(name) => engine.identify_within_with_diagnostics(&name, scope),
+        IdentifyScope::NoAccount => Ok(irlume_auth::IdentifyOutcome {
+            user: None,
+            profile: None,
+            score: 0.0,
+            live: false,
+            reason: "caller has no local account".into(),
+            cause: Some(irlume_common::OutcomeCause::Policy),
+        }),
+    };
+    match scoped {
+        Ok(o) => {
+            // Face disabled by the method policy is decided before
+            // any camera: the same pre-camera refusal the
+            // Authenticate path files (ADR-0030 §5).
+            if o.cause == Some(irlume_common::OutcomeCause::MethodNotAvailable) {
+                note_pre_camera(irlume_common::OutcomeCause::MethodNotAvailable);
+            }
+            Response::Identified {
+                cause: o.cause,
+                user: o.user,
+                profile: o.profile,
+                score: o.score,
+                live: o.live,
+                reason: o.reason,
+            }
+        }
+        // An engine failure is a typed refusal in the reply shape
+        // every identify client decodes (ADR-0030 §5); the prose
+        // stays in `reason` and the record reads the cause from it.
+        Err(e) => {
+            // A failure, not a decision about a face: the record
+            // files it as such (ADR-0030 §5).
+            note_engine_error(&e);
+            Response::Identified {
+                cause: Some(e.cause()),
+                user: None,
+                profile: None,
+                score: 0.0,
+                live: false,
+                reason: e.to_string(),
+            }
+        }
     }
 }
 
@@ -8502,12 +8571,59 @@ mod tests {
         let me = unsafe { libc::geteuid() };
         if me != 0 {
             let name = users::name_for_uid(me).expect("test uid has an account");
-            assert_eq!(identify_scope(&peer(me)), IdentifyScope::SelfOnly(name));
+            assert_eq!(identify_scope(&peer(me)), IdentifyScope::Account(name));
         }
         // A uid outside the account database is denied any scope.
         assert_eq!(identify_scope(&peer(0xfffe_fffe)), IdentifyScope::NoAccount);
         // Ground the reverse lookup itself (added by the same fix).
         assert_eq!(users::name_for_uid(0).as_deref(), Some("root"));
+    }
+
+    /// What an identification searches and files under: the peer's scope for
+    /// `Identify` (root's cross-user search files nowhere), and for
+    /// `IdentifyFor` always the named account, whoever asks. The worker
+    /// searches `identify_target`, so this pins the scope the engine gets.
+    #[test]
+    fn identify_target_follows_the_peer_or_the_named_account() {
+        let _g = env_lock();
+        let peer = |uid| Peer {
+            uid,
+            gid: uid,
+            pid: 1,
+        };
+        assert_eq!(
+            identify_target(&Request::Identify, &peer(0)),
+            Some(IdentifyScope::Full)
+        );
+        assert_eq!(identify_account(&Request::Identify, &peer(0)), None);
+        assert_eq!(
+            identify_account(&Request::Identify, &peer(0xfffe_fffe)),
+            None
+        );
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if me != 0 {
+            assert_eq!(
+                identify_account(&Request::Identify, &peer(me)),
+                users::name_for_uid(me)
+            );
+        }
+        let named = Request::IdentifyFor {
+            user: "carol".into(),
+        };
+        for uid in [0, me, 0xfffe_fffe] {
+            assert_eq!(
+                identify_target(&named, &peer(uid)),
+                Some(IdentifyScope::Account("carol".into())),
+                "IdentifyFor never widens to a cross-user search"
+            );
+            assert_eq!(
+                identify_account(&named, &peer(uid)).as_deref(),
+                Some("carol")
+            );
+        }
+        assert_eq!(identify_target(&Request::Ping, &peer(0)), None);
+        assert_eq!(identify_account(&Request::Ping, &peer(0)), None);
     }
 
     #[test]
@@ -8962,6 +9078,7 @@ mod tests {
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
+            captured_at: None,
         };
         let enr = Enrollment {
             user: "u".into(),
@@ -8992,6 +9109,59 @@ mod tests {
             "untagged scans count under the recognizer that predates tagging"
         );
         assert_eq!(p.live_recognizer.as_deref(), Some("embed:model-b"));
+        assert!(
+            p.scan_captured_at.is_empty(),
+            "an undated enrollment's reply carries no capture times"
+        );
+    }
+
+    /// ADR-0030 §2: capture times travel index for index with the scan
+    /// names, `None` for a scan that predates them, and only when some scan
+    /// is dated.
+    #[test]
+    fn the_enrollment_summary_aligns_capture_times_with_scans() {
+        use irlume_core::storage::{Enrollment, FaceProfile, FaceScan};
+        let scan = |name: &str, captured_at: Option<u64>| FaceScan {
+            name: name.into(),
+            rgb: vec![0.0; 4],
+            ir: None,
+            ir_space: None,
+            embed_space: None,
+            ir_center_edge_ratio: 0.0,
+            ir_brightness: 0.0,
+            pitch: 0.0,
+            captured_at,
+        };
+        let enr = Enrollment {
+            user: "u".into(),
+            profiles: vec![
+                FaceProfile {
+                    name: "Mixed".into(),
+                    ir_calib: None,
+                    ir_calibs: Default::default(),
+                    scans: vec![
+                        scan("old", None),
+                        scan("new", Some(1_790_000_000)),
+                        // Names are not unique in a stored enrollment; the
+                        // position, not the name, carries the time.
+                        scan("new", Some(1_790_000_100)),
+                    ],
+                },
+                FaceProfile {
+                    name: "Undated".into(),
+                    ir_calib: None,
+                    ir_calibs: Default::default(),
+                    scans: vec![scan("a", None)],
+                },
+            ],
+            ..Default::default()
+        };
+        let sum = summarize_enrollment(Some(&enr), "embed:model", "raw", 512);
+        assert_eq!(
+            sum.profiles[0].scan_captured_at,
+            vec![None, Some(1_790_000_000), Some(1_790_000_100)]
+        );
+        assert!(sum.profiles[1].scan_captured_at.is_empty());
     }
 
     #[test]
@@ -9006,6 +9176,7 @@ mod tests {
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
+            captured_at: None,
         };
         let mut p = FaceProfile {
             name: "P".into(),
@@ -9388,6 +9559,8 @@ mod tests {
             "shared_unlock::Binding::capture(",
             "Harness::new(",
             "identify_scope(",
+            "identify_target(",
+            "identify_account(",
             "serve(",
         ];
         /// Drops char literals, string literals and line comments so a brace
@@ -9839,6 +10012,7 @@ mod tests {
         CaptureModeStatus => Request::CaptureModeStatus,
         FaceSensorStatus => Request::FaceSensorStatus { user: Some(u()) },
         LastAttempts => Request::LastAttempts { user: u() },
+        IdentifyFor => Request::IdentifyFor { user: u() },
         PreferencesStatus => Request::PreferencesStatus,
         SelfTest => Request::SelfTest {
             kind: irlume_common::SelfTestKind::Liveness,
@@ -10459,6 +10633,7 @@ mod tests {
                                 scans_by_recognizer: Default::default(),
                                 live_recognizer: None,
                                 ir: None,
+                                scan_captured_at: Vec::new(),
                             }],
                             require_eyes_open: false,
                             closure_calibrated: false,
@@ -11444,6 +11619,7 @@ mod tests {
                     scans_by_recognizer: Default::default(),
                     live_recognizer: None,
                     ir: None,
+                    scan_captured_at: Vec::new(),
                 }],
                 ir_ratio_calibrated: true,
                 camera_groups: Vec::new(),
@@ -13322,6 +13498,7 @@ mod tests {
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
+            captured_at: None,
         }
     }
 
@@ -13827,6 +14004,299 @@ mod tests {
         assert_eq!(latest.camera, None);
     }
 
+    /// The newest identify entry in `user`'s record once `filed` holds,
+    /// or the record as it stands at the deadline (the write is off the
+    /// reply path).
+    fn latest_identify_when(
+        user: &str,
+        e: &mut irlume_auth::Engine,
+        filed: impl Fn(&irlume_common::AttemptRecord) -> bool,
+    ) -> irlume_common::AttemptRecord {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let served = dispatch(
+                Request::LastAttempts {
+                    user: user.to_owned(),
+                },
+                &peer(0),
+                e,
+            );
+            let Response::LastAttempts(record) = served else {
+                panic!("expected LastAttempts, got {served:?}");
+            };
+            if filed(&record) || std::time::Instant::now() > deadline {
+                return record;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// ADR-0030 §2: the account-scoped recognition test searches only the
+    /// named account and files under it — for root as well, whose
+    /// account-less `Identify` has no account to file under — and a peer
+    /// that may not act for the account neither runs it nor writes into
+    /// the account's record.
+    #[test]
+    fn identify_for_files_under_the_named_account_for_root_and_the_account() {
+        use irlume_common::{AttemptKind, AttemptResult, OutcomeCause};
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("identify-for-record");
+        std::fs::write(sb.dir.join("method"), "fingerprint").unwrap();
+        std::env::set_var("IRLUME_METHOD_CONF", sb.dir.join("method"));
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let me = crate::users::name_for_uid(uid).expect("own account");
+        let test_for = |user: &str| Request::IdentifyFor {
+            user: user.to_owned(),
+        };
+        clear_camera_probe_rate_state();
+        // Root is exempt from the camera-probe interval, so its refusal is
+        // the disabled method's, decided before any camera.
+        let root = dispatch(test_for(&me), &peer(0), &mut e);
+        let Response::Identified { user, cause, .. } = root else {
+            panic!("expected Identified, got {root:?}");
+        };
+        assert_eq!(user, None);
+        assert_eq!(cause, Some(OutcomeCause::MethodNotAvailable));
+        let record = latest_identify_when(&me, &mut e, |r| r.latest_identify.is_some());
+        let first = record
+            .latest_identify
+            .expect("root's account-scoped test is filed under the account");
+        assert_eq!(first.kind, AttemptKind::Identify);
+        assert_eq!(first.result, AttemptResult::Refused);
+        assert_eq!(first.cause, Some(OutcomeCause::MethodNotAvailable));
+        assert_eq!(first.camera, None, "refused before a camera was chosen");
+        assert!(
+            record.latest_authenticate.is_none(),
+            "a recognition test never stands in for an authentication"
+        );
+        // Root's account-less search files nothing anywhere: not under the
+        // account (the sequence below shows no gap) and not under root.
+        let _ = dispatch(Request::Identify, &peer(0), &mut e);
+        // The account itself, decided before any camera and filed after
+        // root's test.
+        let own = dispatch(test_for(&me), &peer(uid), &mut e);
+        let Response::Identified { cause, .. } = own else {
+            panic!("expected Identified, got {own:?}");
+        };
+        assert_eq!(cause, Some(OutcomeCause::MethodNotAvailable));
+        let record = latest_identify_when(&me, &mut e, |r| {
+            r.latest_identify
+                .as_ref()
+                .is_some_and(|l| l.seq > first.seq)
+        });
+        let second = record.latest_identify.expect("the account's test is filed");
+        assert_eq!(
+            second.seq,
+            first.seq + 1,
+            "exactly one entry, the account's own test, filed after root's"
+        );
+        if me != "root" {
+            // The writer is FIFO and the account's entry above was queued
+            // after root's Identify, so root's record is settled.
+            assert!(
+                attempt_record::load("root")
+                    .unwrap_or_default()
+                    .latest_identify
+                    .is_none(),
+                "root's cross-user Identify has no account to file under"
+            );
+        }
+        assert_eq!(second.result, AttemptResult::Refused);
+        assert_eq!(second.cause, cause);
+        // Another local user is refused with the posture table's wording and
+        // leaves no trace in the account's record.
+        let stranger = dispatch(test_for(&me), &peer(NOBODY), &mut e);
+        let Response::Error(refusal) = stranger else {
+            panic!("a stranger must be refused, got {stranger:?}");
+        };
+        assert_eq!(
+            refusal,
+            format!("not authorized to test recognition for '{me}'")
+        );
+        // Root files one more test; had the stranger's been filed, the
+        // sequence would show the gap.
+        let _ = dispatch(test_for(&me), &peer(0), &mut e);
+        let record = latest_identify_when(&me, &mut e, |r| {
+            r.latest_identify
+                .as_ref()
+                .is_some_and(|l| l.seq > second.seq)
+        });
+        assert_eq!(
+            record.latest_identify.map(|l| l.seq),
+            Some(second.seq + 1),
+            "the stranger's refused test must not be filed"
+        );
+        // One camera-probe interval per uid covers both identify requests
+        // (root is exempt): the account's test spends it and its
+        // account-less Identify right after, with no record wait between
+        // them (filing never blocks a reply), is throttled.
+        if uid != 0 {
+            clear_camera_probe_rate_state();
+            let spent = dispatch(test_for(&me), &peer(uid), &mut e);
+            let again = dispatch(Request::Identify, &peer(uid), &mut e);
+            let Response::Identified { cause, .. } = spent else {
+                panic!("expected Identified, got {spent:?}");
+            };
+            assert_eq!(cause, Some(OutcomeCause::MethodNotAvailable));
+            let Response::Identified { cause, .. } = again else {
+                panic!("expected Identified, got {again:?}");
+            };
+            assert_eq!(cause, Some(OutcomeCause::RetryThrottled));
+            // Both are filed off the reply path, in order: let them land in
+            // this sandbox before it goes.
+            let record = latest_identify_when(&me, &mut e, |r| {
+                r.latest_identify
+                    .as_ref()
+                    .is_some_and(|l| l.seq >= second.seq + 3)
+            });
+            let latest = record.latest_identify.expect("both tests are filed");
+            assert_eq!(latest.seq, second.seq + 3);
+            assert_eq!(latest.cause, Some(OutcomeCause::RetryThrottled));
+        }
+        clear_camera_probe_rate_state();
+        drop(sb);
+    }
+
+    /// ADR-0030 acceptance: `IdentifyFor` for another account is refused
+    /// before any enrollment load — on the production serving path it is
+    /// answered at the door, never queued for the camera worker (which is
+    /// where the probe interval, the camera and the enrollment live) — and
+    /// the refusal reads the same whether or not the account exists.
+    #[test]
+    fn identify_for_another_account_is_refused_before_it_is_queued() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let _g = env_lock();
+        let sb = sandbox("identify-for-door");
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let me = crate::users::name_for_uid(uid).expect("own account");
+        let arbiter = arbiter::Arbiter::<Queued>::new();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let state = diagnostics::DiagnosticState::default();
+        let taken = std::sync::atomic::AtomicUsize::new(0);
+        let ask = |user: &str| {
+            with_serve_as_peer_and_diagnostics(
+                &arbiter,
+                &ready,
+                &state,
+                peer(NOBODY),
+                |client: &UnixStream| {
+                    let mut client = client;
+                    client
+                        .write_all(
+                            format!("{{\"IdentifyFor\":{{\"user\":\"{user}\"}}}}\n").as_bytes(),
+                        )
+                        .unwrap();
+                    client
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    let mut line = String::new();
+                    BufReader::new(client)
+                        .read_line(&mut line)
+                        .expect("a refusal at the door arrives immediately");
+                    serde_json::from_str::<Response>(line.trim()).unwrap()
+                },
+            )
+        };
+        let (existing, missing) = std::thread::scope(|scope| {
+            let arb = &arbiter;
+            let taken = &taken;
+            // A stand-in camera worker that counts what reaches it.
+            let worker = scope.spawn(move || {
+                while let Some(job) = arb.take() {
+                    taken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let job_class = job.class;
+                    let job_uid = job.uid;
+                    let Queued {
+                        reply,
+                        scope: job_scope,
+                        ..
+                    } = job.payload;
+                    job_scope.finish(irlume_common::diagnostics::CategoricalOutcome::Failed);
+                    arb.finish(job_class, job_uid);
+                    let _ = reply.send(WorkerReply {
+                        response: Response::Error("stand-in worker".into()),
+                        completion: None,
+                        filing: None,
+                    });
+                }
+            });
+            let existing = ask(&me);
+            let missing = ask("irlume-no-such-account");
+            arbiter.close();
+            worker.join().unwrap();
+            (existing, missing)
+        });
+        assert_eq!(
+            taken.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused recognition test must never reach the camera worker"
+        );
+        let refusal = |user: &str| {
+            Response::Error(format!("not authorized to test recognition for '{user}'"))
+        };
+        assert_eq!(
+            serde_json::to_string(&existing).unwrap(),
+            serde_json::to_string(&refusal(&me)).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&missing).unwrap(),
+            serde_json::to_string(&refusal("irlume-no-such-account")).unwrap(),
+            "the refusal must not tell an existing account from a missing one"
+        );
+        // Nothing was filed for the account (the writer is fenced by load).
+        assert_eq!(
+            attempt_record::load(&me).expect("the sandbox attempt store is readable"),
+            Default::default()
+        );
+        drop(sb);
+    }
+
+    /// While the engine loads, an account-scoped test is refused like any
+    /// face request and filed under the account it named, as a startup
+    /// failure without a camera; a stranger is refused by the posture table
+    /// first and files nothing.
+    #[test]
+    fn identify_for_during_startup_files_daemon_starting_under_the_account() {
+        use irlume_common::{AttemptKind, AttemptResult, OutcomeCause};
+        let _g = env_lock();
+        let sb = sandbox("identify-for-startup");
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let me = crate::users::name_for_uid(uid).expect("own account");
+        let stranger =
+            dispatch_before_engine(Request::IdentifyFor { user: me.clone() }, &peer(NOBODY));
+        assert!(
+            matches!(&stranger, Response::Error(e) if e.starts_with("not authorized")),
+            "{stranger:?}"
+        );
+        assert_eq!(
+            attempt_record::load(&me).unwrap_or_default(),
+            Default::default()
+        );
+        let starting = dispatch_before_engine(Request::IdentifyFor { user: me.clone() }, &peer(0));
+        assert!(
+            matches!(&starting, Response::Error(e) if e.contains("still starting")),
+            "{starting:?}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let latest = loop {
+            let record = attempt_record::load(&me).unwrap_or_default();
+            if record.latest_identify.is_some() || std::time::Instant::now() > deadline {
+                break record.latest_identify;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        .expect("the startup refusal is filed under the named account");
+        assert_eq!(latest.kind, AttemptKind::Identify);
+        assert_eq!(latest.result, AttemptResult::Failed);
+        assert_eq!(latest.cause, Some(OutcomeCause::DaemonStarting));
+        assert_eq!(latest.camera, None);
+        drop(sb);
+    }
+
     #[test]
     fn authenticate_on_convenience_tier_is_limited_to_screen_unlock() {
         let _g = env_lock();
@@ -14325,6 +14795,7 @@ mod tests {
                     scans_by_recognizer: Default::default(),
                     live_recognizer: None,
                     ir: None,
+                    scan_captured_at: Vec::new(),
                 }],
                 ir_ratio_calibrated: false,
                 camera_groups: Vec::new(),
@@ -16615,6 +17086,7 @@ mod tests {
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,
+                captured_at: None,
             }],
             ir_calib: None,
             ir_calibs: Default::default(),
@@ -16708,6 +17180,7 @@ mod tests {
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,
+                captured_at: None,
             }],
             ir_calib: None,
             ir_calibs: Default::default(),
@@ -16846,6 +17319,7 @@ mod tests {
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,
+                captured_at: None,
             }],
             ir_calib: None,
             ir_calibs: Default::default(),

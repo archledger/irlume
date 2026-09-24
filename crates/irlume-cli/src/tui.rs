@@ -12242,6 +12242,7 @@ mod tests {
             scans_by_recognizer: Default::default(),
             live_recognizer: None,
             ir: None,
+            scan_captured_at: Vec::new(),
         }
     }
 
@@ -12887,6 +12888,7 @@ mod tests {
                 scans_by_recognizer: Default::default(),
                 live_recognizer: None,
                 ir: None,
+                scan_captured_at: Vec::new(),
             })
             .collect();
         app.begin_enroll();

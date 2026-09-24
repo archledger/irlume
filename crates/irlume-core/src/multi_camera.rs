@@ -85,6 +85,7 @@ pub fn group_summaries(
                             ir_calibs: scans.ir_calibs.clone(),
                         };
                         let readiness = view.readiness(embed_space, ir_space, ir_dim);
+                        let dated = || scans.scans.iter().filter_map(|scan| scan.captured_at);
                         irlume_common::CameraGroupProfileSummary {
                             profile: scans.profile.clone(),
                             scans: readiness.scan_count,
@@ -93,6 +94,8 @@ pub fn group_summaries(
                             compatible_rgb_candidates: readiness.compatible_rgb_candidates,
                             compatible_ir_pairs: readiness.compatible_ir_pairs,
                             calibrated: scans.ir_calibs.contains_key(embed_space),
+                            first_captured_at: dated().min(),
+                            last_captured_at: dated().max(),
                         }
                     })
                     .collect(),
@@ -864,6 +867,7 @@ mod tests {
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
+            captured_at: None,
         }
     }
 
@@ -1283,6 +1287,9 @@ mod tests {
             s.ir = Some(vec![0.25; 4]);
             s.ir_space = Some("adapter:live".into());
             s.embed_space = Some("embed:live".into());
+            // Out of order on purpose: the row reports the range, not the
+            // first and last in store order.
+            s.captured_at = Some(1_790_000_000 + ((n as u64 * 7) % 10));
             scans.push(s);
         }
         store.groups[0].profiles[0] = SecondaryProfileScans {
@@ -1331,6 +1338,24 @@ mod tests {
         assert_eq!(profile.compatible_rgb_candidates, 10);
         assert_eq!(profile.compatible_ir_pairs, 10);
         assert!(profile.calibrated, "the group has its own live-space calib");
+        // ADR-0030 §2: the capture date range over the group's scans.
+        assert_eq!(profile.first_captured_at, Some(1_790_000_000));
+        assert_eq!(profile.last_captured_at, Some(1_790_000_009));
+        let mut undated = store.clone();
+        for scan in &mut undated.groups[0].profiles[0].scans {
+            scan.captured_at = None;
+        }
+        let rows = group_summaries(
+            &undated,
+            Some(primary),
+            &live,
+            &present,
+            "embed:live",
+            "adapter:live",
+            4,
+        );
+        assert_eq!(rows[0].profiles[0].first_captured_at, None);
+        assert_eq!(rows[0].profiles[0].last_captured_at, None);
 
         // The same store against a DIFFERENT live pair, one side unplugged,
         // and a rewritten primary: disconnected, unselected, stale.

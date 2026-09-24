@@ -342,7 +342,9 @@ pub(crate) fn request_kind(req: &Request) -> Option<(LiveOperationKind, bool)> {
             (K::Enrollment, true)
         }
         PositionSample { .. } | PositionSession { .. } => (K::Framing, false),
-        Identify => (K::Identification, false),
+        // A recognition test changes no state: advancing the revision
+        // would make every client drop all of its daemon observations.
+        Identify | IdentifyFor { .. } => (K::Identification, false),
         ListCameras => (K::CameraEnumeration, false),
         SetCameras { .. } | SetCamerasIfCurrent { .. } => (K::CameraSetup, true),
         SetupIrEmitter { dry_run } => (K::CameraSetup, !dry_run),
@@ -487,6 +489,14 @@ mod tests {
         let (state, _) = setup();
         assert!(request_kind(&Request::LiveStatus).is_none());
         assert!(request_kind(&Request::SupportSnapshot { since_ms: 60_000 }).is_none());
+        // A recognition test is activity but never a state change: a
+        // revision bump would make clients drop every observation.
+        for identify in [Request::Identify, Request::IdentifyFor { user: "u".into() }] {
+            assert_eq!(
+                request_kind(&identify),
+                Some((LiveOperationKind::Identification, false))
+            );
+        }
         for _ in 0..100 {
             assert_eq!(snapshot(&state).state_revision, 0);
         }

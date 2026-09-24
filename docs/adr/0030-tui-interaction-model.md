@@ -13,6 +13,10 @@ changes nothing in what the daemon decides: every rule here is about how the
 TUI asks, shows and names. Where a rule needs a new daemon fact it says so;
 each such fact is share-safe and non-biometric.
 
+Amended during C2 (slice 2c): §2 names the reply's per-scan capture times
+`scan_captured_at`, and §5 adds the camera's display name to the attempt
+record, so the Overview can name a camera without the classifying listing.
+
 ## Context
 
 The TUI is complete and correct, and it reads like a map rather than a
@@ -130,8 +134,10 @@ device.
   count and, for scans that carry one, a capture date range. `FaceScan`
   gains an optional `captured_at` (unix seconds) written for new scans,
   and the enrollment reply carries it beside each scan name (an optional
-  per-scan `captured_at` on `ProfileSummary` and a per-group first/last
-  pair on `CameraGroupProfileSummary`, `serde(default)`); older scans and
+  per-scan list, `scan_captured_at` on `ProfileSummary`, aligned index for
+  index with `scans` because scan names are not guaranteed unique, and a
+  per-group first/last pair on `CameraGroupProfileSummary`,
+  `serde(default)`); older scans and
   older daemons show "date not recorded". The count line states only what
   is known: the number of scans against the **capture target**
   (`16 scans · capture target met`), and separately the recognizer
@@ -416,6 +422,14 @@ device.
   the posture table admits the account itself and root, as it does for
   `FaceSensorStatus { user }`. The camera listing of ADR-0029 A gains the
   same USB port chain so the TUI can map a record to a listed camera.
+- Each camera bucket in the record also keeps the camera's display name
+  (ADR-0029's naming: the node's sysfs name, else the USB product
+  string, with control and invisible formatting characters removed, at
+  most 64 characters) as read at its latest attempt that had one. It is
+  display only and never part of the bucket's key. It lets the Overview
+  name the camera of the last attempt without the classifying listing
+  (§6); a camera that is no longer connected is named by it, falling back
+  to vid/pid when no name was recorded.
 - Nothing else: roles come from ADR-0029 A, selection from ADR-0029 B.
 
 ### 6. Machine and account

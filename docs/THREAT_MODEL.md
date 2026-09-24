@@ -318,8 +318,12 @@ with a fabricated print.
 - **Score exposure is authorization-gated.** `Authenticate` (which returns the
   similarity score) is answered only for root peers (the PAM stacks) or the
   account owner probing themselves; any other local peer is refused outright,
-  so there is no cross-user hill-climbing oracle. Scores are logged to the
-  root-only journal, never to unprivileged callers.
+  so there is no cross-user hill-climbing oracle. The 1:N recognition tests
+  return a score too: `Identify` searches every account only for root and
+  otherwise only the caller's own, and `IdentifyFor` (the account-scoped test
+  a client runs for one account) is refused before it is queued unless the
+  caller is root or that account. Scores are logged to the root-only journal, never to
+  unprivileged callers.
 - **Memory hygiene.** Secrets are zeroized where the exposure is real: sealed
   keys, decrypted template plaintext, passwords, and the IPC wire buffers that
   may carry them (`zeroize`). Camera frames and embeddings are transient

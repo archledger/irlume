@@ -9,8 +9,9 @@
 //! What is stored: the time, the surface, the kind, the outcome class,
 //! the cause, the two durations, and the camera as a share-safe location
 //! (model, USB port chain, descriptor token, and a keyed discriminator for
-//! a unit that carries a serial). What is never stored: a score, a
-//! threshold, an embedding, reason prose, a serial or a node path.
+//! a unit that carries a serial) with its display name. What is never
+//! stored: a score, a threshold, an embedding, reason prose, a serial or a
+//! node path.
 //!
 //! Bounds (all enforced on every write): five attempts per camera bucket,
 //! eight camera buckets per account with the least recently used evicted,
@@ -240,6 +241,7 @@ pub(crate) fn apply(record: &mut AttemptRecord, entry: AttemptEntry, now: u64) {
             camera,
             attempts: Vec::new(),
             connected: None,
+            name: None,
         },
     };
     let mut bucket = bucket;
@@ -449,6 +451,10 @@ pub(crate) fn record(user: &str, filed: Filed) -> io::Result<()> {
     // record (the derived Default) starts at one.
     let seq = stored.next_seq.max(1);
     stored.next_seq = seq.wrapping_add(1).max(1);
+    let name = filed
+        .camera
+        .as_ref()
+        .and_then(|location| location.name.clone());
     let entry = AttemptEntry {
         at: filed.at,
         seq,
@@ -463,8 +469,27 @@ pub(crate) fn record(user: &str, filed: Filed) -> io::Result<()> {
             .as_ref()
             .map(|location| camera_of(location, &key)),
     };
+    let camera = entry.camera.clone();
     apply(&mut stored.record, entry, now);
+    name_bucket(&mut stored.record, camera.as_ref(), name);
     store.write(uid, &stored)
+}
+
+/// Keep the display name read at an attempt on its camera's bucket
+/// (ADR-0030 §2). The name is not part of the bucket's key, so buckets
+/// written before names were recorded keep their history; an attempt that
+/// read no name leaves the last known one.
+pub(crate) fn name_bucket(
+    record: &mut AttemptRecord,
+    camera: Option<&AttemptCamera>,
+    name: Option<String>,
+) {
+    let (Some(camera), Some(name)) = (camera, name) else {
+        return;
+    };
+    if let Some(bucket) = record.cameras.iter_mut().find(|b| b.camera == *camera) {
+        bucket.name = Some(name);
+    }
 }
 
 /// Queue capacity for the background writer: attempts complete far
@@ -755,12 +780,14 @@ mod tests {
             port_chain: Some("1-2".into()),
             descriptor_token: "0123456789abcdef".into(),
             serial: Some("e179cb54".into()),
+            name: None,
         };
         let nexigo = irlume_auth::CameraLocation {
             model: "3443:c803".into(),
             port_chain: Some("1-3".into()),
             descriptor_token: "fedcba9876543210".into(),
             serial: None,
+            name: None,
         };
         let mut record = AttemptRecord::default();
         for (i, location) in [&brio, &nexigo].into_iter().enumerate() {
@@ -853,6 +880,7 @@ mod tests {
             port_chain: Some("1-2".into()),
             descriptor_token: "0123456789abcdef".into(),
             serial: Some("e179cb54".into()),
+            name: None,
         };
         let camera = camera_of(&with_serial, &key);
         assert!(camera.unit.is_some());
@@ -941,6 +969,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ADR-0030 §2: the display name rides on the camera's bucket, never
+    /// in its key: a newer name replaces an older one, an attempt that read
+    /// none keeps the last known one, and a name never splits a bucket.
+    #[test]
+    fn a_bucket_keeps_the_latest_display_name_without_keying_on_it() {
+        let now = unix_now();
+        let mut record = AttemptRecord::default();
+        let first = entry(now, AttemptKind::Authenticate, Some("1-2"));
+        let camera = first.camera.clone();
+        apply(&mut record, first, now);
+        name_bucket(&mut record, camera.as_ref(), None);
+        assert_eq!(record.cameras[0].name, None);
+        name_bucket(&mut record, camera.as_ref(), Some("Logitech BRIO".into()));
+        assert_eq!(record.cameras[0].name.as_deref(), Some("Logitech BRIO"));
+        let second = entry(now + 1, AttemptKind::Identify, Some("1-2"));
+        apply(&mut record, second, now + 1);
+        name_bucket(&mut record, camera.as_ref(), None);
+        assert_eq!(record.cameras.len(), 1);
+        assert_eq!(record.cameras[0].attempts.len(), 2);
+        assert_eq!(
+            record.cameras[0].name.as_deref(),
+            Some("Logitech BRIO"),
+            "an attempt that read no name keeps the last known one"
+        );
+        name_bucket(&mut record, camera.as_ref(), Some("BRIO 4K".into()));
+        assert_eq!(record.cameras[0].name.as_deref(), Some("BRIO 4K"));
+        // No camera, no bucket to name.
+        name_bucket(&mut record, None, Some("ignored".into()));
+        assert_eq!(record.cameras[0].name.as_deref(), Some("BRIO 4K"));
+    }
+
     #[test]
     fn record_round_trips_through_the_store_and_stays_private() {
         let _g = crate::tests::env_lock();
@@ -977,6 +1036,7 @@ mod tests {
                     port_chain: Some("3-6".into()),
                     descriptor_token: "0123456789abcdef".into(),
                     serial: Some("200901010001".into()),
+                    name: None,
                 }),
             },
         )
@@ -1013,12 +1073,19 @@ mod tests {
                     port_chain: Some("3-6".into()),
                     descriptor_token: "0123456789abcdef".into(),
                     serial: Some("200901010001".into()),
+                    name: Some("Integrated IR Camera".into()),
                 }),
             },
         )
         .expect("record");
         let again = load(&me).unwrap();
+        // The bucket filed without a name (as before names were recorded)
+        // keeps its history and gains the name its newest attempt read.
         assert_eq!(again.cameras.len(), 1, "same unit, same bucket");
+        assert_eq!(
+            again.cameras[0].name.as_deref(),
+            Some("Integrated IR Camera")
+        );
         assert_eq!(again.cameras[0].attempts.len(), 2);
         // The sequence lives in the file: ordered across restarts, and
         // counting only this account's attempts.

@@ -2598,6 +2598,7 @@ mod tests {
                 scans_by_recognizer: Default::default(),
                 live_recognizer: None,
                 ir: None,
+                scan_captured_at: Vec::new(),
             }],
             false,
         );
@@ -2617,6 +2618,7 @@ mod tests {
                 scans_by_recognizer: Default::default(),
                 live_recognizer: None,
                 ir: None,
+                scan_captured_at: Vec::new(),
             }],
             false,
         );
@@ -2645,6 +2647,7 @@ mod tests {
                 scans_by_recognizer: counts,
                 live_recognizer: Some("embed:model-b".into()),
                 ir: None,
+                scan_captured_at: Vec::new(),
             }],
             false,
         );
@@ -3266,6 +3269,7 @@ mod tests {
                 scans_by_recognizer: Default::default(),
                 live_recognizer: None,
                 ir: None,
+                scan_captured_at: Vec::new(),
             }],
             true,
         );

@@ -94,6 +94,29 @@ pub struct FaceScan {
     /// not recorded (pre-calibration scan); ignored by [`Enrollment::pitch_neutral`].
     #[serde(default)]
     pub pitch: f32,
+    /// When the scan was captured, in unix seconds (ADR-0030 §2: Faces shows
+    /// each camera's capture date range). Display metadata, never a matching
+    /// input. `None` for a scan that predates the field or was captured with
+    /// the clock before the epoch. Omitted when absent, so an older scan
+    /// re-serialises byte for byte: on a host without a TPM key the file is
+    /// that plaintext, and a rewrite that changes nothing else leaves the
+    /// bytes the added cameras' snapshot binding hashes as they were (an
+    /// encrypted store changes on every write through its fresh nonce, a
+    /// cost ADR-0024 accepts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<u64>,
+}
+
+/// Now as unix seconds for a scan's [`FaceScan::captured_at`]; `None` when
+/// the clock reads before the epoch, so a broken clock records no date
+/// rather than 1970.
+#[must_use]
+pub fn capture_time_now() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
+        .filter(|&secs| secs > 0)
 }
 
 /// A face profile: a named set of scans of one face.
@@ -461,7 +484,8 @@ fn migrate(old: LegacyProfile) -> Enrollment {
 
             ir_center_edge_ratio: old.ir_depth_samples.get(i).copied().unwrap_or(0.0),
             ir_brightness: old.ir_brightness_samples.get(i).copied().unwrap_or(0.0),
-            pitch: 0.0, // legacy scans predate pitch calibration
+            pitch: 0.0,        // legacy scans predate pitch calibration
+            captured_at: None, // and record no capture time
         })
         .collect();
     Enrollment {
@@ -1164,6 +1188,7 @@ mod tests {
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
+            captured_at: None,
         }
     }
 
@@ -1418,6 +1443,7 @@ mod tests {
                     ir_center_edge_ratio: 1.4,
                     ir_brightness: 90.0,
                     pitch: 0.52,
+                    captured_at: None,
                 }],
             }],
             require_eyes_open: true,
@@ -1580,6 +1606,7 @@ mod tests {
             ir_center_edge_ratio: ratio,
             ir_brightness: bright,
             pitch: 0.0,
+            captured_at: None,
         }
     }
 
@@ -1593,6 +1620,7 @@ mod tests {
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch,
+            captured_at: None,
         }
     }
 
@@ -1645,6 +1673,7 @@ mod tests {
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
+            captured_at: None,
         }
     }
 
@@ -1695,6 +1724,36 @@ mod tests {
         assert_eq!(s.ir.as_ref().unwrap().len(), 1);
     }
 
+    /// ADR-0030 §2: a scan's capture time is optional display metadata. A
+    /// scan written before it loads as undated and re-serialises without the
+    /// key, byte for byte (on a host without a TPM key that plaintext is the
+    /// file an added camera's snapshot binding hashes), while a dated scan
+    /// keeps its time through both store forms.
+    #[test]
+    fn capture_time_is_optional_and_absent_times_leave_the_bytes_alone() {
+        let old = r#"{"name":"s","rgb":[0.1],"ir":null,"ir_space":null,"embed_space":null,"ir_depth":0.0,"ir_brightness":0.0,"pitch":0.0}"#;
+        let scan: FaceScan = serde_json::from_str(old).unwrap();
+        assert_eq!(scan.captured_at, None);
+        assert_eq!(serde_json::to_string(&scan).unwrap(), old);
+
+        let mut e = sample();
+        let before = serialize_enrollment(&e, None).unwrap();
+        assert!(!String::from_utf8_lossy(&before).contains("captured_at"));
+        assert_eq!(
+            serialize_enrollment(&deserialize_enrollment(&before, None).unwrap(), None).unwrap(),
+            before,
+            "an undated enrollment rewrites to the same bytes"
+        );
+        e.profiles[0].scans[0].captured_at = Some(1_790_000_000);
+        for key in [None, Some(crypto::generate_key())] {
+            let key = key.as_ref().map(|key| key.as_slice());
+            let bytes = serialize_enrollment(&e, key).unwrap();
+            let back = deserialize_enrollment(&bytes, key).unwrap();
+            assert_eq!(back.profiles[0].scans[0].captured_at, Some(1_790_000_000));
+        }
+        assert!(capture_time_now().is_some_and(|now| now > 1_700_000_000));
+    }
+
     #[test]
     fn ir_calibration_ignores_scans_without_ir() {
         // RGB-only scans (no IR) must not count toward the floor.
@@ -1713,6 +1772,7 @@ mod tests {
                     ir_center_edge_ratio: 0.0,
                     ir_brightness: 0.0,
                     pitch: 0.0,
+                    captured_at: None,
                 },
                 scan_with_ir(1.5, 100.0),
             ],
@@ -2014,6 +2074,7 @@ mod tests {
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
+            captured_at: None,
         };
         let mut e = Enrollment::new("u");
         e.profiles.push(FaceProfile {

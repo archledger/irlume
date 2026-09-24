@@ -569,7 +569,10 @@ pub enum Request {
     /// Unprivileged (no credential release), but NOT unscoped: a root peer is
     /// matched against every enrolled user, and a non-root peer only against its
     /// own account. The CLI help has always said so; this wire doc did not, and
-    /// it is the contract the machine surface keys off.
+    /// it is the contract the machine surface keys off. Root's search spans
+    /// accounts and is therefore filed in no account's attempt record; a
+    /// client that shows one account's recognition test sends
+    /// [`Request::IdentifyFor`] instead.
     Identify,
     /// Switch the active RGB+IR camera pair, persisting it (cameras.conf) so it
     /// survives a daemon restart. ROOT ONLY: it writes a system-wide setting
@@ -728,6 +731,16 @@ pub enum Request {
     /// Root or the account itself; answered from the daemon's state
     /// directory without touching the engine or a camera.
     LastAttempts { user: String },
+    /// 1:N identify against one account's enrollment only (ADR-0030 §2):
+    /// the account-scoped recognition test a client (the TUI's Faces page)
+    /// runs for the one account it shows. Root or
+    /// the account itself, checked before the request is queued, so no
+    /// local user can run recognition against another account, learn its
+    /// result or touch its record. Never a grant; answered with
+    /// [`Response::Identified`] and filed as an `identify` attempt in that
+    /// account's record (for root as well). A daemon that predates it
+    /// answers `Error("bad request")`.
+    IdentifyFor { user: String },
     /// Camera-free, non-secret machine preferences as observed by the daemon.
     PreferencesStatus,
     /// Liveness/alignment self-test (no auth side effects). See PAD self-testing.
@@ -1053,8 +1066,11 @@ pub struct AttemptCamera {
 pub struct AttemptEntry {
     /// Unix seconds.
     pub at: u64,
-    /// Order among attempts filed in the same second (a per-daemon-instance
-    /// counter taken at completion); zero from an older daemon.
+    /// The account's completion order: assigned by the daemon's one record
+    /// writer and kept in the account's record, so it stays ordered across
+    /// daemon restarts and is shared by both kinds (a client compares the
+    /// latest `authenticate` and `identify` entries by it, then by `at`).
+    /// Zero from an older daemon.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub seq: u64,
     pub kind: AttemptKind,
@@ -1088,6 +1104,14 @@ pub struct CameraAttempts {
     /// reads `Some(false)` ("replaced unit"). `None` from an older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connected: Option<bool>,
+    /// The camera's display name (ADR-0029: the node's sysfs name, else the
+    /// USB product string) as read at this bucket's most recent attempt that
+    /// had one, so a client can name the camera without a listing that
+    /// opens devices (ADR-0030 §2). Display only: never part of the bucket's
+    /// identity. `None` from an older daemon and for a bucket last written
+    /// before names were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// An account's attempt record (ADR-0030 §5): the latest attempt of each
@@ -1229,6 +1253,14 @@ pub struct ProfileSummary {
     /// This is not a camera, liveness or authentication readiness verdict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ir: Option<ProfileIrSummary>,
+    /// When each scan was captured (unix seconds), index for index with
+    /// `scans`; `None` for a scan that predates capture dates (ADR-0030 §2).
+    /// A parallel list rather than a map because nothing guarantees scan
+    /// names are unique in a stored enrollment. Empty when no scan is dated,
+    /// and from an older daemon; a client reads a list whose length is not
+    /// `scans.len()` as "date not recorded" for every scan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scan_captured_at: Vec<Option<u64>>,
 }
 
 /// Aggregate IR scan compatibility for one profile and the loaded recognizer.
@@ -1520,6 +1552,15 @@ pub struct CameraGroupProfileSummary {
     pub compatible_ir_pairs: usize,
     /// This group carries its own calibration for the live recognizer.
     pub calibrated: bool,
+    /// The earliest and latest capture time (unix seconds) among this
+    /// profile's scans on this group (ADR-0030 §2). A group's scans are
+    /// captured together when the camera is added, so they are all dated or
+    /// all not; `None` for scans that predate capture dates and from an
+    /// older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_captured_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_captured_at: Option<u64>,
 }
 
 /// Daemon response.
@@ -1632,8 +1673,9 @@ pub enum Response {
     TraceAccepted {
         limits: diagnostics::TraceLimits,
     },
-    /// Result of a 1:N `Identify`. `user`/`profile` are `None` when no enrolled
-    /// face matched (check `live` to tell "no match" from "not a live face").
+    /// Result of a 1:N `Identify` or `IdentifyFor`. `user`/`profile` are
+    /// `None` when no enrolled face matched (check `live` to tell "no match"
+    /// from "not a live face").
     Identified {
         user: Option<String>,
         profile: Option<String>,
@@ -2166,6 +2208,8 @@ mod tests {
                 compatible_rgb_candidates: 10,
                 compatible_ir_pairs: 10,
                 calibrated: true,
+                first_captured_at: None,
+                last_captured_at: None,
             }],
         };
         let response = Response::Enrollment {
@@ -2175,6 +2219,7 @@ mod tests {
                 scans_by_recognizer: Default::default(),
                 live_recognizer: None,
                 ir: None,
+                scan_captured_at: Vec::new(),
             }],
             require_eyes_open: false,
             closure_calibrated: false,
@@ -2382,6 +2427,70 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(serde_json::to_value(p).unwrap()["ir"], ir);
+    }
+
+    /// ADR-0030 §2: capture times are additive on the enrollment reply. An
+    /// older daemon's rows decode as undated and an undated row serialises
+    /// exactly as before; a dated row still decodes for an older reader.
+    #[test]
+    fn scan_capture_times_are_optional_in_both_wire_directions() {
+        let old = r#"{"name":"P","scans":["s","t"]}"#;
+        let mut p: super::ProfileSummary = serde_json::from_str(old).unwrap();
+        assert!(p.scan_captured_at.is_empty());
+        assert!(serde_json::to_value(&p)
+            .unwrap()
+            .get("scan_captured_at")
+            .is_none());
+        p.scan_captured_at = vec![None, Some(1_790_000_000)];
+        let wire = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            wire["scan_captured_at"],
+            serde_json::json!([null, 1_790_000_000u64])
+        );
+        #[derive(serde::Deserialize)]
+        struct OldProfile {
+            scans: Vec<String>,
+        }
+        let old_reader: OldProfile = serde_json::from_value(wire).unwrap();
+        assert_eq!(old_reader.scans, ["s", "t"]);
+
+        let old_group = serde_json::json!({"profile":"P","scans":10,
+            "capture_target_met":true,"calibration_fittable":true,
+            "compatible_rgb_candidates":10,"compatible_ir_pairs":10,"calibrated":false});
+        let mut group: super::CameraGroupProfileSummary =
+            serde_json::from_value(old_group.clone()).unwrap();
+        assert_eq!(group.first_captured_at, None);
+        assert_eq!(group.last_captured_at, None);
+        assert_eq!(serde_json::to_value(&group).unwrap(), old_group);
+        group.first_captured_at = Some(1_790_000_000);
+        group.last_captured_at = Some(1_790_000_060);
+        let back: super::CameraGroupProfileSummary =
+            serde_json::from_value(serde_json::to_value(&group).unwrap()).unwrap();
+        assert_eq!(back, group);
+    }
+
+    /// ADR-0030 §2: the account-scoped recognition test is its own request
+    /// variant, so a daemon that predates it cannot mistake it for the
+    /// account-less `Identify`: it fails to parse (answered "bad request").
+    #[test]
+    fn identify_for_names_its_account_and_is_unknown_to_an_older_daemon() {
+        let wire = serde_json::to_string(&super::Request::IdentifyFor {
+            user: "alice".into(),
+        })
+        .unwrap();
+        assert_eq!(wire, r#"{"IdentifyFor":{"user":"alice"}}"#);
+        assert!(matches!(
+            serde_json::from_str::<super::Request>(&wire).unwrap(),
+            super::Request::IdentifyFor { user } if user == "alice"
+        ));
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        enum OldRequest {
+            Identify,
+            LastAttempts { user: String },
+        }
+        assert!(serde_json::from_str::<OldRequest>(&wire).is_err());
+        assert!(serde_json::from_str::<OldRequest>(r#""Identify""#).is_ok());
     }
 
     #[test]

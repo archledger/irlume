@@ -23,7 +23,11 @@ touches disk (`storage.rs`: "We store L2-normalized embeddings, never raw
 images"; verified by grep, there is no image-write path). This is true of both
 stores: the primary `/var/lib/irlume/<user>.json` and the secondary
 `/var/lib/irlume/cameras/<user>.json` hold embeddings and calibration scalars
-only, never images.
+only, never images. Each scan captured since ADR-0030 C2 also records when it
+was captured (a unix timestamp, so the TUI can show a capture date range). It
+is not biometric. It sits inside the same payload as the embeddings, so it is
+encrypted where they are and in a 0600 plaintext file on a host without a TPM
+key.
 
 Why this matters: an embedding is a one-way projection. You cannot re-render the
 enrollment photo from it, and it is not a fingerprint/photo an attacker can

@@ -109,6 +109,8 @@ pub fn classify(req: &Request) -> Class {
         PositionSample { .. }
         | PositionSession { .. }
         | Identify
+        // The account-scoped recognition test captures like Identify.
+        | IdentifyFor { .. }
         | Enroll { .. }
         | EnrollmentSession { .. }
         | AddScan { .. }
@@ -607,6 +609,12 @@ mod tests {
         );
         assert_eq!(
             classify(&Request::PositionSession { user: None }),
+            Class::Camera
+        );
+        // Both recognition tests capture: never a connection-thread status.
+        assert_eq!(classify(&Request::Identify), Class::Camera);
+        assert_eq!(
+            classify(&Request::IdentifyFor { user: "u".into() }),
             Class::Camera
         );
         // Read-only status answers on the connection thread (#212): a TPM-

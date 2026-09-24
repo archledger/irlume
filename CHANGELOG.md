@@ -7,6 +7,24 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Daemon facts for the Overview and Faces pages (ADR-0030 §2, C2). A new
+  `IdentifyFor { user }` request runs the 1:N recognition test against one
+  account's enrollment only. It is root-or-target: the daemon refuses any
+  other peer before the request is queued, so it never reaches the camera,
+  the enrollment or the account's attempt record, and the refusal reads
+  the same whether or not the account exists. It answers with the
+  existing `Identified` reply and is filed as an `identify` attempt in
+  that account's record, for root as well (root's account-less `Identify`
+  still searches every account and files nothing). New scans record when
+  they were captured (`captured_at`, unix seconds, omitted for older scans
+  so an unchanged enrollment serializes exactly as before); the enrollment
+  reply carries a per-scan `scan_captured_at` aligned with `scans` and a
+  `first_captured_at`/`last_captured_at` pair per added-camera profile,
+  all optional, so older daemons and older scans read as "date not
+  recorded". Each camera bucket in the attempt record keeps the camera's
+  display name as read at its latest attempt, so a client can name the
+  camera of the last attempt without a listing that opens devices.
+
 - The per-account attempt record (ADR-0030 §5, C2). The daemon files
   every face attempt in a root-only record under its state directory
   (`/var/lib/irlume/attempts/<uid>.json`): the latest attempt of each

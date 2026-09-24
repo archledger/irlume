@@ -896,6 +896,7 @@ mod tests {
                 ir_center_edge_ratio: 2.0,
                 ir_brightness: 1.0,
                 pitch,
+                captured_at: None,
             }
         }
 

@@ -234,6 +234,7 @@ fn one_profile() -> Vec<ProfileSummary> {
         scans_by_recognizer: Default::default(),
         live_recognizer: None,
         ir: None,
+        scan_captured_at: Vec::new(),
     }]
 }
 

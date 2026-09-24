@@ -2333,6 +2333,7 @@ fn usable_scans_counts_only_the_loaded_recognizer() {
             scans_by_recognizer: counts.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
             live_recognizer: live.map(str::to_string),
             ir: None,
+            scan_captured_at: Vec::new(),
         }
     };
 

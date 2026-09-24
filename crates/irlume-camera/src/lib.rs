@@ -4240,6 +4240,22 @@ pub struct CameraLocation {
     pub port_chain: Option<String>,
     pub descriptor_token: String,
     pub serial: Option<String>,
+    /// The node's display name ([`camera_display_name`]), so a record can
+    /// name the camera without a listing that opens devices (ADR-0030 §2).
+    /// Display only: never part of the location's identity.
+    pub name: Option<String>,
+}
+
+impl CameraLocation {
+    /// The same unit at the same place: every field but the display name,
+    /// which differs between one device's nodes.
+    #[must_use]
+    pub fn same_unit_as(&self, other: &Self) -> bool {
+        self.model == other.model
+            && self.port_chain == other.port_chain
+            && self.descriptor_token == other.descriptor_token
+            && self.serial == other.serial
+    }
 }
 
 /// See [`CameraLocation`]. Sysfs only, and only the USB identity — link
@@ -4249,11 +4265,20 @@ pub struct CameraLocation {
 pub fn camera_location(node: &str) -> Option<CameraLocation> {
     let identity = uvc_descriptor::identity_for_location(node).ok()?;
     let fingerprint = identity.descriptor_fingerprint();
+    let dev_dir = std::path::Path::new("/sys").join(identity.usb_devpath.trim_start_matches('/'));
+    // The identity above follows a symlinked node (a `/dev/v4l/by-id` pin);
+    // the name must come from the same node, as the Cameras page names it.
+    let resolved = std::fs::canonicalize(node).ok();
+    let name_node = resolved
+        .as_deref()
+        .and_then(std::path::Path::to_str)
+        .unwrap_or(node);
     Some(CameraLocation {
         model: format!("{:04x}:{:04x}", identity.vid, identity.pid),
         port_chain: usb_port_chain(&identity.usb_devpath),
         descriptor_token: fingerprint.get(..16)?.to_owned(),
         serial: identity.serial,
+        name: camera_display_name(&dev_dir, name_node),
     })
 }
 
@@ -4270,8 +4295,19 @@ pub fn connected_camera_locations() -> Vec<CameraLocation> {
             camera_location(&format!("/dev/{}", entry.file_name().to_string_lossy()))
         })
         .collect();
-    locations.sort_by(|a, b| (&a.port_chain, &a.model).cmp(&(&b.port_chain, &b.model)));
-    locations.dedup();
+    // One entry per unit: a device's nodes share its location but may carry
+    // different display names, so the name orders last and is not compared.
+    let key = |l: &CameraLocation| {
+        (
+            l.port_chain.clone(),
+            l.model.clone(),
+            l.descriptor_token.clone(),
+            l.serial.clone(),
+            l.name.clone(),
+        )
+    };
+    locations.sort_by_key(key);
+    locations.dedup_by(|a, b| a.same_unit_as(b));
     locations
 }
 
@@ -4295,12 +4331,20 @@ fn usb_port_chain(usb_devpath: &str) -> Option<String> {
 /// changed or spoofed name changes nothing in selection or matching.
 pub fn camera_display_name(dev_dir: &std::path::Path, node: &str) -> Option<String> {
     // Device-provided text: a descriptor may carry anything, including
-    // terminal control sequences. Only printable characters reach a screen,
-    // bounded, and never an empty or whitespace-only name.
+    // terminal control sequences and invisible formatting (bidi overrides,
+    // zero-width marks) that would reorder or hide what is printed beside
+    // it. Only visible characters reach a screen, bounded, and never an
+    // empty or whitespace-only name.
     let clean = |text: String| {
         let text: String = text
             .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
+            .map(|c| {
+                if c.is_control() || is_invisible_format(c) {
+                    ' '
+                } else {
+                    c
+                }
+            })
             .take(64)
             .collect();
         let text = text.trim();
@@ -4318,6 +4362,17 @@ pub fn camera_display_name(dev_dir: &std::path::Path, node: &str) -> Option<Stri
                 .ok()
                 .and_then(clean)
         })
+}
+
+/// Unicode format characters that change how neighbouring text displays
+/// without showing themselves: the Arabic letter mark, zero-width
+/// characters and directional marks, bidi embeddings, overrides and
+/// isolates, invisible operators and the byte-order mark.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
+    )
 }
 
 /// The UVC driver names a node `"<product>: <product>"` and then cuts the
@@ -16744,6 +16799,44 @@ mod tests {
         assert_eq!(camera_location("/dev/irlume-no-such-node"), None);
     }
 
+    /// A device's nodes share one location but can read different display
+    /// names; the name is display only and never tells two units apart.
+    #[test]
+    fn a_location_is_the_same_unit_whatever_its_display_name() {
+        let brio = CameraLocation {
+            model: "046d:085e".into(),
+            port_chain: Some("4-2".into()),
+            descriptor_token: "0123456789abcdef".into(),
+            serial: Some("ABC".into()),
+            name: Some("Logitech BRIO".into()),
+        };
+        let other_node = CameraLocation {
+            name: Some("Logitech BRIO IR".into()),
+            ..brio.clone()
+        };
+        assert!(brio.same_unit_as(&other_node));
+        assert!(brio.same_unit_as(&CameraLocation {
+            name: None,
+            ..brio.clone()
+        }));
+        for moved in [
+            CameraLocation {
+                port_chain: Some("4-3".into()),
+                ..brio.clone()
+            },
+            CameraLocation {
+                serial: Some("XYZ".into()),
+                ..brio.clone()
+            },
+            CameraLocation {
+                descriptor_token: "fedcba9876543210".into(),
+                ..brio.clone()
+            },
+        ] {
+            assert!(!brio.same_unit_as(&moved), "{moved:?}");
+        }
+    }
+
     #[test]
     fn repeated_node_names_collapse_to_one_copy() {
         assert_eq!(
@@ -16792,6 +16885,18 @@ mod tests {
         assert_eq!(
             camera_display_name(&dir, "/dev/irlume-no-such-node").as_deref(),
             Some("Cam [31m era text")
+        );
+        // Nor does invisible formatting: a right-to-left override or a
+        // zero-width space would reorder or hide the text printed beside
+        // the name.
+        std::fs::write(
+            dir.join("product"),
+            "Integrated\u{202E}Camera\u{200B}\u{2066}x\u{FEFF}",
+        )
+        .unwrap();
+        assert_eq!(
+            camera_display_name(&dir, "/dev/irlume-no-such-node").as_deref(),
+            Some("Integrated Camera  x")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

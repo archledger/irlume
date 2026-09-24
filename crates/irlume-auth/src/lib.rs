@@ -1786,6 +1786,7 @@ mod adapter_match_tests {
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,
+                captured_at: None,
             }],
             ir_calib: None,
             ir_calibs: Default::default(),
@@ -8456,6 +8457,8 @@ impl Engine {
             let added = captured.len().min(room);
             let mut added_scans = Vec::with_capacity(added);
             let mut ambient_lit = 0usize;
+            // One capture session, one date (ADR-0030 §2).
+            let captured_at = irlume_core::storage::capture_time_now();
             for s in captured.into_iter().take(room) {
                 if s.ambient_share.is_some_and(|v| v >= AMBIENT_LIT_SHARE) {
                     ambient_lit += 1;
@@ -8472,6 +8475,7 @@ impl Engine {
                     ir_center_edge_ratio: s.center_edge_ratio,
                     ir_brightness: s.brightness,
                     pitch: s.pitch,
+                    captured_at,
                 });
             }
             self.refit_profile_calib(&mut enr.profiles[idx]);
@@ -8505,6 +8509,9 @@ impl Engine {
             scans: Vec::new(),
         };
         let mut ambient_lit = 0usize;
+        // One capture session, one date (ADR-0030 §2); an added camera's
+        // scans are captured here too and keep it in the camera store.
+        let captured_at = irlume_core::storage::capture_time_now();
         for s in captured {
             if s.ambient_share.is_some_and(|v| v >= AMBIENT_LIT_SHARE) {
                 ambient_lit += 1;
@@ -8520,6 +8527,7 @@ impl Engine {
                 ir_center_edge_ratio: s.center_edge_ratio,
                 ir_brightness: s.brightness,
                 pitch: s.pitch,
+                captured_at,
             });
         }
         let n = prof.scans.len();
@@ -8814,6 +8822,8 @@ impl Engine {
         }
         let mut added = Vec::with_capacity(captured.len());
         let mut ambient_lit = 0usize;
+        // One capture session, one date (ADR-0030 §2).
+        let captured_at = storage::capture_time_now();
         for c in captured {
             if c.ambient_share.is_some_and(|v| v >= AMBIENT_LIT_SHARE) {
                 ambient_lit += 1;
@@ -8829,6 +8839,7 @@ impl Engine {
                 ir_center_edge_ratio: c.center_edge_ratio,
                 ir_brightness: c.brightness,
                 pitch: c.pitch,
+                captured_at,
             });
             added.push(sname);
         }
@@ -10138,6 +10149,7 @@ mod tests {
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,
+                captured_at: None,
             })
             .collect();
         // an unseen genuine IR probe: same identity base, fresh noise
@@ -10957,6 +10969,7 @@ mod tests {
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
+            captured_at: None,
         }
     }
 
@@ -11958,6 +11971,7 @@ mod tests {
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,
+                captured_at: None,
             }],
         };
         let mut enr = Enrollment::new("u");
@@ -12889,6 +12903,7 @@ mod engine_tests {
             ir_center_edge_ratio: 1.3,
             ir_brightness: 90.0,
             pitch: 0.5,
+            captured_at: None,
         }
     }
 
@@ -12909,6 +12924,7 @@ mod engine_tests {
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.5,
+                captured_at: None,
             }],
             ir_calib: None,
             ir_calibs: Default::default(),
@@ -14986,6 +15002,11 @@ mod engine_tests {
         assert_eq!(candidate.profiles[0].scans.len(), 11);
         assert!(matches!(outcome, EnrollOutcome::Merged { added: 10, .. }));
         assert_eq!(observer.0.get(), 1);
+        // ADR-0030 §2: the merged scans carry this session's capture time;
+        // the existing scan keeps what it had.
+        let (existing, merged) = candidate.profiles[0].scans.split_at(1);
+        assert_eq!(existing[0].captured_at, None);
+        assert!(merged.iter().all(|scan| scan.captured_at.is_some()));
     }
 
     #[test]
@@ -15157,6 +15178,15 @@ mod engine_tests {
         assert_eq!(candidate.profiles.len(), 1);
         assert_eq!(candidate.profiles[0].name, "Replacement");
         assert_eq!(candidate.profiles[0].scans.len(), 3);
+        // ADR-0030 §2: a new profile's scans (the path an added camera's
+        // capture also takes) are dated, one date for the session.
+        let dates: Vec<_> = candidate.profiles[0]
+            .scans
+            .iter()
+            .map(|scan| scan.captured_at)
+            .collect();
+        assert!(dates[0].is_some(), "{dates:?}");
+        assert!(dates.iter().all(|date| *date == dates[0]), "{dates:?}");
         assert!(candidate.camera_binding.is_some());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         teardown_sandbox(&dir);

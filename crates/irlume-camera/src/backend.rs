@@ -6,12 +6,15 @@
 use irlume_common::live_camera::{
     CameraInventoryReason, CameraInventorySnapshot, CameraInventoryState,
 };
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+use crate::connected::ConnectedPairs;
 use crate::contracts::CameraDescriptor;
 use crate::inventory::{
     CameraInventory, CameraInventoryError, CameraInventoryEvent, CameraObservation,
+    EndpointGeneration,
 };
 use crate::lease::{
     CameraLease, CameraLeaseError, CameraOperationKind, CameraOperationSession, LeaseAuthority,
@@ -36,6 +39,8 @@ trait CameraBackend: Send + Sync + 'static {
 ///
 /// Inventory mutation is isolated from capture routing. Leases and hotplug event
 /// subscription remain later slices and therefore cannot alter behavior here.
+/// Discovery answers it routes are also kept against the inventory generation
+/// they ran under, for the camera-free pairing view (ADR-0029 §1).
 pub(crate) struct CameraSupervisor {
     backend: Arc<dyn CameraBackend>,
     inventory: Arc<Mutex<CameraInventory>>,
@@ -191,11 +196,62 @@ impl CameraSupervisor {
     }
 
     fn discover_nodes(&self) -> Vec<(String, Role)> {
-        self.backend.discover_nodes()
+        let before = self.endpoint_generations();
+        let nodes = self.backend.discover_nodes();
+        self.record_roles(
+            &before,
+            nodes.iter().map(|(path, role)| (path.as_str(), *role)),
+        );
+        nodes
     }
 
     fn list_pairs(&self) -> Vec<CameraPair> {
-        self.backend.list_pairs()
+        let before = self.endpoint_generations();
+        let pairs = self.backend.list_pairs();
+        self.record_roles(
+            &before,
+            pairs
+                .iter()
+                .flat_map(|pair| [(pair.rgb.as_str(), Role::Rgb), (pair.ir.as_str(), Role::Ir)]),
+        );
+        pairs
+    }
+
+    /// The published endpoints' generations, copied under the inventory lock
+    /// and released before any backend call: classification takes leases,
+    /// which lock the inventory themselves.
+    fn endpoint_generations(&self) -> BTreeMap<String, EndpointGeneration> {
+        self.inventory
+            .lock()
+            .map(|inventory| inventory.endpoint_generations())
+            .unwrap_or_default()
+    }
+
+    /// Keep what a discovery that already ran answered, bound to the
+    /// generation it ran under (ADR-0029 §1). Never opens, never changes the
+    /// answer; a poisoned inventory records nothing.
+    fn record_roles<'a>(
+        &self,
+        before: &BTreeMap<String, EndpointGeneration>,
+        classified: impl IntoIterator<Item = (&'a str, Role)>,
+    ) {
+        if before.is_empty() {
+            return;
+        }
+        if let Ok(mut inventory) = self.inventory.lock() {
+            inventory.record_roles(before, classified);
+        }
+    }
+
+    fn connected_pairs(&self) -> ConnectedPairs {
+        match self.inventory.lock() {
+            Ok(inventory) => inventory.connected_pairs(),
+            Err(_) => ConnectedPairs {
+                state: CameraInventoryState::Unavailable,
+                reason: Some(CameraInventoryReason::Inventory),
+                ..Default::default()
+            },
+        }
     }
 
     fn open_rgb(&self, device: &str, lease: CameraLease) -> irlume_common::Result<RgbCamera> {
@@ -305,6 +361,22 @@ pub(crate) fn camera_inventory_snapshot() -> CameraInventorySnapshot {
     snapshot_from_slot(&DEFAULT_CAMERA_SUPERVISOR)
 }
 
+fn connected_pairs_from_slot(slot: &OnceLock<Arc<CameraSupervisor>>) -> ConnectedPairs {
+    slot.get()
+        .map_or_else(ConnectedPairs::default, |supervisor| {
+            supervisor.connected_pairs()
+        })
+}
+
+/// Read the pairing view without initializing the supervisor.
+pub(crate) fn connected_pairs() -> ConnectedPairs {
+    #[cfg(test)]
+    if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
+        return supervisor.connected_pairs();
+    }
+    connected_pairs_from_slot(&DEFAULT_CAMERA_SUPERVISOR)
+}
+
 pub(crate) fn default_camera_supervisor() -> &'static CameraSupervisor {
     DEFAULT_CAMERA_SUPERVISOR
         .get_or_init(|| {
@@ -359,6 +431,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::contracts::CameraInstanceId;
+    use crate::inventory::fixtures::ObservationFixture;
     use crate::{FailedAt, McCentric, Unreadable};
 
     struct TestBackendGuard(Option<Arc<CameraSupervisor>>);
@@ -393,9 +466,9 @@ pub(crate) mod tests {
         endpoint: &str,
         work: impl FnOnce(&CameraOperationSession) -> R,
     ) -> R {
-        let supervisor = Arc::new(CameraSupervisor::new(RecordingBackend {
-            calls: Arc::new(Mutex::new(Vec::new())),
-        }));
+        let supervisor = Arc::new(CameraSupervisor::new(RecordingBackend::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
         seed_test_endpoints(&supervisor, &[endpoint]);
         let _installed = install_test_supervisor(supervisor.clone());
         let operation = supervisor
@@ -408,17 +481,86 @@ pub(crate) mod tests {
         work(&operation)
     }
 
+    type ClassificationHook = Box<dyn FnOnce() + Send>;
+
     #[derive(Clone)]
     struct RecordingBackend {
         calls: Arc<Mutex<Vec<String>>>,
+        /// Discovery's answer; `None` keeps the spy nodes.
+        nodes: Option<Vec<(String, Role)>>,
+        /// Pairing's answer; `None` keeps the spy pair.
+        pairs: Option<Vec<CameraPair>>,
+        /// Runs once inside the next discovery or pairing call, after the
+        /// supervisor's first inventory read and before its second.
+        during_classification: Arc<Mutex<Option<ClassificationHook>>>,
     }
 
     impl RecordingBackend {
+        fn new(calls: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                calls,
+                nodes: None,
+                pairs: None,
+                during_classification: Arc::default(),
+            }
+        }
+
+        fn discovering(mut self, nodes: &[(&str, Role)]) -> Self {
+            self.nodes = Some(owned(nodes));
+            self
+        }
+
+        fn pairing(mut self, pairs: Vec<CameraPair>) -> Self {
+            self.pairs = Some(pairs);
+            self
+        }
+
+        /// Arm the hook for the next discovery or pairing call.
+        fn on_next_classification(&self, hook: impl FnOnce() + Send + 'static) {
+            *self
+                .during_classification
+                .lock()
+                .expect("hook lock poisoned") = Some(Box::new(hook));
+        }
+
+        fn run_hook(&self) {
+            let hook = self
+                .during_classification
+                .lock()
+                .expect("hook lock poisoned")
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+
         fn record(&self, call: impl Into<String>) {
             self.calls
                 .lock()
                 .expect("recording lock poisoned")
                 .push(call.into());
+        }
+    }
+
+    fn owned(nodes: &[(&str, Role)]) -> Vec<(String, Role)> {
+        nodes
+            .iter()
+            .map(|(path, role)| ((*path).to_owned(), *role))
+            .collect()
+    }
+
+    /// A pairing answer; recording reads only its `rgb` and `ir`.
+    fn spy_pair(rgb: &str, ir: &str) -> CameraPair {
+        CameraPair {
+            rgb: rgb.into(),
+            ir: ir.into(),
+            id: None,
+            fixed: false,
+            name: None,
+            identity: None,
+            serial_present: false,
+            port_chain: None,
+            descriptor_token: None,
         }
     }
 
@@ -434,9 +576,7 @@ pub(crate) mod tests {
             "reading status must not initialize a supervisor"
         );
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let supervisor = Arc::new(CameraSupervisor::new(RecordingBackend {
-            calls: calls.clone(),
-        }));
+        let supervisor = Arc::new(CameraSupervisor::new(RecordingBackend::new(calls.clone())));
         seed_test_endpoints(&supervisor, &["/dev/video0"]);
         assert!(slot.set(supervisor).is_ok());
         let snapshot = snapshot_from_slot(&slot);
@@ -451,7 +591,7 @@ pub(crate) mod tests {
     #[test]
     fn live_inventory_poisoned_mutex_is_unavailable_not_a_recovered_old_snapshot() {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let supervisor = Arc::new(CameraSupervisor::new(RecordingBackend { calls }));
+        let supervisor = Arc::new(CameraSupervisor::new(RecordingBackend::new(calls)));
         seed_test_endpoints(&supervisor, &["/dev/video0"]);
         let poison = supervisor.clone();
         let _ = std::thread::spawn(move || {
@@ -468,7 +608,7 @@ pub(crate) mod tests {
     #[test]
     fn live_inventory_snapshot_does_not_acquire_or_extend_an_operation_permit() {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let supervisor = CameraSupervisor::new(RecordingBackend { calls });
+        let supervisor = CameraSupervisor::new(RecordingBackend::new(calls));
         seed_test_endpoints(&supervisor, &["/dev/video0"]);
         let operation = supervisor
             .acquire_operation(&["/dev/video0"], CameraOperationKind::Setup, Instant::now())
@@ -498,6 +638,10 @@ pub(crate) mod tests {
 
         fn discover_nodes(&self) -> Vec<(String, Role)> {
             self.record("discover_nodes");
+            self.run_hook();
+            if let Some(nodes) = &self.nodes {
+                return nodes.clone();
+            }
             vec![
                 ("/dev/spy-ir".into(), Role::Ir),
                 ("/dev/spy-rgb".into(), Role::Rgb),
@@ -506,6 +650,10 @@ pub(crate) mod tests {
 
         fn list_pairs(&self) -> Vec<CameraPair> {
             self.record("list_pairs");
+            self.run_hook();
+            if let Some(pairs) = &self.pairs {
+                return pairs.clone();
+            }
             vec![CameraPair {
                 rgb: "/dev/spy-rgb".into(),
                 ir: "/dev/spy-ir".into(),
@@ -600,9 +748,9 @@ pub(crate) mod tests {
     #[test]
     fn public_camera_entrypoints_route_through_one_supervisor_backend() {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let supervisor = Arc::new(CameraSupervisor::from_arc(Arc::new(RecordingBackend {
-            calls: Arc::clone(&calls),
-        })));
+        let supervisor = Arc::new(CameraSupervisor::from_arc(Arc::new(RecordingBackend::new(
+            Arc::clone(&calls),
+        ))));
         seed_test_endpoints(&supervisor, &["/dev/spy-rgb", "/dev/spy-ir"]);
         let _guard = install_test_supervisor(Arc::clone(&supervisor));
         with_camera_supervisor(|routed| assert!(std::ptr::eq(routed, supervisor.as_ref())));
@@ -713,9 +861,7 @@ pub(crate) mod tests {
 
     #[test]
     fn supervisor_owns_and_validates_one_inventory_instance() {
-        let backend = Arc::new(RecordingBackend {
-            calls: Arc::new(Mutex::new(Vec::new())),
-        });
+        let backend = Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new()))));
         let supervisor = CameraSupervisor::from_arc(backend);
         let observation = CameraObservation::new(
             crate::contracts::BackendKind::UvcV4l2,
@@ -738,9 +884,7 @@ pub(crate) mod tests {
 
     #[test]
     fn supervisor_inventory_poison_fails_closed() {
-        let backend = Arc::new(RecordingBackend {
-            calls: Arc::new(Mutex::new(Vec::new())),
-        });
+        let backend = Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new()))));
         let supervisor = CameraSupervisor::from_arc(backend);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = supervisor.inventory.lock().unwrap();
@@ -762,5 +906,396 @@ pub(crate) mod tests {
         assert!(default_camera_supervisor()
             .backend
             .has_exact_production_uvc_delegates());
+    }
+
+    const BRIO_AT: &str = "/devices/pci0000:00/0000:00:14.0/usb3/3-1";
+    const BRIO_ANSWER: [(&str, Role); 2] = [("/dev/video0", Role::Rgb), ("/dev/video2", Role::Ir)];
+
+    fn brio() -> ObservationFixture {
+        ObservationFixture::usb(BRIO_AT, "046d:085e")
+            .serial("ABC123")
+            .four_node(0)
+    }
+
+    /// A spy supervisor over `backend`, whose inventory holds `observations`.
+    /// `backend` stays with the caller, sharing the hook slot, so a test can
+    /// arm a hook that reaches the supervisor's inventory.
+    fn spy_supervisor(
+        backend: &RecordingBackend,
+        observations: Vec<CameraObservation>,
+    ) -> Arc<CameraSupervisor> {
+        let supervisor = Arc::new(CameraSupervisor::new(backend.clone()));
+        supervisor.reconcile_inventory(observations).unwrap();
+        supervisor
+    }
+
+    fn recorded_role_count(supervisor: &CameraSupervisor) -> usize {
+        supervisor.inventory.lock().unwrap().recorded_role_count()
+    }
+
+    #[test]
+    fn discovery_records_roles_that_connected_pairs_reads_without_a_backend_call() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let answer = [
+            ("/dev/video0", Role::Rgb),
+            ("/dev/video2", Role::Ir),
+            ("/dev/video4", Role::Rgb),
+            ("/dev/video6", Role::Ir),
+        ];
+        let backend = RecordingBackend::new(calls.clone()).discovering(&answer);
+        let supervisor = spy_supervisor(
+            &backend,
+            vec![
+                brio().build(),
+                ObservationFixture::usb("/devices/pci0000:00/0000:00:14.0/usb3/3-2", "1111:2222")
+                    .serial("DEF456")
+                    .fixed()
+                    .four_node(4)
+                    .build(),
+            ],
+        );
+        let _installed = install_test_supervisor(supervisor.clone());
+
+        assert_eq!(crate::discover_nodes(), owned(&answer));
+        let view = crate::connected_pairs();
+        assert_eq!(view.state, CameraInventoryState::Current);
+        assert!(view.unclassified.is_empty());
+        let pairs: Vec<_> = view
+            .pairs
+            .iter()
+            .map(|pair| {
+                (
+                    pair.rgb.as_str(),
+                    pair.ir.as_str(),
+                    pair.identity.as_str(),
+                    pair.fixed,
+                )
+            })
+            .collect();
+        // Topology order, never the fixed-first order of the pair listing.
+        assert_eq!(
+            pairs,
+            [
+                ("/dev/video0", "/dev/video2", "046d:085e:abc123", false),
+                ("/dev/video4", "/dev/video6", "1111:2222:def456", true),
+            ]
+        );
+        for _ in 0..3 {
+            assert_eq!(crate::connected_pairs(), view);
+        }
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["discover_nodes"],
+            "reading the view called a discovery or open delegate"
+        );
+        assert!(
+            supervisor
+                .acquire_operation(
+                    &["/dev/video0"],
+                    CameraOperationKind::Authentication,
+                    Instant::now(),
+                )
+                .is_ok(),
+            "reading the view must not hold a permit"
+        );
+    }
+
+    #[test]
+    fn pairing_records_the_roles_of_the_pairs_it_returns() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let backend =
+            RecordingBackend::new(calls).pairing(vec![spy_pair("/dev/video0", "/dev/video2")]);
+        let supervisor = spy_supervisor(&backend, vec![brio().build()]);
+        let _installed = install_test_supervisor(supervisor);
+
+        let pairs = crate::list_pairs();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].rgb, "/dev/video0");
+        assert_eq!(pairs[0].ir, "/dev/video2");
+        // Startup lists again in the same generation (capabilities, then
+        // selection); the same answer keeps the roles.
+        crate::list_pairs();
+        let view = crate::connected_pairs();
+        assert_eq!(view.pairs.len(), 1);
+        assert_eq!(view.pairs[0].rgb, "/dev/video0");
+        assert_eq!(view.pairs[0].ir, "/dev/video2");
+        assert_eq!(view.pairs[0].identity, "046d:085e:abc123");
+    }
+
+    #[test]
+    fn a_classification_that_raced_a_generation_change_is_not_recorded() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = RecordingBackend::new(calls).discovering(&BRIO_ANSWER);
+        let supervisor = spy_supervisor(&backend, vec![brio().build()]);
+        let inventory = supervisor.inventory.clone();
+        // The test fails if the supervisor held the inventory lock across
+        // the backend call.
+        backend.on_next_classification(move || {
+            inventory
+                .try_lock()
+                .expect("the supervisor held the inventory lock across discovery")
+                .reconcile(vec![brio().evidence("changed").build()])
+                .unwrap();
+        });
+        let _installed = install_test_supervisor(supervisor);
+
+        assert_eq!(crate::discover_nodes(), owned(&BRIO_ANSWER));
+        let view = crate::connected_pairs();
+        assert!(view.pairs.is_empty());
+        assert_eq!(view.unclassified.len(), 1);
+        assert_eq!(view.unclassified[0].generation, 2);
+        assert_eq!(
+            view.unclassified[0].endpoints,
+            ["/dev/video0", "/dev/video2"]
+        );
+
+        // The discard is per generation: the next discovery records.
+        crate::discover_nodes();
+        let view = crate::connected_pairs();
+        assert_eq!(view.pairs.len(), 1);
+        assert_eq!(view.pairs[0].generation, 2);
+        assert!(view.unclassified.is_empty());
+    }
+
+    #[test]
+    fn a_classification_that_raced_an_invalidation_is_not_recorded() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = RecordingBackend::new(calls).discovering(&BRIO_ANSWER);
+        let supervisor = spy_supervisor(&backend, vec![brio().build()]);
+        let inventory = supervisor.inventory.clone();
+        backend.on_next_classification(move || {
+            inventory
+                .try_lock()
+                .expect("the supervisor held the inventory lock across discovery")
+                .invalidate_all();
+        });
+        let _installed = install_test_supervisor(supervisor.clone());
+
+        assert_eq!(crate::discover_nodes(), owned(&BRIO_ANSWER));
+        let view = crate::connected_pairs();
+        assert_eq!(view.state, CameraInventoryState::Refreshing);
+        assert!(view.pairs.is_empty());
+        assert!(view.unclassified.is_empty());
+        assert_eq!(recorded_role_count(&supervisor), 0);
+
+        supervisor
+            .reconcile_inventory(vec![brio().build()])
+            .unwrap();
+        let view = crate::connected_pairs();
+        assert!(view.pairs.is_empty());
+        assert_eq!(view.unclassified.len(), 1);
+        assert_eq!(view.unclassified[0].generation, 2);
+        assert_eq!(
+            view.unclassified[0].endpoints,
+            ["/dev/video0", "/dev/video2"]
+        );
+    }
+
+    #[test]
+    fn a_pairing_that_raced_a_generation_change_is_not_recorded() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let backend =
+            RecordingBackend::new(calls).pairing(vec![spy_pair("/dev/video0", "/dev/video2")]);
+        let supervisor = spy_supervisor(&backend, vec![brio().build()]);
+        let inventory = supervisor.inventory.clone();
+        // The test fails if the supervisor held the inventory lock across
+        // the backend call.
+        backend.on_next_classification(move || {
+            inventory
+                .try_lock()
+                .expect("the supervisor held the inventory lock across pairing")
+                .reconcile(vec![brio().evidence("changed").build()])
+                .unwrap();
+        });
+        let _installed = install_test_supervisor(supervisor.clone());
+
+        let pairs = crate::list_pairs();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].rgb, "/dev/video0");
+        assert_eq!(pairs[0].ir, "/dev/video2");
+        assert_eq!(recorded_role_count(&supervisor), 0);
+        let view = crate::connected_pairs();
+        assert!(view.pairs.is_empty());
+        assert_eq!(view.unclassified.len(), 1);
+        assert_eq!(view.unclassified[0].generation, 2);
+        assert_eq!(
+            view.unclassified[0].endpoints,
+            ["/dev/video0", "/dev/video2"]
+        );
+
+        // The discard is per generation: the next pairing records.
+        crate::list_pairs();
+        let view = crate::connected_pairs();
+        assert_eq!(view.pairs.len(), 1);
+        assert_eq!(view.pairs[0].generation, 2);
+        assert!(view.unclassified.is_empty());
+    }
+
+    #[test]
+    fn an_ir_node_absent_from_the_passive_inventory_is_not_a_candidate() {
+        let camera = || {
+            ObservationFixture::usb(BRIO_AT, "046d:085e")
+                .serial("ABC123")
+                .capture("/dev/video0")
+                .metadata("/dev/video1")
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        // Sysfs saw an IR node the passive inventory does not hold.
+        let backend =
+            RecordingBackend::new(calls).pairing(vec![spy_pair("/dev/video0", "/dev/video2")]);
+        let supervisor = spy_supervisor(&backend, vec![camera().build()]);
+        let _installed = install_test_supervisor(supervisor.clone());
+
+        crate::list_pairs();
+        let view = crate::connected_pairs();
+        assert!(view.pairs.is_empty());
+        assert!(
+            view.unclassified.is_empty(),
+            "an RGB-only camera is not a pair"
+        );
+        assert_eq!(recorded_role_count(&supervisor), 1);
+
+        supervisor
+            .reconcile_inventory(vec![camera().capture("/dev/video2").build()])
+            .unwrap();
+        let view = crate::connected_pairs();
+        assert!(view.pairs.is_empty());
+        assert_eq!(view.unclassified.len(), 1);
+        assert_eq!(view.unclassified[0].generation, 2);
+        assert_eq!(
+            view.unclassified[0].endpoints,
+            ["/dev/video0", "/dev/video2"]
+        );
+
+        crate::list_pairs();
+        let view = crate::connected_pairs();
+        assert_eq!(view.pairs.len(), 1);
+        assert_eq!(view.pairs[0].ir, "/dev/video2");
+    }
+
+    #[test]
+    fn two_serialless_units_of_one_model_are_two_pairs_told_apart_by_topology() {
+        let unit = |port: &str, first| {
+            ObservationFixture::usb(
+                &format!("/devices/pci0000:00/0000:00:14.0/usb1/{port}"),
+                "3277:0059",
+            )
+            .four_node(first)
+            .build()
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = RecordingBackend::new(calls.clone()).discovering(&[
+            ("/dev/video0", Role::Rgb),
+            ("/dev/video2", Role::Ir),
+            ("/dev/video4", Role::Rgb),
+            ("/dev/video6", Role::Ir),
+        ]);
+        // Port 1-1 holds the higher nodes and comes second in the census:
+        // the view follows topology order even where it disagrees with the
+        // census order and with node numbering.
+        let supervisor = spy_supervisor(&backend, vec![unit("1-2", 0), unit("1-1", 4)]);
+        let _installed = install_test_supervisor(supervisor);
+
+        crate::discover_nodes();
+        let view = crate::connected_pairs();
+        assert!(view.unclassified.is_empty());
+        let [first, second] = view.pairs.as_slice() else {
+            panic!("two connected units are two pairs: {:?}", view.pairs);
+        };
+        assert_eq!(first.identity, "3277:0059");
+        assert_eq!(second.identity, "3277:0059");
+        assert!(!first.serial_present);
+        assert!(!second.serial_present);
+        assert_ne!(first.instance_id, second.instance_id);
+        assert_eq!(first.port_chain.as_deref(), Some("1-1"));
+        assert_eq!(second.port_chain.as_deref(), Some("1-2"));
+        assert_eq!(
+            (first.rgb.as_str(), first.ir.as_str()),
+            ("/dev/video4", "/dev/video6")
+        );
+        assert_eq!(
+            (second.rgb.as_str(), second.ir.as_str()),
+            ("/dev/video0", "/dev/video2")
+        );
+        assert_eq!(*calls.lock().unwrap(), ["discover_nodes"]);
+    }
+
+    #[test]
+    fn connected_pairs_never_initializes_the_default_supervisor() {
+        let slot = OnceLock::new();
+        assert_eq!(connected_pairs_from_slot(&slot), ConnectedPairs::default());
+        assert!(
+            slot.get().is_none(),
+            "reading the pairing view must not initialize a supervisor"
+        );
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = RecordingBackend::new(calls.clone()).discovering(&BRIO_ANSWER);
+        let supervisor = spy_supervisor(&backend, vec![brio().build()]);
+        supervisor.discover_nodes();
+        calls.lock().unwrap().clear();
+        assert!(slot.set(supervisor).is_ok());
+
+        let view = connected_pairs_from_slot(&slot);
+        assert_eq!(view.pairs.len(), 1);
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "the pairing view called a discovery or open delegate"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_inventory_reports_unavailable_pairs_and_discovery_still_answers() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = RecordingBackend::new(calls).discovering(&BRIO_ANSWER);
+        let supervisor = spy_supervisor(&backend, vec![brio().build()]);
+        let poison = supervisor.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison.inventory.lock().unwrap();
+            panic!("synthetic poison");
+        })
+        .join();
+        let _installed = install_test_supervisor(supervisor);
+
+        assert_eq!(crate::discover_nodes(), owned(&BRIO_ANSWER));
+        assert_eq!(
+            crate::connected_pairs(),
+            ConnectedPairs {
+                state: CameraInventoryState::Unavailable,
+                reason: Some(CameraInventoryReason::Inventory),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn an_inventory_poisoned_during_discovery_records_nothing_and_discovery_still_answers() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = RecordingBackend::new(calls).discovering(&BRIO_ANSWER);
+        let supervisor = spy_supervisor(&backend, vec![brio().build()]);
+        let inventory = supervisor.inventory.clone();
+        backend.on_next_classification(move || {
+            let _ = std::thread::spawn(move || {
+                let _guard = inventory
+                    .try_lock()
+                    .expect("the supervisor held the inventory lock across discovery");
+                panic!("synthetic poison");
+            })
+            .join();
+        });
+        let _installed = install_test_supervisor(supervisor.clone());
+
+        assert_eq!(crate::discover_nodes(), owned(&BRIO_ANSWER));
+        assert_eq!(
+            crate::connected_pairs(),
+            ConnectedPairs {
+                state: CameraInventoryState::Unavailable,
+                reason: Some(CameraInventoryReason::Inventory),
+                ..Default::default()
+            }
+        );
+        let Err(poisoned) = supervisor.inventory.lock() else {
+            panic!("the classification poisoned the inventory");
+        };
+        assert_eq!(poisoned.into_inner().recorded_role_count(), 0);
     }
 }

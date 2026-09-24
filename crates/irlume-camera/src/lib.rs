@@ -40,6 +40,8 @@ use capture_timing::Stage;
 pub use capture_timing::{CaptureTimings, RateFillFailure};
 pub mod capture_qualification;
 pub mod census;
+mod connected;
+pub use connected::{ConnectedPair, ConnectedPairs, UnclassifiedCamera};
 /// Versioned, backend-neutral camera data contracts.
 pub mod contracts;
 pub mod emitter_journal;
@@ -70,6 +72,19 @@ pub fn camera_inventory_snapshot() -> irlume_common::live_camera::CameraInventor
 /// instead. Monitoring reads sysfs/media topology without opening video nodes.
 pub fn initialize_camera_monitor() {
     let _ = backend::default_camera_supervisor();
+}
+
+/// Every connected camera whose capture nodes all have a role at the
+/// camera's current connection generation, exactly one RGB and one IR
+/// among them, read from the passive inventory and the roles recorded
+/// when discovery last classified its nodes (ADR-0029 §1). Camera-free:
+/// this never initializes the supervisor, opens or classifies a node,
+/// takes a lease or reads sysfs, so any request path may call it. A
+/// camera whose capture nodes have not all been classified in its
+/// current generation is listed as unclassified, never as a pair.
+#[must_use]
+pub fn connected_pairs() -> ConnectedPairs {
+    backend::connected_pairs()
 }
 pub mod measurement;
 mod media_graph;
@@ -3988,6 +4003,40 @@ fn read_vidpid(dev_dir: &std::path::Path) -> Option<String> {
     Some(format!("{}:{}", v.trim(), p.trim()))
 }
 
+/// The binding identity [`device_identity`] reports, from its parts:
+/// `vid:pid`, then `:serial` when the descriptor carries a non-blank
+/// serial, lowercased as a whole. One formatter for both, so a camera-free
+/// pair can never name its camera differently from the enrollment binding
+/// it is compared with.
+pub(crate) fn binding_identity(vid_pid: &str, serial: Option<&str>) -> String {
+    let identity = match serial.map(str::trim).filter(|serial| !serial.is_empty()) {
+        Some(serial) => format!("{vid_pid}:{serial}"),
+        None => vid_pid.to_owned(),
+    };
+    identity.to_lowercase()
+}
+
+/// Whether the USB device directory `dev_dir` is built in: its `removable`
+/// attribute reads `fixed`. Anything else, an unreadable file included,
+/// is external, as the pair listing has always read it.
+fn usb_device_is_fixed(dev_dir: &std::path::Path) -> bool {
+    std::fs::read_to_string(dev_dir.join("removable"))
+        .map(|s| s.trim() == "fixed")
+        .unwrap_or(false)
+}
+
+/// The descriptor facts of one USB device directory, read from sysfs
+/// without opening anything: `vid:pid` as [`read_vidpid`] formats it, and
+/// whether the device is built in. `None` when the directory carries no
+/// `idVendor` or `idProduct`. Takes the directory so a fixture tree can
+/// stand in for sysfs.
+pub(crate) fn usb_device_facts(dev_dir: &std::path::Path) -> Option<inventory::UsbDeviceFacts> {
+    Some(inventory::UsbDeviceFacts::new(
+        read_vidpid(dev_dir)?,
+        usb_device_is_fixed(dev_dir),
+    ))
+}
+
 /// A stable identity for the physical camera behind `/dev/videoN`, for
 /// per-enrollment device binding (anti-swap). Format: `"vid:pid"` plus
 /// `":serial"` when the descriptor carries a serial (`idVendor:idProduct[:serial]`,
@@ -3997,11 +4046,8 @@ pub fn device_identity(device: &str) -> Option<String> {
     let real = std::fs::canonicalize(format!("/sys/class/video4linux/{node}/device")).ok()?;
     let dev_dir = find_attr_dir(&real, "idVendor")?;
     let vidpid = read_vidpid(&dev_dir)?;
-    let id = match std::fs::read_to_string(dev_dir.join("serial")) {
-        Ok(s) if !s.trim().is_empty() => format!("{vidpid}:{}", s.trim()),
-        _ => vidpid,
-    };
-    Some(id.to_lowercase())
+    let serial = std::fs::read_to_string(dev_dir.join("serial")).ok();
+    Some(binding_identity(&vidpid, serial.as_deref()))
 }
 
 /// Every USB identity currently present among the machine's video nodes,
@@ -4545,9 +4591,7 @@ fn pairs_from(nodes: &[(String, Role)]) -> Vec<CameraPair> {
         if rgbs.is_empty() || irs.is_empty() {
             continue;
         }
-        let fixed = std::fs::read_to_string(id.join("removable"))
-            .map(|s| s.trim() == "fixed")
-            .unwrap_or(false);
+        let fixed = usb_device_is_fixed(id);
         let serial_present = std::fs::read_to_string(id.join("serial"))
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false);
@@ -16929,6 +16973,106 @@ mod tests {
         std::fs::write(dir.join("idProduct"), "0059\n").unwrap();
         assert_eq!(read_vidpid(&dir), Some("3277:0059".into()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn binding_identity_is_the_device_identity_format() {
+        assert_eq!(
+            binding_identity("046D:085E", Some(" AbC1 ")),
+            "046d:085e:abc1"
+        );
+        // A blank serial and no serial both leave the bare model id.
+        assert_eq!(binding_identity("046D:085E", Some("  ")), "046d:085e");
+        assert_eq!(binding_identity("046D:085E", None), "046d:085e");
+    }
+
+    #[test]
+    fn usb_device_facts_read_vid_pid_and_removable_from_the_device_dir() {
+        // Its own name: tests in one binary share the pid and run in
+        // parallel, so reusing another test's directory races its cleanup.
+        let dir = std::env::temp_dir().join(format!("irlume-usb-facts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(usb_device_facts(&dir), None);
+        std::fs::write(dir.join("idVendor"), "3277\n").unwrap();
+        std::fs::write(dir.join("idProduct"), "0059\n").unwrap();
+        // No `removable` attribute reads as external, as the pair listing does.
+        assert_eq!(
+            usb_device_facts(&dir),
+            Some(inventory::UsbDeviceFacts::new("3277:0059".into(), false))
+        );
+        std::fs::write(dir.join("removable"), "fixed\n").unwrap();
+        assert_eq!(
+            usb_device_facts(&dir),
+            Some(inventory::UsbDeviceFacts::new("3277:0059".into(), true))
+        );
+        std::fs::write(dir.join("removable"), "removable\n").unwrap();
+        assert_eq!(
+            usb_device_facts(&dir),
+            Some(inventory::UsbDeviceFacts::new("3277:0059".into(), false))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Opens every camera once (the pair listing classifies), so it runs
+    /// only when asked for, with nothing else using the cameras. Prints no
+    /// serial.
+    #[test]
+    #[ignore = "needs connected UVC RGB+IR cameras; run on the reference hardware"]
+    fn connected_pairs_agree_with_list_pairs_on_real_hardware() {
+        initialize_camera_monitor();
+        let listed = list_pairs();
+        let view = connected_pairs();
+        assert_eq!(
+            view.state,
+            irlume_common::live_camera::CameraInventoryState::Current
+        );
+        assert!(
+            !listed.is_empty(),
+            "list_pairs found no RGB+IR pair: connect the cameras and run as a video-group user"
+        );
+        for pair in &listed {
+            let Some(connected) = view
+                .pairs
+                .iter()
+                .find(|connected| connected.rgb == pair.rgb && connected.ir == pair.ir)
+            else {
+                panic!(
+                    "{} + {} is listed but is not a connected pair; unclassified: {:?}",
+                    pair.rgb, pair.ir, view.unclassified
+                );
+            };
+            assert!(
+                pair.identity.as_deref() == Some(connected.identity.as_str()),
+                "the identities of {} differ",
+                pair.rgb
+            );
+            assert_eq!(connected.fixed, pair.fixed);
+            assert_eq!(connected.port_chain, pair.port_chain);
+            assert_eq!(connected.serial_present, pair.serial_present);
+            assert_eq!(
+                Some(connected.vid_pid.as_str()),
+                pair.id.as_ref().map(|id| id.to_lowercase()).as_deref()
+            );
+        }
+        assert_eq!(
+            view.pairs.len(),
+            listed.len(),
+            "a connected pair is missing from the listing"
+        );
+        for pair in &view.pairs {
+            println!(
+                "connected pair: vid_pid={} serial_present={} port_chain={} fixed={} \
+                 generation={} rgb={} ir={}",
+                pair.vid_pid,
+                pair.serial_present,
+                pair.port_chain.as_deref().unwrap_or("-"),
+                pair.fixed,
+                pair.generation,
+                pair.rgb,
+                pair.ir
+            );
+        }
     }
 
     #[test]

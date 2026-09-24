@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use crate::backend::CameraSupervisor;
 use crate::contracts::{BackendKind, CameraCapabilities, PhysicalCameraId};
-use crate::inventory::{CameraInventoryError, CameraInventoryEvent, CameraObservation};
+use crate::inventory::{
+    CameraInventoryError, CameraInventoryEvent, CameraObservation, UsbDeviceFacts,
+};
 
 const MAX_QUIET_SNAPSHOT_ATTEMPTS: usize = 4;
 const MAX_COALESCE_POLLS: usize = 16;
@@ -530,6 +532,7 @@ impl Default for SysfsSnapshotSource {
 struct UdevNodeRecord {
     usb_devpath: String,
     serial: Option<String>,
+    usb_device: Option<UsbDeviceFacts>,
     node_devpath: String,
     devnode: String,
     interface_number: Option<String>,
@@ -546,8 +549,10 @@ fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
 #[derive(Default)]
 struct UdevCameraGroup {
     serial: Option<String>,
+    usb_device: Option<UsbDeviceFacts>,
     evidence: Vec<String>,
     endpoints: Vec<String>,
+    metadata: Vec<String>,
 }
 
 fn devpath(path: &Path) -> String {
@@ -571,6 +576,9 @@ impl SnapshotSource for SysfsSnapshotSource {
             Err(error) => return Err(LifecycleError::Snapshot(error.to_string())),
         };
         let mut records = Vec::new();
+        // One read of each USB device's descriptor files per census, so the
+        // records of one device cannot disagree about them.
+        let mut usb_devices: BTreeMap<PathBuf, Option<UsbDeviceFacts>> = BTreeMap::new();
         for entry in entries {
             let entry = entry.map_err(|error| LifecycleError::Snapshot(error.to_string()))?;
             let name = entry.file_name();
@@ -595,6 +603,7 @@ impl SnapshotSource for SysfsSnapshotSource {
                 records.push(UdevNodeRecord {
                     usb_devpath: "/devices/virtual/video4linux/irlume-test-camera".to_string(),
                     serial: None,
+                    usb_device: None,
                     node_devpath: virtual_devpath,
                     interface_number: None,
                     capture_node: None,
@@ -619,9 +628,14 @@ impl SnapshotSource for SysfsSnapshotSource {
                     interface.display()
                 ))
             })?;
+            let usb_device = usb_devices
+                .entry(usb.to_path_buf())
+                .or_insert_with(|| crate::usb_device_facts(usb))
+                .clone();
             records.push(UdevNodeRecord {
                 usb_devpath: devpath(usb),
                 serial: read_trimmed(usb.join("serial")),
+                usb_device,
                 node_devpath: devpath(&interface),
                 interface_number: read_trimmed(interface.join("bInterfaceNumber")),
                 capture_node: crate::media_graph::node_is_capture(&devnode_text),
@@ -653,6 +667,7 @@ fn observations_from_records(
             .entry(record.usb_devpath.clone())
             .or_insert_with(|| UdevCameraGroup {
                 serial: record.serial.clone(),
+                usb_device: record.usb_device.clone(),
                 ..UdevCameraGroup::default()
             });
         if group.serial != record.serial {
@@ -660,6 +675,9 @@ fn observations_from_records(
                 "conflicting serial evidence for {}",
                 record.usb_devpath
             )));
+        }
+        if record.capture_node == Some(false) {
+            group.metadata.push(endpoint.clone());
         }
         group.evidence.push(evidence);
         group.endpoints.push(endpoint);
@@ -676,7 +694,9 @@ fn observations_from_records(
                 CameraCapabilities::default(),
                 group.evidence,
                 group.endpoints,
-            ))
+            )
+            .with_metadata_endpoints(group.metadata)
+            .with_usb_device(group.usb_device))
         })
         .collect()
 }
@@ -1784,6 +1804,7 @@ mod tests {
             UdevNodeRecord {
                 usb_devpath: "/devices/pci/usb1/camera".into(),
                 serial: Some("serial".into()),
+                usb_device: None,
                 node_devpath: "/devices/pci/usb1/camera/1.2/video2".into(),
                 devnode: "/dev/video2".into(),
                 interface_number: Some("02".into()),
@@ -1792,6 +1813,7 @@ mod tests {
             UdevNodeRecord {
                 usb_devpath: "/devices/pci/usb1/camera".into(),
                 serial: Some("serial".into()),
+                usb_device: None,
                 node_devpath: "/devices/pci/usb1/camera/1.0/video0".into(),
                 devnode: "/dev/video0".into(),
                 interface_number: Some("00".into()),
@@ -1805,5 +1827,30 @@ mod tests {
             "/devices/pci/usb1/camera"
         );
         assert_eq!(observations[0].physical_id().serial(), Some("serial"));
+        assert!(observations[0].usb_device().is_none());
+    }
+
+    #[test]
+    fn udev_records_carry_usb_facts_and_metadata_endpoints_into_the_observation() {
+        let facts = UsbDeviceFacts::new("046d:085e".into(), true);
+        let record = |node: &str, capture_node| UdevNodeRecord {
+            usb_devpath: "/devices/pci0000:00/0000:00:14.0/usb3/3-2".into(),
+            serial: None,
+            usb_device: Some(facts.clone()),
+            node_devpath: format!("/devices/pci0000:00/0000:00:14.0/usb3/3-2/{node}"),
+            devnode: format!("/dev/{node}"),
+            interface_number: None,
+            capture_node,
+        };
+        let observations = observations_from_records(vec![
+            record("video0", Some(true)),
+            record("video1", Some(false)),
+            record("video2", None),
+        ])
+        .unwrap();
+        assert_eq!(observations.len(), 1);
+        // A node the media graph could not place is not a metadata node.
+        assert_eq!(observations[0].metadata_endpoints(), ["/dev/video1"]);
+        assert_eq!(observations[0].usb_device(), Some(&facts));
     }
 }

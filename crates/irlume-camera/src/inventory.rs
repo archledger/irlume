@@ -10,6 +10,7 @@
     )
 )]
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
@@ -18,13 +19,38 @@ use irlume_common::live_camera::{
     MAX_CAMERA_CANDIDATES, MAX_CAMERA_ENDPOINTS, MAX_CAMERA_ENDPOINT_BYTES,
 };
 
+use crate::connected::{self, ConnectedPairs, Pairing, PairingInput};
 use crate::contracts::{
     BackendKind, CameraCapabilities, CameraDescriptor, CameraGeneration, CameraInstanceId,
     PhysicalCameraId,
 };
+use crate::Role;
 
 const MAX_INSTANCE_ID_ATTEMPTS: usize = 64;
 type InstanceIdSource = Box<dyn FnMut() -> CameraInstanceId + Send>;
+
+/// Descriptor facts of the USB device behind one observation, read from
+/// sysfs in the same census as its endpoints and serial, so the connection
+/// generation vouches for them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UsbDeviceFacts {
+    vid_pid: String,
+    fixed: bool,
+}
+
+impl UsbDeviceFacts {
+    pub(crate) fn new(vid_pid: String, fixed: bool) -> Self {
+        Self { vid_pid, fixed }
+    }
+
+    pub(crate) fn vid_pid(&self) -> &str {
+        &self.vid_pid
+    }
+
+    pub(crate) const fn fixed(&self) -> bool {
+        self.fixed
+    }
+}
 
 /// One backend observation before the supervisor assigns lifecycle identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +60,13 @@ pub(crate) struct CameraObservation {
     capabilities: CameraCapabilities,
     lifecycle_evidence: Vec<String>,
     endpoint_paths: Vec<String>,
+    /// Endpoints the media graph placed as metadata nodes at census time:
+    /// neither RGB nor IR, known without opening them (ADR-0029 §1). A
+    /// sorted subset of `endpoint_paths`.
+    metadata_endpoints: Vec<String>,
+    /// `None` for a node without USB descriptors (a test loopback camera),
+    /// which is never paired, exactly as the pair listing never pairs one.
+    usb_device: Option<UsbDeviceFacts>,
 }
 
 impl CameraObservation {
@@ -48,6 +81,8 @@ impl CameraObservation {
             capabilities,
             lifecycle_evidence: Vec::new(),
             endpoint_paths: Vec::new(),
+            metadata_endpoints: Vec::new(),
+            usb_device: None,
         }
     }
 
@@ -83,7 +118,24 @@ impl CameraObservation {
             capabilities,
             lifecycle_evidence,
             endpoint_paths,
+            metadata_endpoints: Vec::new(),
+            usb_device: None,
         }
+    }
+
+    /// Mark the endpoints the media graph placed as metadata nodes. A path
+    /// that is not one of this observation's endpoints is ignored.
+    pub(crate) fn with_metadata_endpoints(mut self, mut metadata: Vec<String>) -> Self {
+        metadata.retain(|path| self.endpoint_paths.contains(path));
+        metadata.sort();
+        metadata.dedup();
+        self.metadata_endpoints = metadata;
+        self
+    }
+
+    pub(crate) fn with_usb_device(mut self, usb_device: Option<UsbDeviceFacts>) -> Self {
+        self.usb_device = usb_device;
+        self
     }
 
     pub(crate) fn physical_id(&self) -> &PhysicalCameraId {
@@ -92,6 +144,14 @@ impl CameraObservation {
 
     pub(crate) fn lifecycle_evidence(&self) -> &[String] {
         &self.lifecycle_evidence
+    }
+
+    pub(crate) fn metadata_endpoints(&self) -> &[String] {
+        &self.metadata_endpoints
+    }
+
+    pub(crate) fn usb_device(&self) -> Option<&UsbDeviceFacts> {
+        self.usb_device.as_ref()
     }
 
     fn descriptor(
@@ -194,6 +254,23 @@ impl CameraInventoryRef {
     }
 }
 
+/// Where one endpoint sits in the published inventory right now: the
+/// connection generation a classification of it is bound to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EndpointGeneration {
+    supervisor_id: CameraInstanceId,
+    instance_id: CameraInstanceId,
+    generation: CameraGeneration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RoleKey {
+    supervisor_id: CameraInstanceId,
+    instance_id: CameraInstanceId,
+    generation: CameraGeneration,
+    endpoint: String,
+}
+
 /// Process-scoped physical-camera lifecycle state.
 ///
 /// Reconciliation is transactional: malformed snapshots and instance-ID
@@ -209,6 +286,9 @@ pub(crate) struct CameraInventory {
     publication_state: CameraInventoryState,
     publication_reason: Option<CameraInventoryReason>,
     observed_at: Option<Instant>,
+    /// Roles discovery answered, bound to the generation it ran under and
+    /// pruned with every mutation (ADR-0029 §1).
+    roles: BTreeMap<RoleKey, Role>,
 }
 
 impl CameraInventory {
@@ -228,6 +308,7 @@ impl CameraInventory {
             publication_state: CameraInventoryState::Uninitialized,
             publication_reason: None,
             observed_at: None,
+            roles: BTreeMap::new(),
         }
     }
 
@@ -262,6 +343,7 @@ impl CameraInventory {
         }
         self.publication_state = CameraInventoryState::Unavailable;
         self.publication_reason = Some(reason);
+        self.prune_roles();
     }
 
     pub(crate) fn retire_unavailable(&mut self, reason: CameraInventoryReason) {
@@ -327,6 +409,149 @@ impl CameraInventory {
             result.candidates.clear();
         }
         result
+    }
+
+    /// Entries a snapshot would publish: the non-invalidated cameras while
+    /// the state is current or refreshing.
+    fn published_entries(&self) -> impl Iterator<Item = &InventoryEntry> + '_ {
+        let visible = matches!(
+            self.publication_state,
+            CameraInventoryState::Current | CameraInventoryState::Refreshing
+        );
+        self.active.values().filter(move |entry| {
+            visible
+                && !self
+                    .invalidated_instance_ids
+                    .contains(entry.descriptor.camera_instance_id())
+        })
+    }
+
+    /// Every endpoint of a published camera with the connection generation
+    /// it belongs to. An endpoint two observations both claim belongs to
+    /// neither, so nothing is ever recorded for it.
+    pub(crate) fn endpoint_generations(&self) -> BTreeMap<String, EndpointGeneration> {
+        let mut generations = BTreeMap::new();
+        let mut contested = BTreeSet::new();
+        for entry in self.published_entries() {
+            let generation = EndpointGeneration {
+                supervisor_id: self.supervisor_id.clone(),
+                instance_id: entry.descriptor.camera_instance_id().clone(),
+                generation: entry.descriptor.generation(),
+            };
+            for endpoint in &entry.observation.endpoint_paths {
+                if generations
+                    .insert(endpoint.clone(), generation.clone())
+                    .is_some()
+                {
+                    contested.insert(endpoint.clone());
+                }
+            }
+        }
+        for endpoint in &contested {
+            generations.remove(endpoint);
+        }
+        generations
+    }
+
+    /// Record what a classification that already ran answered (ADR-0029
+    /// §1). `before` is `endpoint_generations()` read before the
+    /// classification started; a role is kept only for an endpoint whose
+    /// generation is the same now, so a node renumbered, replaced or
+    /// invalidated meanwhile is never given the answer. A second, different
+    /// answer in the same generation clears the endpoint instead of choosing;
+    /// the answer after that is recorded afresh.
+    pub(crate) fn record_roles<'a>(
+        &mut self,
+        before: &BTreeMap<String, EndpointGeneration>,
+        classified: impl IntoIterator<Item = (&'a str, Role)>,
+    ) {
+        let after = self.endpoint_generations();
+        for (endpoint, role) in classified {
+            let (Some(was), Some(now)) = (before.get(endpoint), after.get(endpoint)) else {
+                continue;
+            };
+            if was != now {
+                continue;
+            }
+            let key = RoleKey {
+                supervisor_id: now.supervisor_id.clone(),
+                instance_id: now.instance_id.clone(),
+                generation: now.generation,
+                endpoint: endpoint.to_owned(),
+            };
+            match self.roles.entry(key) {
+                Entry::Vacant(vacant) => {
+                    vacant.insert(role);
+                }
+                Entry::Occupied(recorded) => {
+                    if *recorded.get() != role {
+                        recorded.remove();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop every role whose connection generation is no longer published:
+    /// a changed, invalidated or removed camera, or an earlier supervisor
+    /// incarnation. Runs inside every mutation, under the same lock.
+    fn prune_roles(&mut self) {
+        let live = self.endpoint_generations();
+        self.roles.retain(|key, _| {
+            live.get(&key.endpoint).is_some_and(|current| {
+                current.supervisor_id == key.supervisor_id
+                    && current.instance_id == key.instance_id
+                    && current.generation == key.generation
+            })
+        });
+    }
+
+    /// The camera-free pairing view of ADR-0029 §1 over the published
+    /// inventory and the roles recorded for each camera's current
+    /// generation. No lease, backend, filesystem or monitor operation is
+    /// reachable from it. The live snapshot's wire bounds do not apply here.
+    pub(crate) fn connected_pairs(&self) -> ConnectedPairs {
+        if self.publication_state == CameraInventoryState::Uninitialized {
+            return ConnectedPairs::default();
+        }
+        let mut view = ConnectedPairs {
+            state: self.publication_state,
+            reason: self.publication_reason,
+            supervisor_id: Some(self.supervisor_id.as_str().to_owned()),
+            revision: self.revision,
+            pairs: Vec::new(),
+            unclassified: Vec::new(),
+        };
+        for entry in self.published_entries() {
+            let instance_id = entry.descriptor.camera_instance_id();
+            let generation = entry.descriptor.generation();
+            let input = PairingInput {
+                topology_path: entry.observation.physical_id.topology_path(),
+                serial: entry.observation.physical_id.serial(),
+                usb_device: entry.observation.usb_device.as_ref(),
+                endpoints: &entry.observation.endpoint_paths,
+                metadata_endpoints: &entry.observation.metadata_endpoints,
+                instance_id: instance_id.as_str(),
+                generation: generation.get(),
+            };
+            // Only the current generation's roles are ever looked up.
+            let role_of = |endpoint: &str| {
+                self.roles
+                    .get(&RoleKey {
+                        supervisor_id: self.supervisor_id.clone(),
+                        instance_id: instance_id.clone(),
+                        generation,
+                        endpoint: endpoint.to_owned(),
+                    })
+                    .copied()
+            };
+            match connected::pair_camera(&input, role_of) {
+                Pairing::Pair(pair) => view.pairs.push(pair),
+                Pairing::Unclassified(camera) => view.unclassified.push(camera),
+                Pairing::NotAPair => {}
+            }
+        }
+        view
     }
 
     fn mint_unique_instance_id(
@@ -460,6 +685,7 @@ impl CameraInventory {
         self.publication_state = CameraInventoryState::Current;
         self.publication_reason = None;
         self.observed_at = Some(Instant::now());
+        self.prune_roles();
         Ok((events, true))
     }
 
@@ -470,6 +696,7 @@ impl CameraInventory {
             .values()
             .map(|entry| entry.descriptor.camera_instance_id().clone())
             .collect();
+        self.prune_roles();
     }
 
     pub(crate) fn invalidate_topologies(&mut self, topologies: &BTreeSet<String>) {
@@ -481,6 +708,7 @@ impl CameraInventory {
                 .filter_map(|topology| self.active.get(topology))
                 .map(|entry| entry.descriptor.camera_instance_id().clone()),
         );
+        self.prune_roles();
     }
 
     pub(crate) fn retire_topologies(
@@ -505,6 +733,7 @@ impl CameraInventory {
             self.tombstones.insert(topology.clone());
             events.push(CameraInventoryEvent::Removed(entry.descriptor));
         }
+        self.prune_roles();
         events
     }
 
@@ -635,6 +864,11 @@ impl CameraInventory {
     }
 
     #[cfg(test)]
+    pub(crate) fn recorded_role_count(&self) -> usize {
+        self.roles.len()
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_instance_ids_for_test(ids: Vec<CameraInstanceId>) -> Self {
         let fallback = ids.last().cloned().expect("at least one fixture ID");
         let mut ids = ids.into_iter();
@@ -644,9 +878,112 @@ impl CameraInventory {
     }
 }
 
+/// Census-shaped observations for tests across the crate.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::{CameraObservation, UsbDeviceFacts};
+    use crate::contracts::{BackendKind, CameraCapabilities, PhysicalCameraId};
+
+    pub(crate) struct ObservationFixture {
+        topology: String,
+        serial: Option<String>,
+        usb_device: Option<UsbDeviceFacts>,
+        capture: Vec<String>,
+        metadata: Vec<String>,
+        evidence_tag: String,
+    }
+
+    impl ObservationFixture {
+        /// An external USB camera at `topology` (a canonical `/devices/...`
+        /// path), no serial, no nodes.
+        pub(crate) fn usb(topology: &str, vid_pid: &str) -> Self {
+            Self {
+                topology: topology.to_owned(),
+                serial: None,
+                usb_device: Some(UsbDeviceFacts::new(vid_pid.to_owned(), false)),
+                capture: Vec::new(),
+                metadata: Vec::new(),
+                evidence_tag: String::new(),
+            }
+        }
+
+        pub(crate) fn serial(mut self, serial: &str) -> Self {
+            self.serial = Some(serial.to_owned());
+            self
+        }
+
+        pub(crate) fn fixed(mut self) -> Self {
+            if let Some(usb_device) = &mut self.usb_device {
+                usb_device.fixed = true;
+            }
+            self
+        }
+
+        pub(crate) fn capture(mut self, endpoint: &str) -> Self {
+            self.capture.push(endpoint.to_owned());
+            self
+        }
+
+        pub(crate) fn metadata(mut self, endpoint: &str) -> Self {
+            self.metadata.push(endpoint.to_owned());
+            self
+        }
+
+        /// The layout the BRIO, the NexiGo N930W and the ASUS/Shinetech
+        /// module share: capture, metadata, capture, metadata at
+        /// `/dev/video{first}` to `/dev/video{first + 3}`.
+        pub(crate) fn four_node(self, first: u32) -> Self {
+            self.capture(&format!("/dev/video{first}"))
+                .metadata(&format!("/dev/video{}", first + 1))
+                .capture(&format!("/dev/video{}", first + 2))
+                .metadata(&format!("/dev/video{}", first + 3))
+        }
+
+        pub(crate) fn without_usb_descriptor(mut self) -> Self {
+            self.usb_device = None;
+            self
+        }
+
+        /// Different lifecycle evidence and nothing else, so a reconcile
+        /// reads a changed observation.
+        pub(crate) fn evidence(mut self, tag: &str) -> Self {
+            self.evidence_tag = tag.to_owned();
+            self
+        }
+
+        pub(crate) fn build(self) -> CameraObservation {
+            let topology = &self.topology;
+            let tag = &self.evidence_tag;
+            let evidence = self
+                .capture
+                .iter()
+                .map(|endpoint| (endpoint, "capture"))
+                .chain(self.metadata.iter().map(|endpoint| (endpoint, "metadata")))
+                .map(|(endpoint, kind)| {
+                    let node = endpoint.rsplit('/').next().unwrap_or(endpoint);
+                    format!("{topology}/{node}|{endpoint}||{kind}{tag}")
+                })
+                .collect();
+            let endpoints = self.capture.iter().chain(&self.metadata).cloned().collect();
+            CameraObservation::with_lifecycle_evidence_and_endpoints(
+                BackendKind::UvcV4l2,
+                PhysicalCameraId::new(self.topology, self.serial)
+                    .expect("fixture topology and serial are valid"),
+                CameraCapabilities::default(),
+                evidence,
+                endpoints,
+            )
+            .with_metadata_endpoints(self.metadata)
+            .with_usb_device(self.usb_device)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::fixtures::ObservationFixture;
     use super::*;
+    use crate::connected::UnclassifiedCamera;
     use crate::contracts::{
         BackendKind, CameraCapabilities, CameraGeneration, CameraInstanceId, PhysicalCameraId,
         StreamRole,
@@ -1154,5 +1491,321 @@ mod tests {
         assert_eq!(events[0].descriptor().camera_instance_id(), &replacement_id);
         assert_eq!(generation(&events[0]), 1);
         assert!(inventory.retired_instance_ids.contains(&original_id));
+    }
+
+    const CAMERA_A: &str = "/devices/pci0000:00/0000:00:14.0/usb3/3-1";
+    const CAMERA_B: &str = "/devices/pci0000:00/0000:00:14.0/usb3/3-2";
+    const BRIO_ROLES: [(&str, Role); 2] = [("/dev/video0", Role::Rgb), ("/dev/video2", Role::Ir)];
+
+    fn brio() -> ObservationFixture {
+        ObservationFixture::usb(CAMERA_A, "046d:085e").four_node(0)
+    }
+
+    /// What `discover_nodes` does around a classification with no
+    /// inventory change in between.
+    fn record(inventory: &mut CameraInventory, classified: &[(&str, Role)]) {
+        let before = inventory.endpoint_generations();
+        inventory.record_roles(&before, classified.iter().copied());
+    }
+
+    fn recorded_brio() -> CameraInventory {
+        let mut inventory = CameraInventory::new();
+        inventory.reconcile(vec![brio().build()]).unwrap();
+        record(&mut inventory, &BRIO_ROLES);
+        assert_eq!(inventory.recorded_role_count(), 2);
+        assert_eq!(inventory.connected_pairs().pairs.len(), 1);
+        inventory
+    }
+
+    fn assert_lists_nothing(view: &ConnectedPairs) {
+        assert!(view.pairs.is_empty(), "{view:?}");
+        assert!(view.unclassified.is_empty(), "{view:?}");
+    }
+
+    #[test]
+    fn roles_are_pruned_when_a_reconcile_changes_the_generation() {
+        let mut inventory = recorded_brio();
+        let view = inventory.connected_pairs();
+        assert_eq!(view.pairs[0].generation, 1);
+        let instance_id = view.pairs[0].instance_id.clone();
+
+        let events = inventory
+            .reconcile(vec![brio().evidence("changed").build()])
+            .unwrap();
+        assert!(events[0].is_changed());
+        assert_eq!(inventory.recorded_role_count(), 0);
+        let view = inventory.connected_pairs();
+        assert!(view.pairs.is_empty());
+        assert_eq!(
+            view.unclassified,
+            [UnclassifiedCamera {
+                instance_id,
+                generation: 2,
+                endpoints: vec!["/dev/video0".into(), "/dev/video2".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unchanged_reconcile_keeps_recorded_roles() {
+        let mut inventory = recorded_brio();
+        assert!(inventory
+            .reconcile(vec![brio().build()])
+            .unwrap()
+            .is_empty());
+        assert_eq!(inventory.recorded_role_count(), 2);
+        let view = inventory.connected_pairs();
+        assert_eq!(view.pairs.len(), 1);
+        assert_eq!(view.pairs[0].generation, 1);
+    }
+
+    #[test]
+    fn a_change_to_one_camera_keeps_the_other_cameras_roles() {
+        let b = || ObservationFixture::usb(CAMERA_B, "1111:2222").four_node(4);
+        let mut inventory = CameraInventory::new();
+        inventory
+            .reconcile(vec![brio().build(), b().build()])
+            .unwrap();
+        record(
+            &mut inventory,
+            &[
+                ("/dev/video0", Role::Rgb),
+                ("/dev/video2", Role::Ir),
+                ("/dev/video4", Role::Rgb),
+                ("/dev/video6", Role::Ir),
+            ],
+        );
+        assert_eq!(inventory.connected_pairs().pairs.len(), 2);
+
+        inventory.invalidate_topologies(&BTreeSet::from([CAMERA_A.to_owned()]));
+        let view = inventory.connected_pairs();
+        assert_eq!(view.state, CameraInventoryState::Refreshing);
+        assert_eq!(view.pairs.len(), 1, "{view:?}");
+        assert_eq!(view.pairs[0].rgb, "/dev/video4");
+        assert!(
+            view.unclassified.is_empty(),
+            "an invalidated camera is hidden"
+        );
+        assert_eq!(inventory.recorded_role_count(), 2);
+
+        inventory
+            .reconcile(vec![brio().build(), b().build()])
+            .unwrap();
+        let view = inventory.connected_pairs();
+        assert_eq!(view.pairs.len(), 1, "{view:?}");
+        assert_eq!(view.pairs[0].rgb, "/dev/video4");
+        assert_eq!(view.pairs[0].generation, 1);
+        assert_eq!(view.unclassified.len(), 1);
+        assert_eq!(view.unclassified[0].generation, 2);
+        assert_eq!(
+            view.unclassified[0].endpoints,
+            ["/dev/video0", "/dev/video2"]
+        );
+        assert_eq!(inventory.recorded_role_count(), 2);
+    }
+
+    #[test]
+    fn removal_invalidation_and_unavailability_prune_recorded_roles() {
+        let mut removed = recorded_brio();
+        removed.reconcile(Vec::new()).unwrap();
+        assert_eq!(removed.recorded_role_count(), 0);
+        assert_lists_nothing(&removed.connected_pairs());
+
+        let mut invalidated = recorded_brio();
+        invalidated.invalidate_all();
+        assert_eq!(invalidated.recorded_role_count(), 0);
+        let view = invalidated.connected_pairs();
+        assert_eq!(view.state, CameraInventoryState::Refreshing);
+        assert_lists_nothing(&view);
+
+        let mut unavailable = recorded_brio();
+        unavailable.mark_unavailable(CameraInventoryReason::Monitor);
+        assert_eq!(unavailable.recorded_role_count(), 0);
+        let view = unavailable.connected_pairs();
+        assert_eq!(view.state, CameraInventoryState::Unavailable);
+        assert_eq!(view.reason, Some(CameraInventoryReason::Monitor));
+        assert_lists_nothing(&view);
+    }
+
+    #[test]
+    fn a_role_is_recorded_only_when_the_generation_is_unchanged_across_the_classification() {
+        // The observation changed while the classification ran.
+        let mut inventory = CameraInventory::new();
+        inventory.reconcile(vec![brio().build()]).unwrap();
+        let before = inventory.endpoint_generations();
+        inventory
+            .reconcile(vec![brio().evidence("changed").build()])
+            .unwrap();
+        inventory.record_roles(&before, BRIO_ROLES);
+        assert_eq!(inventory.recorded_role_count(), 0);
+
+        // The lifecycle invalidated the camera while it ran.
+        let mut inventory = CameraInventory::new();
+        inventory.reconcile(vec![brio().build()]).unwrap();
+        let before = inventory.endpoint_generations();
+        inventory.invalidate_all();
+        inventory.record_roles(&before, BRIO_ROLES);
+        assert_eq!(inventory.recorded_role_count(), 0);
+
+        // The camera was removed and came back as a new instance.
+        let mut inventory = CameraInventory::new();
+        inventory.reconcile(vec![brio().build()]).unwrap();
+        let before = inventory.endpoint_generations();
+        inventory.reconcile(Vec::new()).unwrap();
+        inventory.reconcile(vec![brio().build()]).unwrap();
+        inventory.record_roles(&before, BRIO_ROLES);
+        assert_eq!(inventory.recorded_role_count(), 0);
+        assert_eq!(inventory.connected_pairs().unclassified[0].generation, 1);
+
+        // The camera appeared while it ran.
+        let mut inventory = CameraInventory::new();
+        inventory.reconcile(Vec::new()).unwrap();
+        let before = inventory.endpoint_generations();
+        inventory.reconcile(vec![brio().build()]).unwrap();
+        inventory.record_roles(&before, BRIO_ROLES);
+        assert_eq!(inventory.recorded_role_count(), 0);
+    }
+
+    #[test]
+    fn a_role_from_an_older_generation_is_never_read() {
+        let mut inventory = CameraInventory::new();
+        inventory.reconcile(vec![brio().build()]).unwrap();
+        inventory.invalidate_all();
+        inventory.reconcile(vec![brio().build()]).unwrap();
+        let instance_id = inventory.active_descriptors()[0]
+            .camera_instance_id()
+            .clone();
+        // Planted without pruning, as if a mutation had missed it.
+        for (endpoint, role) in BRIO_ROLES {
+            inventory.roles.insert(
+                RoleKey {
+                    supervisor_id: inventory.supervisor_id.clone(),
+                    instance_id: instance_id.clone(),
+                    generation: CameraGeneration::INITIAL,
+                    endpoint: endpoint.to_owned(),
+                },
+                role,
+            );
+        }
+        let view = inventory.connected_pairs();
+        assert!(view.pairs.is_empty());
+        assert_eq!(view.unclassified.len(), 1);
+        assert_eq!(view.unclassified[0].generation, 2);
+        assert_eq!(
+            view.unclassified[0].endpoints,
+            ["/dev/video0", "/dev/video2"]
+        );
+    }
+
+    #[test]
+    fn a_contradicting_role_in_one_generation_clears_the_endpoint() {
+        let mut inventory = recorded_brio();
+        record(&mut inventory, &[("/dev/video2", Role::Rgb)]);
+        assert_eq!(inventory.recorded_role_count(), 1);
+        let view = inventory.connected_pairs();
+        assert!(view.pairs.is_empty());
+        assert_eq!(view.unclassified[0].endpoints, ["/dev/video2"]);
+
+        // The next answer after the contradiction is recorded afresh.
+        record(&mut inventory, &[("/dev/video2", Role::Ir)]);
+        assert_eq!(inventory.recorded_role_count(), 2);
+        let view = inventory.connected_pairs();
+        assert_eq!(view.pairs.len(), 1);
+        assert_eq!(view.pairs[0].ir, "/dev/video2");
+    }
+
+    #[test]
+    fn a_repeated_answer_in_one_generation_keeps_the_role() {
+        let mut inventory = recorded_brio();
+        record(&mut inventory, &BRIO_ROLES);
+        assert_eq!(inventory.recorded_role_count(), 2);
+        assert_eq!(inventory.connected_pairs().pairs.len(), 1);
+    }
+
+    #[test]
+    fn an_endpoint_claimed_by_two_cameras_is_never_recorded() {
+        let mut inventory = CameraInventory::new();
+        inventory
+            .reconcile(vec![
+                ObservationFixture::usb(CAMERA_A, "046d:085e")
+                    .capture("/dev/video0")
+                    .capture("/dev/video2")
+                    .build(),
+                ObservationFixture::usb(CAMERA_B, "1111:2222")
+                    .capture("/dev/video0")
+                    .capture("/dev/video4")
+                    .build(),
+            ])
+            .unwrap();
+        let generations = inventory.endpoint_generations();
+        assert!(!generations.contains_key("/dev/video0"));
+        assert!(generations.contains_key("/dev/video2"));
+        assert!(generations.contains_key("/dev/video4"));
+
+        record(
+            &mut inventory,
+            &[
+                ("/dev/video0", Role::Rgb),
+                ("/dev/video2", Role::Ir),
+                ("/dev/video4", Role::Ir),
+            ],
+        );
+        assert_eq!(inventory.recorded_role_count(), 2);
+        assert!(inventory
+            .roles
+            .keys()
+            .all(|key| key.endpoint != "/dev/video0"));
+    }
+
+    #[test]
+    fn a_changed_usb_descriptor_at_the_same_topology_advances_the_generation() {
+        let topology = "/devices/pci0000:00/0000:00:14.0/usb3/3-1";
+        let mut inventory = CameraInventory::new();
+        inventory
+            .reconcile(vec![ObservationFixture::usb(topology, "046d:085e")
+                .four_node(0)
+                .build()])
+            .unwrap();
+        let events = inventory
+            .reconcile(vec![ObservationFixture::usb(topology, "1111:2222")
+                .four_node(0)
+                .build()])
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].is_changed());
+        assert_eq!(generation(&events[0]), 2);
+    }
+
+    #[test]
+    fn connected_pairs_follow_the_publication_state() {
+        assert_eq!(
+            CameraInventory::new().connected_pairs(),
+            ConnectedPairs::default()
+        );
+        let mut inventory = CameraInventory::new();
+        inventory.reconcile(vec![brio().build()]).unwrap();
+        let snapshot = inventory.snapshot();
+        let view = inventory.connected_pairs();
+        assert_eq!(view.state, CameraInventoryState::Current);
+        assert_eq!(view.supervisor_id, snapshot.supervisor_id);
+        assert_eq!(view.revision, snapshot.revision);
+
+        record(&mut inventory, &BRIO_ROLES);
+        assert_eq!(inventory.snapshot().revision, snapshot.revision);
+        assert_eq!(inventory.connected_pairs().revision, snapshot.revision);
+    }
+
+    #[test]
+    fn a_recorded_camera_without_usb_descriptors_stays_out_of_the_view() {
+        let mut inventory = CameraInventory::new();
+        inventory
+            .reconcile(vec![ObservationFixture::usb(CAMERA_A, "1111:2222")
+                .four_node(0)
+                .without_usb_descriptor()
+                .build()])
+            .unwrap();
+        record(&mut inventory, &BRIO_ROLES);
+        assert_eq!(inventory.recorded_role_count(), 2);
+        assert_lists_nothing(&inventory.connected_pairs());
     }
 }

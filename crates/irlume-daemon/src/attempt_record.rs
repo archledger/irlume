@@ -536,8 +536,29 @@ const WRITER_QUEUE: usize = 64;
 /// most `WRITER_QUEUE` pending records and one writer serialized on the
 /// store lock. A full queue drops the record and says so; the record is
 /// history and never delays a reply.
+///
+/// Test builds file inline instead. The writer thread outlives the test
+/// that queued a record, and filing reads the environment (the passwd
+/// lookup inside glibc, `IRLUME_STATE_DIR`) while a later test may be
+/// rewriting it under the test-only env lock, which the writer cannot take
+/// without stalling a test that holds it (an ASan SEGV in `getenv`). Inline,
+/// those reads fall under the filing test's own guard, like the rest of
+/// the request it came from. The writer's own tests call [`enqueue`] while
+/// holding the env write guard until their records are on disk.
 pub(crate) fn record_in_background(user: String, filed: Filed) {
-    static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if cfg!(test) {
+        file(&user, filed);
+        return;
+    }
+    enqueue(user, filed);
+}
+
+/// Records the writer dropped because its queue was full.
+static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Queue a record for the background writer, or drop it when the queue is
+/// full.
+fn enqueue(user: String, filed: Filed) {
     if writer().try_send(Job::File(user, filed)).is_err() {
         // Journal the first drop and then every hundredth, not each one.
         let dropped = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -546,6 +567,16 @@ pub(crate) fn record_in_background(user: String, filed: Filed) {
                 "irlumed: attempt record writer queue full; {dropped} records dropped so far"
             );
         }
+    }
+}
+
+/// File one record, reporting a failure to the journal.
+fn file(user: &str, filed: Filed) {
+    if let Err(error) = record(user, filed) {
+        irlume_common::jout_warn!(
+            "irlumed: attempt record for '{}' not written: {error}",
+            crate::journal_safe(user)
+        );
     }
 }
 
@@ -567,14 +598,7 @@ fn writer() -> &'static std::sync::mpsc::SyncSender<Job> {
             .spawn(move || {
                 for job in rx {
                     match job {
-                        Job::File(user, filed) => {
-                            if let Err(error) = record(&user, filed) {
-                                irlume_common::jout_warn!(
-                                    "irlumed: attempt record for '{}' not written: {error}",
-                                    crate::journal_safe(&user)
-                                );
-                            }
-                        }
+                        Job::File(user, filed) => file(&user, filed),
                         // The reader may have given up: nobody to tell.
                         Job::Barrier(ack) => {
                             let _ = ack.try_send(());
@@ -1124,6 +1148,131 @@ mod tests {
         );
         std::env::remove_var("IRLUME_STATE_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A test build files on the caller's thread, under the env guard its
+    /// test holds. The background writer outlived the test that queued a
+    /// record and read the environment while a later test rewrote it (an
+    /// ASan SEGV in `getenv`).
+    #[test]
+    fn a_test_build_files_on_the_callers_thread() {
+        let _g = crate::tests::env_lock();
+        let (dir, uid, me) = own_state_dir("inline");
+        record_in_background(me.clone(), refusal(AttemptKind::Authenticate));
+        // Read without the writer fence: nothing was left to the writer.
+        let stored = store().unwrap().read_any(uid).unwrap();
+        assert_eq!(stored.account, me);
+        assert!(stored.record.latest_authenticate.is_some());
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The writer's own tests hold the env write guard until every record
+    // they queued is on disk, so no other test rewrites the environment
+    // while the writer thread reads it.
+
+    /// The production path: records queue in order, and a read waits for
+    /// the ones queued before it.
+    #[test]
+    fn the_writer_files_queued_records_in_order_before_a_read() {
+        let _g = crate::tests::env_lock();
+        let (dir, uid, me) = own_state_dir("writer");
+        enqueue(me.clone(), refusal(AttemptKind::Authenticate));
+        enqueue(me.clone(), refusal(AttemptKind::Identify));
+        enqueue(
+            me.clone(),
+            Filed {
+                result: AttemptResult::Granted,
+                cause: None,
+                ..refusal(AttemptKind::Authenticate)
+            },
+        );
+        // `load` fences on the writer before it reads.
+        let loaded = load(&me).expect("record present");
+        assert_eq!(
+            loaded.latest_authenticate.as_ref().map(|a| a.result),
+            Some(AttemptResult::Granted),
+            "the last authenticate queued is the latest filed"
+        );
+        assert!(loaded.latest_identify.is_some());
+        assert_eq!(store().unwrap().read_any(uid).unwrap().next_seq, 4);
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A full queue drops a record and counts it instead of blocking the
+    /// caller. The test holds the store lock, so the writer stops at its
+    /// first record and the queue fills behind it.
+    #[test]
+    fn a_full_writer_queue_drops_and_counts_instead_of_blocking() {
+        let _g = crate::tests::env_lock();
+        let (dir, uid, me) = own_state_dir("full");
+        let dropped_before = DROPPED.load(std::sync::atomic::Ordering::Relaxed);
+        let queued = WRITER_QUEUE + 8;
+        let held = store().unwrap().lock().unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..queued {
+            enqueue(me.clone(), refusal(AttemptKind::Authenticate));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a full queue must not block the caller"
+        );
+        let dropped = DROPPED.load(std::sync::atomic::Ordering::Relaxed) - dropped_before;
+        // The queue holds WRITER_QUEUE; the writer may already hold one more.
+        assert!((7..=8).contains(&dropped), "dropped {dropped} of {queued}");
+        drop(held);
+        let filed = || {
+            store()
+                .unwrap()
+                .read_any(uid)
+                .unwrap()
+                .next_seq
+                .saturating_sub(1)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while filed() + dropped < queued as u64 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            filed() + dropped,
+            queued as u64,
+            "every record filed or counted"
+        );
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A throwaway `IRLUME_STATE_DIR` (set; the caller holds the env write
+    /// guard) and this process's own uid and account name.
+    fn own_state_dir(tag: &str) -> (std::path::PathBuf, u32, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-attempts-{tag}-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let me = crate::users::name_for_uid(uid).expect("own name");
+        (dir, uid, me)
+    }
+
+    fn refusal(kind: AttemptKind) -> Filed {
+        Filed {
+            at: unix_now(),
+            kind,
+            surface: AttemptSurface::Lock,
+            result: AttemptResult::Refused,
+            cause: Some(OutcomeCause::NoFace),
+            elapsed_ms: 10,
+            capture_ms: None,
+            camera: None,
+        }
     }
 
     #[test]

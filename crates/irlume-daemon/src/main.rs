@@ -10069,6 +10069,8 @@ mod tests {
             "dispatch_using(",
             "retry_throttle::record(",
             "retry_throttle::record_if(",
+            // Files on the caller's thread in test builds.
+            "record_in_background(",
             "account(",
             "uid_for_name(",
             "name_for_uid(",

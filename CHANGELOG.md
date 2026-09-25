@@ -296,6 +296,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- A first GNOME keyring token arm (`irlume keyring arm`, `irlume setup`
+  and the TUI's Password Wallet) whose re-key cannot be verified now
+  keeps the new token instead of erasing it. gnome-keyring changes the
+  keyring before it answers, so a lost answer can follow a re-key that
+  took effect, and erasing the token then left the login keyring keyed
+  to a secret that no longer existed. The token is erased only when
+  gnome-keyring refused the re-key or never received it, or when the
+  keyring still opens with the password; otherwise the arm says the
+  token was kept and how to finish. An arm against a gnome-keyring
+  running as another uid now sends it nothing and rolls back, naming
+  both uids (#250, #846).
+
 - `keyring arm` no longer replaces an armed GNOME keyring token with
   another kind, or arms over a sealed secret irlumed cannot read, even
   when the password passes the login-hash check. The arm picks the kind

@@ -1434,7 +1434,7 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_forget_before_upgrading_to_45() {
     const FEDORA_43: &str = "NAME=\"Fedora Linux\"\nID=fedora\nVERSION_ID=43\n";
     const FEDORA_45: &str = "NAME=\"Fedora Linux\"\nID=fedora\nVERSION_ID=45\n";
     const DEBIAN: &str = "ID=debian\nVERSION_ID=\"13\"\n";
-    const NOTICE: &str = "before upgrading to Fedora 45";
+    const NOTICE: &str = "Before upgrading to Fedora 45";
     const FORGET: &str = "irlume keyring forget";
     const STATUS: &[&str] = &["keyring", "status", "--user", "tester"];
     // The fake daemon reports `armed` and `kind`, and answers a seal with a

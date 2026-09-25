@@ -6587,7 +6587,7 @@ impl App {
                                             crate::upgrade_notice::host_token_upgrade_notice()
                                         {
                                             done.push_str(". ");
-                                            done.push_str(&notice.advice());
+                                            done.push_str(&notice.advice(&user));
                                         }
                                         (true, done)
                                     }

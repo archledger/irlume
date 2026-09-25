@@ -58,15 +58,17 @@ pub(crate) const TOKEN_UPGRADE_NOTICES: &[TokenUpgradeNotice] = &[
 ];
 
 impl TokenUpgradeNotice {
-    /// The reason and what to do, as one paragraph. It does not send the user
-    /// to `irlume keyring arm` on the next release: this build's kind
-    /// detection would pick a token there again.
-    pub(crate) fn advice(&self) -> String {
+    /// The reason and what to do for `user`, as one paragraph. `forget`
+    /// re-keys the keyring through its owner's own session, so the step names
+    /// the account and where to run it. It does not send the user to `irlume
+    /// keyring arm` on the next release: this build's kind detection would pick
+    /// a token there again.
+    pub(crate) fn advice(&self, user: &str) -> String {
         format!(
-            "{} Run `irlume keyring forget` before upgrading to {next} (it re-keys the \
-             login keyring back to your password). Do not arm again on {next} until an \
-             irlume update supports its keyring; until then your password opens it as \
-             usual.",
+            "{} Before upgrading to {next}, log in as {user} and run \
+             `irlume keyring forget` in that graphical session (it re-keys the login \
+             keyring back to the password). Do not arm again on {next} until an irlume \
+             update supports its keyring; until then the password opens it as usual.",
             self.reason,
             next = self.next_release
         )
@@ -106,12 +108,17 @@ fn os_release_field<'a>(os_release: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// The notice for the release `os_release` describes, if one is listed.
-pub(crate) fn token_upgrade_notice(os_release: &str) -> Option<&'static TokenUpgradeNotice> {
-    let id = os_release_field(os_release, "ID")?;
-    let version_id = os_release_field(os_release, "VERSION_ID")?;
-    TOKEN_UPGRADE_NOTICES
+/// `Err` when it names no `ID` or no `VERSION_ID`: the release is then
+/// unknown, not merely unlisted.
+pub(crate) fn token_upgrade_notice(
+    os_release: &str,
+) -> Result<Option<&'static TokenUpgradeNotice>, &'static str> {
+    let id = os_release_field(os_release, "ID").ok_or("os-release names no ID")?;
+    let version_id =
+        os_release_field(os_release, "VERSION_ID").ok_or("os-release names no VERSION_ID")?;
+    Ok(TOKEN_UPGRADE_NOTICES
         .iter()
-        .find(|notice| notice.id == id && notice.version_id == version_id)
+        .find(|notice| notice.id == id && notice.version_id == version_id))
 }
 
 /// [`token_upgrade_notice`] for this host: `IRLUME_OS_RELEASE` when set,
@@ -125,7 +132,8 @@ pub(crate) fn host_token_upgrade_notice_checked(
         None => std::fs::read_to_string("/etc/os-release")
             .or_else(|_| std::fs::read_to_string("/usr/lib/os-release"))?,
     };
-    Ok(token_upgrade_notice(&text))
+    token_upgrade_notice(&text)
+        .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidData, why))
 }
 
 /// [`host_token_upgrade_notice_checked`] where an unreadable release simply
@@ -151,6 +159,9 @@ mod tests {
         std::fs::write(dir.join("debian"), "ID=debian\nVERSION_ID=13\n").unwrap();
         std::env::set_var(OS_RELEASE_ENV, dir.join("debian"));
         assert!(matches!(host_token_upgrade_notice_checked(), Ok(None)));
+        std::fs::write(dir.join("partial"), "ID=fedora\n").unwrap();
+        std::env::set_var(OS_RELEASE_ENV, dir.join("partial"));
+        assert!(host_token_upgrade_notice_checked().is_err());
         std::env::remove_var(OS_RELEASE_ENV);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -161,28 +172,33 @@ mod tests {
 
     #[test]
     fn fedora_43_and_44_are_listed_and_other_releases_are_not() {
-        let notice = token_upgrade_notice(FEDORA_44).expect("Fedora 44 is listed");
+        let notice = token_upgrade_notice(FEDORA_44)
+            .unwrap()
+            .expect("Fedora 44 is listed");
         assert_eq!(notice.release, "Fedora 44");
         assert_eq!(notice.next_release, "Fedora 45");
         // Quoting and field order do not matter.
         assert_eq!(
-            token_upgrade_notice("VERSION_ID=\"44\"\nID='fedora'\n"),
+            token_upgrade_notice("VERSION_ID=\"44\"\nID='fedora'\n").unwrap(),
             Some(notice)
         );
-        let notice = token_upgrade_notice("ID=fedora\nVERSION_ID=43\n").expect("Fedora 43");
+        let notice = token_upgrade_notice("ID=fedora\nVERSION_ID=43\n")
+            .unwrap()
+            .expect("Fedora 43");
         assert_eq!(notice.release, "Fedora 43");
         assert_eq!(notice.next_release, "Fedora 45");
         for other in [
             "ID=fedora\nVERSION_ID=42\n",
             "ID=fedora\nVERSION_ID=45\n",
-            "ID=fedora\n",
-            "VERSION_ID=44\n",
             // A derivative carries its own ID even when it is like Fedora.
             "ID=nobara\nID_LIKE=\"rhel centos fedora\"\nVERSION_ID=44\n",
             "ID=debian\nVERSION_ID=\"13\"\n",
-            "",
         ] {
-            assert_eq!(token_upgrade_notice(other), None, "{other:?}");
+            assert_eq!(token_upgrade_notice(other), Ok(None), "{other:?}");
+        }
+        // Without both keys the release is unknown, not unlisted.
+        for incomplete in ["ID=fedora\n", "VERSION_ID=44\n", ""] {
+            assert!(token_upgrade_notice(incomplete).is_err(), "{incomplete:?}");
         }
     }
 
@@ -201,9 +217,10 @@ mod tests {
     #[test]
     fn every_notice_gives_the_forget_step_and_no_rearm() {
         for notice in TOKEN_UPGRADE_NOTICES {
-            let advice = notice.advice();
+            let advice = notice.advice("alice");
             assert!(
-                advice.contains(&format!("before upgrading to {}", notice.next_release))
+                advice.contains(&format!("Before upgrading to {}", notice.next_release))
+                    && advice.contains("log in as alice")
                     && advice.contains("irlume keyring forget"),
                 "{advice}"
             );

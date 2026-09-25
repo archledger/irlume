@@ -1330,9 +1330,9 @@ fn read_password(prompt: &str) -> Result<zeroize::Zeroizing<String>, String> {
 /// Under a GNOME keyring token, on a release whose next upgrade does not
 /// carry the token over, the step to take before upgrading. Shared by every
 /// token-arm path: `keyring arm`, the setup wizard and the TUI's message.
-pub(crate) fn print_token_upgrade_notice() {
+pub(crate) fn print_token_upgrade_notice(user: &str) {
     if let Some(notice) = upgrade_notice::host_token_upgrade_notice() {
-        println!("[keyring] \u{26a0} {}", notice.advice());
+        println!("[keyring] \u{26a0} {}", notice.advice(user));
     }
 }
 
@@ -1429,7 +1429,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                                 "[keyring] Your password alone no longer opens the keyring \
                                  directly; `irlume keyring forget` re-keys it back."
                             );
-                            print_token_upgrade_notice();
+                            print_token_upgrade_notice(&user);
                             std::process::ExitCode::SUCCESS
                         }
                         Err(e) => {
@@ -1482,7 +1482,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                                 "[keyring] Your password alone no longer opens that keyring; \
                                  `irlume keyring forget` re-keys it back."
                             );
-                            print_token_upgrade_notice();
+                            print_token_upgrade_notice(&user);
                         }
                         // An older daemon does not report the kind.
                         None => println!(
@@ -3923,7 +3923,7 @@ fn report_keyring_os_upgrade(report: &mut crate::doctor_report::Report, user: &s
     });
     match upgrade_notice::token_armed(&answer) {
         Some(true) => {
-            let advice = notice.advice();
+            let advice = notice.advice(user);
             dout!(
                 report,
                 "[doctor] \u{26a0} {user} has a GNOME keyring token armed on {}.\n     {advice}",

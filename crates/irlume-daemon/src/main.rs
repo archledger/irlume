@@ -8448,14 +8448,17 @@ fn finish_unseal_password(
 }
 
 /// How to re-bind a sealed secret after PCR drift, for the armed kind. The
-/// next typed login re-seals any kind. `irlume keyring arm` re-binds a login
-/// password or KDE wallet key, but over a GNOME keyring token it refuses
-/// wherever irlumed cannot read the login hash or would pick another kind
-/// (a KDE wallet beside the login keyring), so a token gets only the login.
+/// next typed login re-seals any kind where the stack carries irlume's
+/// `reseal` line. `irlume keyring arm` re-binds a login password or KDE
+/// wallet key, but over a GNOME keyring token it refuses wherever irlumed
+/// cannot read the login hash or would pick another kind (a KDE wallet beside
+/// the login keyring). A token instead gets `forget` then `arm`: forget
+/// unwraps the token with the password, not the TPM, so drift does not stop
+/// it, and that route works where no `reseal` line is wired (NixOS).
 fn pcr_drift_hint(armed: Option<irlume_core::envelope::SecretKind>) -> &'static str {
     if armed == Some(irlume_core::envelope::SecretKind::GnomeKeyringToken) {
         " -- log in once by typing the password to re-bind the sealed secret to the \
-         current PCRs"
+         current PCRs, or run `irlume keyring forget` and then `irlume keyring arm`"
     } else {
         " -- log in once by typing the password, or re-run `irlume keyring arm`, to \
          re-bind the sealed secret to the current PCRs"
@@ -9025,7 +9028,12 @@ mod tests {
         use irlume_core::envelope::SecretKind as K;
         let token = pcr_drift_hint(Some(K::GnomeKeyringToken));
         assert!(token.contains("typing the password"), "{token}");
-        assert!(!token.contains("keyring arm"), "{token}");
+        // Never a bare re-arm over the token: forget first, then arm.
+        assert!(
+            token.contains("`irlume keyring forget` and then `irlume keyring arm`")
+                && !token.contains("re-run `irlume keyring arm`"),
+            "{token}"
+        );
         for armed in [Some(K::LoginPassword), Some(K::KdeWalletKey), None] {
             let hint = pcr_drift_hint(armed);
             assert!(

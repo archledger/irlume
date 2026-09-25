@@ -13055,7 +13055,10 @@ mod tests {
         ));
         let server = serve_one(
             &sock,
-            |request| matches!(request, Request::ListCameras | Request::CaptureModeStatus),
+            // Only the listing: a stray CaptureModeStatus from another test is
+            // skipped, and `qualification_load` below still catches this
+            // refresh starting a qualification.
+            |request| matches!(request, Request::ListCameras),
             Response::Cameras(vec![]),
             Duration::from_millis(150),
         );

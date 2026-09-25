@@ -103,9 +103,10 @@ PAM (the `/etc/pam.d/irlume-retry-reset` service).
   **irlume-liveness** and **irlume-core** read **irlume-vision**'s output
   types directly.
 - The integration shims (**irlume-pam**, the keyring helpers) stay thin,
-  one system interface each (plus, for **irlume-pam**, the daemon socket),
-  so the attack surface loaded into PAM stacks and keyring startup is as
-  small as it can be. The keyring helpers never talk to the daemon, and
+  one system interface each (plus, for **irlume-pam**, the daemon socket,
+  and for **irlume-gkr-unlock**, the user bus it only watches to learn when
+  gnome-keyring is ready), so the attack surface loaded into PAM stacks and
+  keyring startup is as small as it can be. The keyring helpers never talk to the daemon, and
   no binary links another binary's crate.
 
 Each crate's own source carries the detailed contracts; start at

@@ -149,7 +149,8 @@ fn confirm_cosmic_face(pamh: &Pam) -> IntentConfirmation {
 const RESEAL_STASH_KEY: &str = "pam_irlume_reseal_authtok";
 
 /// PAM-data key for a released GNOME keyring token, carried from the auth
-/// phase to `open_session`, which hands it to the unlock helper. A token never
+/// phase to `open_session`, which hands it to the unlock helper and leaves
+/// the key set but empty, so a handle delivers once. A token never
 /// rides `PAM_AUTHTOK`: on a Debian-style `kr` stack `pam_unix` would consume
 /// it as the Unix password and fail the login it was meant to decorate.
 const GKR_TOKEN_STASH_KEY: &str = "pam_irlume_gkr_token";
@@ -634,18 +635,37 @@ fn try_reseal_session(pamh: &Pam, user: &str) {
 /// stashed, when there is one, no longer opens anything.
 ///
 /// The token normally arrives in the auth-phase stash (face or fingerprint
-/// release). Without one — a typed-password login, or a topology where auth
-/// ran in a different PAM transaction — ask the daemon: `have_password: true`
+/// release). Without one (a typed-password login, or a topology where auth
+/// ran in a different PAM transaction) ask the daemon: `have_password: true`
 /// makes that free for password-armed users (no TPM touched), so the extra
 /// round trip costs only token users, only on their stash-less logins.
-/// Best-effort and silent like everything else in the session phase.
+///
+/// gnome-keyring may not accept the token yet at this point: a
+/// `pam_gnome_keyring --login` daemon refuses it until the session's first
+/// Secret Service client initializes it, after this phase has returned. The
+/// helper therefore hands the token to a detached waiter of its own and
+/// returns within about a second; the waiter delivers it later and logs the
+/// outcome to the journal. Each handle delivers at most once: the stash is
+/// emptied first, on both paths, so a second `open_session` on this handle
+/// neither asks the daemon again nor starts a second waiter. Best-effort and
+/// silent like everything else in the session phase.
 fn deliver_gnome_token(pamh: &Pam, user: &str) {
     // SAFETY: the key was registered by this module in the same PAM
     // transaction and is not replaced while the borrow is live; the borrow
-    // ends inside the first match arm, before `SecretBytes` copies it.
-    let token = match unsafe { pamh.get_secret(GKR_TOKEN_STASH_KEY) } {
-        Ok(stash) if !stash.is_empty() => SecretBytes::new(stash.expose().to_vec()),
-        _ => {
+    // ends inside the match arms, before `SecretBytes` copies it.
+    let stashed = match unsafe { pamh.get_secret(GKR_TOKEN_STASH_KEY) } {
+        Ok(stash) if !stash.is_empty() => Some(SecretBytes::new(stash.expose().to_vec())),
+        // Emptied below by an earlier `open_session` on this handle: the
+        // token was handed on already.
+        Ok(_) => return,
+        Err(_) => None,
+    };
+    // Empty the stash before anything else can fail. The replacement also
+    // wipes the stashed copy.
+    let _ = pamh.send_secret(GKR_TOKEN_STASH_KEY, pamsm::PamSecretBytes::new(Vec::new()));
+    let token = match stashed {
+        Some(token) => token,
+        None => {
             let service = pamh
                 .get_service()
                 .ok()
@@ -738,7 +758,11 @@ fn secure_helper_path(var: &str, compiled: &str) -> String {
 /// target user before touching their runtime directory (the daemon's control
 /// socket authenticates the peer uid, and root pathname work inside a
 /// user-owned directory is the CVE-2018-10380 shape irlume-kwallet-init
-/// already refuses to repeat).
+/// already refuses to repeat). It then forks a detached waiter, which
+/// delivers the token at once if gnome-keyring is already initialized and
+/// otherwise waits for it, and exits at the waiter's first report or after
+/// one second, whichever comes first. Only the helper process itself is
+/// waited for, never the waiter.
 fn hand_token_to_keyring_daemon(user: &str, token: &irlume_common::SecretBytes) -> bool {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -766,17 +790,18 @@ fn hand_token_to_keyring_daemon(user: &str, token: &irlume_common::SecretBytes) 
         drop(sin);
     }
     // Bounded, because this is the PAM session phase and the login blocks on
-    // it. The helper has its own deadlines on the socket, but a wedged or
-    // stopped child would otherwise hang the login here; the helper's own
-    // ceiling plus a margin is the budget, and a child still running past it
-    // is killed rather than waited on.
+    // it. The helper normally exits within a second, but a wedged or stopped
+    // child would otherwise hang the login here; a child still running past
+    // the budget is killed rather than waited on.
     wait_bounded(&mut child, HELPER_BUDGET)
 }
 
-/// Ceiling on the keyring helpers. The GNOME unlock helper's own socket
-/// deadlines are 10s, so this is that plus room to start and exit; the KDE
-/// helper forks and execs the wallet daemon and normally exits in
-/// milliseconds, so the same ceiling is generous there.
+/// Ceiling on the keyring helpers, not their expected time. The GNOME unlock
+/// helper returns within about a second: the process waited for here never
+/// touches the control socket and waits at most one second for its detached
+/// waiter's first report, so this covers a slow user lookup (NSS) and room
+/// to start and exit; the KDE helper forks and execs the wallet daemon and normally exits
+/// in milliseconds, so the same ceiling is generous there.
 const HELPER_BUDGET: Duration = Duration::from_secs(15);
 
 /// Reap `child`, giving up (and killing it) after `budget`.

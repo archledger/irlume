@@ -398,13 +398,26 @@ jobs:
 
       # IRLUME_REQUIRE_PAM_TOOLS makes a missing pamtester or pam_wrapper fail
       # each pamwrap test instead of skipping it; a pamwrap test checks that
-      # this step and the nightly coverage step set it. The floor is about 90%
-      # of the real count (67: 19 unit tests, 48 pamwrap tests), so losing the
+      # this step and the nightly coverage step set it. The floor sits below
+      # the real count (72: 19 unit tests, 53 pamwrap tests), so losing the
       # pamwrap tests fails the lane even though the unit tests still pass.
       - name: test (PAM FFI, against pam_wrapper)
         env:
           IRLUME_REQUIRE_PAM_TOOLS: "1"
         run: ./scripts/run-tests-guarded.sh --min 59 -- cargo test -p irlume-pam --locked -- --include-ignored --test-threads=1
+
+      # The release irlume-gkr-unlock against a real gnome-keyring-daemon
+      # started with --login, as pam_gnome_keyring starts it where no socket
+      # unit exists: the token must arrive only once gnome-keyring is
+      # initialized, with no unlock prompt. Throwaway HOME, runtime dir and
+      # private bus; no display. A missing tool fails the step.
+      - name: test (GNOME keyring token waiter, real gnome-keyring)
+        run: |
+          if command -v apt-get >/dev/null; then
+            sudo apt-get install -y --no-install-recommends \
+              gnome-keyring libsecret-tools python3-jeepney libgcr-base-3-1 libglib2.0-dev dbus-bin systemd
+          fi
+          env -u DISPLAY -u WAYLAND_DISPLAY -u XAUTHORITY bash scripts/gkr-token-waiter-check.sh
 
       - name: test (shared-greeter daemon and PAM admission)
         run: |

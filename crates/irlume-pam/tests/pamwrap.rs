@@ -75,6 +75,10 @@ struct Harness {
     /// Overrides `salt_helper` as `IRLUME_KWALLET_INIT` when set, via
     /// [`Harness::set_kwallet_init`].
     kwallet_init: Option<PathBuf>,
+    /// `IRLUME_GKR_UNLOCK` when set, via [`Harness::set_gkr_unlock`]; by
+    /// default a path that does not exist, so no run can reach an installed
+    /// helper.
+    gkr_unlock: Option<PathBuf>,
     root: PathBuf,
 }
 
@@ -138,6 +142,7 @@ impl Harness {
             root,
             salt_helper,
             kwallet_init: None,
+            gkr_unlock: None,
         })
     }
 
@@ -146,6 +151,11 @@ impl Harness {
     /// and an actual key delivery.
     fn set_kwallet_init(&mut self, path: PathBuf) {
         self.kwallet_init = Some(path);
+    }
+
+    /// Point `IRLUME_GKR_UNLOCK` at `path`.
+    fn set_gkr_unlock(&mut self, path: PathBuf) {
+        self.gkr_unlock = Some(path);
     }
 
     /// Write this run's settings.conf (the module reads it live). `None` removes
@@ -204,6 +214,12 @@ impl Harness {
             .env(
                 "IRLUME_KWALLET_INIT",
                 self.kwallet_init.as_ref().unwrap_or(&self.salt_helper),
+            )
+            .env(
+                "IRLUME_GKR_UNLOCK",
+                self.gkr_unlock
+                    .clone()
+                    .unwrap_or_else(|| self.root.join("no-gkr-unlock")),
             )
             .env_remove("IRLUME_CREDENTIAL_RELEASE_CHALLENGE")
             .env_remove("IRLUME_CONSENT_GESTURE")
@@ -1900,6 +1916,294 @@ fn pamwrap_secret_stash_replaces_and_completes_without_printing() {
             "the replaced stash must read back the exact live secret"
         ),
         other => panic!("expected ResealPassword, daemon saw {other:?}"),
+    }
+}
+
+/// A fake GNOME keyring token, and the SHA-256 of its bytes, which the fake
+/// helper below records instead of the token itself.
+const FAKE_GKR_TOKEN: &str = "fake-gkr-token-for-pamwrap-0000";
+const FAKE_GKR_TOKEN_SHA256: &str =
+    "79e8ab11df7e7931f1ba18b815ab0a7f6ba46c1c40d1e32045d865853b733111";
+
+/// The fake daemon's answer for a token-armed user.
+fn gnome_token() -> Response {
+    Response::PasswordUnsealed {
+        kind: irlume_common::KeyringSecretKind::GnomeKeyringToken,
+        secret: irlume_common::SecretBytes::new(FAKE_GKR_TOKEN.as_bytes().to_vec()),
+    }
+}
+
+/// Writes a fake `IRLUME_GKR_UNLOCK` helper. Each run appends its arguments
+/// to `gkr-argv` and the SHA-256 of its stdin to `gkr-stdin` in `root`, then,
+/// per `mode`:
+///   * `detach`: leaves a `setsid sleep 30` behind, as the real helper leaves
+///     its waiter, writes that process's pid to `gkr-waiter.pid`, and exits 0;
+///   * `hang`: writes its own pid to `gkr-helper.pid` and becomes
+///     `sleep 60`.
+///
+/// Like [`write_kde_fake_helper`], it drops pam_wrapper from its environment
+/// before it runs any command.
+fn write_gkr_fake_helper(root: &Path, mode: &str) -> PathBuf {
+    let path = root.join(format!("gkr-unlock-{mode}.sh"));
+    let body = format!(
+        "#!/bin/sh\n\
+         unset LD_PRELOAD PAM_WRAPPER\n\
+         echo \"$*\" >> '{root}/gkr-argv'\n\
+         sha256sum | cut -d' ' -f1 >> '{root}/gkr-stdin'\n\
+         case {mode} in\n\
+         detach)\n\
+         setsid sleep 30 </dev/null >/dev/null 2>&1 &\n\
+         echo $! > '{root}/gkr-waiter.pid'\n\
+         exit 0\n\
+         ;;\n\
+         hang)\n\
+         echo $$ > '{root}/gkr-helper.pid'\n\
+         exec sleep 60\n\
+         ;;\n\
+         esac\n",
+        root = root.display(),
+    );
+    std::fs::write(&path, body).unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+/// The `irlume-gkr` service: the `reseal` session line and pam_permit, with
+/// the `keyring` auth line first when `auth` is set.
+fn gkr_service(h: &Harness, auth: bool) {
+    let mut lines = Vec::new();
+    if auth {
+        lines.push(h.auth_line("optional", "keyring"));
+        lines.push("auth required pam_permit.so".into());
+    }
+    lines.push(format!("session optional {} reseal", h.module.display()));
+    lines.push("session required pam_permit.so".into());
+    h.write_service("irlume-gkr", &lines);
+}
+
+/// The lines a fake GNOME helper recorded, or none when it never ran.
+fn gkr_record(h: &Harness, file: &str) -> Vec<String> {
+    std::fs::read_to_string(h.root.join(file))
+        .map(|text| text.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Stops a process a fake helper left behind, if it is still there.
+fn kill_recorded(h: &Harness, file: &str) {
+    if let Some(pid) = std::fs::read_to_string(h.root.join(file))
+        .ok()
+        .and_then(|pid| pid.trim().parse::<i32>().ok())
+    {
+        // SAFETY: signals a process a fake helper started for this test.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+}
+
+/// A token-armed typed-password login: the session line asks the daemon for
+/// the token and hands it to the helper, which leaves a waiter running. The
+/// session must not wait for that waiter: the real helper returns within
+/// about a second and gnome-keyring is initialized only after the PAM stack
+/// has returned.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_gnome_token_session_returns_while_the_waiter_runs() {
+    let Some(mut h) = Harness::try_new("gkr-detach") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| match req {
+        Request::UnsealKeyring { .. } => gnome_token(),
+        _ => Response::Error("unexpected request".into()),
+    });
+    h.set_gkr_unlock(write_gkr_fake_helper(&h.root, "detach"));
+    gkr_service(&h, false);
+
+    let started = std::time::Instant::now();
+    let (ok, out) = h.run("irlume-gkr", &["open_session"], "", None);
+    let took = started.elapsed();
+    kill_recorded(&h, "gkr-waiter.pid");
+    assert!(ok, "the session must open: {out}");
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "open_session took {took:?}: it waited for the waiter"
+    );
+    assert!(
+        !out.contains(FAKE_GKR_TOKEN),
+        "the token was printed: {out}"
+    );
+    assert_eq!(gkr_record(&h, "gkr-argv"), ["tester"], "the user is argv");
+    assert_eq!(
+        gkr_record(&h, "gkr-stdin"),
+        [FAKE_GKR_TOKEN_SHA256],
+        "the token, exactly, is on stdin"
+    );
+    let reqs = log.lock().unwrap();
+    assert!(
+        matches!(
+            reqs.as_slice(),
+            [Request::UnsealKeyring { user, have_password: true, .. }] if user == "tester"
+        ),
+        "{reqs:?}"
+    );
+}
+
+/// A face or fingerprint login: the `keyring` auth line stashes the token,
+/// and the session line delivers it without asking the daemon again. A
+/// second `open_session` on the same handle finds the stash emptied and
+/// starts no second helper.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_gnome_token_from_the_auth_stash_is_delivered_once() {
+    let Some(mut h) = Harness::try_new("gkr-stash") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| match req {
+        Request::UnsealKeyring { .. } => gnome_token(),
+        _ => Response::Error("unexpected request".into()),
+    });
+    h.set_gkr_unlock(write_gkr_fake_helper(&h.root, "detach"));
+    gkr_service(&h, true);
+
+    let (ok, out) = h.run(
+        "irlume-gkr",
+        &[
+            "authenticate",
+            "open_session",
+            "close_session",
+            "open_session",
+        ],
+        "",
+        None,
+    );
+    kill_recorded(&h, "gkr-waiter.pid");
+    assert!(ok, "{out}");
+    assert_eq!(gkr_record(&h, "gkr-argv"), ["tester"], "one helper run");
+    assert_eq!(gkr_record(&h, "gkr-stdin"), [FAKE_GKR_TOKEN_SHA256]);
+    let reqs = log.lock().unwrap();
+    assert!(
+        matches!(
+            reqs.as_slice(),
+            [Request::UnsealKeyring {
+                have_password: false,
+                ..
+            }]
+        ),
+        "one UnsealKeyring in the whole transaction, from the auth line: {reqs:?}"
+    );
+}
+
+/// The typed-password path delivers once per handle too: the second
+/// `open_session` neither asks the daemon again nor starts a second helper.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_gnome_token_without_a_stash_is_asked_for_once() {
+    let Some(mut h) = Harness::try_new("gkr-typed-once") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| match req {
+        Request::UnsealKeyring { .. } => gnome_token(),
+        _ => Response::Error("unexpected request".into()),
+    });
+    h.set_gkr_unlock(write_gkr_fake_helper(&h.root, "detach"));
+    gkr_service(&h, false);
+
+    let (ok, out) = h.run(
+        "irlume-gkr",
+        &["open_session", "close_session", "open_session"],
+        "",
+        None,
+    );
+    kill_recorded(&h, "gkr-waiter.pid");
+    assert!(ok, "{out}");
+    assert_eq!(gkr_record(&h, "gkr-argv"), ["tester"], "one helper run");
+    assert_eq!(log.lock().unwrap().len(), 1, "one daemon query");
+}
+
+/// A helper that never exits cannot hold the login: `open_session` returns
+/// IGNORE at the helper budget (15 s), and the helper is killed.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_hanging_gnome_token_helper_is_killed_at_the_budget() {
+    let Some(mut h) = Harness::try_new("gkr-hang") else {
+        return;
+    };
+    serve(&h.socket, |req| match req {
+        Request::UnsealKeyring { .. } => gnome_token(),
+        _ => Response::Error("unexpected request".into()),
+    });
+    h.set_gkr_unlock(write_gkr_fake_helper(&h.root, "hang"));
+    gkr_service(&h, false);
+
+    let started = std::time::Instant::now();
+    let (ok, out) = h.run("irlume-gkr", &["open_session"], "", None);
+    let took = started.elapsed();
+    let pid: i32 = std::fs::read_to_string(h.root.join("gkr-helper.pid"))
+        .expect("the helper ran")
+        .trim()
+        .parse()
+        .unwrap();
+    // Reaped by the module, or at worst a zombie on its way out.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let gone = loop {
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+        let alive = state.is_some_and(|stat| {
+            stat.rsplit(')')
+                .next()
+                .is_some_and(|rest| !rest.trim_start().starts_with('Z'))
+        });
+        if !alive {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    kill_recorded(&h, "gkr-helper.pid");
+    assert!(ok, "IGNORE, and pam_permit opens the session: {out}");
+    assert!(
+        (std::time::Duration::from_secs(14)..std::time::Duration::from_secs(20)).contains(&took),
+        "open_session took {took:?}, not the 15 s budget"
+    );
+    assert!(gone, "the hanging helper {pid} was left running");
+}
+
+/// Only a GNOME keyring token goes to the GNOME helper: a login password, a
+/// KDE wallet key or "not needed" from the daemon never runs it.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_other_keyring_replies_never_run_the_gnome_helper() {
+    for (name, reply) in [
+        ("gkr-login-password", unsealed("hunter2")),
+        ("gkr-not-needed", Response::KeyringUnlockNotNeeded),
+        (
+            "gkr-kde-key",
+            Response::PasswordUnsealed {
+                kind: irlume_common::KeyringSecretKind::KdeWalletKey,
+                secret: irlume_common::SecretBytes::new(vec![
+                    0x42;
+                    irlume_common::kwallet_wire::KEY_LEN
+                ]),
+            },
+        ),
+    ] {
+        let Some(mut h) = Harness::try_new(name) else {
+            return;
+        };
+        let log = serve(&h.socket, move |req| match req {
+            Request::UnsealKeyring { .. } => reply.clone(),
+            _ => Response::Error("unexpected request".into()),
+        });
+        h.set_gkr_unlock(write_gkr_fake_helper(&h.root, "detach"));
+        gkr_service(&h, false);
+        let (ok, out) = h.run("irlume-gkr", &["open_session"], "", None);
+        kill_recorded(&h, "gkr-waiter.pid");
+        assert!(ok, "{name}: {out}");
+        assert_eq!(log.lock().unwrap().len(), 1, "{name}: the daemon was asked");
+        assert!(
+            gkr_record(&h, "gkr-argv").is_empty(),
+            "{name}: the GNOME helper ran"
+        );
     }
 }
 

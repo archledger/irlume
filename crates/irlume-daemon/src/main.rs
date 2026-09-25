@@ -1653,17 +1653,21 @@ fn refuse_nul_password(request: &str, user: &str) -> Response {
 }
 
 /// The refusal for a `SealPassword` whose password irlumed could not check
-/// against a login hash, when `user` has a GNOME keyring token armed or an
-/// envelope that cannot be read; `None` when the arm may proceed (nothing
-/// armed, or a login-password or KDE wallet-key envelope). Nothing is written.
+/// against a login hash, when `armed` (what [`irlume_core::keyring::read_sealed_kind`]
+/// found for `user`) is a GNOME keyring token or an envelope that cannot be
+/// read; `None` when the arm may proceed (nothing armed, or a login-password
+/// or KDE wallet-key envelope). Nothing is written.
 ///
 /// The token's password wrap is under the password it was armed with, or the
 /// one last typed at a login screen that carries the `reseal` line; a
 /// password change alone does not move it. Until such a login, `forget` opens
 /// the wrap only with the old password, so the remedy starts with that login,
 /// which also leaves nothing to re-arm after a password change or PCR drift.
-fn refuse_unverified_token_rearm(user: &str) -> Option<Response> {
-    let refusal = match irlume_core::keyring::read_sealed_kind(user) {
+fn refuse_unverified_token_rearm(
+    user: &str,
+    armed: &irlume_common::Result<Option<irlume_core::envelope::SecretKind>>,
+) -> Option<Response> {
+    let refusal = match armed {
         Ok(Some(irlume_core::envelope::SecretKind::GnomeKeyringToken)) => format!(
             "irlumed cannot check this password against '{user}'s login hash, so it does not \
              re-arm over the GNOME keyring token already armed; nothing was changed. The \
@@ -1676,9 +1680,72 @@ fn refuse_unverified_token_rearm(user: &str) -> Option<Response> {
         Ok(_) => return None,
         Err(e) => format!(
             "{e}; irlumed cannot check this password against '{user}'s login hash, so it \
-             does not arm over a sealed secret it cannot read; nothing was changed. \
-             `sudo irlume diag` shows the envelope's state."
+             does not arm over a sealed secret it cannot read; nothing was changed. {}",
+            keep_unreadable_envelope(user)
         ),
+    };
+    jout_notice!("irlumed: SealPassword: refused for '{user}': {refusal}");
+    Some(Response::Error(refusal))
+}
+
+/// What a `SealPassword` refusal over `user`'s unreadable envelope says to do
+/// with it: keep the file, which the newer irlume that may have written it
+/// can still read.
+fn keep_unreadable_envelope(user: &str) -> String {
+    format!(
+        "Keep {} as it is: if a newer irlume wrote it, that version can still read it.",
+        irlume_core::keyring::envelope_path(user).display()
+    )
+}
+
+/// The refusal for a `SealPassword` that would write a `kind` envelope over
+/// `armed` (what [`irlume_core::keyring::read_sealed_kind`] found for `user`)
+/// where the write cannot be undone, whatever the password check said: an
+/// envelope that cannot be read, or a GNOME keyring token and another kind.
+/// `forced` says the client asked for `kind`. `None` when the arm may
+/// proceed. Nothing is written.
+///
+/// The login keyring was re-keyed to the token when it was armed, and the
+/// envelope holds its only copy, so only `forget`, which re-keys the keyring
+/// back to the password first, may take it away. An envelope that cannot be
+/// read may be a token; it is left for an irlume that can read it. A token
+/// re-arm keeps the token, and login-password and KDE wallet-key envelopes are
+/// derived from the password, so replacing those loses nothing.
+fn refuse_irreversible_seal(
+    user: &str,
+    armed: &irlume_common::Result<Option<irlume_core::envelope::SecretKind>>,
+    kind: irlume_core::envelope::SecretKind,
+    forced: bool,
+) -> Option<Response> {
+    use irlume_core::envelope::SecretKind;
+    let refusal = match armed {
+        Err(e) => format!(
+            "{e}; it may hold the only copy of a GNOME keyring token, so irlumed does not \
+             arm over it; nothing was changed. {}",
+            keep_unreadable_envelope(user)
+        ),
+        Ok(Some(SecretKind::GnomeKeyringToken)) if kind != SecretKind::GnomeKeyringToken => {
+            let why = match (forced, kind) {
+                (true, _) => "as this request asks",
+                (false, SecretKind::KdeWalletKey) => {
+                    "which irlumed picks when it finds a KDE wallet but cannot see the GNOME \
+                     login keyring"
+                }
+                (false, _) => {
+                    "which irlumed picks when a KDE wallet sits beside the GNOME login keyring \
+                     or when it cannot see that keyring"
+                }
+            };
+            format!(
+                "'{user}' has a GNOME keyring token armed, which the login keyring was re-keyed \
+                 to. This arm would replace it with a {}, {why}, so nothing was changed. To arm \
+                 again, run `irlume keyring forget` first, as '{user}' with gnome-keyring \
+                 running: it re-keys the keyring back to the password. Then run \
+                 `irlume keyring arm`.",
+                kind.describe()
+            )
+        }
+        Ok(_) => return None,
     };
     jout_notice!("irlumed: SealPassword: refused for '{user}': {refusal}");
     Some(Response::Error(refusal))
@@ -7069,6 +7136,10 @@ fn dispatch_scoped_session_inner(
                      the login password, so arming a different one would leave the wallet locked"
                 ));
             }
+            // What is armed now, read once and strictly: "nothing armed" and
+            // "cannot be read" differ here, since an envelope that cannot be
+            // read may hold the only copy of a GNOME keyring token.
+            let armed_kind = irlume_core::keyring::read_sealed_kind(&user);
             // No login hash to check against: an LDAP or SSSD account, a
             // locked local one, or a daemon the shipped AppArmor profile keeps
             // out of /etc/shadow. A re-arm over a GNOME keyring token returns
@@ -7082,7 +7153,7 @@ fn dispatch_scoped_session_inner(
             // refusing its re-arm would protect nothing; it proceeds, as does
             // a first arm.
             if verified.is_none() {
-                if let Some(refusal) = refuse_unverified_token_rearm(&user) {
+                if let Some(refusal) = refuse_unverified_token_rearm(&user, &armed_kind) {
                     return refusal;
                 }
             }
@@ -7106,6 +7177,15 @@ fn dispatch_scoped_session_inner(
                     None => irlume_core::envelope::SecretKind::LoginPassword,
                 },
             };
+            // Checked or not, an arm never writes over an envelope it cannot
+            // read, and never replaces an armed token with another kind: the
+            // login keyring was re-keyed to that token, and `forget` re-keys
+            // it back to the password before the envelope goes.
+            if let Some(refusal) =
+                refuse_irreversible_seal(&user, &armed_kind, core_kind, forced_kind.is_some())
+            {
+                return refusal;
+            }
             // A token arm returns the token: the re-key of the login keyring
             // can only happen in the user's session (the control socket
             // authenticates the peer uid), so the caller finishes the job.
@@ -7133,8 +7213,10 @@ fn dispatch_scoped_session_inner(
                          GNOME once to create the keyring, or arm without forcing a kind."
                     ));
                 }
-                let already_token = irlume_core::keyring::sealed_kind(&user)
-                    == Some(irlume_core::envelope::SecretKind::GnomeKeyringToken);
+                let already_token = matches!(
+                    armed_kind,
+                    Ok(Some(irlume_core::envelope::SecretKind::GnomeKeyringToken))
+                );
                 let armed = if already_token {
                     irlume_core::keyring::rearm_gnome_token(&user, password.expose())
                 } else {
@@ -8347,12 +8429,9 @@ fn finish_unseal_password(
         Err(e) => {
             // Here the template key unsealed (face matched) but the PASSWORD seal
             // did not. A PCR drift on this path is fixed by re-binding the sealed
-            // secret: the next typed login re-seals it, or `irlume keyring arm`
-            // does (the enrolled face still works). Where irlumed cannot read the
-            // login hash, the arm refuses over a token and only the login heals.
+            // secret; `pcr_drift_hint` says how for the armed kind.
             let hint = if is_pcr_drift(&e) {
-                " -- log in once by typing the password, or re-run `irlume keyring arm`, to \
-                 re-bind the sealed secret to the current PCRs"
+                pcr_drift_hint(irlume_core::keyring::read_sealed_kind(user).ok().flatten())
             } else {
                 ""
             };
@@ -8365,6 +8444,24 @@ fn finish_unseal_password(
             note_engine_error(&e);
             Response::Error(e.to_string())
         }
+    }
+}
+
+/// How to re-bind a sealed secret after PCR drift, for the armed kind. The
+/// next typed login re-seals any kind where the stack carries irlume's
+/// `reseal` line. `irlume keyring arm` re-binds a login password or KDE
+/// wallet key, but over a GNOME keyring token it refuses wherever irlumed
+/// cannot read the login hash or would pick another kind (a KDE wallet beside
+/// the login keyring). A token instead gets `forget` then `arm`: forget
+/// unwraps the token with the password, not the TPM, so drift does not stop
+/// it, and that route works where no `reseal` line is wired (NixOS).
+fn pcr_drift_hint(armed: Option<irlume_core::envelope::SecretKind>) -> &'static str {
+    if armed == Some(irlume_core::envelope::SecretKind::GnomeKeyringToken) {
+        " -- log in once by typing the password to re-bind the sealed secret to the \
+         current PCRs, or run `irlume keyring forget` and then `irlume keyring arm`"
+    } else {
+        " -- log in once by typing the password, or re-run `irlume keyring arm`, to \
+         re-bind the sealed secret to the current PCRs"
     }
 }
 
@@ -8921,6 +9018,28 @@ mod tests {
         // block the seal (absence of proof is not proof of a wrong password).
         for u in ["locked", "disabled", "nopw", "ghost"] {
             assert_eq!(verifiable_shadow_hash(shadow, u), None, "{u}");
+        }
+    }
+
+    /// Only a token arm leaves out `keyring arm`, which refuses over a token
+    /// wherever it cannot check the password or would pick another kind.
+    #[test]
+    fn the_pcr_drift_hint_offers_arm_only_where_it_can_rebind() {
+        use irlume_core::envelope::SecretKind as K;
+        let token = pcr_drift_hint(Some(K::GnomeKeyringToken));
+        assert!(token.contains("typing the password"), "{token}");
+        // Never a bare re-arm over the token: forget first, then arm.
+        assert!(
+            token.contains("`irlume keyring forget` and then `irlume keyring arm`")
+                && !token.contains("re-run `irlume keyring arm`"),
+            "{token}"
+        );
+        for armed in [Some(K::LoginPassword), Some(K::KdeWalletKey), None] {
+            let hint = pcr_drift_hint(armed);
+            assert!(
+                hint.contains("typing the password") && hint.contains("`irlume keyring arm`"),
+                "{armed:?}: {hint}"
+            );
         }
     }
 
@@ -16921,6 +17040,15 @@ mod tests {
             crate::users::HOME_STAND_IN.with(|h| *h.borrow_mut() = Some((user.into(), home)));
             Self
         }
+
+        /// A home for `user` with no GNOME login keyring in it, as irlumed
+        /// sees a home it cannot read.
+        fn plant_without_keyring(user: &str, sandbox: &Sandbox) -> Self {
+            let home = sandbox.dir.join(format!("bare-home-{user}"));
+            std::fs::create_dir_all(&home).unwrap();
+            crate::users::HOME_STAND_IN.with(|h| *h.borrow_mut() = Some((user.into(), home)));
+            Self
+        }
     }
 
     impl Drop for GnomeHome {
@@ -16991,6 +17119,27 @@ mod tests {
             wallet_salt: None,
             wallet_salt_checked: true,
         }
+    }
+
+    /// A `SealPassword` for `user` with [`SHADOW_PASSWORD`], asking for `kind`
+    /// (`None` lets the daemon pick) and carrying `wallet_salt`.
+    fn login_seal_request(
+        user: &str,
+        kind: Option<irlume_common::KeyringSecretKind>,
+        wallet_salt: Option<irlume_common::WalletSalt>,
+    ) -> Request {
+        Request::SealPassword {
+            kind,
+            user: user.into(),
+            password: irlume_common::SecretBytes::new(SHADOW_PASSWORD.to_vec()),
+            wallet_salt,
+            wallet_salt_checked: true,
+        }
+    }
+
+    /// The account-scoped salt a client reads beside a KDE wallet.
+    fn kde_salt() -> Option<irlume_common::WalletSalt> {
+        irlume_common::WalletSalt::new(vec![0x5a; irlume_common::kwallet_wire::SALT_LEN])
     }
 
     fn reseal_request(user: &str, password: &[u8]) -> Request {
@@ -17130,16 +17279,22 @@ mod tests {
                 assert_eq!(envelope_bytes(&me).as_deref(), Some(&before[..]), "{label}");
             }
         }
-        // An envelope that cannot be read may be a token.
+        // An envelope that cannot be read may be a token. The refusal names
+        // the file to keep.
         plant_fake_envelope(&me);
         let unreadable = envelope_bytes(&me);
+        let keep = format!(
+            "Keep {} as it is",
+            irlume_core::keyring::envelope_path(&me).display()
+        );
         for (who, peer) in &peers {
-            refused(
-                dispatch(seal_request(&me, b"another-password"), peer, &mut e),
-                &format!("{who}, unreadable"),
-                "cannot be read",
-            );
-            assert_eq!(envelope_bytes(&me), unreadable, "{who}, unreadable");
+            let label = format!("{who}, unreadable");
+            let response = dispatch(seal_request(&me, b"another-password"), peer, &mut e);
+            if let Response::Error(msg) = &response {
+                assert!(msg.contains(&keep), "{label}: {msg}");
+            }
+            refused(response, &label, "cannot be read");
+            assert_eq!(envelope_bytes(&me), unreadable, "{label}");
         }
         // A login-password or KDE wallet-key envelope, and nothing armed,
         // pass this check. With no TPM each arm then fails further on.
@@ -17175,6 +17330,133 @@ mod tests {
                 dispatch(seal_request(&me, SHADOW_PASSWORD), peer, &mut e),
                 &format!("{who}, checked"),
             );
+        }
+    }
+
+    /// A password that passes the login-hash check still never replaces an
+    /// armed GNOME keyring token with another kind, since the login keyring
+    /// was re-keyed to that token and `forget` must re-key it back first, and
+    /// never arms over an envelope that cannot be read, for root and the
+    /// owner alike. Both refusals come before the TPM and write nothing. An
+    /// arm of any kind over a login-password or KDE wallet-key envelope, and
+    /// a token arm over a token, pass these checks and go on to the seal.
+    #[test]
+    fn a_checked_seal_never_replaces_a_token_or_an_unreadable_envelope() {
+        use irlume_common::KeyringSecretKind::{KdeWalletKey, LoginPassword};
+        const FORGET_FIRST: &str = "run `irlume keyring forget` first";
+        const UNREADABLE: &str = "cannot be read";
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("seal-checked-overwrite");
+        let _tpm = NoTpm::install();
+        let (me, owner) = own_account();
+        let _shadow = ShadowStandIn::hash_for(&me);
+        let root = peer(0);
+        let mut peers = vec![("root", &root)];
+        if !owner_is_root() {
+            peers.push(("owner", &owner));
+        }
+        let refused = |response: Response, label: &str, want: &str| match response {
+            Response::Error(msg) => {
+                assert!(msg.contains(want), "{label}: {msg}");
+                assert!(msg.contains("nothing was changed"), "{label}: {msg}");
+            }
+            other => panic!("{label}: must be refused, got {other:?}"),
+        };
+        // With no TPM an arm that passes every check fails at the seal, and
+        // the envelope is left as it was.
+        let reached_the_seal = |response: Response, label: &str, before: &Option<Vec<u8>>| {
+            match response {
+                Response::Error(msg) => assert!(msg.starts_with("tpm:"), "{label}: {msg}"),
+                other => panic!("{label}: must fail at the TPM seal, got {other:?}"),
+            }
+            assert_eq!(&envelope_bytes(&me), before, "{label}");
+        };
+
+        let token = plant_token_envelope(&me, SHADOW_PASSWORD);
+        let bare = GnomeHome::plant_without_keyring(&me, &sb);
+        for (who, peer) in &peers {
+            for (which, request) in [
+                ("no login keyring", login_seal_request(&me, None, None)),
+                ("KDE wallet only", login_seal_request(&me, None, kde_salt())),
+                (
+                    "forced login password",
+                    login_seal_request(&me, Some(LoginPassword), None),
+                ),
+                (
+                    "forced KDE wallet key",
+                    login_seal_request(&me, Some(KdeWalletKey), kde_salt()),
+                ),
+            ] {
+                let label = format!("{who}, token, {which}");
+                refused(dispatch(request, peer, &mut e), &label, FORGET_FIRST);
+                assert_eq!(envelope_bytes(&me).as_deref(), Some(&token[..]), "{label}");
+            }
+        }
+        drop(bare);
+        let _home = GnomeHome::plant(&me, &sb);
+        for (who, peer) in &peers {
+            let label = format!("{who}, token, KDE wallet beside the login keyring");
+            let request = login_seal_request(&me, None, kde_salt());
+            refused(dispatch(request, peer, &mut e), &label, FORGET_FIRST);
+            assert_eq!(envelope_bytes(&me).as_deref(), Some(&token[..]), "{label}");
+            let request = login_seal_request(&me, None, None);
+            reached_the_seal(
+                dispatch(request, peer, &mut e),
+                &format!("{who}, token, token"),
+                &Some(token.clone()),
+            );
+        }
+
+        // An envelope that cannot be read may be a token. The refusal names
+        // the file to keep.
+        plant_fake_envelope(&me);
+        let unreadable = envelope_bytes(&me);
+        let keep = format!(
+            "Keep {} as it is",
+            irlume_core::keyring::envelope_path(&me).display()
+        );
+        for (who, peer) in &peers {
+            for (which, request) in [
+                ("token", login_seal_request(&me, None, None)),
+                (
+                    "login password",
+                    login_seal_request(&me, Some(LoginPassword), None),
+                ),
+                (
+                    "KDE wallet key",
+                    login_seal_request(&me, Some(KdeWalletKey), kde_salt()),
+                ),
+            ] {
+                let label = format!("{who}, unreadable, {which}");
+                let response = dispatch(request, peer, &mut e);
+                if let Response::Error(msg) = &response {
+                    assert!(msg.contains(&keep), "{label}: {msg}");
+                }
+                refused(response, &label, UNREADABLE);
+                assert_eq!(envelope_bytes(&me), unreadable, "{label}");
+            }
+        }
+
+        for secret in ["LoginPassword", "KdeWalletKey"] {
+            plant_passwordless_envelope(&me, secret);
+            let before = envelope_bytes(&me);
+            for (who, peer) in &peers {
+                for (which, request) in [
+                    ("token", login_seal_request(&me, None, None)),
+                    (
+                        "login password",
+                        login_seal_request(&me, Some(LoginPassword), None),
+                    ),
+                    (
+                        "KDE wallet key",
+                        login_seal_request(&me, Some(KdeWalletKey), kde_salt()),
+                    ),
+                ] {
+                    let label = format!("{who}, {secret}, {which}");
+                    reached_the_seal(dispatch(request, peer, &mut e), &label, &before);
+                }
+            }
         }
     }
 
@@ -18742,6 +19024,215 @@ mod tests {
         }
         let response = dispatch(release_request(&me, SHADOW_PASSWORD), &owner, &mut e);
         released(response, token.as_bytes());
+    }
+
+    /// With a TPM that seals and a password that matches the login hash, an
+    /// arm that resolves to another kind leaves an armed GNOME keyring token
+    /// as it was: a KDE wallet beside the login keyring (the login password
+    /// is then picked), a home where irlumed sees no login keyring, or a
+    /// kind the client forces. The token kind still re-arms the same token,
+    /// and after `forget` the other kind seals.
+    #[test]
+    #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
+    fn tpm_a_checked_arm_never_replaces_a_token_with_another_kind() {
+        if std::env::var("IRLUME_TCTI").is_err() {
+            return;
+        }
+        use irlume_common::KeyringSecretKind::{KdeWalletKey, LoginPassword};
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("tpm-seal-kind-change");
+        let _shadow = ShadowStandIn::hash_for("carol");
+        let root = peer(0);
+        let token = irlume_core::keyring::arm_gnome_token("carol", SHADOW_PASSWORD)
+            .expect("arm against swtpm");
+        let armed = envelope_bytes("carol").expect("armed");
+        let kept = |response: Response, label: &str| {
+            assert_eq!(
+                envelope_bytes("carol").as_deref(),
+                Some(&armed[..]),
+                "{label}: the token envelope was replaced ({response:?})"
+            );
+            match response {
+                Response::Error(msg) => assert!(
+                    msg.contains("run `irlume keyring forget` first"),
+                    "{label}: {msg}"
+                ),
+                other => panic!("{label}: must be refused, got {other:?}"),
+            }
+        };
+        // carol has no home irlumed can see, so no login keyring either.
+        for (label, request) in [
+            ("no login keyring", login_seal_request("carol", None, None)),
+            (
+                "KDE wallet only",
+                login_seal_request("carol", None, kde_salt()),
+            ),
+            (
+                "forced login password",
+                login_seal_request("carol", Some(LoginPassword), None),
+            ),
+            (
+                "forced KDE wallet key",
+                login_seal_request("carol", Some(KdeWalletKey), kde_salt()),
+            ),
+        ] {
+            kept(dispatch(request, &root, &mut e), label);
+        }
+        let _home = GnomeHome::plant("carol", &sb);
+        kept(
+            dispatch(login_seal_request("carol", None, kde_salt()), &root, &mut e),
+            "KDE wallet beside the login keyring",
+        );
+        match dispatch(login_seal_request("carol", None, None), &root, &mut e) {
+            Response::TokenSealed {
+                token: again,
+                minted: false,
+            } => assert_eq!(again.expose(), token.as_bytes()),
+            other => panic!("the token kind must re-arm the same token, got {other:?}"),
+        }
+        // The remedy: `forget` (the CLI re-keys the keyring back first), then
+        // the arm.
+        match dispatch(
+            Request::ForgetPassword {
+                user: "carol".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::PasswordForgotten => {}
+            other => panic!("expected PasswordForgotten, got {other:?}"),
+        }
+        match dispatch(login_seal_request("carol", None, kde_salt()), &root, &mut e) {
+            Response::PasswordSealed => {}
+            other => panic!("an arm after forget must seal, got {other:?}"),
+        }
+        assert_eq!(
+            irlume_core::keyring::read_sealed_kind("carol").unwrap(),
+            Some(irlume_core::envelope::SecretKind::LoginPassword)
+        );
+    }
+
+    /// With a TPM that seals and a password that matches the login hash, a
+    /// token arm never mints over a token envelope it cannot read (a newer
+    /// envelope version, as after a downgrade, or a truncated file): the new
+    /// token would replace the only copy of the one the login keyring is
+    /// keyed to.
+    #[test]
+    #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
+    fn tpm_a_checked_token_arm_never_mints_over_an_unreadable_envelope() {
+        if std::env::var("IRLUME_TCTI").is_err() {
+            return;
+        }
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("tpm-seal-unreadable-token");
+        let _home = GnomeHome::plant("carol", &sb);
+        let _shadow = ShadowStandIn::hash_for("carol");
+        let root = peer(0);
+        irlume_core::keyring::arm_gnome_token("carol", SHADOW_PASSWORD).expect("arm against swtpm");
+        let armed = envelope_bytes("carol").expect("armed");
+        let mut newer: serde_json::Value = serde_json::from_slice(&armed).unwrap();
+        newer["version"] = serde_json::json!(irlume_core::envelope::CURRENT_VERSION + 1);
+        for (label, bytes) in [
+            ("newer version", serde_json::to_vec(&newer).unwrap()),
+            ("truncated", armed[..armed.len() / 2].to_vec()),
+        ] {
+            std::fs::write(irlume_core::keyring::envelope_path("carol"), &bytes).unwrap();
+            let response = dispatch(login_seal_request("carol", None, None), &root, &mut e);
+            assert_eq!(
+                envelope_bytes("carol").as_deref(),
+                Some(&bytes[..]),
+                "{label}: a token was minted over it ({response:?})"
+            );
+            match response {
+                Response::Error(msg) => assert!(
+                    msg.contains("cannot be read") && msg.contains("nothing was changed"),
+                    "{label}: {msg}"
+                ),
+                other => panic!("{label}: must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// With a TPM that seals and a password that matches the login hash, a
+    /// login-password or KDE wallet-key arm never seals over an envelope it
+    /// cannot read, which may be a token. Once it is removed, both kinds
+    /// arm, re-arm and replace each other.
+    #[test]
+    #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
+    fn tpm_a_checked_arm_never_seals_over_an_unreadable_envelope() {
+        if std::env::var("IRLUME_TCTI").is_err() {
+            return;
+        }
+        use irlume_core::envelope::SecretKind;
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("tpm-seal-unreadable");
+        let _shadow = ShadowStandIn::hash_for("carol");
+        let root = peer(0);
+        // carol has no home irlumed can see: a salt picks the KDE wallet key.
+        for (label, request) in [
+            ("login password", login_seal_request("carol", None, None)),
+            (
+                "KDE wallet key",
+                login_seal_request("carol", None, kde_salt()),
+            ),
+        ] {
+            plant_fake_envelope("carol");
+            let unreadable = envelope_bytes("carol");
+            let response = dispatch(request, &root, &mut e);
+            assert_eq!(
+                envelope_bytes("carol"),
+                unreadable,
+                "{label}: sealed over it ({response:?})"
+            );
+            match response {
+                Response::Error(msg) => assert!(
+                    msg.contains("cannot be read") && msg.contains("nothing was changed"),
+                    "{label}: {msg}"
+                ),
+                other => panic!("{label}: must be refused, got {other:?}"),
+            }
+        }
+        irlume_core::keyring::forget_password("carol").unwrap();
+        for (label, request, kind) in [
+            (
+                "login password",
+                login_seal_request("carol", None, None),
+                SecretKind::LoginPassword,
+            ),
+            (
+                "login password again",
+                login_seal_request("carol", None, None),
+                SecretKind::LoginPassword,
+            ),
+            (
+                "KDE wallet key over a login password",
+                login_seal_request("carol", None, kde_salt()),
+                SecretKind::KdeWalletKey,
+            ),
+            (
+                "KDE wallet key again",
+                login_seal_request("carol", None, kde_salt()),
+                SecretKind::KdeWalletKey,
+            ),
+            (
+                "login password over a KDE wallet key",
+                login_seal_request("carol", None, None),
+                SecretKind::LoginPassword,
+            ),
+        ] {
+            match dispatch(request, &root, &mut e) {
+                Response::PasswordSealed => {}
+                other => panic!("{label}: must seal, got {other:?}"),
+            }
+            assert_eq!(
+                irlume_core::keyring::read_sealed_kind("carol").unwrap(),
+                Some(kind),
+                "{label}"
+            );
+        }
     }
 
     #[test]

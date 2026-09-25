@@ -296,6 +296,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `keyring arm` no longer replaces an armed GNOME keyring token with
+  another kind, or arms over a sealed secret irlumed cannot read, even
+  when the password passes the login-hash check. The arm picks the kind
+  again each time: with a KDE wallet beside the GNOME keyring, or a
+  keyring irlumed could not see, it sealed a login password or KDE wallet
+  key over the token the login keyring was re-keyed to. A sealed secret
+  it could not read, such as one written by a newer irlume, counted as
+  nothing armed. Both arms now refuse and change nothing. Over a token,
+  run `irlume keyring forget` first, as the user with gnome-keyring
+  running: it re-keys the keyring back to the password. A sealed secret
+  irlumed cannot read stays as it is, and the error names its file under
+  `/var/lib/irlume/keyring`; keep it, since a newer irlume that wrote it
+  can still read it. Re-arming a token as a token, and a login password
+  or KDE wallet key as any kind, works as before (#845).
+
 - The GNOME keyring unlock helper wipes every copy it makes of the
   keyring token, and the control packets it and `keyring arm` send to
   gnome-keyring are held in locked memory that is wiped after use (#250,

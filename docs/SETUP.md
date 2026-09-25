@@ -264,6 +264,15 @@ password change or a firmware update: the next login where you type your
 password at such a screen moves the wrap to it and re-binds the seal. Until
 then, `forget` takes the previous password.
 
+`irlume keyring arm` picks the kind again each time, but it does not replace
+an armed token with a login-password or KDE wallet-key arm, which it picks
+when a KDE wallet sits beside the GNOME keyring or when irlumed cannot see the
+keyring. Run `irlume keyring forget` first, as yourself with gnome-keyring
+running, so it can rekey the keyring back. Nor does it arm over a sealed
+secret irlumed cannot read, such as one a newer irlume wrote: the file under
+`/var/lib/irlume/keyring` stays as it is, and that newer version can still
+read it. Both refusals apply to every caller and change nothing.
+
 Where irlumed cannot check passwords, `irlume keyring arm` does not re-arm over
 a token that is already armed, whoever runs it, and changes nothing. To arm
 again there anyway, log in once by typing your current password at such a

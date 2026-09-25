@@ -6,7 +6,8 @@
 // contract the pages rely on: exactly one documentReady or requestFailed
 // per request that is not superseded, a superseded request stays silent,
 // a child that dies from a signal or overruns its budget cannot crash the
-// host, and QProcess never warns about destroying a running child.
+// host, QProcess never warns about destroying a running child, and clicks
+// during a TUI handoff end on the latest page.
 // Exits non-zero on the first failed check's run.
 // Usage: kcm_bridgetest
 
@@ -19,6 +20,11 @@
 
 #include <cstdio>
 #include <memory>
+
+#include <fcntl.h>
+#include <pwd.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 #include "irlumebridge.h"
 
@@ -98,6 +104,67 @@ QString writeProgram(const QTemporaryDir &dir, const QString &name, const QByteA
     file.close();
     file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
     return path;
+}
+
+// Holds the TUI single-instance lock under a private XDG_RUNTIME_DIR, so
+// the bridge's probe sees a running TUI. The file name follows the guard's
+// contract (tui-<login name>.lock, non-ASCII-alphanumerics other than
+// -_. as underscores); flock on a second open file description conflicts
+// even within this process.
+struct FakeRunningTui {
+    int fd = -1;
+    QByteArray savedRuntimeDir;
+
+    explicit FakeRunningTui(const QTemporaryDir &dir)
+        : savedRuntimeDir(qgetenv("XDG_RUNTIME_DIR"))
+    {
+        const QString runtime = dir.filePath(QStringLiteral("runtime"));
+        QDir().mkpath(runtime + QStringLiteral("/irlume"));
+        qputenv("XDG_RUNTIME_DIR", QFile::encodeName(runtime));
+        const struct passwd *pw = getpwuid(geteuid());
+        QString user = pw != nullptr ? QString::fromLatin1(pw->pw_name) : QString();
+        for (QChar &ch : user) {
+            if (!((ch.unicode() < 128) && ch.isLetterOrNumber()) && ch != u'-' && ch != u'_' && ch != u'.') {
+                ch = u'_';
+            }
+        }
+        const QString lock = runtime + QStringLiteral("/irlume/tui-%1.lock").arg(user);
+        fd = open(QFile::encodeName(lock).constData(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        if (fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) != 0) {
+            close(fd);
+            fd = -1;
+        }
+    }
+    ~FakeRunningTui()
+    {
+        if (fd >= 0) {
+            close(fd);
+        }
+        if (savedRuntimeDir.isNull()) {
+            qunsetenv("XDG_RUNTIME_DIR");
+        } else {
+            qputenv("XDG_RUNTIME_DIR", savedRuntimeDir);
+        }
+    }
+};
+
+// A handoff child that appends its page to `log`, takes 300 ms and exits
+// with `code`.
+QByteArray handoffBody(const QString &log, int code)
+{
+    return QStringLiteral("printf '%s\\n' \"${3:-none}\" >> '%1'\nsleep 0.3\nexit %2\n")
+        .arg(log)
+        .arg(code)
+        .toUtf8();
+}
+
+QStringList readLines(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return {};
+    }
+    return QString::fromUtf8(file.readAll()).split(u'\n', Qt::SkipEmptyParts);
 }
 
 const QByteArray kDocument =
@@ -258,6 +325,57 @@ int main(int argc, char **argv)
         spin(400);
         check(calls == 1 && result == IrlumeBridge::HandoffResult::Unknown && warnings.size() == before,
               QStringLiteral("a handoff over its budget is Unknown, once, without a warning"));
+    }
+
+    // Clicks while a handoff is pending: the latest page wins, and at most
+    // one terminal opens.
+    {
+        QStringList opened;
+        const auto open = [&opened](const QString &page) {
+            opened << page;
+        };
+        IrlumeBridge none(writeProgram(dir, QStringLiteral("unused-tui"), "exit 0\n"), 0);
+        {
+            const QByteArray saved = qgetenv("XDG_RUNTIME_DIR");
+            qputenv("XDG_RUNTIME_DIR", QFile::encodeName(dir.filePath(QStringLiteral("no-runtime"))));
+            none.showTuiPage(QStringLiteral("faces"), 5000, open);
+            if (saved.isNull()) {
+                qunsetenv("XDG_RUNTIME_DIR");
+            } else {
+                qputenv("XDG_RUNTIME_DIR", saved);
+            }
+        }
+        check(opened == QStringList{QStringLiteral("faces")},
+              QStringLiteral("with no TUI running the page opens at once, without a handoff"));
+
+        FakeRunningTui tui(dir);
+        check(tui.fd >= 0 && none.tuiProbablyRunning(), QStringLiteral("the fake TUI lock reads as a running TUI"));
+
+        opened.clear();
+        const QString takenLog = dir.filePath(QStringLiteral("taken.log"));
+        IrlumeBridge taken(writeProgram(dir, QStringLiteral("handoff-taken"), handoffBody(takenLog, 0)), 0);
+        taken.showTuiPage(QStringLiteral("faces"), 5000, open);
+        spin(50);
+        taken.showTuiPage(QStringLiteral("cameras"), 5000, open);
+        taken.showTuiPage(QStringLiteral("settings"), 5000, open);
+        for (int waited = 0; waited < 5000 && readLines(takenLog).size() < 2; waited += 20) {
+            spin(20);
+        }
+        spin(600);
+        check(readLines(takenLog) == QStringList{QStringLiteral("faces"), QStringLiteral("settings")} && opened.isEmpty(),
+              QStringLiteral("a TUI that takes the handoff then gets the latest page clicked meanwhile"));
+
+        const QString refusedLog = dir.filePath(QStringLiteral("refused.log"));
+        IrlumeBridge refusedTui(writeProgram(dir, QStringLiteral("handoff-refused"), handoffBody(refusedLog, 3)), 0);
+        refusedTui.showTuiPage(QStringLiteral("faces"), 5000, open);
+        spin(50);
+        refusedTui.showTuiPage(QStringLiteral("cameras"), 5000, open);
+        for (int waited = 0; waited < 5000 && opened.isEmpty(); waited += 20) {
+            spin(20);
+        }
+        spin(600);
+        check(readLines(refusedLog) == QStringList{QStringLiteral("faces")} && opened == QStringList{QStringLiteral("cameras")},
+              QStringLiteral("a refused handoff opens one terminal, on the latest page clicked"));
     }
 
     check(warnings.isEmpty(), QStringLiteral("no warnings (%1 printed)").arg(warnings.size()));

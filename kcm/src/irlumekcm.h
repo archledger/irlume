@@ -42,8 +42,8 @@ public:
     /// terminal: xdg-terminal-exec when available, otherwise the shipped
     /// desktop entry via KIO (no deep link in the fallback). Never blocks
     /// the UI. A launch that cannot happen is reported as
-    /// requestFailed("launch", reason). While a handoff to a running TUI
-    /// is still being checked, further clicks are ignored.
+    /// requestFailed("launch", reason). A click while a handoff to a
+    /// running TUI is still pending replaces the page shown after it.
     Q_INVOKABLE void launchTui(const QString &page);
 
 Q_SIGNALS:
@@ -60,5 +60,4 @@ private:
     void openTerminal(const QString &page);
 
     IrlumeBridge m_bridge;
-    bool m_handoffPending = false;
 };

@@ -34,11 +34,6 @@ void IrlumeKcm::request(const QString &name)
 
 void IrlumeKcm::launchTui(const QString &page)
 {
-    if (m_handoffPending) {
-        // A second click while the first is still being handed off would
-        // start a second child; the first click's outcome covers both.
-        return;
-    }
     if (m_bridge.irlumePath().isEmpty()) {
         Q_EMIT requestFailed(QStringLiteral("launch"), QStringLiteral("the irlume command was not found"));
         return;
@@ -47,17 +42,10 @@ void IrlumeKcm::launchTui(const QString &page)
     // terminal: the child performs the handoff and exits at once, so no
     // window flashes open and closed. The verdict arrives asynchronously;
     // if no live TUI accepted the handoff (the probe raced an exit), open
-    // the terminal so the click still does something visible.
-    if (!m_bridge.tuiProbablyRunning()) {
-        openTerminal(page);
-        return;
-    }
-    m_handoffPending = true;
-    m_bridge.handoffTui(page, 5000, [this, page](IrlumeBridge::HandoffResult result) {
-        m_handoffPending = false;
-        if (result != IrlumeBridge::HandoffResult::Done) {
-            openTerminal(page);
-        }
+    // the terminal so the click still does something visible. A click
+    // while a handoff is pending replaces the page that follows it.
+    m_bridge.showTuiPage(page, 5000, [this](const QString &target) {
+        openTerminal(target);
     });
 }
 

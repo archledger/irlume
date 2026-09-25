@@ -300,6 +300,29 @@ void IrlumeBridge::handoffTui(const QString &page, int timeoutMs, std::function<
     child->start(QIODevice::ReadOnly);
 }
 
+void IrlumeBridge::showTuiPage(const QString &page, int timeoutMs, std::function<void(const QString &)> open)
+{
+    if (m_handoffPending) {
+        // The pending child reports soon; the latest click wins then.
+        m_queuedPage = page;
+        return;
+    }
+    if (!tuiProbablyRunning()) {
+        open(page);
+        return;
+    }
+    m_handoffPending = true;
+    handoffTui(page, timeoutMs, [this, page, timeoutMs, open](HandoffResult result) {
+        m_handoffPending = false;
+        const std::optional<QString> next = std::exchange(m_queuedPage, std::nullopt);
+        if (result != HandoffResult::Done) {
+            open(next.value_or(page));
+        } else if (next && *next != page) {
+            showTuiPage(*next, timeoutMs, open);
+        }
+    });
+}
+
 bool IrlumeBridge::launchTuiDetached(const QString &page)
 {
     if (m_irlumePath.isEmpty()) {

@@ -13,6 +13,7 @@
 
 #include <functional>
 #include <map>
+#include <optional>
 
 /**
  * The process bridge between the System Settings module and the irlume CLI.
@@ -96,6 +97,15 @@ public:
     /// bridge is destroyed first.
     void handoffTui(const QString &page, int timeoutMs, std::function<void(HandoffResult)> done);
 
+    /// Show `page` in a TUI: hand it to a running one (handoffTui), or call
+    /// `open(page)` when none appears to run or none took the handoff.
+    /// While a handoff is pending, a further call replaces the queued page
+    /// instead of starting a second child. When the pending handoff ends,
+    /// the latest queued page is handed off in turn (the TUI took the first
+    /// one) or passed to `open` (it did not), so the last click always has
+    /// an effect and at most one terminal opens.
+    void showTuiPage(const QString &page, int timeoutMs, std::function<void(const QString &)> open);
+
 Q_SIGNALS:
     /// `doc` is the parsed machine-API envelope, including ok/data/error.
     void documentReady(const QString &name, const QVariantMap &doc);
@@ -116,6 +126,8 @@ private:
     void finishWithDocument(const QString &name, const QByteArray &output);
 
     QString m_irlumePath;
+    bool m_handoffPending = false;
+    std::optional<QString> m_queuedPage;
     int m_budgetOverrideMs = 0;
     quint64 m_nextSerial = 0;
     std::map<QString, Inflight> m_inflight;

@@ -1644,6 +1644,118 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_forget_before_upgrading_to_45() {
     }
 }
 
+/// A sandbox whose fake `busctl` names `provider` as the owner of
+/// `org.freedesktop.secrets`, and a command for it that sees a session bus.
+fn secret_service_sandbox(tag: &str, provider: &str) -> Sandbox {
+    let sb = Sandbox::new(tag);
+    sb.fake_tool(
+        "busctl",
+        &format!(
+            "case \"$*\" in\n  *\"status org.freedesktop.secrets\") printf 'Comm={provider}\\n' ;;\n  *) exit 1 ;;\nesac"
+        ),
+    );
+    sb
+}
+
+fn with_session_bus(cmd: &mut Command) -> &mut Command {
+    cmd.env(
+        "DBUS_SESSION_BUS_ADDRESS",
+        "unix:path=/nonexistent-irlume-test-bus",
+    )
+    .env_remove("SUDO_USER")
+}
+
+/// Where oo7-daemon provides the caller's Secret Service, `keyring arm` and
+/// `reseal` ask for the login password, which pam_oo7 hands on, instead of
+/// leaving the kind to irlumed: a token would re-key a keyring oo7 cannot
+/// open with it. Any other provider still leaves the choice to irlumed. The
+/// probe reads the caller's own session bus, so a root caller, whose bus is
+/// not the target account's, always leaves it to irlumed.
+#[test]
+fn keyring_arm_asks_for_the_login_password_where_oo7_provides_secrets() {
+    for (provider, want) in [
+        (
+            "oo7-daemon",
+            (!is_root()).then_some(irlume_common::KeyringSecretKind::LoginPassword),
+        ),
+        ("gnome-keyring-d", None),
+    ] {
+        for command in [&["keyring", "arm"][..], &["reseal"]] {
+            let label = format!("{provider}, {}", command.join(" "));
+            let sb = secret_service_sandbox(
+                &format!("arm-kind-{provider}-{}", command.join("-")),
+                provider,
+            );
+            let log = serve(&sock(&sb), |req| match req {
+                Request::SealPassword { .. } => Response::PasswordSealed,
+                Request::HasSealedPassword { .. } => Response::HasPassword(true),
+                Request::KeyringInfo { .. } => Response::KeyringInfo {
+                    armed: true,
+                    policy: None,
+                    pcrs: Vec::new(),
+                    drifted: None,
+                    kind: Some(irlume_common::KeyringSecretKind::LoginPassword),
+                },
+                _ => Response::Error("unexpected request".into()),
+            });
+            let args = [command, &["--user", "tester"][..]].concat();
+            let (code, out, err) =
+                run_stdin(with_session_bus(&mut sb.cmd_with_fakes(&args)), "hunter2\n");
+            assert_eq!(code, 0, "{label}: {out} {err}");
+            let kind = log.lock().unwrap().iter().find_map(|r| match r {
+                Request::SealPassword { kind, .. } => Some(*kind),
+                _ => None,
+            });
+            assert_eq!(kind, Some(want), "{label}");
+        }
+    }
+}
+
+/// Where oo7-daemon provides the caller's Secret Service and a GNOME keyring
+/// token is armed, `keyring arm` stops before sending anything: an older
+/// irlumed would seal the login password over the token, the only copy of
+/// what the login keyring is keyed to. The message names the way back. A
+/// root caller does not probe its bus and leaves the choice to irlumed, which
+/// refuses to replace the token itself.
+#[test]
+fn keyring_arm_keeps_an_armed_token_where_oo7_provides_secrets() {
+    let sb = secret_service_sandbox("arm-oo7-token", "oo7-daemon");
+    let log = serve(&sock(&sb), |req| match req {
+        Request::SealPassword { .. } => Response::PasswordSealed,
+        Request::KeyringInfo { .. } => Response::KeyringInfo {
+            armed: true,
+            policy: None,
+            pcrs: Vec::new(),
+            drifted: None,
+            kind: Some(irlume_common::KeyringSecretKind::GnomeKeyringToken),
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+    let (code, out, err) = run_stdin(
+        with_session_bus(&mut sb.cmd_with_fakes(&["keyring", "arm", "--user", "tester"])),
+        "hunter2\n",
+    );
+    let sent = log.lock().unwrap().iter().find_map(|r| match r {
+        Request::SealPassword { kind, .. } => Some(*kind),
+        _ => None,
+    });
+    if is_root() {
+        assert_eq!(code, 0, "{out} {err}");
+        assert_eq!(sent, Some(None), "root leaves the kind to irlumed");
+        return;
+    }
+    assert_ne!(code, 0, "{out} {err}");
+    assert_eq!(sent, None, "nothing may reach irlumed's seal");
+    for part in [
+        "GNOME keyring token armed",
+        "nothing was changed",
+        "irlume keyring forget",
+        "gnome-keyring running",
+    ] {
+        assert!(err.contains(part), "{part}: {err}");
+    }
+}
+
 const NIXOS_OS_RELEASE: &str = "NAME=NixOS\nID=nixos\nVERSION_ID=\"25.11\"\n";
 
 /// A wallet-salt helper that finds a KDE wallet salt for every account, so the
@@ -1789,53 +1901,6 @@ fn reseal_on_nixos_keeps_to_the_login_password() {
             Request::HasSealedPassword { .. } => Response::HasPassword(true),
             Request::KeyringMetadata { .. } | Request::KeyringInfo { .. } => {
                 Response::KeyringInfo {
-
-/// A sandbox whose fake `busctl` names `provider` as the owner of
-/// `org.freedesktop.secrets`, and a command for it that sees a session bus.
-fn secret_service_sandbox(tag: &str, provider: &str) -> Sandbox {
-    let sb = Sandbox::new(tag);
-    sb.fake_tool(
-        "busctl",
-        &format!(
-            "case \"$*\" in\n  *\"status org.freedesktop.secrets\") printf 'Comm={provider}\\n' ;;\n  *) exit 1 ;;\nesac"
-        ),
-    );
-    sb
-}
-
-fn with_session_bus(cmd: &mut Command) -> &mut Command {
-    cmd.env(
-        "DBUS_SESSION_BUS_ADDRESS",
-        "unix:path=/nonexistent-irlume-test-bus",
-    )
-    .env_remove("SUDO_USER")
-}
-
-/// Where oo7-daemon provides the caller's Secret Service, `keyring arm` and
-/// `reseal` ask for the login password, which pam_oo7 hands on, instead of
-/// leaving the kind to irlumed: a token would re-key a keyring oo7 cannot
-/// open with it. Any other provider still leaves the choice to irlumed. The
-/// probe reads the caller's own session bus, so a root caller, whose bus is
-/// not the target account's, always leaves it to irlumed.
-#[test]
-fn keyring_arm_asks_for_the_login_password_where_oo7_provides_secrets() {
-    for (provider, want) in [
-        (
-            "oo7-daemon",
-            (!is_root()).then_some(irlume_common::KeyringSecretKind::LoginPassword),
-        ),
-        ("gnome-keyring-d", None),
-    ] {
-        for command in [&["keyring", "arm"][..], &["reseal"]] {
-            let label = format!("{provider}, {}", command.join(" "));
-            let sb = secret_service_sandbox(
-                &format!("arm-kind-{provider}-{}", command.join("-")),
-                provider,
-            );
-            let log = serve(&sock(&sb), |req| match req {
-                Request::SealPassword { .. } => Response::PasswordSealed,
-                Request::HasSealedPassword { .. } => Response::HasPassword(true),
-                Request::KeyringInfo { .. } => Response::KeyringInfo {
                     armed: true,
                     policy: None,
                     pcrs: Vec::new(),
@@ -1973,66 +2038,6 @@ fn login_changes_on_nixos_name_the_module_and_touch_nothing() {
         );
         assert!(!out.contains("DRY RUN"), "{args:?} planned a change: {out}");
         assert!(!lock.exists(), "{args:?} took the PAM lock");
-
-                    kind: Some(irlume_common::KeyringSecretKind::LoginPassword),
-                },
-                _ => Response::Error("unexpected request".into()),
-            });
-            let args = [command, &["--user", "tester"][..]].concat();
-            let (code, out, err) =
-                run_stdin(with_session_bus(&mut sb.cmd_with_fakes(&args)), "hunter2\n");
-            assert_eq!(code, 0, "{label}: {out} {err}");
-            let kind = log.lock().unwrap().iter().find_map(|r| match r {
-                Request::SealPassword { kind, .. } => Some(*kind),
-                _ => None,
-            });
-            assert_eq!(kind, Some(want), "{label}");
-        }
-    }
-}
-
-/// Where oo7-daemon provides the caller's Secret Service and a GNOME keyring
-/// token is armed, `keyring arm` stops before sending anything: an older
-/// irlumed would seal the login password over the token, the only copy of
-/// what the login keyring is keyed to. The message names the way back. A
-/// root caller does not probe its bus and leaves the choice to irlumed, which
-/// refuses to replace the token itself.
-#[test]
-fn keyring_arm_keeps_an_armed_token_where_oo7_provides_secrets() {
-    let sb = secret_service_sandbox("arm-oo7-token", "oo7-daemon");
-    let log = serve(&sock(&sb), |req| match req {
-        Request::SealPassword { .. } => Response::PasswordSealed,
-        Request::KeyringInfo { .. } => Response::KeyringInfo {
-            armed: true,
-            policy: None,
-            pcrs: Vec::new(),
-            drifted: None,
-            kind: Some(irlume_common::KeyringSecretKind::GnomeKeyringToken),
-        },
-        _ => Response::Error("unexpected request".into()),
-    });
-    let (code, out, err) = run_stdin(
-        with_session_bus(&mut sb.cmd_with_fakes(&["keyring", "arm", "--user", "tester"])),
-        "hunter2\n",
-    );
-    let sent = log.lock().unwrap().iter().find_map(|r| match r {
-        Request::SealPassword { kind, .. } => Some(*kind),
-        _ => None,
-    });
-    if is_root() {
-        assert_eq!(code, 0, "{out} {err}");
-        assert_eq!(sent, Some(None), "root leaves the kind to irlumed");
-        return;
-    }
-    assert_ne!(code, 0, "{out} {err}");
-    assert_eq!(sent, None, "nothing may reach irlumed's seal");
-    for part in [
-        "GNOME keyring token armed",
-        "nothing was changed",
-        "irlume keyring forget",
-        "gnome-keyring running",
-    ] {
-        assert!(err.contains(part), "{part}: {err}");
     }
 }
 

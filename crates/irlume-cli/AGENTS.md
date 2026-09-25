@@ -9,7 +9,9 @@ line 11650: search for the names below.
 - `src/main.rs` parses argv by hand (`flag`, `flag_present` accept `--x v` and
   `--x=v`); commands are documented in [docs/COMMANDS.md](../../docs/COMMANDS.md).
 - `DEV_CMDS` need `IRLUME_DEV=1`; they open the camera directly and are never an
-  auth path. A new call site that opens or enumerates a video node fails
+  auth path. The exception is `selftest liveness`: the TUI runs it, so it is
+  ungated and goes through the daemon; keep its camera access there. A new
+  call site that opens or enumerates a video node fails
   `tests/camera_authority.rs` unless marked `// deliberate camera probe:` or
   `// the one permitted probe`; the daemon is the camera authority while it runs.
 - `src/pamwire.rs` and `src/pamwire/stanzas.rs` write the `irlume login` PAM

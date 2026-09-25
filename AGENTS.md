@@ -45,7 +45,8 @@ The main TUI, camera, daemon and auth files run 16k to 24k lines: search, do not
   bubblewrap. Distro packages: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md); the
   full Ubuntu list is `ci.yml` "Install system build dependencies".
 - CLI tests exec `/usr/bin/bwrap` (Ubuntu 24.04: `bash scripts/ci-bubblewrap.sh --check`).
-  PAM end-to-end tests pass vacuously without pamtester and pam_wrapper.
+  Without pamtester and pam_wrapper most PAM end-to-end tests pass vacuously
+  and the COSMIC ones fail ([the PAM AGENTS.md](crates/irlume-pam/AGENTS.md)).
 - There is no `rust-toolchain` file. Outside Nix, run fmt, clippy and doc as
   `cargo +1.88.0 ...`; a newer clippy reports lints CI does not.
 - `bash scripts/fetch-models.sh` fetches and verifies the weights (about 614 MB)
@@ -78,7 +79,7 @@ cargo build --release --locked
 | `--json` output, `schemas/` | `python3 scripts/test-machine-api-conformance.py && python3 scripts/machine-api-conformance.py --irlume target/release/irlume --strict` (needs python3 `jsonschema`) |
 | `scripts/ir-evaluation/` | `python3 -m unittest discover -s scripts/ir-evaluation -p 'test_*.py'` |
 | `packaging/`, versions, `docs/hardware/` | `bash scripts/check-packaging-parity.sh` |
-| systemd units | `systemd-analyze security --offline=true --threshold=37 packaging/systemd/irlumed.service` (94 for `irlume-reconcile.service`) |
+| systemd units | `systemd-analyze verify packaging/systemd/<unit>` for each changed unit (CI first stubs `/usr/bin/irlumed` and `/usr/bin/irlume` with `/bin/true` when absent), then `systemd-analyze security --offline=true --threshold=37 packaging/systemd/irlumed.service` (94 for `irlume-reconcile.service`) |
 | dependencies | `cargo deny check advisories bans licenses sources` and `(cd fuzz && cargo fetch --locked)` |
 | fuzzed parsers | in `fuzz/`: `mkdir -p corpus/<t> && cp -n seeds/<t>/* corpus/<t>/`, then `cargo +nightly-2026-07-15 fuzz run <t> -- -max_total_time=45 -rss_limit_mb=4096` (targets in `fuzz/fuzz_targets/`) |
 | `.github/workflows/` | `bash scripts/check-action-pins.sh`; also use `persist-credentials: false`, least-privilege `permissions`, and pass untrusted values through `env:`; never interpolate an untrusted `${{ }}` expression inside `run:` (`workflow-audit.yml`) |
@@ -151,9 +152,13 @@ cargo build --release --locked
    binary links another binary's crate ([crates/README.md](crates/README.md)).
 3. **Privilege split.** `irlumed` alone owns camera, IR emitter, models,
    templates and TPM, through one serialized worker. Clients hold no secrets and
-   never open a camera. `SO_PEERCRED` is checked per connection. Only the
-   root-only `UnsealPassword` releases the sealed password, never `Authenticate`
-   ([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) "Privilege separation", "Authentication flow").
+   never open a camera. `SO_PEERCRED` is checked per connection. Only two
+   root-only requests release a sealed secret, never `Authenticate`:
+   `UnsealPassword` after a live face match, and `UnsealKeyring` (login
+   password, KDE wallet key or GNOME keyring token) without one, for the
+   fingerprint path, gated on a login or unlock service (ADR-0003,
+   `crates/irlume-common/src/lib.rs`; [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+   "Privilege separation", "Authentication flow").
 4. **Posture and wire.** Every `Request` variant has an explicit arm, with no
    wildcard, in the daemon's posture tables. Socket changes stay additive, as
    old and new binaries meet during upgrades (daemon AGENTS.md). `--json` is a
@@ -163,8 +168,10 @@ cargo build --release --locked
    malformed security setting reads as the safe default (ADR-0018). PAD cues are
    deny-only: Live to Spoof, nothing else (ADR-0013).
 6. **Privileged intent.** At privileged prompts (sudo, su, doas, polkit) only a
-   literal hidden `yes` authorizes one face attempt, other non-empty input stays
-   the password, and empty Enter never starts the camera (ADR-0010, ADR-0011),
+   hidden `yes` authorizes one face attempt (ASCII, at most 16 bytes, compared
+   after trimming whitespace and ignoring case, so ` YES ` counts), other
+   non-empty input stays the password, and empty Enter never starts the camera
+   (ADR-0010, ADR-0011),
    unless the owner set `privileged_face_consent=0`, which the daemon re-checks
    (ADR-0018). Greeter and lock stacks arm on an empty Enter. Mixed versions
    fail closed (ADR-0010).

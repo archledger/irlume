@@ -35,7 +35,9 @@ person out. It is critical-tier ([SECURITY.md](../../SECURITY.md)); the
 - Remote sessions never engage the camera: `is_remote_session` checks
   `PAM_RHOST`, remote-desktop service names and `SSH_*` (residual risk in
   [docs/THREAT_MODEL.md](../../docs/THREAT_MODEL.md)).
-- Privileged intent: only a literal hidden `yes` selects a face attempt, other
+- Privileged intent: only a hidden `yes` selects a face attempt: ASCII, at most
+  16 bytes, compared after trimming whitespace and ignoring case
+  (`classify_intent_input`; its test pins ` YES ` and tab-wrapped `yEs`). Other
   non-empty input stays the password for the next module, and empty input never
   starts the camera (ADR-0010, ADR-0011). With `privileged_face_consent=0` the
   attempt starts at the prompt instead, and the daemon re-checks that key before
@@ -47,7 +49,10 @@ person out. It is critical-tier ([SECURITY.md](../../SECURITY.md)); the
   `crates/irlume-common/src/pam_service.rs` ([its AGENTS.md](../irlume-common/AGENTS.md)).
 - Stacks using the module arguments (`unseal`, `wait`, `reseal`, `keyring`,
   `kr`, `facefirst`, `ondemand`) are written by `crates/irlume-cli/src/pamwire.rs`
-  and `pamwire/stanzas.rs`: face lines are `sufficient`, `[success=1 default=ignore]`
+  and `pamwire/stanzas.rs`, and on NixOS by `nix/module.nix`, which picks its
+  own controls; a change to an argument's meaning or to the allowed controls
+  updates both and runs `nix flake check --no-build --show-trace` beside the
+  CLI wiring tests. Face lines are `sufficient`, `[success=1 default=ignore]`
   or, on polkit consent prompts, `POLKIT_VERIFY_STANZA` (`sufficient` plus
   `abort=die`); keyring and `reseal` lines are `optional`; never `required` or `requisite`.
 

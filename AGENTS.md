@@ -91,7 +91,7 @@ cargo build --release --locked
 | fuzzed parsers | in `fuzz/`: `cargo fetch --locked`, then `mkdir -p corpus/<t> && cp -n seeds/<t>/* corpus/<t>/`, then `cargo +nightly-2026-07-15 fuzz run <t> -- -max_total_time=45 -rss_limit_mb=4096` (targets in `fuzz/fuzz_targets/`) |
 | `.github/workflows/` | `bash scripts/check-action-pins.sh`, `zizmor .github/workflows` and `actionlint` (as in `workflow-audit.yml`); for `hardware-suite.yml` also `python3 scripts/test-nightly-ir-capture.py`, `python3 scripts/ci/test-setup-coverage-tools.py` and `python3 scripts/ci/test-nightly-coverage-contract.py`; use `persist-credentials: false`, least-privilege `permissions`, and pass untrusted values through `env:`; never interpolate an untrusted `${{ }}` expression inside `run:` (`workflow-audit.yml`) |
 | `flake.nix`, `nix/` | `nix flake check --no-build --show-trace` and `nix build .#default --no-link --print-out-paths --show-trace`; after a dependency or fork bump also `nix build --no-link .#default.cargoDeps .#onnxruntime-bin` |
-| `kcm/` | `cmake -S kcm -B target/kcm-build -DBUILD_TESTING=ON && cmake --build target/kcm-build`, then the load test, `kcmshell6` and qmllint steps of `kcm.yml` |
+| `kcm/` | `cmake -S kcm -B target/kcm-build -DBUILD_TESTING=ON && cmake --build target/kcm-build`, then the bridge, page and load test, `kcmshell6` and qmllint steps of `kcm.yml` |
 | `crates/irlume-pam` | the commands in [its AGENTS.md](crates/irlume-pam/AGENTS.md) |
 | an `AGENTS.md`, or a file, link or gate command one cites | `python3 scripts/check-agents-md.py` |
 

@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # KCM build lane: compiles the Plasma System Settings module and runs its
-# headless load test in the two KF6 lanes that ship it (Fedora rpm via
-# Copr, Arch). The universal deb and NixOS carry no KCM yet (see
+# offscreen tests (bridge, page and load test, kcmshell6, qmllint) in the
+# two KF6 lanes that ship it (Fedora rpm via Copr, Arch). The universal
+# deb and NixOS carry no KCM yet (see
 # docs/superpowers/specs/2026-09-18-kcm-plasma-settings-design.md).
 #
 # No `uses:` beyond one SHA-pinned checkout: everything runs inside the
@@ -43,7 +44,9 @@ jobs:
           if command -v dnf >/dev/null; then
             dnf install -y -q git
           else
-            pacman -Sy --noconfirm git
+            # A full upgrade, never a partial one: the tests link Qt
+            # libraries built against the current glibc.
+            pacman -Syu --noconfirm --needed git
           fi
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -57,14 +60,26 @@ jobs:
               qt6-qtbase-devel qt6-qtdeclarative-devel \
               kf6-kcmutils-devel kf6-kcoreaddons-devel kf6-kio-devel kf6-kirigami
           else
-            pacman -Sy --noconfirm cmake extra-cmake-modules gcc \
-              qt6-base qt6-declarative kcmutils kcoreaddons kio kirigami
+            # The base image has no fonts at all, and the page test
+            # measures text: ttf-dejavu gives it real glyph widths.
+            pacman -Syu --noconfirm --needed cmake extra-cmake-modules gcc \
+              qt6-base qt6-declarative kcmutils kcoreaddons kio kirigami \
+              ttf-dejavu
           fi
 
-      - name: Build the module and its load test
+      - name: Build the module and its tests
         run: |
           cmake -S kcm -B kcm-build -DBUILD_TESTING=ON
           cmake --build kcm-build -j"$(nproc)"
+
+      - name: Bridge failure paths (fake irlume programs)
+        run: ./kcm-build/bin/kcm_bridgetest
+
+      - name: Page test (every page, every fixture set, offscreen)
+        run: |
+          # The test forces the offscreen platform and private HOME and XDG
+          # directories itself; the variable only makes that explicit here.
+          QT_QPA_PLATFORM=offscreen ./kcm-build/bin/kcm_pagetest
 
       - name: Headless load test (plugin metadata, factory, bridge)
         run: |
@@ -105,6 +120,12 @@ jobs:
           if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
             exit "$rc"
           fi
+          # A module that is not found also ends by timeout, so the
+          # not-found text must fail the step on its own.
+          if grep -aq "Could not find KCM with given Id" "$log"; then
+            echo "::error::kcmshell6 did not find the kcm_irlume module"
+            exit 1
+          fi
           if grep -aqE "qrc:|Unable to assign|Cannot assign|Error loading QML" "$log"; then
             echo "::error::the module reported QML errors on instantiation"
             exit 1
@@ -116,6 +137,10 @@ jobs:
           # types, so a nonexistent property (twinFormLabelText,
           # Theme.secondaryTextColor - both shipped once) fails here at
           # build time instead of in the user's System Settings.
+          # qmllint exits 0 on warnings and ends each warning line with its
+          # category in brackets (" [missing-property]"), so the step greps
+          # for the categories that break a page at run time. [unqualified]
+          # is left out: `kcm` is a context property qmllint cannot see.
           if [ -x /usr/lib64/qt6/bin/qmllint ]; then
             QMLLINT=/usr/lib64/qt6/bin/qmllint
           elif [ -x /usr/lib/qt6/bin/qmllint ]; then
@@ -127,7 +152,7 @@ jobs:
           status=0
           for f in kcm/src/ui/*.qml; do
             out="$("$QMLLINT" -I /usr/lib64/qt6/qml -I /usr/lib/qt6/qml "$f" 2>&1)" || status=1
-            if printf '%s\n' "$out" | grep -qE "Warning: .*:(missing-property|unqualified|syntax)|Error"; then
+            if printf '%s\n' "$out" | grep -qE '^Error: |^Warning: .*\[(missing-property|missing-type|unresolved-type|unresolved-alias|import|incompatible-type|read-only-property|syntax)\]$'; then
               status=1
               printf '%s\n' "$out"
             fi

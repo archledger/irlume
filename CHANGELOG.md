@@ -311,6 +311,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The System Settings module keeps each page's rows in order and its
+  buttons outside the lists, fits narrow windows, shows the Diagnostics
+  severity headers with plain titles and state icons, explains checks
+  that need administrator rights, collapses metadata-only camera nodes
+  into one line, names the keyring sealing tier in words instead of the
+  raw policy, reports missing template keys and unreachable daemons as
+  problems, explains refused requests (offering Retry when the refusal
+  is retryable), and no longer crashes System Settings when the irlume
+  command is killed.
+
 - `irlume keyring forget` re-keys a GNOME keyring token back to the
   password where the login screen started gnome-keyring and nothing in
   the session has initialized it yet (`pam_gnome_keyring` with no socket

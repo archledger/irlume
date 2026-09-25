@@ -40,6 +40,12 @@ permissions:
 env:
   ALERT_LABEL: ci-alert
 
+# One check at a time: an overlapping scheduled run and manual dispatch
+# could both find no issue and each open one, or both post the day's update.
+concurrency:
+  group: ci-alert
+  cancel-in-progress: false
+
 jobs:
   check:
     name: scheduled workflow health

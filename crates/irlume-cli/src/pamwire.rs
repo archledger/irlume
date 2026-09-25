@@ -248,8 +248,21 @@ pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
     let apply = args.iter().any(|a| a == "--apply");
     let with_sudo = args.iter().any(|a| a == "--with-sudo");
     let with_polkit = args.iter().any(|a| a == "--with-polkit");
+    // On NixOS the system configuration generates the stacks, and the flake
+    // module writes irlume's rules. Refused ahead of the root check, the PAM
+    // lock and the capability reading, so nothing is asked for or touched.
+    let nixos =
+        matches!(action, Some("enable" | "disable" | "reconcile")) && crate::nixos::host_is_nixos();
     match action {
         None | Some("status") => status(),
+        Some("reconcile") if nixos => {
+            eprintln!("{}", crate::nixos::RECONCILE_NOTICE);
+            ExitCode::SUCCESS
+        }
+        Some("enable" | "disable") if nixos => {
+            eprintln!("{}", crate::nixos::LOGIN_REFUSAL);
+            ExitCode::FAILURE
+        }
         Some("enable") => act(true, apply, with_sudo, with_polkit),
         Some("disable") => act(false, apply, with_sudo, with_polkit),
         Some("reconcile") => reconcile(),
@@ -648,6 +661,10 @@ fn surfaces_regressed(
 /// condition `login reconcile` repairs. The TUI's Repair tab uses this to offer
 /// the fix.
 pub(crate) fn reconcile_needed() -> bool {
+    // `login reconcile` changes nothing on NixOS, so there is no repair to offer.
+    if crate::nixos::host_is_nixos() {
+        return false;
+    }
     let Some(WiredMarker {
         sudo: with_sudo,
         polkit: with_polkit,
@@ -5063,6 +5080,42 @@ auth required pam_fprintd.so\n\
             Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
             None => std::env::remove_var("IRLUME_STATE_DIR"),
         }
+    }
+
+    /// `login reconcile` changes nothing on NixOS, so a self-heal marker there
+    /// (an older reconcile adopted the module's lines into one) never offers
+    /// that repair, whatever the marker claims.
+    #[test]
+    fn reconcile_is_never_needed_on_nixos() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TestDir::new("reconcile-nixos");
+        let old: Vec<_> = ["IRLUME_STATE_DIR", crate::os_release::OS_RELEASE_ENV]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect();
+        std::env::set_var("IRLUME_STATE_DIR", &dir.0);
+        let os_release = dir.0.join("os-release");
+        std::fs::write(&os_release, "NAME=NixOS\nID=nixos\n").unwrap();
+        std::env::set_var(crate::os_release::OS_RELEASE_ENV, &os_release);
+        write_wired_marker(
+            true,
+            &WiredMarker {
+                sudo: true,
+                polkit: true,
+                lock: true,
+                face_lock_intent: true,
+            },
+        );
+        let needed = reconcile_needed();
+        for (key, value) in old {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        assert!(!needed);
     }
 
     // ---- #607: yield the stock Omarchy lock lane to the dedicated lane ----

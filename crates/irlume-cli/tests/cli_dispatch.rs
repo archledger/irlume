@@ -92,6 +92,9 @@ impl Sandbox {
             .env("IRLUME_KEYRING_DIR", self.root.join("keyring"))
             .env("IRLUME_METHOD_CONF", self.root.join("cfg").join("method"))
             .env("IRLUME_KWALLET_INIT", self.root.join("wallet-salt-helper"))
+            // Absent, so no distribution: a test never follows the host's
+            // os-release (on NixOS the keyring and login paths differ).
+            .env("IRLUME_OS_RELEASE", self.root.join("no-os-release"))
             .env_remove("IRLUME_DEV")
             .env_remove("IRLUME_CONSENT_GESTURE")
             .env_remove("ORT_DYLIB_PATH")

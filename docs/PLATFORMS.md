@@ -56,7 +56,7 @@ grants remain unqualified. See [the desktop flow](DESKTOP-AUTH.md).
 | Ubuntu, current LTS | PPA `ppa:archledger/irlume` | the PPA carries the current LTS only |
 | Debian 12+, Ubuntu derivatives (Mint, Pop!\_OS, Zorin, elementary), older Ubuntu LTS | `.deb` from [Releases](https://github.com/archledger/irlume/releases) | needs glibc 2.35+; the package refuses anything older |
 | Arch | AUR package [`irlume`](https://aur.archlinux.org/packages/irlume) | builds from the signed release tag; models come from the models-v1 release |
-| NixOS | `nixosModules.irlume` from this flake | declarative daemon + PAM wiring, see [NIXOS.md](NIXOS.md) |
+| NixOS | `nixosModules.irlume` from this flake | declarative daemon + PAM wiring (`irlume login enable` and `disable` refuse there), login password keyring unlock only, see [NIXOS.md](NIXOS.md) |
 | anything else | from source | see [DEVELOPMENT.md](DEVELOPMENT.md); Rust 1.88+, onnxruntime 1.24+ |
 
 Every lane is x86_64 only today (Copr chroots, PPA, `.deb`, and the AUR
@@ -195,8 +195,9 @@ than assuming every desktop has the same prompt or cancellation behavior.
   and live prompt validation. Neither is an all-derivative v0.14 qualification;
   Zorin and elementary remain unconfirmed.
 - Arch derivatives (Manjaro, EndeavourOS) via the AUR package.
-- NixOS on bare-metal IR hardware: the module's greeter and lock-screen matrix
-  was validated on a NixOS VM with camera passthrough (see
+- NixOS: login password keyring unlock only. The module's greeter and
+  lock-screen matrix was recorded on a NixOS VM with camera passthrough when
+  the module was added and has not been re-run since, so it is unverified (see
   [NIXOS.md](NIXOS.md)); a face login on a physical NixOS machine has not been
   reported.
 - Other IR cameras: an 8-bit grey format (`GREY`, `Y8`, `Y800`) is necessary,

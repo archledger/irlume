@@ -296,6 +296,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- On NixOS, where the flake module owns the PAM stacks, `irlume login
+  enable` and `irlume login disable` now refuse with or without
+  `--apply` and point to `services.irlume.pam.services`, `irlume login
+  reconcile` does nothing, and `irlume login status` and `irlume doctor`
+  name that option instead of `irlume login enable`. `irlume keyring
+  arm`, `irlume reseal`, the keyring step of `irlume setup` and the
+  TUI's Password Wallet seal only the login password there, the kind the
+  module's PAM rules were written for: an account that has or would get
+  a KDE wallet key or a GNOME keyring token is refused and nothing is
+  sealed, and a login password already armed stays one. docs/NIXOS.md
+  marks its display manager matrix unverified and login password only
+  (#5, #253, #256).
+
 - `irlume login enable` now wires greetd on Fedora 45 and `sudo` on
   openSUSE Tumbleweed, which ship their PAM service only in
   `/usr/lib/pam.d`: it writes an `/etc/pam.d` override from that copy, and

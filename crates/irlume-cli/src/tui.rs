@@ -6581,12 +6581,21 @@ impl App {
                     "Connect Password Wallet: seal its secret with the TPM and update the wallet if needed",
                     OpTag::Generic,
                     Box::new(move || {
-                        let wallet_salt = match irlume_common::client::read_wallet_salt(&user) {
-                            Ok(salt) => salt,
+                        // On NixOS: refuse an account that has or would
+                        // get a kind other than the login password, before
+                        // anything is sealed.
+                        let seal = match crate::nixos::seal_kind(&user) {
+                            Ok(seal) => seal,
+                            Err(refusal) => return (false, refusal),
+                        };
+                        let (kind, wallet_salt) = match seal.request_fields(&user) {
+                            Ok(fields) => fields,
                             Err(e) => return (false, format!("keyring arm failed: {e}")),
                         };
                         let req = Request::SealPassword {
-                            kind: None, // let the daemon judge from what the user has
+                            // Off NixOS `None`: the daemon judges from what
+                            // the user has.
+                            kind,
                             user: user.clone(),
                             password: irlume_common::SecretBytes::new(pw.to_vec()),
                             wallet_salt,
@@ -17691,6 +17700,135 @@ mod tests {
         );
         wait_op_done(&mut app);
         assert!(app.error.is_some(), "a failed seal must surface");
+    }
+
+    /// On NixOS the Password Wallet refuses an account that would get a KDE
+    /// wallet key, as `keyring arm` does, and says why instead of sealing.
+    /// The fake irlumed reports nothing armed and would seal anything.
+    #[test]
+    fn keyring_arm_on_nixos_refuses_a_kde_wallet_key() {
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, old) in self.0.drain(..) {
+                    match old {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _sock = dead_socket();
+        let dir = std::env::temp_dir().join(format!("irlume-tui-nixos-arm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let os_release = dir.join("os-release");
+        std::fs::write(&os_release, "NAME=NixOS\nID=nixos\n").unwrap();
+        let helper = dir.join("wallet-salt-helper");
+        std::fs::write(&helper, "#!/bin/sh\nprintf '%056d' 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // A fake irlumed: one line-JSON request per connection until `stop`
+        // is set. It keeps this account's metadata and seal requests and,
+        // like `accept_wanted`, refuses anything else unrecorded: a worker
+        // another test left running can connect too.
+        const USER: &str = "irlume-no-such-account";
+        let sock = dir.join("irlumed.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Request>::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = {
+            use std::io::{BufRead as _, Write as _};
+            let (seen, stop) = (seen.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let Ok((mut socket, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    socket.set_nonblocking(false).unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut line = String::new();
+                    if std::io::BufReader::new(&socket)
+                        .read_line(&mut line)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let Ok(request) = serde_json::from_str::<Request>(&line) else {
+                        continue;
+                    };
+                    let reply = match &request {
+                        Request::KeyringMetadata { user } if user == USER => {
+                            Response::KeyringInfo {
+                                armed: false,
+                                policy: None,
+                                pcrs: Vec::new(),
+                                drifted: None,
+                                kind: None,
+                            }
+                        }
+                        Request::SealPassword { user, .. } if user == USER => {
+                            Response::PasswordSealed
+                        }
+                        _ => {
+                            let refusal = Response::Error("fake daemon: not this test's".into());
+                            let _ =
+                                writeln!(socket, "{}", serde_json::to_string(&refusal).unwrap());
+                            continue;
+                        }
+                    };
+                    seen.lock().unwrap().push(request);
+                    let _ = writeln!(socket, "{}", serde_json::to_string(&reply).unwrap());
+                }
+            })
+        };
+        let _restore = Restore(
+            ["IRLUME_OS_RELEASE", "IRLUME_KWALLET_INIT"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        std::env::set_var("IRLUME_OS_RELEASE", &os_release);
+        std::env::set_var("IRLUME_KWALLET_INIT", &helper);
+        std::env::set_var("IRLUME_SOCKET", &sock);
+        let mut app = test_app();
+        app.user = USER.into();
+        app.screen = SC_KEYRING;
+        app.on_key(KeyCode::Char('a'));
+        for _ in 0..2 {
+            for c in "pw".chars() {
+                app.on_key(KeyCode::Char(c));
+            }
+            app.on_key(KeyCode::Enter);
+        }
+        wait_op_done(&mut app);
+        wait_live_done(&mut app);
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|r| matches!(r, Request::KeyringMetadata { .. })),
+            "{seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|r| matches!(r, Request::SealPassword { .. })),
+            "sealed anyway: {seen:?}"
+        );
+        let err = app.error.take().expect("the refusal must surface");
+        assert!(
+            err.contains("would get a KDE wallet key") && err.contains("docs/NIXOS.md"),
+            "got: {err}"
+        );
     }
 
     #[test]

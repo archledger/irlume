@@ -329,17 +329,41 @@ pub(super) fn status() -> ExitCode {
         }
     );
     if !any {
-        println!(
-            "  → enable with:  sudo irlume login enable --apply   (add --with-sudo for face-sudo, \
-             --with-polkit for app prompts like Bitwarden)"
-        );
+        println!("{}", enable_hint(crate::nixos::host_is_nixos()));
     }
     ExitCode::SUCCESS
+}
+
+/// The closing hint of `login status` when no login surface is wired. On
+/// NixOS `irlume login enable` refuses, so it names the module instead.
+fn enable_hint(nixos: bool) -> String {
+    if nixos {
+        format!("  → {}", crate::nixos::PAM_POINTER)
+    } else {
+        "  → enable with:  sudo irlume login enable --apply   (add --with-sudo for face-sudo, \
+         --with-polkit for app prompts like Bitwarden)"
+            .to_string()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With nothing wired, `login status` names the command that wires a
+    /// login surface, except on NixOS, where that command refuses and the
+    /// hint names the module and docs/NIXOS.md.
+    #[test]
+    fn the_enable_hint_names_the_module_on_nixos() {
+        let hint = enable_hint(false);
+        assert!(hint.contains("sudo irlume login enable --apply"), "{hint}");
+        let hint = enable_hint(true);
+        assert!(
+            hint.contains("services.irlume.pam.services") && hint.contains("docs/NIXOS.md"),
+            "{hint}"
+        );
+        assert!(!hint.contains("irlume login enable"), "{hint}");
+    }
 
     /// #607: the yield notice exists exactly when both lane facts hold, and a
     /// non-Omarchy host never sees it.

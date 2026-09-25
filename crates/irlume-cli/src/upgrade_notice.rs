@@ -13,10 +13,6 @@
 
 use irlume_common::{KeyringSecretKind, Response};
 
-/// Redirects the os-release file, for tests (docs/DEVELOPMENT.md "Sandbox
-/// environment overrides").
-pub(crate) const OS_RELEASE_ENV: &str = "IRLUME_OS_RELEASE";
-
 /// An installed release whose next upgrade a GNOME keyring token does not
 /// survive.
 #[derive(Debug, PartialEq, Eq)]
@@ -88,39 +84,13 @@ pub(crate) fn token_armed(answer: &Result<Response, String>) -> Option<bool> {
     }
 }
 
-/// The value of `key` in os-release text. Values may be bare or quoted; as
-/// in the shell syntax the format follows, a later assignment wins. `Err`
-/// for a value that is empty or quoted on one side only.
-fn os_release_field<'a>(os_release: &'a str, key: &str) -> Option<Result<&'a str, ()>> {
-    os_release.lines().rev().find_map(|line| {
-        let (name, value) = line.trim().split_once('=')?;
-        if name != key {
-            return None;
-        }
-        let value = value.trim();
-        let value = value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-            .unwrap_or(value);
-        let quotes: &[char] = &['"', '\''];
-        Some(
-            if value.is_empty() || value.starts_with(quotes) || value.ends_with(quotes) {
-                Err(())
-            } else {
-                Ok(value)
-            },
-        )
-    })
-}
-
 /// The notice for the release `os_release` describes, if one is listed.
 /// `Err` when it names no `ID` or no `VERSION_ID`, or gives one malformed:
 /// the release is then unknown, not merely unlisted.
 pub(crate) fn token_upgrade_notice(
     os_release: &str,
 ) -> Result<Option<&'static TokenUpgradeNotice>, &'static str> {
-    let field = |key: &str| match os_release_field(os_release, key) {
+    let field = |key: &str| match crate::os_release::field(os_release, key) {
         Some(Ok(value)) => Ok(value),
         Some(Err(())) => Err("os-release gives an empty or unbalanced ID or VERSION_ID"),
         None => Err("os-release names no ID or no VERSION_ID"),
@@ -132,17 +102,13 @@ pub(crate) fn token_upgrade_notice(
         .find(|notice| notice.id == id && notice.version_id == version_id))
 }
 
-/// [`token_upgrade_notice`] for this host: `IRLUME_OS_RELEASE` when set,
-/// else `/etc/os-release`, then `/usr/lib/os-release` (os-release(5)).
-/// `Err` when no such file can be read, so a caller can tell "this release
-/// needs no notice" from "the release could not be determined".
+/// [`token_upgrade_notice`] for this host's os-release
+/// ([`crate::os_release::read_host`]). `Err` when no such file can be read,
+/// so a caller can tell "this release needs no notice" from "the release
+/// could not be determined".
 pub(crate) fn host_token_upgrade_notice_checked(
 ) -> std::io::Result<Option<&'static TokenUpgradeNotice>> {
-    let text = match std::env::var_os(OS_RELEASE_ENV) {
-        Some(path) => std::fs::read_to_string(path)?,
-        None => std::fs::read_to_string("/etc/os-release")
-            .or_else(|_| std::fs::read_to_string("/usr/lib/os-release"))?,
-    };
+    let text = crate::os_release::read_host()?;
     token_upgrade_notice(&text)
         .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidData, why))
 }
@@ -156,12 +122,14 @@ pub(crate) fn host_token_upgrade_notice() -> Option<&'static TokenUpgradeNotice>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::os_release::OS_RELEASE_ENV;
 
     #[test]
     fn an_unreadable_release_is_an_error_not_an_unlisted_release() {
         let _guard = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os(OS_RELEASE_ENV);
         let dir = std::env::temp_dir().join(format!("irlume-os-release-{}", std::process::id()));
         std::env::set_var(OS_RELEASE_ENV, dir.join("missing"));
         assert!(host_token_upgrade_notice_checked().is_err());
@@ -173,7 +141,12 @@ mod tests {
         std::fs::write(dir.join("partial"), "ID=fedora\n").unwrap();
         std::env::set_var(OS_RELEASE_ENV, dir.join("partial"));
         assert!(host_token_upgrade_notice_checked().is_err());
-        std::env::remove_var(OS_RELEASE_ENV);
+        // Restore, not remove: a run with the override set (a simulated
+        // NixOS host) keeps it for the tests after this one.
+        match old {
+            Some(value) => std::env::set_var(OS_RELEASE_ENV, value),
+            None => std::env::remove_var(OS_RELEASE_ENV),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -221,18 +194,6 @@ mod tests {
         ] {
             assert!(token_upgrade_notice(incomplete).is_err(), "{incomplete:?}");
         }
-    }
-
-    #[test]
-    fn keys_match_whole_names_and_a_later_assignment_wins() {
-        // VERSION_ID and PLATFORM_ID end in ID but are other keys.
-        assert_eq!(os_release_field(FEDORA_44, "ID"), Some(Ok("fedora")));
-        assert_eq!(os_release_field(FEDORA_44, "VERSION_ID"), Some(Ok("44")));
-        assert_eq!(
-            os_release_field("ID=debian\nID=fedora\n", "ID"),
-            Some(Ok("fedora"))
-        );
-        assert_eq!(os_release_field("# ID=fedora\n", "ID"), None);
     }
 
     #[test]

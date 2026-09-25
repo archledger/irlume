@@ -5,6 +5,17 @@ use super::*;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 static SERIAL: AtomicU64 = AtomicU64::new(0);
+/// Bound for a wait whose outcome must not depend on the clock. A helper run
+/// that ends on its own returns as soon as the helper exits, so this only caps
+/// a hang, with room for a sanitizer build on a loaded runner.
+const UNHURRIED: Duration = Duration::from_secs(30);
+/// Exits 0 only when stdin is exactly the fixture's password followed by EOF,
+/// the input the real helper verifies. `read` succeeds only when it finds a
+/// newline, so a newline or anything after one refuses; without one it reads
+/// until `run_helper` closes stdin. A helper that exits without reading can
+/// close the pipe before `run_helper` writes, which refuses the run however
+/// the helper exits.
+const ACCEPTS: &str = "IFS= read -r secret && exit 1\n[ \"$secret\" = synthetic ]";
 fn env_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
     crate::test_support::env_write()
 }
@@ -33,10 +44,10 @@ impl Fixture {
         irlume_common::write_atomic_reporting(&file,serde_json::to_string(&serde_json::json!({"version":1,"uid":peer.uid,"account":user,"strikes":4,"cooldown":null})).unwrap().as_bytes(),0o600).unwrap();
         file
     }
-    fn helper(&self, body: &str) -> std::path::PathBuf {
-        let file = self.path.join("helper");
-        std::fs::write(&file, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
+    /// A helper script for [`run_script`].
+    fn script(&self, name: &str, body: &str) -> std::path::PathBuf {
+        let file = self.path.join(name);
+        std::fs::write(&file, format!("{body}\n")).unwrap();
         file
     }
 }
@@ -48,6 +59,20 @@ impl Drop for Fixture {
         }
         std::fs::remove_dir_all(&self.path).unwrap();
     }
+}
+/// Runs `script` as the password helper. `/bin/sh` is the program exec'd and
+/// the script its one argument (the account name in production), so no test
+/// execs a file it wrote: exec fails with ETXTBSY while any process holds the
+/// file open for writing, and a sibling test that forks during the write
+/// leaves its child such a descriptor.
+fn run_script(
+    script: &Path,
+    password: &[u8],
+    budget: Duration,
+    active: impl Fn() -> bool,
+) -> Result<(), &'static str> {
+    let script = script.to_str().unwrap();
+    run_helper(Path::new("/bin/sh"), script, password, budget, active)
 }
 fn peer() -> Peer {
     // SAFETY: credential getters have no preconditions.
@@ -139,54 +164,77 @@ fn verifier_timeout_kills_and_reaps_the_exact_process() {
     let _env = env_lock();
     let f = Fixture::new();
     let pidfile = f.path.join("pid");
-    let helper = f.helper(&format!(
-        "echo $$ > '{}'\nexec /bin/sleep 60",
-        pidfile.display()
-    ));
-    let t = Instant::now();
-    assert!(run_helper(
-        &helper,
-        "fixture",
-        b"synthetic",
-        Duration::from_millis(100),
-        || true
-    )
-    .is_err());
-    assert!(t.elapsed() < Duration::from_secs(3));
-    let pid = std::fs::read_to_string(pidfile).unwrap();
+    let sleeper = f.script(
+        "sleeper",
+        &format!("echo $$ > '{}'\nexec /bin/sleep 60", pidfile.display()),
+    );
+    let recorded = || {
+        std::fs::read_to_string(&pidfile)
+            .ok()
+            .filter(|pid| pid.ends_with('\n'))
+    };
+    // `run_helper` calls `active` once before it spawns, then on every poll.
+    // The first poll waits until the helper has recorded its pid, so a helper
+    // that starts late on a loaded runner is not killed before there is a pid
+    // to check. The 100 ms budget still ends the run, not the helper's 60 s.
+    let calls = std::cell::Cell::new(0);
+    let running = std::cell::Cell::new(None);
+    let active = || {
+        calls.set(calls.get() + 1);
+        if calls.get() == 2 {
+            let until = Instant::now() + UNHURRIED;
+            while recorded().is_none() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            running.set(Some(Instant::now()));
+        }
+        true
+    };
+    assert_eq!(
+        run_script(&sleeper, b"synthetic", Duration::from_millis(100), active),
+        Err(REFUSED)
+    );
+    let running = running.get().expect("run_helper polled the helper");
+    assert!(running.elapsed() < Duration::from_secs(3));
+    let pid = recorded().expect("the helper recorded its pid");
     assert!(!Path::new("/proc").join(pid.trim()).exists());
 }
 #[test]
 fn helper_exit_status_and_cancel_control_verification() {
     let _env = env_lock();
     let f = Fixture::new();
-    let success = f.helper("exit 0");
-    assert!(run_helper(
-        &success,
-        "fixture",
-        b"synthetic",
-        Duration::from_secs(2),
-        || true
-    )
-    .is_ok());
-    assert!(run_helper(
-        &success,
-        "fixture",
-        b"synthetic",
-        Duration::from_secs(2),
-        || false
-    )
-    .is_err());
-    let failure = f.helper("exit 1");
-    assert!(run_helper(
-        &failure,
-        "fixture",
-        b"synthetic",
-        Duration::from_secs(2),
-        || true
-    )
-    .is_err());
-    assert!(run_helper(&success, "fixture", b"", Duration::from_secs(2), || true).is_err());
+    let accepts = f.script("accepts", ACCEPTS);
+    assert_eq!(
+        run_script(&accepts, b"synthetic", UNHURRIED, || true),
+        Ok(())
+    );
+    assert_eq!(
+        run_script(&accepts, b"synthetic", UNHURRIED, || false),
+        Err(REFUSED)
+    );
+    // The helper reads this password and exits 1: only its status refuses.
+    assert_eq!(
+        run_script(&accepts, b"wrong", UNHURRIED, || true),
+        Err(REFUSED)
+    );
+    assert_eq!(run_script(&accepts, b"", UNHURRIED, || true), Err(REFUSED));
+}
+
+#[test]
+fn fixture_helper_runs_while_its_script_is_open_for_writing() {
+    // A sibling test that forks while `Fixture::script` writes leaves its
+    // child a write descriptor; holding one here pins that case.
+    let _env = env_lock();
+    let f = Fixture::new();
+    let accepts = f.script("accepts", ACCEPTS);
+    let _writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&accepts)
+        .unwrap();
+    assert_eq!(
+        run_script(&accepts, b"synthetic", UNHURRIED, || true),
+        Ok(())
+    );
 }
 
 #[test]
@@ -221,9 +269,7 @@ fn retry_status_answers_while_models_are_not_ready() {
     std::thread::scope(|scope| {
         let (mut client, server) = UnixStream::pair().unwrap();
         let worker = scope.spawn(|| crate::serve(server, &arbiter, &ready, &diagnostic).unwrap());
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+        client.set_read_timeout(Some(UNHURRIED)).unwrap();
         let wire = serde_json::to_vec(&Request::RetryStatus { user }).unwrap();
         client.write_all(&wire).unwrap();
         client.write_all(b"\n").unwrap();

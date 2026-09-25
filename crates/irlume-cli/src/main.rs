@@ -1346,6 +1346,30 @@ fn verify_keyring_credential(secret: &[u8]) -> Result<(), RekeyError> {
     rekey_login_keyring(secret, secret)
 }
 
+/// How `keyring forget` put the login keyring back on the password.
+#[derive(Debug, PartialEq, Eq)]
+enum RekeyedBack {
+    /// The keyring was keyed to the token and is now keyed to the password.
+    Rekeyed,
+    /// The change back was refused or unanswered, but the keyring opens with
+    /// the password: the token is not its credential.
+    AlreadyPassword,
+}
+
+/// Re-key the login keyring from `token` back to `password`, and prove the
+/// password is its credential. When the change back is refused or goes
+/// unanswered, the keyring may never have taken the token (an arm whose
+/// re-key did not land keeps the token, see [`finish_token_arm`]); a password
+/// that opens the keyring then still clears the way to erase the envelope.
+fn rekey_back(token: &[u8], password: &[u8]) -> Result<RekeyedBack, RekeyError> {
+    match rekey_login_keyring(token, password) {
+        Ok(()) => verify_keyring_credential(password).map(|()| RekeyedBack::Rekeyed),
+        Err(refused) => verify_keyring_credential(password)
+            .map(|()| RekeyedBack::AlreadyPassword)
+            .map_err(|_| refused),
+    }
+}
+
 /// Second half of a GNOME token arm, shared by `keyring arm`, the setup wizard
 /// and the TUI: re-key the login keyring from `password` to `token` and verify
 /// the token is now the live credential. On a RE-arm the keyring is usually
@@ -1723,18 +1747,26 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                         return std::process::ExitCode::FAILURE;
                     }
                 };
-                if let Err(e) = rekey_login_keyring(token.expose(), pw.as_bytes())
-                    .and_then(|()| verify_keyring_credential(pw.as_bytes()))
-                {
-                    eprintln!(
-                        "[keyring] could not re-key the keyring back ({e}); the sealed token \
-                         is UNTOUCHED so nothing is lost. Fix the session (run as '{user}' \
-                         with gnome-keyring running) and retry, or `--force` to delete the \
-                         envelope anyway."
-                    );
-                    return std::process::ExitCode::FAILURE;
+                match rekey_back(token.expose(), pw.as_bytes()) {
+                    Ok(RekeyedBack::Rekeyed) => {
+                        println!("[keyring] login keyring re-keyed back to your password.");
+                    }
+                    Ok(RekeyedBack::AlreadyPassword) => {
+                        println!(
+                            "[keyring] the login keyring already opens with your password; \
+                             the token it never took is erased."
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[keyring] could not re-key the keyring back ({e}); the sealed \
+                             token is UNTOUCHED so nothing is lost. Fix the session (run as \
+                             '{user}' with gnome-keyring running) and retry, or `--force` to \
+                             delete the envelope anyway."
+                        );
+                        return std::process::ExitCode::FAILURE;
+                    }
                 }
-                println!("[keyring] login keyring re-keyed back to your password.");
             } else if token_armed && force {
                 eprintln!(
                     "[keyring] WARNING: --force on a token arm deletes the only copy of the \
@@ -5821,6 +5853,42 @@ mod tests {
         requests: usize,
     }
 
+    /// `keyring forget` erases the token when the keyring opens with the
+    /// password, whether it re-keys back or never took the token, and keeps
+    /// it otherwise.
+    #[test]
+    fn forget_rekeys_back_or_finds_the_password_already_current() {
+        let back = |keyring: &[u8], script: &[Control]| {
+            let outcome = std::cell::Cell::new(None);
+            let run = against(keyring, script, || {
+                outcome.set(Some(rekey_back(ARM_TOKEN, ARM_PASSWORD)));
+                Ok(())
+            });
+            (outcome.take().unwrap(), run)
+        };
+        // Keyed to the token: re-keyed back and verified.
+        let (outcome, run) = back(ARM_TOKEN, &[Control::Answer, Control::Answer]);
+        assert!(matches!(outcome, Ok(RekeyedBack::Rekeyed)), "{outcome:?}");
+        assert_eq!(*run.keyring, ARM_PASSWORD);
+        // The arm's re-key never landed: the change back is refused, but the
+        // password opens the keyring.
+        for first in [Control::Answer, Control::ApplyThenDrop] {
+            let (outcome, run) = back(ARM_PASSWORD, &[first, Control::Answer]);
+            assert!(
+                matches!(outcome, Ok(RekeyedBack::AlreadyPassword)),
+                "{first:?}: {outcome:?}"
+            );
+            assert_eq!(*run.keyring, ARM_PASSWORD);
+        }
+        // Keyed to something else: the token is kept.
+        let (outcome, run) = back(b"another-secret", &[Control::Answer, Control::Answer]);
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert_eq!(*run.keyring, b"another-secret");
+        // No gnome-keyring: nothing can be checked, so the token is kept.
+        let (outcome, _) = back(ARM_PASSWORD, &[]);
+        assert!(outcome.is_err(), "{outcome:?}");
+    }
+
     const ARM_PASSWORD: &[u8] = b"login-password";
     const ARM_TOKEN: &[u8] = b"fresh-random-token";
 
@@ -5879,6 +5947,18 @@ mod tests {
     /// the control socket is gone, as when gnome-keyring exits. An empty
     /// script means no gnome-keyring in the session.
     fn arm_against(keyring: &[u8], script: &[Control], minted: bool) -> ArmRun {
+        against(keyring, script, || {
+            finish_token_arm("testuser", ARM_PASSWORD, ARM_TOKEN, minted)
+        })
+    }
+
+    /// Run `action` against a fake gnome-keyring whose login keyring is keyed
+    /// to `keyring`, and a fake irlumed; see [`arm_against`].
+    fn against(
+        keyring: &[u8],
+        script: &[Control],
+        action: impl FnOnce() -> Result<(), String>,
+    ) -> ArmRun {
         use std::io::{BufRead, Write};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
@@ -5976,7 +6056,7 @@ mod tests {
         let saved_socket = std::env::var_os("IRLUME_SOCKET");
         std::env::set_var("XDG_RUNTIME_DIR", &dir);
         std::env::set_var("IRLUME_SOCKET", &daemon_sock);
-        let result = finish_token_arm("testuser", ARM_PASSWORD, ARM_TOKEN, minted);
+        let result = action();
         stop.store(true, Ordering::SeqCst);
         let requests = keyring_thread.map_or(0, |t| t.join().unwrap());
         daemon_thread.join().unwrap();

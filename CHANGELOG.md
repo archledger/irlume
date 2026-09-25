@@ -306,7 +306,9 @@ All notable changes to irlume are documented here. This project adheres to
   keyring still opens with the password; otherwise the arm says the
   token was kept and how to finish. An arm against a gnome-keyring
   running as another uid now sends it nothing and rolls back, naming
-  both uids (#250, #846).
+  both uids. `irlume keyring forget` erases such a kept token without
+  `--force` when the login keyring already opens with the password
+  (#250, #846).
 
 - `keyring arm` no longer replaces an armed GNOME keyring token with
   another kind, or arms over a sealed secret irlumed cannot read, even

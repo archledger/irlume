@@ -3623,6 +3623,12 @@ pub mod kwallet_wire {
     /// nonzero status is a read or policy failure.
     pub const SALT_ABSENT_EXIT: i32 = 3;
 
+    /// Helper exit status meaning `/run/user/<uid>` does not exist yet: the
+    /// auth phase of a first login after a cold boot, before logind has
+    /// opened the session. The caller may retry once the session is open.
+    /// Every other nonzero status is a failure.
+    pub const SESSION_NOT_READY_EXIT: i32 = 4;
+
     /// Basename of the handoff socket inside `XDG_RUNTIME_DIR`.
     ///
     /// Deliberately the same name `pam_kwallet5` uses (`socketPrefix` in

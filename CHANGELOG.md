@@ -286,6 +286,23 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- On KDE, the first fingerprint login after a cold boot now opens the
+  wallet. The wallet key was released during auth, before logind creates
+  `/run/user/<uid>`, so `irlume-kwallet-init` refused, nothing was
+  logged and the wallet stayed locked unless the user manager was
+  lingering. The helper now exits with a dedicated status for that case,
+  and the `keyring` line stashes the key for irlume's `reseal` session
+  line to hand over once the directory exists, the same handoff the
+  GNOME keyring token already uses. A login where the directory exists
+  still starts the wallet during auth. irlume also leaves a wallet
+  daemon alone when `PAM_KWALLET5_LOGIN` already names one, as
+  `pam_kwallet5` does, instead of starting a second, and after a face
+  login that started the wallet the `keyring` line no longer has irlumed
+  unseal the key again. A stack without irlume's session line keeps the
+  previous cold boot behaviour. Face `unseal` logins never defer the
+  key, so the NixOS module, which wires only the face path, is
+  unaffected.
+
 - `set-cameras` no longer rebuilds `/etc/irlume/cameras.conf` from
   nothing when the file exists but cannot be read. A file holding bytes
   that are not UTF-8, or one whose read failed with an I/O error, was

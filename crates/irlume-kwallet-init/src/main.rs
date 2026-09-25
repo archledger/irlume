@@ -25,7 +25,9 @@
 //! Spawned from the daemon it would live in `irlumed.service`, and restarting
 //! irlume would take the user's wallet daemon down with it.
 
-use irlume_common::kwallet_wire::{KEY_LEN, LOGIN_ENV, SALT_ABSENT_EXIT, SALT_LEN, SOCKET_NAME};
+use irlume_common::kwallet_wire::{
+    KEY_LEN, LOGIN_ENV, SALT_ABSENT_EXIT, SALT_LEN, SESSION_NOT_READY_EXIT, SOCKET_NAME,
+};
 use std::ffi::CString;
 use std::io::{Read, Write};
 use std::os::fd::AsFd as _;
@@ -80,11 +82,42 @@ fn main() -> std::process::ExitCode {
             println!("{}", sock.display());
             std::process::ExitCode::SUCCESS
         }
-        Err(e) => {
+        Err(RunError::NotReady(dir)) => {
+            eprintln!(
+                "irlume-kwallet-init: {} does not exist; \
+                 the session is not far enough along for a wallet",
+                dir.display()
+            );
+            std::process::ExitCode::from(SESSION_NOT_READY_EXIT as u8)
+        }
+        Err(RunError::Failed(e)) => {
             eprintln!("irlume-kwallet-init: {e}");
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// A failed [`run`], distinguishing the one retryable cause (the session
+/// directory not existing yet) from every other failure.
+enum RunError {
+    NotReady(PathBuf),
+    Failed(String),
+}
+
+impl From<String> for RunError {
+    fn from(message: String) -> Self {
+        RunError::Failed(message)
+    }
+}
+
+/// The runtime directory the wallet socket lives under, or [`RunError::NotReady`]
+/// when logind has not created it yet (a cold-boot first login, during auth).
+fn require_runtime_dir(uid: libc::uid_t) -> Result<PathBuf, RunError> {
+    let runtime_dir = PathBuf::from(format!("/run/user/{uid}"));
+    if !runtime_dir.is_dir() {
+        return Err(RunError::NotReady(runtime_dir));
+    }
+    Ok(runtime_dir)
 }
 
 fn write_salt(salt: &[u8]) -> std::io::Result<()> {
@@ -97,20 +130,14 @@ fn write_salt_to(mut out: impl Write, salt: &[u8]) -> std::io::Result<()> {
     out.flush()
 }
 
-fn run(user: &str) -> Result<PathBuf, String> {
+fn run(user: &str) -> Result<PathBuf, RunError> {
     // Read the key first. If it is not exactly KEY_LEN bytes, stop before any
     // process is spawned: ksecretd blocks forever on a short key and silently
     // truncates a long one, so neither failure would be visible at a login.
     let mut key = read_wallet_key_from_stdin()?;
 
     let pw = lookup_user(user)?;
-    let runtime_dir = PathBuf::from(format!("/run/user/{}", pw.uid));
-    if !runtime_dir.is_dir() {
-        return Err(format!(
-            "{} does not exist; the session is not far enough along for a wallet",
-            runtime_dir.display()
-        ));
-    }
+    let runtime_dir = require_runtime_dir(pw.uid)?;
     let sock_path = runtime_dir.join(SOCKET_NAME);
     // Resolved while still privileged: after the drop below, a user-writable
     // PATH or a swapped file could change which program this becomes.
@@ -148,7 +175,10 @@ fn run(user: &str) -> Result<PathBuf, String> {
     // inherits copy-on-write at the same addresses.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        return Err(format!("fork: {}", std::io::Error::last_os_error()));
+        return Err(RunError::Failed(format!(
+            "fork: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     if pid == 0 {
         #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
@@ -187,7 +217,7 @@ fn run(user: &str) -> Result<PathBuf, String> {
         unsafe {
             libc::close(write_fd)
         };
-        return Err(e);
+        return Err(RunError::Failed(e));
     }
 
     // Hand over the key, then get out of the way. ksecretd goes on to block in
@@ -830,8 +860,9 @@ fn write_all(fd: libc::c_int, mut buf: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        enter_user, lookup_salt_user, read_salt_at, read_wallet_key, verify_credentials,
-        wipe_fork_child_key, write_salt_to, LaunchPlan, User, KEY_LEN, LOGIN_ENV, SALT_LEN,
+        enter_user, lookup_salt_user, read_salt_at, read_wallet_key, require_runtime_dir,
+        verify_credentials, wipe_fork_child_key, write_salt_to, LaunchPlan, RunError, User,
+        KEY_LEN, LOGIN_ENV, SALT_LEN,
     };
     use std::ffi::{CStr, CString};
     use std::os::unix::ffi::OsStrExt as _;
@@ -864,6 +895,14 @@ mod tests {
         input.write_all(&[0x5a; 100]).unwrap();
         drop(input);
         assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn missing_runtime_dir_is_reported_as_not_ready() {
+        assert!(matches!(
+            require_runtime_dir(libc::uid_t::MAX),
+            Err(RunError::NotReady(_))
+        ));
     }
 
     #[test]

@@ -241,6 +241,7 @@ KCMUtils.SimpleKCM {
             action: "read the status"
             failure: root.statusFailure
             refusal: root.statusDoc
+            pending: root.statusPending
             failureRetryable: root.cliFound
             onRetryRequested: root.refresh()
         }
@@ -249,6 +250,7 @@ KCMUtils.SimpleKCM {
             action: "read the irlume version"
             failure: root.versionFailure
             refusal: root.versionDoc
+            pending: root.versionPending
             failureRetryable: root.cliFound
             onRetryRequested: root.refresh()
         }

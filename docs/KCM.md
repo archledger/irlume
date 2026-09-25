@@ -41,7 +41,8 @@ alone, and screen readers get the same words.
   whether it is part of an RGB + IR pair (an RGB camera and an IR sensor
   on the same device), and the evidence on one line. Metadata interfaces
   and test devices are listed together on one line at the end. A closed
-  privacy shutter is reported at the top of the page.
+  privacy shutter is reported at the top of the page, for the camera it
+  covers (the list includes cameras face login does not use).
 - **Login wiring**: the login manager, the SELinux module (reading it needs
   administrator rights on SELinux systems, so an ordinary account sees
   "not determined"), and the PAM surfaces present on this machine with

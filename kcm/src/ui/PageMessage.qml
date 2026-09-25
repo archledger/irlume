@@ -26,6 +26,10 @@ Kirigami.InlineMessage {
     // again: not when the irlume command is missing, since the module
     // looks for it only once.
     property bool failureRetryable: true
+    // Whether the page's request for this document is in flight. A refusal
+    // stays shown until the replacement answers, and a second Retry would
+    // only supersede (and kill) that request.
+    property bool pending: false
 
     signal retryRequested()
 
@@ -34,6 +38,7 @@ Kirigami.InlineMessage {
     readonly property bool retryable: message.canRetry
         && (message.failure.length > 0 ? message.failureRetryable
             : (message.refused && !!message.refusal.error && message.refusal.error.retryable === true))
+    readonly property bool retryEnabled: message.retryable && !message.pending
 
     Layout.fillWidth: true
     position: Kirigami.InlineMessage.Position.Header
@@ -48,6 +53,7 @@ Kirigami.InlineMessage {
             text: "Retry"
             icon.name: "view-refresh"
             visible: message.retryable
+            enabled: message.retryEnabled
             onTriggered: message.retryRequested()
         }
     ]

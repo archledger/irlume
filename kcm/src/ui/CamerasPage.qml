@@ -117,6 +117,7 @@ KCMUtils.SimpleKCM {
             action: "list the cameras"
             failure: root.failure
             refusal: root.doc
+            pending: root.pending
             failureRetryable: root.cliFound
             onRetryRequested: root.refresh()
         }
@@ -132,9 +133,11 @@ KCMUtils.SimpleKCM {
             position: Kirigami.InlineMessage.Position.Header
             visible: root.shutterNodes.length > 0
             type: Kirigami.MessageType.Warning
+            // The census covers every video device, not only the pair face
+            // login uses, so the warning speaks for the named cameras only.
             text: root.shutterNodes.length === 1
-                  ? ("The privacy shutter on " + root.shutterNodes[0] + " is closed. Open it to use face login.")
-                  : ("The privacy shutters on " + root.shutterNodes.join(", ") + " are closed. Open them to use face login.")
+                  ? ("The privacy shutter on " + root.shutterNodes[0] + " is closed; that camera sees nothing until it is opened.")
+                  : ("The privacy shutters on " + root.shutterNodes.join(", ") + " are closed; those cameras see nothing until they are opened.")
         }
         Kirigami.InlineMessage {
             objectName: "listingMessage"

@@ -26,6 +26,7 @@
 #include <QMap>
 #include <QQmlComponent>
 #include <QQmlEngine>
+#include <QQmlListReference>
 #include <QQuickItem>
 #include <QQuickWindow>
 #include <QSGRendererInterface>
@@ -383,6 +384,10 @@ void checkDiagnostics(const Ctx &c)
             if (id.startsWith(QLatin1String("emitter-"))) {
                 check(row.value(QStringLiteral("shown")).toString().contains(QLatin1String("administrator rights")),
                       QStringLiteral("%1 explains it needs administrator rights").arg(id));
+                // Nor does the permission error return in the tooltip or
+                // the accessible description, which read `raw`.
+                check(row.value(QStringLiteral("raw")).toString().isEmpty(),
+                      QStringLiteral("%1 keeps the permission error out of its details").arg(id));
             }
             if (id == QLatin1String("capture-mode")) {
                 check(!row.value(QStringLiteral("wrap")).toBool(), QStringLiteral("capture-mode detail is one line"));
@@ -452,6 +457,10 @@ void checkCameras(const Ctx &c)
         c.nowhere(QStringLiteral("face login"));
     } else if (c.set == QLatin1String("edge")) {
         c.visible(QStringLiteral("shutterMessage"));
+        // The census lists every camera, not the pair face login uses: the
+        // warning speaks for the closed camera only.
+        c.textContains(QStringLiteral("shutterMessage"), QStringLiteral("that camera sees nothing until it is opened"));
+        c.nowhere(QStringLiteral("face login"));
         // The machine-level row has no node; it is titled from its class.
         c.visible(QStringLiteral("device-"));
         const auto items = allItems(c.item(QStringLiteral("device-")));
@@ -566,6 +575,29 @@ bool runPage(const std::shared_ptr<QQmlEngine> &engine, const QString &modulePat
                         .arg(refreshed ? QStringLiteral(" after Refresh") : QString());
         if (refreshed) {
             QMetaObject::invokeMethod(current, "refresh");
+            // While the replacement request is in flight, a refusal still on
+            // screen offers no second Retry, which would supersede (and
+            // kill) that request.
+            int offered = 0;
+            for (const QString &name : {QStringLiteral("requestMessage"), QStringLiteral("statusMessage"),
+                                        QStringLiteral("versionMessage")}) {
+                const QQuickItem *message = findItem(current, name);
+                if (message != nullptr && message->property("visible").toBool()
+                    && message->property("retryable").toBool()) {
+                    ++offered;
+                    // The Retry action itself, as the message draws it.
+                    QQmlListReference actions(const_cast<QQuickItem *>(message), "actions");
+                    const QObject *retry = actions.count() > 0 ? actions.at(0) : nullptr;
+                    check(retry != nullptr && retry->property("text").toString() == QLatin1String("Retry")
+                              && !retry->property("enabled").toBool(),
+                          QStringLiteral("%1 disables Retry while its request is pending").arg(name));
+                }
+            }
+            // The refused set's login refusal (not-authorized) is not
+            // retryable; the other pages' daemon-unavailable ones are.
+            if (set == QLatin1String("refused") && page.label != QLatin1String("login")) {
+                check(offered > 0, QStringLiteral("the refused set shows a retryable refusal during Refresh"));
+            }
         }
         waitSettled(module.get());
         ctx.visible(QStringLiteral("loading"), false);

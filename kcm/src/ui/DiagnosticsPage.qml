@@ -96,9 +96,13 @@ KCMUtils.ScrollViewKCM {
             const detail = L.text(check.detail);
             const state = L.text(check.state);
             let shown = detail;
+            let raw = detail;
             let full = true;
             if (L.checkNeedsAdmin(check)) {
+                // The permission error it replaces stays out of the tooltip
+                // and the accessible description too.
                 shown = "Checked only with administrator rights (run: sudo irlume doctor).";
+                raw = "";
             } else if ((state === "warn" || state === "fail") && detail.length === 0) {
                 shown = "Details: open irlume, or run irlume doctor in a terminal.";
             } else if (state === "unknown" && detail.length === 0) {
@@ -112,7 +116,7 @@ KCMUtils.ScrollViewKCM {
                 checkState: state,
                 level: L.checkLevel(check.state),
                 shown: shown,
-                raw: detail,
+                raw: raw,
                 wrap: full,
                 section: L.checkGroupTitle(row.group) + " (" + perGroup[row.group] + ")",
             });
@@ -175,6 +179,7 @@ KCMUtils.ScrollViewKCM {
             action: "run the diagnostics"
             failure: root.failure
             refusal: root.doc
+            pending: root.pending
             failureRetryable: root.cliFound
             onRetryRequested: root.refresh()
         }

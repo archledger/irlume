@@ -128,6 +128,7 @@ KCMUtils.SimpleKCM {
             action: "read the login wiring"
             failure: root.failure
             refusal: root.doc
+            pending: root.pending
             failureRetryable: root.cliFound
             onRetryRequested: root.refresh()
         }

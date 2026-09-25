@@ -23,7 +23,8 @@ pages, so it must never move.
 | Script | What it does |
 |---|---|
 | `run-tests-guarded.sh` | Runs a test command and fails if it selected no tests. `cargo test <name>` exits 0 when the filter matches nothing, which reads as a pass. |
-| `check-packaging-parity.sh` | Every systemd unit and AppArmor rule must ship in every lane, and every lane must agree on the version. |
+| `fetch-ort.sh` | Fetches the ONNX Runtime tarball CI loads through `ORT_DYLIB_PATH`, checks its pinned sha256, and only then unpacks it. Every CI job that needs the runtime calls it; `test-fetch-ort.sh` covers it without the network on every PR. |
+| `check-packaging-parity.sh` | Every systemd unit and AppArmor rule must ship in every lane, every lane must agree on the version, and CI, the lanes and the developer guide must check the same ONNX Runtime sha256. |
 | `check-action-pins.sh` | Enforces SHA-pinning on every GitHub Action, with one documented exception for the SLSA provenance generator. |
 | `check-agents-md.py` | Fails when an `AGENTS.md` cites a path git no longer lists, has a broken relative link or an unclosed code fence, or lists a gate command the `check` job in `ci.yml` no longer runs. Needs PyYAML (`python3-yaml`); `test-check-agents-md.py` covers it. |
 | `ir-node-from-doctor.sh` | Names the IR capture node from `irlume doctor` output, so the nightly hardware suite can point `burst_dump` at it. Separates "no camera" from "no IR camera" from "this no longer parses", which the inline version it replaces could not. `--self-test` runs on every PR. |

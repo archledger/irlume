@@ -248,7 +248,7 @@ throwaway dev daemon never write to the real system:
 | `IRLUME_METHOD_CONF` | the auth-method policy (auto, face, fingerprint, both) | `/etc/irlume/method` |
 | `IRLUME_EMITTER_LOCK_DIR` / `IRLUME_TPM_MARKER_DIR` | IR emitter locks / the raw-TPM marker | `/run/lock/irlume` |
 | `IRLUME_GKR_RUNTIME_DIR` | the runtime directory holding the GNOME keyring control socket (refused when privileged) | `/run/user/<uid>` |
-| `IRLUME_OS_RELEASE` | the os-release file `doctor`, `keyring arm` and `keyring status` read for release-specific upgrade notices; honoured as root, since it only selects which notice is shown (the `platform` and `install-origin` checks still read `/etc/os-release`) | `/etc/os-release`, then `/usr/lib/os-release` |
+| `IRLUME_OS_RELEASE` | the os-release file `doctor`, `keyring arm`, `keyring status` and the TUI read for release-specific upgrade notices; honoured as root, since it only selects which notice is shown (the `platform` and `install-origin` checks still read `/etc/os-release`) | `/etc/os-release`, then `/usr/lib/os-release` |
 
 ## Example binaries
 

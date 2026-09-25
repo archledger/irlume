@@ -14,8 +14,8 @@ All notable changes to irlume are documented here. This project adheres to
   carry over. Do not arm again on Fedora 45 until an irlume update
   supports its keyring; until then the password opens it as usual.
   `irlume doctor` (new check `keyring-os-upgrade`),
-  `irlume keyring status` and `irlume keyring arm` give this step on
-  Fedora 43 and 44.
+  `irlume keyring status`, `irlume keyring arm` and the TUI's Password
+  Wallet page and Diagnostics give this step on Fedora 43 and 44.
 
 - Camera selection order as a pure function (ADR-0029 §1, §3). For
   one account it picks the connected camera to use when camera

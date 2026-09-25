@@ -7,9 +7,9 @@
 //! releases at login. A release whose login screen hands the login keyring to
 //! another provider migrates it with the login password, which no longer opens
 //! a token-keyed keyring. The step is to re-key back with
-//! `irlume keyring forget` before the upgrade; `doctor`, `keyring arm` and
-//! `keyring status` say so on a release listed here. The list is data, so the
-//! next such release is one more row.
+//! `irlume keyring forget` before the upgrade; `doctor`, `keyring arm`,
+//! `keyring status` and the TUI say so on a release listed here. The list is
+//! data, so the next such release is one more row.
 
 use irlume_common::{KeyringSecretKind, Response};
 
@@ -89,33 +89,44 @@ pub(crate) fn token_armed(answer: &Result<Response, String>) -> Option<bool> {
 }
 
 /// The value of `key` in os-release text. Values may be bare or quoted; as
-/// in the shell syntax the format follows, a later assignment wins.
-fn os_release_field<'a>(os_release: &'a str, key: &str) -> Option<&'a str> {
+/// in the shell syntax the format follows, a later assignment wins. `Err`
+/// for a value that is empty or quoted on one side only.
+fn os_release_field<'a>(os_release: &'a str, key: &str) -> Option<Result<&'a str, ()>> {
     os_release.lines().rev().find_map(|line| {
         let (name, value) = line.trim().split_once('=')?;
         if name != key {
             return None;
         }
         let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        let quotes: &[char] = &['"', '\''];
         Some(
-            value
-                .strip_prefix('"')
-                .and_then(|v| v.strip_suffix('"'))
-                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-                .unwrap_or(value),
+            if value.is_empty() || value.starts_with(quotes) || value.ends_with(quotes) {
+                Err(())
+            } else {
+                Ok(value)
+            },
         )
     })
 }
 
 /// The notice for the release `os_release` describes, if one is listed.
-/// `Err` when it names no `ID` or no `VERSION_ID`: the release is then
-/// unknown, not merely unlisted.
+/// `Err` when it names no `ID` or no `VERSION_ID`, or gives one malformed:
+/// the release is then unknown, not merely unlisted.
 pub(crate) fn token_upgrade_notice(
     os_release: &str,
 ) -> Result<Option<&'static TokenUpgradeNotice>, &'static str> {
-    let id = os_release_field(os_release, "ID").ok_or("os-release names no ID")?;
-    let version_id =
-        os_release_field(os_release, "VERSION_ID").ok_or("os-release names no VERSION_ID")?;
+    let field = |key: &str| match os_release_field(os_release, key) {
+        Some(Ok(value)) => Ok(value),
+        Some(Err(())) => Err("os-release gives an empty or unbalanced ID or VERSION_ID"),
+        None => Err("os-release names no ID or no VERSION_ID"),
+    };
+    let id = field("ID")?;
+    let version_id = field("VERSION_ID")?;
     Ok(TOKEN_UPGRADE_NOTICES
         .iter()
         .find(|notice| notice.id == id && notice.version_id == version_id))
@@ -196,8 +207,18 @@ mod tests {
         ] {
             assert_eq!(token_upgrade_notice(other), Ok(None), "{other:?}");
         }
-        // Without both keys the release is unknown, not unlisted.
-        for incomplete in ["ID=fedora\n", "VERSION_ID=44\n", ""] {
+        // Without both keys, or with either malformed, the release is
+        // unknown, not unlisted.
+        for incomplete in [
+            "ID=fedora\n",
+            "VERSION_ID=44\n",
+            "",
+            "ID=\nVERSION_ID=44\n",
+            "ID=\"\"\nVERSION_ID=44\n",
+            "ID=\"fedora\nVERSION_ID=44\n",
+            "ID=fedora\nVERSION_ID=44'\n",
+            "ID=fedora\nVERSION_ID=\"\n",
+        ] {
             assert!(token_upgrade_notice(incomplete).is_err(), "{incomplete:?}");
         }
     }
@@ -205,11 +226,11 @@ mod tests {
     #[test]
     fn keys_match_whole_names_and_a_later_assignment_wins() {
         // VERSION_ID and PLATFORM_ID end in ID but are other keys.
-        assert_eq!(os_release_field(FEDORA_44, "ID"), Some("fedora"));
-        assert_eq!(os_release_field(FEDORA_44, "VERSION_ID"), Some("44"));
+        assert_eq!(os_release_field(FEDORA_44, "ID"), Some(Ok("fedora")));
+        assert_eq!(os_release_field(FEDORA_44, "VERSION_ID"), Some(Ok("44")));
         assert_eq!(
             os_release_field("ID=debian\nID=fedora\n", "ID"),
-            Some("fedora")
+            Some(Ok("fedora"))
         );
         assert_eq!(os_release_field("# ID=fedora\n", "ID"), None);
     }

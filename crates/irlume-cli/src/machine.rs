@@ -1069,14 +1069,42 @@ fn emit_load_failure(
 /// files: the command around it needs root and a real PAM tree, but this is the
 /// part that decides the answer.
 fn verify_surfaces(record: &crate::logintx::Transaction) -> (Vec<Value>, usize) {
+    verify_surfaces_with(record, &crate::pamwire::removal_orphans_service)
+}
+
+/// Tells whether removing a path would leave its service with no PAM
+/// configuration; [`crate::pamwire::removal_orphans_service`] outside tests.
+type OrphanTest<'a> = dyn Fn(&std::path::Path) -> bool + 'a;
+
+/// Whether rolling `surface` back would delete a file that is now its
+/// service's only PAM configuration: apply created it, and the vendor copy it
+/// was made from has gone since. The machine changed in a way the record
+/// cannot undo safely, which verify and rollback both call
+/// `changed-since-apply`.
+fn rollback_orphans(surface: &crate::logintx::SurfaceRecord, orphans: &OrphanTest<'_>) -> bool {
+    surface.before.is_none() && orphans(std::path::Path::new(&surface.path))
+}
+
+/// [`verify_surfaces`] with the orphan test given, so a test can name
+/// surfaces under a temporary root.
+fn verify_surfaces_with(
+    record: &crate::logintx::Transaction,
+    orphans: &OrphanTest<'_>,
+) -> (Vec<Value>, usize) {
     let surfaces: Vec<Value> = record
         .surfaces
         .iter()
         .map(|surface| {
-            let state = match crate::logintx::unchanged_since_apply(surface) {
-                Ok(()) => "as-applied",
-                Err(crate::logintx::RollbackRefusal::ChangedSinceApply) => "changed-since-apply",
-                Err(crate::logintx::RollbackRefusal::Unreadable(_)) => "unreadable",
+            let state = if rollback_orphans(surface, orphans) {
+                "changed-since-apply"
+            } else {
+                match crate::logintx::unchanged_since_apply(surface) {
+                    Ok(()) => "as-applied",
+                    Err(crate::logintx::RollbackRefusal::ChangedSinceApply) => {
+                        "changed-since-apply"
+                    }
+                    Err(crate::logintx::RollbackRefusal::Unreadable(_)) => "unreadable",
+                }
             };
             json!({ "surface": surface.id, "state": state })
         })
@@ -1251,8 +1279,8 @@ fn rollback_restore(
                     }
                 }
                 // The backup is put back with its surface. Leaving a stale one
-                // behind is not inert: a later enable rebuilds from it as the
-                // origin, so it would silently discard an administrator's edits.
+                // behind is not inert: a later disable compares the stack with
+                // it to choose between restoring it and stripping in place.
                 if let Some(sidecar) = &surface
                     .sidecar
                     .as_ref()
@@ -1390,8 +1418,25 @@ fn rollback_blockers_excluding<'a>(
     record: &'a crate::logintx::Transaction,
     done: &crate::logintx::RollbackProgress,
 ) -> RollbackBlockers<'a> {
+    rollback_blockers_with(record, done, &crate::pamwire::removal_orphans_service)
+}
+
+/// [`rollback_blockers_excluding`] with the orphan test given, so a test can
+/// name surfaces under a temporary root.
+fn rollback_blockers_with<'a>(
+    record: &'a crate::logintx::Transaction,
+    done: &crate::logintx::RollbackProgress,
+    orphans: &OrphanTest<'_>,
+) -> RollbackBlockers<'a> {
     let mut blockers = RollbackBlockers::default();
     for surface in &record.surfaces {
+        // Rolling back a created override removes it. When its vendor copy has
+        // gone since, that file is the service's only PAM configuration, and
+        // removing it leaves the service on the denying `other` stack.
+        if !done.touched(&surface.id) && rollback_orphans(surface, orphans) {
+            blockers.changed.push(surface.id.as_str());
+            continue;
+        }
         match crate::logintx::unchanged_since_apply_excluding(surface, done) {
             Ok(()) => {}
             Err(crate::logintx::RollbackRefusal::ChangedSinceApply) => {
@@ -2865,6 +2910,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An override apply created is the service's only PAM configuration once
+    /// its vendor copy is gone: verify calls that drift, rollback refuses it,
+    /// and the restore itself will not delete the file.
+    #[test]
+    fn a_created_override_whose_vendor_copy_left_is_drift_and_never_removed() {
+        let dir = std::env::temp_dir().join(format!("irlume-orphan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let etc = dir.join("etc/pam.d/plasmalogin");
+        let vendor = dir.join("usr/lib/pam.d/plasmalogin");
+        std::fs::create_dir_all(etc.parent().unwrap()).expect("etc dir");
+        std::fs::create_dir_all(vendor.parent().unwrap()).expect("vendor dir");
+        std::fs::write(&vendor, "auth include system-auth\n").expect("write");
+        std::fs::write(&etc, "an override\n").expect("write");
+        let mut record = record_over(&[(
+            "plasmalogin",
+            etc.as_path(),
+            &crate::logintx::sha256_hex(b"an override\n"),
+        )]);
+        // Apply created it.
+        record.surfaces[0].before = None;
+        record.surfaces[0].change = "materialize-override".into();
+        let pairs = [(etc.to_str().unwrap(), vendor.to_str().unwrap())];
+        let orphans = |p: &std::path::Path| crate::pamwire::removal_orphans_in(&pairs, p);
+        let none = crate::logintx::RollbackProgress::default();
+
+        let (surfaces, drifted) = verify_surfaces_with(&record, &orphans);
+        assert_eq!(surfaces[0]["state"], "as-applied");
+        assert_eq!(drifted, 0);
+        assert!(!rollback_blockers_with(&record, &none, &orphans).any());
+
+        std::fs::remove_file(&vendor).expect("the vendor copy goes");
+        let (surfaces, drifted) = verify_surfaces_with(&record, &orphans);
+        assert_eq!(surfaces[0]["state"], "changed-since-apply");
+        assert_eq!(drifted, 1, "counted, so the refusal has a reason");
+        let blockers = rollback_blockers_with(&record, &none, &orphans);
+        assert_eq!(blockers.changed, vec!["plasmalogin"]);
+        let err = crate::pamwire::restore_surface_with(&etc, None, None, &orphans)
+            .expect_err("the only configuration is not removed");
+        assert!(err.contains("only PAM configuration"), "{err}");
+        assert!(etc.exists());
+        // The same restore removes a file whose vendor copy is still there.
+        std::fs::write(&vendor, "auth include system-auth\n").expect("write");
+        crate::pamwire::restore_surface_with(&etc, None, None, &orphans).expect("removed");
+        assert!(!etc.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_rollback_is_allowed_only_when_nothing_drifted() {
         let dir = std::env::temp_dir().join(format!("irlume-rollback-gate-{}", std::process::id()));
@@ -3178,12 +3270,14 @@ mod tests {
             PlannedChange::MaterializeOverride,
             PlannedChange::Wire,
             PlannedChange::RemoveOverride,
+            PlannedChange::RewireOverride,
             PlannedChange::RestoreBackup,
             PlannedChange::StripInPlace,
         ] {
             assert!(change.writes(), "{change:?} writes to disk");
         }
         for change in [
+            PlannedChange::KeepEditedOverride,
             PlannedChange::AlreadyCorrect,
             PlannedChange::NotInstalled,
             PlannedChange::NoAnchor,
@@ -3200,6 +3294,8 @@ mod tests {
             PlannedChange::MaterializeOverride,
             PlannedChange::Wire,
             PlannedChange::RemoveOverride,
+            PlannedChange::RewireOverride,
+            PlannedChange::KeepEditedOverride,
             PlannedChange::RestoreBackup,
             PlannedChange::StripInPlace,
             PlannedChange::AlreadyCorrect,

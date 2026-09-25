@@ -12,11 +12,21 @@
 
 use super::grammar::*;
 use super::stanzas::*;
-use super::{lock_surface_for, Svc, FP_GREETERS, GREETERS, POLKIT, SUDO};
+use super::{lock_surface_for, removal_orphans_service, Svc, FP_GREETERS, GREETERS, POLKIT, SUDO};
 use std::path::{Path, PathBuf};
 
 pub(super) fn read(p: &str) -> Result<String, String> {
     std::fs::read_to_string(p).map_err(|e| format!("read {p}: {e}"))
+}
+
+/// A file's text, or `None` when it does not exist. Any other failure is an
+/// error: a file that cannot be read is not an absent one.
+pub(super) fn read_optional(p: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(p) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read {}: {e}", p.display())),
+    }
 }
 
 pub(super) fn file_has_module(p: &Path) -> bool {
@@ -37,13 +47,27 @@ pub(super) fn file_is_created_override(p: &Path) -> bool {
 /// others would let a plan id stay stable across a state it could not actually
 /// observe.
 pub(crate) fn surface_state(path: &Path) -> String {
-    // The backup as well as the live file. Wiring rebuilds from `.pre-irlume`
-    // when one exists, so the content an apply produces depends on it: a backup
-    // that changed between the plan and the apply changes the outcome while the
-    // live file, and therefore the plan id, stayed identical. The consumer would
-    // be shown one result and the machine would get another.
+    // The backup as well as the live file. The backup decides what a disable
+    // does (restore it, or strip in place), so a backup that changed between
+    // the plan and the apply changes the outcome while the live file, and
+    // therefore the plan id, stayed identical. The consumer would be shown one
+    // result and the machine would get another.
     let bak = PathBuf::from(format!("{}{BACKUP}", path.display()));
     format!("{} {}", surface_digest(path), surface_digest(&bak))
+}
+
+/// [`surface_state`] plus, for a service with a vendor path, the vendor file's
+/// digest. The vendor file decides what happens to an override (and whether
+/// one is created at all), so a vendor update between `plan` and `apply` is a
+/// change to the machine the plan did not show. Covered for every surface with
+/// a vendor path, override or not: when `/etc` is absent the vendor file alone
+/// decides, and a uniform rule cannot miss a switch between the two.
+pub(super) fn surface_state_for(svc: &Svc) -> String {
+    let state = surface_state(Path::new(svc.etc));
+    match svc.vendor {
+        Some(vendor) => format!("{state} {}", surface_digest(Path::new(vendor))),
+        None => state,
+    }
 }
 
 pub(crate) fn surface_digest(path: &Path) -> String {
@@ -106,6 +130,18 @@ pub(crate) fn restore_surface(
     before: Option<&str>,
     metadata: Option<(u32, u32, u32)>,
 ) -> Result<(), String> {
+    restore_surface_with(path, before, metadata, &removal_orphans_service)
+}
+
+/// [`restore_surface`] with the test for "removing this leaves its service
+/// with no PAM configuration" given, so a test can name surfaces under a
+/// temporary root.
+pub(crate) fn restore_surface_with(
+    path: &Path,
+    before: Option<&str>,
+    metadata: Option<(u32, u32, u32)>,
+    orphans: &dyn Fn(&Path) -> bool,
+) -> Result<(), String> {
     match before {
         Some(content) => {
             // The recorded mode and owner go on before the rename, not after.
@@ -124,7 +160,7 @@ pub(crate) fn restore_surface(
                     (m.permissions().mode() & 0o7777, m.uid(), m.gid())
                 })
             });
-            write_atomic_inner(path, content, attrs)
+            write_atomic_inner(path, content, attrs, None)
         }
         None => {
             // The same refusal the replacing branch gets. Removing was a direct
@@ -133,6 +169,16 @@ pub(crate) fn restore_surface(
             // refuses one, and a multiply-linked file lost a name irlume cannot
             // put back.
             inspect_target(path)?;
+            // A file apply created from a vendor copy that has since gone is
+            // now the service's only configuration; removing it would leave PAM
+            // with nothing for the service but the denying `other` stack.
+            if orphans(path) {
+                return Err(format!(
+                    "{} is now its service's only PAM configuration (the vendor copy it was \
+                     made from is gone); not removed",
+                    path.display()
+                ));
+            }
             match std::fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -389,8 +435,8 @@ pub(super) fn fsync_dir(dir: &Path) -> Result<(), String> {
 /// Copy `path` to its `.pre-irlume` backup, atomically, if there is not one yet.
 ///
 /// The copy used to go straight to the final name. A kill or an ENOSPC part way
-/// through left a TRUNCATED file at `.pre-irlume`, and the next enable treats an
-/// existing backup as the pristine origin to rebuild from, so a half-copied
+/// through left a TRUNCATED file at `.pre-irlume`, and the next enable then
+/// treated an existing backup as the pristine origin to rebuild from, so a half-copied
 /// stack became the authority for what the machine's PAM should contain. A
 /// backup that only ever appears complete cannot be believed part way.
 ///
@@ -404,7 +450,7 @@ pub(super) fn backup(path: &Path) -> Result<(), String> {
     // The backup is held to the same standard as the stack it came from, and it
     // was not. `exists()` follows a symlink, so a `.pre-irlume` pointing
     // somewhere else was accepted and then used as the pristine origin a later
-    // enable rebuilds from. A DANGLING one was worse: `exists()` said no, and the
+    // enable rebuilt from. A DANGLING one was worse: `exists()` said no, and the
     // publishing link then failed with EEXIST against the symlink's own name,
     // which read as "a backup is already there" when there was none at all.
     // A complete backup already there is left alone; it must not be replaced
@@ -438,6 +484,53 @@ pub(super) fn backup(path: &Path) -> Result<(), String> {
     written
 }
 
+/// Keep the current file as `<path>.pre-irlume` before `login enable --force`
+/// rebuilds it, so the lines it drops are still on disk.
+///
+/// Published like [`backup`], through a scratch file and a hard link that
+/// refuses to replace anything. Unlike `backup`, an existing copy is accepted
+/// only when it holds exactly these bytes: a different one (a stale backup
+/// from in-place wiring, left by a distribution upgrade) would otherwise be
+/// kept while the caller reported the new copy.
+pub(super) fn keep_copy(path: &Path) -> Result<(), String> {
+    let bak = PathBuf::from(format!("{}{BACKUP}", path.display()));
+    let contents = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let same_as_existing = || -> Result<(), String> {
+        let existing = std::fs::read(&bak).map_err(|e| format!("read {}: {e}", bak.display()))?;
+        if existing == contents {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} already holds a different file; move it away and run again",
+                bak.display()
+            ))
+        }
+    };
+    if inspect_target(&bak)?.is_some() {
+        return same_as_existing();
+    }
+    let meta =
+        std::fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    let tmp = scratch_path(path, "bak");
+    let written = (|| -> Result<(), String> {
+        use std::io::Write as _;
+        let mut file = create_scratch(&tmp)?;
+        file.write_all(&contents)
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        apply_metadata(&tmp, &meta)?;
+        file.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        match std::fs::hard_link(&tmp, &bak) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return same_as_existing(),
+            Err(e) => return Err(format!("keep {}: {e}", bak.display())),
+        }
+        fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    written
+}
+
 /// Copy mode and ownership onto a path.
 pub(super) fn apply_metadata(path: &Path, meta: &std::fs::Metadata) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt as _;
@@ -450,7 +543,40 @@ pub(super) fn apply_metadata(path: &Path, meta: &std::fs::Metadata) -> Result<()
 
 pub(super) fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     let existing = std::fs::symlink_metadata(path).ok();
-    write_atomic_inner(path, contents, existing.as_ref().map(mode_uid_gid))
+    write_atomic_inner(path, contents, existing.as_ref().map(mode_uid_gid), None)
+}
+
+/// [`write_atomic`], refusing when the file no longer holds `expected` at the
+/// moment of the rename. The identity check alone misses an editor that saves
+/// in place (same inode), and a write decided on the old bytes would then
+/// replace the new ones. `None` expects nothing in particular (a file being
+/// created is covered by the identity check).
+pub(super) fn write_atomic_checked(
+    path: &Path,
+    contents: &str,
+    expected: Option<&str>,
+) -> Result<(), String> {
+    let existing = std::fs::symlink_metadata(path).ok();
+    write_atomic_inner(
+        path,
+        contents,
+        existing.as_ref().map(mode_uid_gid),
+        expected.map(str::as_bytes),
+    )
+}
+
+/// Delete `path` only while it holds exactly `expected`, with the checks every
+/// write here makes: never through a symlink or one of several names. An
+/// editor that saved the file after irlume read it keeps its save.
+pub(super) fn remove_checked(path: &Path, expected: Option<&str>) -> Result<(), String> {
+    inspect_target(path)?;
+    if read_optional(path)?.as_deref() != expected {
+        return Err(format!(
+            "{} changed while irlume was reading it; not touched",
+            path.display()
+        ));
+    }
+    std::fs::remove_file(path).map_err(|e| format!("rm {}: {e}", path.display()))
 }
 
 pub(super) fn mode_uid_gid(meta: &std::fs::Metadata) -> (u32, u32, u32) {
@@ -473,6 +599,7 @@ pub(super) fn write_atomic_inner(
     path: &Path,
     contents: &str,
     attrs: Option<(u32, u32, u32)>,
+    expected: Option<&[u8]>,
 ) -> Result<(), String> {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
@@ -506,7 +633,9 @@ pub(super) fn write_atomic_inner(
         // Immediately before the name is taken over, not once at the start. The
         // first look and the rename are two moments, and what matters is what
         // the name refers to at the instant it is replaced.
-        if inspect_target(path)? != before {
+        if inspect_target(path)? != before
+            || expected.is_some_and(|want| std::fs::read(path).ok().as_deref() != Some(want))
+        {
             return Err(format!(
                 "{} changed while irlume was writing it, so it was left alone",
                 path.display()

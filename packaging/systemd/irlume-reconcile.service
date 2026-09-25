@@ -7,8 +7,10 @@ Documentation=https://github.com/archledger/irlume
 # first install) is still caught on the next boot. No ConditionPathExists: the
 # command self-gates. With no marker it either ADOPTS an existing wiring into a
 # marker (an upgrade from a pre-marker version) or exits; with a marker it
-# re-adds only the greeter lines that went missing. Idempotent; the password
-# stays the fallback throughout.
+# re-applies the recorded wiring when a surface lost it, and rebuilds an
+# /etc/pam.d override irlume made from a vendor file when that vendor file
+# changed and nobody edited the override (one with an administrator's lines is
+# never rebuilt). Idempotent; the password stays the fallback throughout.
 
 [Service]
 Type=oneshot

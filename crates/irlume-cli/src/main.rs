@@ -4966,6 +4966,45 @@ fn doctor_run(
             unwired_login_line(&user, crate::nixos::host_is_nixos())
         );
     }
+    // irlume's own /etc copies of vendor PAM files: whether each is in step
+    // with its vendor copy. Emitted on every run; `pass` covers a machine with
+    // none. The detail names services only, never paths.
+    let override_reports = crate::pamwire::override_reports();
+    let worst = override_reports
+        .iter()
+        .map(|r| r.level)
+        .max()
+        .unwrap_or(crate::pamwire::OverrideLevel::Pass);
+    for r in &override_reports {
+        dout!(
+            report,
+            "[doctor] {} login override {}: {}",
+            if r.level == crate::pamwire::OverrideLevel::Warn {
+                "⚠"
+            } else {
+                "·"
+            },
+            r.service,
+            r.note
+        );
+    }
+    // Joined with a separator no note contains, so a reader can split the
+    // detail back into one note per service.
+    let override_detail = override_reports
+        .iter()
+        .map(|r| format!("{}: {}", r.service, r.note))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let override_state = match worst {
+        crate::pamwire::OverrideLevel::Warn => State::Warn,
+        crate::pamwire::OverrideLevel::Info => State::Info,
+        crate::pamwire::OverrideLevel::Pass => State::Pass,
+    };
+    if override_detail.is_empty() {
+        report.check("login-overrides", override_state);
+    } else {
+        report.check_detail("login-overrides", override_state, override_detail);
+    }
     // A brand-new or renamed display manager irlume has no PAM mapping for:
     // `login enable` can't target it, so face login there quietly stays on the
     // password no matter how the reconcile self-heal runs. `active_display_manager`

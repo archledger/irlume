@@ -311,6 +311,53 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume login enable` and the reconcile unit no longer rebuild an
+  `/etc/pam.d` file that irlume created from a vendor copy in
+  `/usr/lib/pam.d` when it has lines irlume did not write. Before, a
+  reconcile run for another service, for example after installing GDM,
+  rebuilt such a file from the vendor copy and dropped a hand-added line
+  without a message. Each file irlume creates now records, in a second
+  header line, the SHA-256 of its vendor file and of every line in it
+  except irlume's own. In a file with other lines irlume updates only its
+  own, and keeps each of them on the same side of every line an
+  administrator added (a faillock or group gate above irlume's `sudo` or
+  `polkit-1` line stays above it); `login enable` shows how the file
+  differs from the vendor copy, and only `login enable --apply --force`
+  rebuilds it, keeping the previous file as `<file>.pre-irlume`. `login
+  disable` keeps such a file and removes irlume's lines from it; when a
+  numeric jump in the other lines counts irlume's lines (an `[success=2
+  default=ignore]` or `[default=1]` written around them), it turns them
+  into inactive `pam_permit.so` lines in the same places instead, so every
+  jump still lands where it did, and it does the same when it could not
+  tell where to put them back without them; a jump from the vendor file
+  that irlume's lines had moved lands where the vendor file has it again.
+  An update of irlume's lines that would move such a jump, or move one of
+  irlume's lines past an administrator's line, is not made, and `login
+  enable` then exits 1. A comment added to a vendor line, or a blank or
+  comment line, is not counted as an administrator's line; a line the file
+  has more often than its vendor copy is, in every copy. When irlume's
+  lines are not in such a file, `login enable` puts them next to its
+  password line, below every line above it, or leaves the file unwired and
+  says why. A file nobody edited is rebuilt when its vendor copy changes,
+  by the reconcile unit and without re-applying the wiring, so vendor
+  updates reach files created from now on; until it runs, the TUI's
+  Diagnostics page shows a "Vendor PAM update" warning with the reconcile
+  fix. A file an earlier release wrote gets the second line at the first
+  reconcile when it still matches its vendor copy; one that no longer
+  matches, such as a Fedora `plasmalogin` file written before the
+  `pam_oo7` lines were added, is kept and reported by `irlume doctor` (new
+  check `login-overrides`) and `irlume login status`, and `login enable
+  --apply --force` rebuilds it. A file whose vendor copy is gone is
+  treated as the service's only configuration: irlume updates its lines in
+  place (in one nobody edited, where a rebuild would put them) and never
+  deletes it, and `login rollback` refuses to (`login verify` reports it
+  as `changed-since-apply`). An override saved with CRLF line endings,
+  which PAM does not read, is reported by `irlume doctor` and rewritten
+  with LF endings by `login enable --apply`. `login plan` counts a vendor
+  file change between plan and apply as a change to the machine, so
+  existing plan ids change once. New change ids `rewire-override` and
+  `keep-edited-override` (follows up #847).
+
 - The System Settings module keeps each page's rows in order and its
   buttons outside the lists, fits narrow windows, shows the Diagnostics
   severity headers with plain titles and state icons, explains checks

@@ -43,9 +43,12 @@ sudo irlume login enable --with-polkit --apply   # wire pam_irlume into polkit-1
 ```
 
 This adds one verify-only line to the `polkit-1` PAM stack (Fedora gets an
-`/etc/pam.d/polkit-1` override of the vendor file; Debian and Arch get an
-edit-in-place with a `.pre-irlume` backup). `sudo irlume login disable --apply`
-removes it along with everything else, flag or no flag.
+`/etc/pam.d/polkit-1` override of the vendor file, rebuilt when the vendor
+file changes unless you added lines to it; one written by an earlier release
+that no longer matches its vendor file is kept and reported by `irlume
+doctor`; Debian and Arch get an edit-in-place with a `.pre-irlume` backup).
+`sudo irlume login disable --apply` removes it along with everything else,
+flag or no flag.
 
 With the default policy, type hidden literal `yes` for one face attempt.
 Automatic PAD remains mandatory before a face grant. Head gestures have been

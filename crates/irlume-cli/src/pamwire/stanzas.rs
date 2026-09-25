@@ -87,6 +87,26 @@ pub(super) const FP_GKR_SESSION: &str =
 pub(super) const RESEAL_SESSION: &str =
     "session    optional                     pam_irlume.so reseal";
 
+/// Tag on the inactive line that holds the place of one of irlume's lines in
+/// an override kept after disable, followed by that line's job (`unseal`,
+/// `keyring`, `reseal`, or nothing for a verify stanza).
+pub(super) const INERT_TAG: &str = "# irlume-inert";
+
+/// The inactive line [`INERT_TAG`] marks. `pam_permit.so` under
+/// `[default=ignore]` changes nothing whatever it returns, so a stack with
+/// these in place of irlume's lines runs exactly as the wired one does when
+/// pam_irlume.so returns `PAM_IGNORE`, and every numeric jump in it still
+/// counts the same lines. `pam_permit.so` ships with Linux-PAM, so the line
+/// outlives an uninstall harmlessly.
+pub(super) fn inert_line(phase: &str, role: &str) -> String {
+    let tag = if role.is_empty() {
+        INERT_TAG.to_string()
+    } else {
+        format!("{INERT_TAG} {role}")
+    };
+    format!("{phase:<11}[default=ignore]             pam_permit.so   {tag}")
+}
+
 /// The plain verify stanza, shared by `sudo` and polkit prompts (Bitwarden vault
 /// unlock, pkexec, systemd unit control): no `unseal` (the daemon refuses
 /// credential release for both classes anyway) and no mode arg (each surface runs

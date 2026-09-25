@@ -28,12 +28,57 @@ The surfaces irlume can wire, and what puts each in scope:
 | Terminal privilege (`sudo`) | `sudo` | opt-in `--with-sudo` |
 | App consent prompts (pkexec, Bitwarden) | `polkit-1` | opt-in `--with-polkit` |
 
-Real `/etc/pam.d` files are backed up to `*.pre-irlume` before editing;
-services a distribution ships only in `/usr/lib/pam.d` (plasmalogin,
+Real `/etc/pam.d` files are backed up to `*.pre-irlume` before editing.
+Services a distribution ships only in `/usr/lib/pam.d` (plasmalogin,
 cosmic-greeter and polkit-1 on Fedora; greetd and gdm-password on Fedora
 45; kde on Arch; sddm, gdm-password, lightdm and sudo on openSUSE
-Tumbleweed) get an `/etc` override materialized from the vendor copy. Both
-revert cleanly.
+Tumbleweed) get an `/etc` override created from the vendor copy. Its second
+line records the SHA-256 of the vendor file and of every line in the override
+except irlume's own. irlume rebuilds an override nobody edited when the vendor
+file changes, so distribution updates still reach it. Where irlume's lines
+sit is not part of that record: if you move one of them in an override you
+did not otherwise edit, the next rebuild puts it back where irlume puts it.
+
+In an override that has lines irlume did not write, irlume changes only its
+own lines and does not rebuild it from a newer vendor file; `irlume login
+enable` shows how the two differ, and `sudo irlume login enable --apply
+--force` rebuilds it, keeping the previous file as `<file>.pre-irlume` (add
+`--with-sudo` or `--with-polkit` for those two services). irlume's lines keep
+their side of each of your lines: a faillock or group gate you put above
+irlume's line stays above it. A comment you add to a vendor line, or a blank
+or comment line, does not count as a line of yours; a copy of a vendor line
+does, and so does the vendor's own copy of it, since irlume cannot tell the
+two apart. An update that would move one of irlume's lines past one of yours,
+or change where a numeric jump in your lines lands (an
+`[success=2 default=ignore]` that counts irlume's lines), is not made: the
+file is kept as it is, `irlume login enable` says why and exits 1, and irlume's
+earlier lines stay in effect until you adjust your line or rebuild the file.
+When irlume's lines are not in such a file at all (after a disable, or taken
+out by hand), `irlume login enable` puts them next to the file's password
+line (the `include` or `substack` of the shared password stack) and below
+every line above it; when it cannot tell which line that is, it leaves the
+file unwired and says so.
+
+An override written by a release before this tracking gets the line at the
+first reconcile when it still matches its vendor copy. One that no longer
+matches (the vendor file changed after irlume wrote it, or you added a line)
+is kept as it is and reported by `irlume doctor` (check `login-overrides`);
+`sudo irlume login enable --apply --force` rebuilds it the same way. That
+includes one that only lacks lines a later vendor file added, since irlume
+cannot tell those from lines removed on purpose.
+
+If a package removes the vendor copy, the override is the service's only
+configuration: irlume then updates its own lines in place and never deletes
+the file. In one nobody edited, irlume's lines go where a rebuild from that
+file would put them. In one with lines you added, irlume cannot tell yours
+from the vendor's without the vendor file, so it moves none of its lines past
+any line; `irlume login enable` says so, and putting the vendor file back
+(reinstalling its package) lets it tell them apart again.
+
+PAM reads a carriage return as part of the line, so an override saved with
+CRLF line endings refuses every login through its service. `irlume doctor`
+reports it, and `sudo irlume login enable --apply` rewrites it with LF
+endings, keeping every line.
 
 ## Stop face everywhere
 
@@ -45,7 +90,21 @@ This unwires every greeter and the lock screen, and removes the `sudo` and
 `polkit-1` lines whether or not you opted in originally. It also:
 
 - restores the original stacks (moves the `.pre-irlume` backup back, or
-  deletes the `/etc` override so the vendor file shows through again),
+  deletes the `/etc` override so the vendor file shows through again). An
+  override with lines irlume did not write is kept instead: irlume removes
+  only its own lines from it, prints how it differs from the vendor copy, and
+  leaves the file for you to delete. When a numeric jump in your lines counts
+  irlume's lines, removing them would make it land elsewhere, so irlume turns
+  them into inactive `pam_permit.so` lines tagged `# irlume-inert` in the
+  same places instead; the stack then runs as it does when irlume's module
+  declines, and a later `disable` removes them once the jump no longer
+  counts them. It does the same when it could not tell where to put its
+  lines back without them (the file has no password line irlume can tell
+  from one of yours, such as a copy of the vendor's), so the next `enable`
+  puts them back in the same places. A numeric jump from the vendor file that irlume's lines had
+  moved lands where the vendor file has it again once they are removed. An
+  override whose vendor copy is gone is kept the same way, since PAM has
+  nothing else for that service,
 - removes the SELinux module on Fedora (`semodule -r irlume`, checked: a
   failure is reported, not papered over),
 - clears the self-heal marker, so the reconcile unit stops re-wiring after
@@ -53,6 +112,15 @@ This unwires every greeter and the lock screen, and removes the `sudo` and
 
 Enrollment data and the daemon stay in place; re-enabling later is one
 command and no re-enrollment.
+
+While login is enabled, deleting irlume's `/etc` override for the active
+login screen, the KDE lock screen, `sudo` or `polkit-1` does not turn face off
+for that service: the reconcile unit treats the missing file as a regression
+and creates it again from the current vendor copy. That is a way to reset one
+of those overrides to the vendor file. An override for a login screen that is
+not the active one is not re-created until the next `irlume login enable`. To
+go back to the vendor files for good, run `sudo irlume login disable
+--apply`.
 
 ## Keep some surfaces
 

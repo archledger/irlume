@@ -370,7 +370,9 @@ pub(super) fn wire_verify_service(content: &str) -> (String, bool) {
 /// current daemons cancel only via the wire's explicit-cancel arm). Migration of an
 /// older plain-`sufficient` install to the abort=die control is handled UPSTREAM by
 /// [`super::wire_service`], which strips every irlume line with [`unwire_lines`] and
-/// then calls this on the clean base, so this only ever INSERTS. There is
+/// then calls this on the clean base, so this only ever INSERTS (in an override
+/// with an administrator's lines above the anchor, `overrides.rs` then puts the
+/// new stanza in the old one's place instead of above those lines). There is
 /// deliberately no in-place upgrade branch: with the pre-strip it would be dead
 /// code (the base never carries an irlume line), and a `.position`-based rewrite
 /// would miss a second stray irlume line and leave a plain-`sufficient` control
@@ -399,6 +401,24 @@ pub(super) fn wire_polkit_service(content: &str) -> (String, bool) {
     (format!("{}\n", out.join("\n")), true)
 }
 
+/// Whether this stack line is one of irlume's: a directive naming the module,
+/// the pam_permit landing irlume tagged, an inactive pam_permit line holding
+/// the place of one of irlume's lines ([`INERT_TAG`]), or a gnome-keyring line
+/// irlume tagged. Exactly the lines [`unwire_lines`] removes.
+pub(super) fn is_irlume_line(l: &str) -> bool {
+    // The module is matched on the DIRECTIVE (what PAM tokenizes), so a
+    // module named only in a comment is never stripped. The tags are
+    // matched on the RAW line, because that is where they live; they
+    // are comments, invisible to PAM by design.
+    let d = directive(l);
+    d.contains(MODULE)
+        || (d.contains("pam_permit.so")
+            && (l.contains("# irlume-landing") || l.contains(INERT_TAG)))
+        // Only the gnome-keyring lines WE tagged; a distro-shipped
+        // keyring line carries no tag and must survive unwiring.
+        || (d.contains("pam_gnome_keyring.so") && l.contains(KEYRING_TAG))
+}
+
 /// Remove every irlume line AND the pam_permit landing we added (used only when
 /// no backup exists; the backup-restore path is preferred).
 pub(super) fn unwire_lines(content: &str) -> (String, bool) {
@@ -408,16 +428,7 @@ pub(super) fn unwire_lines(content: &str) -> (String, bool) {
     let kept: Vec<&str> = content
         .lines()
         .filter(|l| {
-            // The module is matched on the DIRECTIVE (what PAM tokenizes), so a
-            // module named only in a comment is never stripped. The tags are
-            // matched on the RAW line, because that is where they live; they
-            // are comments, invisible to PAM by design.
-            let d = directive(l);
-            let drop = d.contains(MODULE)
-                || (d.contains("pam_permit.so") && l.contains("# irlume-landing"))
-                // Only the gnome-keyring lines WE tagged; a distro-shipped
-                // keyring line carries no tag and must survive unwiring.
-                || (d.contains("pam_gnome_keyring.so") && l.contains(KEYRING_TAG));
+            let drop = is_irlume_line(l);
             if drop {
                 changed = true;
             }

@@ -81,8 +81,8 @@ pub(crate) struct SurfaceRecord {
     /// Wiring creates a backup and unwiring renames it back over the live file,
     /// so both change a second path the record would otherwise never mention.
     /// An undo that does not know about a file cannot undo it, and the leftover
-    /// is not inert: a later enable rebuilds from the backup as its origin, so a
-    /// stale one silently discards whatever an administrator changed in between.
+    /// is not inert: a later disable compares it with the stack to choose
+    /// between restoring it and stripping irlume's lines in place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) sidecar: Option<SidecarRecord>,
 }
@@ -94,10 +94,8 @@ pub(crate) struct SidecarRecord {
     /// The backup's digest as apply left it.
     ///
     /// Rollback used to restore the backup with no check at all, so a backup an
-    /// administrator or a package replaced afterwards was silently overwritten —
-    /// the same defect the surface's own digest exists to prevent, and worse in
-    /// one way: a later enable rebuilds the live stack FROM the backup, so a
-    /// wrong one propagates into PAM at the next enable.
+    /// administrator or a package replaced afterwards was silently overwritten:
+    /// the same defect the surface's own digest exists to prevent.
     ///
     /// Absent on records written before this field existed, in which case the
     /// backup is restored unchecked as it was then; the schema gate is what
@@ -594,9 +592,8 @@ pub(crate) fn unchanged_since_apply_excluding(
     }
     // The backup counts as part of the surface. Rollback restores it too, so
     // leaving it out of the check meant a backup an administrator or a package
-    // replaced afterwards was silently overwritten — and a later `login enable`
-    // rebuilds the LIVE stack from the backup, so a wrong one reaches PAM at the
-    // next enable rather than sitting inert.
+    // replaced afterwards was silently overwritten, and a later disable would
+    // then compare the stack with a file nobody chose.
     //
     // Asked here rather than in the restore loop so it refuses BEFORE anything
     // is written: a rollback that stops halfway through is the thing the blanket

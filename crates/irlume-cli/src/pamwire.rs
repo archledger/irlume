@@ -12,11 +12,14 @@
 //! FAIL-SAFE: every face line is `[success=1 default=ignore]` or `sufficient`,
 //! so the password is always the floor; wiring cannot lock the user out.
 //!
-//! Two file strategies: real `/etc/pam.d` files (gdm-password/sddm/lightdm/sudo)
-//! are backed up to `*.pre-irlume` and edited in place (restore = move the backup
-//! back); vendor-only files (plasmalogin/kde-fingerprint, shipped in
-//! `/usr/lib/pam.d`) get an `/etc` override materialized from the vendor copy and
-//! marked (revert = delete the override).
+//! Two file strategies: real `/etc/pam.d` files are backed up to `*.pre-irlume`
+//! and edited in place (restore = move the backup back). A service a
+//! distribution ships only in `/usr/lib/pam.d` (plasmalogin and polkit-1 on
+//! Fedora, kde on Arch, sudo on openSUSE Tumbleweed, and others) gets an `/etc`
+//! override made from the vendor copy. Its header records the vendor file and
+//! the lines irlume wrote (`pamwire/overrides.rs`), so an override nobody
+//! edited follows vendor updates and is deleted on disable, while one with an
+//! administrator's lines keeps them: irlume then changes only its own lines.
 
 use irlume_common::platform::{distro_family, DistroFamily, SystemCommand};
 use std::path::{Path, PathBuf};
@@ -33,9 +36,13 @@ use std::process::{Command, ExitCode};
 // face/fingerprint split would put one ordering invariant under two owners.
 mod files;
 mod grammar;
+mod overrides;
 mod report;
 mod stanzas;
 mod transform;
+
+#[cfg(test)]
+mod override_tests;
 
 use files::*;
 use grammar::*;
@@ -46,18 +53,22 @@ use transform::*;
 // Re-exported for the rest of the CLI, which reaches these as `pamwire::…`.
 // A glob `use` binds names privately, so the public surface is listed here
 // rather than inherited, which also keeps that surface visible in one place.
+#[cfg(test)]
+pub(crate) use files::restore_surface_with;
 pub(crate) use files::{is_managed_path, lock_pam, restore_surface};
 // The PAM-grammar items shared outside this module: `fingerprint.rs` and the
 // TUI must read stack lines with the same comment and rule-field semantics
 // the wiring uses, or the two would disagree about what a file configures.
 pub(crate) use grammar::{directive, directive_has_auth_module, has_line_continuation};
+pub(crate) use overrides::Level as OverrideLevel;
 pub(crate) use report::{
     keyring_handoff_warnings, login_manager_fact, status_report, surface_facts, HandoffWarning,
 };
 pub(crate) use stanzas::BACKUP;
 
-/// A PAM service to wire. `vendor=Some` → materialize an /etc override from the
-/// vendor copy; `vendor=None` → back up and edit the real /etc file.
+/// A PAM service to wire. With `vendor` set and no administrator's `/etc` file,
+/// irlume keeps an `/etc` override made from the vendor copy; otherwise it
+/// backs up and edits the real `/etc` file.
 struct Svc {
     etc: &'static str,
     vendor: Option<&'static str>,
@@ -244,10 +255,25 @@ const POLKIT: Svc = Svc {
 
 // ---- CLI entry ---------------------------------------------------------------
 
+const LOGIN_USAGE: &str =
+    "usage: irlume login <status|enable|disable|reconcile> [--with-sudo] [--with-polkit] [--apply] [--force]";
+
 pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
     let apply = args.iter().any(|a| a == "--apply");
     let with_sudo = args.iter().any(|a| a == "--with-sudo");
     let with_polkit = args.iter().any(|a| a == "--with-polkit");
+    let force = args.iter().any(|a| a == "--force");
+    // `--force` rebuilds overrides an administrator edited. Only a person
+    // running `enable` may ask for that; reconcile runs unattended, and a
+    // status must never be mistaken for a way to apply it.
+    if force && !matches!(action, Some("enable" | "disable")) {
+        eprintln!("{LOGIN_USAGE}");
+        eprintln!("  (--force applies to login enable only)");
+        return ExitCode::from(2);
+    }
+    if force && action == Some("disable") {
+        eprintln!("[login] note: --force applies to login enable only");
+    }
     // On NixOS the system configuration generates the stacks, and the flake
     // module writes irlume's rules. Refused ahead of the root check, the PAM
     // lock and the capability reading, so nothing is asked for or touched.
@@ -263,13 +289,11 @@ pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
             eprintln!("{}", crate::nixos::LOGIN_REFUSAL);
             ExitCode::FAILURE
         }
-        Some("enable") => act(true, apply, with_sudo, with_polkit),
-        Some("disable") => act(false, apply, with_sudo, with_polkit),
+        Some("enable") => act(true, apply, with_sudo, with_polkit, force),
+        Some("disable") => act(false, apply, with_sudo, with_polkit, false),
         Some("reconcile") => reconcile(),
         _ => {
-            eprintln!(
-                "usage: irlume login <status|enable|disable|reconcile> [--with-sudo] [--with-polkit] [--apply]"
-            );
+            eprintln!("{LOGIN_USAGE}");
             eprintln!("  (without --apply, prints what it WOULD change: a dry run)");
             ExitCode::from(2)
         }
@@ -386,9 +410,11 @@ pub(crate) fn read_wired_marker() -> Option<WiredMarker> {
 }
 
 /// Idempotent repair entry point, meant to run unattended from a systemd path
-/// unit watching the greeter PAM files. If login was enabled (marker present)
-/// but the PAM stack is no longer wired, re-apply the recorded configuration;
-/// otherwise exit quietly. Always root (the path unit's service runs as root).
+/// unit watching the greeter PAM files. If login was enabled (marker present),
+/// first keep irlume's own overrides in step with their vendor files (see
+/// `maintain_overrides`); then, if the PAM stack is no longer wired, re-apply
+/// the recorded configuration; otherwise exit quietly. Always root (the path
+/// unit's service runs as root).
 fn reconcile() -> ExitCode {
     // This unit fires when a PAM file changes, which is exactly what every other
     // irlume path does, so without the lock reconcile is the most likely thing
@@ -473,6 +499,289 @@ fn reconcile() -> ExitCode {
              (sudo={with_sudo}, polkit={with_polkit})"
         );
     }
+    // Overrides irlume created from vendor files are kept in step with those
+    // files here, before the regression checks and without asking the daemon:
+    // a matching file written by an older release gets its tracking line, and
+    // one nobody edited is rebuilt from a changed vendor copy with the settings
+    // its irlume lines already have. An override with lines irlume did not
+    // write is never written here. None of this starts a re-apply.
+    let maintained = effective_uid() != 0 || maintain_overrides();
+    let code = reconcile_wiring(with_sudo, with_polkit, with_lock, face_lock_intent);
+    if maintained {
+        code
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Every surface with a vendor path, with the recipe its override takes.
+fn override_surfaces() -> Vec<(&'static Svc, overrides::Recipe)> {
+    GREETERS
+        .iter()
+        .filter(|s| s.vendor.is_some())
+        .map(|s| (s, overrides::Recipe::Greeter))
+        .chain([
+            (&LOCKSCREEN, overrides::Recipe::Lock),
+            (&SUDO, overrides::Recipe::Verify),
+            (&POLKIT, overrides::Recipe::Polkit),
+        ])
+        .collect()
+}
+
+/// Reconcile's maintenance step over every override on this machine. Returns
+/// false when a write failed, which fails the run.
+fn maintain_overrides() -> bool {
+    let mut ok = true;
+    for (svc, recipe) in override_surfaces() {
+        match maintain_override(svc, recipe) {
+            Ok(Some(line)) => eprintln!("{line}"),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("[login] ✗ {e}");
+                ok = false;
+            }
+        }
+    }
+    ok
+}
+
+/// Whether a failed write is the administrator's choice rather than a fault:
+/// a file made immutable (`chattr +i`, EPERM) or a read-only mount (EROFS).
+/// Reconcile then leaves the file alone and says so, instead of failing the
+/// unit at every timer run; doctor keeps reporting the pending update.
+fn write_refused_by_admin(error: &str) -> bool {
+    [
+        std::io::Error::from_raw_os_error(1).to_string(),
+        std::io::Error::from_raw_os_error(30).to_string(),
+    ]
+    .iter()
+    .any(|reason| error.ends_with(reason.as_str()))
+}
+
+/// The maintenance step for one surface: the line to log when it wrote.
+fn maintain_override(svc: &Svc, recipe: overrides::Recipe) -> Result<Option<String>, String> {
+    let (etc, Some(vendor_path)) = (Path::new(svc.etc), svc.vendor) else {
+        return Ok(None);
+    };
+    // A symlink or a file with several names is refused by every write here;
+    // skipping it keeps the unit from failing every half hour over a file
+    // doctor already reports.
+    if !file_is_created_override(etc) || inspect_target(etc).is_err() {
+        return Ok(None);
+    }
+    let Some(current) = read_optional(etc)? else {
+        return Ok(None);
+    };
+    let vendor = match read_optional(Path::new(vendor_path)) {
+        Ok(vendor) => vendor,
+        // Unreadable is not absent; leave the file for doctor to report.
+        Err(_) => return Ok(None),
+    };
+    let (content, done) =
+        match overrides::maintenance(recipe, &current, vendor_path, vendor.as_deref()) {
+            overrides::Maintenance::Record(content) => (
+                content,
+                format!("recorded {vendor_path} in the override header; no PAM line changed"),
+            ),
+            overrides::Maintenance::Refresh(content) => (
+                content,
+                format!(
+                "rebuilt from {vendor_path}, which changed since irlume created this override; \
+                 irlume's lines keep their settings"
+            ),
+            ),
+            overrides::Maintenance::Nothing | overrides::Maintenance::Blocked(_) => {
+                return Ok(None)
+            }
+        };
+    match write_atomic_checked(etc, &content, Some(&current)) {
+        Ok(()) => Ok(Some(format!("[login] {}: {done}", svc.etc))),
+        Err(e) if write_refused_by_admin(&e) => Ok(Some(format!(
+            "[login] ⚠ {}: left as it is, since it cannot be written ({e})",
+            svc.etc
+        ))),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether reconcile's maintenance step would rebuild an override from a
+/// changed vendor copy: the TUI offers the reconcile for it. Kept apart from
+/// [`reconcile_needed`], which means the wiring was lost and logins fall back
+/// to the password; here the wiring works and only a vendor update waits.
+/// Recording a tracking line is not offered (it changes no PAM line), nor is an
+/// edited override (reconcile never writes one, so offering it would loop).
+pub(crate) fn override_refresh_due() -> bool {
+    if crate::nixos::host_is_nixos() {
+        return false;
+    }
+    let stat = std::fs::symlink_metadata(wired_marker_path())
+        .map(|_| ())
+        .map_err(|e| e.kind());
+    if !marked_for_maintenance(stat, || read_wired_marker().is_some(), login_wired) {
+        return false;
+    }
+    override_surfaces()
+        .into_iter()
+        .any(|(svc, recipe)| refresh_due_for(svc, recipe))
+}
+
+/// Whether reconcile would run its maintenance step, as far as this process
+/// can tell. Reconcile maintains overrides only with a marker, which lives in
+/// the root-only state directory: the TUI runs as the person and usually
+/// cannot even see whether it exists (`stat` is refused). The wiring itself
+/// is readable, and a rebuild needs irlume's lines in the file anyway, so a
+/// marker that cannot be looked at is judged by that.
+fn marked_for_maintenance(
+    stat: Result<(), std::io::ErrorKind>,
+    marker: impl FnOnce() -> bool,
+    wired: impl FnOnce() -> bool,
+) -> bool {
+    match stat {
+        Ok(()) => marker(),
+        Err(std::io::ErrorKind::NotFound) => false,
+        Err(_) => wired(),
+    }
+}
+
+/// [`override_refresh_due`] for one surface: the same reads and the same pure
+/// decision [`maintain_override`] takes, so the offer and the repair agree.
+fn refresh_due_for(svc: &Svc, recipe: overrides::Recipe) -> bool {
+    let etc = Path::new(svc.etc);
+    let Some(vendor_path) = svc.vendor else {
+        return false;
+    };
+    if !file_is_created_override(etc) || inspect_target(etc).is_err() {
+        return false;
+    }
+    let (Ok(Some(current)), Ok(vendor)) =
+        (read_optional(etc), read_optional(Path::new(vendor_path)))
+    else {
+        return false;
+    };
+    matches!(
+        overrides::maintenance(recipe, &current, vendor_path, vendor.as_deref()),
+        overrides::Maintenance::Refresh(_)
+    )
+}
+
+/// One override that needs attention, for doctor and `login status`.
+pub(crate) struct OverrideReport {
+    /// The PAM service name. Never a path: doctor's detail is machine output.
+    pub(crate) service: &'static str,
+    /// The `/etc` path, for the human `login status` report only.
+    pub(crate) path: &'static str,
+    pub(crate) level: overrides::Level,
+    pub(crate) note: String,
+}
+
+/// Every irlume-created override that is not simply in step with its vendor
+/// copy, and why.
+pub(crate) fn override_reports() -> Vec<OverrideReport> {
+    override_surfaces()
+        .into_iter()
+        .filter_map(|(svc, recipe)| {
+            let etc = Path::new(svc.etc);
+            let vendor_path = svc.vendor?;
+            if !file_is_created_override(etc) {
+                return None;
+            }
+            let service = service_name(svc.etc);
+            let report = |level, note: String| {
+                Some(OverrideReport {
+                    service,
+                    path: svc.etc,
+                    level,
+                    note,
+                })
+            };
+            if let Err(why) = inspect_target(etc) {
+                return report(
+                    overrides::Level::Info,
+                    format!("not maintained: {}", why.replace(svc.etc, "the file")),
+                );
+            }
+            let current = match read_optional(etc) {
+                Ok(Some(current)) => current,
+                Ok(None) => return None,
+                // Informational: an unprivileged doctor may simply lack the
+                // permission, which is no fault of the file.
+                Err(_) => {
+                    return report(overrides::Level::Info, "cannot be read here".to_string());
+                }
+            };
+            let vendor = match read_optional(Path::new(vendor_path)) {
+                Ok(vendor) => vendor,
+                Err(_) => {
+                    return report(
+                        overrides::Level::Info,
+                        "its vendor copy cannot be read here".to_string(),
+                    );
+                }
+            };
+            let siblings: Vec<String> = [".rpmnew", ".pacnew", ".dpkg-dist"]
+                .iter()
+                .map(|suffix| format!("{service}{suffix}"))
+                .filter(|name| etc.with_file_name(name).exists())
+                .collect();
+            // A `.pre-irlume` holding another file stops `--force`, so the
+            // note that suggests it says to move that file first.
+            let backup_name = format!("{service}{BACKUP}");
+            let stale_backup = matches!(
+                read_optional(&etc.with_file_name(&backup_name)),
+                Ok(Some(backup)) if backup != current
+            );
+            match overrides::assess(
+                recipe,
+                &current,
+                vendor_path,
+                vendor.as_deref(),
+                &siblings,
+                stale_backup.then_some(backup_name.as_str()),
+                scope_flag(svc.etc),
+            ) {
+                (overrides::Level::Pass, _) | (_, None) => None,
+                (level, Some(note)) => report(level, note),
+            }
+        })
+        .collect()
+}
+
+/// Whether deleting `path` would leave its service with no PAM configuration:
+/// the file is a surface's `/etc` copy and that surface's vendor file is gone
+/// (or cannot be seen). PAM then falls back to `other`, which denies, so every
+/// login through that service fails, the password included. Verify, the
+/// rollback precheck and the restore itself ask this before a rollback would
+/// remove a file apply created.
+pub(crate) fn removal_orphans_service(path: &Path) -> bool {
+    let pairs: Vec<(&str, &str)> = override_surfaces()
+        .iter()
+        .filter_map(|(svc, _)| Some((svc.etc, svc.vendor?)))
+        .collect();
+    removal_orphans_in(&pairs, path)
+}
+
+/// [`removal_orphans_service`] over a given list of `(etc, vendor)` paths, so
+/// a test can name surfaces under a temporary root.
+pub(crate) fn removal_orphans_in(surfaces: &[(&str, &str)], path: &Path) -> bool {
+    surfaces
+        .iter()
+        .find(|(etc, _)| Path::new(etc) == path)
+        .is_some_and(|(_, vendor)| removal_orphans_for(path.exists(), Path::new(vendor).exists()))
+}
+
+/// Testable core of [`removal_orphans_in`].
+fn removal_orphans_for(file_exists: bool, vendor_exists: bool) -> bool {
+    file_exists && !vendor_exists
+}
+
+/// The rest of reconcile: the regression checks and, when one fires, the
+/// re-apply of the recorded wiring.
+fn reconcile_wiring(
+    with_sudo: bool,
+    with_polkit: bool,
+    with_lock: bool,
+    face_lock_intent: bool,
+) -> ExitCode {
     // #607: the Omarchy lane pair is its own regression shape. The lane facts
     // are read once here and given to both pure cores, so this check and
     // `reconcile_needed` cannot disagree about them.
@@ -507,7 +816,14 @@ fn reconcile() -> ExitCode {
         eprintln!("[login] greeter PAM configuration changed; re-applying irlume wiring");
     }
     // The lock is already held above; taking it again would deadlock.
-    act_holding_lock(true, true, with_sudo, with_polkit, ScopeOrigin::Marker)
+    act_holding_lock(
+        true,
+        true,
+        with_sudo,
+        with_polkit,
+        ScopeOrigin::Marker,
+        false,
+    )
 }
 
 /// Whether the ACTIVE display manager's own greeter service carries the module.
@@ -1098,21 +1414,34 @@ pub(crate) fn plan(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<Plan
         with_sudo,
         with_polkit,
         &mut |svc, role, wire, want| {
-            // A service whose decision cannot even be computed (an unreadable file)
-            // is reported as not-installed rather than omitted: a surface silently
-            // missing from a plan is how a consumer comes to believe it was covered.
-            let change = wire_service(svc, enable && want, false, wire)
-                .map(|outcome| outcome.change)
-                .unwrap_or(PlannedChange::NotInstalled);
-            out.push(PlannedSurface {
-                id: service_name(svc.etc),
-                role,
-                change,
-                state: surface_state(Path::new(svc.etc)),
-            });
+            out.push(plan_surface(svc, role, wire, enable && want));
         },
     );
     out
+}
+
+/// One surface of a plan. `want` is whether this run wants irlume's lines in
+/// it (the action and the configuration together).
+fn plan_surface(
+    svc: &Svc,
+    role: &'static str,
+    wire: &dyn Fn(&str) -> (String, bool),
+    want: bool,
+) -> PlannedSurface {
+    // A service whose decision cannot even be computed (an unreadable file)
+    // is reported as not-installed rather than omitted: a surface silently
+    // missing from a plan is how a consumer comes to believe it was covered.
+    let change = wire_service(svc, want, false, wire)
+        .map(|outcome| outcome.change)
+        .unwrap_or(PlannedChange::NotInstalled);
+    PlannedSurface {
+        id: service_name(svc.etc),
+        role,
+        change,
+        // The vendor file too, for a surface that has one: it decides what an
+        // override becomes, so a vendor update makes the plan stale.
+        state: surface_state_for(svc),
+    }
 }
 
 /// One surface after an apply, with what it took to undo it.
@@ -1262,149 +1591,169 @@ pub(crate) fn apply(
         with_sudo,
         with_polkit,
         &mut |svc, role, wire, want| {
-            let path = Path::new(svc.etc);
-            // Re-check the state THIS surface was planned against, immediately
-            // before writing it. Comparing plan ids once up front leaves a
-            // window: `plan` and `apply` are separate filesystem walks, so a
-            // change landing between them is never compared to anything. Doing
-            // it per surface narrows that window to the gap between this check
-            // and this write, which is as tight as it gets without holding a
-            // lock nothing else in the system takes.
-            // A symlinked surface is refused rather than written. write_atomic
-            // renames over the path, which REPLACES the link with a regular
-            // file, and a rollback restores content rather than the link, so the
-            // conversion is silent and permanent. Writing through the link
-            // instead is no better: on Fedora these point into /etc/authselect
-            // and on Debian into /etc/alternatives, both shared targets that
-            // other tooling owns. Neither choice is irlume's to make quietly.
-            // Asked here as well as inside the write, so the refusal reaches the
-            // consumer as a per-surface state with a reason rather than as one
-            // failed operation. `inspect_target` also covers hard links, which
-            // this check did not: a rename replaces one directory entry and
-            // leaves every other name for the inode on the old content.
-            if let Err(message) = inspect_target(path) {
-                out.push(refused_surface_record(svc, role, path, message));
-                return;
-            }
-            let planned_state = expected
-                .iter()
-                .find(|candidate| candidate.id == service_name(svc.etc))
-                .map(|candidate| candidate.state.as_str());
-            let now = surface_state(path);
-            if let Some(planned_state) = planned_state {
-                if planned_state != now {
-                    out.push(AppliedSurface {
-                        id: service_name(svc.etc),
-                        role,
-                        path: svc.etc.to_string(),
-                        change: PlannedChange::NotInstalled,
-                        before: None,
-                        before_metadata: None,
-                        sidecar_before: None,
-                        sidecar_metadata: None,
-                        sidecar_existed: false,
-                        after_sha256: crate::logintx::ABSENT.to_string(),
-                        sidecar_after_sha256: None,
-                        error: Some(format!(
-                            "{} changed between the plan and the write; not touched",
-                            svc.etc
-                        )),
-                    });
-                    return;
-                }
-            }
-            // A file that exists but cannot be read is NOT the same as an
-            // absent one. Collapsing the two with `.ok()` would record
-            // `before: None`, and a later rollback would then DELETE a file it
-            // never captured. Only a genuine NotFound may become None.
-            let before_metadata = crate::logintx::file_metadata(path);
-            // Wiring creates this and unwiring renames it away, so it is part of
-            // what the transaction changed.
-            let sidecar_path = PathBuf::from(format!("{}{BACKUP}", svc.etc));
-            let sidecar_before = std::fs::read_to_string(&sidecar_path).ok();
-            let sidecar_metadata = crate::logintx::file_metadata(&sidecar_path);
-            let sidecar_existed = sidecar_path.exists();
-            let (before, mut read_error) = match std::fs::read_to_string(path) {
-                Ok(content) => (Some(content), None),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
-                Err(error) => (
-                    None,
-                    Some(format!(
-                        "read {} before changing it: {error}",
-                        path.display()
-                    )),
-                ),
-            };
-            if let Some(message) = read_error {
-                // Not touched at all: without a usable before-state there is
-                // nothing to roll back to, so writing would be irreversible.
-                out.push(AppliedSurface {
-                    id: service_name(svc.etc),
-                    role,
-                    path: svc.etc.to_string(),
-                    change: PlannedChange::NotInstalled,
-                    before: None,
-                    before_metadata: None,
-                    sidecar_before: None,
-                    sidecar_metadata: None,
-                    sidecar_existed: false,
-                    after_sha256: crate::logintx::ABSENT.to_string(),
-                    sidecar_after_sha256: None,
-                    error: Some(message),
-                });
-                return;
-            }
-            let (change, error) = match wire_service(svc, enable && want, true, wire) {
-                Ok(outcome) => (outcome.change, None),
-                Err(message) => (PlannedChange::NotInstalled, Some(message)),
-            };
-            // Same rule after the write: only a real NotFound is ABSENT. An
-            // unreadable file would otherwise record a digest
-            // `unchanged_since_apply` can never match, so rollback would report
-            // drift forever instead of the read problem it actually has.
-            let after_sha256 = match std::fs::read(path) {
-                Ok(bytes) => crate::logintx::sha256_hex(&bytes),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    crate::logintx::ABSENT.to_string()
-                }
-                Err(error) => {
-                    read_error = Some(format!(
-                        "read {} after changing it: {error}",
-                        path.display()
-                    ));
-                    crate::logintx::ABSENT.to_string()
-                }
-            };
-            let error = error.or(read_error);
-            // The same question for the backup: what did apply leave there. A
-            // rollback that overwrites a backup somebody replaced afterwards is
-            // the same defect as one that overwrites a stack, and the backup is
-            // the origin a later enable rebuilds from.
-            let sidecar_after_sha256 = Some(surface_digest(&sidecar_path));
-            out.push(AppliedSurface {
-                id: service_name(svc.etc),
-                role,
-                path: svc.etc.to_string(),
-                change,
-                before,
-                before_metadata,
-                sidecar_before,
-                sidecar_metadata,
-                sidecar_existed,
-                after_sha256,
-                sidecar_after_sha256,
-                error,
-            });
+            out.push(apply_surface(svc, role, wire, enable && want, expected));
         },
     );
     out
 }
 
-fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCode {
+/// A surface recorded as not touched, with the reason.
+fn untouched_record(svc: &Svc, role: &'static str, error: String) -> AppliedSurface {
+    AppliedSurface {
+        id: service_name(svc.etc),
+        role,
+        path: svc.etc.to_string(),
+        change: PlannedChange::NotInstalled,
+        before: None,
+        before_metadata: None,
+        sidecar_before: None,
+        sidecar_metadata: None,
+        sidecar_existed: false,
+        after_sha256: crate::logintx::ABSENT.to_string(),
+        sidecar_after_sha256: None,
+        error: Some(error),
+    }
+}
+
+/// Apply one surface of a machine transaction. `want` is whether this run
+/// wants irlume's lines in it (the action and the configuration together).
+fn apply_surface(
+    svc: &Svc,
+    role: &'static str,
+    wire: &dyn Fn(&str) -> (String, bool),
+    want: bool,
+    expected: &[PlannedSurface],
+) -> AppliedSurface {
+    let path = Path::new(svc.etc);
+    // Re-check the state THIS surface was planned against, immediately
+    // before writing it. Comparing plan ids once up front leaves a
+    // window: `plan` and `apply` are separate filesystem walks, so a
+    // change landing between them is never compared to anything. Doing
+    // it per surface narrows that window to the gap between this check
+    // and this write, which is as tight as it gets without holding a
+    // lock nothing else in the system takes.
+    // A symlinked surface is refused rather than written. write_atomic
+    // renames over the path, which REPLACES the link with a regular
+    // file, and a rollback restores content rather than the link, so the
+    // conversion is silent and permanent. Writing through the link
+    // instead is no better: on Fedora these point into /etc/authselect
+    // and on Debian into /etc/alternatives, both shared targets that
+    // other tooling owns. Neither choice is irlume's to make quietly.
+    // Asked here as well as inside the write, so the refusal reaches the
+    // consumer as a per-surface state with a reason rather than as one
+    // failed operation. `inspect_target` also covers hard links, which
+    // this check did not: a rename replaces one directory entry and
+    // leaves every other name for the inode on the old content.
+    if let Err(message) = inspect_target(path) {
+        return refused_surface_record(svc, role, path, message);
+    }
+    let planned_state = expected
+        .iter()
+        .find(|candidate| candidate.id == service_name(svc.etc))
+        .map(|candidate| candidate.state.as_str());
+    // The state covers the vendor file too: it decides what an override
+    // becomes. The planned vendor digest is also handed to the write, which
+    // compares it with the bytes it actually reads, so the check and the use
+    // cannot see two versions of the vendor file.
+    if let Some(planned_state) = planned_state {
+        if planned_state != surface_state_for(svc) {
+            return untouched_record(svc, role, drift_message(svc));
+        }
+    }
+    // A file that exists but cannot be read is NOT the same as an
+    // absent one. Collapsing the two with `.ok()` would record
+    // `before: None`, and a later rollback would then DELETE a file it
+    // never captured. Only a genuine NotFound may become None.
+    let before_metadata = crate::logintx::file_metadata(path);
+    // Wiring creates this and unwiring renames it away, so it is part of
+    // what the transaction changed.
+    let sidecar_path = PathBuf::from(format!("{}{BACKUP}", svc.etc));
+    let sidecar_before = std::fs::read_to_string(&sidecar_path).ok();
+    let sidecar_metadata = crate::logintx::file_metadata(&sidecar_path);
+    let sidecar_existed = sidecar_path.exists();
+    let (before, mut read_error) = match std::fs::read_to_string(path) {
+        Ok(content) => (Some(content), None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+        Err(error) => (
+            None,
+            Some(format!(
+                "read {} before changing it: {error}",
+                path.display()
+            )),
+        ),
+    };
+    if let Some(message) = read_error {
+        // Not touched at all: without a usable before-state there is
+        // nothing to roll back to, so writing would be irreversible.
+        return untouched_record(svc, role, message);
+    }
+    let opts = WireOpts {
+        apply: true,
+        force: false,
+        expect_vendor: planned_state
+            .filter(|_| svc.vendor.is_some())
+            .and_then(|state| state.split(' ').nth(2))
+            .map(str::to_string),
+    };
+    let (change, error) = match wire_service_with(svc, want, &opts, wire) {
+        Ok(outcome) => (outcome.change, None),
+        Err(message) => (PlannedChange::NotInstalled, Some(message)),
+    };
+    // Same rule after the write: only a real NotFound is ABSENT. An
+    // unreadable file would otherwise record a digest
+    // `unchanged_since_apply` can never match, so rollback would report
+    // drift forever instead of the read problem it actually has.
+    let after_sha256 = match std::fs::read(path) {
+        Ok(bytes) => crate::logintx::sha256_hex(&bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::logintx::ABSENT.to_string()
+        }
+        Err(error) => {
+            read_error = Some(format!(
+                "read {} after changing it: {error}",
+                path.display()
+            ));
+            crate::logintx::ABSENT.to_string()
+        }
+    };
+    let error = error.or(read_error);
+    // The same question for the backup: what did apply leave there. A
+    // rollback that overwrites a backup somebody replaced afterwards is
+    // the same defect as one that overwrites a stack.
+    let sidecar_after_sha256 = Some(surface_digest(&sidecar_path));
+    AppliedSurface {
+        id: service_name(svc.etc),
+        role,
+        path: svc.etc.to_string(),
+        change,
+        before,
+        before_metadata,
+        sidecar_before,
+        sidecar_metadata,
+        sidecar_existed,
+        after_sha256,
+        sidecar_after_sha256,
+        error,
+    }
+}
+
+/// The command a person without root is told to run: the same action and
+/// flags, with `--apply`, so following it literally does what they asked.
+fn sudo_rerun_hint(enable: bool, with_sudo: bool, with_polkit: bool, force: bool) -> String {
+    format!(
+        "sudo irlume login {}{}{} --apply{}",
+        if enable { "enable" } else { "disable" },
+        if with_sudo { " --with-sudo" } else { "" },
+        if with_polkit { " --with-polkit" } else { "" },
+        if force && enable { " --force" } else { "" }
+    )
+}
+
+fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool, force: bool) -> ExitCode {
     if apply && effective_uid() != 0 {
         eprintln!(
-            "[login] applying changes needs root; run: sudo irlume login {} --apply",
-            if enable { "enable" } else { "disable" }
+            "[login] applying changes needs root; run: {}",
+            sudo_rerun_hint(enable, with_sudo, with_polkit, force)
         );
         return ExitCode::FAILURE;
     }
@@ -1422,7 +1771,14 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
     } else {
         None
     };
-    act_holding_lock(enable, apply, with_sudo, with_polkit, ScopeOrigin::Command)
+    act_holding_lock(
+        enable,
+        apply,
+        with_sudo,
+        with_polkit,
+        ScopeOrigin::Command,
+        force,
+    )
 }
 
 /// The body of [`act`], for a caller that ALREADY holds the PAM lock.
@@ -1460,8 +1816,8 @@ enum ScopeOrigin {
 }
 
 /// Whether an opt-in surface asked for on the command line came to nothing:
-/// no stack for it on this machine, or no auth line to anchor to. Such a run
-/// must fail rather than report success with the surface unwired. Reconcile
+/// no stack for it on this machine, or no line irlume can wire next to. Such a
+/// run must fail rather than report success with the surface unwired. Reconcile
 /// only replays what an earlier run observed, and a disable delivers nothing,
 /// so neither counts.
 fn requested_scope_unmet(
@@ -1484,11 +1840,40 @@ fn requested_scope_unmet(
 /// sees before the non-zero exit.
 fn unmet_scope_line(flag: &str, service: &str, change: PlannedChange) -> String {
     let why = if change == PlannedChange::NoAnchor {
-        format!("the {service} PAM service has no auth line to anchor to")
+        format!("irlume finds no line in the {service} PAM service to wire next to")
     } else {
         format!("this machine has no {service} PAM service")
     };
     format!("[login] {flag}: not wired ({why})")
+}
+
+/// The lines one surface prints: its line and, for a person at the terminal,
+/// its detail. Reconcile's output goes to the journal, which gets the line
+/// only.
+fn outcome_lines(outcome: &WireOutcome, origin: ScopeOrigin) -> Vec<String> {
+    let mut lines = vec![format!("  {}", outcome.message)];
+    if origin == ScopeOrigin::Command {
+        if let Some(detail) = &outcome.detail {
+            lines.push(detail.clone());
+        }
+    }
+    lines
+}
+
+fn print_outcome(outcome: &WireOutcome, origin: ScopeOrigin) {
+    for line in outcome_lines(outcome, origin) {
+        println!("{line}");
+    }
+}
+
+/// Whether a surface's irlume lines are not what a person asked for, because
+/// updating or adding them was refused (a method switch refused in an
+/// administrator's override, say): such a run fails, so face that was turned
+/// off does not silently stay on, and a file left unwired is not reported as
+/// done.
+/// Reconcile only replays what an earlier run observed, so it does not count.
+fn kept_unmet(origin: ScopeOrigin, outcome: &WireOutcome) -> bool {
+    origin == ScopeOrigin::Command && outcome.unmet
 }
 
 fn act_holding_lock(
@@ -1497,7 +1882,13 @@ fn act_holding_lock(
     with_sudo: bool,
     with_polkit: bool,
     origin: ScopeOrigin,
+    force: bool,
 ) -> ExitCode {
+    let opts = WireOpts {
+        apply,
+        force: force && enable && origin == ScopeOrigin::Command,
+        expect_vendor: None,
+    };
     if !apply {
         println!("[login] DRY RUN: showing what `--apply` would change (nothing is written):");
     }
@@ -1598,11 +1989,17 @@ fn act_holding_lock(
         }
     }
     let mut errs = 0;
+    let mut kept: Vec<&'static str> = Vec::new();
     let mut do_svc = |s: &Svc, wire: &dyn Fn(&str) -> (String, bool), want: bool| {
         // On enable, wire wanted factors and unwire unwanted ones; on disable,
         // unwire everything (want is ANDed with `enable`).
-        match wire_service(s, enable && want, apply, wire) {
-            Ok(msg) => println!("  {msg}"),
+        match wire_service_with(s, enable && want, &opts, wire) {
+            Ok(outcome) => {
+                print_outcome(&outcome, origin);
+                if kept_unmet(origin, &outcome) {
+                    kept.push(s.etc);
+                }
+            }
             Err(e) => {
                 eprintln!("  ✗ {e}");
                 errs += 1;
@@ -1657,9 +2054,12 @@ fn act_holding_lock(
     // every other surface was handled, and the marker records what is wired.
     let mut unmet: Vec<(&str, &str, PlannedChange)> = Vec::new();
     if sudo_in_scope(enable, with_sudo) {
-        match wire_service(&SUDO, enable, apply, &wire_verify_service) {
+        match wire_service_with(&SUDO, enable, &opts, &wire_verify_service) {
             Ok(msg) => {
-                println!("  {msg}");
+                print_outcome(&msg, origin);
+                if kept_unmet(origin, &msg) {
+                    kept.push(SUDO.etc);
+                }
                 if requested_scope_unmet(origin, enable, with_sudo, msg.change) {
                     unmet.push(("--with-sudo", "sudo", msg.change));
                 }
@@ -1671,9 +2071,12 @@ fn act_holding_lock(
         }
     }
     if polkit_in_scope(enable, with_polkit) {
-        match wire_service(&POLKIT, enable, apply, &wire_polkit_service) {
+        match wire_service_with(&POLKIT, enable, &opts, &wire_polkit_service) {
             Ok(msg) => {
-                println!("  {msg}");
+                print_outcome(&msg, origin);
+                if kept_unmet(origin, &msg) {
+                    kept.push(POLKIT.etc);
+                }
                 if requested_scope_unmet(origin, enable, with_polkit, msg.change) {
                     unmet.push(("--with-polkit", "polkit-1", msg.change));
                 } else if enable && apply {
@@ -1748,20 +2151,24 @@ fn act_holding_lock(
         if enable {
             report_keyring_handoff();
         }
-        if unmet.is_empty() {
+        if unmet.is_empty() && kept.is_empty() {
             println!("[login] done. Password remains the fallback everywhere.");
         } else {
-            let flags: Vec<&str> = unmet.iter().map(|(flag, _, _)| *flag).collect();
+            let mut except: Vec<&str> = unmet.iter().map(|(flag, _, _)| *flag).collect();
+            except.extend(kept.iter().copied());
             println!(
                 "[login] done, except {}. Password remains the fallback everywhere.",
-                flags.join(" and ")
+                except.join(" and ")
             );
         }
     }
     for (flag, service, change) in &unmet {
         eprintln!("{}", unmet_scope_line(flag, service, *change));
     }
-    if errs == 0 && unmet.is_empty() {
+    for etc in &kept {
+        eprintln!("[login] {etc}: not updated (see the ⚠ line above)");
+    }
+    if errs == 0 && unmet.is_empty() && kept.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -1793,12 +2200,20 @@ fn polkit_in_scope(enable: bool, with_polkit: bool) -> bool {
 /// in a state nobody chose.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PlannedChange {
-    /// Create an irlume-owned /etc override from the vendor copy.
+    /// Create an irlume-owned /etc override from the vendor copy, or rebuild
+    /// one nobody edited (after a vendor change, or when irlume's lines change).
     MaterializeOverride,
     /// Write irlume lines into the admin's file, taking a backup first.
     Wire,
     /// Remove the irlume-owned override, restoring the vendor copy.
     RemoveOverride,
+    /// Update irlume's lines in an override in place, keeping every other line:
+    /// one with lines irlume did not write, or one whose vendor copy is gone.
+    RewireOverride,
+    /// Leave an override as it is: it has lines irlume did not write and its
+    /// vendor copy moved on, or a write would change where one of its numeric
+    /// jumps lands. Writes nothing.
+    KeepEditedOverride,
     /// Rename the backup back over the live file.
     RestoreBackup,
     /// Strip irlume lines in place, preserving edits made since wiring.
@@ -1823,6 +2238,7 @@ impl PlannedChange {
             Self::MaterializeOverride
                 | Self::Wire
                 | Self::RemoveOverride
+                | Self::RewireOverride
                 | Self::RestoreBackup
                 | Self::StripInPlace
         )
@@ -1835,6 +2251,8 @@ impl PlannedChange {
             Self::MaterializeOverride => "materialize-override",
             Self::Wire => "wire",
             Self::RemoveOverride => "remove-override",
+            Self::RewireOverride => "rewire-override",
+            Self::KeepEditedOverride => "keep-edited-override",
             Self::RestoreBackup => "restore-backup",
             Self::StripInPlace => "strip-in-place",
             Self::AlreadyCorrect => "already-correct",
@@ -1849,6 +2267,28 @@ impl PlannedChange {
 pub(crate) struct WireOutcome {
     pub(crate) change: PlannedChange,
     pub(crate) message: String,
+    /// More for a person at the terminal: how a kept override differs from
+    /// its vendor copy, and the command that rebuilds it. Never printed by
+    /// reconcile, whose output goes to the journal.
+    pub(crate) detail: Option<String>,
+    /// irlume's lines in the file are not the ones this run wanted: updating
+    /// them was refused (it would have moved a jump or one of irlume's lines
+    /// past an administrator's line), so the file keeps its earlier ones.
+    pub(crate) unmet: bool,
+}
+
+/// How a `wire_service` call may act.
+#[derive(Default)]
+struct WireOpts {
+    /// Write, rather than only decide.
+    apply: bool,
+    /// `login enable --force`: rebuild an override with lines irlume did not
+    /// write from the vendor copy, keeping the old file as `.pre-irlume`.
+    force: bool,
+    /// The vendor file's digest the machine plan was computed against. A
+    /// different one at the moment of reading refuses the surface, so the
+    /// vendor copy a plan showed is the one the write uses.
+    expect_vendor: Option<String>,
 }
 
 impl std::fmt::Display for WireOutcome {
@@ -1857,58 +2297,190 @@ impl std::fmt::Display for WireOutcome {
     }
 }
 
+/// Decide, and with `apply` write, one service. The plan and prepare paths and
+/// the tests call this; apply and the human run go through
+/// [`wire_service_with`] for the options only they use.
 fn wire_service(
     s: &Svc,
     enable: bool,
     apply: bool,
     wire: &dyn Fn(&str) -> (String, bool),
 ) -> Result<WireOutcome, String> {
-    let out = |change: PlannedChange, message: String| Ok(WireOutcome { change, message });
+    wire_service_with(
+        s,
+        enable,
+        &WireOpts {
+            apply,
+            ..WireOpts::default()
+        },
+        wire,
+    )
+}
+
+/// The opt-in flag that names a surface on the command line, for hints.
+fn scope_flag(etc: &str) -> &'static str {
+    match service_name(etc) {
+        "sudo" => " --with-sudo",
+        "polkit-1" => " --with-polkit",
+        _ => "",
+    }
+}
+
+/// The override strategy: an irlume-created `/etc` copy of a vendor file, or
+/// none yet. Every decision is [`overrides::decide`]'s; this reads its inputs
+/// and carries out what it chose.
+fn wire_override(
+    s: &Svc,
+    vendor_path: &str,
+    enable: bool,
+    opts: &WireOpts,
+    wire: &dyn Fn(&str) -> (String, bool),
+) -> Result<WireOutcome, String> {
+    let etc = Path::new(s.etc);
+    let current = read_optional(etc)?;
+    if current.is_none() && !enable {
+        return Ok(WireOutcome {
+            change: PlannedChange::NotWired,
+            message: format!("· {}: not wired", s.etc),
+            detail: None,
+            unmet: false,
+        });
+    }
+    // Read once, and compared with the plan's digest when there is one, so the
+    // bytes decided on are the bytes the plan showed. An unreadable vendor file
+    // is an error, never "removed": treating it as gone would wire the override
+    // as the service's only configuration.
+    let vendor = match std::fs::read(vendor_path) {
+        Ok(bytes) => {
+            let digest = crate::logintx::sha256_hex(&bytes);
+            if opts.expect_vendor.as_ref().is_some_and(|e| *e != digest) {
+                return Err(drift_message(s));
+            }
+            Some(String::from_utf8(bytes).map_err(|e| format!("read {vendor_path}: {e}"))?)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if opts
+                .expect_vendor
+                .as_ref()
+                .is_some_and(|e| e != crate::logintx::ABSENT)
+            {
+                return Err(drift_message(s));
+            }
+            None
+        }
+        Err(e) => return Err(format!("read {vendor_path}: {e}")),
+    };
+    // `--force` compares it, so there it must be readable. Otherwise it only
+    // lets the hint for a kept file say to move a different one away first.
+    let backup_path = format!("{}{BACKUP}", s.etc);
+    let backup = if opts.force && enable {
+        read_optional(Path::new(&backup_path))?
+    } else if enable {
+        read_optional(Path::new(&backup_path)).ok().flatten()
+    } else {
+        None
+    };
+    let decision = overrides::decide(&overrides::Input {
+        etc: s.etc,
+        vendor_path,
+        current: current.as_deref(),
+        vendor: vendor.as_deref(),
+        backup: backup.as_deref(),
+        enable,
+        force: opts.force,
+        scope_flag: scope_flag(s.etc),
+        wire,
+    })?;
+    if opts.apply {
+        match &decision.write {
+            overrides::Write::Nothing => {}
+            overrides::Write::Replace(content) => {
+                if decision.keep_copy {
+                    keep_copy(etc)?;
+                }
+                // Checked against the bytes decided on, immediately before the
+                // rename: an editor saving in place in between is not
+                // overwritten.
+                if let Err(e) = write_atomic_checked(etc, content, current.as_deref()) {
+                    return header_write_refused(s.etc, decision.header_only, e);
+                }
+            }
+            overrides::Write::Remove => remove_checked(etc, current.as_deref())?,
+        }
+    }
+    Ok(WireOutcome {
+        change: decision.change,
+        message: decision.message,
+        detail: decision.detail,
+        unmet: decision.unmet,
+    })
+}
+
+/// A failed write. One that would only have added the tracking line to a
+/// file an administrator made immutable or put on a read-only mount changes
+/// nothing PAM reads, so it is reported and skipped, as reconcile's
+/// maintenance step does; any other is an error.
+fn header_write_refused(
+    etc: &str,
+    header_only: bool,
+    error: String,
+) -> Result<WireOutcome, String> {
+    if !(header_only && write_refused_by_admin(&error)) {
+        return Err(error);
+    }
+    Ok(WireOutcome {
+        change: PlannedChange::AlreadyCorrect,
+        message: format!(
+            "⚠ {etc}: left as it is, since it cannot be written ({error}); its PAM lines are \
+             already right"
+        ),
+        detail: None,
+        unmet: false,
+    })
+}
+
+/// The refusal for a surface whose files moved after the plan was made.
+fn drift_message(s: &Svc) -> String {
+    match s.vendor {
+        Some(_) => format!(
+            "{} or its vendor copy changed between the plan and the write; not touched",
+            s.etc
+        ),
+        None => format!(
+            "{} changed between the plan and the write; not touched",
+            s.etc
+        ),
+    }
+}
+
+/// [`wire_service`] with every option: the override strategy for an
+/// irlume-created copy of a vendor file (or none yet), the in-place one for an
+/// administrator's `/etc` file.
+fn wire_service_with(
+    s: &Svc,
+    enable: bool,
+    opts: &WireOpts,
+    wire: &dyn Fn(&str) -> (String, bool),
+) -> Result<WireOutcome, String> {
+    let apply = opts.apply;
+    let out = |change: PlannedChange, message: String| {
+        Ok(WireOutcome {
+            change,
+            message,
+            detail: None,
+            unmet: false,
+        })
+    };
     let etc = Path::new(s.etc);
     // vendor-only service with no admin /etc copy → override strategy.
     let use_override = s.vendor.is_some() && (!etc.exists() || file_is_created_override(etc));
     if enable {
         // RECONCILE, don't skip-if-present: re-wire always rebuilds the desired
-        // line set from the ORIGINAL stack (the vendor copy / the backup) so a
+        // line set from the current stack with irlume's lines stripped, so a
         // method switch (which changes which lines are wanted) actually takes
         // effect instead of being a silent no-op when any pam_irlume line exists.
-        if use_override {
-            let vendor = s.vendor.unwrap();
-            if !Path::new(vendor).exists() {
-                return out(
-                    PlannedChange::NotInstalled,
-                    format!("· {}: not installed (skipped)", s.etc),
-                );
-            }
-            let (base, _) = unwire_lines(&read(vendor)?);
-            let (wired, changed) = wire(&base);
-            // The transform saying "unchanged" means it REFUSED (no anchor, a
-            // continued file): materializing anyway would shadow the vendor
-            // file with a copy carrying no irlume line and report ✓ while face
-            // login stayed off. The in-place branch below already refuses on
-            // this; the override branch must too.
-            if !changed {
-                return out(
-                    PlannedChange::NoAnchor,
-                    format!("· {}: no anchor to wire (skipped)", s.etc),
-                );
-            }
-            let body = format!(
-                "{CREATED_PREFIX}{vendor}; delete this file to restore the vendor copy\n{wired}"
-            );
-            if etc.exists() && read(s.etc).ok().as_deref() == Some(body.as_str()) {
-                return out(
-                    PlannedChange::AlreadyCorrect,
-                    format!("· {}: already correctly wired", s.etc),
-                );
-            }
-            if apply {
-                write_atomic(etc, &body)?;
-            }
-            out(
-                PlannedChange::MaterializeOverride,
-                format!("✓ {}: materialized override from {vendor}", s.etc),
-            )
+        if let (true, Some(vendor_path)) = (use_override, s.vendor) {
+            wire_override(s, vendor_path, true, opts, wire)
         } else {
             if !etc.exists() {
                 return out(
@@ -1974,15 +2546,9 @@ fn wire_service(
         }
     } else {
         // disable / unwire
-        if use_override && etc.exists() && file_is_created_override(etc) {
-            if apply {
-                std::fs::remove_file(etc).map_err(|e| format!("rm {}: {e}", s.etc))?;
-            }
-            out(
-                PlannedChange::RemoveOverride,
-                format!("✓ {}: removed override (vendor restored)", s.etc),
-            )
-        } else if !use_override && etc.exists() {
+        if let (true, Some(vendor_path)) = (use_override, s.vendor) {
+            wire_override(s, vendor_path, false, opts, wire)
+        } else if etc.exists() {
             let bak = PathBuf::from(format!("{}{BACKUP}", s.etc));
             if bak.exists() {
                 // Restore the backup ONLY when it equals the current file minus
@@ -3274,7 +3840,7 @@ mod tests {
 
     /// A declared surface moved under `root`, keeping its shape: its /etc path
     /// and, when it declares one, its vendor path.
-    fn under_root(root: &Path, declared: &Svc) -> Svc {
+    pub(super) fn under_root(root: &Path, declared: &Svc) -> Svc {
         Svc {
             etc: leak(&root.join(declared.etc.trim_start_matches('/'))),
             vendor: declared
@@ -3285,14 +3851,14 @@ mod tests {
 
     /// Lay out a service the way a vendor-only distribution ships it: the file
     /// under `root/usr/lib/pam.d`, and nothing for it under `root/etc/pam.d`.
-    fn ship_vendor_only(root: &Path, service: &str, content: &str) {
+    pub(super) fn ship_vendor_only(root: &Path, service: &str, content: &str) {
         let vendor = root.join("usr/lib/pam.d").join(service);
         std::fs::create_dir_all(vendor.parent().unwrap()).unwrap();
         std::fs::create_dir_all(root.join("etc/pam.d")).unwrap();
         std::fs::write(vendor, content).unwrap();
     }
 
-    fn greeter(etc: &str) -> &'static Svc {
+    pub(super) fn greeter(etc: &str) -> &'static Svc {
         GREETERS
             .iter()
             .find(|s| s.etc == etc)
@@ -3445,11 +4011,15 @@ mod tests {
                 "{change:?}"
             );
         }
+        // A kept or rewired override is a met request: irlume's lines are
+        // correct, whatever else the file carries.
         for change in [
             MaterializeOverride,
             Wire,
             AlreadyCorrect,
             RemoveOverride,
+            RewireOverride,
+            KeepEditedOverride,
             RestoreBackup,
             StripInPlace,
             NotWired,
@@ -3467,15 +4037,15 @@ mod tests {
         );
         assert_eq!(
             unmet_scope_line("--with-polkit", "polkit-1", NoAnchor),
-            "[login] --with-polkit: not wired (the polkit-1 PAM service has no auth \
-             line to anchor to)"
+            "[login] --with-polkit: not wired (irlume finds no line in the polkit-1 PAM \
+             service to wire next to)"
         );
     }
 
     /// Self-cleaning scratch dir for the wire_service file tests.
-    struct TestDir(PathBuf);
+    pub(super) struct TestDir(pub(super) PathBuf);
     impl TestDir {
-        fn new(tag: &str) -> Self {
+        pub(super) fn new(tag: &str) -> Self {
             let d =
                 std::env::temp_dir().join(format!("irlume-pamwire-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&d);
@@ -3568,7 +4138,7 @@ mod tests {
     // directive along with them. Re-check with a diff against upstream rather
     // than by eye.
 
-    const UPSTREAM_FEDORA: &str = r#"auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so
+    pub(super) const UPSTREAM_FEDORA: &str = r#"auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so
 auth        substack      password-auth
 -auth        optional      pam_gnome_keyring.so
 -auth        optional      pam_kwallet5.so
@@ -5714,7 +6284,7 @@ auth required pam_fprintd.so\n\
     // matrix.md for provenance). The survey question: does the wiring recipe
     // place its line on every dialect a user can actually meet?
 
-    fn fixture(distro: &str, service: &str) -> String {
+    pub(super) fn fixture(distro: &str, service: &str) -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/pam")
             .join(distro)

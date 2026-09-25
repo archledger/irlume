@@ -1041,6 +1041,9 @@ struct Probes {
     tpm_present: bool,
     /// A distro PAM regeneration dropped the wiring (self-heal pending).
     reconcile_needed: bool,
+    /// A vendor PAM file changed under an irlume override nobody edited; the
+    /// next reconcile rebuilds it.
+    override_refresh_due: bool,
     /// A confirmed locked/missing default keyring (`None` = no confirmed problem).
     keyring_problem: Option<crate::secrets::LoginKeyringProblem>,
     /// Secure Boot: (firmware supports it, currently enabled, setup mode).
@@ -1191,6 +1194,7 @@ impl Probes {
             fp_keyring_wired: crate::pamwire::fp_keyring_wired(),
             tpm_present: crate::tpm_device().is_some(),
             reconcile_needed: crate::pamwire::reconcile_needed(),
+            override_refresh_due: crate::pamwire::override_refresh_due(),
             keyring_problem: crate::secrets::login_keyring_problem(),
             secureboot: (
                 secureboot::secure_boot_present(),
@@ -3431,6 +3435,15 @@ impl App {
                 "Login connection",
                 Sev::Fail,
                 "a distro PAM regeneration dropped the face-auth wiring; logins fall back to password".into(),
+                Fix::Root(RootFix::LoginReconcile),
+            ));
+        } else if self.probes.override_refresh_due {
+            // The wiring works; a vendor update has not reached irlume's copy
+            // of that file yet. The reconcile timer does it within 30 minutes.
+            v.push(mk(
+                "Vendor PAM update",
+                Sev::Warn,
+                "a vendor PAM file changed; the next reconcile rebuilds irlume's copy of it".into(),
                 Fix::Root(RootFix::LoginReconcile),
             ));
         }
@@ -19964,6 +19977,32 @@ mod tests {
         let text = draw_text(&app);
         assert!(!text.contains("esealing re-binds"), "{text}");
         assert!(!text.contains("Re-arm after"), "{text}");
+    }
+
+    /// A vendor update waiting to reach irlume's copy of a PAM file is not a
+    /// lost wiring: it gets its own warning row with the reconcile fix, and
+    /// the lost-wiring failure, when both hold, is the one shown.
+    #[test]
+    fn a_pending_vendor_refresh_is_a_warning_not_a_lost_wiring() {
+        let mut app = test_app();
+        let row = |app: &App, label: &str| {
+            app.repair
+                .iter()
+                .find(|c| c.label == label)
+                .map(|c| (c.sev == Sev::Warn, c.sev == Sev::Fail))
+        };
+        app.probes = Probes {
+            override_refresh_due: true,
+            ..Probes::default()
+        };
+        app.probes_landed = true;
+        app.recompute_checks();
+        assert_eq!(row(&app, "Vendor PAM update"), Some((true, false)));
+        assert_eq!(row(&app, "Login connection"), None);
+        app.probes.reconcile_needed = true;
+        app.recompute_checks();
+        assert_eq!(row(&app, "Login connection"), Some((false, true)));
+        assert_eq!(row(&app, "Vendor PAM update"), None);
     }
 
     /// A token armed before this build knew the Fedora 45 notice still

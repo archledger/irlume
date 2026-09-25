@@ -28,7 +28,8 @@
 //! before connecting; `gkr-pam-client.c` does the same seteuid dance.
 
 use std::io::{Read, Write};
-use zeroize::Zeroizing;
+
+use crate::SecretBytes;
 
 /// Control operations, from `daemon/control/gkd-control-codes.h`. Only the two
 /// irlume needs are represented; `INITIALIZE` (0) replies with a variable-length
@@ -83,19 +84,21 @@ impl ControlResult {
 /// Encode one request packet. Pure, so the exact bytes are testable against
 /// the layout in `gkr-pam-client.c` without a socket.
 ///
-/// The packet carries the keyring secrets verbatim, so it comes back in a
-/// buffer that wipes itself on drop. It is allocated at its final size, so no
-/// reallocation frees a partial copy first.
-pub fn encode_request(op: Op, args: &[&[u8]]) -> Zeroizing<Vec<u8>> {
+/// The packet carries the keyring secrets verbatim, so it comes back as
+/// [`SecretBytes`]: its pages are locked and it is wiped on drop, like every
+/// other secret buffer. It is allocated at its final size, so no reallocation
+/// frees a partial copy first.
+pub fn encode_request(op: Op, args: &[&[u8]]) -> SecretBytes {
     let total: usize = 8 + args.iter().map(|a| 4 + a.len()).sum::<usize>();
-    let mut buf = Zeroizing::new(Vec::with_capacity(total));
+    let mut buf = Vec::with_capacity(total);
     buf.extend_from_slice(&(total as u32).to_be_bytes());
     buf.extend_from_slice(&(op as u32).to_be_bytes());
     for a in args {
         buf.extend_from_slice(&(a.len() as u32).to_be_bytes());
         buf.extend_from_slice(a);
     }
-    buf
+    debug_assert_eq!(buf.len(), buf.capacity());
+    SecretBytes::new(buf)
 }
 
 /// Decode the fixed 8-byte response. Errors name what was malformed rather than
@@ -135,7 +138,7 @@ pub fn call<S: Read + Write>(
         .write_all(&[0u8])
         .map_err(|e| format!("control socket write (credentials): {e}"))?;
     stream
-        .write_all(&encode_request(op, args))
+        .write_all(encode_request(op, args).expose())
         .map_err(|e| format!("control socket write: {e}"))?;
     let mut reply = [0u8; 8];
     stream
@@ -168,15 +171,16 @@ mod tests {
             b"newpw",
         ]
         .concat();
-        assert_eq!(*got, expect);
+        assert_eq!(got.expose(), &expect[..]);
         // Big-endian, not native: the first length byte of a 24-byte packet
         // must be 0, and the last must be 24.
-        assert_eq!(&got[..4], &[0, 0, 0, 24]);
+        assert_eq!(&got.expose()[..4], &[0, 0, 0, 24]);
     }
 
     #[test]
     fn unlock_request_carries_one_argument() {
         let got = encode_request(Op::Unlock, &[b"s3cret"]);
+        let got = got.expose();
         assert_eq!(&got[..4], &(8u32 + 4 + 6).to_be_bytes());
         assert_eq!(&got[4..8], &1u32.to_be_bytes());
         assert_eq!(&got[8..12], &6u32.to_be_bytes());
@@ -255,6 +259,9 @@ mod tests {
         let res = call(&mut s, Op::Unlock, &[b"tok"]).unwrap();
         assert_eq!(res, ControlResult::Ok);
         assert_eq!(s.written[0], 0, "credentials byte first");
-        assert_eq!(&s.written[1..], &encode_request(Op::Unlock, &[b"tok"])[..]);
+        assert_eq!(
+            &s.written[1..],
+            encode_request(Op::Unlock, &[b"tok"]).expose()
+        );
     }
 }

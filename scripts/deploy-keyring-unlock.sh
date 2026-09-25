@@ -108,8 +108,9 @@ else
                 next
             }
             # RESEAL half of the self-heal: re-binds the sealed password to current
-            # PCRs only after auth SUCCEEDED (session phase runs only then), so it
-            # can never act on a typo. Placed after the session password-auth line.
+            # PCRs only after auth SUCCEEDED (session phase runs only then); irlumed
+            # also refuses a password its login-hash check rejects. Placed after
+            # the session password-auth line.
             /^session[[:space:]]+include[[:space:]]+password-auth/ && !sdone {
                 print
                 print "session     optional      pam_irlume.so reseal"

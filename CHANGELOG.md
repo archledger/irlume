@@ -286,6 +286,25 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The re-seal after login is now accepted only from root: its one sender
+  is the `reseal` session line, which runs in the login stack's root
+  process on every stack irlume wires. `keyring arm`, `reseal` and that
+  re-seal refuse a password containing a NUL byte. Where irlumed can read
+  the account's login hash, it now checks the re-seal's password as
+  `keyring arm`'s already was: a re-seal whose password does not match is
+  refused and the sealed secret stays as it was, so a mistyped password
+  followed by a fingerprint login no longer replaces a working seal.
+  Where it cannot (LDAP and SSSD accounts, and the AppArmor profile that
+  the Debian, Ubuntu, Mint and Arch packages install, which keeps irlumed
+  out of `/etc/shadow`), `keyring arm` no longer re-arms over a GNOME
+  keyring token that is already armed, whoever runs it, and changes
+  nothing. A first arm and the re-seal after login work as before there,
+  so a typed login still moves the token's password wrap after a
+  password change and re-binds the seal after a firmware update. To arm
+  again anyway, log in once by typing your password, then run
+  `irlume keyring forget` with it and arm again (docs/SETUP.md, "Keyring
+  unlock"). `irlume setup` and `irlume reseal` print a refusal as text.
+
 - The PAM module wipes every temporary copy it makes of a released login
   password.
 

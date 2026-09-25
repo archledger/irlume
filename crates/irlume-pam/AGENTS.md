@@ -85,7 +85,9 @@ login or locks a person out. It is critical-tier
   `[success=1 default=ignore]` or, on polkit consent prompts and the Omarchy
   lock (`omarchy-lock-password`), `POLKIT_VERIFY_STANZA` (`sufficient` plus
   `abort=die`); keyring and `reseal` lines are `optional`; never `required` or
-  `requisite`.
+  `requisite`. irlumed accepts `ResealPassword` from root only, so a `reseal`
+  line belongs only in a stack that opens its session as root (a display
+  manager's), never in one a lock screen runs as the user.
 
 ## Testing
 

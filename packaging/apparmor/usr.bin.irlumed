@@ -245,6 +245,10 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   # With NoNewPrivileges, AppArmor may prevent this privilege transition;
   # recovery availability therefore refuses enforcing AppArmor pending runtime
   # qualification. Never grant shadow to the daemon to bypass that refusal.
+  # The daemon still tries to read the login hash to check a keyring password
+  # and treats the refusal as "cannot check"; an explicit deny keeps that
+  # expected refusal (once per typed login) out of the audit log.
+  deny /etc/shadow r,
   /etc/pam.d/irlume-retry-reset r,
   /usr/libexec/irlume-password-verify rCx -> password-verify,
   profile password-verify {

@@ -367,8 +367,10 @@ impl PamServiceModule for IrlumePam {
             // daemon or touch the TPM here, because this auth line runs even after a
             // FAILED password attempt; acting on the token here is exactly the bug
             // that let a typo overwrite the good seal. The mutation happens in
-            // open_session, which PAM only runs once auth has SUCCEEDED, so the token
-            // it acts on is always one pam_unix accepted. Always IGNORE.
+            // open_session, which PAM only runs once auth has SUCCEEDED. That success
+            // can come from another factor after a mistyped password, so irlumed also
+            // checks the token against the login hash where it can read one. Always
+            // IGNORE.
             if reseal {
                 stash_authtok(&pamh);
                 return PamError::IGNORE;
@@ -599,8 +601,9 @@ fn stash_authtok(pamh: &Pam) {
     }
 }
 
-/// SESSION-phase half of `reseal`: retrieve the stashed (already-verified)
-/// password and ask the daemon to re-seal it if the envelope is armed and stale.
+/// SESSION-phase half of `reseal`: retrieve the stashed password and ask the
+/// daemon to re-seal it if the envelope is armed and stale (the daemon checks
+/// it against the login hash where it can read one).
 /// Best-effort and silent: a login session must never fail because of this.
 fn try_reseal_session(pamh: &Pam, user: &str) {
     // SAFETY: the key was registered by `stash_authtok` in this same PAM

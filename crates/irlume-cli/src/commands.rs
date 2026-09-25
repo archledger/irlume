@@ -1150,7 +1150,7 @@ pub fn diag(args: &[String]) -> ExitCode {
         "keyring seal",
         &keyring_path,
         "the keyring credential can unseal",
-        "run `irlume keyring arm` or log in with the typed password to recover and re-bind it",
+        "log in once by typing your password, or run `irlume keyring arm`, to recover and re-bind it",
         "preserve the file and do not force-forget it",
     ) {
         match daemon_request(&Request::HasSealedPassword { user: user.clone() }) {
@@ -1659,6 +1659,10 @@ pub fn reseal(args: &[String]) -> ExitCode {
             println!("[reseal] re-bound to current PCRs {OK}; face unlock will release it again.");
             ExitCode::SUCCESS
         }
+        Ok(Response::Error(e)) => {
+            eprintln!("[reseal] failed: {e}");
+            ExitCode::FAILURE
+        }
         Ok(other) => {
             eprintln!("[reseal] unexpected response: {other:?}");
             ExitCode::FAILURE
@@ -1786,7 +1790,11 @@ pub fn setup(args: &[String]) -> ExitCode {
                         Err(e) => eprintln!("  arm failed: {e}"),
                     }
                 }
-                r => eprintln!("  arm failed: {r:?}"),
+                // The daemon's refusals say what to do next (a re-arm over a
+                // token it cannot check the password for names `keyring
+                // forget`), so show the text, not the reply's debug form.
+                Ok(Response::Error(e)) | Err(e) => eprintln!("  arm failed: {e}"),
+                Ok(other) => eprintln!("  arm failed: unexpected response: {other:?}"),
             }
         }
     }

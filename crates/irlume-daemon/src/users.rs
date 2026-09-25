@@ -61,6 +61,16 @@ pub fn name_for_uid(uid: u32) -> Option<String> {
 /// home is elsewhere, which is exactly the population (LDAP, systemd-homed) the
 /// reentrant NSS lookups here exist to serve.
 pub fn home_for_name(name: &str) -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = HOME_STAND_IN.with(|stand_in| {
+        stand_in
+            .borrow()
+            .as_ref()
+            .filter(|(account, _)| account == name)
+            .map(|(_, home)| home.clone())
+    }) {
+        return Some(home);
+    }
     let cname = CString::new(name).ok()?;
     #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
@@ -86,6 +96,15 @@ pub fn home_for_name(name: &str) -> Option<std::path::PathBuf> {
         return None;
     }
     Some(std::path::PathBuf::from(s))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// An account and the home [`home_for_name`] reports for it on this
+    /// thread while a test has set one, so a dispatch test can give the
+    /// account a GNOME login keyring without reading or writing a real home.
+    pub(crate) static HOME_STAND_IN: std::cell::RefCell<Option<(String, std::path::PathBuf)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Translate the wire secret kind to the core one.

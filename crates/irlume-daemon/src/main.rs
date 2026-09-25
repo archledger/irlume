@@ -1637,14 +1637,64 @@ extern "C" {
     fn crypt(key: *const libc::c_char, salt: *const libc::c_char) -> *mut libc::c_char;
 }
 
+/// The refusal for a keyring seal request whose password holds a NUL byte. A
+/// login password never does (PAM and `crypt()` both end the string there), so
+/// [`password_matches_login`] cannot judge one, and a seal of it would hold
+/// bytes no login reproduces.
+const NUL_PASSWORD_REFUSAL: &str =
+    "a login password cannot contain a NUL byte; nothing was changed";
+
+/// Refuse `request` for `user` because its password holds a NUL byte, and say
+/// so in the journal: no irlume client sends one, so the line points at the
+/// caller that did.
+fn refuse_nul_password(request: &str, user: &str) -> Response {
+    jout_notice!("irlumed: {request}: refused for '{user}': {NUL_PASSWORD_REFUSAL}");
+    Response::Error(NUL_PASSWORD_REFUSAL.into())
+}
+
+/// The refusal for a `SealPassword` whose password irlumed could not check
+/// against a login hash, when `user` has a GNOME keyring token armed or an
+/// envelope that cannot be read; `None` when the arm may proceed (nothing
+/// armed, or a login-password or KDE wallet-key envelope). Nothing is written.
+///
+/// The token's password wrap is under the password it was armed with, or the
+/// one last typed at a login screen that carries the `reseal` line; a
+/// password change alone does not move it. Until such a login, `forget` opens
+/// the wrap only with the old password, so the remedy starts with that login,
+/// which also leaves nothing to re-arm after a password change or PCR drift.
+fn refuse_unverified_token_rearm(user: &str) -> Option<Response> {
+    let refusal = match irlume_core::keyring::read_sealed_kind(user) {
+        Ok(Some(irlume_core::envelope::SecretKind::GnomeKeyringToken)) => format!(
+            "irlumed cannot check this password against '{user}'s login hash, so it does not \
+             re-arm over the GNOME keyring token already armed; nothing was changed. The \
+             token's password copy follows the password last typed at a login screen that \
+             carries irlume's re-seal, so after a password change with no such login since \
+             (or with no such screen, as on NixOS) it still needs the previous password. To \
+             arm again, run `irlume keyring forget` with that password, then \
+             `irlume keyring arm`."
+        ),
+        Ok(_) => return None,
+        Err(e) => format!(
+            "{e}; irlumed cannot check this password against '{user}'s login hash, so it \
+             does not arm over a sealed secret it cannot read; nothing was changed. \
+             `sudo irlume diag` shows the envelope's state."
+        ),
+    };
+    jout_notice!("irlumed: SealPassword: refused for '{user}': {refusal}");
+    Some(Response::Error(refusal))
+}
+
 /// Verify `password` against `user`'s `/etc/shadow` hash so `keyring arm` can
 /// reject a password that is not the current LOGIN password (the cause of the
 /// later "-9" wallet-key-derive failure: the face path jumps over pam_unix, so a
 /// wrong seal is never caught at auth time, only when ksecretd tries to open the
-/// wallet). Returns `Some(true/false)` on a verifiable hash, or `None` when it
-/// cannot verify (no `/etc/shadow` access, no such user, or a locked / empty /
-/// non-password field), in which case the caller does NOT block, since absence
-/// of proof is not proof of a wrong password. Root-only (`/etc/shadow`).
+/// wallet), and the session re-seal can refuse one. Returns `Some(true/false)`
+/// on a verifiable hash, or `None` when it cannot verify (no `/etc/shadow`
+/// access, as under the shipped AppArmor profile, no such user, a locked /
+/// empty / non-password field, or a password with a NUL byte, which both
+/// callers refuse first). `None` does not block by itself, since absence of
+/// proof is not proof of a wrong password, except that a `SealPassword` over
+/// an armed GNOME keyring token is then refused. Root-only (`/etc/shadow`).
 fn password_matches_login(user: &str, password: &[u8]) -> Option<bool> {
     // The whole shadow file (every user's hash), the target hash, and the
     // plaintext password are wrapped in Zeroizing so they are scrubbed on drop
@@ -1652,7 +1702,7 @@ fn password_matches_login(user: &str, password: &[u8]) -> Option<bool> {
     // The rest of the daemon keeps this discipline via SecretBytes; this path
     // (a raw /etc/shadow read + a crypt() call) is the one place that bypassed
     // it.
-    let shadow = zeroize::Zeroizing::new(std::fs::read_to_string("/etc/shadow").ok()?);
+    let shadow = shadow_text()?;
     let stored = zeroize::Zeroizing::new(verifiable_shadow_hash(&shadow, user)?);
     // An interior NUL can't be a shadow password; treat as unverifiable.
     if password.contains(&0) {
@@ -1679,6 +1729,26 @@ fn password_matches_login(user: &str, password: &[u8]) -> Option<bool> {
     #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let computed = unsafe { std::ffi::CStr::from_ptr(out) };
     Some(computed.to_bytes() == stored.as_bytes())
+}
+
+/// The whole of `/etc/shadow`, or `None` when it cannot be read. A test build
+/// returns the calling thread's stand-in instead when a test installed one, so
+/// a dispatch test can pin a known hash without reading the host's file.
+fn shadow_text() -> Option<zeroize::Zeroizing<String>> {
+    #[cfg(test)]
+    if let Some(text) = SHADOW_STAND_IN.with(|s| s.borrow().clone()) {
+        return Some(zeroize::Zeroizing::new(text));
+    }
+    std::fs::read_to_string("/etc/shadow")
+        .ok()
+        .map(zeroize::Zeroizing::new)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What [`shadow_text`] returns on this thread while a test has set it.
+    static SHADOW_STAND_IN: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The user's VERIFIABLE `/etc/shadow` hash, or `None` when there is nothing to
@@ -3830,9 +3900,13 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             user: Some(user.as_str()),
             enrollment: Reads,
         },
+        // Root only: the one sender is pam_irlume's `reseal` session line,
+        // and every stack that carries it opens its session in a root process
+        // (the display manager's worker). Lock screens that run PAM as the
+        // user authenticate without opening a session, so they never send it.
         ResealPassword { user, .. } => RequestPosture {
-            privilege: RootOrTarget {
-                verb: "reseal password for",
+            privilege: RootOnly {
+                command: "reseal_password",
             },
             user: Some(user.as_str()),
             enrollment: Reads,
@@ -4723,6 +4797,9 @@ fn pregate(req: &Request, peer: &Peer) -> Option<Response> {
                     reason: format!("{command} requires root (peer uid {})", peer.uid),
                 });
             }
+            if matches!(req, Request::ResealPassword { .. }) {
+                note_reseal_password_refusal(peer.uid);
+            }
             Some(Response::Error(format!(
                 "{command} requires root (peer uid {})",
                 peer.uid
@@ -4760,6 +4837,32 @@ fn note_unseal_password_refusal(uid: u32) {
         );
     } else {
         irlume_common::dlog!("UnsealPassword refused for uid {uid} (not root)");
+    }
+}
+
+/// Say in the journal why a non-root peer's `ResealPassword` was refused.
+///
+/// Its one sender is pam_irlume's `reseal` session line, and every stack
+/// irlume wires with one opens its session in a root process. A line in a
+/// stack that opens its session as the user would lose the login re-seal
+/// without a trace, so the first refusal per uid says so. Once per uid per
+/// daemon lifetime, for the reason [`note_unseal_password_refusal`] gives.
+fn note_reseal_password_refusal(uid: u32) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
+        std::sync::OnceLock::new();
+    let first = match SEEN.get_or_init(Default::default).lock() {
+        Ok(mut seen) => seen.insert(uid),
+        Err(e) => e.into_inner().insert(uid),
+    };
+    if first {
+        jout_notice!(
+            "irlumed: ResealPassword refused for uid {uid} (not root): the login re-seal \
+             is accepted only from a PAM stack that opens its session as root, so a \
+             `reseal` session line in a stack running as the user re-seals nothing. \
+             Logged once per uid."
+        );
+    } else {
+        irlume_common::dlog!("ResealPassword refused for uid {uid} (not root)");
     }
 }
 
@@ -6934,7 +7037,8 @@ fn dispatch_scoped_session_inner(
             //
             // Refuse to seal a password that is not the user's LOGIN password:
             // it would seal cleanly but fail later at wallet key-derive ("-9").
-            // Only a POSITIVE mismatch blocks; an unverifiable hash proceeds.
+            // A POSITIVE mismatch blocks; an unverifiable hash proceeds, except
+            // over an armed GNOME keyring token (below).
             if !wallet_salt_checked {
                 return Response::Error(
                     "the client did not perform the required account-scoped wallet lookup; upgrade the irlume client and retry"
@@ -6951,11 +7055,36 @@ fn dispatch_scoped_session_inner(
                     );
                 }
             }
-            if password_matches_login(&user, password.expose()) == Some(false) {
+            if password.expose().contains(&0) {
+                return refuse_nul_password("SealPassword", &user);
+            }
+            let verified = password_matches_login(&user, password.expose());
+            if verified == Some(false) {
+                jout_notice!(
+                    "irlumed: SealPassword: '{user}': the password does not match the login \
+                     password; nothing was changed"
+                );
                 return Response::Error(format!(
                     "that is not '{user}'s current login password; the keyring is unlocked with \
                      the login password, so arming a different one would leave the wallet locked"
                 ));
+            }
+            // No login hash to check against: an LDAP or SSSD account, a
+            // locked local one, or a daemon the shipped AppArmor profile keeps
+            // out of /etc/shadow. A re-arm over a GNOME keyring token returns
+            // the existing token and the caller re-keys the login keyring to
+            // it, and an unchecked password says nothing about how that token
+            // was armed (the login re-seal moves its password wrap too), so
+            // the re-arm is refused for every peer, root included. `forget`,
+            // then a fresh arm, mints a new token. An envelope that cannot be
+            // read may be such a token. A login-password or KDE wallet-key
+            // envelope returns nothing and needs no password to forget, so
+            // refusing its re-arm would protect nothing; it proceeds, as does
+            // a first arm.
+            if verified.is_none() {
+                if let Some(refusal) = refuse_unverified_token_rearm(&user) {
+                    return refusal;
+                }
             }
             // On KDE, seal the wallet key derived from this password rather
             // than the password itself. The wallet is keyed to exactly those
@@ -7199,11 +7328,20 @@ fn dispatch_scoped_session_inner(
             wallet_salt,
             wallet_salt_checked,
         } => {
-            // Self-heal hook from the login SESSION phase (runs only after auth
-            // succeeded, so `password` is verified-correct). Same authz as arming
-            // (root or the user), but it can only ever *re-seal an already armed*
-            // password against today's PCRs; it never arms a fresh user, so a
-            // self-peer cannot use it to plant a sealed password they didn't set.
+            // Self-heal hook from the login SESSION phase. Root only (posture
+            // table): the `reseal` session line runs in the login stack's root
+            // process. It can only ever *re-seal an already armed* secret
+            // against today's PCRs; it never arms a fresh user.
+            //
+            // The session phase runs only after authentication succeeded, but
+            // that does not make `password` the one that authenticated: the
+            // stack may have granted on another factor after a password was
+            // typed. So a password that fails the login-hash check is refused
+            // here and the envelope stays as it is. With no hash to check
+            // against, the session contract is all there is to go on and the
+            // re-seal proceeds, re-wrapping a token under the password after a
+            // password change; a re-arm over that token is refused instead
+            // (see `refuse_unverified_token_rearm`).
             //
             // A KDE envelope can be re-derived only from the account-scoped
             // salt supplied by this authenticated caller. Other envelope kinds
@@ -7213,6 +7351,24 @@ fn dispatch_scoped_session_inner(
                     "the PAM client did not perform the required account-scoped wallet lookup; upgrade irlume before resealing"
                         .into(),
                 );
+            }
+            if password.expose().contains(&0) {
+                return refuse_nul_password("ResealPassword", &user);
+            }
+            // Only an armed account has a seal to keep, and the check costs a
+            // crypt() on every session open, so an unarmed one skips it:
+            // `reseal_password` answers `NotArmed` for it.
+            if irlume_core::keyring::has_sealed_password(&user)
+                && password_matches_login(&user, password.expose()) == Some(false)
+            {
+                jout_notice!(
+                    "irlumed: ResealPassword: '{user}': the password does not match the login \
+                     password; the sealed secret was left as it was"
+                );
+                return Response::Error(format!(
+                    "that is not '{user}'s current login password; the sealed secret was left \
+                     as it was"
+                ));
             }
             match irlume_core::keyring::reseal_password(
                 &user,
@@ -7237,7 +7393,10 @@ fn dispatch_scoped_session_inner(
                         changed: outcome == Reseal::Resealed || outcome == Reseal::Upgraded,
                     }
                 }
-                Err(e) => Response::Error(e.to_string()),
+                Err(e) => {
+                    jout_notice!("irlumed: ResealPassword: '{user}': {e}");
+                    Response::Error(e.to_string())
+                }
             }
         }
         // --- template-key recovery passphrase -------------------------------
@@ -8187,10 +8346,13 @@ fn finish_unseal_password(
         // face login that nonetheless leaves the keyring locked.
         Err(e) => {
             // Here the template key unsealed (face matched) but the PASSWORD seal
-            // did not. A PCR drift on this path is fixed by re-binding the password
-            // with `irlume keyring arm` (the enrolled face still works).
+            // did not. A PCR drift on this path is fixed by re-binding the sealed
+            // secret: the next typed login re-seals it, or `irlume keyring arm`
+            // does (the enrolled face still works). Where irlumed cannot read the
+            // login hash, the arm refuses over a token and only the login heals.
             let hint = if is_pcr_drift(&e) {
-                " -- re-run `irlume keyring arm` to re-bind the password to the current PCRs"
+                " -- log in once by typing the password, or re-run `irlume keyring arm`, to \
+                 re-bind the sealed secret to the current PCRs"
             } else {
                 ""
             };
@@ -16709,6 +16871,349 @@ mod tests {
         }
     }
 
+    /// `SHADOW_HASH` is `openssl passwd -6 -salt irlumeseal login-password-1`.
+    const SHADOW_PASSWORD: &[u8] = b"login-password-1";
+    const SHADOW_HASH: &str = "$6$irlumeseal$rl64hv.n.OggfFLAjiiGKp8qsrmMZzKzI4HoWsJPVzKmwb4AiNZRSLeKPOutt.gd4OH937b9/3Deoh6Kb1duV0";
+
+    /// A stand-in `/etc/shadow` for the calling test thread, removed on drop.
+    struct ShadowStandIn;
+
+    impl ShadowStandIn {
+        /// `user` has a verifiable hash of [`SHADOW_PASSWORD`].
+        fn hash_for(user: &str) -> Self {
+            Self::text(format!(
+                "root:*:19000:0:99999:7:::\n{user}:{SHADOW_HASH}:19000:0:99999:7:::\n"
+            ))
+        }
+
+        /// No account a test names has a hash to check against, as on an
+        /// LDAP or SSSD account or under the shipped AppArmor profile.
+        fn unverifiable() -> Self {
+            Self::text("root:*:19000:0:99999:7:::\n".into())
+        }
+
+        fn text(text: String) -> Self {
+            SHADOW_STAND_IN.with(|s| *s.borrow_mut() = Some(text));
+            Self
+        }
+    }
+
+    impl Drop for ShadowStandIn {
+        fn drop(&mut self) {
+            SHADOW_STAND_IN.with(|s| *s.borrow_mut() = None);
+        }
+    }
+
+    /// A home for `user` inside the sandbox that holds a GNOME login keyring,
+    /// reported in place of the account's real home for the calling test
+    /// thread, so a `SealPassword` takes the token path on any host. Removed
+    /// on drop; declare it after the sandbox.
+    struct GnomeHome;
+
+    impl GnomeHome {
+        fn plant(user: &str, sandbox: &Sandbox) -> Self {
+            let home = sandbox.dir.join(format!("home-{user}"));
+            let keyrings = home.join(".local/share/keyrings");
+            std::fs::create_dir_all(&keyrings).unwrap();
+            std::fs::write(keyrings.join("login.keyring"), b"stand-in").unwrap();
+            crate::users::HOME_STAND_IN.with(|h| *h.borrow_mut() = Some((user.into(), home)));
+            Self
+        }
+    }
+
+    impl Drop for GnomeHome {
+        fn drop(&mut self) {
+            crate::users::HOME_STAND_IN.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    /// Points every TPM call at a transport that cannot open, so a test never
+    /// reaches this machine's TPM whichever path the code takes. Restores the
+    /// previous value on drop; take `env_lock()` first.
+    struct NoTpm(Option<std::ffi::OsString>);
+
+    impl NoTpm {
+        fn install() -> Self {
+            let previous = std::env::var_os("IRLUME_TCTI");
+            std::env::set_var("IRLUME_TCTI", "invalid-irlume-test-tcti");
+            Self(previous)
+        }
+    }
+
+    impl Drop for NoTpm {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("IRLUME_TCTI", value),
+                None => std::env::remove_var("IRLUME_TCTI"),
+            }
+        }
+    }
+
+    /// Plant a GNOME keyring token envelope whose password wrap opens under
+    /// `password`. Its TPM blobs are empty, so no unseal of it can succeed.
+    /// Returns the bytes written.
+    fn plant_token_envelope(user: &str, password: &[u8]) -> Vec<u8> {
+        let path = irlume_core::keyring::envelope_path(user);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let wrap = irlume_core::recovery::wrap(password, &[b'a'; 64]).unwrap();
+        let envelope = serde_json::json!({
+            "version": 1, "secret": "GnomeKeyringToken", "pcrs": [],
+            "public": "", "private": "", "password_wrap": wrap,
+        });
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        bytes
+    }
+
+    /// Plant a login-password or KDE wallet-key envelope (`secret` names the
+    /// kind) whose TPM blobs are empty, so no unseal of it can succeed.
+    fn plant_passwordless_envelope(user: &str, secret: &str) {
+        let path = irlume_core::keyring::envelope_path(user);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let envelope = serde_json::json!({
+            "version": 1, "secret": secret, "pcrs": [],
+            "public": "", "private": "",
+        });
+        std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+    }
+
+    fn envelope_bytes(user: &str) -> Option<Vec<u8>> {
+        std::fs::read(irlume_core::keyring::envelope_path(user)).ok()
+    }
+
+    fn seal_request(user: &str, password: &[u8]) -> Request {
+        Request::SealPassword {
+            kind: None,
+            user: user.into(),
+            password: irlume_common::SecretBytes::new(password.to_vec()),
+            wallet_salt: None,
+            wallet_salt_checked: true,
+        }
+    }
+
+    fn reseal_request(user: &str, password: &[u8]) -> Request {
+        Request::ResealPassword {
+            user: user.into(),
+            password: irlume_common::SecretBytes::new(password.to_vec()),
+            wallet_salt: None,
+            wallet_salt_checked: true,
+        }
+    }
+
+    fn release_request(user: &str, password: &[u8]) -> Request {
+        Request::ReleaseTokenForDisarm {
+            user: user.into(),
+            password: irlume_common::SecretBytes::new(password.to_vec()),
+        }
+    }
+
+    /// The account running the tests, and a peer that is that account.
+    fn own_account() -> (String, Peer) {
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let me = crate::users::name_for_uid(uid).expect("own account");
+        (me, peer(uid))
+    }
+
+    /// Under `sudo cargo test` the account's owner is root, which these
+    /// requests allow, so a test of an owner-only refusal has nothing to show.
+    fn owner_is_root() -> bool {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// The `reseal` session line is the only sender of `ResealPassword`, and
+    /// every stack that carries it opens its session in a root process, so
+    /// the account owner's own process is refused before anything is read.
+    #[test]
+    fn reseal_password_is_refused_for_the_account_owner() {
+        if owner_is_root() {
+            return;
+        }
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("reseal-owner");
+        let _tpm = NoTpm::install();
+        let _shadow = ShadowStandIn::unverifiable();
+        let (me, owner) = own_account();
+        let before = plant_token_envelope(&me, b"wrap-password");
+        match dispatch(reseal_request(&me, b"another-password"), &owner, &mut e) {
+            Response::Error(msg) => assert_eq!(
+                msg,
+                format!("reseal_password requires root (peer uid {})", owner.uid)
+            ),
+            other => panic!("the owner's reseal must be refused, got {other:?}"),
+        }
+        assert_eq!(envelope_bytes(&me), Some(before));
+    }
+
+    /// A login password never holds a NUL byte and the login-hash check
+    /// cannot judge one, so both requests refuse it first, for root and the
+    /// owner alike, even on an account whose hash is readable.
+    #[test]
+    fn keyring_requests_refuse_a_password_with_a_nul_byte() {
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("seal-nul");
+        let _tpm = NoTpm::install();
+        let (me, owner) = own_account();
+        let _shadow = ShadowStandIn::hash_for(&me);
+        let root = peer(0);
+        let before = plant_token_envelope(&me, SHADOW_PASSWORD);
+        let mut with_nul = SHADOW_PASSWORD.to_vec();
+        with_nul.extend_from_slice(b"\0anything");
+        for (label, request, who) in [
+            ("owner arm", seal_request(&me, &with_nul), &owner),
+            ("root arm", seal_request(&me, &with_nul), &root),
+            ("root reseal", reseal_request(&me, &with_nul), &root),
+            ("fresh root arm", seal_request("carol", &with_nul), &root),
+        ] {
+            match dispatch(request, who, &mut e) {
+                Response::Error(msg) => assert!(msg.contains("NUL byte"), "{label}: {msg}"),
+                other => panic!("{label} with a NUL byte must be refused, got {other:?}"),
+            }
+            assert_eq!(envelope_bytes(&me).as_deref(), Some(&before[..]), "{label}");
+        }
+        assert_eq!(envelope_bytes("carol"), None, "nothing is sealed");
+    }
+
+    /// Without a login hash to check against (an LDAP or SSSD account, or
+    /// the shipped AppArmor profile), an arm over an armed GNOME keyring
+    /// token, or over an envelope that cannot be read, is refused for root
+    /// and the owner alike, whatever the password, and nothing is written.
+    /// Login-password and KDE wallet-key envelopes, a first arm and a checked
+    /// password pass.
+    #[test]
+    fn an_unverifiable_seal_over_an_armed_token_is_refused() {
+        const REFUSED: &str = "cannot check this password against";
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("seal-unverifiable");
+        let _tpm = NoTpm::install();
+        let (me, owner) = own_account();
+        let _home = GnomeHome::plant(&me, &sb);
+        let unverifiable = ShadowStandIn::unverifiable();
+        let root = peer(0);
+        let mut peers = vec![("root", &root)];
+        if !owner_is_root() {
+            peers.push(("owner", &owner));
+        }
+        let refused = |response: Response, label: &str, want: &str| match response {
+            Response::Error(msg) => {
+                assert!(msg.contains(REFUSED), "{label}: {msg}");
+                assert!(msg.contains(want), "{label}: {msg}");
+                assert!(msg.contains("nothing was changed"), "{label}: {msg}");
+            }
+            other => panic!("{label}: must be refused, got {other:?}"),
+        };
+        let passed = |response: Response, label: &str| {
+            assert!(
+                !matches!(&response, Response::Error(msg) if msg.contains(REFUSED)),
+                "{label}: {response:?}"
+            );
+        };
+
+        let before = plant_token_envelope(&me, b"wrap-password");
+        for (who, peer) in &peers {
+            for (which, password) in [
+                ("wrap password", &b"wrap-password"[..]),
+                ("other password", b"another-password"),
+            ] {
+                let label = format!("{who}, token, {which}");
+                refused(
+                    dispatch(seal_request(&me, password), peer, &mut e),
+                    &label,
+                    "run `irlume keyring forget` with that password, then",
+                );
+                assert_eq!(envelope_bytes(&me).as_deref(), Some(&before[..]), "{label}");
+            }
+        }
+        // An envelope that cannot be read may be a token.
+        plant_fake_envelope(&me);
+        let unreadable = envelope_bytes(&me);
+        for (who, peer) in &peers {
+            refused(
+                dispatch(seal_request(&me, b"another-password"), peer, &mut e),
+                &format!("{who}, unreadable"),
+                "cannot be read",
+            );
+            assert_eq!(envelope_bytes(&me), unreadable, "{who}, unreadable");
+        }
+        // A login-password or KDE wallet-key envelope, and nothing armed,
+        // pass this check. With no TPM each arm then fails further on.
+        for secret in ["LoginPassword", "KdeWalletKey"] {
+            plant_passwordless_envelope(&me, secret);
+            assert_eq!(
+                irlume_core::keyring::read_sealed_kind(&me)
+                    .unwrap()
+                    .map(|kind| format!("{kind:?}")),
+                Some(secret.to_string()),
+                "the planted envelope reads back as {secret}"
+            );
+            for (who, peer) in &peers {
+                passed(
+                    dispatch(seal_request(&me, b"another-password"), peer, &mut e),
+                    &format!("{who}, {secret}"),
+                );
+            }
+        }
+        std::fs::remove_file(irlume_core::keyring::envelope_path(&me)).unwrap();
+        for (who, peer) in &peers {
+            passed(
+                dispatch(seal_request(&me, b"another-password"), peer, &mut e),
+                &format!("{who}, first arm"),
+            );
+        }
+        // Where the hash is readable the login password re-arms a token.
+        drop(unverifiable);
+        let _hash = ShadowStandIn::hash_for(&me);
+        plant_token_envelope(&me, b"wrap-password");
+        for (who, peer) in &peers {
+            passed(
+                dispatch(seal_request(&me, SHADOW_PASSWORD), peer, &mut e),
+                &format!("{who}, checked"),
+            );
+        }
+    }
+
+    /// A password that fails the login-hash check never replaces a sealed
+    /// secret: not through the re-seal after login (root, from the session
+    /// line) and not through an arm.
+    #[test]
+    fn a_wrong_login_password_leaves_the_sealed_secret_unchanged() {
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("reseal-wrong");
+        let _tpm = NoTpm::install();
+        let _shadow = ShadowStandIn::hash_for("carol");
+        let root = peer(0);
+        let before = plant_token_envelope("carol", SHADOW_PASSWORD);
+        for (label, request) in [
+            ("reseal", reseal_request("carol", b"not-the-login-password")),
+            ("arm", seal_request("carol", b"not-the-login-password")),
+        ] {
+            match dispatch(request, &root, &mut e) {
+                Response::Error(msg) => assert!(
+                    msg.contains("not 'carol's current login password"),
+                    "{label}: {msg}"
+                ),
+                other => panic!("{label} with a wrong password must be refused, got {other:?}"),
+            }
+            assert_eq!(
+                envelope_bytes("carol").as_deref(),
+                Some(&before[..]),
+                "{label}"
+            );
+        }
+        // The login password passes the check; with no TPM the re-seal then
+        // fails further on.
+        let response = dispatch(reseal_request("carol", SHADOW_PASSWORD), &root, &mut e);
+        assert!(
+            !matches!(&response, Response::Error(msg) if msg.contains("current login password")),
+            "{response:?}"
+        );
+    }
+
     #[test]
     fn enrollment_removal_preserves_all_state_until_approved_then_retires_recovery() {
         let _g = env_lock();
@@ -17918,6 +18423,323 @@ mod tests {
             Response::HasPassword(armed) => assert!(!armed),
             other => panic!("expected HasPassword(false), got {other:?}"),
         }
+    }
+
+    /// With a TPM that unseals, a `ResealPassword` from the account's own
+    /// process is refused and leaves the token envelope as it was, and a
+    /// password that does not open the token's wrap gets no token.
+    #[test]
+    #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
+    fn tpm_owner_reseal_leaves_the_token_envelope_unchanged() {
+        if std::env::var("IRLUME_TCTI").is_err() || owner_is_root() {
+            return;
+        }
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("tpm-owner-reseal");
+        let _shadow = ShadowStandIn::unverifiable();
+        let (me, owner) = own_account();
+        irlume_core::keyring::arm_gnome_token(&me, b"wrap-password").expect("arm against swtpm");
+        let before = envelope_bytes(&me).expect("armed");
+        let reseal = dispatch(reseal_request(&me, b"another-password"), &owner, &mut e);
+        assert!(
+            matches!(reseal, Response::Error(_)),
+            "the owner's reseal must be refused, got {reseal:?}"
+        );
+        assert_eq!(envelope_bytes(&me).as_deref(), Some(&before[..]));
+        let release = dispatch(release_request(&me, b"another-password"), &owner, &mut e);
+        assert!(
+            matches!(release, Response::Error(_)),
+            "a password that opens nothing gets no token, got {release:?}"
+        );
+        assert_eq!(envelope_bytes(&me).as_deref(), Some(&before[..]));
+    }
+
+    /// With a TPM that unseals and a GNOME login keyring, the owner's arm
+    /// over an armed token gets no token and writes nothing when irlumed
+    /// cannot check the password against a login hash, even with the
+    /// password that opens the token's wrap; and a password with a NUL byte
+    /// is refused where a hash exists.
+    #[test]
+    #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
+    fn tpm_unverified_owner_seal_leaves_the_token_envelope_unchanged() {
+        if std::env::var("IRLUME_TCTI").is_err() || owner_is_root() {
+            return;
+        }
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("tpm-owner-seal");
+        let (me, owner) = own_account();
+        let _home = GnomeHome::plant(&me, &sb);
+        irlume_core::keyring::arm_gnome_token(&me, b"wrap-password").expect("arm against swtpm");
+        let before = envelope_bytes(&me).expect("armed");
+        let unverifiable = ShadowStandIn::unverifiable();
+        for password in [&b"another-password"[..], b"wrap-password"] {
+            let response = dispatch(seal_request(&me, password), &owner, &mut e);
+            assert!(
+                matches!(&response, Response::Error(msg) if msg.contains("irlume keyring forget")),
+                "no hash: must be refused with the remedy, got {response:?}"
+            );
+            assert_eq!(envelope_bytes(&me).as_deref(), Some(&before[..]));
+        }
+        drop(unverifiable);
+        let _hash = ShadowStandIn::hash_for(&me);
+        let mut with_nul = SHADOW_PASSWORD.to_vec();
+        with_nul.extend_from_slice(b"\0anything");
+        let response = dispatch(seal_request(&me, &with_nul), &owner, &mut e);
+        assert!(
+            matches!(response, Response::Error(_)),
+            "NUL byte: must be refused, got {response:?}"
+        );
+        assert_eq!(envelope_bytes(&me).as_deref(), Some(&before[..]));
+    }
+
+    /// Root gets the same refusal as the owner: with no login hash to check
+    /// against, an arm over an armed token gets no token and writes nothing,
+    /// whatever the password and whatever kind it asks for.
+    #[test]
+    #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
+    fn tpm_unverified_root_seal_leaves_the_token_envelope_unchanged() {
+        if std::env::var("IRLUME_TCTI").is_err() {
+            return;
+        }
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("tpm-root-seal");
+        let _home = GnomeHome::plant("carol", &sb);
+        let _shadow = ShadowStandIn::unverifiable();
+        let root = peer(0);
+        irlume_core::keyring::arm_gnome_token("carol", b"wrap-password")
+            .expect("arm against swtpm");
+        let before = envelope_bytes("carol").expect("armed");
+        let forced = Request::SealPassword {
+            kind: Some(irlume_common::KeyringSecretKind::LoginPassword),
+            user: "carol".into(),
+            password: irlume_common::SecretBytes::new(b"wrap-password".to_vec()),
+            wallet_salt: None,
+            wallet_salt_checked: true,
+        };
+        for (label, request) in [
+            ("wrap password", seal_request("carol", b"wrap-password")),
+            ("other password", seal_request("carol", b"another-password")),
+            ("forced login-password kind", forced),
+        ] {
+            let response = dispatch(request, &root, &mut e);
+            assert!(
+                matches!(&response, Response::Error(msg) if msg.contains("irlume keyring forget")),
+                "{label}: must be refused with the remedy, got {response:?}"
+            );
+            assert_eq!(
+                envelope_bytes("carol").as_deref(),
+                Some(&before[..]),
+                "{label}"
+            );
+        }
+    }
+
+    /// With a TPM that unseals, the re-seal after login leaves a sealed
+    /// password and a token alike unchanged when the password fails the
+    /// login-hash check, and the login password still re-seals.
+    #[test]
+    #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
+    fn tpm_reseal_with_a_wrong_login_password_leaves_the_envelope_unchanged() {
+        if std::env::var("IRLUME_TCTI").is_err() {
+            return;
+        }
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("tpm-reseal-wrong");
+        let _shadow = ShadowStandIn::hash_for("carol");
+        let root = peer(0);
+        irlume_core::keyring::seal_password("carol", SHADOW_PASSWORD).expect("seal against swtpm");
+        let sealed = envelope_bytes("carol").expect("armed");
+        let response = dispatch(
+            reseal_request("carol", b"not-the-login-password"),
+            &root,
+            &mut e,
+        );
+        assert!(
+            matches!(response, Response::Error(_)),
+            "sealed password: must be refused, got {response:?}"
+        );
+        assert_eq!(envelope_bytes("carol").as_deref(), Some(&sealed[..]));
+        match dispatch(reseal_request("carol", SHADOW_PASSWORD), &root, &mut e) {
+            Response::PasswordResealed { armed: true, .. } => {}
+            other => panic!("the login password must still re-seal, got {other:?}"),
+        }
+        irlume_core::keyring::forget_password("carol").unwrap();
+        irlume_core::keyring::arm_gnome_token("carol", SHADOW_PASSWORD).expect("arm against swtpm");
+        let token = envelope_bytes("carol").expect("armed");
+        let response = dispatch(
+            reseal_request("carol", b"not-the-login-password"),
+            &root,
+            &mut e,
+        );
+        assert!(
+            matches!(response, Response::Error(_)),
+            "token: must be refused, got {response:?}"
+        );
+        assert_eq!(envelope_bytes("carol").as_deref(), Some(&token[..]));
+    }
+
+    /// With no login hash to check against, the re-seal after login still
+    /// heals a token: after a password change it re-wraps the token under
+    /// the new password, so `forget` takes that password, and after PCR
+    /// drift it re-seals the same token from the wrap. Before that login the
+    /// wrap is still under the old password, so the arm refusal's remedy
+    /// starts with the login; after it, forget then arm mints a new token.
+    #[test]
+    #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
+    fn tpm_unverified_reseal_rewraps_the_token_for_a_later_forget() {
+        if std::env::var("IRLUME_TCTI").is_err() {
+            return;
+        }
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("tpm-reseal-unverified");
+        let _home = GnomeHome::plant("carol", &sb);
+        let _shadow = ShadowStandIn::unverifiable();
+        let root = peer(0);
+        let token = irlume_core::keyring::arm_gnome_token("carol", b"armed-password")
+            .expect("arm against swtpm");
+        let released = |response: Response, label: &str| match response {
+            Response::PasswordUnsealed { secret, .. } => {
+                assert_eq!(secret.expose(), token.as_bytes(), "{label}");
+            }
+            other => panic!("{label}: expected the token, got {other:?}"),
+        };
+
+        // Password change, no typed login yet: the arm is refused and says
+        // to log in first, since only the previous password opens the wrap.
+        let armed = envelope_bytes("carol").expect("armed");
+        match dispatch(seal_request("carol", b"new-password"), &root, &mut e) {
+            Response::Error(msg) => assert!(
+                msg.contains("it still needs the previous password")
+                    && msg.contains("run `irlume keyring forget` with that password"),
+                "{msg}"
+            ),
+            other => panic!("an unchecked re-arm must be refused, got {other:?}"),
+        }
+        assert_eq!(envelope_bytes("carol").as_deref(), Some(&armed[..]));
+        match dispatch(release_request("carol", b"new-password"), &root, &mut e) {
+            Response::Error(msg) => assert!(msg.contains("use the previous one"), "{msg}"),
+            other => panic!("the new password must not open the wrap yet, got {other:?}"),
+        }
+        released(
+            dispatch(release_request("carol", b"armed-password"), &root, &mut e),
+            "the previous password before the login",
+        );
+
+        // The typed login: the seal opens, the wrap does not.
+        match dispatch(reseal_request("carol", b"new-password"), &root, &mut e) {
+            Response::PasswordResealed {
+                armed: true,
+                changed: true,
+            } => {}
+            other => panic!("the login re-seal must re-wrap the token, got {other:?}"),
+        }
+        released(
+            dispatch(release_request("carol", b"new-password"), &root, &mut e),
+            "the new password",
+        );
+        let response = dispatch(release_request("carol", b"armed-password"), &root, &mut e);
+        assert!(
+            matches!(response, Response::Error(_)),
+            "the old password must no longer open the wrap, got {response:?}"
+        );
+
+        // PCR drift: a seal that no longer unseals, with the wrap intact.
+        let path = irlume_core::keyring::envelope_path("carol");
+        let mut broken = irlume_core::envelope::SealedEnvelope::load(&path).unwrap();
+        broken.private = vec![0u8; broken.private.len()];
+        broken.save(&path).unwrap();
+        match dispatch(reseal_request("carol", b"new-password"), &root, &mut e) {
+            Response::PasswordResealed {
+                armed: true,
+                changed: true,
+            } => {}
+            other => panic!("the login re-seal must heal PCR drift, got {other:?}"),
+        }
+        match irlume_core::keyring::unseal_secret("carol") {
+            Ok(unsealed) => assert_eq!(&*unsealed.secret, token.as_bytes()),
+            Err(err) => panic!("the healed seal must unseal the same token: {err}"),
+        }
+
+        // The rest of the remedy: forget with that password, then arm again.
+        released(
+            dispatch(release_request("carol", b"new-password"), &root, &mut e),
+            "forget",
+        );
+        match dispatch(
+            Request::ForgetPassword {
+                user: "carol".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::PasswordForgotten => {}
+            other => panic!("expected PasswordForgotten, got {other:?}"),
+        }
+        match dispatch(seal_request("carol", b"new-password"), &root, &mut e) {
+            Response::TokenSealed {
+                token: fresh,
+                minted: true,
+            } => assert_ne!(fresh.expose(), token.as_bytes(), "a new token"),
+            other => panic!("an arm after forget must mint a token, got {other:?}"),
+        }
+    }
+
+    /// After a password change, a re-seal whose password matches the login
+    /// hash re-wraps the token under it, so a disarm then takes the new
+    /// password and not the old one; and the owner's arm with that checked
+    /// password re-arms the same token over a stale wrap.
+    #[test]
+    #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
+    fn tpm_a_checked_new_password_rewraps_the_token() {
+        if std::env::var("IRLUME_TCTI").is_err() {
+            return;
+        }
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("tpm-reseal-checked");
+        let (me, owner) = own_account();
+        let _home = GnomeHome::plant(&me, &sb);
+        let _shadow = ShadowStandIn::hash_for(&me);
+        let root = peer(0);
+        let released = |response: Response, token: &[u8]| match response {
+            Response::PasswordUnsealed { secret, .. } => assert_eq!(secret.expose(), token),
+            other => panic!("expected the token, got {other:?}"),
+        };
+
+        let token = irlume_core::keyring::arm_gnome_token(&me, b"previous-password")
+            .expect("arm against swtpm");
+        match dispatch(reseal_request(&me, SHADOW_PASSWORD), &root, &mut e) {
+            Response::PasswordResealed {
+                armed: true,
+                changed: true,
+            } => {}
+            other => panic!("a checked new password must re-wrap the token, got {other:?}"),
+        }
+        let response = dispatch(release_request(&me, SHADOW_PASSWORD), &owner, &mut e);
+        released(response, token.as_bytes());
+        let response = dispatch(release_request(&me, b"previous-password"), &owner, &mut e);
+        assert!(
+            matches!(response, Response::Error(_)),
+            "the old password must no longer open the wrap, got {response:?}"
+        );
+
+        irlume_core::keyring::forget_password(&me).unwrap();
+        let token = irlume_core::keyring::arm_gnome_token(&me, b"previous-password")
+            .expect("arm against swtpm");
+        match dispatch(seal_request(&me, SHADOW_PASSWORD), &owner, &mut e) {
+            Response::TokenSealed {
+                token: again,
+                minted: false,
+            } => assert_eq!(again.expose(), token.as_bytes()),
+            other => panic!("a checked password must re-arm over a stale wrap, got {other:?}"),
+        }
+        let response = dispatch(release_request(&me, SHADOW_PASSWORD), &owner, &mut e);
+        released(response, token.as_bytes());
     }
 
     #[test]

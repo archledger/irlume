@@ -138,8 +138,7 @@ jobs:
 
               ver=1.28.1
               cd /tmp
-              curl -fsSLO "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/onnxruntime-linux-x64-${ver}.tgz"
-              tar xzf "onnxruntime-linux-x64-${ver}.tgz"
+              bash /src/scripts/fetch-ort.sh "$ver"
               export ORT_DYLIB_PATH="/tmp/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so"
               cd /src
               runuser -u irlume-test -- cargo build --workspace --locked

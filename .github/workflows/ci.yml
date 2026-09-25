@@ -144,11 +144,15 @@ jobs:
           # guards the (scarcer) LFS bandwidth quota.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # scripts/fetch-ort.sh checks the runtime's sha256 for every job that
+      # loads it; its test runs first, against a stand-in curl.
+      - name: ONNX runtime fetcher test (fixtures only, no network)
+        run: bash scripts/test-fetch-ort.sh
+
       - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
         run: |
           ver=1.28.1
-          curl -fsSLO "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/onnxruntime-linux-x64-${ver}.tgz"
-          tar xzf "onnxruntime-linux-x64-${ver}.tgz"
+          bash scripts/fetch-ort.sh "$ver"
           echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
 
       - name: Action pins (SHA-pinned; SLSA generator excepted)
@@ -473,8 +477,7 @@ jobs:
       - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
         run: |
           ver=1.28.1
-          curl -fsSLO "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/onnxruntime-linux-x64-${ver}.tgz"
-          tar xzf "onnxruntime-linux-x64-${ver}.tgz"
+          bash scripts/fetch-ort.sh "$ver"
           echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
 
       - name: build
@@ -517,8 +520,9 @@ jobs:
       # and every lane must agree on the version. Both failures have shipped
       # before: the 0.6.x rpm installed a timer it left out of %files, PR #98
       # existed to resync drifted version fields, and the 0.7.0 audit found the
-      # PPA lane missing the reconcile timer entirely.
-      - name: packaging parity (units in every lane, versions agree)
+      # PPA lane missing the reconcile timer entirely. It also keeps every copy
+      # of the ONNX Runtime sha256 equal to the one scripts/fetch-ort.sh checks.
+      - name: packaging parity (units in every lane, versions and ONNX Runtime sha256 agree)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends desktop-file-utils

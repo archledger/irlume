@@ -106,12 +106,14 @@ sudo pacman -S --needed base-devel rust clang tpm2-tss pam systemd onnxruntime-c
 
 irlume needs onnxruntime **≥ 1.24** (the `api-24` ABI) and loads it dynamically
 at runtime. Arch's `onnxruntime-cpu` package is new enough. On Fedora/Ubuntu the
-distro build is older, so fetch the upstream release and point `ORT_DYLIB_PATH`
-at it:
+distro build is older, so fetch the upstream release, check it against the
+sha256 CI and the packages pin, and point `ORT_DYLIB_PATH` at it
+(`scripts/fetch-ort.sh 1.28.1` does the same download, check and unpack):
 
 ```sh
 curl -fsSLO https://github.com/microsoft/onnxruntime/releases/download/v1.28.1/onnxruntime-linux-x64-1.28.1.tgz
-tar xzf onnxruntime-linux-x64-1.28.1.tgz
+echo '2529aef968d0ad0603365054bc46ebefa7f0fe3bc12f28c5f729c99ddffe2a81  onnxruntime-linux-x64-1.28.1.tgz' | sha256sum -c - &&
+  tar xzf onnxruntime-linux-x64-1.28.1.tgz
 export ORT_DYLIB_PATH="$PWD/onnxruntime-linux-x64-1.28.1/lib/libonnxruntime.so"
 ```
 

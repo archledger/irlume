@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright the irlume contributors.
 #
-# Every systemd unit must be shipped by every packaging lane, and every lane
-# must agree on the version.
+# Every systemd unit must be shipped by every packaging lane, every lane must
+# agree on the version, and every ONNX Runtime download in CI, the lanes and the
+# developer guide must check the same pinned sha256.
 #
 # This exists because the same bug has now shipped three times. 0.6.x installed
 # irlume-reconcile.timer on Fedora but left it out of the rpm's %files, so the
@@ -290,6 +291,8 @@ ort_pin_of() {
     packaging/debian/build-deb.sh|scripts/build-ppa-source.sh)
       # shellcheck disable=SC2016  # ${ORT_VER:-...} is literal text in those files
       sed -n 's/^ORT_VER="${ORT_VER:-\([0-9][0-9.]*\)}".*/\1/p' "$1" ;;
+    scripts/fetch-ort.sh)
+      sed -n 's/^PINNED_VER=\([0-9][0-9.]*\)$/\1/p' "$1" ;;
     *)
       echo "  ERROR: no ONNX Runtime pin pattern known for $1;" >&2
       echo "  add one to ort_pin_of() in $0 rather than leaving it unchecked." >&2
@@ -307,12 +310,14 @@ ORT_PINNED_BY=(
   packaging/fedora/irlume.spec
   packaging/debian/build-deb.sh
   scripts/build-ppa-source.sh
+  scripts/fetch-ort.sh
 )
 
 # How many times each file is expected to name it. Counting DISTINCT values is
-# not enough: ci.yml fetches the runtime in three separate jobs, and deleting
-# one of those steps leaves the other two agreeing, so a uniqueness check would
-# report ok for a workflow that had silently stopped pinning a lane.
+# not enough: ci.yml fetches the runtime in two separate jobs (check and
+# stable), and deleting one of those steps still leaves one distinct version,
+# so a uniqueness check would report ok for a workflow that had silently
+# stopped pinning a lane.
 declare -A ORT_PIN_COUNT=(
   [.github/workflows/ci.yml]=2
   [.github/workflows/asan.yml]=1
@@ -322,6 +327,7 @@ declare -A ORT_PIN_COUNT=(
   [packaging/fedora/irlume.spec]=1
   [packaging/debian/build-deb.sh]=1
   [scripts/build-ppa-source.sh]=1
+  [scripts/fetch-ort.sh]=1
 )
 
 ort_ref=""
@@ -330,6 +336,11 @@ for f in "${ORT_PINNED_BY[@]}"; do
   if [ -z "$want" ]; then
     echo "  ERROR: no expected pin count for $f; add one to ORT_PIN_COUNT in $0" >&2
     exit 1
+  fi
+  if [ ! -f "$f" ]; then
+    printf '  MISS  %-42s file not found\n' "$f"
+    fail=1
+    continue
   fi
   all="$(ort_pin_of "$f")"
   n="$(printf '%s' "$all" | grep -c . || true)"
@@ -385,6 +396,143 @@ else
     fi
   done
 fi
+
+echo
+echo "== ONNX Runtime downloads in CI, the lanes and the dev guide check one sha256 =="
+# The version names a release; only a digest fixes its bytes. CI loads the
+# runtime into every test process and the lanes ship it beside the daemon, so
+# every file that pins the version above also checks the tarball against one
+# sha256, as many times as it pins the version. Workflows carry no digest of
+# their own: each fetch calls scripts/fetch-ort.sh, which holds it. The lanes
+# keep their own copy (hex, or SRI base64 in the Nix files), and so does the
+# developer guide's recipe.
+ORT_FETCHER=scripts/fetch-ort.sh
+ort_sha_of() {
+  local calls i
+  case "$1" in
+    "$ORT_FETCHER")
+      sed -n 's/^PINNED_SHA256=\([0-9a-f]\{64\}\)$/\1/p' "$1" ;;
+    .github/workflows/ci.yml|.github/workflows/asan.yml|.github/workflows/install-matrix.yml)
+      # One fetcher digest per call that passes the step's pinned `ver`. Only
+      # a line that is the whole call counts: a commented-out call checks
+      # nothing, and one followed by `|| true` does not stop the step when
+      # the digest differs.
+      # shellcheck disable=SC2016  # "$ver" is literal text in the workflows
+      calls="$(grep -cE '^[[:space:]]*bash[[:space:]]+([^[:space:]]*/)?scripts/fetch-ort\.sh[[:space:]]+"\$ver"[[:space:]]*$' "$1" || true)"
+      for ((i = 0; i < calls; i++)); do
+        if [ -f "$ORT_FETCHER" ]; then ort_sha_of "$ORT_FETCHER"; fi
+      done ;;
+    flake.nix|nix/module.nix)
+      # The fetchurl `hash` on the line after the tarball URL, SRI to hex.
+      # shellcheck disable=SC2016  # ${ortVersion} is literal text in the Nix files
+      awk 'index($0, "onnxruntime-linux-x64-${ortVersion}.tgz") { if ((getline nxt) > 0) print nxt }' "$1" \
+        | sed -n 's|^[[:space:]]*hash = "sha256-\([A-Za-z0-9+/]\{43\}=\)";$|\1|p' \
+        | while IFS= read -r sri; do
+            printf '%s' "$sri" | base64 -d | od -An -tx1 -v | tr -d ' \n'
+            echo
+          done ;;
+    packaging/fedora/irlume.spec)
+      # Source1 is the runtime tarball; %prep checks it before unpacking.
+      sed -n "s/^echo '\([0-9a-f]\{64\}\)  %{SOURCE1}' | sha256sum -c -\$/\1/p" "$1" ;;
+    packaging/debian/build-deb.sh|scripts/build-ppa-source.sh)
+      # shellcheck disable=SC2016  # ${ORT_SHA256:-...} is literal text in those files
+      sed -n 's/^ORT_SHA256="${ORT_SHA256:-\([0-9a-f]\{64\}\)}"$/\1/p' "$1" ;;
+    *)
+      echo "  ERROR: no ONNX Runtime sha256 pattern known for $1;" >&2
+      echo "  add one to ort_sha_of() in $0 rather than leaving it unchecked." >&2
+      exit 1
+      ;;
+  esac
+}
+
+# The fetcher first, so a drifted lane is reported against the fetcher's digest.
+ORT_SHA_SITES=("$ORT_FETCHER")
+for f in "${ORT_PINNED_BY[@]}"; do
+  if [ "$f" != "$ORT_FETCHER" ]; then ORT_SHA_SITES+=("$f"); fi
+done
+ort_sha_ref=""
+ort_sha_ref_file=""
+for f in "${ORT_SHA_SITES[@]}"; do
+  want="${ORT_PIN_COUNT[$f]}"
+  if [ ! -f "$f" ]; then
+    printf '  MISS  %-42s file not found\n' "$f"
+    fail=1
+    continue
+  fi
+  all="$(ort_sha_of "$f")"
+  n="$(printf '%s' "$all" | grep -c . || true)"
+  if [ "$n" -ne "$want" ]; then
+    printf '  MISS  %-42s expected %s sha256 check(s), found %s\n' "$f" "$want" "$n"
+    fail=1
+    continue
+  fi
+  found="$(printf '%s\n' "$all" | sort -u)"
+  u="$(printf '%s' "$found" | grep -c . || true)"
+  if [ "$u" -ne 1 ]; then
+    printf '  MISS  %-42s names %s different digests\n' "$f" "$u"
+    fail=1
+    continue
+  fi
+  printf '  ok    %-42s %s\n' "$f" "$found"
+  if [ -z "$ort_sha_ref" ]; then
+    ort_sha_ref="$found"
+    ort_sha_ref_file="$f"
+  elif [ "$found" != "$ort_sha_ref" ]; then
+    printf '  ERROR %-42s checks %s, but %s checks %s\n' \
+      "$f" "$found" "$ort_sha_ref_file" "$ort_sha_ref"
+    fail=1
+  fi
+done
+
+# The developer guide's copy-paste recipe checks the same digest and unpacks
+# only when that check passes: the tar command the version check above pins
+# must follow the check on the next line.
+ORT_DEV_GUIDE=docs/DEVELOPMENT.md
+if [ -z "$ort_sha_ref" ] || [ -z "$ort_ref" ]; then
+  printf '  ERROR %-42s no version and digest to check it against\n' "$ORT_DEV_GUIDE"
+  fail=1
+else
+  doc_check="echo '$ort_sha_ref  onnxruntime-linux-x64-$ort_ref.tgz' | sha256sum -c - &&"
+  if grep -F -A1 -- "$doc_check" "$ORT_DEV_GUIDE" \
+      | grep -qF -- "tar xzf onnxruntime-linux-x64-$ort_ref.tgz"; then
+    printf '  ok    %-42s %s\n' "$ORT_DEV_GUIDE" "$doc_check"
+  else
+    printf '  MISS  %-42s %s, then the tar command\n' "$ORT_DEV_GUIDE" "$doc_check"
+    fail=1
+  fi
+fi
+
+# Under .github, scripts, packaging and nix, and in flake.nix and the developer
+# guide, only a file that checks the digest itself may name the tarball or its
+# download URL. A workflow step or script that fetches the tarball any other
+# way (curl, a mirror, `gh release download`) fails here until it calls
+# scripts/fetch-ort.sh. This script and the fetcher's test name the tarball but
+# download nothing.
+ORT_URL='microsoft/onnxruntime/releases/download'
+ORT_DOWNLOADERS=(
+  "$ORT_FETCHER"
+  flake.nix
+  nix/module.nix
+  packaging/fedora/irlume.spec
+  packaging/debian/build-deb.sh
+  scripts/build-ppa-source.sh
+  "$ORT_DEV_GUIDE"
+)
+while IFS= read -r f; do
+  case "$f" in scripts/check-packaging-parity.sh|scripts/test-fetch-ort.sh) continue ;; esac
+  allowed=0
+  for d in "${ORT_DOWNLOADERS[@]}"; do
+    if [ "$f" = "$d" ]; then allowed=1; fi
+  done
+  if [ "$allowed" -eq 1 ]; then
+    printf '  ok    %-42s names the tarball and checks its sha256\n' "$f"
+  else
+    printf '  MISS  %-42s names the onnxruntime tarball without a sha256 check; call %s\n' \
+      "$f" "$ORT_FETCHER"
+    fail=1
+  fi
+done < <(grep -rlE -- "$ORT_URL|onnxruntime-linux-x64-[^/[:space:]]*\\.tgz" \
+  .github scripts packaging nix flake.nix "$ORT_DEV_GUIDE" | sort)
 
 echo
 echo

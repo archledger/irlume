@@ -36,6 +36,7 @@ on:
       - ".github/workflows/asan.yml"
       - ".github/lsan-suppressions.txt"
       - "scripts/ci-bubblewrap.sh"
+      - "scripts/fetch-ort.sh"
   schedule:
     - cron: "40 4 * * 3" # Wednesdays 04:40 UTC, clear of the other scheduled jobs
   workflow_dispatch:
@@ -136,8 +137,7 @@ jobs:
       - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
         run: |
           ver=1.28.1
-          curl -fsSLO "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/onnxruntime-linux-x64-${ver}.tgz"
-          tar xzf "onnxruntime-linux-x64-${ver}.tgz"
+          bash scripts/fetch-ort.sh "$ver"
           echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
 
       - name: test (instrumented with AddressSanitizer + LeakSanitizer)

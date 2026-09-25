@@ -1447,13 +1447,15 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_forget_before_upgrading_to_45() {
         }
         std::fs::write(sb.path("os-release"), os_release).unwrap();
         serve(&sock(&sb), move |request| match request {
-            Request::KeyringInfo { .. } => Response::KeyringInfo {
-                armed,
-                policy: None,
-                pcrs: Vec::new(),
-                drifted: None,
-                kind,
-            },
+            Request::KeyringInfo { .. } | Request::KeyringMetadata { .. } => {
+                Response::KeyringInfo {
+                    armed,
+                    policy: None,
+                    pcrs: Vec::new(),
+                    drifted: None,
+                    kind,
+                }
+            }
             Request::SealPassword { .. } => Response::TokenSealed {
                 token: irlume_common::SecretBytes::new(b"fixture-token".to_vec()),
                 minted: true,
@@ -1556,6 +1558,37 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_forget_before_upgrading_to_45() {
     assert_eq!(upgrade_check(&sb)["state"], "info");
     let sb = sandbox("debian-token", DEBIAN, true, Some(K::GnomeKeyringToken));
     assert!(!status(&sb).contains(NOTICE));
+
+    // doctor reads the envelope's metadata, never the live PCR diagnosis
+    // behind KeyringInfo; a daemon from before that query leaves it unknown.
+    for (tag, metadata, state) in [
+        ("fedora44-metadata-only", true, "warn"),
+        ("fedora44-no-metadata", false, "unknown"),
+    ] {
+        let sb = Sandbox::new(tag);
+        for tool in ["rpm", "dnf", "dpkg-query", "apt-cache", "pacman"] {
+            sb.fake_tool(tool, "exit 1");
+        }
+        std::fs::write(sb.path("os-release"), FEDORA_44).unwrap();
+        let log = serve(&sock(&sb), move |request| match request {
+            Request::KeyringMetadata { .. } if metadata => Response::KeyringInfo {
+                armed: true,
+                policy: None,
+                pcrs: Vec::new(),
+                drifted: None,
+                kind: Some(K::GnomeKeyringToken),
+            },
+            _ => Response::Error("fixture unavailable".into()),
+        });
+        assert_eq!(upgrade_check(&sb)["state"], state, "{tag}");
+        let requests = log.lock().unwrap();
+        assert!(
+            !requests
+                .iter()
+                .any(|request| matches!(request, Request::KeyringInfo { .. })),
+            "{tag}: {requests:?}"
+        );
+    }
 }
 
 /// An encrypted store whose template key is gone is the one state the old

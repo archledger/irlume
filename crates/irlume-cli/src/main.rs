@@ -3900,8 +3900,11 @@ fn report_faillock_state(report: &mut crate::doctor_report::Report, user: &str) 
 /// Whether the armed keyring secret survives the next upgrade of this
 /// release. Only a release listed in `upgrade_notice` asks the daemon; every
 /// other host reports `info`. There, a GNOME keyring token warns with the
-/// step, any other answer passes, and a daemon that does not answer or does
-/// not report the kind leaves the check `unknown`.
+/// step, any other answer passes, and a daemon that does not answer the
+/// metadata query or does not report the kind leaves the check `unknown`.
+/// The query is `KeyringMetadata`, which reads the envelope only: the live
+/// PCR diagnosis behind `KeyringInfo` waits on the daemon's TPM queue, and
+/// this check needs only `armed` and `kind`.
 fn report_keyring_os_upgrade(report: &mut crate::doctor_report::Report, user: &str) {
     use crate::doctor_report::State;
     const ID: &str = "keyring-os-upgrade";
@@ -3918,7 +3921,7 @@ fn report_keyring_os_upgrade(report: &mut crate::doctor_report::Report, user: &s
             return;
         }
     };
-    let answer = daemon_request(&irlume_common::Request::KeyringInfo {
+    let answer = daemon_request(&irlume_common::Request::KeyringMetadata {
         user: user.to_string(),
     });
     match upgrade_notice::token_armed(&answer) {

@@ -75,8 +75,8 @@ impl TokenUpgradeNotice {
     }
 }
 
-/// Whether the daemon's answer to `KeyringInfo` shows a GNOME keyring token
-/// armed. `None` when it does not say: no answer, an error, another reply, or
+/// Whether the daemon's answer to `KeyringInfo` or `KeyringMetadata` shows a
+/// GNOME keyring token armed. `None` when it does not say: no answer, an error, another reply, or
 /// an armed secret whose kind an older daemon does not report.
 pub(crate) fn token_armed(answer: &Result<Response, String>) -> Option<bool> {
     match answer {

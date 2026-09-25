@@ -18,7 +18,9 @@ moves. This fails when:
   enforced step's `run:` in the required `check` job of
   .github/workflows/ci.yml (a step or job that is conditional, may fail, or
   runs in another directory does not count, nor does a line inside a shell
-  `if`, `case`, loop or function body), or the block is gone or empty;
+  `if`, `case`, loop or function body or after `set +e`; a job that waits
+  on `needs` is an error), or the block is gone or empty, or ends in a
+  dangling continuation;
 * a code fence is never closed.
 
 "The tree" is what git lists: tracked files and new files that are not
@@ -37,7 +39,9 @@ cargo feature such as `irlume-auth/ir-only-evaluation` and a unit name
 inside a command are not. A `:line`, `#anchor`, `--flag=` or `VAR=` around a
 path is stripped first. Placeholders (`<target>`, `NNNN`), absolute paths
 (`/etc/pam.d`, which name the host, not the tree) and `target/` are not
-checked. Files outside the tree are cited by absolute path. Only the root
+checked. Files outside the tree are cited by absolute path. Link
+destinations with more than one level of nested parentheses are not parsed;
+no path in this repository has them. Only the root
 file's gate block is compared with CI; the per-area table, lanes, rules and
 versions need a reread.
 
@@ -73,7 +77,7 @@ LINK = re.compile(
     re.S,
 )
 REFERENCE = re.compile(r"^ {0,3}\[[^\]]+\]:\s*(<[^>\n]*>|\S+)", re.M)
-HREF = re.compile(r"<a\s[^>]*?href=(?:\"([^\"]+)\"|'([^']+)')", re.I)
+HREF = re.compile(r"<a\s[^>]*?href\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s\"'>]+))", re.I)
 FULL_REFERENCE = re.compile(r"\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\[([^\[\]]*)\]")
 DEFINITION = re.compile(r"^ {0,3}\[([^\]]+)\]:", re.M)
 COMMENT = re.compile(r"<!--.*?-->", re.S)
@@ -93,7 +97,7 @@ class Tree:
         self.files = set()
         for name in filter(None, out.split("\0")):
             try:
-                present = (root / name).is_file()
+                present = (root / name).is_file() or (root / name).is_symlink()
             except OSError:
                 present = False
             if present:
@@ -223,7 +227,7 @@ def check_doc(tree, root, name):
     no_code = CODE_SPAN.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), prose)
     targets = [(m.start(), m.group(1)) for m in LINK.finditer(no_code)]
     targets += [(m.start(), m.group(1)) for m in REFERENCE.finditer(no_code)]
-    targets += [(m.start(), m.group(1) or m.group(2)) for m in HREF.finditer(no_code)]
+    targets += [(m.start(), m.group(1) or m.group(2) or m.group(3)) for m in HREF.finditer(no_code)]
     defined = {" ".join(d.lower().split()) for d in DEFINITION.findall(no_code)}
     for m in FULL_REFERENCE.finditer(no_code):
         label = " ".join((m.group(2) or m.group(1)).lower().split())
@@ -262,6 +266,8 @@ def gate_commands(text):
                 fence = match.group(1)
             continue
         if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence):
+            if pending is not None:
+                commands.append((pending[0], None))
             break
         if line.strip() and not line.lstrip().startswith("#"):
             if pending is not None:
@@ -283,7 +289,7 @@ def logical_lines(script):
     joined, comments and heredoc bodies dropped, whitespace collapsed. Lines
     inside a shell `if`, `case`, loop or function body are left out: the
     shell may never run them."""
-    lines, buffer, heredoc, depth = set(), [], None, 0
+    lines, buffer, heredoc, depth, masked = set(), [], None, 0, False
     for raw in str(script).split("\n"):
         if heredoc is not None:
             if raw.strip() == heredoc:
@@ -301,11 +307,13 @@ def logical_lines(script):
         buffer.append(text)
         command = " ".join(" ".join(buffer).split())
         buffer = []
+        if re.match(r"^set\s+(?:\+\w*e\w*|\+o\s+errexit)\b", command):
+            masked = True
         if SHELL_CLOSE.match(command) and depth:
             depth -= 1
         elif SHELL_OPEN.match(command) and not re.search(r"\b(?:fi|esac|done)\s*$|\}\s*$", command):
             depth += 1
-        elif depth == 0:
+        elif depth == 0 and not masked:
             lines.add(command)
         tag = re.search(r"<<-?\s*['\"]?(\w+)['\"]?", command)
         if tag:
@@ -340,6 +348,8 @@ def run_commands(workflow_text):
         return None, f"has no `{GATE_JOB}` job"
     if not enforced(job):
         return None, f"runs the `{GATE_JOB}` job only conditionally"
+    if job.get("needs") and str(job.get("if", "")).strip() not in ("always()", "${{ always() }}"):
+        return None, f"runs the `{GATE_JOB}` job only after its `needs` jobs succeed"
     def default_dir(node):
         defaults = node.get("defaults") if isinstance(node.get("defaults"), dict) else {}
         run = defaults.get("run") if isinstance(defaults.get("run"), dict) else {}
@@ -367,10 +377,12 @@ def check_gate(root, text):
     ran, error = run_commands(workflow)
     if error:
         return [f"{doc}: {CI} {error}, so the gate commands cannot be checked"]
-    return [
+    problems = [f"{doc}:{number}: gate command ends in a dangling \\ continuation"
+                for number, command in commands if command is None]
+    return problems + [
         f"{doc}:{number}: gate command is not a run line of the {GATE_JOB} job in {CI}: {command}"
         for number, command in commands
-        if command not in ran
+        if command is not None and command not in ran
     ]
 
 

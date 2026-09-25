@@ -405,6 +405,27 @@ class CheckAgentsMdTests(unittest.TestCase):
                     f"          {joint}\n          cargo test --locked -p irlume-pam\n          true\n"))
                 self.assertEqual(self.problems(), [MISSING_TEST])
 
+    @needs_yaml
+    def test_masked_failures_needs_and_a_dangling_gate_line_are_named(self):
+        self.write(".github/workflows/ci.yml", CI.replace(
+            "          cargo test --locked -p irlume-pam\n",
+            "          set +e\n          cargo test --locked -p irlume-pam\n          true\n"))
+        self.assertEqual(self.problems(), [MISSING_TEST])
+        self.write(".github/workflows/ci.yml", CI.replace("  check:\n", "  check:\n    needs: setup\n"))
+        self.assertEqual(self.problems(), ["AGENTS.md: .github/workflows/ci.yml runs the `check` job only "
+                                           "after its `needs` jobs succeed, so the gate commands cannot be checked"])
+        self.write(".github/workflows/ci.yml", CI)
+        self.write("AGENTS.md", ROOT_DOC.replace("cargo test --locked -p irlume-pam\n",
+                                                 "cargo test --locked -p irlume-pam \\\n"))
+        self.assertEqual(self.problems(), ["AGENTS.md:13: gate command ends in a dangling \\ continuation"])
+
+    @needs_yaml
+    def test_unquoted_href_and_tracked_symlinks(self):
+        (self.root / "docs").mkdir()
+        (self.root / "docs/link").symlink_to("gone-target")
+        self.root_doc("<a href = docs/gone.md>x</a> <a href=docs/link>y</a> `docs/link`\n")
+        self.assertEqual(self.problems(), ["AGENTS.md:9: link target docs/gone.md does not exist"])
+
     # Robustness
 
     @needs_yaml

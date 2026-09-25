@@ -63,8 +63,9 @@ login or locks a person out. It is critical-tier
   honoring `IntentAttestation::PolicyWaived` (ADR-0018).
 - Every copy the module makes of a secret (`PAM_AUTHTOK`, released secrets)
   must be zeroized: hold it in `SecretBytes`, in pamsm's `PamSecretBytes` for
-  the PAM-data stashes, or wipe it by hand (the `set_authtok` `CString` in
-  `release_secret`). Never log one. A GNOME keyring token never rides
+  the PAM-data stashes, or in `Zeroizing` (the `set_authtok` `CString` from
+  `secret_cstring`, which also wipes the copy a rejected one leaves). Never
+  log one. A GNOME keyring token never rides
   `PAM_AUTHTOK` (`GKR_TOKEN_STASH_KEY`).
 - Service kinds are classified, from a named source, in
   `crates/irlume-common/src/pam_service.rs`

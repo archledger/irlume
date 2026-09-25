@@ -5814,7 +5814,7 @@ mod tests {
         /// The accounts named by each `ForgetPassword` irlumed received.
         forgets: Vec<String>,
         /// The login keyring's credential afterwards.
-        keyring: Vec<u8>,
+        keyring: zeroize::Zeroizing<Vec<u8>>,
         /// Control connections on which the fake gnome-keyring received at
         /// least the credentials byte (a `DropUnread` one reads nothing, so
         /// it never counts).
@@ -5830,7 +5830,7 @@ mod tests {
     fn serve_control(
         mut stream: std::os::unix::net::UnixStream,
         fate: Control,
-        secret: &std::sync::Mutex<Vec<u8>>,
+        secret: &std::sync::Mutex<zeroize::Zeroizing<Vec<u8>>>,
     ) -> bool {
         use std::io::{Read, Write};
         if matches!(fate, Control::DropUnread) {
@@ -5847,14 +5847,15 @@ mod tests {
         stream.read_exact(&mut credentials).unwrap();
         let mut total = [0u8; 4];
         stream.read_exact(&mut total).unwrap();
-        let mut packet = vec![0u8; u32::from_be_bytes(total) as usize - 4];
+        let mut packet = zeroize::Zeroizing::new(vec![0u8; u32::from_be_bytes(total) as usize - 4]);
         stream.read_exact(&mut packet).unwrap();
         let word = |at: usize| u32::from_be_bytes(packet[at..at + 4].try_into().unwrap()) as usize;
         assert_eq!(word(0), 2, "the arm sends only CHANGE");
         let current_len = word(4);
-        let current = packet[8..8 + current_len].to_vec();
+        let current = zeroize::Zeroizing::new(packet[8..8 + current_len].to_vec());
         let new_len = word(8 + current_len);
-        let new = packet[12 + current_len..12 + current_len + new_len].to_vec();
+        let new =
+            zeroize::Zeroizing::new(packet[12 + current_len..12 + current_len + new_len].to_vec());
         let code: u32 = {
             let mut keyring = secret.lock().unwrap();
             if *keyring == current {
@@ -5894,7 +5895,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("keyring")).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
 
-        let secret = Arc::new(Mutex::new(keyring.to_vec()));
+        let secret = Arc::new(Mutex::new(zeroize::Zeroizing::new(keyring.to_vec())));
         let keyring_thread = (!script.is_empty()).then(|| {
             let control = irlume_common::gkr_wire::control_socket_path(&dir);
             let listener = std::os::unix::net::UnixListener::bind(&control).unwrap();
@@ -6005,7 +6006,7 @@ mod tests {
     #[test]
     fn a_minted_token_is_kept_when_the_rekey_answer_is_lost() {
         let run = arm_against(ARM_PASSWORD, &[Control::ApplyThenDrop], true);
-        assert_eq!(run.keyring, ARM_TOKEN, "the re-key reached the keyring");
+        assert_eq!(*run.keyring, ARM_TOKEN, "the re-key reached the keyring");
         let err = run.result.expect_err("an unconfirmed re-key is not an arm");
         assert!(
             run.forgets.is_empty(),
@@ -6022,7 +6023,7 @@ mod tests {
     #[test]
     fn a_minted_token_is_kept_when_every_keyring_answer_is_lost() {
         let run = arm_against(ARM_PASSWORD, &[Control::ApplyThenDrop; 3], true);
-        assert_eq!(run.keyring, ARM_TOKEN, "the re-key reached the keyring");
+        assert_eq!(*run.keyring, ARM_TOKEN, "the re-key reached the keyring");
         let err = run.result.expect_err("an unconfirmed re-key is not an arm");
         assert!(run.forgets.is_empty(), "{err}");
         assert!(err.contains("kept"), "{err}");
@@ -6037,7 +6038,7 @@ mod tests {
             &[Control::Answer, Control::ApplyThenDrop],
             true,
         );
-        assert_eq!(run.keyring, ARM_TOKEN);
+        assert_eq!(*run.keyring, ARM_TOKEN);
         let err = run.result.expect_err("an unverified token is not an arm");
         assert!(run.forgets.is_empty(), "{err}");
         assert!(err.contains("kept"), "{err}");
@@ -6066,7 +6067,7 @@ mod tests {
             ),
         ] {
             let run = arm_against(keyring, script, true);
-            assert_eq!(run.keyring, keyring, "{case}: the keyring is unchanged");
+            assert_eq!(*run.keyring, keyring, "{case}: the keyring is unchanged");
             let err = run.result.expect_err(case);
             assert_eq!(run.forgets, ["testuser"], "{case}: {err}");
             assert!(err.contains("rolled back"), "{case}: {err}");
@@ -6085,7 +6086,7 @@ mod tests {
         POSE_AS_UID.with(|uid| uid.set(Some(keyring_uid.wrapping_add(1))));
         let run = arm_against(ARM_PASSWORD, &[Control::ForeignUid; 3], true);
         POSE_AS_UID.with(|uid| uid.set(None));
-        assert_eq!(run.keyring, ARM_PASSWORD, "the keyring is unchanged");
+        assert_eq!(*run.keyring, ARM_PASSWORD, "the keyring is unchanged");
         let err = run.result.expect_err("another uid's keyring is not armed");
         assert_eq!(run.forgets, ["testuser"], "{err}");
         assert_eq!(run.requests, 0, "nothing is sent to it: {err}");
@@ -6107,7 +6108,7 @@ mod tests {
     fn a_confirmed_rekey_arms_the_token() {
         let run = arm_against(ARM_PASSWORD, &[Control::Answer; 2], true);
         assert_eq!(run.result, Ok(()));
-        assert_eq!(run.keyring, ARM_TOKEN);
+        assert_eq!(*run.keyring, ARM_TOKEN);
         assert!(run.forgets.is_empty());
     }
 }

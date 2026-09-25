@@ -14,7 +14,7 @@
 #
 # Usage:
 #   scripts/run-tests-guarded.sh --min N -- <command> [args...]
-#   scripts/run-tests-guarded.sh --require a,b,c [--min N] -- <command> [args...]
+#   scripts/run-tests-guarded.sh --require a,b,c [--require d ...] [--min N] -- <command> [args...]
 #   scripts/run-tests-guarded.sh --self-test
 #
 # --min asserts that at least N tests passed. Use it for prefix filters
@@ -25,7 +25,9 @@
 # wherever the workflow names tests explicitly: a count alone is not enough
 # there, because renaming one test while adding another keeps the total intact
 # and hides the loss. The contract for those lanes is the named set, not the
-# size of the set.
+# size of the set. --require may be repeated; every flag adds its names to one
+# set, so `--require a --require b,c` requires all three. An empty name, a name
+# with whitespace and a name given twice are usage errors.
 #
 # The command runs through this script rather than the assertion being a
 # separate step against a log file, so the two cannot drift apart: there is no
@@ -49,7 +51,7 @@ readonly SUMMARY_RE='^test result: ok\. [0-9]+ passed;'
 usage() {
   cat >&2 <<'EOF'
 usage: run-tests-guarded.sh --min N -- <command> [args...]
-       run-tests-guarded.sh --require a,b,c [--min N] -- <command> [args...]
+       run-tests-guarded.sh --require a,b,c [--require d ...] [--min N] -- <command> [args...]
        run-tests-guarded.sh --self-test
 EOF
 }
@@ -225,6 +227,39 @@ test m::tests::gamma ... ok
 
 test result: ok. 2 passed; 0 failed'
 
+  # Workflows name one test per flag. Every flag adds to the set; keeping only
+  # the last one would check a single name and let the others go missing.
+  expect "each repeated --require flag names a required test" 1 \
+    "$0" --require alpha --require beta -- printf '%s' 'test m::tests::beta ... ok
+
+test result: ok. 1 passed; 0 failed'
+
+  expect "repeated --require flags pass when every named test ran" 0 \
+    "$0" --require alpha --require beta -- printf '%s' 'test m::tests::alpha ... ok
+test m::tests::beta ... ok
+
+test result: ok. 2 passed; 0 failed'
+
+  expect "a list and a single --require flag combine into one set" 1 \
+    "$0" --require alpha,beta --require gamma -- printf '%s' 'test m::tests::beta ... ok
+test m::tests::gamma ... ok
+
+test result: ok. 2 passed; 0 failed'
+
+  expect "repeated --require flags imply their combined minimum count" 1 \
+    "$0" --require alpha --require beta,gamma -- printf '%s' 'test m::tests::alpha ... ok
+test m::tests::beta ... ok
+test m::tests::gamma ... ok
+
+test result: ok. 2 passed; 0 failed'
+
+  # The count meets the combined minimum here, so only the name check can fail.
+  expect "a name from an earlier --require flag is checked, not only counted" 1 \
+    "$0" --require alpha --require beta -- printf '%s' 'test m::tests::gamma ... ok
+test m::tests::beta ... ok
+
+test result: ok. 2 passed; 0 failed'
+
   echo "-- exit status and output --"
 
   # A non-zero exit from the command under test must survive, and must win over
@@ -271,6 +306,42 @@ test result: ok. 2 passed; 0 failed'
   expect "a doubled comma in --require is a usage error" 2 "$0" --require a,,b -- true
   expect "a leading comma in --require is a usage error" 2 "$0" --require ,a -- true
 
+  # An empty flag is refused wherever it falls, not dropped from the set. --min
+  # keeps each run valid without it, so only the empty-name check can fail.
+  expect "an empty --require flag before another is a usage error" 2 \
+    "$0" --require '' --require alpha --min 1 -- printf '%s' 'test m::tests::alpha ... ok
+
+test result: ok. 1 passed; 0 failed'
+  expect "an empty --require flag after another is a usage error" 2 \
+    "$0" --require alpha --require '' --min 1 -- printf '%s' 'test m::tests::alpha ... ok
+
+test result: ok. 1 passed; 0 failed'
+  expect "a lone empty --require flag is a usage error even with --min" 2 \
+    "$0" --require '' --min 1 -- printf '%s' 'test m::tests::alpha ... ok
+
+test result: ok. 1 passed; 0 failed'
+
+  # Test names hold no whitespace. A line break would also end the split early
+  # and drop every name after it, so a passing alpha would hide zeta and beta.
+  expect "a line break in a --require value is a usage error" 2 \
+    "$0" --require 'alpha
+zeta' --require beta -- printf '%s' 'test m::tests::alpha ... ok
+
+test result: ok. 1 passed; 0 failed'
+  expect "a space in a --require value is a usage error" 2 \
+    "$0" --require 'alpha beta' -- true
+
+  # A name given twice raises the implied minimum past the distinct tests, and
+  # the resulting count error would point away from the real mistake.
+  expect "a name given in two --require flags is a usage error" 2 \
+    "$0" --require alpha --require alpha -- printf '%s' 'test m::tests::alpha ... ok
+
+test result: ok. 1 passed; 0 failed'
+  expect "a name repeated in one --require list is a usage error" 2 \
+    "$0" --require alpha,alpha -- printf '%s' 'test m::tests::alpha ... ok
+
+test result: ok. 1 passed; 0 failed'
+
   # A test named "terse" or "json" is a legitimate filter, not a format request.
   expect "a test named terse is not mistaken for an output format" 0 \
     "$0" --min 1 -- sh -c 'echo "$@"; printf "\ntest result: ok. 1 passed; 0 failed\n"' _ cargo test terse
@@ -314,7 +385,20 @@ while [ $# -gt 0 ]; do
       ;;
     --require)
       [ $# -ge 2 ] || { usage; exit 2; }
-      require_csv="$2"
+      # Every flag adds to one set. A value that is empty or holds whitespace is
+      # refused rather than dropped: test names have neither, and a line break
+      # would end the split below early and lose every name after it.
+      case "$2" in
+        '')
+          echo "error: --require needs a test name, got an empty value" >&2
+          exit 2
+          ;;
+        *[[:space:]]*)
+          printf 'error: a --require name cannot contain whitespace: %q\n' "$2" >&2
+          exit 2
+          ;;
+      esac
+      require_csv="${require_csv:+$require_csv,}$2"
       shift 2
       ;;
     --)
@@ -351,6 +435,14 @@ if [ -n "$require_csv" ]; then
       ;;
   esac
   IFS=',' read -r -a required <<< "$require_csv"
+
+  # A name given twice raises the implied minimum past the number of distinct
+  # tests, so the run would fail on a count that hides the real mistake.
+  duplicates="$(printf '%s\n' "${required[@]}" | LC_ALL=C sort | LC_ALL=C uniq -d)"
+  if [ -n "$duplicates" ]; then
+    echo "error: --require names a test more than once: ${duplicates//$'\n'/ }" >&2
+    exit 2
+  fi
 fi
 
 if [ -z "$expected_min" ] && [ ${#required[@]} -eq 0 ]; then

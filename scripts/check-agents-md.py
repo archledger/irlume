@@ -10,16 +10,19 @@ moves. This fails when:
 * a path in backticks names nothing in the tree (a glob must match at least
   one file);
 * a line of the root file's "Gate commands" block is not, verbatim, a
-  command in .github/workflows/ci.yml;
+  whole command line of a `run:` step in .github/workflows/ci.yml (a
+  comment or a longer command does not count);
 * a bare workflow file name (`ci.yml`) is not in .github/workflows/.
 
-A path is looked up from the repository root, from the AGENTS.md file's own
-directory, and from every crate and crate `src/` directory, because the files
-cite crate-relative paths such as `src/lib.rs` beside the crate they name.
+A path is looked up from the repository root and, for a nested AGENTS.md,
+from its own directory and that directory's `src/`, so `src/main.rs` in the
+daemon's file must be the daemon's. The root file cites full paths.
 Placeholders (`<target>`, `NNNN`), absolute paths (`/etc/pam.d`) and build
-output under `target/` are not checked. A token is treated as a path when its
-first segment exists in one of those places or it ends in a file extension,
-so a cargo feature such as `irlume-auth/ir-only-evaluation` is not a path.
+output under `target/` are not checked. A code span that is one path-shaped
+token is always a path, so a removed top-level directory (`kcm/`) is named.
+Inside a longer span, a command, a token is a path when it ends in `/` or a
+file extension or its first segment exists, so a cargo feature such as
+`irlume-auth/ir-only-evaluation` is not one.
 
 Runs in CI on every push and PR (ci.yml, "AGENTS.md references").
 """
@@ -64,10 +67,9 @@ def outside_fences(text):
 
 
 def bases_for(root, doc):
-    bases = [root, doc.parent]
-    for crate in sorted((root / "crates").glob("*/")):
-        bases.extend([crate, crate / "src"])
-    return bases
+    if doc.parent == root:
+        return [root]
+    return [root, doc.parent, doc.parent / "src"]
 
 
 def resolves(bases, token):
@@ -81,15 +83,15 @@ def resolves(bases, token):
     return False
 
 
-def is_path(bases, token):
+def is_path(bases, token, whole_span=False):
     if PLACEHOLDER.search(token) or token.startswith(("/", "target/", "./target/")):
         return False
     if not PATH_TOKEN.match(token.removeprefix("./")):
         return False
-    first = token.removeprefix("./").split("/", 1)[0]
-    if any((base / first).exists() for base in bases):
+    if whole_span or token.endswith("/") or EXTENSION.search(token):
         return True
-    return bool(EXTENSION.search(token.rstrip("/")))
+    first = token.removeprefix("./").split("/", 1)[0]
+    return any((base / first).exists() for base in bases)
 
 
 def check_links(root, doc, text):
@@ -109,13 +111,16 @@ def check_paths(root, doc, text):
     bases = bases_for(root, doc)
     for number, line in outside_fences(text):
         for span in CODE_SPAN.findall(line):
-            for token in span.split():
+            tokens = span.split()
+            for token in tokens:
                 token = token.strip("'\"(),;")
                 if WORKFLOW_NAME.match(token):
                     if not (root / WORKFLOWS / token).exists():
                         problems.append(f"{doc.relative_to(root)}:{number}: workflow {token} is not in {WORKFLOWS}/")
                     continue
-                if is_path(bases, token) and not resolves(bases, token.removeprefix("./")):
+                if is_path(bases, token, len(tokens) == 1) and not resolves(
+                    bases, token.removeprefix("./")
+                ):
                     problems.append(f"{doc.relative_to(root)}:{number}: path {token} names nothing in the tree")
     return problems
 
@@ -141,6 +146,35 @@ def gate_commands(text):
     return commands or None
 
 
+def run_commands(workflow):
+    """Every command line of the workflow's `run:` steps, comments dropped.
+
+    A block scalar (`run: |`) runs the lines indented deeper than its key; an
+    inline `run:` runs its value.
+    """
+    commands = set()
+    lines = workflow.splitlines()
+    index = 0
+    while index < len(lines):
+        match = re.match(r"^(\s*)(?:-\s+)?run:\s*(.*)$", lines[index])
+        index += 1
+        if not match:
+            continue
+        indent, value = len(match.group(1)), match.group(2).strip()
+        if value[:1] in ("|", ">"):
+            while index < len(lines) and (
+                not lines[index].strip()
+                or len(lines[index]) - len(lines[index].lstrip()) > indent
+            ):
+                commands.add(lines[index].strip())
+                index += 1
+        elif value:
+            if len(value) > 1 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
+            commands.add(value)
+    return {command for command in commands if command and not command.startswith("#")}
+
+
 def check_gate(root, text):
     doc = "AGENTS.md"
     commands = gate_commands(text)
@@ -148,11 +182,11 @@ def check_gate(root, text):
         return [f"{doc}: no command block under \"{GATE_HEADING}\""]
     if not (root / CI).is_file():
         return [f"{doc}: {CI} is missing, so the gate commands cannot be checked"]
-    ci = (root / CI).read_text(encoding="utf-8")
+    ran = run_commands((root / CI).read_text(encoding="utf-8"))
     return [
-        f"{doc}:{number}: gate command is not in {CI}: {command}"
+        f"{doc}:{number}: gate command is not a {CI} run line: {command}"
         for number, command in commands
-        if command not in ci
+        if command not in ran
     ]
 
 

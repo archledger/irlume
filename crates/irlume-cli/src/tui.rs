@@ -15477,7 +15477,7 @@ mod tests {
             ));
             let server = serve_one(
                 &path,
-                |request| matches!(request, Request::Identify | Request::IdentifyFor { .. }),
+                |request| matches!(request, Request::IdentifyFor { user } if user == "alice"),
                 reply,
                 Duration::ZERO,
             );
@@ -15561,7 +15561,10 @@ mod tests {
             ));
             let server = serve_one(
                 &path,
-                |request| matches!(request, Request::RemoveCameraGroup { .. }),
+                |request| {
+                    matches!(request, Request::RemoveCameraGroup { user, group }
+                        if user == "testuser" && group == "cam-046d-085e-SERIAL")
+                },
                 reply,
                 Duration::ZERO,
             );
@@ -18985,7 +18988,7 @@ mod tests {
             ));
             let server = serve_one(
                 &path,
-                |request| matches!(request, Request::LastAttempts { .. }),
+                |request| matches!(request, Request::LastAttempts { user } if user == "alice"),
                 reply,
                 delay,
             );

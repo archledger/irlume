@@ -548,8 +548,9 @@ fn live_freshness_manual_camera_refresh_preserves_identity_and_queues_one_replac
     app.poll();
     assert_eq!(app.pairs[app.cam_sel].rgb, "/dev/video60");
     assert!(!app.cameras_refresh_due(true));
-    // The polls started the due status and profile reads.
-    drain_loads(&mut app);
+    // The polls started the due status and profile reads; both finish
+    // before the socket guard drops.
+    wait_live_done(&mut app);
 }
 
 #[test]

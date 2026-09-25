@@ -1087,21 +1087,18 @@ fn release_secret(
     use irlume_common::KeyringSecretKind as K;
     match kind {
         K::LoginPassword => {
-            // CString copies the bytes; PAM then copies them into its own store,
-            // after which we wipe our copy so the plaintext password does not
-            // linger on this heap. A login password cannot contain a NUL, so
-            // construction only fails on a malformed secret; treat as decline.
-            match CString::new(secret.expose()) {
-                Ok(tok) => {
-                    let set = pamh.set_authtok(&tok);
-                    zeroize::Zeroize::zeroize(&mut tok.into_bytes_with_nul());
-                    if set.is_ok() {
-                        Released::AuthtokSet
-                    } else {
-                        Released::Failed
-                    }
-                }
-                Err(_) => Released::Failed,
+            // PAM copies the token into its own store; the copy made here is
+            // wiped when `tok` drops. A login password cannot contain a NUL,
+            // so one that does is a malformed secret; treat it as a decline.
+            // Keep the conversion in `secret_cstring`: its test covers both
+            // paths.
+            let Some(tok) = secret_cstring(secret.expose()) else {
+                return Released::Failed;
+            };
+            if pamh.set_authtok(&tok).is_ok() {
+                Released::AuthtokSet
+            } else {
+                Released::Failed
             }
         }
         K::KdeWalletKey => match hand_key_to_wallet_daemon(pamh, user, secret.expose()) {
@@ -1126,6 +1123,23 @@ fn release_secret(
             } else {
                 Released::Failed
             }
+        }
+    }
+}
+
+/// A released secret as the C string `set_authtok` takes, wiped when dropped.
+///
+/// `CString::new` copies the secret into one new buffer, which the result
+/// owns and zeroizes on drop. A secret with an interior NUL cannot be a C
+/// string: `CString::new` then returns that copy inside its `NulError`, so it
+/// is taken back with `into_vec` straight into `Zeroizing`, which wipes it
+/// when it drops here (also on unwind), and the result is `None`.
+fn secret_cstring(secret: &[u8]) -> Option<zeroize::Zeroizing<CString>> {
+    match CString::new(secret) {
+        Ok(tok) => Some(zeroize::Zeroizing::new(tok)),
+        Err(rejected) => {
+            drop(zeroize::Zeroizing::new(rejected.into_vec()));
+            None
         }
     }
 }
@@ -1317,6 +1331,36 @@ mod tests {
             Ok(())
         }
         let _: fn(&Pam) -> pamsm::PamResult<()> = require_api;
+    }
+
+    /// The copy `secret_cstring` makes of a released password is zeroized
+    /// before its memory is freed, on both paths: the C string handed to
+    /// `set_authtok`, and the copy `CString::new` keeps inside the
+    /// `NulError` it returns for a secret with an interior NUL.
+    #[test]
+    fn secret_cstring_wipes_its_copy_on_both_paths() {
+        // Not at offset 0: dropping a `CString` clears its first byte, which
+        // would hide a copy that was otherwise freed as is.
+        const MARKER: &[u8] = b"irlume-wipe-check-5c1e";
+        const SECRET: &[u8] = b"pw-irlume-wipe-check-5c1e";
+        const WITH_NUL: &[u8] = b"pw-irlume-wipe-check-5c1e\0tail";
+
+        // The check itself sees an unwiped copy freed as is.
+        let unwiped = freed_blocks::count_unwiped(MARKER, || {
+            drop(std::hint::black_box(SECRET.to_vec()));
+        });
+        assert_eq!(unwiped, 1, "the freed-block check is not installed");
+
+        let unwiped = freed_blocks::count_unwiped(MARKER, || {
+            let tok = secret_cstring(SECRET).expect("no interior NUL");
+            assert_eq!(tok.as_bytes(), SECRET);
+        });
+        assert_eq!(unwiped, 0, "the C string was freed without a wipe");
+
+        let unwiped = freed_blocks::count_unwiped(MARKER, || {
+            assert!(secret_cstring(WITH_NUL).is_none());
+        });
+        assert_eq!(unwiped, 0, "the rejected copy was freed without a wipe");
     }
 
     #[test]
@@ -1651,5 +1695,77 @@ mod tests {
             body[arm..].contains("let _ = "),
             "the info emission must be best-effort"
         );
+    }
+
+    /// The allocator of this test binary, which can find a secret in freed
+    /// memory.
+    ///
+    /// It zero-fills every block it hands out. While [`count_unwiped`] runs
+    /// on a thread, each block that thread frees is read as bytes and
+    /// searched for a marker first; other threads and other times forward to
+    /// `System` unchanged. Use `count_unwiped` only around code that frees
+    /// byte buffers (`Vec<u8>`, `CString`): a typed write can leave padding
+    /// bytes uninitialized, and those must not be read as `u8`.
+    mod freed_blocks {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        struct CheckFreed;
+
+        #[global_allocator]
+        static CHECK_FREED: CheckFreed = CheckFreed;
+
+        thread_local! {
+            static MARKER: Cell<Option<&'static [u8]>> = const { Cell::new(None) };
+            static UNWIPED: Cell<usize> = const { Cell::new(0) };
+        }
+
+        /// Run `f` and count the blocks it frees that still hold `marker`.
+        /// `f` must free only byte buffers (see the module doc).
+        pub(super) fn count_unwiped(marker: &'static [u8], f: impl FnOnce()) -> usize {
+            struct Disarm;
+            impl Drop for Disarm {
+                fn drop(&mut self) {
+                    let _ = MARKER.try_with(|m| m.set(None));
+                }
+            }
+            assert!(!marker.is_empty());
+            UNWIPED.with(|n| n.set(0));
+            MARKER.with(|m| m.set(Some(marker)));
+            let disarm = Disarm;
+            f();
+            drop(disarm);
+            UNWIPED.with(Cell::get)
+        }
+
+        // SAFETY: `alloc` returns `System.alloc_zeroed` for the same layout,
+        // and `dealloc` returns the caller's pointer and layout to `System`
+        // after reading the block, so `System`'s guarantees carry over. The
+        // default `realloc` and `alloc_zeroed` go through these two.
+        unsafe impl GlobalAlloc for CheckFreed {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                // SAFETY: `alloc_zeroed` has the contract the caller keeps
+                // for `alloc`: a layout of non-zero size.
+                unsafe { System.alloc_zeroed(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                if let Some(marker) = MARKER.try_with(Cell::get).ok().flatten() {
+                    // SAFETY: `ptr` is a live block of `layout.size()` bytes
+                    // from `alloc` above, read before it is freed. Every byte
+                    // is initialized: `alloc` zero-filled the block, and while
+                    // a marker is set the only blocks freed are byte buffers
+                    // (see the module doc), whose writes are bytes with no
+                    // padding.
+                    let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
+                    if block.windows(marker.len()).any(|w| w == marker) {
+                        let _ = UNWIPED.try_with(|n| n.set(n.get() + 1));
+                    }
+                }
+                // SAFETY: the caller passes a block from `alloc` above, which
+                // came from `System`, with the layout it was allocated with.
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
     }
 }

@@ -286,6 +286,9 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The PAM module wipes every temporary copy it makes of a released login
+  password.
+
 - A face listing served from the daemon's cache no longer unseals the
   account's template key. For an account with an added camera, the
   cached rows were refreshed by opening the camera store, which is

@@ -189,14 +189,17 @@ def deciding_run(runs):
     """The run that gives the verdict, from runs on main newest first.
 
     The newest completed run, passing over skipped runs and cancelled runs
-    that a newer run replaced. A cancelled run with nothing newer counts: no
-    later run will give a verdict in its place.
+    that a newer run of the same event replaced. A cancelled run with no newer
+    run of its event counts: no later run will give a verdict in its place,
+    and a run of another event may sit in another concurrency group (asan.yml
+    keeps its scheduled runs apart from pushes).
     """
     for index, run in enumerate(runs):
         if run.get('status') != 'completed':
             continue
         conclusion = run.get('conclusion')
-        if conclusion == 'skipped' or (conclusion == 'cancelled' and index > 0):
+        replaced = any(newer.get('event') == run.get('event') for newer in runs[:index])
+        if conclusion == 'skipped' or (conclusion == 'cancelled' and replaced):
             continue
         return run
     return None

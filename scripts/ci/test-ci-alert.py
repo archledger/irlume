@@ -391,6 +391,18 @@ class StepTests(unittest.TestCase):
                          ['CI health: install-matrix.yml failing or stale'], self.output)
         self.assertIn('run 11 (schedule) concluded cancelled', created[0]['body'])
 
+    def test_a_newer_run_of_another_event_does_not_replace_a_cancelled_one(self):
+        # asan.yml keeps scheduled runs in their own concurrency group, so a
+        # newer push cannot be what cancelled the weekly run.
+        state = healthy_state()
+        state['runs']['asan.yml'] += [run(15, 'cancelled', '2026-09-24T10:00:00Z'),
+                                      run(16, None, '2026-09-24T13:05:00Z', 'queued', 'push')]
+        self.check(state)
+        created = self.ops('create')
+        self.assertEqual([c['title'] for c in created],
+                         ['CI health: asan.yml failing or stale'], self.output)
+        self.assertIn('run 15 (schedule) concluded cancelled', created[0]['body'])
+
     def test_pull_request_runs_from_a_branch_named_main_are_not_main_runs(self):
         # gh run list --branch main matches the head branch, so a pull request
         # from a fork's main branch is listed with the runs on main.

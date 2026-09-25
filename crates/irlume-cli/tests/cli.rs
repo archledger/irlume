@@ -30,6 +30,8 @@ fn is_root() -> bool {
 /// Per-test sandbox tree; dropped (deleted) when the test ends.
 struct Sandbox {
     root: PathBuf,
+    /// Host directories `isolated_root_cmd` covers with an empty tmpfs.
+    hidden: Vec<&'static str>,
 }
 
 impl Sandbox {
@@ -47,7 +49,10 @@ impl Sandbox {
         .unwrap();
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Sandbox { root }
+        Sandbox {
+            root,
+            hidden: Vec::new(),
+        }
     }
 
     fn path(&self, rel: &str) -> PathBuf {
@@ -99,7 +104,7 @@ impl Sandbox {
     }
 
     fn isolated_root_cmd(&self, args: &[&str], tools: &[&str]) -> Command {
-        support::isolated_root_command(&self.root, BIN, args, tools)
+        support::isolated_root_command(&self.root, BIN, args, tools, &self.hidden)
     }
 }
 
@@ -1047,6 +1052,50 @@ fn selinux_status_classifies_module_state_from_probe_output() {
     // A bad subcommand is a usage error (2), not a runtime failure (1).
     assert_eq!(code, 2);
     assert!(err.contains("unknown subcommand 'bogus'"), "{err}");
+}
+
+// ----------------------------------------------------------------------- login
+
+/// `--with-sudo` and `--with-polkit` are requests. On a machine that ships
+/// neither service (both PAM directories empty) the preview names each flag
+/// it cannot honour and exits 1; without the flags the same preview exits 0.
+/// A preview writes nothing, so it needs neither the PAM lock nor any tool.
+#[test]
+fn login_enable_fails_when_a_requested_service_is_missing() {
+    let mut sb = Sandbox::new("login-unmet-scope");
+    sb.hidden = vec!["/etc/pam.d", "/usr/lib/pam.d"];
+    let enable = |flags: &[&str]| {
+        let mut args = vec!["login", "enable"];
+        args.extend_from_slice(flags);
+        run(&mut sb.isolated_root_cmd(&args, &[]))
+    };
+
+    let (code, out, err) = enable(&[]);
+    assert_eq!(code, 0, "stdout: {out}\nstderr: {err}");
+    assert!(out.contains("DRY RUN"), "{out}");
+    assert!(!err.contains("not wired"), "{err}");
+
+    for (flag, service) in [("--with-sudo", "sudo"), ("--with-polkit", "polkit-1")] {
+        let (code, out, err) = enable(&[flag]);
+        assert_eq!(code, 1, "{flag}: stdout: {out}\nstderr: {err}");
+        assert!(
+            out.contains(&format!("/etc/pam.d/{service}: not installed (skipped)")),
+            "{flag}: {out}"
+        );
+        assert!(
+            err.contains(&format!(
+                "[login] {flag}: not wired (this machine has no {service} PAM service)"
+            )),
+            "{flag}: {err}"
+        );
+    }
+
+    let (code, _, err) = enable(&["--with-sudo", "--with-polkit"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("--with-sudo: not wired") && err.contains("--with-polkit: not wired"),
+        "{err}"
+    );
 }
 
 // ----------------------------------------------------------------- fingerprint

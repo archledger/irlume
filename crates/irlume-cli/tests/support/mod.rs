@@ -5,17 +5,27 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Run the CLI as namespace-root with a private fixed `/usr/bin`, so code that
-/// deliberately ignores PATH cannot reach the host's privileged tools.
+/// deliberately ignores PATH cannot reach the host's privileged tools. Each
+/// directory in `hidden` that exists on the host is covered by an empty tmpfs,
+/// so a test can present a machine without what the host ships there (a PAM
+/// service, say).
 pub(crate) fn isolated_root_command(
     root: &Path,
     bin: &str,
     args: &[&str],
     tools: &[&str],
+    hidden: &[&str],
 ) -> Command {
-    namespace_command(root, bin, args, tools)
+    namespace_command(root, bin, args, tools, hidden)
 }
 
-fn namespace_command(root: &Path, bin: &str, args: &[&str], tools: &[&str]) -> Command {
+fn namespace_command(
+    root: &Path,
+    bin: &str,
+    args: &[&str],
+    tools: &[&str],
+    hidden: &[&str],
+) -> Command {
     let shell = std::fs::canonicalize("/bin/sh").expect("resolve /bin/sh for sandbox");
     let usr_bin = std::fs::canonicalize("/usr/bin").expect("resolve /usr/bin for sandbox");
     let bin_dir = std::fs::canonicalize("/bin").expect("resolve /bin for sandbox");
@@ -57,6 +67,15 @@ fn namespace_command(root: &Path, bin: &str, args: &[&str], tools: &[&str]) -> C
             "/",
         ])
         .args(["--tmpfs", "/run"]);
+    for dir in hidden {
+        // Same canonical spelling rule as the tool prefixes below; a directory
+        // the host lacks is already absent under the read-only root.
+        if let Ok(canonical) = std::fs::canonicalize(dir) {
+            if canonical.is_dir() {
+                command.args(["--tmpfs", canonical.to_str().unwrap()]);
+            }
+        }
+    }
     for prefix in masked {
         command.args(["--tmpfs", prefix.to_str().unwrap()]);
     }
@@ -138,7 +157,7 @@ done
         supplied,
         supplied,
     );
-    let output = namespace_command(root, "/usr/bin/sh", &["-c", &script], tools)
+    let output = namespace_command(root, "/usr/bin/sh", &["-c", &script], tools, &[])
         .output()
         .expect("spawn isolated command-path assertion");
     assert!(

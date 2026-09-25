@@ -29,8 +29,11 @@ The surfaces irlume can wire, and what puts each in scope:
 | App consent prompts (pkexec, Bitwarden) | `polkit-1` | opt-in `--with-polkit` |
 
 Real `/etc/pam.d` files are backed up to `*.pre-irlume` before editing;
-vendor-owned files (plasmalogin, kde, polkit-1 on Fedora) get an `/etc`
-override materialized from the vendor copy. Both revert cleanly.
+services a distribution ships only in `/usr/lib/pam.d` (plasmalogin,
+cosmic-greeter and polkit-1 on Fedora; greetd and gdm-password on Fedora
+45; kde on Arch; sddm, gdm-password, lightdm and sudo on openSUSE
+Tumbleweed) get an `/etc` override materialized from the vendor copy. Both
+revert cleanly.
 
 ## Stop face everywhere
 

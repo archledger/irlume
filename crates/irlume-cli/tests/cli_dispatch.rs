@@ -105,7 +105,7 @@ impl Sandbox {
     }
 
     fn isolated_root_cmd(&self, args: &[&str], tools: &[&str]) -> Command {
-        support::isolated_root_command(&self.root, BIN, args, tools)
+        support::isolated_root_command(&self.root, BIN, args, tools, &[])
     }
 }
 

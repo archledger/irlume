@@ -296,6 +296,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume login enable` now wires greetd on Fedora 45 and `sudo` on
+  openSUSE Tumbleweed, which ship their PAM service only in
+  `/usr/lib/pam.d`: it writes an `/etc/pam.d` override from that copy, and
+  `login disable` removes it. Both were reported as not installed and
+  skipped, so greetd on Fedora 45 got no face line and `--with-sudo` wired
+  nothing on Tumbleweed. An upgrade from Fedora 44 can leave
+  `/etc/pam.d/greetd.rpmsave` and `/etc/pam.d/greetd.pre-irlume` from the
+  earlier wiring; PAM reads neither, and both can be deleted.
+  `login enable --with-sudo` and `--with-polkit` now exit with status 1
+  when that service is missing or has no auth line to wire, instead of
+  reporting success (#847).
+
 - A first GNOME keyring token arm (`irlume keyring arm`, `irlume setup`
   and the TUI's Password Wallet) whose re-key cannot be verified now
   keeps the new token instead of erasing it. gnome-keyring changes the

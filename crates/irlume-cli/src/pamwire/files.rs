@@ -88,7 +88,7 @@ pub(crate) fn is_managed_path_for(omarchy: bool, cinnamon: bool, path: &str) -> 
         .iter()
         .chain(FP_GREETERS.iter())
         .map(|s| s.etc)
-        .chain([lock_svc.etc, POLKIT.etc, SUDO])
+        .chain([lock_svc.etc, POLKIT.etc, SUDO.etc])
         .any(|managed| managed == bare)
 }
 

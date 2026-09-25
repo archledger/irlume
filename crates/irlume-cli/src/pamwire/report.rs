@@ -111,7 +111,7 @@ fn surface_facts_with(omarchy: bool, cinnamon: bool) -> Vec<SurfaceFact> {
         .collect();
     let (lock_svc, _) = lock_surface_for(omarchy, cinnamon);
     out.push(surface_fact(lock_svc.etc, lock_svc.vendor, ROLE_LOCK));
-    out.push(surface_fact(SUDO, None, ROLE_SUDO));
+    out.push(surface_fact(SUDO.etc, SUDO.vendor, ROLE_SUDO));
     out.push(surface_fact(POLKIT.etc, POLKIT.vendor, ROLE_POLKIT));
     out
 }
@@ -247,12 +247,10 @@ pub(super) fn status_report_for(omarchy: bool, cinnamon: bool) -> Vec<(String, b
             None => out.push((label_of(s.etc), false, false)),
         }
     }
-    let sudo = Path::new(SUDO);
-    out.push((
-        "sudo".into(),
-        sudo.exists(),
-        sudo.exists() && file_has_module(sudo),
-    ));
+    match service_present(&SUDO) {
+        Some(p) => out.push(("sudo".into(), true, file_has_module(&p))),
+        None => out.push(("sudo".into(), false, false)),
+    }
     match service_present(&POLKIT) {
         Some(p) => out.push(("polkit (apps)".into(), true, file_has_module(&p))),
         None => out.push(("polkit (apps)".into(), false, false)),

@@ -1328,8 +1328,9 @@ fn read_password(prompt: &str) -> Result<zeroize::Zeroizing<String>, String> {
 }
 
 /// Under a GNOME keyring token, on a release whose next upgrade does not
-/// carry the token over, the step to take before upgrading.
-fn print_token_upgrade_notice() {
+/// carry the token over, the step to take before upgrading. Shared by every
+/// token-arm path: `keyring arm`, the setup wizard and the TUI's message.
+pub(crate) fn print_token_upgrade_notice() {
     if let Some(notice) = upgrade_notice::host_token_upgrade_notice() {
         println!("[keyring] \u{26a0} {}", notice.advice());
     }
@@ -3904,9 +3905,18 @@ fn report_faillock_state(report: &mut crate::doctor_report::Report, user: &str) 
 fn report_keyring_os_upgrade(report: &mut crate::doctor_report::Report, user: &str) {
     use crate::doctor_report::State;
     const ID: &str = "keyring-os-upgrade";
-    let Some(notice) = upgrade_notice::host_token_upgrade_notice() else {
-        report.check(ID, State::Info);
-        return;
+    let notice = match upgrade_notice::host_token_upgrade_notice_checked() {
+        Ok(Some(notice)) => notice,
+        // A release that was read and is not listed: nothing to check.
+        Ok(None) => {
+            report.check(ID, State::Info);
+            return;
+        }
+        // No os-release could be read: the check could not run.
+        Err(_) => {
+            report.check(ID, State::Unknown);
+            return;
+        }
     };
     let answer = daemon_request(&irlume_common::Request::KeyringInfo {
         user: user.to_string(),

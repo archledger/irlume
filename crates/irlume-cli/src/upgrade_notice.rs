@@ -115,21 +115,45 @@ pub(crate) fn token_upgrade_notice(os_release: &str) -> Option<&'static TokenUpg
 }
 
 /// [`token_upgrade_notice`] for this host: `IRLUME_OS_RELEASE` when set,
-/// else `/etc/os-release`, then `/usr/lib/os-release` (os-release(5)). A
-/// file that cannot be read names no release, so it gives no notice.
-pub(crate) fn host_token_upgrade_notice() -> Option<&'static TokenUpgradeNotice> {
+/// else `/etc/os-release`, then `/usr/lib/os-release` (os-release(5)).
+/// `Err` when no such file can be read, so a caller can tell "this release
+/// needs no notice" from "the release could not be determined".
+pub(crate) fn host_token_upgrade_notice_checked(
+) -> std::io::Result<Option<&'static TokenUpgradeNotice>> {
     let text = match std::env::var_os(OS_RELEASE_ENV) {
-        Some(path) => std::fs::read_to_string(path).ok()?,
+        Some(path) => std::fs::read_to_string(path)?,
         None => std::fs::read_to_string("/etc/os-release")
-            .or_else(|_| std::fs::read_to_string("/usr/lib/os-release"))
-            .ok()?,
+            .or_else(|_| std::fs::read_to_string("/usr/lib/os-release"))?,
     };
-    token_upgrade_notice(&text)
+    Ok(token_upgrade_notice(&text))
+}
+
+/// [`host_token_upgrade_notice_checked`] where an unreadable release simply
+/// gives no notice: for the arm and status paths, which only add advice.
+pub(crate) fn host_token_upgrade_notice() -> Option<&'static TokenUpgradeNotice> {
+    host_token_upgrade_notice_checked().ok().flatten()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unreadable_release_is_an_error_not_an_unlisted_release() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-os-release-{}", std::process::id()));
+        std::env::set_var(OS_RELEASE_ENV, dir.join("missing"));
+        assert!(host_token_upgrade_notice_checked().is_err());
+        assert!(host_token_upgrade_notice().is_none());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("debian"), "ID=debian\nVERSION_ID=13\n").unwrap();
+        std::env::set_var(OS_RELEASE_ENV, dir.join("debian"));
+        assert!(matches!(host_token_upgrade_notice_checked(), Ok(None)));
+        std::env::remove_var(OS_RELEASE_ENV);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     const FEDORA_44: &str = "NAME=\"Fedora Linux\"\nVERSION=\"44 (Workstation Edition)\"\n\
                              ID=fedora\nVERSION_ID=44\nPLATFORM_ID=\"platform:f44\"\n\

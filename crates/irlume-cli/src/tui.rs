@@ -6578,12 +6578,19 @@ impl App {
                         match crate::daemon_request(&req) {
                             Ok(Response::TokenSealed { token, minted }) => {
                                 match crate::finish_token_arm(&user, &pw, token.expose(), minted) {
-                                    Ok(()) => (
-                                        true,
-                                        "keyring armed with a token; the login keyring was \
-                                         re-keyed to it"
-                                            .into(),
-                                    ),
+                                    Ok(()) => {
+                                        let mut done = String::from(
+                                            "keyring armed with a token; the login keyring was \
+                                             re-keyed to it",
+                                        );
+                                        if let Some(notice) =
+                                            crate::upgrade_notice::host_token_upgrade_notice()
+                                        {
+                                            done.push_str(". ");
+                                            done.push_str(&notice.advice());
+                                        }
+                                        (true, done)
+                                    }
                                     Err(e) => (false, e),
                                 }
                             }

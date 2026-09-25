@@ -1666,13 +1666,12 @@ fn refuse_unverified_token_rearm(user: &str) -> Option<Response> {
     let refusal = match irlume_core::keyring::read_sealed_kind(user) {
         Ok(Some(irlume_core::envelope::SecretKind::GnomeKeyringToken)) => format!(
             "irlumed cannot check this password against '{user}'s login hash, so it does not \
-             re-arm over the GNOME keyring token already armed; nothing was changed. After a \
-             password change or a firmware update nothing needs re-arming: the next login \
-             where you type your password at the login screen brings irlume's seal up to \
-             date. To arm again anyway, log in that way once, then run \
-             `irlume keyring forget` with that password, then `irlume keyring arm`. If the \
-             password and the firmware both changed before that login, the login cannot \
-             update the seal: run `irlume keyring forget` with the previous password instead."
+             re-arm over the GNOME keyring token already armed; nothing was changed. The \
+             token's password copy follows the password last typed at a login screen that \
+             carries irlume's re-seal, so after a password change with no such login since \
+             (or with no such screen, as on NixOS) it still needs the previous password. To \
+             arm again, run `irlume keyring forget` with that password, then \
+             `irlume keyring arm`."
         ),
         Ok(_) => return None,
         Err(e) => format!(
@@ -17124,7 +17123,7 @@ mod tests {
                 refused(
                     dispatch(seal_request(&me, password), peer, &mut e),
                     &label,
-                    "log in that way once, then run `irlume keyring forget` with that password",
+                    "run `irlume keyring forget` with that password, then",
                 );
                 assert_eq!(envelope_bytes(&me).as_deref(), Some(&before[..]), "{label}");
             }
@@ -18615,8 +18614,8 @@ mod tests {
         let armed = envelope_bytes("carol").expect("armed");
         match dispatch(seal_request("carol", b"new-password"), &root, &mut e) {
             Response::Error(msg) => assert!(
-                msg.contains("log in that way once, then run `irlume keyring forget`")
-                    && msg.contains("with the previous password instead"),
+                msg.contains("it still needs the previous password")
+                    && msg.contains("run `irlume keyring forget` with that password"),
                 "{msg}"
             ),
             other => panic!("an unchecked re-arm must be refused, got {other:?}"),

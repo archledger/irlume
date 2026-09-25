@@ -286,6 +286,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- A face listing served from the daemon's cache no longer unseals the
+  account's template key. For an account with an added camera, the
+  cached rows were refreshed by opening the camera store, which is
+  encrypted on hosts with a TPM, so each cached `irlume profiles`,
+  `irlume profiles list --json` and `irlume status --json` (the KDE
+  module's overview) and each TUI refresh ran a TPM unseal on the
+  connection thread, outside the worker that serializes TPM use. The
+  rows are now refreshed from the store file's digest and the facts the
+  worker published with them; a store changed since then, or one whose
+  key the worker could not unseal, sends the listing to the worker,
+  which reloads it.
+
 - On KDE, the first fingerprint login after a cold boot now opens the
   wallet. The wallet key was released during auth, before logind creates
   `/run/user/<uid>`, so `irlume-kwallet-init` refused, nothing was

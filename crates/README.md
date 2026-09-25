@@ -1,10 +1,12 @@
 # The irlume crates
 
-Twelve crates. The base layer speaks wire formats and hardware, the
+Thirteen crates. The base layer speaks wire formats and hardware, the
 middle layer turns frames into verdicts, and the top layer is the two
-binaries and three integration shims users actually run. Solid arrows
+binaries and three integration shims users actually run, plus a
+password-check helper the daemon runs. Solid arrows
 read "Cargo-depends on" (every edge verified against cargo metadata);
-dotted arrows are runtime socket IPC, not Cargo dependencies.
+dotted arrows are runtime links (socket IPC, or a helper the daemon
+runs), not Cargo dependencies.
 
 ```mermaid
 flowchart TD
@@ -20,6 +22,7 @@ flowchart TD
     core["irlume-core<br/>enrollment storage, TPM sealing, biopolicy"]
     common["irlume-common<br/>wire protocol, socket client, config"]
     fp["irlume-fingerprint<br/>fprintd companion"]
+    pwv["irlume-password-verify<br/>libexec password check"]
 
     pam -. "socket IPC" .-> daemon
     cli -. "socket IPC" .-> daemon
@@ -48,6 +51,8 @@ flowchart TD
     pam --> common
     gkr --> common
     kwi --> common
+    fp --> common
+    daemon -. "runs" .-> pwv
 ```
 
 ## One authentication, crate by crate
@@ -70,7 +75,7 @@ recognizer), **irlume-liveness** turns the readings into cue verdicts
 (cross-spectrum checks, EAR, the deny-only third-party PAD slot), and
 **irlume-core** compares the embedding against the enrolled templates it
 stores encrypted, with the template key sealed in the TPM. On a grant the
-daemon can unseal the keyring secret, and the two libexec helpers
+daemon can unseal the keyring secret, and two libexec helpers
 (**irlume-gkr-unlock**, **irlume-kwallet-init**) deliver it to
 gnome-keyring or ksecretd so the wallet opens without a prompt.
 
@@ -80,6 +85,9 @@ benchmarks it can also drive the Engine directly, bypassing the daemon
 (the solid `cli --> auth` edge; the dotted one is the socket path it
 bypasses). **irlume-fingerprint** wraps fprintd so a fingerprint
 can stand beside face auth where hardware exists.
+**irlume-password-verify** is the third libexec helper: for a password
+retry reset the daemon runs it to verify the account's password through
+PAM (the `/etc/pam.d/irlume-retry-reset` service).
 
 ## What the graph does and does not promise
 
@@ -88,17 +96,17 @@ can stand beside face auth where hardware exists.
   Cargo-depends on the pipeline crates directly, for its diagnostics,
   benchmarks and model tools, so a change to any pipeline crate must be
   reviewed against the CLI's direct uses too, not only the Engine's.
-- **irlume-common** depends on no other irlume crate (except
-  **irlume-fingerprint**, which depends on nothing at all), and every
-  other crate depends on it: the wire protocol has exactly one home.
+- **irlume-common** depends on no other irlume crate, and every other
+  crate except **irlume-password-verify** (which depends on none)
+  depends on it: the wire protocol has exactly one home.
 - The pipeline crates meet through data, with two deliberate edges:
   **irlume-liveness** and **irlume-core** read **irlume-vision**'s output
   types directly.
-- The integration shims (**irlume-pam**, the libexec helpers) stay thin,
-  socket client plus their single system interface, so the attack surface
-  loaded into PAM stacks and keyring startup is as small as it can be.
-  They relate to the daemon only over the socket at runtime; no binary
-  links another binary's crate.
+- The integration shims (**irlume-pam**, the keyring helpers) stay thin,
+  one system interface each (plus, for **irlume-pam**, the daemon socket),
+  so the attack surface loaded into PAM stacks and keyring startup is as
+  small as it can be. The keyring helpers never talk to the daemon, and
+  no binary links another binary's crate.
 
 Each crate's own source carries the detailed contracts; start at
 `irlume-auth/src/lib.rs` for the Engine's assess flow and

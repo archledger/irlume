@@ -44,14 +44,15 @@ The check wants **exactly one** `Signed-off-by` trailer per commit. If you
 rebase or cherry-pick and the trailer gets duplicated, the build fails until it
 is back to one; `git commit --amend -s --no-edit` fixes a missing one.
 
-Commits carry no AI co-author trailers and no "Generated with" lines. If an AI
-tool helped, say briefly how in the PR description; you are responsible for
-every line under your sign-off.
+Commits carry no AI co-author trailers and no "Generated with" lines; the one
+`Signed-off-by` is yours, and you are responsible for every line under it.
+Your PR description says briefly whether and how an AI tool helped.
 
 ## Pull request process
 
 - PRs merge as a **single squash commit** back to `main`, with a
-  `type: description (#number)` subject (`feat:`, `fix:`, `docs:`, and so on).
+  `type(scope): summary (#number)` subject, scope optional (`fix(camera):`,
+  `feat(tui):`, `docs:`, and so on).
   You do not need to squash your branch yourself; review happens on your
   commits, the squash happens at merge.
 - **First PR from a fork**: GitHub holds a fork's workflows (CI, CodeQL, DCO)

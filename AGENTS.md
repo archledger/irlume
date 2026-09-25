@@ -88,7 +88,7 @@ cargo build --release --locked
 | systemd units | `systemd-analyze verify packaging/systemd/<unit>` for each changed unit (CI first stubs `/usr/bin/irlumed` and `/usr/bin/irlume` with `/bin/true` when absent), then `systemd-analyze security --offline=true --threshold=37 packaging/systemd/irlumed.service` (94 for `packaging/systemd/irlume-reconcile.service`) |
 | dependencies | `cargo deny check advisories bans licenses sources`, `cargo deny --manifest-path fuzz/Cargo.toml check advisories` (`audit.yml` scans the fuzz lockfile) and `(cd fuzz && cargo fetch --locked)` |
 | fuzzed parsers | in `fuzz/`: `cargo fetch --locked`, then `mkdir -p corpus/<t> && cp -n seeds/<t>/* corpus/<t>/`, then `cargo +nightly-2026-07-15 fuzz run <t> -- -max_total_time=45 -rss_limit_mb=4096` (targets in `fuzz/fuzz_targets/`) |
-| `.github/workflows/` | `bash scripts/check-action-pins.sh`, `zizmor` and `actionlint` (as in `workflow-audit.yml`); for `hardware-suite.yml` also `python3 scripts/test-nightly-ir-capture.py`, `python3 scripts/ci/test-setup-coverage-tools.py` and `python3 scripts/ci/test-nightly-coverage-contract.py`; use `persist-credentials: false`, least-privilege `permissions`, and pass untrusted values through `env:`; never interpolate an untrusted `${{ }}` expression inside `run:` (`workflow-audit.yml`) |
+| `.github/workflows/` | `bash scripts/check-action-pins.sh`, `zizmor .github/workflows` and `actionlint` (as in `workflow-audit.yml`); for `hardware-suite.yml` also `python3 scripts/test-nightly-ir-capture.py`, `python3 scripts/ci/test-setup-coverage-tools.py` and `python3 scripts/ci/test-nightly-coverage-contract.py`; use `persist-credentials: false`, least-privilege `permissions`, and pass untrusted values through `env:`; never interpolate an untrusted `${{ }}` expression inside `run:` (`workflow-audit.yml`) |
 | `flake.nix`, `nix/` | `nix flake check --no-build --show-trace` and `nix build .#default --no-link --print-out-paths --show-trace`; after a dependency or fork bump also `nix build --no-link .#default.cargoDeps .#onnxruntime-bin` |
 | `kcm/` | `cmake -S kcm -B target/kcm-build -DBUILD_TESTING=ON && cmake --build target/kcm-build`, then the load test, `kcmshell6` and qmllint steps of `kcm.yml` |
 | `crates/irlume-pam` | the commands in [its AGENTS.md](crates/irlume-pam/AGENTS.md) |
@@ -248,9 +248,11 @@ cargo build --release --locked
   `deny_score` (one decimal) and `deny_reason` (numbers stripped), exact only
   under `IRLUME_LOG=debug`; grant lines log the score to the root-only journal.
   Matching never exits early (THREAT_MODEL.md "Side channels").
-- Secrets stay in `SecretBytes` or `Zeroizing`, never logged. State under
-  `/var/lib/irlume` is 0600 root in 0700 directories, and `/run/lock/irlume`
-  is 2751 root:video on purpose (`packaging/tmpfiles.d/irlume.conf`); no face
+- Keep every secret buffer in `SecretBytes` or `Zeroizing` and never log it;
+  a new plain `Vec<u8>` holding a secret is a defect. State files are 0600
+  root beneath the 0700 root-owned `/var/lib/irlume` (subdirectories follow
+  the unit's `UMask=0027`), and `/run/lock/irlume` is 2751 root:video on
+  purpose (`packaging/tmpfiles.d/irlume.conf`); no face
   image is stored ([docs/SECURITY_AT_REST.md](docs/SECURITY_AT_REST.md)). Device
   text goes through `journal_safe`, `printable` or `camera_display_name`;
   support reports stay share-safe (ADR-0008).

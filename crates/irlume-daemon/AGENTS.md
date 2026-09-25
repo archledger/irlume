@@ -46,7 +46,8 @@ the `Request::ListProfiles` doc in `crates/irlume-common/src/lib.rs`).
   or raising a bound breaks every released client.
 - A new reply field that reaches a non-root peer carries no `/dev` path or
   serial; use handles and `vid:pid` (ADR-0030 §4 and its "Wire boundary"
-  acceptance test).
+  acceptance test). Existing fields that do (`Health.rgb_dev`, `ir_dev` and
+  others) stay as they are until that section lands; never drop them.
 
 ## Posture tables
 

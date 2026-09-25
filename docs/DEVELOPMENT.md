@@ -270,7 +270,8 @@ The `irlume-auth` examples load ONNX models. Without `ORT_DYLIB_PATH` they
 use the first packaged runtime present
 (`/usr/share/irlume/onnxruntime/lib/libonnxruntime.so` on an installed
 Fedora/RPM box, `/opt/irlume/onnxruntime/lib/libonnxruntime.so` on a
-Debian/PPA box), else the system loader; if that fails, or the runtime is
+Debian/PPA box, which ships the upstream `libonnxruntime.so.1.28.1` beside
+that link), else the system loader; if that fails, or the runtime is
 older than 1.24, the model load fails at once with a load error. On a source
 checkout, set the variable (see the ONNX runtime section above).
 

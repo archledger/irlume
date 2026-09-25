@@ -286,6 +286,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The GNOME keyring unlock helper wipes every copy it makes of the
+  keyring token, and the control packets it and `keyring arm` send to
+  gnome-keyring are held in locked memory that is wiped after use (#250,
+  #841).
+
 - The re-seal after login is now accepted only from root: its one sender
   is the `reseal` session line, which runs in the login stack's root
   process on every stack irlume wires. `keyring arm`, `reseal` and that

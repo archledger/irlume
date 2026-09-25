@@ -26,9 +26,11 @@
 use irlume_common::gkr_wire::{self, ControlResult, Op};
 use std::ffi::CString;
 use std::io::Read;
+use std::os::fd::AsFd as _;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 /// Ceiling on the token read from stdin. The armed token is 64 bytes of hex;
 /// the margin tolerates a future longer format without accepting arbitrary
@@ -60,23 +62,7 @@ fn main() -> std::process::ExitCode {
 fn run(user: &str) -> Result<(), String> {
     // Read the token first, before any privilege change, so a malformed
     // invocation fails without side effects.
-    let mut token = Vec::with_capacity(MAX_TOKEN_LEN);
-    std::io::stdin()
-        .take(MAX_TOKEN_LEN as u64 + 1)
-        .read_to_end(&mut token)
-        .map_err(|e| format!("reading the token from stdin: {e}"))?;
-    if token.is_empty() {
-        return Err("empty token on stdin".into());
-    }
-    if token.len() > MAX_TOKEN_LEN {
-        return Err(format!("token longer than {MAX_TOKEN_LEN} bytes; refusing"));
-    }
-    // The keyring credential is a string; a token with a NUL or control bytes
-    // is not one this program ever produced, so refuse it rather than let a
-    // truncated comparison "succeed" somewhere downstream.
-    if token.iter().any(|b| !b.is_ascii_graphic()) {
-        return Err("token contains non-printable bytes; refusing".into());
-    }
+    let token = read_token_from_stdin()?;
 
     let pw = lookup_user(user)?;
     // Refuse when there is no login keyring to unlock.
@@ -116,7 +102,7 @@ fn run(user: &str) -> Result<(), String> {
         .set_read_timeout(Some(IO_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
         .map_err(|e| format!("setting control socket timeouts: {e}"))?;
-    match gkr_wire::call(&mut stream, Op::Unlock, &[&token])? {
+    match gkr_wire::call(&mut stream, Op::Unlock, &[token.as_slice()])? {
         ControlResult::Ok => Ok(()),
         // A DENIED here is not merely a failed unlock. The daemon remembers
         // the rejected secret (`gkm_wrap_layer_mark_login_unlock_failure`) and
@@ -134,6 +120,56 @@ fn run(user: &str) -> Result<(), String> {
         )),
         other => Err(format!("keyring UNLOCK: {}", other.describe())),
     }
+}
+
+/// Read and check the token on stdin.
+///
+/// `Stdin` would keep a second copy in its process-wide buffer, which nothing
+/// wipes. An unbuffered `File` on a clone of the descriptor reads straight
+/// into the buffer [`read_token`] wipes, and closes the clone when done.
+fn read_token_from_stdin() -> Result<Zeroizing<Vec<u8>>, String> {
+    let input = std::io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|e| format!("reading the token from stdin: {e}"))?;
+    read_token(std::fs::File::from(input))
+}
+
+/// Read one token of at most [`MAX_TOKEN_LEN`] printable bytes from `input`,
+/// into a buffer that is wiped when it is dropped, on every return path.
+fn read_token(mut input: impl Read) -> Result<Zeroizing<Vec<u8>>, String> {
+    // One allocation with room for a byte past the limit, which is how an
+    // oversized token shows. It never grows, so no reallocation frees a
+    // partial copy before the wipe.
+    let mut token = Zeroizing::new(vec![0u8; MAX_TOKEN_LEN + 1]);
+    // Best effort, as in irlume-kwallet-init: keep the pages out of swap and
+    // core dumps before any token byte lands in them.
+    irlume_common::memlock::lock_slice(&token);
+    let mut len = 0;
+    while len < token.len() {
+        match input.read(&mut token[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(format!("reading the token from stdin: {e}")),
+        }
+    }
+    // Shrinks the length, not the allocation, so the wipe still covers every
+    // byte read.
+    token.truncate(len);
+    if token.is_empty() {
+        return Err("empty token on stdin".into());
+    }
+    if token.len() > MAX_TOKEN_LEN {
+        return Err(format!("token longer than {MAX_TOKEN_LEN} bytes; refusing"));
+    }
+    // The keyring credential is a string; a token with a NUL or control bytes
+    // is not one this program ever produced, so refuse it rather than let a
+    // truncated comparison "succeed" somewhere downstream.
+    if token.iter().any(|b| !b.is_ascii_graphic()) {
+        return Err("token contains non-printable bytes; refusing".into());
+    }
+    Ok(token)
 }
 
 /// Connect to the control socket without ever blocking past [`IO_TIMEOUT`].
@@ -455,5 +491,293 @@ mod tests {
     #[test]
     fn a_clean_probe_reporting_no_error_is_a_connected_socket() {
         assert!(pending_connect_failure(0, 0, 0).is_none());
+    }
+
+    /// A printable token with [`MARKER`] past offset 0, so a buffer that
+    /// clears only its first byte on drop still counts as unwiped.
+    const TOKEN: &[u8] = b"tok-irlume-wipe-check-5c1e";
+    const MARKER: &[u8] = b"irlume-wipe-check-5c1e";
+    /// Stdin bytes for the refused case: more than the limit plus the one
+    /// byte read past it, so some must stay in the pipe.
+    const OVERSIZED_LEN: usize = 300;
+    /// No account has this name, so `run` stops at the user lookup, after it
+    /// has read and checked the token and before any privilege change.
+    const NO_SUCH_USER: &str = "irlume-test-no-such-user-5c1e";
+
+    #[test]
+    fn the_freed_block_check_sees_an_unwiped_copy() {
+        let unwiped = freed_blocks::count_unwiped(MARKER, || {
+            drop(std::hint::black_box(TOKEN.to_vec()));
+        });
+        assert_eq!(unwiped, 1, "the freed-block check is not installed");
+    }
+
+    /// The UNLOCK packet `gkr_wire::call` builds around the token is wiped
+    /// before its memory is freed.
+    #[test]
+    fn the_unlock_packet_is_wiped_after_it_is_sent() {
+        struct Daemon {
+            sent: usize,
+            reply: &'static [u8],
+        }
+        impl std::io::Write for Daemon {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.sent += buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl std::io::Read for Daemon {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reply.read(buf)
+            }
+        }
+        // Declared length 8, result 0 (OK).
+        const OK_REPLY: &[u8] = &[0, 0, 0, 8, 0, 0, 0, 0];
+
+        let mut daemon = Daemon {
+            sent: 0,
+            reply: OK_REPLY,
+        };
+        let unwiped = freed_blocks::count_unwiped(MARKER, || {
+            let result = gkr_wire::call(&mut daemon, Op::Unlock, &[TOKEN]);
+            assert_eq!(result, Ok(ControlResult::Ok));
+        });
+        assert_eq!(unwiped, 0, "the UNLOCK packet was freed without a wipe");
+        // The credentials byte, the 8-byte header and one length-prefixed
+        // argument.
+        assert_eq!(daemon.sent, 1 + 8 + 4 + TOKEN.len());
+    }
+
+    /// The token goes from the stdin pipe straight into a buffer that is
+    /// wiped before it is freed, on the accepted path and on a refused one.
+    /// Each case runs in a fresh process whose stdin is a pipe this test
+    /// fills and closes.
+    #[test]
+    fn the_stdin_token_is_read_unbuffered_and_wiped() {
+        use std::io::Write as _;
+        let oversized: Vec<u8> = MARKER.iter().copied().cycle().take(OVERSIZED_LEN).collect();
+        for (child, input) in [
+            ("tests::token_stdin_child", TOKEN),
+            ("tests::oversized_token_stdin_child", &oversized[..]),
+        ] {
+            let mut proc = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", child])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut pipe = proc.stdin.take().unwrap();
+            pipe.write_all(input).unwrap();
+            drop(pipe);
+            let out = proc.wait_with_output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{child} failed:\n{stdout}");
+            // An `--exact` name that matches nothing also exits 0.
+            assert!(
+                stdout.contains("test result: ok. 1 passed"),
+                "{child} did not run:\n{stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_token_keeps_the_checks_and_returns_a_wiping_buffer() {
+        let token: Zeroizing<Vec<u8>> = read_token(TOKEN).expect("a printable token");
+        assert_eq!(token.as_slice(), TOKEN);
+
+        let limit = vec![b'a'; MAX_TOKEN_LEN];
+        assert_eq!(
+            read_token(&limit[..]).expect("at the limit").len(),
+            MAX_TOKEN_LEN
+        );
+
+        let over = vec![b'a'; MAX_TOKEN_LEN + 1];
+        let why = read_token(&over[..]).expect_err("one byte over the limit");
+        assert!(why.contains("longer than 256 bytes"), "{why}");
+
+        let why = read_token(&b""[..]).expect_err("no token");
+        assert!(why.contains("empty token"), "{why}");
+
+        for bad in [&b"tok\0en"[..], b"tok en", b"token\n"] {
+            let why = read_token(bad).expect_err("non-printable byte");
+            assert!(why.contains("non-printable"), "{why}");
+        }
+    }
+
+    #[test]
+    fn read_token_retries_an_interrupted_read_and_reports_a_failed_one() {
+        /// Fails each read once with `kind`, then serves from `rest`.
+        struct Flaky {
+            kind: Option<std::io::ErrorKind>,
+            rest: &'static [u8],
+        }
+        impl std::io::Read for Flaky {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.kind.take() {
+                    Some(kind) => Err(kind.into()),
+                    None => self.rest.read(buf),
+                }
+            }
+        }
+
+        let token = read_token(Flaky {
+            kind: Some(std::io::ErrorKind::Interrupted),
+            rest: TOKEN,
+        })
+        .expect("an interrupted read is retried");
+        assert_eq!(token.as_slice(), TOKEN);
+
+        let why = read_token(Flaky {
+            kind: Some(std::io::ErrorKind::BrokenPipe),
+            rest: TOKEN,
+        })
+        .expect_err("a failed read is an error");
+        assert!(why.starts_with("reading the token from stdin"), "{why}");
+    }
+
+    /// A pipe may hand the token over in pieces. One byte per read still
+    /// gives the whole token in order, and the refusal comes after exactly
+    /// one byte past the limit.
+    #[test]
+    fn read_token_joins_one_byte_reads() {
+        /// Serves `rest` one byte per call.
+        struct Trickle<'a> {
+            rest: &'a [u8],
+        }
+        impl std::io::Read for Trickle<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.rest.len().min(buf.len()).min(1);
+                buf[..n].copy_from_slice(&self.rest[..n]);
+                self.rest = &self.rest[n..];
+                Ok(n)
+            }
+        }
+
+        let mut input = Trickle { rest: TOKEN };
+        let token = read_token(&mut input).expect("a printable token");
+        assert_eq!(token.as_slice(), TOKEN);
+
+        // Every printable byte in turn, so a byte out of place shows.
+        let limit: Vec<u8> = (b'!'..=b'~').cycle().take(MAX_TOKEN_LEN).collect();
+        let mut input = Trickle { rest: &limit };
+        let token = read_token(&mut input).expect("at the limit");
+        assert_eq!(token.as_slice(), &limit[..]);
+
+        let over = vec![b'a'; OVERSIZED_LEN];
+        let mut input = Trickle { rest: &over };
+        let why = read_token(&mut input).expect_err("over the limit");
+        assert!(why.contains("longer than 256 bytes"), "{why}");
+        assert_eq!(input.rest.len(), OVERSIZED_LEN - (MAX_TOKEN_LEN + 1));
+    }
+
+    #[test]
+    #[ignore = "fresh-exec child invoked by the_stdin_token_is_read_unbuffered_and_wiped"]
+    fn token_stdin_child() {
+        let unwiped = freed_blocks::count_unwiped(MARKER, || {
+            let why = run(NO_SUCH_USER).expect_err("no account has this name");
+            assert!(why.contains("no such user"), "{why}");
+        });
+        assert_eq!(unwiped, 0, "the token was freed without a wipe");
+        assert_eq!(stdin_bytes_left(), 0);
+    }
+
+    #[test]
+    #[ignore = "fresh-exec child invoked by the_stdin_token_is_read_unbuffered_and_wiped"]
+    fn oversized_token_stdin_child() {
+        let unwiped = freed_blocks::count_unwiped(MARKER, || {
+            let why = run(NO_SUCH_USER).expect_err("an oversized token is refused");
+            assert!(why.contains("longer than 256 bytes"), "{why}");
+        });
+        assert_eq!(unwiped, 0, "the refused token was freed without a wipe");
+        // Only the limit and the one byte past it leave the pipe. A buffered
+        // reader would have drained the rest into memory nothing wipes.
+        assert_eq!(stdin_bytes_left(), OVERSIZED_LEN - (MAX_TOKEN_LEN + 1));
+    }
+
+    /// Bytes still unread in the stdin pipe.
+    fn stdin_bytes_left() -> usize {
+        let mut left: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one int through this valid pointer; it
+        // reads no bytes from the pipe and does not take the descriptor.
+        let rc = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::FIONREAD, &mut left) };
+        assert_eq!(rc, 0, "FIONREAD: {}", std::io::Error::last_os_error());
+        usize::try_from(left).expect("FIONREAD is never negative")
+    }
+
+    /// The allocator of this test binary, which can find a secret in freed
+    /// memory.
+    ///
+    /// It zero-fills every block it hands out. While [`count_unwiped`] runs
+    /// on a thread, each block that thread frees is read as bytes and
+    /// searched for a marker first; other threads and other times forward to
+    /// `System` unchanged. Use `count_unwiped` only around code that frees
+    /// byte buffers (`Vec<u8>`, `String`, `CString`): a typed write can leave
+    /// padding bytes uninitialized, and those must not be read as `u8`.
+    ///
+    /// A copy of the module of the same name in `crates/irlume-pam/src/lib.rs`.
+    mod freed_blocks {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        struct CheckFreed;
+
+        #[global_allocator]
+        static CHECK_FREED: CheckFreed = CheckFreed;
+
+        thread_local! {
+            static MARKER: Cell<Option<&'static [u8]>> = const { Cell::new(None) };
+            static UNWIPED: Cell<usize> = const { Cell::new(0) };
+        }
+
+        /// Run `f` and count the blocks it frees that still hold `marker`.
+        /// `f` must free only byte buffers (see the module doc).
+        pub(super) fn count_unwiped(marker: &'static [u8], f: impl FnOnce()) -> usize {
+            struct Disarm;
+            impl Drop for Disarm {
+                fn drop(&mut self) {
+                    let _ = MARKER.try_with(|m| m.set(None));
+                }
+            }
+            assert!(!marker.is_empty());
+            UNWIPED.with(|n| n.set(0));
+            MARKER.with(|m| m.set(Some(marker)));
+            let disarm = Disarm;
+            f();
+            drop(disarm);
+            UNWIPED.with(Cell::get)
+        }
+
+        // SAFETY: `alloc` returns `System.alloc_zeroed` for the same layout,
+        // and `dealloc` returns the caller's pointer and layout to `System`
+        // after reading the block, so `System`'s guarantees carry over. The
+        // default `realloc` and `alloc_zeroed` go through these two.
+        unsafe impl GlobalAlloc for CheckFreed {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                // SAFETY: `alloc_zeroed` has the contract the caller keeps
+                // for `alloc`: a layout of non-zero size.
+                unsafe { System.alloc_zeroed(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                if let Some(marker) = MARKER.try_with(Cell::get).ok().flatten() {
+                    // SAFETY: `ptr` is a live block of `layout.size()` bytes
+                    // from `alloc` above, read before it is freed. Every byte
+                    // is initialized: `alloc` zero-filled the block, and while
+                    // a marker is set the only blocks freed are byte buffers
+                    // (see the module doc), whose writes are bytes with no
+                    // padding.
+                    let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
+                    if block.windows(marker.len()).any(|w| w == marker) {
+                        let _ = UNWIPED.try_with(|n| n.set(n.get() + 1));
+                    }
+                }
+                // SAFETY: the caller passes a block from `alloc` above, which
+                // came from `System`, with the layout it was allocated with.
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
     }
 }

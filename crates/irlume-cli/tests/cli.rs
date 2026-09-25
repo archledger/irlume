@@ -905,7 +905,7 @@ fn logs_assembles_the_journalctl_argv() {
     let sb = Sandbox::new("logsargv");
     // The fake journalctl echoes one argument per line.
     sb.fake_tool("journalctl", r#"printf '%s\n' "$@""#);
-    const PATTERN: &str = "irlume|pam_kwallet|pam_gnome_keyring";
+    const PATTERN: &str = "irlume|pam_kwallet|pam_gnome_keyring|gkr-pam|pam_oo7|oo7-daemon";
 
     let (code, out, _) = run(&mut sb.cmd_with_fakes(&["logs"]));
     assert_eq!(code, 0);

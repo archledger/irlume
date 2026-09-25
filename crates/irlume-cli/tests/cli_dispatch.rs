@@ -733,6 +733,21 @@ fn reseal_aborts_on_empty_password_and_flags_unexpected_response() {
     );
     assert_eq!(code, 1);
     assert!(err.contains("[reseal] unexpected response"), "{err}");
+
+    // A daemon refusal is shown as its text, which says what to do next.
+    let sb3 = Sandbox::new("resealrefused");
+    serve(&sb3.sock(), |req| match req {
+        Request::HasSealedPassword { .. } => Response::HasPassword(true),
+        Request::SealPassword { .. } => Response::Error("refused; run this".into()),
+        _ => Response::Error("unexpected request".into()),
+    });
+    let (code, _, err) = run_stdin(
+        &mut sb3.cmd(&["reseal", "--user", "tester"]),
+        "pw\n",
+        "reseal",
+    );
+    assert_eq!(code, 1);
+    assert!(err.contains("[reseal] failed: refused; run this"), "{err}");
 }
 
 // ------------------------------------------------------------------ setup arms
@@ -772,8 +787,8 @@ fn setup_already_enrolled_skips_reenroll_and_reports_arm_failure() {
     assert!(out.contains("already enrolled."), "{out}");
     assert!(out.contains("[7/7] PAM login wiring"), "{out}");
     assert!(
-        err.contains("arm failed"),
-        "the SealPassword error must surface: {err}"
+        err.contains("arm failed: tpm busy") && !err.contains("Error("),
+        "the SealPassword error must surface as its text: {err}"
     );
 }
 

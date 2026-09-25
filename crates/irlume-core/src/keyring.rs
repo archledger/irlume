@@ -103,9 +103,10 @@ fn mint_gnome_token() -> Zeroizing<String> {
 }
 
 /// Arm GNOME-keyring unlock for `user`: mint a token, seal it in the TPM, wrap
-/// it under the VERIFIED login `password` (the recovery path for PCR drift),
-/// save the envelope, and return the token so the caller can re-key the login
-/// keyring to it.
+/// it under the login `password` (the recovery path for PCR drift), save the
+/// envelope, and return the token so the caller can re-key the login keyring
+/// to it. irlumed checks `password` against the login hash first where it can
+/// read one; where it cannot, a first arm goes ahead unchecked.
 ///
 /// Ordering is load-bearing: the envelope is durable BEFORE the caller re-keys
 /// the keyring. A crash after this returns but before the re-key leaves the
@@ -171,7 +172,7 @@ pub fn rearm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<Vec<u8
 }
 
 /// Derive the secret of `kind` that `user` should have sealed, from their
-/// VERIFIED login password.
+/// login password (checked by irlumed where it can read the login hash).
 ///
 /// For [`SecretKind::KdeWalletKey`] this is PBKDF2 over the caller-supplied
 /// wallet salt, matching what `pam_kwallet5` computes. Note what that implies after
@@ -210,6 +211,31 @@ pub fn sealed_kind(user: &str) -> Option<SecretKind> {
     SealedEnvelope::load(&envelope_path(user))
         .ok()
         .map(|e| e.secret)
+}
+
+/// What kind of secret `user` has armed, telling "nothing is armed" apart
+/// from "could not tell".
+///
+/// [`sealed_kind`] reads both as `None`. A caller about to seal over the
+/// envelope cannot: an envelope that exists but cannot be read may hold the
+/// only copy of a GNOME keyring token.
+///
+/// # Errors
+/// [`Error::Policy`] when the envelope exists but cannot be loaded, or when
+/// whether it exists cannot be told (an unreadable keyring directory).
+pub fn read_sealed_kind(user: &str) -> Result<Option<SecretKind>> {
+    let path = envelope_path(user);
+    let unreadable = |e: String| {
+        Error::Policy(format!(
+            "the sealed secret for '{user}' cannot be read ({e})"
+        ))
+    };
+    if !path.try_exists().map_err(|e| unreadable(e.to_string()))? {
+        return Ok(None);
+    }
+    SealedEnvelope::load(&path)
+        .map(|env| Some(env.secret))
+        .map_err(|e| unreadable(e.to_string()))
 }
 
 /// Every sealed envelope on this machine, as `(user, kind)`.
@@ -343,7 +369,10 @@ pub enum Reseal {
 /// authentication has already succeeded. (An earlier version called it from an
 /// `optional` auth line that also ran after a FAILED password attempt, which let
 /// a typo overwrite the good seal; that path has been deleted. Never call this
-/// anywhere auth success is not already established.)
+/// anywhere auth success is not already established.) A session can also
+/// follow a grant from another factor after a typed password, so irlumed
+/// first refuses a password that fails its login-hash check where it can
+/// read the account's hash.
 ///
 /// Given a verified password it writes nothing in the common case:
 ///   * not armed            -> `NotArmed` (never auto-arm)
@@ -605,6 +634,54 @@ mod tests {
         assert!(!keyring.join("alice.json").exists());
         forget_password_in(&root, "alice").unwrap();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// No TPM: only the envelope file is read.
+    #[test]
+    fn read_sealed_kind_tells_nothing_armed_from_unreadable() {
+        let _g = crate::testenv::ENV_LOCK.lock().expect("env lock");
+        let dir = crate::test_tmp_dir("kr-read-kind");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
+        let plant = |user: &str, secret: SecretKind| {
+            SealedEnvelope {
+                version: crate::envelope::CURRENT_VERSION,
+                policy: Default::default(),
+                secret,
+                pcrs: Vec::new(),
+                public: Vec::new(),
+                private: Vec::new(),
+                pcr_values: Vec::new(),
+                password_wrap: None,
+            }
+            .save(&envelope_path(user))
+            .unwrap();
+        };
+
+        // Nothing armed, not even a keyring directory.
+        assert_eq!(read_sealed_kind("fresh").unwrap(), None);
+        plant("tok", SecretKind::GnomeKeyringToken);
+        plant("pw", SecretKind::LoginPassword);
+        assert_eq!(
+            read_sealed_kind("tok").unwrap(),
+            Some(SecretKind::GnomeKeyringToken)
+        );
+        assert_eq!(
+            read_sealed_kind("pw").unwrap(),
+            Some(SecretKind::LoginPassword)
+        );
+        // An envelope that cannot be read is not "nothing armed".
+        std::fs::write(envelope_path("garbage"), b"not an envelope").unwrap();
+        assert_eq!(sealed_kind("garbage"), None, "the lossy reading");
+        let err = read_sealed_kind("garbage").expect_err("unreadable");
+        assert!(err.to_string().contains("cannot be read"), "{err}");
+        // Nor is a directory that cannot tell whether anything is armed.
+        std::env::set_var("IRLUME_KEYRING_DIR", envelope_path("garbage"));
+        let err = read_sealed_kind("tok").expect_err("no answer");
+        assert!(err.to_string().contains("cannot be read"), "{err}");
+
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Full arm → unseal round-trip through the keyring layer on the real TPM.

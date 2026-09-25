@@ -154,9 +154,20 @@ in sync after a password change:
    "Change Password" (GNOME).
 3. **irlume's sealed copy**: run `irlume keyring arm` to re-seal the new password.
 
-Rule of thumb: whenever the wallet password changes, re-run `irlume keyring arm`
-so irlume's seal keeps matching it. Your typed password opens everything in the
-meantime, so nothing locks you out.
+With a GNOME keyring token arm, the login keyring is keyed to a random token,
+not to your password, so steps 2 and 3 are not needed: the first login where you
+type the new password at a login screen wired with irlume's re-seal moves
+irlume's copy to it. Until then, `irlume keyring forget` asks for the previous
+password. Where irlumed cannot read your login hash (LDAP or SSSD accounts, and
+the AppArmor profile that the Debian, Ubuntu, Mint and Arch packages install),
+`irlume keyring arm` does not re-arm over the token. To arm again there anyway,
+log in once by typing your new password at such a screen, then run
+`irlume keyring forget` with it, then `irlume keyring arm`.
+
+Rule of thumb: with a login-password or KDE wallet-key arm
+(`irlume keyring status` shows which), whenever the wallet password changes,
+re-run `irlume keyring arm` so irlume's seal keeps matching it. Your typed
+password opens everything in the meantime, so nothing locks you out.
 </details>
 
 <details>

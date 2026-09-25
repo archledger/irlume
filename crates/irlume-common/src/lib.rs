@@ -791,7 +791,14 @@ pub enum Request {
 
     // --- keyring unlock (TPM-sealed password) -------------------------------
     /// Seal `user`'s login password in the TPM so a later face login can release
-    /// it to unlock the GNOME-keyring / KWallet. PRIVILEGED: root or `user`.
+    /// it to unlock the GNOME-keyring / KWallet. The daemon refuses a password
+    /// with a NUL byte, and one that fails its login-hash check where it can
+    /// read the account's hash. Where it cannot (an LDAP or SSSD account, or
+    /// the shipped AppArmor profile, which keeps the daemon out of
+    /// `/etc/shadow`), it refuses an arm over an armed GNOME keyring token, or
+    /// over an envelope it cannot read, from any peer, root included, and
+    /// changes nothing; `irlume keyring forget` and a fresh arm are the way
+    /// back. PRIVILEGED: root or `user`.
     SealPassword {
         user: String,
         password: SecretBytes,
@@ -874,18 +881,24 @@ pub enum Request {
     /// forget` can re-key the login keyring BACK to the password before the
     /// envelope is erased. Without that re-key, deleting a token envelope
     /// strands the keyring on a secret that no longer exists anywhere.
-    /// `password` must be the user's current login password; the daemon
-    /// verifies it before releasing (the caller proves they could have obtained
-    /// the keyring contents anyway). Refused for envelopes of any other kind.
+    /// `password` must open the token's password wrap, made under the login
+    /// password the token was armed or last re-sealed with; the daemon checks
+    /// it before releasing (the caller proves they could have obtained the
+    /// keyring contents anyway). Refused for envelopes of any other kind.
     /// PRIVILEGED: root or `user`.
     ReleaseTokenForDisarm { user: String, password: SecretBytes },
     /// Re-seal `user`'s login password against the *current* PCR policy, but
     /// ONLY if a sealed password is already armed (never auto-arms a fresh user)
     /// and only if it actually changed (the PCRs moved, e.g. a dbx/Secure Boot
     /// update, or the user changed their password). Fired from the login
-    /// **session** phase, which runs only after authentication SUCCEEDED, so
-    /// `password` is always one `pam_unix` accepted (never a typo). PRIVILEGED:
-    /// root or `user`.
+    /// **session** phase, which runs only after authentication SUCCEEDED. That
+    /// does not prove `password` is the one that authenticated, so the daemon
+    /// refuses a password with a NUL byte, and one that fails its login-hash
+    /// check where it can read the account's hash, and leaves the envelope as
+    /// it was. Where it cannot, the session's word is all it has, and the
+    /// password re-seals (a token's password wrap moves to it). PRIVILEGED:
+    /// root only, the PAM session line being its one sender (older daemons
+    /// also accepted `user`).
     ResealPassword {
         user: String,
         password: SecretBytes,

@@ -244,18 +244,36 @@ every login, which is half the point.
 irlume keyring arm
 ```
 
-It prompts for your **login password** (twice in a terminal) and verifies it
-before arming. Depending on the backend, the TPM seals the login password,
-the KDE wallet key, or a random GNOME keyring token. `irlume keyring status`
-reports which kind is armed. No sealed secret is stored in plaintext.
+It prompts for your **login password** (twice in a terminal). irlumed checks
+it against the account's login hash before arming where it can read one. It
+cannot for LDAP or SSSD accounts, or under the AppArmor profile that the
+Debian, Ubuntu, Mint and Arch packages install (Arch loads it only when
+AppArmor is on), which keeps it out of `/etc/shadow`. Depending on the
+backend, the TPM seals the login password, the KDE wallet key, or a random
+GNOME keyring token. `irlume keyring status` reports which kind is armed. No
+sealed secret is stored in plaintext.
 
 GNOME token arming rekeys the login keyring: your password alone no longer
 opens it directly. Use `irlume keyring forget` to rekey it back before
 removing the integration; deleting the token envelope can strand that keyring.
+The envelope also keeps the token wrapped under a password, which recovers the
+token after a firmware or Secure Boot change. That is the password you armed
+with, or the one you last typed at a login screen wired with irlume's re-seal,
+and it is the one `forget` asks for. So a token arm needs no re-arm after a
+password change or a firmware update: the next login where you type your
+password at such a screen moves the wrap to it and re-binds the seal. Until
+then, `forget` takes the previous password.
+
+Where irlumed cannot check passwords, `irlume keyring arm` does not re-arm over
+a token that is already armed, whoever runs it, and changes nothing. To arm
+again there anyway, log in once by typing your current password at such a
+screen, then run `irlume keyring forget` with that password, then
+`irlume keyring arm`.
+
 Password-backed and KDE-key arms should be checked and re-armed after a
 password change if needed. PAM also has a best-effort reseal path after
-independently verified password authentication; a failed reseal does not fail
-the login. Fingerprint login can use the same backend-specific handoff
+password authentication; a failed reseal does not fail the login. Fingerprint
+login can use the same backend-specific handoff
 ([ADR-0003](adr/0003-fingerprint-keyring-unlock.md)).
 
 For KDE, the CLI or PAM session asks the packaged `irlume-kwallet-init` helper

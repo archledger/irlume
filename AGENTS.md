@@ -185,9 +185,10 @@ cargo build --release --locked
    keyring token) without one, for the fingerprint path on a login or unlock
    service; and, to root or the account's owner, the GNOME keyring token in
    `SealPassword`'s `TokenSealed` and in `ReleaseTokenForDisarm` (after the
-   login password is verified), so the caller can re-key the keyring (ADR-0003,
-   `crates/irlume-common/src/lib.rs`; [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-   "Privilege separation", "Authentication flow").
+   password opens the token's password wrap), so the caller can re-key the
+   keyring (ADR-0003, `crates/irlume-common/src/lib.rs`;
+   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) "Privilege separation",
+   "Authentication flow").
 4. **Posture and wire.** Every `Request` variant has an explicit arm, with no
    wildcard, in the daemon's posture tables. Socket changes stay additive, as
    old and new binaries meet during upgrades (daemon AGENTS.md). `--json` is a

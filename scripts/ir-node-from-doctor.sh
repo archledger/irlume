@@ -29,8 +29,13 @@
 #      way to say it, so a format change arrived as "no IR node", which reads
 #      as a hardware fact rather than as a broken parser.
 #
-# Usage:  ir-node-from-doctor.sh <file>   # file holds `irlume doctor` output
+# Usage:  ir-node-from-doctor.sh <file> [node]   # file holds `irlume doctor` output
 #         ir-node-from-doctor.sh --self-test
+#
+# Without a node, the first node doctor classifies Ir is named. With one (the
+# device an installed capture approval names), that node itself must be
+# classified Ir: which IR camera doctor lists first follows its census order,
+# not the approval, and changed on archhost when that order did.
 #
 # Exit codes, which the caller is expected to branch on:
 #   0   an IR node was found; its path is on stdout
@@ -38,6 +43,7 @@
 #   11  doctor listed nodes but classified none of them Ir (a regression)
 #   12  the output did not parse (doctor's format changed; fix this script)
 #   13  doctor could not establish what cameras exist (unreadable or unlistable)
+#   14  a node was requested and doctor lists Ir nodes, but not that one
 #    2  usage error
 set -euo pipefail
 
@@ -45,6 +51,7 @@ readonly EXIT_NO_NODES=10
 readonly EXIT_NO_IR=11
 readonly EXIT_UNPARSEABLE=12
 readonly EXIT_CAMERA_UNKNOWN=13
+readonly EXIT_NODE_NOT_IR=14
 
 readonly SECTION='[doctor] camera nodes (classified by pixel format):'
 
@@ -80,8 +87,8 @@ readonly ABSENCE_MARKER='(no /dev/video* nodes on this machine)'
 readonly KNOWN_ROLES='Rgb|Ir|Other|Unreadable'
 
 parse() {
-  local doc="$1"
-  awk -v section="$SECTION" -v roles="$KNOWN_ROLES" -v absent="$ABSENCE_MARKER" '
+  local doc="$1" want="${2:-}"
+  awk -v section="$SECTION" -v roles="$KNOWN_ROLES" -v absent="$ABSENCE_MARKER" -v want="$want" '
     index($0, section) { in_section = 1; seen_section = 1; next }
     !in_section { next }
     # The section ends at the first line that is not indented under it.
@@ -118,21 +125,22 @@ parse() {
       parsed++
       if (role == "Unreadable") unreadable++
       if (role == "Ir" && ir == "") ir = path
+      if (role == "Ir" && want != "" && path == want) want_ir = 1
     }
     END {
-      printf "%s|%d|%d|%s|%d|%d|%d\n", ir, nodes + 0, parsed + 0, unknown_role, \
-        seen_section + 0, absence_stated + 0, unreadable + 0
+      printf "%s|%d|%d|%s|%d|%d|%d|%d\n", ir, nodes + 0, parsed + 0, unknown_role, \
+        seen_section + 0, absence_stated + 0, unreadable + 0, want_ir + 0
     }
   ' "$doc"
 }
 
 resolve() {
-  local doc="$1" ir nodes parsed unknown seen absent unreadable
+  local doc="$1" want="${2:-}" ir nodes parsed unknown seen absent unreadable want_ir
   # `|`, not a tab: tab is an IFS whitespace character, so `read` would strip
   # the leading empty field and shift every value one position left whenever
   # no IR node was found. That silently turned "no IR node" into "the IR node
   # is 2", which is the same class of defect this whole script exists for.
-  IFS='|' read -r ir nodes parsed unknown seen absent unreadable < <(parse "$doc")
+  IFS='|' read -r ir nodes parsed unknown seen absent unreadable want_ir < <(parse "$doc" "$want")
 
   # The section header itself is a format claim. Losing it means the parse
   # never even started, so nothing below it can be trusted.
@@ -177,6 +185,14 @@ whether this machine has an IR camera is unknown" >&2
     echo "doctor classified ${nodes} camera node(s), none of them Ir" >&2
     return "$EXIT_NO_IR"
   fi
+  if [ -n "$want" ]; then
+    if [ "$want_ir" -ne 1 ]; then
+      echo "doctor does not classify ${want} as Ir (its first Ir node is ${ir})" >&2
+      return "$EXIT_NODE_NOT_IR"
+    fi
+    printf '%s\n' "$want"
+    return 0
+  fi
   printf '%s\n' "$ir"
 }
 
@@ -193,11 +209,11 @@ self_test() {
   # dereferences a `local` that is already out of scope and dies under
   # `set -u`. Nothing below exits early, so the explicit removal always runs.
 
-  check() { # check <name> <expected-exit> <expected-stdout> <fixture-text>
-    local name="$1" want_code="$2" want_out="$3" text="$4"
+  check() { # check <name> <expected-exit> <expected-stdout> <fixture-text> [node]
+    local name="$1" want_code="$2" want_out="$3" text="$4" node="${5:-}"
     local f="$tmp/fixture" got_out got_code=0
     printf '%s' "$text" >"$f"
-    got_out="$(resolve "$f" 2>/dev/null)" || got_code=$?
+    got_out="$(resolve "$f" "$node" 2>/dev/null)" || got_code=$?
     if [ "$got_code" -eq "$want_code" ] && [ "$got_out" = "$want_out" ]; then
       pass=$((pass + 1))
       printf '  ok   %s\n' "$name"
@@ -315,6 +331,29 @@ self_test() {
 [doctor] some later section:
   /dev/video9: Ir (uvcvideo, USB)
 '
+  # A requested node (the capture approval's device) is named only when doctor
+  # classifies that node Ir, wherever it falls in the census order. archhost's
+  # census began listing the NexiGo IR node before the BRIO's in 2026-09.
+  two_ir='[doctor] camera nodes (classified by pixel format):
+  /dev/video6: UVC IR sensor (paired), supported (secure IR tier); driver uvcvideo on USB | formats GREY
+  /dev/video0: UVC RGB camera (paired), supported; driver uvcvideo on USB | formats MJPG/YUYV
+  /dev/video2: UVC IR sensor (paired), supported (secure IR tier); driver uvcvideo on USB | formats GREY
+  /dev/video3: metadata-only node (not a camera), nothing to fix
+'
+  check "requested node listed after another Ir" 0 "/dev/video2" "$two_ir" /dev/video2
+  check "requested node that is not Ir" "$EXIT_NODE_NOT_IR" "" "$two_ir" /dev/video3
+  check "requested node that is not listed" "$EXIT_NODE_NOT_IR" "" "$two_ir" /dev/video9
+  check "without a request the first Ir is named" 0 "/dev/video6" "$two_ir"
+  # The request never softens the other outcomes: no Ir at all is still a
+  # regression, and an unparseable section still says so.
+  check "requested node with no Ir anywhere" "$EXIT_NO_IR" "" \
+'[doctor] camera nodes (classified by pixel format):
+  /dev/video2: Rgb (uvcvideo, USB)
+' /dev/video2
+  check "requested node in an unparseable section" "$EXIT_UNPARSEABLE" "" \
+'[doctor] camera nodes (classified by pixel format):
+  /dev/video2: [Ir] (uvcvideo, USB)
+' /dev/video2
 
   rm -rf "$tmp"
   printf '%d passed, %d failed\n' "$pass" "$fail"
@@ -325,12 +364,13 @@ main() {
   case "${1:-}" in
     --self-test) self_test ;;
     "" | -h | --help)
-      echo "usage: $0 <doctor-output-file> | --self-test" >&2
+      echo "usage: $0 <doctor-output-file> [node] | --self-test" >&2
       exit 2
       ;;
     *)
       [ -r "$1" ] || { echo "cannot read $1" >&2; exit 2; }
-      resolve "$1"
+      [ "$#" -le 2 ] || { echo "usage: $0 <doctor-output-file> [node] | --self-test" >&2; exit 2; }
+      resolve "$1" "${2:-}"
       ;;
   esac
 }

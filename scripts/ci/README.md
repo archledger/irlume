@@ -109,6 +109,16 @@ promotion. Prepare the new ELF and manifest together, keep the previous pair,
 and verify the new pair before enabling it. A mismatched pair fails closed.
 Do not silently approve whatever the runner has built to make CI green.
 
+The nightly reads the world-readable manifest before it calls the helper; the
+helper stays the authority. It captures the device the manifest names, which
+doctor must classify as an IR node (the first IR node doctor lists is used only
+on the noninteractive-sudo route). Every merge changes the source tree, so when
+the manifest names another tree the capture step warns and skips the capture
+for up to seven days after the manifest was written, and the build, tests, real
+TPM and coverage still run. After seven days without a promotion the step
+fails. A doctor regression, an unreadable manifest or an approved device that
+is no longer an IR node fails at once.
+
 Before initial installation, retain a root-private manifest of created paths and
 any pre-existing files. Rollback removes only the newly introduced sudoers rule
 and helper/artifact paths after identity checks, or restores the previous

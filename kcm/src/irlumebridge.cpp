@@ -8,6 +8,9 @@
 #include <QJsonParseError>
 #include <QStandardPaths>
 
+#include <algorithm>
+#include <utility>
+
 #include <fcntl.h>
 #include <pwd.h>
 #include <sys/file.h>
@@ -34,6 +37,10 @@ const QList<CommandSpec> kCommands = {
 
 const QStringList kMachineFlags = {QStringLiteral("--json"), QStringLiteral("--contract"), QStringLiteral("1")};
 
+// Budget for the handoff child to start; the caller's budget then covers
+// the run itself.
+constexpr int kHandoffStartMs = 2000;
+
 QString resolveIrlume()
 {
     // Prefer the packaged absolute path: a settings panel must not run an
@@ -45,6 +52,34 @@ QString resolveIrlume()
     }
     return QStandardPaths::findExecutable(QStringLiteral("irlume"));
 }
+
+// Releases a child and its budget timer without anything being emitted for
+// them: both are disconnected first, and a child that is still running is
+// killed and deleted once it has been reaped. Nothing is destroyed inside
+// its own signal, and QProcess never has to destroy a running child.
+void release(QProcess *process, QTimer *timer)
+{
+    if (timer != nullptr) {
+        timer->stop();
+        timer->disconnect();
+        timer->deleteLater();
+    }
+    if (process == nullptr) {
+        return;
+    }
+    process->disconnect();
+    if (process->state() == QProcess::NotRunning) {
+        process->deleteLater();
+        return;
+    }
+    QObject::connect(process, &QProcess::finished, process, &QObject::deleteLater);
+    QObject::connect(process, &QProcess::errorOccurred, process, [process](QProcess::ProcessError error) {
+        if (error == QProcess::FailedToStart) {
+            process->deleteLater();
+        }
+    });
+    process->kill();
+}
 } // namespace
 
 IrlumeBridge::IrlumeBridge(QObject *parent)
@@ -53,7 +88,34 @@ IrlumeBridge::IrlumeBridge(QObject *parent)
 {
 }
 
-IrlumeBridge::~IrlumeBridge() = default;
+IrlumeBridge::IrlumeBridge(const QString &irlumePath, int budgetMs, QObject *parent)
+    : QObject(parent)
+    , m_irlumePath(irlumePath)
+    , m_budgetOverrideMs(budgetMs)
+{
+}
+
+IrlumeBridge::~IrlumeBridge()
+{
+    // Every child (in flight, being released, or a handoff) is parented to
+    // this bridge. Stop them here, silently, so none reports into a
+    // half-destroyed owner and QProcess does not warn about a running
+    // child when QObject deletes it.
+    m_inflight.clear();
+    const auto processes = findChildren<QProcess *>(Qt::FindDirectChildrenOnly);
+    for (QProcess *process : processes) {
+        process->disconnect();
+        if (process->state() != QProcess::NotRunning) {
+            process->kill();
+            process->waitForFinished(1000);
+        }
+    }
+    const auto timers = findChildren<QTimer *>(Qt::FindDirectChildrenOnly);
+    for (QTimer *timer : timers) {
+        timer->disconnect();
+        timer->stop();
+    }
+}
 
 QString IrlumeBridge::irlumePath() const
 {
@@ -64,6 +126,23 @@ bool IrlumeBridge::knownRequest(const QString &name)
 {
     return std::any_of(kCommands.cbegin(), kCommands.cend(),
                        [&name](const CommandSpec &spec) { return name == spec.name; });
+}
+
+bool IrlumeBridge::isCurrent(const QString &name, quint64 serial) const
+{
+    const auto it = m_inflight.find(name);
+    return it != m_inflight.end() && it->second.serial == serial;
+}
+
+void IrlumeBridge::retire(const QString &name)
+{
+    const auto it = m_inflight.find(name);
+    if (it == m_inflight.end()) {
+        return;
+    }
+    Inflight entry = std::move(it->second);
+    m_inflight.erase(it);
+    release(entry.process.data(), entry.timeout.data());
 }
 
 void IrlumeBridge::request(const QString &name)
@@ -79,38 +158,57 @@ void IrlumeBridge::request(const QString &name)
         return;
     }
 
-    // A re-request replaces any in-flight exec of the same document.
-    m_inflight.erase(name);
+    // A re-request supersedes any in-flight exec of the same document:
+    // the old child is killed and never reports.
+    retire(name);
 
-    Inflight in;
-    in.process = std::make_unique<QProcess>(this);
-    in.timeout = std::make_unique<QTimer>(this);
-    in.timeout->setSingleShot(true);
-
-    QProcess *process = in.process.get();
-    QTimer *timeout = in.timeout.get();
+    const quint64 serial = ++m_nextSerial;
+    auto *process = new QProcess(this);
+    auto *timeout = new QTimer(this);
+    timeout->setSingleShot(true);
     process->setProgram(m_irlumePath);
     process->setArguments(it->argv + kMachineFlags);
     process->setProcessChannelMode(QProcess::SeparateChannels);
+    // Machine mode writes diagnostics to stderr; nothing here reads them.
+    process->setStandardErrorFile(QProcess::nullDevice());
 
-    connect(process, &QProcess::finished, this, [this, name, process](int, QProcess::ExitStatus status) {
-        if (status != QProcess::NormalExit) {
-            finishWithFailure(name, QStringLiteral("irlume crashed"));
+    connect(process, &QProcess::finished, this, [this, name, serial](int, QProcess::ExitStatus status) {
+        if (!isCurrent(name, serial)) {
             return;
         }
-        finishWithDocument(name, process->readAllStandardOutput());
+        QProcess *child = m_inflight[name].process.data();
+        const QByteArray output = child != nullptr ? child->readAllStandardOutput() : QByteArray();
+        retire(name);
+        if (status != QProcess::NormalExit) {
+            Q_EMIT requestFailed(name, QStringLiteral("irlume crashed"));
+            return;
+        }
+        finishWithDocument(name, output);
     });
-    connect(process, &QProcess::errorOccurred, this, [this, name](QProcess::ProcessError) {
-        finishWithFailure(name, QStringLiteral("irlume could not be run"));
+    // A child that dies from a signal is reported by `finished` (crash
+    // exit); only a child that never started ends up here.
+    connect(process, &QProcess::errorOccurred, this, [this, name, serial](QProcess::ProcessError error) {
+        if (error != QProcess::FailedToStart || !isCurrent(name, serial)) {
+            return;
+        }
+        retire(name);
+        Q_EMIT requestFailed(name, QStringLiteral("irlume could not be run"));
     });
-    connect(timeout, &QTimer::timeout, this, [this, name, process]() {
-        process->kill();
-        finishWithFailure(name, QStringLiteral("irlume did not answer within its budget"));
+    connect(timeout, &QTimer::timeout, this, [this, name, serial]() {
+        if (!isCurrent(name, serial)) {
+            return;
+        }
+        retire(name);
+        Q_EMIT requestFailed(name, QStringLiteral("irlume did not answer in time"));
     });
 
-    timeout->start(it->timeoutMs);
-    m_inflight.emplace(name, std::move(in));
-    m_inflight[name].process->start(QIODevice::ReadOnly);
+    Inflight entry;
+    entry.serial = serial;
+    entry.process = process;
+    entry.timeout = timeout;
+    m_inflight[name] = std::move(entry);
+    timeout->start(m_budgetOverrideMs > 0 ? m_budgetOverrideMs : it->timeoutMs);
+    process->start(QIODevice::ReadOnly);
 }
 
 bool IrlumeBridge::tuiProbablyRunning()
@@ -140,7 +238,9 @@ bool IrlumeBridge::tuiProbablyRunning()
     const QString lockPath = QString::fromLatin1(runtimeDir)
         + QStringLiteral("/irlume/tui-%1.lock").arg(user);
     // Open an existing lock only: creating one here would fabricate state.
-    const int fd = open(QFile::encodeName(lockPath).constData(), O_RDWR);
+    // flock needs no write access, and the descriptor must not leak into
+    // any child this process starts.
+    const int fd = open(QFile::encodeName(lockPath).constData(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         return false;
     }
@@ -150,43 +250,66 @@ bool IrlumeBridge::tuiProbablyRunning()
     return rc != 0; // EWOULDBLOCK: someone holds it -> a TUI is live
 }
 
-IrlumeBridge::HandoffResult IrlumeBridge::handoffTuiAndWait(const QString &page, int timeoutMs)
+void IrlumeBridge::handoffTui(const QString &page, int timeoutMs, std::function<void(HandoffResult)> done)
 {
     if (m_irlumePath.isEmpty()) {
-        return HandoffResult::Unknown;
+        done(HandoffResult::Unknown);
+        return;
     }
     QStringList args{QStringLiteral("tui")};
     if (!page.isEmpty()) {
         args << QStringLiteral("--page") << page;
     }
-    QProcess child;
-    child.setProgram(m_irlumePath);
-    child.setArguments(args);
-    child.setProcessChannelMode(QProcess::SeparateChannels);
-    child.start(QIODevice::ReadOnly);
-    if (!child.waitForStarted(2000)) {
-        return HandoffResult::Unknown;
-    }
-    if (!child.waitForFinished(timeoutMs)) {
-        child.kill();
-        child.waitForFinished(1000);
-        return HandoffResult::Unknown;
-    }
-    if (child.exitStatus() != QProcess::NormalExit) {
-        return HandoffResult::Unknown;
-    }
-    // Exit 0 is the TUI's documented "handed off to the running instance"
-    // outcome; any other code means no live TUI accepted the handoff.
-    return child.exitCode() == 0 ? HandoffResult::Done : HandoffResult::NotAccepted;
+    auto *child = new QProcess(this);
+    auto *budget = new QTimer(this);
+    budget->setSingleShot(true);
+    child->setProgram(m_irlumePath);
+    child->setArguments(args);
+    child->setProcessChannelMode(QProcess::SeparateChannels);
+    child->setStandardOutputFile(QProcess::nullDevice());
+    child->setStandardErrorFile(QProcess::nullDevice());
+
+    // Whichever handler fires first reports; release() disconnects the
+    // others.
+    auto finish = [child, budget, done](HandoffResult result) {
+        release(child, budget);
+        done(result);
+    };
+    connect(child, &QProcess::started, budget, [budget, timeoutMs]() {
+        budget->start(timeoutMs);
+    });
+    connect(child, &QProcess::finished, this, [finish](int exitCode, QProcess::ExitStatus status) {
+        if (status != QProcess::NormalExit) {
+            finish(HandoffResult::Unknown);
+            return;
+        }
+        // Exit 0 is the TUI's documented "handed off to the running
+        // instance" outcome; any other code means no live TUI accepted
+        // the handoff.
+        finish(exitCode == 0 ? HandoffResult::Done : HandoffResult::NotAccepted);
+    });
+    connect(child, &QProcess::errorOccurred, this, [finish](QProcess::ProcessError error) {
+        if (error == QProcess::FailedToStart) {
+            finish(HandoffResult::Unknown);
+        }
+    });
+    connect(budget, &QTimer::timeout, this, [finish]() {
+        finish(HandoffResult::Unknown);
+    });
+    budget->start(kHandoffStartMs);
+    child->start(QIODevice::ReadOnly);
 }
 
 bool IrlumeBridge::launchTuiDetached(const QString &page)
 {
+    if (m_irlumePath.isEmpty()) {
+        return false;
+    }
     const QString xdgTerminal = QStandardPaths::findExecutable(QStringLiteral("xdg-terminal-exec"));
     if (xdgTerminal.isEmpty()) {
         return false;
     }
-    QStringList args{QStringLiteral("irlume"), QStringLiteral("tui")};
+    QStringList args{m_irlumePath, QStringLiteral("tui")};
     if (!page.isEmpty()) {
         args << QStringLiteral("--page") << page;
     }
@@ -195,22 +318,11 @@ bool IrlumeBridge::launchTuiDetached(const QString &page)
 
 void IrlumeBridge::finishWithDocument(const QString &name, const QByteArray &output)
 {
-    if (m_inflight.erase(name) == 0) {
-        return;
-    }
     QJsonParseError parseError{};
     const QJsonDocument doc = QJsonDocument::fromJson(output, &parseError);
     if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
-        finishWithFailure(name, QStringLiteral("irlume did not answer with a JSON document"));
+        Q_EMIT requestFailed(name, QStringLiteral("irlume did not answer with a JSON document"));
         return;
     }
     Q_EMIT documentReady(name, doc.object().toVariantMap());
 }
-
-void IrlumeBridge::finishWithFailure(const QString &name, const QString &reason)
-{
-    m_inflight.erase(name);
-    Q_EMIT requestFailed(name, reason);
-}
-
-#include "irlumebridge.moc"

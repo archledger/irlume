@@ -31,23 +31,34 @@ public:
 
     /// Run one machine-API command by table name ("version", "status",
     /// "doctor", "census", "login") and report it asynchronously.
-    /// Exactly one of documentReady or requestFailed is emitted per call.
-    /// A document whose envelope says ok:false is STILL a document: typed
-    /// refusals are state, not failures.
+    /// Exactly one of documentReady or requestFailed is emitted per call,
+    /// unless a later call for the same name supersedes it while it runs:
+    /// the superseded call then reports nothing. A document whose envelope
+    /// says ok:false is STILL a document: typed refusals are state, not
+    /// failures.
     Q_INVOKABLE void request(const QString &name);
 
     /// Launch `irlume tui` (optionally deep-linked to a page) in a
     /// terminal: xdg-terminal-exec when available, otherwise the shipped
-    /// desktop entry via KIO (no deep link in the fallback).
+    /// desktop entry via KIO (no deep link in the fallback). Never blocks
+    /// the UI. A launch that cannot happen is reported as
+    /// requestFailed("launch", reason). While a handoff to a running TUI
+    /// is still being checked, further clicks are ignored.
     Q_INVOKABLE void launchTui(const QString &page);
 
 Q_SIGNALS:
     /// `doc` is the parsed machine-API envelope, including ok/data/error.
     void documentReady(const QString &name, const QVariantMap &doc);
     /// Only for: binary missing, process crash/timeout, or output that is
-    /// not a JSON document. Machine-API refusals arrive via documentReady.
+    /// not a JSON document, plus launch failures under the name "launch".
+    /// Machine-API refusals arrive via documentReady.
     void requestFailed(const QString &name, const QString &reason);
 
 private:
+    /// The terminal half of launchTui: xdg-terminal-exec, then the
+    /// desktop entry.
+    void openTerminal(const QString &page);
+
     IrlumeBridge m_bridge;
+    bool m_handoffPending = false;
 };

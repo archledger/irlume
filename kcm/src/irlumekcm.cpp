@@ -3,6 +3,7 @@
 #include "irlumekcm.h"
 
 #include <KIO/ApplicationLauncherJob>
+#include <KJob>
 #include <KPluginFactory>
 #include <KPluginMetaData>
 #include <KService>
@@ -33,17 +34,35 @@ void IrlumeKcm::request(const QString &name)
 
 void IrlumeKcm::launchTui(const QString &page)
 {
-    // When a TUI is already running, hand the page over WITHOUT opening a
-    // terminal: the child performs the handoff and exits instantly, so no
-    // window flashes open and closed. The handoff is verified
-    // synchronously: if no live TUI accepted it (the probe raced an exit),
-    // fall through and open the terminal so the click still does
-    // something visible.
-    if (m_bridge.tuiProbablyRunning()
-        && m_bridge.handoffTuiAndWait(page, 5000)
-               == IrlumeBridge::HandoffResult::Done) {
+    if (m_handoffPending) {
+        // A second click while the first is still being handed off would
+        // start a second child; the first click's outcome covers both.
         return;
     }
+    if (m_bridge.irlumePath().isEmpty()) {
+        Q_EMIT requestFailed(QStringLiteral("launch"), QStringLiteral("the irlume command was not found"));
+        return;
+    }
+    // When a TUI is already running, hand the page over WITHOUT opening a
+    // terminal: the child performs the handoff and exits at once, so no
+    // window flashes open and closed. The verdict arrives asynchronously;
+    // if no live TUI accepted the handoff (the probe raced an exit), open
+    // the terminal so the click still does something visible.
+    if (!m_bridge.tuiProbablyRunning()) {
+        openTerminal(page);
+        return;
+    }
+    m_handoffPending = true;
+    m_bridge.handoffTui(page, 5000, [this, page](IrlumeBridge::HandoffResult result) {
+        m_handoffPending = false;
+        if (result != IrlumeBridge::HandoffResult::Done) {
+            openTerminal(page);
+        }
+    });
+}
+
+void IrlumeKcm::openTerminal(const QString &page)
+{
     if (m_bridge.launchTuiDetached(page)) {
         return;
     }
@@ -57,6 +76,11 @@ void IrlumeKcm::launchTui(const QString &page)
         return;
     }
     auto *job = new KIO::ApplicationLauncherJob(service, this);
+    connect(job, &KJob::result, this, [this](KJob *finished) {
+        if (finished->error() != 0) {
+            Q_EMIT requestFailed(QStringLiteral("launch"), finished->errorString());
+        }
+    });
     job->start();
 }
 

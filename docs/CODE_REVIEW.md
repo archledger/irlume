@@ -15,7 +15,11 @@ Every change to `main` arrives as a pull request and is reviewed before merge.
    and the relevant hardware lanes must pass on the final head before merge.
    Pending Packit builds are recorded honestly, never claimed as passed.
 4. **Docs**: behavior changes update `CHANGELOG.md`; interface changes update
-   `docs/MACHINE-API.md` and the schema.
+   `docs/MACHINE-API.md` and the schema. A change that makes a line of an
+   `AGENTS.md` wrong (a command, path, CI lane, toolchain version or rule it
+   cites) fixes that line in the same PR; CI's `scripts/check-agents-md.py`
+   catches cited paths git no longer lists, broken links, and gate commands
+   the `check` job in `ci.yml` no longer runs.
 
 ## How review is conducted
 

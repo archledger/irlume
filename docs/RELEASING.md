@@ -22,6 +22,9 @@ carries that release's version label.
    released. Inspect package contents, ownership, runtime dependencies and version
    metadata. The recipe parity script checks declarations; it does not replace
    inspecting built artifacts or running installation transactions.
+5. Reread the `AGENTS.md` files against the changes since the previous release.
+   CI checks their paths, links and gate commands, not their rules, test lanes
+   or versions (MSRV, ONNX Runtime, the fuzz nightly, the models release).
 
 On disposable systems for each supported channel, keep an independent working
 password/admin session and record these outcomes. Do not record passwords,

@@ -92,6 +92,7 @@ cargo build --release --locked
 | `flake.nix`, `nix/` | `nix flake check --no-build --show-trace` and `nix build .#default --no-link --print-out-paths --show-trace`; after a dependency or fork bump also `nix build --no-link .#default.cargoDeps .#onnxruntime-bin` |
 | `kcm/` | `cmake -S kcm -B target/kcm-build -DBUILD_TESTING=ON && cmake --build target/kcm-build`, then the load test, `kcmshell6` and qmllint steps of `kcm.yml` |
 | `crates/irlume-pam` | the commands in [its AGENTS.md](crates/irlume-pam/AGENTS.md) |
+| an `AGENTS.md`, or a file, link or gate command one cites | `python3 scripts/check-agents-md.py` |
 
 ## Testing
 
@@ -307,6 +308,11 @@ cargo build --release --locked
   `Security`), newest first: one `- ` bullet, a blank line between bullets,
   two-space continuation indent, present tense, ADR section and issue cited
   (`(ADR-0029 B1)`, `#797`).
+- A change that makes a line of an `AGENTS.md` wrong (a command, path, CI lane,
+  toolchain version or rule it cites) fixes that line in the same PR. CI runs
+  `scripts/check-agents-md.py` (needs python3 `yaml`) for cited paths git no
+  longer lists, broken links, and gate commands the `check` job in `ci.yml` no
+  longer runs; rules, lanes, the table above and versions need a reread.
 - Update by rebasing (`git fetch <upstream> && git rebase <upstream>/main`,
   rerun the gate, `git push --force-with-lease`), not merging: it keeps every
   commit signed off and the squash free of merge commits. A rebase or
@@ -336,4 +342,5 @@ cargo build --release --locked
 - Commit secrets, biometric data, weights, build output, tool state, or
   rustflags such as `target-cpu=native` in `.cargo/config.toml`.
 - Add tool-specific agent instruction files (shared guidance goes in an
-  `AGENTS.md`), or edit `AGENTS.md` files unless that is the task.
+  `AGENTS.md`), or edit `AGENTS.md` files beyond the lines your change makes
+  wrong, unless that is the task.

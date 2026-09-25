@@ -91,6 +91,26 @@ jobs:
           # Do not leave the job token in .git/config for later steps to reach.
           persist-credentials: false
 
+      - name: Install system build dependencies
+        run: |
+          # Self-hosted Arch runner: the toolchain deps are preinstalled
+          # (base-devel, clang, pam, tpm2-tss); apt path kept for any future
+          # hosted fallback.
+          if command -v apt-get >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              build-essential pkg-config clang libclang-dev libpam0g-dev libpam-wrapper pamtester libtss2-dev libudev-dev libdbus-1-dev dbus-daemon strace bubblewrap apparmor python3-yaml
+          else
+            for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
+          fi
+
+      # Early and cheap, before the model download: it reads only git's file
+      # list and ci.yml (PyYAML from the step above).
+      - name: AGENTS.md references (paths, links, gate commands)
+        run: |
+          python3 -B scripts/test-check-agents-md.py
+          python3 -B scripts/check-agents-md.py
+
       # The ONNX weights (~614 MB: the five recognizers/landmarkers plus the
       # two PAD models) are fetched from the models-v1 release, not
       # Git LFS; cache them keyed on models/SHA256SUMS (changes exactly when the
@@ -104,19 +124,6 @@ jobs:
 
       - name: Fetch model weights (models-v1 release, sha256-verified)
         run: bash scripts/fetch-models.sh
-
-      - name: Install system build dependencies
-        run: |
-          # Self-hosted Arch runner: the toolchain deps are preinstalled
-          # (base-devel, clang, pam, tpm2-tss); apt path kept for any future
-          # hosted fallback.
-          if command -v apt-get >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends \
-              build-essential pkg-config clang libclang-dev libpam0g-dev libpam-wrapper pamtester libtss2-dev libudev-dev libdbus-1-dev dbus-daemon strace bubblewrap apparmor
-          else
-            for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
-          fi
 
       - name: Prepare and verify isolated CLI test namespaces
         run: bash scripts/ci-bubblewrap.sh

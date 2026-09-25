@@ -9,13 +9,16 @@ moves. This fails when:
 * a relative link (inline, with or without a title, `<...>` target,
   reference definition, image or `<a href>`) does not resolve from the file
   that holds it, or leaves the repository; a leading `/` is the repo root;
+  a full or collapsed reference link (`[text][label]`, `[label][]`) has no
+  definition;
 * a path in a code span names nothing in the tree (a glob must match at
   least one file);
 * a line of the root file's "Gate commands" block is not, after joining
-  `\\` continuations, a whole command line of an enforced step's `run:` in
-  the required `check` job of .github/workflows/ci.yml (a step or job that
-  is conditional, may fail, or runs in another directory does not count),
-  or the block is gone or empty;
+  `\\` continuations on both sides, a whole top-level command line of an
+  enforced step's `run:` in the required `check` job of
+  .github/workflows/ci.yml (a step or job that is conditional, may fail, or
+  runs in another directory does not count, nor does a line inside a shell
+  `if`, `case`, loop or function body), or the block is gone or empty;
 * a code fence is never closed.
 
 "The tree" is what git lists: tracked files and new files that are not
@@ -59,7 +62,7 @@ EXTENSIONS = (
 ).split()
 EXTENSION = re.compile(r"\.(?:" + "|".join(EXTENSIONS) + r")$")
 BARE_NAME = re.compile(r"^[\w@+-][\w.@+-]*$")
-PATH_TOKEN = re.compile(r"^[\w.@+*-]+(?:/[\w.@+*-]*)+$")
+PATH_TOKEN = re.compile(r"^[\w.@+*?\[\]-]+(?:/[\w.@+*?\[\]-]*)+$")
 PLACEHOLDER = re.compile(r"[<>{}$]|NNNN|://")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)((?:(?!\n[ \t]*\n).)+?)(?<!`)\1(?!`)", re.S)
@@ -70,9 +73,13 @@ LINK = re.compile(
     re.S,
 )
 REFERENCE = re.compile(r"^ {0,3}\[[^\]]+\]:\s*(<[^>\n]*>|\S+)", re.M)
-HREF = re.compile(r"<a\s[^>]*?href=\"([^\"]+)\"", re.I)
+HREF = re.compile(r"<a\s[^>]*?href=(?:\"([^\"]+)\"|'([^']+)')", re.I)
+FULL_REFERENCE = re.compile(r"\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\[([^\[\]]*)\]")
+DEFINITION = re.compile(r"^ {0,3}\[([^\]]+)\]:", re.M)
 COMMENT = re.compile(r"<!--.*?-->", re.S)
 ENFORCED_IF = {"success()", "always()", "${{ success() }}", "${{ always() }}", "true"}
+SHELL_OPEN = re.compile(r"^(?:if|case|for|while|until|select)\b|^(?:function\s+)?[\w-]+\s*\(\)\s*\{?$|^function\s+[\w-]+")
+SHELL_CLOSE = re.compile(r"^(?:fi|esac|done|\})\s*(?:[;&|#].*)?$")
 
 
 class Tree:
@@ -149,7 +156,7 @@ def clean_token(token):
     token = re.sub(r"^--?[\w-]+=", "", token)
     token = re.sub(r"^[A-Z_][A-Z0-9_]*=", "", token)
     token = re.sub(r"#.*$", "", token)
-    token = re.sub(r"(?::\d+)+$", "", token)
+    token = re.sub(r"(?::\d+(?:-\d+)?)+$", "", token)
     return token.removeprefix("./")
 
 
@@ -201,7 +208,12 @@ def check_doc(tree, root, name):
     no_code = CODE_SPAN.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), prose)
     targets = [(m.start(), m.group(1)) for m in LINK.finditer(no_code)]
     targets += [(m.start(), m.group(1)) for m in REFERENCE.finditer(no_code)]
-    targets += [(m.start(), m.group(1)) for m in HREF.finditer(no_code)]
+    targets += [(m.start(), m.group(1) or m.group(2)) for m in HREF.finditer(no_code)]
+    defined = {" ".join(d.lower().split()) for d in DEFINITION.findall(no_code)}
+    for m in FULL_REFERENCE.finditer(no_code):
+        label = " ".join((m.group(2) or m.group(1)).lower().split())
+        if label not in defined:
+            problems.append(f"{name}:{line_at(no_code, m.start())}: reference link [{label}] has no definition")
     for offset, target in sorted(targets):
         target = target.strip("<>")
         if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", target) or target.startswith("#"):
@@ -225,7 +237,7 @@ def gate_commands(text):
         start = lines.index(GATE_HEADING)
     except ValueError:
         return None
-    commands, fence = [], None
+    commands, fence, pending = [], None, None
     for number, line in enumerate(lines[start + 1:], start + 2):
         match = FENCE.match(line)
         if fence is None:
@@ -237,14 +249,26 @@ def gate_commands(text):
         if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence):
             break
         if line.strip() and not line.lstrip().startswith("#"):
-            commands.append((number, " ".join(line.split())))
+            if pending is not None:
+                start_line, parts = pending
+                parts.append(line.strip())
+            else:
+                start_line, parts = number, [line.strip()]
+            if parts[-1].endswith("\\"):
+                parts[-1] = parts[-1][:-1]
+                pending = (start_line, parts)
+                continue
+            pending = None
+            commands.append((start_line, " ".join(" ".join(parts).split())))
     return commands or None
 
 
 def logical_lines(script):
-    """The command lines of a `run:` script: `\\` continuations joined,
-    comments and heredoc bodies dropped, whitespace collapsed."""
-    lines, buffer, heredoc = set(), [], None
+    """The top-level command lines of a `run:` script: `\\` continuations
+    joined, comments and heredoc bodies dropped, whitespace collapsed. Lines
+    inside a shell `if`, `case`, loop or function body are left out: the
+    shell may never run them."""
+    lines, buffer, heredoc, depth = set(), [], None, 0
     for raw in str(script).split("\n"):
         if heredoc is not None:
             if raw.strip() == heredoc:
@@ -259,7 +283,12 @@ def logical_lines(script):
         buffer.append(text)
         command = " ".join(" ".join(buffer).split())
         buffer = []
-        lines.add(command)
+        if SHELL_CLOSE.match(command) and depth:
+            depth -= 1
+        elif SHELL_OPEN.match(command) and not re.search(r"\b(?:fi|esac|done)\s*$|\}\s*$", command):
+            depth += 1
+        elif depth == 0:
+            lines.add(command)
         tag = re.search(r"<<-?\s*['\"]?(\w+)['\"]?", command)
         if tag:
             heredoc = tag.group(1)
@@ -270,9 +299,11 @@ def logical_lines(script):
 
 def enforced(node):
     condition = node.get("if")
-    if condition is not None and str(condition).strip() not in ENFORCED_IF:
+    if condition is not None and condition is not True \
+            and str(condition).strip() not in ENFORCED_IF:
         return False
-    return node.get("continue-on-error") is not True
+    tolerate = node.get("continue-on-error")
+    return tolerate is None or tolerate is False or str(tolerate).strip() == "false"
 
 
 def run_commands(workflow_text):
@@ -291,8 +322,11 @@ def run_commands(workflow_text):
         return None, f"has no `{GATE_JOB}` job"
     if not enforced(job):
         return None, f"runs the `{GATE_JOB}` job only conditionally"
-    defaults = job.get("defaults") if isinstance(job.get("defaults"), dict) else {}
-    job_dir = (defaults.get("run") or {}).get("working-directory")
+    def default_dir(node):
+        defaults = node.get("defaults") if isinstance(node.get("defaults"), dict) else {}
+        run = defaults.get("run") if isinstance(defaults.get("run"), dict) else {}
+        return run.get("working-directory")
+    job_dir = default_dir(job) or default_dir(data)
     commands = set()
     for step in job.get("steps") or []:
         if not isinstance(step, dict) or "run" not in step or not enforced(step):

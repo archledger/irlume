@@ -336,6 +336,56 @@ class CheckAgentsMdTests(unittest.TestCase):
         script = "set -e\n# note\ncargo test \\\n  -p x\ncat <<'EOF'\ncargo fake\nEOF\ndone\n"
         self.assertEqual(checker.logical_lines(script), {"set -e", "cargo test -p x", "cat <<'EOF'", "done"})
 
+    @needs_yaml
+    def test_question_mark_and_bracket_globs_must_match(self):
+        self.root_doc("Tests: `crates/irlume-pam/tests/pamwra?.rs` and `crates/irlume-pam/tests/[p]amwrap.rs`.\n")
+        self.assertEqual(self.problems(), [])
+        (self.root / "crates/irlume-pam/tests/pamwrap.rs").unlink()
+        found = self.problems()
+        self.assertIn("AGENTS.md:9: path crates/irlume-pam/tests/pamwra?.rs names nothing in the tree", found)
+        self.assertIn("AGENTS.md:9: path crates/irlume-pam/tests/[p]amwrap.rs names nothing in the tree", found)
+
+    @needs_yaml
+    def test_a_line_range_is_stripped_before_the_path_is_checked(self):
+        self.root_doc("See `crates/gone/x.rs:40-55` and `crates/irlume-pam/src/lib.rs:1-2`.\n")
+        self.assertEqual(self.problems(), ["AGENTS.md:9: path crates/gone/x.rs names nothing in the tree"])
+
+    @needs_yaml
+    def test_single_quoted_href_and_undefined_references_are_checked(self):
+        self.root_doc("<a href='docs/gone.md'>x</a> [guide][missing] [ok][] [lit][ok]\n\n[ok]: CONTRIBUTING.md\n")
+        self.assertEqual(self.problems(), [
+            "AGENTS.md:9: reference link [missing] has no definition",
+            "AGENTS.md:9: link target docs/gone.md does not exist",
+        ])
+
+    @needs_yaml
+    def test_a_continued_gate_line_matches_the_joined_command(self):
+        self.write("AGENTS.md", ROOT_DOC.replace(
+            "cargo test --locked -p irlume-pam\n", "cargo test --locked \\\n  -p irlume-pam\n"))
+        self.assertEqual(self.problems(), [])
+
+    @needs_yaml
+    def test_a_gate_command_inside_a_shell_block_is_named(self):
+        for body in ("          if false; then\n            cargo test --locked -p irlume-pam\n          fi\n",
+                     "          run_tests() {\n            cargo test --locked -p irlume-pam\n          }\n",
+                     "          for x in; do\n            cargo test --locked -p irlume-pam\n          done\n"):
+            with self.subTest(body=body):
+                self.write(".github/workflows/ci.yml", CI.replace(
+                    "          # the PAM crate\n          cargo test --locked -p irlume-pam\n", body))
+                self.assertEqual(self.problems(), [MISSING_TEST])
+
+    @needs_yaml
+    def test_step_conditions_and_defaults_follow_github_semantics(self):
+        self.write(".github/workflows/ci.yml", CI.replace(TEST_STEP, "        if: true\n" + TEST_STEP))
+        self.assertEqual(self.problems(), [])
+        self.write(".github/workflows/ci.yml",
+                   CI.replace(TEST_STEP, "        continue-on-error: ${{ matrix.experimental }}\n" + TEST_STEP))
+        self.assertEqual(self.problems(), [MISSING_TEST])
+        self.write(".github/workflows/ci.yml", "defaults:\n  run:\n    working-directory: fuzz\n" + CI)
+        found = self.problems()
+        self.assertEqual(len(found), 2, found)
+        self.assertIn(MISSING_TEST, found)
+
     # Robustness
 
     @needs_yaml

@@ -8429,14 +8429,9 @@ fn finish_unseal_password(
         Err(e) => {
             // Here the template key unsealed (face matched) but the PASSWORD seal
             // did not. A PCR drift on this path is fixed by re-binding the sealed
-            // secret: the next typed login re-seals it, or `irlume keyring arm`
-            // does (the enrolled face still works). Over a token the arm refuses
-            // where irlumed cannot read the login hash, and wherever the kind it
-            // picks is another one (a KDE wallet beside the login keyring); then
-            // only the login heals.
+            // secret; `pcr_drift_hint` says how for the armed kind.
             let hint = if is_pcr_drift(&e) {
-                " -- log in once by typing the password, or re-run `irlume keyring arm`, to \
-                 re-bind the sealed secret to the current PCRs"
+                pcr_drift_hint(irlume_core::keyring::read_sealed_kind(user).ok().flatten())
             } else {
                 ""
             };
@@ -8449,6 +8444,21 @@ fn finish_unseal_password(
             note_engine_error(&e);
             Response::Error(e.to_string())
         }
+    }
+}
+
+/// How to re-bind a sealed secret after PCR drift, for the armed kind. The
+/// next typed login re-seals any kind. `irlume keyring arm` re-binds a login
+/// password or KDE wallet key, but over a GNOME keyring token it refuses
+/// wherever irlumed cannot read the login hash or would pick another kind
+/// (a KDE wallet beside the login keyring), so a token gets only the login.
+fn pcr_drift_hint(armed: Option<irlume_core::envelope::SecretKind>) -> &'static str {
+    if armed == Some(irlume_core::envelope::SecretKind::GnomeKeyringToken) {
+        " -- log in once by typing the password to re-bind the sealed secret to the \
+         current PCRs"
+    } else {
+        " -- log in once by typing the password, or re-run `irlume keyring arm`, to \
+         re-bind the sealed secret to the current PCRs"
     }
 }
 
@@ -9005,6 +9015,23 @@ mod tests {
         // block the seal (absence of proof is not proof of a wrong password).
         for u in ["locked", "disabled", "nopw", "ghost"] {
             assert_eq!(verifiable_shadow_hash(shadow, u), None, "{u}");
+        }
+    }
+
+    /// Only a token arm leaves out `keyring arm`, which refuses over a token
+    /// wherever it cannot check the password or would pick another kind.
+    #[test]
+    fn the_pcr_drift_hint_offers_arm_only_where_it_can_rebind() {
+        use irlume_core::envelope::SecretKind as K;
+        let token = pcr_drift_hint(Some(K::GnomeKeyringToken));
+        assert!(token.contains("typing the password"), "{token}");
+        assert!(!token.contains("keyring arm"), "{token}");
+        for armed in [Some(K::LoginPassword), Some(K::KdeWalletKey), None] {
+            let hint = pcr_drift_hint(armed);
+            assert!(
+                hint.contains("typing the password") && hint.contains("`irlume keyring arm`"),
+                "{armed:?}: {hint}"
+            );
         }
     }
 

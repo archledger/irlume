@@ -49,7 +49,8 @@ The main TUI, camera, daemon and auth files run 16k to 25k lines: search, do not
   runtime-directory test exec `/usr/bin/bwrap` (Ubuntu 24.04:
   `bash scripts/ci-bubblewrap.sh --check`); the CLI's other black-box tests
   do not. Without pamtester and pam_wrapper most PAM end-to-end tests pass
-  vacuously and the COSMIC ones fail ([the PAM AGENTS.md](crates/irlume-pam/AGENTS.md)).
+  vacuously and the COSMIC ones fail; `IRLUME_REQUIRE_PAM_TOOLS=1`, set in CI,
+  makes them all fail ([the PAM AGENTS.md](crates/irlume-pam/AGENTS.md)).
 - There is no `rust-toolchain` file. Outside Nix, run fmt, clippy and doc as
   `cargo +1.88.0 ...`; a newer clippy reports lints CI does not.
 - `bash scripts/fetch-models.sh` fetches and verifies the weights (about 614 MB)
@@ -76,7 +77,7 @@ cargo test --locked -p irlume-camera --features capture-timing --lib
 RUSTDOCFLAGS="-D warnings" cargo doc --locked -p irlume-auth -p irlume-camera --features irlume-auth/ir-only-evaluation --no-deps
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 cargo build --release --locked
-./scripts/run-tests-guarded.sh --min 650 -- cargo test --workspace --locked
+./scripts/run-tests-guarded.sh --min 2720 -- cargo test --workspace --locked
 ```
 
 | When you touch | Also run |

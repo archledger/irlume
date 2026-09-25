@@ -70,8 +70,11 @@ where older page text breaks them.
 
 1. Pick a verb letter that passes the global-key test.
 2. Add an `(SC_X, KeyCode::Char('x'))` arm in `on_action`, which `on_key` falls
-   through to after the global keys; send daemon work with
-   `start_async(label, OpTag::..., Request::..., map_fn)`; route it in `poll`.
+   through to after the global keys. Only read-only daemon work sends at once,
+   with `start_async(label, OpTag::..., Request::..., map_fn)`, routed in
+   `poll`. A write or root action sets
+   `self.confirm = Some((prompt, label, ConfirmAct::...))` and runs only when
+   the dialog is confirmed, so no key press mutates on its own.
 3. List the key in `screen_actions()` and the page's `draw_*` action rows.
 4. Put pure logic in a `src/tui/*.rs` module that takes the clock as an
    argument (see `tui/attempts.rs`, `tui/dates.rs`).
@@ -102,4 +105,6 @@ where older page text breaks them.
   `test_app()` literal and `drain_loads`, or its worker outlives the guard and
   reads the next test's `IRLUME_SOCKET`.
 - Other env tests hold `crate::testenv::ENV_LOCK`. Black-box tests
-  (`tests/cli.rs`: `Sandbox`, `serve`) run the binary under `/usr/bin/bwrap`.
+  (`tests/cli.rs`: `Sandbox`, `serve`) run the binary directly under the
+  sandbox environment overrides; only `isolated_root_cmd`, for fixed-path root
+  probes, needs `/usr/bin/bwrap`, so the rest run on a host without it.

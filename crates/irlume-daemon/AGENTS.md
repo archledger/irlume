@@ -17,10 +17,14 @@ the `Request::ListProfiles` doc in `crates/irlume-common/src/lib.rs`).
   clients say it "needs a newer irlumed; restart it after the upgrade".
 - A new request may answer with a new `Response` variant; an existing request
   sends one only to a client that opted in with a `#[serde(default)]` flag
-  (`structured_errors`). New reply fields use `#[serde(default, skip_serializing_if = ...)]`;
-  new reply enum values need `#[serde(other)] Unknown` or a `wire_compatible`
-  widening. A new field breaks every struct literal of its type in other
-  crates' tests (#817).
+  (`structured_errors`). New reply fields use `#[serde(default, skip_serializing_if = ...)]`.
+  A new value in an existing reply enum reaches a released client only through
+  a fallback that client already has: a `#[serde(other)] Unknown` arm that
+  shipped in an earlier release (adding both in one change protects only new
+  clients), or the `wire_compatible` pattern of `IrOnlyReadiness`, where the
+  old field carries a value old clients know and the precise one travels in a
+  new field. `KeyringSecretKind` has no fallback today. A new field breaks
+  every struct literal of its type in other crates' tests (#817).
 - Never add a field to a `#[serde(deny_unknown_fields)]` wire type
   (`EnrollmentDecision` in `crates/irlume-common/src/lib.rs`, the `*Wire` types
   in `crates/irlume-common/src/live_camera.rs`): an older peer rejects the whole

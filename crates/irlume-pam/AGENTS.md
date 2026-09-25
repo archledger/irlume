@@ -27,7 +27,12 @@ person out. It is critical-tier ([SECURITY.md](../../SECURITY.md)); the
   on a daemon reply returns only `PAM_IGNORE` (`try_verify`). A catch-all that
   answered `SUCCESS` is how #365 happened.
 - The module holds no camera, models, templates or images and decides nothing:
-  one request, one mapped reply ([docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) "Privilege separation").
+  it maps each daemon reply to a PAM code ([docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) "Privilege separation").
+  Two bounded paths send more than one request, and both stay: `wait` retries
+  `try_verify` or `try_unseal` until a match or `WAIT_BUDGET` (20 s), and with
+  `facefirst` or `ondemand` an `UnsealUnavailable` (release refused before any
+  face attempt) falls back to one identity-only `try_verify`. A denial,
+  transport error or failed delivery never buys another attempt.
 - It runs in setuid stacks with the caller's environment: read socket and
   helper paths only through `irlume_common::client::secure_env` (`socket_path`,
   `secure_helper_path`). Anything else that environment can change, such as

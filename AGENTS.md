@@ -44,7 +44,8 @@ The main TUI, camera, daemon and auth files run 16k to 24k lines: search, do not
   1.28.1 (sets `ORT_DYLIB_PATH`), but has no pamtester, pam_wrapper, swtpm or
   bubblewrap. Distro packages: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md); the
   full Ubuntu list is `ci.yml` "Install system build dependencies".
-- CLI tests exec `/usr/bin/bwrap` (Ubuntu 24.04: `bash scripts/ci-bubblewrap.sh --check`).
+- The CLI's fixed-path root-probe tests exec `/usr/bin/bwrap` (Ubuntu 24.04:
+  `bash scripts/ci-bubblewrap.sh --check`); its other black-box tests do not.
   Without pamtester and pam_wrapper most PAM end-to-end tests pass vacuously
   and the COSMIC ones fail ([the PAM AGENTS.md](crates/irlume-pam/AGENTS.md)).
 - There is no `rust-toolchain` file. Outside Nix, run fmt, clippy and doc as
@@ -80,7 +81,7 @@ cargo build --release --locked
 | `scripts/ir-evaluation/` | `python3 -m unittest discover -s scripts/ir-evaluation -p 'test_*.py'` |
 | `packaging/`, versions, `docs/hardware/` | `bash scripts/check-packaging-parity.sh` |
 | systemd units | `systemd-analyze verify packaging/systemd/<unit>` for each changed unit (CI first stubs `/usr/bin/irlumed` and `/usr/bin/irlume` with `/bin/true` when absent), then `systemd-analyze security --offline=true --threshold=37 packaging/systemd/irlumed.service` (94 for `irlume-reconcile.service`) |
-| dependencies | `cargo deny check advisories bans licenses sources` and `(cd fuzz && cargo fetch --locked)` |
+| dependencies | `cargo deny check advisories bans licenses sources`, `cargo deny --manifest-path fuzz/Cargo.toml check advisories` (`audit.yml` scans the fuzz lockfile) and `(cd fuzz && cargo fetch --locked)` |
 | fuzzed parsers | in `fuzz/`: `mkdir -p corpus/<t> && cp -n seeds/<t>/* corpus/<t>/`, then `cargo +nightly-2026-07-15 fuzz run <t> -- -max_total_time=45 -rss_limit_mb=4096` (targets in `fuzz/fuzz_targets/`) |
 | `.github/workflows/` | `bash scripts/check-action-pins.sh`; also use `persist-credentials: false`, least-privilege `permissions`, and pass untrusted values through `env:`; never interpolate an untrusted `${{ }}` expression inside `run:` (`workflow-audit.yml`) |
 | `flake.nix`, `nix/` | `nix flake check --no-build --show-trace` and `nix build .#default --no-link --print-out-paths --show-trace`; after a dependency or fork bump also `nix build --no-link .#default.cargoDeps .#onnxruntime-bin` |

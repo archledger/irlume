@@ -12130,9 +12130,36 @@ mod tests {
         }
     }
 
+    // The steps of the guided enrollment the fake daemons below serve, one
+    // predicate per step, each for the `test-user` account these tests
+    // enroll (other tests' workers use `testuser`). `accept_wanted` skips
+    // anything else, so a stray request cannot stand in for the step.
+
+    /// Opening the framing session.
+    fn framing_start(request: &Request) -> bool {
+        matches!(request, Request::PositionSession { user: Some(user) } if user == "test-user")
+    }
+
+    /// One framing sample on the fallback path.
+    fn framing_sample(request: &Request) -> bool {
+        matches!(request, Request::PositionSample { user: Some(user) } if user == "test-user")
+    }
+
+    /// The capture: any enrollment request for the account, so a test can
+    /// still tell one batch from the per-scan requests it replaces.
+    fn enrollment_capture(request: &Request) -> bool {
+        matches!(
+            request,
+            Request::EnrollmentSession { user, .. }
+                | Request::Enroll { user, .. }
+                | Request::AddScan { user, .. }
+                if user == "test-user"
+        )
+    }
+
     #[test]
     fn guided_enrollment_uses_one_batch_after_one_countdown() {
-        use std::io::{BufRead, Write};
+        use std::io::Write;
         let _guard = dead_socket();
         let path =
             std::env::temp_dir().join(format!("irlume-guided-batch-{}.sock", std::process::id()));
@@ -12141,11 +12168,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             // The compatibility daemon rejects the new request before any
             // framing session is accepted, then serves the original API.
-            let (mut unsupported, _) = listener.accept().unwrap();
-            let mut initial = String::new();
-            std::io::BufReader::new(&unsupported)
-                .read_line(&mut initial)
-                .unwrap();
+            let (mut unsupported, _, initial) = accept_wanted(&listener, framing_start);
             assert!(matches!(
                 serde_json::from_str::<Request>(&initial).unwrap(),
                 Request::PositionSession { .. }
@@ -12158,11 +12181,7 @@ mod tests {
             .unwrap();
             drop(unsupported);
             for _ in 0..6 {
-                let (mut socket, _) = listener.accept().unwrap();
-                let mut line = String::new();
-                std::io::BufReader::new(&socket)
-                    .read_line(&mut line)
-                    .unwrap();
+                let (mut socket, _, line) = accept_wanted(&listener, framing_sample);
                 assert!(matches!(
                     serde_json::from_str::<Request>(&line).unwrap(),
                     Request::PositionSample { .. }
@@ -12174,11 +12193,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut line = String::new();
-            std::io::BufReader::new(&socket)
-                .read_line(&mut line)
-                .unwrap();
+            let (mut socket, _, line) = accept_wanted(&listener, enrollment_capture);
             let batch = matches!(serde_json::from_str::<Request>(&line).unwrap(),Request::EnrollmentSession { scans:10, improve:false, ref user, .. } if user=="test-user");
             if !batch {
                 writeln!(
@@ -12244,13 +12259,7 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         std::env::set_var("IRLUME_SOCKET", &path);
         let server = std::thread::spawn(move || {
-            let (mut guide, _) = listener.accept().unwrap();
-            guide
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = std::io::BufReader::new(guide.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
+            let (mut guide, mut reader, mut line) = accept_wanted(&listener, framing_start);
             if serde_json::from_str::<serde_json::Value>(&line).unwrap()
                 != serde_json::json!({"PositionSession":{"user":"test-user"}})
             {
@@ -12289,11 +12298,7 @@ mod tests {
             );
             drop(reader);
             drop(guide);
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut line = String::new();
-            std::io::BufReader::new(&socket)
-                .read_line(&mut line)
-                .unwrap();
+            let (mut socket, _, line) = accept_wanted(&listener, enrollment_capture);
             let batch = matches!(serde_json::from_str::<Request>(&line).unwrap(),Request::EnrollmentSession { scans:10, improve:false, ref user, .. } if user=="test-user");
             if !batch {
                 writeln!(
@@ -12359,13 +12364,10 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         std::env::set_var("IRLUME_SOCKET", &path);
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, mut reader, mut line) = accept_wanted(&listener, framing_start);
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
             assert!(matches!(
                 serde_json::from_str::<Request>(&line).unwrap(),
                 Request::PositionSession { .. }
@@ -12383,11 +12385,7 @@ mod tests {
             .unwrap();
             line.clear();
             assert_eq!(reader.read_line(&mut line).unwrap(), 0);
-            listener.set_nonblocking(true).unwrap();
-            assert_eq!(
-                listener.accept().unwrap_err().kind(),
-                std::io::ErrorKind::WouldBlock
-            );
+            listener
         });
         let (tx, rx) = mpsc::channel();
         enroll_worker(
@@ -12399,7 +12397,29 @@ mod tests {
             tx,
         );
         let messages: Vec<_> = rx.try_iter().collect();
-        server.join().unwrap();
+        let listener = server.join().unwrap();
+        // The worker has returned, so a fallback or enrollment request it
+        // made is already queued. A worker another test left running may
+        // have connected too: its request is refused and ignored.
+        listener.set_nonblocking(true).unwrap();
+        while let Ok((mut stream, _)) = listener.accept() {
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(&stream).read_line(&mut line);
+            assert!(
+                !serde_json::from_str::<Request>(&line).is_ok_and(|request| {
+                    framing_start(&request)
+                        || framing_sample(&request)
+                        || enrollment_capture(&request)
+                }),
+                "an accepted framing failure fell back or started enrollment: {line}"
+            );
+            let refusal = Response::Error("fake daemon: not the request under test".into());
+            let _ = writeln!(stream, "{}", serde_json::to_string(&refusal).unwrap());
+        }
         std::fs::remove_file(path).unwrap();
         assert!(messages.iter().any(|m| matches!(m, WMsg::Err(_))));
         assert!(!messages
@@ -13060,50 +13080,26 @@ mod tests {
 
     #[test]
     fn audit_camera_refresh_does_not_block_navigation_on_daemon_latency() {
-        use std::io::{BufRead, Write};
         let _guard = dead_socket();
         let sock = std::env::temp_dir().join(format!(
             "irlume-tui-camera-audit-{}.sock",
             std::process::id()
         ));
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        std::env::set_var("IRLUME_SOCKET", &sock);
-        let server = std::thread::spawn(move || {
-            let mut requests = Vec::new();
-            for response in [Response::Cameras(vec![])] {
-                let deadline = Instant::now() + Duration::from_secs(2);
-                let mut stream = loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => break stream,
-                        Err(error)
-                            if error.kind() == std::io::ErrorKind::WouldBlock
-                                && Instant::now() < deadline =>
-                        {
-                            std::thread::sleep(Duration::from_millis(5))
-                        }
-                        Err(error) => panic!("camera fixture accept did not finish: {error}"),
-                    }
-                };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut line = String::new();
-                std::io::BufReader::new(&stream)
-                    .read_line(&mut line)
-                    .unwrap();
-                requests.push(serde_json::from_str::<Request>(&line).unwrap());
-                std::thread::sleep(Duration::from_millis(150));
-                writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
-            }
-            requests
-        });
+        let server = serve_one(
+            &sock,
+            // Only the listing: a stray CaptureModeStatus from another test is
+            // skipped, and `qualification_load` below still catches this
+            // refresh starting a qualification.
+            |request| matches!(request, Request::ListCameras),
+            Response::Cameras(vec![]),
+            Duration::from_millis(150),
+        );
         let mut app = live_test_app();
         let started = std::time::Instant::now();
         app.refresh_camera_listing();
         let blocked = started.elapsed();
-        let requests = server.join().unwrap();
-        assert!(matches!(requests.as_slice(), [Request::ListCameras]));
+        let request = server.join().unwrap();
+        assert!(matches!(request, Request::ListCameras), "{request:?}");
         assert!(
             app.qualification_load.is_none(),
             "role inspection never qualifies capture"
@@ -13113,11 +13109,7 @@ mod tests {
             app.poll();
             std::thread::sleep(Duration::from_millis(5));
         }
-        std::fs::remove_file(sock).unwrap();
-        assert!(
-            app.pairs_known,
-            "the completed background result must land; requests={requests:?}"
-        );
+        assert!(app.pairs_known, "the completed background result must land");
         assert!(
             blocked < Duration::from_millis(100),
             "camera metadata blocked navigation for {blocked:?}"
@@ -13463,6 +13455,108 @@ mod tests {
                 && app.attempts_load.is_none(),
             "background loads must finish before releasing the test socket"
         );
+    }
+
+    /// Accept connections on a fake daemon's `listener` until one sends a
+    /// request that `wanted` accepts, and return that connection, a reader
+    /// on it and the request line. IRLUME_SOCKET is process-wide, so a
+    /// background worker another test left running can connect first:
+    /// every other request gets an error reply and is skipped. Panics
+    /// after 10 s without a wanted request.
+    fn accept_wanted(
+        listener: &std::os::unix::net::UnixListener,
+        wanted: fn(&Request) -> bool,
+    ) -> (
+        std::os::unix::net::UnixStream,
+        std::io::BufReader<std::os::unix::net::UnixStream>,
+        String,
+    ) {
+        use std::io::{BufRead, Write};
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut skipped = Vec::new();
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "no wanted request within 10 s; skipped {skipped:?}"
+            );
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("fake daemon accept failed: {error}; skipped {skipped:?}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            if serde_json::from_str::<Request>(&line).is_ok_and(|request| wanted(&request)) {
+                return (stream, reader, line);
+            }
+            let refusal = Response::Error("fake daemon: not the request under test".into());
+            let _ = writeln!(stream, "{}", serde_json::to_string(&refusal).unwrap());
+            skipped.push(line);
+        }
+    }
+
+    /// Point IRLUME_SOCKET at a fake daemon on `path` for the one request
+    /// a test is about, taken with `accept_wanted`: it answers `reply`
+    /// after `delay` and returns the request. The socket is removed as
+    /// soon as that request arrives, so a refresh after it finds no socket
+    /// and fails fast instead of queueing here.
+    fn serve_one(
+        path: &std::path::Path,
+        wanted: fn(&Request) -> bool,
+        reply: Response,
+        delay: Duration,
+    ) -> std::thread::JoinHandle<Request> {
+        use std::io::Write;
+        let _ = std::fs::remove_file(path);
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        std::env::set_var("IRLUME_SOCKET", path);
+        let path = path.to_owned();
+        std::thread::spawn(move || {
+            let (mut stream, _, line) = accept_wanted(&listener, wanted);
+            drop(listener);
+            std::fs::remove_file(&path).unwrap();
+            std::thread::sleep(delay);
+            writeln!(stream, "{}", serde_json::to_string(&reply).unwrap()).unwrap();
+            serde_json::from_str(&line).unwrap()
+        })
+    }
+
+    /// The fake daemon replies with an error to a request it was not set
+    /// up for and keeps waiting; the wanted request gets the reply, and
+    /// the socket is gone once it has.
+    #[test]
+    fn fake_daemon_refuses_other_requests_and_serves_the_wanted_one() {
+        let _guard = dead_socket();
+        let path = std::env::temp_dir().join(format!(
+            "irlume-tui-fake-daemon-{}.sock",
+            std::process::id()
+        ));
+        let server = serve_one(
+            &path,
+            |request| matches!(request, Request::ListCameras),
+            Response::Cameras(vec![]),
+            Duration::ZERO,
+        );
+        let other = crate::daemon_request(&Request::KeyringInfo {
+            user: "testuser".into(),
+        });
+        assert!(matches!(other, Ok(Response::Error(_))), "{other:?}");
+        let wanted = crate::daemon_request(&Request::ListCameras);
+        assert!(
+            matches!(&wanted, Ok(Response::Cameras(cameras)) if cameras.is_empty()),
+            "{wanted:?}"
+        );
+        assert!(matches!(server.join().unwrap(), Request::ListCameras));
+        assert!(!path.exists(), "the socket outlived the wanted request");
     }
 
     /// Render the full frame at 120x50 and return the flattened text.
@@ -15385,7 +15479,6 @@ mod tests {
     /// "bad request" reads as needing a newer irlumed.
     #[test]
     fn test_recognition_sends_identify_for_the_shown_account() {
-        use std::io::{BufRead, Write};
         let _guard = dead_socket();
         for (index, (reply, expected)) in [
             (
@@ -15414,26 +15507,12 @@ mod tests {
                 "irlume-tui-identify-for-{}-{index}.sock",
                 std::process::id()
             ));
-            let _ = std::fs::remove_file(&path);
-            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-            std::env::set_var("IRLUME_SOCKET", &path);
-            let socket_path = path.clone();
-            let server = std::thread::spawn(move || {
-                let (mut socket, _) = listener.accept().unwrap();
-                // One request only: the refresh after the test then finds
-                // no socket and fails fast instead of queueing here.
-                drop(listener);
-                std::fs::remove_file(&socket_path).unwrap();
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut line = String::new();
-                std::io::BufReader::new(&socket)
-                    .read_line(&mut line)
-                    .unwrap();
-                writeln!(socket, "{}", serde_json::to_string(&reply).unwrap()).unwrap();
-                serde_json::from_str::<Request>(&line).unwrap()
-            });
+            let server = serve_one(
+                &path,
+                |request| matches!(request, Request::IdentifyFor { user } if user == "alice"),
+                reply,
+                Duration::ZERO,
+            );
             let mut app = test_app();
             app.user = "alice".into();
             app.caps.rgb = true;
@@ -15484,7 +15563,6 @@ mod tests {
     /// lists the camera says so in a camera's words.
     #[test]
     fn removing_an_added_camera_never_shows_its_id() {
-        use std::io::{BufRead, Write};
         let _guard = dead_socket();
         // The store id a root peer sees carries the camera's identity.
         let id = "cam-046d-085e-SERIAL";
@@ -15513,26 +15591,20 @@ mod tests {
                 "irlume-tui-remove-added-{}-{index}.sock",
                 std::process::id()
             ));
-            let _ = std::fs::remove_file(&path);
-            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-            std::env::set_var("IRLUME_SOCKET", &path);
-            let socket_path = path.clone();
-            let server = std::thread::spawn(move || {
-                let (mut socket, _) = listener.accept().unwrap();
-                // One request only: the refresh after it then finds no
-                // socket and fails fast instead of queueing here.
-                drop(listener);
-                std::fs::remove_file(&socket_path).unwrap();
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut line = String::new();
-                std::io::BufReader::new(&socket)
-                    .read_line(&mut line)
-                    .unwrap();
-                writeln!(socket, "{}", serde_json::to_string(&reply).unwrap()).unwrap();
-                serde_json::from_str::<Request>(&line).unwrap()
-            });
+            let server = serve_one(
+                &path,
+                |request| {
+                    matches!(request, Request::RemoveCameraGroup { user, group }
+                        if user == "testuser" && group == "cam-046d-085e-SERIAL")
+                },
+                reply,
+                Duration::ZERO,
+            );
+            // A worker another test left running can reach this socket
+            // first: here a keyring check lands before the removal.
+            let mut stray = test_app();
+            stray.refresh_keyring_diagnostic();
+            drain_loads(&mut stray);
             let mut app = test_app();
             app.screen = SC_PROFILES;
             app.profiles_loaded = true;
@@ -18913,7 +18985,6 @@ mod tests {
     /// behind its record writer for up to 2 s.
     #[test]
     fn the_attempts_worker_asks_for_the_tui_account_within_its_own_budget() {
-        use std::io::{BufRead, Write};
         let _guard = dead_socket();
         let record = attempt_record(attempt(
             irlume_common::AttemptKind::Authenticate,
@@ -18947,28 +19018,17 @@ mod tests {
                 "irlume-tui-attempts-{}-{index}.sock",
                 std::process::id()
             ));
-            let _ = std::fs::remove_file(&path);
-            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-            std::env::set_var("IRLUME_SOCKET", &path);
-            let server = std::thread::spawn(move || {
-                let (mut socket, _) = listener.accept().unwrap();
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut line = String::new();
-                std::io::BufReader::new(&socket)
-                    .read_line(&mut line)
-                    .unwrap();
-                std::thread::sleep(delay);
-                writeln!(socket, "{}", serde_json::to_string(&reply).unwrap()).unwrap();
-                serde_json::from_str::<Request>(&line).unwrap()
-            });
+            let server = serve_one(
+                &path,
+                |request| matches!(request, Request::LastAttempts { user } if user == "alice"),
+                reply,
+                delay,
+            );
             let mut app = test_app();
             app.user = "alice".into();
             app.refresh_attempts();
             drain_loads(&mut app);
             let request = server.join().unwrap();
-            std::fs::remove_file(&path).unwrap();
             assert!(
                 matches!(&request, Request::LastAttempts { user } if user == "alice"),
                 "{request:?}"
@@ -19214,6 +19274,20 @@ mod tests {
                         .read_line(&mut line)
                         .unwrap();
                     let request: Request = serde_json::from_str(&line).unwrap();
+                    // A worker another test left running asks for its own
+                    // account: refuse it and keep it out of the record.
+                    let stray = match &request {
+                        Request::KeyringMetadata { user }
+                        | Request::KeyringInfo { user }
+                        | Request::HasSealedPassword { user }
+                        | Request::RecoveryStatus { user } => user != "light-poll-user",
+                        _ => false,
+                    };
+                    if stray {
+                        let refusal = Response::Error("not the request under test".into());
+                        let _ = writeln!(socket, "{}", serde_json::to_string(&refusal).unwrap());
+                        continue;
+                    }
                     let last = matches!(request, Request::RecoveryStatus { .. });
                     let response = match &request {
                         Request::Ping => Response::Pong,
@@ -19235,13 +19309,13 @@ mod tests {
                 }
                 requested
             });
-            let state = LightState::gather("testuser", None);
+            let state = LightState::gather("light-poll-user", None);
             let requests = server.join().unwrap();
             std::fs::remove_file(&path).unwrap();
             assert_eq!(state.keyring_armed, Some(true));
-            assert!(requests
-                .iter()
-                .any(|r| matches!(r, Request::KeyringMetadata { user } if user == "testuser")));
+            assert!(requests.iter().any(
+                |r| matches!(r, Request::KeyringMetadata { user } if user == "light-poll-user")
+            ));
             assert!(
                 !requests
                     .iter()
@@ -19367,12 +19441,28 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         std::env::set_var("IRLUME_SOCKET", &path);
         let started = std::time::Instant::now();
-        let mut app = App::new("testuser".into());
+        let mut app = App::new("constructor-user".into());
         assert!(
             started.elapsed() < Duration::from_millis(200),
             "construction must not wait for observations"
         );
-        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        // Nothing was asked for this account. A worker another test left
+        // running may still connect (IRLUME_SOCKET is process-wide), so a
+        // connection alone proves nothing: its request names its own
+        // account, or none (a Ping), and a request construction waited on
+        // would have broken the time bound above.
+        while let Ok((stream, _)) = listener.accept() {
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut line = String::new();
+            let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(&stream), &mut line);
+            assert!(
+                !line.contains("constructor-user"),
+                "construction sent {line}"
+            );
+        }
         app.screen = SC_FINGERPRINT;
         assert!(draw_text(&app).contains("unknown"));
         std::fs::remove_file(path).unwrap();
@@ -20989,6 +21079,8 @@ mod tests {
         app.on_key(KeyCode::Char('2'));
         let (_, msg) = app.activity.last().unwrap();
         assert!(msg.contains("no camera") && !msg.contains("(v"), "{msg}");
+        // Landing on Faces started a profile listing.
+        drain_loads(&mut app);
     }
 
     /// ADR-0030 §1.1: Enter opens things; it never arms a confirmation,
@@ -22172,6 +22264,7 @@ mod tests {
     fn repair_surfaces_keyring_drift_with_the_reseal_fix() {
         // A TUI-only user never runs `doctor`; PCR drift must show on Repair
         // and point at the reseal action (the newly-added parity fix).
+        let _guard = dead_socket();
         let mut app = test_app();
         app.keyring_drift = None;
         app.run_checks();
@@ -22198,6 +22291,8 @@ mod tests {
         assert!(
             matches!(&app.confirm, Some((_, _, ConfirmAct::Sus(Suspend::MoreAction(invocation)))) if invocation.args("bob") == ["reseal", "--user", "bob"])
         );
+        // The fix opens the wallet page, which starts a keyring check.
+        drain_loads(&mut app);
     }
 
     // ---- an unanswered question renders as unknown, never as a negative ----

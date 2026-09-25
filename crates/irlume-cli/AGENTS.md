@@ -108,8 +108,12 @@ where older pages break them.
   `on_key`, then, before the guard drops, wait for all it started:
   `wait_op_done`, `wait_enroll_done` or `drain_loads`, plus `wait_live_done`
   after anything that calls `refresh()` (a finished op or enrollment does),
-  since `drain_loads` leaves its live load running. For a mock daemon, point
-  `IRLUME_SOCKET` at a fake that answers one line-JSON request per connection.
+  since `drain_loads` leaves its live load running. For a mock daemon, use
+  `serve_one` (it points `IRLUME_SOCKET` at a fake that answers one request,
+  then removes its socket) or, for several connections, `accept_wanted` in
+  the fake's loop. Both answer one line-JSON request per connection and reply
+  with an error to any request the test did not ask for: a worker another
+  test left running can connect first.
 - `test_app()` starts with every capability false. Set `app.caps` for a
   camera-gated key; `poll` re-derives it from Health and the live snapshot,
   so a test that polls sets those (see `live_test_app`). `reported_caps`

@@ -46,8 +46,10 @@ does not compile until its posture is chosen. Never add `_ =>`.
 | `diagnostic_operation_class` | `src/main.rs` | diagnostic trace class |
 | `dispatch_scoped_session_inner` | `src/main.rs` | the worker's handler arm |
 
-`Status` requests are answered on the connection thread only from memory, and
-never touch TPM, camera or engine there. When `dispatch_status` returns `None`
+`Status` requests are answered on the connection thread and never touch TPM,
+camera or engine there; file reads are fine (`/etc/irlume/settings.conf` for
+`PreferencesStatus`, the attempt record for `LastAttempts`, envelope paths and
+metadata, recovery store checks). When `dispatch_status` returns `None`
 (a `ListProfiles` whose enrollment summary is not published, or is stale), the
 request queues to the worker, which does the real load (a TPM unseal, maybe a
 template-key reseal) and publishes the summary. Keep that fallthrough:

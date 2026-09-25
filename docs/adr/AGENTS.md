@@ -28,4 +28,4 @@ do, so sketch one in the PR early ([CONTRIBUTING.md](../../CONTRIBUTING.md)
    (ADR-0021) or in the Status of the ADR that makes it (ADR-0027).
 5. Plain punctuation, no em dashes (CONTRIBUTING.md "Writing style").
 
-Before camera or TUI work, read ADR-0007, 0023, 0024, 0028, 0029 and 0030.
+Before camera or TUI work, read ADR-0007, 0023, 0024, 0027, 0028, 0029 and 0030.

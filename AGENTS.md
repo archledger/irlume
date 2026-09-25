@@ -21,7 +21,7 @@ code, and say so in the PR. `ADR-NNNN` means `docs/adr/NNNN-*.md`. Nested
 | Path | What it is | Start at |
 |---|---|---|
 | `crates/irlume-common` | Wire types (`Request`, `Response`), socket client, config. Depends on no other irlume crate. | [its AGENTS.md](crates/irlume-common/AGENTS.md), [docs/SETUP.md](docs/SETUP.md) |
-| `crates/irlume-camera` | V4L2/UVC capture, IR emitter, device pinning, inventory. | `src/lib.rs`; ADR-0007, 0023, 0024, 0028, 0029 |
+| `crates/irlume-camera` | V4L2/UVC capture, IR emitter, device pinning, inventory. | `src/lib.rs`; ADR-0007, 0023, 0024, 0027, 0028, 0029 |
 | `crates/irlume-vision`, `-liveness` | Detection, alignment, embedding; liveness cues and PAD. | ADR-0013, ADR-0019, [docs/PAD_SELFTEST.md](docs/PAD_SELFTEST.md) |
 | `crates/irlume-core` | Encrypted templates, TPM sealing, keyring and recovery envelopes. | ADR-0025, [docs/SECURITY_AT_REST.md](docs/SECURITY_AT_REST.md) |
 | `crates/irlume-auth` | The `Engine`: the only place a grant is decided. | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) "Authentication flow" |
@@ -110,8 +110,11 @@ cargo build --release --locked
 - CI selects ignored tests by prefix (`loopback_`, `bench_`, `tpm_`, `pinned_`,
   `shared_greeter_real_daemon`), exact `--require` name or whole target
   (`irlume-pam`, `irlume-daemon --test shutdown`) in `ci.yml` and the hardware
-  workflows. Any other ignored test never runs; renaming a selected one breaks
-  its lane, so update every workflow naming it (`grep -rn <name> .github/workflows`).
+  workflows, and a few ignored child tests run in a fresh process from a
+  parent test (`--ignored --exact <path>`, e.g. `wallet_stdin_child` in
+  `crates/irlume-kwallet-init/src/main.rs`). Any other ignored test never runs;
+  renaming a selected or child test breaks its lane or parent, so update every
+  caller (`grep -rn <name> .github crates`).
 - A test that passes alone but fails in the full run shares process state (an
   unlocked env variable, a thread that outlived its guard, a process-wide
   cache). Compare `-- <name> --exact` with the full run and `--test-threads=1`,
@@ -152,12 +155,15 @@ cargo build --release --locked
 2. **One decider.** Only `irlume-auth` decides a grant; shims stay thin; no
    binary links another binary's crate ([crates/README.md](crates/README.md)).
 3. **Privilege split.** `irlumed` alone owns camera, IR emitter, models,
-   templates and TPM, through one serialized worker. Clients hold no secrets and
-   never open a camera. `SO_PEERCRED` is checked per connection. Only two
-   root-only requests release a sealed secret, never `Authenticate`:
-   `UnsealPassword` after a live face match, and `UnsealKeyring` (login
-   password, KDE wallet key or GNOME keyring token) without one, for the
-   fingerprint path, gated on a login or unlock service (ADR-0003,
+   templates and TPM, through one serialized worker. Clients keep no secrets
+   (one a reply carries is used at once and dropped) and never open a camera.
+   `SO_PEERCRED` is checked per connection. Four replies carry a secret, never
+   `Authenticate`'s: root-only `UnsealPassword` after a live face match and
+   `UnsealKeyring` (login password, KDE wallet key or GNOME keyring token)
+   without one, for the fingerprint path on a login or unlock service; and, to
+   root or the account's owner, the GNOME keyring token in `SealPassword`'s
+   `TokenSealed` and in `ReleaseTokenForDisarm` (after the login password is
+   verified), so the caller can re-key the keyring (ADR-0003,
    `crates/irlume-common/src/lib.rs`; [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
    "Privilege separation", "Authentication flow").
 4. **Posture and wire.** Every `Request` variant has an explicit arm, with no
@@ -200,8 +206,10 @@ cargo build --release --locked
   `face_landmarks_detector.tflite` is the one exception). A new model is
   permissive in code, weights and training data ([CONTRIBUTING.md](CONTRIBUTING.md)
   "Ground rules for a security project", [models/README.md](models/README.md)).
-- No score, threshold value or similarity in UI text, unprivileged replies or
-  the attempt record; nothing biometric in logs. Journal deny lines go through
+- No score, threshold value or similarity in UI text, the attempt record, or a
+  reply to anyone but root or the account's own caller (`Authenticate`,
+  `Identify` and `IdentifyFor` return the owner's score by design); nothing
+  biometric in logs. Journal deny lines go through
   `deny_score` (one decimal) and `deny_reason` (numbers stripped), exact only
   under `IRLUME_LOG=debug`; grant lines log the score to the root-only journal.
   Matching never exits early (ADR-0030 section 5, THREAT_MODEL.md "Side channels").

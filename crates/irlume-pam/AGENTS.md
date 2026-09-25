@@ -32,14 +32,16 @@ person out. It is critical-tier ([SECURITY.md](../../SECURITY.md)); the
   `try_verify` or `try_unseal` until a match or `WAIT_BUDGET` (20 s), and with
   `facefirst` or `ondemand` an `UnsealUnavailable` (release refused before any
   face attempt) falls back to one identity-only `try_verify`. A denial,
-  transport error or failed delivery never buys another attempt.
+  transport error or failed delivery never takes that fallback (in `wait` mode
+  it is retried like any other failure until the budget runs out).
 - It runs in setuid stacks with the caller's environment: read socket and
   helper paths only through `irlume_common::client::secure_env` (`socket_path`,
   `secure_helper_path`). Anything else that environment can change, such as
   `privileged_face_consent_required()`, must be re-checked by the daemon.
-- Remote sessions never engage the camera: `is_remote_session` checks
-  `PAM_RHOST`, remote-desktop service names and `SSH_*` (residual risk in
-  [docs/THREAT_MODEL.md](../../docs/THREAT_MODEL.md)).
+- `is_remote_session` keeps the camera off for known remote signals:
+  `PAM_RHOST`, remote-desktop service names and `SSH_*`. It cannot see remote
+  control of the genuine local seat, or a GNOME Remote Desktop headless login
+  through `gdm-password` without `PAM_RHOST` (its comment in `src/lib.rs`).
 - Privileged intent: only a hidden `yes` selects a face attempt: ASCII, at most
   16 bytes, compared after trimming whitespace and ignoring case
   (`classify_intent_input`; its test pins ` YES ` and tab-wrapped `yEs`). Other

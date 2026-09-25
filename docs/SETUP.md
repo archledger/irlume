@@ -272,6 +272,14 @@ screen, then run `irlume keyring forget` with that password, then
 that login, the login cannot update the seal; run `irlume keyring forget`
 with the previous password instead.
 
+With a token armed on Fedora 43 or 44, run `irlume keyring forget` before
+upgrading to Fedora 45: on Fedora 45 the login screen unlocks the login keyring
+through oo7, which migrates it with the login password, so a token-keyed
+keyring does not carry over. Do not arm again on Fedora 45 until an irlume
+update supports its keyring; until then the password opens it as usual.
+`irlume doctor`, `irlume keyring status` and `irlume keyring arm` give this
+step on Fedora 43 and 44.
+
 Password-backed and KDE-key arms should be checked and re-armed after a
 password change if needed. PAM also has a best-effort reseal path after
 password authentication; a failed reseal does not fail the login. Fingerprint

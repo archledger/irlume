@@ -7,6 +7,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **With a GNOME keyring token armed on Fedora 43 or 44, run
+  `irlume keyring forget` before upgrading to Fedora 45.** On Fedora 45
+  the login screen unlocks the login keyring through oo7, which migrates
+  it with the login password, so a keyring keyed to a token does not
+  carry over. Do not arm again on Fedora 45 until an irlume update
+  supports its keyring; until then the password opens it as usual.
+  `irlume doctor` (new check `keyring-os-upgrade`),
+  `irlume keyring status` and `irlume keyring arm` give this step on
+  Fedora 43 and 44.
+
 - Camera selection order as a pure function (ADR-0029 §1, §3). For
   one account it picks the connected camera to use when camera
   selection is automatic: the primary camera when both of its sides

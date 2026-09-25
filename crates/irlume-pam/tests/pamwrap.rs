@@ -178,16 +178,19 @@ impl Harness {
         stdin: &str,
         authtok_env: Option<&str>,
     ) -> (bool, String) {
-        self.run_with_consent_env(service, ops, stdin, authtok_env, None)
+        self.run_with_env(service, ops, stdin, authtok_env, &[])
     }
 
-    fn run_with_consent_env(
+    /// [`Harness::run`] with extra `env` pairs, set after
+    /// [`remove_remote_env`], so a test can pass a remote marker or
+    /// `PAM_RHOST` through on purpose.
+    fn run_with_env(
         &self,
         service: &str,
         ops: &[&str],
         stdin: &str,
         authtok_env: Option<&str>,
-        consent_env: Option<&str>,
+        env: &[(&str, &str)],
     ) -> (bool, String) {
         let mut cmd = Command::new("pamtester");
         cmd.arg(service).arg("tester").args(ops);
@@ -209,13 +212,12 @@ impl Harness {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        remove_remote_env(&mut cmd);
         match authtok_env {
             Some(tok) => cmd.env("PAM_AUTHTOK", tok),
             None => cmd.env_remove("PAM_AUTHTOK"),
         };
-        if let Some(value) = consent_env {
-            cmd.env("IRLUME_CONSENT_GESTURE", value);
-        }
+        cmd.envs(env.iter().copied());
         let mut child = cmd.spawn().expect("spawn pamtester");
         child.stdin.take().unwrap().write_all(stdin.as_bytes()).ok();
         let out = child.wait_with_output().expect("wait for pamtester");
@@ -252,6 +254,25 @@ impl Drop for Harness {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+/// The environment variables `is_remote_session` (src/lib.rs) reads as a
+/// remote session, each with a value an ssh shell exports. Either one makes
+/// the module's authenticate return PAM_IGNORE before any mode runs.
+const REMOTE_ENV_MARKERS: [(&str, &str); 2] = [
+    ("SSH_CONNECTION", "192.0.2.1 50000 192.0.2.2 22"),
+    ("SSH_TTY", "/dev/pts/9"),
+];
+
+/// Keep the caller's session out of a run that loads the module: remove
+/// [`REMOTE_ENV_MARKERS`], which a run over ssh inherits, and `PAM_RHOST`,
+/// which a pam_set_items.so line copies into the PAM item the module also
+/// checks. A test that wants a remote run sets one again afterwards.
+fn remove_remote_env(cmd: &mut Command) {
+    for (name, _) in REMOTE_ENV_MARKERS {
+        cmd.env_remove(name);
+    }
+    cmd.env_remove("PAM_RHOST");
 }
 
 /// Find libpam_wrapper.so: `PAM_WRAPPER_SO` override first, then the packaged
@@ -462,6 +483,107 @@ fn pamwrap_granting_daemon_face_path() {
         }
         other => panic!("expected Authenticate, daemon saw {other:?}"),
     }
+}
+
+/// Every runner that loads the module must drop what [`remove_remote_env`]
+/// drops, or a test that expects a daemon request fails when run from an
+/// ssh shell. This reruns tests from both runners, pamtester and the COSMIC
+/// conversation driver, in a child test process that inherits both markers
+/// and a remote `PAM_RHOST`. The last two tests each run a stack with a
+/// pam_set_items.so line, which copies `PAM_RHOST` into the PAM item.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_runners_remove_inherited_remote_variables() {
+    if Harness::try_new("remote-env").is_none() {
+        return;
+    }
+    let tests = [
+        "pamwrap_granting_daemon_face_path",
+        "pamwrap_keyring_mode_reports_whether_a_password_is_present",
+        "cosmic::cosmic_cached_empty_token_requires_a_fresh_nonempty_choice",
+    ];
+    let out = Command::new(std::env::current_exe().expect("test binary path"))
+        .args(tests)
+        .args(["--exact", "--ignored", "--test-threads=1"])
+        .envs(REMOTE_ENV_MARKERS)
+        .env("PAM_RHOST", "192.0.2.7")
+        .output()
+        .expect("rerun the tests");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Each test's own result line as well as the exit status: libtest exits 0
+    // when a filter matches nothing, so a renamed test would pass here unseen.
+    let each_passed = tests
+        .iter()
+        .all(|name| stdout.contains(&format!("test {name} ... ok")));
+    assert!(
+        out.status.success() && each_passed,
+        "the tests must pass with the remote variables inherited:\n{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `sudo` in an ssh shell sets no PAM_RHOST, so the module finds the remote
+/// session from `SSH_CONNECTION` or `SSH_TTY` alone. Each marker on its own
+/// must keep every request from the daemon and fail a stack that only the
+/// module can grant, and the typed password must still authenticate, with
+/// no face prompt. The control runs without a marker reach the daemon.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_ssh_markers_make_no_request_and_leave_the_password_path() {
+    let Some(h) = Harness::try_new("ssh-markers") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| match req {
+        Request::Authenticate { .. } => grant(),
+        _ => Response::Error("unexpected request".into()),
+    });
+    h.write_service("irlume-face-ssh", &[h.auth_line("required", "")]);
+    let checker = h.token_checker("ssh-markers", FIXED_TEST_TOKEN);
+    h.write_service(
+        "sudo",
+        &[
+            h.auth_line("sufficient", ""),
+            format!(
+                "auth required pam_exec.so expose_authtok {}",
+                checker.display()
+            ),
+        ],
+    );
+    let password = format!("{FIXED_TEST_TOKEN}\n");
+
+    for marker in REMOTE_ENV_MARKERS {
+        let name = marker.0;
+        let (ok, out) = h.run_with_env("irlume-face-ssh", &["authenticate"], "", None, &[marker]);
+        assert!(!ok, "{name} must stand the module down: {out}");
+        let (ok, out) = h.run_with_env("sudo", &["authenticate"], &password, None, &[marker]);
+        assert!(
+            ok,
+            "with {name} set the typed password must authenticate: {out}"
+        );
+        assert!(
+            !out.contains(FACE_INTENT_INFO),
+            "with {name} set the module must not offer face: {out}"
+        );
+        let reqs = log.lock().unwrap();
+        assert!(
+            reqs.is_empty(),
+            "{name} must keep every request from the daemon: {reqs:?}"
+        );
+    }
+
+    // Control: the same stacks without a marker reach the daemon.
+    let (ok, out) = h.run("irlume-face-ssh", &["authenticate"], "", None);
+    assert!(
+        ok,
+        "without a marker the granting daemon must authenticate: {out}"
+    );
+    let (ok, out) = h.run("sudo", &["authenticate"], "yes\n", None);
+    assert!(
+        ok,
+        "without a marker a confirmed face path must grant: {out}"
+    );
+    assert_eq!(out.matches(FACE_INTENT_INFO).count(), 1, "{out}");
+    assert_eq!(log.lock().unwrap().len(), 2, "one request per control run");
 }
 
 const FACE_INTENT_INFO: &str = "Type yes to use face authentication";

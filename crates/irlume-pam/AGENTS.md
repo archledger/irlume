@@ -98,9 +98,9 @@ login or locks a person out. It is critical-tier
     `PAM_WRAPPER_SO=/path/to/libpam_wrapper.so`.
   - Run as CI does:
     `./scripts/run-tests-guarded.sh --min 16 -- cargo test -p irlume-pam --locked -- --include-ignored --test-threads=1`
-  - Over SSH, prefix that with `env -u SSH_CONNECTION -u SSH_TTY`; the harness
-    passes both through, so the module stands down as for a remote session and
-    the tests that expect a grant fail.
+  - The pamtester and COSMIC runners remove `SSH_CONNECTION`, `SSH_TTY` and
+    `PAM_RHOST` from what they pass on (`remove_remote_env`), so the suite runs
+    the same over SSH; set a marker on purpose with `run_with_env`.
   - Without pamtester or libpam_wrapper.so each `tests/pamwrap.rs` test returns
     early and passes (libtest hides its "skipping" note); only the COSMIC
     tests fail, so a filtered run that leaves them out tests no PAM stack. Check

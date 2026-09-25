@@ -116,8 +116,8 @@ state = json.load(open(STATE))
 args = sys.argv[1:]
 words, flags, i = [], {}, 0
 while i < len(args):
-    if args[i] == '--paginate':
-        flags['paginate'] = True
+    if args[i] in ('--paginate', '--all'):
+        flags[args[i][2:]] = True
         i += 1
     elif args[i].startswith('--'):
         flags[args[i][2:]] = args[i + 1]
@@ -157,6 +157,9 @@ def issue(number):
 STATUSES = {'queued', 'in_progress', 'completed', 'requested', 'waiting', 'pending'}
 if words[:2] == ['run', 'list']:
     assert flags['repo'] == 'archledger/irlume'
+    listed = {w['path'].rsplit('/', 1)[-1]: w for w in state['workflows']}
+    if listed.get(flags['workflow'], {}).get('state', 'active') != 'active' and 'all' not in flags:
+        sys.exit(f"could not find any workflows named {flags['workflow']}")
     runs = [r for r in state['runs'].get(flags['workflow'], [])
             if r.get('headBranch', 'main') == flags.get('branch', r.get('headBranch', 'main'))]
     status = flags.get('status')
@@ -405,6 +408,17 @@ class StepTests(unittest.TestCase):
                          ['CI health: codeql.yml failing or stale'], self.output)
         self.assertIn('last succeeded 2026-09-12T00:20:00Z', created[0]['body'])
         self.assertIn('over the 8 d limit', created[0]['body'])
+
+    def test_many_pull_request_runs_cannot_hide_the_runs_on_main(self):
+        # gh applies --limit before the pull request runs are dropped, so a
+        # burst of them from a fork's main branch must not fill the page.
+        state = healthy_state()
+        state['runs']['codeql.yml'] += [
+            run(2000 + n, 'success', f'2026-09-24T{10 + n // 60:02d}:{n % 60:02d}:00Z',
+                event='pull_request')
+            for n in range(40)]
+        self.check(state)
+        self.assertEqual(self.log, [], self.output)
 
     def test_finding_no_scheduled_workflow_is_an_error_that_changes_no_issue(self):
         state = healthy_state()

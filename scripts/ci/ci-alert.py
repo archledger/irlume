@@ -40,6 +40,9 @@ FIELDS_JSON = 'databaseId,status,conclusion,createdAt,event,url'
 GRACE = timedelta(days=1)
 FIELDS = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
 # Eight years from a leap year: every month length and weekday alignment.
+# Enough for daily, weekly and monthly schedules; a yearly schedule tied to a
+# weekday (for example "0 0 1 1 0") can have a longer gap than this window
+# shows. No workflow in this repository uses one.
 WINDOW = (date(2024, 1, 1), date(2032, 1, 1))
 
 
@@ -249,13 +252,15 @@ class GitHub:
     def json(self, *args):
         return json.loads(self(*args, '--repo', self.repo))
 
-    def runs(self, name, status=None, limit=20):
+    def runs(self, name, status=None, limit=100):
         """Runs of workflow file `name` on main, newest first.
 
         `--branch main` matches the head branch, which a pull request from a
-        fork's own main branch shares, so pull request runs are dropped here.
+        fork's own main branch shares, so pull request runs are dropped here;
+        the limit is generous so they cannot fill it. `--all` is needed for a
+        disabled workflow, which `--workflow` alone does not find.
         """
-        found = self.json('run', 'list', '--workflow', name, '--branch', 'main',
+        found = self.json('run', 'list', '--all', '--workflow', name, '--branch', 'main',
                           *(('--status', status) if status else ()),
                           '--limit', str(limit), '--json', FIELDS_JSON)
         return [r for r in found if not str(r.get('event', '')).startswith('pull_request')]

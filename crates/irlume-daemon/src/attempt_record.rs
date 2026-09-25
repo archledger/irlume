@@ -536,8 +536,20 @@ const WRITER_QUEUE: usize = 64;
 /// most `WRITER_QUEUE` pending records and one writer serialized on the
 /// store lock. A full queue drops the record and says so; the record is
 /// history and never delays a reply.
+///
+/// Test builds file inline instead. The writer thread outlives the test
+/// that queued a record, and filing reads the environment (the passwd
+/// lookup inside glibc, `IRLUME_STATE_DIR`) while a later test may be
+/// rewriting it under the test-only env lock, which the writer cannot take
+/// without stalling a test that holds it (an ASan SEGV in `getenv`). Inline,
+/// those reads fall under the filing test's own guard, like the rest of
+/// the request it came from.
 pub(crate) fn record_in_background(user: String, filed: Filed) {
     static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if cfg!(test) {
+        file(&user, filed);
+        return;
+    }
     if writer().try_send(Job::File(user, filed)).is_err() {
         // Journal the first drop and then every hundredth, not each one.
         let dropped = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -546,6 +558,16 @@ pub(crate) fn record_in_background(user: String, filed: Filed) {
                 "irlumed: attempt record writer queue full; {dropped} records dropped so far"
             );
         }
+    }
+}
+
+/// File one record, reporting a failure to the journal.
+fn file(user: &str, filed: Filed) {
+    if let Err(error) = record(user, filed) {
+        irlume_common::jout_warn!(
+            "irlumed: attempt record for '{}' not written: {error}",
+            crate::journal_safe(user)
+        );
     }
 }
 
@@ -567,14 +589,7 @@ fn writer() -> &'static std::sync::mpsc::SyncSender<Job> {
             .spawn(move || {
                 for job in rx {
                     match job {
-                        Job::File(user, filed) => {
-                            if let Err(error) = record(&user, filed) {
-                                irlume_common::jout_warn!(
-                                    "irlumed: attempt record for '{}' not written: {error}",
-                                    crate::journal_safe(&user)
-                                );
-                            }
-                        }
+                        Job::File(user, filed) => file(&user, filed),
                         // The reader may have given up: nobody to tell.
                         Job::Barrier(ack) => {
                             let _ = ack.try_send(());
@@ -1122,6 +1137,47 @@ mod tests {
             replaced.record.latest_identify.is_none(),
             "the foreign history is gone"
         );
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A test build files on the caller's thread, under the env guard its
+    /// test holds. The background writer outlived the test that queued a
+    /// record and read the environment while a later test rewrote it (an
+    /// ASan SEGV in `getenv`).
+    #[test]
+    fn a_test_build_files_on_the_callers_thread() {
+        let _g = crate::tests::env_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-attempts-inline-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let me = crate::users::name_for_uid(uid).expect("own name");
+        record_in_background(
+            me.clone(),
+            Filed {
+                at: unix_now(),
+                kind: AttemptKind::Authenticate,
+                surface: AttemptSurface::Lock,
+                result: AttemptResult::Refused,
+                cause: Some(OutcomeCause::NoFace),
+                elapsed_ms: 10,
+                capture_ms: None,
+                camera: None,
+            },
+        );
+        // Read without the writer fence: nothing was left to the writer.
+        let stored = store().unwrap().read_any(uid).unwrap();
+        assert_eq!(stored.account, me);
+        assert!(stored.record.latest_authenticate.is_some());
         std::env::remove_var("IRLUME_STATE_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }

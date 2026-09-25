@@ -107,6 +107,11 @@ cargo build --release --locked
 - Tests never write real system paths: use DEVELOPMENT.md "Sandbox environment
   overrides" under the crate's env lock (common `testenv::lock()`; core, camera,
   cli `crate::testenv::ENV_LOCK`; auth `tests::ENV_LOCK`; daemon `env_lock()`).
+- A test or probe that starts a real keyring daemon (`gnome-keyring-daemon`,
+  `ksecretd`, `kwalletd6`) gives it a throwaway HOME, runtime dir and private
+  session bus, and unsets `DISPLAY`, `WAYLAND_DISPLAY` and `XAUTHORITY`, as
+  `scripts/gkr-token-check.sh` does: otherwise its unlock prompt appears on
+  the developer's screen and asks for their real password.
 - TPM tests (`#[ignore]`) run by name against swtpm:
   `scripts/with-swtpm.sh <cmd>` (never falls back to hardware) or
   `IRLUME_TCTI=swtpm:host=127.0.0.1,port=2321` (DEVELOPMENT.md). Never sweep

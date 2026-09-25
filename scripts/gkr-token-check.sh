@@ -21,7 +21,9 @@
 #   5. the disarm path works:      CHANGE(token -> password) puts it back
 #   6. N cycles leak no daemons
 #
-# Everything runs as the invoking user inside a throwaway HOME and runtime dir.
+# Everything runs as the invoking user inside a throwaway HOME and runtime dir,
+# with no display: a locked keyring's unlock prompt fails instead of appearing
+# on the caller's screen, where it would ask for their real password.
 # The Python side implements the control protocol independently of the Rust
 # crate, so agreement between them and a real daemon is a cross-check rather
 # than one implementation agreeing with itself.
@@ -48,6 +50,9 @@ export XDG_DATA_HOME="$HOME/.local/share"
 mkdir -p "$HOME" "$XDG_RUNTIME_DIR" "$XDG_DATA_HOME"
 chmod 700 "$XDG_RUNTIME_DIR"
 unset DBUS_SESSION_BUS_ADDRESS GNOME_KEYRING_CONTROL
+# gcr-prompter is a GUI started on the private bus; without these it cannot
+# draw on the caller's session.
+unset DISPLAY WAYLAND_DISPLAY XAUTHORITY
 
 PASS=0
 FAIL=0

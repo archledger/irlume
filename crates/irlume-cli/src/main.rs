@@ -23,6 +23,7 @@ mod commands;
 mod consent;
 mod doctor_report;
 mod fingerprint;
+mod gkr_session;
 mod logintx;
 mod logs;
 mod machine;
@@ -1220,10 +1221,15 @@ fn verify(args: &[String]) -> std::process::ExitCode {
 /// what that proves about the login keyring.
 #[derive(Debug)]
 enum RekeyError {
+    /// gnome-keyring answered DENIED and did not change the keyring: the
+    /// current secret was wrong, or the daemon is one `pam_gnome_keyring`
+    /// started with `--login` that nothing has initialized yet, which refuses
+    /// every request.
+    Denied(String),
     /// The keyring did not change: the request was never sent (no session
     /// runtime directory, nothing listening on the control socket, or a
     /// gnome-keyring running as another uid, which ignores the request) or
-    /// gnome-keyring answered with a refusal.
+    /// gnome-keyring answered FAILED.
     Unchanged(String),
     /// The request may have reached gnome-keyring and no usable answer came
     /// back: a failed write or read, a malformed answer or an unknown code.
@@ -1236,7 +1242,9 @@ enum RekeyError {
 impl std::fmt::Display for RekeyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RekeyError::Unchanged(e) | RekeyError::Unconfirmed(e) => f.write_str(e),
+            RekeyError::Denied(e) | RekeyError::Unchanged(e) | RekeyError::Unconfirmed(e) => {
+                f.write_str(e)
+            }
         }
     }
 }
@@ -1252,34 +1260,6 @@ fn control_client_uid() -> libc::uid_t {
     // SAFETY: takes no arguments, reads only this process's own credentials,
     // and is specified as always succeeding.
     unsafe { libc::geteuid() }
-}
-
-/// The uid of the process listening at the other end of `stream`, from
-/// `SO_PEERCRED` (for a connected client, the listener's credentials when it
-/// called `listen`).
-fn socket_peer_uid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<libc::uid_t> {
-    use std::os::unix::io::AsRawFd;
-    let mut ucred = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: `stream` keeps the fd open for the call, and `ucred` and `len`
-    // are live out-parameters sized for SO_PEERCRED.
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut ucred as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(ucred.uid)
 }
 
 /// One CHANGE against the caller's own gnome-keyring control socket.
@@ -1304,7 +1284,7 @@ fn rekey_login_keyring(current: &[u8], new: &[u8]) -> Result<(), RekeyError> {
     // (`control_input` in gkd-control-server.c). Check before sending, so
     // that case is a known no-op and the secrets stay in this process.
     let me = control_client_uid();
-    match socket_peer_uid(&stream) {
+    match gkr_session::peer_credentials(&stream).map(|peer| peer.uid) {
         Ok(owner) if owner == me => {}
         Ok(owner) => {
             return Err(RekeyError::Unchanged(format!(
@@ -1322,11 +1302,17 @@ fn rekey_login_keyring(current: &[u8], new: &[u8]) -> Result<(), RekeyError> {
     match gkr_wire::call(&mut stream, Op::Change, &[current, new]) {
         Ok(ControlResult::Ok) => Ok(()),
         // DENIED: gnome-keyring did not change the keyring (a wrong current
-        // secret, or the change failed). FAILED: it could not read the
-        // request (`control_change_login` in gkd-control-server.c).
-        Ok(refused @ (ControlResult::Denied | ControlResult::Failed)) => Err(
-            RekeyError::Unchanged(format!("keyring re-key: {}", refused.describe())),
-        ),
+        // secret, the change failed, or nothing has initialized a `--login`
+        // daemon yet). FAILED: it could not read the request
+        // (`control_change_login` in gkd-control-server.c).
+        Ok(ControlResult::Denied) => Err(RekeyError::Denied(format!(
+            "keyring re-key: {}",
+            ControlResult::Denied.describe()
+        ))),
+        Ok(ControlResult::Failed) => Err(RekeyError::Unchanged(format!(
+            "keyring re-key: {}",
+            ControlResult::Failed.describe()
+        ))),
         // A code gnome-keyring never sends for a CHANGE.
         Ok(other) => Err(RekeyError::Unconfirmed(format!(
             "keyring re-key: {}",
@@ -1372,6 +1358,51 @@ fn rekey_back(token: &[u8], password: &[u8]) -> Result<RekeyedBack, RekeyError> 
     }
 }
 
+/// [`rekey_back`] for `keyring forget`, which may run before anything in the
+/// session has initialized a gnome-keyring the login screen started with
+/// `--login` (Fedora 43 and 44 start it that way). Such a daemon answers
+/// DENIED to every CHANGE. When the change back is DENIED, `initialize` checks
+/// for exactly that daemon and, unless another Secret Service provider runs
+/// the session, has the user bus start `org.gnome.keyring` once, as a GNOME
+/// session's first keyring client does; the change back is then tried once
+/// more. Denied CHANGEs before initialization change and record nothing.
+fn rekey_back_initializing(
+    token: &[u8],
+    password: &[u8],
+    initialize: impl FnOnce() -> gkr_session::Initialized,
+) -> Result<RekeyedBack, RekeyError> {
+    use gkr_session::Initialized;
+    let first = rekey_back(token, password);
+    let Err(RekeyError::Denied(refused)) = first else {
+        return first;
+    };
+    match initialize() {
+        Initialized::Now => {
+            println!(
+                "[keyring] gnome-keyring here was started by the login screen and not \
+                 initialized yet; started it through the session bus, as a GNOME session \
+                 does, and trying again."
+            );
+            rekey_back(token, password)
+        }
+        Initialized::NotNeeded => Err(RekeyError::Denied(refused)),
+        // Here the DENIED says nothing about the secret: this daemon refuses
+        // every request until something initializes it.
+        Initialized::OtherProvider => Err(RekeyError::Denied(
+            "keyring re-key: refused, because gnome-keyring here was started by the login \
+             screen and nothing has initialized it, and another Secret Service provider runs \
+             this session, so irlume leaves gnome-keyring alone. Run `irlume keyring forget` \
+             from a GNOME session"
+                .to_string(),
+        )),
+        Initialized::Failed(why) => Err(RekeyError::Denied(format!(
+            "keyring re-key: refused, because gnome-keyring here was started by the login \
+             screen and nothing has initialized it, and irlume could not initialize it \
+             through the session bus: {why}"
+        ))),
+    }
+}
+
 /// Second half of a GNOME token arm, shared by `keyring arm`, the setup wizard
 /// and the TUI: re-key the login keyring from `password` to `token` and verify
 /// the token is now the live credential. On a RE-arm the keyring is usually
@@ -1389,18 +1420,47 @@ fn rekey_back(token: &[u8], password: &[u8]) -> Result<RekeyedBack, RekeyError> 
 /// credential. A reused token may BE the live keyring credential and is never
 /// deleted here. Returns a human-readable error; success needs no message
 /// beyond the caller's own.
+///
+/// A session whose gnome-keyring the login screen started and nothing
+/// initialized gets no re-key at all (see [`gkr_session`]): that daemon
+/// refuses every CHANGE, and a token armed there is never delivered at login.
+/// Every arm path refuses such a session before sealing; this check covers a
+/// session that changed since.
 pub(crate) fn finish_token_arm(
     user: &str,
     password: &[u8],
     token: &[u8],
     minted: bool,
 ) -> Result<(), String> {
+    finish_token_arm_in(user, password, token, minted, gkr_session::session_refusal)
+}
+
+/// [`finish_token_arm`] with the session check passed in, so tests can
+/// answer it without a real session.
+fn finish_token_arm_in(
+    user: &str,
+    password: &[u8],
+    token: &[u8],
+    minted: bool,
+    session_refusal: impl FnOnce() -> Option<String>,
+) -> Result<(), String> {
+    if let Some(why) = session_refusal() {
+        // Nothing was sent to gnome-keyring, so the keyring never took the
+        // token and a fresh one has nothing to protect.
+        if !minted {
+            return Err(format!(
+                "not armed: {why}. The envelope was left in place, since it holds the token \
+                 armed earlier; nothing was sent to gnome-keyring."
+            ));
+        }
+        return Err(format!("not armed: {why}. {}.", erase_unused_token(user)));
+    }
     let rekey = rekey_login_keyring(password, token);
     // The keyring may already be keyed to this exact token (idempotent
     // re-arm, or a re-key whose answer was lost); verification decides.
     let checked = verify_keyring_credential(token);
     let rekey_confirmed = rekey.is_ok();
-    let rekey_unchanged = matches!(rekey, Err(RekeyError::Unchanged(_)));
+    let rekey_unchanged = matches!(rekey, Err(RekeyError::Denied(_) | RekeyError::Unchanged(_)));
     let e = match (rekey, checked) {
         (_, Ok(())) => return Ok(()),
         // Report the re-key's own error; after a confirmed re-key, the
@@ -1426,7 +1486,17 @@ pub(crate) fn finish_token_arm(
              `irlume keyring forget` re-keys the keyring back to the password first."
         ));
     }
-    let cleanup = match daemon_request(&irlume_common::Request::ForgetPassword {
+    let cleanup = erase_unused_token(user);
+    Err(format!(
+        "keyring re-key failed: {e}. {cleanup}. Run the arm as '{user}' inside \
+         their own graphical session."
+    ))
+}
+
+/// Roll back a freshly minted token the login keyring never took, and say
+/// how that went.
+fn erase_unused_token(user: &str) -> String {
+    match daemon_request(&irlume_common::Request::ForgetPassword {
         user: user.to_string(),
     }) {
         Ok(irlume_common::Response::PasswordForgotten) => {
@@ -1436,11 +1506,7 @@ pub(crate) fn finish_token_arm(
             "WARNING: could not erase the unused token envelope ({other:?}); run \
              `irlume keyring forget` to clean up. The keyring itself is unchanged"
         ),
-    };
-    Err(format!(
-        "keyring re-key failed: {e}. {cleanup}. Run the arm as '{user}' inside \
-         their own graphical session."
-    ))
+    }
 }
 
 /// Read a typed secret without echo, mirroring the arm prompt's terminal/pipe
@@ -1576,6 +1642,19 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                 Some(kind) => Ok(Some(kind)),
                 None => crate::secrets::arm_kind_hint(&user, wallet_salt.as_ref()),
             };
+            // Where the daemon judges, it may mint a GNOME keyring token, so
+            // a session that could never deliver one stops the arm before
+            // sealing, and nothing armed is replaced. A requested login
+            // password mints no token and skips this check.
+            if matches!(kind, Ok(None)) {
+                if let Some(why) = gkr_session::token_arm_refusal(&user, wallet_salt.as_ref()) {
+                    eprintln!(
+                        "[keyring] not armed: {why}. Nothing was changed. Run \
+                         `irlume keyring arm` from a GNOME session."
+                    );
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
             let reply = kind.and_then(|kind| {
                 daemon_request(&irlume_common::Request::SealPassword {
                     kind,
@@ -1779,7 +1858,15 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                         return std::process::ExitCode::FAILURE;
                     }
                 };
-                match rekey_back(token.expose(), pw.as_bytes()) {
+                let initialize = || {
+                    gkr_session::Live::from_env().map_or(
+                        gkr_session::Initialized::NotNeeded,
+                        |session| {
+                            gkr_session::initialize_for_forget(&session, control_client_uid())
+                        },
+                    )
+                };
+                match rekey_back_initializing(token.expose(), pw.as_bytes(), initialize) {
                     Ok(RekeyedBack::Rekeyed) => {
                         println!("[keyring] login keyring re-keyed back to your password.");
                     }
@@ -5935,6 +6022,10 @@ mod tests {
         /// answering, as gnome-keyring does for a client whose uid is not
         /// its own (`control_input` in gkd-control-server.c).
         ForeignUid,
+        /// Read the request and answer DENIED without applying it, as a
+        /// daemon `pam_gnome_keyring` started with `--login` does until
+        /// something initializes it (`gkd-control-server.c`, `gkd-login.c`).
+        Uninitialized,
     }
 
     thread_local! {
@@ -6030,14 +6121,16 @@ mod tests {
             zeroize::Zeroizing::new(packet[12 + current_len..12 + current_len + new_len].to_vec());
         let code: u32 = {
             let mut keyring = secret.lock().unwrap();
-            if *keyring == current {
+            if matches!(fate, Control::Uninitialized) {
+                1 // DENIED, whatever the secret
+            } else if *keyring == current {
                 *keyring = new;
                 0 // OK
             } else {
                 1 // DENIED
             }
         };
-        if matches!(fate, Control::Answer) {
+        if matches!(fate, Control::Answer | Control::Uninitialized) {
             let mut reply = 8u32.to_be_bytes().to_vec();
             reply.extend_from_slice(&code.to_be_bytes());
             stream.write_all(&reply).unwrap();
@@ -6052,7 +6145,7 @@ mod tests {
     /// script means no gnome-keyring in the session.
     fn arm_against(keyring: &[u8], script: &[Control], minted: bool) -> ArmRun {
         against(keyring, script, || {
-            finish_token_arm("testuser", ARM_PASSWORD, ARM_TOKEN, minted)
+            finish_token_arm_in("testuser", ARM_PASSWORD, ARM_TOKEN, minted, || None)
         })
     }
 
@@ -6294,5 +6387,142 @@ mod tests {
         assert_eq!(run.result, Ok(()));
         assert_eq!(*run.keyring, ARM_TOKEN);
         assert!(run.forgets.is_empty());
+    }
+
+    /// Run `rekey_back_initializing` against a fake gnome-keyring, with
+    /// `initialize` standing in for the session bus. Returns the outcome,
+    /// the run and how often `initialize` was asked.
+    fn forget_against(
+        keyring: &[u8],
+        script: &[Control],
+        initialize: gkr_session::Initialized,
+    ) -> (Result<RekeyedBack, RekeyError>, ArmRun, usize) {
+        let outcome = std::cell::Cell::new(None);
+        let asked = std::cell::Cell::new(0);
+        let initialize = std::cell::Cell::new(Some(initialize));
+        let run = against(keyring, script, || {
+            outcome.set(Some(rekey_back_initializing(
+                ARM_TOKEN,
+                ARM_PASSWORD,
+                || {
+                    asked.set(asked.get() + 1);
+                    initialize.take().unwrap()
+                },
+            )));
+            Ok(())
+        });
+        (outcome.take().unwrap(), run, asked.get())
+    }
+
+    /// Right after login on Fedora 43 or 44, gnome-keyring is a `--login`
+    /// daemon nothing has initialized, which refuses every CHANGE. `forget`
+    /// has the bus start it once and the change back then goes through,
+    /// whether the keyring was keyed to the token or never took it.
+    #[test]
+    fn forget_initializes_a_login_started_gnome_keyring_once_and_retries() {
+        use gkr_session::Initialized;
+        let waiting = [
+            Control::Uninitialized,
+            Control::Uninitialized,
+            Control::Answer,
+            Control::Answer,
+        ];
+        let (outcome, run, asked) = forget_against(ARM_TOKEN, &waiting, Initialized::Now);
+        assert!(matches!(outcome, Ok(RekeyedBack::Rekeyed)), "{outcome:?}");
+        assert_eq!(*run.keyring, ARM_PASSWORD);
+        assert_eq!((asked, run.requests), (1, 4));
+
+        let (outcome, run, asked) = forget_against(ARM_PASSWORD, &waiting, Initialized::Now);
+        assert!(
+            matches!(outcome, Ok(RekeyedBack::AlreadyPassword)),
+            "{outcome:?}"
+        );
+        assert_eq!(*run.keyring, ARM_PASSWORD);
+        assert_eq!(asked, 1);
+
+        // Initialized, and keyed to something else after all: one start
+        // only, and the token is kept.
+        let (outcome, run, asked) = forget_against(b"another-secret", &waiting, Initialized::Now);
+        assert!(matches!(outcome, Err(RekeyError::Denied(_))), "{outcome:?}");
+        assert_eq!(*run.keyring, b"another-secret");
+        assert_eq!((asked, run.requests), (1, 4));
+    }
+
+    /// Without that daemon to initialize, or beside another Secret Service
+    /// provider, `forget` sends nothing more and keeps the token; only a
+    /// DENIED change back asks at all.
+    #[test]
+    fn forget_retries_only_after_an_initialization_and_only_on_denied() {
+        use gkr_session::Initialized;
+        let refused = [Control::Uninitialized, Control::Uninitialized];
+        for (case, initialize, says) in [
+            (
+                "not a login-started daemon",
+                Initialized::NotNeeded,
+                "denied",
+            ),
+            (
+                "another provider",
+                Initialized::OtherProvider,
+                "another Secret Service provider runs this session",
+            ),
+            (
+                "the start did not help",
+                Initialized::Failed("fixture failure".into()),
+                "fixture failure",
+            ),
+        ] {
+            let (outcome, run, asked) = forget_against(ARM_TOKEN, &refused, initialize);
+            let Err(RekeyError::Denied(e)) = &outcome else {
+                panic!("{case}: {outcome:?}");
+            };
+            assert!(e.contains(says), "{case}: {e}");
+            // A daemon waiting for initialization refuses whatever the
+            // secret, so only the plain refusal may blame the secret.
+            assert_eq!(
+                e.contains("wrong secret"),
+                matches!(case, "not a login-started daemon"),
+                "{case}: {e}"
+            );
+            assert_eq!(*run.keyring, ARM_TOKEN, "{case}: the token is kept");
+            assert_eq!((asked, run.requests), (1, 2), "{case}");
+        }
+        // No gnome-keyring at all, and a change back that goes through: no
+        // bus is asked.
+        let (outcome, _, asked) = forget_against(ARM_TOKEN, &[], Initialized::Now);
+        assert!(
+            matches!(outcome, Err(RekeyError::Unchanged(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(asked, 0);
+        let (outcome, _, asked) =
+            forget_against(ARM_TOKEN, &[Control::Answer; 2], Initialized::Now);
+        assert!(matches!(outcome, Ok(RekeyedBack::Rekeyed)), "{outcome:?}");
+        assert_eq!(asked, 0);
+    }
+
+    /// A token arm from a session whose gnome-keyring the login screen
+    /// started and nothing initialized sends gnome-keyring nothing. A fresh
+    /// token is rolled back and an earlier one kept.
+    #[test]
+    fn a_token_arm_in_a_session_without_an_initialized_gnome_keyring_sends_nothing() {
+        let refusal = || Some(gkr_session::NOT_A_GNOME_SESSION.to_string());
+        let run = against(ARM_PASSWORD, &[Control::Answer; 2], || {
+            finish_token_arm_in("testuser", ARM_PASSWORD, ARM_TOKEN, true, refusal)
+        });
+        let err = run.result.expect_err("not armed");
+        assert!(err.contains("not a GNOME session"), "{err}");
+        assert!(err.contains("rolled back"), "{err}");
+        assert_eq!(run.forgets, ["testuser"], "{err}");
+        assert_eq!(run.requests, 0, "nothing is sent: {err}");
+        assert_eq!(*run.keyring, ARM_PASSWORD, "{err}");
+
+        let run = against(ARM_PASSWORD, &[Control::Answer; 2], || {
+            finish_token_arm_in("testuser", ARM_PASSWORD, ARM_TOKEN, false, refusal)
+        });
+        let err = run.result.expect_err("not armed");
+        assert!(err.contains("left in place"), "{err}");
+        assert!(run.forgets.is_empty(), "{err}");
+        assert_eq!(run.requests, 0, "{err}");
     }
 }

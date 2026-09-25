@@ -27,13 +27,16 @@ const SECRETS_BUS: &str = "org.freedesktop.secrets";
 /// through `pam_oo7`.
 const OO7_DAEMON: &str = "oo7-daemon";
 
-/// Locale-pinned `busctl --user`, or `None` when busctl is not installed.
-fn busctl_user() -> Option<Command> {
+/// Locale-pinned `busctl --user` that activates nothing and waits at most
+/// `timeout_secs` for a reply, or `None` when busctl is not installed.
+fn busctl_user_within(timeout_secs: u32) -> Option<Command> {
     let path = which_busctl()?;
     let mut c = Command::new(path);
     c.env("LC_ALL", "C")
         .env("LANG", "C")
-        .args(["--user", "--timeout=3", "--auto-start=no"]);
+        .arg("--user")
+        .arg(format!("--timeout={timeout_secs}"))
+        .arg("--auto-start=no");
     Some(c)
 }
 
@@ -97,7 +100,7 @@ impl LoginKeyringProblem {
 /// or `oo7-daemon` from Fedora 45. Knowing which one lets the doctor line name
 /// the PAM module that unlocks it.
 fn provider_name() -> Option<String> {
-    let mut cmd = busctl_user()?;
+    let mut cmd = busctl_user_within(3)?;
     let out = cmd.args(["status", SECRETS_BUS]).output().ok()?;
     if !out.status.success() {
         return None;
@@ -235,7 +238,14 @@ fn query_collection() -> Collection {
 }
 
 fn busctl_output(args: &[&str]) -> Option<String> {
-    let out = busctl_user()?.args(args).output().ok()?;
+    busctl_output_within(3, args)
+}
+
+/// The stdout of one `busctl --user --auto-start=no` call that waits at most
+/// `timeout_secs` for its reply, or `None` when busctl is missing or the call
+/// failed.
+pub(crate) fn busctl_output_within(timeout_secs: u32, args: &[&str]) -> Option<String> {
+    let out = busctl_user_within(timeout_secs)?.args(args).output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())

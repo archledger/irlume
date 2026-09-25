@@ -311,6 +311,23 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume keyring forget` re-keys a GNOME keyring token back to the
+  password where the login screen started gnome-keyring and nothing in
+  the session has initialized it yet (`pam_gnome_keyring` with no socket
+  unit, as on Fedora 43 and 44). Such a gnome-keyring refuses every
+  re-key until then, so forget failed and kept the token. Now, when the
+  change back is refused, the process behind the control socket is a
+  `gnome-keyring-daemon --login`, `org.gnome.keyring` has no owner and no
+  other Secret Service provider owns `org.freedesktop.secrets`, forget
+  has the session bus start `org.gnome.keyring` once, as a GNOME
+  session's first keyring client does, and tries again. Beside another
+  provider, such as KDE's, it starts nothing and says to run forget from
+  a GNOME session. `irlume keyring arm`, `irlume setup` and the TUI's
+  Password Wallet no longer arm a token in such a session, for example a
+  Plasma session on an account whose only keyring is GNOME's: the token
+  would never be delivered there. They refuse before sealing, say this
+  is not a GNOME session, and change nothing (#250).
+
 - A GNOME keyring token armed on Fedora 43 or 44 is delivered even when
   gnome-keyring answers the first attempt with a timeout or a failure:
   the waiter asks for the keyring daemon again after half a second and

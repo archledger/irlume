@@ -204,7 +204,7 @@ fn detection_home() -> Option<PathBuf> {
 
 /// The home directory (passwd field 6) for `user`, via `getent passwd`, or
 /// `None` when getent is absent or the user is unknown.
-fn passwd_home(user: &str) -> Option<PathBuf> {
+pub(crate) fn passwd_home(user: &str) -> Option<PathBuf> {
     let out = std::process::Command::new("getent")
         .args(["passwd", user])
         .output()

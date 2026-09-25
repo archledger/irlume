@@ -795,10 +795,13 @@ pub enum Request {
     /// with a NUL byte, and one that fails its login-hash check where it can
     /// read the account's hash. Where it cannot (an LDAP or SSSD account, or
     /// the shipped AppArmor profile, which keeps the daemon out of
-    /// `/etc/shadow`), it refuses an arm over an armed GNOME keyring token, or
-    /// over an envelope it cannot read, from any peer, root included, and
-    /// changes nothing; `irlume keyring forget` and a fresh arm are the way
-    /// back. PRIVILEGED: root or `user`.
+    /// `/etc/shadow`), it refuses an arm over an armed GNOME keyring token.
+    /// Either way it refuses an arm over an envelope it cannot read, and one
+    /// that would replace an armed token with another kind. Each refusal
+    /// applies to any peer, root included, and changes nothing. Over a token,
+    /// `irlume keyring forget` and a fresh arm are the way back; an envelope
+    /// it cannot read is left for an irlume that can read it. PRIVILEGED:
+    /// root or `user`.
     SealPassword {
         user: String,
         password: SecretBytes,

@@ -243,6 +243,9 @@ throwaway dev daemon never write to the real system:
 | `IRLUME_PCR_SIGNATURE` / `IRLUME_PCR_PUBKEY` | the pcrlock signature JSON / public-key PEM | discovered on the system paths |
 | `IRLUME_PCRLOCK_JSON` | the systemd-pcrlock prediction file (Tier-2 gate) | `/var/lib/systemd/pcrlock.json` |
 | `IRLUME_SELINUX_PP` | the compiled SELinux module `irlume login` loads (source builds have no packaged `.pp`) | packaged path |
+| `IRLUME_METHOD_CONF` | the auth-method policy (auto, face, fingerprint, both) | `/etc/irlume/method` |
+| `IRLUME_EMITTER_LOCK_DIR` / `IRLUME_TPM_MARKER_DIR` | IR emitter locks / the raw-TPM marker | `/run/lock/irlume` |
+| `IRLUME_GKR_RUNTIME_DIR` | the runtime directory holding the GNOME keyring control socket (refused when privileged) | `/run/user/<uid>` |
 
 ## Example binaries
 
@@ -263,12 +266,14 @@ CLI tools, they open the camera directly and hold no privileged path.
 | `embed_parity` (irlume-auth) | whether concurrent-load RGB dimming shifts the face embedding enough to hurt recognition |
 | `landmark_dump` (irlume-auth) | IR strobe burst + per-frame FaceMesh coordinates and the IR brightness at each landmark, for landmark-relief prototyping |
 
-The `irlume-auth` examples load ONNX models, so they need `ORT_DYLIB_PATH`
-set (see the ONNX runtime section above; on an installed Fedora/RPM box,
-`/usr/share/irlume/onnxruntime/lib/libonnxruntime.so` works, on a Debian/PPA
-box `/opt/irlume/onnxruntime/lib/libonnxruntime.so.1.28.1`). Without it the
-process hangs instead of erroring: an upstream `ort` bug where building the
-load-failure message re-enters the API lock being initialized.
+The `irlume-auth` examples load ONNX models. Without `ORT_DYLIB_PATH` they
+use the first packaged runtime present
+(`/usr/share/irlume/onnxruntime/lib/libonnxruntime.so` on an installed
+Fedora/RPM box, `/opt/irlume/onnxruntime/lib/libonnxruntime.so` on a
+Debian/PPA box, which ships the upstream `libonnxruntime.so.1.28.1` beside
+that link), else the system loader; if that fails, or the runtime is
+older than 1.24, the model load fails at once with a load error. On a source
+checkout, set the variable (see the ONNX runtime section above).
 
 ### Using landmark_dump
 

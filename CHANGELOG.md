@@ -311,6 +311,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- A GNOME keyring token armed on Fedora 43 or 44 is delivered even when
+  gnome-keyring answers the first attempt with a timeout or a failure:
+  the waiter asks for the keyring daemon again after half a second and
+  tries it until its 120 s bound, instead of waiting for a daemon change
+  that a daemon which keeps running never makes (#250).
+
 - `pam_irlume` logs one warning when it cannot hand the GNOME keyring
   token on at login: `irlume-gkr-unlock` is missing, cannot be started,
   exits with an error or is ended by a signal, or is still running after

@@ -406,49 +406,17 @@ fn live_freshness_known_uvc_history_is_bounded_to_configured_endpoints() {
 
 #[test]
 fn live_freshness_capture_qualification_is_a_separate_explicit_request() {
-    use std::io::{BufRead, Write};
     let _guard = dead_socket();
     let socket = std::env::temp_dir().join(format!(
         "irlume-qualification-fixture-{}.sock",
         std::process::id()
     ));
-    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    std::env::set_var("IRLUME_SOCKET", &socket);
-    // The socket path is process-wide: a background worker left by another
-    // test can connect here first. Answer every connection with an error
-    // and return the first request that is the one under test.
-    let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let mut stream = match listener.accept() {
-                Ok((stream, _)) => stream,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(error) => panic!("qualification fixture accept did not finish: {error}"),
-            };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut line = String::new();
-            let _ = std::io::BufReader::new(&stream).read_line(&mut line);
-            let _ = writeln!(
-                stream,
-                "{}",
-                serde_json::to_string(&Response::Error("fixture: unavailable".into())).unwrap()
-            );
-            match serde_json::from_str::<Request>(&line) {
-                Ok(request @ Request::CaptureModeStatus) => return request,
-                _ if Instant::now() < deadline => continue,
-                other => panic!("qualification fixture saw no CaptureModeStatus; last: {other:?}"),
-            }
-        }
-    });
+    let server = serve_one(
+        &socket,
+        |request| matches!(request, Request::CaptureModeStatus),
+        Response::Error("fixture: unavailable".into()),
+        Duration::ZERO,
+    );
     let mut app = live_test_app();
     app.screen = SC_CAMERAS;
     app.on_key(KeyCode::Char('c'));
@@ -464,7 +432,6 @@ fn live_freshness_capture_qualification_is_a_separate_explicit_request() {
         app.poll();
         std::thread::sleep(Duration::from_millis(5));
     }
-    std::fs::remove_file(socket).unwrap();
     assert!(matches!(request, Request::CaptureModeStatus));
     assert!(app.qualification_load.is_none());
     assert!(app.camera_load.is_none());
@@ -527,6 +494,7 @@ fn live_freshness_unknown_reader_cannot_start_enrollment_or_claim_absence() {
 
 #[test]
 fn live_freshness_manual_camera_refresh_preserves_identity_and_queues_one_replacement() {
+    let _guard = dead_socket();
     let mut app = live_test_app();
     let mut snapshot = live_test_snapshot();
     snapshot.cameras.revision = 2;
@@ -580,6 +548,8 @@ fn live_freshness_manual_camera_refresh_preserves_identity_and_queues_one_replac
     app.poll();
     assert_eq!(app.pairs[app.cam_sel].rgb, "/dev/video60");
     assert!(!app.cameras_refresh_due(true));
+    // The polls started the due status and profile reads.
+    drain_loads(&mut app);
 }
 
 #[test]

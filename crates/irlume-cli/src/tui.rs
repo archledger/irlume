@@ -12130,16 +12130,30 @@ mod tests {
         }
     }
 
-    /// The requests a guided enrollment sends. The fake daemons below
-    /// check their order and skip every other request (`accept_wanted`).
-    fn enrollment_request(request: &Request) -> bool {
+    // The steps of the guided enrollment the fake daemons below serve, one
+    // predicate per step, each for the `test-user` account these tests
+    // enroll (other tests' workers use `testuser`). `accept_wanted` skips
+    // anything else, so a stray request cannot stand in for the step.
+
+    /// Opening the framing session.
+    fn framing_start(request: &Request) -> bool {
+        matches!(request, Request::PositionSession { user: Some(user) } if user == "test-user")
+    }
+
+    /// One framing sample on the fallback path.
+    fn framing_sample(request: &Request) -> bool {
+        matches!(request, Request::PositionSample { user: Some(user) } if user == "test-user")
+    }
+
+    /// The capture: any enrollment request for the account, so a test can
+    /// still tell one batch from the per-scan requests it replaces.
+    fn enrollment_capture(request: &Request) -> bool {
         matches!(
             request,
-            Request::PositionSession { .. }
-                | Request::PositionSample { .. }
-                | Request::EnrollmentSession { .. }
-                | Request::Enroll { .. }
-                | Request::AddScan { .. }
+            Request::EnrollmentSession { user, .. }
+                | Request::Enroll { user, .. }
+                | Request::AddScan { user, .. }
+                if user == "test-user"
         )
     }
 
@@ -12154,7 +12168,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             // The compatibility daemon rejects the new request before any
             // framing session is accepted, then serves the original API.
-            let (mut unsupported, _, initial) = accept_wanted(&listener, enrollment_request);
+            let (mut unsupported, _, initial) = accept_wanted(&listener, framing_start);
             assert!(matches!(
                 serde_json::from_str::<Request>(&initial).unwrap(),
                 Request::PositionSession { .. }
@@ -12167,7 +12181,7 @@ mod tests {
             .unwrap();
             drop(unsupported);
             for _ in 0..6 {
-                let (mut socket, _, line) = accept_wanted(&listener, enrollment_request);
+                let (mut socket, _, line) = accept_wanted(&listener, framing_sample);
                 assert!(matches!(
                     serde_json::from_str::<Request>(&line).unwrap(),
                     Request::PositionSample { .. }
@@ -12179,7 +12193,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            let (mut socket, _, line) = accept_wanted(&listener, enrollment_request);
+            let (mut socket, _, line) = accept_wanted(&listener, enrollment_capture);
             let batch = matches!(serde_json::from_str::<Request>(&line).unwrap(),Request::EnrollmentSession { scans:10, improve:false, ref user, .. } if user=="test-user");
             if !batch {
                 writeln!(
@@ -12245,7 +12259,7 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         std::env::set_var("IRLUME_SOCKET", &path);
         let server = std::thread::spawn(move || {
-            let (mut guide, mut reader, mut line) = accept_wanted(&listener, enrollment_request);
+            let (mut guide, mut reader, mut line) = accept_wanted(&listener, framing_start);
             if serde_json::from_str::<serde_json::Value>(&line).unwrap()
                 != serde_json::json!({"PositionSession":{"user":"test-user"}})
             {
@@ -12284,7 +12298,7 @@ mod tests {
             );
             drop(reader);
             drop(guide);
-            let (mut socket, _, line) = accept_wanted(&listener, enrollment_request);
+            let (mut socket, _, line) = accept_wanted(&listener, enrollment_capture);
             let batch = matches!(serde_json::from_str::<Request>(&line).unwrap(),Request::EnrollmentSession { scans:10, improve:false, ref user, .. } if user=="test-user");
             if !batch {
                 writeln!(
@@ -12350,7 +12364,7 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         std::env::set_var("IRLUME_SOCKET", &path);
         let server = std::thread::spawn(move || {
-            let (mut stream, mut reader, mut line) = accept_wanted(&listener, enrollment_request);
+            let (mut stream, mut reader, mut line) = accept_wanted(&listener, framing_start);
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
@@ -19242,6 +19256,20 @@ mod tests {
                         .read_line(&mut line)
                         .unwrap();
                     let request: Request = serde_json::from_str(&line).unwrap();
+                    // A worker another test left running asks for its own
+                    // account: refuse it and keep it out of the record.
+                    let stray = match &request {
+                        Request::KeyringMetadata { user }
+                        | Request::KeyringInfo { user }
+                        | Request::HasSealedPassword { user }
+                        | Request::RecoveryStatus { user } => user != "light-poll-user",
+                        _ => false,
+                    };
+                    if stray {
+                        let refusal = Response::Error("not the request under test".into());
+                        let _ = writeln!(socket, "{}", serde_json::to_string(&refusal).unwrap());
+                        continue;
+                    }
                     let last = matches!(request, Request::RecoveryStatus { .. });
                     let response = match &request {
                         Request::Ping => Response::Pong,
@@ -19263,13 +19291,13 @@ mod tests {
                 }
                 requested
             });
-            let state = LightState::gather("testuser", None);
+            let state = LightState::gather("light-poll-user", None);
             let requests = server.join().unwrap();
             std::fs::remove_file(&path).unwrap();
             assert_eq!(state.keyring_armed, Some(true));
-            assert!(requests
-                .iter()
-                .any(|r| matches!(r, Request::KeyringMetadata { user } if user == "testuser")));
+            assert!(requests.iter().any(
+                |r| matches!(r, Request::KeyringMetadata { user } if user == "light-poll-user")
+            ));
             assert!(
                 !requests
                     .iter()
@@ -19395,12 +19423,28 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         std::env::set_var("IRLUME_SOCKET", &path);
         let started = std::time::Instant::now();
-        let mut app = App::new("testuser".into());
+        let mut app = App::new("constructor-user".into());
         assert!(
             started.elapsed() < Duration::from_millis(200),
             "construction must not wait for observations"
         );
-        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        // Nothing was asked for this account. A worker another test left
+        // running may still connect (IRLUME_SOCKET is process-wide), so a
+        // connection alone proves nothing: its request names its own
+        // account, or none (a Ping), and a request construction waited on
+        // would have broken the time bound above.
+        while let Ok((stream, _)) = listener.accept() {
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut line = String::new();
+            let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(&stream), &mut line);
+            assert!(
+                !line.contains("constructor-user"),
+                "construction sent {line}"
+            );
+        }
         app.screen = SC_FINGERPRINT;
         assert!(draw_text(&app).contains("unknown"));
         std::fs::remove_file(path).unwrap();

@@ -7,12 +7,27 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Keyring arms seal the login password where oo7 keeps the login
+  keyring, as on Fedora 45 GNOME, whose login screen hands the password
+  to `oo7-daemon` through `pam_oo7`: oo7 opens the keyring with that
+  password and cannot open one keyed to a GNOME keyring token. irlumed
+  looks for oo7's files in the default keyring directory
+  (`~/.local/share/keyrings/v1/`, or the `login.keyring.migrated` stamp
+  oo7 leaves after copying a gnome-keyring file), and `keyring arm`,
+  `reseal`, `setup` and the TUI, run in the user's own session, also
+  ask which program provides the Secret Service. Such an arm keeps a
+  GNOME keyring token that is already armed: it refuses and names
+  `irlume keyring forget`, which re-keys the keyring back to the
+  password through gnome-keyring. `irlume doctor` names `pam_oo7` as
+  the module that unlocks `oo7-daemon`, and `irlume login status`
+  counts pam_oo7's auth and session lines as a keyring hand-off.
+
 - **With a GNOME keyring token armed on Fedora 43 or 44, run
   `irlume keyring forget` before upgrading to Fedora 45.** On Fedora 45
   the login screen unlocks the login keyring through oo7, which migrates
   it with the login password, so a keyring keyed to a token does not
-  carry over. Do not arm again on Fedora 45 until an irlume update
-  supports its keyring; until then the password opens it as usual.
+  carry over. After the first login on Fedora 45, `irlume keyring arm`
+  seals the login password, which oo7 accepts.
   `irlume doctor` (new check `keyring-os-upgrade`),
   `irlume keyring status`, `irlume keyring arm` and the TUI's Password
   Wallet page and Diagnostics give this step on Fedora 43 and 44.

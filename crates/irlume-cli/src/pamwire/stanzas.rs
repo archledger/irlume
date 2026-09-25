@@ -128,6 +128,12 @@ pub(super) const POLKIT_VERIFY_STANZA: &str =
 /// KDE's kwallet-pam still installs `pam_kwallet5.so` under Plasma 6 (the
 /// running provider process is `ksecretd`, but the PAM module kept the 5 in its
 /// name); older Plasma and a few distros ship `pam_kwallet.so`. GNOME ships
-/// `pam_gnome_keyring.so`.
-pub(super) const KEYRING_CONSUMERS: &[&str] =
-    &["pam_kwallet5.so", "pam_kwallet.so", "pam_gnome_keyring.so"];
+/// `pam_gnome_keyring.so`, and GDM 51 on Fedora 45 adds `pam_oo7.so`, whose
+/// auth half stashes `PAM_AUTHTOK` and whose session half hands it to
+/// `oo7-daemon`, the same two halves.
+pub(super) const KEYRING_CONSUMERS: &[&str] = &[
+    "pam_kwallet5.so",
+    "pam_kwallet.so",
+    "pam_gnome_keyring.so",
+    "pam_oo7.so",
+];

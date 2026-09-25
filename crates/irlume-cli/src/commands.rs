@@ -1654,17 +1654,26 @@ pub fn reseal(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let req = Request::SealPassword {
-        // Off NixOS `None`: the daemon judges from what the user has.
-        kind,
-        user,
-        // Copy the bytes out rather than moving the `String`: `Zeroizing` owns
-        // the buffer and wipes it on drop, and `SecretBytes` wipes the copy.
-        password: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
-        wallet_salt,
-        wallet_salt_checked: true,
+    // On NixOS the module's rules decide (a login password). Elsewhere the
+    // daemon judges from what the user has, unless oo7 runs this session's
+    // Secret Service (it takes the login password).
+    let kind = match kind {
+        Some(kind) => Ok(Some(kind)),
+        None => crate::secrets::arm_kind_hint(&user, wallet_salt.as_ref()),
     };
-    match daemon_request(&req) {
+    let reply = kind.and_then(|kind| {
+        daemon_request(&Request::SealPassword {
+            kind,
+            user,
+            // Copy the bytes out rather than moving the `String`: `Zeroizing`
+            // owns the buffer and wipes it on drop, and `SecretBytes` wipes
+            // the copy.
+            password: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
+            wallet_salt,
+            wallet_salt_checked: true,
+        })
+    });
+    match reply {
         Ok(Response::PasswordSealed) => {
             println!("[reseal] re-bound to current PCRs {OK}; face unlock will release it again.");
             ExitCode::SUCCESS
@@ -1793,17 +1802,29 @@ pub fn setup(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match daemon_request(&Request::SealPassword {
-                // Off NixOS `None`: the daemon judges from what the user has.
-                kind,
-                user: user.clone(),
-                // `pw` has to outlive this request for the token branch below,
-                // so the bytes are copied rather than moved. The old `.clone()`
-                // here left a whole second password on the heap unwiped.
-                password: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
-                wallet_salt,
-                wallet_salt_checked: true,
-            }) {
+            // On NixOS the module's rules decide (a login password).
+            // Elsewhere the daemon judges from what the user has, unless oo7
+            // runs this session's Secret Service (it takes the login
+            // password); an armed GNOME keyring token stops the arm there
+            // before anything is sent.
+            let kind = match kind {
+                Some(kind) => Ok(Some(kind)),
+                None => crate::secrets::arm_kind_hint(&user, wallet_salt.as_ref()),
+            };
+            let reply = kind.and_then(|kind| {
+                daemon_request(&Request::SealPassword {
+                    kind,
+                    user: user.clone(),
+                    // `pw` has to outlive this request for the token branch
+                    // below, so the bytes are copied rather than moved. The
+                    // old `.clone()` here left a whole second password on
+                    // the heap unwiped.
+                    password: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
+                    wallet_salt,
+                    wallet_salt_checked: true,
+                })
+            });
+            match reply {
                 Ok(Response::PasswordSealed) => println!("  armed {OK}"),
                 // GNOME token arm: the wizard runs in the user's session, so
                 // it can finish the re-key exactly like `keyring arm`.

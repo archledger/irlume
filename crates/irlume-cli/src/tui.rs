@@ -6592,16 +6592,26 @@ impl App {
                             Ok(fields) => fields,
                             Err(e) => return (false, format!("keyring arm failed: {e}")),
                         };
-                        let req = Request::SealPassword {
-                            // Off NixOS `None`: the daemon judges from what
-                            // the user has.
-                            kind,
-                            user: user.clone(),
-                            password: irlume_common::SecretBytes::new(pw.to_vec()),
-                            wallet_salt,
-                            wallet_salt_checked: true,
+                        // On NixOS the module's rules decide (a login
+                        // password). Elsewhere the daemon judges from what the
+                        // user has, unless oo7 runs this session's Secret
+                        // Service (it takes the login password); an armed
+                        // GNOME keyring token stops the arm there before
+                        // anything is sent.
+                        let kind = match kind {
+                            Some(kind) => Ok(Some(kind)),
+                            None => crate::secrets::arm_kind_hint(&user, wallet_salt.as_ref()),
                         };
-                        match crate::daemon_request(&req) {
+                        let reply = kind.and_then(|kind| {
+                            crate::daemon_request(&Request::SealPassword {
+                                kind,
+                                user: user.clone(),
+                                password: irlume_common::SecretBytes::new(pw.to_vec()),
+                                wallet_salt,
+                                wallet_salt_checked: true,
+                            })
+                        });
+                        match reply {
                             Ok(Response::TokenSealed { token, minted }) => {
                                 match crate::finish_token_arm(&user, &pw, token.expose(), minted) {
                                     Ok(()) => {

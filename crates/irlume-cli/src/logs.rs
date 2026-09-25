@@ -14,8 +14,9 @@
 //! The view greps the SYSTEM journal for the whole face-auth story in one
 //! stream: `irlumed` daemon lines (attempts, scores, gate reasons, [debug]
 //! pipeline traces), PAM audit records naming `pam_irlume` (what the greeter
-//! actually granted), and the keyring modules (`pam_kwallet*`,
-//! `pam_gnome_keyring`) that a face login is supposed to feed.
+//! actually granted), and the keyring modules a face login is supposed to
+//! feed: `pam_kwallet*`, `pam_gnome_keyring` (whose own lines are tagged
+//! `gkr-pam`), and `pam_oo7` with the `oo7-daemon` it starts.
 
 use crate::is_root;
 use std::path::Path;
@@ -23,7 +24,7 @@ use std::process::{Command, ExitCode};
 
 const DROPIN_DIR: &str = "/etc/systemd/system/irlumed.service.d";
 const DROPIN: &str = "/etc/systemd/system/irlumed.service.d/50-irlume-debug.conf";
-const PATTERN: &str = "irlume|pam_kwallet|pam_gnome_keyring";
+const PATTERN: &str = "irlume|pam_kwallet|pam_gnome_keyring|gkr-pam|pam_oo7|oo7-daemon";
 
 /// Whether the debug-logging drop-in is active (the TUI's toggle reads this
 /// to know which way `logs debug` should flip).
@@ -306,6 +307,26 @@ mod tests {
 
     fn opts(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Every keyring provider's own journal lines match the filter:
+    /// pam_gnome_keyring logs as `gkr-pam`, and oo7 has its PAM module and
+    /// daemon.
+    #[test]
+    fn the_filter_matches_every_keyring_provider() {
+        let alternatives: Vec<&str> = PATTERN.split('|').collect();
+        for line in [
+            "gdm-password][2823]: gkr-pam: stashed password to try later in open session",
+            "gdm-password][2823]: pam_oo7(gdm-password:session): unlock failed",
+            "oo7-daemon[1234]: failed to unlock the login collection",
+            "plasmalogin[912]: pam_kwallet5(plasmalogin:session): open_session called without kwallet5_key",
+            "irlumed[2637]: irlumed: UnsealKeyring: OK",
+        ] {
+            assert!(
+                alternatives.iter().any(|needle| line.contains(needle)),
+                "{line}"
+            );
+        }
     }
 
     #[test]

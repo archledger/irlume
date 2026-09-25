@@ -4,11 +4,11 @@
 //! Secret Service (login keyring) diagnostics for `irlume doctor`.
 //!
 //! Bitwarden's biometric unlock, and any app that stores secrets, needs a
-//! Secret Service provider (GNOME Keyring or KWallet) running on the session
-//! bus with a default collection unlocked. The provider can be running without
-//! a default collection, or applications can reach a different provider from
-//! the wallet Irlume unlocks. Report those states separately from a locked
-//! wallet; none alone proves that the sealed credential is stale.
+//! Secret Service provider (GNOME Keyring, KWallet or oo7) running on the
+//! session bus with a default collection unlocked. The provider can be running
+//! without a default collection, or applications can reach a different
+//! provider from the wallet Irlume unlocks. Report those states separately
+//! from a locked wallet; none alone proves that the sealed credential is stale.
 //!
 //! This probe shells out to `busctl --user` rather than linking a D-Bus client,
 //! matching how irlume-fingerprint talks to fprintd. It only inspects the
@@ -21,6 +21,11 @@ use std::process::Command;
 /// The service can exist without a default collection (ReadAlias returns `/`).
 const SECRETS_PATH: &str = "/org/freedesktop/secrets";
 const SECRETS_BUS: &str = "org.freedesktop.secrets";
+
+/// oo7's Secret Service, as `busctl status` names it (`/usr/libexec/oo7-daemon`
+/// on Fedora, `/usr/lib/oo7-daemon` on Arch). GDM 51 on Fedora 45 unlocks it
+/// through `pam_oo7`.
+const OO7_DAEMON: &str = "oo7-daemon";
 
 /// Locale-pinned `busctl --user`, or `None` when busctl is not installed.
 fn busctl_user() -> Option<Command> {
@@ -88,8 +93,9 @@ impl LoginKeyringProblem {
 
 /// The process backing `org.freedesktop.secrets`, as a friendly name. KDE
 /// Plasma 6 uses `ksecretd` (launched by pam_kwallet5 with `--pam-login`);
-/// older KDE uses `kwalletd6`/`kwalletd5`; GNOME uses `gnome-keyring-daemon`.
-/// Knowing which one lets the doctor line name the PAM module that unlocks it.
+/// older KDE uses `kwalletd6`/`kwalletd5`; GNOME uses `gnome-keyring-daemon`,
+/// or `oo7-daemon` from Fedora 45. Knowing which one lets the doctor line name
+/// the PAM module that unlocks it.
 fn provider_name() -> Option<String> {
     let mut cmd = busctl_user()?;
     let out = cmd.args(["status", SECRETS_BUS]).output().ok()?;
@@ -111,7 +117,70 @@ fn unlock_module_for(provider: &str) -> Option<&'static str> {
     match provider {
         "ksecretd" | "kwalletd6" | "kwalletd5" => Some("pam_kwallet5"),
         "gnome-keyring-d" | "gnome-keyring-daemon" => Some("pam_gnome_keyring"),
+        OO7_DAEMON => Some("pam_oo7"),
         _ => None,
+    }
+}
+
+/// The kind a keyring arm for `user` asks irlumed for (`None` leaves the
+/// choice to irlumed, which decides from the account's home), or, as the
+/// error, why the arm stops before anything is sent.
+///
+/// Where oo7-daemon provides the Secret Service in the caller's own session,
+/// the answer is the login password: oo7 opens the login keyring with it and
+/// cannot open one keyed to a GNOME keyring token, and irlumed cannot see the
+/// session bus. A KDE wallet salt leaves the choice to irlumed, which weighs
+/// the wallet key against the password. A root caller's session bus is not
+/// the target account's, so root leaves it to irlumed, as does a caller with
+/// no session bus or no answer.
+///
+/// Before asking for the login password it asks irlumed what is armed
+/// (`KeyringInfo`, which every irlumed that can seal a token answers with
+/// the kind). An older irlumed seals a requested kind without checking for
+/// an armed GNOME keyring token, the only copy of what the login keyring is
+/// keyed to, so an armed token stops the arm here; a reply that does not say
+/// what is armed leaves the choice to irlumed.
+pub(crate) fn arm_kind_hint(
+    user: &str,
+    wallet_salt: Option<&irlume_common::WalletSalt>,
+) -> Result<Option<irlume_common::KeyringSecretKind>, String> {
+    arm_kind_from(
+        user,
+        wallet_salt,
+        !crate::is_root() && have_session_bus(),
+        provider_name,
+        || crate::daemon_request(&irlume_common::Request::KeyringInfo { user: user.into() }),
+    )
+}
+
+/// [`arm_kind_hint`] with its inputs passed in. `own_session`: the caller is
+/// not root and has a session bus. `provider` names the owner of
+/// `org.freedesktop.secrets` on it, and `armed` asks irlumed what is armed;
+/// each runs only when everything before it points at oo7.
+fn arm_kind_from(
+    user: &str,
+    wallet_salt: Option<&irlume_common::WalletSalt>,
+    own_session: bool,
+    provider: impl FnOnce() -> Option<String>,
+    armed: impl FnOnce() -> Result<irlume_common::Response, String>,
+) -> Result<Option<irlume_common::KeyringSecretKind>, String> {
+    if wallet_salt.is_some() || !own_session || provider().as_deref() != Some(OO7_DAEMON) {
+        return Ok(None);
+    }
+    match crate::upgrade_notice::token_armed(&armed()) {
+        Some(true) => Err(format!(
+            "'{user}' has a GNOME keyring token armed, and oo7 provides this session's \
+             Secret Service, so this arm would replace the token with the login password; \
+             nothing was changed. The token is the only copy of what the login keyring is \
+             keyed to. Run `irlume keyring forget` first, as '{user}' with gnome-keyring \
+             running: it re-keys the keyring back to the password. Then run `irlume keyring \
+             arm`."
+        )),
+        // Nothing armed, or a login password or KDE wallet key.
+        Some(false) => Ok(Some(irlume_common::KeyringSecretKind::LoginPassword)),
+        // Armed with a kind irlumed does not report (an older one, or an
+        // envelope it cannot read), a refusal, no answer or another reply.
+        None => Ok(None),
     }
 }
 
@@ -241,7 +310,7 @@ pub fn report_keyring_status(report: &mut crate::doctor_report::Report) {
             format!("login keyring{who}: {}.\n     {}",
                 LoginKeyringProblem::MissingDefault.description(), LoginKeyringProblem::MissingDefault.advice())),
         Collection::NoProvider => (State::Info,
-            "login keyring: no Secret Service provider running (GNOME Keyring / KWallet). Your desktop normally starts it at login.".to_string()),
+            "login keyring: no Secret Service provider running (GNOME Keyring, KWallet or oo7). Your desktop normally starts it at login.".to_string()),
         Collection::Unavailable => (State::Unknown,
             "login keyring: could not determine the default collection's state; check the session bus and Secret Service provider.".to_string()),
     };
@@ -252,7 +321,91 @@ pub fn report_keyring_status(report: &mut crate::doctor_report::Report) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_locked, unlock_module_for};
+    use super::{arm_kind_from, parse_locked, unlock_module_for};
+
+    /// An arm asks for the login password only where oo7 provides the
+    /// caller's own Secret Service and irlumed says no GNOME keyring token is
+    /// armed. An armed token stops the arm before anything is sent, even to
+    /// an older irlumed that would seal the login password over it. Every
+    /// other case leaves the choice to irlumed, and the bus and irlumed are
+    /// asked only when the answer depends on them.
+    #[test]
+    fn an_arm_asks_for_the_login_password_only_where_oo7_can_take_it() {
+        use irlume_common::{KeyringSecretKind as Kind, Response};
+        let info = |armed, kind| {
+            Ok(Response::KeyringInfo {
+                armed,
+                policy: None,
+                pcrs: Vec::new(),
+                drifted: None,
+                kind,
+            })
+        };
+        let oo7 = || Some("oo7-daemon".to_string());
+        let no_probe = || -> Option<String> { panic!("the session bus must not be probed") };
+        let no_ask = || -> Result<Response, String> { panic!("irlumed must not be asked") };
+        let salt =
+            irlume_common::WalletSalt::new(vec![0x5a; irlume_common::kwallet_wire::SALT_LEN])
+                .unwrap();
+
+        // A KDE wallet salt, or a root caller or one without a session bus.
+        assert_eq!(
+            arm_kind_from("alice", Some(&salt), true, oo7, no_ask),
+            Ok(None)
+        );
+        assert_eq!(
+            arm_kind_from("alice", None, false, no_probe, no_ask),
+            Ok(None)
+        );
+        // busctl missing or failing, or another provider.
+        for provider in [None, Some("gnome-keyring-d"), Some("ksecretd")] {
+            assert_eq!(
+                arm_kind_from("alice", None, true, || provider.map(str::to_string), no_ask),
+                Ok(None),
+                "{provider:?}"
+            );
+        }
+        // oo7 with nothing armed, or a login password or KDE wallet key.
+        for reply in [
+            info(false, None),
+            info(true, Some(Kind::LoginPassword)),
+            info(true, Some(Kind::KdeWalletKey)),
+        ] {
+            let label = format!("{reply:?}");
+            assert_eq!(
+                arm_kind_from("alice", None, true, oo7, || reply),
+                Ok(Some(Kind::LoginPassword)),
+                "{label}"
+            );
+        }
+        // oo7 with a GNOME keyring token armed.
+        let refusal = arm_kind_from("alice", None, true, oo7, || {
+            info(true, Some(Kind::GnomeKeyringToken))
+        })
+        .unwrap_err();
+        for part in [
+            "'alice' has a GNOME keyring token armed",
+            "nothing was changed",
+            "irlume keyring forget",
+            "gnome-keyring running",
+        ] {
+            assert!(refusal.contains(part), "{part}: {refusal}");
+        }
+        // oo7, but irlumed does not say what is armed.
+        for reply in [
+            info(true, None),
+            Ok(Response::Error("bad request".into())),
+            Err("irlumed is not running".into()),
+            Ok(Response::HasPassword(true)),
+        ] {
+            let label = format!("{reply:?}");
+            assert_eq!(
+                arm_kind_from("alice", None, true, oo7, || reply),
+                Ok(None),
+                "{label}"
+            );
+        }
+    }
 
     // Run the real probe/report in a child process so fixture PATH and bus
     // environment cannot race unrelated unit tests or touch the user's bus.
@@ -369,6 +522,77 @@ esac
         }
     }
 
+    /// Doctor names the running provider and the PAM module that unlocks
+    /// it at login: `pam_oo7` for oo7-daemon (Fedora 45 GNOME), as for the
+    /// gnome-keyring and KWallet daemons.
+    #[test]
+    fn doctor_names_the_module_that_unlocks_each_provider() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("irlume-secrets-comm-{}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let busctl = dir.join("busctl");
+        std::fs::write(
+            &busctl,
+            r#"#!/bin/sh
+case "$*" in
+  *"status org.freedesktop.secrets") printf 'Comm=%s\n' "$IRLUME_TEST_SECRET_COMM" ;;
+  *"NameHasOwner s org.freedesktop.secrets") printf 'b true\n' ;;
+  *"ReadAlias s default") printf 'o "/org/freedesktop/secrets/collection/login"\n' ;;
+  *"org.freedesktop.Secret.Collection Locked") printf 'b true\n' ;;
+  *) exit 64 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&busctl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (comm, module) in [
+            ("oo7-daemon", "pam_oo7"),
+            ("gnome-keyring-d", "pam_gnome_keyring"),
+            ("ksecretd", "pam_kwallet5"),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "secrets::tests::secret_service_fixture_child",
+                    "--nocapture",
+                ])
+                .env("PATH", &dir)
+                .env(
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    "unix:path=/nonexistent-irlume-test-bus",
+                )
+                .env("IRLUME_TEST_SECRET_STATE", "locked")
+                .env("IRLUME_TEST_SECRET_COMM", comm)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{comm}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let json = stdout
+                .lines()
+                .find_map(|line| line.split_once("IRLUME_FIXTURE_RESULT=").map(|(_, v)| v))
+                .expect(&stdout);
+            let checks: serde_json::Value = serde_json::from_str(json).unwrap();
+            let detail = checks["checks"][0]["detail"].as_str().unwrap();
+            assert!(detail.contains(&format!("[{comm}]")), "{comm}: {detail}");
+            assert!(
+                detail.contains(&format!("via {module}.")),
+                "{comm}: {detail}"
+            );
+        }
+    }
+
     #[test]
     fn secret_service_fixture_child() {
         if std::env::var_os("IRLUME_TEST_SECRET_STATE").is_none() {
@@ -428,6 +652,8 @@ esac
             unlock_module_for("gnome-keyring-d"),
             Some("pam_gnome_keyring")
         );
+        // oo7-daemon, the Secret Service GDM 51 unlocks through pam_oo7.
+        assert_eq!(unlock_module_for("oo7-daemon"), Some("pam_oo7"));
         // An unknown provider yields no hint rather than a wrong one.
         assert_eq!(unlock_module_for("keepassxc"), None);
     }

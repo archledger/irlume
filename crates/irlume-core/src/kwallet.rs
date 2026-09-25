@@ -56,13 +56,18 @@ pub fn derive_key(secret: &[u8], salt: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
 }
 
 /// Which secret to seal for a user, combining the caller's account-scoped KDE
-/// salt result with the GNOME keyring visible below `home`.
+/// salt result with the GNOME keyrings visible below `home`.
 ///
 /// A KDE wallet key only makes sense where there is a KDE wallet. A GNOME
 /// keyring token only makes sense where there is a GNOME login keyring to
 /// re-key to it, and not where a KDE wallet also exists: the wallet key is
 /// derived from the password, so a token arm would leave the KDE wallet with
 /// nothing to open it.
+///
+/// A home oo7 keeps (see [`oo7_keeps_keyrings`]) is never given a token: oo7
+/// opens the login keyring with the login password, which `pam_oo7` passes on
+/// at login, and cannot open one keyed to a token. It still counts as a GNOME
+/// backend beside a KDE wallet.
 ///
 /// The conservative direction is [`crate::envelope::SecretKind::LoginPassword`],
 /// the behaviour before #250, so anything ambiguous (both backends, neither)
@@ -73,12 +78,24 @@ pub fn detect_kind(home: &Path, has_kde_salt: bool) -> crate::envelope::SecretKi
     use crate::envelope::SecretKind;
     // gnome-keyring's login keyring: what a token re-keys, and what a wallet
     // key arm would break.
-    let has_gnome = home.join(".local/share/keyrings/login.keyring").exists();
-    match (has_kde_salt, has_gnome) {
-        (true, false) => SecretKind::KdeWalletKey,
-        (false, true) => SecretKind::GnomeKeyringToken,
+    let has_gnome_keyring = home.join(".local/share/keyrings/login.keyring").exists();
+    match (has_kde_salt, has_gnome_keyring, oo7_keeps_keyrings(home)) {
+        (true, false, false) => SecretKind::KdeWalletKey,
+        (false, true, false) => SecretKind::GnomeKeyringToken,
         _ => SecretKind::LoginPassword,
     }
+}
+
+/// Whether oo7, the Secret Service GDM 51 unlocks through `pam_oo7`, keeps
+/// the keyrings below `home`.
+///
+/// oo7 stores keyrings under `keyrings/v1/`. When it copies a gnome-keyring
+/// file there it writes a `.migrated` stamp beside the original and leaves
+/// the original in place, so a home upgraded from gnome-keyring still has
+/// `login.keyring` and is told apart by the stamp or the directory.
+pub fn oo7_keeps_keyrings(home: &Path) -> bool {
+    let keyrings = home.join(".local/share/keyrings");
+    keyrings.join("v1").is_dir() || keyrings.join("login.keyring.migrated").exists()
 }
 
 #[cfg(test)]
@@ -231,6 +248,82 @@ mod tests {
         assert_eq!(
             detect_kind(&mk("kde", false), true),
             SecretKind::KdeWalletKey
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// oo7 opens the login keyring with the login password and cannot open
+    /// one keyed to a token, so a home oo7 has written to never gets a token.
+    /// Its markers: the `keyrings/v1/` directory it keeps keyrings in, and the
+    /// `.migrated` stamp it leaves beside a gnome-keyring file it has copied
+    /// (the file itself stays). A home upgraded from gnome-keyring has all
+    /// three. oo7 counts as a second backend next to a KDE wallet, so that
+    /// home also keeps the password.
+    #[test]
+    fn detect_kind_declines_a_token_where_oo7_keeps_the_keyring() {
+        use crate::envelope::SecretKind;
+        let base = std::env::temp_dir().join(format!("irlume-detect-oo7-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mk = |name: &str, files: &[&str], dirs: &[&str]| {
+            let h = base.join(name);
+            let keyrings = h.join(".local/share/keyrings");
+            std::fs::create_dir_all(&keyrings).unwrap();
+            for d in dirs {
+                std::fs::create_dir_all(keyrings.join(d)).unwrap();
+            }
+            for f in files {
+                std::fs::write(keyrings.join(f), b"x").unwrap();
+            }
+            h
+        };
+
+        let upgraded = mk(
+            "upgraded",
+            &[
+                "login.keyring",
+                "login.keyring.migrated",
+                "v1/login.keyring",
+            ],
+            &["v1"],
+        );
+        assert_eq!(
+            detect_kind(&upgraded, false),
+            SecretKind::LoginPassword,
+            "an upgraded home keeps the gnome-keyring file beside oo7's copy"
+        );
+        for (name, files, dirs) in [
+            (
+                "stamp-only",
+                &["login.keyring", "login.keyring.migrated"][..],
+                &[][..],
+            ),
+            ("v1-beside-v0", &["login.keyring"][..], &["v1"][..]),
+            ("fresh-oo7", &["v1/login.keyring"][..], &["v1"][..]),
+            ("empty-v1", &[][..], &["v1"][..]),
+        ] {
+            assert_eq!(
+                detect_kind(&mk(name, files, dirs), false),
+                SecretKind::LoginPassword,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            detect_kind(&mk("kde-and-oo7", &[], &["v1"]), true),
+            SecretKind::LoginPassword,
+            "a KDE wallet beside an oo7 keyring is two backends"
+        );
+        // The stamp belongs to the file it names: another keyring's stamp
+        // says nothing about the login keyring.
+        assert_eq!(
+            detect_kind(
+                &mk(
+                    "other-stamp",
+                    &["login.keyring", "Default.keyring.migrated"],
+                    &[]
+                ),
+                false
+            ),
+            SecretKind::GnomeKeyringToken
         );
         let _ = std::fs::remove_dir_all(&base);
     }

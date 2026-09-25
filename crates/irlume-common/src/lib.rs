@@ -796,8 +796,10 @@ pub enum Request {
     /// read the account's hash. Where it cannot (an LDAP or SSSD account, or
     /// the shipped AppArmor profile, which keeps the daemon out of
     /// `/etc/shadow`), it refuses an arm over an armed GNOME keyring token.
-    /// Either way it refuses an arm over an envelope it cannot read, and one
-    /// that would replace an armed token with another kind. Each refusal
+    /// Either way it refuses an arm over an envelope it cannot read, one that
+    /// would replace an armed token with another kind, detected or requested,
+    /// and a requested `GnomeKeyringToken` where oo7 keeps the account's
+    /// keyrings (oo7 opens them with the login password). Each refusal
     /// applies to any peer, root included, and changes nothing. Over a token,
     /// `irlume keyring forget` and a fresh arm are the way back; an envelope
     /// it cannot read is left for an irlume that can read it. PRIVILEGED:
@@ -813,6 +815,13 @@ pub enum Request {
         /// `None` is also what an older client sends, and resolving it by
         /// inspection is the right answer for one: a KDE-only machine gets the
         /// wallet key without the client having to know to ask.
+        ///
+        /// Current clients send `LoginPassword` when `oo7-daemon` provides the
+        /// Secret Service in the caller's own session, which the daemon cannot
+        /// see, and `None` otherwise. An older daemon seals a requested kind
+        /// without checking for an armed token, so before sending
+        /// `LoginPassword` such a client asks `KeyringInfo` and stops when a
+        /// GNOME keyring token is armed; when it cannot tell, it sends `None`.
         #[serde(default)]
         kind: Option<KeyringSecretKind>,
         /// Account-scoped KDE wallet salt read by the authorized caller. The

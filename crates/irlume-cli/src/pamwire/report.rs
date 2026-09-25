@@ -173,8 +173,9 @@ pub(super) fn report_keyring_handoff() {
             None => println!(
                 "  ⚠ {}: a face or fingerprint login releases your login password, but no\n     \
                  keyring module reads it afterwards, so KWallet/the login keyring will\n     \
-                 still prompt. Install kwallet-pam (KDE) or gnome-keyring (GNOME); if it\n     \
-                 is already installed, its auth line must sit BELOW the pam_irlume line.",
+                 still prompt. Install kwallet-pam (KDE), or gnome-keyring or pam_oo7\n     \
+                 (GNOME); if it is already installed, its auth line must sit BELOW the\n     \
+                 pam_irlume line.",
                 w.service
             ),
         }

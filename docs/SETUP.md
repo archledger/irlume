@@ -298,6 +298,24 @@ startup`: it tries the typed password first, which no longer opens a keyring
 keyed to the token. That line is expected, and the token's success clears it.
 [DEBUGGING.md](DEBUGGING.md) lists every line the waiter writes.
 
+Where the login screen starts gnome-keyring (`pam_gnome_keyring.so auto_start`
+with no socket unit, as on Fedora 43 and 44), the daemon refuses every request
+until the session's first keyring client initializes it. A GNOME session does
+that within seconds of login; a Plasma session does not. So where the login
+screen started gnome-keyring and nothing in the session initialized it, such as
+a Plasma session on an account whose only keyring is GNOME's,
+`irlume keyring arm`, `irlume setup` and the TUI refuse a token before anything
+is sealed: they say this is not a GNOME session and change nothing. Arm from a
+GNOME session.
+
+`irlume keyring forget` works in such a session too. When gnome-keyring refuses
+the change back, and the process behind its control socket is a
+`gnome-keyring-daemon --login` that has not claimed `org.gnome.keyring`, forget
+has the session bus start `org.gnome.keyring` once, as a GNOME session's first
+keyring client does, and tries again. It starts nothing while another Secret
+Service provider, such as KDE's, owns `org.freedesktop.secrets`; the token
+then stays sealed, and forget asks you to run it from a GNOME session.
+
 `irlume keyring arm` picks the kind again each time, but it does not replace
 an armed token with a login-password or KDE wallet-key arm, which it picks
 where oo7 keeps the keyring, when a KDE wallet sits beside the GNOME keyring or

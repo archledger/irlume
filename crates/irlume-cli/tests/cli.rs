@@ -2041,6 +2041,172 @@ fn login_changes_on_nixos_name_the_module_and_touch_nothing() {
     }
 }
 
+/// A stand-in for the gnome-keyring that `pam_gnome_keyring auto_start`
+/// starts: a process whose argv reads `gnome-keyring-daemon ... --login`,
+/// listening on `runtime_dir/keyring/control` and answering every request
+/// DENIED, as that daemon does until something initializes it. It is this
+/// test binary run again under that argv; dropping it kills it.
+struct FakeLoginKeyring(std::process::Child);
+
+impl FakeLoginKeyring {
+    fn start(runtime_dir: &std::path::Path) -> Self {
+        use std::os::unix::process::CommandExt as _;
+        let socket = runtime_dir.join("keyring/control");
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        // After `--`, libtest reads `--login` as one more name filter, which
+        // matches no test.
+        let child = Command::new(std::env::current_exe().unwrap())
+            .arg0("gnome-keyring-daemon")
+            .args([
+                "--exact",
+                "fake_login_gnome_keyring_child",
+                "--nocapture",
+                "--",
+                "--login",
+            ])
+            .env("IRLUME_TEST_FAKE_LOGIN_KEYRING", &socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let fake = FakeLoginKeyring(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fake gnome-keyring never listened"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        fake
+    }
+}
+
+impl Drop for FakeLoginKeyring {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn fake_login_gnome_keyring_child() {
+    use std::io::Read as _;
+    let Some(socket) = std::env::var_os("IRLUME_TEST_FAKE_LOGIN_KEYRING") else {
+        return;
+    };
+    // The parent kills this process when its test ends. A parent killed
+    // outright cannot, so bound the stand-in's life on its own.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(120));
+        std::process::exit(0);
+    });
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        // A bare connect, which reads the peer's credentials, closes first.
+        let mut head = [0u8; 5];
+        if stream.read_exact(&mut head).is_err() {
+            continue;
+        }
+        let total = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+        let mut rest = vec![0u8; total.saturating_sub(4)];
+        if stream.read_exact(&mut rest).is_err() {
+            continue;
+        }
+        // Length 8, result 1 (denied).
+        let _ = stream.write_all(&[0, 0, 0, 8, 0, 0, 0, 1]);
+    }
+}
+
+/// A token arm from a session whose gnome-keyring the login screen started
+/// and nothing initialized, as in a Plasma session on an account whose only
+/// keyring is GNOME's, would re-key the keyring to a token that is never
+/// delivered at login. `keyring arm` refuses it before `SealPassword`, so
+/// nothing is minted or replaced. Where irlumed would seal no token, the arm
+/// goes ahead, and a token sealed anyway is rolled back without a re-key.
+#[test]
+fn a_token_arm_is_refused_before_sealing_where_gnome_keyring_was_never_initialized() {
+    let sb = Sandbox::new("gkr-uninitialized");
+    let home = sb.path("home");
+    let keyrings = home.join(".local/share/keyrings");
+    std::fs::create_dir_all(&keyrings).unwrap();
+    sb.fake_tool(
+        "getent",
+        &format!(
+            "[ \"$*\" = \"passwd tester\" ] || exit 2\necho 'tester:x:4242:4242::{}:/bin/sh'",
+            home.display()
+        ),
+    );
+    // org.gnome.keyring has an owner only when the test says so. Any other
+    // bus call fails: the oo7 probe of `keyring arm` then finds no
+    // oo7-daemon, and any other call fails the arm loudly.
+    sb.fake_tool(
+        "busctl",
+        "case \"$*\" in\n  *'--auto-start=no call org.freedesktop.DBus /org/freedesktop/DBus \
+         org.freedesktop.DBus NameHasOwner s org.gnome.keyring') \
+         echo \"b $IRLUME_TEST_KEYRING_OWNED\" ;;\n  *) exit 64 ;;\nesac",
+    );
+    let log = serve(&sock(&sb), |request| match request {
+        Request::SealPassword { .. } => Response::TokenSealed {
+            token: irlume_common::SecretBytes::new(b"fixture-token".to_vec()),
+            minted: true,
+        },
+        Request::ForgetPassword { .. } => Response::PasswordForgotten,
+        _ => Response::Error("fixture unavailable".into()),
+    });
+    let runtime_dir = sb.path("run");
+    let _keyring = FakeLoginKeyring::start(&runtime_dir);
+    let arm = |owned: &str| {
+        let (code, out, err) = run_stdin(
+            sb.cmd_with_fakes(&["keyring", "arm", "--user", "tester"])
+                .env("XDG_RUNTIME_DIR", &runtime_dir)
+                .env("IRLUME_TEST_KEYRING_OWNED", owned),
+            "fixture-password\n",
+        );
+        let requests = std::mem::take(&mut *log.lock().unwrap());
+        (code, format!("{out}{err}"), requests)
+    };
+
+    // No login keyring in the home: irlumed seals a login password, so the
+    // arm is not stopped here. The fixture daemon answers with a token all
+    // the same, and the arm then rolls it back without sending a re-key.
+    let (code, text, requests) = arm("false");
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("not a GNOME session"), "{text}");
+    assert!(text.contains("rolled back"), "{text}");
+    assert!(
+        matches!(
+            requests.as_slice(),
+            [Request::SealPassword { .. }, Request::ForgetPassword { .. }]
+        ),
+        "{requests:?}"
+    );
+
+    // A GNOME-only home, where irlumed would mint a token: refused, and
+    // irlumed never asked.
+    std::fs::write(keyrings.join("login.keyring"), b"fixture").unwrap();
+    let (code, text, requests) = arm("false");
+    assert!(requests.is_empty(), "nothing reaches irlumed: {requests:?}");
+    assert_ne!(code, 0, "{text}");
+    assert!(
+        text.contains("not armed") && text.contains("not a GNOME session"),
+        "{text}"
+    );
+    assert!(text.contains("Nothing was changed"), "{text}");
+
+    // The same daemon once a GNOME session initialized it: the arm goes to
+    // irlumed (this fixture keyring then refuses the re-key).
+    let (code, text, requests) = arm("true");
+    assert_ne!(code, 0, "{text}");
+    assert!(!text.contains("not a GNOME session"), "{text}");
+    assert!(
+        matches!(requests.first(), Some(Request::SealPassword { .. })),
+        "{requests:?}"
+    );
+}
+
 /// An encrypted store whose template key is gone is the one state the old
 /// `encrypted` bool could not express, because it was computed FROM the key's
 /// presence. It reported "plaintext at rest", which understates the posture and

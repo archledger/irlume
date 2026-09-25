@@ -6602,6 +6602,24 @@ impl App {
                             Some(kind) => Ok(Some(kind)),
                             None => crate::secrets::arm_kind_hint(&user, wallet_salt.as_ref()),
                         };
+                        // Where the daemon judges, it may mint a GNOME keyring
+                        // token, so this is asked before sealing, as `keyring
+                        // arm` does: a token this session could never deliver
+                        // is not minted. A requested login password mints no
+                        // token and skips the check.
+                        if matches!(kind, Ok(None)) {
+                            if let Some(why) =
+                                crate::gkr_session::token_arm_refusal(&user, wallet_salt.as_ref())
+                            {
+                                return (
+                                    false,
+                                    format!(
+                                        "keyring not armed: {why}. Nothing was changed. Arm \
+                                         from a GNOME session."
+                                    ),
+                                );
+                            }
+                        }
                         let reply = kind.and_then(|kind| {
                             crate::daemon_request(&Request::SealPassword {
                                 kind,

@@ -4,10 +4,11 @@ irlume ships a flake with two things a NixOS user needs: a source build of the
 daemon and CLI (`packages.default`), and `nixosModules.irlume`, which runs the
 daemon, opens the camera, and splices face auth into the PAM stacks you name.
 
-The PAM control flags in the module are not defaults picked by feel. Each was
-derived on a NixOS VM against the real greeter and lock-screen stacks, then
-checked by logging in with a face and confirming the keyring unlocked without a
-prompt. The matrix at the end of this file lists what was tested.
+The PAM control flags in the module were derived on a NixOS VM against the
+greeter and lock-screen stacks when the module was added, with a sealed login
+password. That matrix has not been re-run since, so it is unverified; the end
+of this file lists what it covered. On NixOS irlume supports the login password
+kind of keyring unlock only (see "Keyring unlock").
 
 ## Requirements
 
@@ -63,7 +64,8 @@ sudo irlume enroll --user $USER
 irlume doctor          # camera, models, daemon, TPM state
 ```
 
-To bind the login password into the TPM so a face login also unlocks the wallet:
+To bind the login password into the TPM so a face login also unlocks the wallet
+(see "Keyring unlock" for which accounts can):
 
 ```
 sudo irlume keyring arm
@@ -104,6 +106,40 @@ A name the module does not recognise defaults to the login profile. Set
 ```nix
 services.irlume.pam.services.my-custom-locker.profile = "lock";
 ```
+
+## PAM changes go through the module
+
+The system configuration generates `/etc/pam.d`, and the next rebuild replaces
+any edit, so on NixOS `irlume login enable` and `irlume login disable` exit with
+an error that points here, with or without `--apply`, and `irlume login
+reconcile` reports nothing to do. The TUI runs the same commands and shows the
+same message. Add or remove a service under `services.irlume.pam.services` and
+rebuild. `irlume login status` still reports the stacks, and where it or
+`irlume doctor` finds no login screen wired, it names that option, not `irlume
+login enable`.
+
+## Keyring unlock
+
+On NixOS irlume seals only the login password, the kind the module's PAM rules
+were written for.
+
+On other distributions irlume seals a KDE wallet key for an account with a KDE
+wallet, and re-keys a GNOME login keyring to a random token. Both need PAM
+rules the module does not add yet, a session-phase `pam_irlume.so reseal` rule
+among them. So on NixOS `irlume keyring arm`, `irlume reseal`, the keyring step
+of `irlume setup` and the TUI's Password Wallet refuse, and seal nothing, for
+an account that has or would get either kind:
+
+- an account with a KDE wallet and no GNOME login keyring (a wallet key);
+- an account with a GNOME login keyring and no KDE wallet (a token).
+
+An account with neither wallet, or with both, gets the login password, and an
+account whose login password is already armed keeps it when it re-arms or
+reseals. `irlume keyring forget` removes a wallet key or token armed earlier; a
+token is re-keyed back to your password first. As on every distribution, irlume
+does not arm over a sealed secret irlumed cannot read; on NixOS `keyring arm`,
+`reseal` and the setup step say so before asking for the password. Without an
+arm, irlume leaves the wallet to the rest of the PAM stack.
 
 ## greetd on a wlroots compositor (Sway, Hyprland)
 
@@ -166,11 +202,15 @@ daemon's environment (`systemd.services.irlumed.environment`). Without it,
 `.tflite` support reports "runtime not installed" and everything else keeps
 working; a missing runtime is never a startup failure.
 
-## What was validated
+## What was tested (unverified)
 
-Every row below was exercised on a NixOS VM: log in or unlock with a face, then
-confirm the keyring state. "keyring" means a browser launched afterward without
-a keyring-unlock prompt.
+The rows below were exercised on a NixOS VM when the module was added (#5, July
+2026): log in or unlock with a face, then confirm the keyring state. "keyring"
+means a browser launched afterward without a keyring-unlock prompt. Every row
+used a sealed login password, before irlume could seal a KDE wallet key or a
+GNOME keyring token (#253, #256). The matrix has not been re-run since against
+the current module, irlume or nixpkgs, so no row is a current result, and only
+the login password kind is supported (see "Keyring unlock").
 
 | Surface | Service | Control | Keyring backend | Result |
 | --- | --- | --- | --- | --- |

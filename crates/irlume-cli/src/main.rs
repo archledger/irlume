@@ -27,6 +27,8 @@ mod logintx;
 mod logs;
 mod machine;
 mod models;
+mod nixos;
+mod os_release;
 mod pad;
 mod pamwire;
 mod preferences;
@@ -1491,12 +1493,31 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
     let user = user_arg(args);
     match sub {
         Some("arm") => {
+            // Before the password prompt: on NixOS an account that has or
+            // would get a kind other than the login password is refused
+            // without asking for anything.
+            let seal = match crate::nixos::seal_kind(&user) {
+                Ok(seal) => seal,
+                Err(refusal) => {
+                    eprintln!("[keyring] {refusal}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let what = match seal {
+                crate::nixos::SealKind::DaemonDecides => {
+                    "Depending on the wallet you run, what gets sealed is the password \
+                     itself, the key your KDE wallet is already opened with, or a fresh \
+                     random token this re-keys your GNOME keyring to. Nothing is stored in \
+                     plaintext either way."
+                }
+                crate::nixos::SealKind::LoginPassword => {
+                    "On NixOS what gets sealed is the password itself; it is not stored in \
+                     plaintext."
+                }
+            };
             println!(
                 "[keyring] Arming face-driven keyring unlock for '{user}'.\n\
-                 Enter this user's LOGIN password. Depending on the wallet you run, what \
-                 gets sealed is the password itself, the key your KDE wallet is already \
-                 opened with, or a fresh random token this re-keys your GNOME keyring to. \
-                 Nothing is stored in plaintext either way."
+                 Enter this user's LOGIN password. {what}"
             );
             // No-echo prompt on a real terminal; fall back to a plain stdin line
             // when piped (scripts / tests), where /dev/tty isn't available.
@@ -1539,15 +1560,16 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                 eprintln!("[keyring] empty password; aborted");
                 return std::process::ExitCode::from(2);
             }
-            let wallet_salt = match irlume_common::client::read_wallet_salt(&user) {
-                Ok(salt) => salt,
+            let (kind, wallet_salt) = match seal.request_fields(&user) {
+                Ok(fields) => fields,
                 Err(e) => {
                     eprintln!("[keyring] arm failed: {e}");
                     return std::process::ExitCode::FAILURE;
                 }
             };
             let req = irlume_common::Request::SealPassword {
-                kind: None, // let the daemon judge from what the user has
+                // Off NixOS `None`: the daemon judges from what the user has.
+                kind,
                 user: user.clone(),
                 password: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
                 wallet_salt,
@@ -4095,6 +4117,52 @@ fn report_keyring_os_upgrade(report: &mut crate::doctor_report::Report, user: &s
     }
 }
 
+/// Doctor's line for an enrolled account whose active login manager is not
+/// wired. On NixOS `irlume login enable` refuses, so it names the module.
+fn unwired_login_line(user: &str, nixos: bool) -> String {
+    if nixos {
+        format!(
+            "[doctor] ⚠ {user} is enrolled but no login manager is wired for face auth.\n     \
+             On NixOS the system configuration owns the PAM stacks: list the display\n     \
+             manager's PAM service under `services.irlume.pam.services` and rebuild\n     \
+             (docs/NIXOS.md)."
+        )
+    } else {
+        format!(
+            "[doctor] ⚠ {user} is enrolled but no login manager is wired for face auth.\n     \
+             A system update (authselect / pam-auth-update) may have regenerated the\n     \
+             PAM stacks. The irlume-reconcile.path unit re-applies this automatically\n     \
+             once login was enabled; if it persists, re-wire with:\n     \
+             sudo irlume login enable --apply"
+        )
+    }
+}
+
+/// Doctor's line when polkit app prompts are not wired. On NixOS `irlume
+/// login enable` refuses, so it points to docs/NIXOS.md instead.
+fn polkit_unwired_line(bitwarden_action: bool, nixos: bool) -> &'static str {
+    match (bitwarden_action, nixos) {
+        (true, false) => {
+            "[doctor] polkit app prompts: NOT wired, but Bitwarden's polkit action is installed.\n     \
+             Its biometric unlock will fall back to the password prompt. Enable with:\n     \
+             sudo irlume login enable --with-polkit --apply"
+        }
+        (true, true) => {
+            "[doctor] polkit app prompts: NOT wired, but Bitwarden's polkit action is installed.\n     \
+             Its biometric unlock will fall back to the password prompt. On NixOS the\n     \
+             system configuration owns the PAM stacks (docs/NIXOS.md)."
+        }
+        (false, false) => {
+            "[doctor] polkit app prompts: not wired (opt-in: sudo irlume login enable \
+             --with-polkit --apply)"
+        }
+        (false, true) => {
+            "[doctor] polkit app prompts: not wired (on NixOS the system configuration owns \
+             the PAM stacks; docs/NIXOS.md)"
+        }
+    }
+}
+
 fn doctor_run(
     report: &mut crate::doctor_report::Report,
     args: &[String],
@@ -4657,14 +4725,10 @@ fn doctor_run(
             "{}",
             "[doctor] polkit app prompts: wired ✓ (keyboard confirmation required)"
         ),
-        Some(false) if bitwarden_action => dout!(report,
-            "[doctor] polkit app prompts: NOT wired, but Bitwarden's polkit action is installed.\n     \
-             Its biometric unlock will fall back to the password prompt. Enable with:\n     \
-             sudo irlume login enable --with-polkit --apply"
-        ),
-        Some(false) => dout!(report,
-            "[doctor] polkit app prompts: not wired (opt-in: sudo irlume login enable \
-             --with-polkit --apply)"
+        Some(false) => dout!(
+            report,
+            "{}",
+            polkit_unwired_line(bitwarden_action, crate::nixos::host_is_nixos())
         ),
         None => {}
     }
@@ -4801,11 +4865,8 @@ fn doctor_run(
     if enrolled && !login_ok {
         dout!(
             report,
-            "[doctor] ⚠ {user} is enrolled but no login manager is wired for face auth.\n     \
-             A system update (authselect / pam-auth-update) may have regenerated the\n     \
-             PAM stacks. The irlume-reconcile.path unit re-applies this automatically\n     \
-             once login was enabled; if it persists, re-wire with:\n     \
-             sudo irlume login enable --apply"
+            "{}",
+            unwired_login_line(&user, crate::nixos::host_is_nixos())
         );
     }
     // A brand-new or renamed display manager irlume has no PAM mapping for:
@@ -5102,6 +5163,39 @@ mod tests {
         assert!(!doctor_wants_check(&[]));
         assert!(!doctor_wants_check(&["--checkout".to_string()]));
         assert!(!doctor_wants_check(&["--check=1".to_string()]));
+    }
+
+    /// Doctor's unwired-login and polkit lines name `irlume login enable`
+    /// everywhere but NixOS, where that command refuses; there they name the
+    /// module and docs/NIXOS.md instead.
+    #[test]
+    fn doctor_wiring_remedies_name_the_module_on_nixos() {
+        let login = unwired_login_line("alice", false);
+        assert!(
+            login.contains("sudo irlume login enable --apply"),
+            "{login}"
+        );
+        let login = unwired_login_line("alice", true);
+        assert!(
+            login.contains("alice is enrolled")
+                && login.contains("services.irlume.pam.services")
+                && login.contains("docs/NIXOS.md"),
+            "{login}"
+        );
+        assert!(!login.contains("irlume login enable"), "{login}");
+        for bitwarden_action in [false, true] {
+            let polkit = polkit_unwired_line(bitwarden_action, false);
+            assert!(
+                polkit.contains("sudo irlume login enable --with-polkit --apply"),
+                "{polkit}"
+            );
+            let polkit = polkit_unwired_line(bitwarden_action, true);
+            assert!(
+                polkit.contains("docs/NIXOS.md") && !polkit.contains("irlume login enable"),
+                "{polkit}"
+            );
+            assert_eq!(polkit.contains("Bitwarden"), bitwarden_action, "{polkit}");
+        }
     }
     use super::*;
 

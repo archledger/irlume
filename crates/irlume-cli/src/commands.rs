@@ -1616,6 +1616,15 @@ pub fn reseal(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    // On NixOS the token early return below would promise a session line the
+    // module does not write, so the NixOS decision comes first.
+    let seal = match crate::nixos::seal_kind(&user) {
+        Ok(seal) => seal,
+        Err(refusal) => {
+            eprintln!("[reseal] {refusal}");
+            return ExitCode::FAILURE;
+        }
+    };
     // A token envelope (#250) heals itself: the session-phase reseal re-seals
     // it from its password wrap on the next typed-password login. Re-arming it
     // here would mint a NEW token and hand it back for a keyring re-key this
@@ -1638,15 +1647,16 @@ pub fn reseal(args: &[String]) -> ExitCode {
     let Some(pw) = prompt_login_password() else {
         return ExitCode::from(2);
     };
-    let wallet_salt = match irlume_common::client::read_wallet_salt(&user) {
-        Ok(salt) => salt,
+    let (kind, wallet_salt) = match seal.request_fields(&user) {
+        Ok(fields) => fields,
         Err(e) => {
             eprintln!("[reseal] failed: {e}");
             return ExitCode::FAILURE;
         }
     };
     let req = Request::SealPassword {
-        kind: None, // let the daemon judge from what the user has
+        // Off NixOS `None`: the daemon judges from what the user has.
+        kind,
         user,
         // Copy the bytes out rather than moving the `String`: `Zeroizing` owns
         // the buffer and wipes it on drop, and `SecretBytes` wipes the copy.
@@ -1759,20 +1769,33 @@ pub fn setup(args: &[String]) -> ExitCode {
     // Anti-spoof coverage is shipped and default-on since ADR-0013 (ViT RGB
     // PAD + FLIR IR PAD in models-v1), so the old opt-in offer step is gone.
     println!("\n[4/7] Keyring unlock (face login opens your wallet)");
-    if yes_no(
-        "  Arm keyring unlock now (you'll enter your login password)?",
-        /* default_yes: */ true,
-    ) {
+    // On NixOS an account that has or would get a kind other than the login
+    // password skips this step before anything is asked.
+    let arm = match crate::nixos::seal_kind(&user) {
+        Ok(seal) => {
+            let yes = yes_no(
+                "  Arm keyring unlock now (you'll enter your login password)?",
+                /* default_yes: */ true,
+            );
+            yes.then_some(seal)
+        }
+        Err(refusal) => {
+            eprintln!("  {refusal}");
+            None
+        }
+    };
+    if let Some(seal) = arm {
         if let Some(pw) = prompt_login_password() {
-            let wallet_salt = match irlume_common::client::read_wallet_salt(&user) {
-                Ok(salt) => salt,
+            let (kind, wallet_salt) = match seal.request_fields(&user) {
+                Ok(fields) => fields,
                 Err(e) => {
                     eprintln!("  arm failed: {e}");
                     return ExitCode::FAILURE;
                 }
             };
             match daemon_request(&Request::SealPassword {
-                kind: None, // let the daemon judge from what the user has
+                // Off NixOS `None`: the daemon judges from what the user has.
+                kind,
                 user: user.clone(),
                 // `pw` has to outlive this request for the token branch below,
                 // so the bytes are copied rather than moved. The old `.clone()`
@@ -1822,8 +1845,13 @@ pub fn setup(args: &[String]) -> ExitCode {
 
     // 6. Login wiring.
     println!("\n[7/7] PAM login wiring");
-    println!("  preview the changes with `irlume login enable` (dry-run), then apply with");
-    println!("  `sudo irlume login enable --apply` to wire greeters + lock screen.");
+    if crate::nixos::host_is_nixos() {
+        println!("  on NixOS the system configuration owns PAM: list the services under");
+        println!("  `services.irlume.pam.services` and rebuild (docs/NIXOS.md).");
+    } else {
+        println!("  preview the changes with `irlume login enable` (dry-run), then apply with");
+        println!("  `sudo irlume login enable --apply` to wire greeters + lock screen.");
+    }
     println!("  once wired: at the greeter/lock, leave the password empty and press Enter");
     println!("  to use your face (typing a password never starts the camera).");
 

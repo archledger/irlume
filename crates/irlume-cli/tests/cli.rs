@@ -77,6 +77,10 @@ impl Sandbox {
             .env("IRLUME_KEYRING_DIR", self.root.join("keyring"))
             .env("IRLUME_METHOD_CONF", self.root.join("cfg").join("method"))
             .env("IRLUME_KWALLET_INIT", self.root.join("wallet-salt-helper"))
+            // Absent, so no distribution: a test never follows the host's
+            // os-release (on NixOS the keyring and login paths differ), and
+            // one that wants NixOS sets its own.
+            .env("IRLUME_OS_RELEASE", self.root.join("no-os-release"))
             .env_remove("IRLUME_DEV")
             .env_remove("ORT_DYLIB_PATH")
             .env_remove("IRLUME_MODEL")
@@ -1637,6 +1641,291 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_forget_before_upgrading_to_45() {
                 .any(|request| matches!(request, Request::KeyringInfo { .. })),
             "{tag}: {requests:?}"
         );
+    }
+}
+
+const NIXOS_OS_RELEASE: &str = "NAME=NixOS\nID=nixos\nVERSION_ID=\"25.11\"\n";
+
+/// A wallet-salt helper that finds a KDE wallet salt for every account, so the
+/// daemon's kind detection would pick the KDE wallet key.
+fn kde_salt_helper(sb: &Sandbox) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let helper = sb.path("wallet-salt-helper");
+    std::fs::write(
+        &helper,
+        "#!/bin/sh\n[ \"$1\" = --read-salt ] && [ \"$#\" -eq 2 ] || exit 1\n\
+         printf '%056d' 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// Each `SealPassword` a fake daemon received: its forced kind and whether it
+/// carried a wallet salt.
+fn sealed(
+    log: &std::sync::Mutex<Vec<Request>>,
+) -> Vec<(Option<irlume_common::KeyringSecretKind>, bool)> {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|request| match request {
+            Request::SealPassword {
+                kind, wallet_salt, ..
+            } => Some((*kind, wallet_salt.is_some())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The NixOS module's PAM rules were written for a sealed login password and
+/// add no session `reseal` rule (docs/NIXOS.md). On NixOS `keyring arm`
+/// refuses an account that has or would get a KDE wallet key or a GNOME
+/// keyring token, before it asks for the password, and asks for the login
+/// password by name otherwise. Everywhere else the daemon still picks the
+/// kind.
+#[test]
+fn keyring_arm_on_nixos_seals_only_the_login_password() {
+    use irlume_common::KeyringSecretKind as K;
+    let fedora = "NAME=\"Fedora Linux\"\nID=fedora\nVERSION_ID=44\n";
+    // The account does not exist, so neither side finds a home: a KDE wallet
+    // salt alone decides the kind, as in irlumed's SealPassword arm.
+    let user = "irlume-no-such-account";
+    let arm = |sb: &Sandbox, os_release: &str| {
+        std::fs::write(sb.path("os-release"), os_release).unwrap();
+        let mut command = sb.cmd(&["keyring", "arm", "--user", user]);
+        command.env("IRLUME_OS_RELEASE", sb.path("os-release"));
+        command
+    };
+    // A daemon holding `armed` for the account (None: nothing) that seals
+    // whatever it is asked to.
+    let daemon = |sb: &Sandbox, armed: Option<K>| {
+        serve(&sock(sb), move |req| match req {
+            Request::KeyringMetadata { .. } => Response::KeyringInfo {
+                armed: armed.is_some(),
+                policy: None,
+                pcrs: Vec::new(),
+                drifted: None,
+                kind: armed,
+            },
+            Request::SealPassword { .. } => Response::PasswordSealed,
+            _ => Response::Error("unexpected request".into()),
+        })
+    };
+
+    // NixOS, a KDE wallet salt, nothing armed yet or a wallet key armed:
+    // refused before the password prompt, and nothing is sealed.
+    for armed in [None, Some(K::KdeWalletKey)] {
+        let sb = Sandbox::new(&format!("keyring-nixos-kde-{}", armed.is_some()));
+        kde_salt_helper(&sb);
+        let log = daemon(&sb, armed);
+        let (code, out, err) = run(&mut arm(&sb, NIXOS_OS_RELEASE));
+        assert_eq!(code, 1, "{armed:?}\n{out}\n{err}");
+        let has = if armed.is_some() { "has" } else { "would get" };
+        assert!(
+            err.contains(&format!("{has} a KDE wallet key")) && err.contains("docs/NIXOS.md"),
+            "{err}"
+        );
+        // `forget` is named only when there is an arm for it to remove.
+        assert_eq!(
+            err.contains("irlume keyring forget"),
+            armed.is_some(),
+            "{err}"
+        );
+        assert!(
+            !err.contains("empty password"),
+            "asked for a password: {err}"
+        );
+        assert!(sealed(&log).is_empty(), "{armed:?}: sealed anyway");
+    }
+
+    // NixOS, a login password already armed: re-armed as one, although a
+    // first arm with this wallet salt would get the wallet key.
+    let sb = Sandbox::new("keyring-nixos-rearm");
+    kde_salt_helper(&sb);
+    let log = daemon(&sb, Some(K::LoginPassword));
+    let (code, out, err) = run_stdin(&mut arm(&sb, NIXOS_OS_RELEASE), "hunter2\n");
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert_eq!(sealed(&log), [(Some(K::LoginPassword), false)]);
+
+    // NixOS, no wallet salt: the login password, asked for by name and with
+    // no salt (irlumed refuses one beside a forced kind other than the key).
+    let sb = Sandbox::new("keyring-nixos-lp");
+    let log = daemon(&sb, None);
+    let (code, out, err) = run_stdin(&mut arm(&sb, NIXOS_OS_RELEASE), "hunter2\n");
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert_eq!(sealed(&log), [(Some(K::LoginPassword), false)]);
+
+    // Off NixOS nothing changes: the daemon judges, with the salt it needs,
+    // and is asked nothing else.
+    let sb = Sandbox::new("keyring-fedora-kde");
+    kde_salt_helper(&sb);
+    let log = daemon(&sb, None);
+    let (code, out, err) = run_stdin(&mut arm(&sb, fedora), "hunter2\n");
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert_eq!(sealed(&log), [(None, true)]);
+    assert_eq!(log.lock().unwrap().len(), 1, "{:?}", log.lock().unwrap());
+}
+
+/// On NixOS `reseal` decides before its GNOME token early return, and keeps
+/// to the login password as `keyring arm` does: a KDE wallet key, a GNOME
+/// keyring token or a sealed secret irlumed cannot read is refused before the
+/// password prompt, and a login password is re-bound as one, with no wallet
+/// salt. Off NixOS a token still re-binds itself and nothing else is asked.
+#[test]
+fn reseal_on_nixos_keeps_to_the_login_password() {
+    use irlume_common::KeyringSecretKind as K;
+    let fedora = "NAME=\"Fedora Linux\"\nID=fedora\nVERSION_ID=44\n";
+    let user = "irlume-no-such-account";
+    let reseal = |sb: &Sandbox, os_release: &str| {
+        std::fs::write(sb.path("os-release"), os_release).unwrap();
+        let mut command = sb.cmd(&["reseal", "--user", user]);
+        command.env("IRLUME_OS_RELEASE", sb.path("os-release"));
+        command
+    };
+    // A daemon holding `kind` for the account (None: an envelope it cannot
+    // read) that seals whatever it is asked to.
+    let daemon = |sb: &Sandbox, kind: Option<K>| {
+        serve(&sock(sb), move |req| match req {
+            Request::HasSealedPassword { .. } => Response::HasPassword(true),
+            Request::KeyringMetadata { .. } | Request::KeyringInfo { .. } => {
+                Response::KeyringInfo {
+                    armed: true,
+                    policy: None,
+                    pcrs: Vec::new(),
+                    drifted: None,
+                    kind,
+                }
+            }
+            Request::SealPassword { .. } => Response::PasswordSealed,
+            _ => Response::Error("unexpected request".into()),
+        })
+    };
+
+    // A wallet key or token names `forget` and docs/NIXOS.md. An unreadable
+    // envelope gets irlumed's own advice instead: keep the file, which
+    // `forget --force` would delete.
+    for (tag, kind, refusal, forget) in [
+        (
+            "gt",
+            Some(K::GnomeKeyringToken),
+            "has a GNOME keyring token",
+            true,
+        ),
+        ("kk", Some(K::KdeWalletKey), "has a KDE wallet key", true),
+        (
+            "unknown",
+            None,
+            "a sealed secret irlumed cannot read",
+            false,
+        ),
+    ] {
+        let sb = Sandbox::new(&format!("reseal-nixos-{tag}"));
+        let log = daemon(&sb, kind);
+        let (code, out, err) = run_stdin(&mut reseal(&sb, NIXOS_OS_RELEASE), "hunter2\n");
+        assert_eq!(code, 1, "{tag}\n{out}\n{err}");
+        assert!(
+            err.contains(refusal) && err.contains("Nothing was sealed"),
+            "{tag}: {err}"
+        );
+        for needle in ["irlume keyring forget", "docs/NIXOS.md"] {
+            assert_eq!(err.contains(needle), forget, "{tag}: {needle:?} in {err}");
+        }
+        if !forget {
+            assert!(
+                err.contains("as it is: if a newer irlume wrote it"),
+                "{err}"
+            );
+        }
+        assert!(!out.contains("re-binds itself"), "{tag}: {out}");
+        assert!(
+            !out.contains("Re-binding"),
+            "{tag}: asked for a password: {out}"
+        );
+        assert!(sealed(&log).is_empty(), "{tag}: sealed anyway");
+    }
+
+    // A login password is re-bound as one, although this wallet salt would
+    // give a first arm the wallet key.
+    let sb = Sandbox::new("reseal-nixos-lp");
+    kde_salt_helper(&sb);
+    let log = daemon(&sb, Some(K::LoginPassword));
+    let (code, out, err) = run_stdin(&mut reseal(&sb, NIXOS_OS_RELEASE), "hunter2\n");
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("re-bound to current PCRs"), "{out}");
+    assert_eq!(sealed(&log), [(Some(K::LoginPassword), false)]);
+
+    // Off NixOS: unchanged. A token re-binds itself, and the only questions
+    // are the two reseal always asked.
+    let sb = Sandbox::new("reseal-fedora-gt");
+    let log = daemon(&sb, Some(K::GnomeKeyringToken));
+    let (code, out, err) = run_stdin(&mut reseal(&sb, fedora), "hunter2\n");
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("re-binds itself"), "{out}");
+    let asked = log.lock().unwrap().clone();
+    assert!(
+        matches!(
+            asked.as_slice(),
+            [
+                Request::HasSealedPassword { .. },
+                Request::KeyringInfo { .. }
+            ]
+        ),
+        "{asked:?}"
+    );
+}
+
+/// On NixOS the module owns the PAM stacks, so `login enable`, `disable` and
+/// `reconcile` change nothing and name `services.irlume.pam.services`
+/// instead. They refuse before the root check, the PAM lock and the camera
+/// reading. The fake daemon answers, so even a build without the refusal
+/// reads capabilities from it and never probes a camera.
+#[test]
+fn login_changes_on_nixos_name_the_module_and_touch_nothing() {
+    let sb = Sandbox::new("login-nixos");
+    std::fs::write(sb.path("os-release"), NIXOS_OS_RELEASE).unwrap();
+    serve(&sock(&sb), |req| match req {
+        Request::Ping => Response::Pong,
+        Request::Health => Response::Health {
+            tier: "none".into(),
+            rgb_dev: None,
+            ir_dev: None,
+            mesh: false,
+            adapter: false,
+            rgb_pad: None,
+            ir_pad: None,
+            version: env!("CARGO_PKG_VERSION").into(),
+            apparmor: None,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+    let lock = sb.path("pam.lock");
+    let mut cases: Vec<(&[&str], i32)> =
+        vec![(&["login", "enable"], 1), (&["login", "disable"], 1)];
+    // Unprivileged, a build without the refusal cannot write a PAM stack; as
+    // root it could, so the writing forms run only unprivileged.
+    if !is_root() {
+        cases.extend([
+            (&["login", "enable", "--apply"][..], 1),
+            (
+                &["login", "enable", "--with-sudo", "--with-polkit", "--apply"],
+                1,
+            ),
+            (&["login", "disable", "--apply"], 1),
+            (&["login", "reconcile"], 0),
+        ]);
+    }
+    for (args, want) in cases {
+        let (code, out, err) = run(sb
+            .cmd(args)
+            .env("IRLUME_OS_RELEASE", sb.path("os-release"))
+            .env("IRLUME_PAM_LOCK", &lock));
+        assert_eq!(code, want, "{args:?}\n{out}\n{err}");
+        assert!(
+            err.contains("services.irlume.pam.services") && err.contains("docs/NIXOS.md"),
+            "{args:?}: {err}"
+        );
+        assert!(!out.contains("DRY RUN"), "{args:?} planned a change: {out}");
+        assert!(!lock.exists(), "{args:?} took the PAM lock");
     }
 }
 

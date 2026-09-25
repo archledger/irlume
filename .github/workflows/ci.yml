@@ -399,7 +399,7 @@ jobs:
       # IRLUME_REQUIRE_PAM_TOOLS makes a missing pamtester or pam_wrapper fail
       # each pamwrap test instead of skipping it; a pamwrap test checks that
       # this step and the nightly coverage step set it. The floor sits below
-      # the real count (72: 19 unit tests, 53 pamwrap tests), so losing the
+      # the real count (74: 20 unit tests, 54 pamwrap tests), so losing the
       # pamwrap tests fails the lane even though the unit tests still pass.
       - name: test (PAM FFI, against pam_wrapper)
         env:

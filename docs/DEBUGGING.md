@@ -29,6 +29,7 @@ How to read the key lines:
 | `pam_unix(<svc>:auth): authentication failure` with **no** irlumed line before it | a typed (wrong) password; correct on-demand behavior: typing never fires the camera |
 | `plasma-kwallet-pam` / `pam_gnome_keyring` lines | the unsealed secret reaching your wallet/keyring |
 | `irlume-gkr-unlock[pid]: …` | a GNOME keyring token on its way to gnome-keyring. Most of these lines do not contain the word irlume, so `irlume logs` leaves them out; read them with `journalctl -t irlume-gkr-unlock` (below) |
+| `pam_irlume(<svc>:session): GNOME keyring token hand-off failed: …` | the session line could not hand the GNOME keyring token to `irlume-gkr-unlock`, or the helper reported a failure, so a token-armed login keyring stays locked; the end of the line says how, for example `exited with code 1`, and for a failure the waiter saw, its own `irlume-gkr-unlock` line (below) gives the reason |
 
 ### GNOME keyring token: `irlume-gkr-unlock`
 

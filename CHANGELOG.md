@@ -311,6 +311,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `pam_irlume` logs one warning when it cannot hand the GNOME keyring
+  token on at login: `irlume-gkr-unlock` is missing, cannot be started,
+  exits with an error or is ended by a signal, or is still running after
+  15 s and is killed. The line goes to the authpriv journal through
+  `pam_syslog`, for example `pam_irlume(gdm-password:session): GNOME
+  keyring token hand-off failed: irlume-gkr-unlock exited with code 1`,
+  and `irlume logs` shows it. It carries fixed text and the exit code or
+  signal only, never the token, its length or a password. A token handed
+  to the helper's waiter writes nothing here; the waiter logs its own
+  outcome under `irlume-gkr-unlock`. Until now a failure before that
+  hand-off left the login keyring locked with no trace, since the module
+  discards the helper's own error output (#250).
+
 - A login keyring armed with a GNOME keyring token now unlocks at login on
   Fedora 43 and 44 GNOME, and wherever `pam_gnome_keyring` starts
   gnome-keyring with `--login` and no socket unit. That gnome-keyring

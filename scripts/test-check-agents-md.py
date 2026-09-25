@@ -386,6 +386,25 @@ class CheckAgentsMdTests(unittest.TestCase):
         self.assertEqual(len(found), 2, found)
         self.assertIn(MISSING_TEST, found)
 
+    @needs_yaml
+    def test_a_glob_star_stays_inside_one_directory(self):
+        (self.root / "crates/irlume-pam/tests/pamwrap.rs").unlink()
+        self.write("crates/irlume-pam/tests/unit/deep.rs", "")
+        found = self.problems()
+        self.assertIn("AGENTS.md:7: path crates/irlume-pam/tests/*.rs names nothing in the tree", found)
+        self.assertTrue(checker.glob_match("a/b/c/d.rs", "a/**/d.rs"))
+        self.assertTrue(checker.glob_match("a/d.rs", "a/**/d.rs"))
+        self.assertFalse(checker.glob_match("a/b/d.rs", "a/*.rs"))
+
+    @needs_yaml
+    def test_a_gate_command_after_a_short_circuit_operator_is_named(self):
+        for joint in ("false &&", "true ||", "echo x |"):
+            with self.subTest(joint=joint):
+                self.write(".github/workflows/ci.yml", CI.replace(
+                    "          cargo test --locked -p irlume-pam\n",
+                    f"          {joint}\n          cargo test --locked -p irlume-pam\n          true\n"))
+                self.assertEqual(self.problems(), [MISSING_TEST])
+
     # Robustness
 
     @needs_yaml

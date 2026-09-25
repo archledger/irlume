@@ -14,7 +14,7 @@ moves. This fails when:
 * a path in a code span names nothing in the tree (a glob must match at
   least one file);
 * a line of the root file's "Gate commands" block is not, after joining
-  `\\` continuations on both sides, a whole top-level command line of an
+  `\\`, `&&`, `||` and `|` continuations, a whole top-level command line of an
   enforced step's `run:` in the required `check` job of
   .github/workflows/ci.yml (a step or job that is conditional, may fail, or
   runs in another directory does not count, nor does a line inside a shell
@@ -108,8 +108,23 @@ class Tree:
     def has(self, path):
         path = path.rstrip("/")
         if any(ch in path for ch in "*?["):
-            return any(fnmatch.fnmatchcase(name, path) for name in self.files)
+            return any(glob_match(name, path) for name in self.files | self.dirs)
         return path in self.files or path in self.dirs
+
+
+def glob_match(name, pattern):
+    """Shell glob semantics: `*`, `?` and `[..]` stay inside one path segment;
+    a `**` segment matches any number of segments."""
+    names, parts = name.split("/"), pattern.split("/")
+
+    def match(i, j):
+        if j == len(parts):
+            return i == len(names)
+        if parts[j] == "**":
+            return any(match(k, j + 1) for k in range(i, len(names) + 1))
+        return i < len(names) and fnmatch.fnmatchcase(names[i], parts[j]) and match(i + 1, j + 1)
+
+    return match(0, 0)
 
 
 def joined(base, path):
@@ -279,6 +294,9 @@ def logical_lines(script):
             continue
         if text.endswith("\\"):
             buffer.append(text[:-1])
+            continue
+        if re.search(r"(?:&&|\|\||\|)$", text):
+            buffer.append(text)
             continue
         buffer.append(text)
         command = " ".join(" ".join(buffer).split())

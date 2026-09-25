@@ -91,20 +91,6 @@ jobs:
           # Do not leave the job token in .git/config for later steps to reach.
           persist-credentials: false
 
-      # The ONNX weights (~614 MB: the five recognizers/landmarkers plus the
-      # two PAD models) are fetched from the models-v1 release, not
-      # Git LFS; cache them keyed on models/SHA256SUMS (changes exactly when the
-      # weights do) so a warm run skips the download (fetch-models.sh verifies
-      # the cached copies and no-ops).
-      - name: Cache model weights
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: models
-          key: models-${{ hashFiles('models/SHA256SUMS') }}
-
-      - name: Fetch model weights (models-v1 release, sha256-verified)
-        run: bash scripts/fetch-models.sh
-
       - name: Install system build dependencies
         run: |
           # Self-hosted Arch runner: the toolchain deps are preinstalled
@@ -118,12 +104,26 @@ jobs:
             for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
           fi
 
-      # Early and cheap: it reads only git's file list and ci.yml (PyYAML
-      # from the step above), so nothing fetched later can satisfy it.
+      # Early and cheap, before the model download: it reads only git's file
+      # list and ci.yml (PyYAML from the step above).
       - name: AGENTS.md references (paths, links, gate commands)
         run: |
           python3 -B scripts/test-check-agents-md.py
           python3 -B scripts/check-agents-md.py
+
+      # The ONNX weights (~614 MB: the five recognizers/landmarkers plus the
+      # two PAD models) are fetched from the models-v1 release, not
+      # Git LFS; cache them keyed on models/SHA256SUMS (changes exactly when the
+      # weights do) so a warm run skips the download (fetch-models.sh verifies
+      # the cached copies and no-ops).
+      - name: Cache model weights
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: models
+          key: models-${{ hashFiles('models/SHA256SUMS') }}
+
+      - name: Fetch model weights (models-v1 release, sha256-verified)
+        run: bash scripts/fetch-models.sh
 
       - name: Prepare and verify isolated CLI test namespaces
         run: bash scripts/ci-bubblewrap.sh

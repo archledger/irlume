@@ -12385,11 +12385,7 @@ mod tests {
             .unwrap();
             line.clear();
             assert_eq!(reader.read_line(&mut line).unwrap(), 0);
-            listener.set_nonblocking(true).unwrap();
-            assert_eq!(
-                listener.accept().unwrap_err().kind(),
-                std::io::ErrorKind::WouldBlock
-            );
+            listener
         });
         let (tx, rx) = mpsc::channel();
         enroll_worker(
@@ -12401,7 +12397,29 @@ mod tests {
             tx,
         );
         let messages: Vec<_> = rx.try_iter().collect();
-        server.join().unwrap();
+        let listener = server.join().unwrap();
+        // The worker has returned, so a fallback or enrollment request it
+        // made is already queued. A worker another test left running may
+        // have connected too: its request is refused and ignored.
+        listener.set_nonblocking(true).unwrap();
+        while let Ok((mut stream, _)) = listener.accept() {
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(&stream).read_line(&mut line);
+            assert!(
+                !serde_json::from_str::<Request>(&line).is_ok_and(|request| {
+                    framing_start(&request)
+                        || framing_sample(&request)
+                        || enrollment_capture(&request)
+                }),
+                "an accepted framing failure fell back or started enrollment: {line}"
+            );
+            let refusal = Response::Error("fake daemon: not the request under test".into());
+            let _ = writeln!(stream, "{}", serde_json::to_string(&refusal).unwrap());
+        }
         std::fs::remove_file(path).unwrap();
         assert!(messages.iter().any(|m| matches!(m, WMsg::Err(_))));
         assert!(!messages

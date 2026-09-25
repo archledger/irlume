@@ -1132,12 +1132,13 @@ fn release_secret(
 /// `CString::new` copies the secret into one new buffer, which the result
 /// owns and zeroizes on drop. A secret with an interior NUL cannot be a C
 /// string: `CString::new` then returns that copy inside its `NulError`, so it
-/// is taken back with `into_vec` and zeroized here, and the result is `None`.
+/// is taken back with `into_vec` straight into `Zeroizing`, which wipes it
+/// when it drops here (also on unwind), and the result is `None`.
 fn secret_cstring(secret: &[u8]) -> Option<zeroize::Zeroizing<CString>> {
     match CString::new(secret) {
         Ok(tok) => Some(zeroize::Zeroizing::new(tok)),
         Err(rejected) => {
-            zeroize::Zeroize::zeroize(&mut rejected.into_vec());
+            drop(zeroize::Zeroizing::new(rejected.into_vec()));
             None
         }
     }

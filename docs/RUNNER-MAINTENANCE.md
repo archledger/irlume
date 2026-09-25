@@ -52,7 +52,7 @@ sudo /usr/local/libexec/irlume-ci-capture <tree> /dev/video2 | tar -t
 ```
 
 Six `frame*.pgm` files plus `means.txt`, and one emitter proof line on
-stderr, means the promotion took. The nightly `ci-alert` workflow will flag
+stderr, means the promotion took. The daily `ci-alert` workflow will flag
 the suite red if you forget; this page is how you fix it.
 
 minihost has no installed helper; its lane uses the direct `sudo burst_dump`
@@ -89,7 +89,10 @@ the next queued job there), then rerun the failed job.
 
 ## Watching for all three
 
-The `ci-alert` workflow (`.github/workflows/ci-alert.yml`) checks the nightly
-hardware suite and the weekly install matrix once a day and keeps a single
-`ci-alert`-labeled tracking issue open while either is failing or stale. If
-that issue opens, this page is the first place to look.
+The `ci-alert` workflow (`.github/workflows/ci-alert.yml`) checks every
+scheduled workflow once a day, the nightly hardware suite and the weekly
+install matrix included. A workflow whose latest completed run on main failed,
+or whose latest success is older than its schedule's longest gap plus one day
+(48 h for the nightly suite), gets its own `ci-alert`-labeled tracking issue,
+titled `CI health: hardware-suite.yml failing or stale` for the suite. If that
+issue opens, this page is the first place to look.

@@ -310,8 +310,9 @@ cargo build --release --locked
   (`(ADR-0029 B1)`, `#797`).
 - A change that makes a line of an `AGENTS.md` wrong (a command, path, CI lane,
   toolchain version or rule it cites) fixes that line in the same PR. CI runs
-  `scripts/check-agents-md.py` for moved paths, broken links and gate commands
-  that left `ci.yml`; rules, lanes and versions need a reread.
+  `scripts/check-agents-md.py` (needs python3 `yaml`) for cited paths git no
+  longer lists, broken links, and gate commands the `check` job in `ci.yml` no
+  longer runs; rules, lanes, the table above and versions need a reread.
 - Update by rebasing (`git fetch <upstream> && git rebase <upstream>/main`,
   rerun the gate, `git push --force-with-lease`), not merging: it keeps every
   commit signed off and the squash free of merge commits. A rebase or

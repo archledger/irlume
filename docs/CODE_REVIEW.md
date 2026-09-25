@@ -18,7 +18,8 @@ Every change to `main` arrives as a pull request and is reviewed before merge.
    `docs/MACHINE-API.md` and the schema. A change that makes a line of an
    `AGENTS.md` wrong (a command, path, CI lane, toolchain version or rule it
    cites) fixes that line in the same PR; CI's `scripts/check-agents-md.py`
-   catches moved paths, broken links and gate commands that left `ci.yml`.
+   catches cited paths git no longer lists, broken links, and gate commands
+   the `check` job in `ci.yml` no longer runs.
 
 ## How review is conducted
 

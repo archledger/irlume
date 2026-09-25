@@ -20,14 +20,22 @@ recorded in `/usr/local/lib/irlume-ci/capture.json`, which binds three facts:
 ```
 
 The binding is deliberate: a runner compromise must not turn into arbitrary
-camera access. The consequence is that **every new source tree that changes
-the capture path needs an administrator promotion**, or the suite fails at
-`IR camera strobe-burst capture` with `capture build is not approved`. From
-2026-09-11 to 2026-09-14 the manifest still named the v0.12.0 tree, and every
-run on newer heads failed there.
+camera access. The consequence is that **every new source tree needs an
+administrator promotion** before the strobe stage captures again; the manifest
+binds the whole tree, so any merge counts, not only camera changes. From
+2026-09-11 to 2026-09-14 the manifest still named the v0.12.0 tree, and from
+2026-09-20 the v0.14.0 one, and every run on newer heads failed there.
 
-Promote after merging camera-affecting changes (anything touching
-`crates/irlume-camera`, or before a release):
+The stage now reads the manifest first. On a tree it does not name, it warns
+(`IR capture not run`) and skips the capture until seven days after the
+manifest was written, so the rest of the suite and coverage keep running;
+from then on it fails, even on nights the camera is away, and `ci-alert`
+opens its issue. It captures the device the
+manifest names, not the first IR node doctor lists, so check the device too
+when you promote: the IR node's number can change when cameras are replugged.
+
+Promote before a release, after camera changes, and at least weekly while
+main moves:
 
 1. Ship the exact tree to archhost (rsync a clean checkout, no `.git`
    needed for the build itself).
@@ -52,8 +60,10 @@ sudo /usr/local/libexec/irlume-ci-capture <tree> /dev/video2 | tar -t
 ```
 
 Six `frame*.pgm` files plus `means.txt`, and one emitter proof line on
-stderr, means the promotion took. The daily `ci-alert` workflow will flag
-the suite red if you forget; this page is how you fix it.
+stderr, means the promotion took. The run's `IR camera strobe-burst capture`
+step warns while the approval is stale and fails once it is more than seven
+days old, at which point the daily `ci-alert` workflow flags the suite red;
+this page is how you fix it.
 
 minihost has no installed helper; its lane uses the direct `sudo burst_dump`
 fallback and needs no promotion.

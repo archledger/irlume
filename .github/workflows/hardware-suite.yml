@@ -113,8 +113,45 @@ jobs:
           # The parse now lives in a script with a self-test that hosted CI
           # runs on every PR, so the next doctor format change fails in
           # seconds instead of parking this stage until someone reads a log.
+          # With the restricted helper installed, its approval (world-readable;
+          # the helper stays the authority) names the source tree it was built
+          # from and the one device it captures. That device is the IR node,
+          # not whichever IR node doctor lists first: the census order is not
+          # the approval, and archhost's changed in 2026-09. A checkout the
+          # approval does not cover is reported as such, apart from a capture
+          # that failed. Every merge changes the tree, so an approval that is
+          # this many days old fails the step instead of warning, checked
+          # before the absent-camera skip so a borrowed camera cannot hold the
+          # nightly green past it. The approved device is validated either way.
+          approval_grace_days=7
+          helper=/usr/local/libexec/irlume-ci-capture
+          approval=/usr/local/lib/irlume-ci/capture.json
+          tree=$(git rev-parse 'HEAD^{tree}')
+          want=""; skip_capture=0
+          if [ -x "$helper" ]; then
+            if ! approved=$(python3 -I -c 'import json, re, sys
+          m = json.load(open(sys.argv[1]))
+          t, d = m.get("source_tree"), m.get("device")
+          if not (isinstance(t, str) and re.fullmatch("[0-9a-f]{40}", t)
+                  and isinstance(d, str) and re.fullmatch("/dev/video[0-9]{1,3}", d)):
+              sys.exit("capture approval has no valid source_tree and device")
+          print(t, d)' "$approval"); then
+              echo "::error::cannot read the capture approval $approval; an administrator reinstalls it (scripts/ci/README.md)"
+              exit 1
+            fi
+            read -r approved_tree want <<<"$approved"
+            if [ "$approved_tree" != "$tree" ]; then
+              stale_secs=$(( $(date +%s) - $(stat -c %Y "$approval") ))
+              if [ "$stale_secs" -ge $(( approval_grace_days * 86400 )) ]; then
+                echo "::error::IR capture not run for $(( stale_secs / 86400 )) days: the capture approval covers source tree $approved_tree, not this checkout's $tree. An administrator must promote the current tree (scripts/ci/README.md)."
+                exit 1
+              fi
+              echo "::warning::IR capture not run: the capture approval covers source tree $approved_tree (written $(( stale_secs / 86400 )) day(s) ago), not this checkout's $tree. An administrator promotes the current tree (scripts/ci/README.md); $approval_grace_days days after the approval was written this step fails."
+              skip_capture=1
+            fi
+          fi
           ir=""; rc=0
-          ir=$(scripts/ir-node-from-doctor.sh "$doc") || rc=$?
+          ir=$(scripts/ir-node-from-doctor.sh "$doc" ${want:+"$want"}) || rc=$?
           case "$rc" in
             0) ;;
             10)
@@ -137,12 +174,19 @@ jobs:
               echo "::error::doctor could not establish what cameras exist (unreadable nodes or an unwalkable /dev). The emitter test did NOT run; this is not an absent camera"
               cat "$doc"; exit 1
               ;;
+            14)
+              echo "::error::the capture approval names $want, which doctor does not classify as an IR node; the camera nodes changed, so an administrator promotes again with the current device (scripts/ci/README.md)"
+              cat "$doc"; exit 1
+              ;;
             *)
               echo "::error::scripts/ir-node-from-doctor.sh exited $rc"
               cat "$doc"; exit 1
               ;;
           esac
           echo "IR node: $ir"
+          if [ "$skip_capture" -eq 1 ]; then
+            exit 0
+          fi
           out=$(mktemp -d)
           trap 'rm -rf "$out"' EXIT
           # This trusted-main-only job must inspect the root-private recovery
@@ -159,13 +203,11 @@ jobs:
           # its exit status cannot select an unprivileged-to-sudo fallback.
           # Run once with the required privilege, keeping the positive emitter
           # proof, frame count and spread checks below as independent gates.
-          helper=/usr/local/libexec/irlume-ci-capture
           captured=0
           if [ -x "$helper" ]; then
             # Restricted runners use an administrator-approved binary. The
             # helper rejects a different source tree before opening the camera and
             # streams only capture files from its private output directory.
-            tree=$(git rev-parse 'HEAD^{tree}')
             if sudo -n "$helper" "$tree" "$ir" 2>"$err" | tar -xf - -C "$out"; then
               captured=1
             fi

@@ -2,15 +2,18 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright the irlume contributors.
 """Execute the real nightly camera shell with fixtures; never access hardware."""
+import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+TREE = 'a' * 40
 
 
 def camera_step():
@@ -51,7 +54,13 @@ export FIXTURE_PRIVILEGED=1
 exec "$@"
 ''')
         self.write(self.target / 'debug/irlume', '''#!/bin/bash
-printf '%s\\n' '[doctor] camera nodes (classified by pixel format):' '  /dev/video2: Ir (uvcvideo, USB)'
+if [ "${NO_NODES:-0}" = 1 ]; then
+  printf '%s\\n' '[doctor] camera nodes (classified by pixel format):' '  (no /dev/video* nodes on this machine)'
+elif [ "${TWO_IR:-0}" = 1 ]; then
+  printf '%s\\n' '[doctor] camera nodes (classified by pixel format):' '  /dev/video6: Ir (uvcvideo, USB)' '  /dev/video2: Ir (uvcvideo, USB)'
+else
+  printf '%s\\n' '[doctor] camera nodes (classified by pixel format):' '  /dev/video2: Ir (uvcvideo, USB)'
+fi
 ''')
         self.write(self.target / 'debug/examples/burst_dump', '''#!/bin/bash
 set -eu
@@ -84,7 +93,8 @@ fi
                         CARGO_TARGET_DIR=str(self.target), TMPDIR=str(self.root),
                         CALLS=str(self.root / 'calls'))
         for key in ['FIXTURE_PRIVILEGED', 'DENY_SUDO', 'FAIL_CAPTURE', 'FRAMES',
-                    'SPREAD', 'NO_MARKER', 'PROOF', 'HELPER_EXIT', 'REJECT_BUILD']:
+                    'SPREAD', 'NO_MARKER', 'PROOF', 'HELPER_EXIT', 'REJECT_BUILD', 'TWO_IR',
+                    'NO_NODES']:
             self.env.pop(key, None)
 
     def write(self, path, source):
@@ -92,12 +102,23 @@ fi
         path.chmod(0o755)
 
     def run_step(self, **env):
-        body = camera_step().replace('/usr/local/libexec/irlume-ci-capture', str(self.root / 'capture-helper'))
+        body = (camera_step()
+                .replace('/usr/local/libexec/irlume-ci-capture', str(self.root / 'capture-helper'))
+                .replace('/usr/local/lib/irlume-ci/capture.json', str(self.root / 'capture.json')))
         return subprocess.run(['/bin/bash', '-e', '-c', body],
                               cwd=self.root, env=dict(self.env, **env),
                               capture_output=True, text=True, timeout=10)
 
-    def install_helper(self):
+    def approve(self, tree=TREE, device='/dev/video2', age_days=0, text=None):
+        """Write the fixture approval, dated `age_days` back."""
+        path = self.root / 'capture.json'
+        path.write_text(text if text is not None else json.dumps(
+            {'schema': 1, 'source_tree': tree, 'sha256': 'b' * 64, 'device': device}))
+        stamp = time.time() - age_days * 86400
+        os.utime(path, (stamp, stamp))
+
+    def install_helper(self, **approval):
+        self.approve(**approval)
         self.write(self.root / 'capture-helper', '''#!/bin/bash
 set -eu
 [ "${FIXTURE_PRIVILEGED:-0}" = 1 ] || exit 93
@@ -138,6 +159,76 @@ exit "${HELPER_EXIT:-0}"
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.root / 'calls').exists())
         self.assertIn('build is not approved', result.stdout + result.stderr)
+
+    def test_helper_captures_the_approved_device_not_the_first_ir_node(self):
+        self.install_helper()
+        result = self.run_step(TWO_IR='1')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('IR node: /dev/video2', result.stdout)
+        self.assertEqual((self.root / 'calls').read_text(), '1\n')
+
+    def test_approved_device_doctor_does_not_call_ir_never_captures(self):
+        self.install_helper(device='/dev/video3')
+        result = self.run_step()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / 'calls').exists())
+        self.assertIn('names /dev/video3, which doctor does not classify as an IR node', result.stdout)
+
+    def test_approval_for_another_tree_warns_and_skips_within_grace(self):
+        for age, shown in [(0, 0), (7 - 1 / 24, 6)]:
+            with self.subTest(age=age):
+                self.install_helper(tree='c' * 40, age_days=age)
+                result = self.run_step()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse((self.root / 'calls').exists())
+                self.assertIn('::warning::IR capture not run', result.stdout)
+                self.assertIn(f'written {shown} day(s) ago', result.stdout)
+
+    def test_approval_for_another_tree_fails_from_seven_days(self):
+        for age in [7, 8]:
+            with self.subTest(age=age):
+                self.install_helper(tree='c' * 40, age_days=age)
+                result = self.run_step()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.root / 'calls').exists())
+                self.assertIn(f'::error::IR capture not run for {age} days', result.stdout)
+
+    def test_absent_camera_skip_cannot_outlast_the_deadline(self):
+        self.install_helper(tree='c' * 40, age_days=1)
+        result = self.run_step(NO_NODES='1')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('camera stage skipped', result.stdout)
+        self.assertIn('::warning::IR capture not run', result.stdout)
+        self.install_helper(tree='c' * 40, age_days=8)
+        result = self.run_step(NO_NODES='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('::error::IR capture not run for 8 days', result.stdout)
+
+    def test_stale_tree_still_validates_the_approved_device(self):
+        self.install_helper(tree='c' * 40, device='/dev/video3')
+        result = self.run_step(TWO_IR='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / 'calls').exists())
+        self.assertIn('names /dev/video3, which doctor does not classify as an IR node', result.stdout)
+
+    def test_another_tree_still_fails_on_a_doctor_regression(self):
+        self.install_helper(tree='c' * 40)
+        self.write(self.target / 'debug/irlume', """#!/bin/bash
+printf '%s\\n' '[doctor] camera nodes (classified by pixel format):' '  /dev/video0: Rgb (uvcvideo, USB)'
+""")
+        result = self.run_step()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('none as Ir', result.stdout)
+
+    def test_unreadable_or_incomplete_approval_never_captures(self):
+        for text in ['{', '{"schema": 1, "source_tree": "%s"}' % TREE,
+                     '{"schema": 1, "source_tree": "short", "device": "/dev/video2"}']:
+            with self.subTest(text=text):
+                self.install_helper(text=text)
+                result = self.run_step()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.root / 'calls').exists())
+                self.assertIn('cannot read the capture approval', result.stdout)
 
     def test_verified_default_keeps_frame_and_spread_gates(self):
         for helper in [False, True]:

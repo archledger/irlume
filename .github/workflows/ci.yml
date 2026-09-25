@@ -147,6 +147,11 @@ jobs:
       - name: Action pins (SHA-pinned; SLSA generator excepted)
         run: bash scripts/check-action-pins.sh
 
+      - name: AGENTS.md references (paths, links, gate commands)
+        run: |
+          python3 scripts/test-check-agents-md.py
+          python3 scripts/check-agents-md.py
+
       - name: Non-granting IR harness offline tests (no camera)
         run: python3 -m unittest discover -s scripts/ir-evaluation -p 'test_*.py'
 

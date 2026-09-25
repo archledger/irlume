@@ -58,6 +58,12 @@ pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Longest single wait for a bus message, so a stop request is seen promptly.
 pub(crate) const WAIT_SLICE: Duration = Duration::from_millis(250);
 
+/// Pause before the owner of `org.gnome.keyring` is asked for again after an
+/// attempt that failed in a way the same daemon can recover from (a timeout,
+/// a `FAILED` answer, an owner that could not be identified). Such a daemon
+/// keeps its name, so no owner change would ever bring it back.
+pub(crate) const RETRY_AFTER: Duration = Duration::from_millis(500);
+
 /// What the waiter observed about the owner of `org.gnome.keyring`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Identity {
@@ -353,8 +359,8 @@ pub(crate) enum AfterChange {
     Stale { peer_pid: u32 },
     /// The listener is not the owner's: treat the name as unowned.
     Mismatch { peer_pid: u32 },
-    /// No verdict (no listener, FAILED, a timeout): drop the owner and wait
-    /// for the next change.
+    /// No verdict (no listener, FAILED, a timeout): ask for the current
+    /// owner again after [`RETRY_AFTER`] and try it.
     Retry,
 }
 
@@ -423,6 +429,9 @@ fn on_bus(world: &mut impl World, token: &[u8], plan: &Plan) -> Outcome {
     };
     let mut mismatch_logged = false;
     let mut waiting = false;
+    // When to ask for the current owner again after a retryable failure. An
+    // identity mismatch is not retried: only an owner change can end it.
+    let mut retry_at: Option<Instant> = None;
     loop {
         if world.stop_requested() {
             return Outcome::Stopped;
@@ -442,7 +451,7 @@ fn on_bus(world: &mut impl World, token: &[u8], plan: &Plan) -> Outcome {
                         mismatch_logged = true;
                     }
                 }
-                Attempt::Retry => {}
+                Attempt::Retry => retry_at = Some(world.now() + RETRY_AFTER),
             }
         }
         if !waiting {
@@ -462,8 +471,23 @@ fn on_bus(world: &mut impl World, token: &[u8], plan: &Plan) -> Outcome {
                 bound_secs: plan.bound_secs(),
             };
         }
-        match world.next_owner_change(WAIT_SLICE.min(plan.deadline() - now)) {
-            Ok(Some(change)) => owner = change,
+        if retry_at.is_some_and(|at| now >= at) {
+            retry_at = None;
+            owner = match world.owner() {
+                Ok(current) => current,
+                Err(BusLost) => return poll_control(world, token, plan),
+            };
+            continue;
+        }
+        let mut slice = WAIT_SLICE.min(plan.deadline() - now);
+        if let Some(at) = retry_at {
+            slice = slice.min(at - now);
+        }
+        match world.next_owner_change(slice) {
+            Ok(Some(change)) => {
+                owner = change;
+                retry_at = None;
+            }
             Ok(None) => {}
             Err(BusLost) => return poll_control(world, token, plan),
         }
@@ -703,6 +727,8 @@ mod tests {
                 Some((at, _)) if *at <= until => {
                     let (at, owner) = self.changes.pop_front().unwrap();
                     self.now = self.start + at.max(self.elapsed());
+                    // `owner()` answers with the current owner from now on.
+                    self.owner_at_start.clone_from(&owner);
                     Ok(Some(owner))
                 }
                 _ => {
@@ -896,8 +922,11 @@ mod tests {
         );
     }
 
+    /// A daemon that times out or answers FAILED keeps its name, so no owner
+    /// change would bring it back: the same owner is asked for and tried
+    /// again after a pause.
     #[test]
-    fn an_unreachable_or_failed_daemon_drops_the_owner_until_the_next_change() {
+    fn an_unreachable_or_failed_daemon_is_tried_again_while_it_keeps_the_name() {
         for first in [
             Sent::Unreachable,
             answered(ControlResult::Failed),
@@ -905,18 +934,68 @@ mod tests {
         ] {
             let mut w = Script::new()
                 .change_at(1.0, Some(OWNER))
-                .change_at(3.0, Some(OWNER))
                 .serves(OWNER, DAEMON)
                 .reply(first)
                 .reply(answered(ControlResult::Ok))
                 .reply(answered(ControlResult::Ok));
             let outcome = w.run();
+            let pause = u64::try_from(RETRY_AFTER.as_millis()).unwrap();
             assert!(
-                matches!(outcome, Outcome::Delivered { after_ms, .. } if after_ms >= 3000),
-                "{first:?}: retried only at the next change: {outcome:?}"
+                matches!(outcome, Outcome::Delivered { after_ms, .. }
+                    if (1000 + pause..2000).contains(&after_ms)),
+                "{first:?}: tried again after the pause, with no owner change: {outcome:?}"
             );
-            assert_eq!(w.sent.len(), 3, "{first:?}");
+            assert_eq!(
+                w.ops(),
+                [
+                    (Op::Change, Expect::OwnerOrManager { owner_pid: DAEMON }),
+                    (Op::Change, Expect::OwnerOrManager { owner_pid: DAEMON }),
+                    (Op::Unlock, Expect::Peer(DAEMON)),
+                ],
+                "{first:?}"
+            );
         }
+    }
+
+    /// A retry asks the bus for the owner now: one that released the name
+    /// meanwhile is not tried again, and a new owner is tried at once.
+    #[test]
+    fn a_retry_follows_the_current_owner() {
+        let mut w = Script::new()
+            .change_at(1.0, Some(OWNER))
+            .change_at(1.2, None)
+            .change_at(3.0, Some(":1.20"))
+            .serves(OWNER, DAEMON)
+            .reply(answered(ControlResult::Failed))
+            .reply(Sent::Answered {
+                result: ControlResult::Ok,
+                peer_pid: DAEMON + 2,
+            })
+            .reply(answered(ControlResult::Ok));
+        w.identities.push((
+            ":1.20".into(),
+            Identity::Serves {
+                owner_pid: DAEMON + 2,
+            },
+        ));
+        let outcome = w.run();
+        assert!(
+            matches!(outcome, Outcome::Delivered { daemon_pid, after_ms } if daemon_pid == DAEMON + 2 && after_ms >= 3000),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            w.ops(),
+            [
+                (Op::Change, Expect::OwnerOrManager { owner_pid: DAEMON }),
+                (
+                    Op::Change,
+                    Expect::OwnerOrManager {
+                        owner_pid: DAEMON + 2
+                    }
+                ),
+                (Op::Unlock, Expect::Peer(DAEMON + 2)),
+            ]
+        );
     }
 
     #[test]

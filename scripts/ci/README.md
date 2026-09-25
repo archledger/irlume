@@ -153,3 +153,26 @@ workflow guard: all supported scenarios must pass, and seven unrelated or
 substituted successes cannot hide any missing required scenario. It also checks
 zero selection and propagation of a failed test command. Retiring a supported
 command requires an explicit review of this named contract and its fixtures.
+
+## CI health alert
+
+`ci-alert.py` is the logic of `.github/workflows/ci-alert.yml`. It watches every
+workflow file with an `on.schedule` trigger, except its own, and reads the
+schedules itself, so a new scheduled workflow needs no edit here. It accepts
+only the block style the workflows use (`schedule:` then `- cron:` lines) and
+reports any other form as an alert rather than skipping the file. Finding no
+scheduled workflow at all (a wrong path, a sparse checkout) exits 2 and changes
+no issue.
+
+A workflow alerts when its latest completed run on main did not succeed, or
+when its latest success is older than the longest gap between its cron firings
+plus one day (48 h daily, 8 d weekly, 32 d monthly). Pull request runs are not
+runs on main, even from a fork's branch named main. Skipped runs, and cancelled
+runs that a newer run replaced, give no verdict; a cancelled run with no newer
+run does.
+
+`python3 scripts/ci/test-ci-alert.py` runs the workflow's step as written
+against a fake `gh` and the repository's real workflow files, including the
+2026-09-15 to 09-24 advisory audit failures and a runner that stays offline. It
+needs `jq`, and compares the schedule reader with PyYAML: locally the
+comparison is skipped when PyYAML is missing, under Actions the test fails.

@@ -4,13 +4,21 @@
 # from 2026-09-10 to 2026-09-14 it was red four nights in a row for runner
 # environment reasons and nothing surfaced it until release day, because the
 # old hourly host monitor was retired with its agent. A genuine regression
-# would have looked exactly the same.
+# would have looked exactly the same. The advisory audit then failed every day
+# from 2026-09-15 to 2026-09-24 and no alert named it, because this check
+# watched only the suite and the install matrix.
 #
-# Daily, check the latest result of each watched workflow on main. On any
-# failure or staleness, keep exactly one open tracking issue (label ci-alert):
-# open it if absent, comment the current facts if already open, and close it
-# with a recovery note when everything is green again. No third-party actions,
-# no secrets beyond the default token, and no pull_request trigger.
+# Daily, judge every workflow with an `on.schedule` trigger (read from the
+# files in .github/workflows, so a new scheduled workflow is watched without
+# an edit here) on two things: the latest completed run on main, and the age
+# of the latest success against the schedule's longest gap plus one day. The
+# second catches a runner that stays offline, whose newest run is always a
+# young queued one. Each failing or stale workflow gets its own tracking issue
+# (label ci-alert), commented at most once a day and closed once it stops
+# alerting, so a lane that is already red cannot hide a new one. Logic and
+# fixtures: scripts/ci/ci-alert.py and scripts/ci/test-ci-alert.py (run in
+# ci.yml). No actions other than a pinned checkout, no secrets beyond the
+# default token, and no pull_request trigger.
 name: CI health alert
 
 on:
@@ -25,6 +33,7 @@ on:
         options: [dry, check]
 
 permissions:
+  actions: read
   contents: read
   issues: write
 
@@ -33,104 +42,18 @@ env:
 
 jobs:
   check:
-    name: nightly and install-matrix health
+    name: scheduled workflow health
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Evaluate watched workflows and maintain the tracking issue
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Evaluate scheduled workflows and maintain their tracking issues
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           MODE: ${{ inputs.mode || 'check' }}
-          # staleness ceilings: the suite may queue for a day while a runner is
-          # off; a week is generous for the Monday install matrix.
-          SUITE_STALE_HOURS: "48"
-          MATRIX_STALE_DAYS: "8"
         run: |
-          set -euo pipefail
-          verdicts=()
-          alert=0
-
-          judge() { # workflow_file stale_seconds
-            local file="$1" stale_seconds="$2"
-            local run json id status conclusion created age
-            run="$(gh run list --repo "$REPO" --workflow "$file" --branch main --limit 1 --json databaseId,status,conclusion,createdAt,url)"
-            count="$(jq length <<<"$run")"
-            if [ "$count" -eq 0 ]; then
-              verdicts+=("no runs of $file on main yet")
-              alert=1
-              return
-            fi
-            json="$(jq -r '.[0]' <<<"$run")"
-            id="$(jq -r .databaseId <<<"$json")"
-            status="$(jq -r .status <<<"$json")"
-            conclusion="$(jq -r '.conclusion // "none"' <<<"$json")"
-            created="$(jq -r .createdAt <<<"$json")"
-            url="$(jq -r .url <<<"$json")"
-            age="$(( $(date +%s) - $(date -d "$created" +%s) ))"
-            if [ "$status" != "completed" ]; then
-              if [ "$age" -ge "$stale_seconds" ]; then
-                verdicts+=("$file run $id stuck $status since $created: $url")
-                alert=1
-              else
-                verdicts+=("$file run $id is $status (not yet judgeable): $url")
-              fi
-            elif [ "$conclusion" != "success" ]; then
-              verdicts+=("$file run $id concluded $conclusion at $created: $url")
-              alert=1
-            elif [ "$age" -ge "$stale_seconds" ]; then
-              verdicts+=("$file latest success is stale (created $created): $url")
-              alert=1
-            else
-              verdicts+=("$file healthy: $url")
-            fi
-          }
-
-          judge hardware-suite.yml "$(( SUITE_STALE_HOURS * 3600 ))"
-          judge install-matrix.yml "$(( MATRIX_STALE_DAYS * 86400 ))"
-
-          printf '%s\n' "${verdicts[@]}"
-          echo "alert=$alert"
-
-          if [ "$MODE" = dry ]; then
-            echo "dry mode: no issue changes"
-            exit "$alert"
-          fi
-
-          body="$(printf '%s\n' "${verdicts[@]}")"
-          open="$(gh issue list --repo "$REPO" --label "$ALERT_LABEL" --state open --json number --jq 'length')"
-
-          if [ "$alert" -eq 1 ]; then
-            if [ "$open" -eq 0 ]; then
-              gh label create "$ALERT_LABEL" --repo "$REPO" --color b60205 \
-                --description "open while a watched CI workflow is failing or stale" >/dev/null 2>&1 || true
-              gh issue create --repo "$REPO" --label "$ALERT_LABEL" \
-                --title 'CI health: watched workflow failing or stale' \
-                --body "Automated check $(date -u +%FT%TZ):
-
-          $body
-
-          This issue is opened and closed automatically by the CI health alert workflow; a human should still diagnose and fix." >/dev/null
-              echo "opened tracking issue"
-            else
-              number="$(gh issue list --repo "$REPO" --label "$ALERT_LABEL" --state open --json number --jq '.[0].number')"
-              # one comment per day: skip if today's check already posted
-              if ! gh issue view "$number" --repo "$REPO" --json comments --jq '.comments[-1].body' \
-                 | grep -q "Automated check $(date -u +%F)"; then
-                gh issue comment "$number" --repo "$REPO" \
-                  --body "Automated check $(date -u +%FT%TZ):
-
-          $body" >/dev/null
-              fi
-              echo "updated tracking issue #$number"
-            fi
-          elif [ "$open" -ne 0 ]; then
-            number="$(gh issue list --repo "$REPO" --label "$ALERT_LABEL" --state open --json number --jq '.[0].number')"
-            gh issue close "$number" --repo "$REPO" --reason completed \
-              --comment "All watched workflows healthy again as of $(date -u +%FT%TZ):
-
-          $body" >/dev/null
-            echo "closed tracking issue #$number"
-          else
-            echo "healthy; nothing to do"
-          fi
+          python3 scripts/ci/ci-alert.py --repo "$REPO" --label "$ALERT_LABEL" --mode "$MODE"

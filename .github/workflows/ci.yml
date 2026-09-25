@@ -581,6 +581,17 @@ jobs:
           python3 scripts/ci/test-setup-coverage-tools.py
           python3 scripts/ci/test-nightly-coverage-contract.py
 
+      # ci-alert.yml runs only on main, once a day, so a mistake in its verdicts
+      # shows up as silence. Its step runs here against a fake gh and the real
+      # workflow files: fixtures only, no network, no issue changes. PyYAML is
+      # the reference its schedule reader is compared with; under Actions the
+      # test fails rather than skip that comparison.
+      - name: CI health alert verdicts (fixtures only, no network)
+        run: |
+          set -euo pipefail
+          python3 -c 'import yaml' 2>/dev/null || { sudo apt-get -qq update && sudo apt-get -qq install -y --no-install-recommends python3-yaml; }
+          python3 scripts/ci/test-ci-alert.py
+
       - name: systemd-analyze verify (unit syntax)
         run: |
           set -euo pipefail

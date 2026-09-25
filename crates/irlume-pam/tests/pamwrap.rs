@@ -1939,10 +1939,13 @@ fn gnome_token() -> Response {
 ///   * `detach`: leaves a `setsid sleep 30` behind, as the real helper leaves
 ///     its waiter, writes that process's pid to `gkr-waiter.pid`, and exits 0;
 ///   * `hang`: writes its own pid to `gkr-helper.pid` and becomes
-///     `sleep 60`.
+///     `sleep 60`;
+///   * `exit3`: exits 3;
+///   * `killed`: ends itself with SIGKILL.
 ///
-/// Like [`write_kde_fake_helper`], it drops pam_wrapper from its environment
-/// before it runs any command.
+/// It reads all of stdin before any of these, as the real helper does, so the
+/// module's write never meets a closed pipe. Like [`write_kde_fake_helper`],
+/// it drops pam_wrapper from its environment before it runs any command.
 fn write_gkr_fake_helper(root: &Path, mode: &str) -> PathBuf {
     let path = root.join(format!("gkr-unlock-{mode}.sh"));
     let body = format!(
@@ -1959,6 +1962,12 @@ fn write_gkr_fake_helper(root: &Path, mode: &str) -> PathBuf {
          hang)\n\
          echo $$ > '{root}/gkr-helper.pid'\n\
          exec sleep 60\n\
+         ;;\n\
+         exit3)\n\
+         exit 3\n\
+         ;;\n\
+         killed)\n\
+         kill -KILL $$\n\
          ;;\n\
          esac\n",
         root = root.display(),
@@ -2119,55 +2128,6 @@ fn pamwrap_gnome_token_without_a_stash_is_asked_for_once() {
     assert_eq!(log.lock().unwrap().len(), 1, "one daemon query");
 }
 
-/// A helper that never exits cannot hold the login: `open_session` returns
-/// IGNORE at the helper budget (15 s), and the helper is killed.
-#[test]
-#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
-fn pamwrap_hanging_gnome_token_helper_is_killed_at_the_budget() {
-    let Some(mut h) = Harness::try_new("gkr-hang") else {
-        return;
-    };
-    serve(&h.socket, |req| match req {
-        Request::UnsealKeyring { .. } => gnome_token(),
-        _ => Response::Error("unexpected request".into()),
-    });
-    h.set_gkr_unlock(write_gkr_fake_helper(&h.root, "hang"));
-    gkr_service(&h, false);
-
-    let started = std::time::Instant::now();
-    let (ok, out) = h.run("irlume-gkr", &["open_session"], "", None);
-    let took = started.elapsed();
-    let pid: i32 = std::fs::read_to_string(h.root.join("gkr-helper.pid"))
-        .expect("the helper ran")
-        .trim()
-        .parse()
-        .unwrap();
-    // Reaped by the module, or at worst a zombie on its way out.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let gone = loop {
-        let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
-        let alive = state.is_some_and(|stat| {
-            stat.rsplit(')')
-                .next()
-                .is_some_and(|rest| !rest.trim_start().starts_with('Z'))
-        });
-        if !alive {
-            break true;
-        }
-        if std::time::Instant::now() >= deadline {
-            break false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    };
-    kill_recorded(&h, "gkr-helper.pid");
-    assert!(ok, "IGNORE, and pam_permit opens the session: {out}");
-    assert!(
-        (std::time::Duration::from_secs(14)..std::time::Duration::from_secs(20)).contains(&took),
-        "open_session took {took:?}, not the 15 s budget"
-    );
-    assert!(gone, "the hanging helper {pid} was left running");
-}
-
 /// Only a GNOME keyring token goes to the GNOME helper: a login password, a
 /// KDE wallet key or "not needed" from the daemon never runs it.
 #[test]
@@ -2204,6 +2164,201 @@ fn pamwrap_other_keyring_replies_never_run_the_gnome_helper() {
             gkr_record(&h, "gkr-argv").is_empty(),
             "{name}: the GNOME helper ran"
         );
+    }
+}
+
+/// Start of every line the module logs for a failed token hand-off.
+const GKR_HAND_OFF_FAILED: &str = "GNOME keyring token hand-off failed: irlume-gkr-unlock ";
+
+/// Writes the `irlume-gkr` service with no auth line ([`gkr_service`]) and a
+/// fake daemon that answers `UnsealKeyring` with [`gnome_token`]. With no
+/// auth phase there is no stash, so `open_session` asks the daemon and hands
+/// the reply to the helper at `IRLUME_GKR_UNLOCK`.
+///
+/// It also writes the `other` service, which libpam reads as the default for
+/// every service. Without it libpam logs an error of its own through
+/// `pam_syslog` on every run, and the module's lines would not be the only
+/// ones [`gnome_token_session`] collects.
+fn gnome_token_service(h: &Harness) -> Arc<Mutex<Vec<Request>>> {
+    let log = serve(&h.socket, |req| match req {
+        Request::UnsealKeyring { .. } => gnome_token(),
+        _ => Response::Error("unexpected request".into()),
+    });
+    gkr_service(h, false);
+    h.write_service(
+        "other",
+        &["auth", "account", "password", "session"]
+            .map(|kind| format!("{kind} required pam_deny.so")),
+    );
+    log
+}
+
+/// Runs `open_session` on the `irlume-gkr` service with `helper` as
+/// `IRLUME_GKR_UNLOCK` and pam_wrapper's full log on, and returns whether
+/// the session opened, the whole output, and each `pam_syslog` call as
+/// (priority, text).
+///
+/// pam_wrapper takes over `pam_syslog` (1.1.5 on Ubuntu 24.04 and 1.1.8 on
+/// Fedora 44 alike), unless `PAM_WRAPPER_USE_SYSLOG` starts with `1`, so
+/// nothing reaches the host's journal. With `PAM_WRAPPER_DEBUGLEVEL` at 3
+/// each call prints the trace line `pwrap_pam_vsyslog called` and then its
+/// text on stderr, whatever its priority, for example
+/// `PWRAP_WARN[<prog> (<pid>)] - SYSLOG(4): <text>` for a warning. A
+/// priority carrying facility bits would print as a larger number.
+fn gnome_token_session(h: &Harness, helper: &Path) -> (bool, String, Vec<(u32, String)>) {
+    let helper = helper.to_str().expect("test paths are UTF-8");
+    let (ok, out) = h.run_with_env(
+        "irlume-gkr",
+        &["open_session"],
+        "",
+        None,
+        &[
+            ("IRLUME_GKR_UNLOCK", helper),
+            ("PAM_WRAPPER_DEBUGLEVEL", "3"),
+            ("PAM_WRAPPER_USE_SYSLOG", "0"),
+        ],
+    );
+    let logged: Vec<(u32, String)> = out
+        .lines()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once("] - SYSLOG(")?;
+            let (priority, text) = rest.split_once("): ")?;
+            Some((priority.parse().ok()?, text.to_string()))
+        })
+        .collect();
+    assert_eq!(
+        out.matches("pwrap_pam_vsyslog called").count(),
+        logged.len(),
+        "every pam_syslog call must be collected: {out}"
+    );
+    (ok, out, logged)
+}
+
+/// A failed token hand-off logs exactly one warning naming the failure, with
+/// fixed text and at most the exit code or signal, never the token; a
+/// successful one, which leaves the helper's waiter running, logs nothing.
+/// The session opens either way.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_gnome_token_hand_off_failure_logs_one_warning() {
+    let Some(h) = Harness::try_new("gkr-log") else {
+        return;
+    };
+    let daemon = gnome_token_service(&h);
+    let not_executable = h.root.join("gkr-unlock-not-executable.sh");
+    std::fs::write(&not_executable, "#!/bin/sh\nexit 0\n").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let cases = [
+        (
+            write_gkr_fake_helper(&h.root, "exit3"),
+            Some("exited with code 3"),
+            true,
+        ),
+        (
+            write_gkr_fake_helper(&h.root, "killed"),
+            Some("was ended by signal 9"),
+            true,
+        ),
+        (write_gkr_fake_helper(&h.root, "detach"), None, true),
+        (h.root.join("no-such-helper"), Some("not found"), false),
+        (not_executable, Some("could not be started"), false),
+    ];
+    for (run, (helper, failure, starts)) in cases.iter().enumerate() {
+        for record in ["gkr-argv", "gkr-stdin", "gkr-waiter.pid"] {
+            let _ = std::fs::remove_file(h.root.join(record));
+        }
+        let (ok, out, logged) = gnome_token_session(&h, helper);
+        kill_recorded(&h, "gkr-waiter.pid");
+        assert!(ok, "the session must open whatever the helper does: {out}");
+        let expected: Vec<(u32, String)> = failure
+            .iter()
+            .map(|rest| (4, format!("{GKR_HAND_OFF_FAILED}{rest}")))
+            .collect();
+        assert_eq!(
+            logged,
+            expected,
+            "{}: exactly one warning for a failure, none for a success: {out}",
+            helper.display()
+        );
+        assert!(
+            !out.contains(FAKE_GKR_TOKEN),
+            "the token must never be printed: {out}"
+        );
+        let (argv, stdin): (&[&str], &[&str]) = if *starts {
+            (&["tester"], &[FAKE_GKR_TOKEN_SHA256])
+        } else {
+            (&[], &[])
+        };
+        assert_eq!(
+            gkr_record(&h, "gkr-argv"),
+            argv,
+            "{}: the helper runs once, as the user's name",
+            helper.display()
+        );
+        assert_eq!(
+            gkr_record(&h, "gkr-stdin"),
+            stdin,
+            "{}: the token, exactly, is on stdin",
+            helper.display()
+        );
+        let reqs = daemon.lock().unwrap();
+        assert_eq!(
+            reqs.len(),
+            run + 1,
+            "one delivery query per session: {reqs:?}"
+        );
+        assert!(
+            matches!(reqs[run], Request::UnsealKeyring { .. }),
+            "{reqs:?}"
+        );
+    }
+}
+
+/// A helper that never exits cannot hold the login: `open_session` returns
+/// IGNORE at the helper budget (15 s), the helper is killed, and that failure
+/// is logged as one warning; the session still opens.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_gnome_token_helper_past_the_budget_is_killed_and_logged() {
+    let Some(h) = Harness::try_new("gkr-budget") else {
+        return;
+    };
+    let _daemon = gnome_token_service(&h);
+    let helper = write_gkr_fake_helper(&h.root, "hang");
+
+    let started = std::time::Instant::now();
+    let (ok, out, logged) = gnome_token_session(&h, &helper);
+    let took = started.elapsed();
+    assert!(
+        ok,
+        "the session must open after the helper is killed: {out}"
+    );
+    assert!(
+        took >= std::time::Duration::from_secs(15) && took < std::time::Duration::from_secs(20),
+        "the module waits out its 15 s budget and no longer: {took:?}"
+    );
+    assert_eq!(
+        logged,
+        vec![(
+            4,
+            format!("{GKR_HAND_OFF_FAILED}was still running after 15 s and was killed")
+        )],
+        "{out}"
+    );
+    assert!(!out.contains(FAKE_GKR_TOKEN), "{out}");
+    assert_eq!(gkr_record(&h, "gkr-argv"), ["tester"]);
+    assert_eq!(gkr_record(&h, "gkr-stdin"), [FAKE_GKR_TOKEN_SHA256]);
+    let pid = std::fs::read_to_string(h.root.join("gkr-helper.pid")).unwrap();
+    let proc_dir = PathBuf::from(format!("/proc/{}", pid.trim()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::fs::read(proc_dir.join("cmdline")).is_ok_and(|c| c.starts_with(b"sleep")) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the helper must be killed, not left running"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 

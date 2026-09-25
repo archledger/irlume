@@ -647,8 +647,10 @@ fn try_reseal_session(pamh: &Pam, user: &str) {
 /// returns within about a second; the waiter delivers it later and logs the
 /// outcome to the journal. Each handle delivers at most once: the stash is
 /// emptied first, on both paths, so a second `open_session` on this handle
-/// neither asks the daemon again nor starts a second waiter. Best-effort and
-/// silent like everything else in the session phase.
+/// neither asks the daemon again nor starts a second waiter. Best-effort like
+/// everything else in the session phase: nothing reaches the prompt and the
+/// session opens either way, but a failed hand-off to the helper writes one
+/// journal warning ([`hand_token_to_keyring_daemon`]).
 fn deliver_gnome_token(pamh: &Pam, user: &str) {
     // SAFETY: the key was registered by this module in the same PAM
     // transaction and is not replaced while the borrow is live; the borrow
@@ -699,7 +701,7 @@ fn deliver_gnome_token(pamh: &Pam, user: &str) {
             }
         }
     };
-    let _ = hand_token_to_keyring_daemon(user, &token);
+    let _ = hand_token_to_keyring_daemon(pamh, user, &token);
 }
 
 /// SESSION-phase delivery of a KDE wallet key deferred by the auth phase: the
@@ -763,12 +765,29 @@ fn secure_helper_path(var: &str, compiled: &str) -> String {
 /// otherwise waits for it, and exits at the waiter's first report or after
 /// one second, whichever comes first. Only the helper process itself is
 /// waited for, never the waiter.
-fn hand_token_to_keyring_daemon(user: &str, token: &irlume_common::SecretBytes) -> bool {
+///
+/// Exit status 0 means the token was delivered or handed to the waiter,
+/// which logs its own outcome under `irlume-gkr-unlock`; that returns `true`
+/// and writes nothing here. Anything else writes one warning through
+/// `pam_syslog` ([`log_hand_off_failure`]): the helper is missing, cannot be
+/// started, closes its input early, exits non-zero (1 is a refusal or an
+/// error before the hand-off, or a waiter that failed or died within its
+/// first second), ends on a signal, is killed at [`HELPER_BUDGET`], or cannot
+/// be waited for. The helper's own stderr goes to /dev/null, so for an error
+/// before the hand-off that line is the only trace of a token that never
+/// reached the keyring.
+fn hand_token_to_keyring_daemon(
+    pamh: &Pam,
+    user: &str,
+    token: &irlume_common::SecretBytes,
+) -> bool {
     use std::io::Write;
+    use std::os::unix::process::ExitStatusExt as _;
     use std::process::{Command, Stdio};
 
     let helper = secure_helper_path("IRLUME_GKR_UNLOCK", irlume_common::GKR_UNLOCK_PATH);
     if !std::path::Path::new(&helper).is_file() {
+        log_hand_off_failure(pamh, HandOffFailure::Missing);
         return false;
     }
     let mut child = match Command::new(&helper)
@@ -779,11 +798,15 @@ fn hand_token_to_keyring_daemon(user: &str, token: &irlume_common::SecretBytes) 
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => {
+            log_hand_off_failure(pamh, HandOffFailure::Spawn);
+            return false;
+        }
     };
     if let Some(mut sin) = child.stdin.take() {
         if sin.write_all(token.expose()).is_err() {
             kill_bounded(&mut child);
+            log_hand_off_failure(pamh, HandOffFailure::Input);
             return false;
         }
         // EOF tells the helper the token is complete.
@@ -792,8 +815,72 @@ fn hand_token_to_keyring_daemon(user: &str, token: &irlume_common::SecretBytes) 
     // Bounded, because this is the PAM session phase and the login blocks on
     // it. The helper normally exits within a second, but a wedged or stopped
     // child would otherwise hang the login here; a child still running past
-    // the budget is killed rather than waited on.
-    wait_bounded(&mut child, HELPER_BUDGET)
+    // the budget is killed rather than waited on. `reap_by` also gives up
+    // when the status cannot be read, which the deadline check tells apart.
+    let deadline = Instant::now() + HELPER_BUDGET;
+    let failure = match reap_by(&mut child, deadline) {
+        Some(status) if status.success() => return true,
+        Some(status) => match (status.code(), status.signal()) {
+            (Some(code), _) => HandOffFailure::Exit(code),
+            (None, Some(signal)) => HandOffFailure::Signal(signal),
+            (None, None) => HandOffFailure::Unknown,
+        },
+        None if Instant::now() >= deadline => HandOffFailure::TimedOut,
+        None => HandOffFailure::Unknown,
+    };
+    log_hand_off_failure(pamh, failure);
+    false
+}
+
+/// Why [`hand_token_to_keyring_daemon`] failed. It holds no secret: only the
+/// step that failed and the helper's exit code or signal number, so nothing
+/// logged from it can carry the token, its length or a password.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandOffFailure {
+    /// The helper path does not name a regular file.
+    Missing,
+    /// The helper could not be started.
+    Spawn,
+    /// The helper closed its input before taking the whole token.
+    Input,
+    /// The helper exited with this non-zero code.
+    Exit(i32),
+    /// The helper was ended by this signal.
+    Signal(i32),
+    /// The helper was still running at [`HELPER_BUDGET`] and was killed.
+    TimedOut,
+    /// Waiting for the helper failed, so its exit status is unknown.
+    Unknown,
+}
+
+impl HandOffFailure {
+    /// The journal text: fixed wording plus at most one number.
+    fn message(self) -> String {
+        const HELPER: &str = "irlume-gkr-unlock";
+        let what = match self {
+            HandOffFailure::Missing => format!("{HELPER} not found"),
+            HandOffFailure::Spawn => format!("{HELPER} could not be started"),
+            HandOffFailure::Input => format!("{HELPER} closed its input early"),
+            HandOffFailure::Exit(code) => format!("{HELPER} exited with code {code}"),
+            HandOffFailure::Signal(signal) => format!("{HELPER} was ended by signal {signal}"),
+            HandOffFailure::TimedOut => format!(
+                "{HELPER} was still running after {} s and was killed",
+                HELPER_BUDGET.as_secs()
+            ),
+            HandOffFailure::Unknown => format!("{HELPER} could not be waited for"),
+        };
+        format!("GNOME keyring token hand-off failed: {what}")
+    }
+}
+
+/// Write `failure` to the journal as one warning.
+///
+/// `pam_syslog` logs under `LOG_AUTHPRIV` with the standard
+/// `pam_irlume(<service>:session):` prefix and never calls `openlog`, so the
+/// host process's own syslog identity and facility stay as they were. Taking
+/// a [`HandOffFailure`] instead of text keeps secrets out by construction.
+fn log_hand_off_failure(pamh: &Pam, failure: HandOffFailure) {
+    let _ = pamh.syslog(pamsm::LogLvl::WARNING, &failure.message());
 }
 
 /// Ceiling on the keyring helpers, not their expected time. The GNOME unlock
@@ -803,11 +890,6 @@ fn hand_token_to_keyring_daemon(user: &str, token: &irlume_common::SecretBytes) 
 /// to start and exit; the KDE helper forks and execs the wallet daemon and normally exits
 /// in milliseconds, so the same ceiling is generous there.
 const HELPER_BUDGET: Duration = Duration::from_secs(15);
-
-/// Reap `child`, giving up (and killing it) after `budget`.
-fn wait_bounded(child: &mut std::process::Child, budget: Duration) -> bool {
-    reap_by(child, Instant::now() + budget).is_some_and(|status| status.success())
-}
 
 /// Reap `child`, giving up (and killing it) at `deadline`.
 ///
@@ -1723,6 +1805,31 @@ mod tests {
             body[arm..].contains("let _ = "),
             "the info emission must be best-effort"
         );
+    }
+
+    /// The journal lines for a failed GNOME keyring token hand-off are fixed
+    /// text plus at most one number (an exit code, a signal or the budget),
+    /// never anything derived from the token. Hand-written expectations: the
+    /// table is the contract.
+    #[test]
+    fn keyring_hand_off_failures_log_fixed_text_and_at_most_one_number() {
+        use super::HandOffFailure;
+        let prefix = "GNOME keyring token hand-off failed: irlume-gkr-unlock ";
+        for (failure, rest) in [
+            (HandOffFailure::Missing, "not found"),
+            (HandOffFailure::Spawn, "could not be started"),
+            (HandOffFailure::Input, "closed its input early"),
+            (HandOffFailure::Exit(1), "exited with code 1"),
+            (HandOffFailure::Exit(-3), "exited with code -3"),
+            (HandOffFailure::Signal(9), "was ended by signal 9"),
+            (
+                HandOffFailure::TimedOut,
+                "was still running after 15 s and was killed",
+            ),
+            (HandOffFailure::Unknown, "could not be waited for"),
+        ] {
+            assert_eq!(failure.message(), format!("{prefix}{rest}"), "{failure:?}");
+        }
     }
 
     /// The allocator of this test binary, which can find a secret in freed

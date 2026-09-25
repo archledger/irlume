@@ -88,7 +88,9 @@ const GREETERS: &[Svc] = &[
     }, // COSMIC (Pop!_OS / System76)
     Svc {
         etc: "/etc/pam.d/greetd",
-        vendor: None,
+        // Fedora 45 ships greetd's service only in the vendor dir; f44 and
+        // earlier ship /etc/pam.d/greetd.
+        vendor: Some("/usr/lib/pam.d/greetd"),
     }, // greetd (sway / wayland / tuigreet)
     Svc {
         etc: "/etc/pam.d/ly",
@@ -224,7 +226,12 @@ const FP_GREETERS: &[Svc] = &[Svc {
     etc: "/etc/pam.d/gdm-fingerprint",
     vendor: None,
 }];
-const SUDO: &str = "/etc/pam.d/sudo";
+/// Opt-in via `--with-sudo`. openSUSE Tumbleweed ships sudo's service only in
+/// the vendor dir; most families ship a real /etc file.
+const SUDO: Svc = Svc {
+    etc: "/etc/pam.d/sudo",
+    vendor: Some("/usr/lib/pam.d/sudo"),
+};
 /// polkit's agent helper always authenticates through the `polkit-1` PAM
 /// service. Debian/Arch ship a real /etc file (edit-in-place with backup);
 /// Fedora ships only the vendor copy (materialize an /etc override from it,
@@ -402,7 +409,7 @@ fn reconcile() -> ExitCode {
             // service / path unit run as root, so this is only a manual-run edge.
             return ExitCode::SUCCESS;
         }
-        let with_sudo = Path::new(SUDO).exists() && file_has_module(Path::new(SUDO));
+        let with_sudo = sudo_wired();
         let with_polkit = polkit_wired() == Some(true);
         // Record the lock screen as ours only if the /etc override actually
         // carries the module now (it was wired), not merely because the vendor
@@ -433,7 +440,7 @@ fn reconcile() -> ExitCode {
     // The FILE is the ground truth for "is this surface ours": adopt a wired
     // surface the marker missed, the same reasoning as the no-marker adoption
     // above, and record it so the next run agrees.
-    let file_sudo = Path::new(SUDO).exists() && file_has_module(Path::new(SUDO));
+    let file_sudo = sudo_wired();
     let file_polkit = polkit_wired() == Some(true);
     let adopted = (file_sudo && !with_sudo) || (file_polkit && !with_polkit);
     let with_sudo = with_sudo || file_sudo;
@@ -487,7 +494,7 @@ fn reconcile() -> ExitCode {
         eprintln!("[login] greeter PAM configuration changed; re-applying irlume wiring");
     }
     // The lock is already held above; taking it again would deadlock.
-    act_holding_lock(true, true, with_sudo, with_polkit)
+    act_holding_lock(true, true, with_sudo, with_polkit, ScopeOrigin::Marker)
 }
 
 /// Whether the ACTIVE display manager's own greeter service carries the module.
@@ -507,6 +514,14 @@ fn reconcile() -> ExitCode {
 pub(crate) fn lock_wired() -> bool {
     let (svc, _) = lock_surface();
     Path::new(svc.etc).exists() && file_has_module(Path::new(svc.etc))
+}
+
+/// Does the sudo stack carry the module right now? irlume's line always lives
+/// in the /etc file, whether it edited that file or materialized it from the
+/// vendor copy.
+fn sudo_wired() -> bool {
+    let etc = Path::new(SUDO.etc);
+    etc.exists() && file_has_module(etc)
 }
 
 pub(crate) fn active_login_wired() -> bool {
@@ -586,7 +601,7 @@ fn polkit_stanza_stale(etc: &Path) -> bool {
 fn wired_surface_regressed(with_sudo: bool, with_polkit: bool) -> bool {
     let fp: Vec<&Path> = FP_GREETERS.iter().map(|s| Path::new(s.etc)).collect();
     surfaces_regressed(
-        with_sudo.then(|| Path::new(SUDO)),
+        with_sudo.then(|| (Path::new(SUDO.etc), SUDO.vendor.map(Path::new))),
         with_polkit.then(|| (Path::new(POLKIT.etc), POLKIT.vendor.map(Path::new))),
         &fp,
     )
@@ -594,13 +609,17 @@ fn wired_surface_regressed(with_sudo: bool, with_polkit: bool) -> bool {
 
 /// Testable core of [`wired_surface_regressed`], taking the paths so a temp
 /// directory can drive it. `sudo`/`polkit` are `None` when the marker says we
-/// never wired them.
+/// never wired them; each carries its vendor path when it has one.
 fn surfaces_regressed(
-    sudo: Option<&Path>,
+    sudo: Option<(&Path, Option<&Path>)>,
     polkit: Option<(&Path, Option<&Path>)>,
     fp_services: &[&Path],
 ) -> bool {
-    if sudo.is_some_and(path_regressed) {
+    // sudo is materialized from a vendor copy where the distribution ships it
+    // only there (openSUSE Tumbleweed), so a deleted /etc override is a
+    // regression the same way it is for polkit below. Elsewhere there is no
+    // vendor copy and only a stripped file counts.
+    if sudo.is_some_and(|(etc, vendor)| lock_regressed(etc, vendor)) {
         return true;
     }
     // polkit is materialized from a vendor copy on Fedora, so a DELETED /etc
@@ -1048,15 +1067,7 @@ fn walk_surfaces(enable: bool, with_sudo: bool, with_polkit: bool, visit: &mut S
         face_lock && !stock_lane_yielded(),
     );
     if sudo_in_scope(enable, with_sudo) {
-        visit(
-            &Svc {
-                etc: SUDO,
-                vendor: None,
-            },
-            ROLE_SUDO,
-            &wire_verify_service,
-            true,
-        );
+        visit(&SUDO, ROLE_SUDO, &wire_verify_service, true);
     }
     if polkit_in_scope(enable, with_polkit) {
         visit(&POLKIT, ROLE_POLKIT, &wire_polkit_service, true);
@@ -1394,7 +1405,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
     } else {
         None
     };
-    act_holding_lock(enable, apply, with_sudo, with_polkit)
+    act_holding_lock(enable, apply, with_sudo, with_polkit, ScopeOrigin::Command)
 }
 
 /// The body of [`act`], for a caller that ALREADY holds the PAM lock.
@@ -1422,7 +1433,54 @@ fn enable_permitted(enable: bool, caps_established: bool) -> Result<(), &'static
     Ok(())
 }
 
-fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCode {
+/// Who chose the opt-in scopes (`with_sudo`, `with_polkit`) of a run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScopeOrigin {
+    /// The command line: `--with-sudo` and `--with-polkit` are requests.
+    Command,
+    /// `reconcile` replaying the marker, which records what WAS wired.
+    Marker,
+}
+
+/// Whether an opt-in surface asked for on the command line came to nothing:
+/// no stack for it on this machine, or no auth line to anchor to. Such a run
+/// must fail rather than report success with the surface unwired. Reconcile
+/// only replays what an earlier run observed, and a disable delivers nothing,
+/// so neither counts.
+fn requested_scope_unmet(
+    origin: ScopeOrigin,
+    enable: bool,
+    requested: bool,
+    change: PlannedChange,
+) -> bool {
+    origin == ScopeOrigin::Command
+        && enable
+        && requested
+        && matches!(
+            change,
+            PlannedChange::NotInstalled | PlannedChange::NoAnchor
+        )
+}
+
+/// The line that names a requested opt-in surface this run did not wire, and
+/// why. Printed after the per-file lines, so it is the last thing a reader
+/// sees before the non-zero exit.
+fn unmet_scope_line(flag: &str, service: &str, change: PlannedChange) -> String {
+    let why = if change == PlannedChange::NoAnchor {
+        format!("the {service} PAM service has no auth line to anchor to")
+    } else {
+        format!("this machine has no {service} PAM service")
+    };
+    format!("[login] {flag}: not wired ({why})")
+}
+
+fn act_holding_lock(
+    enable: bool,
+    apply: bool,
+    with_sudo: bool,
+    with_polkit: bool,
+    origin: ScopeOrigin,
+) -> ExitCode {
     if !apply {
         println!("[login] DRY RUN: showing what `--apply` would change (nothing is written):");
     }
@@ -1577,17 +1635,18 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
              leaving the stock password lane untouched; removing the dedicated lane restores it"
         );
     }
+    // The opt-in scopes the command line asked for that came to nothing. They
+    // fail the run, but unlike an error they still let the marker be written:
+    // every other surface was handled, and the marker records what is wired.
+    let mut unmet: Vec<(&str, &str, PlannedChange)> = Vec::new();
     if sudo_in_scope(enable, with_sudo) {
-        match wire_service(
-            &Svc {
-                etc: SUDO,
-                vendor: None,
-            },
-            enable,
-            apply,
-            &wire_verify_service,
-        ) {
-            Ok(msg) => println!("  {msg}"),
+        match wire_service(&SUDO, enable, apply, &wire_verify_service) {
+            Ok(msg) => {
+                println!("  {msg}");
+                if requested_scope_unmet(origin, enable, with_sudo, msg.change) {
+                    unmet.push(("--with-sudo", "sudo", msg.change));
+                }
+            }
             Err(e) => {
                 eprintln!("  ✗ {e}");
                 errs += 1;
@@ -1598,7 +1657,9 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
         match wire_service(&POLKIT, enable, apply, &wire_polkit_service) {
             Ok(msg) => {
                 println!("  {msg}");
-                if enable && apply {
+                if requested_scope_unmet(origin, enable, with_polkit, msg.change) {
+                    unmet.push(("--with-polkit", "polkit-1", msg.change));
+                } else if enable && apply {
                     println!(
                         "    polkit prompts (Bitwarden unlock, pkexec) now take your face.\n    \
                          Type yes for one face attempt, or use your password."
@@ -1637,7 +1698,7 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
         // and a later distro PAM rewrite would strip irlume from it for good.
         // Observed the same way `reconcile`'s adopt path already does it.
         if enable {
-            let obs_sudo = Path::new(SUDO).exists() && file_has_module(Path::new(SUDO));
+            let obs_sudo = sudo_wired();
             let obs_polkit = polkit_wired() == Some(true);
             let obs_lock = lock_wired();
             // #607: alongside the observed facts, record the yield intent when
@@ -1670,9 +1731,20 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
         if enable {
             report_keyring_handoff();
         }
-        println!("[login] done. Password remains the fallback everywhere.");
+        if unmet.is_empty() {
+            println!("[login] done. Password remains the fallback everywhere.");
+        } else {
+            let flags: Vec<&str> = unmet.iter().map(|(flag, _, _)| *flag).collect();
+            println!(
+                "[login] done, except {}. Password remains the fallback everywhere.",
+                flags.join(" and ")
+            );
+        }
     }
-    if errs == 0 {
+    for (flag, service, change) in &unmet {
+        eprintln!("{}", unmet_scope_line(flag, service, *change));
+    }
+    if errs == 0 && unmet.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -3071,7 +3143,9 @@ mod tests {
     /// skipped the whole distro. The vendor paths make wire_service
     /// materialize /etc overrides exactly as it already does for plasmalogin
     /// and kde on other layouts; on families that ship /etc/pam.d directly
-    /// the vendor path is never consulted.
+    /// the vendor path is never consulted. Fedora 45 moved greetd there too
+    /// (and GDM 51 moved gdm-password); openSUSE Tumbleweed also ships sudo
+    /// only there.
     #[test]
     fn the_dm_greeters_carry_vendor_paths_for_the_suse_layout() {
         for (etc, vendor) in [
@@ -3079,6 +3153,7 @@ mod tests {
             ("/etc/pam.d/gdm-password", "/usr/lib/pam.d/gdm-password"),
             ("/etc/pam.d/lightdm", "/usr/lib/pam.d/lightdm"),
             ("/etc/pam.d/cosmic-greeter", "/usr/lib/pam.d/cosmic-greeter"),
+            ("/etc/pam.d/greetd", "/usr/lib/pam.d/greetd"),
         ] {
             let svc = GREETERS
                 .iter()
@@ -3086,16 +3161,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("{etc} missing"));
             assert_eq!(svc.vendor, Some(vendor), "{etc}");
         }
-        // No accidental over-reach: greeters without a verified vendor-only
-        // layout keep vendor: None (the /etc file is the only copy families
-        // ship for these today).
-        for etc in ["/etc/pam.d/greetd", "/etc/pam.d/ly"] {
-            let svc = GREETERS
-                .iter()
-                .find(|s| s.etc == etc)
-                .unwrap_or_else(|| panic!("{etc} missing"));
-            assert_eq!(svc.vendor, None, "{etc}");
-        }
+        assert_eq!(SUDO.vendor, Some("/usr/lib/pam.d/sudo"));
+        // No accidental over-reach: a greeter without a verified vendor-only
+        // layout keeps vendor: None (ly ships only /etc/pam.d/ly).
+        let ly = GREETERS
+            .iter()
+            .find(|s| s.etc == "/etc/pam.d/ly")
+            .expect("ly missing");
+        assert_eq!(ly.vendor, None);
     }
 
     /// End to end on the survey's openSUSE fixture: a vendor-only sddm (the
@@ -3165,6 +3238,221 @@ mod tests {
             "disable must expose the original vendor stack"
         );
         assert_eq!(std::fs::read_to_string(&vendor).unwrap(), fixture);
+    }
+
+    // ---- vendor-only services ------------------------------------------------
+    //
+    // Some distributions ship a service ONLY under /usr/lib/pam.d, so there is
+    // no /etc/pam.d file to edit and wiring must materialize an /etc override
+    // from the vendor copy. Fixture provenance, byte for byte:
+    // - fedora-45/greetd: Fedora dist-git rpms/greetd, branch f45 at fe1afafe
+    //   (greetd.pam, installed as %{_prefix}/lib/pam.d/greetd). f44 and
+    //   earlier install it to /etc/pam.d.
+    // - fedora-45/gdm-password: GNOME/gdm tag 51.0,
+    //   data/pam-redhat/gdm-password.pam, which Fedora 45's gdm-51.0 installs
+    //   unpatched under %{_prefix}/lib/pam.d.
+    // - opensuse/sudo: openSUSE pool/sudo, branch factory (sudo.pamd,
+    //   installed to %{_pam_vendordir} where %{_distconfdir} is defined, as on
+    //   Tumbleweed).
+
+    /// A declared surface moved under `root`, keeping its shape: its /etc path
+    /// and, when it declares one, its vendor path.
+    fn under_root(root: &Path, declared: &Svc) -> Svc {
+        Svc {
+            etc: leak(&root.join(declared.etc.trim_start_matches('/'))),
+            vendor: declared
+                .vendor
+                .map(|v| leak(&root.join(v.trim_start_matches('/')))),
+        }
+    }
+
+    /// Lay out a service the way a vendor-only distribution ships it: the file
+    /// under `root/usr/lib/pam.d`, and nothing for it under `root/etc/pam.d`.
+    fn ship_vendor_only(root: &Path, service: &str, content: &str) {
+        let vendor = root.join("usr/lib/pam.d").join(service);
+        std::fs::create_dir_all(vendor.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(root.join("etc/pam.d")).unwrap();
+        std::fs::write(vendor, content).unwrap();
+    }
+
+    fn greeter(etc: &str) -> &'static Svc {
+        GREETERS
+            .iter()
+            .find(|s| s.etc == etc)
+            .unwrap_or_else(|| panic!("{etc} is not a declared greeter"))
+    }
+
+    /// The on-demand jump shape around the password carrier: the face line
+    /// directly above it and irlume's permit landing directly below, so
+    /// `success=1` skips exactly the carrier.
+    fn assert_jump_around_carrier(wired: &str, carrier: &str) {
+        let lines: Vec<&str> = wired.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| directive(l).contains(carrier))
+            .unwrap_or_else(|| panic!("the vendor carrier line is gone: {wired}"));
+        assert!(at > 0, "nothing above the carrier: {wired}");
+        assert_eq!(
+            lines[at - 1],
+            GREETER_UNSEAL_COSMIC_JUMP,
+            "the face line sits directly above the carrier: {wired}"
+        );
+        assert_eq!(
+            lines.get(at + 1).copied(),
+            Some(PERMIT_LANDING),
+            "the landing sits directly below the carrier: {wired}"
+        );
+    }
+
+    /// Fedora 45 moved greetd's service to /usr/lib/pam.d. Wiring must find it
+    /// there, materialize the override with the face line, and remove only
+    /// that override on disable.
+    #[test]
+    fn fedora45_vendor_only_greetd_is_wired() {
+        let dir = TestDir::new("f45-greetd");
+        let declared = greeter("/etc/pam.d/greetd");
+        let stock = fixture("fedora-45", "greetd");
+        ship_vendor_only(&dir.0, "greetd", &stock);
+        let svc = under_root(&dir.0, declared);
+        let ondemand = dm_profile(declared.etc, None).ondemand;
+        assert!(ondemand, "greetd arms on an empty Enter");
+        let wire = |c: &str| wire_greeter_impl(c, true, true, ondemand);
+        let outcome = wire_service(&svc, true, true, &wire).unwrap();
+        assert_eq!(
+            outcome.change,
+            PlannedChange::MaterializeOverride,
+            "the vendor-only greetd must be wired: {outcome}"
+        );
+        let wired = std::fs::read_to_string(svc.etc).unwrap();
+        assert!(wired.starts_with(CREATED_PREFIX), "{wired}");
+        assert_jump_around_carrier(&wired, "substack    system-auth");
+        let again = wire_service(&svc, true, true, &wire).unwrap();
+        assert_eq!(again.change, PlannedChange::AlreadyCorrect, "{again}");
+        let off = wire_service(&svc, false, true, &wire).unwrap();
+        assert_eq!(off.change, PlannedChange::RemoveOverride, "{off}");
+        assert!(!Path::new(svc.etc).exists());
+        assert_eq!(
+            std::fs::read_to_string(svc.vendor.unwrap()).unwrap(),
+            stock,
+            "the vendor file is never written"
+        );
+    }
+
+    /// GDM 51 (Fedora 45) moved gdm-password to /usr/lib/pam.d, behind a
+    /// `gdm-password-auth-substack` service and a leading
+    /// `pam_selinux_permit` line. The face line must still wrap that carrier,
+    /// below the SELinux line.
+    #[test]
+    fn fedora45_vendor_only_gdm_password_is_wired() {
+        let dir = TestDir::new("f45-gdm-password");
+        let declared = greeter("/etc/pam.d/gdm-password");
+        let stock = fixture("fedora-45", "gdm-password");
+        ship_vendor_only(&dir.0, "gdm-password", &stock);
+        let svc = under_root(&dir.0, declared);
+        let ondemand = dm_profile(declared.etc, Some(51)).ondemand;
+        let wire = |c: &str| wire_greeter_impl(c, true, true, ondemand);
+        let outcome = wire_service(&svc, true, true, &wire).unwrap();
+        assert_eq!(
+            outcome.change,
+            PlannedChange::MaterializeOverride,
+            "{outcome}"
+        );
+        let wired = std::fs::read_to_string(svc.etc).unwrap();
+        assert_jump_around_carrier(&wired, "substack      gdm-password-auth-substack");
+        let lines: Vec<&str> = wired.lines().collect();
+        let selinux = lines
+            .iter()
+            .position(|l| directive(l).contains("pam_selinux_permit.so"))
+            .unwrap_or_else(|| panic!("the SELinux line is gone: {wired}"));
+        let face = lines
+            .iter()
+            .position(|l| *l == GREETER_UNSEAL_COSMIC_JUMP)
+            .unwrap();
+        assert!(selinux < face, "the SELinux line still runs first: {wired}");
+    }
+
+    /// Tumbleweed ships sudo only in /usr/lib/pam.d, where `--with-sudo` said
+    /// "not installed (skipped)" and wired nothing.
+    #[test]
+    fn opensuse_vendor_only_sudo_is_wired_on_request() {
+        let dir = TestDir::new("suse-sudo");
+        assert_eq!(SUDO.etc, "/etc/pam.d/sudo");
+        let stock = fixture("opensuse", "sudo");
+        ship_vendor_only(&dir.0, "sudo", &stock);
+        let svc = under_root(&dir.0, &SUDO);
+        let outcome = wire_service(&svc, true, true, &wire_verify_service).unwrap();
+        assert_eq!(
+            outcome.change,
+            PlannedChange::MaterializeOverride,
+            "{outcome}"
+        );
+        let wired = std::fs::read_to_string(svc.etc).unwrap();
+        let lines: Vec<&str> = wired.lines().collect();
+        let stanza = lines
+            .iter()
+            .position(|l| *l == VERIFY_STANZA)
+            .unwrap_or_else(|| panic!("no verify stanza: {wired}"));
+        assert_eq!(
+            lines.get(stanza + 1).copied(),
+            Some("auth     include        common-auth"),
+            "the stanza sits above the password stack: {wired}"
+        );
+        let off = wire_service(&svc, false, true, &wire_verify_service).unwrap();
+        assert_eq!(off.change, PlannedChange::RemoveOverride, "{off}");
+        assert!(!Path::new(svc.etc).exists());
+    }
+
+    /// `--with-sudo` and `--with-polkit` are explicit requests: when the
+    /// surface resolves to nothing (no stack at all, or no auth line to anchor
+    /// to) the run fails instead of reporting success. Reconcile replays the
+    /// marker rather than a request, and disable has nothing to deliver.
+    #[test]
+    fn a_requested_surface_that_resolves_to_nothing_fails_the_run() {
+        use PlannedChange::*;
+        use ScopeOrigin::{Command, Marker};
+        for change in [NotInstalled, NoAnchor] {
+            assert!(
+                requested_scope_unmet(Command, true, true, change),
+                "{change:?}"
+            );
+            assert!(
+                !requested_scope_unmet(Command, true, false, change),
+                "{change:?}"
+            );
+            assert!(
+                !requested_scope_unmet(Command, false, true, change),
+                "{change:?}"
+            );
+            assert!(
+                !requested_scope_unmet(Marker, true, true, change),
+                "{change:?}"
+            );
+        }
+        for change in [
+            MaterializeOverride,
+            Wire,
+            AlreadyCorrect,
+            RemoveOverride,
+            RestoreBackup,
+            StripInPlace,
+            NotWired,
+        ] {
+            assert!(
+                !requested_scope_unmet(Command, true, true, change),
+                "{change:?}"
+            );
+        }
+        // The closing line says which of the two it was, and claims nothing
+        // about what an older run left in the file.
+        assert_eq!(
+            unmet_scope_line("--with-sudo", "sudo", NotInstalled),
+            "[login] --with-sudo: not wired (this machine has no sudo PAM service)"
+        );
+        assert_eq!(
+            unmet_scope_line("--with-polkit", "polkit-1", NoAnchor),
+            "[login] --with-polkit: not wired (the polkit-1 PAM service has no auth \
+             line to anchor to)"
+        );
     }
 
     /// Self-cleaning scratch dir for the wire_service file tests.
@@ -4628,12 +4916,18 @@ auth required pam_fprintd.so\n\
         assert!(!surfaces_regressed(None, None, &[]));
         // Intact surfaces are not regressions.
         assert!(!surfaces_regressed(
-            Some(&wired),
+            Some((&wired, None)),
             Some((&polkit_ok, None)),
             &[&wired]
         ));
         // Each surface on its own must trigger a repair.
-        assert!(surfaces_regressed(Some(&stripped), None, &[]));
+        assert!(surfaces_regressed(Some((&stripped, None)), None, &[]));
+        // sudo is materialized from a vendor copy where the distribution
+        // ships one only there (openSUSE Tumbleweed), so it follows polkit:
+        // deleted with the vendor copy still present is a regression, deleted
+        // with none is not ours to restore.
+        assert!(surfaces_regressed(Some((&gone, Some(&vendor))), None, &[]));
+        assert!(!surfaces_regressed(Some((&gone, None)), None, &[]));
         assert!(surfaces_regressed(None, Some((&stripped, None)), &[]));
         // The 0.9.0 polkit shape: module present on a plain `sufficient`.
         // Presence alone said "not regressed", every packaging lane's

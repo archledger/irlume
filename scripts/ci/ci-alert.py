@@ -185,27 +185,34 @@ def scheduled_workflows(directory, exclude=None):
     return watched
 
 
-def deciding_run(runs):
+def has_concurrency(text):
+    """Whether a workflow file declares a concurrency group (top level or job)."""
+    return re.search(r'^\s*concurrency:', text, re.M) is not None
+
+
+def deciding_run(runs, grouped=True):
     """The run that gives the verdict, from runs on main newest first.
 
-    The newest completed run, passing over skipped runs and cancelled runs
-    that a newer run of the same event replaced. A cancelled run with no newer
-    run of its event counts: no later run will give a verdict in its place,
-    and a run of another event may sit in another concurrency group (asan.yml
-    keeps its scheduled runs apart from pushes).
+    The newest completed run, passing over skipped runs and, in a workflow
+    with a concurrency group (`grouped`), cancelled runs that a newer run of
+    the same event replaced. Without a group nothing replaces a run, so a
+    cancelled one (by hand or by timeout) always counts; a run of another
+    event may sit in another group (asan.yml keeps its scheduled runs apart
+    from pushes), so it never counts as the replacement.
     """
     for index, run in enumerate(runs):
         if run.get('status') != 'completed':
             continue
         conclusion = run.get('conclusion')
-        replaced = any(newer.get('event') == run.get('event') for newer in runs[:index])
+        replaced = grouped and any(newer.get('event') == run.get('event')
+                                   for newer in runs[:index])
         if conclusion == 'skipped' or (conclusion == 'cancelled' and replaced):
             continue
         return run
     return None
 
 
-def judge(name, limit, runs, success, workflow, now):
+def judge(name, limit, runs, success, workflow, now, grouped=True):
     """(alert, lines) for one workflow.
 
     runs: its runs on main in any status, newest first; success: its newest
@@ -223,7 +230,7 @@ def judge(name, limit, runs, success, workflow, now):
         alert = True
         lines.append(f'{name}: cannot read its schedule: {limit}')
         limit = None
-    latest = deciding_run(runs)
+    latest = deciding_run(runs, grouped)
     if latest is not None and latest.get('conclusion') != 'success':
         alert = True
         lines.append(f"{name} run {latest['databaseId']} ({latest.get('event', '?')}) concluded "
@@ -361,7 +368,8 @@ def main(argv=None):
         else:
             runs = gh.runs(name)
             success = next(iter(gh.runs(name, 'success')), None)
-        alert, lines = judge(name, limit, runs, success, workflow, now)
+        grouped = has_concurrency((Path(args.workflows) / name).read_text())
+        alert, lines = judge(name, limit, runs, success, workflow, now, grouped)
         verdicts.append((name, alert, lines))
         print('\n'.join(lines))
     alert = int(any(a for _, a, _ in verdicts))

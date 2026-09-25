@@ -403,6 +403,18 @@ class StepTests(unittest.TestCase):
                          ['CI health: asan.yml failing or stale'], self.output)
         self.assertIn('run 15 (schedule) concluded cancelled', created[0]['body'])
 
+    def test_without_a_concurrency_group_a_cancelled_run_is_never_replaced(self):
+        # audit.yml has no concurrency group: a queued scheduled run after a
+        # cancelled one (by hand, or by timeout) did not replace it.
+        state = healthy_state()
+        state['runs']['audit.yml'] += [run(17, 'cancelled', '2026-09-24T10:00:00Z'),
+                                       run(18, None, '2026-09-24T13:05:00Z', 'queued')]
+        self.check(state)
+        created = self.ops('create')
+        self.assertEqual([c['title'] for c in created],
+                         ['CI health: audit.yml failing or stale'], self.output)
+        self.assertIn('run 17 (schedule) concluded cancelled', created[0]['body'])
+
     def test_pull_request_runs_from_a_branch_named_main_are_not_main_runs(self):
         # gh run list --branch main matches the head branch, so a pull request
         # from a fork's main branch is listed with the runs on main.

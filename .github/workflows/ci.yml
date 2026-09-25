@@ -190,10 +190,11 @@ jobs:
         run: cargo build --release --locked
 
       # Guarded because `cargo test` exits 0 even when it discovers no tests at
-      # all. The floor sits well below the real count (707 at 0.7.0), so it
-      # catches a collapse in discovery without churning as tests are added.
+      # all. The floor is about 90% of the real count (3022 in September 2026),
+      # so losing more than about 300 tests fails the lane; added tests need no
+      # change.
       - name: test
-        run: ./scripts/run-tests-guarded.sh --min 650 -- cargo test --workspace --locked
+        run: ./scripts/run-tests-guarded.sh --min 2720 -- cargo test --workspace --locked
 
       # These pure harness contracts are intentionally separate from the ignored
       # physical-camera test: CI can prove evidence parsing and service/socket
@@ -391,8 +392,15 @@ jobs:
           ./scripts/run-tests-guarded.sh --min 5 -- cargo test -p irlume-cli --test cli_bench --locked -- --ignored bench_ --test-threads=1
           ./scripts/run-tests-guarded.sh --min 1 -- cargo test -p irlume-daemon --test shutdown --locked -- --ignored --test-threads=1
 
+      # IRLUME_REQUIRE_PAM_TOOLS makes a missing pamtester or pam_wrapper fail
+      # each pamwrap test instead of skipping it; a pamwrap test checks that
+      # this step and the nightly coverage step set it. The floor is about 90%
+      # of the real count (67: 19 unit tests, 48 pamwrap tests), so losing the
+      # pamwrap tests fails the lane even though the unit tests still pass.
       - name: test (PAM FFI, against pam_wrapper)
-        run: ./scripts/run-tests-guarded.sh --min 16 -- cargo test -p irlume-pam --locked -- --include-ignored --test-threads=1
+        env:
+          IRLUME_REQUIRE_PAM_TOOLS: "1"
+        run: ./scripts/run-tests-guarded.sh --min 59 -- cargo test -p irlume-pam --locked -- --include-ignored --test-threads=1
 
       - name: test (shared-greeter daemon and PAM admission)
         run: |
@@ -473,10 +481,11 @@ jobs:
         run: cargo build --release --locked
 
       # Guarded because `cargo test` exits 0 even when it discovers no tests at
-      # all. The floor sits well below the real count (707 at 0.7.0), so it
-      # catches a collapse in discovery without churning as tests are added.
+      # all. The floor is about 90% of the real count (3022 in September 2026),
+      # so losing more than about 300 tests fails the lane; added tests need no
+      # change.
       - name: test
-        run: ./scripts/run-tests-guarded.sh --min 650 -- cargo test --workspace --locked
+        run: ./scripts/run-tests-guarded.sh --min 2720 -- cargo test --workspace --locked
 
   # Statement coverage is measured nightly on the hardware-suite job (real TPM
   # + loopback cameras + PAM FFI), which is the only measurement that can reach

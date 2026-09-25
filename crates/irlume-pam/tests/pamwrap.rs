@@ -25,14 +25,15 @@
 //!     `pam_set_items.so` (ships in the same package) is found in the
 //!     `pam_wrapper/` directory next to the wrapper library.
 //!
-//! The tests are `#[ignore]`d so a bare `cargo test` stays green on boxes
-//! without the tools; CI (and anyone with them installed) runs
+//! The tests that need the tools are `#[ignore]`d so a bare `cargo test`
+//! stays green on boxes without them; CI (and anyone with them installed) runs
 //! `cargo test -p irlume-pam -- --include-ignored --test-threads=1`. One
 //! at a time: pam_wrapper 1.1.5 (Ubuntu 24.04) can give two pamtester runs
 //! that start together the same config directory, and one of them then
-//! fails (see `write_kde_fake_helper`). Most tests also return early with
-//! a note if the tools are missing; the COSMIC ones in `pamwrap/cosmic.rs`
-//! fail instead.
+//! fails (see `write_kde_fake_helper`). If the tools are missing, most
+//! tests return early with a note on stderr, unless `IRLUME_REQUIRE_PAM_TOOLS`
+//! is set to anything but empty or `0` (the CI lanes use `1`): then they
+//! fail. The COSMIC ones in `pamwrap/cosmic.rs` fail either way.
 //!
 //! What pamtester cannot drive: `pam_sm_setcred` (pamtester has no `setcred`
 //! operation; the module's is a constant `SUCCESS` one-liner) and the
@@ -78,15 +79,16 @@ struct Harness {
 }
 
 impl Harness {
-    /// `None` (after an explanatory eprintln) when pam_wrapper or pamtester is
-    /// not installed; tests early-return so `--include-ignored` never breaks a
-    /// box without the tools.
+    /// `None` (after a note on stderr) when pam_wrapper or pamtester is not
+    /// installed, so tests early-return and `--include-ignored` passes on a
+    /// box without the tools. With [`REQUIRE_TOOLS_VAR`] set, as in the CI
+    /// lanes, a missing tool panics instead: see [`tool_missing`].
     fn try_new(name: &str) -> Option<Self> {
         let Some(wrapper) = wrapper_lib() else {
-            eprintln!(
-                "skipping: libpam_wrapper.so not found \
+            tool_missing(
+                "libpam_wrapper.so not found \
                  (Fedora: dnf install pam_wrapper; Ubuntu: apt-get install libpam-wrapper; \
-                 or set PAM_WRAPPER_SO)"
+                 or set PAM_WRAPPER_SO)",
             );
             return None;
         };
@@ -100,7 +102,7 @@ impl Harness {
             wrapper.display()
         );
         if !pamtester_available() {
-            eprintln!("skipping: pamtester not on PATH (dnf/apt-get install pamtester)");
+            tool_missing("pamtester not on PATH (dnf/apt-get install pamtester)");
             return None;
         }
 
@@ -275,6 +277,26 @@ fn remove_remote_env(cmd: &mut Command) {
     cmd.env_remove("PAM_RHOST");
 }
 
+/// Set to anything but empty or `0`, a missing pamtester or libpam_wrapper.so
+/// fails each test instead of skipping it. The PAM lanes in ci.yml and
+/// hardware-suite.yml set it to `1`, and `pamwrap_ci_lanes_require_the_tools`
+/// checks that they do.
+const REQUIRE_TOOLS_VAR: &str = "IRLUME_REQUIRE_PAM_TOOLS";
+
+/// Report a missing PAM tool: a panic when [`REQUIRE_TOOLS_VAR`] is set, so
+/// the lane fails instead of passing having run no PAM stack, otherwise a
+/// skip note on stderr (libtest hides it from a passing test unless run with
+/// `--nocapture`).
+fn tool_missing(what: &str) {
+    let required =
+        std::env::var_os(REQUIRE_TOOLS_VAR).is_some_and(|value| !value.is_empty() && value != "0");
+    assert!(
+        !required,
+        "{what}; {REQUIRE_TOOLS_VAR} is set, so a missing tool fails instead of skipping"
+    );
+    eprintln!("skipping: {what}; set {REQUIRE_TOOLS_VAR}=1 to fail instead");
+}
+
 /// Find libpam_wrapper.so: `PAM_WRAPPER_SO` override first, then the packaged
 /// locations on Fedora/RHEL, Debian/Ubuntu, and Arch.
 fn wrapper_lib() -> Option<PathBuf> {
@@ -425,6 +447,119 @@ fn unsealed(pw: &str) -> Response {
 //
 // All #[ignore] strings are identical: needs pam_wrapper + pamtester
 // (attribute literals cannot reference a const).
+
+/// A lane that sets [`REQUIRE_TOOLS_VAR`] must fail when a PAM tool is
+/// missing instead of passing having run no PAM stack, and a run without it
+/// must still skip. This reruns a grant test in a child test process once
+/// per tool, whatever the host has installed: first with `PAM_WRAPPER_SO`
+/// naming a file that does not exist, then with empty stand-ins for the
+/// wrapper and `pam_set_items.so` and a `PATH` that holds no pamtester. With
+/// the variable set to `1` the child must fail, naming the tool and the
+/// variable; unset or `0`, it must pass. It needs no PAM tools itself, so it
+/// is not ignored.
+#[test]
+fn pamwrap_missing_tools_fail_when_required_and_skip_otherwise() {
+    const CHILD: &str = "pamwrap_granting_daemon_face_path";
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    // Never created: no pamtester can be found on it, and there is nothing
+    // to clean up.
+    let no_tools = tmp.join("pamwrap-no-tools-path");
+    let no_wrapper = no_tools.join("libpam_wrapper.so");
+    // The child only checks that these exist, then stops at the missing
+    // pamtester before anything would load them.
+    let stand_in = tmp.join("pamwrap-stand-in");
+    let stand_in_wrapper = stand_in.join("libpam_wrapper.so");
+    std::fs::create_dir_all(stand_in.join("pam_wrapper")).unwrap();
+    std::fs::write(&stand_in_wrapper, b"").unwrap();
+    std::fs::write(stand_in.join("pam_wrapper/pam_set_items.so"), b"").unwrap();
+
+    let rerun = |wrapper: &Path, require: Option<&str>| {
+        let mut cmd = Command::new(std::env::current_exe().expect("test binary path"));
+        cmd.args([CHILD, "--exact", "--ignored", "--test-threads=1"])
+            .env("PATH", &no_tools)
+            .env("PAM_WRAPPER_SO", wrapper);
+        match require {
+            Some(value) => cmd.env(REQUIRE_TOOLS_VAR, value),
+            None => cmd.env_remove(REQUIRE_TOOLS_VAR),
+        };
+        let out = cmd.output().expect("rerun the test");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success(), text)
+    };
+
+    let required =
+        format!("{REQUIRE_TOOLS_VAR} is set, so a missing tool fails instead of skipping");
+    for (wrapper, tool) in [
+        (no_wrapper.as_path(), "libpam_wrapper.so not found"),
+        (stand_in_wrapper.as_path(), "pamtester not on PATH"),
+    ] {
+        let (ok, out) = rerun(wrapper, Some("1"));
+        assert!(
+            !ok && out.contains(&format!("test {CHILD} ... FAILED"))
+                && out.contains(tool)
+                && out.contains(&required),
+            "with {REQUIRE_TOOLS_VAR}=1 and {tool}, the test must fail:\n{out}"
+        );
+        for require in [None, Some("0")] {
+            let (ok, out) = rerun(wrapper, require);
+            // The test's own line as well as the exit status: libtest exits 0
+            // when a filter matches nothing.
+            assert!(
+                ok && out.contains(&format!("test {CHILD} ... ok")),
+                "with {REQUIRE_TOOLS_VAR}={require:?} and {tool}, the test must skip:\n{out}"
+            );
+        }
+    }
+}
+
+/// The CI steps that run these tests set [`REQUIRE_TOOLS_VAR`]. Without it a
+/// runner that lost pamtester or pam_wrapper skips each test and the lane
+/// still passes, so dropping the line would go unnoticed.
+#[test]
+fn pamwrap_ci_lanes_require_the_tools() {
+    let env_line = format!("{REQUIRE_TOOLS_VAR}: \"1\"");
+    for (name, workflow) in [
+        ("ci.yml", include_str!("../../../.github/workflows/ci.yml")),
+        (
+            "hardware-suite.yml",
+            include_str!("../../../.github/workflows/hardware-suite.yml"),
+        ),
+    ] {
+        // A step runs from its `- name:` or `- uses:` line to the next one.
+        let mut steps: Vec<Vec<&str>> = Vec::new();
+        for line in workflow.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("- name:") || trimmed.starts_with("- uses:") {
+                steps.push(Vec::new());
+            }
+            if let Some(step) = steps.last_mut() {
+                step.push(line.trim());
+            }
+        }
+        let pam_steps: Vec<_> = steps
+            .iter()
+            .filter(|step| {
+                step.iter()
+                    .any(|l| l.contains("-p irlume-pam ") && l.contains("--include-ignored"))
+            })
+            .collect();
+        assert!(
+            !pam_steps.is_empty(),
+            "{name}: no step runs `-p irlume-pam ... --include-ignored`"
+        );
+        for step in pam_steps {
+            assert!(
+                step.contains(&env_line.as_str()),
+                "{name}: the step {:?} runs the pamwrap tests without `{env_line}` in its env",
+                step[0]
+            );
+        }
+    }
+}
 
 /// Fail-closed floor: with irlumed unreachable (no socket at all) the module
 /// returns IGNORE, and a stack containing only it can grant nobody. The second

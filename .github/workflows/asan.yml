@@ -154,6 +154,6 @@ jobs:
           # at all. No cfg gates the test set by toolchain, so the nightly run
           # selects the same tests the stable lanes do.
           LSAN_OPTIONS="suppressions=$PWD/.github/lsan-suppressions.txt:print_suppressions=1" \
-            ./scripts/run-tests-guarded.sh --min 650 -- \
+            ./scripts/run-tests-guarded.sh --min 2720 -- \
             cargo +nightly test --workspace --locked \
               --target x86_64-unknown-linux-gnu

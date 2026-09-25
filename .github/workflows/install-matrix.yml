@@ -143,7 +143,7 @@ jobs:
               export ORT_DYLIB_PATH="/tmp/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so"
               cd /src
               runuser -u irlume-test -- cargo build --workspace --locked
-              runuser -u irlume-test -- ./scripts/run-tests-guarded.sh --min 650 \
+              runuser -u irlume-test -- ./scripts/run-tests-guarded.sh --min 2720 \
                 --require auth_sensor_and_consent_concurrent_writes_preserve_both_policies,auth_sensor_owner_change_requires_ack_and_preserves_unrelated_settings,selinux_status_classifies_module_state_from_probe_output,credential_verifier_rejects_retained_or_wrong_identity,salt_reader_boundaries_run_in_fresh_processes \
                 -- cargo test --workspace --locked
             '

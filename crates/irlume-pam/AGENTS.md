@@ -92,22 +92,23 @@ login or locks a person out. It is critical-tier
 ## Testing
 
 - Unit tests: `cargo test --locked -p irlume-pam`. The tests in
-  `tests/pamwrap.rs` and `tests/pamwrap/cosmic.rs` are `#[ignore]`d (run them
-  with `--include-ignored`, as below). They drive the real `.so` through a real
-  PAM stack with pamtester and pam_wrapper, against an in-process fake daemon
-  at `IRLUME_SOCKET`; no root, no daemon.
+  `tests/pamwrap.rs` and `tests/pamwrap/cosmic.rs` that need PAM tools are
+  `#[ignore]`d (run them with `--include-ignored`, as below). They drive the
+  real `.so` through a real PAM stack with pamtester and pam_wrapper, against
+  an in-process fake daemon at `IRLUME_SOCKET`; no root, no daemon.
   - Fedora: `dnf install pam_wrapper pamtester`. Debian and Ubuntu:
     `apt-get install libpam-wrapper pamtester`. Elsewhere set
     `PAM_WRAPPER_SO=/path/to/libpam_wrapper.so`.
   - Run as CI does:
-    `./scripts/run-tests-guarded.sh --min 16 -- cargo test -p irlume-pam --locked -- --include-ignored --test-threads=1`
+    `IRLUME_REQUIRE_PAM_TOOLS=1 ./scripts/run-tests-guarded.sh --min 59 -- cargo test -p irlume-pam --locked -- --include-ignored --test-threads=1`
   - The pamtester and COSMIC runners remove `SSH_CONNECTION`, `SSH_TTY` and
     `PAM_RHOST` from what they pass on (`remove_remote_env`), so the suite runs
     the same over SSH; set a marker on purpose with `run_with_env`.
-  - Without pamtester or libpam_wrapper.so each `tests/pamwrap.rs` test returns
-    early and passes (libtest hides its "skipping" note); only the COSMIC
-    tests fail, so a filtered run that leaves them out tests no PAM stack. Check
-    `command -v pamtester` and the wrapper path before you report a pass.
+  - Without pamtester or libpam_wrapper.so each ignored `tests/pamwrap.rs`
+    test returns early and passes (libtest hides its "skipping" note), and the
+    COSMIC tests fail, so a filtered run that leaves them out tests no PAM
+    stack. `IRLUME_REQUIRE_PAM_TOOLS=1`, set in the CI PAM lanes, makes each of
+    those tests fail instead; set it, as above, before you report a pass.
     `nix develop` has neither tool; the COSMIC tests also compile a C driver
     (`cc`, libpam headers).
 - The fake daemon must send the real wire text

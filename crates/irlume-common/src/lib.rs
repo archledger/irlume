@@ -1858,11 +1858,12 @@ pub enum Response {
         token: SecretBytes,
         /// Whether the token was freshly minted (first arm) or reused from an
         /// existing envelope (re-arm). Governs the caller's failure handling:
-        /// a minted envelope is inert and safe to roll back with
-        /// `ForgetPassword`; a reused one may hold the LIVE keyring credential
-        /// and must never be deleted on error. Defaults to `false`, the
-        /// never-delete reading, so an older caller cannot inherit the
-        /// destructive branch.
+        /// a minted envelope may be rolled back with `ForgetPassword` once
+        /// the caller has shown the keyring never took the token (a re-key
+        /// whose answer was lost may have landed); a reused one may hold the
+        /// LIVE keyring credential and must never be deleted on error.
+        /// Defaults to `false`, the never-delete reading, so an older caller
+        /// cannot inherit the destructive branch.
         #[serde(default)]
         minted: bool,
     },

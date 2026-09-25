@@ -22,7 +22,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [the PAM guide](crates/irlume-pam/AGE
 Start at `crates/irlume-pam/src/lib.rs` and `kcm/`; seeds go in
 `fuzz/seeds/<target>/`, ADRs in `docs/adr/NNNN-*.md`, never `/etc/pam.d`.
 Lanes: `ci.yml`. Build: `cargo check --features irlume-pam/extra`.
-Tests: `crates/irlume-pam/tests/*.rs`.
+Tests: `crates/irlume-pam/tests/*.rs`. Every `.rs` file; `Cargo.toml`.
 
 ## Gate commands
 
@@ -60,6 +60,7 @@ class CheckAgentsMdTests(unittest.TestCase):
         self.write("crates/irlume-daemon/AGENTS.md", "# Daemon\n\nStart at `src/main.rs`.\n")
         self.write("crates/irlume-cli/src/main.rs", "")
         self.write("kcm/CMakeLists.txt", "")
+        self.write("Cargo.toml", "")
         self.write("AGENTS.md", ROOT_DOC)
 
     def tearDown(self):
@@ -89,6 +90,14 @@ class CheckAgentsMdTests(unittest.TestCase):
     def test_the_root_file_cites_full_paths(self):
         self.write("AGENTS.md", ROOT_DOC.replace("`kcm/`", "`src/lib.rs`"))
         self.assertEqual(self.problems(), ["AGENTS.md:4: path src/lib.rs names nothing in the tree"])
+
+    def test_a_removed_root_file_cited_by_bare_name_is_named(self):
+        (self.root / "Cargo.toml").unlink()
+        self.assertEqual(self.problems(), ["AGENTS.md:7: path Cargo.toml names nothing in the tree"])
+
+    def test_an_empty_gate_block_is_an_error(self):
+        self.write("AGENTS.md", ROOT_DOC.replace("cargo fmt --all --check\ncargo test --locked -p irlume-pam\n", "# none\n"))
+        self.assertEqual(self.problems(), ['AGENTS.md: no command block under "## Gate commands"'])
 
     def test_a_removed_top_level_directory_is_named(self):
         (self.root / "kcm/CMakeLists.txt").unlink()
@@ -125,22 +134,43 @@ class CheckAgentsMdTests(unittest.TestCase):
 
     def test_run_commands_reads_inline_and_block_steps(self):
         workflow = textwrap.dedent("""\
-            steps:
-              - run: 'cargo fmt --all --check'
-              - name: block
-                run: |
-                  set -e
-                  # not a command
-                  cargo build
-
-              - name: next
+            jobs:
+              check:
+                defaults:
+                  run:
+                    shell: bash
                 env:
-                  run: not-a-step-key
+                  run: job-env
+                steps:
+                  - run: 'cargo fmt --all --check'
+                  - name: block
+                    run: |
+                      set -e
+                      # not a command
+                      cargo build
+
+                  - name: next
+                    env:
+                      run: step-env
+                    with:
+                      args:
+                        - run: nested-list
+                    run: cargo doc
+                after: not-a-step
+              other:
+                steps:
+                - run: unindented list
             """)
         self.assertEqual(
             checker.run_commands(workflow),
-            {"cargo fmt --all --check", "set -e", "cargo build", "not-a-step-key"},
+            {"cargo fmt --all --check", "set -e", "cargo build", "cargo doc", "unindented list"},
         )
+
+    def test_a_gate_command_kept_only_under_env_is_named(self):
+        self.write(".github/workflows/ci.yml", CI.replace(
+            "        run: |\n          # the PAM crate\n          cargo test --locked -p irlume-pam\n",
+            "        env:\n          run: cargo test --locked -p irlume-pam\n        run: echo moved\n"))
+        self.assertEqual(self.problems(), [self.MISSING_TEST])
 
     def test_a_missing_gate_block_is_an_error(self):
         self.write("AGENTS.md", ROOT_DOC.replace("## Gate commands", "## Commands"))

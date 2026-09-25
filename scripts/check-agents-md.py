@@ -10,8 +10,9 @@ moves. This fails when:
 * a path in backticks names nothing in the tree (a glob must match at least
   one file);
 * a line of the root file's "Gate commands" block is not, verbatim, a
-  whole command line of a `run:` step in .github/workflows/ci.yml (a
-  comment or a longer command does not count);
+  whole command line of a step's `run:` in .github/workflows/ci.yml (a
+  comment, a longer command or a `run` key under `env:` does not count),
+  or the block is gone or empty;
 * a bare workflow file name (`ci.yml`) is not in .github/workflows/.
 
 A path is looked up from the repository root and, for a nested AGENTS.md,
@@ -22,7 +23,9 @@ output under `target/` are not checked. A code span that is one path-shaped
 token is always a path, so a removed top-level directory (`kcm/`) is named.
 Inside a longer span, a command, a token is a path when it ends in `/` or a
 file extension or its first segment exists, so a cargo feature such as
-`irlume-auth/ir-only-evaluation` is not one.
+`irlume-auth/ir-only-evaluation` is not one. A bare name with a file
+extension (`Cargo.toml`) is a path too, so files outside the tree, such as
+`/etc/irlume/settings.conf`, are cited by absolute path.
 
 Runs in CI on every push and PR (ci.yml, "AGENTS.md references").
 """
@@ -40,6 +43,9 @@ GATE_HEADING = "## Gate commands"
 LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 CODE_SPAN = re.compile(r"`([^`\n]+)`")
 PATH_TOKEN = re.compile(r"^[\w.@+*-]+(?:/[\w.@+*-]*)+$")
+BARE_NAME = re.compile(r"^[\w@+-][\w.@+-]*$")
+STEP_ITEM = re.compile(r"^(\s*)-(\s+)(\S.*)$")
+YAML_KEY = re.compile(r"^([\w-]+):\s*(.*)$")
 EXTENSION = re.compile(r"\.(?:rs|md|py|sh|toml|ya?ml|json|nix|lock|conf|service|tflite)$")
 WORKFLOW_NAME = re.compile(r"^[\w-]+\.ya?ml$")
 PLACEHOLDER = re.compile(r"[<>]|NNNN")
@@ -86,6 +92,8 @@ def resolves(bases, token):
 def is_path(bases, token, whole_span=False):
     if PLACEHOLDER.search(token) or token.startswith(("/", "target/", "./target/")):
         return False
+    if "/" not in token:
+        return bool(BARE_NAME.match(token) and EXTENSION.search(token))
     if not PATH_TOKEN.match(token.removeprefix("./")):
         return False
     if whole_span or token.endswith("/") or EXTENSION.search(token):
@@ -138,7 +146,7 @@ def gate_commands(text):
             break
         if line.startswith("```"):
             if fenced:
-                return commands
+                return commands or None
             fenced = True
             continue
         if fenced and line.strip() and not line.lstrip().startswith("#"):
@@ -147,24 +155,49 @@ def gate_commands(text):
 
 
 def run_commands(workflow):
-    """Every command line of the workflow's `run:` steps, comments dropped.
+    """Every command line of the workflow's step `run:` keys, comments dropped.
 
-    A block scalar (`run: |`) runs the lines indented deeper than its key; an
-    inline `run:` runs its value.
+    Only a step's own `run` key counts: on the step's `- ` line or at its key
+    column inside a `steps:` list. A `run` under `env:`, `with:` or a job's
+    `defaults:` is data, not a command. A block scalar (`run: |`) runs the
+    lines indented deeper than its key; an inline `run:` runs its value.
     """
     commands = set()
     lines = workflow.splitlines()
+    steps_column = None  # column of the `steps:` key being read
+    key_column = None  # column of the current step's keys
     index = 0
     while index < len(lines):
-        match = re.match(r"^(\s*)(?:-\s+)?run:\s*(.*)$", lines[index])
+        line = lines[index]
         index += 1
-        if not match:
+        text = line.strip()
+        if not text or text.startswith("#"):
             continue
-        indent, value = len(match.group(1)), match.group(2).strip()
+        column = len(line) - len(line.lstrip())
+        if steps_column is not None and (
+            column < steps_column or (column == steps_column and not text.startswith("-"))
+        ):
+            steps_column = key_column = None
+        if steps_column is None:
+            if re.match(r"^steps:\s*$", text):
+                steps_column = column
+            continue
+        item = STEP_ITEM.match(line)
+        if item and (key_column is None or len(item.group(1)) < key_column):
+            key_column = len(item.group(1)) + 1 + len(item.group(2))
+            entry = item.group(3)
+        elif column == key_column:
+            entry = text
+        else:
+            continue
+        key = YAML_KEY.match(entry)
+        if not key or key.group(1) != "run":
+            continue
+        value = key.group(2).strip()
         if value[:1] in ("|", ">"):
             while index < len(lines) and (
                 not lines[index].strip()
-                or len(lines[index]) - len(lines[index].lstrip()) > indent
+                or len(lines[index]) - len(lines[index].lstrip()) > key_column
             ):
                 commands.add(lines[index].strip())
                 index += 1

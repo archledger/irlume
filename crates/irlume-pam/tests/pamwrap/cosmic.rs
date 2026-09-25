@@ -39,12 +39,11 @@ fn run(
         .env("PAM_WRAPPER_SERVICE_DIR", &h.service_dir)
         .env("IRLUME_CONFIG_DIR", &h.config_dir)
         .env("IRLUME_SOCKET", &h.socket)
-        .env_remove("SSH_CONNECTION")
-        .env_remove("SSH_TTY")
         .env_remove("PAM_AUTHTOK")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    remove_remote_env(&mut command);
     if let Some(token) = cached {
         command.env("PAM_AUTHTOK", token);
     }

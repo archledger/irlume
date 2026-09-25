@@ -10,9 +10,10 @@ moves. This fails when:
 * a path in backticks names nothing in the tree (a glob must match at least
   one file);
 * a line of the root file's "Gate commands" block is not, verbatim, a
-  whole command line of a step's `run:` in .github/workflows/ci.yml (a
-  comment, a longer command or a `run` key under `env:` does not count),
-  or the block is gone or empty;
+  whole command line of a step's `run:` in the required `check` job of
+  .github/workflows/ci.yml (a comment, a longer command, a `run` key under
+  `env:` or the same command in another job does not count), or the block
+  is gone or empty;
 * a bare workflow file name (`ci.yml`) is not in .github/workflows/.
 
 A path is looked up from the repository root and, for a nested AGENTS.md,
@@ -39,6 +40,7 @@ import sys
 WORKFLOWS = Path(".github/workflows")
 CI = WORKFLOWS / "ci.yml"
 GATE_HEADING = "## Gate commands"
+GATE_JOB = "check"
 
 LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 CODE_SPAN = re.compile(r"`([^`\n]+)`")
@@ -154,6 +156,32 @@ def gate_commands(text):
     return commands or None
 
 
+def job_block(workflow, job):
+    """The lines of `jobs.<job>` in the workflow, or None when it has none."""
+    lines = workflow.splitlines()
+    jobs_column = start = job_column = None
+    for number, line in enumerate(lines):
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        column = len(line) - len(line.lstrip())
+        if start is not None:
+            if column <= job_column:
+                return "\n".join(lines[start:number])
+            continue
+        if jobs_column is None:
+            if column == 0 and text == "jobs:":
+                jobs_column = 0
+            continue
+        if column == 0:
+            return None
+        if text == f"{job}:" and (job_column is None or column == job_column):
+            start, job_column = number, column
+        elif job_column is None:
+            job_column = column
+    return "\n".join(lines[start:]) if start is not None else None
+
+
 def run_commands(workflow):
     """Every command line of the workflow's step `run:` keys, comments dropped.
 
@@ -215,9 +243,12 @@ def check_gate(root, text):
         return [f"{doc}: no command block under \"{GATE_HEADING}\""]
     if not (root / CI).is_file():
         return [f"{doc}: {CI} is missing, so the gate commands cannot be checked"]
-    ran = run_commands((root / CI).read_text(encoding="utf-8"))
+    block = job_block((root / CI).read_text(encoding="utf-8"), GATE_JOB)
+    if block is None:
+        return [f"{doc}: {CI} has no `{GATE_JOB}` job, so the gate commands cannot be checked"]
+    ran = run_commands(block)
     return [
-        f"{doc}:{number}: gate command is not a {CI} run line: {command}"
+        f"{doc}:{number}: gate command is not a run line of the {GATE_JOB} job in {CI}: {command}"
         for number, command in commands
         if command not in ran
     ]

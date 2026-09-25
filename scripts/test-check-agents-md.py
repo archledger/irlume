@@ -120,8 +120,26 @@ class CheckAgentsMdTests(unittest.TestCase):
         self.write(".github/workflows/ci.yml", CI.replace("--locked -p irlume-pam", "--locked --workspace"))
         self.assertEqual(self.problems(), [self.MISSING_TEST])
 
-    MISSING_TEST = ("AGENTS.md:13: gate command is not a .github/workflows/ci.yml "
-                    "run line: cargo test --locked -p irlume-pam")
+    MISSING_TEST = ("AGENTS.md:13: gate command is not a run line of the check job in "
+                    ".github/workflows/ci.yml: cargo test --locked -p irlume-pam")
+
+    def test_a_gate_command_only_another_job_runs_is_named(self):
+        moved = CI.replace(
+            "      - name: test\n        run: |\n          # the PAM crate\n          cargo test --locked -p irlume-pam\n",
+            "")
+        self.write(".github/workflows/ci.yml",
+                   moved + "  stable:\n    steps:\n      - run: cargo test --locked -p irlume-pam\n")
+        self.assertEqual(self.problems(), [self.MISSING_TEST])
+
+    def test_a_workflow_without_the_check_job_is_an_error(self):
+        self.write(".github/workflows/ci.yml", CI.replace("  check:", "  build:"))
+        self.assertEqual(self.problems(), [
+            "AGENTS.md: .github/workflows/ci.yml has no `check` job, so the gate commands cannot be checked"])
+
+    def test_job_block_ends_at_the_next_job(self):
+        workflow = "on: push\njobs:\n  check:\n    steps:\n      - run: a\n  other:\n    steps:\n      - run: b\n"
+        self.assertEqual(checker.job_block(workflow, "check"), "  check:\n    steps:\n      - run: a")
+        self.assertIsNone(checker.job_block(workflow, "missing"))
 
     def test_a_gate_command_left_only_in_a_comment_is_named(self):
         self.write(".github/workflows/ci.yml",

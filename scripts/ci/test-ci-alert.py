@@ -325,7 +325,8 @@ class StepTests(unittest.TestCase):
         state['runs']['audit.yml'] = audit_incident()
         state['issues'].append({'number': 950, 'title': 'CI health: audit.yml failing or stale',
                                 'labels': ['ci-alert'], 'state': 'OPEN', 'body': '',
-                                'comments': [{'body': 'Automated check 2026-09-24T09:00:00Z:'}]})
+                                'comments': [{'body': 'Automated check 2026-09-24T09:00:00Z:'},
+                                             {'body': 'Looking into it: the runner lost its disk.'}]})
         self.check(state)
         self.assertEqual(self.log, [], self.output)
 

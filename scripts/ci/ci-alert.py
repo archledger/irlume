@@ -282,9 +282,11 @@ class GitHub:
                 for w in map(json.loads, out.splitlines()) if w['path'].startswith('.github/')}
 
 
-def last_note(gh, number):
+def notes(gh, number):
+    """The issue's body and every comment, so a human comment after today's
+    automated update cannot hide it."""
     issue = gh.json('issue', 'view', str(number), '--json', 'body,comments')
-    return issue['comments'][-1]['body'] if issue['comments'] else issue['body']
+    return [issue['body'], *(comment['body'] for comment in issue['comments'])]
 
 
 def maintain_issues(gh, label, verdicts, now):
@@ -314,7 +316,7 @@ def maintain_issues(gh, label, verdicts, now):
             tracked.append(f'- {title}: {url.strip()}')
             print(f'opened issue: {title}')
         elif alert:
-            if f'Automated check {now:%Y-%m-%d}' not in last_note(gh, number):
+            if not any(f'Automated check {now:%Y-%m-%d}' in note for note in notes(gh, number)):
                 gh('issue', 'comment', str(number), '--repo', gh.repo, '--body', f'{header}\n\n{body}')
             tracked.append(f'- {title}: #{number}')
             print(f'updated issue #{number}: {title}')

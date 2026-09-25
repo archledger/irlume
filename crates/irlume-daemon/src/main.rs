@@ -3385,13 +3385,15 @@ fn serve_peer(
             };
             let class = arbiter::classify(&req);
             // Status is answered HERE, on the connection's own thread: it is
-            // read-only, engine-free, and possibly slow (ListProfiles is a
-            // TPM unseal), so it must neither wait behind the worker nor make
-            // an authentication wait behind it (#212).
+            // read-only and engine-free, so it must neither wait behind the
+            // worker nor make an authentication wait behind it (#212). A
+            // ListProfiles miss is a TPM unseal, which is why it queues to
+            // the worker below; a hit reads sysfs and hashes files only.
             // A Status request is answered here ONLY if dispatch_status can
-            // answer it from memory. `None` means it cannot (an unpublished
-            // enrollment summary), and the request must then take the normal
-            // queue path so the worker does the real load and publishes it.
+            // answer it without the worker. `None` means it cannot (an
+            // unpublished or stale enrollment summary), and the request
+            // must then take the normal queue path so the worker does the
+            // real load and publishes it.
             // Answering the None with an error instead made every listing
             // fail: the miss never reached the worker, so nothing ever
             // published, so every later listing missed too.
@@ -4050,13 +4052,49 @@ struct EnrollmentSummary {
     /// hit can tell a legacy rewrite of the primary (which sends no
     /// request) from an unchanged file.
     primary_digest: PrimaryDigest,
+    /// The secondary camera store as `camera_groups` was built from it.
+    camera_store: CameraStoreSnapshot,
 }
 
-/// The primary enrollment file as one cheap read sees it: absent, present
-/// with the SHA-256 of its bytes, or unreadable. Absent and unreadable are
-/// distinct so a file that appears in an unreadable form (a directory, a
-/// permission or I/O failure) is never mistaken for "still absent" and
-/// the failure reaches the worker, which reports it.
+/// What a cached summary keeps about the secondary camera store, so a
+/// cache hit can refresh the camera-group rows without opening the store:
+/// an encrypted store opens only under the account template key, and
+/// unsealing that key is TPM work that belongs on the worker.
+#[derive(Clone, Debug)]
+struct CameraStoreSnapshot {
+    /// The store file's state when the rows were built. A hit compares it
+    /// with the file's current digest; any change is a miss.
+    file: PrimaryDigest,
+    /// The store's activation digest (its `primary_snapshot_sha256`), so a
+    /// hit can recompute `stale` against the current primary. `None` when
+    /// no store loaded.
+    activation: Option<String>,
+    /// The load asked for the account template key and did not get it (an
+    /// unseal failure). The error is published, but a hit is a miss, so the
+    /// worker retries the unseal instead of the cache repeating a failure
+    /// that may not recur. A store that does not parse or decrypt fails the
+    /// same way on every load, so its error is served from the cache.
+    key_unavailable: bool,
+}
+
+impl Default for CameraStoreSnapshot {
+    /// No store read: at a cache hit a store present now is a miss, and an
+    /// unreadable one reports its read error.
+    fn default() -> Self {
+        Self {
+            file: PrimaryDigest::Absent,
+            activation: None,
+            key_unavailable: false,
+        }
+    }
+}
+
+/// A state file (the primary enrollment, or the secondary camera store) as
+/// one cheap read sees it: absent, present with the SHA-256 of its bytes,
+/// or unreadable. Absent and unreadable are distinct so a file that
+/// appears in an unreadable form (a directory, a permission or I/O
+/// failure) is never mistaken for "still absent": for the primary, the
+/// failure reaches the worker, which reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PrimaryDigest {
     Absent,
@@ -4095,7 +4133,17 @@ impl PrimaryDigest {
 /// The current primary file's state: one file read, no TPM, safe on a
 /// connection thread.
 fn primary_digest_now(user: &str) -> PrimaryDigest {
-    match std::fs::read(irlume_core::multi_camera::primary_enrollment_path(user)) {
+    file_digest_now(&irlume_core::multi_camera::primary_enrollment_path(user))
+}
+
+/// The current secondary camera store file's state: one file read, never
+/// parsed or decrypted, so no template key and no TPM.
+fn camera_store_digest_now(user: &str) -> PrimaryDigest {
+    file_digest_now(&irlume_core::multi_camera::secondary_store_path(user))
+}
+
+fn file_digest_now(path: &std::path::Path) -> PrimaryDigest {
+    match std::fs::read(path) {
         Ok(bytes) => PrimaryDigest::Present(irlume_common::sha256_hex(&bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => PrimaryDigest::Absent,
         Err(_) => PrimaryDigest::Unreadable,
@@ -4262,37 +4310,77 @@ impl EnrollmentSummary {
 }
 
 /// Camera-group rows for the enrollment summary (ADR-0024 Phase 2):
-/// computed WORKER-side (a publish-time freeze - the connection-thread
-/// cache path serves it memory-only), from the secondary store, the
-/// CURRENT primary bytes, the engine's live pair and spaces, and the
-/// identities sysfs currently reports (no device opens). A store that
-/// exists but cannot be summarized reports its diagnostic instead of
-/// pretending to be empty.
-fn camera_group_rows(
+/// computed WORKER-side (a publish-time freeze: a cache hit on the
+/// connection thread refreshes only the volatile facts, from sysfs and two
+/// file digests, in [`refresh_camera_group_flags`]), from the secondary
+/// store, the CURRENT primary bytes, the engine's live pair and spaces,
+/// and the identities sysfs currently reports (no device opens). A store
+/// that exists but cannot be summarized reports its diagnostic instead of
+/// pretending to be empty. Also records the store facts a cache hit
+/// refreshes the rows from ([`CameraStoreSnapshot`]).
+fn summarize_camera_groups(
+    summary: &mut EnrollmentSummary,
     user: &str,
     engine: &irlume_auth::Engine,
-) -> (Vec<irlume_common::CameraGroupSummary>, Option<String>) {
+) {
+    summarize_camera_groups_keyed(
+        summary,
+        user,
+        engine,
+        irlume_core::multi_camera::production_key_for,
+    );
+}
+
+/// [`summarize_camera_groups`] with the store's key resolver (production
+/// passes `production_key_for`; tests pass a fake).
+fn summarize_camera_groups_keyed(
+    summary: &mut EnrollmentSummary,
+    user: &str,
+    engine: &irlume_auth::Engine,
+    key_for: impl Fn(
+        &str,
+    ) -> Result<
+        Option<zeroize::Zeroizing<Vec<u8>>>,
+        irlume_core::multi_camera::SecondaryStoreError,
+    >,
+) {
     let path = irlume_core::multi_camera::secondary_store_path(user);
-    let store = match irlume_core::multi_camera::load_secondary(&path) {
-        Ok(None) => return (Vec::new(), None),
+    let before = camera_store_digest_now(user);
+    let key_unavailable = std::cell::Cell::new(false);
+    let loaded = irlume_core::multi_camera::load_secondary_resolved(&path, |user| {
+        let key = key_for(user);
+        key_unavailable.set(key.is_err());
+        key
+    });
+    summary.camera_groups = Vec::new();
+    summary.camera_store_error = None;
+    summary.camera_store = CameraStoreSnapshot {
+        // Tied to the bytes the load read, as the primary's digest is.
+        file: PrimaryDigest::settled(before, camera_store_digest_now(user)),
+        activation: None,
+        key_unavailable: key_unavailable.get(),
+    };
+    let store = match loaded {
+        Ok(None) => return,
         Ok(Some(store)) => store,
-        Err(error) => return (Vec::new(), Some(error.to_string())),
+        Err(error) => {
+            summary.camera_store_error = Some(error.to_string());
+            return;
+        }
     };
     let primary = std::fs::read(irlume_core::multi_camera::primary_enrollment_path(user)).ok();
     let live = engine.live_pair();
     let present = irlume_auth::present_device_identities();
-    (
-        irlume_core::multi_camera::group_summaries(
-            &store,
-            primary.as_deref(),
-            &live,
-            &present,
-            engine.embed_space(),
-            engine.ir_space(),
-            engine.ir_dim(),
-        ),
-        None,
-    )
+    summary.camera_groups = irlume_core::multi_camera::group_summaries(
+        &store,
+        primary.as_deref(),
+        &live,
+        &present,
+        engine.embed_space(),
+        engine.ir_space(),
+        engine.ir_dim(),
+    );
+    summary.camera_store.activation = Some(store.primary_snapshot_sha256);
 }
 
 #[allow(clippy::type_complexity)]
@@ -4352,6 +4440,7 @@ fn summarize_enrollment(
                 }
             }),
             primary_digest: PrimaryDigest::Absent,
+            camera_store: CameraStoreSnapshot::default(),
             profiles: enr
                 .profiles
                 .iter()
@@ -4398,6 +4487,7 @@ fn summarize_enrollment(
             camera_store_error: None,
             primary_camera: None,
             primary_digest: PrimaryDigest::Absent,
+            camera_store: CameraStoreSnapshot::default(),
             profiles: Vec::new(),
             ir_ratio_calibrated: false,
         },
@@ -4675,12 +4765,14 @@ fn note_unseal_password_refusal(uid: u32) {
 
 /// Answer a [`arbiter::Class::Status`] request. Runs on the CONNECTION
 /// THREAD: everything here is read-only and engine-free (`Health` reads the
-/// published [`EngineBits`]), so a slow status read (`ListProfiles` is a TPM
-/// unseal, 10.8s measured on one machine) cannot make an authentication
-/// wait, and a wedged worker cannot make `Ping` lie about the daemon being
-/// down (#212). Returns `None` for requests that are not status, which the
-/// worker then serves as before, EXCEPT that the shared [`pregate`] answers a
-/// bad username or an unauthorized peer here whatever the request is: `serve`
+/// published [`EngineBits`]), so a status read cannot make an
+/// authentication wait, and a wedged worker cannot make `Ping` lie about
+/// the daemon being down (#212). `ListProfiles` answers only a cache hit
+/// here, from sysfs and file digests; a miss queues to the worker, whose
+/// load is a TPM unseal (10.8s measured on one machine). Returns `None` for
+/// requests that are not status, which the worker then serves as before,
+/// EXCEPT that the shared [`pregate`] answers a bad username or an
+/// unauthorized peer here whatever the request is: `serve`
 /// only routes status requests here, and `dispatch` wants that answer anyway.
 fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
     dispatch_status_with_diagnostics(req, peer, None)
@@ -4794,69 +4886,79 @@ fn dispatch_status_with_diagnostics(
             // does the real load (TPM unseal, possible key re-seal) and
             // publishes. Serving the real load here would put a TPM command
             // and a potential template-key WRITE on a connection thread.
-            match cached_enrollment_summary(user) {
-                // A primary rewritten by a legacy writer since publication
-                // sends no request: its binding may have changed, so the
-                // cached summary is a miss and the worker reloads (ADR-0029).
-                // Compared even when the file was absent at publication, so
-                // an enrollment created since is seen.
-                Some(sum) if !sum.primary_digest.unchanged(&primary_digest_now(user)) => {
-                    return None
-                }
-                Some(mut sum) => {
-                    // Hotplug and legacy rewrites since publication must
-                    // not be hidden by the cache: refresh the volatile
-                    // facts (sysfs + two file reads, no opens/TPM).
-                    refresh_camera_group_flags(user, &mut sum);
-                    sum.into_response_for(peer, *handles)
-                }
-                None => return None,
+            let mut sum = cached_enrollment_summary(user)?;
+            let primary = primary_digest_now(user);
+            // A primary rewritten by a legacy writer since publication
+            // sends no request: its binding may have changed, so the
+            // cached summary is a miss and the worker reloads (ADR-0029).
+            // Compared even when the file was absent at publication, so
+            // an enrollment created since is seen.
+            if !sum.primary_digest.unchanged(&primary) {
+                return None;
             }
+            // Hotplug since publication must not be hidden by the cache:
+            // refresh the volatile facts (sysfs and file digests, no device
+            // opens, no template key). A camera store changed since then
+            // is a miss like the primary, and so is a published store
+            // error that came from an unseal failure.
+            if !refresh_camera_group_flags(user, &primary, &mut sum) {
+                return None;
+            }
+            sum.into_response_for(peer, *handles)
         }
         _ => return None,
     })
 }
 
-/// Read the envelope once. Only the worker's explicit diagnostic request supplies
-/// a TPM-backed observer; metadata status always supplies a no-op observer.
 /// Refreshes the VOLATILE camera-group flags on a cached summary before it
-/// is served (ADR-0024 slice E hardware finding): hotplug changes
+/// is served (ADR-0024 slice E hardware finding), or returns `false` when
+/// the request must queue to the worker instead: the secondary store
+/// changed since publication, or the worker's load could not get the
+/// template key (the worker retries the unseal). Hotplug changes
 /// connection and selection state without touching the enrollment, so the
 /// worker-published cache would otherwise keep answering "connected" for
-/// an unplugged camera. Both recomputations are sysfs-only - no device
-/// opens, no TPM - safe on a connection thread. Store-backed facts (stale,
-/// counts, calibration, generation) stay frozen: they only change through
-/// mutations, which invalidate the cache.
-fn refresh_camera_group_flags(user: &str, summary: &mut EnrollmentSummary) {
-    if summary.camera_groups.is_empty() && summary.camera_store_error.is_none() {
-        return;
-    }
-    // A store that became unreadable or vanished since publication must
-    // not keep serving its frozen rows: report the error, or nothing.
-    let store = irlume_core::multi_camera::load_secondary(
-        &irlume_core::multi_camera::secondary_store_path(user),
-    );
-    let stale = match store {
+/// an unplugged camera: both are recomputed from sysfs and the engine's
+/// published pair, with no device opens. `stale` is recomputed from the
+/// store's published activation digest and `primary`, the primary file's
+/// current digest.
+///
+/// The store file is read only to hash it, never parsed or decrypted: an
+/// encrypted store opens only under the account template key, and
+/// unsealing that key is TPM work (a key write when none is sealed) that
+/// belongs on the worker. A store removed or unreadable since publication
+/// is reported as the worker's load reports it. Store-backed facts
+/// (counts, calibration, generation) stay as published, and so does any
+/// other store error the worker published (a store that does not parse or
+/// decrypt), until the store file, the primary or the enrollment changes.
+fn refresh_camera_group_flags(
+    user: &str,
+    primary: &PrimaryDigest,
+    summary: &mut EnrollmentSummary,
+) -> bool {
+    let bytes = match std::fs::read(irlume_core::multi_camera::secondary_store_path(user)) {
+        Ok(bytes) => bytes,
         Err(error) => {
             summary.camera_groups.clear();
-            summary.camera_store_error = Some(error.to_string());
-            return;
+            summary.camera_store_error =
+                (error.kind() != std::io::ErrorKind::NotFound).then(|| {
+                    irlume_core::multi_camera::SecondaryStoreError::Io(error.to_string())
+                        .to_string()
+                });
+            return true;
         }
-        Ok(None) => {
-            summary.camera_groups.clear();
-            summary.camera_store_error = None;
-            return;
-        }
-        Ok(Some(store)) => {
-            summary.camera_store_error = None;
-            // A LEGACY rewrite of the primary sends no request and
-            // invalidates nothing (the slice E live finding): re-verify
-            // the activation digest against the CURRENT primary bytes.
-            let primary = std::fs::read(irlume_core::multi_camera::primary_enrollment_path(user))
-                .ok()
-                .map(|bytes| irlume_common::sha256_hex(&bytes));
-            primary.as_deref() != Some(store.primary_snapshot_sha256.as_str())
-        }
+    };
+    let now = PrimaryDigest::Present(irlume_common::sha256_hex(&bytes));
+    if !summary.camera_store.file.unchanged(&now) || summary.camera_store.key_unavailable {
+        return false;
+    }
+    if summary.camera_groups.is_empty() {
+        return true;
+    }
+    // A primary that no longer matches the store's activation binding
+    // deactivates every group (ADR-0024 §1.1); an absent one is a change.
+    let stale = match (primary, summary.camera_store.activation.as_deref()) {
+        (PrimaryDigest::Present(primary), Some(activation)) => primary != activation,
+        _ => true,
     };
     let present = irlume_auth::present_device_identities();
     let live = {
@@ -4876,6 +4978,7 @@ fn refresh_camera_group_flags(user: &str, summary: &mut EnrollmentSummary) {
         group.stale = stale;
     }
     refresh_camera_group_flags_with(summary, &present, &live);
+    true
 }
 
 /// The pure core of [`refresh_camera_group_flags`] over caller-supplied
@@ -4898,6 +5001,8 @@ fn refresh_camera_group_flags_with(
     }
 }
 
+/// Read the envelope once. Only the worker's explicit diagnostic request supplies
+/// a TPM-backed observer; metadata status always supplies a no-op observer.
 fn keyring_info(
     user: &str,
     diagnose: impl FnOnce(&irlume_core::envelope::SealedEnvelope) -> Option<bool>,
@@ -6399,9 +6504,7 @@ fn dispatch_scoped_session_inner(
                         engine.ir_space(),
                         engine.ir_dim(),
                     );
-                    let (camera_groups, camera_store_error) = camera_group_rows(&user, engine);
-                    sum.camera_groups = camera_groups;
-                    sum.camera_store_error = camera_store_error;
+                    summarize_camera_groups(&mut sum, &user, engine);
                     // Tied to the bytes the load read: a file that changed
                     // under the load is not filed under its new digest.
                     sum.primary_digest =
@@ -7783,10 +7886,8 @@ fn set_require_eyes_open_off(user: &str, engine: &irlume_auth::Engine) -> Respon
                 engine.ir_space(),
                 engine.ir_dim(),
             );
-            let (camera_groups, camera_store_error) = camera_group_rows(user, engine);
+            summarize_camera_groups(&mut summary, user, engine);
             summary.primary_digest = primary_digest_now(user);
-            summary.camera_groups = camera_groups;
-            summary.camera_store_error = camera_store_error;
             publish_enrollment_summary(user, summary);
             Response::Ok("require-eyes-open disabled".into())
         }
@@ -11949,6 +12050,7 @@ mod tests {
                 camera_store_error: None,
                 primary_camera: None,
                 primary_digest: PrimaryDigest::Absent,
+                camera_store: CameraStoreSnapshot::default(),
             },
         );
         match dispatch_status(&req, &peer) {
@@ -12081,6 +12183,7 @@ mod tests {
                     camera_store_error: None,
                     primary_camera: None,
                     primary_digest: PrimaryDigest::Absent,
+                    camera_store: CameraStoreSnapshot::default(),
                 },
             );
             let response = dispatch(request, &owner, &mut engine);
@@ -12148,6 +12251,7 @@ mod tests {
                 connected_handle: None,
             }),
             primary_digest: PrimaryDigest::Absent,
+            camera_store: CameraStoreSnapshot::default(),
         };
         let present = vec![
             "046d:085e:e179cb54".to_string(),
@@ -12254,6 +12358,7 @@ mod tests {
                     connected_handle: None,
                 }),
                 primary_digest: primary_digest_now(user),
+                camera_store: CameraStoreSnapshot::default(),
             },
         );
         let request = Request::ListProfiles {
@@ -12289,6 +12394,7 @@ mod tests {
                 camera_store_error: None,
                 primary_camera: None,
                 primary_digest: primary_digest_now(user),
+                camera_store: CameraStoreSnapshot::default(),
             },
         );
         assert!(matches!(
@@ -12312,6 +12418,7 @@ mod tests {
                 camera_store_error: None,
                 primary_camera: None,
                 primary_digest: primary_digest_now(user),
+                camera_store: CameraStoreSnapshot::default(),
             },
         );
         std::fs::create_dir(&path).unwrap();
@@ -12330,6 +12437,7 @@ mod tests {
                 camera_store_error: None,
                 primary_camera: None,
                 primary_digest: primary_digest_now(user),
+                camera_store: CameraStoreSnapshot::default(),
             },
         );
         assert!(dispatch_status(&request, &peer(0)).is_none());
@@ -12356,6 +12464,7 @@ mod tests {
                 camera_store_error: None,
                 primary_camera: None,
                 primary_digest: PrimaryDigest::Unsettled,
+                camera_store: CameraStoreSnapshot::default(),
             },
         );
         assert!(
@@ -12416,6 +12525,7 @@ mod tests {
                 camera_store_error: None,
                 primary_camera: None,
                 primary_digest: PrimaryDigest::Absent,
+                camera_store: CameraStoreSnapshot::default(),
             },
         );
         match dispatch(delete(), &peer(NOBODY), &mut e) {
@@ -15125,6 +15235,7 @@ mod tests {
                 camera_store_error: None,
                 primary_camera: None,
                 primary_digest: PrimaryDigest::Absent,
+                camera_store: CameraStoreSnapshot::default(),
             },
         );
         let sb = sandbox("summary-carryover");
@@ -15541,6 +15652,7 @@ mod tests {
                     camera_store_error: None,
                     primary_camera: None,
                     primary_digest: PrimaryDigest::Absent,
+                    camera_store: CameraStoreSnapshot::default(),
                 },
             );
             match dispatch(request.clone(), &peer(NOBODY), &mut e) {
@@ -15659,6 +15771,7 @@ mod tests {
                 camera_store_error: None,
                 primary_camera: None,
                 primary_digest: PrimaryDigest::Absent,
+                camera_store: CameraStoreSnapshot::default(),
             },
         );
         assert!(
@@ -17945,10 +18058,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cached_group_rows_refresh_stale_after_a_legacy_primary_rewrite() {
-        let _g = env_lock();
-        let sb = sandbox("stale-refresh");
+    /// A plaintext primary for carol with one profile, and a secondary
+    /// store (not yet written) whose one group is bound to those bytes.
+    fn camera_group_fixture(
+        dir: &std::path::Path,
+    ) -> (Enrollment, irlume_core::multi_camera::SecondaryStore) {
         let mut enr = Enrollment::new("carol");
         enr.camera_binding = Some(irlume_core::storage::CameraBinding {
             rgb: Some("046d:lap".into()),
@@ -17970,15 +18084,14 @@ mod tests {
             ir_calib: None,
             ir_calibs: Default::default(),
         });
-        write_enrollment(&sb.dir, &enr);
-        let digest = irlume_common::sha256_hex(
-            &std::fs::read(sb.dir.join("carol.json")).expect("primary bytes"),
-        );
+        write_enrollment(dir, &enr);
         let store = irlume_core::multi_camera::SecondaryStore {
             format_version: irlume_core::multi_camera::SECONDARY_STORE_VERSION,
             owner: "carol".into(),
             generation: 1,
-            primary_snapshot_sha256: digest,
+            primary_snapshot_sha256: irlume_common::sha256_hex(
+                &std::fs::read(dir.join("carol.json")).expect("primary bytes"),
+            ),
             groups: vec![irlume_core::multi_camera::SecondaryGroup {
                 id: irlume_core::multi_camera::CameraGroupId::new("cam-desk".into()).unwrap(),
                 pair: irlume_core::multi_camera::GroupPair {
@@ -17992,13 +18105,174 @@ mod tests {
                 }],
             }],
         };
-        irlume_core::multi_camera::save_secondary(
-            &irlume_core::multi_camera::secondary_store_path("carol"),
-            &store,
-        )
-        .expect("plant secondary");
+        (enr, store)
+    }
 
-        let mut summary = EnrollmentSummary {
+    /// Builds and publishes carol's summary as the worker's `ListProfiles`
+    /// arm does, with `key_for` as the camera store's key resolver.
+    fn publish_camera_group_summary(
+        enr: &Enrollment,
+        e: &irlume_auth::Engine,
+        key_for: impl Fn(
+            &str,
+        ) -> Result<
+            Option<zeroize::Zeroizing<Vec<u8>>>,
+            irlume_core::multi_camera::SecondaryStoreError,
+        >,
+    ) -> EnrollmentSummary {
+        let mut summary =
+            summarize_enrollment(Some(enr), e.embed_space(), e.ir_space(), e.ir_dim());
+        summarize_camera_groups_keyed(&mut summary, "carol", e, key_for);
+        summary.primary_digest = primary_digest_now("carol");
+        publish_enrollment_summary("carol", summary.clone());
+        summary
+    }
+
+    /// Writes [`camera_group_fixture`]'s store encrypted under a test key,
+    /// as a TPM host does, without a TPM.
+    fn plant_encrypted_camera_store(store: &irlume_core::multi_camera::SecondaryStore) {
+        let path = irlume_core::multi_camera::secondary_store_path("carol");
+        irlume_core::multi_camera::save_secondary_resolved(&path, store, |_| {
+            Ok(Some(zeroize::Zeroizing::new(vec![7u8; 32])))
+        })
+        .expect("plant the encrypted store");
+        let raw = std::fs::read_to_string(&path).expect("store bytes");
+        assert!(
+            raw.contains("\"enc\"") && !raw.contains("primary_snapshot_sha256"),
+            "the store is written encrypted: {raw}"
+        );
+    }
+
+    fn list_carol() -> Request {
+        Request::ListProfiles {
+            user: "carol".into(),
+            structured_errors: false,
+            handles: false,
+        }
+    }
+
+    #[test]
+    fn a_cached_listing_requests_no_template_key_for_an_encrypted_camera_store() {
+        let _g = env_lock();
+        let e = engine();
+        let sb = sandbox("enc-cam-hit");
+        let (enr, store) = camera_group_fixture(&sb.dir);
+        plant_encrypted_camera_store(&store);
+
+        // The worker builds and publishes the summary: its load asks for the
+        // key once, which is where that request belongs.
+        let requests = std::cell::Cell::new(0);
+        let summary = publish_camera_group_summary(&enr, &e, |_| {
+            requests.set(requests.get() + 1);
+            Ok(Some(zeroize::Zeroizing::new(vec![7u8; 32])))
+        });
+        assert_eq!(requests.get(), 1, "the worker's load decrypts the store");
+        assert_eq!(summary.camera_groups.len(), 1);
+        assert_eq!(summary.camera_store_error, None);
+
+        // From here any template-key request fails where the reply shows it,
+        // and reaches no TPM: the sealed-key file does not parse, and a host
+        // without a TPM refuses an encrypted store outright.
+        let key_file = irlume_core::template_key::key_path("carol");
+        std::fs::create_dir_all(key_file.parent().expect("key dir")).unwrap();
+        std::fs::write(&key_file, b"not a sealed key").unwrap();
+
+        match dispatch_status(&list_carol(), &peer(0)) {
+            Some(Response::Enrollment {
+                camera_groups,
+                camera_store_error,
+                ..
+            }) => {
+                assert_eq!(
+                    camera_store_error, None,
+                    "the cache hit requested the template key"
+                );
+                assert_eq!(camera_groups.len(), 1, "the published row is served");
+                assert!(!camera_groups[0].stale, "the binding matches the primary");
+            }
+            other => panic!("expected a cache hit, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&key_file).unwrap(),
+            b"not a sealed key",
+            "no key was written"
+        );
+        invalidate_enrollment_summary("carol");
+    }
+
+    #[test]
+    fn a_camera_store_error_from_an_unseal_failure_queues_the_listing_to_the_worker() {
+        let _g = env_lock();
+        let e = engine();
+        let sb = sandbox("enc-cam-unseal");
+        let (enr, store) = camera_group_fixture(&sb.dir);
+        plant_encrypted_camera_store(&store);
+
+        // The worker's load could not get the template key.
+        let summary = publish_camera_group_summary(&enr, &e, |_| {
+            Err(irlume_core::multi_camera::SecondaryStoreError::Invalid(
+                "the account template key is unavailable: test".into(),
+            ))
+        });
+        assert!(summary.camera_groups.is_empty());
+        let error = summary
+            .camera_store_error
+            .expect("the unseal failure is reported");
+        assert!(error.contains("template key is unavailable"), "{error}");
+
+        // The store file is unchanged, but the failure may not recur: a hit
+        // is a miss, so the worker retries the unseal.
+        assert!(
+            dispatch_status(&list_carol(), &peer(0)).is_none(),
+            "the listing queues to the worker"
+        );
+        invalidate_enrollment_summary("carol");
+    }
+
+    #[test]
+    fn a_camera_store_error_that_recurs_on_every_load_is_served_from_the_cache() {
+        let _g = env_lock();
+        let e = engine();
+        let sb = sandbox("enc-cam-nokey");
+        let (enr, store) = camera_group_fixture(&sb.dir);
+        plant_encrypted_camera_store(&store);
+
+        // The resolver answers with no key, as on a host without a TPM: the
+        // encrypted store is refused, the same way on every load.
+        let summary = publish_camera_group_summary(&enr, &e, |_| Ok(None));
+        assert!(summary.camera_groups.is_empty());
+        let published = summary
+            .camera_store_error
+            .clone()
+            .expect("the encrypted store is refused");
+
+        // While the store file is unchanged, a hit serves that error.
+        let mut refreshed = summary;
+        assert!(
+            refresh_camera_group_flags("carol", &primary_digest_now("carol"), &mut refreshed),
+            "an unchanged store is a hit"
+        );
+        assert_eq!(refreshed.camera_store_error.as_ref(), Some(&published));
+        match dispatch_status(&list_carol(), &peer(0)) {
+            Some(Response::Enrollment {
+                camera_groups,
+                camera_store_error,
+                ..
+            }) => {
+                assert!(camera_groups.is_empty());
+                assert_eq!(camera_store_error, Some(published));
+            }
+            other => panic!("expected a cache hit, got {other:?}"),
+        }
+        invalidate_enrollment_summary("carol");
+    }
+
+    /// The one cached row [`camera_group_fixture`]'s store lists, published
+    /// against the files as they are now.
+    fn published_camera_group_summary(
+        store: &irlume_core::multi_camera::SecondaryStore,
+    ) -> EnrollmentSummary {
+        EnrollmentSummary {
             profiles: Vec::new(),
             ir_ratio_calibrated: false,
             camera_groups: vec![irlume_common::CameraGroupSummary {
@@ -18014,28 +18288,123 @@ mod tests {
             }],
             camera_store_error: None,
             primary_camera: None,
-            primary_digest: PrimaryDigest::Absent,
-        };
-        // Published while active; a legacy writer then rewrites the primary
-        // with NO request in flight: the cached row must flip to stale.
+            primary_digest: primary_digest_now("carol"),
+            camera_store: CameraStoreSnapshot {
+                file: camera_store_digest_now("carol"),
+                activation: Some(store.primary_snapshot_sha256.clone()),
+                key_unavailable: false,
+            },
+        }
+    }
+
+    #[test]
+    fn cached_group_rows_refresh_stale_after_a_legacy_primary_rewrite() {
+        let _g = env_lock();
+        let sb = sandbox("stale-refresh");
+        let (_, store) = camera_group_fixture(&sb.dir);
+        // Plaintext, as a host without a TPM writes it: no key involved.
+        irlume_core::multi_camera::save_secondary_resolved(
+            &irlume_core::multi_camera::secondary_store_path("carol"),
+            &store,
+            |_| Ok(None),
+        )
+        .expect("plant secondary");
+        let mut summary = published_camera_group_summary(&store);
+        assert!(refresh_camera_group_flags(
+            "carol",
+            &primary_digest_now("carol"),
+            &mut summary
+        ));
+        assert!(!summary.camera_groups[0].stale, "published while active");
+
+        // A legacy writer then rewrites the primary with NO request in
+        // flight: the cached row must flip to stale.
         std::fs::write(sb.dir.join("carol.json"), b"legacy-rewrite").expect("rewrite");
-        refresh_camera_group_flags("carol", &mut summary);
+        assert!(refresh_camera_group_flags(
+            "carol",
+            &primary_digest_now("carol"),
+            &mut summary
+        ));
         assert!(summary.camera_groups[0].stale, "the rewrite is visible");
         assert!(summary.camera_store_error.is_none());
+    }
 
-        // A store that became unreadable reports its error and serves no
-        // frozen rows at all.
-        std::fs::write(
-            irlume_core::multi_camera::secondary_store_path("carol"),
-            b"{\"format_version\":1,\"owner\":\"carol\"}",
-        )
-        .expect("corrupt the store");
-        refresh_camera_group_flags("carol", &mut summary);
+    #[test]
+    fn cached_group_rows_follow_the_camera_store_file() {
+        let _g = env_lock();
+        let sb = sandbox("store-refresh");
+        let (_, store) = camera_group_fixture(&sb.dir);
+        let path = irlume_core::multi_camera::secondary_store_path("carol");
+        let plant = || {
+            irlume_core::multi_camera::save_secondary_resolved(&path, &store, |_| Ok(None))
+                .expect("plant secondary")
+        };
+        plant();
+        let published = published_camera_group_summary(&store);
+        let primary = primary_digest_now("carol");
+        let refreshed = |summary: &mut EnrollmentSummary| {
+            refresh_camera_group_flags("carol", &primary, summary)
+        };
+
+        let mut summary = published.clone();
+        assert!(refreshed(&mut summary), "an unchanged store is a hit");
+        assert_eq!(summary.camera_groups.len(), 1);
+        publish_enrollment_summary("carol", published.clone());
+        match dispatch_status(&list_carol(), &peer(0)) {
+            Some(Response::Enrollment { camera_groups, .. }) => {
+                assert_eq!(camera_groups.len(), 1, "the published row is served");
+            }
+            other => panic!("expected a cache hit, got {other:?}"),
+        }
+
+        // A store that changed while the worker loaded it has no settled
+        // digest: a miss even though the file is unchanged now.
+        let mut summary = EnrollmentSummary {
+            camera_store: CameraStoreSnapshot {
+                file: PrimaryDigest::Unsettled,
+                ..published.camera_store.clone()
+            },
+            ..published.clone()
+        };
+        assert!(!refreshed(&mut summary), "an unsettled store is a miss");
+
+        // Rewritten since publication (here into a store that does not
+        // parse): a miss, so the worker reloads and reports what it finds.
+        std::fs::write(&path, b"{\"format_version\":1,\"owner\":\"carol\"}").unwrap();
+        let mut summary = published.clone();
+        assert!(!refreshed(&mut summary), "a rewritten store is a miss");
+        assert!(
+            dispatch_status(&list_carol(), &peer(0)).is_none(),
+            "the listing queues to the worker"
+        );
+
+        // Removed: no rows and no error, as the worker's load reports it.
+        std::fs::remove_file(&path).unwrap();
+        let mut summary = published.clone();
+        assert!(refreshed(&mut summary));
         assert!(summary.camera_groups.is_empty());
-        assert!(summary
+        assert_eq!(summary.camera_store_error, None);
+
+        // Unreadable (here a directory): no rows, and the read error.
+        std::fs::create_dir(&path).unwrap();
+        let mut summary = published.clone();
+        assert!(refreshed(&mut summary));
+        assert!(summary.camera_groups.is_empty());
+        let error = summary
             .camera_store_error
-            .as_deref()
-            .is_some_and(|e| !e.is_empty()));
+            .expect("the read error is reported");
+        assert!(error.contains("cannot read secondary store"), "{error}");
+        std::fs::remove_dir(&path).unwrap();
+
+        // A store written after a summary that saw none is a miss too.
+        plant();
+        let mut summary = EnrollmentSummary {
+            camera_groups: Vec::new(),
+            camera_store: CameraStoreSnapshot::default(),
+            ..published.clone()
+        };
+        assert!(!refreshed(&mut summary), "a new store is a miss");
+        invalidate_enrollment_summary("carol");
     }
 
     #[test]
@@ -18058,6 +18427,7 @@ mod tests {
             camera_store_error: None,
             primary_camera: None,
             primary_digest: PrimaryDigest::Absent,
+            camera_store: CameraStoreSnapshot::default(),
         };
         // The worker froze the row while the camera was plugged in AND
         // selected; hotplug since then: the identity is gone and the live
@@ -18131,9 +18501,11 @@ mod tests {
                 }],
             }],
         };
-        irlume_core::multi_camera::save_secondary(
+        // Plaintext, so neither load below asks for the template key.
+        irlume_core::multi_camera::save_secondary_resolved(
             &irlume_core::multi_camera::secondary_store_path("carol"),
             &store,
+            |_| Ok(None),
         )
         .expect("plant secondary");
 
@@ -18161,14 +18533,21 @@ mod tests {
             }
             other => panic!("expected Enrollment, got {other:?}"),
         }
+        // The worker published a summary the next listing is served from.
+        match dispatch_status(&list_carol(), &peer(0)) {
+            Some(Response::Enrollment {
+                camera_groups,
+                camera_store_error,
+                ..
+            }) => {
+                assert!(camera_store_error.is_none());
+                assert_eq!(camera_groups.len(), 1, "the cache hit lists the group");
+            }
+            other => panic!("expected a cache hit, got {other:?}"),
+        }
 
         // A corrupt secondary store reports its diagnostic instead of
         // silently listing nothing.
-        irlume_core::multi_camera::save_secondary(
-            &irlume_core::multi_camera::secondary_store_path("carol"),
-            &store,
-        )
-        .ok();
         std::fs::write(
             irlume_core::multi_camera::secondary_store_path("carol"),
             b"{\"format_version\":1,\"owner\":\"carol\",\"generation\":1,\"primary_snapshot_sha256\":\"nothex\",\"groups\":[]}",
@@ -18194,6 +18573,16 @@ mod tests {
                 assert!(error.contains("invalid secondary store"), "{error}");
             }
             other => panic!("expected Enrollment, got {other:?}"),
+        }
+        // It fails the same way on every load, so the cache serves it.
+        match dispatch_status(&list_carol(), &peer(0)) {
+            Some(Response::Enrollment {
+                camera_store_error, ..
+            }) => {
+                let error = camera_store_error.expect("the cached store error");
+                assert!(error.contains("invalid secondary store"), "{error}");
+            }
+            other => panic!("expected a cache hit, got {other:?}"),
         }
     }
 }

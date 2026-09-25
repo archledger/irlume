@@ -273,6 +273,31 @@ password change or a firmware update: the next login where you type your
 password at such a screen moves the wrap to it and re-binds the seal. Until
 then, `forget` takes the previous password.
 
+At each login, irlume's session line hands the token to `irlume-gkr-unlock`,
+which gives it to gnome-keyring over gnome-keyring's control socket once
+gnome-keyring can take it. Where `pam_gnome_keyring` starts gnome-keyring with
+`--login` and no socket unit exists (Fedora 43 and 44), gnome-keyring accepts
+nothing until the session's first Secret Service client initializes it, about
+2 s after the desktop starts. So the helper leaves a small waiter behind and
+the login does not wait for it. The waiter sends the token when gnome-keyring
+claims `org.gnome.keyring` on your session bus, which is before an
+application's unlock prompt can appear, and gives up after 120 s. Where
+gnome-keyring runs from a socket unit (Debian, Ubuntu, Arch), the token goes
+as soon as something in the login starts gnome-keyring, normally
+`pam_gnome_keyring` or the desktop's first Secret Service client; the waiter
+never starts it itself. The outcome is in the journal under the helper's own
+name (`irlume logs` shows only the lines that mention irlume):
+
+```sh
+journalctl -b -t irlume-gkr-unlock
+```
+
+`token delivered N ms after the session line` is the normal line. After a
+typed-password login gnome-keyring also logs `failed to unlock login keyring on
+startup`: it tries the typed password first, which no longer opens a keyring
+keyed to the token. That line is expected, and the token's success clears it.
+[DEBUGGING.md](DEBUGGING.md) lists every line the waiter writes.
+
 `irlume keyring arm` picks the kind again each time, but it does not replace
 an armed token with a login-password or KDE wallet-key arm, which it picks
 where oo7 keeps the keyring, when a KDE wallet sits beside the GNOME keyring or

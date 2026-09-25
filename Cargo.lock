@@ -1140,6 +1140,7 @@ dependencies = [
 name = "irlume-gkr-unlock"
 version = "0.14.0"
 dependencies = [
+ "dbus",
  "irlume-common",
  "libc",
  "zeroize",

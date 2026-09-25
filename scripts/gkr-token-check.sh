@@ -11,8 +11,8 @@
 #   2. the token IS the credential: CHANGE(token, token) is accepted and
 #                                   CHANGE(password, password) is DENIED
 #   3. it survives a daemon restart: a FRESH daemon (which starts locked) is
-#                                   unlocked by irlume-gkr-unlock with the token
-#                                   and NOT by the password
+#                                   unlocked by irlume-gkr-unlock --foreground
+#                                   with the token and NOT by the password
 #   4. the keyring still works:    a canary secret stored before the re-key is
 #                                   readable after it, through the Secret
 #                                   Service, so "unlocked" is not just a status
@@ -27,6 +27,10 @@
 # The Python side implements the control protocol independently of the Rust
 # crate, so agreement between them and a real daemon is a cross-check rather
 # than one implementation agreeing with itself.
+#
+# Here the daemon is always initialized from the start;
+# scripts/gkr-token-waiter-check.sh covers the helper's wait for one that is
+# not initialized yet.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -69,8 +73,10 @@ trap cleanup EXIT
 
 # A private session bus: the Secret Service canary needs one, and it must not
 # be the caller's own bus, where a real gnome-keyring is already the provider.
-eval "$(dbus-daemon --session --print-address=1 --print-pid=1 --fork \
-    | { read -r addr; read -r pid; echo "export DBUS_SESSION_BUS_ADDRESS='$addr'; DBUS_PID=$pid"; })"
+# It listens at $XDG_RUNTIME_DIR/bus, the one place the helper looks for the
+# user bus.
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+DBUS_PID="$(dbus-daemon --session --address="$DBUS_SESSION_BUS_ADDRESS" --print-pid=1 --fork)"
 
 # ---------------------------------------------------------------- the client
 # Independent implementation of gnome-keyring's control protocol, from
@@ -197,15 +203,19 @@ echo "[3] restart the daemon, then unlock with irlume-gkr-unlock"
 kill_daemon
 start_daemon || { echo "daemon did not restart"; exit 1; }
 
-if printf '%s' "wrong-token-0000" | env IRLUME_GKR_RUNTIME_DIR="$XDG_RUNTIME_DIR" IRLUME_GKR_HOME="$HOME" \
-        "$HELPER" "$(id -un)" 2>"$BASE/err.wrong"; then
-    bad "the helper reported success for a WRONG token"
+printf '%s' "wrong-token-0000" | env IRLUME_GKR_RUNTIME_DIR="$XDG_RUNTIME_DIR" IRLUME_GKR_HOME="$HOME" \
+    "$HELPER" --foreground --timeout-secs 10 "$(id -un)" 2>"$BASE/err.wrong"
+rc=$?
+# 4 is "stale": the daemon, already initialized, refused CHANGE(token, token),
+# and the helper sent nothing more.
+if [[ $rc -eq 4 ]]; then
+    ok "helper refused a wrong token as stale (exit 4)"
 else
-    ok "helper refused a wrong token ($(tr -d '\n' <"$BASE/err.wrong" | tail -c 60))"
+    bad "a WRONG token gave exit $rc, not 4: $(tr -d '\n' <"$BASE/err.wrong" | tail -c 120)"
 fi
 
 if printf '%s' "$TOKEN" | env IRLUME_GKR_RUNTIME_DIR="$XDG_RUNTIME_DIR" IRLUME_GKR_HOME="$HOME" \
-        "$HELPER" "$(id -un)" 2>"$BASE/err.right"; then
+        "$HELPER" --foreground --timeout-secs 10 "$(id -un)" 2>"$BASE/err.right"; then
     ok "helper unlocked a freshly started daemon with the sealed token"
 else
     bad "helper failed with the correct token: $(cat "$BASE/err.right")"
@@ -233,7 +243,7 @@ kr="$XDG_DATA_HOME/keyrings/login.keyring"
 if [[ -f "$kr" ]]; then
     mv "$kr" "$kr.hidden"
     if printf '%s' "$TOKEN" | env IRLUME_GKR_RUNTIME_DIR="$XDG_RUNTIME_DIR" IRLUME_GKR_HOME="$HOME" \
-            "$HELPER" "$(id -un)" 2>"$BASE/err.nokr"; then
+            "$HELPER" --foreground --timeout-secs 10 "$(id -un)" 2>"$BASE/err.nokr"; then
         bad "the helper unlocked with NO login keyring present (it created one)"
     else
         grep -q 'refusing to UNLOCK' "$BASE/err.nokr" \
@@ -260,7 +270,7 @@ for _ in $(seq 1 "$CYCLES"); do
     kill_daemon
     start_daemon || break
     printf '%s' "$PASSWORD" | env IRLUME_GKR_RUNTIME_DIR="$XDG_RUNTIME_DIR" IRLUME_GKR_HOME="$HOME" \
-        "$HELPER" "$(id -un)" >/dev/null 2>&1 || bad "cycle unlock failed"
+        "$HELPER" --foreground --timeout-secs 10 "$(id -un)" >/dev/null 2>&1 || bad "cycle unlock failed"
     cycles_run=$((cycles_run+1))
 done
 after="$(pgrep -u "$(id -u)" -cf "gnome-keyring-daemon.*--foreground")"

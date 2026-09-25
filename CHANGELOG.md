@@ -311,6 +311,23 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- A login keyring armed with a GNOME keyring token now unlocks at login on
+  Fedora 43 and 44 GNOME, and wherever `pam_gnome_keyring` starts
+  gnome-keyring with `--login` and no socket unit. That gnome-keyring
+  refuses every unlock until the session's first Secret Service client
+  initializes it, seconds after the login, so the token irlume sent from
+  the session line was always refused and the keyring stayed locked after
+  every login, typed, face or fingerprint. `irlume-gkr-unlock` now returns
+  to the login within about a second and leaves a waiter behind, which
+  sends the token once gnome-keyring claims `org.gnome.keyring` on the
+  session bus and is checked to be the user's own, before an application's
+  unlock prompt can appear. It sends `CHANGE(token, token)` first, which
+  gnome-keyring does not remember when it refuses, so a token that no
+  longer matches is never recorded. The outcome is in the journal under
+  `irlume-gkr-unlock` (docs/DEBUGGING.md), and a second session open on
+  the same PAM handle no longer hands the token on again. Armed accounts
+  need only the update (#250).
+
 - On NixOS, where the flake module owns the PAM stacks, `irlume login
   enable` and `irlume login disable` now refuse with or without
   `--apply` and point to `services.irlume.pam.services`, `irlume login

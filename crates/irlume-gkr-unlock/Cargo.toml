@@ -10,11 +10,14 @@ path = "src/main.rs"
 
 # Deliberately minimal, like irlume-kwallet-init: this runs as root in the
 # login path, so it takes no dependency on the TPM, inference or serialization
-# stacks.
+# stacks. libdbus is linked for the waiter, which watches the user bus for
+# gnome-keyring to initialize; that code runs only after the permanent drop to
+# the target user, and it never carries the token.
 [dependencies]
 irlume-common.workspace = true
 libc.workspace = true
 zeroize.workspace = true
+dbus.workspace = true
 
 [lints]
 workspace = true

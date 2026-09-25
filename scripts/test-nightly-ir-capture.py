@@ -54,7 +54,9 @@ export FIXTURE_PRIVILEGED=1
 exec "$@"
 ''')
         self.write(self.target / 'debug/irlume', '''#!/bin/bash
-if [ "${TWO_IR:-0}" = 1 ]; then
+if [ "${NO_NODES:-0}" = 1 ]; then
+  printf '%s\\n' '[doctor] camera nodes (classified by pixel format):' '  (no /dev/video* nodes on this machine)'
+elif [ "${TWO_IR:-0}" = 1 ]; then
   printf '%s\\n' '[doctor] camera nodes (classified by pixel format):' '  /dev/video6: Ir (uvcvideo, USB)' '  /dev/video2: Ir (uvcvideo, USB)'
 else
   printf '%s\\n' '[doctor] camera nodes (classified by pixel format):' '  /dev/video2: Ir (uvcvideo, USB)'
@@ -91,7 +93,8 @@ fi
                         CARGO_TARGET_DIR=str(self.target), TMPDIR=str(self.root),
                         CALLS=str(self.root / 'calls'))
         for key in ['FIXTURE_PRIVILEGED', 'DENY_SUDO', 'FAIL_CAPTURE', 'FRAMES',
-                    'SPREAD', 'NO_MARKER', 'PROOF', 'HELPER_EXIT', 'REJECT_BUILD', 'TWO_IR']:
+                    'SPREAD', 'NO_MARKER', 'PROOF', 'HELPER_EXIT', 'REJECT_BUILD', 'TWO_IR',
+                    'NO_NODES']:
             self.env.pop(key, None)
 
     def write(self, path, source):
@@ -172,21 +175,41 @@ exit "${HELPER_EXIT:-0}"
         self.assertIn('names /dev/video3, which doctor does not classify as an IR node', result.stdout)
 
     def test_approval_for_another_tree_warns_and_skips_within_grace(self):
-        for age in [0, 7]:
+        for age, shown in [(0, 0), (7 - 1 / 24, 6)]:
             with self.subTest(age=age):
                 self.install_helper(tree='c' * 40, age_days=age)
                 result = self.run_step()
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertFalse((self.root / 'calls').exists())
                 self.assertIn('::warning::IR capture not run', result.stdout)
-                self.assertIn(f'written {age} day(s) ago', result.stdout)
+                self.assertIn(f'written {shown} day(s) ago', result.stdout)
 
-    def test_approval_for_another_tree_fails_after_grace(self):
+    def test_approval_for_another_tree_fails_from_seven_days(self):
+        for age in [7, 8]:
+            with self.subTest(age=age):
+                self.install_helper(tree='c' * 40, age_days=age)
+                result = self.run_step()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.root / 'calls').exists())
+                self.assertIn(f'::error::IR capture not run for {age} days', result.stdout)
+
+    def test_absent_camera_skip_cannot_outlast_the_deadline(self):
+        self.install_helper(tree='c' * 40, age_days=1)
+        result = self.run_step(NO_NODES='1')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('camera stage skipped', result.stdout)
+        self.assertIn('::warning::IR capture not run', result.stdout)
         self.install_helper(tree='c' * 40, age_days=8)
-        result = self.run_step()
+        result = self.run_step(NO_NODES='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('::error::IR capture not run for 8 days', result.stdout)
+
+    def test_stale_tree_still_validates_the_approved_device(self):
+        self.install_helper(tree='c' * 40, device='/dev/video3')
+        result = self.run_step(TWO_IR='1')
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.root / 'calls').exists())
-        self.assertIn('::error::IR capture not run for 8 days', result.stdout)
+        self.assertIn('names /dev/video3, which doctor does not classify as an IR node', result.stdout)
 
     def test_another_tree_still_fails_on_a_doctor_regression(self):
         self.install_helper(tree='c' * 40)

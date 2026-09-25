@@ -118,14 +118,16 @@ jobs:
           # from and the one device it captures. That device is the IR node,
           # not whichever IR node doctor lists first: the census order is not
           # the approval, and archhost's changed in 2026-09. A checkout the
-          # approval does not cover is reported as such below, apart from a
-          # capture that failed. Every merge changes the tree, so an approval
-          # older than this many days fails the step instead of warning.
+          # approval does not cover is reported as such, apart from a capture
+          # that failed. Every merge changes the tree, so an approval that is
+          # this many days old fails the step instead of warning, checked
+          # before the absent-camera skip so a borrowed camera cannot hold the
+          # nightly green past it. The approved device is validated either way.
           approval_grace_days=7
           helper=/usr/local/libexec/irlume-ci-capture
           approval=/usr/local/lib/irlume-ci/capture.json
           tree=$(git rev-parse 'HEAD^{tree}')
-          want=""; approved_tree=""; stale_days=""
+          want=""; skip_capture=0
           if [ -x "$helper" ]; then
             if ! approved=$(python3 -I -c 'import json, re, sys
           m = json.load(open(sys.argv[1]))
@@ -139,8 +141,13 @@ jobs:
             fi
             read -r approved_tree want <<<"$approved"
             if [ "$approved_tree" != "$tree" ]; then
-              want=""
-              stale_days=$(( ($(date +%s) - $(stat -c %Y "$approval")) / 86400 ))
+              stale_secs=$(( $(date +%s) - $(stat -c %Y "$approval") ))
+              if [ "$stale_secs" -ge $(( approval_grace_days * 86400 )) ]; then
+                echo "::error::IR capture not run for $(( stale_secs / 86400 )) days: the capture approval covers source tree $approved_tree, not this checkout's $tree. An administrator must promote the current tree (scripts/ci/README.md)."
+                exit 1
+              fi
+              echo "::warning::IR capture not run: the capture approval covers source tree $approved_tree (written $(( stale_secs / 86400 )) day(s) ago), not this checkout's $tree. An administrator promotes the current tree (scripts/ci/README.md); $approval_grace_days days after the approval was written this step fails."
+              skip_capture=1
             fi
           fi
           ir=""; rc=0
@@ -177,13 +184,8 @@ jobs:
               ;;
           esac
           echo "IR node: $ir"
-          if [ -n "$stale_days" ]; then
-            if [ "$stale_days" -le "$approval_grace_days" ]; then
-              echo "::warning::IR capture not run: the capture approval covers source tree $approved_tree (written $stale_days day(s) ago), not this checkout's $tree. An administrator promotes the current tree (scripts/ci/README.md); after $approval_grace_days days without one this step fails."
-              exit 0
-            fi
-            echo "::error::IR capture not run for $stale_days days: the capture approval covers source tree $approved_tree, not this checkout's $tree. An administrator must promote the current tree (scripts/ci/README.md)."
-            exit 1
+          if [ "$skip_capture" -eq 1 ]; then
+            exit 0
           fi
           out=$(mktemp -d)
           trap 'rm -rf "$out"' EXIT

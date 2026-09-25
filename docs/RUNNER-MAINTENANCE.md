@@ -27,9 +27,10 @@ binds the whole tree, so any merge counts, not only camera changes. From
 2026-09-20 the v0.14.0 one, and every run on newer heads failed there.
 
 The stage now reads the manifest first. On a tree it does not name, it warns
-(`IR capture not run`) and skips the capture for seven days after the
+(`IR capture not run`) and skips the capture until seven days after the
 manifest was written, so the rest of the suite and coverage keep running;
-after that it fails and `ci-alert` opens its issue. It captures the device the
+from then on it fails, even on nights the camera is away, and `ci-alert`
+opens its issue. It captures the device the
 manifest names, not the first IR node doctor lists, so check the device too
 when you promote: the IR node's number can change when cameras are replugged.
 

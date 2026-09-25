@@ -60,7 +60,11 @@ mkdir -p "$RT"; chown "$TESTUSER:$TESTUSER" "$RT"; chmod 700 "$RT"
 HOMEDIR=/home/$TESTUSER
 KWL=$HOMEDIR/.local/share/kwalletd/kdewallet.kwl
 
-ADDR=$(sudo -u "$TESTUSER" dbus-daemon --session --fork --print-address)
+# The bus starts with the same clean environment as everything the test user
+# runs below: services it activates (a wallet prompt) must not inherit a
+# display that sudo kept (DISPLAY and XAUTHORITY are in Fedora's env_keep).
+ADDR=$(sudo -u "$TESTUSER" env -i HOME="$HOMEDIR" USER="$TESTUSER" PATH=/usr/bin:/bin \
+  XDG_RUNTIME_DIR="$RT" dbus-daemon --session --fork --print-address)
 [ -n "$ADDR" ] || { echo "could not start a session bus"; exit 2; }
 asuser() {
   sudo -u "$TESTUSER" env -i HOME="$HOMEDIR" USER="$TESTUSER" PATH=/usr/bin:/bin \

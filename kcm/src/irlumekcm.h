@@ -41,23 +41,31 @@ public:
     /// Launch `irlume tui` (optionally deep-linked to a page) in a
     /// terminal: xdg-terminal-exec when available, otherwise the shipped
     /// desktop entry via KIO (no deep link in the fallback). Never blocks
-    /// the UI. A launch that cannot happen is reported as
-    /// requestFailed("launch", reason). A click while a handoff to a
-    /// running TUI is still pending replaces the page shown after it.
-    Q_INVOKABLE void launchTui(const QString &page);
+    /// the UI. `origin` names the module page that asked (overview,
+    /// diagnostics, cameras, login). A launch that cannot happen is
+    /// reported as launchFailed(origin, reason), so the page that asked
+    /// shows it whichever page is current by then. A click while a handoff
+    /// to a running TUI is still pending replaces the page shown after it,
+    /// and the origin any failure is reported to.
+    Q_INVOKABLE void launchTui(const QString &page, const QString &origin);
 
 Q_SIGNALS:
     /// `doc` is the parsed machine-API envelope, including ok/data/error.
     void documentReady(const QString &name, const QVariantMap &doc);
     /// Only for: binary missing, process crash/timeout, or output that is
-    /// not a JSON document, plus launch failures under the name "launch".
-    /// Machine-API refusals arrive via documentReady.
+    /// not a JSON document. Machine-API refusals arrive via documentReady.
     void requestFailed(const QString &name, const QString &reason);
+    /// A launchTui call that could not open the TUI, for the page named by
+    /// its origin.
+    void launchFailed(const QString &origin, const QString &reason);
 
 private:
     /// The terminal half of launchTui: xdg-terminal-exec, then the
     /// desktop entry.
-    void openTerminal(const QString &page);
+    void openTerminal(const QString &page, const QString &origin);
 
     IrlumeBridge m_bridge;
+    /// The origin of the latest launch click, which a pending handoff
+    /// reports to when it falls back to a terminal.
+    QString m_launchOrigin;
 };

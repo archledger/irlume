@@ -32,7 +32,9 @@ public:
     /// delay; an unknown name is refused synchronously, as the bridge does.
     Q_INVOKABLE void request(const QString &name);
     /// Records the page; nothing is launched.
-    Q_INVOKABLE void launchTui(const QString &page);
+    Q_INVOKABLE void launchTui(const QString &page, const QString &origin);
+    /// Reports a launch failure to `origin`, as the real module does.
+    Q_INVOKABLE void failLaunch(const QString &origin, const QString &reason);
 
     /// Requests not answered yet.
     [[nodiscard]] int outstanding() const;
@@ -41,6 +43,7 @@ public:
 Q_SIGNALS:
     void documentReady(const QString &name, const QVariantMap &doc);
     void requestFailed(const QString &name, const QString &reason);
+    void launchFailed(const QString &origin, const QString &reason);
     void outstandingChanged();
     void launchesChanged();
 

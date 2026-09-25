@@ -76,7 +76,7 @@ KCMUtils.SimpleKCM {
 
     function launch() {
         root.launchFailure = "";
-        kcm.launchTui("cameras");
+        kcm.launchTui("cameras", "cameras");
     }
 
     Component.onCompleted: root.refresh()
@@ -98,7 +98,12 @@ KCMUtils.SimpleKCM {
                 root.doc = null;
                 root.failure = reason;
                 root.pending = false;
-            } else if (name === "launch" && root.isCurrentPage) {
+            }
+        }
+        function onLaunchFailed(origin, reason) {
+            // Only this page's own clicks: a launch that fails after the
+            // user moved to another page is not that page's error.
+            if (origin === "cameras") {
                 root.launchFailure = reason;
             }
         }

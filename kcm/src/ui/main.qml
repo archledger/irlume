@@ -172,8 +172,13 @@ KCMUtils.SimpleKCM {
         if (s.fingerprint_known !== true) {
             return {level: L.UNKNOWN, value: "not determined"};
         }
-        return s.fingerprint === true ? {level: L.GOOD, value: "found"}
-                                      : {level: L.NEUTRAL, value: "none found"};
+        if (s.fingerprint === true) {
+            return {level: L.GOOD, value: "found"};
+        }
+        // No reader is only information while face can still sign in.
+        return s.auth_method === "fingerprint" || s.face_disabled === true
+            ? {level: L.ATTENTION, value: "none found (the sign-in method is fingerprint)"}
+            : {level: L.NEUTRAL, value: "none found"};
     }
 
     function refresh() {
@@ -187,7 +192,7 @@ KCMUtils.SimpleKCM {
 
     function launch(page) {
         root.launchFailure = "";
-        kcm.launchTui(page);
+        kcm.launchTui(page, "overview");
     }
 
     Component.onCompleted: root.refresh()
@@ -217,7 +222,12 @@ KCMUtils.SimpleKCM {
                 root.statusDoc = null;
                 root.statusFailure = reason;
                 root.statusPending = false;
-            } else if (name === "launch" && root.isCurrentPage) {
+            }
+        }
+        function onLaunchFailed(origin, reason) {
+            // Only this page's own clicks: a launch that fails after the
+            // user moved to another page is not that page's error.
+            if (origin === "overview") {
                 root.launchFailure = reason;
             }
         }

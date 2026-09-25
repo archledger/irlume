@@ -340,6 +340,10 @@ void checkOverview(const Ctx &c)
         c.textContains(QStringLiteral("sensorsRow"), QStringLiteral("(daemon not reachable from this account)"));
     } else if (c.set == QLatin1String("edge")) {
         c.textContains(QStringLiteral("recoveryButton"), QStringLiteral("Set recovery passphrase"));
+        // Fingerprint is the sign-in method and no reader was found: no
+        // biometric path is left, which is not mere information.
+        c.level(QStringLiteral("fingerprintRow"), QStringLiteral("attention"));
+        c.textContains(QStringLiteral("fingerprintRow"), QStringLiteral("the sign-in method is fingerprint"));
     } else if (c.set == QLatin1String("key-missing")) {
         c.level(QStringLiteral("templatesRow"), QStringLiteral("problem"));
         c.level(QStringLiteral("sensorsRow"), QStringLiteral("attention"));
@@ -569,6 +573,28 @@ bool runPage(const std::shared_ptr<QQmlEngine> &engine, const QString &modulePat
         pageChecks(ctx);
     }
     check(module->property("launches").toStringList().isEmpty(), QStringLiteral("nothing was launched"));
+
+    // A launch failure reaches the page that asked, whichever page is
+    // current: another page's failure leaves this one (and the overview
+    // underneath a subpage) alone.
+    {
+        const auto failureOf = [](const QQuickItem *item) {
+            return item->property("launchFailure").toString();
+        };
+        const QString other = page.label == QLatin1String("login") ? QStringLiteral("cameras")
+                                                                   : QStringLiteral("login");
+        QMetaObject::invokeMethod(module.get(), "failLaunch", Q_ARG(QString, other),
+                                  Q_ARG(QString, QStringLiteral("fixture launch failure")));
+        waitSettled(module.get());
+        check(failureOf(current).isEmpty() && failureOf(mainUi).isEmpty(),
+              QStringLiteral("a launch failure from another page is not shown here"));
+        QMetaObject::invokeMethod(module.get(), "failLaunch", Q_ARG(QString, page.label),
+                                  Q_ARG(QString, QStringLiteral("fixture launch failure")));
+        waitSettled(module.get());
+        check(failureOf(current) == QLatin1String("fixture launch failure")
+                  && (current == mainUi || failureOf(mainUi).isEmpty()),
+              QStringLiteral("this page's launch failure is shown here only"));
+    }
 
     window->hide();
     hostObject.reset();

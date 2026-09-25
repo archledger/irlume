@@ -19,8 +19,9 @@ good nor bad, such as a keyring unlock that is not armed), never by colour
 alone, and screen readers get the same words.
 
 - **Overview**: the daemon, enrollment, keyring unlock (with its sealing
-  tier in words, as the TUI shows it), templates at rest, recovery passphrase, face sensors and
-  fingerprint reader. Templates that are encrypted while their sealed key
+  tier in words, as the TUI shows it), templates at rest, recovery
+  passphrase, face sensors and fingerprint reader. A missing reader needs
+  attention when fingerprint is the sign-in method. Templates that are encrypted while their sealed key
   is missing read as a problem, with the way back (`irlume recovery
   restore` when a recovery passphrase is set, enrolling again when it is
   not). A daemon that is starting, not reachable, or not reachable from
@@ -63,11 +64,14 @@ right screen when the session provides `xdg-terminal-exec` (otherwise the
 plain TUI launcher opens). Interactive flows, authorizations and the login
 plan/apply/verify/rollback transaction stay in the TUI, where they are
 reviewed and tested; the GUI is a view. A launch that fails is reported at
-the top of the page.
+the top of the page that asked for it, even after you move to another
+page.
 
 Because the TUI is single-instance ([TUI.md](TUI.md)), clicking a launch
 button twice does not pile up terminals: the running TUI switches to the
-requested screen, and System Settings never waits for it.
+requested screen, and System Settings never waits for it. A click made
+while an earlier one is still being handed over replaces the screen that
+opens.
 
 ## Packaging
 

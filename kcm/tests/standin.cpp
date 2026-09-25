@@ -94,10 +94,15 @@ void IrlumeFixtureKcm::request(const QString &name)
     });
 }
 
-void IrlumeFixtureKcm::launchTui(const QString &page)
+void IrlumeFixtureKcm::launchTui(const QString &page, const QString &)
 {
     m_launches << page;
     Q_EMIT launchesChanged();
+}
+
+void IrlumeFixtureKcm::failLaunch(const QString &origin, const QString &reason)
+{
+    Q_EMIT launchFailed(origin, reason);
 }
 
 #include "standin.moc"

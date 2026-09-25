@@ -162,7 +162,9 @@ password. Where irlumed cannot read your login hash (LDAP or SSSD accounts, and
 the AppArmor profile that the Debian, Ubuntu, Mint and Arch packages install),
 `irlume keyring arm` does not re-arm over the token. To arm again there anyway,
 log in once by typing your new password at such a screen, then run
-`irlume keyring forget` with it, then `irlume keyring arm`.
+`irlume keyring forget` with it, then `irlume keyring arm`. If a firmware
+update also landed before that login, the login cannot update irlume's copy;
+use the previous password with `irlume keyring forget` instead.
 
 Rule of thumb: with a login-password or KDE wallet-key arm
 (`irlume keyring status` shows which), whenever the wallet password changes,

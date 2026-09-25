@@ -268,7 +268,9 @@ Where irlumed cannot check passwords, `irlume keyring arm` does not re-arm over
 a token that is already armed, whoever runs it, and changes nothing. To arm
 again there anyway, log in once by typing your current password at such a
 screen, then run `irlume keyring forget` with that password, then
-`irlume keyring arm`.
+`irlume keyring arm`. If the password and the firmware both changed before
+that login, the login cannot update the seal; run `irlume keyring forget`
+with the previous password instead.
 
 Password-backed and KDE-key arms should be checked and re-armed after a
 password change if needed. PAM also has a best-effort reseal path after

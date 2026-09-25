@@ -1670,7 +1670,9 @@ fn refuse_unverified_token_rearm(user: &str) -> Option<Response> {
              password change or a firmware update nothing needs re-arming: the next login \
              where you type your password at the login screen brings irlume's seal up to \
              date. To arm again anyway, log in that way once, then run \
-             `irlume keyring forget` with that password, then `irlume keyring arm`."
+             `irlume keyring forget` with that password, then `irlume keyring arm`. If the \
+             password and the firmware both changed before that login, the login cannot \
+             update the seal: run `irlume keyring forget` with the previous password instead."
         ),
         Ok(_) => return None,
         Err(e) => format!(
@@ -18613,7 +18615,8 @@ mod tests {
         let armed = envelope_bytes("carol").expect("armed");
         match dispatch(seal_request("carol", b"new-password"), &root, &mut e) {
             Response::Error(msg) => assert!(
-                msg.contains("log in that way once, then run `irlume keyring forget`"),
+                msg.contains("log in that way once, then run `irlume keyring forget`")
+                    && msg.contains("with the previous password instead"),
                 "{msg}"
             ),
             other => panic!("an unchecked re-arm must be refused, got {other:?}"),

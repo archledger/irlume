@@ -151,7 +151,7 @@ does not establish KeePassXC or 1Password vault support.
   any other response intentionally chooses the password/fingerprint path.
 - Bitwarden says biometrics are unavailable: its polkit action file is
   missing (`irlume doctor` reports this) or the desktop app needs the
-  Secret Service (GNOME Keyring / KWallet) running. `irlume doctor` also
+  Secret Service (GNOME Keyring, KWallet or oo7) running. `irlume doctor` also
   reports whether a Secret Service provider is up and the login keyring is
   unlocked; run it as yourself (not under sudo), since it inspects your
   session bus.

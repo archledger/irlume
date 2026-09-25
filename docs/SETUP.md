@@ -253,6 +253,15 @@ backend, the TPM seals the login password, the KDE wallet key, or a random
 GNOME keyring token. `irlume keyring status` reports which kind is armed. No
 sealed secret is stored in plaintext.
 
+Where oo7 keeps the login keyring (Fedora 45 GNOME, whose login screen hands
+the password to `oo7-daemon` through `pam_oo7`), the arm seals the login
+password: oo7 opens the keyring with it and cannot open one keyed to a token.
+irlumed looks in the default keyring directory, `~/.local/share/keyrings/`,
+for oo7's `v1/` directory or the `login.keyring.migrated` stamp oo7 leaves
+beside a gnome-keyring file it has copied. `keyring arm`, `reseal`, `setup`
+and the TUI, run in your own session and not under `sudo`, also ask which
+program provides the Secret Service.
+
 GNOME token arming rekeys the login keyring: your password alone no longer
 opens it directly. Use `irlume keyring forget` to rekey it back before
 removing the integration; deleting the token envelope can strand that keyring.
@@ -266,12 +275,13 @@ then, `forget` takes the previous password.
 
 `irlume keyring arm` picks the kind again each time, but it does not replace
 an armed token with a login-password or KDE wallet-key arm, which it picks
-when a KDE wallet sits beside the GNOME keyring or when irlumed cannot see the
-keyring. Run `irlume keyring forget` first, as yourself with gnome-keyring
-running, so it can rekey the keyring back. Nor does it arm over a sealed
-secret irlumed cannot read, such as one a newer irlume wrote: the file under
-`/var/lib/irlume/keyring` stays as it is, and that newer version can still
-read it. Both refusals apply to every caller and change nothing.
+where oo7 keeps the keyring, when a KDE wallet sits beside the GNOME keyring or
+when irlumed cannot see the keyring. Run `irlume keyring forget` first, as
+yourself with gnome-keyring running, so it can rekey the keyring back. Nor does
+it arm over a sealed secret irlumed cannot read, such as one a newer irlume
+wrote: the file under `/var/lib/irlume/keyring` stays as it is, and that newer
+version can still read it. Both refusals apply to every caller and change
+nothing.
 
 Where irlumed cannot check passwords, `irlume keyring arm` does not re-arm over
 a token that is already armed, whoever runs it, and changes nothing. To arm
@@ -284,10 +294,11 @@ with the previous password instead.
 With a token armed on Fedora 43 or 44, run `irlume keyring forget` before
 upgrading to Fedora 45: on Fedora 45 the login screen unlocks the login keyring
 through oo7, which migrates it with the login password, so a token-keyed
-keyring does not carry over. Do not arm again on Fedora 45 until an irlume
-update supports its keyring; until then the password opens it as usual.
-`irlume doctor`, `irlume keyring status` and `irlume keyring arm` give this
-step on Fedora 43 and 44.
+keyring does not carry over. `forget` re-keys through gnome-keyring, and where
+gnome-keyring no longer runs it keeps the token and says so. After the first
+login on Fedora 45, `irlume keyring arm` seals the login password, which oo7
+accepts. `irlume doctor`, `irlume keyring status` and `irlume keyring arm`
+give this step on Fedora 43 and 44.
 
 Password-backed and KDE-key arms should be checked and re-armed after a
 password change if needed. PAM also has a best-effort reseal path after
@@ -408,7 +419,10 @@ Two differences from KDE are worth knowing:
 
 GDM's upstream `gdm-password.pam` ships both halves on every OS variant it
 provides (Red Hat, Arch, LFS, Exherbo), so the check stays quiet on a stock
-GNOME system.
+GNOME system. From GDM 51 the Red Hat variant (Fedora 45) also lists
+`pam_oo7.so`, with the same two halves: its auth line reads `PAM_AUTHTOK`
+and its session line hands the password to `oo7-daemon`. The check counts
+either module's pair.
 
 **Fingerprint on GNOME.** GDM's `gdm-fingerprint.pam` names neither
 `pam_fprintd.so` (it delegates to `auth substack fingerprint-auth`) nor any

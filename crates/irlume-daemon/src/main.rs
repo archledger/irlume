@@ -1732,8 +1732,8 @@ fn refuse_irreversible_seal(
                      login keyring"
                 }
                 (false, _) => {
-                    "which irlumed picks when a KDE wallet sits beside the GNOME login keyring \
-                     or when it cannot see that keyring"
+                    "which irlumed picks where oo7 keeps the login keyring, where a KDE wallet \
+                     sits beside the GNOME login keyring, or where it cannot see that keyring"
                 }
             };
             format!(
@@ -7194,6 +7194,36 @@ fn dispatch_scoped_session_inner(
             // live credential is the old token, and overwriting its only copy
             // with a fresh one would strand the keyring permanently.
             if core_kind == irlume_core::envelope::SecretKind::GnomeKeyringToken {
+                let already_token = matches!(
+                    armed_kind,
+                    Ok(Some(irlume_core::envelope::SecretKind::GnomeKeyringToken))
+                );
+                // oo7 opens the login keyring with the login password, and the
+                // re-key that completes a token arm speaks only to
+                // gnome-keyring. Detection already declines such a home; this
+                // catches a client that asked for the kind explicitly.
+                if home
+                    .as_deref()
+                    .is_some_and(irlume_core::kwallet::oo7_keeps_keyrings)
+                {
+                    // An arm without a forced kind is refused too while a
+                    // token is armed, so the advice starts with `forget`.
+                    let next = if already_token {
+                        format!(
+                            "Run `irlume keyring forget` first, as '{user}' with gnome-keyring \
+                             running, then arm without forcing a kind"
+                        )
+                    } else {
+                        "Arm without forcing a kind".to_string()
+                    };
+                    let refusal = format!(
+                        "oo7 keeps '{user}'s login keyring and opens it with the login \
+                         password, which a token cannot replace; nothing was changed. {next} \
+                         to seal the login password."
+                    );
+                    jout_notice!("irlumed: SealPassword: refused for '{user}': {refusal}");
+                    return Response::Error(refusal);
+                }
                 // The re-key that completes a token arm CREATES the login
                 // keyring when none exists, keyed to the token, rather than
                 // failing (`change_or_create_login()` in gnome-keyring's
@@ -7213,10 +7243,6 @@ fn dispatch_scoped_session_inner(
                          GNOME once to create the keyring, or arm without forcing a kind."
                     ));
                 }
-                let already_token = matches!(
-                    armed_kind,
-                    Ok(Some(irlume_core::envelope::SecretKind::GnomeKeyringToken))
-                );
                 let armed = if already_token {
                     irlume_core::keyring::rearm_gnome_token(&user, password.expose())
                 } else {
@@ -17057,6 +17083,19 @@ mod tests {
         }
     }
 
+    /// Give the home [`GnomeHome::plant`] made for `user` what oo7 leaves on
+    /// an upgrade from gnome-keyring: its own copy under `keyrings/v1/` and a
+    /// `.migrated` stamp beside the gnome-keyring file, which stays.
+    fn migrate_to_oo7(user: &str, sandbox: &Sandbox) {
+        let keyrings = sandbox
+            .dir
+            .join(format!("home-{user}"))
+            .join(".local/share/keyrings");
+        std::fs::create_dir_all(keyrings.join("v1")).unwrap();
+        std::fs::write(keyrings.join("v1/login.keyring"), b"stand-in").unwrap();
+        std::fs::write(keyrings.join("login.keyring.migrated"), b"").unwrap();
+    }
+
     /// Points every TPM call at a transport that cannot open, so a test never
     /// reaches this machine's TPM whichever path the code takes. Restores the
     /// previous value on drop; take `env_lock()` first.
@@ -17458,6 +17497,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// An arm never replaces an armed GNOME keyring token with the login
+    /// password that detection picks once oo7 keeps the keyring: the
+    /// envelope holds the only copy of the credential the login keyring is
+    /// keyed to. The checked login password is refused, the refusal names oo7
+    /// as the reason for the login password and gnome-keyring in its remedy
+    /// (the re-key back goes through it), and nothing reaches the TPM. The
+    /// other kinds over a token are covered by
+    /// `a_checked_seal_never_replaces_a_token_or_an_unreadable_envelope`.
+    #[test]
+    fn an_arm_on_an_oo7_home_keeps_an_armed_token() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("seal-oo7-keeps-token");
+        let _tpm = NoTpm::install();
+        let _home = GnomeHome::plant("carol", &sb);
+        migrate_to_oo7("carol", &sb);
+        let _shadow = ShadowStandIn::hash_for("carol");
+        let before = plant_token_envelope("carol", SHADOW_PASSWORD);
+        match dispatch(login_seal_request("carol", None, None), &peer(0), &mut e) {
+            Response::Error(msg) => {
+                for part in [
+                    "GNOME keyring token",
+                    "where oo7 keeps the login keyring",
+                    "nothing was changed",
+                    "irlume keyring forget",
+                    "gnome-keyring running",
+                ] {
+                    assert!(msg.contains(part), "{part}: {msg}");
+                }
+            }
+            other => panic!("the token must be kept, got {other:?}"),
+        }
+        assert_eq!(envelope_bytes("carol").as_deref(), Some(&before[..]));
+    }
+
+    /// A client that asks for a token on a home oo7 keeps is refused before
+    /// anything is minted: oo7 opens the login keyring with the login
+    /// password, and the token re-key speaks only gnome-keyring's socket.
+    /// With a token already armed, an arm without a forced kind is refused
+    /// too, so the advice starts with `forget`.
+    #[test]
+    fn a_forced_token_arm_on_an_oo7_home_is_refused() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("seal-oo7-token");
+        let _tpm = NoTpm::install();
+        let _home = GnomeHome::plant("carol", &sb);
+        migrate_to_oo7("carol", &sb);
+        let _shadow = ShadowStandIn::hash_for("carol");
+        let forced = || {
+            login_seal_request(
+                "carol",
+                Some(irlume_common::KeyringSecretKind::GnomeKeyringToken),
+                None,
+            )
+        };
+        match dispatch(forced(), &peer(0), &mut e) {
+            Response::Error(msg) => {
+                assert!(msg.contains("oo7"), "{msg}");
+                assert!(msg.contains("nothing was changed"), "{msg}");
+                assert!(msg.contains("Arm without forcing a kind"), "{msg}");
+            }
+            other => panic!("a forced token on an oo7 home must be refused, got {other:?}"),
+        }
+        assert_eq!(envelope_bytes("carol"), None, "nothing is sealed");
+        let before = plant_token_envelope("carol", SHADOW_PASSWORD);
+        match dispatch(forced(), &peer(0), &mut e) {
+            Response::Error(msg) => {
+                assert!(msg.contains("oo7"), "{msg}");
+                assert!(msg.contains("irlume keyring forget"), "{msg}");
+                assert!(msg.contains("gnome-keyring running"), "{msg}");
+            }
+            other => panic!("a forced token on an oo7 home must be refused, got {other:?}"),
+        }
+        assert_eq!(envelope_bytes("carol").as_deref(), Some(&before[..]));
     }
 
     /// A password that fails the login-hash check never replaces a sealed
@@ -19233,6 +19349,58 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// With a TPM that seals, a first arm on a home oo7 migrated from
+    /// gnome-keyring seals the login password, which pam_oo7 hands on, and
+    /// mints no token: oo7 cannot open a keyring keyed to one.
+    #[test]
+    #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
+    fn tpm_a_first_arm_on_an_oo7_home_seals_the_login_password() {
+        if std::env::var("IRLUME_TCTI").is_err() {
+            return;
+        }
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("tpm-oo7-first-arm");
+        let _home = GnomeHome::plant("carol", &sb);
+        migrate_to_oo7("carol", &sb);
+        let _shadow = ShadowStandIn::hash_for("carol");
+        match dispatch(seal_request("carol", SHADOW_PASSWORD), &peer(0), &mut e) {
+            Response::PasswordSealed => {}
+            other => panic!("an oo7 home must get the login password, got {other:?}"),
+        }
+        assert_eq!(
+            irlume_core::keyring::read_sealed_kind("carol").unwrap(),
+            Some(irlume_core::envelope::SecretKind::LoginPassword)
+        );
+    }
+
+    /// With a TPM that unseals, a GNOME keyring token armed before the home
+    /// moved to oo7 is kept: a re-arm with the checked login password, which
+    /// detection now answers with the login password, is refused and the
+    /// envelope stays byte-identical, so `irlume keyring forget` can still
+    /// re-key the keyring back.
+    #[test]
+    #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
+    fn tpm_an_arm_on_an_oo7_home_keeps_an_armed_token() {
+        if std::env::var("IRLUME_TCTI").is_err() {
+            return;
+        }
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("tpm-oo7-keeps-token");
+        let _home = GnomeHome::plant("carol", &sb);
+        let _shadow = ShadowStandIn::hash_for("carol");
+        irlume_core::keyring::arm_gnome_token("carol", SHADOW_PASSWORD).expect("arm against swtpm");
+        let before = envelope_bytes("carol").expect("armed");
+        migrate_to_oo7("carol", &sb);
+        let response = dispatch(seal_request("carol", SHADOW_PASSWORD), &peer(0), &mut e);
+        assert!(
+            matches!(&response, Response::Error(msg) if msg.contains("irlume keyring forget")),
+            "the token must be kept, got {response:?}"
+        );
+        assert_eq!(envelope_bytes("carol").as_deref(), Some(&before[..]));
     }
 
     #[test]

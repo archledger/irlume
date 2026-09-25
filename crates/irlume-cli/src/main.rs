@@ -1567,15 +1567,25 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                     return std::process::ExitCode::FAILURE;
                 }
             };
-            let req = irlume_common::Request::SealPassword {
-                // Off NixOS `None`: the daemon judges from what the user has.
-                kind,
-                user: user.clone(),
-                password: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
-                wallet_salt,
-                wallet_salt_checked: true,
+            // On NixOS the module's rules decide (a login password).
+            // Elsewhere the daemon judges from what the user has, unless oo7
+            // runs this session's Secret Service (it takes the login
+            // password); an armed GNOME keyring token stops the arm there
+            // before anything is sent.
+            let kind = match kind {
+                Some(kind) => Ok(Some(kind)),
+                None => crate::secrets::arm_kind_hint(&user, wallet_salt.as_ref()),
             };
-            match daemon_request(&req) {
+            let reply = kind.and_then(|kind| {
+                daemon_request(&irlume_common::Request::SealPassword {
+                    kind,
+                    user: user.clone(),
+                    password: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
+                    wallet_salt,
+                    wallet_salt_checked: true,
+                })
+            });
+            match reply {
                 Ok(irlume_common::Response::PasswordSealed) => {
                     println!("[keyring] \u{2705} armed. After a face login, your wallet will unlock automatically.");
                     println!("[keyring] NOTE: if you change your login password, re-run `irlume keyring arm`.");

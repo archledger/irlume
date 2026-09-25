@@ -7,9 +7,9 @@
 //! releases at login. A release whose login screen hands the login keyring to
 //! another provider migrates it with the login password, which no longer opens
 //! a token-keyed keyring. The step is to re-key back with
-//! `irlume keyring forget` before the upgrade; `doctor`, `keyring arm`,
-//! `keyring status` and the TUI say so on a release listed here. The list is
-//! data, so the next such release is one more row.
+//! `irlume keyring forget` before the upgrade and to arm again after it;
+//! `doctor`, `keyring arm`, `keyring status` and the TUI say so on a release
+//! listed here. The list is data, so the next such release is one more row.
 
 use irlume_common::{KeyringSecretKind, Response};
 
@@ -56,15 +56,16 @@ pub(crate) const TOKEN_UPGRADE_NOTICES: &[TokenUpgradeNotice] = &[
 impl TokenUpgradeNotice {
     /// The reason and what to do for `user`, as one paragraph. `forget`
     /// re-keys the keyring through its owner's own session, so the step names
-    /// the account and where to run it. It does not send the user to `irlume
-    /// keyring arm` on the next release: this build's kind detection would pick
-    /// a token there again.
+    /// the account and where to run it. The re-arm comes only after the first
+    /// login on the next release: before the upgrade an arm picks a token
+    /// again, and once oo7 keeps the keyring an arm seals the login password,
+    /// the secret oo7 opens it with.
     pub(crate) fn advice(&self, user: &str) -> String {
         format!(
             "{} Before upgrading to {next}, log in as {user} and run \
              `irlume keyring forget` in that graphical session (it re-keys the login \
-             keyring back to the password). Do not arm again on {next} until an irlume \
-             update supports its keyring; until then the password opens it as usual.",
+             keyring back to the password). After the first login on {next}, \
+             `irlume keyring arm` seals the login password, which oo7 accepts.",
             self.reason,
             next = self.next_release
         )
@@ -197,17 +198,24 @@ mod tests {
     }
 
     #[test]
-    fn every_notice_gives_the_forget_step_and_no_rearm() {
+    fn every_notice_gives_the_forget_step_and_the_rearm() {
         for notice in TOKEN_UPGRADE_NOTICES {
             let advice = notice.advice("alice");
+            let next = notice.next_release;
             assert!(
-                advice.contains(&format!("Before upgrading to {}", notice.next_release))
+                advice.contains(&format!("Before upgrading to {next}"))
                     && advice.contains("log in as alice")
                     && advice.contains("irlume keyring forget"),
                 "{advice}"
             );
-            // A re-arm on the next release would pick a token again.
-            assert!(!advice.contains("irlume keyring arm"), "{advice}");
+            // The one re-arm is the last sentence, after the first login on
+            // the next release: an arm before the upgrade picks a token again.
+            let rearm = format!(
+                "After the first login on {next}, `irlume keyring arm` seals the login \
+                 password, which oo7 accepts."
+            );
+            assert!(advice.ends_with(&rearm), "{advice}");
+            assert_eq!(advice.matches("irlume keyring arm").count(), 1, "{advice}");
             assert!(!advice.contains('\u{2014}'), "{advice}");
         }
     }

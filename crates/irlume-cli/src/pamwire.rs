@@ -3887,6 +3887,22 @@ session    optional      pam_gnome_keyring.so auto_start\n";
         assert!(!w.contains(KEYRING_TAG), "nothing of ours to tag here");
     }
 
+    /// A complete pam_oo7 pair (auth below the fprintd anchor, plus a session
+    /// line) consumes the released login password as pam_gnome_keyring's
+    /// does, so it gets the unseal line only, and irlume adds no
+    /// pam_gnome_keyring pair of its own beside it.
+    #[test]
+    fn wire_fp_keyring_counts_a_pam_oo7_pair_as_a_consumer() {
+        let with_oo7 = "#%PAM-1.0\nauth       required      pam_fprintd.so\n\
+-auth      optional      pam_oo7.so\n\
+-session   optional      pam_oo7.so auto_start\n";
+        let (w, changed) = wire_fp_keyring(with_oo7, "gdm-fingerprint");
+        assert!(changed);
+        assert!(w.contains("pam_irlume.so keyring"), "{w}");
+        assert!(!w.contains("pam_gnome_keyring.so"), "{w}");
+        assert_eq!(w.matches("pam_oo7.so").count(), 2, "{w}");
+    }
+
     #[test]
     fn unwiring_removes_our_keyring_lines_but_keeps_the_distros() {
         // Ours are tagged; a distro-shipped keyring line is not, and must survive.
@@ -3958,6 +3974,52 @@ auth       optional      pam_gnome_keyring.so\n";
         // The hand-off still resolves, so a rename costs nothing else.
         let h = keyring_handoff(&w, "gdm-password").expect("releases a credential");
         assert_eq!(h.complete, Some("pam_gnome_keyring.so"));
+    }
+
+    /// GDM 51 on Fedora 45 lists pam_oo7 beside pam_gnome_keyring, both
+    /// optional (`-`), after its renamed password substack. The fixture is
+    /// /usr/lib/pam.d/gdm-password from gdm-51~rc-2.fc45.x86_64, byte for
+    /// byte the same as GDM 51.0's pam-redhat/gdm-password.pam. pam_oo7 reads
+    /// PAM_AUTHTOK in its auth half and hands it to oo7-daemon from its
+    /// session half, so both keyring auth lines must sit below the face line,
+    /// and oo7's pair alone is a complete hand-off: a stack that keeps only
+    /// oo7's lines must not be reported as releasing a password nothing reads.
+    #[test]
+    fn fedora_45_gdm_password_hands_the_password_to_pam_oo7() {
+        let stock = fixture("fedora-45", "gdm-password");
+        let (wired, changed) = wire_greeter_impl(&stock, true, true, true);
+        assert!(changed, "the Fedora 45 stack must be wirable");
+        let lines: Vec<&str> = wired.lines().collect();
+        let face = lines
+            .iter()
+            .position(|l| l.contains("pam_irlume.so unseal"))
+            .expect("face line");
+        for module in ["pam_gnome_keyring.so", "pam_oo7.so"] {
+            let auth = lines
+                .iter()
+                .position(|l| is_auth_directive(l) && l.contains(module))
+                .unwrap_or_else(|| panic!("{module}: vendor auth line kept"));
+            assert!(face < auth, "{module} must read the released password");
+        }
+        let h = keyring_handoff(&wired, "gdm-password").expect("releases a credential");
+        assert!(h.complete.is_some(), "auth_only={:?}", h.auth_only);
+
+        let oo7_only: String = stock
+            .lines()
+            .filter(|l| !l.contains("pam_gnome_keyring.so"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let (wired, changed) = wire_greeter_impl(&oo7_only, true, true, true);
+        assert!(changed);
+        let h = keyring_handoff(&wired, "gdm-password").expect("releases a credential");
+        assert_eq!(
+            h.complete,
+            Some("pam_oo7.so"),
+            "auth_only={:?}",
+            h.auth_only
+        );
+        let (_, again) = wire_greeter_impl(&wired, true, true, true);
+        assert!(!again, "rewiring must be a no-op");
     }
 
     #[test]
@@ -5668,9 +5730,15 @@ auth required pam_fprintd.so\n\
     #[test]
     fn the_wiring_recipe_wires_every_real_distro_dialect() {
         let expect_sufficient = ["arch", "debian"];
-        let expect_jump = ["fedora", "opensuse"];
-        for distro in ["arch", "debian", "fedora", "opensuse"] {
-            for service in ["sddm", "gdm-password", "lightdm"] {
+        let expect_jump = ["fedora", "fedora-45", "opensuse"];
+        // Fedora 45 adds GDM 51's gdm-password, whose password substack is
+        // renamed to gdm-password-auth-substack.
+        let dialects = ["arch", "debian", "fedora", "opensuse"]
+            .map(|distro| (distro, &["sddm", "gdm-password", "lightdm"][..]))
+            .into_iter()
+            .chain([("fedora-45", &["gdm-password"][..])]);
+        for (distro, services) in dialects {
+            for &service in services {
                 let stock = fixture(distro, service);
                 let (wired, changed) = wire_greeter_impl(&stock, true, true, false);
                 assert!(

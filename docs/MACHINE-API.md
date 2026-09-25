@@ -260,6 +260,7 @@ reused for a different meaning. The registry as of this contract:
 | `pam-regeneration-guard` | whether a distro PAM regeneration would strip the wiring unnoticed |
 | `install-hygiene` | leftover backups, and hand-installed builds overlaying packaged ones |
 | `keyring-secrets` | the login keyring's lock state and provider |
+| `keyring-os-upgrade` | whether the armed keyring secret survives the next upgrade of this release. `warn`, with the step in `detail`, when the account has a GNOME keyring token armed on a release whose upgrade does not carry it over (Fedora 43 or 44, before Fedora 45: run `irlume keyring forget` first); `pass` for any other kind, or nothing armed, on such a release; `unknown` when the daemon does not answer its metadata query or does not report the kind, or when the release cannot be determined (no readable os-release, or an `ID` or `VERSION_ID` that is missing, empty or unbalanced in its quoting); `info` on every other release |
 | `camera-groups` | enrolled secondary-camera groups (ADR-0024): present and healthy, stale, or the secondary store unreadable. Conditionally present: emitted only when groups exist or the store cannot be read |
 | `pam-faillock` | the `pam_faillock` tally for the target account (the OS-level lockout counter, distinct from irlume's own retry throttle): quiet when clean, `warn` with the count and the `faillock --reset` remedy at/above the threshold. Conditionally present: root-only and requires the `faillock` binary |
 

@@ -41,6 +41,7 @@ mod support_report;
 mod trace;
 mod tui;
 mod uninstall;
+mod upgrade_notice;
 
 pub(crate) fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     // BOTH standard spellings. `--name=value` used to be invisible here, and the
@@ -1326,6 +1327,15 @@ fn read_password(prompt: &str) -> Result<zeroize::Zeroizing<String>, String> {
     }
 }
 
+/// Under a GNOME keyring token, on a release whose next upgrade does not
+/// carry the token over, the step to take before upgrading. Shared by every
+/// token-arm path: `keyring arm`, the setup wizard and the TUI's message.
+pub(crate) fn print_token_upgrade_notice(user: &str) {
+    if let Some(notice) = upgrade_notice::host_token_upgrade_notice() {
+        println!("[keyring] \u{26a0} {}", notice.advice(user));
+    }
+}
+
 /// `irlume keyring <arm|status|forget>`: manage the TPM-sealed login password
 /// that lets a face login unlock the GNOME-keyring / KWallet. Talks to `irlumed`
 /// over the socket (the daemon owns the TPM + the root-only sealed store).
@@ -1419,6 +1429,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                                 "[keyring] Your password alone no longer opens the keyring \
                                  directly; `irlume keyring forget` re-keys it back."
                             );
+                            print_token_upgrade_notice(&user);
                             std::process::ExitCode::SUCCESS
                         }
                         Err(e) => {
@@ -1471,6 +1482,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                                 "[keyring] Your password alone no longer opens that keyring; \
                                  `irlume keyring forget` re-keys it back."
                             );
+                            print_token_upgrade_notice(&user);
                         }
                         // An older daemon does not report the kind.
                         None => println!(
@@ -3885,6 +3897,48 @@ fn report_faillock_state(report: &mut crate::doctor_report::Report, user: &str) 
     report.check("pam-faillock", State::Warn);
 }
 
+/// Whether the armed keyring secret survives the next upgrade of this
+/// release. Only a release listed in `upgrade_notice` asks the daemon; every
+/// other host reports `info`. There, a GNOME keyring token warns with the
+/// step, any other answer passes, and a daemon that does not answer the
+/// metadata query or does not report the kind leaves the check `unknown`.
+/// The query is `KeyringMetadata`, which reads the envelope only: the live
+/// PCR diagnosis behind `KeyringInfo` waits on the daemon's TPM queue, and
+/// this check needs only `armed` and `kind`.
+fn report_keyring_os_upgrade(report: &mut crate::doctor_report::Report, user: &str) {
+    use crate::doctor_report::State;
+    const ID: &str = "keyring-os-upgrade";
+    let notice = match upgrade_notice::host_token_upgrade_notice_checked() {
+        Ok(Some(notice)) => notice,
+        // A release that was read and is not listed: nothing to check.
+        Ok(None) => {
+            report.check(ID, State::Info);
+            return;
+        }
+        // No os-release could be read: the check could not run.
+        Err(_) => {
+            report.check(ID, State::Unknown);
+            return;
+        }
+    };
+    let answer = daemon_request(&irlume_common::Request::KeyringMetadata {
+        user: user.to_string(),
+    });
+    match upgrade_notice::token_armed(&answer) {
+        Some(true) => {
+            let advice = notice.advice(user);
+            dout!(
+                report,
+                "[doctor] \u{26a0} {user} has a GNOME keyring token armed on {}.\n     {advice}",
+                notice.release
+            );
+            report.check_detail(ID, State::Warn, advice);
+        }
+        Some(false) => report.check(ID, State::Pass),
+        None => report.check(ID, State::Unknown),
+    }
+}
+
 fn doctor_run(
     report: &mut crate::doctor_report::Report,
     args: &[String],
@@ -4488,6 +4542,7 @@ fn doctor_run(
     // Secret Service provider is up and the collection is unlocked. Self-gates
     // on a session bus, so it stays silent under `sudo irlume doctor`.
     crate::secrets::report_keyring_status(report);
+    report_keyring_os_upgrade(report, &user);
 
     // --- wiring drift ------------------------------------------------------
     // If the user is enrolled but no greeter is wired, a distro tool most

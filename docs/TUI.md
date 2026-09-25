@@ -298,7 +298,9 @@ in the order F6 walks them: arm or re-arm (`a`), reseal (`b`, once armed),
 forget (`f`), refresh the pcrlock policy (`p`, Tier 2 seals only) and check the
 current PCRs (`d`, once armed). A window too narrow for all of them continues
 the row below. Forget on a GNOME keyring token, or on a seal whose kind the
-daemon does not report, runs the CLI's re-key flow first.
+daemon does not report, runs the CLI's re-key flow first. With a GNOME keyring
+token armed on Fedora 43 or 44, the page and Diagnostics say to run
+`irlume keyring forget` before upgrading to Fedora 45.
 
 Recovery shows whether the face templates are encrypted and whether a recovery
 passphrase is set. Its actions share one row too: set (`s`), restore (`t`) and

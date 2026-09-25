@@ -1391,6 +1391,206 @@ fn keyring_success_paths_with_a_live_daemon() {
     assert_eq!(sealed.1, b"hunter2");
 }
 
+/// A stand-in gnome-keyring control socket at `runtime_dir/keyring/control`
+/// that answers every request `ok`, so a GNOME token arm can finish its re-key
+/// and the check after it without a keyring daemon. The accept thread is
+/// detached, as in `serve`.
+fn serve_keyring_control(runtime_dir: &std::path::Path) {
+    use std::io::Read as _;
+    let path = runtime_dir.join("keyring/control");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            // The credentials byte, then the request's total length, which
+            // counts its own four bytes.
+            let mut head = [0u8; 5];
+            if stream.read_exact(&mut head).is_err() {
+                continue;
+            }
+            let total = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let mut rest = vec![0u8; total.saturating_sub(4)];
+            if stream.read_exact(&mut rest).is_err() {
+                continue;
+            }
+            // Length 8, result 0 (ok).
+            let _ = stream.write_all(&[0, 0, 0, 8, 0, 0, 0, 0]);
+        }
+    });
+}
+
+/// On Fedora 45 the login screen unlocks the login keyring through oo7, which
+/// migrates it with the login password, so a keyring keyed to an irlume token
+/// does not carry over. On Fedora 43 and 44 a token arm is told, by
+/// `keyring arm`, `keyring status` and both doctor reports, to re-key back
+/// with `keyring forget` before upgrading. Other answers and other releases
+/// stay quiet, each with the check state that says why.
+#[test]
+fn a_token_arm_on_fedora_43_or_44_is_told_to_forget_before_upgrading_to_45() {
+    use irlume_common::KeyringSecretKind as K;
+    const FEDORA_44: &str = "NAME=\"Fedora Linux\"\nVERSION=\"44 (Workstation Edition)\"\n\
+                       ID=fedora\nVERSION_ID=44\nVARIANT_ID=workstation\n";
+    const FEDORA_43: &str = "NAME=\"Fedora Linux\"\nID=fedora\nVERSION_ID=43\n";
+    const FEDORA_45: &str = "NAME=\"Fedora Linux\"\nID=fedora\nVERSION_ID=45\n";
+    const DEBIAN: &str = "ID=debian\nVERSION_ID=\"13\"\n";
+    const NOTICE: &str = "Before upgrading to Fedora 45";
+    const FORGET: &str = "irlume keyring forget";
+    const STATUS: &[&str] = &["keyring", "status", "--user", "tester"];
+    // The fake daemon reports `armed` and `kind`, and answers a seal with a
+    // fresh token. Failing package probes keep doctor's install-origin step
+    // off the host's package database.
+    let sandbox = |tag: &str, os_release: &str, armed: bool, kind: Option<K>| {
+        let sb = Sandbox::new(tag);
+        for tool in ["rpm", "dnf", "dpkg-query", "apt-cache", "pacman"] {
+            sb.fake_tool(tool, "exit 1");
+        }
+        std::fs::write(sb.path("os-release"), os_release).unwrap();
+        serve(&sock(&sb), move |request| match request {
+            Request::KeyringInfo { .. } | Request::KeyringMetadata { .. } => {
+                Response::KeyringInfo {
+                    armed,
+                    policy: None,
+                    pcrs: Vec::new(),
+                    drifted: None,
+                    kind,
+                }
+            }
+            Request::SealPassword { .. } => Response::TokenSealed {
+                token: irlume_common::SecretBytes::new(b"fixture-token".to_vec()),
+                minted: true,
+            },
+            _ => Response::Error("fixture unavailable".into()),
+        });
+        sb
+    };
+    let command = |sb: &Sandbox, args: &[&str]| {
+        let mut command = sb.cmd_with_fakes(args);
+        command.env("IRLUME_OS_RELEASE", sb.path("os-release"));
+        command
+    };
+    let status = |sb: &Sandbox| -> String {
+        let (code, out, err) = run(&mut command(sb, STATUS));
+        assert_eq!(code, 0, "{out} {err}");
+        out
+    };
+    let upgrade_check = |sb: &Sandbox| -> serde_json::Value {
+        let (_, out, err) = run(&mut command(sb, &["doctor", "--json"]));
+        let report: serde_json::Value =
+            serde_json::from_str(&out).unwrap_or_else(|error| panic!("{error}: {out} {err}"));
+        report["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "keyring-os-upgrade")
+            .cloned()
+            .unwrap_or_else(|| panic!("no keyring-os-upgrade check: {out}"))
+    };
+
+    let sb = sandbox(
+        "fedora44-token",
+        FEDORA_44,
+        true,
+        Some(K::GnomeKeyringToken),
+    );
+    let out = status(&sb);
+    assert!(
+        out.contains(NOTICE) && out.contains(FORGET),
+        "keyring status must give the pre-upgrade step: {out}"
+    );
+    let runtime_dir = sb.path("run");
+    serve_keyring_control(&runtime_dir);
+    let (code, out, err) = run_stdin(
+        command(&sb, &["keyring", "arm", "--user", "tester"]).env("XDG_RUNTIME_DIR", &runtime_dir),
+        "hunter2\n",
+    );
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(out.contains("armed with a keyring token"), "{out} {err}");
+    assert!(
+        out.contains(NOTICE) && out.contains(FORGET),
+        "a token arm must give the pre-upgrade step: {out}"
+    );
+    let (_, out, err) = run(&mut command(&sb, &["doctor", "--user", "tester"]));
+    assert!(
+        out.contains(NOTICE) && out.contains(FORGET),
+        "doctor must give the pre-upgrade step: {out} {err}"
+    );
+    let check = upgrade_check(&sb);
+    assert_eq!(check["state"], "warn", "{check}");
+    let detail = check["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains(NOTICE) && detail.contains(FORGET),
+        "{check}"
+    );
+
+    // Fedora 43 upgrades straight to Fedora 45 too.
+    let sb = sandbox(
+        "fedora43-token",
+        FEDORA_43,
+        true,
+        Some(K::GnomeKeyringToken),
+    );
+    let out = status(&sb);
+    assert!(out.contains(NOTICE) && out.contains(FORGET), "{out}");
+
+    // A password arm on the same release migrates with the password.
+    let sb = sandbox("fedora44-password", FEDORA_44, true, Some(K::LoginPassword));
+    assert!(!status(&sb).contains(NOTICE));
+
+    // Nothing armed, and an armed secret this daemon does not name.
+    for (tag, armed, state) in [
+        ("fedora44-unarmed", false, "pass"),
+        ("fedora44-kind-unreported", true, "unknown"),
+    ] {
+        let sb = sandbox(tag, FEDORA_44, armed, None);
+        assert!(!status(&sb).contains(NOTICE), "{tag}");
+        assert_eq!(upgrade_check(&sb)["state"], state, "{tag}");
+    }
+
+    // A token on a release with no known upgrade concern.
+    let sb = sandbox(
+        "fedora45-token",
+        FEDORA_45,
+        true,
+        Some(K::GnomeKeyringToken),
+    );
+    assert!(!status(&sb).contains(NOTICE));
+    assert_eq!(upgrade_check(&sb)["state"], "info");
+    let sb = sandbox("debian-token", DEBIAN, true, Some(K::GnomeKeyringToken));
+    assert!(!status(&sb).contains(NOTICE));
+
+    // doctor reads the envelope's metadata, never the live PCR diagnosis
+    // behind KeyringInfo; a daemon from before that query leaves it unknown.
+    for (tag, metadata, state) in [
+        ("fedora44-metadata-only", true, "warn"),
+        ("fedora44-no-metadata", false, "unknown"),
+    ] {
+        let sb = Sandbox::new(tag);
+        for tool in ["rpm", "dnf", "dpkg-query", "apt-cache", "pacman"] {
+            sb.fake_tool(tool, "exit 1");
+        }
+        std::fs::write(sb.path("os-release"), FEDORA_44).unwrap();
+        let log = serve(&sock(&sb), move |request| match request {
+            Request::KeyringMetadata { .. } if metadata => Response::KeyringInfo {
+                armed: true,
+                policy: None,
+                pcrs: Vec::new(),
+                drifted: None,
+                kind: Some(K::GnomeKeyringToken),
+            },
+            _ => Response::Error("fixture unavailable".into()),
+        });
+        assert_eq!(upgrade_check(&sb)["state"], state, "{tag}");
+        let requests = log.lock().unwrap();
+        assert!(
+            !requests
+                .iter()
+                .any(|request| matches!(request, Request::KeyringInfo { .. })),
+            "{tag}: {requests:?}"
+        );
+    }
+}
+
 /// An encrypted store whose template key is gone is the one state the old
 /// `encrypted` bool could not express, because it was computed FROM the key's
 /// presence. It reported "plaintext at rest", which understates the posture and

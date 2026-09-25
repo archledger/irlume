@@ -1786,7 +1786,10 @@ pub fn setup(args: &[String]) -> ExitCode {
                 // it can finish the re-key exactly like `keyring arm`.
                 Ok(Response::TokenSealed { token, minted }) => {
                     match crate::finish_token_arm(&user, pw.as_bytes(), token.expose(), minted) {
-                        Ok(()) => println!("  armed with a keyring token {OK}"),
+                        Ok(()) => {
+                            println!("  armed with a keyring token {OK}");
+                            crate::print_token_upgrade_notice(&user);
+                        }
                         Err(e) => eprintln!("  arm failed: {e}"),
                     }
                 }

@@ -1047,6 +1047,9 @@ struct Probes {
     secureboot: (bool, bool, bool),
     /// Firmware boot mode label (UEFI/legacy), from efivars.
     boot_mode: String,
+    /// This release's pending keyring-token upgrade notice, if it is
+    /// listed ([`crate::upgrade_notice`]).
+    token_upgrade_notice: Option<&'static crate::upgrade_notice::TokenUpgradeNotice>,
 }
 
 impl Probes {
@@ -1195,6 +1198,7 @@ impl Probes {
                 secureboot::is_setup_mode(),
             ),
             boot_mode: secureboot::detect_boot_mode().as_str().to_string(),
+            token_upgrade_notice: crate::upgrade_notice::host_token_upgrade_notice(),
         }
     }
 }
@@ -3517,6 +3521,19 @@ impl App {
                     Fix::Manual(problem.advice().into()),
                 ));
             }
+        }
+        // A token armed before this build learned the notice gets it here
+        // and on the wallet page, not only right after an arm.
+        if let Some(notice) = self.token_upgrade_notice() {
+            v.push(mk(
+                "Keyring upgrade",
+                Sev::Warn,
+                format!(
+                    "the armed GNOME keyring token does not carry over an upgrade to {}",
+                    notice.next_release
+                ),
+                Fix::Manual(notice.advice(&self.user)),
+            ));
         }
 
         // Drift is an explicit historical observation. Metadata cannot detect
@@ -6578,12 +6595,19 @@ impl App {
                         match crate::daemon_request(&req) {
                             Ok(Response::TokenSealed { token, minted }) => {
                                 match crate::finish_token_arm(&user, &pw, token.expose(), minted) {
-                                    Ok(()) => (
-                                        true,
-                                        "keyring armed with a token; the login keyring was \
-                                         re-keyed to it"
-                                            .into(),
-                                    ),
+                                    Ok(()) => {
+                                        let mut done = String::from(
+                                            "keyring armed with a token; the login keyring was \
+                                             re-keyed to it",
+                                        );
+                                        if let Some(notice) =
+                                            crate::upgrade_notice::host_token_upgrade_notice()
+                                        {
+                                            done.push_str(". ");
+                                            done.push_str(&notice.advice(&user));
+                                        }
+                                        (true, done)
+                                    }
                                     Err(e) => (false, e),
                                 }
                             }
@@ -8990,6 +9014,15 @@ impl App {
         self.draw_page_paragraph(f, area, lines, &targets, None);
     }
 
+    /// The release's upgrade notice when the daemon reports a GNOME keyring
+    /// token armed for this account; `None` for any other kind, an unknown
+    /// kind, or a release with nothing listed.
+    fn token_upgrade_notice(&self) -> Option<&'static crate::upgrade_notice::TokenUpgradeNotice> {
+        let token = self.keyring_armed == Some(true)
+            && self.keyring_kind == Some(irlume_common::KeyringSecretKind::GnomeKeyringToken);
+        self.probes.token_upgrade_notice.filter(|_| token)
+    }
+
     fn draw_keyring(&self, f: &mut Frame, area: Rect) {
         let mut targets = Vec::new();
         let armed = self.keyring_armed.unwrap_or(false);
@@ -9032,6 +9065,12 @@ impl App {
                 Span::raw(what.to_string()),
                 Span::styled(note.to_string(), Style::new().dim()),
             ]));
+            if let Some(notice) = self.token_upgrade_notice() {
+                lines.push(Line::from(Span::styled(
+                    format!("  ⚠ {}", notice.advice(&self.user)),
+                    Style::new().fg(th().warn),
+                )));
+            }
         }
         if armed {
             let drift = match (self.keyring_checked_at, self.keyring_drift) {
@@ -19759,6 +19798,52 @@ mod tests {
         let text = draw_text(&app);
         assert!(!text.contains("esealing re-binds"), "{text}");
         assert!(!text.contains("Re-arm after"), "{text}");
+    }
+
+    /// A token armed before this build knew the Fedora 45 notice still
+    /// gets it, on the wallet page and in Diagnostics, and only a token does.
+    #[test]
+    fn an_existing_token_arm_shows_the_upgrade_notice() {
+        use irlume_common::KeyringSecretKind as K;
+        let fedora_44 = crate::upgrade_notice::TOKEN_UPGRADE_NOTICES
+            .iter()
+            .find(|notice| notice.release == "Fedora 44")
+            .expect("Fedora 44 is listed");
+        let mut app = test_app();
+        app.screen = SC_KEYRING;
+        app.daemon_up = true;
+        app.daemon_reach = crate::commands::DaemonReach::Running;
+        app.keyring_armed = Some(true);
+        // The wallet page shows on a box with a TPM and a way to log in.
+        app.probes = Probes {
+            tpm_present: true,
+            fp_present: Some(true),
+            token_upgrade_notice: Some(fedora_44),
+            ..Probes::default()
+        };
+        app.probes_landed = true;
+        let upgrade_row = |app: &App| app.repair.iter().any(|c| c.label == "Keyring upgrade");
+        for kind in [None, Some(K::LoginPassword), Some(K::KdeWalletKey)] {
+            app.keyring_kind = kind;
+            app.recompute_checks();
+            assert!(!upgrade_row(&app), "{kind:?}");
+            assert!(!draw_text_at(&app, 120, 60).contains("⚠ On Fedora 45"));
+        }
+        app.keyring_kind = Some(K::GnomeKeyringToken);
+        app.recompute_checks();
+        assert!(upgrade_row(&app));
+        // The line's start, which wrapping cannot split.
+        let text = draw_text_at(&app, 120, 60);
+        assert!(text.contains("⚠ On Fedora 45"), "{text}");
+        // Nothing listed for this release, or nothing armed: no notice.
+        app.probes.token_upgrade_notice = None;
+        app.recompute_checks();
+        assert!(!upgrade_row(&app));
+        app.probes.token_upgrade_notice = Some(fedora_44);
+        app.keyring_armed = Some(false);
+        app.recompute_checks();
+        assert!(!upgrade_row(&app));
+        assert!(!draw_text_at(&app, 120, 60).contains("⚠ On Fedora 45"));
     }
 
     #[test]

@@ -28,6 +28,7 @@
 //! before connecting; `gkr-pam-client.c` does the same seteuid dance.
 
 use std::io::{Read, Write};
+use zeroize::Zeroizing;
 
 /// Control operations, from `daemon/control/gkd-control-codes.h`. Only the two
 /// irlume needs are represented; `INITIALIZE` (0) replies with a variable-length
@@ -81,9 +82,13 @@ impl ControlResult {
 
 /// Encode one request packet. Pure, so the exact bytes are testable against
 /// the layout in `gkr-pam-client.c` without a socket.
-pub fn encode_request(op: Op, args: &[&[u8]]) -> Vec<u8> {
+///
+/// The packet carries the keyring secrets verbatim, so it comes back in a
+/// buffer that wipes itself on drop. It is allocated at its final size, so no
+/// reallocation frees a partial copy first.
+pub fn encode_request(op: Op, args: &[&[u8]]) -> Zeroizing<Vec<u8>> {
     let total: usize = 8 + args.iter().map(|a| 4 + a.len()).sum::<usize>();
-    let mut buf = Vec::with_capacity(total);
+    let mut buf = Zeroizing::new(Vec::with_capacity(total));
     buf.extend_from_slice(&(total as u32).to_be_bytes());
     buf.extend_from_slice(&(op as u32).to_be_bytes());
     for a in args {
@@ -163,7 +168,7 @@ mod tests {
             b"newpw",
         ]
         .concat();
-        assert_eq!(got, expect);
+        assert_eq!(*got, expect);
         // Big-endian, not native: the first length byte of a 24-byte packet
         // must be 0, and the last must be 24.
         assert_eq!(&got[..4], &[0, 0, 0, 24]);

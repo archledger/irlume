@@ -1142,6 +1142,7 @@ version = "0.14.0"
 dependencies = [
  "irlume-common",
  "libc",
+ "zeroize",
 ]
 
 [[package]]

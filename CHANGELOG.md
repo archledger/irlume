@@ -318,7 +318,7 @@ All notable changes to irlume are documented here. This project adheres to
   unexpected response. A login password is now resealed as one (without a
   wallet salt), a KDE wallet key as one (and a missing wallet salt file is
   reported before the password prompt), and a GNOME keyring token still
-  re-binds itself on the next password login.
+  re-binds itself on the next password login (found in #851).
 
 - A login is treated as cold unless the account has a live local graphical
   session. An SSH login or a text console counted as the live session a

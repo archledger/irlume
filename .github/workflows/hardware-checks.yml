@@ -75,11 +75,11 @@ jobs:
           # would destroy persistent hardware state this test never owned, and
           # an interrupted run leaves the fixture installed for the next one to
           # delete. Its pcrlock coverage runs on swtpm.
-          ./scripts/run-tests-guarded.sh --require seal_unseal_roundtrip_real_tpm,arm_and_unseal_roundtrip,reseal_only_when_stale,tpm_key_and_recovery_lifecycle,tpm_tampered_seal_falls_back_then_recovery_heals \
+          ./scripts/run-tests-guarded.sh --require seal_unseal_roundtrip_real_tpm,arm_and_unseal_roundtrip,reseal_only_when_stale,tpm_key_and_recovery_lifecycle,tpm_tampered_seal_falls_back_then_recovery_heals,software_digests_match_a_trial_session \
             -- cargo test -p irlume-core --lib --locked -- --ignored \
             seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale \
             tpm_key_and_recovery_lifecycle tpm_tampered_seal_falls_back_then_recovery_heals \
-            --test-threads=1
+            software_digests_match_a_trial_session --test-threads=1
         env:
           IRLUME_TCTI: device:/dev/tpmrm0
       - name: TPM round trip over the default transport order (raw device, manager fallback; ADR-0026)

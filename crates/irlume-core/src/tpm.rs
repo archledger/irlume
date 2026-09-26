@@ -3031,8 +3031,8 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
     /// command code shows up as a mismatch rather than as a later unseal
     /// failure nobody can attribute.
     #[test]
-    #[ignore = "real TPM, run as root and BY NAME so it cannot be lost among the other ignored \
-                TPM tests: sudo <test-binary> software_digests_match --ignored --nocapture"]
+    #[ignore = "needs a TPM; CI runs it by name on swtpm and on the real chip \
+                (IRLUME_TCTI), and scripts/with-swtpm.sh runs it anywhere"]
     fn software_digests_match_a_trial_session() {
         // FAILS rather than skips when the TPM is out of reach. This is the only
         // thing standing behind replacing a TPM computation with arithmetic, and
@@ -3041,9 +3041,9 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         // it has asked for hardware.
         let mut ctx = open_context().unwrap_or_else(|e| {
             panic!(
-                "this test exists to compare software digests against a real TPM, \
-                 and no TPM context could be opened ({e}). Run it as root on a \
-                 machine with a TPM; do not treat this as a skip."
+                "this test exists to compare software digests against a TPM, and \
+                 no TPM context could be opened ({e}). Run it with a TPM in reach \
+                 (scripts/with-swtpm.sh, or IRLUME_TCTI); do not treat this as a skip."
             )
         });
 

@@ -869,6 +869,17 @@ pub enum Request {
         /// module from before this field.
         #[serde(default)]
         have_password: bool,
+        /// Sent by the auth-phase `keyring` line, which is what a lock-screen
+        /// unlock of a running desktop sends. The daemon releases nothing to
+        /// such a request while the account has a live local desktop. A
+        /// request without it is served as before: the session-phase GNOME
+        /// keyring token delivery of a login whose auth phase stashed none
+        /// (a session being opened, whose own desktop logind already lists
+        /// as live), and any module from before this field, so an older
+        /// module meeting a newer daemon during an upgrade still gets its
+        /// token.
+        #[serde(default)]
+        auth_phase: bool,
     },
     /// Whether `user` has a sealed password armed (for status / CLI / the
     /// delete-erases-it warning). Unprivileged: root or `user`.

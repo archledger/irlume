@@ -427,7 +427,9 @@ via authselect on Fedora or pam-auth-update on Debian), inside the same
 the TPM-sealed secret at the post-auth landing, and `pam_kwallet5.so`
 below it opens the wallet: a cold-boot fingerprint login unlocks KWallet with
 no prompt, same as face. The lock screen needs none of this: a warm unlock
-meets a wallet the login already opened.
+meets a wallet the login already opened, and irlumed releases nothing while
+the account has a live local desktop, so a fingerprint at the lock screen
+never re-opens a wallet or keyring you locked by hand.
 
 #### GNOME: what has to be in place for the login keyring
 

@@ -313,11 +313,15 @@ impl PamServiceModule for IrlumePam {
                     .ok()
                     .flatten()
                     .and_then(|c| c.to_str().ok().map(str::to_string));
+                // Marked as the auth phase: irlumed releases nothing to it
+                // while the account has a live local desktop, which is what
+                // a lock-screen unlock of that desktop is.
                 if let Ok(Response::PasswordUnsealed { secret, kind }) =
                     request(&Request::UnsealKeyring {
                         user: user.clone(),
                         service,
                         have_password,
+                        auth_phase: true,
                     })
                 {
                     // Routed by kind, not assumed: on KDE this starts the
@@ -688,6 +692,10 @@ fn deliver_gnome_token(pamh: &Pam, user: &str) {
                 user: user.to_string(),
                 service,
                 have_password: true,
+                // This session is being opened, so it is a login, not a
+                // lock-screen unlock of a running desktop, although logind
+                // lists it as live already.
+                auth_phase: false,
             }) {
                 // Only a token belongs on the control socket. A password or a
                 // wallet key reaching here would mean the user is armed for a

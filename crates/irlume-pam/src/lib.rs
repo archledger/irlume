@@ -211,7 +211,18 @@ fn is_remote_session(pamh: &Pam) -> bool {
     // checks are the best available authenticate()-time signal. They are NOT a
     // complete remote-desktop policy (see the residual below).
     if let Ok(Some(svc)) = pamh.get_service() {
-        if is_remote_desktop_service(&svc.to_string_lossy()) {
+        let svc = svc.to_string_lossy();
+        if is_remote_desktop_service(&svc) {
+            return true;
+        }
+        // polkit's agent helper carries no remote marker: it clears its
+        // environment (or starts fresh from a socket), and polkit sets no
+        // PAM_RHOST. An administrator in an SSH session who runs pkexec,
+        // run0 or systemctl answers the prompt at pkttyagent, so the agent
+        // that asked is what says where the requester is.
+        if irlume_common::pam_service::classify(&svc) == Some(ServiceKind::AppConsent)
+            && !consent_requester_is_local()
+        {
             return true;
         }
     }
@@ -255,6 +266,152 @@ fn is_remote_desktop_service(service: &str) -> bool {
         || s.starts_with("nxnode")
         || s.starts_with("nxserver")
         || s == "sshd" // belt-and-suspenders alongside the rhost / SSH_* checks
+}
+
+/// Where a process sits in logind's view, read from its cgroup path.
+#[derive(Debug, PartialEq, Eq)]
+enum CgroupOwner {
+    /// A process in a login session's scope (`session-<id>.scope`), of the
+    /// user whose slice holds it.
+    Session { id: String, uid: u32 },
+    /// A process the user's service manager started (`user@<uid>.service`),
+    /// which belongs to no session. logind names the user's display session
+    /// for it, as polkit itself does for such a subject.
+    UserManager(u32),
+}
+
+/// The owner of a process from its `/proc/<pid>/cgroup` text: the unified
+/// hierarchy's line (`0::`), else systemd's legacy one (`name=systemd`).
+/// `None` for anything else, such as a system service.
+fn cgroup_owner(text: &str) -> Option<CgroupOwner> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, ':');
+            let (_, controllers, path) = (fields.next()?, fields.next()?, fields.next()?);
+            (controllers.is_empty() || controllers == "name=systemd").then_some(path)
+        })
+        .find_map(owner_of_path)
+}
+
+/// The owner of a cgroup path, read only where logind and the system
+/// manager place things: `/user.slice/user-<uid>.slice/session-<id>.scope`
+/// for a session (a scope with no children), and
+/// `/user.slice/user-<uid>.slice/user@<uid>.service/...` for the user's
+/// service manager. A scope the user creates themselves (`systemd-run
+/// --user --scope`) lives below their service manager whatever it is named,
+/// so it reads as the service manager, never as a session.
+fn owner_of_path(path: &str) -> Option<CgroupOwner> {
+    let mut parts = path.split('/').filter(|part| !part.is_empty());
+    if parts.next()? != "user.slice" {
+        return None;
+    }
+    let uid: u32 = parts
+        .next()?
+        .strip_prefix("user-")?
+        .strip_suffix(".slice")?
+        .parse()
+        .ok()?;
+    let unit = parts.next()?;
+    if let Some(id) = unit
+        .strip_prefix("session-")
+        .and_then(|u| u.strip_suffix(".scope"))
+    {
+        return (parts.next().is_none() && logind_id(id)).then(|| CgroupOwner::Session {
+            id: id.to_string(),
+            uid,
+        });
+    }
+    let manager: u32 = unit
+        .strip_prefix("user@")?
+        .strip_suffix(".service")?
+        .parse()
+        .ok()?;
+    (manager == uid).then_some(CgroupOwner::UserManager(uid))
+}
+
+/// Whether `id` can be a logind session id, which becomes a file name.
+fn logind_id(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// The value of `key` in one of logind's `KEY=value` state files.
+fn logind_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines().find_map(|line| {
+        line.strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix('='))
+            .map(str::trim)
+    })
+}
+
+/// The process that asked polkit's agent helper for this authentication: the
+/// agent at the other end of its standard input when that is a socket (the
+/// socket-activated helper), else its parent (the setuid helper the agent
+/// spawns). `None` when neither names a process other than init.
+fn requesting_agent_pid() -> Option<u32> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` and `len` are valid for writes of the sizes passed, and
+    // `getsockopt` writes at most `len` bytes. Standard input may be closed or
+    // not a socket; the call then fails and nothing is read from `cred`.
+    let peer = unsafe {
+        libc::getsockopt(
+            0,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::addr_of_mut!(cred).cast(),
+            &mut len,
+        )
+    } == 0;
+    let pid = if peer {
+        u32::try_from(cred.pid).ok()?
+    } else {
+        std::os::unix::process::parent_id()
+    };
+    (pid > 1).then_some(pid)
+}
+
+/// Whether the agent behind a consent prompt is in a local login session.
+/// False when the session is remote, and also when the agent, its session or
+/// the session's remoteness cannot be established: the prompt then goes to
+/// the password, never to the camera.
+fn consent_requester_is_local() -> bool {
+    let proc_dir = irlume_common::client::secure_env("IRLUME_PROC_DIR").map_or_else(
+        || std::path::PathBuf::from("/proc"),
+        std::path::PathBuf::from,
+    );
+    let logind_dir = irlume_common::client::secure_env("IRLUME_LOGIND_DIR").map_or_else(
+        || std::path::PathBuf::from("/run/systemd"),
+        std::path::PathBuf::from,
+    );
+    let Some(pid) = requesting_agent_pid() else {
+        return false;
+    };
+    let Ok(cgroup) = std::fs::read_to_string(proc_dir.join(pid.to_string()).join("cgroup")) else {
+        return false;
+    };
+    let (session, uid) = match cgroup_owner(&cgroup) {
+        Some(CgroupOwner::Session { id, uid }) => (id, uid),
+        Some(CgroupOwner::UserManager(uid)) => {
+            let Ok(user) = std::fs::read_to_string(logind_dir.join("users").join(uid.to_string()))
+            else {
+                return false;
+            };
+            match logind_value(&user, "DISPLAY") {
+                Some(id) if logind_id(id) => (id.to_string(), uid),
+                _ => return false,
+            }
+        }
+        None => return false,
+    };
+    // The session must be the agent's user's, and say it is local.
+    std::fs::read_to_string(logind_dir.join("sessions").join(session)).is_ok_and(|text| {
+        logind_value(&text, "UID") == Some(uid.to_string().as_str())
+            && logind_value(&text, "REMOTE") == Some("0")
+    })
 }
 
 impl PamServiceModule for IrlumePam {
@@ -1410,6 +1567,68 @@ pam_module!(IrlumePam);
 
 #[cfg(test)]
 mod tests {
+
+    /// The cgroup path names the session, or the user manager, of the agent
+    /// behind a consent prompt; anything else (a system service, a malformed
+    /// session id that would become a path) names no owner.
+    #[test]
+    fn cgroup_paths_name_the_session_or_the_user_manager() {
+        use super::{cgroup_owner, CgroupOwner};
+        assert_eq!(
+            cgroup_owner("0::/user.slice/user-1000.slice/session-3.scope\n"),
+            Some(CgroupOwner::Session {
+                id: "3".into(),
+                uid: 1000
+            })
+        );
+        // A scope the user names like a session, below their own service
+        // manager, is the service manager's.
+        assert_eq!(
+            cgroup_owner(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/session-3.scope\n"
+            ),
+            Some(CgroupOwner::UserManager(1000))
+        );
+        assert_eq!(
+            cgroup_owner(
+                "0::/user.slice/user-1000.slice/user@1000.service/session.slice/org.gnome.Shell@wayland.service\n"
+            ),
+            Some(CgroupOwner::UserManager(1000))
+        );
+        // cgroup v1 (legacy or hybrid): systemd's named hierarchy.
+        assert_eq!(
+            cgroup_owner(
+                "12:pids:/user.slice\n1:name=systemd:/user.slice/user-1000.slice/session-c2.scope\n"
+            ),
+            Some(CgroupOwner::Session {
+                id: "c2".into(),
+                uid: 1000
+            })
+        );
+        for text in [
+            "0::/system.slice/polkit-agent-helper@1.service\n",
+            "0::/init.scope\n",
+            "0::/user.slice/user-1000.slice/session-..%2f.scope\n",
+            "12:pids:/user.slice/user-1000.slice/session-3.scope\n",
+            // Not where logind puts a session, nor a matching service manager.
+            "0::/system.slice/x.service/session-3.scope\n",
+            "0::/user.slice/user-1000.slice/session-3.scope/sub\n",
+            "0::/user.slice/user-1000.slice/user@1001.service/app.slice\n",
+            "0::/session-3.scope\n",
+            "",
+        ] {
+            assert_eq!(cgroup_owner(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn logind_state_files_are_read_by_exact_key() {
+        use super::logind_value;
+        let session = "UID=1000\nREMOTE_HOST=example\nREMOTE=1\nTYPE=tty\n";
+        assert_eq!(logind_value(session, "REMOTE"), Some("1"));
+        assert_eq!(logind_value("NAME=a\nDISPLAY=2\n", "DISPLAY"), Some("2"));
+        assert_eq!(logind_value("REMOTE_HOST=h\n", "REMOTE"), None);
+    }
 
     /// Only a delivery that actually reached a consumer may continue the stack.
     ///

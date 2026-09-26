@@ -749,24 +749,42 @@ pub(crate) fn override_reports() -> Vec<OverrideReport> {
 /// Whether deleting `path` would leave its service with no PAM configuration:
 /// the file is a surface's `/etc` copy and that surface's vendor file is gone
 /// (or cannot be seen). PAM then falls back to `other`, which denies, so every
-/// login through that service fails, the password included. Verify, the
-/// rollback precheck and the restore itself ask this before a rollback would
-/// remove a file apply created.
+/// login through that service fails, the password included. Verify and the
+/// rollback precheck ask this before a rollback would remove a file apply
+/// created; the removal itself asks [`vendor_gone_service`].
 pub(crate) fn removal_orphans_service(path: &Path) -> bool {
-    let pairs: Vec<(&str, &str)> = override_surfaces()
-        .iter()
-        .filter_map(|(svc, _)| Some((svc.etc, svc.vendor?)))
-        .collect();
-    removal_orphans_in(&pairs, path)
+    removal_orphans_in(&override_pairs(), path)
 }
 
 /// [`removal_orphans_service`] over a given list of `(etc, vendor)` paths, so
 /// a test can name surfaces under a temporary root.
 pub(crate) fn removal_orphans_in(surfaces: &[(&str, &str)], path: &Path) -> bool {
+    surfaces.iter().any(|(etc, _)| Path::new(etc) == path)
+        && removal_orphans_for(path.exists(), !vendor_gone_in(surfaces, path))
+}
+
+/// Whether `path` is a surface's `/etc` copy whose vendor file is gone (or
+/// cannot be seen), whatever is at `path` now. The removal a rollback makes
+/// asks this again once the file it removes is out of the way, where
+/// [`removal_orphans_service`], which needs the file there, says no.
+pub(crate) fn vendor_gone_service(path: &Path) -> bool {
+    vendor_gone_in(&override_pairs(), path)
+}
+
+/// [`vendor_gone_service`] over a given list of `(etc, vendor)` paths.
+pub(crate) fn vendor_gone_in(surfaces: &[(&str, &str)], path: &Path) -> bool {
     surfaces
         .iter()
         .find(|(etc, _)| Path::new(etc) == path)
-        .is_some_and(|(_, vendor)| removal_orphans_for(path.exists(), Path::new(vendor).exists()))
+        .is_some_and(|(_, vendor)| !Path::new(vendor).exists())
+}
+
+/// The `(etc, vendor)` paths of the surfaces irlume may create overrides for.
+fn override_pairs() -> Vec<(&'static str, &'static str)> {
+    override_surfaces()
+        .iter()
+        .filter_map(|(svc, _)| Some((svc.etc, svc.vendor?)))
+        .collect()
 }
 
 /// Testable core of [`removal_orphans_in`].
@@ -2519,7 +2537,7 @@ fn wire_override(
                         ))
                     }
                 };
-                remove_checked_if(etc, current.as_deref(), &still)?;
+                remove_checked_if(etc, current.as_deref().map(str::as_bytes), &still)?;
             }
         }
     }

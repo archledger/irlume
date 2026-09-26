@@ -12,7 +12,7 @@
 
 use super::grammar::*;
 use super::stanzas::*;
-use super::{lock_surface_for, removal_orphans_service, Svc, FP_GREETERS, GREETERS, POLKIT, SUDO};
+use super::{lock_surface_for, vendor_gone_service, Svc, FP_GREETERS, GREETERS, POLKIT, SUDO};
 use std::path::{Path, PathBuf};
 
 pub(super) fn read(p: &str) -> Result<String, String> {
@@ -134,17 +134,17 @@ pub(crate) fn restore_surface(
     before: Option<&str>,
     metadata: Option<(u32, u32, u32)>,
 ) -> Result<(), String> {
-    restore_surface_with(path, before, metadata, &removal_orphans_service)
+    restore_surface_with(path, before, metadata, &vendor_gone_service)
 }
 
-/// [`restore_surface`] with the test for "removing this leaves its service
-/// with no PAM configuration" given, so a test can name surfaces under a
-/// temporary root.
+/// [`restore_surface`] with the test for "this path's vendor copy is gone"
+/// (see [`super::vendor_gone_service`]) given, so a test can name surfaces
+/// under a temporary root.
 pub(crate) fn restore_surface_with(
     path: &Path,
     before: Option<&str>,
     metadata: Option<(u32, u32, u32)>,
-    orphans: &dyn Fn(&Path) -> bool,
+    vendor_gone: &dyn Fn(&Path) -> bool,
 ) -> Result<(), String> {
     match before {
         // A file that already holds the recorded bytes is left as it is, read
@@ -176,27 +176,42 @@ pub(crate) fn restore_surface_with(
             // a symlink was unlinked despite the claim that every write path
             // refuses one, and a multiply-linked file lost a name irlume cannot
             // put back.
-            inspect_target(path)?;
+            if inspect_target(path)?.is_none() {
+                return Ok(());
+            }
             // A file apply created from a vendor copy that has since gone is
             // now the service's only configuration; removing it would leave PAM
             // with nothing for the service but the denying `other` stack.
-            if orphans(path) {
-                return Err(format!(
+            let orphaned = || {
+                format!(
                     "{} is now its service's only PAM configuration (the vendor copy it was \
                      made from is gone); not removed",
                     path.display()
-                ));
+                )
+            };
+            if vendor_gone(path) {
+                return Err(orphaned());
             }
-            match std::fs::remove_file(path) {
-                Ok(()) => {}
+            // Removed as a disable removes an override: the file checked is
+            // the file removed, and the vendor copy is checked again once the
+            // file is out of the way, since a package can remove it at any
+            // moment and the PAM lock does not stop it. A vendor copy gone by
+            // then puts the file back. The removal is made durable (the
+            // directory is synced), so a resume never skips a file that a power
+            // cut brought back.
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => bytes,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => return Err(format!("remove {}: {error}", path.display())),
-            }
-            // A deletion is a directory change like any other. Without this the
-            // unlink could be lost to a power cut while the durable progress
-            // note said the surface was done, so a resume would skip a file that
-            // is still there.
-            fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+                Err(error) => return Err(format!("read {}: {error}", path.display())),
+            };
+            let still = || {
+                if vendor_gone(path) {
+                    Err(orphaned())
+                } else {
+                    Ok(())
+                }
+            };
+            remove_checked_if(path, Some(&bytes), &still).map_err(String::from)
         }
     }
 }
@@ -840,7 +855,7 @@ pub(super) fn write_atomic_checked(
 /// Test-only: [`remove_checked_if`] with no further condition.
 #[cfg(test)]
 pub(super) fn remove_checked(path: &Path, expected: Option<&str>) -> Result<(), WriteError> {
-    remove_checked_if(path, expected, &|| Ok(()))
+    remove_checked_if(path, expected.map(str::as_bytes), &|| Ok(()))
 }
 
 /// Delete `path` only while it holds exactly `expected`, with the checks every
@@ -873,7 +888,7 @@ pub(super) fn remove_checked(path: &Path, expected: Option<&str>) -> Result<(), 
 /// meanwhile would otherwise leave the service with no configuration at all.
 pub(super) fn remove_checked_if(
     path: &Path,
-    expected: Option<&str>,
+    expected: Option<&[u8]>,
     still: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), WriteError> {
     use std::io::{Read as _, Seek as _};
@@ -914,7 +929,7 @@ pub(super) fn remove_checked_if(
         Ok(meta.file_type().is_file()
             && meta.nlink() == 1
             && (meta.dev(), meta.ino()) == identity
-            && bytes == expected.as_bytes())
+            && bytes == expected)
     };
     if !holds_expected(&mut file)? {
         return Err(changed().into());

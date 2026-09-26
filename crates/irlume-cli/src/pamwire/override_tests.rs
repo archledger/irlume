@@ -1239,6 +1239,7 @@ fn record_of(applied: &[AppliedSurface]) -> crate::logintx::Transaction {
 /// rollback does.
 fn roll_back(record: &crate::logintx::Transaction, pairs: &[(&str, &str)]) -> Result<(), String> {
     let orphans = |p: &Path| removal_orphans_in(pairs, p);
+    let vendor_gone = |p: &Path| vendor_gone_in(pairs, p);
     let (states, drifted) = crate::machine::verify_surfaces_with(record, &orphans);
     if drifted != 0 {
         return Err(format!("verify: {states:?}"));
@@ -1260,7 +1261,7 @@ fn roll_back(record: &crate::logintx::Transaction, pairs: &[(&str, &str)]) -> Re
             Path::new(&surface.path),
             surface.before.as_deref(),
             attrs(surface.mode, surface.uid, surface.gid),
-            &orphans,
+            &vendor_gone,
         )
         .map_err(|e| format!("{}: {e}", surface.id))?;
         if let Some(sidecar) = &surface.sidecar {
@@ -1268,7 +1269,7 @@ fn roll_back(record: &crate::logintx::Transaction, pairs: &[(&str, &str)]) -> Re
                 Path::new(&sidecar.path),
                 sidecar.before.as_deref(),
                 attrs(sidecar.mode, sidecar.uid, sidecar.gid),
-                &orphans,
+                &vendor_gone,
             )
             .map_err(|e| format!("{} backup: {e}", surface.id))?;
         }
@@ -2040,6 +2041,42 @@ fn a_backup_another_writer_published_meanwhile_survives_the_rollback() {
         };
         assert_eq!(read_file(svc.etc), stack);
     }
+}
+
+/// A rollback deletes an override apply created only while its vendor copy is
+/// there. A package can remove that copy right after the rollback's first
+/// look: the copy is checked again once the override is out of the way, and
+/// the override goes back, so the service keeps a configuration.
+#[test]
+fn a_rollback_keeps_an_override_whose_vendor_copy_goes_during_the_removal() {
+    let dir = TestDir::new("ovr-rollback-vendor-race");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    let created = read_file(svc.etc);
+    let vendor = svc.vendor.unwrap();
+    let pairs = [(svc.etc, vendor)];
+    let looks = std::cell::Cell::new(0);
+    // The package removes the vendor copy right after the first look.
+    let vendor_gone = |p: &Path| {
+        let gone = vendor_gone_in(&pairs, p);
+        if looks.replace(looks.get() + 1) == 0 {
+            std::fs::remove_file(vendor).unwrap();
+        }
+        gone
+    };
+    let err = restore_surface_with(Path::new(svc.etc), None, None, &vendor_gone)
+        .expect_err("the override is kept");
+    assert!(err.contains("only PAM configuration"), "{err}");
+    assert_eq!(read_file(svc.etc), created, "back where it was");
+    let etc_dir = Path::new(svc.etc).parent().unwrap();
+    assert_eq!(entries(etc_dir), ["plasmalogin"], "nothing left aside");
+    // With the vendor copy there throughout, the override is removed.
+    std::fs::write(vendor, UPSTREAM_FEDORA).unwrap();
+    restore_surface_with(Path::new(svc.etc), None, None, &|p: &Path| {
+        vendor_gone_in(&pairs, p)
+    })
+    .expect("removed");
+    assert!(!exists(svc.etc));
 }
 
 // ---- updating irlume's lines where a jump counts them ------------------------------

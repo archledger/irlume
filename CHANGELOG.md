@@ -360,22 +360,23 @@ All notable changes to irlume are documented here. This project adheres to
   configuration: irlume updates its lines in place (in one nobody edited,
   where a rebuild would put them) and never deletes it, and `login
   rollback` refuses to (`login verify` reports it as
-  `changed-since-apply`). An override saved with CRLF line endings, which
-  PAM does not read, is reported by `irlume doctor` and rewritten with LF
-  endings by `login enable --apply`, header lines included. `login enable`
-  and `login disable` leave a file with a line that ends in `\`, which PAM
-  joins with the next line into one rule, as it is and exit 1: taking out
-  or rewriting one physical line of it can change the rule before it. A
-  write or removal of one of these files never replaces or deletes a file
-  another program put there after irlume read it, including one created
-  where irlume read none, and never reverts a mode or owner set after
-  irlume read it, and an override is deleted only while its vendor copy is
-  still there. A jump whose type is written in brackets (`[auth]`) is
-  counted like any other, and a jump onto the first of two identical rules
-  is told from one onto the second. `login plan` counts a vendor file
-  change between plan and apply as a change to the machine, so existing
-  plan ids change once. New change ids `rewire-override` and
-  `keep-edited-override` (follows up #847).
+  `changed-since-apply`), also when a package removes the vendor copy
+  while the rollback is removing the file. An override saved with CRLF
+  line endings, which PAM does not read, is reported by `irlume doctor`
+  and rewritten with LF endings by `login enable --apply`, header lines
+  included. `login enable` and `login disable` leave a file with a line
+  that ends in `\`, which PAM joins with the next line into one rule, as
+  it is and exit 1: taking out or rewriting one physical line of it can
+  change the rule before it. A write or removal of one of these files
+  never replaces or deletes a file another program put there after irlume
+  read it, including one created where irlume read none, and never reverts
+  a mode or owner set after irlume read it, and an override is deleted
+  only while its vendor copy is still there. A jump whose type is written
+  in brackets (`[auth]`) is counted like any other, and a jump onto the
+  first of two identical rules is told from one onto the second. `login
+  plan` counts a vendor file change between plan and apply as a change to
+  the machine, so existing plan ids change once. New change ids
+  `rewire-override` and `keep-edited-override` (follows up #847).
 
 - `irlume login rollback` no longer writes a file the transaction did not
   change. A surface `login apply` left alone (a symlink, a file with a

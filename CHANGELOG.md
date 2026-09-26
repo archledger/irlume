@@ -375,14 +375,15 @@ All notable changes to irlume are documented here. This project adheres to
   irlume read it, an override is deleted only while its vendor copy is
   still there, and one made from a vendor copy stays in place only while
   that copy is still the one it was made from. On a filesystem that cannot
-  swap two files in one step (`RENAME_EXCHANGE`), irlume refuses to
-  replace one of these files rather than risk overwriting a change made at
-  the same moment. A jump whose type is written in brackets (`[auth]`) is
-  counted like any other, and a jump onto the first of two identical rules
-  is told from one onto the second. `login plan` counts a vendor file
-  change between plan and apply as a change to the machine, so existing
-  plan ids change once. New change ids `rewire-override` and
-  `keep-edited-override` (follows up #847).
+  swap two files in one step (`RENAME_EXCHANGE`), irlume refuses a checked
+  replacement (of one of these files, or by a rollback) rather than risk
+  overwriting a change made at the same moment. A jump whose type is
+  written in brackets (`[auth]`) is counted like any other, a jump onto
+  the first of two identical rules is told from one onto the second, and a
+  jump that runs past the lines left into an include is followed too.
+  `login plan` counts a vendor file change between plan and apply as a
+  change to the machine, so existing plan ids change once. New change ids
+  `rewire-override` and `keep-edited-override` (follows up #847).
 
 - `irlume login rollback` no longer writes a file the transaction did not
   change. A surface `login apply` left alone (a symlink, a file with a
@@ -394,7 +395,10 @@ All notable changes to irlume are documented here. This project adheres to
   kept by a rollback too, where it used to be deleted or overwritten with
   the file apply had read. A rollback now also removes the `.pre-irlume`
   backup that wiring a file in place created, and keeps one another
-  program put there while apply was running.
+  program put there while apply was running. A rollback replaces or
+  removes a file only while it still holds what the transaction left,
+  checked in the same step as the change, so a file a package or an editor
+  put there after the rollback's own check is kept.
 
 - The cleanup of scratch files a killed irlume left in `/etc/pam.d`
   removes only the names irlume gives them

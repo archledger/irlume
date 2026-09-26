@@ -1261,6 +1261,7 @@ fn roll_back(record: &crate::logintx::Transaction, pairs: &[(&str, &str)]) -> Re
             Path::new(&surface.path),
             surface.before.as_deref(),
             attrs(surface.mode, surface.uid, surface.gid),
+            Some(&surface.after_sha256),
             &vendor_gone,
         )
         .map_err(|e| format!("{}: {e}", surface.id))?;
@@ -1269,6 +1270,7 @@ fn roll_back(record: &crate::logintx::Transaction, pairs: &[(&str, &str)]) -> Re
                 Path::new(&sidecar.path),
                 sidecar.before.as_deref(),
                 attrs(sidecar.mode, sidecar.uid, sidecar.gid),
+                sidecar.after_sha256.as_deref(),
                 &vendor_gone,
             )
             .map_err(|e| format!("{} backup: {e}", surface.id))?;
@@ -2140,7 +2142,8 @@ fn a_rollback_keeps_an_override_whose_vendor_copy_goes_during_the_removal() {
         }
         gone
     };
-    let err = restore_surface_with(Path::new(svc.etc), None, None, &vendor_gone)
+    let after = crate::logintx::sha256_hex(created.as_bytes());
+    let err = restore_surface_with(Path::new(svc.etc), None, None, Some(&after), &vendor_gone)
         .expect_err("the override is kept");
     assert!(err.contains("only PAM configuration"), "{err}");
     assert_eq!(read_file(svc.etc), created, "back where it was");
@@ -2148,11 +2151,71 @@ fn a_rollback_keeps_an_override_whose_vendor_copy_goes_during_the_removal() {
     assert_eq!(entries(etc_dir), ["plasmalogin"], "nothing left aside");
     // With the vendor copy there throughout, the override is removed.
     std::fs::write(vendor, UPSTREAM_FEDORA).unwrap();
-    restore_surface_with(Path::new(svc.etc), None, None, &|p: &Path| {
+    restore_surface_with(Path::new(svc.etc), None, None, Some(&after), &|p: &Path| {
         vendor_gone_in(&pairs, p)
     })
     .expect("removed");
     assert!(!exists(svc.etc));
+}
+
+/// Reconcile's refresh is made from the vendor copy it read. A package that
+/// replaces that copy before the refreshed file is in place gets the
+/// override back as it was; the unit logs it and does not fail.
+#[test]
+fn a_refresh_whose_vendor_copy_changes_during_the_write_is_not_kept() {
+    let dir = TestDir::new("ovr-refresh-vendor-race");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    let vendor = svc.vendor.unwrap();
+    wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    let before = read_file(svc.etc);
+    let before_inode = inode(svc.etc);
+    std::fs::write(vendor, fedora_with_oo7()).unwrap();
+    arm(&VENDOR_CHANGES_DURING_WRITE, Path::new(vendor));
+    let logged = maintain(&svc, overrides::Recipe::Greeter);
+    disarm(&VENDOR_CHANGES_DURING_WRITE, Path::new(vendor));
+    let logged = logged.expect("the refusal is logged");
+    assert!(
+        logged.contains("left as it is") && logged.contains("changed while irlume was writing"),
+        "{logged}"
+    );
+    assert_eq!(read_file(svc.etc), before, "the override is back");
+    assert_eq!(inode(svc.etc), before_inode, "the same file");
+    let etc_dir = Path::new(svc.etc).parent().unwrap();
+    assert_eq!(entries(etc_dir), ["plasmalogin"]);
+}
+
+/// A rollback changes a file only while it is still the one the transaction
+/// left. One a package or an editor put there after the rollback's own check
+/// is kept, whether the rollback would remove it or write the old content
+/// over it, and so is a file where the transaction left none.
+#[test]
+fn a_rollback_keeps_a_file_that_replaced_the_one_the_transaction_left() {
+    let dir = TestDir::new("ovr-rollback-replaced");
+    let path = dir.0.join("sudo");
+    let left = "IRLUME'S FILE\n";
+    let after = crate::logintx::sha256_hex(left.as_bytes());
+    let never = |_: &Path| false;
+    std::fs::write(&path, "A PACKAGE'S FILE\n").unwrap();
+    let err =
+        restore_surface_with(&path, None, None, Some(&after), &never).expect_err("not removed");
+    assert!(err.contains("changed since the transaction"), "{err}");
+    assert_eq!(read_file(path.to_str().unwrap()), "A PACKAGE'S FILE\n");
+    let err = restore_surface_with(&path, Some("the original\n"), None, Some(&after), &never)
+        .expect_err("not overwritten");
+    assert!(err.contains("changed while irlume was writing"), "{err}");
+    assert_eq!(read_file(path.to_str().unwrap()), "A PACKAGE'S FILE\n");
+    let absent = crate::logintx::ABSENT;
+    restore_surface_with(&path, Some("the original\n"), None, Some(absent), &never)
+        .expect_err("a file where the transaction left none is kept");
+    assert_eq!(read_file(path.to_str().unwrap()), "A PACKAGE'S FILE\n");
+    // With the transaction's own file there, both go ahead.
+    std::fs::write(&path, left).unwrap();
+    restore_surface_with(&path, Some("the original\n"), None, Some(&after), &never).unwrap();
+    assert_eq!(read_file(path.to_str().unwrap()), "the original\n");
+    std::fs::write(&path, left).unwrap();
+    restore_surface_with(&path, None, None, Some(&after), &never).unwrap();
+    assert!(!path.exists());
+    assert!(entries(&dir.0).is_empty(), "{:?}", entries(&dir.0));
 }
 
 // ---- updating irlume's lines where a jump counts them ------------------------------

@@ -1251,6 +1251,7 @@ fn rollback_restore(
                     std::path::Path::new(&surface.path),
                     surface.before.as_deref(),
                     metadata,
+                    Some(&surface.after_sha256),
                 )
             })
         };
@@ -1295,6 +1296,7 @@ fn rollback_restore(
                         std::path::Path::new(&sidecar.path),
                         sidecar.before.as_deref(),
                         sidecar_metadata,
+                        sidecar.after_sha256.as_deref(),
                     ) {
                         irlume_common::dlog!("{command}: {} backup failed: {message}", surface.id);
                         return emit_with_extra(
@@ -2961,13 +2963,14 @@ mod tests {
         let blockers = rollback_blockers_with(&record, &none, &orphans);
         assert_eq!(blockers.changed, vec!["plasmalogin"]);
         let vendor_gone = |p: &std::path::Path| crate::pamwire::vendor_gone_in(&pairs, p);
-        let err = crate::pamwire::restore_surface_with(&etc, None, None, &vendor_gone)
+        let err = crate::pamwire::restore_surface_with(&etc, None, None, None, &vendor_gone)
             .expect_err("the only configuration is not removed");
         assert!(err.contains("only PAM configuration"), "{err}");
         assert!(etc.exists());
         // The same restore removes a file whose vendor copy is still there.
         std::fs::write(&vendor, "auth include system-auth\n").expect("write");
-        crate::pamwire::restore_surface_with(&etc, None, None, &vendor_gone).expect("removed");
+        crate::pamwire::restore_surface_with(&etc, None, None, None, &vendor_gone)
+            .expect("removed");
         assert!(!etc.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -577,6 +577,9 @@ fn maintain_override(svc: &Svc, recipe: overrides::Recipe) -> Result<Option<Stri
         // Unreadable is not absent; leave the file for doctor to report.
         Err(_) => return Ok(None),
     };
+    let decided = vendor
+        .as_deref()
+        .map(|v| crate::logintx::sha256_hex(v.as_bytes()));
     let (content, done) =
         match overrides::maintenance(recipe, &current, vendor_path, vendor.as_deref()) {
             overrides::Maintenance::Record(content) => (
@@ -594,10 +597,32 @@ fn maintain_override(svc: &Svc, recipe: overrides::Recipe) -> Result<Option<Stri
                 return Ok(None)
             }
         };
-    match write_atomic_checked(etc, &content, Some(&current)) {
+    // Made from the vendor copy read above, so kept only while that copy is
+    // still the same once the file is in place, as in `wire_override`. A
+    // package that changed it meanwhile starts another reconcile, which
+    // decides afresh.
+    let vendor_moved = std::cell::Cell::new(false);
+    let still = || -> Result<(), String> {
+        #[cfg(test)]
+        change_vendor_for_test(Path::new(vendor_path));
+        if vendor_digest_now(vendor_path) == decided {
+            Ok(())
+        } else {
+            vendor_moved.set(true);
+            Err(format!(
+                "{vendor_path} changed while irlume was writing {}",
+                svc.etc
+            ))
+        }
+    };
+    match write_atomic_checked_if(etc, &content, Some(&current), &still) {
         Ok(()) => Ok(Some(format!("[login] {}: {done}", svc.etc))),
         Err(e) if write_refused_by_admin(&e.message) => Ok(Some(format!(
             "[login] ⚠ {}: left as it is, since it cannot be written ({e})",
+            svc.etc
+        ))),
+        Err(e) if vendor_moved.get() && !e.landed => Ok(Some(format!(
+            "[login] ⚠ {}: left as it is: {e}; the next reconcile decides again",
             svc.etc
         ))),
         Err(e) => Err(e.into()),
@@ -2499,12 +2524,7 @@ fn wire_override(
         let decided = vendor
             .as_deref()
             .map(|v| crate::logintx::sha256_hex(v.as_bytes()));
-        let vendor_now = || match std::fs::symlink_metadata(vendor_path) {
-            Ok(meta) if meta.file_type().is_file() => std::fs::read(vendor_path)
-                .ok()
-                .map(|b| crate::logintx::sha256_hex(&b)),
-            _ => None,
-        };
+        let vendor_now = || vendor_digest_now(vendor_path);
         match &decision.write {
             overrides::Write::Nothing => {}
             overrides::Write::Replace(content) => {
@@ -2567,6 +2587,17 @@ fn wire_override(
         detail: decision.detail,
         unmet: decision.unmet,
     })
+}
+
+/// The digest of the vendor file at `vendor_path` now, `None` when it is not
+/// a regular file that can be read.
+fn vendor_digest_now(vendor_path: &str) -> Option<String> {
+    match std::fs::symlink_metadata(vendor_path) {
+        Ok(meta) if meta.file_type().is_file() => std::fs::read(vendor_path)
+            .ok()
+            .map(|b| crate::logintx::sha256_hex(&b)),
+        _ => None,
+    }
 }
 
 /// A failed write. One that would only have added the tracking line to a
@@ -3175,7 +3206,7 @@ mod tests {
         #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
         let gone = dir.join("kde-fingerprint");
-        restore_surface(&gone, Some("restored\n"), Some((0o600, uid, gid))).expect("restore");
+        restore_surface(&gone, Some("restored\n"), Some((0o600, uid, gid)), None).expect("restore");
         assert_eq!(
             std::fs::metadata(&gone).unwrap().permissions().mode() & 0o7777,
             0o600
@@ -3229,7 +3260,7 @@ mod tests {
             "the peer name was detached from the content"
         );
         // Restore refuses on the same terms; it used to have no check at all.
-        assert!(restore_surface(&a, Some("restored\n"), None).is_err());
+        assert!(restore_surface(&a, Some("restored\n"), None, None).is_err());
 
         // REMOVING a surface is a write path too. Rollback removes a file that
         // was absent before the transaction, and that branch called remove_file
@@ -3238,14 +3269,14 @@ mod tests {
         // irlume cannot put back.
         let gone_link = dir.join("was-absent");
         std::os::unix::fs::symlink(&real, &gone_link).unwrap();
-        let refused = restore_surface(&gone_link, None, None)
+        let refused = restore_surface(&gone_link, None, None, None)
             .expect_err("removing a symlink must be refused too");
         assert!(refused.contains("symlink"), "{refused}");
         assert!(gone_link.is_symlink(), "the symlink was unlinked");
         let peer = dir.join("linked-peer");
         std::fs::hard_link(&a, &peer).unwrap();
         assert!(
-            restore_surface(&a, None, None).is_err(),
+            restore_surface(&a, None, None, None).is_err(),
             "removing one name of a multiply-linked file must be refused"
         );
         std::fs::remove_file(&peer).unwrap();
@@ -6391,7 +6422,7 @@ auth required pam_fprintd.so\n\
         let file = dir.join("sudo");
         std::fs::write(&file, "changed by apply\n").expect("write");
 
-        restore_surface(&file, Some("the original\n"), None).expect("restore");
+        restore_surface(&file, Some("the original\n"), None, None).expect("restore");
         assert_eq!(
             std::fs::read_to_string(&file).expect("read"),
             "the original\n"
@@ -6452,8 +6483,13 @@ auth required pam_fprintd.so\n\
 
         // The recorded pre-change state: same bytes, but a tighter mode.
         let meta = crate::logintx::file_metadata(&file).expect("metadata");
-        restore_surface(&file, Some("the original\n"), Some((0o640, meta.1, meta.2)))
-            .expect("restore");
+        restore_surface(
+            &file,
+            Some("the original\n"),
+            Some((0o640, meta.1, meta.2)),
+            None,
+        )
+        .expect("restore");
 
         assert_eq!(
             std::fs::read_to_string(&file).expect("read"),
@@ -6479,12 +6515,12 @@ auth required pam_fprintd.so\n\
         let file = dir.join("materialized-override");
         std::fs::write(&file, "irlume made this\n").expect("write");
 
-        restore_surface(&file, None, None).expect("restore");
+        restore_surface(&file, None, None, None).expect("restore");
         assert!(!file.exists(), "the file must be gone, not empty");
 
         // Restoring an already-absent file is not an error: a rollback that
         // partly ran and is run again must be able to finish.
-        restore_surface(&file, None, None).expect("restoring an absent file is fine");
+        restore_surface(&file, None, None, None).expect("restoring an absent file is fine");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

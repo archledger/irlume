@@ -518,16 +518,19 @@ fn occurrence(chain: &[&str], at: usize) -> (String, usize) {
 
 fn landing_of(chain: &[&str], at: usize, n: usize) -> Landing {
     let last = chain.len() - 1;
-    if n > last - at {
-        return Landing::PastEnd;
-    }
-    let skipped = &chain[at + 1..=at + n];
+    // A jump longer than the lines left can still land inside an include's
+    // expansion, which this file does not show, so an include among the
+    // lines it skips makes it `Across` either way.
+    let skipped = &chain[at + 1..=(at + n).min(last)];
     let target = (at + n + 1 < chain.len()).then(|| at + n + 1);
     if skipped.iter().any(|l| is_include(l)) {
         return Landing::Across {
             skipped: skipped.iter().map(|l| line_key(l)).collect(),
             target: target.map(|to| occurrence(chain, to)),
         };
+    }
+    if n > last - at {
+        return Landing::PastEnd;
     }
     match target {
         Some(to) => {
@@ -3687,5 +3690,40 @@ session     include       password-auth
         let d = run(&old, Some(&v2), true, &greeter);
         assert_eq!(d.write, Write::Nothing, "{}", d.message);
         assert!(d.message.contains("not rebuilt"), "{}", d.message);
+    }
+
+    /// A jump longer than the lines left can land inside an include's
+    /// expansion, so taking out a line it skips changes where it lands
+    /// there. That is a move: disable keeps an inactive line in irlume's
+    /// place.
+    #[test]
+    fn an_overlong_jump_into_an_include_is_followed() {
+        let polkit_vendor =
+            "#%PAM-1.0\nauth       include      system-auth\naccount    include      system-auth\n";
+        let gate =
+            "auth       [success=5 default=ignore]   pam_succeed_if.so quiet user ingroup wheel   # local";
+        let file = insert_above(
+            &created(polkit_vendor, &wire_polkit_service),
+            "pam_irlume.so",
+            gate,
+        );
+        let lands = |text: &str| {
+            jumps(text)
+                .into_iter()
+                .find(|j| j.line == norm(gate))
+                .map(|j| j.landing)
+        };
+        assert!(
+            matches!(lands(&file), Some(Landing::Across { target: None, .. })),
+            "{:?}",
+            lands(&file)
+        );
+        assert_ne!(lands(&file), lands(&base(&file)));
+        let d = run(&file, Some(polkit_vendor), false, &wire_polkit_service);
+        assert_eq!(d.change, PlannedChange::StripInPlace, "{}", d.message);
+        let after = written(&d).expect("a write");
+        assert!(!content_has_module(&after), "{after}");
+        assert!(after.contains(INERT_TAG), "{after}");
+        assert_eq!(lands(&after), lands(&file), "{after}");
     }
 }

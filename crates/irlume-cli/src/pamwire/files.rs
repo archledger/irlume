@@ -133,19 +133,34 @@ pub(crate) fn restore_surface(
     path: &Path,
     before: Option<&str>,
     metadata: Option<(u32, u32, u32)>,
+    after: Option<&str>,
 ) -> Result<(), String> {
-    restore_surface_with(path, before, metadata, &vendor_gone_service)
+    restore_surface_with(path, before, metadata, after, &vendor_gone_service)
 }
 
 /// [`restore_surface`] with the test for "this path's vendor copy is gone"
 /// (see [`super::vendor_gone_service`]) given, so a test can name surfaces
 /// under a temporary root.
+///
+/// `after` is the digest the transaction recorded for the file it left (or
+/// `ABSENT`): the file is replaced or removed only while it is still that
+/// file, checked in the same step as the change. The rollback checked it
+/// before starting, but a package or an editor can replace the file in
+/// between. `None`, for a record written before a backup's digest was kept,
+/// changes whatever is there.
 pub(crate) fn restore_surface_with(
     path: &Path,
     before: Option<&str>,
     metadata: Option<(u32, u32, u32)>,
+    after: Option<&str>,
     vendor_gone: &dyn Fn(&Path) -> bool,
 ) -> Result<(), String> {
+    let changed = || {
+        format!(
+            "{} changed since the transaction; not touched",
+            path.display()
+        )
+    };
     match before {
         // A file that already holds the recorded bytes is left as it is, read
         // through the path as the digest a rollback checks is. That is every
@@ -168,7 +183,12 @@ pub(crate) fn restore_surface_with(
             // fields existed: the replacing file inherits the current one's
             // attributes rather than a guess.
             let attrs = metadata.map_or(Attrs::Carried, Attrs::Given);
-            write_atomic_inner(path, content, attrs, Expect::Any, &|| Ok(())).map_err(String::from)
+            let expect = match after {
+                None => Expect::Any,
+                Some(crate::logintx::ABSENT) => Expect::Absent,
+                Some(digest) => Expect::Digest(digest),
+            };
+            write_atomic_inner(path, content, attrs, expect, &|| Ok(())).map_err(String::from)
         }
         None => {
             // The same refusal the replacing branch gets. Removing was a direct
@@ -204,6 +224,11 @@ pub(crate) fn restore_surface_with(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(format!("read {}: {error}", path.display())),
             };
+            // The bytes removed are the file the transaction left, not
+            // whatever replaced it since the rollback's own check.
+            if after.is_some_and(|want| crate::logintx::sha256_hex(&bytes) != want) {
+                return Err(changed());
+            }
             let still = || {
                 if vendor_gone(path) {
                     Err(orphaned())
@@ -860,6 +885,16 @@ pub(super) fn write_atomic(path: &Path, contents: &str) -> Result<(), WriteError
     write_atomic_inner(path, contents, Attrs::Carried, Expect::Any, &|| Ok(()))
 }
 
+/// Test-only: [`write_atomic_checked_if`] with no further condition.
+#[cfg(test)]
+pub(super) fn write_atomic_checked(
+    path: &Path,
+    contents: &str,
+    expected: Option<&str>,
+) -> Result<(), WriteError> {
+    write_atomic_checked_if(path, contents, expected, &|| Ok(()))
+}
+
 /// [`write_atomic`], refusing when the file no longer holds `expected` at the
 /// moment of the rename. The identity check alone misses an editor that saves
 /// in place (same inode), and a write decided on the old bytes would then
@@ -870,21 +905,13 @@ pub(super) fn write_atomic(path: &Path, contents: &str) -> Result<(), WriteError
 /// before the rename, is another writer's (a package's, an administrator's)
 /// and is kept; the write is refused. Taking it as the file to replace would
 /// swap irlume's file in over a stack nobody decided on.
-pub(super) fn write_atomic_checked(
-    path: &Path,
-    contents: &str,
-    expected: Option<&str>,
-) -> Result<(), WriteError> {
-    write_atomic_checked_if(path, contents, expected, &|| Ok(()))
-}
-
-/// [`write_atomic_checked`], asking `still` last, once irlume's file is in
-/// place and before the file it replaced is removed: a refusal puts that
-/// file back (or removes the one created) and is returned, not landed. It
-/// lets an override made from a vendor copy go in only while that copy is
-/// still the one it was made from: a package that replaced or removed it
-/// meanwhile would otherwise find a file made from its old copy shadowing
-/// its new one.
+///
+/// `still` is asked last, once irlume's file is in place and before the file
+/// it replaced is removed: a refusal puts that file back (or removes the one
+/// created) and is returned, not landed. It lets an override made from a
+/// vendor copy go in only while that copy is still the one it was made from:
+/// a package that replaced or removed it meanwhile would otherwise find a
+/// file made from its old copy shadowing its new one.
 pub(super) fn write_atomic_checked_if(
     path: &Path,
     contents: &str,
@@ -1142,6 +1169,20 @@ enum Expect<'a> {
     Absent,
     /// A file holding exactly these bytes.
     Bytes(&'a [u8]),
+    /// A file whose bytes have this SHA-256 (hex).
+    Digest(&'a str),
+}
+
+impl Expect<'_> {
+    /// Whether a file with these bytes (`None`: unreadable or absent) is
+    /// what a checked write requires.
+    fn held_by(self, bytes: Option<&[u8]>) -> bool {
+        match self {
+            Expect::Bytes(want) => bytes == Some(want),
+            Expect::Digest(want) => bytes.is_some_and(|b| crate::logintx::sha256_hex(b) == want),
+            Expect::Any | Expect::Absent => true,
+        }
+    }
 }
 
 /// Where a written file's mode and owner come from.
@@ -1187,7 +1228,7 @@ fn write_atomic_inner(
         return Err(changed_while_writing(path).into());
     }
     let expected = match expect {
-        Expect::Bytes(bytes) => Some(bytes),
+        Expect::Bytes(_) | Expect::Digest(_) => Some(expect),
         Expect::Any | Expect::Absent => None,
     };
     // The attributes the new file gets, and those the file it replaces must
@@ -1229,7 +1270,7 @@ fn write_atomic_inner(
         // first look and the rename are two moments, and what matters is what
         // the name refers to at the instant it is replaced.
         if inspect_target(path)? != before
-            || expected.is_some_and(|want| std::fs::read(path).ok().as_deref() != Some(want))
+            || expected.is_some_and(|want| !want.held_by(std::fs::read(path).ok().as_deref()))
             || carried.is_some_and(|want| {
                 std::fs::symlink_metadata(path)
                     .ok()
@@ -1283,7 +1324,7 @@ fn install(
     tmp: &Path,
     path: &Path,
     before: TargetState,
-    expected: Option<&[u8]>,
+    expected: Option<Expect<'_>>,
     carried: Option<(u32, u32, u32)>,
     ours: Option<(u64, u64)>,
     still: &dyn Fn() -> Result<(), String>,
@@ -1350,7 +1391,7 @@ fn install(
             && (m.dev(), m.ino()) == identity
             && carried.is_none_or(|want| mode_uid_gid(&m) == want)
     }) && expected
-        .is_none_or(|want| std::fs::read(tmp).ok().as_deref() == Some(want));
+        .is_none_or(|want| want.held_by(std::fs::read(tmp).ok().as_deref()));
     if !replaced_the_checked_file {
         // Another writer's file came out: give it its name back.
         swap_back(tmp, path, ours)?;

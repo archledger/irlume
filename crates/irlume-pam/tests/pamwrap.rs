@@ -124,6 +124,14 @@ impl Harness {
         std::fs::create_dir_all(&service_dir).unwrap();
         let config_dir = root.join("cfg");
         std::fs::create_dir_all(&config_dir).unwrap();
+        // The agent behind a consent prompt (polkit-1) is pamtester's parent,
+        // this test process. Give it a local login session so the polkit
+        // tests reach the daemon; the consent-origin test replaces it.
+        agent_session(
+            &root,
+            "0::/user.slice/user-1000.slice/session-7.scope\n",
+            Some("UID=1000\nREMOTE=0\nTYPE=wayland\n"),
+        );
         let salt_helper = root.join("wallet-salt-helper");
         std::fs::write(
             &salt_helper,
@@ -211,6 +219,8 @@ impl Harness {
             .env("PAM_WRAPPER_SERVICE_DIR", &self.service_dir)
             .env("IRLUME_SOCKET", &self.socket)
             .env("IRLUME_CONFIG_DIR", &self.config_dir)
+            .env("IRLUME_PROC_DIR", self.root.join("proc"))
+            .env("IRLUME_LOGIND_DIR", self.root.join("logind"))
             .env(
                 "IRLUME_KWALLET_INIT",
                 self.kwallet_init.as_ref().unwrap_or(&self.salt_helper),
@@ -286,6 +296,23 @@ const REMOTE_ENV_MARKERS: [(&str, &str); 2] = [
 /// [`REMOTE_ENV_MARKERS`], which a run over ssh inherits, and `PAM_RHOST`,
 /// which a pam_set_items.so line copies into the PAM item the module also
 /// checks. A test that wants a remote run sets one again afterwards.
+/// Describe this test process, pamtester's parent and so the agent behind a
+/// consent prompt, to the module under `root`: its `cgroup` text in a fake
+/// `/proc`, and session 7 in a fake logind directory (`None` removes it).
+fn agent_session(root: &Path, cgroup: &str, session: Option<&str>) {
+    let proc_dir = root.join("proc").join(std::process::id().to_string());
+    std::fs::create_dir_all(&proc_dir).unwrap();
+    std::fs::write(proc_dir.join("cgroup"), cgroup).unwrap();
+    let sessions = root.join("logind/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    match session {
+        Some(text) => std::fs::write(sessions.join("7"), text).unwrap(),
+        None => {
+            let _ = std::fs::remove_file(sessions.join("7"));
+        }
+    }
+}
+
 fn remove_remote_env(cmd: &mut Command) {
     for (name, _) in REMOTE_ENV_MARKERS {
         cmd.env_remove(name);
@@ -816,6 +843,75 @@ fn pamwrap_remote_class_services_make_no_request() {
     let (ok, out) = h.run("irlume-face-local", &["authenticate"], "", None);
     assert!(ok, "{out}");
     assert_eq!(log.lock().unwrap().len(), 1);
+}
+
+/// A consent prompt (polkit) never reaches the camera when the agent that
+/// asked is in a remote login session, or when its session cannot be
+/// resolved: polkit's agent helper carries no PAM_RHOST and no SSH marker, so
+/// an administrator in an SSH session answering pkttyagent looks local
+/// otherwise. The agent here is this test process, described through the
+/// module's `/proc` and logind overrides.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_consent_from_a_remote_or_unknown_session_makes_no_request() {
+    let Some(h) = Harness::try_new("consent-origin") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| match req {
+        Request::Authenticate { .. } => grant(),
+        _ => Response::Error("unexpected request".into()),
+    });
+    h.write_service("polkit-1", &[h.auth_line("required", "")]);
+    let scope = "0::/user.slice/user-1000.slice/session-7.scope\n";
+    for (why, cgroup, session) in [
+        (
+            "a remote session",
+            scope,
+            Some("UID=1000\nREMOTE=1\nTYPE=tty\n"),
+        ),
+        ("a session logind does not know", scope, None),
+        (
+            "a session with no REMOTE= line",
+            scope,
+            Some("UID=1000\nTYPE=tty\n"),
+        ),
+        (
+            "another user's local session",
+            scope,
+            Some("UID=1001\nREMOTE=0\n"),
+        ),
+        (
+            "no login session at all",
+            "0::/system.slice/some.service\n",
+            Some("UID=1000\nREMOTE=0\n"),
+        ),
+        (
+            // A scope the user named after a local session, below their own
+            // service manager, with no display session to fall back on.
+            "a user-made scope named like a session",
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/session-7.scope\n",
+            Some("UID=1000\nREMOTE=0\n"),
+        ),
+    ] {
+        agent_session(&h.root, cgroup, session);
+        let (ok, out) = h.run("polkit-1", &["authenticate"], "yes\n", None);
+        assert!(!ok, "{why} must stand the module down: {out}");
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "{why} must keep every request from the daemon"
+        );
+    }
+    // Control: the same prompt from a local session reaches the daemon.
+    agent_session(&h.root, scope, Some("UID=1000\nREMOTE=0\nTYPE=wayland\n"));
+    let (ok, out) = h.run("polkit-1", &["authenticate"], "yes\n", None);
+    assert!(ok, "{out}");
+    assert_eq!(log.lock().unwrap().len(), 1);
+    // A non-consent service does not ask where the agent is.
+    agent_session(&h.root, scope, Some("UID=1000\nREMOTE=1\n"));
+    h.write_service("sudo", &[h.auth_line("required", "")]);
+    let (ok, out) = h.run("sudo", &["authenticate"], "yes\n", None);
+    assert!(ok, "{out}");
+    assert_eq!(log.lock().unwrap().len(), 2);
 }
 
 const FACE_INTENT_INFO: &str = "Type yes to use face authentication";

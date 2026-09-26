@@ -276,10 +276,12 @@ Full write-up: [`pad-results/2026-06-30-ir-liveness-selftest.md`](pad-results/20
 Seal a random release secret (or the login password) in the **TPM**, gated by
 **PCR policy**; release only on a successful live+match. Sealing picks the
 strongest policy the machine supports: `PolicyAuthorizeNV` against a
-provisioned systemd-pcrlock NV index (Tier 2; after a firmware or Secure Boot
-update the admin re-runs `systemd-pcrlock make-policy` and the seal keeps
-working), else a literal `PolicyPCR` over PCR 7 (Tier 3; a Secure Boot change
-requires a re-arm). The pcrlock policy is round-trip verified at seal time, so
+provisioned systemd-pcrlock NV index whose policy covers a firmware-measured
+PCR, 0 to 7 (Tier 2; after a firmware or Secure Boot update the admin re-runs
+`systemd-pcrlock make-policy` and the seal keeps working), else a literal
+`PolicyPCR` over PCR 7 (Tier 3; a Secure Boot change requires a re-arm). A
+pcrlock policy over OS-measured PCRs only binds less than PCR 7 and is passed
+over. The pcrlock policy is round-trip verified at seal time, so
 a policy that cannot unseal on the current boot is never trusted; the literal
 PCR-7 fallback binds to PCR values just read from the live TPM, so it unseals
 on the current boot by construction. Never store a recoverable face image;

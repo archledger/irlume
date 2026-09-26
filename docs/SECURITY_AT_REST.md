@@ -50,7 +50,8 @@ matching also requires passing IR liveness; an inverted RGB image can't.)
    random 32 bytes sealed by the TPM. The stored key envelope holds only the
    TPM `public`/`private` blobs; the `private` is wrapped under the TPM's
    Storage Root Key with a **PCR policy**: a provisioned systemd-pcrlock NV
-   policy (Tier 2) where one exists, else the literal **PCR-7** policy (Tier 3,
+   policy (Tier 2) where one exists and covers a firmware-measured PCR (0 to
+   7), else the literal **PCR-7** policy (Tier 3,
    the default on most machines). Note Tier 3 binds to the Secure Boot
    **state** (PCR 7), not the loaded kernel/initrd, so a validly-signed but
    modified kernel does not move it; Tier 2 is the one that binds

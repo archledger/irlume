@@ -135,5 +135,7 @@ where older pages break them.
   reads the next test's `IRLUME_SOCKET`.
 - Other env tests hold `crate::testenv::ENV_LOCK`. Black-box tests
   (`tests/cli.rs`: `Sandbox`, `serve`) run the binary directly under the
-  sandbox environment overrides; only `isolated_root_cmd`, for fixed-path root
-  probes, needs `/usr/bin/bwrap`, so the rest run on a host without it.
+  sandbox environment overrides; only those built on
+  `support::isolated_root_command` need `/usr/bin/bwrap`: `isolated_root_cmd`
+  for fixed-path root probes, and tests that bind fixture directories at fixed
+  paths such as `/etc/pam.d` (its `binds`). The rest run on a host without it.

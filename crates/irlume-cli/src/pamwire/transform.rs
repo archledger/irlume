@@ -60,10 +60,9 @@ pub(super) fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHan
     // with ONLY the `keyring` line, and a missing or mis-ordered wallet
     // module there went unreported: the wallet stayed locked after a
     // fingerprint login with nothing naming why.
-    let unseal_at = lines.iter().position(|l| {
-        let d = directive(l);
-        d.contains(MODULE) && (d.contains("unseal") || d.contains("keyring"))
-    })?;
+    let unseal_at = lines
+        .iter()
+        .position(|l| irlume_rule_has_arg(l, "unseal") || irlume_rule_has_arg(l, "keyring"))?;
     let consumer_in = |l: &str| consumer_active_for(l, service);
     // A given module's session line may sit anywhere in the session phase, so
     // that half is searched across the whole file; only the AUTH half is
@@ -252,10 +251,7 @@ pub(super) fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
     if has_line_continuation(content) {
         return (content.to_string(), false);
     }
-    if content.lines().any(|l| {
-        let d = directive(l);
-        d.contains(MODULE) && d.contains("keyring")
-    }) {
+    if content.lines().any(|l| irlume_rule_has_arg(l, "keyring")) {
         return (content.to_string(), false); // already wired
     }
     let lines: Vec<&str> = content.lines().collect();
@@ -319,11 +315,10 @@ pub(super) fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
     //
     // After `FP_GKR_SESSION` on purpose: that line may be what starts the
     // daemon (`auto_start`), and our helper needs something listening.
-    if !lines.iter().any(|l| {
-        let d = directive(l);
-        let phase = d.strip_prefix('-').unwrap_or(d);
-        phase.split_whitespace().next() == Some("session") && d.contains(MODULE)
-    }) {
+    if !lines
+        .iter()
+        .any(|l| irlume_rule(l).is_some_and(|r| r.phase == "session"))
+    {
         out.push(RESEAL_SESSION.to_string());
     }
     (format!("{}\n", out.join("\n")), true)
@@ -370,7 +365,9 @@ pub(super) fn wire_verify_service(content: &str) -> (String, bool) {
 /// current daemons cancel only via the wire's explicit-cancel arm). Migration of an
 /// older plain-`sufficient` install to the abort=die control is handled UPSTREAM by
 /// [`super::wire_service`], which strips every irlume line with [`unwire_lines`] and
-/// then calls this on the clean base, so this only ever INSERTS. There is
+/// then calls this on the clean base, so this only ever INSERTS (in an override
+/// with an administrator's lines above the anchor, `overrides.rs` then puts the
+/// new stanza in the old one's place instead of above those lines). There is
 /// deliberately no in-place upgrade branch: with the pre-strip it would be dead
 /// code (the base never carries an irlume line), and a `.position`-based rewrite
 /// would miss a second stray irlume line and leave a plain-`sufficient` control
@@ -399,6 +396,26 @@ pub(super) fn wire_polkit_service(content: &str) -> (String, bool) {
     (format!("{}\n", out.join("\n")), true)
 }
 
+/// Whether this stack line is one of irlume's: a rule whose module path is
+/// pam_irlume.so, the pam_permit landing irlume tagged, an inactive pam_permit
+/// line holding the place of one of irlume's lines ([`INERT_TAG`]), or a
+/// gnome-keyring line irlume tagged. Exactly the lines [`unwire_lines`]
+/// removes, and the lines an override's recorded digest leaves out.
+pub(super) fn is_irlume_line(l: &str) -> bool {
+    // Modules are matched on the module-path FIELD of the directive (what
+    // PAM loads), so a module named only in a comment or in another
+    // module's arguments (`pam_exec.so /usr/local/libexec/
+    // check-pam_irlume.so`) is never taken for irlume's. The tags are
+    // matched on the RAW line, because that is where they live; they are
+    // comments, invisible to PAM by design.
+    irlume_rule(l).is_some()
+        || (rule_names_module(l, "pam_permit.so")
+            && (l.contains("# irlume-landing") || l.contains(INERT_TAG)))
+        // Only the gnome-keyring lines WE tagged; a distro-shipped
+        // keyring line carries no tag and must survive unwiring.
+        || (rule_names_module(l, "pam_gnome_keyring.so") && l.contains(KEYRING_TAG))
+}
+
 /// Remove every irlume line AND the pam_permit landing we added (used only when
 /// no backup exists; the backup-restore path is preferred).
 pub(super) fn unwire_lines(content: &str) -> (String, bool) {
@@ -408,16 +425,7 @@ pub(super) fn unwire_lines(content: &str) -> (String, bool) {
     let kept: Vec<&str> = content
         .lines()
         .filter(|l| {
-            // The module is matched on the DIRECTIVE (what PAM tokenizes), so a
-            // module named only in a comment is never stripped. The tags are
-            // matched on the RAW line, because that is where they live; they
-            // are comments, invisible to PAM by design.
-            let d = directive(l);
-            let drop = d.contains(MODULE)
-                || (d.contains("pam_permit.so") && l.contains("# irlume-landing"))
-                // Only the gnome-keyring lines WE tagged; a distro-shipped
-                // keyring line carries no tag and must survive unwiring.
-                || (d.contains("pam_gnome_keyring.so") && l.contains(KEYRING_TAG));
+            let drop = is_irlume_line(l);
             if drop {
                 changed = true;
             }

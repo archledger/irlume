@@ -9,7 +9,9 @@ Documentation=https://github.com/archledger/irlume
 # Watch every PAM file irlume can wire (keep in sync with GREETERS +
 # FP_GREETERS + LOCKSCREEN + CINNAMON_LOCKSCREEN + OMARCHY_LOCKSCREEN in
 # pamwire.rs); any modification triggers a
-# reconcile, which is a no-op unless the wiring actually went missing.
+# reconcile, which is a no-op unless the wiring actually went missing. A vendor
+# file changing under /usr/lib/pam.d is not watched here: the timer finds it,
+# since package updates replace files by rename, which a watch misses anyway.
 PathModified=/etc/pam.d/gdm-password
 PathModified=/etc/pam.d/gdm-fingerprint
 PathModified=/etc/pam.d/sddm

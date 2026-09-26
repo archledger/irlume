@@ -8,15 +8,47 @@ use std::process::{Command, Stdio};
 /// deliberately ignores PATH cannot reach the host's privileged tools. Each
 /// directory in `hidden` that exists on the host is covered by an empty tmpfs,
 /// so a test can present a machine without what the host ships there (a PAM
-/// service, say).
+/// service, say). Each `(source, destination)` in `binds` puts a test's own
+/// directory at a fixed system path, writable, so the CLI works on fixture
+/// PAM files where it looks for the real ones.
 pub(crate) fn isolated_root_command(
     root: &Path,
     bin: &str,
     args: &[&str],
     tools: &[&str],
     hidden: &[&str],
+    binds: &[(&Path, &str)],
 ) -> Command {
-    namespace_command(root, bin, args, tools, hidden)
+    namespace_command(root, bin, args, tools, hidden, binds)
+}
+
+/// Bind `source` at `destination` inside the namespace.
+///
+/// A destination the host lacks (Debian and Ubuntu have no `/usr/lib/pam.d`)
+/// cannot become a mount point under the read-only root. Its parent is then
+/// covered by a tmpfs holding every host entry again, read-only, which gives
+/// the destination somewhere to be created without hiding anything else.
+fn bind_args(command: &mut Command, source: &Path, destination: &str) {
+    let dest = Path::new(destination);
+    if !dest.is_dir() {
+        let parent = dest.parent().expect("a destination below /");
+        let parent_str = parent.to_str().unwrap();
+        command.args(["--tmpfs", parent_str]);
+        for entry in std::fs::read_dir(parent).expect("read the destination's parent") {
+            let path = entry.expect("a directory entry").path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let path_str = path.to_str().unwrap();
+            if meta.file_type().is_symlink() {
+                let target = std::fs::read_link(&path).expect("read a symlink");
+                command.args(["--symlink", target.to_str().unwrap(), path_str]);
+            } else if meta.is_dir() || meta.is_file() {
+                command.args(["--ro-bind", path_str, path_str]);
+            }
+        }
+    }
+    command.args(["--bind", source.to_str().unwrap(), destination]);
 }
 
 fn namespace_command(
@@ -25,6 +57,7 @@ fn namespace_command(
     args: &[&str],
     tools: &[&str],
     hidden: &[&str],
+    binds: &[(&Path, &str)],
 ) -> Command {
     let shell = std::fs::canonicalize("/bin/sh").expect("resolve /bin/sh for sandbox");
     let usr_bin = std::fs::canonicalize("/usr/bin").expect("resolve /usr/bin for sandbox");
@@ -75,6 +108,9 @@ fn namespace_command(
                 command.args(["--tmpfs", canonical.to_str().unwrap()]);
             }
         }
+    }
+    for (source, destination) in binds {
+        bind_args(&mut command, source, destination);
     }
     for prefix in masked {
         command.args(["--tmpfs", prefix.to_str().unwrap()]);
@@ -157,7 +193,7 @@ done
         supplied,
         supplied,
     );
-    let output = namespace_command(root, "/usr/bin/sh", &["-c", &script], tools, &[])
+    let output = namespace_command(root, "/usr/bin/sh", &["-c", &script], tools, &[], &[])
         .output()
         .expect("spawn isolated command-path assertion");
     assert!(

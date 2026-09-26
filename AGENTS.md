@@ -45,7 +45,8 @@ The main TUI, camera, daemon and auth files run 16k to 25k lines: search, do not
   bubblewrap. Distro packages: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md); the
   base Ubuntu list is the `check` job's "Install system build dependencies"
   step in `ci.yml` (later steps add swtpm, ffmpeg and more).
-- The CLI's fixed-path root-probe tests and the daemon's shared-greeter
+- The CLI's fixed-path root-probe tests, its tests that bind fixture PAM
+  directories at system paths, and the daemon's shared-greeter
   runtime-directory test exec `/usr/bin/bwrap` (Ubuntu 24.04:
   `bash scripts/ci-bubblewrap.sh --check`); the CLI's other black-box tests
   do not. Without pamtester and pam_wrapper most PAM end-to-end tests pass

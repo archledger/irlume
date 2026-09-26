@@ -108,7 +108,7 @@ impl Sandbox {
     }
 
     fn isolated_root_cmd(&self, args: &[&str], tools: &[&str]) -> Command {
-        support::isolated_root_command(&self.root, BIN, args, tools, &self.hidden)
+        support::isolated_root_command(&self.root, BIN, args, tools, &self.hidden, &[])
     }
 }
 
@@ -2039,6 +2039,378 @@ fn login_changes_on_nixos_name_the_module_and_touch_nothing() {
         assert!(!out.contains("DRY RUN"), "{args:?} planned a change: {out}");
         assert!(!lock.exists(), "{args:?} took the PAM lock");
     }
+}
+
+/// `--force` rebuilds overrides an administrator edited, so only `login
+/// enable` takes it: the unattended reconcile and a status read refuse it
+/// with a usage error before anything is read or locked.
+#[test]
+fn login_force_is_refused_outside_enable() {
+    let sb = Sandbox::new("login-force-scope");
+    let lock = sb.path("pam.lock");
+    for args in [
+        &["login", "reconcile", "--force"][..],
+        &["login", "status", "--force"],
+        &["login", "--force"],
+    ] {
+        let (code, out, err) = run(sb.cmd(args).env("IRLUME_PAM_LOCK", &lock));
+        assert_eq!(code, 2, "{args:?}\n{out}\n{err}");
+        assert!(
+            err.contains("--force applies to login enable only"),
+            "{err}"
+        );
+        assert!(!lock.exists(), "{args:?} took the PAM lock");
+    }
+    // `disable` takes nothing from it: the flag is noted and the run goes on
+    // (a dry run here, which reads PAM files and writes nothing).
+    let (_, out, err) = run(sb
+        .cmd(&["login", "disable", "--force"])
+        .env("IRLUME_PAM_LOCK", &lock));
+    assert!(
+        err.contains("[login] note: --force applies to login enable only"),
+        "{out}\n{err}"
+    );
+    assert!(out.contains("DRY RUN"), "{out}\n{err}");
+    assert!(!lock.exists(), "a dry run takes no lock");
+}
+
+/// The harness can bind a fixture directory at a system path the host does
+/// not have (Debian and Ubuntu ship no `/usr/lib/pam.d`), without hiding the
+/// parent's other entries. Proved with a path no host has.
+#[test]
+fn the_namespace_binds_a_directory_the_host_lacks() {
+    let sb = Sandbox::new("bind-missing");
+    let fixture = sb.path("probe");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("marker"), "bound\n").unwrap();
+    let destination = "/usr/lib/irlume-test-bind-probe";
+    assert!(!std::path::Path::new(destination).exists());
+    let sibling = std::fs::read_dir("/usr/lib")
+        .unwrap()
+        .flatten()
+        .find(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .expect("a directory under /usr/lib")
+        .path();
+    let script = format!(
+        "read line < {destination}/marker && [ \"$line\" = bound ] && [ -d {} ] && \
+         echo ok > {destination}/written",
+        sibling.display()
+    );
+    let output = support::isolated_root_command(
+        &sb.root,
+        "/usr/bin/sh",
+        &["-c", &script],
+        &[],
+        &[],
+        &[(&fixture, destination)],
+    )
+    .output()
+    .expect("spawn the namespace");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.join("written")).unwrap(),
+        "ok\n",
+        "the bind is writable"
+    );
+}
+
+/// The lines of a PAM file that are irlume's, sorted: what reconcile's
+/// maintenance step must carry over when it rebuilds an override.
+fn irlume_lines(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter(|l| l.contains("pam_irlume.so") || l.contains("# irlume-landing"))
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// `login reconcile` as root keeps irlume's own overrides in step with their
+/// vendor files, and touches nothing else: a file an administrator edited
+/// stays byte for byte, one written by an older release that still matches
+/// its vendor copy only gains the tracking line, and one nobody edited is
+/// rebuilt when its vendor file changes. The intact check passes, so this
+/// needs no daemon and runs no re-apply.
+#[test]
+fn login_reconcile_rewrites_only_the_override_whose_vendor_copy_changed() {
+    let mut sb = Sandbox::new("reconcile-overrides");
+    // The host's display manager must not point the check at a greeter the
+    // fixture does not have.
+    sb.hidden.push("/etc/systemd/system");
+    let etc = sb.path("pam-etc");
+    let vendor = sb.path("pam-vendor");
+    std::fs::create_dir_all(&etc).unwrap();
+    std::fs::create_dir_all(&vendor).unwrap();
+    let header = |service: &str| {
+        format!(
+            "# irlume: created from /usr/lib/pam.d/{service}; delete this file to restore the \
+             vendor copy\n"
+        )
+    };
+
+    // plasmalogin: written by an older irlume, with a line an admin added.
+    let plasma_vendor = "auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so\n\
+auth        substack      password-auth\n\
+-auth        optional      pam_kwallet5.so\n\
+-auth        optional      pam_oo7.so\n\
+auth        include       postlogin\n\
+account     include       password-auth\n\
+session     include       password-auth\n\
+-session     optional      pam_kwallet5.so auto_start\n\
+-session     optional      pam_oo7.so auto_start\n";
+    let plasma = format!(
+        "{}auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so\n\
+auth       [success=2 default=ignore]   pam_fprintd.so max-tries=1 timeout=15   # local\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth        substack      password-auth\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+auth       optional                     pam_irlume.so keyring\n\
+auth       optional                     pam_irlume.so reseal\n\
+-auth        optional      pam_kwallet5.so\n\
+auth        include       postlogin\n\
+account     include       password-auth\n\
+session     include       password-auth\n\
+session    optional                     pam_irlume.so reseal\n\
+-session     optional      pam_kwallet5.so auto_start\n",
+        header("plasmalogin")
+    );
+
+    // polkit-1: written by an older irlume, still matching its vendor copy.
+    let polkit_vendor = "#%PAM-1.0\nauth       include      system-auth\naccount    include      system-auth\nsession    include      system-auth\n";
+    let polkit = format!(
+        "{}#%PAM-1.0\n\
+auth       [success=done new_authtok_reqd=done abort=die default=ignore]   pam_irlume.so\n\
+auth       include      system-auth\n\
+account    include      system-auth\n\
+session    include      system-auth\n",
+        header("polkit-1")
+    );
+
+    // sddm: the same, until its vendor file changes below.
+    let sddm_vendor = "#%PAM-1.0\nauth     substack       common-auth\naccount  include        common-account\nsession  include        common-session\n";
+    let sddm = format!(
+        "{}#%PAM-1.0\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth     substack       common-auth\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+auth       optional                     pam_irlume.so keyring\n\
+auth       optional                     pam_irlume.so reseal\n\
+account  include        common-account\n\
+session  include        common-session\n\
+session    optional                     pam_irlume.so reseal\n",
+        header("sddm")
+    );
+    for (dir, name, text) in [
+        (&vendor, "plasmalogin", plasma_vendor),
+        (&vendor, "polkit-1", polkit_vendor),
+        (&vendor, "sddm", sddm_vendor),
+        (&etc, "plasmalogin", plasma.as_str()),
+        (&etc, "polkit-1", polkit.as_str()),
+        (&etc, "sddm", sddm.as_str()),
+    ] {
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+    std::fs::write(
+        sb.path("state/login.wired"),
+        "with_sudo=false\nwith_polkit=true\nwith_lock=false\nface_lock_intent=false\n",
+    )
+    .unwrap();
+    let reconcile = |sb: &Sandbox| {
+        run(support::isolated_root_command(
+            &sb.root,
+            BIN,
+            &["login", "reconcile"],
+            &[],
+            &sb.hidden,
+            &[(&etc, "/etc/pam.d"), (&vendor, "/usr/lib/pam.d")],
+        )
+        .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
+        .env("IRLUME_PAM_LOCK", sb.path("pam.lock")))
+    };
+    let read = |name: &str| std::fs::read_to_string(etc.join(name)).unwrap();
+    let digest = |text: &str| {
+        use sha2::{Digest as _, Sha256};
+        Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let without_line_2 = |text: &str| {
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.remove(1);
+        format!("{}\n", lines.join("\n"))
+    };
+
+    // The first run records the two files that match their vendor copies.
+    let (code, out, err) = reconcile(&sb);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert_eq!(read("plasmalogin"), plasma, "the edited file is untouched");
+    for (name, old, vendor_text) in [
+        ("polkit-1", &polkit, polkit_vendor),
+        ("sddm", &sddm, sddm_vendor),
+    ] {
+        let now = read(name);
+        assert_eq!(without_line_2(&now), *old, "{name}: no PAM line changed");
+        assert!(
+            now.lines().nth(1).unwrap().starts_with(&format!(
+                "# irlume: override v1 vendor-sha256={} ",
+                digest(vendor_text)
+            )),
+            "{name}: {now}"
+        );
+        assert!(
+            err.contains(&format!(
+                "[login] /etc/pam.d/{name}: recorded /usr/lib/pam.d/{name} in the override \
+                 header; no PAM line changed"
+            )),
+            "{err}"
+        );
+    }
+    assert!(!err.contains("plasmalogin"), "{err}");
+    assert!(!err.contains("re-applying"), "no re-apply: {err}");
+
+    // sddm's vendor file changes; only sddm follows it.
+    let sddm_v2 = format!("{sddm_vendor}session  optional       pam_keyinit.so revoke\n");
+    std::fs::write(vendor.join("sddm"), &sddm_v2).unwrap();
+    let polkit_recorded = read("polkit-1");
+    let sddm_recorded = read("sddm");
+    let (code, out, err) = reconcile(&sb);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let sddm_now = read("sddm");
+    assert!(sddm_now.contains("pam_keyinit.so revoke"), "{sddm_now}");
+    assert_eq!(irlume_lines(&sddm_now), irlume_lines(&sddm_recorded));
+    assert!(
+        sddm_now.lines().nth(1).unwrap().starts_with(&format!(
+            "# irlume: override v1 vendor-sha256={} ",
+            digest(&sddm_v2)
+        )),
+        "{sddm_now}"
+    );
+    assert!(
+        err.contains(
+            "[login] /etc/pam.d/sddm: rebuilt from /usr/lib/pam.d/sddm, which changed since \
+             irlume created this override; irlume's lines keep their settings"
+        ),
+        "{err}"
+    );
+    assert_eq!(read("polkit-1"), polkit_recorded);
+    assert_eq!(read("plasmalogin"), plasma);
+
+    // Nothing is left to do.
+    let (code, out, err) = reconcile(&sb);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(!err.contains("[login] /etc/pam.d/"), "{err}");
+    assert_eq!(read("sddm"), sddm_now);
+    assert_eq!(read("polkit-1"), polkit_recorded);
+    assert_eq!(read("plasmalogin"), plasma);
+    assert_eq!(
+        std::fs::read_to_string(vendor.join("sddm")).unwrap(),
+        sddm_v2,
+        "vendor files are never written"
+    );
+}
+
+/// The auth line `n` modules after the first auth line containing `needle`:
+/// where a `default=n` on that line lands.
+fn auth_lands_after(text: &str, needle: &str, n: usize) -> String {
+    let chain: Vec<&str> = text
+        .lines()
+        .filter(|l| {
+            let first = l.split_whitespace().next().unwrap_or("");
+            first.trim_start_matches('-') == "auth"
+        })
+        .collect();
+    let at = chain
+        .iter()
+        .position(|l| l.contains(needle))
+        .expect("the jump line");
+    chain.get(at + n + 1).map_or("(end)", |l| l).to_string()
+}
+
+/// `login disable --apply` as root on an override with an administrator's
+/// failure jump above irlume's face line (`default=1` skips the face line and
+/// lands on the password stack). The run keeps inactive lines in irlume's
+/// places, so the jump still lands on the password stack.
+#[test]
+fn login_disable_keeps_a_failure_jump_on_the_password_stack() {
+    let mut sb = Sandbox::new("disable-fail-jump");
+    sb.hidden.push("/etc/systemd/system");
+    let etc = sb.path("pam-etc");
+    let vendor = sb.path("pam-vendor");
+    std::fs::create_dir_all(&etc).unwrap();
+    std::fs::create_dir_all(&vendor).unwrap();
+    let plasma_vendor = "auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so\n\
+auth        substack      password-auth\n\
+-auth        optional      pam_gnome_keyring.so\n\
+-auth        optional      pam_kwallet5.so\n\
+auth        include       postlogin\n\
+account     include       password-auth\n\
+session     include       password-auth\n\
+-session     optional      pam_kwallet5.so auto_start\n";
+    let fail_jump = "auth       [success=done default=1]   pam_fprintd.so max-tries=1   # local";
+    let plasma = format!(
+        "# irlume: created from /usr/lib/pam.d/plasmalogin; delete this file to restore the \
+         vendor copy\n\
+auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so\n\
+{fail_jump}\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth        substack      password-auth\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+auth       optional                     pam_irlume.so keyring\n\
+auth       optional                     pam_irlume.so reseal\n\
+-auth        optional      pam_gnome_keyring.so\n\
+-auth        optional      pam_kwallet5.so\n\
+auth        include       postlogin\n\
+account     include       password-auth\n\
+session     include       password-auth\n\
+session    optional                     pam_irlume.so reseal\n\
+-session     optional      pam_kwallet5.so auto_start\n"
+    );
+    std::fs::write(vendor.join("plasmalogin"), plasma_vendor).unwrap();
+    std::fs::write(etc.join("plasmalogin"), &plasma).unwrap();
+    let password = "auth        substack      password-auth";
+    assert_eq!(auth_lands_after(&plasma, "pam_fprintd.so", 1), password);
+    // On a Fedora host disable also removes the SELinux module; a semodule
+    // that lists nothing reports it not loaded.
+    sb.fake_tool("semodule", "exit 0");
+    let (code, out, err) = run(support::isolated_root_command(
+        &sb.root,
+        BIN,
+        &["login", "disable", "--apply"],
+        &["semodule"],
+        &sb.hidden,
+        &[(&etc, "/etc/pam.d"), (&vendor, "/usr/lib/pam.d")],
+    )
+    .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
+    .env("IRLUME_PAM_LOCK", sb.path("pam.lock")));
+    assert_eq!(code, 0, "{out}\n{err}");
+    let after = std::fs::read_to_string(etc.join("plasmalogin")).unwrap();
+    assert!(
+        !after
+            .lines()
+            .any(|l| l.split('#').next().unwrap().contains("pam_irlume.so")),
+        "no live irlume line: {after}"
+    );
+    assert!(after.contains(fail_jump), "{after}");
+    assert_eq!(
+        auth_lands_after(&after, "pam_fprintd.so", 1),
+        password,
+        "{after}"
+    );
+    assert!(
+        out.contains("/etc/pam.d/plasmalogin: turned irlume's lines into inactive"),
+        "{out}\n{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(vendor.join("plasmalogin")).unwrap(),
+        plasma_vendor,
+        "vendor files are never written"
+    );
 }
 
 /// A stand-in for the gnome-keyring that `pam_gnome_keyring auto_start`

@@ -68,16 +68,17 @@ fn wiring_mode(role: &str, content: &str) -> Option<&'static str> {
     if !content_has_module(content) {
         return None;
     }
-    if role == ROLE_SUDO
-        || role == ROLE_POLKIT
-        || (role == ROLE_LOCK && !content.contains("unseal"))
-    {
+    // Read from the arguments of irlume's own rules, so a comment or another
+    // module's line that happens to say `unseal` or `ondemand` names no mode.
+    let has = |arg: &str| content.lines().any(|l| irlume_rule_has_arg(l, arg));
+    let unseal = has("unseal");
+    if role == ROLE_SUDO || role == ROLE_POLKIT || (role == ROLE_LOCK && !unseal) {
         return Some("verify");
     }
-    if !content.contains("unseal") {
+    if !unseal {
         return Some("keyring");
     }
-    if content.contains("ondemand") {
+    if has("ondemand") {
         return Some("on-demand");
     }
     Some("face-first")
@@ -316,6 +317,12 @@ pub(super) fn status() -> ExitCode {
     ) {
         println!("{line}");
     }
+    // An irlume-created override that is out of step with its vendor copy, or
+    // kept with an administrator's lines: the same facts doctor's
+    // `login-overrides` check reports.
+    for line in override_notes(&override_reports()) {
+        println!("{line}");
+    }
     // A greeter can be correctly wired and still leave the wallet locked, so
     // this is reported next to the wiring rather than left to `doctor`: it is
     // the difference between "face logs me in" and "face logs me in AND my
@@ -333,6 +340,22 @@ pub(super) fn status() -> ExitCode {
         println!("{}", enable_hint(crate::nixos::host_is_nixos()));
     }
     ExitCode::SUCCESS
+}
+
+/// The `login status` lines for overrides that need attention, named by path
+/// like the rows above them. Pure, so the wording is pinned without a machine
+/// that has any.
+pub(super) fn override_notes(reports: &[OverrideReport]) -> Vec<String> {
+    reports
+        .iter()
+        .map(|r| {
+            let glyph = match r.level {
+                overrides::Level::Warn => "⚠",
+                _ => "·",
+            };
+            format!("  {glyph} {}: {}", r.path, r.note)
+        })
+        .collect()
 }
 
 /// The closing hint of `login status` when no login surface is wired. On
@@ -405,6 +428,47 @@ mod tests {
         assert_eq!(wiring_mode(ROLE_LOGIN_FP, keyring), Some("keyring"));
         // Nothing wired says nothing.
         assert_eq!(wiring_mode(ROLE_LOCK, "#%PAM-1.0\n"), None);
+    }
+
+    /// The mode is read from the arguments of irlume's own rules. Another
+    /// module's arguments or a comment naming pam_irlume.so, `unseal` or
+    /// `ondemand` neither makes a surface wired nor changes its mode.
+    #[test]
+    fn wiring_mode_reads_only_irlume_rules() {
+        let exec = "auth required pam_exec.so /usr/local/libexec/check-pam_irlume.so unseal\n";
+        assert_eq!(wiring_mode(ROLE_LOGIN, exec), None);
+        let keyring = format!(
+            "auth optional pam_irlume.so keyring\n{exec}# unseal ondemand once face is enrolled\n"
+        );
+        assert_eq!(wiring_mode(ROLE_LOGIN_FP, &keyring), Some("keyring"));
+        let facefirst = "auth [success=1 default=ignore] pam_irlume.so unseal facefirst\n\
+             auth optional pam_exec.so /usr/local/bin/log ondemand\n";
+        assert_eq!(wiring_mode(ROLE_LOGIN, facefirst), Some("face-first"));
+    }
+
+    #[test]
+    fn override_notes_name_the_file_and_mark_warnings() {
+        let notes = override_notes(&[
+            OverrideReport {
+                service: "plasmalogin",
+                path: "/etc/pam.d/plasmalogin",
+                level: overrides::Level::Warn,
+                note: "kept with lines irlume did not write".into(),
+            },
+            OverrideReport {
+                service: "polkit-1",
+                path: "/etc/pam.d/polkit-1",
+                level: overrides::Level::Info,
+                note: "matches its vendor copy".into(),
+            },
+        ]);
+        assert_eq!(
+            notes,
+            vec![
+                "  ⚠ /etc/pam.d/plasmalogin: kept with lines irlume did not write",
+                "  · /etc/pam.d/polkit-1: matches its vendor copy",
+            ]
+        );
     }
 
     #[test]

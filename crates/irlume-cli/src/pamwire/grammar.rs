@@ -10,8 +10,184 @@
 
 use super::stanzas::{KEYRING_CONSUMERS, MODULE};
 
+/// Whether any line of `c` is a rule that loads pam_irlume.so (see
+/// [`irlume_rule`]).
 pub(super) fn content_has_module(c: &str) -> bool {
-    c.lines().any(|l| directive(l).contains(MODULE))
+    c.lines().any(|l| irlume_rule(l).is_some())
+}
+
+/// A PAM rule line split into its fields the way libpam splits it:
+/// `[-]type control module-path module-arguments`, per pam.conf(5).
+pub(crate) struct Rule<'a> {
+    /// The type, read case-insensitively as libpam reads it and without its
+    /// leading `-`: `auth`, `account`, `password` or `session`.
+    pub(crate) phase: &'static str,
+    /// One word, or the inside of a bracketed group: `success=1
+    /// default=ignore` for `[success=1 default=ignore]`.
+    pub(crate) control: &'a str,
+    /// The module path as written: a bare name or a path.
+    pub(crate) module: &'a str,
+    pub(crate) args: Vec<&'a str>,
+}
+
+/// What separates the fields of a PAM line: libpam's `_pam_tokenize` splits
+/// on these three and nothing else.
+const FIELD_DELIMITERS: [char; 3] = [' ', '\t', '\n'];
+
+/// The next field of a directive, advancing `rest` past it, as libpam's
+/// `_pam_tokenize` reads it. A field that opens with `[` runs to the first
+/// `]` not written `\]`, spaces included, and comes back without its
+/// brackets, as libpam hands it on; the next field starts right after that
+/// `]`. One never closed runs to the end of the line. Any field can be
+/// bracketed this way, the type and the module path included.
+///
+/// libpam also turns each `\]` inside the brackets into `]`. The field is
+/// returned as written instead, which answers every question asked of it
+/// here the same way: a field holding `]` equals no type, control keyword,
+/// module file name or argument irlume looks for.
+fn next_field<'a>(rest: &mut &'a str) -> Option<&'a str> {
+    let s = rest.trim_start_matches(FIELD_DELIMITERS);
+    if s.is_empty() {
+        *rest = s;
+        return None;
+    }
+    if let Some(inner) = s.strip_prefix('[') {
+        let bytes = inner.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && bytes[i] != b']' {
+            if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b']') {
+                i += 1;
+            }
+            i += 1;
+        }
+        let i = i.min(inner.len());
+        *rest = inner.get(i + 1..).unwrap_or("");
+        return Some(&inner[..i]);
+    }
+    let end = s.find(FIELD_DELIMITERS).unwrap_or(s.len());
+    let (field, tail) = s.split_at(end);
+    *rest = tail;
+    Some(field)
+}
+
+/// The type and control of any line libpam reads as part of a stack, an
+/// `include` or `substack` line among them: what numeric jumps and the chain
+/// of a phase are counted from.
+pub(crate) struct Head<'a> {
+    /// As in [`Rule::phase`].
+    pub(crate) phase: &'static str,
+    /// As in [`Rule::control`].
+    pub(crate) control: &'a str,
+    /// Everything after the control.
+    rest: &'a str,
+}
+
+/// The type and control of a line, split as [`rule`] splits them, or `None`
+/// for a comment, a blank line, an `@include` or a line whose type is not one
+/// of the four. A bracketed type (`[auth]`) is read as libpam reads it.
+pub(crate) fn head(line: &str) -> Option<Head<'_>> {
+    let line = line.trim_start_matches([' ', '\t']);
+    let mut rest = &line[..line.find('#').unwrap_or(line.len())];
+    let kind = next_field(&mut rest)?;
+    let bare = kind.strip_prefix('-').unwrap_or(kind);
+    let phase = ["auth", "account", "password", "session"]
+        .into_iter()
+        .find(|p| p.eq_ignore_ascii_case(bare))?;
+    let control = next_field(&mut rest)?;
+    Some(Head {
+        phase,
+        control,
+        rest,
+    })
+}
+
+/// Whether this line is an `include` or `substack` line, whose third field
+/// names a stack rather than a module. libpam compares the control with its
+/// keywords after taking off any brackets, so `[include]` is one too.
+pub(crate) fn names_stack(h: &Head<'_>) -> bool {
+    h.control.eq_ignore_ascii_case("include") || h.control.eq_ignore_ascii_case("substack")
+}
+
+/// The `value=N` jumps of a control, as `(value, N)` with N above zero. libpam
+/// reads every control that is not one of its keywords as `value=action`
+/// pairs, bracketed (`[success=2 default=ignore]`) or not (`success=2`).
+pub(crate) fn numeric_actions(h: &Head<'_>) -> Vec<(String, usize)> {
+    const KEYWORDS: [&str; 6] = [
+        "required",
+        "requisite",
+        "sufficient",
+        "optional",
+        "include",
+        "substack",
+    ];
+    if KEYWORDS.iter().any(|k| h.control.eq_ignore_ascii_case(k)) {
+        return Vec::new();
+    }
+    h.control
+        .split(FIELD_DELIMITERS)
+        .filter_map(|kv| {
+            let (key, value) = kv.split_once('=')?;
+            let n: usize = value.parse().ok()?;
+            (n > 0).then(|| (key.to_string(), n))
+        })
+        .collect()
+}
+
+/// The fields of a rule line, or `None` for anything that loads no module: a
+/// comment, a blank line, an `@include`, an `include` or `substack` line
+/// (their third field names a stack, not a module), a line whose type is not
+/// one of the four, or one with no module path.
+///
+/// Only spaces and tabs are skipped before the type, as libpam skips them. A
+/// line that starts with any other blank (a vertical tab, a form feed, a
+/// no-break space) has a type libpam does not know, so it loads no module:
+/// PAM installs a rule that always fails in its place.
+pub(crate) fn rule(line: &str) -> Option<Rule<'_>> {
+    let h = head(line)?;
+    if names_stack(&h) {
+        return None;
+    }
+    let (phase, control, mut rest) = (h.phase, h.control, h.rest);
+    let module = next_field(&mut rest)?;
+    let mut args = Vec::new();
+    while let Some(arg) = next_field(&mut rest) {
+        args.push(arg);
+    }
+    Some(Rule {
+        phase,
+        control,
+        module,
+        args,
+    })
+}
+
+/// The file name of a module path: everything after its last `/`, so both
+/// `pam_irlume.so` and `/usr/lib64/security/pam_irlume.so` name
+/// `pam_irlume.so`.
+fn module_file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// True when this line is a rule whose module path names `module` by file
+/// name. A module named in an argument (`pam_exec.so /usr/local/libexec/
+/// check-pam_irlume.so`), in a comment or as part of a longer file name
+/// (`pam_irlume.so.disabled`) does not count: PAM loads none of those.
+pub(crate) fn rule_names_module(line: &str, module: &str) -> bool {
+    rule(line).is_some_and(|r| module_file_name(r.module) == module)
+}
+
+/// The fields of this line when it is a rule that loads pam_irlume.so, which
+/// is how irlume tells its own lines apart: by the module path, never by the
+/// name appearing somewhere in the line.
+pub(super) fn irlume_rule(line: &str) -> Option<Rule<'_>> {
+    rule(line).filter(|r| module_file_name(r.module) == MODULE)
+}
+
+/// Whether this line is a rule that loads pam_irlume.so with `arg` among its
+/// arguments (`unseal`, `keyring`, `reseal`), matched whole as the module
+/// matches them.
+pub(super) fn irlume_rule_has_arg(line: &str, arg: &str) -> bool {
+    irlume_rule(line).is_some_and(|r| r.args.contains(&arg))
 }
 
 /// An `auth`-phase line whose password path is an `include` a `success=N` jump
@@ -213,42 +389,12 @@ pub(crate) fn has_line_continuation(content: &str) -> bool {
 /// authentication, and the `--fingerprint-only` gate then stood face down on
 /// a box where no fingerprint rule answers any prompt.
 pub(crate) fn auth_module(line: &str) -> Option<&str> {
-    let mut toks = directive(line).split_whitespace();
-    let kind = toks.next()?;
-    if !kind
-        .strip_prefix('-')
-        .unwrap_or(kind)
-        .eq_ignore_ascii_case("auth")
-    {
-        return None;
-    }
-    let control = toks.next()?;
-    if control.eq_ignore_ascii_case("include") || control.eq_ignore_ascii_case("substack") {
-        return None;
-    }
-    if control.starts_with('[') && !control.ends_with(']') {
-        let mut closed = false;
-        for token in toks.by_ref() {
-            if token.ends_with(']') {
-                closed = true;
-                break;
-            }
-        }
-        if !closed {
-            return None;
-        }
-    }
-    toks.next()
+    rule(line).filter(|r| r.phase == "auth").map(|r| r.module)
 }
 
 /// True when this line is an auth rule whose module-path names `module` (by
 /// file name, so `/usr/lib64/security/pam_fprintd.so` matches
 /// `pam_fprintd.so` and `pam_fprintd.so.disabled` does not).
 pub(crate) fn directive_has_auth_module(line: &str, module: &str) -> bool {
-    auth_module(line).is_some_and(|path| {
-        std::path::Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            == Some(module)
-    })
+    auth_module(line).is_some_and(|path| module_file_name(path) == module)
 }

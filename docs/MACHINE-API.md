@@ -256,6 +256,7 @@ reused for a different meaning. The registry as of this contract:
 | `polkit-helper-sandbox` | whether the polkit helper's sandbox permits what irlume needs |
 | `ir-calibration` | whether this account's IR enrollment carries the per-user liveness floor |
 | `login-wiring` | whether face auth is wired into the login stack |
+| `login-overrides` | whether the `/etc/pam.d` copies irlume made of vendor PAM files are in step with them. `warn` names a copy with CRLF line endings (PAM does not read it), a copy with lines irlume did not write whose vendor copy changed since irlume wrote it (or that predates vendor tracking and differs from its vendor copy, including one that only lacks lines its vendor copy has), or one that predates vendor tracking, lacks irlume's lines and has a numeric jump that may have counted them; `info` names one waiting for the next reconcile, one whose vendor copy changed but that reconcile does not rebuild (and why), one whose vendor copy is gone (it is then the service's only configuration), one without irlume's lines that keeps lines irlume did not write, or one where inactive lines hold the places of irlume's lines after a disable; `pass` with none. The detail is one `<service>: <note>` per copy, joined with ` \| ` (no note contains that), and names services and commands, never paths or PAM lines |
 | `display-manager` | whether the active display manager is one irlume can target |
 | `pam-regeneration-guard` | whether a distro PAM regeneration would strip the wiring unnoticed |
 | `install-hygiene` | leftover backups, and hand-installed builds overlaying packaged ones |
@@ -670,19 +671,52 @@ service" rather than "not wired here". Surfaces are named by PAM service, never
 by path, in keeping with the no-paths rule.
 
 `change` is one of `wire`, `materialize-override`, `restore-backup`,
-`remove-override`, `strip-in-place`, `already-correct`, `not-installed`,
-`no-anchor`, `not-wired`. `writes` on a change says whether applying it would
-touch disk, and the top-level `writes` counts them, so "nothing to do" is a fact
-the engine states rather than one a consumer infers from outcome names it may
-not recognise.
+`remove-override`, `rewire-override`, `keep-edited-override`,
+`strip-in-place`, `already-correct`, `not-installed`, `no-anchor`,
+`not-wired`. `writes` on a change says whether applying it would touch disk,
+and the top-level `writes` counts them, so "nothing to do" is a fact the engine
+states rather than one a consumer infers from outcome names it may not
+recognise.
+
+The override changes concern a service a distribution ships only under
+`/usr/lib/pam.d`, for which irlume keeps its own copy in `/etc/pam.d`.
+`materialize-override` creates that copy from the vendor file, rebuilds one
+nobody edited (after a vendor change, or when irlume's lines change), or adds
+the tracking header line to a copy an earlier release wrote that still matches
+its vendor file (no PAM line changes; it still writes). `rewire-override`
+updates irlume's lines in a copy and keeps every other line: one with lines
+irlume did not write, or one whose vendor file is gone. irlume's lines keep
+their side of every line an administrator added. `keep-edited-override` writes
+nothing: the copy has lines irlume did not write and its vendor file changed
+since irlume created it (or it predates vendor tracking and differs), or
+updating irlume's lines would move where one of its numeric jumps lands or
+move one of irlume's lines past an administrator's line. A copy nobody edited
+is not rebuilt either when irlume's lines would make a numeric jump in its new
+vendor file land somewhere other than it does there (a jump the update added,
+or one whose landing it changed); it reports `already-correct`, since its
+irlume lines are right for the vendor text it was built from, and `doctor`'s
+`login-overrides` check carries the pending update. A copy with lines irlume
+did not write and none of irlume's gets them next to its password line, below
+every line above it; when irlume cannot tell which line that is (another line
+has the same text and there is no vendor file to compare with, or every
+candidate is a line an administrator added), it reports `no-anchor` and writes
+nothing. `remove-override` deletes a copy nobody edited; a disable turns one
+with other lines into `strip-in-place` and keeps the file. When a numeric jump
+in those lines counts irlume's lines, `strip-in-place` replaces them with
+inactive `pam_permit.so` lines in the same places rather than removing them,
+so the jump lands where it did; it does the same when irlume could not tell
+where to put its lines back without them. The API never rebuilds an edited
+copy: that takes the human `login enable --force`.
 
 `plan_id` is a digest of the action and the exact per-surface outcomes it was
 computed against. Two plans over an unchanged machine share an id; any change to
-what would happen produces a different one. It exists so that a later apply can
-refuse a plan that no longer matches the machine rather than silently doing
-something the consumer never displayed. It is an identifier, not a security
-boundary: apply will re-derive the plan from the machine rather than trusting
-anything the id encodes.
+what would happen produces a different one. For a surface with a vendor path it
+covers the vendor file too, whether or not an override exists yet, so a vendor
+update between `plan` and `apply` makes the plan stale. It exists so that a
+later apply can refuse a plan that no longer matches the machine rather than
+silently doing something the consumer never displayed. It is an identifier,
+not a security boundary: apply will re-derive the plan from the machine rather
+than trusting anything the id encodes.
 
 Sudo and polkit are opt-in on the human command and are not included in a plan,
 so a panel never shows a user surfaces they did not ask for. Disabling still
@@ -716,7 +750,9 @@ stays empty, and a caller recovering from a half-changed login stack needs the
 id from the same place it reads everything else.
 
 **verify** answers whether the machine is still as that transaction left it,
-per surface: `as-applied`, `changed-since-apply`, or `unreadable`. It also
+per surface: `as-applied`, `changed-since-apply`, or `unreadable`. An override
+the transaction created whose vendor file has gone since reads
+`changed-since-apply` (see below). It also
 states `rollback_available`, so a consumer does not have to infer it from
 per-surface states it may not recognise. Read-only.
 
@@ -725,7 +761,10 @@ surface is still exactly as apply left it**. Restoring a file something else has
 edited since would revert a change the transaction never made, so drift stops
 the whole rollback rather than skipping the drifted surface: a half-rolled-back
 login stack is its own hazard. Every surface is checked before any is written.
-Without `--apply` it reports what it would restore and touches nothing.
+A file that already holds the content recorded for it, such as a surface apply
+refused or left alone, is not written again, so its mode, owner and links stay
+as they are. Without `--apply` it reports what it would restore and touches
+nothing.
 
 Transaction records live under the state directory, `0600` in a `0700`
 directory. They contain the pre-change content of each file, which is not secret
@@ -743,13 +782,28 @@ names a file irlume does not manage, so rollback refuses to touch it),
 `operation-failed`.
 
 A surface's `.pre-irlume` backup is part of the surface. The plan id covers it,
-so a backup that changes between `plan` and `apply` makes the plan stale: wiring
-rebuilds from the backup when one exists, so the content an apply produces
-depends on it, and a consumer would otherwise be shown one outcome while the
-machine got another. Rollback checks it too and refuses the whole record if it
-is not as apply left it. That matters more than it sounds: a later `login
-enable` rebuilds the live stack FROM the backup, so a wrong one reaches PAM at
-the next enable rather than sitting inert.
+so a backup that changes between `plan` and `apply` makes the plan stale: the
+backup decides what a disable does (restore it, or strip irlume's lines in
+place), so a consumer would otherwise be shown one outcome while the machine got
+another. The vendor file decides an override's outcome the same way and is
+covered the same way; apply compares each surface's files with the plan
+immediately before writing it and refuses one whose `/etc` file, backup or
+vendor file changed (`<file> or its vendor copy changed between the plan and
+the write`). Rollback checks the backup too and refuses the whole record if it
+is not as apply left it. A backup apply created is removed by the rollback.
+
+Rollback also refuses (`changed-since-apply`) a record that would delete an
+override apply created when that override's vendor file has gone since: the
+file is then the service's only PAM configuration, and deleting it would leave
+the service on the denying `other` stack.
+
+The reconcile unit keeps irlume's overrides in step with their vendor files
+between transactions: it adds the tracking line to one written by an older
+release, and rebuilds one nobody edited when its vendor file changes. Such a
+write makes an earlier transaction that touched that file read as changed
+since apply, which blocks its rollback. Rolling back a rebuild of an override
+nobody edited is undone again at the next timer run, since the vendor file is
+still newer than the copy.
 
 A rollback that stops partway records which surfaces it put back, durably, as it
 goes. Re-running it resumes: those surfaces are skipped rather than re-checked,

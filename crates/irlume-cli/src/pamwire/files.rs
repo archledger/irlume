@@ -12,11 +12,21 @@
 
 use super::grammar::*;
 use super::stanzas::*;
-use super::{lock_surface_for, Svc, FP_GREETERS, GREETERS, POLKIT, SUDO};
+use super::{lock_surface_for, vendor_gone_service, Svc, FP_GREETERS, GREETERS, POLKIT, SUDO};
 use std::path::{Path, PathBuf};
 
 pub(super) fn read(p: &str) -> Result<String, String> {
     std::fs::read_to_string(p).map_err(|e| format!("read {p}: {e}"))
+}
+
+/// A file's text, or `None` when it does not exist. Any other failure is an
+/// error: a file that cannot be read is not an absent one.
+pub(super) fn read_optional(p: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(p) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read {}: {e}", p.display())),
+    }
 }
 
 pub(super) fn file_has_module(p: &Path) -> bool {
@@ -37,22 +47,39 @@ pub(super) fn file_is_created_override(p: &Path) -> bool {
 /// others would let a plan id stay stable across a state it could not actually
 /// observe.
 pub(crate) fn surface_state(path: &Path) -> String {
-    // The backup as well as the live file. Wiring rebuilds from `.pre-irlume`
-    // when one exists, so the content an apply produces depends on it: a backup
-    // that changed between the plan and the apply changes the outcome while the
-    // live file, and therefore the plan id, stayed identical. The consumer would
-    // be shown one result and the machine would get another.
+    // The backup as well as the live file. The backup decides what a disable
+    // does (restore it, or strip in place), so a backup that changed between
+    // the plan and the apply changes the outcome while the live file, and
+    // therefore the plan id, stayed identical. The consumer would be shown one
+    // result and the machine would get another.
     let bak = PathBuf::from(format!("{}{BACKUP}", path.display()));
     format!("{} {}", surface_digest(path), surface_digest(&bak))
+}
+
+/// [`surface_state`] plus, for a service with a vendor path, the vendor file's
+/// digest. The vendor file decides what happens to an override (and whether
+/// one is created at all), so a vendor update between `plan` and `apply` is a
+/// change to the machine the plan did not show. Covered for every surface with
+/// a vendor path, override or not: when `/etc` is absent the vendor file alone
+/// decides, and a uniform rule cannot miss a switch between the two.
+pub(super) fn surface_state_for(svc: &Svc) -> String {
+    let state = surface_state(Path::new(svc.etc));
+    match svc.vendor {
+        Some(vendor) => format!("{state} {}", surface_digest(Path::new(vendor))),
+        None => state,
+    }
 }
 
 pub(crate) fn surface_digest(path: &Path) -> String {
     match crate::logintx::file_sha256(path) {
         Ok(Some(digest)) => digest,
         Ok(None) => crate::logintx::ABSENT.to_string(),
-        Err(_) => "unreadable".to_string(),
+        Err(_) => UNREADABLE.to_string(),
     }
 }
+
+/// What [`surface_digest`] says about a file that exists but cannot be read.
+pub(crate) const UNREADABLE: &str = "unreadable";
 
 /// Whether irlume manages this path at all.
 ///
@@ -96,7 +123,8 @@ pub(crate) fn is_managed_path_for(omarchy: bool, cinnamon: bool, path: &str) -> 
 ///
 /// Reuses the same atomic write the wiring path uses, so a restore lands the
 /// way every other PAM write here does. The caller must have checked
-/// `unchanged_since_apply` first; this does the write, not the decision.
+/// `unchanged_since_apply` first; this does the write, not the decision. A
+/// file that already holds the recorded content is not written at all.
 ///
 /// `None` content means the file did not exist before, so it is removed rather
 /// than written empty: an empty PAM file is not the same as an absent one, and
@@ -105,8 +133,45 @@ pub(crate) fn restore_surface(
     path: &Path,
     before: Option<&str>,
     metadata: Option<(u32, u32, u32)>,
+    after: Option<&str>,
 ) -> Result<(), String> {
+    restore_surface_with(path, before, metadata, after, &vendor_gone_service)
+}
+
+/// [`restore_surface`] with the test for "this path's vendor copy is gone"
+/// (see [`super::vendor_gone_service`]) given, so a test can name surfaces
+/// under a temporary root.
+///
+/// `after` is the digest the transaction recorded for the file it left (or
+/// `ABSENT`): the file is replaced or removed only while it is still that
+/// file, checked in the same step as the change. The rollback checked it
+/// before starting, but a package or an editor can replace the file in
+/// between. `None`, for a record written before a backup's digest was kept,
+/// changes whatever is there.
+pub(crate) fn restore_surface_with(
+    path: &Path,
+    before: Option<&str>,
+    metadata: Option<(u32, u32, u32)>,
+    after: Option<&str>,
+    vendor_gone: &dyn Fn(&Path) -> bool,
+) -> Result<(), String> {
+    let changed = || {
+        format!(
+            "{} changed since the transaction; not touched",
+            path.display()
+        )
+    };
     match before {
+        // A file that already holds the recorded bytes is left as it is, read
+        // through the path as the digest a rollback checks is. That is every
+        // surface the transaction did not write: one it refused (a symlink,
+        // or one of several names for a file) and one it left alone because
+        // it changed after the plan. Writing it anyway replaced the file with
+        // a new one: on a link that is the replacement irlume refuses, so the
+        // rollback stopped there and never reached the surfaces after it, and
+        // on a regular file it put the recorded mode back over one set since
+        // and dropped anything else attached to the old inode.
+        Some(content) if std::fs::read(path).is_ok_and(|now| now == content.as_bytes()) => Ok(()),
         Some(content) => {
             // The recorded mode and owner go on before the rename, not after.
             // Applying them afterwards published a PAM stack that was briefly
@@ -117,14 +182,13 @@ pub(crate) fn restore_surface(
             // `None` keeps the old behaviour for records written before those
             // fields existed: the replacing file inherits the current one's
             // attributes rather than a guess.
-            let attrs = metadata.or_else(|| {
-                std::fs::symlink_metadata(path).ok().as_ref().map(|m| {
-                    use std::os::unix::fs::MetadataExt as _;
-                    use std::os::unix::fs::PermissionsExt as _;
-                    (m.permissions().mode() & 0o7777, m.uid(), m.gid())
-                })
-            });
-            write_atomic_inner(path, content, attrs)
+            let attrs = metadata.map_or(Attrs::Carried, Attrs::Given);
+            let expect = match after {
+                None => Expect::Any,
+                Some(crate::logintx::ABSENT) => Expect::Absent,
+                Some(digest) => Expect::Digest(digest),
+            };
+            write_atomic_inner(path, content, attrs, expect, &|| Ok(())).map_err(String::from)
         }
         None => {
             // The same refusal the replacing branch gets. Removing was a direct
@@ -132,17 +196,47 @@ pub(crate) fn restore_surface(
             // a symlink was unlinked despite the claim that every write path
             // refuses one, and a multiply-linked file lost a name irlume cannot
             // put back.
-            inspect_target(path)?;
-            match std::fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => return Err(format!("remove {}: {error}", path.display())),
+            if inspect_target(path)?.is_none() {
+                return Ok(());
             }
-            // A deletion is a directory change like any other. Without this the
-            // unlink could be lost to a power cut while the durable progress
-            // note said the surface was done, so a resume would skip a file that
-            // is still there.
-            fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+            // A file apply created from a vendor copy that has since gone is
+            // now the service's only configuration; removing it would leave PAM
+            // with nothing for the service but the denying `other` stack.
+            let orphaned = || {
+                format!(
+                    "{} is now its service's only PAM configuration (the vendor copy it was \
+                     made from is gone); not removed",
+                    path.display()
+                )
+            };
+            if vendor_gone(path) {
+                return Err(orphaned());
+            }
+            // Removed as a disable removes an override: the file checked is
+            // the file removed, and the vendor copy is checked again once the
+            // file is out of the way, since a package can remove it at any
+            // moment and the PAM lock does not stop it. A vendor copy gone by
+            // then puts the file back. The removal is made durable (the
+            // directory is synced), so a resume never skips a file that a power
+            // cut brought back.
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(format!("read {}: {error}", path.display())),
+            };
+            // The bytes removed are the file the transaction left, not
+            // whatever replaced it since the rollback's own check.
+            if after.is_some_and(|want| crate::logintx::sha256_hex(&bytes) != want) {
+                return Err(changed());
+            }
+            let still = || {
+                if vendor_gone(path) {
+                    Err(orphaned())
+                } else {
+                    Ok(())
+                }
+            };
+            remove_checked_if(path, Some(&bytes), &still).map_err(String::from)
         }
     }
 }
@@ -232,10 +326,29 @@ pub(super) fn sweep_abandoned_scratch() {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.starts_with('.') && name.contains(".irlume-") && name.ends_with(".tmp") {
+        if is_abandoned_scratch(name) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// Whether [`sweep_abandoned_scratch`] removes a file of this name: exactly
+/// a name [`scratch_path`] makes, `.{service}.irlume-{kind}.{pid}.{seq}.tmp`
+/// with a kind from [`SCRATCH_KINDS`]. A name that only looks like one, such
+/// as `.sudo.irlume-review.tmp`, is somebody else's file and stays.
+pub(super) fn is_abandoned_scratch(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.').and_then(|r| r.strip_suffix(".tmp")) else {
+        return false;
+    };
+    let mut fields = rest.rsplitn(3, '.');
+    let (Some(seq), Some(pid), Some(head)) = (fields.next(), fields.next(), fields.next()) else {
+        return false;
+    };
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let service = SCRATCH_KINDS
+        .iter()
+        .find_map(|kind| head.strip_suffix(&format!(".irlume-{kind}")));
+    number(seq) && number(pid) && service.is_some_and(|s| !s.is_empty())
 }
 
 // ---- file ops ----------------------------------------------------------------
@@ -249,6 +362,36 @@ pub(super) fn service_present(s: &Svc) -> Option<PathBuf> {
         .map(|_| PathBuf::from(s.etc))
 }
 
+/// Test-only: the paths a hook below acts on, each once. A set rather than
+/// one slot, so tests running on parallel threads, each arming a hook for
+/// its own path, do not disarm each other's.
+#[cfg(test)]
+pub(super) type TestHook = std::sync::Mutex<Vec<PathBuf>>;
+
+/// Test-only: make `hook` act once on `path`.
+#[cfg(test)]
+pub(super) fn arm(hook: &TestHook, path: &Path) {
+    hook.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(path.to_path_buf());
+}
+
+/// Test-only: take `path` off `hook` if it has not acted.
+#[cfg(test)]
+pub(super) fn disarm(hook: &TestHook, path: &Path) {
+    hook.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|armed| armed != path);
+}
+
+/// Test-only: whether `hook` is armed for `path`, disarming it.
+#[cfg(test)]
+fn fires(hook: &TestHook, path: &Path) -> bool {
+    let mut armed = hook.lock().unwrap_or_else(|e| e.into_inner());
+    let at = armed.iter().position(|armed| armed == path);
+    at.map(|at| armed.remove(at)).is_some()
+}
+
 /// Test-only: replace a target during the window between the first look and the
 /// rename, so the recheck has something to catch.
 ///
@@ -258,11 +401,9 @@ pub(super) fn service_present(s: &Svc) -> Option<PathBuf> {
 /// left every test green.
 #[cfg(test)]
 pub(super) fn swap_target_for_test(path: &Path) {
-    let mut armed = SWAP_DURING_WRITE.lock().unwrap_or_else(|e| e.into_inner());
-    if armed.as_deref() != Some(path) {
+    if !fires(&SWAP_DURING_WRITE, path) {
         return;
     }
-    *armed = None;
     // A different inode under the same name: what an administrator, a package
     // or another writer does in that window.
     //
@@ -276,8 +417,153 @@ pub(super) fn swap_target_for_test(path: &Path) {
 }
 
 #[cfg(test)]
-pub(super) static SWAP_DURING_WRITE: std::sync::Mutex<Option<PathBuf>> =
-    std::sync::Mutex::new(None);
+pub(super) static SWAP_DURING_WRITE: TestHook = TestHook::new(Vec::new());
+
+/// Test-only: rewrite a target IN PLACE (same file, new bytes) in the window
+/// between [`remove_checked_if`]'s check and its removal, as an editor that
+/// saves in place does.
+#[cfg(test)]
+pub(super) fn edit_target_for_test(path: &Path) {
+    if !fires(&EDIT_DURING_REMOVE, path) {
+        return;
+    }
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, b"EDITED IN PLACE\n"));
+}
+
+#[cfg(test)]
+pub(super) static EDIT_DURING_REMOVE: TestHook = TestHook::new(Vec::new());
+
+/// Test-only: create a new file at a target [`remove_checked_if`] has just
+/// renamed aside, as a writer arriving in that moment would.
+#[cfg(test)]
+pub(super) fn occupy_target_for_test(path: &Path) {
+    if !fires(&OCCUPY_AFTER_ASIDE, path) {
+        return;
+    }
+    let _ = std::fs::write(path, "A NEWER FILE\n");
+}
+
+#[cfg(test)]
+pub(super) static OCCUPY_AFTER_ASIDE: TestHook = TestHook::new(Vec::new());
+
+/// Test-only: delete a vendor file at the moment a removal's last check
+/// reads it, as a package removing it in that window would.
+#[cfg(test)]
+pub(super) fn remove_vendor_for_test(vendor: &Path) {
+    if fires(&VENDOR_GONE_DURING_REMOVE, vendor) {
+        let _ = std::fs::remove_file(vendor);
+    }
+}
+
+#[cfg(test)]
+pub(super) static VENDOR_GONE_DURING_REMOVE: TestHook = TestHook::new(Vec::new());
+
+/// Test-only: replace a vendor file at the moment a write's last check reads
+/// it, as a package updating it in that window would.
+#[cfg(test)]
+pub(super) fn change_vendor_for_test(vendor: &Path) {
+    if fires(&VENDOR_CHANGES_DURING_WRITE, vendor) {
+        let _ = std::fs::write(vendor, "auth       include      system-auth   # newer\n");
+    }
+}
+
+#[cfg(test)]
+pub(super) static VENDOR_CHANGES_DURING_WRITE: TestHook = TestHook::new(Vec::new());
+
+/// Test-only: another writer's file arrives at a write's target after the
+/// write's last check and before its file is installed: renamed over an
+/// existing target, or created where there was none.
+#[cfg(test)]
+pub(super) fn interlope_for_test(path: &Path) {
+    if !fires(&INTERLOPE_BEFORE_INSTALL, path) {
+        return;
+    }
+    let replacement = path.with_extension("irlume-interloper");
+    let _ = std::fs::write(&replacement, "SOMEONE ELSE'S FILE\n");
+    let _ = std::fs::rename(&replacement, path);
+}
+
+#[cfg(test)]
+pub(super) static INTERLOPE_BEFORE_INSTALL: TestHook = TestHook::new(Vec::new());
+
+/// Test-only: a second writer replaces the path after a write swapped its
+/// file in and found a first writer's file in its way, before the write
+/// swaps that one back.
+#[cfg(test)]
+fn second_interloper_for_test(path: &Path) {
+    if fires(&SECOND_INTERLOPER, path) {
+        let replacement = path.with_extension("irlume-second");
+        let _ = std::fs::write(&replacement, "A NEWER FILE\n");
+        let _ = std::fs::rename(&replacement, path);
+    }
+}
+
+#[cfg(test)]
+pub(super) static SECOND_INTERLOPER: TestHook = TestHook::new(Vec::new());
+
+/// Test-only: another writer's backup appears after [`backup`] found none,
+/// before its link publishes irlume's.
+#[cfg(test)]
+fn backup_appears_for_test(bak: &Path) {
+    if fires(&BACKUP_APPEARS, bak) {
+        let _ = std::fs::write(bak, "SOMEONE ELSE'S BACKUP\n");
+    }
+}
+
+#[cfg(test)]
+pub(super) static BACKUP_APPEARS: TestHook = TestHook::new(Vec::new());
+
+/// Test-only: the mode of a target changes (same file, same bytes) after a
+/// write's last check and before its file is installed, as a `chmod` by an
+/// administrator or a package would.
+#[cfg(test)]
+fn chmod_for_test(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    if fires(&CHMOD_BEFORE_INSTALL, path) {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+#[cfg(test)]
+pub(super) static CHMOD_BEFORE_INSTALL: TestHook = TestHook::new(Vec::new());
+
+/// Test-only: renames to or from these paths behave as on a filesystem
+/// without `RENAME_NOREPLACE` and `RENAME_EXCHANGE` (EINVAL). Stays armed
+/// until disarmed.
+#[cfg(test)]
+pub(super) static NO_RENAME_FLAGS: TestHook = TestHook::new(Vec::new());
+
+#[cfg(test)]
+fn armed(hook: &TestHook, path: &Path) -> bool {
+    hook.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|armed| armed == path)
+}
+
+/// Test-only: fail the directory sync that follows the rename or unlink of
+/// this path, as an I/O error there would, so a failure after the change is
+/// reachable.
+#[cfg(test)]
+pub(super) static FAIL_SYNC_AFTER_CHANGE: TestHook = TestHook::new(Vec::new());
+
+/// Make the change to `path` durable. A failure here comes after the change,
+/// so it is reported as one that landed.
+fn sync_after_change(path: &Path) -> Result<(), WriteError> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    #[cfg(test)]
+    if fires(&FAIL_SYNC_AFTER_CHANGE, path) {
+        return Err(WriteError::landed(format!(
+            "fsync {}: failed for the test",
+            dir.display()
+        )));
+    }
+    fsync_dir(dir).map_err(WriteError::landed)
+}
 
 /// What a PAM path is, for deciding whether irlume may replace it.
 ///
@@ -312,6 +598,12 @@ pub(super) type TargetState = Option<(u64, u64)>;
 /// external writer this narrows the window rather than closing it.
 pub(super) fn inspect_target(path: &Path) -> Result<TargetState, String> {
     use std::os::unix::fs::MetadataExt as _;
+    Ok(target_metadata(path)?.map(|meta| (meta.dev(), meta.ino())))
+}
+
+/// [`inspect_target`], returning the metadata it read.
+fn target_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, String> {
+    use std::os::unix::fs::MetadataExt as _;
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -337,7 +629,7 @@ pub(super) fn inspect_target(path: &Path) -> Result<TargetState, String> {
             meta.nlink()
         ));
     }
-    Ok(Some((meta.dev(), meta.ino())))
+    Ok(Some(meta))
 }
 
 /// A scratch path in the same directory as `path`, unique to this call.
@@ -350,6 +642,7 @@ pub(super) fn inspect_target(path: &Path) -> Result<TargetState, String> {
 /// paths apart, and a unique name means a leftover from a killed run is never
 /// adopted either.
 pub(super) fn scratch_path(path: &Path, kind: &str) -> PathBuf {
+    debug_assert!(SCRATCH_KINDS.contains(&kind), "{kind}");
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -359,6 +652,11 @@ pub(super) fn scratch_path(path: &Path, kind: &str) -> PathBuf {
         std::process::id()
     ))
 }
+
+/// The kinds of scratch file [`scratch_path`] makes: `new` for a write, `bak`
+/// for a backup. The sweep of abandoned scratch files matches these and no
+/// other.
+const SCRATCH_KINDS: [&str; 2] = ["new", "bak"];
 
 /// Create the scratch file, never adopting one that is already there.
 pub(super) fn create_scratch(tmp: &Path) -> Result<std::fs::File, String> {
@@ -386,11 +684,52 @@ pub(super) fn fsync_dir(dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("fsync {}: {e}", dir.display()))
 }
 
+/// The `.pre-irlume` files this process published, each by path and identity
+/// (see [`published_here`]).
+static PUBLISHED: std::sync::Mutex<Vec<(PathBuf, (u64, u64))>> = std::sync::Mutex::new(Vec::new());
+
+/// Note that `identity` is the file this process linked at `bak`.
+fn note_published(bak: &Path, identity: (u64, u64)) {
+    PUBLISHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((bak.to_path_buf(), identity));
+}
+
+/// Whether the file at `bak` is one [`backup`] or [`keep_copy`] linked there
+/// in this process.
+///
+/// A transaction records a backup that was absent when it looked and is
+/// there after its write as one it created, and a rollback then deletes it.
+/// That is right only for irlume's own: another writer can put a file there
+/// in between, and the publishing link then fails with `EEXIST`, which
+/// [`backup`] takes as a complete backup already in place. The identity has
+/// the limit [`inspect_target`] describes.
+pub(super) fn published_here(bak: &Path) -> bool {
+    let Ok(Some(identity)) = inspect_target(bak) else {
+        return false;
+    };
+    PUBLISHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(path, published)| path == bak && *published == identity)
+}
+
+/// The identity of an open scratch file, to note once it is published.
+fn identity_of(file: &std::fs::File, tmp: &Path) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", tmp.display()))?;
+    Ok((meta.dev(), meta.ino()))
+}
+
 /// Copy `path` to its `.pre-irlume` backup, atomically, if there is not one yet.
 ///
 /// The copy used to go straight to the final name. A kill or an ENOSPC part way
-/// through left a TRUNCATED file at `.pre-irlume`, and the next enable treats an
-/// existing backup as the pristine origin to rebuild from, so a half-copied
+/// through left a TRUNCATED file at `.pre-irlume`, and the next enable then
+/// treated an existing backup as the pristine origin to rebuild from, so a half-copied
 /// stack became the authority for what the machine's PAM should contain. A
 /// backup that only ever appears complete cannot be believed part way.
 ///
@@ -404,7 +743,7 @@ pub(super) fn backup(path: &Path) -> Result<(), String> {
     // The backup is held to the same standard as the stack it came from, and it
     // was not. `exists()` follows a symlink, so a `.pre-irlume` pointing
     // somewhere else was accepted and then used as the pristine origin a later
-    // enable rebuilds from. A DANGLING one was worse: `exists()` said no, and the
+    // enable rebuilt from. A DANGLING one was worse: `exists()` said no, and the
     // publishing link then failed with EEXIST against the symlink's own name,
     // which read as "a backup is already there" when there was none at all.
     // A complete backup already there is left alone; it must not be replaced
@@ -419,18 +758,69 @@ pub(super) fn backup(path: &Path) -> Result<(), String> {
     let written = (|| -> Result<(), String> {
         use std::io::Write as _;
         let mut file = create_scratch(&tmp)?;
+        let ours = identity_of(&file, &tmp)?;
         file.write_all(&contents)
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
         apply_metadata(&tmp, &meta)?;
         // Before the link, so the name never points at bytes that are not there.
         file.sync_all()
             .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        #[cfg(test)]
+        backup_appears_for_test(&bak);
         // Fails with EEXIST if another run got there first, which is the answer
         // wanted: that backup is complete and this one is redundant.
         match std::fs::hard_link(&tmp, &bak) {
-            Ok(()) => {}
+            Ok(()) => note_published(&bak, ours),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
             Err(e) => return Err(format!("backup {}: {e}", path.display())),
+        }
+        fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    written
+}
+
+/// Keep the current file as `<path>.pre-irlume` before `login enable --force`
+/// rebuilds it, so the lines it drops are still on disk.
+///
+/// Published like [`backup`], through a scratch file and a hard link that
+/// refuses to replace anything. Unlike `backup`, an existing copy is accepted
+/// only when it holds exactly these bytes: a different one (a stale backup
+/// from in-place wiring, left by a distribution upgrade) would otherwise be
+/// kept while the caller reported the new copy.
+pub(super) fn keep_copy(path: &Path) -> Result<(), String> {
+    let bak = PathBuf::from(format!("{}{BACKUP}", path.display()));
+    let contents = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let same_as_existing = || -> Result<(), String> {
+        let existing = std::fs::read(&bak).map_err(|e| format!("read {}: {e}", bak.display()))?;
+        if existing == contents {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} already holds a different file; move it away and run again",
+                bak.display()
+            ))
+        }
+    };
+    if inspect_target(&bak)?.is_some() {
+        return same_as_existing();
+    }
+    let meta =
+        std::fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    let tmp = scratch_path(path, "bak");
+    let written = (|| -> Result<(), String> {
+        use std::io::Write as _;
+        let mut file = create_scratch(&tmp)?;
+        let ours = identity_of(&file, &tmp)?;
+        file.write_all(&contents)
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        apply_metadata(&tmp, &meta)?;
+        file.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        match std::fs::hard_link(&tmp, &bak) {
+            Ok(()) => note_published(&bak, ours),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return same_as_existing(),
+            Err(e) => return Err(format!("keep {}: {e}", bak.display())),
         }
         fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
     })();
@@ -448,9 +838,320 @@ pub(super) fn apply_metadata(path: &Path, meta: &std::fs::Metadata) -> Result<()
         .map_err(|e| format!("chown {}: {e}", path.display()))
 }
 
-pub(super) fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
-    let existing = std::fs::symlink_metadata(path).ok();
-    write_atomic_inner(path, contents, existing.as_ref().map(mode_uid_gid))
+/// A PAM write or removal that did not complete.
+#[derive(Debug)]
+pub(super) struct WriteError {
+    pub(super) message: String,
+    /// The file had already been replaced or removed when this failed: only
+    /// making that durable was left, so the change is irlume's. Otherwise
+    /// irlume changed nothing at the path, and what is there is the file it
+    /// found, or one another writer put there meanwhile, which a refusal
+    /// keeps.
+    pub(super) landed: bool,
+}
+
+impl WriteError {
+    /// A failure after the file at the path was replaced or removed.
+    fn landed(message: String) -> Self {
+        Self {
+            message,
+            landed: true,
+        }
+    }
+}
+
+impl From<String> for WriteError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            landed: false,
+        }
+    }
+}
+
+impl From<WriteError> for String {
+    fn from(error: WriteError) -> Self {
+        error.message
+    }
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+pub(super) fn write_atomic(path: &Path, contents: &str) -> Result<(), WriteError> {
+    write_atomic_inner(path, contents, Attrs::Carried, Expect::Any, &|| Ok(()))
+}
+
+/// Test-only: [`write_atomic_checked_if`] with no further condition.
+#[cfg(test)]
+pub(super) fn write_atomic_checked(
+    path: &Path,
+    contents: &str,
+    expected: Option<&str>,
+) -> Result<(), WriteError> {
+    write_atomic_checked_if(path, contents, expected, &|| Ok(()))
+}
+
+/// [`write_atomic`], refusing when the file no longer holds `expected` at the
+/// moment of the rename. The identity check alone misses an editor that saves
+/// in place (same inode), and a write decided on the old bytes would then
+/// replace the new ones.
+///
+/// `None` expects no file: the caller read none and decided to create one.
+/// A file that is there by the time of the first look here, or that appears
+/// before the rename, is another writer's (a package's, an administrator's)
+/// and is kept; the write is refused. Taking it as the file to replace would
+/// swap irlume's file in over a stack nobody decided on.
+///
+/// `still` is asked last, once irlume's file is in place and before the file
+/// it replaced is removed: a refusal puts that file back (or removes the one
+/// created) and is returned, not landed. It lets an override made from a
+/// vendor copy go in only while that copy is still the one it was made from:
+/// a package that replaced or removed it meanwhile would otherwise find a
+/// file made from its old copy shadowing its new one.
+pub(super) fn write_atomic_checked_if(
+    path: &Path,
+    contents: &str,
+    expected: Option<&str>,
+    still: &dyn Fn() -> Result<(), String>,
+) -> Result<(), WriteError> {
+    let expect = expected.map_or(Expect::Absent, |bytes| Expect::Bytes(bytes.as_bytes()));
+    write_atomic_inner(path, contents, Attrs::Carried, expect, still)
+}
+
+/// Test-only: [`remove_checked_if`] with no further condition.
+#[cfg(test)]
+pub(super) fn remove_checked(path: &Path, expected: Option<&str>) -> Result<(), WriteError> {
+    remove_checked_if(path, expected.map(str::as_bytes), &|| Ok(()))
+}
+
+/// Delete `path` only while it holds exactly `expected`, with the checks every
+/// write here makes: never through a symlink or one of several names. A
+/// package manager or an editor that replaced the file after irlume read it
+/// keeps its file, and an editor that saved in place keeps its save when the
+/// save lands before the second check below.
+///
+/// The check and the removal act on one file. Checking the bytes at the path
+/// and then unlinking the path are two moments, and the PAM lock does not
+/// exclude other writers: a file renamed over the path between them was
+/// deleted unseen. So the file is opened and checked through that open file,
+/// then renamed to a private name in the same directory, and only that name
+/// is unlinked, once it is known to be the same file still holding the same
+/// bytes. A file that replaced it meanwhile is moved back, never over a newer
+/// one, and the removal is refused.
+///
+/// What this cannot see: a writer that already had the file open when it was
+/// renamed aside, and writes to it after the second check, writes into the
+/// removed file. No removal built on unlinking a name can see that write; the
+/// window is the one between the second check and the unlink.
+///
+/// `None` expects the file to be absent: nothing is removed, and a file that
+/// appeared is left alone.
+///
+/// `still` is asked last, once the file is out of the way and checked again,
+/// right before the removal; a refusal from it puts the file back and is
+/// returned. It lets an override be deleted only while the vendor copy it
+/// hands the service back to is still there: a package that removed that copy
+/// meanwhile would otherwise leave the service with no configuration at all.
+pub(super) fn remove_checked_if(
+    path: &Path,
+    expected: Option<&[u8]>,
+    still: &dyn Fn() -> Result<(), String>,
+) -> Result<(), WriteError> {
+    use std::io::{Read as _, Seek as _};
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let changed = || {
+        format!(
+            "{} changed while irlume was reading it; not touched",
+            path.display()
+        )
+    };
+    // The refusals every write makes, with their own reasons.
+    let Some(identity) = inspect_target(path)? else {
+        return expected.map_or(Ok(()), |_| Err(changed().into()));
+    };
+    let Some(expected) = expected else {
+        return Err(changed().into());
+    };
+    // No symlink is followed from here on: a path that became one since
+    // fails to open.
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(changed().into()),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(changed().into()),
+        Err(e) => return Err(format!("open {}: {e}", path.display()).into()),
+    };
+    let holds_expected = |file: &mut std::fs::File| -> Result<bool, String> {
+        let meta = file
+            .metadata()
+            .map_err(|e| format!("stat {}: {e}", path.display()))?;
+        let mut bytes = Vec::new();
+        file.rewind()
+            .and_then(|()| file.read_to_end(&mut bytes))
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        Ok(meta.file_type().is_file()
+            && meta.nlink() == 1
+            && (meta.dev(), meta.ino()) == identity
+            && bytes == expected)
+    };
+    if !holds_expected(&mut file)? {
+        return Err(changed().into());
+    }
+    #[cfg(test)]
+    swap_target_for_test(path);
+    #[cfg(test)]
+    edit_target_for_test(path);
+    let aside = move_aside(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => changed(),
+        _ => format!("rename {} aside: {e}", path.display()),
+    })?;
+    #[cfg(test)]
+    occupy_target_for_test(path);
+    // What was renamed is whatever held the name at that instant. Only the
+    // file checked above, still holding the checked bytes, is removed: a
+    // file renamed over the path since the check, or this one edited in
+    // place before this second look, goes back where it was.
+    let same_file =
+        std::fs::symlink_metadata(&aside).is_ok_and(|meta| (meta.dev(), meta.ino()) == identity);
+    let verdict = if same_file {
+        holds_expected(&mut file).and_then(|holds| {
+            if holds {
+                still().map(|()| true)
+            } else {
+                Ok(false)
+            }
+        })
+    } else {
+        Ok(false)
+    };
+    if verdict != Ok(true) {
+        let why = verdict.err().unwrap_or_else(changed);
+        return match put_back(&aside, path) {
+            Ok(()) => Err(why.into()),
+            Err(e) => Err(format!(
+                "{} changed while irlume was removing it, and could not be put back ({e}); \
+                 the file that was there is at {}",
+                path.display(),
+                aside.display()
+            )
+            .into()),
+        };
+    }
+    // The checked file no longer has its name from here on, so a failure
+    // now is one after the change.
+    std::fs::remove_file(&aside)
+        .map_err(|e| WriteError::landed(format!("rm {}: {e}", aside.display())))?;
+    sync_after_change(path)
+}
+
+/// Rename `path` to a private name in its directory, hidden, unique to this
+/// call and never an existing file's, and return that name. Not a scratch
+/// name: the sweep of abandoned scratch files must never delete a file that
+/// [`remove_checked_if`] could not put back.
+fn move_aside(path: &Path) -> std::io::Result<PathBuf> {
+    move_aside_as(path, path, "removing")
+}
+
+/// Rename `from` to a private name in the directory of `named_for`,
+/// `.{name}.irlume-{kind}.{pid}.{seq}`, never an existing file's, and return
+/// that name. `kind` is never a scratch kind, so the sweep of abandoned
+/// scratch files never takes the file.
+fn move_aside_as(from: &Path, named_for: &Path, kind: &str) -> std::io::Result<PathBuf> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    debug_assert!(!SCRATCH_KINDS.contains(&kind), "{kind}");
+    let dir = named_for.parent().unwrap_or_else(|| Path::new("."));
+    let fname = named_for
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("pam");
+    let mut attempts = 0;
+    loop {
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let aside = dir.join(format!(
+            ".{fname}.irlume-{kind}.{}.{seq}",
+            std::process::id()
+        ));
+        let moved = match renameat2_noreplace(from, &aside) {
+            // No RENAME_NOREPLACE on this filesystem. The name is this call's
+            // own, so a plain rename replaces nothing unless a file left by an
+            // earlier run has it, which is checked first.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) => {
+                match std::fs::symlink_metadata(&aside) {
+                    Ok(_) => Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
+                    Err(_) => std::fs::rename(from, &aside),
+                }
+            }
+            other => other,
+        };
+        match moved {
+            Ok(()) => return Ok(aside),
+            // A leftover from an earlier run with the same process id.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 8 => {
+                attempts += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Rename `aside` back to `path`, failing rather than replacing a file that
+/// took the name meanwhile. Without `RENAME_NOREPLACE` a hard link gives the
+/// same refusal.
+fn put_back(aside: &Path, path: &Path) -> std::io::Result<()> {
+    match renameat2_noreplace(aside, path) {
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) => {
+            std::fs::hard_link(aside, path)?;
+            std::fs::remove_file(aside)
+        }
+        other => other,
+    }
+}
+
+/// `renameat2(2)` with `RENAME_NOREPLACE`: `EEXIST` when `to` exists.
+fn renameat2_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    renameat2(from, to, libc::RENAME_NOREPLACE)
+}
+
+/// Swap the two names in one step: each then refers to the file the other
+/// did.
+fn renameat2_exchange(from: &Path, to: &Path) -> std::io::Result<()> {
+    renameat2(from, to, libc::RENAME_EXCHANGE)
+}
+
+fn renameat2(from: &Path, to: &Path, flags: libc::c_uint) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    #[cfg(test)]
+    if armed(&NO_RENAME_FLAGS, to) || armed(&NO_RENAME_FLAGS, from) {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let c = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    };
+    let (from_c, to_c) = (c(from)?, c(to)?);
+    // SAFETY: both pointers come from CStrings that live until the call
+    // returns, and AT_FDCWD resolves them as rename(2) would.
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from_c.as_ptr(),
+            libc::AT_FDCWD,
+            to_c.as_ptr(),
+            flags,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 pub(super) fn mode_uid_gid(meta: &std::fs::Metadata) -> (u32, u32, u32) {
@@ -458,7 +1159,47 @@ pub(super) fn mode_uid_gid(meta: &std::fs::Metadata) -> (u32, u32, u32) {
     (meta.mode() & 0o7777, meta.uid(), meta.gid())
 }
 
-/// Replace `path` with `contents`, durably, carrying the given mode and owner.
+/// What a write requires of the file it replaces, checked at its first look
+/// and again as the file is swapped in.
+#[derive(Clone, Copy)]
+enum Expect<'a> {
+    /// Whatever is there, or nothing.
+    Any,
+    /// Nothing: the write creates the file.
+    Absent,
+    /// A file holding exactly these bytes.
+    Bytes(&'a [u8]),
+    /// A file whose bytes have this SHA-256 (hex).
+    Digest(&'a str),
+}
+
+impl Expect<'_> {
+    /// Whether a file with these bytes (`None`: unreadable or absent) is
+    /// what a checked write requires.
+    fn held_by(self, bytes: Option<&[u8]>) -> bool {
+        match self {
+            Expect::Bytes(want) => bytes == Some(want),
+            Expect::Digest(want) => bytes.is_some_and(|b| crate::logintx::sha256_hex(b) == want),
+            Expect::Any | Expect::Absent => true,
+        }
+    }
+}
+
+/// Where a written file's mode and owner come from.
+#[derive(Clone, Copy)]
+enum Attrs {
+    /// The file it replaces, read in the same look that identifies that file
+    /// and required again of the file the swap takes out, so a `chmod` or
+    /// `chown` made in between is never reverted. A new file gets the
+    /// defaults.
+    Carried,
+    /// These, whatever the file has now: a rollback puts back recorded ones.
+    Given((u32, u32, u32)),
+}
+
+/// Replace `path` with `contents`, durably, with the mode and owner `attrs`
+/// names, only while the file there is what `expect` requires, and only when
+/// `still` agrees once the new file is in place (see [`install`]).
 ///
 /// Attributes are set on the scratch file BEFORE the rename, so the name never
 /// resolves to a PAM file with the wrong mode or owner. Setting them afterwards
@@ -469,24 +1210,46 @@ pub(super) fn mode_uid_gid(meta: &std::fs::Metadata) -> (u32, u32, u32) {
 /// them a successful `close` says nothing about what survives a power loss, and
 /// a PAM stack that comes back as a mixture of two versions is the failure this
 /// whole module exists to avoid.
-pub(super) fn write_atomic_inner(
+fn write_atomic_inner(
     path: &Path,
     contents: &str,
-    attrs: Option<(u32, u32, u32)>,
-) -> Result<(), String> {
+    attrs: Attrs,
+    expect: Expect<'_>,
+    still: &dyn Fn() -> Result<(), String>,
+) -> Result<(), WriteError> {
     use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
-    let dir = path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     // What the target is right now. A rename REPLACES whatever the name refers
     // to, so this has to be settled before anything is written, and confirmed
     // again before the name is taken over.
-    let before = inspect_target(path)?;
+    let found = target_metadata(path)?;
+    let before: TargetState = found.as_ref().map(|meta| (meta.dev(), meta.ino()));
+    if matches!(expect, Expect::Absent) && before.is_some() {
+        return Err(changed_while_writing(path).into());
+    }
+    let expected = match expect {
+        Expect::Bytes(_) | Expect::Digest(_) => Some(expect),
+        Expect::Any | Expect::Absent => None,
+    };
+    // The attributes the new file gets, and those the file it replaces must
+    // still have when it is swapped out (carried ones only).
+    let (attrs, carried) = match attrs {
+        Attrs::Carried => {
+            let found = found.as_ref().map(mode_uid_gid);
+            (found, found)
+        }
+        Attrs::Given(given) => (Some(given), None),
+    };
     let tmp = scratch_path(path, "new");
-    let result = (|| -> Result<(), String> {
+    // The scratch file's identity, so cleanup removes that name only while it
+    // still refers to this file and never to one swapped out of the path.
+    let mut ours: Option<(u64, u64)> = None;
+    let result = (|| -> Result<(), WriteError> {
         let mut file = create_scratch(&tmp)?;
+        let meta = file
+            .metadata()
+            .map_err(|e| format!("stat {}: {e}", tmp.display()))?;
+        ours = Some((meta.dev(), meta.ino()));
         file.write_all(contents.as_bytes())
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
         if let Some((mode, uid, gid)) = attrs {
@@ -506,19 +1269,218 @@ pub(super) fn write_atomic_inner(
         // Immediately before the name is taken over, not once at the start. The
         // first look and the rename are two moments, and what matters is what
         // the name refers to at the instant it is replaced.
-        if inspect_target(path)? != before {
-            return Err(format!(
-                "{} changed while irlume was writing it, so it was left alone",
-                path.display()
-            ));
+        if inspect_target(path)? != before
+            || expected.is_some_and(|want| !want.held_by(std::fs::read(path).ok().as_deref()))
+            || carried.is_some_and(|want| {
+                std::fs::symlink_metadata(path)
+                    .ok()
+                    .map(|meta| mode_uid_gid(&meta))
+                    != Some(want)
+            })
+        {
+            return Err(changed_while_writing(path).into());
         }
-        std::fs::rename(&tmp, path).map_err(|e| format!("rename into {}: {e}", path.display()))?;
-        fsync_dir(&dir)
+        #[cfg(test)]
+        interlope_for_test(path);
+        #[cfg(test)]
+        chmod_for_test(path);
+        install(&tmp, path, before, expected, carried, ours, still)?;
+        sync_after_change(path)
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let still_ours = std::fs::symlink_metadata(&tmp).is_ok_and(|m| {
+            use std::os::unix::fs::MetadataExt as _;
+            Some((m.dev(), m.ino())) == ours
+        });
+        if still_ours {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
     result
+}
+
+fn changed_while_writing(path: &Path) -> String {
+    format!(
+        "{} changed while irlume was writing it, so it was left alone",
+        path.display()
+    )
+}
+
+/// Put the finished scratch file `tmp` at `path`, as one step with the check
+/// that decided it, so a file another writer put there after that check is
+/// never replaced. The PAM lock does not exclude package managers or editors.
+///
+/// - `before` absent (a creation): the name is taken only while nothing has
+///   it (`RENAME_NOREPLACE`, or a hard link where the filesystem lacks it).
+/// - `before` a file (a replacement): the two names are exchanged in one
+///   step, and the file that comes out of the path must be the one checked
+///   (same inode, one link, `expected`'s bytes and the `carried` mode and
+///   owner when given). Any other is exchanged back and the write is refused.
+///
+/// On a filesystem without `RENAME_EXCHANGE` a replacement falls back to a
+/// plain rename right after the check, as irlume wrote before; the window
+/// between the two remains there.
+fn install(
+    tmp: &Path,
+    path: &Path,
+    before: TargetState,
+    expected: Option<Expect<'_>>,
+    carried: Option<(u32, u32, u32)>,
+    ours: Option<(u64, u64)>,
+    still: &dyn Fn() -> Result<(), String>,
+) -> Result<(), WriteError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let unsupported =
+        |e: &std::io::Error| matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS));
+    let Some(identity) = before else {
+        match renameat2_noreplace(tmp, path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(changed_while_writing(path).into());
+            }
+            Err(e) if unsupported(&e) => match std::fs::hard_link(tmp, path) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(tmp);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(changed_while_writing(path).into());
+                }
+                Err(e) => return Err(format!("link into {}: {e}", path.display()).into()),
+            },
+            Err(e) => return Err(format!("rename into {}: {e}", path.display()).into()),
+        }
+        // Asked with irlume's file in place, so nothing the condition depends
+        // on can change between the answer and the file appearing. A refusal
+        // takes the new file away again.
+        return match still() {
+            Ok(()) => Ok(()),
+            Err(why) => {
+                take_back_created(path, ours)?;
+                Err(why.into())
+            }
+        };
+    };
+    match renameat2_exchange(tmp, path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(changed_while_writing(path).into());
+        }
+        // A checked replacement is one step with its check or not made at
+        // all: a plain rename after the check replaces whatever another
+        // writer put there in between. A write that expects nothing in
+        // particular falls back to one, as irlume wrote before.
+        Err(e) if unsupported(&e) && expected.is_some() => {
+            return Err(format!(
+                "{} is on a filesystem that cannot swap two files in one step \
+                 (RENAME_EXCHANGE), so irlume cannot replace it without the chance of \
+                 overwriting a change made at the same moment; not changed",
+                path.display()
+            )
+            .into());
+        }
+        Err(e) if unsupported(&e) => {
+            return std::fs::rename(tmp, path)
+                .map_err(|e| format!("rename into {}: {e}", path.display()).into());
+        }
+        Err(e) => return Err(format!("rename into {}: {e}", path.display()).into()),
+    }
+    // `tmp` now names what the path held at the instant of the exchange.
+    let replaced_the_checked_file = std::fs::symlink_metadata(tmp).is_ok_and(|m| {
+        m.file_type().is_file()
+            && m.nlink() == 1
+            && (m.dev(), m.ino()) == identity
+            && carried.is_none_or(|want| mode_uid_gid(&m) == want)
+    }) && expected
+        .is_none_or(|want| want.held_by(std::fs::read(tmp).ok().as_deref()));
+    if !replaced_the_checked_file {
+        // Another writer's file came out: give it its name back.
+        swap_back(tmp, path, ours)?;
+        return Err(changed_while_writing(path).into());
+    }
+    // Asked with irlume's file in place, as for a creation. A refusal puts
+    // the checked file, the same inode with its mode and owner, back.
+    if let Err(why) = still() {
+        swap_back(tmp, path, ours)?;
+        return Err(why.into());
+    }
+    std::fs::remove_file(tmp).map_err(|e| WriteError::landed(format!("rm {}: {e}", tmp.display())))
+}
+
+/// Exchange the file at `tmp` (the one irlume's replaced, or another
+/// writer's) back into `path` for irlume's own, which the caller's cleanup
+/// then removes from `tmp`. `Ok` when that is what happened.
+///
+/// A second writer can replace irlume's file at `path` before this exchange.
+/// It then puts the older file back and takes out the second writer's, the
+/// newer, which goes back once more; the file that comes out is kept under a
+/// private name, not left under the scratch name, which the sweep of
+/// abandoned scratch files deletes.
+fn swap_back(tmp: &Path, path: &Path, ours: Option<(u64, u64)>) -> Result<(), WriteError> {
+    use std::os::unix::fs::MetadataExt as _;
+    #[cfg(test)]
+    second_interloper_for_test(path);
+    if let Err(e) = renameat2_exchange(tmp, path) {
+        return Err(WriteError::landed(format!(
+            "{} changed while irlume was writing it, and the file that was there could not \
+             be put back ({e}); it is at {}",
+            path.display(),
+            kept_aside(tmp, path).display()
+        )));
+    }
+    let came_out = std::fs::symlink_metadata(tmp).ok();
+    if came_out.is_none_or(|m| Some((m.dev(), m.ino())) == ours) {
+        let _ = fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")));
+        return Ok(());
+    }
+    let _ = renameat2_exchange(tmp, path);
+    Err(format!(
+        "{} changed twice while irlume was writing it, so it was left alone; a file another \
+         writer put there meanwhile is at {}",
+        path.display(),
+        kept_aside(tmp, path).display()
+    )
+    .into())
+}
+
+/// Remove the file irlume has just created at `path`, only while it is
+/// irlume's (`ours`): it is moved aside and identified first, and a file
+/// another writer put there instead goes back.
+fn take_back_created(path: &Path, ours: Option<(u64, u64)>) -> Result<(), WriteError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let aside = match move_aside(path) {
+        Ok(aside) => aside,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(WriteError::landed(format!(
+                "rename {} aside to take it back: {e}",
+                path.display()
+            )))
+        }
+    };
+    if std::fs::symlink_metadata(&aside).is_ok_and(|m| Some((m.dev(), m.ino())) == ours) {
+        std::fs::remove_file(&aside)
+            .map_err(|e| WriteError::landed(format!("rm {}: {e}", aside.display())))?;
+        let _ = fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")));
+        return Ok(());
+    }
+    match put_back(&aside, path) {
+        Ok(()) => Err(changed_while_writing(path).into()),
+        Err(e) => Err(format!(
+            "{} changed while irlume was writing it, and could not be put back ({e}); the file \
+             that was there is at {}",
+            path.display(),
+            aside.display()
+        )
+        .into()),
+    }
+}
+
+/// Another writer's file, found under the scratch name `tmp` after a write
+/// was refused, moved to a private name next to `path` that the sweep of
+/// abandoned scratch files never takes. Where it is now: that name, or `tmp`
+/// if it could not be moved.
+fn kept_aside(tmp: &Path, path: &Path) -> PathBuf {
+    move_aside_as(tmp, path, "kept").unwrap_or_else(|_| tmp.to_path_buf())
 }
 
 // ---- SELinux (Fedora) --------------------------------------------------------

@@ -13,7 +13,8 @@ Documentation=https://github.com/archledger/irlume
 # Config regenerators commonly replace files by rename, which is exactly the
 # case the self-heal exists for, so the wiring must not depend on the watcher
 # noticing. This runs the same reconcile on a schedule; it is a no-op unless the
-# wiring actually went missing, and it self-gates on the login.wired marker, so
+# wiring actually went missing or a vendor PAM file behind one of irlume's
+# /etc/pam.d overrides changed, and it self-gates on the login.wired marker, so
 # it stays idle on a box that never ran `irlume login enable`.
 OnBootSec=3min
 OnUnitActiveSec=30min

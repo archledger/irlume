@@ -788,10 +788,11 @@ pub(crate) fn removal_orphans_in(surfaces: &[(&str, &str)], path: &Path) -> bool
         && removal_orphans_for(path.exists(), !vendor_gone_in(surfaces, path))
 }
 
-/// Whether `path` is a surface's `/etc` copy whose vendor file is gone (or
-/// cannot be seen), whatever is at `path` now. The removal a rollback makes
-/// asks this again once the file it removes is out of the way, where
-/// [`removal_orphans_service`], which needs the file there, says no.
+/// Whether `path` is a surface's `/etc` copy whose vendor file is gone, or is
+/// not one PAM can use (see [`vendor_usable`]), whatever is at `path` now.
+/// The removal a rollback makes asks this again once the file it removes is
+/// out of the way, where [`removal_orphans_service`], which needs the file
+/// there, says no.
 pub(crate) fn vendor_gone_service(path: &Path) -> bool {
     vendor_gone_in(&override_pairs(), path)
 }
@@ -801,7 +802,18 @@ pub(crate) fn vendor_gone_in(surfaces: &[(&str, &str)], path: &Path) -> bool {
     surfaces
         .iter()
         .find(|(etc, _)| Path::new(etc) == path)
-        .is_some_and(|(_, vendor)| !Path::new(vendor).exists())
+        .is_some_and(|(_, vendor)| !vendor_usable(vendor))
+}
+
+/// Whether PAM can use the vendor file at `vendor_path` as the service's
+/// stack: a regular file (through a symlink too, as PAM follows one) that can
+/// be opened. Something else at that path, such as a directory or a FIFO a
+/// package transaction leaves there for a moment, is not one, and a service
+/// whose `/etc` override is removed then has no configuration. A FIFO is never
+/// opened: its type is checked first.
+fn vendor_usable(vendor_path: &str) -> bool {
+    std::fs::metadata(vendor_path).is_ok_and(|meta| meta.is_file())
+        && std::fs::File::open(vendor_path).is_ok()
 }
 
 /// The `(etc, vendor)` paths of the surfaces irlume may create overrides for.

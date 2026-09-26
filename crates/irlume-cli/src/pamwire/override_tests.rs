@@ -2218,6 +2218,30 @@ fn a_rollback_keeps_a_file_that_replaced_the_one_the_transaction_left() {
     assert!(entries(&dir.0).is_empty(), "{:?}", entries(&dir.0));
 }
 
+/// A vendor path that holds something PAM cannot use as the service's stack
+/// (a directory a package transaction left there, say) counts as gone:
+/// verify reports the override apply created, and a rollback keeps it.
+#[test]
+fn a_rollback_keeps_an_override_whose_vendor_path_is_not_a_file() {
+    let dir = TestDir::new("ovr-rollback-vendor-dir");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    let created = read_file(svc.etc);
+    let vendor = svc.vendor.unwrap();
+    std::fs::remove_file(vendor).unwrap();
+    std::fs::create_dir(vendor).unwrap();
+    let pairs = [(svc.etc, vendor)];
+    assert!(vendor_gone_in(&pairs, Path::new(svc.etc)));
+    assert!(removal_orphans_in(&pairs, Path::new(svc.etc)));
+    let after = crate::logintx::sha256_hex(created.as_bytes());
+    let err = restore_surface_with(Path::new(svc.etc), None, None, Some(&after), &|p: &Path| {
+        vendor_gone_in(&pairs, p)
+    })
+    .expect_err("the override is kept");
+    assert!(err.contains("only PAM configuration"), "{err}");
+    assert_eq!(read_file(svc.etc), created);
+}
+
 // ---- updating irlume's lines where a jump counts them ------------------------------
 
 /// Whether `text` has a live rule loading pam_irlume.so with `arg`, in `phase`.

@@ -1116,12 +1116,22 @@ pub(crate) fn verify_surfaces_with(
     (surfaces, drifted)
 }
 
+/// The after-digest a rollback holds a file to, so it replaces or removes only
+/// the file the transaction left: the one the record confirmed. An
+/// unconfirmed record's digests were never confirmed (`prepare` records
+/// `ABSENT` for every surface before anything is written), so its restore
+/// writes over whatever is there, which is how an interrupted apply is
+/// recovered.
+fn confirmed_after(after: Option<&str>, unconfirmed: bool) -> Option<&str> {
+    after.filter(|_| !unconfirmed)
+}
+
 /// Restore every surface of a transaction, or report what it would restore.
 ///
 /// Shared by the confirmed and the unconfirmed path so the restore itself has
-/// one implementation. `unconfirmed` only changes what is reported: the writes
-/// are identical, and the decision about whether restoring is safe was already
-/// made by the caller.
+/// one implementation. The decision about whether restoring is safe was
+/// already made by the caller. `unconfirmed` changes what is reported, and
+/// what each write is held to (see [`confirmed_after`]).
 fn rollback_restore(
     command: &'static str,
     record: &crate::logintx::Transaction,
@@ -1251,7 +1261,7 @@ fn rollback_restore(
                     std::path::Path::new(&surface.path),
                     surface.before.as_deref(),
                     metadata,
-                    Some(&surface.after_sha256),
+                    confirmed_after(Some(&surface.after_sha256), unconfirmed),
                 )
             })
         };
@@ -1296,7 +1306,7 @@ fn rollback_restore(
                         std::path::Path::new(&sidecar.path),
                         sidecar.before.as_deref(),
                         sidecar_metadata,
-                        sidecar.after_sha256.as_deref(),
+                        confirmed_after(sidecar.after_sha256.as_deref(), unconfirmed),
                     ) {
                         irlume_common::dlog!("{command}: {} backup failed: {message}", surface.id);
                         return emit_with_extra(
@@ -2929,6 +2939,54 @@ mod tests {
     /// An override apply created is the service's only PAM configuration once
     /// its vendor copy is gone: verify calls that drift, rollback refuses it,
     /// and the restore itself will not delete the file.
+    /// An apply interrupted before its record was confirmed leaves every
+    /// surface recorded with the placeholder after-digest `ABSENT`. Its
+    /// rollback (`--accept-unconfirmed`) must still restore a file the apply
+    /// changed and remove one it created: the placeholder does not gate the
+    /// writes. A confirmed record's digest does.
+    #[test]
+    fn an_unconfirmed_rollback_is_not_held_to_placeholder_digests() {
+        let dir = std::env::temp_dir().join(format!("irlume-unconfirmed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let changed = dir.join("sudo");
+        let created = dir.join("plasmalogin");
+        std::fs::write(&changed, "wired by the interrupted apply\n").expect("write");
+        std::fs::write(&created, "created by the interrupted apply\n").expect("write");
+        let placeholder = Some(crate::logintx::ABSENT);
+        let never = |_: &std::path::Path| false;
+        assert!(
+            crate::pamwire::restore_surface_with(
+                &changed,
+                Some("the original\n"),
+                None,
+                confirmed_after(placeholder, false),
+                &never,
+            )
+            .is_err(),
+            "a confirmed record's digest gates the write"
+        );
+        crate::pamwire::restore_surface_with(
+            &changed,
+            Some("the original\n"),
+            None,
+            confirmed_after(placeholder, true),
+            &never,
+        )
+        .expect("restored");
+        assert_eq!(std::fs::read_to_string(&changed).unwrap(), "the original\n");
+        crate::pamwire::restore_surface_with(
+            &created,
+            None,
+            None,
+            confirmed_after(placeholder, true),
+            &never,
+        )
+        .expect("removed");
+        assert!(!created.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_created_override_whose_vendor_copy_left_is_drift_and_never_removed() {
         let dir = std::env::temp_dir().join(format!("irlume-orphan-{}", std::process::id()));

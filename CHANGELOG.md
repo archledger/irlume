@@ -311,6 +311,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume reseal` re-binds the kind of secret that is armed. It let
+  irlumed choose as for a first arm, so a GNOME-only account armed with
+  its login password was given a new GNOME keyring token: irlumed sealed
+  it, the login keyring was never keyed to it, and `reseal` reported an
+  unexpected response. A login password is now resealed as one (without a
+  wallet salt), a KDE wallet key as one (and a missing wallet salt file is
+  reported before the password prompt), and a GNOME keyring token still
+  re-binds itself on the next password login.
+
 - A login is treated as cold unless the account has a live local graphical
   session. An SSH login or a text console counted as the live session a
   lock screen belongs to, so a graphical login by someone also logged in

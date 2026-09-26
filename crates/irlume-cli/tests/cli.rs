@@ -1665,12 +1665,13 @@ fn with_session_bus(cmd: &mut Command) -> &mut Command {
     .env_remove("SUDO_USER")
 }
 
-/// Where oo7-daemon provides the caller's Secret Service, `keyring arm` and
-/// `reseal` ask for the login password, which pam_oo7 hands on, instead of
-/// leaving the kind to irlumed: a token would re-key a keyring oo7 cannot
-/// open with it. Any other provider still leaves the choice to irlumed. The
-/// probe reads the caller's own session bus, so a root caller, whose bus is
-/// not the target account's, always leaves it to irlumed.
+/// Where oo7-daemon provides the caller's Secret Service, `keyring arm` asks
+/// for the login password, which pam_oo7 hands on, instead of leaving the
+/// kind to irlumed: a token would re-key a keyring oo7 cannot open with it.
+/// Any other provider still leaves the choice to irlumed. The probe reads the
+/// caller's own session bus, so a root caller, whose bus is not the target
+/// account's, always leaves it to irlumed. `reseal` re-binds the kind that is
+/// armed, here a login password, whatever the provider and the caller.
 #[test]
 fn keyring_arm_asks_for_the_login_password_where_oo7_provides_secrets() {
     for (provider, want) in [
@@ -1706,6 +1707,11 @@ fn keyring_arm_asks_for_the_login_password_where_oo7_provides_secrets() {
                 Request::SealPassword { kind, .. } => Some(*kind),
                 _ => None,
             });
+            let want = if command == ["reseal"] {
+                Some(irlume_common::KeyringSecretKind::LoginPassword)
+            } else {
+                want
+            };
             assert_eq!(kind, Some(want), "{label}");
         }
     }
@@ -1984,6 +1990,80 @@ fn reseal_on_nixos_keeps_to_the_login_password() {
         ),
         "{asked:?}"
     );
+}
+
+/// Off NixOS `reseal` re-binds the kind that is armed, as irlumed reports it,
+/// instead of letting irlumed judge afresh as a first arm does: a GNOME-only
+/// home armed with its login password was sent a request with no kind and
+/// got a new GNOME keyring token, sealed and never keyed into the keyring. A
+/// login password goes without a wallet salt even where a wallet exists, a
+/// KDE wallet key with it; a KDE wallet key whose salt is gone is refused
+/// before the password prompt. An irlumed that does not say what is armed
+/// still gets the arm-time choice.
+#[test]
+fn reseal_rebinds_the_kind_that_is_armed() {
+    use irlume_common::KeyringSecretKind as K;
+    let fedora = "NAME=\"Fedora Linux\"\nID=fedora\nVERSION_ID=44\n";
+    let user = "irlume-no-such-account";
+    let run_reseal = |tag: &str, armed: Option<K>, salt: bool| {
+        let sb = Sandbox::new(&format!("reseal-armed-{tag}"));
+        if salt {
+            kde_salt_helper(&sb);
+        }
+        std::fs::write(sb.path("os-release"), fedora).unwrap();
+        let log = serve(&sock(&sb), move |req| match req {
+            Request::HasSealedPassword { .. } => Response::HasPassword(true),
+            Request::KeyringInfo { .. } => Response::KeyringInfo {
+                armed: true,
+                policy: None,
+                pcrs: Vec::new(),
+                drifted: None,
+                kind: armed,
+            },
+            Request::SealPassword { .. } => Response::PasswordSealed,
+            _ => Response::Error("unexpected request".into()),
+        });
+        let mut command = sb.cmd(&["reseal", "--user", user]);
+        command.env("IRLUME_OS_RELEASE", sb.path("os-release"));
+        let (code, out, err) = run_stdin(&mut command, "hunter2\n");
+        (code, out, err, sealed(&log))
+    };
+
+    for (tag, armed, salt, want) in [
+        (
+            "lp",
+            Some(K::LoginPassword),
+            false,
+            (Some(K::LoginPassword), false),
+        ),
+        (
+            "lp-kde",
+            Some(K::LoginPassword),
+            true,
+            (Some(K::LoginPassword), false),
+        ),
+        (
+            "kk",
+            Some(K::KdeWalletKey),
+            true,
+            (Some(K::KdeWalletKey), true),
+        ),
+        ("older", None, false, (None, false)),
+    ] {
+        let (code, out, err, sealed) = run_reseal(tag, armed, salt);
+        assert_eq!(code, 0, "{tag}\n{out}\n{err}");
+        assert!(out.contains("re-bound to current PCRs"), "{tag}: {out}");
+        assert_eq!(sealed, [want], "{tag}");
+    }
+
+    let (code, out, err, sealed) = run_reseal("kk-no-salt", Some(K::KdeWalletKey), false);
+    assert_eq!(code, 1, "{out}\n{err}");
+    assert!(
+        err.contains("armed with a KDE wallet key") && err.contains("Nothing was sealed"),
+        "{err}"
+    );
+    assert!(!out.contains("Re-binding"), "asked for a password: {out}");
+    assert!(sealed.is_empty());
 }
 
 /// On NixOS the module owns the PAM stacks, so `login enable`, `disable` and

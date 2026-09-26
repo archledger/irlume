@@ -782,6 +782,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- pam_irlume stands down when `PAM_XDISPLAY`, or a `PAM_TTY` a display
+  manager filled with its display, names an X display on another host
+  (`host:N`), as a login screen served over XDMCP does while leaving
+  `PAM_RHOST` unset. A TCP display on this machine (`localhost:10`)
+  counts as remote too; `:N`, `unix:N` and a tty device do not. The
+  pamsm fork gains the two item readers this needs (tag
+  `irlume-0.5.5-patch.2`) (#871).
+
 - TPM seals prefer the policies that bind the platform's boot state: a
   provisioned systemd-pcrlock policy covering one of PCRs 0 to 7 (Tier
   2), else literal PCR 7 (Tier 3), ranked in that order above systemd's

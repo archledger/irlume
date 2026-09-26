@@ -425,6 +425,11 @@ transaction it can tell is remote:
   and `cockpit`, and the remote-desktop names (`xrdp*`, any name containing
   `vnc`, `xpra*`, NoMachine's `nx*`). A web console behind a local reverse
   proxy reports a loopback `PAM_RHOST`, so only its name gives it away.
+- `PAM_XDISPLAY`, or a `PAM_TTY` a display manager filled with its display,
+  names an X display on another host (`host:N`), as a login screen served
+  over XDMCP does while leaving `PAM_RHOST` unset. A TCP display on this
+  machine (`localhost:10`, the shape ssh X11 forwarding gives) counts too;
+  `:N`, `unix:N` and a tty device do not.
 - The service is a consent prompt (polkit's `polkit-1`), and the agent that
   asked is in a remote login session, or its session cannot be resolved.
   polkit's agent helper carries no `PAM_RHOST` and no ssh variables, so this
@@ -477,6 +482,5 @@ What the module cannot tell apart, and has to be handled outside it:
   (`systemd-run --user`) is judged by their display session, which is local
   while they are also logged in at the machine.
 - A remote login through a service irlume does not know by name, into which
-  pam_irlume was added by hand, that sets neither `PAM_RHOST` nor the ssh
-  variables, and a remote X display (`PAM_XDISPLAY` of `host:N`) reaching
-  such a stack: the module does not read `PAM_XDISPLAY`.
+  pam_irlume was added by hand, that sets neither `PAM_RHOST`, the ssh
+  variables nor a remote X display.

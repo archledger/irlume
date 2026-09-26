@@ -184,9 +184,11 @@ fn firewall(body: impl FnOnce() -> PamError) -> PamError {
 /// True when the PAM transaction is for a remote (non-local) session, so the
 /// local camera must not be engaged. Checks PAM_RHOST first (set by sshd and
 /// other network services to the client host); an empty, "localhost", or
-/// loopback (127.0.0.1 / ::1) rhost is local. Falls back to the SSH_CONNECTION
-/// / SSH_TTY environment markers for services that do not set rhost but run
-/// under an ssh session (e.g. `sudo` in an ssh shell).
+/// loopback (127.0.0.1 / ::1) rhost is local. Then an X display on another
+/// host in PAM_XDISPLAY or PAM_TTY (a login screen served over XDMCP), the
+/// service name, and a consent prompt's requesting session. Falls back to the
+/// SSH_CONNECTION / SSH_TTY environment markers for services that do not set
+/// rhost but run under an ssh session (e.g. `sudo` in an ssh shell).
 fn is_remote_session(pamh: &Pam) -> bool {
     if let Ok(Some(rhost)) = pamh.get_rhost() {
         let h = rhost.to_string_lossy();
@@ -199,6 +201,18 @@ fn is_remote_session(pamh: &Pam) -> bool {
         if !local {
             return true;
         }
+    }
+    // A login screen on an X server at another host (XDMCP) is remote
+    // whatever the service: the display manager names that display in
+    // PAM_XDISPLAY, and some also in PAM_TTY, while PAM_RHOST stays unset.
+    let item = |value: pamsm::PamResult<Option<&CStr>>| {
+        value
+            .ok()
+            .flatten()
+            .is_some_and(|v| names_remote_x_display(&v.to_string_lossy()))
+    };
+    if item(pamh.get_xdisplay()) || item(pamh.get_tty()) {
+        return true;
     }
     // Remote-desktop PAM services (xrdp / VNC / xpra / NoMachine) frequently set
     // NEITHER a PAM_RHOST nor the SSH_* markers, yet the person driving them is
@@ -240,6 +254,27 @@ fn is_remote_session(pamh: &Pam) -> bool {
     // screen to remote control, and do not wire face auth where GNOME Remote Login
     // is enabled.
     std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+}
+
+/// Whether `display` is an X display on another host: `host:N` or
+/// `host:N.S` with a host part other than empty (`:0`, a local display) or
+/// `unix` (`unix:0`, the local socket). A TCP display on this machine
+/// (`localhost:10`, the shape ssh X11 forwarding gives) counts as remote too:
+/// a login screen at the machine's own seat does not run on one. A device
+/// path (`/dev/tty1`) or a value without a display number is not a display.
+fn names_remote_x_display(display: &str) -> bool {
+    let display = display.trim();
+    if display.starts_with('/') {
+        return false;
+    }
+    let Some((host, number)) = display.rsplit_once(':') else {
+        return false;
+    };
+    let is_display_number = number
+        .split('.')
+        .next()
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    is_display_number && !host.is_empty() && host != "unix"
 }
 
 /// Known remote-desktop / remote-shell PAM service names whose sessions are not
@@ -1567,6 +1602,37 @@ pam_module!(IrlumePam);
 
 #[cfg(test)]
 mod tests {
+
+    /// A display on another host is remote; the local display, the local
+    /// socket, a tty device and anything that is not a display are not.
+    #[test]
+    fn only_a_display_on_another_host_is_remote() {
+        use super::names_remote_x_display;
+        for remote in [
+            "remote.example:0",
+            "192.0.2.7:1",
+            "host:0.1",
+            "localhost:10.0",
+            "127.0.0.1:0",
+            " remote:0 ",
+        ] {
+            assert!(names_remote_x_display(remote), "{remote}");
+        }
+        for local in [
+            ":0",
+            ":1.0",
+            "unix:0",
+            "/dev/tty1",
+            "tty7",
+            "ssh",
+            "",
+            "wayland-0",
+            "host:",
+            "host:x",
+        ] {
+            assert!(!names_remote_x_display(local), "{local}");
+        }
+    }
 
     /// The cgroup path names the session, or the user manager, of the agent
     /// behind a consent prompt; anything else (a system service, a malformed

@@ -1133,11 +1133,17 @@ pub fn diag(args: &[String]) -> ExitCode {
             "none (no Tier 1 on this boot chain)"
         }
     );
-    match irlume_core::tpm::pcrlock_provisioned() {
-        Some(nv) => println!(
+    match (
+        irlume_core::tpm::pcrlock_provisioned(),
+        irlume_core::tpm::pcrlock_for_sealing(),
+    ) {
+        (Some(nv), Some(_)) => println!(
             "  pcrlock       : provisioned, NV 0x{nv:x} (Tier 2 candidate: an arm uses it only if it unseals on this boot, else falls back to literal PCR 7)"
         ),
-        None => println!(
+        (Some(nv), None) => println!(
+            "  pcrlock       : provisioned, NV 0x{nv:x}, over no firmware-measured PCR (0 to 7), so seals use literal PCR 7"
+        ),
+        (None, _) => println!(
             "  pcrlock       : not provisioned (optional; `systemd-pcrlock make-policy` enables Tier 2, else seals use literal PCR 7)"
         ),
     }

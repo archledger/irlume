@@ -775,7 +775,7 @@ fn with_srk_mode<T>(
 pub fn stronger_tier_available_than(current: &SealedEnvelope) -> bool {
     stronger_tier_than(
         current.strength_rank(),
-        || pcrlock_provisioned().is_some(),
+        || pcrlock_for_sealing().is_some(),
         || crate::envelope::binds_firmware_state(&policy_pcrs()),
     )
 }
@@ -799,8 +799,9 @@ fn stronger_tier_than(
 
 /// Seal `secret` under the best policy available on this machine, trying each
 /// tier in order and round-trip-verifying before trusting it:
-///   * Tier 2: if a systemd-pcrlock policy is provisioned
-///     ([`pcrlock_provisioned`]), a `PolicyAuthorizeNV` against its NV index.
+///   * Tier 2: if a systemd-pcrlock policy covering a firmware-measured PCR
+///     is provisioned ([`pcrlock_for_sealing`]), a `PolicyAuthorizeNV`
+///     against its NV index.
 ///     `make-policy` re-predicts the index across firmware / Secure Boot
 ///     updates, so those don't require a reseal either. Explicit sealing at
 ///     this tier is also available via [`seal_with_pcrlock`].
@@ -818,7 +819,7 @@ fn stronger_tier_than(
 /// the higher one genuinely does not unseal on this machine.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
-    if let Some(nv_index) = pcrlock_provisioned() {
+    if let Some(nv_index) = pcrlock_for_sealing() {
         // A pcrlock seal can SUCCEED yet be un-unsealable on this boot (e.g.
         // the policy predicts a PCR this OS never extends, so the super-PCR
         // replay fails): the "sealed but unusable" trap. Only trust it after
@@ -1882,6 +1883,20 @@ pub fn pcrlock_provisioned() -> Option<u32> {
     u32::try_from(plock.nv_index?).ok()
 }
 
+/// The NV index of the provisioned pcrlock policy when [`seal`] uses it: one
+/// that covers a firmware-measured PCR (0 to 7). A policy over OS-measured
+/// PCRs only (PCR 15, say) binds less of the platform than the literal PCR 7
+/// seal, so the ladder takes that instead, and the upgrade check does not
+/// count it. `seal_with_pcrlock` still seals under any provisioned policy.
+pub fn pcrlock_for_sealing() -> Option<u32> {
+    let plock = read_pcrlock_json().ok()?;
+    let pcrs: Vec<u32> = plock.pcr_values.iter().map(|e| e.pcr).collect();
+    if !crate::envelope::binds_firmware_state(&pcrs) {
+        return None;
+    }
+    u32::try_from(plock.nv_index?).ok()
+}
+
 /// Marker `policy_aware_err` embeds when it diagnoses PCR drift;
 /// [`is_pcr_mismatch`] keys on it, so the two stay in sync here.
 const PCR_MISMATCH_MARKER: &str = "PCR mismatch";
@@ -2850,6 +2865,45 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert_eq!(&*unseal(&ladder).expect("unseal the ladder seal"), secret);
     }
 
+    /// Only a pcrlock policy covering a firmware-measured PCR is sealed under
+    /// or counted as an upgrade: one over PCR 15 alone, as a real machine
+    /// here provisioned, binds less than the literal PCR 7 seal.
+    #[test]
+    fn only_a_firmware_binding_pcrlock_policy_is_used_for_sealing() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::path::PathBuf::from(crate::test_tmp_dir("pcrlock-firmware"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("pcrlock.json");
+        let value = "ab".repeat(32);
+        std::env::set_var("IRLUME_PCRLOCK_JSON", &json);
+        for (pcrs, used) in [
+            (&[15][..], false),
+            (&[11, 15], false),
+            (&[7], true),
+            (&[0, 2, 4, 15], true),
+        ] {
+            let entries: Vec<String> = pcrs
+                .iter()
+                .map(|pcr| format!(r#"{{"pcr":{pcr},"values":["{value}"]}}"#))
+                .collect();
+            std::fs::write(
+                &json,
+                format!(
+                    r#"{{"pcrBank":"sha256","pcrValues":[{}],"nvIndex":27981881}}"#,
+                    entries.join(",")
+                ),
+            )
+            .unwrap();
+            assert_eq!(pcrlock_provisioned(), Some(27_981_881), "{pcrs:?}");
+            assert_eq!(pcrlock_for_sealing().is_some(), used, "{pcrs:?}");
+        }
+        std::env::remove_var("IRLUME_PCRLOCK_JSON");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The upgrade predicate: a signed envelope, or a literal one over no
     /// firmware-measured PCR, has a stronger policy to move to when pcrlock
     /// is provisioned or the configured literal PCRs bind firmware state (the
@@ -3154,8 +3208,9 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
 
     /// The auto-tier ladder in [`seal`] on real hardware: whatever tier it
     /// lands on must round-trip. When the pcrlock rung is genuinely usable
-    /// (provisioned AND a direct pcrlock seal round-trips), the ladder must
-    /// land on Tier 2, whether or not a signed policy exists. When pcrlock is
+    /// (provisioned, covering a firmware-measured PCR, AND a direct pcrlock
+    /// seal round-trips), the ladder must land on Tier 2, whether or not a
+    /// signed policy exists; over OS-measured PCRs only it must not. When pcrlock is
     /// provisioned but broken (e.g. Pop!_OS predicts a PCR 15 the OS never
     /// extends, so the policy can never be satisfied), the ladder must NOT
     /// land there; falling through to the literal seal is the correct result.
@@ -3176,11 +3231,18 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert_eq!(&*got, secret, "ladder round-trip must match");
 
         let landed_pcrlock = matches!(env.policy, PolicyKind::PcrlockNv { .. });
-        if pcrlock_usable {
+        let binds_firmware = pcrlock_for_sealing().is_some();
+        if pcrlock_usable && binds_firmware {
             assert!(
                 landed_pcrlock,
                 "usable pcrlock: seal() must pick Tier 2, got {:?}",
                 env.policy
+            );
+        }
+        if !binds_firmware {
+            assert!(
+                !landed_pcrlock,
+                "a pcrlock policy over no firmware-measured PCR must not be sealed under"
             );
         }
         if !pcrlock_usable {

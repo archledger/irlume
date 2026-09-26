@@ -316,7 +316,7 @@ All notable changes to irlume are documented here. This project adheres to
   lock screen belongs to, so a graphical login by someone also logged in
   over SSH was taken for a lock-screen unlock and skipped unlocking the
   login keyring. irlume now asks logind for a user session that is active
-  or online, of type x11, wayland or mir, and not remote.
+  or online, of type x11, wayland or mir, and not remote (#862).
 
 - `irlume login enable` and the reconcile unit no longer rebuild an
   `/etc/pam.d` file that irlume created from a vendor copy in

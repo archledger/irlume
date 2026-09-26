@@ -952,6 +952,14 @@ fn plan_id(action: &str, planned: &[crate::pamwire::PlannedSurface]) -> String {
         // stays `wire`, and an apply carrying the old id would overwrite a stack
         // the consumer never saw.
         material.push_str(&surface.state);
+        // And what the plan decided from outside those files (LightDM's
+        // remote-login settings): with a stack unwired, face and reseal-only
+        // wiring can share the change name and the state.
+        material.push_str(match (surface.want, surface.face_blocked) {
+            (false, _) => " off",
+            (true, false) => " on",
+            (true, true) => " on-without-face",
+        });
     }
     use sha2::{Digest as _, Sha256};
     let digest = Sha256::digest(material.as_bytes());
@@ -3377,6 +3385,8 @@ mod tests {
                 role: "login-screen",
                 change: PlannedChange::Wire,
                 state: state.to_string(),
+                want: true,
+                face_blocked: false,
             }]
         };
         let before = plan_id("enable", &with_state("aaaa"));
@@ -3403,6 +3413,8 @@ mod tests {
                 role: "login-screen",
                 change,
                 state: "same-state".into(),
+                want: true,
+                face_blocked: false,
             }]
         };
         let base = plan_id("enable", &surfaces(PlannedChange::Wire));

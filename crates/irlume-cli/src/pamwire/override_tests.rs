@@ -1139,11 +1139,11 @@ fn the_enable_plan_covers_each_greeter_vendor_copy_and_not_polkit() {
     let dir = TestDir::new("ovr-plan-scope");
     let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
     assert_eq!(surface_state_for(&svc).split(' ').count(), 3);
-    let planned = plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, true);
+    let planned = plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false);
     assert_eq!(planned.change, PlannedChange::MaterializeOverride);
     assert_eq!(planned.state, surface_state_for(&svc));
     std::fs::write(svc.vendor.unwrap(), fedora_with_oo7()).unwrap();
-    let later = plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, true);
+    let later = plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false);
     assert_ne!(later.state, planned.state, "a vendor update makes it stale");
 }
 
@@ -1156,14 +1156,53 @@ fn apply_refuses_a_surface_whose_vendor_copy_changed_after_the_plan() {
         role: ROLE_LOGIN,
         change: PlannedChange::MaterializeOverride,
         state: surface_state_for(&svc),
+        want: true,
+        face_blocked: false,
     };
     std::fs::write(svc.vendor.unwrap(), fedora_with_oo7()).unwrap();
-    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, &[planned]);
+    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false, &[planned]);
     let error = applied.error.expect("the surface is refused");
     assert!(
         error.contains("changed between the plan and the write"),
         "{error}"
     );
+    assert!(!exists(svc.etc), "nothing was written");
+}
+
+/// What the run wants for a surface can change after the plan with no file
+/// it digests changing (LightDM's remote-login settings live elsewhere), and
+/// the apply then refuses the surface instead of acting on a decision nobody
+/// was shown.
+#[test]
+fn apply_refuses_a_surface_whose_want_changed_after_the_plan() {
+    let dir = TestDir::new("ovr-apply-want");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    let planned = PlannedSurface {
+        id: service_name(svc.etc),
+        role: ROLE_LOGIN,
+        change: PlannedChange::NotWired,
+        state: surface_state_for(&svc),
+        want: false,
+        face_blocked: false,
+    };
+    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false, &[planned]);
+    let error = applied.error.expect("the surface is refused");
+    assert!(
+        error.contains("how it should be wired changed between the plan and the write"),
+        "{error}"
+    );
+    assert!(!exists(svc.etc), "nothing was written");
+    // The same for face lines the plan kept out and the apply would not.
+    let planned = PlannedSurface {
+        id: service_name(svc.etc),
+        role: ROLE_LOGIN,
+        change: PlannedChange::MaterializeOverride,
+        state: surface_state_for(&svc),
+        want: true,
+        face_blocked: true,
+    };
+    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false, &[planned]);
+    assert!(applied.error.is_some(), "the surface is refused");
     assert!(!exists(svc.etc), "nothing was written");
 }
 
@@ -1184,12 +1223,26 @@ fn a_surface_refused_for_vendor_drift_does_not_block_the_rollback() {
     let refused_before = read_file(refused.etc);
     std::fs::write(backup_of(&refused), "an older sddm\n").unwrap();
 
-    let plan = |svc: &Svc| plan_surface(svc, ROLE_LOGIN, &face_and_keyring, true);
+    let plan = |svc: &Svc| plan_surface(svc, ROLE_LOGIN, &face_and_keyring, true, false);
     let planned = [plan(&written), plan(&refused)];
     std::fs::write(refused.vendor.unwrap(), fedora_with_oo7()).unwrap();
     let applied = [
-        apply_surface(&written, ROLE_LOGIN, &face_and_keyring, true, &planned),
-        apply_surface(&refused, ROLE_LOGIN, &face_and_keyring, true, &planned),
+        apply_surface(
+            &written,
+            ROLE_LOGIN,
+            &face_and_keyring,
+            true,
+            false,
+            &planned,
+        ),
+        apply_surface(
+            &refused,
+            ROLE_LOGIN,
+            &face_and_keyring,
+            true,
+            false,
+            &planned,
+        ),
     ];
     assert_eq!(applied[0].error, None);
     assert!(content_has_module(&read_file(written.etc)));
@@ -1324,12 +1377,26 @@ fn a_rollback_does_not_rewrite_a_surface_the_apply_left_alone() {
     std::fs::write(&bak, "an older sddm\n").unwrap();
     std::fs::set_permissions(&bak, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    let plan = |svc: &Svc| plan_surface(svc, ROLE_LOGIN, &face_and_keyring, true);
+    let plan = |svc: &Svc| plan_surface(svc, ROLE_LOGIN, &face_and_keyring, true, false);
     let planned = [plan(&written), plan(&untouched)];
     std::fs::write(untouched.vendor.unwrap(), fedora_with_oo7()).unwrap();
     let applied = [
-        apply_surface(&written, ROLE_LOGIN, &face_and_keyring, true, &planned),
-        apply_surface(&untouched, ROLE_LOGIN, &face_and_keyring, true, &planned),
+        apply_surface(
+            &written,
+            ROLE_LOGIN,
+            &face_and_keyring,
+            true,
+            false,
+            &planned,
+        ),
+        apply_surface(
+            &untouched,
+            ROLE_LOGIN,
+            &face_and_keyring,
+            true,
+            false,
+            &planned,
+        ),
     ];
     assert_eq!(applied[0].error, None);
     assert!(applied[1].error.is_some(), "the sddm surface is left alone");
@@ -1397,12 +1464,19 @@ fn rollback_passes_over_a_linked_surface(kind: &str) {
     let last = linked_path("kde");
     let target_inode = inode(leak_path(&target));
 
-    let plan = |svc: &Svc| plan_surface(svc, ROLE_LOGIN, &face_and_keyring, true);
+    let plan = |svc: &Svc| plan_surface(svc, ROLE_LOGIN, &face_and_keyring, true, false);
     let planned = [plan(&first), plan(&written), plan(&last)];
     let applied = [
-        apply_surface(&first, ROLE_LOGIN, &face_and_keyring, true, &planned),
-        apply_surface(&written, ROLE_LOGIN, &face_and_keyring, true, &planned),
-        apply_surface(&last, ROLE_LOGIN, &face_and_keyring, true, &planned),
+        apply_surface(&first, ROLE_LOGIN, &face_and_keyring, true, false, &planned),
+        apply_surface(
+            &written,
+            ROLE_LOGIN,
+            &face_and_keyring,
+            true,
+            false,
+            &planned,
+        ),
+        apply_surface(&last, ROLE_LOGIN, &face_and_keyring, true, false, &planned),
     ];
     assert!(applied[0].error.is_some(), "{kind}: refused");
     assert_eq!(applied[1].error, None, "{kind}");
@@ -1432,9 +1506,15 @@ fn rollback_passes_over_a_linked_surface(kind: &str) {
 fn a_rollback_keeps_the_file_a_refused_write_left_in_place() {
     let dir = TestDir::new("ovr-refused-create");
     let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
-    let planned = [plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, true)];
+    let planned = [plan_surface(
+        &svc,
+        ROLE_LOGIN,
+        &face_and_keyring,
+        true,
+        false,
+    )];
     arm(&SWAP_DURING_WRITE, Path::new(svc.etc));
-    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, &planned);
+    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false, &planned);
     disarm(&SWAP_DURING_WRITE, Path::new(svc.etc));
     let error = applied.error.clone().expect("the write is refused");
     assert!(error.contains("left alone"), "{error}");
@@ -1453,10 +1533,16 @@ fn a_rollback_keeps_the_file_a_refused_removal_put_back() {
     ship_vendor_only(&dir.0, "sddm", UPSTREAM_FEDORA);
     let svc = under_root(&dir.0, greeter("/etc/pam.d/sddm"));
     wire_service(&svc, true, true, &face_and_keyring).unwrap();
-    let planned = [plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, false)];
+    let planned = [plan_surface(
+        &svc,
+        ROLE_LOGIN,
+        &face_and_keyring,
+        false,
+        false,
+    )];
     assert_eq!(planned[0].change.id(), "remove-override");
     arm(&SWAP_DURING_WRITE, Path::new(svc.etc));
-    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, false, &planned);
+    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, false, false, &planned);
     disarm(&SWAP_DURING_WRITE, Path::new(svc.etc));
     let error = applied.error.clone().expect("the removal is refused");
     assert!(error.contains("not touched"), "{error}");
@@ -1478,9 +1564,15 @@ fn a_rollback_keeps_the_stack_a_refused_in_place_write_left() {
         vendor: None,
     };
     std::fs::write(svc.etc, ADMIN_STACK).unwrap();
-    let planned = [plan_surface(&svc, ROLE_SUDO, &wire_verify_service, true)];
+    let planned = [plan_surface(
+        &svc,
+        ROLE_SUDO,
+        &wire_verify_service,
+        true,
+        false,
+    )];
     arm(&SWAP_DURING_WRITE, Path::new(svc.etc));
-    let applied = apply_surface(&svc, ROLE_SUDO, &wire_verify_service, true, &planned);
+    let applied = apply_surface(&svc, ROLE_SUDO, &wire_verify_service, true, false, &planned);
     disarm(&SWAP_DURING_WRITE, Path::new(svc.etc));
     assert!(applied.error.is_some(), "the write is refused");
     assert_eq!(read_file(svc.etc), "SOMEONE ELSE'S FILE\n");
@@ -1501,9 +1593,15 @@ fn a_rollback_keeps_the_stack_a_refused_in_place_write_left() {
 fn a_write_that_failed_after_landing_is_rolled_back() {
     let dir = TestDir::new("ovr-landed-create");
     let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
-    let planned = [plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, true)];
+    let planned = [plan_surface(
+        &svc,
+        ROLE_LOGIN,
+        &face_and_keyring,
+        true,
+        false,
+    )];
     arm(&FAIL_SYNC_AFTER_CHANGE, Path::new(svc.etc));
-    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, &planned);
+    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false, &planned);
     disarm(&FAIL_SYNC_AFTER_CHANGE, Path::new(svc.etc));
     let error = applied.error.clone().expect("the sync failed");
     assert!(error.contains("failed for the test"), "{error}");
@@ -1520,9 +1618,15 @@ fn a_write_that_failed_after_landing_is_rolled_back() {
     let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
     wire_service(&svc, true, true, &face_and_keyring).unwrap();
     let created = read_file(svc.etc);
-    let planned = [plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, false)];
+    let planned = [plan_surface(
+        &svc,
+        ROLE_LOGIN,
+        &face_and_keyring,
+        false,
+        false,
+    )];
     arm(&FAIL_SYNC_AFTER_CHANGE, Path::new(svc.etc));
-    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, false, &planned);
+    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, false, false, &planned);
     disarm(&FAIL_SYNC_AFTER_CHANGE, Path::new(svc.etc));
     assert!(applied.error.is_some(), "the sync failed");
     assert!(!exists(svc.etc), "the removal landed");
@@ -1543,8 +1647,14 @@ fn a_rollback_removes_the_backup_the_apply_made() {
         vendor: None,
     };
     std::fs::write(svc.etc, ADMIN_STACK).unwrap();
-    let planned = [plan_surface(&svc, ROLE_SUDO, &wire_verify_service, true)];
-    let applied = apply_surface(&svc, ROLE_SUDO, &wire_verify_service, true, &planned);
+    let planned = [plan_surface(
+        &svc,
+        ROLE_SUDO,
+        &wire_verify_service,
+        true,
+        false,
+    )];
+    let applied = apply_surface(&svc, ROLE_SUDO, &wire_verify_service, true, false, &planned);
     assert_eq!(applied.error, None);
     assert!(content_has_module(&read_file(svc.etc)));
     assert_eq!(read_file(&backup_of(&svc)), ADMIN_STACK);
@@ -2090,12 +2200,18 @@ fn a_backup_another_writer_published_meanwhile_survives_the_rollback() {
         };
         std::fs::write(svc.etc, ADMIN_STACK).unwrap();
         let bak = backup_of(&svc);
-        let planned = [plan_surface(&svc, ROLE_SUDO, &wire_verify_service, true)];
+        let planned = [plan_surface(
+            &svc,
+            ROLE_SUDO,
+            &wire_verify_service,
+            true,
+            false,
+        )];
         arm(&BACKUP_APPEARS, Path::new(&bak));
         if refused {
             arm(&SWAP_DURING_WRITE, Path::new(svc.etc));
         }
-        let applied = apply_surface(&svc, ROLE_SUDO, &wire_verify_service, true, &planned);
+        let applied = apply_surface(&svc, ROLE_SUDO, &wire_verify_service, true, false, &planned);
         disarm(&BACKUP_APPEARS, Path::new(&bak));
         disarm(&SWAP_DURING_WRITE, Path::new(svc.etc));
         assert_eq!(applied.error.is_some(), refused, "{:?}", applied.error);
@@ -2260,9 +2376,15 @@ fn a_kept_override_fails_its_surface_in_a_machine_apply() {
         1,
     );
     std::fs::write(svc.etc, &continued).unwrap();
-    let planned = [plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, false)];
+    let planned = [plan_surface(
+        &svc,
+        ROLE_LOGIN,
+        &face_and_keyring,
+        false,
+        false,
+    )];
     assert_eq!(planned[0].change, PlannedChange::KeepEditedOverride);
-    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, false, &planned);
+    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, false, false, &planned);
     let error = applied.error.clone().expect("the surface fails");
     assert!(error.contains("kept as it is"), "{error}");
     assert!(applied.kept);
@@ -2274,9 +2396,22 @@ fn a_kept_override_fails_its_surface_in_a_machine_apply() {
 
     let drift_dir = TestDir::new("ovr-apply-unmet-drift");
     let drifted = plasmalogin(&drift_dir.0, UPSTREAM_FEDORA);
-    let planned = [plan_surface(&drifted, ROLE_LOGIN, &face_and_keyring, true)];
+    let planned = [plan_surface(
+        &drifted,
+        ROLE_LOGIN,
+        &face_and_keyring,
+        true,
+        false,
+    )];
     std::fs::write(drifted.vendor.unwrap(), fedora_with_oo7()).unwrap();
-    let refused = apply_surface(&drifted, ROLE_LOGIN, &face_and_keyring, true, &planned);
+    let refused = apply_surface(
+        &drifted,
+        ROLE_LOGIN,
+        &face_and_keyring,
+        true,
+        false,
+        &planned,
+    );
     assert!(refused.error.is_some() && !refused.kept);
     assert!(!crate::machine::marker_follows(&[applied, refused]));
 }

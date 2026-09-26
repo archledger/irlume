@@ -782,6 +782,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- pam_irlume stands down for the `cockpit` and `remote` PAM services, which
+  the daemon's service table already treats as remote, and
+  `irlume login enable` and the reconcile unit keep irlume's face and
+  fingerprint lines out of LightDM, leaving only the keyring hand-off,
+  while its XDMCP or VNC server is on or the running LightDM started before
+  its configuration last changed (`irlume doctor` warns). Both give a remote user a login screen whose
+  PAM transaction looks local, so the camera at the machine could answer a
+  remote login for whoever sat in front of it. docs/THREAT_MODEL.md gains a
+  Remote sessions section with what the module cannot tell apart (#866).
+
 - A fingerprint at the lock screen of a running desktop no longer releases
   the sealed keyring secret. The fingerprint `keyring` line asked irlumed
   for it although that desktop's own login had opened the keyring or

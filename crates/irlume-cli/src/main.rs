@@ -5013,16 +5013,46 @@ fn doctor_run(
     // PAM message. Without it a desktop integration reading `doctor --json` would
     // see `pass` while the human output shows a warning, and this file's own rule
     // is that the two must not disagree.
-    match crate::pamwire::active_dm_recognized() {
-        Some((dm, true)) if crate::pamwire::active_dm_hides_pam_instructions().is_some() => report
-            .check_detail(
+    // A login screen irlume deliberately leaves unwired (a LightDM serving
+    // XDMCP or VNC login screens to remote users) is one it cannot target
+    // either, so the same check warns and says why.
+    let unwired = crate::pamwire::active_dm_face_blocked();
+    match (crate::pamwire::active_dm_recognized(), &unwired) {
+        (Some((dm, true)), Some((_, why))) => report.check_detail(
+            "display-manager",
+            State::Warn,
+            format!("{dm}; irlume keeps face and fingerprint off it: {why}"),
+        ),
+        (Some((dm, true)), None)
+            if crate::pamwire::active_dm_hides_pam_instructions().is_some() =>
+        {
+            report.check_detail(
                 "display-manager",
                 State::Pass,
                 format!("{dm}; does not display PAM instructions to the user"),
-            ),
-        Some((_, true)) => report.check("display-manager", State::Pass),
-        Some((_, false)) => report.check("display-manager", State::Warn),
-        None => report.check("display-manager", State::Info),
+            )
+        }
+        (Some((_, true)), None) => report.check("display-manager", State::Pass),
+        (Some((_, false)), _) => report.check("display-manager", State::Warn),
+        (None, _) => report.check("display-manager", State::Info),
+    }
+    if let Some((dm, why)) = &unwired {
+        // Said from the stack itself: where the reseal lines could not be
+        // placed, irlume took all its lines out, the hand-off too.
+        let handoff = if crate::pamwire::active_greeter_hands_tokens_over() {
+            "a GNOME keyring token is still handed over"
+        } else {
+            "irlume's lines are all out of that stack, so a GNOME keyring token armed for \
+             an account is not handed over there"
+        };
+        dout!(
+            report,
+            "[doctor] ⚠ {why}.\n     irlume keeps face and fingerprint off {dm}'s login screen while \
+             that is so; your\n     password works, and {handoff}. To use face\n     there, turn \
+             that server off in LightDM's configuration and restart LightDM (it\n     keeps the \
+             configuration it started with); the reconcile unit then puts the face\n     lines \
+             back, or run `sudo irlume login enable --apply`."
+        );
     }
     if let Some((dm, false)) = crate::pamwire::active_dm_recognized() {
         dout!(

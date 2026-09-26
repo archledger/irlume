@@ -215,7 +215,7 @@ fn is_remote_session(pamh: &Pam) -> bool {
             return true;
         }
     }
-    // RESIDUAL (documented in docs/THREAT_MODEL.md): a deny-list by service name
+    // RESIDUAL (docs/THREAT_MODEL.md, "Remote sessions"): a deny-list by service name
     // cannot catch every remote login. Two known classes:
     //  - Remote-control software attached to the GENUINE local greeter/desktop on
     //    seat0 (x11vnc of :0, an RDP screen-share, NoMachine to the physical
@@ -236,7 +236,16 @@ fn is_remote_session(pamh: &Pam) -> bool {
 /// broad substring sweep) so a legitimate local greeter is never stranded; an
 /// unmatched service just falls through to the ordinary remote checks. Face auth
 /// standing down here means IGNORE -> the password path, never a denied login.
+///
+/// The shared service table's remote rows count too (`remote` for rlogin and
+/// telnet-style daemons, `cockpit` for the web console), so the module and the
+/// daemon's classifier cannot disagree about a name both know. A web console
+/// behind a local reverse proxy reports a loopback PAM_RHOST, so only the name
+/// catches it.
 fn is_remote_desktop_service(service: &str) -> bool {
+    if irlume_common::pam_service::classify(service) == Some(ServiceKind::Remote) {
+        return true;
+    }
     let s = service.trim().to_ascii_lowercase();
     s.starts_with("xrdp")            // xrdp, xrdp-sesman
         || s.contains("vnc")         // tigervnc, x11vnc, vncserver, kde vnc, ...
@@ -1577,6 +1586,10 @@ mod tests {
             "nxagent",
             "sshd",
             "XRDP-SESMAN", // case-insensitive
+            // The shared table's remote rows.
+            "remote",
+            "cockpit",
+            " Cockpit ",
         ] {
             assert!(is_remote_desktop_service(svc), "{svc} must be remote");
         }

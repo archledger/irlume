@@ -737,6 +737,87 @@ fn pamwrap_ssh_markers_make_no_request_and_leave_the_password_path() {
     assert_eq!(log.lock().unwrap().len(), 2, "one request per control run");
 }
 
+/// `PAM_RHOST` decides local or remote on its own, set by a pam_set_items.so
+/// line as a network service sets it. Empty, `localhost` (any case) and the
+/// two loopback literals are local, surrounding blanks trimmed; anything else
+/// is remote and keeps every request from the daemon. `::ffff:127.0.0.1` and
+/// `127.0.0.2` are loopback too, and are pinned as remote: the list is exact,
+/// and failing closed there only costs the password prompt.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_rhost_decides_local_or_remote() {
+    let Some(h) = Harness::try_new("rhost-table") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| match req {
+        Request::Authenticate { .. } => grant(),
+        _ => Response::Error("unexpected request".into()),
+    });
+    h.write_service(
+        "irlume-face-rhost",
+        &[
+            format!("auth [default=ignore] {}", h.set_items.display()),
+            h.auth_line("required", ""),
+        ],
+    );
+    let local = [
+        "",
+        "localhost",
+        "LOCALHOST",
+        "localhost.localdomain",
+        "127.0.0.1",
+        "::1",
+        " 127.0.0.1 ",
+    ];
+    let remote = ["192.0.2.7", "host.example", "::ffff:127.0.0.1", "127.0.0.2"];
+    for rhost in local.iter().chain(remote.iter()) {
+        let is_local = local.contains(rhost);
+        let before = log.lock().unwrap().len();
+        let (ok, out) = h.run_with_env(
+            "irlume-face-rhost",
+            &["authenticate"],
+            "",
+            None,
+            &[("PAM_RHOST", rhost)],
+        );
+        let requests = log.lock().unwrap().len() - before;
+        assert_eq!(
+            (ok, requests),
+            if is_local { (true, 1) } else { (false, 0) },
+            "PAM_RHOST {rhost:?}: {out}"
+        );
+    }
+}
+
+/// The remote rows of the shared service table (`sshd`, `remote`,
+/// `cockpit`) stand the module down by name, whatever PAM_RHOST says: a web
+/// console behind a local reverse proxy reports a loopback client.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_remote_class_services_make_no_request() {
+    let Some(h) = Harness::try_new("remote-class") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| match req {
+        Request::Authenticate { .. } => grant(),
+        _ => Response::Error("unexpected request".into()),
+    });
+    for service in ["sshd", "remote", "cockpit"] {
+        h.write_service(service, &[h.auth_line("required", "")]);
+        let (ok, out) = h.run(service, &["authenticate"], "", None);
+        assert!(!ok, "{service} must stand the module down: {out}");
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "{service} must keep every request from the daemon"
+        );
+    }
+    // Control: a local name reaches the daemon.
+    h.write_service("irlume-face-local", &[h.auth_line("required", "")]);
+    let (ok, out) = h.run("irlume-face-local", &["authenticate"], "", None);
+    assert!(ok, "{out}");
+    assert_eq!(log.lock().unwrap().len(), 1);
+}
+
 const FACE_INTENT_INFO: &str = "Type yes to use face authentication";
 
 const FIXED_TEST_TOKEN: &str = "fixed-test-token";

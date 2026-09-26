@@ -99,7 +99,7 @@ pub(super) fn autologin_source_in(
 }
 
 /// A file's text, `None` when it does not exist.
-fn read(path: &Path) -> Result<Option<String>, String> {
+pub(super) fn read(path: &Path) -> Result<Option<String>, String> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -140,7 +140,7 @@ fn drop_ins(dir: &Path, conf_only: bool) -> Result<Vec<PathBuf>, String> {
 /// The `key=value` pairs of an INI-style file, each with its section. A `#`
 /// or `;` starts a comment; SDDM also cuts a `#` inside a line, and an
 /// account name has none, so every reader here does.
-fn assignments(text: &str) -> Vec<(String, String, String)> {
+pub(super) fn assignments(text: &str) -> Vec<(String, String, String)> {
     let mut section = String::new();
     let mut out = Vec::new();
     for line in text.lines() {
@@ -175,7 +175,7 @@ fn unquoted(value: &str) -> &str {
 
 /// A GKeyFile boolean, read leniently: a doubtful spelling counts as on,
 /// because only a user match makes it matter.
-fn on(value: &str) -> bool {
+pub(super) fn on(value: &str) -> bool {
     matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes")
 }
 
@@ -216,19 +216,32 @@ fn last_user_in(
     Ok(last.and_then(|(value, path)| (value == user).then_some(path)))
 }
 
+/// LightDM's drop-in directories, in the order it reads them.
+pub(super) const LIGHTDM_DROP_IN_DIRS: [&str; 4] = [
+    "usr/share/lightdm/lightdm.conf.d",
+    "usr/local/share/lightdm/lightdm.conf.d",
+    "etc/xdg/lightdm/lightdm.conf.d",
+    "etc/lightdm/lightdm.conf.d",
+];
+
+/// LightDM's main configuration file, read after every drop-in.
+pub(super) const LIGHTDM_MAIN: &str = "etc/lightdm/lightdm.conf";
+
+/// The files LightDM reads, in its order: the `*.conf` drop-ins of each
+/// configuration directory, then the main file.
+pub(super) fn lightdm_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for dir in LIGHTDM_DROP_IN_DIRS {
+        files.extend(drop_ins(&root.join(dir), true)?);
+    }
+    files.push(root.join(LIGHTDM_MAIN));
+    Ok(files)
+}
+
 /// LightDM's `autologin-user=` in any seat section, the last one read for
 /// each section deciding.
 fn lightdm_source(root: &Path, user: &str) -> Result<Option<PathBuf>, String> {
-    let mut files = Vec::new();
-    for dir in [
-        "usr/share/lightdm/lightdm.conf.d",
-        "usr/local/share/lightdm/lightdm.conf.d",
-        "etc/xdg/lightdm/lightdm.conf.d",
-        "etc/lightdm/lightdm.conf.d",
-    ] {
-        files.extend(drop_ins(&root.join(dir), true)?);
-    }
-    files.push(root.join("etc/lightdm/lightdm.conf"));
+    let files = lightdm_files(root)?;
     let mut seats: std::collections::HashMap<String, (String, PathBuf)> =
         std::collections::HashMap::new();
     for path in files {

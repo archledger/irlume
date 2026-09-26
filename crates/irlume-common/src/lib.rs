@@ -869,6 +869,16 @@ pub enum Request {
         /// module from before this field.
         #[serde(default)]
         have_password: bool,
+        /// Sent from `open_session` (the GNOME keyring token delivery of a
+        /// login whose auth phase stashed none), not from an auth-phase line.
+        /// The daemon releases nothing to an auth-phase request while the
+        /// account has a live local desktop, which is what a lock-screen
+        /// unlock of that desktop sends; a session being opened is a login,
+        /// and the desktop logind already lists for it is its own. Defaults
+        /// to `false`: a PAM module from before this field is treated as the
+        /// auth phase.
+        #[serde(default)]
+        session_phase: bool,
     },
     /// Whether `user` has a sealed password armed (for status / CLI / the
     /// delete-erases-it warning). Unprivileged: root or `user`.

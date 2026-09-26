@@ -600,6 +600,7 @@ mod tests {
                 user: "u".into(),
                 service: None,
                 have_password: false,
+                session_phase: false,
             }),
             Class::Auth
         );

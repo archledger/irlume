@@ -3207,7 +3207,13 @@ static SOCKET_ACTIVATED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// credentials. That is what lets the daemon answer it while the engine is still
 /// loading (#244). Every authorization check below is a property of the REQUEST,
 /// never of startup state, so answering early cannot weaken any of them.
-fn unseal_keyring(user: &str, service: Option<&str>, have_password: bool, peer: &Peer) -> Response {
+fn unseal_keyring(
+    user: &str,
+    service: Option<&str>,
+    have_password: bool,
+    session_phase: bool,
+    peer: &Peer,
+) -> Response {
     let user = user.to_string();
     let service = service.map(str::to_string);
 
@@ -3259,12 +3265,16 @@ fn unseal_keyring(user: &str, service: Option<&str>, have_password: bool, peer: 
     // unlock of a desktop that is already running: that desktop's own login
     // opened them, and a release here would re-open a keyring its owner
     // locked by hand, or start a wallet daemon, after nothing more than a
-    // fingerprint at the lock screen (ADR-0003). So with a live local
-    // graphical session for the account nothing is unsealed, whatever the
-    // kind. Handing a GNOME keyring token to a session whose keyring is
-    // locked belongs to the session phase, after the unlock succeeded, and
-    // is not made here: this auth-phase release was dropped there anyway.
-    if crate::users::uid_for_name(&user).is_some_and(attempt_record::has_local_graphical_session) {
+    // fingerprint at the lock screen (ADR-0003). So an auth-phase request
+    // for an account with a live local graphical session gets nothing,
+    // whatever the kind. A session-phase request comes from a session being
+    // opened, a login whose own desktop logind lists as live already, and
+    // is served: it is how a typed-password login delivers a GNOME keyring
+    // token. A lock screen authenticates and never opens a session.
+    if !session_phase
+        && crate::users::uid_for_name(&user)
+            .is_some_and(attempt_record::has_local_graphical_session)
+    {
         jout_info!(
             "irlumed: UnsealKeyring: '{user}' has a live local graphical session; nothing released"
         );
@@ -3330,7 +3340,14 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             user,
             service,
             have_password,
-        } => unseal_keyring(&user, service.as_deref(), have_password, peer),
+            session_phase,
+        } => unseal_keyring(
+            &user,
+            service.as_deref(),
+            have_password,
+            session_phase,
+            peer,
+        ),
         Request::Ping => Response::Ok("starting".into()),
         Request::PreferencesStatus => {
             Response::PreferencesStatus(irlume_common::PreferencesState::observe())
@@ -7413,6 +7430,7 @@ fn dispatch_scoped_session_inner(
             user,
             service,
             have_password,
+            session_phase,
         } => {
             // Credential-release boundary, same vocabulary as the password
             // unseal: the request's whole daemon-side interval, every exit.
@@ -7420,7 +7438,13 @@ fn dispatch_scoped_session_inner(
                 scope,
                 irlume_common::diagnostics::TraceStage::CredentialUnseal,
             );
-            unseal_keyring(&user, service.as_deref(), have_password, peer)
+            unseal_keyring(
+                &user,
+                service.as_deref(),
+                have_password,
+                session_phase,
+                peer,
+            )
         }
         Request::ForgetPassword { user } => match irlume_core::keyring::forget_password(&user) {
             Ok(()) => Response::PasswordForgotten,
@@ -10721,6 +10745,7 @@ mod tests {
             user: u(),
             service: None,
             have_password: false,
+            session_phase: false,
         },
         HasSealedPassword => Request::HasSealedPassword { user: u() },
         KeyringMetadata => Request::KeyringMetadata { user: u() },
@@ -11336,6 +11361,7 @@ mod tests {
                 user: "../template-keys/alice".into(),
                 service: Some("login".into()),
                 have_password: false,
+                session_phase: false,
             },
             &peer(0),
         );
@@ -16722,10 +16748,10 @@ mod tests {
             std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
             outcomes.push((
                 kind,
-                unseal_keyring("carol", Some("plasmalogin"), true, &peer(0)),
-                unseal_keyring("carol", Some("plasmalogin"), false, &peer(0)),
-                unseal_keyring("carol", Some("sudo"), true, &peer(0)),
-                unseal_keyring("carol", Some("plasmalogin"), true, &peer(NOBODY)),
+                unseal_keyring("carol", Some("plasmalogin"), true, false, &peer(0)),
+                unseal_keyring("carol", Some("plasmalogin"), false, false, &peer(0)),
+                unseal_keyring("carol", Some("sudo"), true, false, &peer(0)),
+                unseal_keyring("carol", Some("plasmalogin"), true, false, &peer(NOBODY)),
             ));
         }
         match previous {
@@ -16751,7 +16777,10 @@ mod tests {
     /// (a lock-screen unlock of its desktop, or a second login while it
     /// runs) unseals nothing, whatever is armed: that desktop's login opened
     /// the keyring or wallet already (ADR-0003). An SSH login alone is not
-    /// such a session, so a cold release still goes ahead.
+    /// such a session, so a cold release still goes ahead. A session-phase
+    /// request comes from a login opening its own desktop, which logind
+    /// lists as live already, and still reaches a GNOME keyring token: it is
+    /// how a typed-password login delivers one.
     #[test]
     fn a_warm_unlock_releases_no_keyring_secret() {
         let _g = env_lock();
@@ -16781,11 +16810,12 @@ mod tests {
             std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
             let _ = std::fs::remove_file(sessions.join("2"));
             std::fs::write(sessions.join("c1"), session("1", "tty")).unwrap();
-            let cold = unseal_keyring(&user, Some("plasmalogin"), false, &peer(0));
+            let cold = unseal_keyring(&user, Some("plasmalogin"), false, false, &peer(0));
             std::fs::write(sessions.join("2"), session("0", "wayland")).unwrap();
-            let lock = unseal_keyring(&user, Some("kde"), false, &peer(0));
-            let login = unseal_keyring(&user, Some("plasmalogin"), false, &peer(0));
-            outcomes.push((kind, cold, lock, login));
+            let lock = unseal_keyring(&user, Some("kde"), false, false, &peer(0));
+            let login = unseal_keyring(&user, Some("plasmalogin"), false, false, &peer(0));
+            let session = unseal_keyring(&user, Some("plasmalogin"), true, true, &peer(0));
+            outcomes.push((kind, cold, lock, login, session));
         }
         *attempt_record::SESSIONS_ROOT
             .lock()
@@ -16794,7 +16824,20 @@ mod tests {
             Some(value) => std::env::set_var("IRLUME_TCTI", value),
             None => std::env::remove_var("IRLUME_TCTI"),
         }
-        for (kind, cold, lock, login) in outcomes {
+        for (kind, cold, lock, login, session) in outcomes {
+            // The session phase asks with the password present, so only a
+            // token goes on to the TPM (and fails on the invalid TCTI here).
+            if kind == "GnomeKeyringToken" {
+                assert!(
+                    matches!(session, Response::Error(_)),
+                    "{kind}: the session phase reaches the token: {session:?}"
+                );
+            } else {
+                assert!(
+                    matches!(session, Response::KeyringUnlockNotNeeded),
+                    "{kind}: {session:?}"
+                );
+            }
             assert!(
                 matches!(cold, Response::Error(_)),
                 "{kind}: a cold release goes ahead"
@@ -16821,6 +16864,7 @@ mod tests {
                 user: "carol".into(),
                 service: Some("kde".into()),
                 have_password: false,
+                session_phase: false,
             },
             &peer(NOBODY),
             &mut e,
@@ -16838,6 +16882,7 @@ mod tests {
                 user: "carol".into(),
                 service: Some("kde".into()),
                 have_password: false,
+                session_phase: false,
             },
             &peer(0),
             &mut e,
@@ -16857,6 +16902,7 @@ mod tests {
                 user: "carol".into(),
                 service: Some("sudo".into()),
                 have_password: false,
+                session_phase: false,
             },
             &peer(0),
             &mut e,
@@ -16870,6 +16916,7 @@ mod tests {
                 user: "carol".into(),
                 service: Some("kde".into()),
                 have_password: false,
+                session_phase: false,
             },
             &peer(0),
             &mut e,
@@ -18857,6 +18904,7 @@ mod tests {
                 user: "carol".into(),
                 service: Some("kde".into()),
                 have_password: false,
+                session_phase: false,
             },
             &peer(NOBODY),
             &mut e,
@@ -18874,6 +18922,7 @@ mod tests {
                 user: "carol".into(),
                 service: Some("kde".into()),
                 have_password: false,
+                session_phase: false,
             },
             &root,
             &mut e,

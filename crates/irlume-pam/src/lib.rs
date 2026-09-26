@@ -318,6 +318,7 @@ impl PamServiceModule for IrlumePam {
                         user: user.clone(),
                         service,
                         have_password,
+                        session_phase: false,
                     })
                 {
                     // Routed by kind, not assumed: on KDE this starts the
@@ -688,6 +689,10 @@ fn deliver_gnome_token(pamh: &Pam, user: &str) {
                 user: user.to_string(),
                 service,
                 have_password: true,
+                // This session is being opened, so it is a login, not a
+                // lock-screen unlock of a running desktop, although logind
+                // lists it as live already.
+                session_phase: true,
             }) {
                 // Only a token belongs on the control socket. A password or a
                 // wallet key reaching here would mean the user is armed for a

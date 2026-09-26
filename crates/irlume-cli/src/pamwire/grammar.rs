@@ -183,6 +183,22 @@ pub(super) fn irlume_rule(line: &str) -> Option<Rule<'_>> {
     rule(line).filter(|r| module_file_name(r.module) == MODULE)
 }
 
+/// Whether this line is an `auth` rule of pam_irlume.so that authenticates or
+/// releases a secret: any but a pure `reseal` line, which only re-seals a
+/// typed password and hands a keyring token over. That covers `unseal`,
+/// `keyring`, the older `wait` form, a bare verify line, and a line that
+/// names `reseal` beside one of those, since the module handles the others
+/// first; every one of them can reach the camera or a sealed secret.
+pub(super) fn irlume_auth_rule_beyond_reseal(line: &str) -> bool {
+    irlume_rule(line).is_some_and(|rule| {
+        let credential = rule
+            .args
+            .iter()
+            .any(|arg| matches!(*arg, "unseal" | "keyring" | "wait"));
+        rule.phase == "auth" && (credential || !rule.args.contains(&"reseal"))
+    })
+}
+
 /// Whether this line is a rule that loads pam_irlume.so with `arg` among its
 /// arguments (`unseal`, `keyring`, `reseal`), matched whole as the module
 /// matches them.

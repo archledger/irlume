@@ -122,6 +122,16 @@ fn namespace_command(
     if unshare_pid {
         command.arg("--unshare-pid");
     }
+    // A bind to a destination the host lacks re-mounts the parent's host
+    // entries (`bind_args`), which would uncover a hidden directory or an
+    // earlier bind below that parent. Those binds go first, so the hidden
+    // directories and the other binds land on top of them.
+    let (missing, present): (Vec<_>, Vec<_>) = binds
+        .iter()
+        .partition(|(_, destination)| !Path::new(destination).is_dir());
+    for (source, destination) in missing {
+        bind_args(&mut command, source, destination);
+    }
     for dir in hidden {
         // Same canonical spelling rule as the tool prefixes below; a directory
         // the host lacks is already absent under the read-only root.
@@ -131,7 +141,7 @@ fn namespace_command(
             }
         }
     }
-    for (source, destination) in binds {
+    for (source, destination) in present {
         bind_args(&mut command, source, destination);
     }
     for prefix in masked {

@@ -108,16 +108,15 @@ pub(super) fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHan
 /// (Secure-tier credential release); `keyring` adds the post-auth keyring-unseal
 /// line (fingerprint keyring unlock; needed in gdm-password too, since GDM's
 /// SESSION keyring unlock runs through gdm-password even on a fingerprint login).
-/// Reseal (self-heal of the sealed password) rides along whenever either is set.
+/// Reseal (self-heal of the sealed password, and the GNOME keyring token
+/// hand-off) always rides along. With neither set it is all this adds, which
+/// is what a login screen `remote_seats` keeps the camera off gets.
 pub(super) fn wire_greeter_impl(
     content: &str,
     face: bool,
     keyring: bool,
     ondemand: bool,
 ) -> (String, bool) {
-    if !face && !keyring {
-        return (content.to_string(), false);
-    }
     if has_line_continuation(content) {
         return (content.to_string(), false);
     }

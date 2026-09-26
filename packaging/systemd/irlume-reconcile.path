@@ -30,6 +30,15 @@ PathModified=/etc/pam.d/polkit-1
 # units for a watched file's removal).
 PathModified=/etc/pam.d/omarchy-lock-face
 PathModified=/etc/pam.d/omarchy-lock-password
+# LightDM's configuration: turning its XDMCP or VNC server on serves the
+# `lightdm` login screen to remote users, and reconcile takes irlume's face
+# lines out of that stack (pamwire/remote_seats.rs), which should happen
+# before LightDM restarts with the change. A directory here fires on its
+# entries changing. The vendor drop-in directories under /usr change by
+# package updates, which the timer finds.
+PathModified=/etc/lightdm/lightdm.conf
+PathModified=/etc/lightdm/lightdm.conf.d
+PathModified=/etc/xdg/lightdm/lightdm.conf.d
 Unit=irlume-reconcile.service
 
 [Install]

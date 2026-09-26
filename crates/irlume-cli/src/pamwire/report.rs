@@ -47,8 +47,10 @@ pub(super) fn surface_fact(
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_default();
-    let wired = content_has_module(&content);
     let mode = wiring_mode(role, &content);
+    // A login stack with only irlume's reseal lines (`remote_seats`) hands a
+    // keyring token over and authenticates nothing, so it is not wired.
+    let wired = mode.is_some();
     SurfaceFact {
         id: service_name(etc),
         role,
@@ -64,7 +66,7 @@ pub(super) fn surface_fact(
 /// `verify` is the plain consent line (sudo, polkit, and the Omarchy lock,
 /// whose polkit-recipe line carries no `unseal`); a keyring-only line is the
 /// fingerprint unlock rather than face at all, and locks never carry one.
-fn wiring_mode(role: &str, content: &str) -> Option<&'static str> {
+pub(super) fn wiring_mode(role: &str, content: &str) -> Option<&'static str> {
     if !content_has_module(content) {
         return None;
     }
@@ -76,7 +78,15 @@ fn wiring_mode(role: &str, content: &str) -> Option<&'static str> {
         return Some("verify");
     }
     if !unseal {
-        return Some("keyring");
+        if has("keyring") {
+            return Some("keyring");
+        }
+        // An older `wait` line or a bare verify line still authenticates; a
+        // stack with only the `reseal` lines does not (`remote_seats`).
+        return content
+            .lines()
+            .any(irlume_auth_rule_beyond_reseal)
+            .then_some("verify");
     }
     if has("ondemand") {
         return Some("on-demand");

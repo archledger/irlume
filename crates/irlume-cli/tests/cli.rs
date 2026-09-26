@@ -2773,6 +2773,283 @@ session    optional                     pam_irlume.so reseal\n";
     );
 }
 
+/// A LightDM fixture in a root namespace: `/etc/pam.d/lightdm` in Debian's
+/// include layout, `/etc/lightdm/lightdm.conf`, LightDM as the active login
+/// manager, and a daemon reporting the Secure tier, so face login is wanted.
+struct LightdmBed {
+    sb: Sandbox,
+    pam: PathBuf,
+    conf: PathBuf,
+    units: PathBuf,
+}
+
+impl LightdmBed {
+    fn new(tag: &str) -> Self {
+        Self::with_tier(tag, "secure")
+    }
+
+    fn with_tier(tag: &str, tier: &'static str) -> Self {
+        let sb = Sandbox::new(tag);
+        let (pam, conf, units) = (sb.path("pam-etc"), sb.path("lightdm-etc"), sb.path("units"));
+        for dir in [&pam, &conf, &units] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            pam.join("lightdm"),
+            "#%PAM-1.0\n@include common-auth\n@include common-account\n@include common-session\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "/usr/lib/systemd/system/lightdm.service",
+            units.join("display-manager.service"),
+        )
+        .unwrap();
+        serve(&sock(&sb), move |req| match req {
+            Request::Health => Response::Health {
+                tier: tier.into(),
+                rgb_dev: None,
+                ir_dev: None,
+                mesh: true,
+                adapter: false,
+                rgb_pad: None,
+                ir_pad: None,
+                version: String::new(),
+                apparmor: None,
+            },
+            _ => Response::Error("unexpected request".into()),
+        });
+        // Enabling where SELinux is on also loads the module and relabels.
+        for tool in ["semodule", "systemctl", "restorecon"] {
+            sb.fake_tool(tool, "exit 0");
+        }
+        LightdmBed {
+            sb,
+            pam,
+            conf,
+            units,
+        }
+    }
+
+    fn xdmcp(&self, on: bool) {
+        std::fs::write(
+            self.conf.join("lightdm.conf"),
+            format!("[Seat:*]\ngreeter-session=lightdm-gtk-greeter\n[XDMCPServer]\nenabled={on}\n"),
+        )
+        .unwrap();
+    }
+
+    fn run(&self, args: &[&str]) -> (i32, String, String) {
+        run(support::isolated_root_command(
+            &self.sb.root,
+            BIN,
+            args,
+            &["semodule", "systemctl", "restorecon"],
+            &self.sb.hidden,
+            &[
+                (&self.pam, "/etc/pam.d"),
+                (&self.conf, "/etc/lightdm"),
+                (&self.units, "/etc/systemd/system"),
+            ],
+        )
+        .env("IRLUME_OS_RELEASE", self.sb.path("no-os-release"))
+        .env("IRLUME_PAM_LOCK", self.sb.path("pam.lock")))
+    }
+
+    fn stack(&self) -> String {
+        std::fs::read_to_string(self.pam.join("lightdm")).unwrap()
+    }
+
+    /// irlume's face line is in the stack.
+    fn face(&self) -> bool {
+        self.stack().contains("pam_irlume.so unseal")
+    }
+
+    /// irlume's session line, the keyring hand-off, is in the stack.
+    fn reseal(&self) -> bool {
+        self.stack()
+            .contains("session    optional                     pam_irlume.so reseal")
+    }
+}
+
+/// While LightDM's XDMCP server is on, `login enable` keeps irlume's face and
+/// fingerprint lines out of `lightdm`: a remote X server gets a login screen
+/// through that same service, with no PAM_RHOST, and the camera here would
+/// answer for it. The reseal lines, which never reach the camera, go in as
+/// usual. With the server off, the same run wires face.
+#[test]
+fn login_enable_keeps_face_out_of_lightdm_while_it_serves_xdmcp() {
+    let bed = LightdmBed::new("lightdm-xdmcp");
+    bed.xdmcp(true);
+    let (code, out, err) = bed.run(&["login", "enable"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out.contains(
+            "/etc/pam.d/lightdm: face and fingerprint left out: LightDM's XDMCP \
+             (/etc/lightdm/lightdm.conf) server is on"
+        ),
+        "{out}\n{err}"
+    );
+    let (code, out, err) = bed.run(&["login", "enable", "--apply"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(!bed.face() && bed.reseal(), "{}", bed.stack());
+
+    bed.xdmcp(false);
+    let (code, out, err) = bed.run(&["login", "enable", "--apply"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(!out.contains("left out"), "{out}\n{err}");
+    assert!(bed.face() && bed.reseal(), "{}", bed.stack());
+}
+
+/// A LightDM that must keep face off but whose stack has lost the line
+/// irlume places its reseal lines next to is unwired whole, so no face line
+/// stays behind; `login status` then reports it unwired, as it does a
+/// reseal-only one.
+#[test]
+fn a_lightdm_the_reseal_lines_cannot_land_on_is_unwired_whole() {
+    let bed = LightdmBed::new("lightdm-no-anchor");
+    bed.xdmcp(true);
+    let (code, out, err) = bed.run(&["login", "enable", "--apply"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(!bed.face() && bed.reseal(), "{}", bed.stack());
+    let (_, status, err) = bed.run(&["login", "status", "--json"]);
+    let status: serde_json::Value = serde_json::from_str(&status).expect(&err);
+    let lightdm = status["data"]["surfaces"]
+        .as_array()
+        .expect("surfaces")
+        .iter()
+        .find(|s| s["id"] == "lightdm")
+        .expect("lightdm")
+        .clone();
+    assert_eq!(lightdm["wired"], false, "{lightdm}");
+
+    // Face wired, then the anchor goes: an administrator replaced the
+    // include irlume placed its lines around.
+    bed.xdmcp(false);
+    let (code, out, err) = bed.run(&["login", "enable", "--apply"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(bed.face(), "{}", bed.stack());
+    let edited = bed.stack().replace("@include common-auth\n", "");
+    std::fs::write(bed.pam.join("lightdm"), &edited).unwrap();
+    bed.xdmcp(true);
+    // A keyring token does not keep the face line there: removing it from a
+    // login screen remote users reach comes first, and the run says what
+    // that costs the token.
+    std::fs::write(
+        bed.sb.path("keyring/alice.json"),
+        r#"{"version":1,"secret":"GnomeKeyringToken","pcrs":[],"public":"","private":""}"#,
+    )
+    .unwrap();
+    let (code, out, err) = bed.run(&["login", "enable", "--apply"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out.contains("no longer delivered at this login screen"),
+        "{out}\n{err}"
+    );
+    assert!(
+        !bed.stack().contains("pam_irlume.so"),
+        "no irlume line stays: {}",
+        bed.stack()
+    );
+}
+
+/// With nothing wanted on LightDM (no camera here), a run that would unwire a
+/// stack handing a keyring token over is refused as anywhere else, even
+/// while LightDM serves remote login screens: there is no face line to take
+/// off, so the token guard's answer stands.
+#[test]
+fn a_lightdm_nothing_wants_keeps_the_token_guard() {
+    let bed = LightdmBed::with_tier("lightdm-no-camera", "none");
+    let stack = "#%PAM-1.0\n@include common-auth\n\
+                 auth       optional                     pam_irlume.so reseal\n\
+                 @include common-account\n@include common-session\n\
+                 session    optional                     pam_irlume.so reseal\n";
+    std::fs::write(bed.pam.join("lightdm"), stack).unwrap();
+    bed.xdmcp(true);
+    std::fs::write(
+        bed.sb.path("keyring/alice.json"),
+        r#"{"version":1,"secret":"GnomeKeyringToken","pcrs":[],"public":"","private":""}"#,
+    )
+    .unwrap();
+    let (code, out, err) = bed.run(&["login", "enable", "--apply"]);
+    assert_eq!(code, 1, "{out}\n{err}");
+    assert!(err.contains("login keyring of alice"), "{out}\n{err}");
+    assert_eq!(bed.stack(), stack, "a refused run writes nothing");
+}
+
+/// A LightDM that still carries a face line while nothing wants a factor
+/// (the camera away for a moment) loses that line once it serves remote login
+/// screens, keeping its reseal lines, so the token guard has nothing to stop:
+/// left there, the line would serve the remote screens once the camera is
+/// back.
+#[test]
+fn a_lightdm_nothing_wants_still_loses_its_face_line() {
+    // The stack an enable wrote while the camera was there.
+    let earlier = LightdmBed::new("lightdm-stale-face-wired");
+    earlier.xdmcp(false);
+    let (code, out, err) = earlier.run(&["login", "enable", "--apply"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(earlier.face(), "{}", earlier.stack());
+
+    let bed = LightdmBed::with_tier("lightdm-stale-face", "none");
+    std::fs::write(bed.pam.join("lightdm"), earlier.stack()).unwrap();
+    bed.xdmcp(true);
+    std::fs::write(
+        bed.sb.path("keyring/alice.json"),
+        r#"{"version":1,"secret":"GnomeKeyringToken","pcrs":[],"public":"","private":""}"#,
+    )
+    .unwrap();
+    let (code, out, err) = bed.run(&["login", "enable", "--apply"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(!bed.face() && bed.reseal(), "{}\n{out}\n{err}", bed.stack());
+}
+
+/// The reconcile unit strips the face lines from a LightDM irlume had wired
+/// once its XDMCP server is turned on, keeping the reseal lines; counts that
+/// as intact afterwards; puts the face lines back once the server is off;
+/// and does the same on the run that adopts the marker after an upgrade.
+#[test]
+fn reconcile_keeps_face_off_lightdm_while_it_serves_xdmcp() {
+    let bed = LightdmBed::new("lightdm-reconcile");
+    bed.xdmcp(false);
+    let (code, out, err) = bed.run(&["login", "enable", "--apply"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(bed.face(), "{}", bed.stack());
+
+    bed.xdmcp(true);
+    let (code, out, err) = bed.run(&["login", "reconcile"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        err.contains("removing LightDM's face and fingerprint lines"),
+        "{err}"
+    );
+    assert!(!bed.face() && bed.reseal(), "{}", bed.stack());
+
+    let (code, out, err) = bed.run(&["login", "reconcile"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        !err.contains("LightDM") && !err.contains("re-applying"),
+        "{err}"
+    );
+
+    bed.xdmcp(false);
+    let (code, out, err) = bed.run(&["login", "reconcile"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(err.contains("restoring its face lines"), "{err}");
+    assert!(bed.face(), "{}", bed.stack());
+
+    // An upgrade from a release without the marker: the adopting run strips
+    // the face lines too.
+    std::fs::remove_file(bed.sb.path("state/login.wired")).unwrap();
+    bed.xdmcp(true);
+    let (code, out, err) = bed.run(&["login", "reconcile"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        err.contains("adopted the existing face-login wiring"),
+        "{err}"
+    );
+    assert!(!bed.face() && bed.reseal(), "{}", bed.stack());
+}
+
 /// A stand-in for the gnome-keyring that `pam_gnome_keyring auto_start`
 /// starts: a process whose argv reads `gnome-keyring-daemon ... --login`,
 /// listening on `runtime_dir/keyring/control` and answering every request

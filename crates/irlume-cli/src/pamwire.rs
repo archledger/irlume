@@ -38,6 +38,7 @@ mod autologin;
 mod files;
 mod grammar;
 mod overrides;
+mod remote_seats;
 mod report;
 mod stanzas;
 mod token;
@@ -473,6 +474,11 @@ fn reconcile() -> ExitCode {
              (sudo={with_sudo}, polkit={with_polkit}, lock={with_lock}); a future distro PAM \
              update will now re-apply it automatically"
         );
+        // Package upgrades start this run, so the face lines of a LightDM
+        // that serves remote login screens come out here, not on a later one.
+        if remote_seat_change().is_some() {
+            return reconcile_wiring(with_sudo, with_polkit, with_lock, false);
+        }
         return ExitCode::SUCCESS;
     };
     // The marker records what `login enable` wired, and it can drift: a real
@@ -850,7 +856,11 @@ fn reconcile_wiring(
     let lane_yield = lane_yield_for(omarchy, face_lane_present, stock_wired, with_lock, || {
         wants().face_lock
     });
+    // A greeter `remote_seats` governs can need its face lines stripped or
+    // put back while the module stays in its stack.
+    let remote_seat = remote_seat_change();
     if active_login_wired()
+        && remote_seat.is_none()
         && !lockscreen_regressed(with_lock)
         && !wired_surface_regressed(with_sudo, with_polkit)
         && !reclaim
@@ -870,6 +880,12 @@ fn reconcile_wiring(
         eprintln!("[login] the dedicated Omarchy face lane is gone; restoring the stock lock lane");
     } else if lane_yield {
         eprintln!("[login] the dedicated Omarchy face lane exists; yielding the stock lock lane");
+    } else if let Some(RemoteSeat::Strip(why)) = &remote_seat {
+        eprintln!("[login] {why}; removing LightDM's face and fingerprint lines");
+    } else if let Some(RemoteSeat::Restore) = &remote_seat {
+        eprintln!(
+            "[login] LightDM no longer serves remote login screens; restoring its face lines"
+        );
     } else {
         eprintln!("[login] greeter PAM configuration changed; re-applying irlume wiring");
     }
@@ -1053,6 +1069,7 @@ pub(crate) fn reconcile_needed() -> bool {
     let face_lane_present = Path::new(OMARCHY_FACE_LANE).exists();
     let stock_wired = lock_wired();
     !active_login_wired()
+        || remote_seat_change().is_some()
         || lockscreen_regressed(with_lock)
         || wired_surface_regressed(with_sudo, with_polkit)
         || lane_reclaim_for(face_lock_intent, omarchy, face_lane_present, stock_wired)
@@ -1229,6 +1246,33 @@ fn dm_profile(greeter_etc: &str, gnome: Option<u32>) -> DmProfile {
     }
 }
 
+/// Whether a greeter's wiring has something to do: a factor this run wants,
+/// or, on a greeter whose face lines are kept out (`remote_seats`), a face or
+/// fingerprint line an earlier enable left there. That line comes off even
+/// while nothing wants a factor (the camera away for a moment): left there,
+/// it serves the remote screens again once the camera is back.
+fn greeter_wanted(s: &Svc, factors: bool, face_blocked: bool) -> bool {
+    factors || (face_blocked && carries_face_lines(s.etc))
+}
+
+/// Whether a greeter gets irlume's lines. One whose face lines are kept out
+/// (`remote_seats`) gets the reseal lines alone, but where that recipe cannot
+/// land (no anchor, a continued line, lines irlume keeps as they are) it is
+/// unwired whole instead, so no face line stays behind; the token guard then
+/// refuses a run that would strand a keyring token that way.
+fn greeter_want(
+    s: &Svc,
+    want: bool,
+    face_blocked: bool,
+    wire: &dyn Fn(&str) -> (String, bool),
+) -> bool {
+    if !(want && face_blocked) {
+        return want;
+    }
+    wire_service(s, true, false, wire)
+        .is_ok_and(|outcome| outcome.change != PlannedChange::NoAnchor && !outcome.unmet)
+}
+
 /// Every login manager irlume knows, and the PAM services it consults.
 ///
 /// A table rather than a `match` so a test can walk it: each entry claims irlume
@@ -1258,6 +1302,63 @@ const DM_PAM_SERVICES: &[(&str, &str, Option<&str>)] = &[
     // separate fingerprint service.
     ("cosmic-greeter", "cosmic-greeter", None),
 ];
+
+/// The active login manager and why irlume keeps face and fingerprint off
+/// its greeter whatever the configuration wants (a LightDM that serves remote
+/// login screens, see `remote_seats`), or `None`.
+pub(crate) fn active_dm_face_blocked() -> Option<(String, String)> {
+    let dm = active_display_manager()?;
+    let (greeter, _) = dm_pam_services(&dm);
+    remote_seats::face_blocked(greeter).map(|why| (dm, why))
+}
+
+/// Whether the active login manager's greeter stack carries irlume's `reseal`
+/// session line, which hands a GNOME keyring token over.
+pub(crate) fn active_greeter_hands_tokens_over() -> bool {
+    active_display_manager().is_some_and(|dm| {
+        let (greeter, _) = dm_pam_services(&dm);
+        std::fs::read_to_string(format!("/etc/pam.d/{greeter}"))
+            .is_ok_and(|text| token::delivers_tokens(&text))
+    })
+}
+
+/// Whether the file at `etc` carries one of irlume's lines that reach the
+/// camera or release a secret on their own: any irlume `auth` rule but the
+/// `reseal` line.
+fn carries_face_lines(etc: &str) -> bool {
+    std::fs::read_to_string(etc).is_ok_and(|text| text.lines().any(irlume_auth_rule_beyond_reseal))
+}
+
+/// What reconcile has to change on a greeter `remote_seats` governs: strip
+/// the face lines from one that is blocked (after an upgrade into this rule,
+/// once XDMCP or VNC was turned on, or once LightDM's configuration changed
+/// under a running LightDM), or put them back on one left with only its
+/// `reseal` lines once nothing blocks it.
+enum RemoteSeat {
+    Strip(String),
+    Restore,
+}
+
+fn remote_seat_change() -> Option<RemoteSeat> {
+    GREETERS.iter().find_map(|s| {
+        let path = Path::new(s.etc);
+        if !path.exists() || !file_has_module(path) {
+            return None;
+        }
+        match (
+            remote_seats::face_blocked(service_name(s.etc)),
+            carries_face_lines(s.etc),
+        ) {
+            (Some(why), true) => Some(RemoteSeat::Strip(why)),
+            // Only this rule leaves a greeter with irlume's module and no
+            // face or keyring line: a greeter nothing wants is unwired whole.
+            (None, false) if remote_seats::governs(service_name(s.etc)) => {
+                Some(RemoteSeat::Restore)
+            }
+            _ => None,
+        }
+    })
+}
 
 /// Login managers verified not to display PAM informational messages.
 const DM_HIDES_PAM_TEXT_INFO: &[&str] = &["plasmalogin"];
@@ -1423,6 +1524,13 @@ pub(crate) struct PlannedSurface {
     /// carrying that id would overwrite a stack the consumer was never shown.
     /// The digest is what makes the id describe a state rather than an intent.
     pub(crate) state: String,
+    /// Whether the plan wanted irlume's lines here. Not only the files decide
+    /// it: LightDM's remote-login settings do too (`remote_seats`), so an
+    /// apply compares it as well as the state before writing.
+    pub(crate) want: bool,
+    /// Whether the plan kept the surface's face and fingerprint lines out
+    /// (`remote_seats`), which the files it digests do not show either.
+    pub(crate) face_blocked: bool,
 }
 
 /// What `login enable`/`login disable` would change, computed without writing.
@@ -1432,7 +1540,12 @@ pub(crate) struct PlannedSurface {
 /// PAM files and needs no privilege; only applying does.
 /// Called once per surface: the service, its role, the wiring recipe for it,
 /// and whether this configuration wants it wired.
-type SurfaceVisitor<'a> = dyn FnMut(&Svc, &'static str, &dyn Fn(&str) -> (String, bool), bool) + 'a;
+/// Called once per surface: the service, its role, the wiring recipe for it,
+/// whether this configuration wants it wired, and whether its face and
+/// fingerprint lines are kept out whatever the configuration wants
+/// (`remote_seats`).
+type SurfaceVisitor<'a> =
+    dyn FnMut(&Svc, &'static str, &dyn Fn(&str) -> (String, bool), bool, bool) + 'a;
 
 /// Walk every surface an enable/disable would touch, calling `visit` for each.
 ///
@@ -1452,12 +1565,26 @@ fn walk_surfaces(enable: bool, with_sudo: bool, with_polkit: bool, visit: &mut S
         let unified_login_lock =
             s.etc.ends_with("/cosmic-greeter") || s.etc.ends_with("/gdm-password");
         let face = face_login || (unified_login_lock && face_lock);
-        let greeter_wire = |c: &str| wire_greeter_impl(c, face, fp_keyring, prof.ondemand);
-        visit(s, ROLE_LOGIN, &greeter_wire, face || fp_keyring);
+        // A login screen remote users reach keeps only irlume's `reseal`
+        // lines, the keyring hand-off, which never reaches the camera
+        // (`remote_seats`).
+        let blocked = remote_seats::face_blocked(service_name(s.etc)).is_some();
+        let (face_line, keyring_line) = if blocked {
+            (false, false)
+        } else {
+            (face, fp_keyring)
+        };
+        let greeter_wire = |c: &str| wire_greeter_impl(c, face_line, keyring_line, prof.ondemand);
+        let wanted = greeter_wanted(s, face || fp_keyring, blocked);
+        let want = greeter_want(s, wanted, blocked, &greeter_wire);
+        // The flag says face and fingerprint are kept out of a stack that
+        // would carry them; a greeter nothing wants is unwired as ever, and
+        // the token guard treats it as ever.
+        visit(s, ROLE_LOGIN, &greeter_wire, want, blocked && wanted);
     }
     for s in FP_GREETERS {
         let fp_wire = |c: &str| wire_fp_keyring(c, service_name(s.etc));
-        visit(s, ROLE_LOGIN_FP, &fp_wire, fp_keyring);
+        visit(s, ROLE_LOGIN_FP, &fp_wire, fp_keyring, false);
     }
     let (lock_svc, lock_wire) = lock_surface();
     // #607: the dedicated Omarchy face lane owns face-on-lock when it exists,
@@ -1467,12 +1594,13 @@ fn walk_surfaces(enable: bool, with_sudo: bool, with_polkit: bool, visit: &mut S
         ROLE_LOCK,
         &lock_wire,
         face_lock && !stock_lane_yielded(),
+        false,
     );
     if sudo_in_scope(enable, with_sudo) {
-        visit(&SUDO, ROLE_SUDO, &wire_verify_service, true);
+        visit(&SUDO, ROLE_SUDO, &wire_verify_service, true, false);
     }
     if polkit_in_scope(enable, with_polkit) {
-        visit(&POLKIT, ROLE_POLKIT, &wire_polkit_service, true);
+        visit(&POLKIT, ROLE_POLKIT, &wire_polkit_service, true, false);
     }
 }
 
@@ -1486,11 +1614,20 @@ pub(crate) fn tokens_a_run_strands(enable: bool) -> Result<Vec<String>, String> 
         return tokens_a_disable_strands();
     }
     let mut dropping: Vec<&'static str> = Vec::new();
-    walk_surfaces(true, false, false, &mut |svc, role, _wire, want| {
-        if (role == ROLE_LOGIN || role == ROLE_LOGIN_FP) && !want {
-            dropping.push(svc.etc);
-        }
-    });
+    walk_surfaces(
+        true,
+        false,
+        false,
+        &mut |svc, role, _wire, want, blocked| {
+            // A login screen remote users reach loses its lines whatever a
+            // token needs: leaving a face line there is the worse failure,
+            // and the envelope still lets `irlume keyring forget` re-key the
+            // keyring back (`greeter_want`, `remote_seats`).
+            if (role == ROLE_LOGIN || role == ROLE_LOGIN_FP) && !want && !blocked {
+                dropping.push(svc.etc);
+            }
+        },
+    );
     token::tokens_stranded_by(&dropping)
 }
 
@@ -1500,8 +1637,8 @@ pub(crate) fn plan(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<Plan
         enable,
         with_sudo,
         with_polkit,
-        &mut |svc, role, wire, want| {
-            out.push(plan_surface(svc, role, wire, enable && want));
+        &mut |svc, role, wire, want, blocked| {
+            out.push(plan_surface(svc, role, wire, enable && want, blocked));
         },
     );
     out
@@ -1514,6 +1651,7 @@ fn plan_surface(
     role: &'static str,
     wire: &dyn Fn(&str) -> (String, bool),
     want: bool,
+    face_blocked: bool,
 ) -> PlannedSurface {
     // A service whose decision cannot even be computed (an unreadable file)
     // is reported as not-installed rather than omitted: a surface silently
@@ -1528,6 +1666,8 @@ fn plan_surface(
         // The vendor file too, for a surface that has one: it decides what an
         // override becomes, so a vendor update makes the plan stale.
         state: surface_state_for(svc),
+        want,
+        face_blocked,
     }
 }
 
@@ -1577,7 +1717,7 @@ pub(crate) fn prepare(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<A
         enable,
         with_sudo,
         with_polkit,
-        &mut |svc, role, wire, want| {
+        &mut |svc, role, wire, want, _blocked| {
             let path = Path::new(svc.etc);
             let before_metadata = crate::logintx::file_metadata(path);
             // Wiring creates this and unwiring renames it away, so it is part of
@@ -1641,8 +1781,15 @@ pub(crate) fn apply(
         enable,
         with_sudo,
         with_polkit,
-        &mut |svc, role, wire, want| {
-            out.push(apply_surface(svc, role, wire, enable && want, expected));
+        &mut |svc, role, wire, want, blocked| {
+            out.push(apply_surface(
+                svc,
+                role,
+                wire,
+                enable && want,
+                blocked,
+                expected,
+            ));
         },
     );
     out
@@ -1773,6 +1920,7 @@ fn apply_surface(
     role: &'static str,
     wire: &dyn Fn(&str) -> (String, bool),
     want: bool,
+    face_blocked: bool,
     expected: &[PlannedSurface],
 ) -> AppliedSurface {
     let path = Path::new(svc.etc);
@@ -1798,10 +1946,25 @@ fn apply_surface(
     if let Err(message) = inspect_target(path) {
         return untouched_record(svc, role, message);
     }
-    let planned_state = expected
+    let planned = expected
         .iter()
-        .find(|candidate| candidate.id == service_name(svc.etc))
-        .map(|candidate| candidate.state.as_str());
+        .find(|candidate| candidate.id == service_name(svc.etc));
+    // What this run wants here can change without any file it digests
+    // changing: LightDM's remote-login settings live elsewhere.
+    if planned
+        .is_some_and(|candidate| candidate.want != want || candidate.face_blocked != face_blocked)
+    {
+        return untouched_record(
+            svc,
+            role,
+            format!(
+                "{}: how it should be wired changed between the plan and the write \
+                 (LightDM's remote login settings, say); not touched",
+                svc.etc
+            ),
+        );
+    }
+    let planned_state = planned.map(|candidate| candidate.state.as_str());
     // The state covers the vendor file too: it decides what an override
     // becomes. The planned vendor digest is also handed to the write, which
     // compares it with the bytes it actually reads, so the check and the use
@@ -2243,8 +2406,33 @@ fn act_holding_lock(
         let unified_login_lock =
             s.etc.ends_with("/cosmic-greeter") || s.etc.ends_with("/gdm-password");
         let face = want_face_login || (unified_login_lock && want_face_lock);
-        let greeter_wire = |c: &str| wire_greeter_impl(c, face, want_fp_keyring, prof.ondemand);
-        do_svc(s, &greeter_wire, face || want_fp_keyring);
+        // A login screen remote users reach keeps only irlume's `reseal`
+        // lines, the keyring hand-off, which never reaches the camera
+        // (`remote_seats`); said wherever the service exists.
+        let blocked = remote_seats::face_blocked(service_name(s.etc));
+        if let Some(why) = &blocked {
+            if enable && service_present(s).is_some() {
+                println!("  {}: face and fingerprint left out: {why}", s.etc);
+            }
+        }
+        let (face_line, keyring_line) = if blocked.is_some() {
+            (false, false)
+        } else {
+            (face, want_fp_keyring)
+        };
+        let greeter_wire = |c: &str| wire_greeter_impl(c, face_line, keyring_line, prof.ondemand);
+        let wanted = greeter_wanted(s, face || want_fp_keyring, blocked.is_some());
+        let want = greeter_want(s, wanted, blocked.is_some(), &greeter_wire);
+        if enable && blocked.is_some() && wanted && !want {
+            println!(
+                "  {}: irlume's reseal lines cannot be placed here, so every irlume line \
+                 comes out; a GNOME keyring token armed for an account is no longer \
+                 delivered at this login screen (`irlume keyring forget` re-keys the \
+                 keyring back to the password)",
+                s.etc
+            );
+        }
+        do_svc(s, &greeter_wire, want);
     }
     for s in FP_GREETERS {
         let fp_wire = |c: &str| wire_fp_keyring(c, service_name(s.etc));
@@ -4968,6 +5156,55 @@ auth       optional      pam_gnome_keyring.so\n";
     }
 
     #[test]
+    fn every_irlume_auth_line_but_reseal_counts_as_face() {
+        // What reconcile strips from a login screen `remote_seats` keeps the
+        // camera off, and what status counts as wiring.
+        for line in [
+            "auth sufficient pam_irlume.so unseal ondemand kr",
+            "auth optional pam_irlume.so keyring",
+            "auth sufficient pam_irlume.so wait",
+            "auth sufficient pam_irlume.so",
+            "auth optional pam_irlume.so keyring reseal",
+        ] {
+            assert!(irlume_auth_rule_beyond_reseal(line), "{line}");
+        }
+        for line in [
+            "auth optional pam_irlume.so reseal",
+            "session optional pam_irlume.so reseal",
+            "auth optional pam_permit.so # irlume-landing",
+        ] {
+            assert!(!irlume_auth_rule_beyond_reseal(line), "{line}");
+        }
+        let wait = "@include common-auth\nauth sufficient pam_irlume.so wait\n";
+        assert_eq!(report::wiring_mode(ROLE_LOGIN, wait), Some("verify"));
+        let reseal = "@include common-auth\nauth optional pam_irlume.so reseal\n\
+                      session optional pam_irlume.so reseal\n";
+        assert_eq!(report::wiring_mode(ROLE_LOGIN, reseal), None);
+    }
+
+    #[test]
+    fn a_greeter_with_neither_face_nor_keyring_gets_only_the_reseal_lines() {
+        // What a login screen `remote_seats` keeps the camera off gets, in
+        // both layouts: the keyring hand-off, nothing that reaches the camera.
+        let debian = "#%PAM-1.0\n@include common-auth\n@include common-account\n\
+                      @include common-session\n";
+        for (layout, stack) in [("include", debian), ("substack", UPSTREAM_FEDORA)] {
+            let (wired, changed) = wire_greeter_impl(stack, false, false, true);
+            assert!(changed, "{layout}");
+            assert!(
+                wired.contains(RESEAL_AUTH) && wired.contains(RESEAL_SESSION),
+                "{layout}"
+            );
+            assert!(
+                !wired
+                    .lines()
+                    .any(|l| irlume_rule_has_arg(l, "unseal") || irlume_rule_has_arg(l, "keyring")),
+                "{layout}: {wired}"
+            );
+        }
+    }
+
+    #[test]
     fn plasmalogin_fingerprint_keyring_line_lands_above_the_wallet_module() {
         // The KDE fingerprint→KWallet chain. Plasma's greeter runs ONE stack
         // for user auth (plasma-login-manager's PamBackend selects only
@@ -6744,6 +6981,7 @@ auth required pam_fprintd.so\n\
             ROLE_SUDO,
             &wire_verify_service,
             true,
+            false,
             &[],
         );
         assert!(rec.error.is_some(), "with the reason it was refused");

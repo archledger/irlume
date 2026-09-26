@@ -396,3 +396,59 @@ with a fabricated print.
   genuine success does not establish safety against that case. Root deletion,
   disk rollback and the ambiguity between socket delivery and durable reset are
   outside an exactly-once guarantee. Ordinary password login remains available.
+
+## Remote sessions
+
+The camera answers for whoever sits at this machine, so pam_irlume stands down
+(it returns `PAM_IGNORE`, and the stack goes on to the password) for a PAM
+transaction it can tell is remote:
+
+- `PAM_RHOST` names another host. Empty, `localhost`, `localhost.localdomain`,
+  `127.0.0.1` and `::1` count as local, in any case and with surrounding
+  blanks trimmed. Every other value counts as remote, other loopback
+  spellings such as `127.0.0.2` or `::ffff:127.0.0.1` included.
+- `SSH_CONNECTION` or `SSH_TTY` is set, as for `sudo` in an ssh shell.
+- The service is remote by name: the shared service table's `sshd`, `remote`
+  and `cockpit`, and the remote-desktop names (`xrdp*`, any name containing
+  `vnc`, `xpra*`, NoMachine's `nx*`). A web console behind a local reverse
+  proxy reports a loopback `PAM_RHOST`, so only its name gives it away.
+
+LightDM's XDMCP and VNC servers give remote users a login screen through the
+same `lightdm` service as the local one, and set no `PAM_RHOST`; an Xvnc
+display is `:N` like a local one. So while either server is on in LightDM's
+configuration, `irlume login enable` and the reconcile unit (whose path unit
+watches LightDM's configuration files as well as the PAM files) keep irlume's
+face and fingerprint lines out of `lightdm`, removing them if they are there, and
+leave only its `reseal` lines, which never reach the camera and hand a GNOME
+keyring token over; `irlume doctor` warns. Both servers are off by default.
+A running LightDM keeps the configuration it started with, so the face lines
+also stay out while the running LightDM started before its configuration last
+changed. Once LightDM has restarted with the server off, the reconcile unit
+puts them back. The path unit reacts within a second to an edit in place; a
+file replaced by rename (`sed -i`, most configuration managers) escapes file
+watches, and the reconcile timer then applies the rule within 30 minutes. After
+turning XDMCP or VNC on that way, run `sudo irlume login reconcile` before
+restarting LightDM.
+
+What the module cannot tell apart, and has to be handled outside it:
+
+- Remote-control software attached to the real login screen or desktop
+  (x11vnc on `:0`, an RDP screen share, NoMachine to the physical session).
+  The PAM request comes from the local greeter or lock screen and looks
+  exactly like someone at the keyboard. Do not expose a login or lock screen
+  with face login wired to remote control.
+- GNOME Remote Desktop's multi-user remote login, which authenticates through
+  the ordinary `gdm-password` service. If that transaction sets no
+  `PAM_RHOST`, it looks local. Do not wire face login where GNOME Remote
+  Login is enabled.
+- A fingerprint reader in a shared stack. `irlume fingerprint enable` puts
+  `pam_fprintd` into the distribution's shared stack (`common-auth`,
+  `system-auth`), which LightDM's login screen includes; irlume keeps its own
+  lines out of a LightDM that serves remote login screens, but not that
+  module, so a finger presented at this machine could answer an XDMCP or VNC
+  login. Do not enable fingerprint login together with LightDM's remote
+  servers.
+- A remote login through a service irlume does not know by name, into which
+  pam_irlume was added by hand, that sets neither `PAM_RHOST` nor the ssh
+  variables, and a remote X display (`PAM_XDISPLAY` of `host:N`) reaching
+  such a stack: the module does not read `PAM_XDISPLAY`.

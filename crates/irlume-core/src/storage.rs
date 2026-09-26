@@ -734,7 +734,12 @@ fn save_with_key(
 /// falling back to the password, if the seal can no longer be satisfied).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn load(user: &str) -> irlume_common::Result<Option<Enrollment>> {
-    load_with_key(user).map(|loaded| loaded.map(|(enrollment, _)| enrollment))
+    load_with(
+        user,
+        template_key::UserStateLock::acquire,
+        template_key::load_key_unlocked,
+    )
+    .map(|loaded| loaded.map(|(enrollment, _)| enrollment))
 }
 
 /// An enrollment together with the template key its load unsealed (`None`

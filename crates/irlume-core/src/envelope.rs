@@ -220,6 +220,21 @@ impl SealedEnvelope {
     /// secret blob; only the TPM can unseal it, but keep it unreadable anyway.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn save(&self, path: &Path) -> Result<()> {
+        match self.save_reporting(path)? {
+            irlume_common::AtomicWrite::Durable => Ok(()),
+            irlume_common::AtomicWrite::VisibleNotDurable(e) => Err(Error::Io(e.to_string())),
+        }
+    }
+
+    /// [`save`](Self::save), telling a write that published apart from one
+    /// that did not: `VisibleNotDurable` means readers already see this
+    /// envelope although syncing its directory failed, and `Err` means
+    /// nothing was published.
+    ///
+    /// # Errors
+    /// Returns the directory, serialization or write error when nothing was
+    /// published.
+    pub fn save_reporting(&self, path: &Path) -> Result<irlume_common::AtomicWrite> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
         }
@@ -228,7 +243,8 @@ impl SealedEnvelope {
         // the live seal. Every seal writer (keyring arm/reseal, template-key
         // reseal) goes through here, so this one change protects them all; the
         // greeter unseal always reads a whole envelope, old or new.
-        irlume_common::write_0600_atomic(path, s.as_bytes()).map_err(|e| Error::Io(e.to_string()))
+        irlume_common::write_atomic_reporting(path, s.as_bytes(), 0o600)
+            .map_err(|e| Error::Io(e.to_string()))
     }
 }
 

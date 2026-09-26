@@ -391,7 +391,16 @@ fn move_with(
     if candidate.strength_rank() <= env.strength_rank() {
         return Ok(false);
     }
-    candidate.save(&path)?;
+    // Once the new envelope is visible the move happened, even when syncing
+    // the directory failed: an error here must mean the old one is still in
+    // place. A power loss may bring the old envelope back, which unseals too.
+    if let irlume_common::AtomicWrite::VisibleNotDurable(e) = candidate.save_reporting(&path)? {
+        eprintln!(
+            "irlume: moved the template key of '{user}' to a stronger TPM policy, but syncing \
+             its directory failed ({e}); after a power loss the previous envelope, which still \
+             unseals, may come back"
+        );
+    }
     set_0600(&path);
     Ok(true)
 }

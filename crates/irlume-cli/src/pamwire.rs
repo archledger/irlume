@@ -1526,6 +1526,10 @@ pub(crate) struct AppliedSurface {
     /// and the surfaces that DID change are still recorded, so a rollback can
     /// undo a partial run.
     pub(crate) error: Option<String>,
+    /// The failure is only that irlume kept the file as it was rather than
+    /// change it as asked (see [`WireOutcome`]'s `unmet`): nothing went wrong
+    /// with the machine, so the self-heal marker still follows the apply.
+    pub(crate) kept: bool,
 }
 
 /// Read every surface's pre-change state, writing nothing.
@@ -1580,6 +1584,7 @@ pub(crate) fn prepare(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<A
                 after_sha256: crate::logintx::ABSENT.to_string(),
                 sidecar_after_sha256: None,
                 error,
+                kept: false,
             });
         },
     );
@@ -1664,6 +1669,7 @@ fn untouched_record(svc: &Svc, role: &'static str, error: String) -> AppliedSurf
         // `surface_state` makes.
         after_sha256,
         error: Some(error),
+        kept: false,
     }
 }
 
@@ -1805,8 +1811,15 @@ fn apply_surface(
             .and_then(|state| state.split(' ').nth(2))
             .map(str::to_string),
     };
-    let (change, error) = match wire_service_with(svc, want, &opts, wire) {
-        Ok(outcome) => (outcome.change, None),
+    let (change, error, kept) = match wire_service_with(svc, want, &opts, wire) {
+        // Kept rather than changed as asked: updating irlume's lines would
+        // move a jump or one of them past an administrator's line, or the
+        // file has a continued line. Nothing was written, and irlume's lines
+        // are not the ones this run wanted, so the surface fails, as the
+        // human command fails the run (`kept_unmet`), and the marker is not
+        // written as if it had succeeded.
+        Ok(outcome) if outcome.unmet => (outcome.change, Some(outcome.message), true),
+        Ok(outcome) => (outcome.change, None, false),
         // Refused, or failed before anything was written: irlume changed
         // nothing at the path. What is there is the file this run read, or
         // one another writer put there meanwhile, which the checked write
@@ -1833,9 +1846,10 @@ fn apply_surface(
                 after_sha256,
                 sidecar_after_sha256: sidecar.after_sha256,
                 error: Some(e.message),
+                kept: false,
             };
         }
-        Err(e) => (PlannedChange::NotInstalled, Some(e.message)),
+        Err(e) => (PlannedChange::NotInstalled, Some(e.message), false),
     };
     // Same rule after the write: only a real NotFound is ABSENT. An
     // unreadable file would otherwise record a digest
@@ -1872,6 +1886,7 @@ fn apply_surface(
         after_sha256,
         sidecar_after_sha256: sidecar.after_sha256,
         error,
+        kept,
     }
 }
 

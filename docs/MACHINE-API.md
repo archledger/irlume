@@ -690,11 +690,14 @@ their side of every line an administrator added. `keep-edited-override` writes
 nothing: the copy has lines irlume did not write and its vendor file changed
 since irlume created it (or it predates vendor tracking and differs), or
 updating irlume's lines would move where one of its numeric jumps lands or
-move one of irlume's lines past an administrator's line. A copy nobody edited
-is not rebuilt either when irlume's lines would make a numeric jump in its new
-vendor file land somewhere other than it does there (a jump the update added,
-or one whose landing it changed); it reports `already-correct`, since its
-irlume lines are right for the vendor text it was built from, and `doctor`'s
+move one of irlume's lines past an administrator's line. `login apply` counts
+such a surface as failed (`applied: false`, and the apply fails), since
+irlume's lines are not the ones it was asked for; as on the command line, the
+self-heal marker still follows the other surfaces. A copy nobody edited is not
+rebuilt either when irlume's lines would make a numeric jump in its new vendor
+file land somewhere other than it does there (a jump the update added, or one
+whose landing it changed); it reports `already-correct`, since its irlume
+lines are right for the vendor text it was built from, and `doctor`'s
 `login-overrides` check carries the pending update. A copy with lines irlume
 did not write and none of irlume's gets them next to its password line, below
 every line above it; when irlume cannot tell which line that is (another line

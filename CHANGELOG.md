@@ -791,11 +791,13 @@ All notable changes to irlume are documented here. This project adheres to
   A Tier 1 envelope an earlier release wrote still unseals, and moves on
   its next verified reseal: the next password login for the keyring
   secret, also when that login re-wraps a GNOME keyring token after a
-  password change, and the next face match for the template key. Without
-  a pcrlock policy covering one of PCRs 0 to 7, an `IRLUME_PCRS` naming
-  none of them leaves Tier 1 envelopes as they are. `irlume diag`,
-  `irlume doctor` and the TUI no longer present the signed policy as a
-  sealing tier (#868).
+  password change, and irlumed's next start for the template key (the
+  package update restarts it), never inside an authentication request,
+  which unseals the key once (ADR-0025). Without a pcrlock policy
+  covering one of PCRs 0 to 7, an `IRLUME_PCRS` naming none of them
+  leaves Tier 1 envelopes as they are. `irlume diag`, `irlume doctor`
+  and the TUI no longer present the signed policy as a sealing tier
+  (#868, #870).
 
 - pam_irlume stands down for a polkit consent prompt whose requesting
   agent is in a remote login session, or in one it cannot resolve.

@@ -316,6 +316,10 @@ pub fn load_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum KeyLoadPolicy {
     Upgrade,
+    /// The normal unseal, never followed by a move to a stronger policy: an
+    /// authentication request unseals the key at most once (ADR-0025), and
+    /// the move round-trip unseals the new envelope.
+    Keep,
     ReadOnly,
 }
 
@@ -327,6 +331,78 @@ pub(crate) fn load_key_unlocked(user: &str) -> Result<Zeroizing<Vec<u8>>> {
         tpm::stronger_tier_available_than,
         tpm::seal,
     )
+}
+
+/// The key for an authentication request: caller holds the user state lock.
+/// Never moves the envelope to a stronger policy, which would unseal the key
+/// a second time inside the request (ADR-0025); irlumed does that at startup
+/// ([`move_to_stronger_policy`]).
+pub(crate) fn load_key_for_authentication_unlocked(user: &str) -> Result<Zeroizing<Vec<u8>>> {
+    load_key_with(
+        user,
+        KeyLoadPolicy::Keep,
+        tpm::unseal,
+        tpm::stronger_tier_available_than,
+        tpm::seal,
+    )
+}
+
+/// Move `user`'s template key to a strictly stronger TPM policy when one is
+/// available: a signed Tier 1 envelope an earlier release wrote, or a literal
+/// one after a pcrlock policy covering a firmware-measured PCR was
+/// provisioned. irlumed calls this at startup, off every authentication
+/// request. With nothing stronger available it reads only the envelope and
+/// the policy files; otherwise it unseals the key once, seals it under the
+/// ladder's policy (round-trip verified) and keeps the new envelope only if
+/// it ranks higher. `Ok(true)` when the envelope moved.
+///
+/// # Errors
+/// Returns the lock, envelope, unseal, seal or save error; the envelope is
+/// then left as it was.
+pub fn move_to_stronger_policy(user: &str) -> Result<bool> {
+    if !has_key(user) {
+        return Ok(false);
+    }
+    let _state = UserStateLock::acquire(user)?;
+    move_with(
+        user,
+        tpm::unseal,
+        tpm::stronger_tier_available_than,
+        tpm::seal,
+    )
+}
+
+/// [`move_to_stronger_policy`] with the TPM calls passed in. Unlike the
+/// best-effort move in [`load_key_with`], a failed seal or save is an error,
+/// so irlumed can say the key stayed where it was.
+fn move_with(
+    user: &str,
+    unseal: impl FnOnce(&SealedEnvelope) -> Result<Zeroizing<Vec<u8>>>,
+    stronger_tier_available: impl FnOnce(&SealedEnvelope) -> bool,
+    seal: impl FnOnce(&[u8]) -> Result<SealedEnvelope>,
+) -> Result<bool> {
+    let path = key_path(user);
+    let env = SealedEnvelope::load(&path)?;
+    if !stronger_tier_available(&env) {
+        return Ok(false);
+    }
+    let key = unseal(&env)?;
+    let candidate = seal(&key)?;
+    if candidate.strength_rank() <= env.strength_rank() {
+        return Ok(false);
+    }
+    // Once the new envelope is visible the move happened, even when syncing
+    // the directory failed: an error here must mean the old one is still in
+    // place. A power loss may bring the old envelope back, which unseals too.
+    if let irlume_common::AtomicWrite::VisibleNotDurable(e) = candidate.save_reporting(&path)? {
+        eprintln!(
+            "irlume: moved the template key of '{user}' to a stronger TPM policy, but syncing \
+             its directory failed ({e}); after a power loss the previous envelope, which still \
+             unseals, may come back"
+        );
+    }
+    set_0600(&path);
+    Ok(true)
 }
 
 /// Caller holds the existing user state lock. Never upgrades the envelope or
@@ -359,10 +435,11 @@ fn load_key_with(
     // Best-effort tier auto-upgrade (mirrors keyring::reseal_password): if a
     // strictly stronger policy is available than the one this key was sealed
     // under (pcrlock provisioned since, or a signed Tier 1 envelope from an
-    // earlier release), re-seal the key to it with no re-enroll. The check
-    // short-circuits to a no-op once the envelope is already at the best
-    // policy, so there is no steady per-match cost. Never fail the load on it:
-    // the key unsealed fine and the weaker envelope stays usable.
+    // earlier release), re-seal the key to it with no re-enroll. Not on an
+    // authentication request's load (`Keep`), since the ladder's round trip
+    // unseals again. The check short-circuits to a no-op once the envelope is
+    // already at the best policy. Never fail the load on it: the key unsealed
+    // fine and the weaker envelope stays usable.
     if policy == KeyLoadPolicy::Upgrade && stronger_tier_available(&env) {
         if let Ok(candidate) = seal(&key) {
             if candidate.strength_rank() > env.strength_rank() && candidate.save(&path).is_ok() {
@@ -604,6 +681,23 @@ mod tests {
         .unwrap();
         assert_eq!(key.as_slice(), &[42; 32]);
         assert_eq!(std::fs::read(key_path("alice")).unwrap(), before);
+        // An authentication request's load unseals once and never moves the
+        // envelope, whose round trip would unseal it again (ADR-0025).
+        let mut unseals = 0;
+        let key = load_key_with(
+            "alice",
+            KeyLoadPolicy::Keep,
+            |_: &SealedEnvelope| {
+                unseals += 1;
+                Ok(Zeroizing::new(vec![42; 32]))
+            },
+            |_| panic!("an authentication load must not probe upgrades"),
+            |_| panic!("an authentication load must not seal"),
+        )
+        .unwrap();
+        assert_eq!(key.as_slice(), &[42; 32]);
+        assert_eq!(unseals, 1);
+        assert_eq!(std::fs::read(key_path("alice")).unwrap(), before);
         let key = load_key_with(
             "alice",
             KeyLoadPolicy::Upgrade,
@@ -747,6 +841,103 @@ mod tests {
 
     /// Full TPM-backed lifecycle: seal a key, recovery-wrap it, simulate a PCR
     /// move by forgetting the seal, then restore from the passphrase.
+    /// The startup move reads only the envelope when nothing stronger is
+    /// available, moves a key onto a stronger policy, keeps it where it is
+    /// when the ladder did not reach one, and reports a failed seal instead
+    /// of passing it off as nothing to do.
+    #[test]
+    fn the_startup_move_moves_skips_or_reports() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("move-with"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &dir);
+        let weak: SealedEnvelope =
+            serde_json::from_str(r#"{"version":1,"pcrs":[7],"public":"","private":""}"#).unwrap();
+        weak.save(&key_path("alice")).unwrap();
+        let before = std::fs::read(key_path("alice")).unwrap();
+        let unseal = |_: &SealedEnvelope| Ok(Zeroizing::new(vec![42; 32]));
+        let stronger = |_: &[u8]| {
+            let mut env: SealedEnvelope = serde_json::from_slice(&before).unwrap();
+            env.policy = crate::envelope::PolicyKind::PcrlockNv { nv_index: 1 };
+            Ok(env)
+        };
+
+        assert!(!move_with(
+            "alice",
+            |_| panic!("nothing stronger: no unseal"),
+            |_| false,
+            |_| panic!("nothing stronger: no seal"),
+        )
+        .unwrap());
+        let same = |_: &[u8]| Ok(serde_json::from_slice::<SealedEnvelope>(&before).unwrap());
+        assert!(!move_with("alice", unseal, |_| true, same).unwrap());
+        assert_eq!(std::fs::read(key_path("alice")).unwrap(), before);
+        assert!(move_with(
+            "alice",
+            unseal,
+            |_| true,
+            |_| Err(irlume_common::Error::Tpm("seal failed".into())),
+        )
+        .is_err());
+        assert_eq!(std::fs::read(key_path("alice")).unwrap(), before);
+        assert!(move_with("alice", unseal, |_| true, stronger).unwrap());
+        assert!(matches!(
+            SealedEnvelope::load(&key_path("alice")).unwrap().policy,
+            crate::envelope::PolicyKind::PcrlockNv { .. }
+        ));
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A template key on a weaker policy stays there through an
+    /// authentication request's load, which unseals it once, and moves when
+    /// irlumed starts: once, and not again when nothing stronger is left.
+    #[test]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
+    fn the_template_key_moves_at_startup_not_during_authentication() {
+        use crate::envelope::PolicyKind;
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = crate::test_tmp_dir("tk-move");
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _pcrlock = crate::tpm::tests::PcrlockFixture::provision(0x0181_C113);
+
+        let key = crypto::generate_key();
+        crate::tpm::seal_with_pcrs(&key, &[7])
+            .unwrap()
+            .save(&key_path("mv"))
+            .unwrap();
+        let policy = || SealedEnvelope::load(&key_path("mv")).unwrap().policy;
+
+        {
+            let _state = UserStateLock::acquire("mv").unwrap();
+            assert_eq!(&*load_key_for_authentication_unlocked("mv").unwrap(), &*key);
+        }
+        assert_eq!(policy(), PolicyKind::PcrLiteral, "authentication moved it");
+
+        assert!(move_to_stronger_policy("mv").unwrap(), "the startup move");
+        assert!(
+            matches!(policy(), PolicyKind::PcrlockNv { .. }),
+            "got {:?}",
+            policy()
+        );
+        assert!(
+            !move_to_stronger_policy("mv").unwrap(),
+            "nothing stronger left"
+        );
+        assert!(
+            !move_to_stronger_policy("nobody").unwrap(),
+            "no key, no move"
+        );
+        assert_eq!(&*load_key("mv").unwrap(), &*key, "still unseals");
+        forget_key("mv").unwrap();
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+    }
+
     #[test]
     #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn tpm_key_and_recovery_lifecycle() {
@@ -889,7 +1080,8 @@ mod tests {
 
     /// On signed-UKI hardware, a template key an earlier release sealed under
     /// the signed Tier 1 policy moves to a bound policy (literal PCR 7, or
-    /// pcrlock) the next time it is loaded (i.e. the next face match), with no
+    /// pcrlock) the next time it is loaded outside an authentication request
+    /// (irlumed's start, through [`move_to_stronger_policy`]), with no
     /// re-enroll. Companion to the keyring reseal upgrade.
     #[test]
     #[ignore = "requires a real TPM + fresh systemd signed-PCR artifacts (UKI/systemd-boot)"]

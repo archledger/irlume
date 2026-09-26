@@ -943,6 +943,28 @@ fn main() {
                 }
             }
 
+            // Move each account's template key to a stronger TPM policy when one
+            // is available (a signed Tier 1 seal an earlier release wrote, or a
+            // literal one after pcrlock was provisioned). Here at startup, not
+            // in an authentication request, which unseals the key at most once
+            // (ADR-0025) while the move round-trip unseals the new envelope. With
+            // nothing stronger available only the envelope and the policy files
+            // are read, so an ordinary start does no TPM work here.
+            if irlume_core::template_key::tpm_available() {
+                for user in irlume_core::storage::list_users() {
+                    match irlume_core::template_key::move_to_stronger_policy(&user) {
+                        Ok(true) => jout_notice!(
+                            "irlumed: moved the template key of '{user}' to a stronger TPM policy"
+                        ),
+                        Ok(false) => {}
+                        Err(e) => jout_warn!(
+                            "irlumed: could not move the template key of '{user}' to a stronger \
+                             TPM policy ({e}); its envelope was not changed"
+                        ),
+                    }
+                }
+            }
+
             // SO_PEERCRED is the authorization boundary, and the socket mode must not
             // pretend to be a second one.
             //

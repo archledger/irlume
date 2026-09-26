@@ -292,11 +292,13 @@ signature where a UKI publishes one (Tier 1). That policy binds only PCR 11,
 which the operating system measures itself, so it binds less of the platform
 than PCR 7 or a pcrlock policy, and new seals no longer use it. A Tier 1
 envelope still unseals, and its next verified reseal moves it to pcrlock or
-literal PCR 7: a password login for the keyring secret, the next face match
-for the template key. Where no pcrlock policy covering one of PCRs 0 to 7 is
-provisioned, an `IRLUME_PCRS` that names none of them keeps Tier 1 envelopes
-where they are, since a literal policy over it would bind no more. Full-disk
-encryption is what protects the rest of the disk.
+literal PCR 7: a password login for the keyring secret, and irlumed's next
+start for the template key, which moves there and not inside an authentication
+request (an authentication unseals the key once, ADR-0025). Where no pcrlock
+policy covering one of PCRs 0 to 7 is provisioned, an `IRLUME_PCRS` that names
+none of them keeps Tier 1 envelopes where they are, since a literal policy
+over it would bind no more. Full-disk encryption is what protects the rest of
+the disk.
 
 **Fingerprint keyring unlock** ([ADR-0003](adr/0003-fingerprint-keyring-unlock.md))
 releases the sealed secret on *root peer + login-service-class*, without

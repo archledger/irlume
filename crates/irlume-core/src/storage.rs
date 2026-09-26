@@ -744,6 +744,8 @@ pub type LoadedEnrollment = (Enrollment, Option<Zeroizing<Vec<u8>>>);
 /// [`load`] that also returns the template key it unsealed (`None` for a
 /// plaintext store), so the rest of an authentication request can lend that
 /// key to its later encrypted reads instead of unsealing again (ADR-0025).
+/// Unlike [`load`], it never moves the key to a stronger TPM policy, whose
+/// round trip would unseal it a second time; irlumed does that at startup.
 ///
 /// # Errors
 /// As [`load`].
@@ -751,7 +753,7 @@ pub fn load_with_key(user: &str) -> irlume_common::Result<Option<LoadedEnrollmen
     load_with(
         user,
         template_key::UserStateLock::acquire,
-        template_key::load_key_unlocked,
+        template_key::load_key_for_authentication_unlocked,
     )
 }
 
@@ -792,7 +794,7 @@ pub fn load_snapshot(user: &str) -> irlume_common::Result<Option<PrimarySnapshot
     load_snapshot_with(
         user,
         template_key::UserStateLock::acquire,
-        template_key::load_key_unlocked,
+        template_key::load_key_for_authentication_unlocked,
     )
 }
 

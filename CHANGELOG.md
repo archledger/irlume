@@ -372,8 +372,12 @@ All notable changes to irlume are documented here. This project adheres to
   or removal of one of these files never replaces or deletes a file
   another program put there after irlume read it, including one created
   where irlume read none, and never reverts a mode or owner set after
-  irlume read it, and an override is deleted only while its vendor copy is
-  still there. A jump whose type is written in brackets (`[auth]`) is
+  irlume read it, an override is deleted only while its vendor copy is
+  still there, and one made from a vendor copy stays in place only while
+  that copy is still the one it was made from. On a filesystem that cannot
+  swap two files in one step (`RENAME_EXCHANGE`), irlume refuses to
+  replace one of these files rather than risk overwriting a change made at
+  the same moment. A jump whose type is written in brackets (`[auth]`) is
   counted like any other, and a jump onto the first of two identical rules
   is told from one onto the second. `login plan` counts a vendor file
   change between plan and apply as a change to the machine, so existing

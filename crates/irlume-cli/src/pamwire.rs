@@ -2494,6 +2494,17 @@ fn wire_override(
         wire,
     })?;
     if opts.apply {
+        // The vendor copy as decided on above, and as it is now. A package can
+        // replace or remove it at any moment without taking irlume's lock.
+        let decided = vendor
+            .as_deref()
+            .map(|v| crate::logintx::sha256_hex(v.as_bytes()));
+        let vendor_now = || match std::fs::symlink_metadata(vendor_path) {
+            Ok(meta) if meta.file_type().is_file() => std::fs::read(vendor_path)
+                .ok()
+                .map(|b| crate::logintx::sha256_hex(&b)),
+            _ => None,
+        };
         match &decision.write {
             overrides::Write::Nothing => {}
             overrides::Write::Replace(content) => {
@@ -2502,8 +2513,25 @@ fn wire_override(
                 }
                 // Checked against the bytes decided on, immediately before the
                 // rename: an editor saving in place in between is not
-                // overwritten.
-                if let Err(e) = write_atomic_checked(etc, content, current.as_deref()) {
+                // overwritten. And made from the vendor copy decided on, so it
+                // stays only while that copy is still the same once it is in
+                // place: an override made from a vendor copy a package has
+                // since replaced would shadow the new one, with modules the
+                // package may have removed. The file then goes back as it was.
+                let still = || -> Result<(), String> {
+                    #[cfg(test)]
+                    change_vendor_for_test(Path::new(vendor_path));
+                    if vendor_now() == decided {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "{vendor_path} changed while irlume was writing {}; the file was \
+                             left as it was, run again to decide afresh",
+                            s.etc
+                        ))
+                    }
+                };
+                if let Err(e) = write_atomic_checked_if(etc, content, current.as_deref(), &still) {
                     return header_write_refused(s.etc, decision.header_only, e);
                 }
             }
@@ -2515,18 +2543,10 @@ fn wire_override(
                 // every login, passwords included. So the vendor copy is
                 // checked again once the override is out of the way, and the
                 // override goes back if it is no longer the same.
-                let decided = vendor
-                    .as_deref()
-                    .map(|v| crate::logintx::sha256_hex(v.as_bytes()));
                 let still = || -> Result<(), String> {
                     #[cfg(test)]
                     remove_vendor_for_test(Path::new(vendor_path));
-                    let now = match std::fs::symlink_metadata(vendor_path) {
-                        Ok(meta) if meta.file_type().is_file() => std::fs::read(vendor_path)
-                            .ok()
-                            .map(|b| crate::logintx::sha256_hex(&b)),
-                        _ => None,
-                    };
+                    let now = vendor_now();
                     if now.is_some() && now == decided {
                         Ok(())
                     } else {

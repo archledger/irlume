@@ -1922,7 +1922,9 @@ fn a_checked_create_keeps_a_file_that_appeared() {
 
 /// On a filesystem without RENAME_NOREPLACE and RENAME_EXCHANGE a creation
 /// still never replaces a file that appeared (it links the file in, which
-/// refuses an existing name), and writes otherwise work as before.
+/// refuses an existing name). A checked replacement is refused rather than
+/// made with a plain rename, which would replace a file another writer put
+/// there after the check; a write that checks nothing still falls back.
 #[test]
 fn checked_writes_work_without_the_rename_flags() {
     let dir = TestDir::new("ovr-write-no-flags");
@@ -1940,10 +1942,56 @@ fn checked_writes_work_without_the_rename_flags() {
     );
     std::fs::remove_file(&path).unwrap();
     write_atomic_checked(&path, "created\n", None).unwrap();
-    write_atomic_checked(&path, "replaced\n", Some("created\n")).unwrap();
+    let err = write_atomic_checked(&path, "replaced\n", Some("created\n"))
+        .expect_err("no checked replacement without RENAME_EXCHANGE");
+    assert!(err.message.contains("RENAME_EXCHANGE"), "{err}");
+    assert!(!err.landed);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "created\n");
+    write_atomic(&path, "replaced\n").unwrap();
     disarm(&NO_RENAME_FLAGS, &path);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced\n");
     assert_eq!(entries(&dir.0), ["sudo"], "no scratch file is left");
+}
+
+/// An override is made from the vendor copy read at the start. A package
+/// that replaces that copy before the override is in place gets the file
+/// back as it was: the created override is removed, a replaced one is put
+/// back (the same file, not a copy), and the run says to decide afresh.
+#[test]
+fn an_override_whose_vendor_copy_changes_during_the_write_is_not_kept() {
+    let opts = WireOpts {
+        apply: true,
+        force: false,
+        expect_vendor: None,
+    };
+    let dir = TestDir::new("ovr-write-vendor-race");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    let vendor = svc.vendor.unwrap();
+    let etc_dir = Path::new(svc.etc).parent().unwrap();
+    arm(&VENDOR_CHANGES_DURING_WRITE, Path::new(vendor));
+    let err = wire_service_with(&svc, true, &opts, &face_and_keyring)
+        .map_err(String::from)
+        .err()
+        .expect("refused");
+    disarm(&VENDOR_CHANGES_DURING_WRITE, Path::new(vendor));
+    assert!(err.contains("changed while irlume was writing"), "{err}");
+    assert!(!exists(svc.etc), "the created override is taken back");
+    assert!(entries(etc_dir).is_empty(), "{:?}", entries(etc_dir));
+
+    std::fs::write(vendor, UPSTREAM_FEDORA).unwrap();
+    wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    let before = read_file(svc.etc);
+    let before_inode = inode(svc.etc);
+    arm(&VENDOR_CHANGES_DURING_WRITE, Path::new(vendor));
+    let err = wire_service_with(&svc, true, &opts, &keyring_only)
+        .map_err(String::from)
+        .err()
+        .expect("refused");
+    disarm(&VENDOR_CHANGES_DURING_WRITE, Path::new(vendor));
+    assert!(err.contains("changed while irlume was writing"), "{err}");
+    assert_eq!(read_file(svc.etc), before, "the replaced override is back");
+    assert_eq!(inode(svc.etc), before_inode, "the same file");
+    assert_eq!(entries(etc_dir), ["plasmalogin"]);
 }
 
 /// A creation decided on no file refuses a file that is there when the

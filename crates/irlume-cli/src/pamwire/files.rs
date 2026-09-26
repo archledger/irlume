@@ -168,7 +168,7 @@ pub(crate) fn restore_surface_with(
             // fields existed: the replacing file inherits the current one's
             // attributes rather than a guess.
             let attrs = metadata.map_or(Attrs::Carried, Attrs::Given);
-            write_atomic_inner(path, content, attrs, Expect::Any).map_err(String::from)
+            write_atomic_inner(path, content, attrs, Expect::Any, &|| Ok(())).map_err(String::from)
         }
         None => {
             // The same refusal the replacing branch gets. Removing was a direct
@@ -436,6 +436,18 @@ pub(super) fn remove_vendor_for_test(vendor: &Path) {
 
 #[cfg(test)]
 pub(super) static VENDOR_GONE_DURING_REMOVE: TestHook = TestHook::new(Vec::new());
+
+/// Test-only: replace a vendor file at the moment a write's last check reads
+/// it, as a package updating it in that window would.
+#[cfg(test)]
+pub(super) fn change_vendor_for_test(vendor: &Path) {
+    if fires(&VENDOR_CHANGES_DURING_WRITE, vendor) {
+        let _ = std::fs::write(vendor, "auth       include      system-auth   # newer\n");
+    }
+}
+
+#[cfg(test)]
+pub(super) static VENDOR_CHANGES_DURING_WRITE: TestHook = TestHook::new(Vec::new());
 
 /// Test-only: another writer's file arrives at a write's target after the
 /// write's last check and before its file is installed: renamed over an
@@ -845,7 +857,7 @@ impl std::fmt::Display for WriteError {
 }
 
 pub(super) fn write_atomic(path: &Path, contents: &str) -> Result<(), WriteError> {
-    write_atomic_inner(path, contents, Attrs::Carried, Expect::Any)
+    write_atomic_inner(path, contents, Attrs::Carried, Expect::Any, &|| Ok(()))
 }
 
 /// [`write_atomic`], refusing when the file no longer holds `expected` at the
@@ -863,8 +875,24 @@ pub(super) fn write_atomic_checked(
     contents: &str,
     expected: Option<&str>,
 ) -> Result<(), WriteError> {
+    write_atomic_checked_if(path, contents, expected, &|| Ok(()))
+}
+
+/// [`write_atomic_checked`], asking `still` last, once irlume's file is in
+/// place and before the file it replaced is removed: a refusal puts that
+/// file back (or removes the one created) and is returned, not landed. It
+/// lets an override made from a vendor copy go in only while that copy is
+/// still the one it was made from: a package that replaced or removed it
+/// meanwhile would otherwise find a file made from its old copy shadowing
+/// its new one.
+pub(super) fn write_atomic_checked_if(
+    path: &Path,
+    contents: &str,
+    expected: Option<&str>,
+    still: &dyn Fn() -> Result<(), String>,
+) -> Result<(), WriteError> {
     let expect = expected.map_or(Expect::Absent, |bytes| Expect::Bytes(bytes.as_bytes()));
-    write_atomic_inner(path, contents, Attrs::Carried, expect)
+    write_atomic_inner(path, contents, Attrs::Carried, expect, still)
 }
 
 /// Test-only: [`remove_checked_if`] with no further condition.
@@ -1129,7 +1157,8 @@ enum Attrs {
 }
 
 /// Replace `path` with `contents`, durably, with the mode and owner `attrs`
-/// names, only while the file there is what `expect` requires.
+/// names, only while the file there is what `expect` requires, and only when
+/// `still` agrees once the new file is in place (see [`install`]).
 ///
 /// Attributes are set on the scratch file BEFORE the rename, so the name never
 /// resolves to a PAM file with the wrong mode or owner. Setting them afterwards
@@ -1145,6 +1174,7 @@ fn write_atomic_inner(
     contents: &str,
     attrs: Attrs,
     expect: Expect<'_>,
+    still: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), WriteError> {
     use std::io::Write as _;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -1213,7 +1243,7 @@ fn write_atomic_inner(
         interlope_for_test(path);
         #[cfg(test)]
         chmod_for_test(path);
-        install(&tmp, path, before, expected, carried, ours)?;
+        install(&tmp, path, before, expected, carried, ours, still)?;
         sync_after_change(path)
     })();
     if result.is_err() {
@@ -1256,33 +1286,56 @@ fn install(
     expected: Option<&[u8]>,
     carried: Option<(u32, u32, u32)>,
     ours: Option<(u64, u64)>,
+    still: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), WriteError> {
     use std::os::unix::fs::MetadataExt as _;
     let unsupported =
         |e: &std::io::Error| matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS));
     let Some(identity) = before else {
-        return match renameat2_noreplace(tmp, path) {
-            Ok(()) => Ok(()),
+        match renameat2_noreplace(tmp, path) {
+            Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err(changed_while_writing(path).into())
+                return Err(changed_while_writing(path).into());
             }
             Err(e) if unsupported(&e) => match std::fs::hard_link(tmp, path) {
                 Ok(()) => {
                     let _ = std::fs::remove_file(tmp);
-                    Ok(())
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    Err(changed_while_writing(path).into())
+                    return Err(changed_while_writing(path).into());
                 }
-                Err(e) => Err(format!("link into {}: {e}", path.display()).into()),
+                Err(e) => return Err(format!("link into {}: {e}", path.display()).into()),
             },
-            Err(e) => Err(format!("rename into {}: {e}", path.display()).into()),
+            Err(e) => return Err(format!("rename into {}: {e}", path.display()).into()),
+        }
+        // Asked with irlume's file in place, so nothing the condition depends
+        // on can change between the answer and the file appearing. A refusal
+        // takes the new file away again.
+        return match still() {
+            Ok(()) => Ok(()),
+            Err(why) => {
+                take_back_created(path, ours)?;
+                Err(why.into())
+            }
         };
     };
     match renameat2_exchange(tmp, path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(changed_while_writing(path).into());
+        }
+        // A checked replacement is one step with its check or not made at
+        // all: a plain rename after the check replaces whatever another
+        // writer put there in between. A write that expects nothing in
+        // particular falls back to one, as irlume wrote before.
+        Err(e) if unsupported(&e) && expected.is_some() => {
+            return Err(format!(
+                "{} is on a filesystem that cannot swap two files in one step \
+                 (RENAME_EXCHANGE), so irlume cannot replace it without the chance of \
+                 overwriting a change made at the same moment; not changed",
+                path.display()
+            )
+            .into());
         }
         Err(e) if unsupported(&e) => {
             return std::fs::rename(tmp, path)
@@ -1298,11 +1351,31 @@ fn install(
             && carried.is_none_or(|want| mode_uid_gid(&m) == want)
     }) && expected
         .is_none_or(|want| std::fs::read(tmp).ok().as_deref() == Some(want));
-    if replaced_the_checked_file {
-        return std::fs::remove_file(tmp)
-            .map_err(|e| WriteError::landed(format!("rm {}: {e}", tmp.display())));
+    if !replaced_the_checked_file {
+        // Another writer's file came out: give it its name back.
+        swap_back(tmp, path, ours)?;
+        return Err(changed_while_writing(path).into());
     }
-    // Another writer's file came out: give it its name back.
+    // Asked with irlume's file in place, as for a creation. A refusal puts
+    // the checked file, the same inode with its mode and owner, back.
+    if let Err(why) = still() {
+        swap_back(tmp, path, ours)?;
+        return Err(why.into());
+    }
+    std::fs::remove_file(tmp).map_err(|e| WriteError::landed(format!("rm {}: {e}", tmp.display())))
+}
+
+/// Exchange the file at `tmp` (the one irlume's replaced, or another
+/// writer's) back into `path` for irlume's own, which the caller's cleanup
+/// then removes from `tmp`. `Ok` when that is what happened.
+///
+/// A second writer can replace irlume's file at `path` before this exchange.
+/// It then puts the older file back and takes out the second writer's, the
+/// newer, which goes back once more; the file that comes out is kept under a
+/// private name, not left under the scratch name, which the sweep of
+/// abandoned scratch files deletes.
+fn swap_back(tmp: &Path, path: &Path, ours: Option<(u64, u64)>) -> Result<(), WriteError> {
+    use std::os::unix::fs::MetadataExt as _;
     #[cfg(test)]
     second_interloper_for_test(path);
     if let Err(e) = renameat2_exchange(tmp, path) {
@@ -1313,15 +1386,10 @@ fn install(
             kept_aside(tmp, path).display()
         )));
     }
-    // `tmp` now names what the path held at this second exchange: irlume's
-    // file, which the caller removes, unless a second writer replaced it in
-    // between. Then the exchange put the first writer's file back and took
-    // out the second writer's, the newer. That one goes back once more, and
-    // the file that comes out is kept under a private name, not left under
-    // the scratch name, which the sweep of abandoned scratch files deletes.
     let came_out = std::fs::symlink_metadata(tmp).ok();
     if came_out.is_none_or(|m| Some((m.dev(), m.ino())) == ours) {
-        return Err(changed_while_writing(path).into());
+        let _ = fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")));
+        return Ok(());
     }
     let _ = renameat2_exchange(tmp, path);
     Err(format!(
@@ -1331,6 +1399,39 @@ fn install(
         kept_aside(tmp, path).display()
     )
     .into())
+}
+
+/// Remove the file irlume has just created at `path`, only while it is
+/// irlume's (`ours`): it is moved aside and identified first, and a file
+/// another writer put there instead goes back.
+fn take_back_created(path: &Path, ours: Option<(u64, u64)>) -> Result<(), WriteError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let aside = match move_aside(path) {
+        Ok(aside) => aside,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(WriteError::landed(format!(
+                "rename {} aside to take it back: {e}",
+                path.display()
+            )))
+        }
+    };
+    if std::fs::symlink_metadata(&aside).is_ok_and(|m| Some((m.dev(), m.ino())) == ours) {
+        std::fs::remove_file(&aside)
+            .map_err(|e| WriteError::landed(format!("rm {}: {e}", aside.display())))?;
+        let _ = fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")));
+        return Ok(());
+    }
+    match put_back(&aside, path) {
+        Ok(()) => Err(changed_while_writing(path).into()),
+        Err(e) => Err(format!(
+            "{} changed while irlume was writing it, and could not be put back ({e}); the file \
+             that was there is at {}",
+            path.display(),
+            aside.display()
+        )
+        .into()),
+    }
 }
 
 /// Another writer's file, found under the scratch name `tmp` after a write

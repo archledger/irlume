@@ -429,7 +429,7 @@ transaction it can tell is remote:
   names an X display on another host (`host:N`), as a login screen served
   over XDMCP does while leaving `PAM_RHOST` unset. A TCP display on this
   machine (`localhost:10`, the shape ssh X11 forwarding gives) counts too;
-  `:N`, `unix:N` and a tty device do not.
+  `:N`, `unix:N`, `unix/:N` and a tty device do not.
 - The service is a consent prompt (polkit's `polkit-1`), and the agent that
   asked is in a remote login session, or its session cannot be resolved.
   polkit's agent helper carries no `PAM_RHOST` and no ssh variables, so this

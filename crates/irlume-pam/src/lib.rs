@@ -256,12 +256,14 @@ fn is_remote_session(pamh: &Pam) -> bool {
     std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
 }
 
-/// Whether `display` is an X display on another host: `host:N` or
-/// `host:N.S` with a host part other than empty (`:0`, a local display) or
-/// `unix` (`unix:0`, the local socket). A TCP display on this machine
-/// (`localhost:10`, the shape ssh X11 forwarding gives) counts as remote too:
-/// a login screen at the machine's own seat does not run on one. A device
-/// path (`/dev/tty1`) or a value without a display number is not a display.
+/// Whether `display` is an X display on another host, in X11's
+/// `[protocol/][host]:N[.S]` form: a host part other than empty (`:0`, a local
+/// display) or `unix` (`unix:0`), and a protocol other than `unix` or `local`
+/// (`unix/:0`, the local socket). A TCP display on this machine
+/// (`localhost:10`, the shape ssh X11 forwarding gives, or `tcp/...`) counts
+/// as remote too: a login screen at the machine's own seat does not run on
+/// one. A device path (`/dev/tty1`) or a value without a display number is not
+/// a display.
 fn names_remote_x_display(display: &str) -> bool {
     let display = display.trim();
     if display.starts_with('/') {
@@ -274,7 +276,14 @@ fn names_remote_x_display(display: &str) -> bool {
         .split('.')
         .next()
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
-    is_display_number && !host.is_empty() && host != "unix"
+    if !is_display_number {
+        return false;
+    }
+    match host.split_once('/') {
+        Some(("unix" | "local", _)) => false,
+        Some(_) => true,
+        None => !host.is_empty() && host != "unix",
+    }
 }
 
 /// Known remote-desktop / remote-shell PAM service names whose sessions are not
@@ -1615,6 +1624,9 @@ mod tests {
             "localhost:10.0",
             "127.0.0.1:0",
             " remote:0 ",
+            "tcp/remote.example:0",
+            "inet6/[::1]:0",
+            "tcp/:0",
         ] {
             assert!(names_remote_x_display(remote), "{remote}");
         }
@@ -1622,6 +1634,8 @@ mod tests {
             ":0",
             ":1.0",
             "unix:0",
+            "unix/:0",
+            "local/:1.0",
             "/dev/tty1",
             "tty7",
             "ssh",

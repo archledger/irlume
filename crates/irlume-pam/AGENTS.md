@@ -49,7 +49,10 @@ login or locks a person out. It is critical-tier
   `secure_helper_path`). Anything else that environment can change, such as
   `privileged_face_consent_required()`, must be re-checked by the daemon.
 - `is_remote_session` keeps the camera off for known remote signals: a
-  non-local `PAM_RHOST`, the names in `is_remote_desktop_service`, and
+  non-local `PAM_RHOST`, an X display on another host in `PAM_XDISPLAY` or
+  `PAM_TTY` (`names_remote_x_display`), the names in
+  `is_remote_desktop_service`, a consent prompt whose requesting agent is in a
+  remote or unresolvable logind session (`consent_requester_is_local`), and
   `SSH_CONNECTION` or `SSH_TTY` in the calling process's environment. Known
   blind spots include remote control of the genuine local seat and a GNOME
   Remote Desktop headless login through `gdm-password` without `PAM_RHOST`
@@ -101,9 +104,10 @@ login or locks a person out. It is critical-tier
     `PAM_WRAPPER_SO=/path/to/libpam_wrapper.so`.
   - Run as CI does:
     `IRLUME_REQUIRE_PAM_TOOLS=1 ./scripts/run-tests-guarded.sh --min 59 -- cargo test -p irlume-pam --locked -- --include-ignored --test-threads=1`
-  - The pamtester and COSMIC runners remove `SSH_CONNECTION`, `SSH_TTY` and
-    `PAM_RHOST` from what they pass on (`remove_remote_env`), so the suite runs
-    the same over SSH; set a marker on purpose with `run_with_env`.
+  - The pamtester and COSMIC runners remove `SSH_CONNECTION`, `SSH_TTY`,
+    `PAM_RHOST`, `PAM_XDISPLAY` and `PAM_TTY` from what they pass on
+    (`remove_remote_env`), so the suite runs the same over SSH; set a marker
+    on purpose with `run_with_env`.
   - Without pamtester or libpam_wrapper.so each ignored `tests/pamwrap.rs`
     test returns early and passes (libtest hides its "skipping" note), and the
     COSMIC tests fail, so a filtered run that leaves them out tests no PAM

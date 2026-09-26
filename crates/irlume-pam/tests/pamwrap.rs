@@ -318,6 +318,8 @@ fn remove_remote_env(cmd: &mut Command) {
         cmd.env_remove(name);
     }
     cmd.env_remove("PAM_RHOST");
+    cmd.env_remove("PAM_XDISPLAY");
+    cmd.env_remove("PAM_TTY");
 }
 
 /// Set to anything but empty or `0`, a missing pamtester or libpam_wrapper.so
@@ -812,6 +814,54 @@ fn pamwrap_rhost_decides_local_or_remote() {
             (ok, requests),
             if is_local { (true, 1) } else { (false, 0) },
             "PAM_RHOST {rhost:?}: {out}"
+        );
+    }
+}
+
+/// A login screen on an X server at another host (XDMCP) sets no PAM_RHOST;
+/// its display, in PAM_XDISPLAY or PAM_TTY, is what says it is remote. A
+/// local display, the local socket and a tty device reach the daemon.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_a_remote_x_display_makes_no_request() {
+    let Some(h) = Harness::try_new("xdisplay-table") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| match req {
+        Request::Authenticate { .. } => grant(),
+        _ => Response::Error("unexpected request".into()),
+    });
+    h.write_service(
+        "irlume-face-xdisplay",
+        &[
+            format!("auth [default=ignore] {}", h.set_items.display()),
+            h.auth_line("required", ""),
+        ],
+    );
+    let cases = [
+        ("PAM_XDISPLAY", "remote.example:0", false),
+        ("PAM_XDISPLAY", "192.0.2.7:1.0", false),
+        ("PAM_XDISPLAY", "localhost:10.0", false),
+        ("PAM_TTY", "remote.example:0", false),
+        ("PAM_XDISPLAY", ":0", true),
+        ("PAM_XDISPLAY", "unix:0", true),
+        ("PAM_TTY", ":0", true),
+        ("PAM_TTY", "/dev/tty1", true),
+    ];
+    for (item, value, local) in cases {
+        let before = log.lock().unwrap().len();
+        let (ok, out) = h.run_with_env(
+            "irlume-face-xdisplay",
+            &["authenticate"],
+            "",
+            None,
+            &[(item, value)],
+        );
+        let requests = log.lock().unwrap().len() - before;
+        assert_eq!(
+            (ok, requests),
+            if local { (true, 1) } else { (false, 0) },
+            "{item}={value:?}: {out}"
         );
     }
 }

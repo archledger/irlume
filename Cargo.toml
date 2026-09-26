@@ -134,7 +134,7 @@ strip = true
 # policy commands to required_session_1 only as an 8.0 break (PR #624). Only move to
 # a plain crates.io release after that release exists AND passes the HW round-trip.
 [patch.crates-io]
-# archledger/pam_sm_rust @ irlume-patches, signed tag irlume-0.5.5-patch.1:
+# archledger/pam_sm_rust @ irlume-patches, signed tag irlume-0.5.5-patch.2:
 # the irlume-maintained fork of rcatolino/pam_sm_rust 0.5.5 (ADR-0012). The
 # fork removes the unsafe response-returning conversation path, validates all
 # six pam_sm_* entrypoints, confines handles to callback threads, and stores
@@ -142,5 +142,5 @@ strip = true
 # crates.io package, so this exact-rev Git pin is the only selector. Cargo.lock
 # freezes the rev, and the fork branch is protected against force-push and
 # deletion. Bump = re-tag, review the delta, update this rev.
-pamsm = { git = "https://github.com/archledger/pam_sm_rust", rev = "ac9f644240e95c49246cb6b55adce2f2aea12a77" }
+pamsm = { git = "https://github.com/archledger/pam_sm_rust", rev = "5cd182d42076bd4fd0a8c4367f042c6d641a2457" }
 tss-esapi = { git = "https://github.com/archledger/rust-tss-esapi", rev = "7567f6048d2bcb42779e80c0dad90e7eacf6185c" }

@@ -171,9 +171,12 @@ fn session_state_from(
 /// `CLASS=user`, `STATE` active or online, `TYPE` x11, wayland or mir, and
 /// `REMOTE=0`, so an SSH login, a text console or a remote desktop does not
 /// count. Read from logind's session files, as [`session_state_for`] reads
-/// them. `false` when they cannot be read.
-pub(crate) fn has_local_graphical_session(uid: u32) -> bool {
-    has_local_graphical_session_in(&sessions_root(), uid)
+/// them. `None` when they cannot be read, the directory or a session file in
+/// it, so a caller guarding a release can refuse it rather than guess; a file
+/// that disappears while it is read belongs to a session that just ended and
+/// does not count. A live session found anywhere is conclusive.
+pub(crate) fn local_graphical_session(uid: u32) -> Option<bool> {
+    local_graphical_session_in(&sessions_root(), uid)
 }
 
 /// Test-only: logind's session directory, when a test has pointed it
@@ -194,21 +197,42 @@ fn sessions_root() -> std::path::PathBuf {
     std::path::PathBuf::from("/run/systemd/sessions")
 }
 
-fn has_local_graphical_session_in(sessions_root: &Path, uid: u32) -> bool {
-    let Ok(entries) = std::fs::read_dir(sessions_root) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
+fn local_graphical_session_in(sessions_root: &Path, uid: u32) -> Option<bool> {
+    let entries = std::fs::read_dir(sessions_root).ok()?;
+    let (mut live, mut unknown) = (false, false);
+    for entry in entries {
+        let Ok(entry) = entry else {
+            unknown = true;
+            continue;
+        };
         // Regular files only: logind keeps a FIFO per session (`<id>.ref`)
         // in the same directory, and reading one blocks.
-        entry.file_type().is_ok_and(|kind| kind.is_file())
-            && std::fs::read_to_string(entry.path())
-                .is_ok_and(|facts| local_graphical_session_of(&facts, uid))
-    })
+        match entry.file_type() {
+            Ok(kind) if kind.is_file() => {}
+            Ok(_) => continue,
+            Err(_) => {
+                unknown = true;
+                continue;
+            }
+        }
+        match std::fs::read_to_string(entry.path()) {
+            Ok(facts) => live |= local_graphical_session_of(&facts, uid),
+            // The session ended while the directory was read.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => unknown = true,
+        }
+    }
+    if live {
+        Some(true)
+    } else if unknown {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 /// Whether one logind session file describes a live local graphical session
-/// of `uid` (see [`has_local_graphical_session`]).
+/// of `uid` (see [`local_graphical_session`]).
 fn local_graphical_session_of(facts: &str, uid: u32) -> bool {
     let val = |key: &str| {
         facts
@@ -814,19 +838,53 @@ mod tests {
         let scan = |dir: std::path::PathBuf| {
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let _ = tx.send(has_local_graphical_session_in(&dir, 1000));
+                let _ = tx.send(local_graphical_session_in(&dir, 1000));
             });
             rx.recv_timeout(std::time::Duration::from_secs(10))
                 .expect("the scan does not block on the FIFO")
         };
-        assert!(!scan(dir.clone()), "an SSH login alone is not a desktop");
+        assert_eq!(
+            scan(dir.clone()),
+            Some(false),
+            "an SSH login alone is not a desktop"
+        );
         std::fs::write(
             dir.join("7"),
             "UID=1000\nSTATE=active\nREMOTE=0\nTYPE=wayland\nCLASS=user\n",
         )
         .unwrap();
-        assert!(scan(dir.clone()));
-        assert!(!has_local_graphical_session_in(&dir.join("missing"), 1000));
+        assert_eq!(scan(dir.clone()), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// State the scan cannot read is unknown, never "no desktop": a caller
+    /// guarding a release must be able to refuse on it. A missing directory
+    /// and a session file that is not text are unknown; a live desktop found
+    /// beside such a file is still conclusive.
+    #[test]
+    fn the_session_scan_reports_what_it_cannot_read() {
+        let dir =
+            std::env::temp_dir().join(format!("irlume-sessions-unknown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(local_graphical_session_in(&dir, 1000), None, "no directory");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            local_graphical_session_in(&dir, 1000),
+            Some(false),
+            "no sessions"
+        );
+        std::fs::write(dir.join("5"), [0xff_u8, 0xfe, 0x00, 0x41]).unwrap();
+        assert_eq!(
+            local_graphical_session_in(&dir, 1000),
+            None,
+            "a file that is not text"
+        );
+        std::fs::write(
+            dir.join("7"),
+            "UID=1000\nSTATE=active\nREMOTE=0\nTYPE=wayland\nCLASS=user\n",
+        )
+        .unwrap();
+        assert_eq!(local_graphical_session_in(&dir, 1000), Some(true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

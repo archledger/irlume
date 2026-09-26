@@ -3271,15 +3271,22 @@ fn unseal_keyring(
     // session-phase GNOME keyring token delivery of a typed-password login,
     // whose own desktop logind lists as live already (a lock screen
     // authenticates and never opens a session), and a module from before
-    // the flag.
-    if auth_phase
-        && crate::users::uid_for_name(&user)
-            .is_some_and(attempt_record::has_local_graphical_session)
-    {
-        jout_info!(
-            "irlumed: UnsealKeyring: '{user}' has a live local graphical session; nothing released"
-        );
-        return Response::KeyringUnlockNotNeeded;
+    // the flag. An auth-phase request is withheld too when irlumed cannot
+    // tell (logind's session state or the account cannot be read): the
+    // typed password still opens a password- or wallet-key-keyed keyring,
+    // and a GNOME keyring token still reaches the session phase.
+    if auth_phase {
+        let live =
+            crate::users::uid_for_name(&user).and_then(attempt_record::local_graphical_session);
+        if live != Some(false) {
+            let why = if live == Some(true) {
+                "has a live local graphical session"
+            } else {
+                "could not be checked for a live local desktop"
+            };
+            jout_info!("irlumed: UnsealKeyring: '{user}' {why}; nothing released");
+            return Response::KeyringUnlockNotNeeded;
+        }
     }
     // A typed password already opens a password-keyed keyring or KDE wallet, so touching the
     // TPM would spend an unseal (up to seconds on a discrete TPM) to release a
@@ -16776,7 +16783,8 @@ mod tests {
     /// the session phase of a login opening its own desktop, which logind
     /// lists as live already, still reaches a GNOME keyring token (it is how
     /// a typed-password login delivers one), and so does a module from
-    /// before the flag.
+    /// before the flag. When logind's state cannot be read, an auth-phase
+    /// request is withheld as for a live desktop; the others are served.
     #[test]
     fn a_warm_unlock_releases_no_keyring_secret() {
         let _g = env_lock();
@@ -16812,7 +16820,26 @@ mod tests {
             let login = unseal_keyring(&user, Some("plasmalogin"), false, true, &peer(0));
             let session = unseal_keyring(&user, Some("plasmalogin"), true, false, &peer(0));
             let older = unseal_keyring(&user, Some("kde"), false, false, &peer(0));
-            outcomes.push((kind, cold, lock, login, session, older));
+            let set_root = |root: std::path::PathBuf| {
+                *attempt_record::SESSIONS_ROOT
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(root);
+            };
+            set_root(sessions.join("unreadable"));
+            let unknown = unseal_keyring(&user, Some("plasmalogin"), false, true, &peer(0));
+            let unknown_session =
+                unseal_keyring(&user, Some("plasmalogin"), false, false, &peer(0));
+            set_root(sessions.clone());
+            outcomes.push((
+                kind,
+                cold,
+                lock,
+                login,
+                session,
+                older,
+                unknown,
+                unknown_session,
+            ));
         }
         *attempt_record::SESSIONS_ROOT
             .lock()
@@ -16821,7 +16848,15 @@ mod tests {
             Some(value) => std::env::set_var("IRLUME_TCTI", value),
             None => std::env::remove_var("IRLUME_TCTI"),
         }
-        for (kind, cold, lock, login, session, older) in outcomes {
+        for (kind, cold, lock, login, session, older, unknown, unknown_session) in outcomes {
+            assert!(
+                matches!(unknown, Response::KeyringUnlockNotNeeded),
+                "{kind}: an unreadable logind state withholds the auth phase: {unknown:?}"
+            );
+            assert!(
+                matches!(unknown_session, Response::Error(_)),
+                "{kind}: a request without the flag is still served: {unknown_session:?}"
+            );
             assert!(
                 matches!(older, Response::Error(_)),
                 "{kind}: a module from before the flag is served as before: {older:?}"

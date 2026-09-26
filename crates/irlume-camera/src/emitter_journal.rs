@@ -1407,7 +1407,7 @@ mod tests {
     /// PANICS rather than self-skips when the setup is absent: running an
     /// ignored test is a request for the harness (#361).
     #[test]
-    #[ignore = "needs a root-owned pre-created lock; set IRLUME_EMITTER_LOCK_DIR and pre-create the lock file as root:<caller-group> 0660"]
+    #[ignore = "needs a root-owned pre-created lock; scripts/emitter-lock-tests.sh pre-creates it as root:<caller-group> 0660"]
     fn lock_succeeds_on_a_preexisting_lock_this_process_cannot_chmod() {
         use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -1443,9 +1443,12 @@ mod tests {
     /// any local user hold this camera's lock and keep the emitter dark for
     /// everyone. Trusting it would put authentication behind a lock an
     /// unprivileged process can deny. Same harness as the 0660 test: the
-    /// file must belong to another uid, pre-created as root with mode 0666.
+    /// file must belong to another uid, pre-created as root with mode 0666 and
+    /// the caller's group, as the device's is: with another group the lock
+    /// refuses already when it cannot take the device's group, and the mode
+    /// check this test is about never runs.
     #[test]
-    #[ignore = "needs a root-owned 0666 pre-created lock; set IRLUME_EMITTER_LOCK_DIR and pre-create the lock file as root 0666"]
+    #[ignore = "needs a root-owned 0666 pre-created lock; scripts/emitter-lock-tests.sh pre-creates it as root:<caller-group> 0666"]
     fn lock_refuses_an_other_accessible_lock_it_cannot_fix() {
         use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};

@@ -412,6 +412,18 @@ transaction it can tell is remote:
   and `cockpit`, and the remote-desktop names (`xrdp*`, any name containing
   `vnc`, `xpra*`, NoMachine's `nx*`). A web console behind a local reverse
   proxy reports a loopback `PAM_RHOST`, so only its name gives it away.
+- The service is a consent prompt (polkit's `polkit-1`), and the agent that
+  asked is in a remote login session, or its session cannot be resolved.
+  polkit's agent helper carries no `PAM_RHOST` and no ssh variables, so this
+  is how a prompt answered at pkttyagent in an SSH session stays off the
+  camera. The agent is the process at the other end of the helper's socket
+  (the socket-activated helper) or the helper's parent (the setuid one). Its
+  cgroup names its logind session only where logind puts one
+  (`user.slice/user-<uid>.slice/session-<id>.scope`), and the session must
+  be that user's. A process the user's service manager runs, such as a
+  desktop's own polkit agent or a scope the user created under any name,
+  belongs to no session, and the module then takes the user's display
+  session, as polkit does.
 
 LightDM's XDMCP and VNC servers give remote users a login screen through the
 same `lightdm` service as the local one, and set no `PAM_RHOST`; an Xvnc
@@ -448,6 +460,9 @@ What the module cannot tell apart, and has to be handled outside it:
   module, so a finger presented at this machine could answer an XDMCP or VNC
   login. Do not enable fingerprint login together with LightDM's remote
   servers.
+- A command an SSH user starts inside their service manager
+  (`systemd-run --user`) is judged by their display session, which is local
+  while they are also logged in at the machine.
 - A remote login through a service irlume does not know by name, into which
   pam_irlume was added by hand, that sets neither `PAM_RHOST` nor the ssh
   variables, and a remote X display (`PAM_XDISPLAY` of `host:N`) reaching

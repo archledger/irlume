@@ -275,17 +275,25 @@ Full write-up: [`pad-results/2026-06-30-ir-liveness-selftest.md`](pad-results/20
 
 Seal a random release secret (or the login password) in the **TPM**, gated by
 **PCR policy**; release only on a successful live+match. Sealing picks the
-strongest policy the machine supports: a signed `PolicyAuthorize` over
-systemd's PCR-11 signature where a UKI publishes one (Tier 1; kernel updates
-need no re-seal), `PolicyAuthorizeNV` against a provisioned systemd-pcrlock NV
-index (Tier 2; after a firmware or Secure Boot update the admin re-runs
-`systemd-pcrlock make-policy` and the seal keeps working), or a literal
-`PolicyPCR` over PCR 7 (Tier 3; a Secure Boot change requires a re-arm). The
-higher tiers (signed and pcrlock) are round-trip verified at seal time, so a
-policy that cannot unseal on the current boot is never trusted; the literal
+strongest policy the machine supports: `PolicyAuthorizeNV` against a
+provisioned systemd-pcrlock NV index (Tier 2; after a firmware or Secure Boot
+update the admin re-runs `systemd-pcrlock make-policy` and the seal keeps
+working), else a literal `PolicyPCR` over PCR 7 (Tier 3; a Secure Boot change
+requires a re-arm). The pcrlock policy is round-trip verified at seal time, so
+a policy that cannot unseal on the current boot is never trusted; the literal
 PCR-7 fallback binds to PCR values just read from the live TPM, so it unseals
 on the current boot by construction. Never store a recoverable face image;
 decrypted template plaintext and keys are zeroized.
+
+Earlier releases preferred a signed `PolicyAuthorize` over systemd's PCR-11
+signature where a UKI publishes one (Tier 1). That policy binds only PCR 11,
+which the operating system measures itself, so it binds less of the platform
+than PCR 7 or a pcrlock policy, and new seals no longer use it. A Tier 1
+envelope still unseals, and its next verified reseal moves it to pcrlock or
+literal PCR 7: a password login for the keyring secret, the next face match
+for the template key. An `IRLUME_PCRS` that names none of PCRs 0 to 7 keeps
+Tier 1 envelopes where they are, since a literal policy over it would bind no
+more. Full-disk encryption is what protects the rest of the disk.
 
 **Fingerprint keyring unlock** ([ADR-0003](adr/0003-fingerprint-keyring-unlock.md))
 releases the sealed secret on *root peer + login-service-class*, without

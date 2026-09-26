@@ -782,6 +782,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- TPM seals prefer the policies that bind the platform's boot state: a
+  provisioned systemd-pcrlock policy (Tier 2), else literal PCR 7
+  (Tier 3), ranked in that order above systemd's signed PCR 11 policy
+  (Tier 1), which binds only what the operating system measures itself
+  and is no longer used for new seals. A Tier 1 envelope an earlier
+  release wrote still unseals, and moves on its next verified reseal: the
+  next password login for the keyring secret, also when that login
+  re-wraps a GNOME keyring token after a password change, and the next
+  face match for the template key. An `IRLUME_PCRS` naming none of PCRs 0
+  to 7 leaves Tier 1 envelopes as they are. `irlume diag`, `irlume doctor`
+  and the TUI no longer present the signed policy as a sealing tier
+  (#868).
+
 - pam_irlume stands down for the `cockpit` and `remote` PAM services, which
   the daemon's service table already treats as remote, and
   `irlume login enable` and the reconcile unit keep irlume's face and
@@ -804,6 +817,7 @@ All notable changes to irlume are documented here. This project adheres to
   still receives its GNOME keyring token in the session phase (#863). When
   irlumed cannot read logind's session state or the account, it withholds
   the release as well (#864).
+
 
 ## [0.14.0] - 2026-09-19
 

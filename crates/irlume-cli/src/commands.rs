@@ -1128,7 +1128,7 @@ pub fn diag(args: &[String]) -> ExitCode {
     println!(
         "  signed policy : {}",
         if irlume_core::pcrsig::signed_policy_available() {
-            "PCR-11 signature present (Tier 1: kernel updates won't need re-seal)"
+            "PCR-11 signature present (Tier 1: not used for new seals, it binds only what the booted OS measures; an older Tier 1 seal still unseals and moves on its next reseal)"
         } else {
             "none (no Tier 1 on this boot chain)"
         }

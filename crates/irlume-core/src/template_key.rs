@@ -345,7 +345,7 @@ fn load_key_with(
     user: &str,
     policy: KeyLoadPolicy,
     unseal: impl FnOnce(&SealedEnvelope) -> Result<Zeroizing<Vec<u8>>>,
-    stronger_tier_available: impl FnOnce(&crate::envelope::PolicyKind) -> bool,
+    stronger_tier_available: impl FnOnce(&SealedEnvelope) -> bool,
     seal: impl FnOnce(&[u8]) -> Result<SealedEnvelope>,
 ) -> Result<Zeroizing<Vec<u8>>> {
     let path = key_path(user);
@@ -363,7 +363,7 @@ fn load_key_with(
     // short-circuits to a no-op once the envelope is already at the best
     // policy, so there is no steady per-match cost. Never fail the load on it:
     // the key unsealed fine and the weaker envelope stays usable.
-    if policy == KeyLoadPolicy::Upgrade && stronger_tier_available(&env.policy) {
+    if policy == KeyLoadPolicy::Upgrade && stronger_tier_available(&env) {
         if let Ok(candidate) = seal(&key) {
             if candidate.strength_rank() > env.strength_rank() && candidate.save(&path).is_ok() {
                 set_0600(&path);

@@ -441,7 +441,7 @@ pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) 
             // round-trip-verifies internally), so a machine already at its
             // best policy writes nothing.
             if let Ok(env) = SealedEnvelope::load(&envelope_path(user)) {
-                if tpm::stronger_tier_available_than(&env.policy) {
+                if tpm::stronger_tier_available_than(&env) {
                     let mut candidate = tpm::seal(password)?;
                     // Carry the kind across the upgrade. tpm::seal defaults it,
                     // so without this a tier climb would rewrite a wallet-key
@@ -465,7 +465,7 @@ pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) 
 /// recovery wrap carried over, or `None` when no stronger policy is available
 /// or the ladder did not reach one.
 fn climbed_token(env: &SealedEnvelope, token: &[u8]) -> Result<Option<SealedEnvelope>> {
-    if !tpm::stronger_tier_available_than(&env.policy) {
+    if !tpm::stronger_tier_available_than(env) {
         return Ok(None);
     }
     let mut candidate = tpm::seal(token)?;

@@ -9774,7 +9774,8 @@ impl App {
         // earlier release left behind. The daemon's KeyringInfo names the
         // armed envelope's actual policy, shown here in full while the Wallet
         // page names only its tier; no local probe can predict it, so without
-        // an answer this line says only that nothing is armed.
+        // an answer this line says only whether anything is armed, and that
+        // it does not know when the wallet state itself went unobserved.
         lines.push(Line::from(vec![
             Span::styled("  PCR policy ", Style::new().dim()),
             Span::styled(
@@ -9784,8 +9785,10 @@ impl App {
                     "unknown (observation unavailable)".to_string()
                 } else if self.keyring_armed == Some(true) {
                     "unreported by this daemon".to_string()
-                } else {
+                } else if self.keyring_armed == Some(false) {
                     "not armed; tier decided at arm time".to_string()
+                } else {
+                    "unknown (wallet state not observed)".to_string()
                 },
                 Style::new().dim(),
             ),
@@ -22780,6 +22783,23 @@ mod tests {
         let text = draw_text(&app);
         assert!(
             row_with(&text, "PCR policy").contains("pcrlock NV 0x1a2b (Tier 2)"),
+            "{text}"
+        );
+        // Up, but the wallet state went unobserved: unknown, not "not armed",
+        // which would invite an arm nothing showed was missing.
+        app.keyring_armed = None;
+        app.keyring_policy = None;
+        let text = draw_text(&app);
+        let row = row_with(&text, "PCR policy");
+        assert!(
+            row.contains("unknown (wallet state not observed)"),
+            "{text}"
+        );
+        assert!(!row.contains("not armed"), "{text}");
+        app.keyring_armed = Some(false);
+        let text = draw_text(&app);
+        assert!(
+            row_with(&text, "PCR policy").contains("not armed; tier decided at arm time"),
             "{text}"
         );
     }

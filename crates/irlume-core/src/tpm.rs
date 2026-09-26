@@ -772,32 +772,29 @@ fn with_srk_mode<T>(
 /// without the user re-arming, and without churning the TPM on a machine
 /// already at its best available policy. Only signals availability; the
 /// actual round-trip verification happens in [`seal`].
-pub fn stronger_tier_available_than(current: &PolicyKind) -> bool {
+pub fn stronger_tier_available_than(current: &SealedEnvelope) -> bool {
     stronger_tier_than(
-        current,
+        current.strength_rank(),
         || pcrlock_provisioned().is_some(),
         || crate::envelope::binds_firmware_state(&policy_pcrs()),
     )
 }
 
-/// [`stronger_tier_available_than`] with the pcrlock probe, and whether the
-/// configured literal PCRs bind firmware state, passed in.
+/// [`stronger_tier_available_than`] over the envelope's
+/// [`SealedEnvelope::strength_rank`], with the pcrlock probe, and whether
+/// the configured literal PCRs bind firmware state, passed in. The ladder can
+/// reach the literal policy's rank when its PCRs bind firmware state (the
+/// default PCR 7 does), and pcrlock's once one is provisioned; whether a
+/// provisioned pcrlock policy binds firmware state is known only after
+/// sealing, where the caller compares ranks again.
 fn stronger_tier_than(
-    current: &PolicyKind,
+    current: u8,
     pcrlock: impl FnOnce() -> bool,
     literal_binds_firmware: impl FnOnce() -> bool,
 ) -> bool {
-    match current {
-        // pcrlock is the strongest; nothing to upgrade to, and never down to
-        // a signed-only policy whatever the boot chain publishes.
-        PolicyKind::PcrlockNv { .. } => false,
-        // Literal -> pcrlock only once a pcrlock policy is provisioned.
-        PolicyKind::PcrLiteral => pcrlock(),
-        // Signed -> pcrlock, or the literal seal where its PCRs bind firmware
-        // state (the default PCR 7 does). An `IRLUME_PCRS` without any would
-        // replace the signed policy with one that binds no more.
-        PolicyKind::Authorized { .. } => pcrlock() || literal_binds_firmware(),
-    }
+    let pcrlock_rank = PolicyKind::PcrlockNv { nv_index: 0 }.strength_rank();
+    (literal_binds_firmware() && current < PolicyKind::PcrLiteral.strength_rank())
+        || (current < pcrlock_rank && pcrlock())
 }
 
 /// Seal `secret` under the best policy available on this machine, trying each
@@ -2853,27 +2850,32 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert_eq!(&*unseal(&ladder).expect("unseal the ladder seal"), secret);
     }
 
-    /// The upgrade predicate: a signed envelope has a stronger policy to move
-    /// to when pcrlock is provisioned or the literal PCRs bind firmware state
-    /// (the default PCR 7 does), a literal one only once pcrlock is
-    /// provisioned, and a pcrlock one never, whatever the boot chain
-    /// publishes.
+    /// The upgrade predicate: a signed envelope, or a literal one over no
+    /// firmware-measured PCR, has a stronger policy to move to when pcrlock
+    /// is provisioned or the configured literal PCRs bind firmware state (the
+    /// default PCR 7 does); a literal PCR 7 one only once pcrlock is
+    /// provisioned; a pcrlock one never, whatever the boot chain publishes.
     #[test]
     fn upgrades_move_toward_bound_policies_only() {
         let signed = PolicyKind::Authorized {
             pubkey_pem: String::new(),
             policy_ref: Vec::new(),
-        };
-        let pcrlock = PolicyKind::PcrlockNv { nv_index: 1 };
+        }
+        .strength_rank();
+        let pcrlock = PolicyKind::PcrlockNv { nv_index: 1 }.strength_rank();
+        let literal = PolicyKind::PcrLiteral.strength_rank();
+        let unbound = 0;
         for provisioned in [false, true] {
             for firmware in [false, true] {
+                for weak in [signed, unbound] {
+                    assert_eq!(
+                        stronger_tier_than(weak, || provisioned, || firmware),
+                        provisioned || firmware
+                    );
+                }
+                assert!(!stronger_tier_than(pcrlock, || provisioned, || firmware));
                 assert_eq!(
-                    stronger_tier_than(&signed, || provisioned, || firmware),
-                    provisioned || firmware
-                );
-                assert!(!stronger_tier_than(&pcrlock, || provisioned, || firmware));
-                assert_eq!(
-                    stronger_tier_than(&PolicyKind::PcrLiteral, || provisioned, || firmware),
+                    stronger_tier_than(literal, || provisioned, || firmware),
                     provisioned
                 );
             }

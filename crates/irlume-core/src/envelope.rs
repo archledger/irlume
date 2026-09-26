@@ -173,13 +173,18 @@ pub fn binds_firmware_state(pcrs: &[u32]) -> bool {
 
 impl SealedEnvelope {
     /// The strength rank of this envelope's binding: its policy's
-    /// [`PolicyKind::strength_rank`], except that a literal policy leaving
-    /// out every firmware-measured PCR (an `IRLUME_PCRS` override such as
-    /// `11`) ranks below every policy, so a reseal never moves an envelope
-    /// onto one.
+    /// [`PolicyKind::strength_rank`], except that a literal or pcrlock
+    /// policy leaving out every firmware-measured PCR (an `IRLUME_PCRS`
+    /// override such as `11`, or a custom pcrlock policy over OS PCRs only)
+    /// ranks below every policy, so a reseal never moves an envelope onto
+    /// one, and moves an envelope off one when something better is there.
     pub fn strength_rank(&self) -> u8 {
         match self.policy {
-            PolicyKind::PcrLiteral if !binds_firmware_state(&self.pcrs) => 0,
+            PolicyKind::PcrLiteral | PolicyKind::PcrlockNv { .. }
+                if !binds_firmware_state(&self.pcrs) =>
+            {
+                0
+            }
             ref policy => policy.strength_rank(),
         }
     }
@@ -238,16 +243,16 @@ mod b64 {
 mod tests {
     use super::*;
 
-    /// A literal envelope over no firmware-measured PCR (an `IRLUME_PCRS`
-    /// such as `11`) ranks below the signed policy, so a reseal never moves a
-    /// signed envelope onto it; over PCR 7, or any of 0 to 7, it ranks as
-    /// its policy does.
+    /// A literal or pcrlock envelope over no firmware-measured PCR (an
+    /// `IRLUME_PCRS` such as `11`, a pcrlock policy over OS PCRs only) ranks
+    /// below the signed policy, so a reseal never moves a signed envelope
+    /// onto it; over PCR 7, or any of 0 to 7, it ranks as its policy does.
     #[test]
-    fn a_literal_envelope_ranks_by_the_pcrs_it_binds() {
-        let literal = |pcrs: &[u32]| SealedEnvelope {
+    fn an_envelope_ranks_by_the_pcrs_it_binds() {
+        let sealed = |policy: PolicyKind, pcrs: &[u32]| SealedEnvelope {
             secret: SecretKind::default(),
             version: CURRENT_VERSION,
-            policy: PolicyKind::PcrLiteral,
+            policy,
             pcrs: pcrs.to_vec(),
             public: Vec::new(),
             private: Vec::new(),
@@ -258,15 +263,20 @@ mod tests {
             pubkey_pem: String::new(),
             policy_ref: Vec::new(),
         };
-        assert!(literal(&[11]).strength_rank() < signed.strength_rank());
-        assert!(literal(&[]).strength_rank() < signed.strength_rank());
-        for pcrs in [&[7][..], &[0, 7], &[0, 2, 4], &[7, 11]] {
-            assert_eq!(
-                literal(pcrs).strength_rank(),
-                PolicyKind::PcrLiteral.strength_rank(),
-                "{pcrs:?}"
-            );
+        let pcrlock = PolicyKind::PcrlockNv { nv_index: 1 };
+        for policy in [PolicyKind::PcrLiteral, pcrlock] {
+            assert!(sealed(policy.clone(), &[11]).strength_rank() < signed.strength_rank());
+            assert!(sealed(policy.clone(), &[]).strength_rank() < signed.strength_rank());
+            for pcrs in [&[7][..], &[0, 7], &[0, 2, 4], &[7, 11]] {
+                assert_eq!(
+                    sealed(policy.clone(), pcrs).strength_rank(),
+                    policy.strength_rank(),
+                    "{policy:?} {pcrs:?}"
+                );
+            }
         }
+        // The signed policy ranks as itself whatever it records.
+        assert_eq!(sealed(signed.clone(), &[11]).strength_rank(), 1);
     }
 
     #[test]

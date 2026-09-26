@@ -279,10 +279,12 @@ fn names_remote_x_display(display: &str) -> bool {
     if !is_display_number {
         return false;
     }
+    // Transport names are case-insensitive in X11 (`UNIX/:0`).
     match host.split_once('/') {
-        Some(("unix" | "local", _)) => false,
-        Some(_) => true,
-        None => !host.is_empty() && host != "unix",
+        Some((protocol, _)) => {
+            !(protocol.eq_ignore_ascii_case("unix") || protocol.eq_ignore_ascii_case("local"))
+        }
+        None => !host.is_empty() && !host.eq_ignore_ascii_case("unix"),
     }
 }
 
@@ -1636,6 +1638,9 @@ mod tests {
             "unix:0",
             "unix/:0",
             "local/:1.0",
+            "UNIX/:0",
+            "Local/:1",
+            "UNIX:0",
             "/dev/tty1",
             "tty7",
             "ssh",

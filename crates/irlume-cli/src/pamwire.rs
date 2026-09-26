@@ -2439,7 +2439,38 @@ fn wire_override(
                     return header_write_refused(s.etc, decision.header_only, e);
                 }
             }
-            overrides::Write::Remove => remove_checked(etc, current.as_deref())?,
+            overrides::Write::Remove => {
+                // Deleting the override hands the service back to the vendor
+                // copy decided on above. A package can remove or change that
+                // copy meanwhile without taking irlume's lock, and a service
+                // with neither file falls through to `other`, which refuses
+                // every login, passwords included. So the vendor copy is
+                // checked again once the override is out of the way, and the
+                // override goes back if it is no longer the same.
+                let decided = vendor
+                    .as_deref()
+                    .map(|v| crate::logintx::sha256_hex(v.as_bytes()));
+                let still = || -> Result<(), String> {
+                    #[cfg(test)]
+                    remove_vendor_for_test(Path::new(vendor_path));
+                    let now = match std::fs::symlink_metadata(vendor_path) {
+                        Ok(meta) if meta.file_type().is_file() => std::fs::read(vendor_path)
+                            .ok()
+                            .map(|b| crate::logintx::sha256_hex(&b)),
+                        _ => None,
+                    };
+                    if now.is_some() && now == decided {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "{vendor_path} changed while irlume was removing {}; the override \
+                             was kept, run again to decide afresh",
+                            s.etc
+                        ))
+                    }
+                };
+                remove_checked_if(etc, current.as_deref(), &still)?;
+            }
         }
     }
     Ok(WireOutcome {

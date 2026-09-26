@@ -515,6 +515,42 @@ fn disable_removes_an_unedited_override_and_strips_an_edited_one() {
     assert_eq!(change_id(&again), "not-wired", "{again}");
 }
 
+/// Deleting an unedited override hands the service back to its vendor copy.
+/// A package that removes that copy while irlume removes the override would
+/// leave the service with neither, and PAM would fall through to `other`,
+/// which refuses every login: the override is put back instead.
+#[test]
+fn disable_keeps_the_override_when_the_vendor_copy_goes_meanwhile() {
+    let dir = TestDir::new("ovr-disable-vendor-goes");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    let vendor_path = svc.vendor.unwrap();
+    wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    let tracked = read_file(svc.etc);
+    arm(&VENDOR_GONE_DURING_REMOVE, Path::new(vendor_path));
+    let Err(err) = wire_service(&svc, false, true, &face_and_keyring) else {
+        panic!("the removal is refused");
+    };
+    disarm(&VENDOR_GONE_DURING_REMOVE, Path::new(vendor_path));
+    assert!(
+        err.to_string()
+            .contains("changed while irlume was removing"),
+        "{err}"
+    );
+    assert!(!exists(vendor_path), "the package removed it");
+    assert_eq!(
+        read_file(svc.etc),
+        tracked,
+        "the override is back, byte for byte"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(Path::new(svc.etc).parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("irlume-removing"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
 /// The ThinkPad file on disable. Its `success=2` counts irlume's face line
 /// and lands on irlume's permit landing; without irlume's lines it would land
 /// on a wallet line. The lines become inactive in their places, so the jump
@@ -553,16 +589,44 @@ fn disable_keeps_a_legacy_override_that_differs_from_its_vendor_copy() {
     assert_eq!(read_file(svc.etc), after);
 }
 
+/// A jump written with a bracketed type counts irlume's lines like any other:
+/// libpam reads `[auth]` as `auth`. Disable keeps irlume's lines as inactive
+/// lines and the jump lands where it did.
+#[test]
+fn a_jump_with_a_bracketed_type_keeps_its_landing_on_disable() {
+    let dir = TestDir::new("ovr-disable-bracketed-type");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    let vendor_path = svc.vendor.unwrap();
+    let before = thinkpad_before(vendor_path).replacen(
+        "auth       [success=2 default=ignore]   pam_fprintd.so",
+        "[auth]     [success=2 default=ignore]   pam_fprintd.so",
+        1,
+    );
+    assert!(before.contains("[auth]     [success=2"), "{before}");
+    std::fs::write(svc.etc, &before).unwrap();
+    std::fs::write(vendor_path, fedora_with_oo7()).unwrap();
+    let off = wire_service(&svc, false, true, &face_and_keyring).unwrap();
+    assert_eq!(change_id(&off), "strip-in-place", "{off}");
+    let after = read_file(svc.etc);
+    assert!(!content_has_module(&after), "{after}");
+    assert_eq!(
+        after.lines().count(),
+        before.lines().count(),
+        "every line keeps its place: {after}"
+    );
+    assert_eq!(
+        lands_after(&after, "pam_fprintd.so", 2),
+        lands_after(&before, "pam_fprintd.so", 2),
+        "{after}"
+    );
+}
+
 /// The auth line `n` modules after the first line containing `needle`: where
 /// a `success=n` or `default=n` on that line lands.
 fn lands_after(text: &str, needle: &str, n: usize) -> String {
     let chain: Vec<&str> = text
         .lines()
-        .filter(|l| {
-            let d = directive(l);
-            let first = d.split_whitespace().next().unwrap_or("");
-            first.trim_start_matches('-') == "auth"
-        })
+        .filter(|l| grammar::head(l).is_some_and(|h| h.phase == "auth"))
         .collect();
     let at = chain
         .iter()
@@ -1213,8 +1277,16 @@ fn mode(path: &str) -> u32 {
     std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
 }
 
+/// `Svc.etc` is `&'static str`, so a test path is leaked to satisfy it. Each
+/// leaked path stays listed in `KEPT`, which keeps it reachable: LeakSanitizer
+/// reports none of them, and the ASan job needs no suppression for this module.
 fn leak_path(path: &Path) -> &'static str {
-    Box::leak(path.to_string_lossy().into_owned().into_boxed_str())
+    static KEPT: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let leaked: &'static str = Box::leak(path.to_string_lossy().into_owned().into_boxed_str());
+    KEPT.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(leaked);
+    leaked
 }
 
 /// An administrator's own stack, wired in place rather than overridden.
@@ -1743,4 +1815,95 @@ fn keeping_a_copy_accepts_only_an_identical_existing_one() {
     std::fs::write(&copy, "something else\n").unwrap();
     assert!(keep_copy(&path).is_err());
     assert_eq!(std::fs::read_to_string(&copy).unwrap(), "something else\n");
+}
+
+// ---- checked writes: the check and the install are one step ---------------------
+
+/// The names in `dir`, sorted: what a write left behind.
+fn entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Another writer's file that replaces the checked one after irlume's last
+/// check, before irlume's file is installed, is kept: the write swaps its
+/// file in, sees the file that came out is not the one it checked, and puts
+/// the other writer's back.
+#[test]
+fn a_checked_write_keeps_a_file_that_replaced_the_checked_one() {
+    let dir = TestDir::new("ovr-write-interloper");
+    let path = dir.0.join("sudo");
+    std::fs::write(&path, "decided on this\n").unwrap();
+    arm(&INTERLOPE_BEFORE_INSTALL, &path);
+    let err = write_atomic_checked(&path, "IRLUME'S FILE\n", Some("decided on this\n"))
+        .expect_err("the write is refused");
+    disarm(&INTERLOPE_BEFORE_INSTALL, &path);
+    assert!(
+        err.message.contains("changed while irlume was writing"),
+        "{err}"
+    );
+    assert!(!err.landed, "nothing of irlume's is at the path");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "SOMEONE ELSE'S FILE\n"
+    );
+    assert_eq!(entries(&dir.0), ["sudo"], "no scratch file is left");
+}
+
+/// A file that appears where irlume is creating one, after irlume saw none,
+/// is never replaced.
+#[test]
+fn a_checked_create_keeps_a_file_that_appeared() {
+    let dir = TestDir::new("ovr-create-interloper");
+    let path = dir.0.join("sudo");
+    arm(&INTERLOPE_BEFORE_INSTALL, &path);
+    let err = write_atomic_checked(&path, "IRLUME'S FILE\n", None).expect_err("refused");
+    disarm(&INTERLOPE_BEFORE_INSTALL, &path);
+    assert!(
+        err.message.contains("changed while irlume was writing"),
+        "{err}"
+    );
+    assert!(!err.landed);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "SOMEONE ELSE'S FILE\n"
+    );
+    assert_eq!(entries(&dir.0), ["sudo"]);
+    // With nothing in the way the file is created and replaced as before.
+    let fresh = dir.0.join("polkit-1");
+    write_atomic_checked(&fresh, "first\n", None).unwrap();
+    write_atomic_checked(&fresh, "second\n", Some("first\n")).unwrap();
+    assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "second\n");
+    assert_eq!(entries(&dir.0), ["polkit-1", "sudo"]);
+}
+
+/// On a filesystem without RENAME_NOREPLACE and RENAME_EXCHANGE a creation
+/// still never replaces a file that appeared (it links the file in, which
+/// refuses an existing name), and writes otherwise work as before.
+#[test]
+fn checked_writes_work_without_the_rename_flags() {
+    let dir = TestDir::new("ovr-write-no-flags");
+    let path = dir.0.join("sudo");
+    arm(&NO_RENAME_FLAGS, &path);
+    arm(&INTERLOPE_BEFORE_INSTALL, &path);
+    let err = write_atomic_checked(&path, "IRLUME'S FILE\n", None).expect_err("refused");
+    assert!(
+        err.message.contains("changed while irlume was writing"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "SOMEONE ELSE'S FILE\n"
+    );
+    std::fs::remove_file(&path).unwrap();
+    write_atomic_checked(&path, "created\n", None).unwrap();
+    write_atomic_checked(&path, "replaced\n", Some("created\n")).unwrap();
+    disarm(&NO_RENAME_FLAGS, &path);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced\n");
+    assert_eq!(entries(&dir.0), ["sudo"], "no scratch file is left");
 }

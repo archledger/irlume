@@ -356,10 +356,14 @@ All notable changes to irlume are documented here. This project adheres to
   rollback` refuses to (`login verify` reports it as
   `changed-since-apply`). An override saved with CRLF line endings, which
   PAM does not read, is reported by `irlume doctor` and rewritten with LF
-  endings by `login enable --apply`. `login plan` counts a vendor file
-  change between plan and apply as a change to the machine, so existing
-  plan ids change once. New change ids `rewire-override` and
-  `keep-edited-override` (follows up #847).
+  endings by `login enable --apply`. A write or removal of one of these
+  files never replaces or deletes a file another program put there after
+  irlume read it, and an override is deleted only while its vendor copy is
+  still there. A jump whose type is written in brackets (`[auth]`) is
+  counted like any other. `login plan` counts a vendor file change between
+  plan and apply as a change to the machine, so existing plan ids change
+  once. New change ids `rewire-override` and `keep-edited-override`
+  (follows up #847).
 - `irlume login rollback` no longer writes a file the transaction did not
   change. A surface `login apply` left alone (a symlink, a file with a
   second name, or one whose file or vendor copy changed after the plan)

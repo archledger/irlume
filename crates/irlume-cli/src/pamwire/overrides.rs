@@ -23,8 +23,8 @@
 //! unwiring anything on a capability reading.
 
 use super::grammar::{
-    content_has_module, directive, irlume_rule, is_auth_substack_anchor, is_include_auth_layout,
-    is_passwd_substack,
+    self, content_has_module, directive, head, irlume_rule, is_auth_substack_anchor,
+    is_include_auth_layout, is_passwd_substack,
 };
 use super::stanzas::{inert_line, BACKUP, CREATED_PREFIX, INERT_TAG, KEYRING_TAG};
 use super::transform::{
@@ -280,15 +280,11 @@ fn irlume_lines(text: &str) -> Vec<String> {
 
 const PHASES: [&str; 4] = ["auth", "account", "password", "session"];
 
-/// The phase of a PAM line, without the `-` that tolerates a missing module.
-/// `None` for a comment, an `@include` or anything else.
+/// The phase of a PAM line, without the `-` that tolerates a missing module,
+/// read as libpam reads the type (a bracketed `[auth]` included). `None` for
+/// a comment, an `@include` or anything else.
 fn phase(line: &str) -> Option<&'static str> {
-    let first = directive(line).split_whitespace().next()?;
-    let first = first.strip_prefix('-').unwrap_or(first);
-    PHASES
-        .iter()
-        .copied()
-        .find(|p| p.eq_ignore_ascii_case(first))
+    head(line).map(|h| h.phase)
 }
 
 /// What one of irlume's lines is for, so an old and a new version of it can
@@ -418,42 +414,14 @@ fn chain<'a>(text: &'a str, phase_name: &str) -> Vec<&'a str> {
 }
 
 fn is_include(line: &str) -> bool {
-    let d = directive(line);
-    d.starts_with("@include")
-        || d.split_whitespace()
-            .nth(1)
-            .is_some_and(|c| c.eq_ignore_ascii_case("include"))
+    directive(line).starts_with("@include")
+        || head(line).is_some_and(|h| h.control.eq_ignore_ascii_case("include"))
 }
 
-/// The numeric actions of a bracketed control, as `(value, count)`.
+/// The numeric actions of a line's control, as `(value, count)` (see
+/// [`grammar::numeric_actions`]).
 fn numeric_actions(line: &str) -> Vec<(String, usize)> {
-    let d = directive(line);
-    let mut toks = d.split_whitespace();
-    toks.next();
-    let Some(first) = toks.next() else {
-        return Vec::new();
-    };
-    if !first.starts_with('[') {
-        return Vec::new();
-    }
-    let mut control = vec![first];
-    if !first.ends_with(']') {
-        for t in toks.by_ref() {
-            control.push(t);
-            if t.ends_with(']') {
-                break;
-            }
-        }
-    }
-    control
-        .iter()
-        .map(|t| t.trim_start_matches('[').trim_end_matches(']'))
-        .filter_map(|kv| {
-            let (key, value) = kv.split_once('=')?;
-            let n: usize = value.parse().ok()?;
-            (n > 0).then(|| (key.to_string(), n))
-        })
-        .collect()
+    head(line).map_or_else(Vec::new, |h| grammar::numeric_actions(&h))
 }
 
 fn landing_of(chain: &[&str], at: usize, n: usize) -> Landing {

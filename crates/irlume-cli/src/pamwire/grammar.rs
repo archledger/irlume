@@ -70,6 +70,69 @@ fn next_field<'a>(rest: &mut &'a str) -> Option<&'a str> {
     Some(field)
 }
 
+/// The type and control of any line libpam reads as part of a stack, an
+/// `include` or `substack` line among them: what numeric jumps and the chain
+/// of a phase are counted from.
+pub(crate) struct Head<'a> {
+    /// As in [`Rule::phase`].
+    pub(crate) phase: &'static str,
+    /// As in [`Rule::control`].
+    pub(crate) control: &'a str,
+    /// Everything after the control.
+    rest: &'a str,
+}
+
+/// The type and control of a line, split as [`rule`] splits them, or `None`
+/// for a comment, a blank line, an `@include` or a line whose type is not one
+/// of the four. A bracketed type (`[auth]`) is read as libpam reads it.
+pub(crate) fn head(line: &str) -> Option<Head<'_>> {
+    let line = line.trim_start_matches([' ', '\t']);
+    let mut rest = &line[..line.find('#').unwrap_or(line.len())];
+    let kind = next_field(&mut rest)?;
+    let bare = kind.strip_prefix('-').unwrap_or(kind);
+    let phase = ["auth", "account", "password", "session"]
+        .into_iter()
+        .find(|p| p.eq_ignore_ascii_case(bare))?;
+    let control = next_field(&mut rest)?;
+    Some(Head {
+        phase,
+        control,
+        rest,
+    })
+}
+
+/// Whether this line is an `include` or `substack` line, whose third field
+/// names a stack rather than a module. libpam compares the control with its
+/// keywords after taking off any brackets, so `[include]` is one too.
+pub(crate) fn names_stack(h: &Head<'_>) -> bool {
+    h.control.eq_ignore_ascii_case("include") || h.control.eq_ignore_ascii_case("substack")
+}
+
+/// The `value=N` jumps of a control, as `(value, N)` with N above zero. libpam
+/// reads every control that is not one of its keywords as `value=action`
+/// pairs, bracketed (`[success=2 default=ignore]`) or not (`success=2`).
+pub(crate) fn numeric_actions(h: &Head<'_>) -> Vec<(String, usize)> {
+    const KEYWORDS: [&str; 6] = [
+        "required",
+        "requisite",
+        "sufficient",
+        "optional",
+        "include",
+        "substack",
+    ];
+    if KEYWORDS.iter().any(|k| h.control.eq_ignore_ascii_case(k)) {
+        return Vec::new();
+    }
+    h.control
+        .split(FIELD_DELIMITERS)
+        .filter_map(|kv| {
+            let (key, value) = kv.split_once('=')?;
+            let n: usize = value.parse().ok()?;
+            (n > 0).then(|| (key.to_string(), n))
+        })
+        .collect()
+}
+
 /// The fields of a rule line, or `None` for anything that loads no module: a
 /// comment, a blank line, an `@include`, an `include` or `substack` line
 /// (their third field names a stack, not a module), a line whose type is not
@@ -80,17 +143,11 @@ fn next_field<'a>(rest: &mut &'a str) -> Option<&'a str> {
 /// no-break space) has a type libpam does not know, so it loads no module:
 /// PAM installs a rule that always fails in its place.
 pub(crate) fn rule(line: &str) -> Option<Rule<'_>> {
-    let line = line.trim_start_matches([' ', '\t']);
-    let mut rest = &line[..line.find('#').unwrap_or(line.len())];
-    let kind = next_field(&mut rest)?;
-    let bare = kind.strip_prefix('-').unwrap_or(kind);
-    let phase = ["auth", "account", "password", "session"]
-        .into_iter()
-        .find(|p| p.eq_ignore_ascii_case(bare))?;
-    let control = next_field(&mut rest)?;
-    if control.eq_ignore_ascii_case("include") || control.eq_ignore_ascii_case("substack") {
+    let h = head(line)?;
+    if names_stack(&h) {
         return None;
     }
+    let (phase, control, mut rest) = (h.phase, h.control, h.rest);
     let module = next_field(&mut rest)?;
     let mut args = Vec::new();
     while let Some(arg) = next_field(&mut rest) {

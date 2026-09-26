@@ -11,12 +11,16 @@
 //! model and gives revocability: re-seal under a fresh secret to revoke.
 //!
 //! [`seal`] picks the strongest policy the machine supports (the tier ladder):
-//! a signed `PolicyAuthorize` over systemd's PCR signature (Tier 1, survives
-//! kernel updates), `PolicyAuthorizeNV` against a provisioned systemd-pcrlock
-//! NV index (Tier 2, survives firmware / Secure Boot updates once the admin
-//! re-runs `make-policy`), or a literal `PolicyPCR` over PCR 7 (Tier 3, the
+//! `PolicyAuthorizeNV` against a provisioned systemd-pcrlock NV index (Tier 2,
+//! survives firmware / Secure Boot updates once the admin re-runs
+//! `make-policy`), else a literal `PolicyPCR` over PCR 7 (Tier 3, the
 //! universal fallback; a Secure Boot config change requires a re-arm, and the
-//! daemon falls back to the typed password until then).
+//! daemon falls back to the typed password until then). A signed
+//! `PolicyAuthorize` over systemd's PCR 11 signature (Tier 1) is no longer
+//! sealed: PCR 11 is measured by the operating system itself, so it binds
+//! less of the platform than PCR 7 or pcrlock. Tier 1 envelopes written by
+//! earlier releases still unseal and move to a bound tier on their next
+//! verified reseal.
 //!
 //! Every transient handle (SRK, loaded sealed object, trial/policy session) is
 //! flushed on both success and error paths via the scope helpers below. TPMs
@@ -72,6 +76,7 @@ const TCTI_RESOURCE_MANAGER: &str = "device:/dev/tpmrm0";
 
 /// TPM2_PolicyAuthorize command code (big-endian), folded into the authorized
 /// policy digest per the TPM2 spec.
+#[cfg(test)]
 const TPM_CC_POLICY_AUTHORIZE: [u8; 4] = [0x00, 0x00, 0x01, 0x6A];
 
 /// PCRs the secret is bound to by default: PCR 7 = UEFI Secure Boot policy.
@@ -760,32 +765,43 @@ fn with_srk_mode<T>(
     result
 }
 
-/// True when this machine could seal under a strictly stronger tier than
+/// True when this machine could seal under a strictly stronger policy than
 /// `current` right now. Used by the login-time self-heal to auto-upgrade an
-/// envelope sealed under a weaker tier (e.g. one written before signed-PCR
-/// worked) without the user re-arming, and without churning the TPM on a
-/// machine already at its best available tier. Only signals availability; the
+/// envelope sealed under a weaker policy (a signed Tier 1 envelope from an
+/// earlier release, or a literal one written before pcrlock was provisioned)
+/// without the user re-arming, and without churning the TPM on a machine
+/// already at its best available policy. Only signals availability; the
 /// actual round-trip verification happens in [`seal`].
-pub fn stronger_tier_available_than(current: &PolicyKind) -> bool {
-    match current {
-        // Tier 1 is the strongest; nothing to upgrade to.
-        PolicyKind::Authorized { .. } => false,
-        // Tier 2 -> Tier 1 only if signed-PCR artifacts exist.
-        PolicyKind::PcrlockNv { .. } => crate::pcrsig::signed_policy_available(),
-        // Tier 3 -> a higher tier if either signed-PCR or pcrlock is available.
-        PolicyKind::PcrLiteral => {
-            crate::pcrsig::signed_policy_available() || pcrlock_provisioned().is_some()
-        }
-    }
+pub fn stronger_tier_available_than(current: &SealedEnvelope) -> bool {
+    stronger_tier_than(
+        current.strength_rank(),
+        || pcrlock_for_sealing().is_some(),
+        || crate::envelope::binds_firmware_state(&policy_pcrs()),
+    )
+}
+
+/// [`stronger_tier_available_than`] over the envelope's
+/// [`SealedEnvelope::strength_rank`], with the pcrlock probe, and whether
+/// the configured literal PCRs bind firmware state, passed in. The ladder can
+/// reach the literal policy's rank when its PCRs bind firmware state (the
+/// default PCR 7 does), and pcrlock's once one is provisioned; whether a
+/// provisioned pcrlock policy binds firmware state is known only after
+/// sealing, where the caller compares ranks again.
+fn stronger_tier_than(
+    current: u8,
+    pcrlock: impl FnOnce() -> bool,
+    literal_binds_firmware: impl FnOnce() -> bool,
+) -> bool {
+    let pcrlock_rank = PolicyKind::PcrlockNv { nv_index: 0 }.strength_rank();
+    (literal_binds_firmware() && current < PolicyKind::PcrLiteral.strength_rank())
+        || (current < pcrlock_rank && pcrlock())
 }
 
 /// Seal `secret` under the best policy available on this machine, trying each
 /// tier in order and round-trip-verifying before trusting it:
-///   * Tier 1: if systemd has published signed-PCR artifacts (UKI / systemd-boot),
-///     a `PolicyAuthorize` over its signing key, binding the PCRs it signs
-///     (typically PCR 11). Survives kernel updates with no reseal.
-///   * Tier 2: if a systemd-pcrlock policy is provisioned
-///     ([`pcrlock_provisioned`]), a `PolicyAuthorizeNV` against its NV index.
+///   * Tier 2: if a systemd-pcrlock policy covering a firmware-measured PCR
+///     is provisioned ([`pcrlock_for_sealing`]), a `PolicyAuthorizeNV`
+///     against its NV index.
 ///     `make-policy` re-predicts the index across firmware / Secure Boot
 ///     updates, so those don't require a reseal either. Explicit sealing at
 ///     this tier is also available via [`seal_with_pcrlock`].
@@ -793,42 +809,28 @@ pub fn stronger_tier_available_than(current: &PolicyKind) -> bool {
 ///     ([`policy_pcrs`], default PCR 7). If those PCRs move (dbx/Secure Boot
 ///     update) the envelope stops unsealing and the user re-runs `keyring arm`.
 ///
+/// A signed `PolicyAuthorize` over systemd's PCR 11 signature (Tier 1) is
+/// never tried, even where a UKI publishes one: it binds only what the
+/// operating system measures, which a literal PCR 7 seal outranks.
+///
 /// Every producer funnels through here (keyring arm, the template key, both
 /// reseal self-heals), so a reseal re-runs the ladder: it can move an envelope
 /// up a tier when one became available, and only lands on a lower tier when
 /// the higher one genuinely does not unseal on this machine.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
-    if crate::pcrsig::signed_policy_available() {
-        match seal_authorized(secret) {
-            // A signed seal can SUCCEED yet be un-unsealable on this boot: the
-            // artifacts under /run/systemd are systemd's, signed for a PCR-11
-            // value that only matches a UKI/measured-boot chain. On a GRUB box
-            // (or any host where those don't correspond to the live PCRs) the
-            // envelope seals fine but PolicyAuthorize fails at unseal (TPM
-            // 0x4c4): the "sealed but unusable" trap that broke enrollment.
-            // So round-trip it: only trust the authorized envelope if it
-            // actually unseals right now; otherwise fall back to the literal
-            // PCR seal, which is bound to values we read from this TPM.
-            Ok(env) => match unseal(&env) {
-                Ok(rt) if rt.as_slice() == secret => return Ok(env),
-                Ok(_) => eprintln!(
-                    "irlume: signed-PCR seal round-trip mismatch; falling back to literal PCR seal"
-                ),
-                Err(e) => eprintln!(
-                    "irlume: signed-PCR seal doesn't unseal on this boot ({e}); falling back to literal PCR seal"
-                ),
-            },
-            Err(e) => eprintln!(
-                "irlume: signed-PCR seal unavailable ({e}); falling back to literal PCR seal"
-            ),
-        }
-    }
-    if let Some(nv_index) = pcrlock_provisioned() {
-        // Same trap as Tier 1: a pcrlock seal can succeed yet not unseal on
-        // this boot (e.g. the policy predicts a PCR this OS never extends, so
-        // the super-PCR replay fails). Only trust it after a round-trip.
+    if let Some(nv_index) = pcrlock_for_sealing() {
+        // A pcrlock seal can SUCCEED yet be un-unsealable on this boot (e.g.
+        // the policy predicts a PCR this OS never extends, so the super-PCR
+        // replay fails): the "sealed but unusable" trap. Only trust it after
+        // a round-trip; otherwise fall back to the literal PCR seal, which is
+        // bound to values read from this TPM.
         match seal_pcrlock(secret, nv_index) {
+            // The prediction is read again to seal, so a policy rewritten in
+            // between is checked on the envelope it produced as well.
+            Ok(env) if !crate::envelope::binds_firmware_state(&env.pcrs) => eprintln!(
+                "irlume: the pcrlock policy covers no firmware-measured PCR; using the literal PCR seal"
+            ),
             Ok(env) => match unseal(&env) {
                 Ok(rt) if rt.as_slice() == secret => return Ok(env),
                 Ok(_) => eprintln!(
@@ -1109,10 +1111,12 @@ fn unseal_literal(env: &SealedEnvelope, mode: SrkMode) -> Result<Zeroizing<Vec<u
 /// Seal `secret` under a `PolicyAuthorize` over systemd's PCR-signing public
 /// key. The object's `authPolicy` commits only to that key's Name (not to any
 /// concrete PCR value), so any PCR state for which systemd has shipped a valid
-/// signature can unseal, the basis for surviving kernel/UKI updates without a
-/// reseal. Binds exactly the PCRs systemd signs (read from the signature file,
-/// typically PCR 11). Uses an empty `policyRef`, matching systemd's convention.
-fn seal_authorized(secret: &[u8]) -> Result<SealedEnvelope> {
+/// signature can unseal. Binds exactly the PCRs systemd signs (read from the
+/// signature file, typically PCR 11). Uses an empty `policyRef`, matching
+/// systemd's convention. [`seal`] no longer writes this policy; tests use it
+/// to build the envelopes earlier releases wrote.
+#[cfg(test)]
+pub(crate) fn seal_authorized(secret: &[u8]) -> Result<SealedEnvelope> {
     let pubkey_pem = crate::pcrsig::load_pubkey_pem()?;
     let pcrs = crate::pcrsig::signed_pcrs(crate::pcrsig::DEFAULT_BANK)
         .ok_or_else(|| Error::Policy("signed-PCR file has no usable signatures".into()))?;
@@ -1381,6 +1385,7 @@ fn rsa_pem_to_public(pubkey_pem: &str) -> Result<Public> {
 /// empty starting policy: reset to a zero digest, fold in the command code + the
 /// signing key's Name, then the policyRef. Mirrors the TPM2 spec so we don't
 /// need a null verification ticket in a trial session.
+#[cfg(test)]
 fn authorize_policy_digest(key_name: &[u8], policy_ref: &[u8]) -> Result<Digest> {
     let mut h = Sha256::new();
     h.update([0u8; 32]); // reset to Zero Digest (SHA-256 size)
@@ -1880,6 +1885,20 @@ pub fn seal_with_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope>
 /// this to decide whether the Tier 2 rung exists on this machine.
 pub fn pcrlock_provisioned() -> Option<u32> {
     let plock = read_pcrlock_json().ok()?;
+    u32::try_from(plock.nv_index?).ok()
+}
+
+/// The NV index of the provisioned pcrlock policy when [`seal`] uses it: one
+/// that covers a firmware-measured PCR (0 to 7). A policy over OS-measured
+/// PCRs only (PCR 15, say) binds less of the platform than the literal PCR 7
+/// seal, so the ladder takes that instead, and the upgrade check does not
+/// count it. `seal_with_pcrlock` still seals under any provisioned policy.
+pub fn pcrlock_for_sealing() -> Option<u32> {
+    let plock = read_pcrlock_json().ok()?;
+    let pcrs: Vec<u32> = plock.pcr_values.iter().map(|e| e.pcr).collect();
+    if !crate::envelope::binds_firmware_state(&pcrs) {
+        return None;
+    }
     u32::try_from(plock.nv_index?).ok()
 }
 
@@ -2833,28 +2852,102 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         );
     }
 
+    /// A Tier 1 envelope an earlier release wrote must keep unsealing, so its
+    /// next verified reseal can move it, while the ladder itself never lands
+    /// on the signed policy even where the boot chain publishes one.
     #[test]
     #[ignore = "requires a real TPM + fresh systemd signed-PCR artifacts (UKI/systemd-boot); covers Tier-1 PolicyAuthorize"]
     fn seal_unseal_signed_pcr_roundtrip_real_hardware() {
         let secret = b"irlume-keyring-secret-roundtrip!";
-        let env = seal(secret).expect("ladder seal on signed-PCR hardware");
-        assert!(
-            matches!(env.policy, PolicyKind::Authorized { .. }),
-            "on signed-PCR hardware the ladder must land on Tier-1 PolicyAuthorize, got {:?}",
-            env.policy
-        );
+        let env = seal_authorized(secret).expect("signed-PCR seal");
         let got = unseal(&env).expect("unseal the signed-PCR envelope");
         assert_eq!(&*got, secret, "signed-PCR round-trip must match");
+        let ladder = seal(secret).expect("ladder seal on signed-PCR hardware");
+        assert!(
+            !matches!(ladder.policy, PolicyKind::Authorized { .. }),
+            "the ladder must bind PCR 7 or pcrlock, not PCR 11 alone"
+        );
+        assert_eq!(&*unseal(&ladder).expect("unseal the ladder seal"), secret);
+    }
+
+    /// Only a pcrlock policy covering a firmware-measured PCR is sealed under
+    /// or counted as an upgrade: one over PCR 15 alone, as a real machine
+    /// here provisioned, binds less than the literal PCR 7 seal.
+    #[test]
+    fn only_a_firmware_binding_pcrlock_policy_is_used_for_sealing() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::path::PathBuf::from(crate::test_tmp_dir("pcrlock-firmware"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("pcrlock.json");
+        let value = "ab".repeat(32);
+        std::env::set_var("IRLUME_PCRLOCK_JSON", &json);
+        for (pcrs, used) in [
+            (&[15][..], false),
+            (&[11, 15], false),
+            (&[7], true),
+            (&[0, 2, 4, 15], true),
+        ] {
+            let entries: Vec<String> = pcrs
+                .iter()
+                .map(|pcr| format!(r#"{{"pcr":{pcr},"values":["{value}"]}}"#))
+                .collect();
+            std::fs::write(
+                &json,
+                format!(
+                    r#"{{"pcrBank":"sha256","pcrValues":[{}],"nvIndex":27981881}}"#,
+                    entries.join(",")
+                ),
+            )
+            .unwrap();
+            assert_eq!(pcrlock_provisioned(), Some(27_981_881), "{pcrs:?}");
+            assert_eq!(pcrlock_for_sealing().is_some(), used, "{pcrs:?}");
+        }
+        std::env::remove_var("IRLUME_PCRLOCK_JSON");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The upgrade predicate: a signed envelope, or a literal one over no
+    /// firmware-measured PCR, has a stronger policy to move to when pcrlock
+    /// is provisioned or the configured literal PCRs bind firmware state (the
+    /// default PCR 7 does); a literal PCR 7 one only once pcrlock is
+    /// provisioned; a pcrlock one never, whatever the boot chain publishes.
+    #[test]
+    fn upgrades_move_toward_bound_policies_only() {
+        let signed = PolicyKind::Authorized {
+            pubkey_pem: String::new(),
+            policy_ref: Vec::new(),
+        }
+        .strength_rank();
+        let pcrlock = PolicyKind::PcrlockNv { nv_index: 1 }.strength_rank();
+        let literal = PolicyKind::PcrLiteral.strength_rank();
+        let unbound = 0;
+        for provisioned in [false, true] {
+            for firmware in [false, true] {
+                for weak in [signed, unbound] {
+                    assert_eq!(
+                        stronger_tier_than(weak, || provisioned, || firmware),
+                        provisioned || firmware
+                    );
+                }
+                assert!(!stronger_tier_than(pcrlock, || provisioned, || firmware));
+                assert_eq!(
+                    stronger_tier_than(literal, || provisioned, || firmware),
+                    provisioned
+                );
+            }
+        }
     }
 
     /// A synthetic systemd-pcrlock policy, provisioned for the guard's lifetime.
     ///
     /// Extracted from `seal_unseal_pcrlock_roundtrip_provisioned_nv`, which built
     /// this inline, so the tier-climb tests can establish the precondition they
-    /// were missing: `stronger_tier_available_than(PcrLiteral)` is
-    /// `signed_policy_available() || pcrlock_provisioned().is_some()`, and on a
-    /// bare swtpm neither holds, so those tests asserted a climb that could not
-    /// happen (#361).
+    /// were missing: `stronger_tier_available_than(PcrLiteral)` needs
+    /// `pcrlock_provisioned()`, and on a bare swtpm that does not hold, so
+    /// those tests asserted a climb that could not happen (#361).
     ///
     /// What this IS: a real owner-hierarchy NV space holding the alg-tagged
     /// policy digest of the live PCR state, laid out the way
@@ -3120,8 +3213,9 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
 
     /// The auto-tier ladder in [`seal`] on real hardware: whatever tier it
     /// lands on must round-trip. When the pcrlock rung is genuinely usable
-    /// (provisioned AND a direct pcrlock seal round-trips) and no signed
-    /// policy outranks it, the ladder must land on Tier 2. When pcrlock is
+    /// (provisioned, covering a firmware-measured PCR, AND a direct pcrlock
+    /// seal round-trips), the ladder must land on Tier 2, whether or not a
+    /// signed policy exists; over OS-measured PCRs only it must not. When pcrlock is
     /// provisioned but broken (e.g. Pop!_OS predicts a PCR 15 the OS never
     /// extends, so the policy can never be satisfied), the ladder must NOT
     /// land there; falling through to the literal seal is the correct result.
@@ -3142,11 +3236,18 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert_eq!(&*got, secret, "ladder round-trip must match");
 
         let landed_pcrlock = matches!(env.policy, PolicyKind::PcrlockNv { .. });
-        if pcrlock_usable && !crate::pcrsig::signed_policy_available() {
+        let binds_firmware = pcrlock_for_sealing().is_some();
+        if pcrlock_usable && binds_firmware {
             assert!(
                 landed_pcrlock,
-                "usable pcrlock + no signed policy: seal() must pick Tier 2, got {:?}",
+                "usable pcrlock: seal() must pick Tier 2, got {:?}",
                 env.policy
+            );
+        }
+        if !binds_firmware {
+            assert!(
+                !landed_pcrlock,
+                "a pcrlock policy over no firmware-measured PCR must not be sealed under"
             );
         }
         if !pcrlock_usable {

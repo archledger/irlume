@@ -4398,14 +4398,20 @@ fn doctor_run(
         report,
         "[doctor] signed PCR policy: {}",
         if irlume_core::pcrsig::signed_policy_available() {
-            "systemd PCR-11 signature present ✓; kernel updates won't need re-seal"
+            "systemd PCR-11 signature present; not used for new seals (it binds only what the booted OS measures)"
         } else {
             "none (no Tier 1 on this boot chain)"
         }
     );
+    // A provisioned policy that covers no firmware-measured PCR is passed
+    // over for sealing (`pcrlock_for_sealing`), so it is not a passing rung.
+    let pcrlock = (
+        irlume_core::tpm::pcrlock_provisioned(),
+        irlume_core::tpm::pcrlock_for_sealing(),
+    );
     report.check(
         "pcrlock",
-        if irlume_core::tpm::pcrlock_provisioned().is_some() {
+        if pcrlock.1.is_some() {
             State::Pass
         } else {
             State::Info
@@ -4414,14 +4420,19 @@ fn doctor_run(
     dout!(
         report,
         "[doctor] pcrlock: {}",
-        match irlume_core::tpm::pcrlock_provisioned() {
-            Some(nv) => format!(
+        match pcrlock {
+            (Some(nv), Some(_)) => format!(
                 "provisioned, NV 0x{nv:x}; an arm binds to it if it unseals on this boot (Tier 2)"
             ),
-            None => "not provisioned: seals use the literal PCR-7 policy + recovery passphrase \
+            (Some(nv), None) => format!(
+                "provisioned, NV 0x{nv:x}, over no firmware-measured PCR (0 to 7), so seals \
+                 use the literal PCR-7 policy; Tier 2 needs a pcrlock policy that covers one"
+            ),
+            (None, _) =>
+                "not provisioned: seals use the literal PCR-7 policy + recovery passphrase \
                      (re-arm/restore after firmware updates); `systemd-pcrlock make-policy` \
                      enables Tier 2"
-                .to_string(),
+                    .to_string(),
         }
     );
 

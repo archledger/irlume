@@ -42,7 +42,11 @@ pub enum PolicyKind {
     PcrLiteral,
     /// Tier 1 (UKI/systemd-boot): `PolicyAuthorize` over a signing public key.
     /// Any PCR state for which a valid systemd-issued signature exists unseals,
-    /// so kernel updates don't require a reseal.
+    /// so kernel updates don't require a reseal. That signature covers PCR 11
+    /// alone, which the operating system measures itself, so it binds less
+    /// of the platform than PCR 7 or pcrlock. New seals no longer use this
+    /// tier; an existing envelope still unseals and moves to a bound tier on
+    /// its next verified reseal.
     Authorized {
         pubkey_pem: String,
         #[serde(with = "b64", default, skip_serializing_if = "Vec::is_empty")]
@@ -56,15 +60,18 @@ pub enum PolicyKind {
 }
 
 impl PolicyKind {
-    /// Strength rank of this tier, higher is stronger: signed PolicyAuthorize
-    /// (Tier 1) > pcrlock NV (Tier 2) > literal PolicyPCR (Tier 3). Used to
-    /// decide whether a re-seal would upgrade an existing envelope. The enum
-    /// declaration order does not match tier order, so rank explicitly.
+    /// Strength rank of this policy, higher is stronger: pcrlock NV (Tier 2) >
+    /// literal PolicyPCR (Tier 3) > signed PolicyAuthorize (Tier 1). The tier
+    /// numbers name the boot setup, not the strength. pcrlock and the literal
+    /// PCR 7 policy bind the firmware and Secure Boot state; the signed policy
+    /// binds only PCR 11, which the operating system measures itself. Used,
+    /// through [`SealedEnvelope::strength_rank`], to decide whether a re-seal
+    /// would upgrade an existing envelope.
     pub fn strength_rank(&self) -> u8 {
         match self {
-            PolicyKind::Authorized { .. } => 3,
-            PolicyKind::PcrlockNv { .. } => 2,
-            PolicyKind::PcrLiteral => 1,
+            PolicyKind::PcrlockNv { .. } => 3,
+            PolicyKind::PcrLiteral => 2,
+            PolicyKind::Authorized { .. } => 1,
         }
     }
 
@@ -157,7 +164,39 @@ pub struct SealedEnvelope {
     pub password_wrap: Option<crate::recovery::RecoveryEnvelope>,
 }
 
+/// Whether a literal policy over `pcrs` binds anything the firmware measured:
+/// PCRs 0 to 7 are extended before the operating system runs, so a system
+/// booted another way cannot give them their sealed values.
+pub fn binds_firmware_state(pcrs: &[u32]) -> bool {
+    pcrs.iter().any(|&pcr| pcr < 8)
+}
+
 impl SealedEnvelope {
+    /// The strength rank of this envelope's binding: its policy's
+    /// [`PolicyKind::strength_rank`], except that a literal or pcrlock
+    /// policy leaving out every firmware-measured PCR (an `IRLUME_PCRS`
+    /// override such as `11`, or a custom pcrlock policy over OS PCRs only)
+    /// ranks below every policy, so a reseal never moves an envelope onto
+    /// one, and moves an envelope off one when something better is there.
+    ///
+    /// A signed envelope over a firmware-measured PCR (a custom signature, not
+    /// systemd's PCR 11 one) ranks as the literal policy, so a reseal moves it
+    /// only to pcrlock and never swaps its update tolerance for a literal seal
+    /// that binds no more.
+    pub fn strength_rank(&self) -> u8 {
+        match self.policy {
+            PolicyKind::PcrLiteral | PolicyKind::PcrlockNv { .. }
+                if !binds_firmware_state(&self.pcrs) =>
+            {
+                0
+            }
+            PolicyKind::Authorized { .. } if binds_firmware_state(&self.pcrs) => {
+                PolicyKind::PcrLiteral.strength_rank()
+            }
+            ref policy => policy.strength_rank(),
+        }
+    }
+
     pub(crate) fn validate_version(&self) -> Result<()> {
         if self.version != CURRENT_VERSION {
             return Err(Error::Protocol(format!(
@@ -212,19 +251,62 @@ mod b64 {
 mod tests {
     use super::*;
 
+    /// A literal or pcrlock envelope over no firmware-measured PCR (an
+    /// `IRLUME_PCRS` such as `11`, a pcrlock policy over OS PCRs only) ranks
+    /// below the signed policy, so a reseal never moves a signed envelope
+    /// onto it; over PCR 7, or any of 0 to 7, it ranks as its policy does.
     #[test]
-    fn strength_rank_orders_signed_above_pcrlock_above_literal() {
+    fn an_envelope_ranks_by_the_pcrs_it_binds() {
+        let sealed = |policy: PolicyKind, pcrs: &[u32]| SealedEnvelope {
+            secret: SecretKind::default(),
+            version: CURRENT_VERSION,
+            policy,
+            pcrs: pcrs.to_vec(),
+            public: Vec::new(),
+            private: Vec::new(),
+            pcr_values: Vec::new(),
+            password_wrap: None,
+        };
+        let signed = PolicyKind::Authorized {
+            pubkey_pem: String::new(),
+            policy_ref: Vec::new(),
+        };
+        let pcrlock = PolicyKind::PcrlockNv { nv_index: 1 };
+        for policy in [PolicyKind::PcrLiteral, pcrlock] {
+            assert!(sealed(policy.clone(), &[11]).strength_rank() < signed.strength_rank());
+            assert!(sealed(policy.clone(), &[]).strength_rank() < signed.strength_rank());
+            for pcrs in [&[7][..], &[0, 7], &[0, 2, 4], &[7, 11]] {
+                assert_eq!(
+                    sealed(policy.clone(), pcrs).strength_rank(),
+                    policy.strength_rank(),
+                    "{policy:?} {pcrs:?}"
+                );
+            }
+        }
+        // systemd's signed policy over PCR 11 ranks as itself; one a custom
+        // signature put over a firmware PCR ranks as the literal policy.
+        assert_eq!(sealed(signed.clone(), &[11]).strength_rank(), 1);
+        assert_eq!(
+            sealed(signed.clone(), &[7, 11]).strength_rank(),
+            PolicyKind::PcrLiteral.strength_rank()
+        );
+    }
+
+    #[test]
+    fn strength_rank_orders_pcrlock_above_literal_above_signed() {
         let signed = PolicyKind::Authorized {
             pubkey_pem: String::new(),
             policy_ref: Vec::new(),
         };
         let pcrlock = PolicyKind::PcrlockNv { nv_index: 1 };
         let literal = PolicyKind::PcrLiteral;
-        assert!(signed.strength_rank() > pcrlock.strength_rank());
         assert!(pcrlock.strength_rank() > literal.strength_rank());
-        // A re-seal must never "upgrade" from a stronger tier to a weaker one.
-        assert_eq!(signed.strength_rank(), 3);
-        assert_eq!(literal.strength_rank(), 1);
+        // A policy over PCR 11 alone binds less of the platform than a literal
+        // PCR 7 seal, so that outranks it: a reseal moves a signed envelope to
+        // a literal or pcrlock policy, never back.
+        assert!(literal.strength_rank() > signed.strength_rank());
+        assert_eq!(pcrlock.strength_rank(), 3);
+        assert_eq!(signed.strength_rank(), 1);
     }
 
     #[test]

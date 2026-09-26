@@ -1865,6 +1865,34 @@ fn a_checked_write_keeps_a_file_that_replaced_the_checked_one() {
     assert_eq!(entries(&dir.0), ["sudo"], "no scratch file is left");
 }
 
+/// A second writer that replaces the path after the write swapped its file
+/// in, and before it swaps the first writer's back, keeps its file in place;
+/// the first writer's file is kept under a private name the scratch sweep
+/// never takes, not left under the scratch name.
+#[test]
+fn a_checked_write_keeps_a_second_file_that_replaced_it_meanwhile() {
+    let dir = TestDir::new("ovr-write-two-interlopers");
+    let path = dir.0.join("sudo");
+    std::fs::write(&path, "decided on this\n").unwrap();
+    arm(&INTERLOPE_BEFORE_INSTALL, &path);
+    arm(&SECOND_INTERLOPER, &path);
+    let err = write_atomic_checked(&path, "IRLUME'S FILE\n", Some("decided on this\n"))
+        .expect_err("the write is refused");
+    disarm(&INTERLOPE_BEFORE_INSTALL, &path);
+    disarm(&SECOND_INTERLOPER, &path);
+    assert!(!err.landed, "{err}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "A NEWER FILE\n");
+    let names = entries(&dir.0);
+    assert_eq!(names.len(), 2, "{names:?}");
+    let kept = names.iter().find(|n| *n != "sudo").unwrap();
+    assert!(!is_abandoned_scratch(kept), "{kept}");
+    assert!(err.message.contains(kept.as_str()), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(dir.0.join(kept)).unwrap(),
+        "SOMEONE ELSE'S FILE\n"
+    );
+}
+
 /// A file that appears where irlume is creating one, after irlume saw none,
 /// is never replaced.
 #[test]

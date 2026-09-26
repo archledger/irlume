@@ -691,20 +691,22 @@ nothing: the copy has lines irlume did not write and its vendor file changed
 since irlume created it (or it predates vendor tracking and differs), or
 updating irlume's lines would move where one of its numeric jumps lands or
 move one of irlume's lines past an administrator's line. A copy nobody edited
-whose vendor file gained a numeric jump that irlume's lines would move is not
-rebuilt either; it reports `already-correct`, since its irlume lines are right
-for the vendor text it was built from, and `doctor`'s `login-overrides` check
-carries the pending update. A copy with lines irlume did not write and none
-of irlume's gets them next to its password line, below every line above it;
-when irlume cannot tell which line that is (another line has the same text
-and there is no vendor file to compare with, or every candidate is a line an
-administrator added), it reports `no-anchor` and writes nothing. `remove-override` deletes a copy nobody edited; a
-disable turns one with other lines into `strip-in-place` and keeps the file.
-When a numeric jump in those lines counts irlume's lines, `strip-in-place`
-replaces them with inactive `pam_permit.so` lines in the same places rather
-than removing them, so the jump lands where it did; it does the same when
-irlume could not tell where to put its lines back without them. The API never rebuilds an
-edited copy: that takes the human `login enable --force`.
+is not rebuilt either when irlume's lines would make a numeric jump in its new
+vendor file land somewhere other than it does there (a jump the update added,
+or one whose landing it changed); it reports `already-correct`, since its
+irlume lines are right for the vendor text it was built from, and `doctor`'s
+`login-overrides` check carries the pending update. A copy with lines irlume
+did not write and none of irlume's gets them next to its password line, below
+every line above it; when irlume cannot tell which line that is (another line
+has the same text and there is no vendor file to compare with, or every
+candidate is a line an administrator added), it reports `no-anchor` and writes
+nothing. `remove-override` deletes a copy nobody edited; a disable turns one
+with other lines into `strip-in-place` and keeps the file. When a numeric jump
+in those lines counts irlume's lines, `strip-in-place` replaces them with
+inactive `pam_permit.so` lines in the same places rather than removing them,
+so the jump lands where it did; it does the same when irlume could not tell
+where to put its lines back without them. The API never rebuilds an edited
+copy: that takes the human `login enable --force`.
 
 `plan_id` is a digest of the action and the exact per-surface outcomes it was
 computed against. Two plans over an unchanged machine share an id; any change to

@@ -712,18 +712,25 @@ enum JumpCheck {
 }
 
 /// The jumps a write moves because of irlume's lines: each lands somewhere
-/// other than it did in `before` (or is new), and somewhere other than it
-/// would with irlume's lines taken out. A vendor file that changed the lines
-/// inside its own jump moves that jump without irlume's help, and an
-/// arrangement the file already had is not new; neither counts.
+/// other than it would with irlume's lines taken out, and is not an
+/// arrangement the file already had. A vendor file that changed the lines
+/// inside its own jump moves that jump without irlume's help, so that does
+/// not count. An arrangement the file already had is the same jump landing
+/// on the same line as in `before`, where without irlume's lines it also
+/// landed where it does now without them: a vendor update that changes where
+/// the jump lands without irlume's lines makes it new, even when irlume's
+/// lines keep it on the line the old file had.
 fn jumps_moved_by_irlume(before: &str, after: &str) -> Vec<Shift> {
     let old = jumps(before);
+    let old_bare = jumps(&base(before));
     let unwired = jumps(&base(after));
     let mut out: Vec<Shift> = Vec::new();
     for j in jumps(after) {
-        let moved_by_irlume = find_landing(&unwired, &j).is_some_and(|bare| bare != j.landing);
-        let changed = find_landing(&old, &j).is_none_or(|prior| prior != j.landing);
-        if moved_by_irlume && changed && !out.iter().any(|s| s.line == j.line) {
+        let bare = find_landing(&unwired, &j);
+        let moved_by_irlume = bare.as_ref().is_some_and(|bare| *bare != j.landing);
+        let already = find_landing(&old, &j).is_some_and(|prior| prior == j.landing)
+            && find_landing(&old_bare, &j) == bare;
+        if moved_by_irlume && !already && !out.iter().any(|s| s.line == j.line) {
             out.push(Shift {
                 phase: j.phase,
                 line: j.line,
@@ -1995,10 +2002,10 @@ pub(super) fn assess(
                                        old one"
                         .to_string(),
                     Hold::Jump => format!(
-                        "its vendor copy changed and gained a numeric jump that irlume's lines \
-                         would move, so reconcile does not rebuild it; to take the new vendor \
-                         copy anyway, delete the file and run {enable_apply}, then check that \
-                         jump"
+                        "its vendor copy changed, and irlume's lines would make a numeric jump \
+                         in the new one land somewhere other than it does there, so reconcile \
+                         does not rebuild it; to take the new vendor copy anyway, delete the \
+                         file and run {enable_apply}, then check that jump"
                     ),
                 }),
             ),
@@ -3641,5 +3648,44 @@ session     include       password-auth
         assert!(written(&d).is_some(), "{}", d.message);
         assert!(d.keep_copy);
         assert!(d.message.contains("now jumps to"), "{}", d.message);
+    }
+
+    /// A vendor update that changes where one of its jumps lands blocks a
+    /// rebuild even when irlume's lines keep that jump on the line the old
+    /// file had: measured against the new vendor file, irlume's lines move
+    /// it.
+    #[test]
+    fn a_jump_whose_landing_the_vendor_changed_is_measured_against_the_new_vendor_file() {
+        let vp = "/usr/lib/pam.d/plasmalogin";
+        let substack = "auth        substack      password-auth\n";
+        let jump = "auth       [success=1 default=ignore]   pam_fprintd.so";
+        let v1 = VENDOR.replacen(substack, &format!("{jump}\n{substack}"), 1);
+        let v2 = v1.replacen(
+            substack,
+            &format!("{substack}auth        optional      pam_vendor_note.so\n"),
+            1,
+        );
+        let lands = |text: &str| {
+            jumps(text)
+                .into_iter()
+                .find(|j| j.line == norm(jump))
+                .map(|j| j.landing)
+        };
+        let old = generation(&v1);
+        let (rebuilt, ok) = greeter(&base(&v2));
+        assert!(ok);
+        let password = line(substack.trim_end());
+        assert_eq!(lands(&old), Some(password.clone()), "{old}");
+        assert_eq!(lands(&rebuilt), Some(password), "{rebuilt}");
+        assert_eq!(
+            lands(&v2),
+            Some(line("auth        optional      pam_vendor_note.so")),
+            "the vendor file now means it to land here"
+        );
+        let m = maintenance(Recipe::Greeter, &old, vp, Some(&v2));
+        assert!(matches!(m, Maintenance::Blocked(Hold::Jump)), "{m:?}");
+        let d = run(&old, Some(&v2), true, &greeter);
+        assert_eq!(d.write, Write::Nothing, "{}", d.message);
+        assert!(d.message.contains("not rebuilt"), "{}", d.message);
     }
 }

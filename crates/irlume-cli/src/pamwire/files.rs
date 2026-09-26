@@ -453,6 +453,21 @@ pub(super) fn interlope_for_test(path: &Path) {
 #[cfg(test)]
 pub(super) static INTERLOPE_BEFORE_INSTALL: TestHook = TestHook::new(Vec::new());
 
+/// Test-only: a second writer replaces the path after a write swapped its
+/// file in and found a first writer's file in its way, before the write
+/// swaps that one back.
+#[cfg(test)]
+fn second_interloper_for_test(path: &Path) {
+    if fires(&SECOND_INTERLOPER, path) {
+        let replacement = path.with_extension("irlume-second");
+        let _ = std::fs::write(&replacement, "A NEWER FILE\n");
+        let _ = std::fs::rename(&replacement, path);
+    }
+}
+
+#[cfg(test)]
+pub(super) static SECOND_INTERLOPER: TestHook = TestHook::new(Vec::new());
+
 /// Test-only: another writer's backup appears after [`backup`] found none,
 /// before its link publishes irlume's.
 #[cfg(test)]
@@ -986,24 +1001,36 @@ pub(super) fn remove_checked_if(
 /// name: the sweep of abandoned scratch files must never delete a file that
 /// [`remove_checked_if`] could not put back.
 fn move_aside(path: &Path) -> std::io::Result<PathBuf> {
+    move_aside_as(path, path, "removing")
+}
+
+/// Rename `from` to a private name in the directory of `named_for`,
+/// `.{name}.irlume-{kind}.{pid}.{seq}`, never an existing file's, and return
+/// that name. `kind` is never a scratch kind, so the sweep of abandoned
+/// scratch files never takes the file.
+fn move_aside_as(from: &Path, named_for: &Path, kind: &str) -> std::io::Result<PathBuf> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("pam");
+    debug_assert!(!SCRATCH_KINDS.contains(&kind), "{kind}");
+    let dir = named_for.parent().unwrap_or_else(|| Path::new("."));
+    let fname = named_for
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("pam");
     let mut attempts = 0;
     loop {
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let aside = dir.join(format!(
-            ".{fname}.irlume-removing.{}.{seq}",
+            ".{fname}.irlume-{kind}.{}.{seq}",
             std::process::id()
         ));
-        let moved = match renameat2_noreplace(path, &aside) {
+        let moved = match renameat2_noreplace(from, &aside) {
             // No RENAME_NOREPLACE on this filesystem. The name is this call's
             // own, so a plain rename replaces nothing unless a file left by an
             // earlier run has it, which is checked first.
             Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) => {
                 match std::fs::symlink_metadata(&aside) {
                     Ok(_) => Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
-                    Err(_) => std::fs::rename(path, &aside),
+                    Err(_) => std::fs::rename(from, &aside),
                 }
             }
             other => other,
@@ -1186,7 +1213,7 @@ fn write_atomic_inner(
         interlope_for_test(path);
         #[cfg(test)]
         chmod_for_test(path);
-        install(&tmp, path, before, expected, carried)?;
+        install(&tmp, path, before, expected, carried, ours)?;
         sync_after_change(path)
     })();
     if result.is_err() {
@@ -1228,6 +1255,7 @@ fn install(
     before: TargetState,
     expected: Option<&[u8]>,
     carried: Option<(u32, u32, u32)>,
+    ours: Option<(u64, u64)>,
 ) -> Result<(), WriteError> {
     use std::os::unix::fs::MetadataExt as _;
     let unsupported =
@@ -1275,15 +1303,42 @@ fn install(
             .map_err(|e| WriteError::landed(format!("rm {}: {e}", tmp.display())));
     }
     // Another writer's file came out: give it its name back.
-    match renameat2_exchange(tmp, path) {
-        Ok(()) => Err(changed_while_writing(path).into()),
-        Err(e) => Err(WriteError::landed(format!(
+    #[cfg(test)]
+    second_interloper_for_test(path);
+    if let Err(e) = renameat2_exchange(tmp, path) {
+        return Err(WriteError::landed(format!(
             "{} changed while irlume was writing it, and the file that was there could not \
              be put back ({e}); it is at {}",
             path.display(),
-            tmp.display()
-        ))),
+            kept_aside(tmp, path).display()
+        )));
     }
+    // `tmp` now names what the path held at this second exchange: irlume's
+    // file, which the caller removes, unless a second writer replaced it in
+    // between. Then the exchange put the first writer's file back and took
+    // out the second writer's, the newer. That one goes back once more, and
+    // the file that comes out is kept under a private name, not left under
+    // the scratch name, which the sweep of abandoned scratch files deletes.
+    let came_out = std::fs::symlink_metadata(tmp).ok();
+    if came_out.is_none_or(|m| Some((m.dev(), m.ino())) == ours) {
+        return Err(changed_while_writing(path).into());
+    }
+    let _ = renameat2_exchange(tmp, path);
+    Err(format!(
+        "{} changed twice while irlume was writing it, so it was left alone; a file another \
+         writer put there meanwhile is at {}",
+        path.display(),
+        kept_aside(tmp, path).display()
+    )
+    .into())
+}
+
+/// Another writer's file, found under the scratch name `tmp` after a write
+/// was refused, moved to a private name next to `path` that the sweep of
+/// abandoned scratch files never takes. Where it is now: that name, or `tmp`
+/// if it could not be moved.
+fn kept_aside(tmp: &Path, path: &Path) -> PathBuf {
+    move_aside_as(tmp, path, "kept").unwrap_or_else(|_| tmp.to_path_buf())
 }
 
 // ---- SELinux (Fedora) --------------------------------------------------------

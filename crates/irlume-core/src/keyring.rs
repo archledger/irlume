@@ -362,10 +362,11 @@ pub enum Reseal {
     /// longer unsealed (PCRs moved: dbx/Secure Boot update) or the password
     /// differed (the user changed it). This is the self-heal.
     Resealed,
-    /// The password and PCR policy were unchanged, but a stronger sealing tier
-    /// became available (e.g. signed-PCR started working), so the envelope was
-    /// re-sealed to that tier. Lets an existing arm climb to Tier 1 on the next
-    /// login with no `keyring arm` from the user.
+    /// The password and PCR policy were unchanged, but a stronger policy is
+    /// available (pcrlock was provisioned, or the envelope is a signed Tier 1
+    /// one from an earlier release), so the envelope was re-sealed to it. Lets
+    /// an existing arm move on the next login with no `keyring arm` from the
+    /// user.
     Upgraded,
 }
 
@@ -431,14 +432,14 @@ pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) 
     // to reseal for correctness; don't churn the TPM on every single login.
     if let Ok(current) = unseal_password(user) {
         if current.as_slice() == password {
-            // One exception: if a strictly stronger sealing tier became
-            // available since this envelope was written (e.g. signed-PCR now
-            // works), climb to it. This is how an existing arm reaches Tier 1
-            // after a fix/config change without the user re-arming. Only fires
-            // when an upgrade is actually possible, and only adopts the new
-            // envelope if the ladder genuinely produced a stronger tier (it
-            // round-trip-verifies internally), so a machine already at its best
-            // tier writes nothing.
+            // One exception: if a strictly stronger policy is available than
+            // the one this envelope was written under (pcrlock provisioned
+            // since, or a signed Tier 1 envelope from an earlier release),
+            // move to it without the user re-arming. Only fires when an
+            // upgrade is actually possible, and only adopts the new envelope
+            // if the ladder genuinely produced a stronger policy (it
+            // round-trip-verifies internally), so a machine already at its
+            // best policy writes nothing.
             if let Ok(env) = SealedEnvelope::load(&envelope_path(user)) {
                 if tpm::stronger_tier_available_than(&env.policy) {
                     let mut candidate = tpm::seal(password)?;
@@ -447,7 +448,7 @@ pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) 
                     // envelope as a login-password one and the next login would
                     // hand 56 bytes of key to pam_gnome_keyring as an AUTHTOK.
                     candidate.secret = kind;
-                    if candidate.policy.strength_rank() > env.policy.strength_rank() {
+                    if candidate.strength_rank() > env.strength_rank() {
                         candidate.save(&envelope_path(user))?;
                         return Ok(Reseal::Upgraded);
                     }
@@ -460,6 +461,23 @@ pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) 
     Ok(Reseal::Resealed)
 }
 
+/// `env`'s token sealed under a strictly stronger policy, with its kind and
+/// recovery wrap carried over, or `None` when no stronger policy is available
+/// or the ladder did not reach one.
+fn climbed_token(env: &SealedEnvelope, token: &[u8]) -> Result<Option<SealedEnvelope>> {
+    if !tpm::stronger_tier_available_than(&env.policy) {
+        return Ok(None);
+    }
+    let mut candidate = tpm::seal(token)?;
+    // tpm::seal knows nothing of kinds or wraps; dropping either here would
+    // downgrade the envelope to a password seal (next login routes the token
+    // into PAM_AUTHTOK) or amputate the recovery path until the next password
+    // change.
+    candidate.secret = SecretKind::GnomeKeyringToken;
+    candidate.password_wrap = env.password_wrap.clone();
+    Ok((candidate.strength_rank() > env.strength_rank()).then_some(candidate))
+}
+
 /// The token half of [`reseal_password`]. A token cannot be re-derived, so the
 /// self-heal runs through the envelope itself: the TPM seal and the password
 /// wrap each recover the other.
@@ -467,7 +485,8 @@ pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) 
 ///   * seal unseals, wrap opens under `password`  -> `Unchanged` (or the same
 ///     tier climb the password kinds get)
 ///   * seal unseals, wrap does not open           -> the user changed their
-///     password; re-wrap under the new one, `Resealed`
+///     password; re-wrap under the new one (and take a stronger policy in
+///     the same write when one is available), `Resealed`
 ///   * seal fails, wrap opens                     -> PCR drift; re-seal the
 ///     recovered token, `Resealed`
 ///   * both fail                                  -> error, envelope untouched:
@@ -480,27 +499,26 @@ fn reseal_token(user: &str, password: &[u8], env: SealedEnvelope) -> Result<Rese
                 crate::recovery::unwrap(password, w).is_ok_and(|t| t.as_slice() == token.as_slice())
             });
             if !wrap_current {
-                // Only the wrap is stale (password change, or an envelope
-                // missing its wrap): refresh it and keep the seal as-is.
+                // The wrap is stale (password change, or an envelope missing
+                // its wrap): refresh it. A stronger policy is taken in the
+                // same write, since this login may be the only one before the
+                // next password change; failing to reach it keeps the seal
+                // as it is, so the refreshed wrap still lands.
                 let mut env = env;
                 env.password_wrap = Some(crate::recovery::wrap(password, &token)?);
+                if let Ok(Some(stronger)) = climbed_token(&env, &token) {
+                    env = stronger;
+                }
                 env.save(&envelope_path(user))?;
                 return Ok(Reseal::Resealed);
             }
-            if tpm::stronger_tier_available_than(&env.policy) {
-                let mut candidate = tpm::seal(&token)?;
-                // tpm::seal knows nothing of kinds or wraps; dropping either
-                // here would downgrade the envelope to a password seal (next
-                // login routes the token into PAM_AUTHTOK) or amputate the
-                // recovery path until the next password change.
-                candidate.secret = SecretKind::GnomeKeyringToken;
-                candidate.password_wrap = env.password_wrap.clone();
-                if candidate.policy.strength_rank() > env.policy.strength_rank() {
-                    candidate.save(&envelope_path(user))?;
-                    return Ok(Reseal::Upgraded);
+            match climbed_token(&env, &token)? {
+                Some(stronger) => {
+                    stronger.save(&envelope_path(user))?;
+                    Ok(Reseal::Upgraded)
                 }
+                None => Ok(Reseal::Unchanged),
             }
-            Ok(Reseal::Unchanged)
         }
         Err(unseal_err) => {
             let Some(wrap) = env.password_wrap.as_ref() else {
@@ -713,32 +731,33 @@ mod tests {
         std::env::remove_var("IRLUME_KEYRING_DIR");
     }
 
-    /// On signed-UKI hardware, an envelope armed under a weaker tier auto-upgrades
-    /// to Tier-1 on the next login-time reseal, with no `keyring arm` from the
-    /// user. This is the migration path after signed-PCR started working.
+    /// On signed-UKI hardware, a signed Tier 1 envelope an earlier release
+    /// armed moves to a bound policy (literal PCR 7, or pcrlock) on the next
+    /// login-time reseal, with no `keyring arm` from the user.
     #[test]
     #[ignore = "requires a real TPM + fresh systemd signed-PCR artifacts (UKI/systemd-boot)"]
-    fn reseal_auto_upgrades_weaker_tier_to_signed() {
+    fn reseal_moves_a_signed_envelope_to_a_bound_policy() {
         use crate::envelope::{PolicyKind, SealedEnvelope};
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
         let dir = crate::test_tmp_dir("kr-upgrade");
         std::env::set_var("IRLUME_KEYRING_DIR", &dir);
         let _ = std::fs::remove_dir_all(dir);
         let pw = b"correct horse battery staple";
-        // Simulate an "old" arm under the weakest tier (literal PCR 7).
-        tpm::seal_with_pcrs(pw, &[7])
+        // Simulate an "old" arm under the signed policy earlier releases chose.
+        tpm::seal_authorized(pw)
             .unwrap()
             .save(&envelope_path("tester"))
             .unwrap();
-        assert_eq!(
-            SealedEnvelope::load(&envelope_path("tester"))
-                .unwrap()
-                .policy
-                .strength_rank(),
-            1,
-            "precondition: sealed at Tier 3 (literal)"
+        assert!(
+            matches!(
+                SealedEnvelope::load(&envelope_path("tester"))
+                    .unwrap()
+                    .policy,
+                PolicyKind::Authorized { .. }
+            ),
+            "precondition: sealed at Tier 1 (signed)"
         );
-        // A login-time reseal with the same verified password upgrades the tier.
+        // A login-time reseal with the same verified password moves it.
         assert_eq!(
             // A login-password envelope never reads `home`: derive_secret
             // returns the password unchanged.
@@ -747,9 +766,17 @@ mod tests {
         );
         let env = SealedEnvelope::load(&envelope_path("tester")).unwrap();
         assert!(
-            matches!(env.policy, PolicyKind::Authorized { .. }),
-            "should climb to Tier 1, got {:?}",
+            matches!(
+                env.policy,
+                PolicyKind::PcrLiteral | PolicyKind::PcrlockNv { .. }
+            ),
+            "should move to a bound policy, got {:?}",
             env.policy
+        );
+        assert_eq!(
+            reseal_password("tester", pw, None).unwrap(),
+            Reseal::Unchanged,
+            "and stay there"
         );
         assert_eq!(&*unseal_password("tester").unwrap(), pw, "still unseals");
         forget_password("tester").unwrap();
@@ -993,6 +1020,48 @@ mod tests {
     /// then the token is unrecoverable; losing the kind routes 64 bytes of
     /// token into `PAM_AUTHTOK` on the next login. This is #253's
     /// `resealing_preserves_the_secret_kind` trap, one field wider.
+    /// A password change and a stronger policy arriving together: the login
+    /// that re-wraps the token under the new password also moves its seal,
+    /// in one write, so an envelope whose owner changes their password at
+    /// the first login after an upgrade does not stay on the weaker policy.
+    #[test]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
+    fn a_password_change_also_moves_the_token_to_a_stronger_policy() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        let dir = crate::test_tmp_dir("kr-token-rewrap-climb");
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
+        let _ = std::fs::remove_dir_all(dir);
+        let _pcrlock = tpm::tests::PcrlockFixture::provision(0x0181_C112);
+
+        let (old_pw, new_pw) = (b"old-password".as_slice(), b"new-password".as_slice());
+        let token = mint_gnome_token();
+        let mut weak = tpm::seal_with_pcrs(token.as_bytes(), &[7]).expect("seal at Tier 3");
+        weak.secret = SecretKind::GnomeKeyringToken;
+        weak.password_wrap = Some(crate::recovery::wrap(old_pw, token.as_bytes()).unwrap());
+        weak.save(&envelope_path("rewrap")).expect("arm");
+
+        assert_eq!(
+            reseal_password("rewrap", new_pw, None).unwrap(),
+            Reseal::Resealed
+        );
+        let env = SealedEnvelope::load(&envelope_path("rewrap")).unwrap();
+        assert!(
+            matches!(env.policy, crate::envelope::PolicyKind::PcrlockNv { .. }),
+            "the re-wrap must take the stronger policy too, got {:?}",
+            env.policy
+        );
+        assert_eq!(env.secret, SecretKind::GnomeKeyringToken);
+        let wrap = env.password_wrap.as_ref().expect("the wrap");
+        assert_eq!(
+            &*crate::recovery::unwrap(new_pw, wrap).expect("the new password opens it"),
+            token.as_bytes()
+        );
+        assert_eq!(&*unseal_password("rewrap").unwrap(), token.as_bytes());
+
+        forget_password("rewrap").unwrap();
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+    }
+
     #[test]
     #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn a_tier_climb_keeps_both_the_kind_and_the_recovery_wrap() {
@@ -1003,8 +1072,8 @@ mod tests {
 
         // The precondition this test never established (#361): a climb needs a
         // stronger tier to exist, and `stronger_tier_available_than(PcrLiteral)`
-        // is `signed_policy_available() || pcrlock_provisioned().is_some()`. On
-        // a bare swtpm neither holds, so `reseal_password` correctly answered
+        // needs `pcrlock_provisioned()`. On a bare swtpm that does not
+        // hold, so `reseal_password` correctly answered
         // Unchanged and the assertion below could never pass. Provisioning a
         // synthetic Tier 2 makes the climb real: a genuine PolicyAuthorizeNV
         // session and TPM round trip, which is the boundary the credential-leak
@@ -1020,9 +1089,8 @@ mod tests {
         assert_eq!(
             SealedEnvelope::load(&envelope_path("climb"))
                 .unwrap()
-                .policy
-                .strength_rank(),
-            1,
+                .policy,
+            crate::envelope::PolicyKind::PcrLiteral,
             "precondition: sealed at Tier 3, or the climb below never runs"
         );
 

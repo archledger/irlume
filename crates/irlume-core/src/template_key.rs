@@ -357,17 +357,15 @@ fn load_key_with(
     let env = SealedEnvelope::load(&path)?;
     let key = unseal(&env)?;
     // Best-effort tier auto-upgrade (mirrors keyring::reseal_password): if a
-    // strictly stronger sealing tier became available since this key was sealed
-    // (e.g. signed-PCR started working), re-seal the key to it so an existing
-    // enrollment reaches Tier 1 with no re-enroll. The check short-circuits to a
-    // no-op once the envelope is already at the best tier, so there is no steady
-    // per-match cost. Never fail the load on it: the key unsealed fine and the
-    // weaker envelope stays usable.
+    // strictly stronger policy is available than the one this key was sealed
+    // under (pcrlock provisioned since, or a signed Tier 1 envelope from an
+    // earlier release), re-seal the key to it with no re-enroll. The check
+    // short-circuits to a no-op once the envelope is already at the best
+    // policy, so there is no steady per-match cost. Never fail the load on it:
+    // the key unsealed fine and the weaker envelope stays usable.
     if policy == KeyLoadPolicy::Upgrade && stronger_tier_available(&env.policy) {
         if let Ok(candidate) = seal(&key) {
-            if candidate.policy.strength_rank() > env.policy.strength_rank()
-                && candidate.save(&path).is_ok()
-            {
+            if candidate.strength_rank() > env.strength_rank() && candidate.save(&path).is_ok() {
                 set_0600(&path);
             }
         }
@@ -620,13 +618,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(key.as_slice(), &[42; 32]);
-        assert_eq!(
-            SealedEnvelope::load(&key_path("alice"))
-                .unwrap()
-                .policy
-                .strength_rank(),
-            2
-        );
+        assert!(matches!(
+            SealedEnvelope::load(&key_path("alice")).unwrap().policy,
+            crate::envelope::PolicyKind::PcrlockNv { .. }
+        ));
         assert_ne!(std::fs::read(key_path("alice")).unwrap(), before);
         std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
         std::fs::remove_dir_all(dir).unwrap();
@@ -892,12 +887,13 @@ mod tests {
         std::env::remove_var("IRLUME_RECOVERY_DIR");
     }
 
-    /// On signed-UKI hardware, a template key sealed under a weaker tier
-    /// auto-upgrades to Tier 1 the next time it is loaded (i.e. the next face
-    /// match), with no re-enroll. Companion to the keyring reseal upgrade.
+    /// On signed-UKI hardware, a template key an earlier release sealed under
+    /// the signed Tier 1 policy moves to a bound policy (literal PCR 7, or
+    /// pcrlock) the next time it is loaded (i.e. the next face match), with no
+    /// re-enroll. Companion to the keyring reseal upgrade.
     #[test]
     #[ignore = "requires a real TPM + fresh systemd signed-PCR artifacts (UKI/systemd-boot)"]
-    fn load_key_auto_upgrades_weaker_tier_to_signed() {
+    fn load_key_moves_a_signed_seal_to_a_bound_policy() {
         use crate::crypto;
         use crate::envelope::PolicyKind;
         let _g = ENV_LOCK.lock().unwrap();
@@ -906,25 +902,27 @@ mod tests {
         std::fs::create_dir_all(crate::test_tmp_dir("tk-upg")).unwrap();
 
         let key = crypto::generate_key();
-        // Simulate an "old" seal under the weakest tier (literal PCR 7).
-        crate::tpm::seal_with_pcrs(&key, &[7])
+        // Simulate an "old" seal under the signed policy earlier releases chose.
+        crate::tpm::seal_authorized(&key)
             .unwrap()
             .save(&key_path("rt"))
             .unwrap();
-        assert_eq!(
-            SealedEnvelope::load(&key_path("rt"))
-                .unwrap()
-                .policy
-                .strength_rank(),
-            1,
-            "precondition: sealed at Tier 3"
+        assert!(
+            matches!(
+                SealedEnvelope::load(&key_path("rt")).unwrap().policy,
+                PolicyKind::Authorized { .. }
+            ),
+            "precondition: sealed at Tier 1"
         );
-        // A load (what every match does) returns the key AND upgrades the tier.
+        // A load (what every match does) returns the key AND moves the seal.
         assert_eq!(&*load_key("rt").unwrap(), &*key);
         let env = SealedEnvelope::load(&key_path("rt")).unwrap();
         assert!(
-            matches!(env.policy, PolicyKind::Authorized { .. }),
-            "should climb to Tier 1, got {:?}",
+            matches!(
+                env.policy,
+                PolicyKind::PcrLiteral | PolicyKind::PcrlockNv { .. }
+            ),
+            "should move to a bound policy, got {:?}",
             env.policy
         );
         assert_eq!(

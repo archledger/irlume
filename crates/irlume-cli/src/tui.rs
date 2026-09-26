@@ -9769,13 +9769,12 @@ impl App {
             Span::styled(format!("Secure Boot {} · ", sb.0), Style::new().fg(sb.1)),
             Span::styled(self.probes.boot_mode.clone(), Style::new().dim()),
         ]));
-        // The seal tier is a three-rung ladder (signed PCR-11 > pcrlock NV >
-        // literal PCR-7; see irlume-core/src/pcrsig.rs). The daemon's
-        // KeyringInfo names the armed envelope's actual rung, shown here in
-        // full while the Wallet page names only its tier; a local artifact
-        // probe can only prove Tier 1 availability, so without an answer
-        // this line told every Tier-2 pcrlock user their seal sat on the
-        // weakest tier.
+        // The seal is pcrlock NV where provisioned, else literal PCR-7 (see
+        // irlume-core/src/tpm.rs `seal`); a signed PCR-11 seal is only what an
+        // earlier release left behind. The daemon's KeyringInfo names the
+        // armed envelope's actual policy, shown here in full while the Wallet
+        // page names only its tier; no local probe can predict it, so without
+        // an answer this line says only that nothing is armed.
         lines.push(Line::from(vec![
             Span::styled("  PCR policy ", Style::new().dim()),
             Span::styled(
@@ -9785,8 +9784,6 @@ impl App {
                     "unknown (observation unavailable)".to_string()
                 } else if self.keyring_armed == Some(true) {
                     "unreported by this daemon".to_string()
-                } else if irlume_core::pcrsig::signed_policy_available() {
-                    "signed (PCR-11, Tier 1) available".to_string()
                 } else {
                     "not armed; tier decided at arm time".to_string()
                 },

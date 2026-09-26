@@ -759,7 +759,10 @@ surface is still exactly as apply left it**. Restoring a file something else has
 edited since would revert a change the transaction never made, so drift stops
 the whole rollback rather than skipping the drifted surface: a half-rolled-back
 login stack is its own hazard. Every surface is checked before any is written.
-Without `--apply` it reports what it would restore and touches nothing.
+A file that already holds the content recorded for it, such as a surface apply
+refused or left alone, is not written again, so its mode, owner and links stay
+as they are. Without `--apply` it reports what it would restore and touches
+nothing.
 
 Transaction records live under the state directory, `0600` in a `0700`
 directory. They contain the pre-change content of each file, which is not secret
@@ -785,7 +788,7 @@ covered the same way; apply compares each surface's files with the plan
 immediately before writing it and refuses one whose `/etc` file, backup or
 vendor file changed (`<file> or its vendor copy changed between the plan and
 the write`). Rollback checks the backup too and refuses the whole record if it
-is not as apply left it.
+is not as apply left it. A backup apply created is removed by the rollback.
 
 Rollback also refuses (`changed-since-apply`) a record that would delete an
 override apply created when that override's vendor file has gone since: the

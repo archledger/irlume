@@ -23,10 +23,10 @@
 //! unwiring anything on a capability reading.
 
 use super::grammar::{
-    content_has_module, directive, is_auth_substack_anchor, is_include_auth_layout,
+    content_has_module, directive, irlume_rule, is_auth_substack_anchor, is_include_auth_layout,
     is_passwd_substack,
 };
-use super::stanzas::{inert_line, BACKUP, CREATED_PREFIX, INERT_TAG, KEYRING_TAG, MODULE};
+use super::stanzas::{inert_line, BACKUP, CREATED_PREFIX, INERT_TAG, KEYRING_TAG};
 use super::transform::{
     is_irlume_line, unwire_lines, wire_greeter_impl, wire_lock, wire_polkit_service,
     wire_verify_service,
@@ -306,15 +306,15 @@ fn kind(line: &str) -> String {
     } else if line.contains(KEYRING_TAG) {
         "keyring-tag".to_string()
     } else {
-        let d = directive(line);
-        let mut tokens = d.split_whitespace().skip_while(|t| !t.ends_with(MODULE));
-        tokens.next();
-        tokens.next().unwrap_or("").to_string()
+        irlume_rule(line)
+            .and_then(|r| r.args.first().copied())
+            .unwrap_or("")
+            .to_string()
     };
     format!("{phase} {job}")
 }
 
-/// `body` with every line naming pam_irlume.so replaced by an inactive line of
+/// `body` with every rule loading pam_irlume.so replaced by an inactive line of
 /// the same phase and job, in the same place. Every other line stays, irlume's
 /// permit landing included. So every numeric jump counts the same lines and
 /// lands where it did, and the stack runs as the wired one does when
@@ -325,7 +325,7 @@ fn neutralize(body: &str) -> String {
     let lines: Vec<String> = body
         .lines()
         .map(|l| {
-            if directive(l).contains(MODULE) {
+            if irlume_rule(l).is_some() {
                 let k = kind(l);
                 let (phase, job) = k.split_once(' ').unwrap_or((k.as_str(), ""));
                 inert_line(phase, job)
@@ -1677,9 +1677,8 @@ struct Settings {
 fn infer(recipe: Recipe, body: &str) -> Option<Settings> {
     let lines: Vec<Vec<&str>> = body
         .lines()
-        .map(directive)
-        .filter(|d| d.contains(MODULE))
-        .map(|d| d.split_whitespace().collect())
+        .filter_map(irlume_rule)
+        .map(|r| r.args)
         .collect();
     if lines.is_empty() {
         return None;
@@ -2047,6 +2046,96 @@ session     include       password-auth
             scope_flag: "",
             wire,
         }
+    }
+
+    /// How irlume told its own lines apart before it read the module-path
+    /// field: the module named anywhere in the directive, plus the tagged
+    /// lines. Kept here to compare the digests earlier builds recorded.
+    fn is_irlume_line_by_substring(l: &str) -> bool {
+        let d = directive(l);
+        d.contains("pam_irlume.so")
+            || (d.contains("pam_permit.so")
+                && (l.contains("# irlume-landing") || l.contains(INERT_TAG)))
+            || (d.contains("pam_gnome_keyring.so") && l.contains(KEYRING_TAG))
+    }
+
+    fn body_digest_by_substring(body: &str) -> String {
+        let kept: Vec<&str> = body
+            .lines()
+            .filter(|l| !is_irlume_line_by_substring(l))
+            .collect();
+        sha256(&format!("{}\n", kept.join("\n")))
+    }
+
+    /// Every override irlume writes is its vendor copy plus irlume's own
+    /// lines, and every one of those loads pam_irlume.so by its module path
+    /// or is a tagged line. So the body digest an earlier build recorded with
+    /// the substring rule is the one this build computes, and a file nobody
+    /// edited still reads as unedited, and still follows its vendor copy,
+    /// after the upgrade. Checked over every vendor fixture and recipe.
+    #[test]
+    fn an_unedited_override_digests_as_it_did_under_the_substring_rule() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pam");
+        let mut vendors = vec![VENDOR.to_string(), vendor_v2()];
+        for distro in std::fs::read_dir(&root).unwrap() {
+            for file in std::fs::read_dir(distro.unwrap().path()).unwrap() {
+                vendors.push(std::fs::read_to_string(file.unwrap().path()).unwrap());
+            }
+        }
+        let fp_keyring = |c: &str| super::super::transform::wire_fp_keyring(c, "gdm-fingerprint");
+        type OwnedWire = Box<dyn Fn(&str) -> (String, bool)>;
+        let mut recipes: Vec<(String, OwnedWire)> = vec![
+            ("lock".into(), Box::new(wire_lock)),
+            ("verify".into(), Box::new(wire_verify_service)),
+            ("polkit".into(), Box::new(wire_polkit_service)),
+            ("fingerprint keyring".into(), Box::new(fp_keyring)),
+        ];
+        for (face, keyring, ondemand) in [
+            (true, true, true),
+            (true, true, false),
+            (true, false, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            recipes.push((
+                format!("greeter face={face} keyring={keyring} ondemand={ondemand}"),
+                Box::new(move |c: &str| wire_greeter_impl(c, face, keyring, ondemand)),
+            ));
+        }
+        let vp = "/usr/lib/pam.d/plasmalogin";
+        let mut checked = 0;
+        for vendor in &vendors {
+            for (label, wire) in &recipes {
+                let (wired, ok) = wire(&base(vendor));
+                if !ok {
+                    continue;
+                }
+                let written = render(vp, vendor, &wired);
+                let p = parse(&written).unwrap();
+                assert_eq!(
+                    body_digest(&p.body),
+                    body_digest_by_substring(&p.body),
+                    "{label}\n{written}"
+                );
+                let earlier = format!(
+                    "{}\n{}\n{wired}",
+                    created_line(vp),
+                    tracking_line(&sha256(vendor), &body_digest_by_substring(&wired))
+                );
+                let p = parse(&earlier).unwrap();
+                assert_eq!(classify(&p, Some(vendor)), Class::U1, "{label}\n{earlier}");
+                assert_eq!(
+                    classify(
+                        &p,
+                        Some(&format!("{vendor}session optional pam_keyinit.so\n"))
+                    ),
+                    Class::U2,
+                    "{label}: a vendor update still reaches it"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 100, "only {checked} files checked");
     }
 
     #[test]

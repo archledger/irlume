@@ -30,14 +30,18 @@ The surfaces irlume can wire, and what puts each in scope:
 
 Real `/etc/pam.d` files are backed up to `*.pre-irlume` before editing.
 Services a distribution ships only in `/usr/lib/pam.d` (plasmalogin,
-cosmic-greeter and polkit-1 on Fedora; greetd and gdm-password on Fedora
-45; kde on Arch; sddm, gdm-password, lightdm and sudo on openSUSE
-Tumbleweed) get an `/etc` override created from the vendor copy. Its second
-line records the SHA-256 of the vendor file and of every line in the override
-except irlume's own. irlume rebuilds an override nobody edited when the vendor
-file changes, so distribution updates still reach it. Where irlume's lines
-sit is not part of that record: if you move one of them in an override you
-did not otherwise edit, the next rebuild puts it back where irlume puts it.
+cosmic-greeter and polkit-1 on Fedora; greetd and gdm-password on Fedora 45;
+kde on Arch; sddm, gdm-password, lightdm and sudo on openSUSE Tumbleweed) get
+an `/etc` override created from the vendor copy. Its second line records the
+SHA-256 of the vendor file and of every line in the override except irlume's
+own: the lines whose module path is `pam_irlume.so`, and the `pam_permit.so`
+and `pam_gnome_keyring.so` lines irlume tags. A line that names
+`pam_irlume.so` only in an argument or a comment, such as a `pam_exec.so`
+check, counts as one of yours. irlume rebuilds an override nobody edited when
+the vendor file changes, so distribution updates still reach it. Where
+irlume's lines sit is not part of that record: if you move one of them in an
+override you did not otherwise edit, the next rebuild puts it back where
+irlume puts it.
 
 In an override that has lines irlume did not write, irlume changes only its
 own lines and does not rebuild it from a newer vendor file; `irlume login

@@ -1074,7 +1074,7 @@ fn verify_surfaces(record: &crate::logintx::Transaction) -> (Vec<Value>, usize) 
 
 /// Tells whether removing a path would leave its service with no PAM
 /// configuration; [`crate::pamwire::removal_orphans_service`] outside tests.
-type OrphanTest<'a> = dyn Fn(&std::path::Path) -> bool + 'a;
+pub(crate) type OrphanTest<'a> = dyn Fn(&std::path::Path) -> bool + 'a;
 
 /// Whether rolling `surface` back would delete a file that is now its
 /// service's only PAM configuration: apply created it, and the vendor copy it
@@ -1087,7 +1087,7 @@ fn rollback_orphans(surface: &crate::logintx::SurfaceRecord, orphans: &OrphanTes
 
 /// [`verify_surfaces`] with the orphan test given, so a test can name
 /// surfaces under a temporary root.
-fn verify_surfaces_with(
+pub(crate) fn verify_surfaces_with(
     record: &crate::logintx::Transaction,
     orphans: &OrphanTest<'_>,
 ) -> (Vec<Value>, usize) {
@@ -1423,7 +1423,7 @@ fn rollback_blockers_excluding<'a>(
 
 /// [`rollback_blockers_excluding`] with the orphan test given, so a test can
 /// name surfaces under a temporary root.
-fn rollback_blockers_with<'a>(
+pub(crate) fn rollback_blockers_with<'a>(
     record: &'a crate::logintx::Transaction,
     done: &crate::logintx::RollbackProgress,
     orphans: &OrphanTest<'_>,
@@ -1448,6 +1448,47 @@ fn rollback_blockers_with<'a>(
         }
     }
     blockers
+}
+
+/// The transaction record of each surface an apply prepared or wrote.
+pub(crate) fn surface_records(
+    surfaces: &[crate::pamwire::AppliedSurface],
+) -> Vec<crate::logintx::SurfaceRecord> {
+    surfaces
+        .iter()
+        .map(|surface| crate::logintx::SurfaceRecord {
+            id: surface.id.to_string(),
+            path: surface.path.clone(),
+            change: surface.change.id().to_string(),
+            before: surface.before.clone(),
+            after_sha256: surface.after_sha256.clone(),
+            mode: surface.before_metadata.map(|(mode, _, _)| mode),
+            uid: surface.before_metadata.map(|(_, uid, _)| uid),
+            gid: surface.before_metadata.map(|(_, _, gid)| gid),
+            // Recorded only when there was a backup to speak of, so a
+            // surface irlume never wired carries no sidecar at all: one that
+            // was there before, or one this run left where there was none.
+            // Wiring in place creates the backup, and a rollback that did not
+            // know of it left it behind, for a later disable to compare the
+            // stack with.
+            sidecar: (surface.sidecar_existed
+                || surface.sidecar_before.is_some()
+                || surface
+                    .sidecar_after_sha256
+                    .as_deref()
+                    .is_some_and(|digest| {
+                        digest != crate::logintx::ABSENT && digest != crate::pamwire::UNREADABLE
+                    }))
+            .then(|| crate::logintx::SidecarRecord {
+                path: format!("{}{}", surface.path, crate::pamwire::BACKUP),
+                after_sha256: surface.sidecar_after_sha256.clone(),
+                before: surface.sidecar_before.clone(),
+                mode: surface.sidecar_metadata.map(|(mode, _, _)| mode),
+                uid: surface.sidecar_metadata.map(|(_, uid, _)| uid),
+                gid: surface.sidecar_metadata.map(|(_, _, gid)| gid),
+            }),
+        })
+        .collect()
 }
 
 /// `irlume login apply --action X --plan-id ID --json`: carry out a plan.
@@ -1519,33 +1560,6 @@ pub fn login_apply(args: &[String]) -> ExitCode {
     // Failing to record is therefore a refusal, not a warning: nothing has been
     // touched yet, so refusing costs the caller a retry rather than a login.
     let transaction_id = random_id();
-    let to_records = |surfaces: &[crate::pamwire::AppliedSurface]| {
-        surfaces
-            .iter()
-            .map(|surface| crate::logintx::SurfaceRecord {
-                id: surface.id.to_string(),
-                path: surface.path.clone(),
-                change: surface.change.id().to_string(),
-                before: surface.before.clone(),
-                after_sha256: surface.after_sha256.clone(),
-                mode: surface.before_metadata.map(|(mode, _, _)| mode),
-                uid: surface.before_metadata.map(|(_, uid, _)| uid),
-                gid: surface.before_metadata.map(|(_, _, gid)| gid),
-                // Recorded only when there was a backup to speak of, so a
-                // surface irlume never wired carries no sidecar at all.
-                sidecar: (surface.sidecar_existed || surface.sidecar_before.is_some()).then(|| {
-                    crate::logintx::SidecarRecord {
-                        path: format!("{}{}", surface.path, crate::pamwire::BACKUP),
-                        after_sha256: surface.sidecar_after_sha256.clone(),
-                        before: surface.sidecar_before.clone(),
-                        mode: surface.sidecar_metadata.map(|(mode, _, _)| mode),
-                        uid: surface.sidecar_metadata.map(|(_, uid, _)| uid),
-                        gid: surface.sidecar_metadata.map(|(_, _, gid)| gid),
-                    }
-                }),
-            })
-            .collect::<Vec<_>>()
-    };
     let mut record = crate::logintx::Transaction {
         id: transaction_id,
         schema_version: crate::logintx::SCHEMA_VERSION,
@@ -1553,7 +1567,7 @@ pub fn login_apply(args: &[String]) -> ExitCode {
         action: action.to_string(),
         plan_id: current_plan,
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
-        surfaces: to_records(&crate::pamwire::prepare(enable, false, false)),
+        surfaces: surface_records(&crate::pamwire::prepare(enable, false, false)),
     };
     if let Err(message) = record.save() {
         irlume_common::dlog!("login.apply: refusing, cannot record beforehand: {message}");
@@ -1566,7 +1580,7 @@ pub fn login_apply(args: &[String]) -> ExitCode {
     // The plan is handed to apply so each surface can be re-checked against the
     // state it was planned against, immediately before that surface is written.
     let applied = crate::pamwire::apply(enable, false, false, &planned);
-    record.surfaces = to_records(&applied);
+    record.surfaces = surface_records(&applied);
     record.status = crate::logintx::TransactionStatus::Applied;
     // Rewriting this can fail, and by now the files HAVE changed. The prepared
     // record is already on disk with the before-states, so a rollback remains

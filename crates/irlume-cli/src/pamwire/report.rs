@@ -68,16 +68,17 @@ fn wiring_mode(role: &str, content: &str) -> Option<&'static str> {
     if !content_has_module(content) {
         return None;
     }
-    if role == ROLE_SUDO
-        || role == ROLE_POLKIT
-        || (role == ROLE_LOCK && !content.contains("unseal"))
-    {
+    // Read from the arguments of irlume's own rules, so a comment or another
+    // module's line that happens to say `unseal` or `ondemand` names no mode.
+    let has = |arg: &str| content.lines().any(|l| irlume_rule_has_arg(l, arg));
+    let unseal = has("unseal");
+    if role == ROLE_SUDO || role == ROLE_POLKIT || (role == ROLE_LOCK && !unseal) {
         return Some("verify");
     }
-    if !content.contains("unseal") {
+    if !unseal {
         return Some("keyring");
     }
-    if content.contains("ondemand") {
+    if has("ondemand") {
         return Some("on-demand");
     }
     Some("face-first")
@@ -427,6 +428,22 @@ mod tests {
         assert_eq!(wiring_mode(ROLE_LOGIN_FP, keyring), Some("keyring"));
         // Nothing wired says nothing.
         assert_eq!(wiring_mode(ROLE_LOCK, "#%PAM-1.0\n"), None);
+    }
+
+    /// The mode is read from the arguments of irlume's own rules. Another
+    /// module's arguments or a comment naming pam_irlume.so, `unseal` or
+    /// `ondemand` neither makes a surface wired nor changes its mode.
+    #[test]
+    fn wiring_mode_reads_only_irlume_rules() {
+        let exec = "auth required pam_exec.so /usr/local/libexec/check-pam_irlume.so unseal\n";
+        assert_eq!(wiring_mode(ROLE_LOGIN, exec), None);
+        let keyring = format!(
+            "auth optional pam_irlume.so keyring\n{exec}# unseal ondemand once face is enrolled\n"
+        );
+        assert_eq!(wiring_mode(ROLE_LOGIN_FP, &keyring), Some("keyring"));
+        let facefirst = "auth [success=1 default=ignore] pam_irlume.so unseal facefirst\n\
+             auth optional pam_exec.so /usr/local/bin/log ondemand\n";
+        assert_eq!(wiring_mode(ROLE_LOGIN, facefirst), Some("face-first"));
     }
 
     #[test]

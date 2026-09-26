@@ -470,6 +470,7 @@ fn force_refuses_when_a_different_backup_is_in_the_way() {
             ..force_apply()
         };
         let err = wire_service_with(&svc, true, &opts, &face_and_keyring)
+            .map_err(String::from)
             .err()
             .expect("a different backup is in the way");
         assert!(err.contains("already holds a different file"), "{err}");
@@ -629,6 +630,102 @@ fn strip_then_rewire_returns_an_edited_override_byte_for_byte() {
         "irlume's lines go back where they were, so no jump moves: {on}"
     );
     assert_eq!(read_file(svc.etc), before);
+}
+
+/// An administrator's rule that names pam_irlume.so only in its arguments.
+const EXEC_CHECK: &str =
+    "auth       required     pam_exec.so /usr/local/libexec/check-pam_irlume.so";
+
+/// irlume tells its own lines by their module path. A rule that only names
+/// pam_irlume.so in an argument is an administrator's line like any other:
+/// it counts in the recorded digest, so a vendor update does not rebuild the
+/// file without it, and disable and enable leave it where it is.
+#[test]
+fn an_admin_rule_naming_irlume_in_its_arguments_survives_vendor_updates() {
+    let dir = TestDir::new("ovr-exec-arg");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    let vendor_path = svc.vendor.unwrap();
+    wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    let edited = with_line(&read_file(svc.etc), EXEC_CHECK);
+    std::fs::write(svc.etc, &edited).unwrap();
+
+    // The vendor update, then the reconcile unit's run.
+    std::fs::write(vendor_path, fedora_with_oo7()).unwrap();
+    let logged = maintain(&svc, overrides::Recipe::Greeter);
+    let after = read_file(svc.etc);
+    assert!(
+        after.contains(EXEC_CHECK),
+        "reconcile ({logged:?}) left:\n{after}"
+    );
+    assert_eq!(after, edited, "reconcile wrote nothing");
+    assert_eq!(logged, None);
+    assert!(
+        !refresh_due_for(&svc, overrides::Recipe::Greeter),
+        "no rebuild is offered for an edited file"
+    );
+
+    // A re-apply keeps the file and shows the rule as the difference.
+    let on = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert_eq!(change_id(&on), "keep-edited-override", "{on}");
+    assert_eq!(read_file(svc.etc), edited);
+    let diff = diff_lines(&detail_text(&on));
+    assert!(diff.contains(&format!("- {EXEC_CHECK}")), "{diff:?}");
+
+    // Disable removes irlume's lines and keeps the rule.
+    let off = wire_service(&svc, false, true, &face_and_keyring).unwrap();
+    assert_eq!(change_id(&off), "strip-in-place", "{off}");
+    let stripped = read_file(svc.etc);
+    assert!(stripped.contains(EXEC_CHECK), "{stripped}");
+    assert!(
+        !content_has_module(&stripped),
+        "the rule is not irlume's wiring: {stripped}"
+    );
+    assert!(!stripped.contains("irlume-inert"), "{stripped}");
+
+    // Enable puts irlume's lines back where they were.
+    let on = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert_eq!(change_id(&on), "rewire-override", "{on}");
+    assert_eq!(read_file(svc.etc), edited, "byte for byte");
+    assert_eq!(
+        read_file(vendor_path),
+        fedora_with_oo7(),
+        "vendor untouched"
+    );
+}
+
+/// Lines PAM reads differently from how they look: one led by a no-break
+/// space or a vertical tab loads no module at all (libpam skips only spaces
+/// and tabs, so its type is unknown), and `[include]` includes a file. Added
+/// by an administrator, each is theirs, not irlume's: it counts in the
+/// recorded digest, and a vendor update does not rebuild the file without it.
+#[test]
+fn admin_lines_pam_does_not_load_as_the_module_survive_vendor_updates() {
+    for (n, line) in [
+        "\u{a0}auth       required     pam_irlume.so",
+        "\u{b}auth       required     pam_irlume.so",
+        "auth       [include]    pam_irlume.so",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dir = TestDir::new(&format!("ovr-not-loaded-{n}"));
+        let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+        wire_service(&svc, true, true, &face_and_keyring).unwrap();
+        let edited = with_line(&read_file(svc.etc), line);
+        std::fs::write(svc.etc, &edited).unwrap();
+        std::fs::write(svc.vendor.unwrap(), fedora_with_oo7()).unwrap();
+        let logged = maintain(&svc, overrides::Recipe::Greeter);
+        assert_eq!(logged, None, "{line:?}");
+        assert_eq!(
+            read_file(svc.etc),
+            edited,
+            "{line:?}: reconcile wrote nothing"
+        );
+        assert!(
+            !refresh_due_for(&svc, overrides::Recipe::Greeter),
+            "{line:?}: no rebuild is offered for an edited file"
+        );
+    }
 }
 
 /// openSUSE Tumbleweed ships sudo only in /usr/lib/pam.d. A faillock line an
@@ -997,6 +1094,387 @@ fn apply_refuses_a_surface_whose_vendor_copy_changed_after_the_plan() {
     assert!(!exists(svc.etc), "nothing was written");
 }
 
+/// A partial machine apply: one surface written, another refused because its
+/// vendor copy changed after the plan. The refused surface is recorded as it
+/// stands, its backup included, so `login verify` finds it as applied and
+/// `login rollback` puts the written one back.
+#[test]
+fn a_surface_refused_for_vendor_drift_does_not_block_the_rollback() {
+    let dir = TestDir::new("ovr-partial-apply");
+    // Written: a vendor-only plasmalogin the enable creates an override of.
+    let written = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    // Refused: an sddm override irlume created earlier, with a backup next
+    // to it.
+    ship_vendor_only(&dir.0, "sddm", UPSTREAM_FEDORA);
+    let refused = under_root(&dir.0, greeter("/etc/pam.d/sddm"));
+    wire_service(&refused, true, true, &face_and_keyring).unwrap();
+    let refused_before = read_file(refused.etc);
+    std::fs::write(backup_of(&refused), "an older sddm\n").unwrap();
+
+    let plan = |svc: &Svc| plan_surface(svc, ROLE_LOGIN, &face_and_keyring, true);
+    let planned = [plan(&written), plan(&refused)];
+    std::fs::write(refused.vendor.unwrap(), fedora_with_oo7()).unwrap();
+    let applied = [
+        apply_surface(&written, ROLE_LOGIN, &face_and_keyring, true, &planned),
+        apply_surface(&refused, ROLE_LOGIN, &face_and_keyring, true, &planned),
+    ];
+    assert_eq!(applied[0].error, None);
+    assert!(content_has_module(&read_file(written.etc)));
+    let error = applied[1]
+        .error
+        .as_deref()
+        .expect("the sddm surface is refused");
+    assert!(
+        error.contains("changed between the plan and the write"),
+        "{error}"
+    );
+    assert_eq!(read_file(refused.etc), refused_before, "and left alone");
+
+    let record = record_of(&applied);
+    assert_eq!(
+        applied[1].before.as_deref(),
+        Some(refused_before.as_str()),
+        "the refused surface is recorded as it stands"
+    );
+    let pairs = [
+        (written.etc, written.vendor.unwrap()),
+        (refused.etc, refused.vendor.unwrap()),
+    ];
+    roll_back(&record, &pairs).expect("the rollback runs");
+    assert!(!exists(written.etc), "the created override is gone again");
+    assert_eq!(read_file(refused.etc), refused_before);
+    assert_eq!(read_file(&backup_of(&refused)), "an older sddm\n");
+}
+
+/// The transaction record `login apply` writes for these surfaces.
+fn record_of(applied: &[AppliedSurface]) -> crate::logintx::Transaction {
+    crate::logintx::Transaction {
+        id: "0123456789abcdef0123456789abcdef".into(),
+        schema_version: crate::logintx::SCHEMA_VERSION,
+        status: crate::logintx::TransactionStatus::Applied,
+        action: "enable".into(),
+        plan_id: "f".repeat(32),
+        engine_version: "0.0.0".into(),
+        surfaces: crate::machine::surface_records(applied),
+    }
+}
+
+/// `login verify`, then `login rollback --apply`, for surfaces under a temp
+/// root (`pairs` are their `/etc` and vendor paths): the record must read as
+/// applied and pass the gate over every surface, then each surface and its
+/// backup are restored in order, stopping at the first failure as the
+/// rollback does.
+fn roll_back(record: &crate::logintx::Transaction, pairs: &[(&str, &str)]) -> Result<(), String> {
+    let orphans = |p: &Path| removal_orphans_in(pairs, p);
+    let (states, drifted) = crate::machine::verify_surfaces_with(record, &orphans);
+    if drifted != 0 {
+        return Err(format!("verify: {states:?}"));
+    }
+    let none = crate::logintx::RollbackProgress::default();
+    let blockers = crate::machine::rollback_blockers_with(record, &none, &orphans);
+    if blockers.any() {
+        return Err(format!(
+            "changed {:?}, unreadable {:?}",
+            blockers.changed, blockers.unreadable
+        ));
+    }
+    let attrs = |mode: Option<u32>, uid: Option<u32>, gid: Option<u32>| match (mode, uid, gid) {
+        (Some(mode), Some(uid), Some(gid)) => Some((mode, uid, gid)),
+        _ => None,
+    };
+    for surface in &record.surfaces {
+        restore_surface_with(
+            Path::new(&surface.path),
+            surface.before.as_deref(),
+            attrs(surface.mode, surface.uid, surface.gid),
+            &orphans,
+        )
+        .map_err(|e| format!("{}: {e}", surface.id))?;
+        if let Some(sidecar) = &surface.sidecar {
+            restore_surface_with(
+                Path::new(&sidecar.path),
+                sidecar.before.as_deref(),
+                attrs(sidecar.mode, sidecar.uid, sidecar.gid),
+                &orphans,
+            )
+            .map_err(|e| format!("{} backup: {e}", surface.id))?;
+        }
+    }
+    Ok(())
+}
+
+fn inode(path: &str) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::symlink_metadata(path).unwrap().ino()
+}
+
+fn mode(path: &str) -> u32 {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
+}
+
+fn leak_path(path: &Path) -> &'static str {
+    Box::leak(path.to_string_lossy().into_owned().into_boxed_str())
+}
+
+/// An administrator's own stack, wired in place rather than overridden.
+const ADMIN_STACK: &str =
+    "#%PAM-1.0\nauth       include      system-auth\naccount    include      system-auth\n";
+
+/// A rollback writes nothing over a surface the apply left alone, or over its
+/// backup: the same files stay, and a mode an administrator set after the
+/// apply is kept. Rewriting them replaced each file with a new one carrying
+/// the recorded mode, although the transaction had not changed either.
+#[test]
+fn a_rollback_does_not_rewrite_a_surface_the_apply_left_alone() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = TestDir::new("ovr-rollback-untouched");
+    let written = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    // An administrator's /etc/pam.d/sddm with a backup, whose vendor copy
+    // changes after the plan, so the apply leaves both alone.
+    ship_vendor_only(&dir.0, "sddm", UPSTREAM_FEDORA);
+    let untouched = under_root(&dir.0, greeter("/etc/pam.d/sddm"));
+    std::fs::write(untouched.etc, ADMIN_STACK).unwrap();
+    std::fs::set_permissions(untouched.etc, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let bak = backup_of(&untouched);
+    std::fs::write(&bak, "an older sddm\n").unwrap();
+    std::fs::set_permissions(&bak, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let plan = |svc: &Svc| plan_surface(svc, ROLE_LOGIN, &face_and_keyring, true);
+    let planned = [plan(&written), plan(&untouched)];
+    std::fs::write(untouched.vendor.unwrap(), fedora_with_oo7()).unwrap();
+    let applied = [
+        apply_surface(&written, ROLE_LOGIN, &face_and_keyring, true, &planned),
+        apply_surface(&untouched, ROLE_LOGIN, &face_and_keyring, true, &planned),
+    ];
+    assert_eq!(applied[0].error, None);
+    assert!(applied[1].error.is_some(), "the sddm surface is left alone");
+    let record = record_of(&applied);
+
+    // After the apply, the administrator tightens both files.
+    for path in [untouched.etc, bak.as_str()] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let files = (inode(untouched.etc), inode(&bak));
+    let pairs = [
+        (written.etc, written.vendor.unwrap()),
+        (untouched.etc, untouched.vendor.unwrap()),
+    ];
+    roll_back(&record, &pairs).expect("the rollback runs");
+    assert!(!exists(written.etc), "the created override is gone again");
+    assert_eq!(read_file(untouched.etc), ADMIN_STACK);
+    assert_eq!(read_file(&bak), "an older sddm\n");
+    assert_eq!(
+        (inode(untouched.etc), inode(&bak)),
+        files,
+        "the same files, not replacements"
+    );
+    assert_eq!(
+        (mode(untouched.etc), mode(&bak)),
+        (0o600, 0o600),
+        "the later chmod is kept"
+    );
+}
+
+/// A surface refused because it is a symlink, or one of several names for a
+/// file, does not stop the rollback: it is left as it is, and the surfaces
+/// before and after it in the walk are restored. The restore used to write
+/// it, the write refused the link, and the rollback stopped there on every
+/// retry, with `login verify` saying it was available.
+#[test]
+fn a_rollback_passes_over_a_symlinked_surface_the_apply_refused() {
+    rollback_passes_over_a_linked_surface("symlink");
+}
+
+#[test]
+fn a_rollback_passes_over_a_hard_linked_surface_the_apply_refused() {
+    rollback_passes_over_a_linked_surface("hardlink");
+}
+
+fn rollback_passes_over_a_linked_surface(kind: &str) {
+    let dir = TestDir::new(&format!("ovr-rollback-{kind}"));
+    let written = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    let target = dir.0.join("alternatives-stack");
+    std::fs::write(&target, ADMIN_STACK).unwrap();
+    let linked_path = |name: &str| {
+        let path = dir.0.join("etc/pam.d").join(name);
+        if kind == "symlink" {
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+        } else {
+            std::fs::hard_link(&target, &path).unwrap();
+        }
+        Svc {
+            etc: leak_path(&path),
+            vendor: None,
+        }
+    };
+    // One before the written surface and one after it.
+    let first = linked_path("gdm-password");
+    let last = linked_path("kde");
+    let target_inode = inode(leak_path(&target));
+
+    let plan = |svc: &Svc| plan_surface(svc, ROLE_LOGIN, &face_and_keyring, true);
+    let planned = [plan(&first), plan(&written), plan(&last)];
+    let applied = [
+        apply_surface(&first, ROLE_LOGIN, &face_and_keyring, true, &planned),
+        apply_surface(&written, ROLE_LOGIN, &face_and_keyring, true, &planned),
+        apply_surface(&last, ROLE_LOGIN, &face_and_keyring, true, &planned),
+    ];
+    assert!(applied[0].error.is_some(), "{kind}: refused");
+    assert_eq!(applied[1].error, None, "{kind}");
+    assert!(applied[2].error.is_some(), "{kind}: refused");
+    let record = record_of(&applied);
+    let pairs = [(written.etc, written.vendor.unwrap())];
+    roll_back(&record, &pairs).unwrap_or_else(|e| panic!("{kind}: {e}"));
+    assert!(!exists(written.etc), "{kind}: the created override is gone");
+    for svc in [&first, &last] {
+        let meta = std::fs::symlink_metadata(svc.etc).unwrap();
+        assert_eq!(meta.is_symlink(), kind == "symlink", "{kind}: {}", svc.etc);
+        assert_eq!(read_file(svc.etc), ADMIN_STACK, "{kind}: {}", svc.etc);
+    }
+    assert_eq!(read_file(leak_path(&target)), ADMIN_STACK, "{kind}");
+    assert_eq!(inode(leak_path(&target)), target_inode, "{kind}");
+    if kind == "hardlink" {
+        assert_eq!(inode(first.etc), target_inode, "still one file");
+        assert_eq!(inode(last.etc), target_inode, "still one file");
+    }
+}
+
+/// Another writer's file that a checked write refused to replace is recorded
+/// as it stands, so a rollback of the transaction keeps it. Here the /etc
+/// file appears between irlume's scratch write and its rename. Recorded as
+/// the absent file the apply had read, the rollback deleted it.
+#[test]
+fn a_rollback_keeps_the_file_a_refused_write_left_in_place() {
+    let dir = TestDir::new("ovr-refused-create");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    let planned = [plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, true)];
+    arm(&SWAP_DURING_WRITE, Path::new(svc.etc));
+    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, &planned);
+    disarm(&SWAP_DURING_WRITE, Path::new(svc.etc));
+    let error = applied.error.clone().expect("the write is refused");
+    assert!(error.contains("left alone"), "{error}");
+    assert_eq!(read_file(svc.etc), "SOMEONE ELSE'S FILE\n");
+    roll_back(&record_of(&[applied]), &[(svc.etc, svc.vendor.unwrap())])
+        .expect("the rollback runs");
+    assert_eq!(read_file(svc.etc), "SOMEONE ELSE'S FILE\n", "and kept");
+}
+
+/// The same for a removal: a package renames its file over irlume's
+/// override after the removal checked it, so the removal puts that file
+/// back, and a rollback does not write the override over it.
+#[test]
+fn a_rollback_keeps_the_file_a_refused_removal_put_back() {
+    let dir = TestDir::new("ovr-refused-remove");
+    ship_vendor_only(&dir.0, "sddm", UPSTREAM_FEDORA);
+    let svc = under_root(&dir.0, greeter("/etc/pam.d/sddm"));
+    wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    let planned = [plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, false)];
+    assert_eq!(planned[0].change.id(), "remove-override");
+    arm(&SWAP_DURING_WRITE, Path::new(svc.etc));
+    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, false, &planned);
+    disarm(&SWAP_DURING_WRITE, Path::new(svc.etc));
+    let error = applied.error.clone().expect("the removal is refused");
+    assert!(error.contains("not touched"), "{error}");
+    assert_eq!(read_file(svc.etc), "SOMEONE ELSE'S FILE\n");
+    roll_back(&record_of(&[applied]), &[(svc.etc, svc.vendor.unwrap())])
+        .expect("the rollback runs");
+    assert_eq!(read_file(svc.etc), "SOMEONE ELSE'S FILE\n", "and kept");
+}
+
+/// The same for a stack wired in place: the backup is made, then the stack
+/// is replaced before the rename. The replacement stays through a rollback,
+/// and the backup this run made goes.
+#[test]
+fn a_rollback_keeps_the_stack_a_refused_in_place_write_left() {
+    let dir = TestDir::new("ovr-refused-in-place");
+    std::fs::create_dir_all(dir.0.join("etc/pam.d")).unwrap();
+    let svc = Svc {
+        etc: leak_path(&dir.0.join("etc/pam.d/sudo")),
+        vendor: None,
+    };
+    std::fs::write(svc.etc, ADMIN_STACK).unwrap();
+    let planned = [plan_surface(&svc, ROLE_SUDO, &wire_verify_service, true)];
+    arm(&SWAP_DURING_WRITE, Path::new(svc.etc));
+    let applied = apply_surface(&svc, ROLE_SUDO, &wire_verify_service, true, &planned);
+    disarm(&SWAP_DURING_WRITE, Path::new(svc.etc));
+    assert!(applied.error.is_some(), "the write is refused");
+    assert_eq!(read_file(svc.etc), "SOMEONE ELSE'S FILE\n");
+    assert!(exists(&backup_of(&svc)), "the backup was made first");
+    roll_back(&record_of(&[applied]), &[]).expect("the rollback runs");
+    assert_eq!(read_file(svc.etc), "SOMEONE ELSE'S FILE\n", "and kept");
+    assert!(
+        !exists(&backup_of(&svc)),
+        "the backup this run made is gone"
+    );
+}
+
+/// A write that failed only after it landed, when the directory sync that
+/// makes it durable failed, did change the file, so it is recorded as a
+/// change and a rollback puts back what was there. Only a write that did not
+/// land is recorded as the file stands.
+#[test]
+fn a_write_that_failed_after_landing_is_rolled_back() {
+    let dir = TestDir::new("ovr-landed-create");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    let planned = [plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, true)];
+    arm(&FAIL_SYNC_AFTER_CHANGE, Path::new(svc.etc));
+    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, &planned);
+    disarm(&FAIL_SYNC_AFTER_CHANGE, Path::new(svc.etc));
+    let error = applied.error.clone().expect("the sync failed");
+    assert!(error.contains("failed for the test"), "{error}");
+    assert!(
+        content_has_module(&read_file(svc.etc)),
+        "the override landed"
+    );
+    assert_eq!(applied.before, None, "where there was none");
+    roll_back(&record_of(&[applied]), &[(svc.etc, svc.vendor.unwrap())])
+        .expect("the rollback runs");
+    assert!(!exists(svc.etc), "the override is gone again");
+
+    let dir = TestDir::new("ovr-landed-remove");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    let created = read_file(svc.etc);
+    let planned = [plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, false)];
+    arm(&FAIL_SYNC_AFTER_CHANGE, Path::new(svc.etc));
+    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, false, &planned);
+    disarm(&FAIL_SYNC_AFTER_CHANGE, Path::new(svc.etc));
+    assert!(applied.error.is_some(), "the sync failed");
+    assert!(!exists(svc.etc), "the removal landed");
+    roll_back(&record_of(&[applied]), &[(svc.etc, svc.vendor.unwrap())])
+        .expect("the rollback runs");
+    assert_eq!(read_file(svc.etc), created, "the override is back");
+}
+
+/// Wiring a stack in place makes its `.pre-irlume` backup, and a rollback of
+/// that transaction removes it again: the record names the backup the run
+/// created, not only one that was there before.
+#[test]
+fn a_rollback_removes_the_backup_the_apply_made() {
+    let dir = TestDir::new("ovr-rollback-made-backup");
+    std::fs::create_dir_all(dir.0.join("etc/pam.d")).unwrap();
+    let svc = Svc {
+        etc: leak_path(&dir.0.join("etc/pam.d/sudo")),
+        vendor: None,
+    };
+    std::fs::write(svc.etc, ADMIN_STACK).unwrap();
+    let planned = [plan_surface(&svc, ROLE_SUDO, &wire_verify_service, true)];
+    let applied = apply_surface(&svc, ROLE_SUDO, &wire_verify_service, true, &planned);
+    assert_eq!(applied.error, None);
+    assert!(content_has_module(&read_file(svc.etc)));
+    assert_eq!(read_file(&backup_of(&svc)), ADMIN_STACK);
+    let record = record_of(&[applied]);
+    let sidecar = record.surfaces[0]
+        .sidecar
+        .as_ref()
+        .expect("the backup is recorded");
+    assert_eq!(sidecar.before, None, "it was not there before");
+    roll_back(&record, &[]).expect("the rollback runs");
+    assert_eq!(read_file(svc.etc), ADMIN_STACK);
+    assert!(!exists(&backup_of(&svc)), "no backup is left behind");
+}
+
 /// The vendor digest the per-surface check compared is handed to the write,
 /// which compares it with the bytes it reads, so a vendor file replaced in
 /// between is refused rather than used.
@@ -1011,6 +1489,7 @@ fn the_write_refuses_a_vendor_copy_other_than_the_one_checked() {
     };
     std::fs::write(svc.vendor.unwrap(), fedora_with_oo7()).unwrap();
     let err = wire_service_with(&svc, true, &opts, &face_and_keyring)
+        .map_err(String::from)
         .err()
         .expect("refused");
     assert!(err.contains("or its vendor copy changed"), "{err}");
@@ -1025,6 +1504,7 @@ fn a_checked_write_refuses_a_file_edited_in_place_meanwhile() {
     let path = dir.0.join("stack");
     std::fs::write(&path, "edited in place\n").unwrap();
     let err = write_atomic_checked(&path, "irlume's\n", Some("decided on this\n"))
+        .map_err(String::from)
         .expect_err("the bytes changed");
     assert!(err.contains("left alone"), "{err}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited in place\n");
@@ -1037,11 +1517,154 @@ fn a_checked_removal_keeps_a_file_edited_meanwhile() {
     let dir = TestDir::new("ovr-checked-remove");
     let path = dir.0.join("plasmalogin");
     std::fs::write(&path, "saved by an editor\n").unwrap();
-    let err = remove_checked(&path, Some("decided on this\n")).expect_err("the bytes changed");
+    let err = remove_checked(&path, Some("decided on this\n"))
+        .map_err(String::from)
+        .expect_err("the bytes changed");
     assert!(err.contains("not touched"), "{err}");
     assert!(path.exists());
     remove_checked(&path, Some("saved by an editor\n")).unwrap();
     assert!(!path.exists());
+    assert!(leftovers(&dir.0).is_empty(), "{:?}", leftovers(&dir.0));
+}
+
+/// Names irlume made in `dir` for its own use and should not have left.
+fn leftovers(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".irlume-") || n.contains("irlume-swap-source"))
+        .collect()
+}
+
+/// A package manager or an editor that replaces the file (a rename over its
+/// name) after irlume checked it keeps its file: the removal acts on the
+/// file irlume checked, never on whatever holds the name when it unlinks.
+/// Reachable only from inside the removal, hence the test hook.
+#[test]
+fn a_checked_removal_keeps_a_file_that_replaced_it_after_the_check() {
+    let dir = TestDir::new("ovr-remove-swapped");
+    let path = dir.0.join("plasmalogin");
+    std::fs::write(&path, "decided on this\n").unwrap();
+    arm(&SWAP_DURING_WRITE, &path);
+    let err = remove_checked(&path, Some("decided on this\n"));
+    disarm(&SWAP_DURING_WRITE, &path);
+    let err = err
+        .map_err(String::from)
+        .expect_err("the file was replaced after the check");
+    assert!(err.contains("not touched"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "SOMEONE ELSE'S FILE\n",
+        "the replacement survives"
+    );
+    assert!(leftovers(&dir.0).is_empty(), "{:?}", leftovers(&dir.0));
+}
+
+/// The same for an editor that saves in place after the check: the bytes
+/// are compared again once the file is out of the way, and it goes back.
+#[test]
+fn a_checked_removal_keeps_a_file_edited_in_place_after_the_check() {
+    let dir = TestDir::new("ovr-remove-edited");
+    let path = dir.0.join("plasmalogin");
+    std::fs::write(&path, "decided on this\n").unwrap();
+    arm(&EDIT_DURING_REMOVE, &path);
+    let err = remove_checked(&path, Some("decided on this\n"));
+    disarm(&EDIT_DURING_REMOVE, &path);
+    let err = err
+        .map_err(String::from)
+        .expect_err("the file was edited after the check");
+    assert!(err.contains("not touched"), "{err}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "EDITED IN PLACE\n");
+    assert!(leftovers(&dir.0).is_empty(), "{:?}", leftovers(&dir.0));
+}
+
+/// A file that replaced the checked one is put back without replacing a
+/// newer file that took the name meanwhile; when it cannot be, it stays at
+/// its private name and the error says where.
+#[test]
+fn a_file_that_cannot_be_put_back_is_named_and_nothing_is_replaced() {
+    let dir = TestDir::new("ovr-remove-occupied");
+    let path = dir.0.join("plasmalogin");
+    std::fs::write(&path, "decided on this\n").unwrap();
+    arm(&SWAP_DURING_WRITE, &path);
+    arm(&OCCUPY_AFTER_ASIDE, &path);
+    let err = remove_checked(&path, Some("decided on this\n"));
+    disarm(&SWAP_DURING_WRITE, &path);
+    disarm(&OCCUPY_AFTER_ASIDE, &path);
+    let err = err
+        .map_err(String::from)
+        .expect_err("the file was replaced after the check");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "A NEWER FILE\n");
+    let left = leftovers(&dir.0);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].contains(".irlume-removing."), "{left:?}");
+    assert!(
+        err.contains("could not be put back") && err.contains(&left[0]),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.0.join(&left[0])).unwrap(),
+        "SOMEONE ELSE'S FILE\n",
+        "the replacement is kept under its private name"
+    );
+    assert!(
+        !is_abandoned_scratch(&left[0]),
+        "the scratch sweep never deletes it"
+    );
+}
+
+/// A symlink, a file with a second name, other bytes, and a file where none
+/// was expected are refused as before, each leaving everything in place.
+#[test]
+fn a_checked_removal_refuses_links_and_other_files() {
+    let dir = TestDir::new("ovr-remove-refusals");
+    let target = dir.0.join("real");
+    std::fs::write(&target, "decided on this\n").unwrap();
+
+    let link = dir.0.join("sddm");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let err = remove_checked(&link, Some("decided on this\n"))
+        .map_err(String::from)
+        .expect_err("a symlink");
+    assert!(err.contains("symlink"), "{err}");
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+
+    let second = dir.0.join("lightdm");
+    std::fs::hard_link(&target, &second).unwrap();
+    let err = remove_checked(&second, Some("decided on this\n"))
+        .map_err(String::from)
+        .expect_err("two names");
+    assert!(err.contains("hard links"), "{err}");
+    assert!(second.exists() && target.exists());
+    std::fs::remove_file(&second).unwrap();
+
+    let err = remove_checked(&target, Some("other bytes\n"))
+        .map_err(String::from)
+        .expect_err("other bytes");
+    assert!(err.contains("not touched"), "{err}");
+    let err = remove_checked(&target, None)
+        .map_err(String::from)
+        .expect_err("expected absent");
+    assert!(err.contains("not touched"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "decided on this\n"
+    );
+
+    let absent = dir.0.join("gdm-password");
+    let err = remove_checked(&absent, Some("decided on this\n"))
+        .map_err(String::from)
+        .expect_err("gone");
+    assert!(err.contains("not touched"), "{err}");
+    assert!(leftovers(&dir.0).is_empty(), "{:?}", leftovers(&dir.0));
+}
+
+/// A removal decided on an absent file finds nothing to remove.
+#[test]
+fn a_checked_removal_of_a_file_expected_absent_does_nothing() {
+    let dir = TestDir::new("ovr-remove-absent");
+    remove_checked(&dir.0.join("gdm-password"), None).expect("nothing to remove");
+    assert!(leftovers(&dir.0).is_empty(), "{:?}", leftovers(&dir.0));
 }
 
 /// Reconcile leaves an override it may not write (made immutable, or on a
@@ -1091,10 +1714,10 @@ fn the_refresh_offer_needs_the_marker_or_the_wiring() {
 #[test]
 fn a_header_only_write_that_cannot_be_made_is_skipped() {
     let error = |code: i32| {
-        format!(
+        WriteError::from(format!(
             "create /etc/pam.d/.polkit-1.irlume-new.2.3.tmp: {}",
             std::io::Error::from_raw_os_error(code)
-        )
+        ))
     };
     for code in [1, 30] {
         let out = header_write_refused("/etc/pam.d/polkit-1", true, error(code)).expect("skipped");

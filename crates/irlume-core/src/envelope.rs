@@ -178,12 +178,20 @@ impl SealedEnvelope {
     /// override such as `11`, or a custom pcrlock policy over OS PCRs only)
     /// ranks below every policy, so a reseal never moves an envelope onto
     /// one, and moves an envelope off one when something better is there.
+    ///
+    /// A signed envelope over a firmware-measured PCR (a custom signature, not
+    /// systemd's PCR 11 one) ranks as the literal policy, so a reseal moves it
+    /// only to pcrlock and never swaps its update tolerance for a literal seal
+    /// that binds no more.
     pub fn strength_rank(&self) -> u8 {
         match self.policy {
             PolicyKind::PcrLiteral | PolicyKind::PcrlockNv { .. }
                 if !binds_firmware_state(&self.pcrs) =>
             {
                 0
+            }
+            PolicyKind::Authorized { .. } if binds_firmware_state(&self.pcrs) => {
+                PolicyKind::PcrLiteral.strength_rank()
             }
             ref policy => policy.strength_rank(),
         }
@@ -275,8 +283,13 @@ mod tests {
                 );
             }
         }
-        // The signed policy ranks as itself whatever it records.
+        // systemd's signed policy over PCR 11 ranks as itself; one a custom
+        // signature put over a firmware PCR ranks as the literal policy.
         assert_eq!(sealed(signed.clone(), &[11]).strength_rank(), 1);
+        assert_eq!(
+            sealed(signed.clone(), &[7, 11]).strength_rank(),
+            PolicyKind::PcrLiteral.strength_rank()
+        );
     }
 
     #[test]

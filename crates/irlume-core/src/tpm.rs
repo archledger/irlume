@@ -826,6 +826,11 @@ pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
         // a round-trip; otherwise fall back to the literal PCR seal, which is
         // bound to values read from this TPM.
         match seal_pcrlock(secret, nv_index) {
+            // The prediction is read again to seal, so a policy rewritten in
+            // between is checked on the envelope it produced as well.
+            Ok(env) if !crate::envelope::binds_firmware_state(&env.pcrs) => eprintln!(
+                "irlume: the pcrlock policy covers no firmware-measured PCR; using the literal PCR seal"
+            ),
             Ok(env) => match unseal(&env) {
                 Ok(rt) if rt.as_slice() == secret => return Ok(env),
                 Ok(_) => eprintln!(

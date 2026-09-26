@@ -869,16 +869,19 @@ pub enum Request {
         /// module from before this field.
         #[serde(default)]
         have_password: bool,
-        /// Sent from `open_session` (the GNOME keyring token delivery of a
-        /// login whose auth phase stashed none), not from an auth-phase line.
-        /// The daemon releases nothing to an auth-phase request while the
-        /// account has a live local desktop, which is what a lock-screen
-        /// unlock of that desktop sends; a session being opened is a login,
-        /// and the desktop logind already lists for it is its own. Defaults
-        /// to `false`: a PAM module from before this field is treated as the
-        /// auth phase.
+        /// Sent by the auth-phase `keyring` line, which is what a lock-screen
+        /// unlock of a running desktop sends. The daemon releases nothing to
+        /// such a request while the account has a live local desktop. A
+        /// request without it is served as before: the session-phase GNOME
+        /// keyring token delivery of a login whose auth phase stashed none
+        /// (a session being opened, whose own desktop logind already lists
+        /// as live), and any module from before this field, so an older
+        /// module meeting a newer daemon during an upgrade still gets its
+        /// token. The module also asks nothing from the auth phase while the
+        /// account has a live local desktop, which covers a newer module
+        /// meeting an older daemon.
         #[serde(default)]
-        session_phase: bool,
+        auth_phase: bool,
     },
     /// Whether `user` has a sealed password armed (for status / CLI / the
     /// delete-erases-it warning). Unprivileged: root or `user`.

@@ -1643,12 +1643,12 @@ fn pamwrap_keyring_mode_reports_whether_a_password_is_present() {
                 user,
                 service,
                 have_password,
-                session_phase,
+                auth_phase,
             } => {
                 assert_eq!(user, "tester");
                 assert_eq!(service.as_deref(), Some("irlume-fp"));
                 assert!(!have_password, "no password was set in this transaction");
-                assert!(!session_phase, "the keyring line runs in the auth phase");
+                assert!(auth_phase, "the keyring line runs in the auth phase");
             }
             other => panic!("expected UnsealKeyring, daemon saw {other:?}"),
         }
@@ -2055,7 +2055,7 @@ fn pamwrap_gnome_token_session_returns_while_the_waiter_runs() {
             [Request::UnsealKeyring {
                 user,
                 have_password: true,
-                session_phase: true,
+                auth_phase: false,
                 ..
             }] if user == "tester"
         ),
@@ -2101,7 +2101,7 @@ fn pamwrap_gnome_token_from_the_auth_stash_is_delivered_once() {
             reqs.as_slice(),
             [Request::UnsealKeyring {
                 have_password: false,
-                session_phase: false,
+                auth_phase: true,
                 ..
             }]
         ),

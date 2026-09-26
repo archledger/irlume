@@ -313,12 +313,21 @@ impl PamServiceModule for IrlumePam {
                     .ok()
                     .flatten()
                     .and_then(|c| c.to_str().ok().map(str::to_string));
+                // A lock-screen unlock of a running desktop needs nothing:
+                // that desktop's login opened its keyring or wallet, and a
+                // release here would re-open one its owner locked by hand.
+                // irlumed refuses such a release too; asking nothing here
+                // also holds while an older irlumed still runs during an
+                // upgrade.
+                if irlume_common::platform::user_has_live_session(&user) {
+                    return PamError::IGNORE;
+                }
                 if let Ok(Response::PasswordUnsealed { secret, kind }) =
                     request(&Request::UnsealKeyring {
                         user: user.clone(),
                         service,
                         have_password,
-                        session_phase: false,
+                        auth_phase: true,
                     })
                 {
                     // Routed by kind, not assumed: on KDE this starts the
@@ -692,7 +701,7 @@ fn deliver_gnome_token(pamh: &Pam, user: &str) {
                 // This session is being opened, so it is a login, not a
                 // lock-screen unlock of a running desktop, although logind
                 // lists it as live already.
-                session_phase: true,
+                auth_phase: false,
             }) {
                 // Only a token belongs on the control socket. A password or a
                 // wallet key reaching here would mean the user is armed for a

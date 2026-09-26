@@ -1838,6 +1838,9 @@ struct Settings {
 
 /// Read the settings back from irlume's lines. `None` when there are none, or
 /// when they contradict each other (an `ondemand` and a `facefirst` face line).
+/// A greeter with neither face nor keyring lines is the reseal-only stack a
+/// remote LightDM seat gets, recognised only when every irlume line is a
+/// reseal line.
 fn infer(recipe: Recipe, body: &str) -> Option<Settings> {
     let lines: Vec<Vec<&str>> = body
         .lines()
@@ -1866,7 +1869,13 @@ fn infer(recipe: Recipe, body: &str) -> Option<Settings> {
     } else {
         false
     };
-    (face || keyring).then_some(Settings {
+    if !face && !keyring {
+        return lines
+            .iter()
+            .all(|t| t.contains(&"reseal"))
+            .then_some(Settings::default());
+    }
+    Some(Settings {
         face,
         keyring,
         ondemand,
@@ -2718,9 +2727,6 @@ session     include       password-auth
         for face in [false, true] {
             for keyring in [false, true] {
                 for ondemand in [false, true] {
-                    if !face && !keyring {
-                        continue;
-                    }
                     let (wired, ok) = wire_greeter_impl(&base_text, face, keyring, ondemand);
                     assert!(ok);
                     let got = infer(Recipe::Greeter, &wired).unwrap();
@@ -2738,6 +2744,13 @@ session     include       password-auth
             infer(Recipe::Greeter, &base_text),
             None,
             "nothing of irlume's"
+        );
+        let (reseal_only, _) = wire_greeter_impl(&base_text, false, false, false);
+        let stray = format!("{reseal_only}auth optional pam_irlume.so wait\n");
+        assert_eq!(
+            infer(Recipe::Greeter, &stray),
+            None,
+            "a line beside the reseal ones is not a known recipe"
         );
         let (sudo, _) = wire_verify_service("auth include system-auth\n");
         assert!(infer(Recipe::Verify, &sudo).is_some());
@@ -2790,6 +2803,17 @@ session     include       password-auth
             maintenance(Recipe::Greeter, &fresh, vp, Some(&v2)),
             Maintenance::Nothing
         );
+        // A reseal-only file (a remote LightDM seat) follows its vendor copy too.
+        let reseal_file = {
+            let (w, _) = wire_greeter_impl(&base(VENDOR), false, false, false);
+            render(vp, VENDOR, &w)
+        };
+        let Maintenance::Refresh(fresh) = maintenance(Recipe::Greeter, &reseal_file, vp, Some(&v2))
+        else {
+            panic!("an unedited reseal-only file follows its vendor copy");
+        };
+        assert!(fresh.contains("pam_oo7.so"));
+        assert_eq!(irlume_lines(&fresh), irlume_lines(&reseal_file));
         // Edited or differing files are never written here.
         for text in [
             with_admin_line(&generation(VENDOR)),

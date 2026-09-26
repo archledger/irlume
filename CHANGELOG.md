@@ -776,7 +776,9 @@ All notable changes to irlume are documented here. This project adheres to
   kind of secret: a user session that is active or online, of type x11,
   wayland or mir, and not remote counts, an SSH login or a text console
   does not. A cold login releases as before, and a typed-password login
-  still receives its GNOME keyring token in the session phase (#863).
+  still receives its GNOME keyring token in the session phase (#863). When
+  irlumed cannot read logind's session state or the account, it withholds
+  the release as well (#864).
 
 ## [0.14.0] - 2026-09-19
 

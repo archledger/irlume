@@ -604,8 +604,13 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     // The state roots outside the default, resolved before anything is
     // removed: the one irlumed's unit names is lost once the unit goes, and
     // every one of them is both disarmed and wiped below. The token guard
-    // read the same roots before the teardown began and refused on an error.
-    let extra_roots = extra_state_roots().unwrap_or_default();
+    // read the same roots before the teardown began and refused on an error;
+    // one that appears only now (the unit became unreadable since) keeps the
+    // wipe from counting as complete, and with it the SRK eviction.
+    let (extra_roots, roots_unknown) = match extra_state_roots() {
+        Ok(roots) => (roots, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
     // 1. PAM FIRST. Un-wire every greeter, the lock screen, sudo, and polkit
     //    (disable puts the opt-in stacks in scope regardless of flags) so no
     //    stack references pam_irlume.so once the module is removed.
@@ -698,6 +703,11 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     //    failure lands in data_left and pulls data_wiped false.
     let users = irlume_core::storage::list_users();
     let mut data_left: Vec<String> = Vec::new();
+    if let Some(e) = &roots_unknown {
+        data_left.push(format!(
+            "state roots irlumed's unit names (could not be read: {e}; not disarmed or wiped)"
+        ));
+    }
     for user in &users {
         let _ = irlume_core::keyring::forget_password(user);
         if !keep_data {
@@ -961,7 +971,26 @@ fn unit_env_under(root: &Path, var: &str) -> Result<Option<PathBuf>, String> {
     for text in &texts {
         found = unit_env_in(text, var, found);
     }
+    // systemd applies `UnsetEnvironment=` after every `Environment=`, whatever
+    // the order of the lines: a variable it names, bare or with the value it
+    // has, is not in the daemon's environment.
+    if let Some(value) = &found {
+        let assignment = format!("{var}={}", value.display());
+        if texts.iter().any(|text| unit_unsets(text, var, &assignment)) {
+            found = None;
+        }
+    }
     Ok(found)
+}
+
+/// Whether a unit file's `UnsetEnvironment=` lines name `var`, bare or as the
+/// exact `assignment` it has.
+fn unit_unsets(unit: &str, var: &str, assignment: &str) -> bool {
+    unit.lines()
+        .filter_map(|line| line.trim().strip_prefix("UnsetEnvironment="))
+        .flat_map(str::split_whitespace)
+        .map(|word| word.trim_matches('"'))
+        .any(|word| word == var || word == assignment)
 }
 
 /// The keyring directory irlumed's unit points `IRLUME_KEYRING_DIR` at, when
@@ -1744,6 +1773,31 @@ mod tests {
             "[Service]\nEnvironment=\n",
         );
         assert_eq!(env("IRLUME_STATE_DIR"), None);
+        // UnsetEnvironment= removes a variable whatever came after it.
+        put(
+            "run/systemd/system/irlumed.service.d/30-reset.conf",
+            "[Service]\nUnsetEnvironment=IRLUME_KEYRING_DIR\n",
+        );
+        put(
+            "usr/lib/systemd/system/irlumed.service.d/40-keys.conf",
+            "[Service]\nEnvironment=IRLUME_KEYRING_DIR=/later\n",
+        );
+        assert_eq!(env("IRLUME_KEYRING_DIR"), None);
+        assert_eq!(env("IRLUME_STATE_DIR"), Some(PathBuf::from("/etc")));
+        put(
+            "run/systemd/system/irlumed.service.d/30-reset.conf",
+            "[Service]\nUnsetEnvironment=IRLUME_STATE_DIR=/elsewhere\n",
+        );
+        assert_eq!(
+            env("IRLUME_STATE_DIR"),
+            Some(PathBuf::from("/etc")),
+            "another value"
+        );
+        put(
+            "run/systemd/system/irlumed.service.d/30-reset.conf",
+            "[Service]\nUnsetEnvironment=IRLUME_STATE_DIR=/etc\n",
+        );
+        assert_eq!(env("IRLUME_STATE_DIR"), None, "the value it has");
         let _ = std::fs::remove_dir_all(&root);
     }
 

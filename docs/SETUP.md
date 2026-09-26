@@ -308,6 +308,16 @@ a Plasma session on an account whose only keyring is GNOME's,
 is sealed: they say this is not a GNOME session and change nothing. Arm from a
 GNOME session.
 
+The token reaches the keyring only through irlume's session line in the login
+screen's PAM stack, so the same three also refuse a token, before anything is
+sealed, where no login would deliver it: the active login screen's stack has
+no irlume session line, irlume does not wire that login screen, or the login
+manager logs the account in automatically (irlume reads the GDM, SDDM, Plasma
+Login, LightDM, greetd, COSMIC and ly settings for this). An automatic login asks
+for nothing, so irlume releases no token there. `irlume setup` arms before its
+wiring step, so on a GNOME machine not wired yet it reports this; run
+`sudo irlume login enable --apply`, then `irlume keyring arm`.
+
 `irlume keyring forget` works in such a session too. When gnome-keyring refuses
 the change back, and the process behind its control socket is a
 `gnome-keyring-daemon --login` that has not claimed `org.gnome.keyring`, forget
@@ -827,7 +837,10 @@ sudo irlume login disable --apply
 ```
 
 Removes every PAM change (greeter, lock, and `sudo`) and restores the originals.
-Your password login is never touched. To remove just face-`sudo` while keeping
+Your password login is never touched. While an account's GNOME keyring is keyed
+to an irlume token, the disable refuses: the session line it removes is what
+delivers the token. Run `irlume keyring forget` in that account's session first
+([DISABLE.md](DISABLE.md)). To remove just face-`sudo` while keeping
 the greeter, re-run `login enable --apply` *without* `--with-sudo`. For every
 off-switch in one place (per-surface tiers, standing face down without touching
 PAM, canceling a running scan, full uninstall), read [DISABLE.md](DISABLE.md).

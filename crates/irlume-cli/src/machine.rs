@@ -176,6 +176,7 @@ fn error_message(code: &str) -> Option<&'static str> {
         "usage-error" => "Usage error. Run the command with --help.",
         "protocol-error" => "The daemon sent an unexpected response; it may be older than this CLI. Run irlume doctor.",
         "daemon-unavailable" => "irlumed is not running; start it with: sudo systemctl enable --now irlumed.",
+        "keyring-token-armed" => "A login keyring is keyed to an irlume token that this change would stop delivering. Run irlume keyring forget in that account's session first.",
         _ => return None,
     })
 }
@@ -1571,6 +1572,31 @@ pub fn login_apply(args: &[String]) -> ExitCode {
             ExitCode::FAILURE,
         );
     }
+    // A run that removes the session line delivering a GNOME keyring token
+    // (a disable, or an enable the configuration no longer wants on a login
+    // stack) leaves that keyring locked at every login. `irlume login`
+    // refuses it unless a person passes --force; a panel has no such
+    // override, so it is refused here, before anything is recorded or written.
+    match crate::pamwire::tokens_a_run_strands(enable) {
+        Ok(users) if users.is_empty() => {}
+        Ok(users) => {
+            irlume_common::dlog!(
+                "login.apply: refusing {action}, keyring token armed for {}",
+                users.join(", ")
+            );
+            return emit(
+                &failure(COMMAND, "keyring-token-armed", false, contract),
+                ExitCode::FAILURE,
+            );
+        }
+        Err(store) => {
+            irlume_common::dlog!("login.apply: refusing {action}, envelope store: {store}");
+            return emit(
+                &failure(COMMAND, "operation-failed", false, contract),
+                ExitCode::FAILURE,
+            );
+        }
+    }
 
     // WRITE-AHEAD. The before-states are captured and persisted BEFORE the first
     // PAM write, because the alternative has no safe ordering: writing the files
@@ -1869,6 +1895,9 @@ pub fn login_rollback(args: &[String]) -> ExitCode {
                 ExitCode::FAILURE,
             );
         }
+        if let Some(refusal) = rollback_token_refusal(COMMAND, &record, will_apply, contract) {
+            return refusal;
+        }
         return rollback_restore(COMMAND, &record, will_apply, contract, true);
     }
     let blockers = rollback_blockers(&record);
@@ -1887,7 +1916,51 @@ pub fn login_rollback(args: &[String]) -> ExitCode {
         };
         return emit(&failure(COMMAND, code, false, contract), ExitCode::FAILURE);
     }
+    if let Some(refusal) = rollback_token_refusal(COMMAND, &record, will_apply, contract) {
+        return refusal;
+    }
     rollback_restore(COMMAND, &record, will_apply, contract, false)
+}
+
+/// The refusal for a rollback that would strand a GNOME keyring token, asked
+/// once the rollback is otherwise allowed. Restoring a stack from before an
+/// enable removes the session line that delivers a token armed since, as a
+/// disable would, and is refused the same way. Only an apply is checked: a
+/// dry run writes nothing, and without root it cannot read the envelope
+/// store.
+fn rollback_token_refusal(
+    command: &'static str,
+    record: &crate::logintx::Transaction,
+    will_apply: bool,
+    contract: u32,
+) -> Option<ExitCode> {
+    if !will_apply {
+        return None;
+    }
+    let restores = record
+        .surfaces
+        .iter()
+        .map(|s| (std::path::Path::new(&s.path), s.before.as_deref()));
+    match crate::pamwire::tokens_a_restore_strands(restores) {
+        Ok(users) if users.is_empty() => None,
+        Ok(users) => {
+            irlume_common::dlog!(
+                "login.rollback: refusing, keyring token armed for {}",
+                users.join(", ")
+            );
+            Some(emit(
+                &failure(command, "keyring-token-armed", false, contract),
+                ExitCode::FAILURE,
+            ))
+        }
+        Err(store) => {
+            irlume_common::dlog!("login.rollback: refusing, envelope store: {store}");
+            Some(emit(
+                &failure(command, "operation-failed", false, contract),
+                ExitCode::FAILURE,
+            ))
+        }
+    }
 }
 
 fn valid_login_apply_args(args: &[String]) -> Option<(&'static str, String)> {

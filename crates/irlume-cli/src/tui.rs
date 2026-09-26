@@ -6626,10 +6626,7 @@ impl App {
                             {
                                 return (
                                     false,
-                                    format!(
-                                        "keyring not armed: {why}. Nothing was changed. Arm \
-                                         from a GNOME session."
-                                    ),
+                                    format!("keyring not armed: {why}. Nothing was changed."),
                                 );
                             }
                         }

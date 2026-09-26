@@ -2121,11 +2121,12 @@ fn login_changes_on_nixos_name_the_module_and_touch_nothing() {
     }
 }
 
-/// `--force` rebuilds overrides an administrator edited, so only `login
-/// enable` takes it: the unattended reconcile and a status read refuse it
-/// with a usage error before anything is read or locked.
+/// `--force` is a person overriding a refusal (`enable` rebuilding overrides
+/// an administrator edited, `disable` going ahead although a keyring token
+/// depends on it), so only those two take it: the unattended reconcile and a
+/// status read refuse it with a usage error before anything is read or locked.
 #[test]
-fn login_force_is_refused_outside_enable() {
+fn login_force_is_refused_outside_enable_and_disable() {
     let sb = Sandbox::new("login-force-scope");
     let lock = sb.path("pam.lock");
     for args in [
@@ -2136,20 +2137,17 @@ fn login_force_is_refused_outside_enable() {
         let (code, out, err) = run(sb.cmd(args).env("IRLUME_PAM_LOCK", &lock));
         assert_eq!(code, 2, "{args:?}\n{out}\n{err}");
         assert!(
-            err.contains("--force applies to login enable only"),
+            err.contains("--force applies to login enable and disable only"),
             "{err}"
         );
         assert!(!lock.exists(), "{args:?} took the PAM lock");
     }
-    // `disable` takes nothing from it: the flag is noted and the run goes on
-    // (a dry run here, which reads PAM files and writes nothing).
+    // `disable` takes it without a note, and the run goes on (a dry run
+    // here, which reads PAM files and writes nothing).
     let (_, out, err) = run(sb
         .cmd(&["login", "disable", "--force"])
         .env("IRLUME_PAM_LOCK", &lock));
-    assert!(
-        err.contains("[login] note: --force applies to login enable only"),
-        "{out}\n{err}"
-    );
+    assert!(!err.contains("note: --force"), "{out}\n{err}");
     assert!(out.contains("DRY RUN"), "{out}\n{err}");
     assert!(!lock.exists(), "a dry run takes no lock");
 }
@@ -2493,6 +2491,288 @@ session    optional                     pam_irlume.so reseal\n\
     );
 }
 
+/// `login disable --apply` as root refuses while an account's GNOME keyring is
+/// keyed to an irlume token and a login stack carries the session line that
+/// delivers it: the stack stays byte for byte. `--force` goes ahead.
+#[test]
+fn login_disable_refuses_while_a_keyring_token_depends_on_it() {
+    let mut sb = Sandbox::new("disable-token");
+    sb.hidden.push("/etc/systemd/system");
+    let etc = sb.path("pam-etc");
+    let vendor = sb.path("pam-vendor");
+    std::fs::create_dir_all(&etc).unwrap();
+    std::fs::create_dir_all(&vendor).unwrap();
+    let plasma_vendor = "auth        substack      password-auth\n\
+account     include       password-auth\n\
+session     include       password-auth\n";
+    let plasma = "# irlume: created from /usr/lib/pam.d/plasmalogin; delete this file to restore \
+the vendor copy\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth        substack      password-auth\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+auth       optional                     pam_irlume.so reseal\n\
+account     include       password-auth\n\
+session     include       password-auth\n\
+session    optional                     pam_irlume.so reseal\n";
+    std::fs::write(vendor.join("plasmalogin"), plasma_vendor).unwrap();
+    std::fs::write(etc.join("plasmalogin"), plasma).unwrap();
+    // A sealed GNOME keyring token for alice, in the keyring directory the
+    // harness points irlume at. Only its kind is read.
+    std::fs::write(
+        sb.path("keyring/alice.json"),
+        r#"{"version":1,"secret":"GnomeKeyringToken","pcrs":[],"public":"","private":""}"#,
+    )
+    .unwrap();
+    sb.fake_tool("semodule", "exit 0");
+    let disable = |args: &[&str]| {
+        run(support::isolated_root_command(
+            &sb.root,
+            BIN,
+            args,
+            &["semodule"],
+            &sb.hidden,
+            &[(&etc, "/etc/pam.d"), (&vendor, "/usr/lib/pam.d")],
+        )
+        .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
+        .env("IRLUME_PAM_LOCK", sb.path("pam.lock")))
+    };
+    let (code, out, err) = disable(&["login", "disable", "--apply"]);
+    assert_eq!(code, 1, "{out}\n{err}");
+    assert!(
+        err.contains("login keyring of alice is keyed to an irlume-held token")
+            && err.contains("irlume keyring forget")
+            && err.contains("--force"),
+        "{out}\n{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(etc.join("plasmalogin")).unwrap(),
+        plasma,
+        "a refused disable writes nothing"
+    );
+    // The dry run names the same refusal.
+    let (code, _, err) = disable(&["login", "disable"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("keyring of alice"), "{err}");
+    // A panel's disable has no --force: the machine API refuses it with its
+    // own code, before anything is recorded or written.
+    let (_, plan, err) = disable(&["login", "plan", "--action", "disable", "--json"]);
+    let plan: serde_json::Value = serde_json::from_str(&plan).expect(&err);
+    let plan_id = plan["data"]["plan_id"].as_str().expect("plan_id");
+    let (code, applied, err) = disable(&[
+        "login",
+        "apply",
+        "--action",
+        "disable",
+        "--plan-id",
+        plan_id,
+        "--json",
+    ]);
+    assert_eq!(code, 1, "{applied}\n{err}");
+    let applied: serde_json::Value = serde_json::from_str(&applied).expect(&err);
+    assert_eq!(applied["error"]["code"], "keyring-token-armed", "{applied}");
+    assert_eq!(applied["error"]["retryable"], false, "{applied}");
+    assert_eq!(
+        std::fs::read_to_string(etc.join("plasmalogin")).unwrap(),
+        plasma,
+        "a refused machine disable writes nothing"
+    );
+
+    let (code, out, err) = disable(&["login", "disable", "--apply", "--force"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let live = std::fs::read_to_string(etc.join("plasmalogin")).unwrap_or_default();
+    assert!(
+        !live
+            .lines()
+            .any(|l| l.split('#').next().unwrap().contains("pam_irlume.so")),
+        "no live irlume line: {live}"
+    );
+}
+
+/// `login enable --apply` refuses too when the configuration no longer wants
+/// a login stack that delivers a GNOME keyring token (here the daemon reports
+/// no camera, so nothing wants face there), since unwiring it removes the
+/// session line; `--force` goes ahead.
+#[test]
+fn login_enable_refuses_to_unwire_a_token_delivery() {
+    let mut sb = Sandbox::new("enable-token");
+    sb.hidden.push("/etc/systemd/system");
+    let etc = sb.path("pam-etc");
+    let vendor = sb.path("pam-vendor");
+    std::fs::create_dir_all(&etc).unwrap();
+    std::fs::create_dir_all(&vendor).unwrap();
+    let plasma_vendor = "auth        substack      password-auth\n\
+account     include       password-auth\n\
+session     include       password-auth\n";
+    let plasma = "# irlume: created from /usr/lib/pam.d/plasmalogin; delete this file to restore \
+the vendor copy\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth        substack      password-auth\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+auth       optional                     pam_irlume.so reseal\n\
+account     include       password-auth\n\
+session     include       password-auth\n\
+session    optional                     pam_irlume.so reseal\n";
+    std::fs::write(vendor.join("plasmalogin"), plasma_vendor).unwrap();
+    std::fs::write(etc.join("plasmalogin"), plasma).unwrap();
+    std::fs::write(
+        sb.path("keyring/alice.json"),
+        r#"{"version":1,"secret":"GnomeKeyringToken","pcrs":[],"public":"","private":""}"#,
+    )
+    .unwrap();
+    serve(&sock(&sb), |req| match req {
+        Request::Health => Response::Health {
+            tier: "none".into(),
+            rgb_dev: None,
+            ir_dev: None,
+            mesh: false,
+            adapter: false,
+            rgb_pad: None,
+            ir_pad: None,
+            version: String::new(),
+            apparmor: None,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+    // Enabling where SELinux is on also loads the module and relabels the
+    // socket.
+    sb.fake_tool("semodule", "exit 0");
+    sb.fake_tool("systemctl", "exit 0");
+    sb.fake_tool("restorecon", "exit 0");
+    let enable = |args: &[&str]| {
+        run(support::isolated_root_command(
+            &sb.root,
+            BIN,
+            args,
+            &["semodule", "systemctl", "restorecon"],
+            &sb.hidden,
+            &[(&etc, "/etc/pam.d"), (&vendor, "/usr/lib/pam.d")],
+        )
+        .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
+        .env("IRLUME_PAM_LOCK", sb.path("pam.lock")))
+    };
+    let (code, out, err) = enable(&["login", "enable", "--apply"]);
+    assert_eq!(code, 1, "{out}\n{err}");
+    assert!(
+        err.contains("login keyring of alice is keyed to an irlume-held token"),
+        "{out}\n{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(etc.join("plasmalogin")).unwrap(),
+        plasma,
+        "a refused enable writes nothing"
+    );
+    let (code, out, err) = enable(&["login", "enable", "--apply", "--force"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let live = std::fs::read_to_string(etc.join("plasmalogin")).unwrap_or_default();
+    assert!(
+        !live.lines().any(|l| l
+            .split('#')
+            .next()
+            .unwrap()
+            .contains("pam_irlume.so reseal")),
+        "{live}"
+    );
+}
+
+/// A machine `login rollback --apply` that would restore a stack from before
+/// an enable removes the session line a GNOME keyring token armed since
+/// depends on, so it refuses as `keyring-token-armed` and writes nothing.
+/// Without a token it restores the stack.
+#[test]
+fn login_rollback_refuses_while_a_keyring_token_depends_on_it() {
+    let mut sb = Sandbox::new("rollback-token");
+    sb.hidden.push("/etc/systemd/system");
+    let etc = sb.path("pam-etc");
+    std::fs::create_dir_all(&etc).unwrap();
+    let before = "auth        substack      password-auth\n\
+session     include       password-auth\n";
+    let wired = "auth        substack      password-auth\n\
+auth       optional                     pam_irlume.so reseal\n\
+session     include       password-auth\n\
+session    optional                     pam_irlume.so reseal\n";
+    std::fs::write(etc.join("lightdm"), wired).unwrap();
+    let digest = {
+        use sha2::{Digest as _, Sha256};
+        Sha256::digest(wired.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let id = "0123456789abcdef0123456789abcdef";
+    let store = sb.path("state/login-transactions");
+    std::fs::create_dir_all(&store).unwrap();
+    let record = serde_json::json!({
+        "id": id,
+        "status": "applied",
+        "action": "enable",
+        "plan_id": "f".repeat(32),
+        "engine_version": "0.0.0",
+        "surfaces": [{
+            "id": "lightdm",
+            "path": "/etc/pam.d/lightdm",
+            "change": "wire",
+            "before": before,
+            "after_sha256": digest,
+        }],
+    });
+    std::fs::write(store.join(format!("{id}.json")), record.to_string()).unwrap();
+    std::fs::write(
+        sb.path("keyring/alice.json"),
+        r#"{"version":1,"secret":"GnomeKeyringToken","pcrs":[],"public":"","private":""}"#,
+    )
+    .unwrap();
+    let rollback = || {
+        run(support::isolated_root_command(
+            &sb.root,
+            BIN,
+            &[
+                "login",
+                "rollback",
+                "--transaction-id",
+                id,
+                "--apply",
+                "--json",
+            ],
+            &[],
+            &sb.hidden,
+            &[(&etc, "/etc/pam.d")],
+        )
+        .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
+        .env("IRLUME_PAM_LOCK", sb.path("pam.lock")))
+    };
+    // A rollback that cannot proceed anyway says why, not to forget a token:
+    // the same record left unconfirmed needs --accept-unconfirmed first.
+    let mut prepared = record.clone();
+    prepared["status"] = "prepared".into();
+    std::fs::write(store.join(format!("{id}.json")), prepared.to_string()).unwrap();
+    let (code, out, err) = rollback();
+    assert_eq!(code, 1, "{out}\n{err}");
+    let document: serde_json::Value = serde_json::from_str(&out).expect(&err);
+    assert_eq!(
+        document["error"]["code"], "unconfirmed-transaction",
+        "{out}"
+    );
+    std::fs::write(store.join(format!("{id}.json")), record.to_string()).unwrap();
+
+    let (code, out, err) = rollback();
+    assert_eq!(code, 1, "{out}\n{err}");
+    let document: serde_json::Value = serde_json::from_str(&out).expect(&err);
+    assert_eq!(document["error"]["code"], "keyring-token-armed", "{out}");
+    assert_eq!(
+        std::fs::read_to_string(etc.join("lightdm")).unwrap(),
+        wired,
+        "a refused rollback writes nothing"
+    );
+
+    std::fs::remove_file(sb.path("keyring/alice.json")).unwrap();
+    let (code, out, err) = rollback();
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert_eq!(
+        std::fs::read_to_string(etc.join("lightdm")).unwrap(),
+        before
+    );
+}
+
 /// A stand-in for the gnome-keyring that `pam_gnome_keyring auto_start`
 /// starts: a process whose argv reads `gnome-keyring-daemon ... --login`,
 /// listening on `runtime_dir/keyring/control` and answering every request
@@ -2580,7 +2860,8 @@ fn fake_login_gnome_keyring_child() {
 /// goes ahead, and a token sealed anyway is rolled back without a re-key.
 #[test]
 fn a_token_arm_is_refused_before_sealing_where_gnome_keyring_was_never_initialized() {
-    let sb = Sandbox::new("gkr-uninitialized");
+    let mut sb = Sandbox::new("gkr-uninitialized");
+    sb.hidden.push("/etc/gdm");
     let home = sb.path("home");
     let keyrings = home.join(".local/share/keyrings");
     std::fs::create_dir_all(&keyrings).unwrap();
@@ -2610,11 +2891,42 @@ fn a_token_arm_is_refused_before_sealing_where_gnome_keyring_was_never_initializ
     });
     let runtime_dir = sb.path("run");
     let _keyring = FakeLoginKeyring::start(&runtime_dir);
+    // A GDM login screen whose stack carries irlume's session line, so the
+    // token would be delivered and only the session decides. The host's own
+    // login manager and GDM settings stay out of it.
+    let pam = sb.path("pam-etc");
+    let units = sb.path("units");
+    std::fs::create_dir_all(&pam).unwrap();
+    std::fs::create_dir_all(&units).unwrap();
+    std::fs::write(
+        pam.join("gdm-password"),
+        "auth     substack      password-auth\n\
+         session  include       password-auth\n\
+         session    optional                     pam_irlume.so reseal\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "/usr/lib/systemd/system/gdm.service",
+        units.join("display-manager.service"),
+    )
+    .unwrap();
     let arm = |owned: &str| {
+        // Namespace root in the host's PID namespace: the session check
+        // reads the fake gnome-keyring's pid from its socket and its argv
+        // from /proc.
         let (code, out, err) = run_stdin(
-            sb.cmd_with_fakes(&["keyring", "arm", "--user", "tester"])
-                .env("XDG_RUNTIME_DIR", &runtime_dir)
-                .env("IRLUME_TEST_KEYRING_OWNED", owned),
+            support::isolated_root_command_with_host_pids(
+                &sb.root,
+                BIN,
+                &["keyring", "arm", "--user", "tester"],
+                &["getent", "busctl"],
+                &["/etc/gdm", "/etc/gdm3"],
+                &[(&pam, "/etc/pam.d"), (&units, "/etc/systemd/system")],
+            )
+            .env("IRLUME_KWALLET_INIT", sb.path("wallet-salt-helper"))
+            .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
+            .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("IRLUME_TEST_KEYRING_OWNED", owned),
             "fixture-password\n",
         );
         let requests = std::mem::take(&mut *log.lock().unwrap());

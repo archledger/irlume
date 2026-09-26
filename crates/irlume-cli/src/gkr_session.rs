@@ -17,7 +17,9 @@
 //! does when it refuses the change back ([`initialize_for_forget`]). A token
 //! arm refuses there instead ([`token_arm_refusal`]): a token is only
 //! delivered once a GNOME session initializes gnome-keyring, so a token armed
-//! from this session would never unlock the keyring.
+//! from this session would never unlock the keyring. It refuses, too, where
+//! no login would deliver the token at all
+//! ([`crate::pamwire::token_delivery_refusal`]).
 //!
 //! D-Bus goes through `busctl --user --auto-start=no`, as in
 //! [`crate::secrets`], and no secret goes near it. Only
@@ -303,27 +305,46 @@ fn arms_a_token(home: Option<&Path>, has_wallet_salt: bool) -> bool {
     })
 }
 
-/// The refusal for a token arm from this session, or `None`. Asked before
+/// The refusal for a token arm, ending in what to do, or `None`. Asked before
 /// `SealPassword`, so a refused arm mints and seals nothing: the answer is
 /// `None` unless irlumed would seal a token for `user` (the account's home
-/// holds a GNOME login keyring and no KDE wallet salt was found), and the
+/// holds a GNOME login keyring and no KDE wallet salt was found), and then
+/// either no login would deliver the token (the login screen's stack lacks
+/// irlume's session line, or the account logs in automatically) or the
 /// session's gnome-keyring is a `--login` daemon that nothing initialized.
 pub(crate) fn token_arm_refusal(
     user: &str,
     wallet_salt: Option<&irlume_common::WalletSalt>,
 ) -> Option<String> {
-    let session = Live::from_env()?;
     // A KDE wallet salt never arms a token, so skip the passwd lookup.
     let token = wallet_salt.is_none()
         && arms_a_token(crate::bitwarden::passwd_home(user).as_deref(), false);
-    token_arm_refusal_in(token, &session, crate::control_client_uid())
+    token_arm_refusal_in(
+        token,
+        || crate::pamwire::token_delivery_refusal(user),
+        Live::from_env().as_ref(),
+        crate::control_client_uid(),
+    )
 }
 
-fn token_arm_refusal_in(token: bool, session: &impl Session, me: libc::uid_t) -> Option<String> {
+/// [`token_arm_refusal`] with the delivery check and the session passed in.
+/// Without a session to inspect, only the delivery check runs.
+fn token_arm_refusal_in(
+    token: bool,
+    delivery: impl FnOnce() -> Option<String>,
+    session: Option<&impl Session>,
+    me: libc::uid_t,
+) -> Option<String> {
     if !token {
         return None;
     }
-    uninitialized_refusal(session, me)
+    if let Some(why) = delivery() {
+        return Some(why);
+    }
+    let why = uninitialized_refusal(session?, me)?;
+    Some(format!(
+        "{why}. Run `irlume keyring arm` from a GNOME session"
+    ))
 }
 
 /// [`NOT_A_GNOME_SESSION`] when this session's gnome-keyring is a `--login`
@@ -559,19 +580,46 @@ mod tests {
 
     #[test]
     fn a_token_arm_is_refused_only_where_a_token_is_armed_and_never_delivered() {
+        let delivered = || None;
         let uninitialized = Fake::login_daemon();
-        let refusal = token_arm_refusal_in(true, &uninitialized, ME).expect("refused");
+        let refusal =
+            token_arm_refusal_in(true, delivered, Some(&uninitialized), ME).expect("refused");
         assert!(refusal.contains("not a GNOME session"), "{refusal}");
         assert!(refusal.contains("started by the login screen"), "{refusal}");
+        assert!(refusal.ends_with("from a GNOME session"), "{refusal}");
         assert_eq!(uninitialized.started(), 0, "an arm never starts anything");
 
         // Initialized (a GNOME session), and no token to arm (a KDE wallet or
         // no GNOME keyring): no refusal, and the second asks nothing.
         let initialized = Fake::login_daemon().owned(KEYRING_BUS, DAEMON as u32);
-        assert_eq!(token_arm_refusal_in(true, &initialized, ME), None);
+        assert_eq!(
+            token_arm_refusal_in(true, delivered, Some(&initialized), ME),
+            None
+        );
         let other_kind = Fake::login_daemon();
-        assert_eq!(token_arm_refusal_in(false, &other_kind, ME), None);
+        let unasked = || -> Option<String> { panic!("no token, no delivery check") };
+        assert_eq!(
+            token_arm_refusal_in(false, unasked, Some(&other_kind), ME),
+            None
+        );
         assert!(other_kind.calls().is_empty(), "{:?}", other_kind.calls());
+    }
+
+    #[test]
+    fn a_token_no_login_delivers_is_refused_before_the_session_is_asked() {
+        let undelivered = || Some("no session line".to_string());
+        let initialized = Fake::login_daemon().owned(KEYRING_BUS, DAEMON as u32);
+        assert_eq!(
+            token_arm_refusal_in(true, undelivered, Some(&initialized), ME).as_deref(),
+            Some("no session line")
+        );
+        assert!(initialized.calls().is_empty(), "{:?}", initialized.calls());
+        // With no session to inspect, the delivery check still answers.
+        assert_eq!(
+            token_arm_refusal_in(true, undelivered, None::<&Fake>, ME).as_deref(),
+            Some("no session line")
+        );
+        assert_eq!(token_arm_refusal_in(true, || None, None::<&Fake>, ME), None);
     }
 
     #[test]

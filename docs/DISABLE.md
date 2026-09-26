@@ -95,7 +95,28 @@ sudo irlume login disable --apply
 ```
 
 This unwires every greeter and the lock screen, and removes the `sudo` and
-`polkit-1` lines whether or not you opted in originally. It also:
+`polkit-1` lines whether or not you opted in originally.
+
+While any account's GNOME login keyring is keyed to an irlume token
+(`irlume keyring status` says so), the disable refuses and changes nothing.
+The session line it removes is what hands that token to the keyring, and
+without it the keyring stays locked at every login, a typed password
+included, under a secret nobody has seen. Have each such user run
+`irlume keyring forget` in their own session first, which re-keys the
+keyring back to their password, or add `--force` to disable anyway. A
+`login enable` that would unwire such a login screen, because the
+configuration no longer wants face or fingerprint there, refuses the same
+way, and so does the reconcile unit. A machine-API `login apply` of either
+action, or a `login rollback --apply` that would restore a stack without that
+line, refuses as `keyring-token-armed`.
+
+The dry run (`irlume login disable` without `--apply`) names the same
+refusal only when it can read the sealed-envelope store. Run without root on
+a packaged install it cannot, since the store is root-only, so it says that
+`--apply` will check as root and shows the plan without having checked; run
+it with `sudo` to see the answer.
+
+The disable also:
 
 - restores the original stacks (moves the `.pre-irlume` backup back, or
   deletes the `/etc` override so the vendor file shows through again). An

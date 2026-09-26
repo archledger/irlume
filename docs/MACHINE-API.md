@@ -778,6 +778,12 @@ A transaction id is a 32-character hex string. Anything else is a `usage-error`,
 rejected rather than sanitised, because the id becomes a filename.
 
 Error codes: `plan-stale`, `changed-since-apply`, `not-found`,
+`keyring-token-armed` (a disable, an enable that would unwire a login screen
+the configuration no longer wants, or a `rollback --apply` that would restore
+a stack without it, while an account's GNOME keyring is keyed to an irlume
+token and a login stack carries the session line that delivers it; refused
+before anything is recorded or written, and not retryable until that account
+runs `irlume keyring forget`),
 `not-authorized` (apply and `rollback --apply` need root, checked before
 anything is written rather than left to a write failing partway),
 `unconfirmed-transaction`, `unsupported-record`, `unmanaged-path` (a record

@@ -311,6 +311,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- A GNOME keyring token is no longer armed where no login delivers it, and
+  `irlume login disable` no longer removes the line that delivers one. The
+  token reaches the keyring only through irlume's session line in the login
+  screen's PAM stack. Arming before `login enable` (the order `irlume setup`
+  follows), arming for an account that logs in automatically, or disabling
+  afterwards left the login keyring locked at every login, a typed password
+  included, under a secret nobody had seen. `keyring arm`, `setup` and the
+  TUI now refuse a token, before sealing, when the active login screen's
+  stack has no irlume session line or its login manager logs the account in
+  automatically. `login disable`, and a `login enable` or reconcile run
+  that would unwire a login screen that delivers a token (after a method or
+  camera change, say), refuse while an account holds one, unless run with
+  `--force`; a machine-API apply, or a rollback that would restore a stack
+  without that line, refuses as `keyring-token-armed` (#865).
+
 - `irlume reseal` re-binds the kind of secret that is armed. It let
   irlumed choose as for a first arm, so a GNOME-only account armed with
   its login password was given a new GNOME keyring token: irlumed sealed

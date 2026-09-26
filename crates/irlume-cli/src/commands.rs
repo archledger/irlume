@@ -1625,17 +1625,16 @@ pub fn reseal(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // What is armed, which this command re-binds as it is.
+    let armed = match daemon_request(&Request::KeyringInfo { user: user.clone() }) {
+        Ok(Response::KeyringInfo { kind, .. }) => kind,
+        _ => None,
+    };
     // A token envelope (#250) heals itself: the session-phase reseal re-seals
     // it from its password wrap on the next typed-password login. Re-arming it
     // here would mint a NEW token and hand it back for a keyring re-key this
     // command does not perform, stranding the keyring on the old one.
-    if matches!(
-        daemon_request(&Request::KeyringInfo { user: user.clone() }),
-        Ok(Response::KeyringInfo {
-            kind: Some(irlume_common::KeyringSecretKind::GnomeKeyringToken),
-            ..
-        })
-    ) {
+    if armed == Some(irlume_common::KeyringSecretKind::GnomeKeyringToken) {
         println!(
             "[reseal] '{user}' is armed with a GNOME keyring token; it re-binds itself on \
              your next password login. To rebuild it from scratch, run `irlume keyring \
@@ -1643,23 +1642,41 @@ pub fn reseal(args: &[String]) -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-    println!("[reseal] Re-binding '{user}'s sealed secret to the current TPM/PCR state.");
-    let Some(pw) = prompt_login_password() else {
-        return ExitCode::from(2);
-    };
-    let (kind, wallet_salt) = match seal.request_fields(&user) {
+    let (kind, mut wallet_salt) = match seal.request_fields(&user) {
         Ok(fields) => fields,
         Err(e) => {
             eprintln!("[reseal] failed: {e}");
             return ExitCode::FAILURE;
         }
     };
-    // On NixOS the module's rules decide (a login password). Elsewhere the
-    // daemon judges from what the user has, unless oo7 runs this session's
-    // Secret Service (it takes the login password).
-    let kind = match kind {
-        Some(kind) => Ok(Some(kind)),
+    // The kind that is armed is the one resealed: on NixOS the module's
+    // rules decide (a login password), and elsewhere irlumed says what it
+    // holds. Letting irlumed judge afresh, as a first arm does, can pick
+    // another kind: a GNOME-only home armed with its login password got a
+    // new GNOME keyring token, sealed and never keyed into the keyring. A
+    // KDE wallet key is derived again with the wallet's salt, and no other
+    // kind carries one. Only an irlumed that does not say what is armed
+    // leaves the choice to the arm-time rules.
+    let kind = match kind.or(armed) {
+        Some(irlume_common::KeyringSecretKind::KdeWalletKey) if wallet_salt.is_none() => {
+            eprintln!(
+                "[reseal] '{user}' is armed with a KDE wallet key, but the wallet's salt file \
+                 cannot be found, so the key cannot be derived again. Nothing was sealed. Run \
+                 `irlume keyring forget`, then `irlume keyring arm`."
+            );
+            return ExitCode::FAILURE;
+        }
+        Some(kind) => {
+            if kind != irlume_common::KeyringSecretKind::KdeWalletKey {
+                wallet_salt = None;
+            }
+            Ok(Some(kind))
+        }
         None => crate::secrets::arm_kind_hint(&user, wallet_salt.as_ref()),
+    };
+    println!("[reseal] Re-binding '{user}'s sealed secret to the current TPM/PCR state.");
+    let Some(pw) = prompt_login_password() else {
+        return ExitCode::from(2);
     };
     let reply = kind.and_then(|kind| {
         daemon_request(&Request::SealPassword {

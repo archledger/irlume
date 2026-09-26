@@ -931,10 +931,10 @@ fn the_root_hint_repeats_the_flags_given() {
         sudo_rerun_hint(true, false, false, false),
         "sudo irlume login enable --apply"
     );
+    // A disable takes --force too: past a GNOME keyring token refusal.
     assert_eq!(
         sudo_rerun_hint(false, false, true, true),
-        "sudo irlume login disable --with-polkit --apply",
-        "--force is for enable only"
+        "sudo irlume login disable --with-polkit --apply --force"
     );
 }
 

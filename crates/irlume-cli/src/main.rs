@@ -1648,10 +1648,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
             // password mints no token and skips this check.
             if matches!(kind, Ok(None)) {
                 if let Some(why) = gkr_session::token_arm_refusal(&user, wallet_salt.as_ref()) {
-                    eprintln!(
-                        "[keyring] not armed: {why}. Nothing was changed. Run \
-                         `irlume keyring arm` from a GNOME session."
-                    );
+                    eprintln!("[keyring] not armed: {why}. Nothing was changed.");
                     return std::process::ExitCode::FAILURE;
                 }
             }

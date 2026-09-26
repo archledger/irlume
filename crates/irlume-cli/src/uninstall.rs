@@ -601,6 +601,16 @@ fn closing_line(report: &TeardownReport, snapshots: &SnapshotEvidence) -> String
 /// Run the four teardown steps in the lockout-safe order. Public so the TUI
 /// calls the identical sequence behind its own confirmation.
 pub fn perform_teardown(keep_data: bool) -> TeardownReport {
+    // The state roots outside the default, resolved before anything is
+    // removed: the one irlumed's unit names is lost once the unit goes, and
+    // every one of them is both disarmed and wiped below. The token guard
+    // read the same roots before the teardown began and refused on an error;
+    // one that appears only now (the unit became unreadable since) keeps the
+    // wipe from counting as complete, and with it the SRK eviction.
+    let (extra_roots, roots_unknown) = match extra_state_roots() {
+        Ok(roots) => (roots, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
     // 1. PAM FIRST. Un-wire every greeter, the lock screen, sudo, and polkit
     //    (disable puts the opt-in stacks in scope regardless of flags) so no
     //    stack references pam_irlume.so once the module is removed.
@@ -693,6 +703,11 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     //    failure lands in data_left and pulls data_wiped false.
     let users = irlume_core::storage::list_users();
     let mut data_left: Vec<String> = Vec::new();
+    if let Some(e) = &roots_unknown {
+        data_left.push(format!(
+            "state roots irlumed's unit names (could not be read: {e}; not disarmed or wiped)"
+        ));
+    }
     for user in &users {
         let _ = irlume_core::keyring::forget_password(user);
         if !keep_data {
@@ -712,9 +727,9 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     // default-root enumeration above is blind to these roots for the same
     // environment reason as the token guard; 2026-09-17 audit).
     let mut users_cleared = users.len();
-    for root in extra_state_roots() {
-        for user in irlume_core::storage::list_users_at(&root) {
-            let _ = irlume_core::keyring::forget_password_in(&root, &user);
+    for root in &extra_roots {
+        for user in irlume_core::storage::list_users_at(root) {
+            let _ = irlume_core::keyring::forget_password_in(root, &user);
             users_cleared += 1;
         }
     }
@@ -747,6 +762,25 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
             for dir in wipe_data_trees(&[p]) {
                 data_left.push(format!("{} (user state)", dir.display()));
             }
+        }
+        // And the source-install roots the sweep above does not reach:
+        // root's own, and the one irlumed's unit named (a human home's root
+        // is already gone, which counts as wiped). The unit's value comes
+        // from a configuration file, so only a directory named `irlume`, as
+        // install-host.sh writes it, is removed whole; any other is left and
+        // reported rather than trusted with a recursive delete.
+        let (ours, other): (Vec<PathBuf>, Vec<PathBuf>) = extra_roots
+            .iter()
+            .cloned()
+            .partition(|root| root.file_name().is_some_and(|name| name == "irlume"));
+        for dir in wipe_data_trees(&ours) {
+            data_left.push(format!("{} (state root)", dir.display()));
+        }
+        for dir in other.iter().filter(|dir| dir.exists()) {
+            data_left.push(format!(
+                "{} (state root irlumed's unit names; not an `irlume` directory, so left for you)",
+                dir.display()
+            ));
         }
     }
 
@@ -838,10 +872,180 @@ fn human_homes() -> Vec<std::path::PathBuf> {
 /// State roots outside the environment-resolved default: each human account's
 /// `~/.local/share/irlume`, where a source install keeps the machine state
 /// (`install-host.sh` writes `IRLUME_STATE_DIR` into the unit, not the shell)
-/// and the login runner keeps its records. Only existing directories are
-/// named, and the default root is never duplicated into the list.
-fn extra_state_roots() -> Vec<PathBuf> {
-    extra_state_roots_with(&human_homes(), &irlume_common::state_dir())
+/// and the login runner keeps its records, and root's own, where
+/// `install-host.sh` run directly as root keeps it. Only existing directories
+/// are named, and the default root is never duplicated into the list.
+/// The state root the installed irlumed unit names, which `install-host.sh`
+/// writes for a source install whatever account ran it (one resolved through
+/// NSS, or with a UID outside the human range), is swept too.
+fn extra_state_roots() -> Result<Vec<PathBuf>, String> {
+    let default = irlume_common::state_dir();
+    let mut roots = home_state_roots(&default);
+    for root in unit_state_roots(&default)? {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
+
+/// The per-account state roots: each human account's and root's own.
+fn home_state_roots(default: &Path) -> Vec<PathBuf> {
+    let mut homes = human_homes();
+    homes.extend(root_home());
+    extra_state_roots_with(&homes, default)
+}
+
+/// The state root irlumed's unit names, when it is not `default` and exists
+/// or cannot be inspected (reading it then fails and the sweep refuses,
+/// instead of quietly leaving out the store the daemon uses).
+fn unit_state_roots(default: &Path) -> Result<Vec<PathBuf>, String> {
+    Ok(unit_env("IRLUME_STATE_DIR")?
+        .filter(|root| root != default)
+        .filter(|root| match std::fs::metadata(root) {
+            Ok(meta) => meta.is_dir(),
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        })
+        .into_iter()
+        .collect())
+}
+
+/// systemd's unit directories for system services, highest precedence first.
+const UNIT_LAYERS: [&str; 7] = [
+    "etc/systemd/system.control",
+    "run/systemd/system.control",
+    "run/systemd/transient",
+    "etc/systemd/system",
+    "run/systemd/system",
+    "usr/local/lib/systemd/system",
+    "usr/lib/systemd/system",
+];
+
+/// A directory variable (`IRLUME_STATE_DIR`, `IRLUME_KEYRING_DIR`) as systemd
+/// gives it to irlumed: the unit file from the highest layer that has one
+/// (`install-host.sh` writes /etc, a package ships /usr/lib), then every
+/// layer's drop-ins merged by name, a higher layer's file masking a lower
+/// one's, applied in name order; the last assignment wins, and an empty
+/// `Environment=` resets. A file that exists and cannot be read is an error:
+/// the directory it would name is unknown.
+fn unit_env(var: &str) -> Result<Option<PathBuf>, String> {
+    unit_env_under(Path::new("/"), var)
+}
+
+fn unit_env_under(root: &Path, var: &str) -> Result<Option<PathBuf>, String> {
+    let read = |path: &Path| match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    };
+    let mut texts = Vec::new();
+    for layer in UNIT_LAYERS {
+        if let Some(text) = read(&root.join(layer).join("irlumed.service"))? {
+            texts.push(text);
+            break;
+        }
+    }
+    let mut drop_ins: std::collections::BTreeMap<std::ffi::OsString, PathBuf> =
+        std::collections::BTreeMap::new();
+    for layer in UNIT_LAYERS {
+        let dir = root.join(layer).join("irlumed.service.d");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{}: {e}", dir.display())),
+        };
+        for entry in entries {
+            let path = entry.map_err(|e| format!("{}: {e}", dir.display()))?.path();
+            if path.extension().is_some_and(|ext| ext == "conf") {
+                if let Some(name) = path.file_name() {
+                    // Layers come highest first: the first file of a name wins.
+                    drop_ins.entry(name.to_os_string()).or_insert(path);
+                }
+            }
+        }
+    }
+    for path in drop_ins.values() {
+        texts.extend(read(path)?);
+    }
+    let mut found = None;
+    for text in &texts {
+        found = unit_env_in(text, var, found);
+    }
+    // systemd applies `UnsetEnvironment=` after every `Environment=`, whatever
+    // the order of the lines: a variable it names, bare or with the value it
+    // has, is not in the daemon's environment.
+    if let Some(value) = &found {
+        let assignment = format!("{var}={}", value.display());
+        if texts.iter().any(|text| unit_unsets(text, var, &assignment)) {
+            found = None;
+        }
+    }
+    Ok(found)
+}
+
+/// Whether a unit file's `UnsetEnvironment=` lines name `var`, bare or as the
+/// exact `assignment` it has.
+fn unit_unsets(unit: &str, var: &str, assignment: &str) -> bool {
+    unit.lines()
+        .filter_map(|line| line.trim().strip_prefix("UnsetEnvironment="))
+        .flat_map(str::split_whitespace)
+        .map(|word| word.trim_matches('"'))
+        .any(|word| word == var || word == assignment)
+}
+
+/// The keyring directory irlumed's unit points `IRLUME_KEYRING_DIR` at, when
+/// it is not the one this process uses: a separately started CLI does not
+/// inherit the daemon's environment, so its own default misses that store.
+fn unit_keyring_dirs() -> Result<Vec<PathBuf>, String> {
+    Ok(unit_env("IRLUME_KEYRING_DIR")?.into_iter().collect())
+}
+
+/// `<var>` after a unit file's `Environment=` lines, starting from `found`:
+/// each line holds space-separated assignments, any of them in double quotes,
+/// and an empty `Environment=` resets the list.
+fn unit_env_in(unit: &str, var: &str, mut found: Option<PathBuf>) -> Option<PathBuf> {
+    for line in unit.lines() {
+        let Some(value) = line.trim().strip_prefix("Environment=") else {
+            continue;
+        };
+        if value.trim().is_empty() {
+            found = None;
+            continue;
+        }
+        let (mut word, mut quoted, mut words) = (String::new(), false, Vec::new());
+        for c in value.chars() {
+            match c {
+                '"' => quoted = !quoted,
+                ' ' | '\t' if !quoted => words.push(std::mem::take(&mut word)),
+                c => word.push(c),
+            }
+        }
+        words.push(word);
+        for word in words {
+            if let Some(dir) = word
+                .strip_prefix(var)
+                .and_then(|rest| rest.strip_prefix('='))
+            {
+                found = Some(PathBuf::from(dir));
+            }
+        }
+    }
+    found.filter(|dir| dir.is_absolute())
+}
+
+/// Root's home from `/etc/passwd` (uid 0), `None` when it cannot be read.
+fn root_home() -> Option<PathBuf> {
+    root_home_in(&std::fs::read_to_string("/etc/passwd").ok()?)
+}
+
+fn root_home_in(passwd: &str) -> Option<PathBuf> {
+    passwd.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        (fields.get(2) == Some(&"0"))
+            .then(|| fields.get(5).filter(|home| home.starts_with('/')))
+            .flatten()
+            .map(PathBuf::from)
+    })
 }
 
 /// [`extra_state_roots`] with the homes and default root injected, so the
@@ -864,8 +1068,51 @@ fn extra_state_roots_with(homes: &[PathBuf], default_root: &Path) -> Vec<PathBuf
 fn sealed_token_holders() -> Result<Vec<String>, String> {
     sealed_token_holders_with(
         irlume_core::keyring::list_sealed_kinds(),
-        &extra_state_roots(),
+        &extra_state_roots()?,
+        &unit_keyring_dirs()?,
     )
+}
+
+/// [`sealed_token_holders`] for the login guards (`login disable`, a
+/// stranding enable, a machine rollback): a per-user state root counts only
+/// when its keyring directory is a real directory owned by root, which only
+/// a root irlumed writes. A user owns their home, so without that anyone
+/// could plant an envelope, or an unreadable one, that makes a root disable
+/// refuse, and the machine API has no `--force` past it. The uninstall sweep
+/// deletes those trees, so it keeps counting every envelope in them.
+pub(crate) fn root_sealed_token_holders() -> Result<Vec<String>, String> {
+    let default = irlume_common::state_dir();
+    let mut roots = Vec::new();
+    for root in home_state_roots(&default) {
+        if root_owned_dir(&root.join("keyring"))? {
+            roots.push(root);
+        }
+    }
+    // What irlumed's own unit names is trusted by where it comes from (a unit
+    // file only root writes), links followed as irlumed follows them.
+    roots.extend(unit_state_roots(&default)?);
+    let mut dirs = Vec::new();
+    for dir in unit_keyring_dirs()? {
+        match std::fs::metadata(&dir) {
+            Ok(meta) if meta.is_dir() => dirs.push(dir),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{}: {e}", dir.display())),
+        }
+    }
+    sealed_token_holders_with(irlume_core::keyring::list_sealed_kinds(), &roots, &dirs)
+}
+
+/// Whether `path` is a real directory (not a link to one) owned by root. A
+/// path that is missing is not; one whose metadata cannot be read is an
+/// error, since it may be the store that holds a token.
+fn root_owned_dir(path: &Path) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(meta.is_dir() && meta.uid() == 0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
 }
 
 /// [`sealed_token_holders`] with the default-root enumeration and the extra
@@ -873,6 +1120,7 @@ fn sealed_token_holders() -> Result<Vec<String>, String> {
 fn sealed_token_holders_with(
     default: irlume_common::Result<Vec<(String, irlume_core::envelope::SecretKind)>>,
     roots: &[PathBuf],
+    keyring_dirs: &[PathBuf],
 ) -> Result<Vec<String>, String> {
     let mut holders: Vec<String> = Vec::new();
     let mut collect = |sealed: Vec<(String, irlume_core::envelope::SecretKind)>| {
@@ -889,6 +1137,12 @@ fn sealed_token_holders_with(
         collect(
             irlume_core::keyring::list_sealed_kinds_in(root)
                 .map_err(|e| format!("{}: {e}", root.join("keyring").display()))?,
+        );
+    }
+    for dir in keyring_dirs {
+        collect(
+            irlume_core::keyring::list_sealed_kinds_at(dir)
+                .map_err(|e| format!("{}: {e}", dir.display()))?,
         );
     }
     Ok(holders)
@@ -1438,6 +1692,197 @@ mod tests {
     // remove_dir_all on a regular FILE fails on any filesystem, root or not, so
     // the failure fixture is deterministic.
     #[test]
+    fn only_a_real_root_owned_directory_is_trusted() {
+        assert_eq!(root_owned_dir(Path::new("/")), Ok(true));
+        let dir = std::env::temp_dir().join(format!("irlume-root-owned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        assert_eq!(
+            root_owned_dir(&link),
+            Ok(false),
+            "a link to a root-owned directory"
+        );
+        if !is_root() {
+            assert_eq!(
+                root_owned_dir(&dir),
+                Ok(false),
+                "a directory this user owns"
+            );
+        }
+        assert_eq!(root_owned_dir(&dir.join("missing")), Ok(false));
+        // Under a directory this process cannot search, the answer is unknown.
+        if !is_root() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let closed = dir.join("closed");
+            std::fs::create_dir_all(closed.join("keyring")).unwrap();
+            std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let answer = root_owned_dir(&closed.join("keyring"));
+            std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(answer.is_err_and(|e| e.contains("closed/keyring")));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_unit_environment_follows_systemd_layering() {
+        let root = std::env::temp_dir().join(format!("irlume-unit-layers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let put = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let env = |var: &str| unit_env_under(&root, var).unwrap();
+        assert_eq!(env("IRLUME_STATE_DIR"), None, "no unit anywhere");
+        // A packaged unit under /usr/lib, then /etc's copy of the unit wins.
+        put(
+            "usr/lib/systemd/system/irlumed.service",
+            "[Service]\nEnvironment=IRLUME_STATE_DIR=/a\n",
+        );
+        assert_eq!(env("IRLUME_STATE_DIR"), Some(PathBuf::from("/a")));
+        put(
+            "etc/systemd/system/irlumed.service",
+            "[Service]\nExecStart=/x\n",
+        );
+        assert_eq!(
+            env("IRLUME_STATE_DIR"),
+            None,
+            "only the highest unit file counts"
+        );
+        // Drop-ins from every layer, in name order; /etc masks /run by name.
+        put(
+            "run/systemd/system/irlumed.service.d/10-state.conf",
+            "[Service]\nEnvironment=IRLUME_STATE_DIR=/run\n",
+        );
+        assert_eq!(env("IRLUME_STATE_DIR"), Some(PathBuf::from("/run")));
+        put(
+            "etc/systemd/system/irlumed.service.d/10-state.conf",
+            "[Service]\nEnvironment=IRLUME_STATE_DIR=/etc\n",
+        );
+        assert_eq!(env("IRLUME_STATE_DIR"), Some(PathBuf::from("/etc")));
+        put(
+            "usr/lib/systemd/system/irlumed.service.d/20-keys.conf",
+            "[Service]\nEnvironment=IRLUME_KEYRING_DIR=/keys\n",
+        );
+        assert_eq!(env("IRLUME_KEYRING_DIR"), Some(PathBuf::from("/keys")));
+        // An empty assignment resets what came before.
+        put(
+            "run/systemd/system/irlumed.service.d/30-reset.conf",
+            "[Service]\nEnvironment=\n",
+        );
+        assert_eq!(env("IRLUME_STATE_DIR"), None);
+        // UnsetEnvironment= removes a variable whatever came after it.
+        put(
+            "run/systemd/system/irlumed.service.d/30-reset.conf",
+            "[Service]\nUnsetEnvironment=IRLUME_KEYRING_DIR\n",
+        );
+        put(
+            "usr/lib/systemd/system/irlumed.service.d/40-keys.conf",
+            "[Service]\nEnvironment=IRLUME_KEYRING_DIR=/later\n",
+        );
+        assert_eq!(env("IRLUME_KEYRING_DIR"), None);
+        assert_eq!(env("IRLUME_STATE_DIR"), Some(PathBuf::from("/etc")));
+        put(
+            "run/systemd/system/irlumed.service.d/30-reset.conf",
+            "[Service]\nUnsetEnvironment=IRLUME_STATE_DIR=/elsewhere\n",
+        );
+        assert_eq!(
+            env("IRLUME_STATE_DIR"),
+            Some(PathBuf::from("/etc")),
+            "another value"
+        );
+        put(
+            "run/systemd/system/irlumed.service.d/30-reset.conf",
+            "[Service]\nUnsetEnvironment=IRLUME_STATE_DIR=/etc\n",
+        );
+        assert_eq!(env("IRLUME_STATE_DIR"), None, "the value it has");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_keyring_directory_the_unit_names_is_swept_too() {
+        let dir = std::env::temp_dir().join(format!("irlume-unit-keyring-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("carol.json"),
+            r#"{"version":1,"secret":"GnomeKeyringToken","pcrs":[],"public":"","private":""}"#,
+        )
+        .unwrap();
+        let holders =
+            sealed_token_holders_with(Ok(Vec::new()), &[], std::slice::from_ref(&dir)).unwrap();
+        assert_eq!(holders, vec!["carol".to_string()]);
+        std::fs::write(dir.join("dave.json"), b"not an envelope").unwrap();
+        let err =
+            sealed_token_holders_with(Ok(Vec::new()), &[], std::slice::from_ref(&dir)).unwrap_err();
+        assert!(err.contains(dir.to_str().unwrap()), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            unit_env_in(
+                "Environment=IRLUME_KEYRING_DIR=/srv/keys IRLUME_STATE_DIR_X=/x\n",
+                "IRLUME_KEYRING_DIR",
+                None
+            ),
+            Some(PathBuf::from("/srv/keys"))
+        );
+        assert_eq!(
+            unit_env_in(
+                "Environment=IRLUME_STATE_DIR_X=/x\n",
+                "IRLUME_STATE_DIR",
+                None
+            ),
+            None,
+            "a longer name is another variable"
+        );
+    }
+
+    #[test]
+    fn the_unit_names_the_state_root_install_host_configured() {
+        let unit = "[Service]\nExecStart=/usr/local/bin/irlumed\n\
+            Environment=\"ORT_DYLIB_PATH=/opt/ort/libonnxruntime.so\"\n\
+            Environment=\"IRLUME_STATE_DIR=/home/ldap user/.local/share/irlume\"\n";
+        assert_eq!(
+            unit_env_in(unit, "IRLUME_STATE_DIR", None),
+            Some(PathBuf::from("/home/ldap user/.local/share/irlume"))
+        );
+        assert_eq!(
+            unit_env_in(
+                "Environment=A=1 IRLUME_STATE_DIR=/srv/irlume B=2\n",
+                "IRLUME_STATE_DIR",
+                None
+            ),
+            Some(PathBuf::from("/srv/irlume"))
+        );
+        assert_eq!(
+            unit_env_in("[Service]\nExecStart=/x\n", "IRLUME_STATE_DIR", None),
+            None
+        );
+        assert_eq!(
+            unit_env_in(
+                "Environment=IRLUME_STATE_DIR=relative\n",
+                "IRLUME_STATE_DIR",
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn root_home_comes_from_the_uid_0_entry() {
+        assert_eq!(
+            root_home_in("bin:x:1:1::/:/sbin/nologin\nroot:x:0:0:root:/var/root:/bin/sh\n"),
+            Some(PathBuf::from("/var/root"))
+        );
+        assert_eq!(root_home_in("root:x:0:0:root::/bin/sh\n"), None, "no home");
+        assert_eq!(
+            root_home_in("alice:x:1000:1000::/home/alice:/bin/sh\n"),
+            None
+        );
+    }
+
+    #[test]
     fn human_homes_skips_system_accounts_and_malformed_lines() {
         // Invariant test (no /etc/passwd fixture): every returned home is an
         // absolute path belonging to a human account; a machine with no human
@@ -1622,8 +2067,8 @@ mod tests {
         let root = base.join("home/.local/share/irlume");
         std::fs::create_dir_all(root.join("keyring")).unwrap();
         std::fs::write(root.join("keyring/carol.json"), b"not an envelope").unwrap();
-        let err =
-            sealed_token_holders_with(Ok(Vec::new()), std::slice::from_ref(&root)).unwrap_err();
+        let err = sealed_token_holders_with(Ok(Vec::new()), std::slice::from_ref(&root), &[])
+            .unwrap_err();
         assert!(
             err.contains(root.join("keyring").to_str().unwrap()),
             "error must name the swept root: {err}"
@@ -1636,6 +2081,7 @@ mod tests {
                 "alice".into(),
                 irlume_core::envelope::SecretKind::LoginPassword,
             )]),
+            &[],
             &[],
         )
         .unwrap();

@@ -19,7 +19,26 @@ pub(crate) fn isolated_root_command(
     hidden: &[&str],
     binds: &[(&Path, &str)],
 ) -> Command {
-    namespace_command(root, bin, args, tools, hidden, binds)
+    namespace_command(root, bin, args, tools, hidden, binds, true)
+}
+
+/// [`isolated_root_command`] in the host's PID namespace, for a test whose
+/// command must see a process the test started outside it: a Unix socket
+/// peer's pid is reported as 0 across PID namespaces, and `/proc` shows
+/// only the namespace's own processes.
+#[allow(
+    dead_code,
+    reason = "cli_dispatch.rs shares this module and needs no host pid"
+)]
+pub(crate) fn isolated_root_command_with_host_pids(
+    root: &Path,
+    bin: &str,
+    args: &[&str],
+    tools: &[&str],
+    hidden: &[&str],
+    binds: &[(&Path, &str)],
+) -> Command {
+    namespace_command(root, bin, args, tools, hidden, binds, false)
 }
 
 /// Bind `source` at `destination` inside the namespace.
@@ -58,6 +77,7 @@ fn namespace_command(
     tools: &[&str],
     hidden: &[&str],
     binds: &[(&Path, &str)],
+    unshare_pid: bool,
 ) -> Command {
     let shell = std::fs::canonicalize("/bin/sh").expect("resolve /bin/sh for sandbox");
     let usr_bin = std::fs::canonicalize("/usr/bin").expect("resolve /usr/bin for sandbox");
@@ -90,7 +110,6 @@ fn namespace_command(
             "0",
             "--gid",
             "0",
-            "--unshare-pid",
             "--unshare-net",
             "--unshare-ipc",
             "--unshare-uts",
@@ -100,6 +119,9 @@ fn namespace_command(
             "/",
         ])
         .args(["--tmpfs", "/run"]);
+    if unshare_pid {
+        command.arg("--unshare-pid");
+    }
     for dir in hidden {
         // Same canonical spelling rule as the tool prefixes below; a directory
         // the host lacks is already absent under the read-only root.
@@ -125,8 +147,13 @@ fn namespace_command(
             .args(["--ro-bind", fake.to_str().unwrap()])
             .arg(format!("/usr/bin/{tool}"));
     }
+    command.args(["--dev", "/dev"]);
+    // A fresh procfs needs a PID namespace of its own; otherwise the host's
+    // `/proc`, read-only under the root bind, stays in place.
+    if unshare_pid {
+        command.args(["--proc", "/proc"]);
+    }
     command
-        .args(["--dev", "/dev", "--proc", "/proc"])
         .args(["--bind", root.to_str().unwrap(), root.to_str().unwrap()])
         .args(["--chdir", root.join("work").to_str().unwrap(), "--", bin])
         .args(args)
@@ -193,7 +220,7 @@ done
         supplied,
         supplied,
     );
-    let output = namespace_command(root, "/usr/bin/sh", &["-c", &script], tools, &[], &[])
+    let output = namespace_command(root, "/usr/bin/sh", &["-c", &script], tools, &[], &[], true)
         .output()
         .expect("spawn isolated command-path assertion");
     assert!(

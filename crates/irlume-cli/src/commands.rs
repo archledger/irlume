@@ -1835,10 +1835,7 @@ pub fn setup(args: &[String]) -> ExitCode {
             let kind = match kind {
                 Ok(None) => {
                     match crate::gkr_session::token_arm_refusal(&user, wallet_salt.as_ref()) {
-                        Some(why) => Err(format!(
-                            "{why}. Nothing was changed. Run `irlume keyring arm` \
-                             from a GNOME session."
-                        )),
+                        Some(why) => Err(format!("{why}. Nothing was changed.")),
                         None => Ok(None),
                     }
                 }

@@ -20,6 +20,7 @@ irlume-auth.workspace = true
 irlume-fingerprint.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 libc.workspace = true   # restore default SIGPIPE so `irlume … | head` doesn't panic
 rand.workspace = true   # session and operation identifiers for the machine event stream
 image = { workspace = true }

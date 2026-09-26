@@ -34,11 +34,13 @@ use std::process::{Command, ExitCode};
 // greeter files (a GDM box gets the face `unseal` line and the fingerprint
 // keyring line in one `/etc/pam.d/gdm-password`, in a required order), so a
 // face/fingerprint split would put one ordering invariant under two owners.
+mod autologin;
 mod files;
 mod grammar;
 mod overrides;
 mod report;
 mod stanzas;
+mod token;
 mod transform;
 
 #[cfg(test)]
@@ -65,6 +67,9 @@ pub(crate) use report::{
     keyring_handoff_warnings, login_manager_fact, status_report, surface_facts, HandoffWarning,
 };
 pub(crate) use stanzas::BACKUP;
+pub(crate) use token::{
+    token_delivery_refusal, tokens_a_disable_strands, tokens_a_restore_strands,
+};
 
 /// A PAM service to wire. With `vendor` set and no administrator's `/etc` file,
 /// irlume keeps an `/etc` override made from the vendor copy; otherwise it
@@ -263,16 +268,14 @@ pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
     let with_sudo = args.iter().any(|a| a == "--with-sudo");
     let with_polkit = args.iter().any(|a| a == "--with-polkit");
     let force = args.iter().any(|a| a == "--force");
-    // `--force` rebuilds overrides an administrator edited. Only a person
-    // running `enable` may ask for that; reconcile runs unattended, and a
-    // status must never be mistaken for a way to apply it.
+    // `--force` is a person overriding a refusal: an enable rebuilds
+    // overrides an administrator edited, and a disable goes ahead although a
+    // GNOME keyring token depends on the line it removes. Reconcile runs
+    // unattended, and a status must never be mistaken for a way to apply it.
     if force && !matches!(action, Some("enable" | "disable")) {
         eprintln!("{LOGIN_USAGE}");
-        eprintln!("  (--force applies to login enable only)");
+        eprintln!("  (--force applies to login enable and disable only)");
         return ExitCode::from(2);
-    }
-    if force && action == Some("disable") {
-        eprintln!("[login] note: --force applies to login enable only");
     }
     // On NixOS the system configuration generates the stacks, and the flake
     // module writes irlume's rules. Refused ahead of the root check, the PAM
@@ -290,7 +293,7 @@ pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
         Some("enable") => act(true, apply, with_sudo, with_polkit, force),
-        Some("disable") => act(false, apply, with_sudo, with_polkit, false),
+        Some("disable") => act(false, apply, with_sudo, with_polkit, force),
         Some("reconcile") => reconcile(),
         _ => {
             eprintln!("{LOGIN_USAGE}");
@@ -1373,6 +1376,7 @@ const ROLE_POLKIT: &str = "polkit";
 /// Extracted so the human `login enable` report and the machine plan derive
 /// their intent from one place. Two copies of this rule drifting apart would
 /// have the plan promise one thing and the apply do another.
+#[derive(Clone, Copy)]
 pub(crate) struct Wants {
     /// Face releases the login credential only on the Secure (IR) tier.
     pub(crate) face_login: bool,
@@ -1383,7 +1387,18 @@ pub(crate) struct Wants {
 }
 
 /// `Auto` follows the hardware; an explicit method overrides it.
+///
+/// Read once per process, as the capabilities it starts from are
+/// (`crate::caps`): the token guard, the plan and the writes of one run then
+/// decide from the same method setting and fingerprint availability, instead
+/// of each reading its own, which a method change or a reader coming and
+/// going between them could make disagree.
 pub(crate) fn wants() -> Wants {
+    static WANTS: std::sync::OnceLock<Wants> = std::sync::OnceLock::new();
+    *WANTS.get_or_init(read_wants)
+}
+
+fn read_wants() -> Wants {
     let caps = crate::caps();
     let method = irlume_core::policy::method();
     let is_fp_method = method.face_disabled(); // Method::Fingerprint
@@ -1459,6 +1474,24 @@ fn walk_surfaces(enable: bool, with_sudo: bool, with_polkit: bool, visit: &mut S
     if polkit_in_scope(enable, with_polkit) {
         visit(&POLKIT, ROLE_POLKIT, &wire_polkit_service, true);
     }
+}
+
+/// The accounts whose GNOME keyring token this login run would leave with
+/// no delivery: every token holder when the run leaves a login stack that
+/// carries irlume's `reseal` line without irlume's lines. A disable leaves
+/// every one so, without asking what the configuration wants; an enable
+/// leaves those the configuration no longer wants wired.
+pub(crate) fn tokens_a_run_strands(enable: bool) -> Result<Vec<String>, String> {
+    if !enable {
+        return tokens_a_disable_strands();
+    }
+    let mut dropping: Vec<&'static str> = Vec::new();
+    walk_surfaces(true, false, false, &mut |svc, role, _wire, want| {
+        if (role == ROLE_LOGIN || role == ROLE_LOGIN_FP) && !want {
+            dropping.push(svc.etc);
+        }
+    });
+    token::tokens_stranded_by(&dropping)
 }
 
 pub(crate) fn plan(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<PlannedSurface> {
@@ -1898,7 +1931,7 @@ fn sudo_rerun_hint(enable: bool, with_sudo: bool, with_polkit: bool, force: bool
         if enable { "enable" } else { "disable" },
         if with_sudo { " --with-sudo" } else { "" },
         if with_polkit { " --with-polkit" } else { "" },
-        if force && enable { " --force" } else { "" }
+        if force { " --force" } else { "" }
     )
 }
 
@@ -2082,6 +2115,39 @@ fn act_holding_lock(
              (or, if it will not start, `irlume doctor` says why)"
         );
         return ExitCode::FAILURE;
+    }
+    // A run that leaves a login stack without the session line delivering a
+    // GNOME keyring token (every disable, and an enable whose configuration
+    // no longer wants that stack wired) leaves that keyring locked at every
+    // login under a secret nobody has seen. Refused while any account holds
+    // one, unless the person says otherwise; `irlume uninstall` refuses the
+    // same way first, and reconcile has no override. Asked after the
+    // capability check, so an enable decides from established capabilities.
+    // A dry run names the refusal the apply would make; unprivileged, it may
+    // be unable to read the envelope store, and then only says the apply
+    // will check.
+    if !(origin == ScopeOrigin::Command && force) {
+        match tokens_a_run_strands(enable) {
+            Ok(users) if users.is_empty() => {}
+            Ok(users) => {
+                for line in token::stranded_lines(&users) {
+                    eprintln!("{line}");
+                }
+                return ExitCode::FAILURE;
+            }
+            Err(store) if apply => {
+                eprintln!(
+                    "[login] refusing: could not read the sealed-envelope store ({store}), so \
+                     irlume cannot tell whether a login keyring depends on the session line \
+                     this run removes. Fix the store, or re-run with --force."
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(store) => println!(
+                "  (could not check for GNOME keyring tokens here: {store}; `--apply` checks \
+                 as root)"
+            ),
+        }
     }
     // Method + tier aware plan: wire exactly what the chosen method needs on
     // this hardware, and (on enable) UNWIRE what it doesn't, so switching method

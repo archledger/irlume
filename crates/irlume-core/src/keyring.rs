@@ -266,6 +266,16 @@ pub fn list_sealed_kinds_in(state_root: &Path) -> Result<Vec<(String, SecretKind
     sealed_kinds_at(&state_root.join("keyring"))
 }
 
+/// [`list_sealed_kinds`] over an explicit keyring directory, such as one
+/// irlumed's unit points `IRLUME_KEYRING_DIR` at, which a separately started
+/// CLI does not inherit.
+///
+/// # Errors
+/// Same conditions as [`list_sealed_kinds`].
+pub fn list_sealed_kinds_at(dir: &Path) -> Result<Vec<(String, SecretKind)>> {
+    sealed_kinds_at(dir)
+}
+
 fn sealed_kinds_at(dir: &Path) -> Result<Vec<(String, SecretKind)>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,

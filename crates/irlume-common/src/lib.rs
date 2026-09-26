@@ -877,9 +877,7 @@ pub enum Request {
         /// (a session being opened, whose own desktop logind already lists
         /// as live), and any module from before this field, so an older
         /// module meeting a newer daemon during an upgrade still gets its
-        /// token. The module also asks nothing from the auth phase while the
-        /// account has a live local desktop, which covers a newer module
-        /// meeting an older daemon.
+        /// token.
         #[serde(default)]
         auth_phase: bool,
     },

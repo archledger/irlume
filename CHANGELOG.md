@@ -771,13 +771,12 @@ All notable changes to irlume are documented here. This project adheres to
   the sealed keyring secret. The fingerprint `keyring` line asked irlumed
   for it although that desktop's own login had opened the keyring or
   wallet already, and the release re-opened a keyring its owner had locked
-  by hand, or started the KDE wallet daemon. pam_irlume now asks for
-  nothing from the auth phase while the account has a live local desktop,
-  and irlumed refuses such a request itself, for every kind of secret: a
-  user session that is active or online, of type x11, wayland or mir, and
-  not remote counts, an SSH login or a text console does not. A cold login
-  releases as before, and a typed-password login still receives its GNOME
-  keyring token in the session phase (#863).
+  by hand, or started the KDE wallet daemon. irlumed now refuses that
+  auth-phase request while the account has a live local desktop, for every
+  kind of secret: a user session that is active or online, of type x11,
+  wayland or mir, and not remote counts, an SSH login or a text console
+  does not. A cold login releases as before, and a typed-password login
+  still receives its GNOME keyring token in the session phase (#863).
 
 ## [0.14.0] - 2026-09-19
 

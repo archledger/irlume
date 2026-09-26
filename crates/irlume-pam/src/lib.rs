@@ -313,15 +313,9 @@ impl PamServiceModule for IrlumePam {
                     .ok()
                     .flatten()
                     .and_then(|c| c.to_str().ok().map(str::to_string));
-                // A lock-screen unlock of a running desktop needs nothing:
-                // that desktop's login opened its keyring or wallet, and a
-                // release here would re-open one its owner locked by hand.
-                // irlumed refuses such a release too; asking nothing here
-                // also holds while an older irlumed still runs during an
-                // upgrade.
-                if irlume_common::platform::user_has_live_session(&user) {
-                    return PamError::IGNORE;
-                }
+                // Marked as the auth phase: irlumed releases nothing to it
+                // while the account has a live local desktop, which is what
+                // a lock-screen unlock of that desktop is.
                 if let Ok(Response::PasswordUnsealed { secret, kind }) =
                     request(&Request::UnsealKeyring {
                         user: user.clone(),

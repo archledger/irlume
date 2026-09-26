@@ -48,9 +48,10 @@ shipped acceleration guarantee.
 
 - Test discipline toward the OpenSSF silver criteria: measure statement
   coverage (cargo-llvm-cov), and add a regression test with every bug fix
-  that can be tested without hardware. With the Tier-1 signed-PCR unseal now
-  working (see below), the `seal_unseal_signed_pcr_roundtrip_real_hardware`
+  that can be tested without hardware. The Tier-1 signed-PCR unseal works
+  (see below), and the `seal_unseal_signed_pcr_roundtrip_real_hardware`
   test on a systemd-boot/UKI host covers `seal_authorized` / `unseal_authorized`
+  (new seals no longer use Tier 1; the test proves older envelopes unseal)
   and an earlier full suite reached ~80.1% line coverage. The v0.14.0
   [September 19 nightly run](https://github.com/archledger/irlume/actions/runs/35447111819)
   recorded 83.03% line coverage; neither figure is a timeless coverage claim.

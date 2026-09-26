@@ -4398,7 +4398,7 @@ fn doctor_run(
         report,
         "[doctor] signed PCR policy: {}",
         if irlume_core::pcrsig::signed_policy_available() {
-            "systemd PCR-11 signature present ✓; kernel updates won't need re-seal"
+            "systemd PCR-11 signature present; not used for new seals (it binds only what the booted OS measures)"
         } else {
             "none (no Tier 1 on this boot chain)"
         }

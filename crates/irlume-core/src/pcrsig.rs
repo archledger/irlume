@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright the irlume contributors.
 
-//! Consume systemd's signed-PCR-policy artifacts (the Tier-1 / UKI path).
+//! Read systemd's signed-PCR-policy artifacts (the Tier-1 / UKI path).
 //!
 //! When a Unified Kernel Image is built with `ukify --pcr-private-key` /
 //! `--pcr-public-key` (or `systemd-measure sign`), systemd-stub exposes, at
@@ -14,10 +14,12 @@
 //! or re-enrollment. This module discovers and parses those files; the TPM
 //! `PolicyAuthorize` machinery lives in [`crate::tpm`].
 //!
-//! This is the path that applies on systemd-boot / UKI distros (Arch, and any
-//! Fedora/Pop install using a signed UKI). On a GRUB2 box with no signed UKI the
-//! artifacts are absent, [`signed_policy_available`] is false, and the caller
-//! falls back to the pcrlock (Tier 2) or literal-PCR (Tier 3) path.
+//! [`crate::tpm::seal`] no longer seals under this policy: it binds only
+//! PCR 11, which the operating system measures itself, and the ladder prefers
+//! pcrlock (Tier 2) or literal PCR 7 (Tier 3). The module stays for unsealing
+//! Tier 1 envelopes earlier releases wrote, until their next verified reseal
+//! moves them, and for diagnostics that say whether a boot chain publishes a
+//! signature ([`signed_policy_available`]).
 //!
 //! Signature-file schema (one array per PCR bank):
 //! ```json

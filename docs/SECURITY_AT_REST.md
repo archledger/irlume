@@ -49,12 +49,15 @@ matching also requires passing IR liveness; an inverted RGB image can't.)
 3. **Key custody: TPM-sealed, never on disk in the clear.** The AES key is a
    random 32 bytes sealed by the TPM. The stored key envelope holds only the
    TPM `public`/`private` blobs; the `private` is wrapped under the TPM's
-   Storage Root Key with a **PCR policy**: the strongest of a signed PCR-11
-   policy (Tier 1, which measures the boot chain), a provisioned systemd-pcrlock
-   NV policy (Tier 2), or the literal **PCR-7** policy (Tier 3, the default on
-   most machines). Note Tier 3 binds to the Secure Boot **state** (PCR 7), not
-   the loaded kernel/initrd, so a validly-signed but modified kernel does not
-   move it; Tiers 1 and 2 are the ones that bind boot-component measurements.
+   Storage Root Key with a **PCR policy**: a provisioned systemd-pcrlock NV
+   policy (Tier 2) where one exists, else the literal **PCR-7** policy (Tier 3,
+   the default on most machines). Note Tier 3 binds to the Secure Boot
+   **state** (PCR 7), not the loaded kernel/initrd, so a validly-signed but
+   modified kernel does not move it; Tier 2 is the one that binds
+   boot-component measurements. A signed PCR-11 policy (Tier 1), which earlier
+   releases preferred on UKI machines, binds only what the operating system
+   measures itself, so new seals no longer use it and an existing Tier 1
+   envelope moves on its next reseal.
    The plaintext key exists only transiently in the daemon's memory (zeroized
    on drop).
 
@@ -72,12 +75,12 @@ chain and, for fingerprint sensors, Microsoft-issued factory certificates
 after Microsoft retired the hardware page that documented them).
 
 What corresponds: both seal biometric-derived secrets to a TPM 2.0, and both
-gate their release on firmware-measured state. irlume's signed PCR-11 policy
-(Tier 1) and pcrlock policy (Tier 2) are the closest analog to SDEV-style
-firmware attestation of the sensor chain: a signed statement, checked before
-the credential moves, that the machine below the credential is the one that
-was measured. The literal PCR-7 policy (Tier 3) is the deliberately weaker
-corner: boot-chain *state*, not component measurements.
+gate their release on firmware-measured state. irlume's pcrlock policy
+(Tier 2) is the closest analog to SDEV-style firmware attestation of the
+sensor chain: a statement, checked before the credential moves, that the
+machine below the credential is the one that was measured. The literal PCR-7
+policy (Tier 3) is the weaker corner: boot-chain *state*, not component
+measurements.
 
 What does not correspond, stated plainly: ESS isolates the matching engine
 in a hypervisor; Linux has no equivalent here, and irlume runs in the normal

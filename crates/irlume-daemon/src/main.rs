@@ -3255,6 +3255,21 @@ fn unseal_keyring(user: &str, service: Option<&str>, have_password: bool, peer: 
             return Response::Error(format!("keyring unseal not allowed for {class:?}"));
         }
     }
+    // Released for the login that opens a keyring or wallet, never for an
+    // unlock of a desktop that is already running: that desktop's own login
+    // opened them, and a release here would re-open a keyring its owner
+    // locked by hand, or start a wallet daemon, after nothing more than a
+    // fingerprint at the lock screen (ADR-0003). So with a live local
+    // graphical session for the account nothing is unsealed, whatever the
+    // kind. Handing a GNOME keyring token to a session whose keyring is
+    // locked belongs to the session phase, after the unlock succeeded, and
+    // is not made here: this auth-phase release was dropped there anyway.
+    if crate::users::uid_for_name(&user).is_some_and(attempt_record::has_local_graphical_session) {
+        jout_info!(
+            "irlumed: UnsealKeyring: '{user}' has a live local graphical session; nothing released"
+        );
+        return Response::KeyringUnlockNotNeeded;
+    }
     // A typed password already opens a password-keyed keyring or KDE wallet, so touching the
     // TPM would spend an unseal (up to seconds on a discrete TPM) to release a
     // secret the caller then discards. For a token envelope the typed password
@@ -16729,6 +16744,69 @@ mod tests {
             assert!(matches!(no_password, Response::Error(_)));
             assert!(matches!(elevation, Response::Error(_)));
             assert!(matches!(unprivileged, Response::Error(_)));
+        }
+    }
+
+    /// A keyring release for an account with a live local graphical session
+    /// (a lock-screen unlock of its desktop, or a second login while it
+    /// runs) unseals nothing, whatever is armed: that desktop's login opened
+    /// the keyring or wallet already (ADR-0003). An SSH login alone is not
+    /// such a session, so a cold release still goes ahead.
+    #[test]
+    fn a_warm_unlock_releases_no_keyring_secret() {
+        let _g = env_lock();
+        let sb = sandbox("warm-keyring");
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let user = crate::users::name_for_uid(uid).expect("the test runs as a named account");
+        let sessions = sb.dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        *attempt_record::SESSIONS_ROOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(sessions.clone());
+        let path = irlume_core::keyring::envelope_path(&user);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // An invalid TCTI keeps every release that goes ahead off a real TPM:
+        // it fails there, which tells it apart from a skipped one.
+        let previous = std::env::var_os("IRLUME_TCTI");
+        std::env::set_var("IRLUME_TCTI", "invalid-irlume-test-tcti");
+        let session = |remote: &str, kind: &str| {
+            format!("UID={uid}\nSTATE=active\nREMOTE={remote}\nTYPE={kind}\nCLASS=user\n")
+        };
+        let mut outcomes = Vec::new();
+        for kind in ["LoginPassword", "KdeWalletKey", "GnomeKeyringToken"] {
+            let envelope = serde_json::json!({
+                "version": 1, "secret": kind, "pcrs": [], "public": "", "private": ""
+            });
+            std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+            let _ = std::fs::remove_file(sessions.join("2"));
+            std::fs::write(sessions.join("c1"), session("1", "tty")).unwrap();
+            let cold = unseal_keyring(&user, Some("plasmalogin"), false, &peer(0));
+            std::fs::write(sessions.join("2"), session("0", "wayland")).unwrap();
+            let lock = unseal_keyring(&user, Some("kde"), false, &peer(0));
+            let login = unseal_keyring(&user, Some("plasmalogin"), false, &peer(0));
+            outcomes.push((kind, cold, lock, login));
+        }
+        *attempt_record::SESSIONS_ROOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_TCTI", value),
+            None => std::env::remove_var("IRLUME_TCTI"),
+        }
+        for (kind, cold, lock, login) in outcomes {
+            assert!(
+                matches!(cold, Response::Error(_)),
+                "{kind}: a cold release goes ahead"
+            );
+            assert!(
+                matches!(lock, Response::KeyringUnlockNotNeeded),
+                "{kind}: {lock:?}"
+            );
+            assert!(
+                matches!(login, Response::KeyringUnlockNotNeeded),
+                "{kind}: {login:?}"
+            );
         }
     }
 

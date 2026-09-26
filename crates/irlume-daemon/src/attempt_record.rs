@@ -165,6 +165,64 @@ fn session_state_from(
     )
 }
 
+/// Whether the account `uid` has a live local graphical session: a desktop,
+/// or its lock screen, running on this machine. By the rule the PAM module
+/// uses for a warm unlock (`irlume_common::platform::user_has_live_session`):
+/// `CLASS=user`, `STATE` active or online, `TYPE` x11, wayland or mir, and
+/// `REMOTE=0`, so an SSH login, a text console or a remote desktop does not
+/// count. Read from logind's session files, as [`session_state_for`] reads
+/// them. `false` when they cannot be read.
+pub(crate) fn has_local_graphical_session(uid: u32) -> bool {
+    has_local_graphical_session_in(&sessions_root(), uid)
+}
+
+/// Test-only: logind's session directory, when a test has pointed it
+/// elsewhere.
+#[cfg(test)]
+pub(crate) static SESSIONS_ROOT: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+fn sessions_root() -> std::path::PathBuf {
+    #[cfg(test)]
+    if let Some(root) = SESSIONS_ROOT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return root;
+    }
+    std::path::PathBuf::from("/run/systemd/sessions")
+}
+
+fn has_local_graphical_session_in(sessions_root: &Path, uid: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir(sessions_root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        // Regular files only: logind keeps a FIFO per session (`<id>.ref`)
+        // in the same directory, and reading one blocks.
+        entry.file_type().is_ok_and(|kind| kind.is_file())
+            && std::fs::read_to_string(entry.path())
+                .is_ok_and(|facts| local_graphical_session_of(&facts, uid))
+    })
+}
+
+/// Whether one logind session file describes a live local graphical session
+/// of `uid` (see [`has_local_graphical_session`]).
+fn local_graphical_session_of(facts: &str, uid: u32) -> bool {
+    let val = |key: &str| {
+        facts
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .map_or("", str::trim)
+    };
+    val("UID=").parse::<u32>().ok() == Some(uid)
+        && val("CLASS=") == "user"
+        && matches!(val("STATE="), "active" | "online")
+        && matches!(val("TYPE="), "x11" | "wayland" | "mir")
+        && val("REMOTE=") == "0"
+}
+
 pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -699,6 +757,78 @@ pub(crate) fn annotate_connected(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a live local desktop of the account counts for a keyring
+    /// release: an SSH login, a text console, a remote desktop, a greeter, a
+    /// closing session, the user manager or another account's desktop does
+    /// not, and neither does a file without the facts to tell.
+    #[test]
+    fn only_a_live_local_desktop_of_the_account_counts() {
+        let facts = |uid: u32, class: &str, state: &str, kind: &str, remote: &str| {
+            format!(
+                "UID={uid}\nUSER=someone\nACTIVE=1\nSTATE={state}\nREMOTE={remote}\nTYPE={kind}\nCLASS={class}\n"
+            )
+        };
+        for (state, kind) in [("active", "wayland"), ("online", "x11"), ("active", "mir")] {
+            assert!(
+                local_graphical_session_of(&facts(1000, "user", state, kind, "0"), 1000),
+                "{state} {kind}"
+            );
+        }
+        for (uid, class, state, kind, remote) in [
+            (1000, "user", "active", "tty", "1"),
+            (1000, "user", "active", "tty", "0"),
+            (1000, "user", "active", "wayland", "1"),
+            (1000, "greeter", "active", "wayland", "0"),
+            (1000, "user", "closing", "wayland", "0"),
+            (1000, "manager", "active", "unspecified", "0"),
+            (1001, "user", "active", "wayland", "0"),
+        ] {
+            assert!(
+                !local_graphical_session_of(&facts(uid, class, state, kind, remote), 1000),
+                "{uid} {class} {state} {kind} {remote}"
+            );
+        }
+        assert!(!local_graphical_session_of(
+            "UID=1000\nCLASS=user\nSTATE=active\n",
+            1000
+        ));
+    }
+
+    /// The scan reads session files only: logind keeps a FIFO per session in
+    /// the same directory, and reading one blocks.
+    #[test]
+    fn the_session_scan_skips_fifos_and_finds_the_desktop() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = std::env::temp_dir().join(format!("irlume-sessions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = std::ffi::CString::new(dir.join("7.ref").as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        std::fs::write(
+            dir.join("c3"),
+            "UID=1000\nSTATE=active\nREMOTE=1\nTYPE=tty\nCLASS=user\n",
+        )
+        .unwrap();
+        let scan = |dir: std::path::PathBuf| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(has_local_graphical_session_in(&dir, 1000));
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the scan does not block on the FIFO")
+        };
+        assert!(!scan(dir.clone()), "an SSH login alone is not a desktop");
+        std::fs::write(
+            dir.join("7"),
+            "UID=1000\nSTATE=active\nREMOTE=0\nTYPE=wayland\nCLASS=user\n",
+        )
+        .unwrap();
+        assert!(scan(dir.clone()));
+        assert!(!has_local_graphical_session_in(&dir.join("missing"), 1000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn entry(at: u64, kind: AttemptKind, camera: Option<&str>) -> AttemptEntry {
         AttemptEntry {

@@ -158,18 +158,21 @@ fn distro_family_from(os: &str) -> DistroFamily {
     }
 }
 
-/// Best-effort "does this user already have a live login session", the same
-/// heuristic the daemon uses for its warm/cold classification: `/run/user/<uid>`
-/// exists. The PAM module uses it to distinguish a COLD login (unlock the login
-/// keyring: let the auth stack continue so pam_gnome_keyring runs) from a WARM
-/// lock-screen unlock (keyring already open: short-circuit). Lingering user
-/// services can also create `/run/user/<uid>`; treating that rare case as "warm"
-/// is acceptable (worst case: a cold login that skips the keyring-continue).
+/// Best-effort "does this user already have a live local graphical session":
+/// the desktop a lock screen would unlock. The PAM module uses it to
+/// distinguish a COLD login (unlock the login keyring: let the auth stack
+/// continue so pam_gnome_keyring runs) from a WARM lock-screen unlock (keyring
+/// already open: short-circuit).
+///
+/// An SSH login, a text console or a remote desktop is not that session, and
+/// counting one made a graphical login by someone who was also logged in over
+/// SSH look warm, so it skipped the keyring unlock the login needed.
 pub fn user_has_live_session(user: &str) -> bool {
-    // Prefer logind: an ACTIVE, `user`-class session. Unlike a bare
+    // Prefer logind (see [`is_local_graphical_user`]). Unlike a bare
     // `/run/user/<uid>` check, this is NOT fooled by a runtime dir that lingers
-    // after logout, which otherwise makes a logout→login look "warm" and skip
-    // the cold-login keyring unlock. Fall back to `/run/user/<uid>` if logind is
+    // after logout, or by one an SSH session or a lingering user manager
+    // keeps, which otherwise makes a login look "warm" and skip the cold-login
+    // keyring unlock. Fall back to `/run/user/<uid>` if logind is
     // unavailable.
     if let Some(active) = active_graphical_session(user) {
         return active;
@@ -179,9 +182,9 @@ pub fn user_has_live_session(user: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// `Some(active?)` from logind: does `user` own an active/online `user`-class
-/// session right now? `None` if `loginctl` is missing/unparsable (→ caller falls
-/// back to the runtime-dir heuristic).
+/// `Some(live?)` from logind: does `user` own a live local graphical session
+/// right now (see [`is_local_graphical_user`])? `None` if `loginctl` is
+/// missing/unparsable (→ caller falls back to the runtime-dir heuristic).
 fn active_graphical_session(user: &str) -> Option<bool> {
     let out = std::process::Command::new(SystemCommand::Loginctl.path()?)
         .args(["list-sessions", "--no-legend"])
@@ -198,34 +201,59 @@ fn active_graphical_session(user: &str) -> Option<bool> {
         if cols.next() != Some(user) {
             continue;
         }
-        if session_is_active_user(session) {
+        if session_is_local_graphical_user(session) {
             return Some(true);
         }
     }
     Some(false)
 }
 
-/// A greeter session is `Class=greeter`; a real logged-in session is
-/// `Class=user`. A logout closes the user session (gone or `closing`), so only a
-/// live lock screen leaves an active/online user-class session.
-fn session_is_active_user(session: &str) -> bool {
+/// Whether logind's `session` is a live local graphical session of a user
+/// (see [`is_local_graphical_user`]). Fails closed: a session `loginctl`
+/// cannot describe is not one.
+fn session_is_local_graphical_user(session: &str) -> bool {
     let Some(loginctl) = SystemCommand::Loginctl.path() else {
         return false;
     };
     let Ok(out) = std::process::Command::new(loginctl)
-        .args(["show-session", session, "-p", "Class", "-p", "State"])
+        .args([
+            "show-session",
+            session,
+            "-p",
+            "Class",
+            "-p",
+            "State",
+            "-p",
+            "Type",
+            "-p",
+            "Remote",
+        ])
         .output()
     else {
         return false;
     };
-    let t = String::from_utf8_lossy(&out.stdout);
+    is_local_graphical_user(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Whether `loginctl show-session -p Class -p State -p Type -p Remote` output
+/// describes a live local graphical session of a user: `Class=user` (a
+/// greeter session is `Class=greeter`), `State` active or online (a logout
+/// leaves the session gone or `closing`, so only a live desktop or its lock
+/// screen qualifies), `Type` x11, wayland or mir (an SSH login or a text
+/// console is `tty`), and `Remote=no` (a remote desktop is not the seat a
+/// lock screen or login screen runs on).
+fn is_local_graphical_user(properties: &str) -> bool {
     let val = |k: &str| {
-        t.lines()
+        properties
+            .lines()
             .find_map(|l| l.strip_prefix(k))
             .unwrap_or("")
             .trim()
     };
-    val("Class=") == "user" && matches!(val("State="), "active" | "online")
+    val("Class=") == "user"
+        && matches!(val("State="), "active" | "online")
+        && matches!(val("Type="), "x11" | "wayland" | "mir")
+        && val("Remote=") == "no"
 }
 
 /// Does this name resolve to a real account on this system (via NSS, so
@@ -422,7 +450,52 @@ mod tests {
     fn unknown_session_id_is_not_an_active_user_session() {
         // `loginctl show-session` on a bogus id prints nothing usable; the
         // parser must fail closed (false), never treat it as active.
-        assert!(!session_is_active_user("irlume-test-no-such-session"));
+        assert!(!session_is_local_graphical_user(
+            "irlume-test-no-such-session"
+        ));
+    }
+
+    /// Only a live local desktop (or its lock screen) is warm. An SSH login
+    /// or a text console used to count, so a graphical login by someone also
+    /// logged in over SSH skipped the keyring unlock it needed.
+    #[test]
+    fn only_a_live_local_graphical_session_is_warm() {
+        let props = |class: &str, state: &str, kind: &str, remote: &str| {
+            format!("Class={class}\nState={state}\nType={kind}\nRemote={remote}\n")
+        };
+        for (class, state, kind, remote) in [
+            ("user", "active", "wayland", "no"),
+            ("user", "online", "wayland", "no"),
+            ("user", "active", "x11", "no"),
+            ("user", "online", "mir", "no"),
+        ] {
+            assert!(
+                is_local_graphical_user(&props(class, state, kind, remote)),
+                "{class} {state} {kind} {remote}"
+            );
+        }
+        for (class, state, kind, remote) in [
+            // An SSH login.
+            ("user", "active", "tty", "yes"),
+            ("user", "online", "tty", "yes"),
+            // A text console.
+            ("user", "active", "tty", "no"),
+            // A remote desktop.
+            ("user", "active", "wayland", "yes"),
+            // A greeter, a closing session, a background one.
+            ("greeter", "active", "wayland", "no"),
+            ("user", "closing", "wayland", "no"),
+            ("user", "active", "unspecified", "no"),
+            ("background", "active", "unspecified", "no"),
+        ] {
+            assert!(
+                !is_local_graphical_user(&props(class, state, kind, remote)),
+                "{class} {state} {kind} {remote}"
+            );
+        }
+        // An older logind without Type or Remote gives no answer to trust.
+        assert!(!is_local_graphical_user("Class=user\nState=active\n"));
+        assert!(!is_local_graphical_user(""));
     }
 
     #[test]

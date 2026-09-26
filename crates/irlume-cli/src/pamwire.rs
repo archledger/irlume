@@ -1246,6 +1246,15 @@ fn dm_profile(greeter_etc: &str, gnome: Option<u32>) -> DmProfile {
     }
 }
 
+/// Whether a greeter's wiring has something to do: a factor this run wants,
+/// or, on a greeter whose face lines are kept out (`remote_seats`), a face or
+/// fingerprint line an earlier enable left there. That line comes off even
+/// while nothing wants a factor (the camera away for a moment): left there,
+/// it serves the remote screens again once the camera is back.
+fn greeter_wanted(s: &Svc, factors: bool, face_blocked: bool) -> bool {
+    factors || (face_blocked && carries_face_lines(s.etc))
+}
+
 /// Whether a greeter gets irlume's lines. One whose face lines are kept out
 /// (`remote_seats`) gets the reseal lines alone, but where that recipe cannot
 /// land (no anchor, a continued line, lines irlume keeps as they are) it is
@@ -1566,17 +1575,12 @@ fn walk_surfaces(enable: bool, with_sudo: bool, with_polkit: bool, visit: &mut S
             (face, fp_keyring)
         };
         let greeter_wire = |c: &str| wire_greeter_impl(c, face_line, keyring_line, prof.ondemand);
-        let want = greeter_want(s, face || fp_keyring, blocked, &greeter_wire);
+        let wanted = greeter_wanted(s, face || fp_keyring, blocked);
+        let want = greeter_want(s, wanted, blocked, &greeter_wire);
         // The flag says face and fingerprint are kept out of a stack that
         // would carry them; a greeter nothing wants is unwired as ever, and
         // the token guard treats it as ever.
-        visit(
-            s,
-            ROLE_LOGIN,
-            &greeter_wire,
-            want,
-            blocked && (face || fp_keyring),
-        );
+        visit(s, ROLE_LOGIN, &greeter_wire, want, blocked && wanted);
     }
     for s in FP_GREETERS {
         let fp_wire = |c: &str| wire_fp_keyring(c, service_name(s.etc));
@@ -2417,8 +2421,9 @@ fn act_holding_lock(
             (face, want_fp_keyring)
         };
         let greeter_wire = |c: &str| wire_greeter_impl(c, face_line, keyring_line, prof.ondemand);
-        let want = greeter_want(s, face || want_fp_keyring, blocked.is_some(), &greeter_wire);
-        if enable && blocked.is_some() && (face || want_fp_keyring) && !want {
+        let wanted = greeter_wanted(s, face || want_fp_keyring, blocked.is_some());
+        let want = greeter_want(s, wanted, blocked.is_some(), &greeter_wire);
+        if enable && blocked.is_some() && wanted && !want {
             println!(
                 "  {}: irlume's reseal lines cannot be placed here, so every irlume line \
                  comes out; a GNOME keyring token armed for an account is no longer \

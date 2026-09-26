@@ -2976,6 +2976,33 @@ fn a_lightdm_nothing_wants_keeps_the_token_guard() {
     assert_eq!(bed.stack(), stack, "a refused run writes nothing");
 }
 
+/// A LightDM that still carries a face line while nothing wants a factor
+/// (the camera away for a moment) loses that line once it serves remote login
+/// screens, keeping its reseal lines, so the token guard has nothing to stop:
+/// left there, the line would serve the remote screens once the camera is
+/// back.
+#[test]
+fn a_lightdm_nothing_wants_still_loses_its_face_line() {
+    // The stack an enable wrote while the camera was there.
+    let earlier = LightdmBed::new("lightdm-stale-face-wired");
+    earlier.xdmcp(false);
+    let (code, out, err) = earlier.run(&["login", "enable", "--apply"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(earlier.face(), "{}", earlier.stack());
+
+    let bed = LightdmBed::with_tier("lightdm-stale-face", "none");
+    std::fs::write(bed.pam.join("lightdm"), earlier.stack()).unwrap();
+    bed.xdmcp(true);
+    std::fs::write(
+        bed.sb.path("keyring/alice.json"),
+        r#"{"version":1,"secret":"GnomeKeyringToken","pcrs":[],"public":"","private":""}"#,
+    )
+    .unwrap();
+    let (code, out, err) = bed.run(&["login", "enable", "--apply"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(!bed.face() && bed.reseal(), "{}\n{out}\n{err}", bed.stack());
+}
+
 /// The reconcile unit strips the face lines from a LightDM irlume had wired
 /// once its XDMCP server is turned on, keeping the reseal lines; counts that
 /// as intact afterwards; puts the face lines back once the server is off;

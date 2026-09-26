@@ -47,21 +47,25 @@ In an override that has lines irlume did not write, irlume changes only its
 own lines and does not rebuild it from a newer vendor file; `irlume login
 enable` shows how the two differ, and `sudo irlume login enable --apply
 --force` rebuilds it, keeping the previous file as `<file>.pre-irlume` (add
-`--with-sudo` or `--with-polkit` for those two services). irlume's lines keep
-their side of each of your lines: a faillock or group gate you put above
-irlume's line stays above it. A comment you add to a vendor line, or a blank
-or comment line, does not count as a line of yours; a copy of a vendor line
-does, and so does the vendor's own copy of it, since irlume cannot tell the
-two apart. An update that would move one of irlume's lines past one of yours,
-or change where a numeric jump in your lines lands (an
-`[success=2 default=ignore]` that counts irlume's lines), is not made: the
-file is kept as it is, `irlume login enable` says why and exits 1, and irlume's
-earlier lines stay in effect until you adjust your line or rebuild the file.
-When irlume's lines are not in such a file at all (after a disable, or taken
-out by hand), `irlume login enable` puts them next to the file's password
-line (the `include` or `substack` of the shared password stack) and below
-every line above it; when it cannot tell which line that is, it leaves the
-file unwired and says so.
+`--with-sudo` or `--with-polkit` for those two services). It does not when
+irlume's lines would move a numeric jump the vendor file has (a `[success=1
+default=ignore]` just above its password line, say): it says why, and deleting
+the file and running `sudo irlume login enable --apply` creates it again from
+the vendor file, after which you check that jump. irlume's lines keep their
+side of each of your lines: a faillock or group gate you put above irlume's
+line stays above it. A comment you add to a vendor line, or a blank or comment
+line, does not count as a line of yours; a copy of a vendor line does, and so
+does the vendor's own copy of it, since irlume cannot tell the two apart. An
+update that would move one of irlume's lines past one of yours, or change
+where a numeric jump in your lines lands (an `[success=2 default=ignore]` that
+counts irlume's lines), is not made: the file is kept as it is, `irlume login
+enable` says why and exits 1, and irlume's earlier lines stay in effect until
+you adjust your line or rebuild the file. A file with a line that ends in `\`
+is not changed at all (see `disable` below). When irlume's lines are not in
+such a file at all (after a disable, or taken out by hand), `irlume login
+enable` puts them next to the file's password line (the `include` or
+`substack` of the shared password stack) and below every line above it; when
+it cannot tell which line that is, it leaves the file unwired and says so.
 
 An override written by a release before this tracking gets the line at the
 first reconcile when it still matches its vendor copy. One that no longer
@@ -111,7 +115,11 @@ This unwires every greeter and the lock screen, and removes the `sudo` and
   and leaves an inactive line where one is no longer used, so your jump
   still lands where it did. A numeric jump from the vendor file that
   irlume's lines had moved lands where the vendor file has it again once
-  they are removed. An
+  they are removed. A file with a line that ends in `\`, which PAM joins
+  with the next line into one rule, is left as it is, irlume's lines
+  included: taking out one physical line of it can make the rule before it
+  take in the next one, the password line included. `disable` says so and
+  exits 1; join those lines or take irlume's lines out by hand. An
   override whose vendor copy is gone is kept the same way, since PAM has
   nothing else for that service,
 - removes the SELinux module on Fedora (`semodule -r irlume`, checked: a

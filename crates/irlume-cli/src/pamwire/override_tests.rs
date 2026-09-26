@@ -1917,6 +1917,131 @@ fn checked_writes_work_without_the_rename_flags() {
     assert_eq!(entries(&dir.0), ["sudo"], "no scratch file is left");
 }
 
+/// A creation decided on no file refuses a file that is there when the
+/// write starts: one a package or an administrator created after the caller
+/// read none. Taking it as the file to replace swapped irlume's in over it.
+#[test]
+fn a_checked_create_keeps_a_file_that_was_there_when_it_started() {
+    let dir = TestDir::new("ovr-create-already-there");
+    let path = dir.0.join("sudo");
+    std::fs::write(&path, "the package's stack\n").unwrap();
+    let err = write_atomic_checked(&path, "IRLUME'S FILE\n", None).expect_err("refused");
+    assert!(
+        err.message.contains("changed while irlume was writing"),
+        "{err}"
+    );
+    assert!(!err.landed);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "the package's stack\n"
+    );
+    assert_eq!(entries(&dir.0), ["sudo"], "no scratch file is left");
+}
+
+/// A `chmod` made after a write's last check, before its file is swapped in,
+/// is not reverted: the file that comes out of the path no longer has the
+/// mode irlume carried over, so it goes back and the write is refused.
+#[test]
+fn a_checked_write_keeps_a_mode_changed_meanwhile() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = TestDir::new("ovr-write-chmod");
+    let path = dir.0.join("sudo");
+    std::fs::write(&path, "decided on this\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    arm(&CHMOD_BEFORE_INSTALL, &path);
+    let err = write_atomic_checked(&path, "IRLUME'S FILE\n", Some("decided on this\n"))
+        .expect_err("refused");
+    disarm(&CHMOD_BEFORE_INSTALL, &path);
+    assert!(
+        err.message.contains("changed while irlume was writing"),
+        "{err}"
+    );
+    assert!(!err.landed);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "decided on this\n");
+    assert_eq!(mode(path.to_str().unwrap()), 0o600, "the new mode stays");
+    assert_eq!(entries(&dir.0), ["sudo"], "no scratch file is left");
+    // Written again with the new mode in view, the write carries it.
+    write_atomic_checked(&path, "IRLUME'S FILE\n", Some("decided on this\n")).unwrap();
+    assert_eq!(mode(path.to_str().unwrap()), 0o600);
+}
+
+/// The sweep of abandoned scratch files takes exactly the names irlume makes
+/// and nothing that only looks like one.
+#[test]
+fn the_scratch_sweep_takes_only_names_irlume_makes() {
+    for kind in ["new", "bak"] {
+        let made = scratch_path(Path::new("/etc/pam.d/polkit-1"), kind);
+        let name = made.file_name().unwrap().to_str().unwrap();
+        assert!(is_abandoned_scratch(name), "{name}");
+    }
+    assert!(is_abandoned_scratch(".sudo.irlume-new.1234.0.tmp"));
+    for name in [
+        ".sudo.irlume-review.tmp",
+        ".sudo.irlume-new.tmp",
+        ".sudo.irlume-new.1234.tmp",
+        ".sudo.irlume-new.12a4.0.tmp",
+        ".sudo.irlume-new.1234..tmp",
+        ".sudo.irlume-old.1234.0.tmp",
+        ".sudo.irlume-removing.1234.0",
+        ".sudo.irlume-removing.1234.0.tmp",
+        ".sudo.irlume-new.1234.0.tmp.swp",
+        "..irlume-new.1234.0.tmp",
+        ".irlume-new.1234.0.tmp",
+        "sudo.irlume-new.1234.0.tmp",
+    ] {
+        assert!(!is_abandoned_scratch(name), "{name}");
+    }
+}
+
+/// A backup another writer puts where an apply was about to publish its own
+/// is not the run's: the record keeps it as it stands, and a rollback leaves
+/// it, whether the stack write then lands or is refused.
+#[test]
+fn a_backup_another_writer_published_meanwhile_survives_the_rollback() {
+    for refused in [false, true] {
+        let dir = TestDir::new(if refused {
+            "ovr-foreign-backup-refused"
+        } else {
+            "ovr-foreign-backup"
+        });
+        std::fs::create_dir_all(dir.0.join("etc/pam.d")).unwrap();
+        let svc = Svc {
+            etc: leak_path(&dir.0.join("etc/pam.d/sudo")),
+            vendor: None,
+        };
+        std::fs::write(svc.etc, ADMIN_STACK).unwrap();
+        let bak = backup_of(&svc);
+        let planned = [plan_surface(&svc, ROLE_SUDO, &wire_verify_service, true)];
+        arm(&BACKUP_APPEARS, Path::new(&bak));
+        if refused {
+            arm(&SWAP_DURING_WRITE, Path::new(svc.etc));
+        }
+        let applied = apply_surface(&svc, ROLE_SUDO, &wire_verify_service, true, &planned);
+        disarm(&BACKUP_APPEARS, Path::new(&bak));
+        disarm(&SWAP_DURING_WRITE, Path::new(svc.etc));
+        assert_eq!(applied.error.is_some(), refused, "{:?}", applied.error);
+        assert_eq!(read_file(&bak), "SOMEONE ELSE'S BACKUP\n");
+        let record = record_of(&[applied]);
+        let sidecar = record.surfaces[0]
+            .sidecar
+            .as_ref()
+            .expect("the backup is recorded");
+        assert_eq!(
+            sidecar.before.as_deref(),
+            Some("SOMEONE ELSE'S BACKUP\n"),
+            "as it stands"
+        );
+        roll_back(&record, &[]).expect("the rollback runs");
+        assert_eq!(read_file(&bak), "SOMEONE ELSE'S BACKUP\n", "and kept");
+        let stack = if refused {
+            "SOMEONE ELSE'S FILE\n"
+        } else {
+            ADMIN_STACK
+        };
+        assert_eq!(read_file(svc.etc), stack);
+    }
+}
+
 // ---- updating irlume's lines where a jump counts them ------------------------------
 
 /// Whether `text` has a live rule loading pam_irlume.so with `arg`, in `phase`.

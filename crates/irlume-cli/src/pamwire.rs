@@ -1592,14 +1592,7 @@ fn captured(path: &Path) -> (Option<String>, String) {
 fn untouched_record(svc: &Svc, role: &'static str, error: String) -> AppliedSurface {
     let path = Path::new(svc.etc);
     let (before, after_sha256) = captured(path);
-    let sidecar_path = PathBuf::from(format!("{}{BACKUP}", svc.etc));
-    let sidecar = match inspect_target(&sidecar_path) {
-        Ok(Some(_)) => match captured(&sidecar_path) {
-            (Some(text), digest) => Some((text, digest)),
-            (None, _) => None,
-        },
-        _ => None,
-    };
+    let sidecar = Sidecar::as_it_stands(&PathBuf::from(format!("{}{BACKUP}", svc.etc)));
     AppliedSurface {
         id: service_name(svc.etc),
         role,
@@ -1607,17 +1600,75 @@ fn untouched_record(svc: &Svc, role: &'static str, error: String) -> AppliedSurf
         change: PlannedChange::NotInstalled,
         before,
         before_metadata: crate::logintx::file_metadata(path),
-        sidecar_metadata: sidecar
-            .as_ref()
-            .and_then(|_| crate::logintx::file_metadata(&sidecar_path)),
-        sidecar_existed: sidecar.is_some(),
-        sidecar_after_sha256: sidecar.as_ref().map(|(_, digest)| digest.clone()),
-        sidecar_before: sidecar.map(|(text, _)| text),
+        sidecar_before: sidecar.before,
+        sidecar_metadata: sidecar.metadata,
+        sidecar_existed: sidecar.existed,
+        sidecar_after_sha256: sidecar.after_sha256,
         // The digest shape the applied path records and the precheck
         // compares: the live file alone, not the live+backup pair
         // `surface_state` makes.
         after_sha256,
         error: Some(error),
+    }
+}
+
+/// A surface's `.pre-irlume` backup, as its record describes it (see the
+/// fields of the same names in [`AppliedSurface`]).
+struct Sidecar {
+    before: Option<String>,
+    metadata: Option<(u32, u32, u32)>,
+    existed: bool,
+    after_sha256: Option<String>,
+}
+
+impl Sidecar {
+    /// The backup before a write, with no after-state yet.
+    fn before_write(path: &Path) -> Self {
+        Self {
+            before: std::fs::read_to_string(path).ok(),
+            metadata: crate::logintx::file_metadata(path),
+            existed: path.exists(),
+            after_sha256: None,
+        }
+    }
+
+    /// The backup as it stands, recorded as a surface left alone records
+    /// it: its text as the before-image and its digest as the after-state, so
+    /// a rollback leaves it as it is. Recorded only when a restore of it
+    /// could not fail: a regular file with one name, read as text.
+    fn as_it_stands(path: &Path) -> Self {
+        match inspect_target(path).map(|found| found.map(|_| captured(path))) {
+            Ok(Some((Some(text), digest))) => Self {
+                before: Some(text),
+                metadata: crate::logintx::file_metadata(path),
+                existed: true,
+                after_sha256: Some(digest),
+            },
+            _ => Self {
+                before: None,
+                metadata: None,
+                existed: false,
+                after_sha256: None,
+            },
+        }
+    }
+
+    /// The backup after this run's write, with the digest it has now. One
+    /// that was absent before the write and is there now is the run's own
+    /// only when this process published that very file (see
+    /// [`published_here`]): one another writer put there meanwhile is
+    /// recorded as it stands, so a rollback keeps it rather than deleting it
+    /// as the run's.
+    fn after_write(self, path: &Path) -> Self {
+        let after = surface_digest(path);
+        let appeared = !self.existed && after != crate::logintx::ABSENT && after != UNREADABLE;
+        if appeared && !published_here(path) {
+            return Self::as_it_stands(path);
+        }
+        Self {
+            after_sha256: Some(after),
+            ..self
+        }
     }
 }
 
@@ -1674,9 +1725,7 @@ fn apply_surface(
     // Wiring creates this and unwiring renames it away, so it is part of
     // what the transaction changed.
     let sidecar_path = PathBuf::from(format!("{}{BACKUP}", svc.etc));
-    let sidecar_before = std::fs::read_to_string(&sidecar_path).ok();
-    let sidecar_metadata = crate::logintx::file_metadata(&sidecar_path);
-    let sidecar_existed = sidecar_path.exists();
+    let sidecar = Sidecar::before_write(&sidecar_path);
     let (before, mut read_error) = match std::fs::read_to_string(path) {
         Ok(content) => (Some(content), None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
@@ -1715,6 +1764,7 @@ fn apply_surface(
         // before the write was refused.
         Err(e) if !e.landed => {
             let (before, after_sha256) = captured(path);
+            let sidecar = sidecar.after_write(&sidecar_path);
             return AppliedSurface {
                 id: service_name(svc.etc),
                 role,
@@ -1722,11 +1772,11 @@ fn apply_surface(
                 change: PlannedChange::NotInstalled,
                 before,
                 before_metadata: crate::logintx::file_metadata(path),
-                sidecar_before,
-                sidecar_metadata,
-                sidecar_existed,
+                sidecar_before: sidecar.before,
+                sidecar_metadata: sidecar.metadata,
+                sidecar_existed: sidecar.existed,
                 after_sha256,
-                sidecar_after_sha256: Some(surface_digest(&sidecar_path)),
+                sidecar_after_sha256: sidecar.after_sha256,
                 error: Some(e.message),
             };
         }
@@ -1753,7 +1803,7 @@ fn apply_surface(
     // The same question for the backup: what did apply leave there. A
     // rollback that overwrites a backup somebody replaced afterwards is
     // the same defect as one that overwrites a stack.
-    let sidecar_after_sha256 = Some(surface_digest(&sidecar_path));
+    let sidecar = sidecar.after_write(&sidecar_path);
     AppliedSurface {
         id: service_name(svc.etc),
         role,
@@ -1761,11 +1811,11 @@ fn apply_surface(
         change,
         before,
         before_metadata,
-        sidecar_before,
-        sidecar_metadata,
-        sidecar_existed,
+        sidecar_before: sidecar.before,
+        sidecar_metadata: sidecar.metadata,
+        sidecar_existed: sidecar.existed,
         after_sha256,
-        sidecar_after_sha256,
+        sidecar_after_sha256: sidecar.after_sha256,
         error,
     }
 }

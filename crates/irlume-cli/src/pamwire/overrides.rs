@@ -23,8 +23,8 @@
 //! unwiring anything on a capability reading.
 
 use super::grammar::{
-    self, content_has_module, directive, head, irlume_rule, is_auth_substack_anchor,
-    is_include_auth_layout, is_passwd_substack,
+    self, content_has_module, directive, has_line_continuation, head, irlume_rule,
+    is_auth_substack_anchor, is_include_auth_layout, is_passwd_substack,
 };
 use super::stanzas::{inert_line, BACKUP, CREATED_PREFIX, INERT_TAG, KEYRING_TAG};
 use super::transform::{
@@ -92,6 +92,7 @@ fn parse_v1(line: &str) -> Option<(String, String)> {
 
 /// An override split into its header lines and its body.
 pub(super) struct Parsed<'a> {
+    /// The two header lines, without carriage returns, like the body.
     first: &'a str,
     track_line: Option<&'a str>,
     /// `(vendor, body)` digests from a readable tracking line.
@@ -119,7 +120,11 @@ pub(super) fn parse(content: &str) -> Option<Parsed<'_>> {
     if !content.starts_with(CREATED_PREFIX) {
         return None;
     }
-    let lines: Vec<&str> = content.lines().collect();
+    // `str::lines` takes the `\r` of a CRLF ending off; this takes any other a
+    // line ends in (a file converted to CRLF twice ends its lines in
+    // `\r\r\n`), from the header lines too, so a write that keeps them has
+    // no carriage return left.
+    let lines: Vec<&str> = content.lines().map(|l| l.trim_end_matches('\r')).collect();
     let first = *lines.first()?;
     let track_at = lines
         .iter()
@@ -133,7 +138,7 @@ pub(super) fn parse(content: &str) -> Option<Parsed<'_>> {
         .enumerate()
         .skip(1)
         .filter(|(i, _)| Some(*i) != track_at)
-        .map(|(_, l)| l.trim_end_matches('\r'))
+        .map(|(_, l)| *l)
         .collect();
     let body = if body_lines.is_empty() {
         String::new()
@@ -413,11 +418,18 @@ fn filled_in_place(body: &str, wired: &str, edited: bool) -> Option<(String, Jum
 /// Where a numeric jump lands.
 #[derive(Clone, Debug)]
 pub(super) enum Landing {
-    /// On this line. Two landings are the same when their `key` is: the line
-    /// itself, whitespace normalized, or for one of irlume's lines its job
-    /// (see [`kind`]), so a new version of irlume's line, or an inactive line
-    /// holding its place, is the same landing. `text` is for messages.
-    Line { key: String, text: String },
+    /// On this line. Two landings are the same when their `key` and `nth`
+    /// are: the line itself, whitespace normalized, or for one of irlume's
+    /// lines its job (see [`kind`]), so a new version of irlume's line, or an
+    /// inactive line holding its place, is the same landing; and which line
+    /// of the phase with that key it is, counting from 1, so a jump that
+    /// moves from one copy of a rule to the next copy is seen to move.
+    /// `text` is for messages.
+    Line {
+        key: String,
+        nth: usize,
+        text: String,
+    },
     /// Just past the last module of the phase: the stack ends there.
     End,
     /// Past the end of the stack, which libpam logs as a bad jump and fails.
@@ -426,14 +438,16 @@ pub(super) enum Landing {
     /// count. Equal only when the same lines are skipped to the same target.
     Across {
         skipped: Vec<String>,
-        target: Option<String>,
+        target: Option<(String, usize)>,
     },
 }
 
 impl PartialEq for Landing {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Landing::Line { key: a, .. }, Landing::Line { key: b, .. }) => a == b,
+            (Landing::Line { key: a, nth: m, .. }, Landing::Line { key: b, nth: n, .. }) => {
+                a == b && m == n
+            }
             (Landing::End, Landing::End) | (Landing::PastEnd, Landing::PastEnd) => true,
             (
                 Landing::Across {
@@ -455,7 +469,8 @@ impl Eq for Landing {}
 impl Landing {
     fn describe(&self, phase: &str) -> String {
         match self {
-            Landing::Line { text, .. } => format!("`{text}`"),
+            Landing::Line { text, nth: 1, .. } => format!("`{text}`"),
+            Landing::Line { text, nth, .. } => format!("copy {nth} of `{text}`"),
             Landing::End => format!("the end of the {phase} stack"),
             Landing::PastEnd => format!("past the end of the {phase} stack, which fails it"),
             Landing::Across { .. } => {
@@ -493,24 +508,36 @@ fn numeric_actions(line: &str) -> Vec<(String, usize)> {
     head(line).map_or_else(Vec::new, |h| grammar::numeric_actions(&h))
 }
 
+/// The key of the chain's line at `at` and which line with that key it is,
+/// counting from 1 (see [`Landing::Line`]).
+fn occurrence(chain: &[&str], at: usize) -> (String, usize) {
+    let key = line_key(chain[at]);
+    let nth = chain[..=at].iter().filter(|l| line_key(l) == key).count();
+    (key, nth)
+}
+
 fn landing_of(chain: &[&str], at: usize, n: usize) -> Landing {
     let last = chain.len() - 1;
     if n > last - at {
         return Landing::PastEnd;
     }
     let skipped = &chain[at + 1..=at + n];
-    let target = chain.get(at + n + 1).copied();
+    let target = (at + n + 1 < chain.len()).then(|| at + n + 1);
     if skipped.iter().any(|l| is_include(l)) {
         return Landing::Across {
             skipped: skipped.iter().map(|l| line_key(l)).collect(),
-            target: target.map(line_key),
+            target: target.map(|to| occurrence(chain, to)),
         };
     }
     match target {
-        Some(line) => Landing::Line {
-            key: line_key(line),
-            text: norm(line),
-        },
+        Some(to) => {
+            let (key, nth) = occurrence(chain, to);
+            Landing::Line {
+                key,
+                nth,
+                text: norm(chain[to]),
+            }
+        }
         None => Landing::End,
     }
 }
@@ -1163,6 +1190,46 @@ fn no_anchor(etc: &str) -> Decision {
     )
 }
 
+/// A file with a line that ends in `\`, left as it is. PAM joins such a
+/// line with the next one into one rule, so taking out, adding or rewriting
+/// one physical line can change another rule: remove irlume's line after a
+/// continued one and the continued rule takes in the next line instead, the
+/// password stack included. Every wiring recipe refuses such a file for the
+/// same reason.
+fn continued(i: &Input<'_>) -> Decision {
+    let (etc, vendor_path) = (i.etc, i.vendor_path);
+    let way = if i.enable {
+        "join those lines by hand and run this again".to_string()
+    } else if i.vendor.is_some() {
+        format!(
+            "join those lines or take irlume's lines out by hand, or delete it to use \
+             {vendor_path}"
+        )
+    } else {
+        "join those lines or take irlume's lines out by hand".to_string()
+    };
+    Decision {
+        unmet: true,
+        ..keep(
+            PlannedChange::KeepEditedOverride,
+            format!(
+                "⚠ {etc}: kept as it is: a line in it ends in `\\`, which PAM joins with the \
+                 next line, and irlume does not change such a file line by line; {way}"
+            ),
+        )
+    }
+}
+
+/// How to take the vendor file after all when irlume's lines would move one
+/// of its numeric jumps.
+fn take_anyway(etc: &str, vendor_path: &str, scope_flag: &str) -> String {
+    format!(
+        "to take {vendor_path} anyway, delete {etc} and run `sudo irlume login \
+         enable{scope_flag} --apply`, which creates it again with irlume's lines in, and then \
+         check that jump"
+    )
+}
+
 /// The one decision for an irlume-created override, whoever runs it.
 ///
 /// An override with lines irlume did not write is never rebuilt from the
@@ -1247,6 +1314,9 @@ fn remove_or_strip(i: &Input<'_>, p: &Parsed<'_>, class: Class) -> Decision {
     let (stripped, had) = unwire_lines(&p.body);
     if !had {
         return keep(PlannedChange::NotWired, format!("· {etc}: not wired"));
+    }
+    if has_line_continuation(&p.body) {
+        return continued(i);
     }
     let kept_why = match (i.vendor, lacks(&p.body, i.vendor)) {
         (None, _) => {
@@ -1335,14 +1405,36 @@ fn forced(i: &Input<'_>, current: &str, p: &Parsed<'_>) -> Result<Decision, Stri
              and run again"
         ));
     }
+    // The preview shows what the rebuild drops before `--apply`.
+    let detail = Some(diff_block(etc, vendor_path, &p.body, v));
+    // `--force` gives up the lines irlume did not write, not the vendor's
+    // own jumps: irlume's lines must not move one, as in any other rebuild.
+    let warn = match check_jumps(&p.body, &wired, false) {
+        JumpCheck::Refuse(reason) => {
+            return Ok(Decision {
+                detail,
+                unmet: true,
+                ..keep(
+                    PlannedChange::KeepEditedOverride,
+                    format!(
+                        "⚠ {etc}: not rebuilt from {vendor_path}: {reason}; {}",
+                        take_anyway(etc, vendor_path, i.scope_flag)
+                    ),
+                )
+            });
+        }
+        JumpCheck::Warn(warn) => warn,
+        JumpCheck::Clear => String::new(),
+    };
     Ok(Decision {
         keep_copy: true,
-        // The preview shows what the rebuild drops before `--apply`.
-        detail: Some(diff_block(etc, vendor_path, &p.body, v)),
+        detail,
         ..replace(
             PlannedChange::MaterializeOverride,
             render(vendor_path, v, &wired),
-            format!("✓ {etc}: rebuilt from {vendor_path}; the previous file is at {etc}{BACKUP}"),
+            format!(
+                "✓ {etc}: rebuilt from {vendor_path}; the previous file is at {etc}{BACKUP}{warn}"
+            ),
         )
     })
 }
@@ -1405,12 +1497,7 @@ fn rebuild(i: &Input<'_>, current: &str, p: &Parsed<'_>, class: Class) -> Decisi
             }
             Err(reason) => (
                 reason,
-                format!(
-                    "; to take {vendor_path} anyway, delete {etc} and run `sudo irlume login \
-                     enable{} --apply`, which creates it again with irlume's lines in, and then \
-                     check that jump",
-                    i.scope_flag
-                ),
+                format!("; {}", take_anyway(etc, vendor_path, i.scope_flag)),
             ),
         }
     };
@@ -1466,6 +1553,12 @@ struct InPlace {
 /// irlume's lines past an administrator's line.
 fn in_place(i: &Input<'_>, p: &Parsed<'_>, m: InPlace) -> Decision {
     let etc = i.etc;
+    // Checked on the whole body: the recipe refuses a continued line in the
+    // lines irlume did not write, but a `\` added to one of irlume's own
+    // lines is gone once they are taken out.
+    if has_line_continuation(&p.body) {
+        return continued(i);
+    }
     let bare = base(&p.body);
     let (wired, ok) = (i.wire)(&bare);
     if !ok {
@@ -2059,6 +2152,7 @@ session     include       password-auth
     fn line(text: &str) -> Landing {
         Landing::Line {
             key: line_key(text),
+            nth: 1,
             text: norm(text),
         }
     }
@@ -3412,5 +3506,140 @@ session     include       password-auth
         }
         let d = run(&legacy(VENDOR), Some(VENDOR), true, &keyring_only);
         assert!(!d.header_only, "{}", d.message);
+    }
+
+    /// A jump onto the first of two identical rules lands on the second one
+    /// once the line it skips is gone. That is a move: disable keeps an
+    /// inactive line in irlume's place, with the vendor copy present or gone.
+    #[test]
+    fn a_jump_onto_the_first_of_two_identical_rules_is_followed() {
+        let gate = "auth       [success=1 default=ignore]   pam_succeed_if.so quiet user ingroup kiosk   # local";
+        let hook = "auth       optional     pam_exec.so quiet /usr/local/sbin/login-hook   # local";
+        let reseal = "pam_irlume.so reseal";
+        let with_gate = insert_above(&generation(VENDOR), reseal, gate);
+        let edited = insert_below(&insert_below(&with_gate, reseal, hook), reseal, hook);
+        let gate_lands = |text: &str| {
+            jumps(text)
+                .into_iter()
+                .find(|j| j.line == norm(gate))
+                .map(|j| j.landing)
+        };
+        assert_eq!(gate_lands(&edited), Some(line(hook)), "{edited}");
+        let second = Landing::Line {
+            key: line_key(hook),
+            nth: 2,
+            text: norm(hook),
+        };
+        assert_eq!(gate_lands(&base(&edited)), Some(second));
+        for vendor in [Some(VENDOR), None] {
+            let d = run(&edited, vendor, false, &greeter);
+            assert_eq!(d.change, PlannedChange::StripInPlace, "{}", d.message);
+            assert!(d.message.contains("copy 2 of `"), "{}", d.message);
+            let after = written(&d).expect("a write");
+            assert!(!content_has_module(&after), "{after}");
+            assert!(after.contains("# irlume-inert reseal"), "{after}");
+            assert_eq!(gate_lands(&after), Some(line(hook)), "{after}");
+        }
+    }
+
+    /// PAM joins a line that ends in `\` with the next one into one rule, so
+    /// such a file is not what its lines say one at a time. Disable leaves it
+    /// byte for byte, with irlume's lines in, and says why: taking out
+    /// irlume's line after a continued one would make that rule take in the
+    /// password line instead. Enable does not rewrite irlume's lines in it
+    /// either, a `\` added to one of them included.
+    #[test]
+    fn a_file_with_a_continued_line_is_left_as_it_is() {
+        let continued_above = insert_above(
+            &generation(VENDOR),
+            "pam_irlume.so unseal",
+            "auth       optional     pam_echo.so before face \\",
+        );
+        for vendor in [Some(VENDOR), None] {
+            let d = run(&continued_above, vendor, false, &greeter);
+            assert_eq!(d.write, Write::Nothing, "{}", d.message);
+            assert_eq!(d.change, PlannedChange::KeepEditedOverride);
+            assert!(d.unmet, "{}", d.message);
+            assert!(d.message.contains("ends in `\\`"), "{}", d.message);
+            assert_eq!(
+                d.message.contains("delete it to use"),
+                vendor.is_some(),
+                "{}",
+                d.message
+            );
+        }
+        let continued_own = generation(VENDOR).replacen(
+            "pam_irlume.so unseal ondemand\n",
+            "pam_irlume.so unseal ondemand \\\n                                        debug\n",
+            1,
+        );
+        let facefirst: WireFn<'_> = &|c: &str| wire_greeter_impl(c, true, true, false);
+        for vendor in [Some(VENDOR), None] {
+            let d = run(&continued_own, vendor, true, facefirst);
+            assert_eq!(d.write, Write::Nothing, "{}", d.message);
+            assert!(d.unmet, "{}", d.message);
+            assert!(d.message.contains("ends in `\\`"), "{}", d.message);
+        }
+    }
+
+    /// A file whose line endings were converted to CRLF twice ends each line
+    /// in `\r\r\n`. The header lines lose every carriage return too, so the
+    /// rewrite has none left, and the next run finds nothing to do.
+    #[test]
+    fn a_doubled_carriage_return_is_gone_after_one_rewrite() {
+        let vp = "/usr/lib/pam.d/plasmalogin";
+        let tracked = generation(VENDOR);
+        for text in [tracked.clone(), with_admin_line(&tracked)] {
+            let doubled = text.replace('\n', "\r\r\n");
+            let d = run(&doubled, Some(VENDOR), true, &greeter);
+            let after = written(&d).unwrap_or_else(|| panic!("a write: {}", d.message));
+            assert!(!after.contains('\r'), "{after:?}");
+            assert_eq!(after, text);
+            let again = run(&after, Some(VENDOR), true, &greeter);
+            assert_eq!(again.write, Write::Nothing, "{}", again.message);
+            let (_, note) = assess(Recipe::Greeter, &after, vp, Some(VENDOR), &[], None, "");
+            assert!(!note.is_some_and(|n| n.contains("CRLF")));
+        }
+    }
+
+    /// `--force` gives up the lines irlume did not write, not the vendor
+    /// file's own jumps: when irlume's lines would move one, the rebuild is
+    /// refused as any rebuild is, with the way to take the vendor file
+    /// anyway. A file without irlume's lines in it is rebuilt, and the
+    /// message says where the jump lands, as a creation does.
+    #[test]
+    fn force_does_not_let_irlume_lines_move_a_vendor_jump() {
+        let v3 = VENDOR.replacen(
+            "auth        substack      password-auth\n",
+            "auth       [success=1 default=ignore]   pam_fprintd.so\nauth        substack      password-auth\n",
+            1,
+        );
+        let forced = |current: &str| {
+            let mut i = input(Some(current), Some(&v3), true, &greeter);
+            i.force = true;
+            decide(&i).unwrap()
+        };
+        let edited = with_admin_line(&generation(VENDOR));
+        let d = forced(&edited);
+        assert_eq!(d.write, Write::Nothing, "{}", d.message);
+        assert!(d.unmet && !d.keep_copy, "{}", d.message);
+        assert!(
+            d.message
+                .contains("the jump in `auth [success=1 default=ignore] pam_fprintd.so`"),
+            "{}",
+            d.message
+        );
+        assert!(
+            d.message.contains("delete /etc/pam.d/plasmalogin and run"),
+            "{}",
+            d.message
+        );
+        assert!(d.detail.is_some(), "the diff is still shown");
+        let p = parse(&edited).unwrap();
+        let unwired = keep_header(&p, &base(&p.body));
+        let d = forced(&unwired);
+        assert!(written(&d).is_some(), "{}", d.message);
+        assert!(d.keep_copy);
+        assert!(d.message.contains("now jumps to"), "{}", d.message);
     }
 }

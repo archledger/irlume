@@ -167,14 +167,8 @@ pub(crate) fn restore_surface_with(
             // `None` keeps the old behaviour for records written before those
             // fields existed: the replacing file inherits the current one's
             // attributes rather than a guess.
-            let attrs = metadata.or_else(|| {
-                std::fs::symlink_metadata(path).ok().as_ref().map(|m| {
-                    use std::os::unix::fs::MetadataExt as _;
-                    use std::os::unix::fs::PermissionsExt as _;
-                    (m.permissions().mode() & 0o7777, m.uid(), m.gid())
-                })
-            });
-            write_atomic_inner(path, content, attrs, None).map_err(String::from)
+            let attrs = metadata.map_or(Attrs::Carried, Attrs::Given);
+            write_atomic_inner(path, content, attrs, Expect::Any).map_err(String::from)
         }
         None => {
             // The same refusal the replacing branch gets. Removing was a direct
@@ -298,9 +292,23 @@ pub(super) fn sweep_abandoned_scratch() {
     }
 }
 
-/// Whether [`sweep_abandoned_scratch`] removes a file of this name.
+/// Whether [`sweep_abandoned_scratch`] removes a file of this name: exactly
+/// a name [`scratch_path`] makes, `.{service}.irlume-{kind}.{pid}.{seq}.tmp`
+/// with a kind from [`SCRATCH_KINDS`]. A name that only looks like one, such
+/// as `.sudo.irlume-review.tmp`, is somebody else's file and stays.
 pub(super) fn is_abandoned_scratch(name: &str) -> bool {
-    name.starts_with('.') && name.contains(".irlume-") && name.ends_with(".tmp")
+    let Some(rest) = name.strip_prefix('.').and_then(|r| r.strip_suffix(".tmp")) else {
+        return false;
+    };
+    let mut fields = rest.rsplitn(3, '.');
+    let (Some(seq), Some(pid), Some(head)) = (fields.next(), fields.next(), fields.next()) else {
+        return false;
+    };
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let service = SCRATCH_KINDS
+        .iter()
+        .find_map(|kind| head.strip_suffix(&format!(".irlume-{kind}")));
+    number(seq) && number(pid) && service.is_some_and(|s| !s.is_empty())
 }
 
 // ---- file ops ----------------------------------------------------------------
@@ -430,6 +438,32 @@ pub(super) fn interlope_for_test(path: &Path) {
 #[cfg(test)]
 pub(super) static INTERLOPE_BEFORE_INSTALL: TestHook = TestHook::new(Vec::new());
 
+/// Test-only: another writer's backup appears after [`backup`] found none,
+/// before its link publishes irlume's.
+#[cfg(test)]
+fn backup_appears_for_test(bak: &Path) {
+    if fires(&BACKUP_APPEARS, bak) {
+        let _ = std::fs::write(bak, "SOMEONE ELSE'S BACKUP\n");
+    }
+}
+
+#[cfg(test)]
+pub(super) static BACKUP_APPEARS: TestHook = TestHook::new(Vec::new());
+
+/// Test-only: the mode of a target changes (same file, same bytes) after a
+/// write's last check and before its file is installed, as a `chmod` by an
+/// administrator or a package would.
+#[cfg(test)]
+fn chmod_for_test(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    if fires(&CHMOD_BEFORE_INSTALL, path) {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+#[cfg(test)]
+pub(super) static CHMOD_BEFORE_INSTALL: TestHook = TestHook::new(Vec::new());
+
 /// Test-only: renames to or from these paths behave as on a filesystem
 /// without `RENAME_NOREPLACE` and `RENAME_EXCHANGE` (EINVAL). Stays armed
 /// until disarmed.
@@ -497,6 +531,12 @@ pub(super) type TargetState = Option<(u64, u64)>;
 /// external writer this narrows the window rather than closing it.
 pub(super) fn inspect_target(path: &Path) -> Result<TargetState, String> {
     use std::os::unix::fs::MetadataExt as _;
+    Ok(target_metadata(path)?.map(|meta| (meta.dev(), meta.ino())))
+}
+
+/// [`inspect_target`], returning the metadata it read.
+fn target_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, String> {
+    use std::os::unix::fs::MetadataExt as _;
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -522,7 +562,7 @@ pub(super) fn inspect_target(path: &Path) -> Result<TargetState, String> {
             meta.nlink()
         ));
     }
-    Ok(Some((meta.dev(), meta.ino())))
+    Ok(Some(meta))
 }
 
 /// A scratch path in the same directory as `path`, unique to this call.
@@ -535,6 +575,7 @@ pub(super) fn inspect_target(path: &Path) -> Result<TargetState, String> {
 /// paths apart, and a unique name means a leftover from a killed run is never
 /// adopted either.
 pub(super) fn scratch_path(path: &Path, kind: &str) -> PathBuf {
+    debug_assert!(SCRATCH_KINDS.contains(&kind), "{kind}");
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -544,6 +585,11 @@ pub(super) fn scratch_path(path: &Path, kind: &str) -> PathBuf {
         std::process::id()
     ))
 }
+
+/// The kinds of scratch file [`scratch_path`] makes: `new` for a write, `bak`
+/// for a backup. The sweep of abandoned scratch files matches these and no
+/// other.
+const SCRATCH_KINDS: [&str; 2] = ["new", "bak"];
 
 /// Create the scratch file, never adopting one that is already there.
 pub(super) fn create_scratch(tmp: &Path) -> Result<std::fs::File, String> {
@@ -569,6 +615,47 @@ pub(super) fn fsync_dir(dir: &Path) -> Result<(), String> {
     std::fs::File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|e| format!("fsync {}: {e}", dir.display()))
+}
+
+/// The `.pre-irlume` files this process published, each by path and identity
+/// (see [`published_here`]).
+static PUBLISHED: std::sync::Mutex<Vec<(PathBuf, (u64, u64))>> = std::sync::Mutex::new(Vec::new());
+
+/// Note that `identity` is the file this process linked at `bak`.
+fn note_published(bak: &Path, identity: (u64, u64)) {
+    PUBLISHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((bak.to_path_buf(), identity));
+}
+
+/// Whether the file at `bak` is one [`backup`] or [`keep_copy`] linked there
+/// in this process.
+///
+/// A transaction records a backup that was absent when it looked and is
+/// there after its write as one it created, and a rollback then deletes it.
+/// That is right only for irlume's own: another writer can put a file there
+/// in between, and the publishing link then fails with `EEXIST`, which
+/// [`backup`] takes as a complete backup already in place. The identity has
+/// the limit [`inspect_target`] describes.
+pub(super) fn published_here(bak: &Path) -> bool {
+    let Ok(Some(identity)) = inspect_target(bak) else {
+        return false;
+    };
+    PUBLISHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(path, published)| path == bak && *published == identity)
+}
+
+/// The identity of an open scratch file, to note once it is published.
+fn identity_of(file: &std::fs::File, tmp: &Path) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", tmp.display()))?;
+    Ok((meta.dev(), meta.ino()))
 }
 
 /// Copy `path` to its `.pre-irlume` backup, atomically, if there is not one yet.
@@ -604,16 +691,19 @@ pub(super) fn backup(path: &Path) -> Result<(), String> {
     let written = (|| -> Result<(), String> {
         use std::io::Write as _;
         let mut file = create_scratch(&tmp)?;
+        let ours = identity_of(&file, &tmp)?;
         file.write_all(&contents)
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
         apply_metadata(&tmp, &meta)?;
         // Before the link, so the name never points at bytes that are not there.
         file.sync_all()
             .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        #[cfg(test)]
+        backup_appears_for_test(&bak);
         // Fails with EEXIST if another run got there first, which is the answer
         // wanted: that backup is complete and this one is redundant.
         match std::fs::hard_link(&tmp, &bak) {
-            Ok(()) => {}
+            Ok(()) => note_published(&bak, ours),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
             Err(e) => return Err(format!("backup {}: {e}", path.display())),
         }
@@ -654,13 +744,14 @@ pub(super) fn keep_copy(path: &Path) -> Result<(), String> {
     let written = (|| -> Result<(), String> {
         use std::io::Write as _;
         let mut file = create_scratch(&tmp)?;
+        let ours = identity_of(&file, &tmp)?;
         file.write_all(&contents)
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
         apply_metadata(&tmp, &meta)?;
         file.sync_all()
             .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
         match std::fs::hard_link(&tmp, &bak) {
-            Ok(()) => {}
+            Ok(()) => note_published(&bak, ours),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return same_as_existing(),
             Err(e) => return Err(format!("keep {}: {e}", bak.display())),
         }
@@ -724,27 +815,26 @@ impl std::fmt::Display for WriteError {
 }
 
 pub(super) fn write_atomic(path: &Path, contents: &str) -> Result<(), WriteError> {
-    let existing = std::fs::symlink_metadata(path).ok();
-    write_atomic_inner(path, contents, existing.as_ref().map(mode_uid_gid), None)
+    write_atomic_inner(path, contents, Attrs::Carried, Expect::Any)
 }
 
 /// [`write_atomic`], refusing when the file no longer holds `expected` at the
 /// moment of the rename. The identity check alone misses an editor that saves
 /// in place (same inode), and a write decided on the old bytes would then
-/// replace the new ones. `None` expects nothing in particular (a file being
-/// created is covered by the identity check).
+/// replace the new ones.
+///
+/// `None` expects no file: the caller read none and decided to create one.
+/// A file that is there by the time of the first look here, or that appears
+/// before the rename, is another writer's (a package's, an administrator's)
+/// and is kept; the write is refused. Taking it as the file to replace would
+/// swap irlume's file in over a stack nobody decided on.
 pub(super) fn write_atomic_checked(
     path: &Path,
     contents: &str,
     expected: Option<&str>,
 ) -> Result<(), WriteError> {
-    let existing = std::fs::symlink_metadata(path).ok();
-    write_atomic_inner(
-        path,
-        contents,
-        existing.as_ref().map(mode_uid_gid),
-        expected.map(str::as_bytes),
-    )
+    let expect = expected.map_or(Expect::Absent, |bytes| Expect::Bytes(bytes.as_bytes()));
+    write_atomic_inner(path, contents, Attrs::Carried, expect)
 }
 
 /// Test-only: [`remove_checked_if`] with no further condition.
@@ -972,7 +1062,32 @@ pub(super) fn mode_uid_gid(meta: &std::fs::Metadata) -> (u32, u32, u32) {
     (meta.mode() & 0o7777, meta.uid(), meta.gid())
 }
 
-/// Replace `path` with `contents`, durably, carrying the given mode and owner.
+/// What a write requires of the file it replaces, checked at its first look
+/// and again as the file is swapped in.
+#[derive(Clone, Copy)]
+enum Expect<'a> {
+    /// Whatever is there, or nothing.
+    Any,
+    /// Nothing: the write creates the file.
+    Absent,
+    /// A file holding exactly these bytes.
+    Bytes(&'a [u8]),
+}
+
+/// Where a written file's mode and owner come from.
+#[derive(Clone, Copy)]
+enum Attrs {
+    /// The file it replaces, read in the same look that identifies that file
+    /// and required again of the file the swap takes out, so a `chmod` or
+    /// `chown` made in between is never reverted. A new file gets the
+    /// defaults.
+    Carried,
+    /// These, whatever the file has now: a rollback puts back recorded ones.
+    Given((u32, u32, u32)),
+}
+
+/// Replace `path` with `contents`, durably, with the mode and owner `attrs`
+/// names, only while the file there is what `expect` requires.
 ///
 /// Attributes are set on the scratch file BEFORE the rename, so the name never
 /// resolves to a PAM file with the wrong mode or owner. Setting them afterwards
@@ -983,24 +1098,40 @@ pub(super) fn mode_uid_gid(meta: &std::fs::Metadata) -> (u32, u32, u32) {
 /// them a successful `close` says nothing about what survives a power loss, and
 /// a PAM stack that comes back as a mixture of two versions is the failure this
 /// whole module exists to avoid.
-pub(super) fn write_atomic_inner(
+fn write_atomic_inner(
     path: &Path,
     contents: &str,
-    attrs: Option<(u32, u32, u32)>,
-    expected: Option<&[u8]>,
+    attrs: Attrs,
+    expect: Expect<'_>,
 ) -> Result<(), WriteError> {
     use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     // What the target is right now. A rename REPLACES whatever the name refers
     // to, so this has to be settled before anything is written, and confirmed
     // again before the name is taken over.
-    let before = inspect_target(path)?;
+    let found = target_metadata(path)?;
+    let before: TargetState = found.as_ref().map(|meta| (meta.dev(), meta.ino()));
+    if matches!(expect, Expect::Absent) && before.is_some() {
+        return Err(changed_while_writing(path).into());
+    }
+    let expected = match expect {
+        Expect::Bytes(bytes) => Some(bytes),
+        Expect::Any | Expect::Absent => None,
+    };
+    // The attributes the new file gets, and those the file it replaces must
+    // still have when it is swapped out (carried ones only).
+    let (attrs, carried) = match attrs {
+        Attrs::Carried => {
+            let found = found.as_ref().map(mode_uid_gid);
+            (found, found)
+        }
+        Attrs::Given(given) => (Some(given), None),
+    };
     let tmp = scratch_path(path, "new");
     // The scratch file's identity, so cleanup removes that name only while it
     // still refers to this file and never to one swapped out of the path.
     let mut ours: Option<(u64, u64)> = None;
     let result = (|| -> Result<(), WriteError> {
-        use std::os::unix::fs::MetadataExt as _;
         let mut file = create_scratch(&tmp)?;
         let meta = file
             .metadata()
@@ -1027,12 +1158,20 @@ pub(super) fn write_atomic_inner(
         // the name refers to at the instant it is replaced.
         if inspect_target(path)? != before
             || expected.is_some_and(|want| std::fs::read(path).ok().as_deref() != Some(want))
+            || carried.is_some_and(|want| {
+                std::fs::symlink_metadata(path)
+                    .ok()
+                    .map(|meta| mode_uid_gid(&meta))
+                    != Some(want)
+            })
         {
             return Err(changed_while_writing(path).into());
         }
         #[cfg(test)]
         interlope_for_test(path);
-        install(&tmp, path, before, expected)?;
+        #[cfg(test)]
+        chmod_for_test(path);
+        install(&tmp, path, before, expected, carried)?;
         sync_after_change(path)
     })();
     if result.is_err() {
@@ -1062,8 +1201,8 @@ fn changed_while_writing(path: &Path) -> String {
 ///   it (`RENAME_NOREPLACE`, or a hard link where the filesystem lacks it).
 /// - `before` a file (a replacement): the two names are exchanged in one
 ///   step, and the file that comes out of the path must be the one checked
-///   (same inode, one link, and `expected`'s bytes when given). Any other is
-///   exchanged back and the write is refused.
+///   (same inode, one link, `expected`'s bytes and the `carried` mode and
+///   owner when given). Any other is exchanged back and the write is refused.
 ///
 /// On a filesystem without `RENAME_EXCHANGE` a replacement falls back to a
 /// plain rename right after the check, as irlume wrote before; the window
@@ -1073,6 +1212,7 @@ fn install(
     path: &Path,
     before: TargetState,
     expected: Option<&[u8]>,
+    carried: Option<(u32, u32, u32)>,
 ) -> Result<(), WriteError> {
     use std::os::unix::fs::MetadataExt as _;
     let unsupported =
@@ -1108,9 +1248,13 @@ fn install(
         Err(e) => return Err(format!("rename into {}: {e}", path.display()).into()),
     }
     // `tmp` now names what the path held at the instant of the exchange.
-    let replaced_the_checked_file = std::fs::symlink_metadata(tmp)
-        .is_ok_and(|m| m.file_type().is_file() && m.nlink() == 1 && (m.dev(), m.ino()) == identity)
-        && expected.is_none_or(|want| std::fs::read(tmp).ok().as_deref() == Some(want));
+    let replaced_the_checked_file = std::fs::symlink_metadata(tmp).is_ok_and(|m| {
+        m.file_type().is_file()
+            && m.nlink() == 1
+            && (m.dev(), m.ino()) == identity
+            && carried.is_none_or(|want| mode_uid_gid(&m) == want)
+    }) && expected
+        .is_none_or(|want| std::fs::read(tmp).ok().as_deref() == Some(want));
     if replaced_the_checked_file {
         return std::fs::remove_file(tmp)
             .map_err(|e| WriteError::landed(format!("rm {}: {e}", tmp.display())));

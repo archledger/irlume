@@ -750,7 +750,13 @@ the surfaces that did change can be rolled back. The id travels IN THE
 DOCUMENT in that case, as a top-level `transaction_id` beside `failed`, not on
 standard error: machine mode promises stdout carries the answer and stderr
 stays empty, and a caller recovering from a half-changed login stack needs the
-id from the same place it reads everything else.
+id from the same place it reads everything else. Beside them, `changes` lists
+every surface as the success document does (`surface`, `role`, `change`,
+`applied`), so a caller can name the surface that failed. Each change in either
+document also carries `kept`: true for a surface irlume left as it was rather
+than update it (its lines would have moved an administrator's jump or line, or
+the file has a continued line; the plan shows it as `keep-edited-override`),
+which fails the apply without anything written there.
 
 **verify** answers whether the machine is still as that transaction left it,
 per surface: `as-applied`, `changed-since-apply`, or `unreadable`. An override

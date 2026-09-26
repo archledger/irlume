@@ -1702,6 +1702,7 @@ pub fn login_apply(args: &[String]) -> ExitCode {
                 "role": surface.role,
                 "change": surface.change.id(),
                 "applied": surface.error.is_none(),
+                "kept": surface.kept,
             })
         })
         .collect();
@@ -1729,9 +1730,16 @@ pub fn login_apply(args: &[String]) -> ExitCode {
             failed.len(),
             record.id
         );
+        // Which surfaces failed, and which irlume kept as they were, rides
+        // along the same way: the per-surface results the success document
+        // has, so a caller can name the refused surface.
         emit_with_extra(
             &failure(COMMAND, "operation-failed", false, contract),
-            json!({ "transaction_id": record.id, "failed": failed.len() }),
+            json!({
+                "transaction_id": record.id,
+                "failed": failed.len(),
+                "changes": changes,
+            }),
             ExitCode::FAILURE,
         )
     }

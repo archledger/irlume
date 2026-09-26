@@ -311,6 +311,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- A login is treated as cold unless the account has a live local graphical
+  session. An SSH login or a text console counted as the live session a
+  lock screen belongs to, so a graphical login by someone also logged in
+  over SSH was taken for a lock-screen unlock and skipped unlocking the
+  login keyring. irlume now asks logind for a user session that is active
+  or online, of type x11, wayland or mir, and not remote (#862).
+
 - `irlume login enable` and the reconcile unit no longer rebuild an
   `/etc/pam.d` file that irlume created from a vendor copy in
   `/usr/lib/pam.d` when it has lines irlume did not write. Before, a

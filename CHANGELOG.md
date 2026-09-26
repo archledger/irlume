@@ -341,44 +341,44 @@ All notable changes to irlume are documented here. This project adheres to
   line, so the jump lands where it did and a disable followed by an enable
   after such a change wires the file again. An update of irlume's lines
   that would still move such a jump, or move one of irlume's lines past an
-  administrator's line, is not made, and `login enable` then exits 1. A
-  comment added to a vendor line, or a blank or comment line, is not
-  counted as an administrator's line; a line the file has more often than
-  its vendor copy is, in every copy. When irlume's lines are not in such a
-  file, `login enable` puts them next to its password line, below every
-  line above it, or leaves the file unwired and says why. A file nobody
-  edited is rebuilt when its vendor copy changes, by the reconcile unit
-  and without re-applying the wiring, so vendor updates reach files
-  created from now on, except when irlume's lines would make a numeric
-  jump in the new vendor copy land somewhere other than it does there;
-  until it runs, the TUI's Diagnostics page shows a "Vendor PAM update"
-  warning with the reconcile fix. A file an earlier release wrote gets the
-  second line at the first reconcile when it still matches its vendor
-  copy; one that no longer matches, such as a Fedora `plasmalogin` file
-  written before the `pam_oo7` lines were added, is kept and reported by
-  `irlume doctor` (new check `login-overrides`) and `irlume login status`,
-  and `login enable --apply --force` rebuilds it. A file whose vendor copy
-  is gone is treated as the service's only configuration: irlume updates
-  its lines in place (in one nobody edited, where a rebuild would put
-  them) and never deletes it, and `login rollback` refuses to (`login
-  verify` reports it as `changed-since-apply`), also when a package
-  removes the vendor copy while the rollback is removing the file. An
-  override saved with CRLF line endings, which PAM does not read, is
-  reported by `irlume doctor` and rewritten with LF endings by `login
-  enable --apply`, header lines included. `login enable` and `login
-  disable` leave a file with a line that ends in `\`, which PAM joins with
-  the next line into one rule, as it is and exit 1: taking out or
-  rewriting one physical line of it can change the rule before it. A write
-  or removal of one of these files never replaces or deletes a file
-  another program put there after irlume read it, including one created
-  where irlume read none, and never reverts a mode or owner set after
-  irlume read it, an override is deleted only while its vendor copy is
-  still there as a regular file PAM can read, and one made from a vendor
-  copy stays in place only while that copy is still the one it was made
-  from. On a filesystem that cannot swap two files in one step
-  (`RENAME_EXCHANGE`), irlume refuses a checked replacement (of one of
-  these files, or by a rollback) rather than risk overwriting a change
-  made at the same moment. A jump whose type is written in brackets
+  administrator's line, is not made, and `login enable` then exits 1
+  (`login apply` reports that surface as failed). A comment added to a
+  vendor line, or a blank or comment line, is not counted as an
+  administrator's line; a line the file has more often than its vendor
+  copy is, in every copy. When irlume's lines are not in such a file,
+  `login enable` puts them next to its password line, below every line
+  above it, or leaves the file unwired and says why. A file nobody edited
+  is rebuilt when its vendor copy changes, by the reconcile unit and
+  without re-applying the wiring, so vendor updates reach files created
+  from now on, except when irlume's lines would make a numeric jump in the
+  new vendor copy land somewhere other than it does there; until it runs,
+  the TUI's Diagnostics page shows a "Vendor PAM update" warning with the
+  reconcile fix. A file an earlier release wrote gets the second line at
+  the first reconcile when it still matches its vendor copy; one that no
+  longer matches, such as a Fedora `plasmalogin` file written before the
+  `pam_oo7` lines were added, is kept and reported by `irlume doctor` (new
+  check `login-overrides`) and `irlume login status`, and `login enable
+  --apply --force` rebuilds it. A file whose vendor copy is gone is
+  treated as the service's only configuration: irlume updates its lines in
+  place (in one nobody edited, where a rebuild would put them) and never
+  deletes it, and `login rollback` refuses to (`login verify` reports it
+  as `changed-since-apply`), also when a package removes the vendor copy
+  while the rollback is removing the file. An override saved with CRLF
+  line endings, which PAM does not read, is reported by `irlume doctor`
+  and rewritten with LF endings by `login enable --apply`, header lines
+  included. `login enable` and `login disable` leave a file with a line
+  that ends in `\`, which PAM joins with the next line into one rule, as
+  it is and exit 1: taking out or rewriting one physical line of it can
+  change the rule before it. A write or removal of one of these files
+  never replaces or deletes a file another program put there after irlume
+  read it, including one created where irlume read none, and never reverts
+  a mode or owner set after irlume read it, an override is deleted only
+  while its vendor copy is still there as a regular file PAM can read, and
+  one made from a vendor copy stays in place only while that copy is still
+  the one it was made from. On a filesystem that cannot swap two files in
+  one step (`RENAME_EXCHANGE`), irlume refuses a checked replacement (of
+  one of these files, or by a rollback) rather than risk overwriting a
+  change made at the same moment. A jump whose type is written in brackets
   (`[auth]`) is counted like any other, a jump onto the first of two
   identical rules is told from one onto the second, and a jump that runs
   past the lines left into an include is followed too. `login plan` counts

@@ -1806,6 +1806,13 @@ fn apply_surface(
             .map(str::to_string),
     };
     let (change, error) = match wire_service_with(svc, want, &opts, wire) {
+        // Kept rather than changed as asked: updating irlume's lines would
+        // move a jump or one of them past an administrator's line, or the
+        // file has a continued line. Nothing was written, and irlume's lines
+        // are not the ones this run wanted, so the surface fails, as the
+        // human command fails the run (`kept_unmet`), and the marker is not
+        // written as if it had succeeded.
+        Ok(outcome) if outcome.unmet => (outcome.change, Some(outcome.message)),
         Ok(outcome) => (outcome.change, None),
         // Refused, or failed before anything was written: irlume changed
         // nothing at the path. What is there is the file this run read, or

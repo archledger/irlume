@@ -2242,6 +2242,30 @@ fn a_rollback_keeps_an_override_whose_vendor_path_is_not_a_file() {
     assert_eq!(read_file(svc.etc), created);
 }
 
+/// An override irlume keeps rather than changing as asked (here a disable
+/// of a file with a continued line, which leaves irlume's lines live) fails
+/// its surface in a machine apply, as it fails the human command, so
+/// `login apply` does not report success or drop the self-heal marker.
+#[test]
+fn a_kept_override_fails_its_surface_in_a_machine_apply() {
+    let dir = TestDir::new("ovr-apply-unmet");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    let continued = read_file(svc.etc).replacen(
+        "auth        substack      password-auth\n",
+        "auth       optional     pam_echo.so before the password \\\nauth        substack      password-auth\n",
+        1,
+    );
+    std::fs::write(svc.etc, &continued).unwrap();
+    let planned = [plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, false)];
+    assert_eq!(planned[0].change, PlannedChange::KeepEditedOverride);
+    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, false, &planned);
+    let error = applied.error.expect("the surface fails");
+    assert!(error.contains("kept as it is"), "{error}");
+    assert_eq!(read_file(svc.etc), continued, "nothing written");
+    assert!(content_has_module(&read_file(svc.etc)));
+}
+
 // ---- updating irlume's lines where a jump counts them ------------------------------
 
 /// Whether `text` has a live rule loading pam_irlume.so with `arg`, in `phase`.

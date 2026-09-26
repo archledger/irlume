@@ -2244,8 +2244,11 @@ fn a_rollback_keeps_an_override_whose_vendor_path_is_not_a_file() {
 
 /// An override irlume keeps rather than changing as asked (here a disable
 /// of a file with a continued line, which leaves irlume's lines live) fails
-/// its surface in a machine apply, as it fails the human command, so
-/// `login apply` does not report success or drop the self-heal marker.
+/// its surface in a machine apply, as it fails the human command. As there,
+/// it does not hold back the self-heal marker: otherwise the marker kept
+/// saying "wired" after a disable, and reconcile wired again every surface
+/// the disable had unwired. A surface that failed for another reason still
+/// holds it back.
 #[test]
 fn a_kept_override_fails_its_surface_in_a_machine_apply() {
     let dir = TestDir::new("ovr-apply-unmet");
@@ -2260,10 +2263,22 @@ fn a_kept_override_fails_its_surface_in_a_machine_apply() {
     let planned = [plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, false)];
     assert_eq!(planned[0].change, PlannedChange::KeepEditedOverride);
     let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, false, &planned);
-    let error = applied.error.expect("the surface fails");
+    let error = applied.error.clone().expect("the surface fails");
     assert!(error.contains("kept as it is"), "{error}");
+    assert!(applied.kept);
     assert_eq!(read_file(svc.etc), continued, "nothing written");
     assert!(content_has_module(&read_file(svc.etc)));
+    assert!(crate::machine::marker_follows(std::slice::from_ref(
+        &applied
+    )));
+
+    let drift_dir = TestDir::new("ovr-apply-unmet-drift");
+    let drifted = plasmalogin(&drift_dir.0, UPSTREAM_FEDORA);
+    let planned = [plan_surface(&drifted, ROLE_LOGIN, &face_and_keyring, true)];
+    std::fs::write(drifted.vendor.unwrap(), fedora_with_oo7()).unwrap();
+    let refused = apply_surface(&drifted, ROLE_LOGIN, &face_and_keyring, true, &planned);
+    assert!(refused.error.is_some() && !refused.kept);
+    assert!(!crate::machine::marker_follows(&[applied, refused]));
 }
 
 // ---- updating irlume's lines where a jump counts them ------------------------------

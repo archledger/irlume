@@ -1126,6 +1126,16 @@ fn confirmed_after(after: Option<&str>, unconfirmed: bool) -> Option<&str> {
     after.filter(|_| !unconfirmed)
 }
 
+/// Whether `login apply` records the self-heal marker for what it just did:
+/// when no surface failed, or the only failures are surfaces irlume kept as
+/// they were rather than change them as asked, as the human command does.
+/// Skipping it for a kept surface left the marker saying "wired" after a
+/// disable that unwired every other surface, and the reconcile path unit
+/// then wired them all again.
+pub(crate) fn marker_follows(applied: &[crate::pamwire::AppliedSurface]) -> bool {
+    applied.iter().all(|s| s.error.is_none() || s.kept)
+}
+
 /// Restore every surface of a transaction, or report what it would restore.
 ///
 /// Shared by the confirmed and the unconfirmed path so the restore itself has
@@ -1622,7 +1632,7 @@ pub fn login_apply(args: &[String]) -> ExitCode {
     //
     // The scopes match what `apply` planned: this command wires the greeter and
     // lock screen, and never sudo or polkit, which are their own opt-in.
-    if failed.is_empty() {
+    if marker_follows(&applied) {
         // Only the scopes this command is responsible for. `login apply` wires
         // the greeter and the lock screen and never touches sudo or polkit, so
         // it must not overwrite their flags: a machine `enable` on a host where

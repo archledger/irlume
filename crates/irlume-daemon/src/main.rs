@@ -959,7 +959,7 @@ fn main() {
                         Ok(false) => {}
                         Err(e) => jout_warn!(
                             "irlumed: could not move the template key of '{user}' to a stronger \
-                             TPM policy ({e}); it stays as it is and unseals as before"
+                             TPM policy ({e}); its envelope was not changed"
                         ),
                     }
                 }

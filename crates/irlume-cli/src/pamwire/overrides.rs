@@ -333,6 +333,75 @@ fn neutralize(body: &str) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
+/// `body` with irlume's lines updated in their own places: each line of
+/// irlume's takes the line `wired` has for the same job (see [`kind`]), an
+/// inactive line holding a place included, and a rule loading pam_irlume.so
+/// that `wired` has no line for becomes an inactive line in the same place.
+/// irlume's other lines (its permit landing, its tagged keyring lines, and
+/// inactive lines `wired` does not fill) stay as they are. So every line
+/// keeps its position and no jump that counts irlume's lines moves.
+///
+/// `None` when `wired` has a line of irlume's that `body` has no place for:
+/// adding one is a move of its own, which [`arrange`] and [`check_jumps`]
+/// decide.
+fn fill_slots(body: &str, wired: &str) -> Option<String> {
+    let mut wanted: Vec<(String, &str)> = wired
+        .lines()
+        .filter(|l| is_irlume_line(l))
+        .map(|l| (kind(l), l))
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    for line in body.lines() {
+        if !is_irlume_line(line) {
+            out.push(line.to_string());
+            continue;
+        }
+        let k = kind(line);
+        if let Some(at) = wanted.iter().position(|(w, _)| *w == k) {
+            out.push(wanted.remove(at).1.to_string());
+        } else if irlume_rule(line).is_some() {
+            let (phase, job) = k.split_once(' ').unwrap_or((k.as_str(), ""));
+            out.push(inert_line(phase, job));
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    wanted.is_empty().then(|| format!("{}\n", out.join("\n")))
+}
+
+/// Where each numeric jump of irlume's own rules lands, keyed by the rule's
+/// kind and the action: what [`fill_slots`] must leave as the recipe has it.
+fn own_landings(text: &str) -> Vec<(String, String, Landing)> {
+    let mut out = Vec::new();
+    for phase_name in PHASES {
+        let chain = chain(text, phase_name);
+        for (at, line) in chain.iter().enumerate() {
+            if irlume_rule(line).is_none() {
+                continue;
+            }
+            for (key, n) in numeric_actions(line) {
+                out.push((kind(line), key, landing_of(&chain, at, n)));
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    out
+}
+
+/// [`fill_slots`] as an alternative to a write [`check_jumps`] refused: the
+/// filled file when it moves no jump of the other lines and irlume's own
+/// jumps land as they do in `wired`.
+fn filled_in_place(body: &str, wired: &str, edited: bool) -> Option<(String, JumpCheck)> {
+    let filled = fill_slots(body, wired)?;
+    if own_landings(&filled) != own_landings(wired) {
+        return None;
+    }
+    match check_jumps(body, &filled, edited) {
+        JumpCheck::Refuse(_) => None,
+        check => Some((filled, check)),
+    }
+}
+
 // ---- numeric jumps -------------------------------------------------------------
 //
 // A control such as `[success=2 default=ignore]` skips the next two modules of
@@ -1452,7 +1521,7 @@ fn in_place(i: &Input<'_>, p: &Parsed<'_>, m: InPlace) -> Decision {
             ..keep(PlannedChange::KeepEditedOverride, message)
         }
     };
-    let arranged = match arrange(&p.body, &bare, wired, i.vendor, edited, i.wire) {
+    let arranged = match arrange(&p.body, &bare, wired.clone(), i.vendor, edited, i.wire) {
         Ok(text) => text,
         Err(Misplaced::Crossing(line)) => {
             return refuse(format!(
@@ -1482,11 +1551,35 @@ fn in_place(i: &Input<'_>, p: &Parsed<'_>, m: InPlace) -> Decision {
             };
         }
     };
-    let mut message = match check_jumps(&p.body, &arranged, edited) {
-        JumpCheck::Refuse(reason) => return refuse(format!("move a jump: {reason}")),
-        JumpCheck::Warn(warn) => format!("{rewired}{warn}"),
-        JumpCheck::Clear => rewired,
+    // A write that would move a jump can often be made without moving
+    // anything: each of irlume's lines updated in its own place, and an
+    // inactive line kept where this configuration no longer wants one (face
+    // login turned off where a jump counts the face line, or lines a disable
+    // left inactive).
+    let (arranged, check, filled) = match check_jumps(&p.body, &arranged, edited) {
+        JumpCheck::Refuse(reason) => match filled_in_place(&p.body, &wired, edited) {
+            Some((text, check)) => (text, check, true),
+            None => return refuse(format!("move a jump: {reason}")),
+        },
+        check => (arranged, check, false),
     };
+    if filled && normalize(&arranged) == normalize(&p.body) && !p.crlf {
+        let (change, message) = unchanged;
+        return Decision {
+            detail,
+            ..keep(change, message)
+        };
+    }
+    let mut message = match check {
+        JumpCheck::Warn(warn) => format!("{rewired}{warn}"),
+        JumpCheck::Clear | JumpCheck::Refuse(_) => rewired,
+    };
+    if filled && arranged.contains(INERT_TAG) {
+        message.push_str(
+            "; an inactive line holds the place of each of irlume's lines this configuration \
+             does not use, so every jump lands where it did",
+        );
+    }
     if p.crlf {
         message.push_str(&format!("; {CRLF_FIXED}"));
     }

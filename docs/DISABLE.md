@@ -105,8 +105,13 @@ This unwires every greeter and the lock screen, and removes the `sudo` and
   counts them. It does the same when it could not tell where to put its
   lines back without them (the file has no password line irlume can tell
   from one of yours, such as a copy of the vendor's), so the next `enable`
-  puts them back in the same places. A numeric jump from the vendor file that irlume's lines had
-  moved lands where the vendor file has it again once they are removed. An
+  puts them back in the same places. If the machine's configuration
+  changed in between (for example an RGB-only camera no longer does face
+  login), that `enable` turns on the lines it still uses in their places
+  and leaves an inactive line where one is no longer used, so your jump
+  still lands where it did. A numeric jump from the vendor file that
+  irlume's lines had moved lands where the vendor file has it again once
+  they are removed. An
   override whose vendor copy is gone is kept the same way, since PAM has
   nothing else for that service,
 - removes the SELinux module on Fedora (`semodule -r irlume`, checked: a

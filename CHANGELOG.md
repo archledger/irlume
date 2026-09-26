@@ -333,9 +333,14 @@ All notable changes to irlume are documented here. This project adheres to
   same places instead, so every jump still lands where it did, and it does
   the same when it could not tell where to put them back without them; a
   jump from the vendor file that irlume's lines had moved lands where the
-  vendor file has it again. An update of irlume's lines that would move
-  such a jump, or move one of irlume's lines past an administrator's line,
-  is not made, and `login enable` then exits 1. A comment added to a
+  vendor file has it again. An update that only turns on or off lines such
+  a jump counts is made in place: each of irlume's lines takes its own
+  place, and a line the configuration no longer uses (face login on an
+  RGB-only camera, say) stays as an inactive line, so the jump lands where
+  it did and a disable followed by an enable after such a change wires the
+  file again. An update of irlume's lines that would still move such a
+  jump, or move one of irlume's lines past an administrator's line, is not
+  made, and `login enable` then exits 1. A comment added to a
   vendor line, or a blank or comment line, is not counted as an
   administrator's line; a line the file has more often than its vendor
   copy is, in every copy. When irlume's lines are not in such a file,

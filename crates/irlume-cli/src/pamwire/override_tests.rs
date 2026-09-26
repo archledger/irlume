@@ -214,11 +214,12 @@ fn an_edited_override_keeps_its_lines_under_every_greeter_recipe() {
     }
 }
 
-/// The jump the ThinkPad's line carries counts irlume's lines. A recipe that
-/// moves them (fingerprint only, no face line) would move where it lands, so
-/// the file is left exactly as it is.
+/// The jump the ThinkPad's line carries counts irlume's lines. A recipe
+/// without the face line would move where it lands if the face line were
+/// removed, so the face line's place is kept by an inactive line instead:
+/// the update is made and the jump lands where it did.
 #[test]
-fn a_recipe_change_that_would_move_an_admin_jump_leaves_the_file_alone() {
+fn a_recipe_change_under_an_admin_jump_keeps_the_places_it_counts() {
     let dir = TestDir::new("ovr-jump");
     let svc = plasmalogin(&dir.0, &fedora_with_oo7());
     let vendor_path = svc.vendor.unwrap();
@@ -226,12 +227,16 @@ fn a_recipe_change_that_would_move_an_admin_jump_leaves_the_file_alone() {
     let before = legacy_override(vendor_path, &with_line(&wired, LOCAL_JUMP));
     std::fs::write(svc.etc, &before).unwrap();
     let outcome = wire_service(&svc, true, true, &keyring_only).unwrap();
-    assert_eq!(change_id(&outcome), "keep-edited-override", "{outcome}");
-    assert!(
-        outcome.message.contains("pam_fprintd.so") && outcome.message.contains("reseal"),
-        "the message quotes the jump and where it would land: {outcome}"
+    assert_eq!(change_id(&outcome), "rewire-override", "{outcome}");
+    let after = read_file(svc.etc);
+    assert!(!has_live(&after, "auth", "unseal"), "{after}");
+    assert!(after.contains(&format!("{INERT_TAG} unseal")), "{after}");
+    assert_eq!(after.lines().count(), before.lines().count(), "{after}");
+    assert_eq!(
+        lands_after(&after, "pam_fprintd.so", 2),
+        lands_after(&before, "pam_fprintd.so", 2),
+        "{after}"
     );
-    assert_eq!(read_file(svc.etc), before);
 }
 
 // ---- following the vendor copy -----------------------------------------------------
@@ -871,26 +876,30 @@ fn the_polkit_migration_keeps_irlume_below_an_admin_gate() {
     }
 }
 
-/// A method switch the ThinkPad's jump refuses leaves irlume's earlier lines
-/// in the file, face included. A person's run then fails and says so, rather
-/// than report success while face stays on at the login screen; reconcile,
-/// which replays what an earlier run saw, does not count it.
+/// A method switch the file cannot take leaves irlume's earlier lines as they
+/// are: here face login is wanted in a file whose fingerprint jump skips only
+/// the password line, so a face line would need a new place inside that
+/// jump. A person's run then fails and says so, rather than report success
+/// while the file does not do what was asked; reconcile, which replays what
+/// an earlier run saw, does not count it.
 #[test]
 fn a_refused_update_is_an_unmet_request_for_a_person_only() {
     let dir = TestDir::new("ovr-unmet");
     let svc = plasmalogin(&dir.0, &fedora_with_oo7());
     let vendor_path = svc.vendor.unwrap();
-    let (wired, _) = face_and_keyring(&unwire_lines(&fedora_with_oo7()).0);
-    let before = legacy_override(vendor_path, &with_line(&wired, LOCAL_JUMP));
+    let (rebuilt, _) = keyring_only(&unwire_lines(&fedora_with_oo7()).0);
+    let jump =
+        "auth       [success=1 default=ignore]   pam_fprintd.so max-tries=1 timeout=5   # local";
+    let before = legacy_override(vendor_path, &with_line(&rebuilt, jump));
     std::fs::write(svc.etc, &before).unwrap();
-    let outcome = wire_service(&svc, true, true, &keyring_only).unwrap();
+    let outcome = wire_service(&svc, true, true, &face_and_keyring).unwrap();
     assert_eq!(change_id(&outcome), "keep-edited-override", "{outcome}");
     assert!(outcome.unmet, "{outcome}");
-    assert!(read_file(svc.etc).contains("pam_irlume.so unseal"));
+    assert_eq!(read_file(svc.etc), before);
     assert!(kept_unmet(ScopeOrigin::Command, &outcome));
     assert!(!kept_unmet(ScopeOrigin::Marker, &outcome));
     // Keeping a file whose irlume lines are right is no unmet request.
-    let same = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    let same = wire_service(&svc, true, true, &keyring_only).unwrap();
     assert_eq!(change_id(&same), "keep-edited-override", "{same}");
     assert!(!same.unmet);
     assert!(!kept_unmet(ScopeOrigin::Command, &same));
@@ -1906,4 +1915,109 @@ fn checked_writes_work_without_the_rename_flags() {
     disarm(&NO_RENAME_FLAGS, &path);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced\n");
     assert_eq!(entries(&dir.0), ["sudo"], "no scratch file is left");
+}
+
+// ---- updating irlume's lines where a jump counts them ------------------------------
+
+/// Whether `text` has a live rule loading pam_irlume.so with `arg`, in `phase`.
+fn has_live(text: &str, phase: &str, arg: &str) -> bool {
+    text.lines()
+        .any(|l| irlume_rule(l).is_some_and(|r| r.phase == phase) && irlume_rule_has_arg(l, arg))
+}
+
+/// The laptop's round trip with a plan change in between. Wired with face on,
+/// then disabled (irlume's lines become inactive and the fingerprint jump
+/// keeps its landing), then enabled for a camera that no longer does face
+/// login: the keyring and reseal lines come back in their own places, the
+/// face line's place stays inactive, and the jump lands where it did. With
+/// face wanted again the file is the original one.
+#[test]
+fn enable_after_a_plan_change_fills_the_places_a_jump_counts() {
+    let dir = TestDir::new("ovr-refill-after-disable");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    let vendor_path = svc.vendor.unwrap();
+    let wired = thinkpad_before(vendor_path);
+    std::fs::write(svc.etc, &wired).unwrap();
+    std::fs::write(vendor_path, fedora_with_oo7()).unwrap();
+    let landing = lands_after(&wired, "pam_fprintd.so", 2);
+
+    wire_service(&svc, false, true, &face_and_keyring).unwrap();
+    let disabled = read_file(svc.etc);
+    assert!(!content_has_module(&disabled), "{disabled}");
+
+    let on = wire_service(&svc, true, true, &keyring_only).unwrap();
+    assert_eq!(change_id(&on), "rewire-override", "{on}");
+    assert!(!on.unmet, "{on}");
+    let after = read_file(svc.etc);
+    assert!(has_live(&after, "auth", "keyring"), "{after}");
+    assert!(has_live(&after, "auth", "reseal"), "{after}");
+    assert!(has_live(&after, "session", "reseal"), "{after}");
+    assert!(!has_live(&after, "auth", "unseal"), "no face line: {after}");
+    assert!(
+        after.contains(&format!("{INERT_TAG} unseal")),
+        "its place is held: {after}"
+    );
+    assert!(after.contains(LOCAL_JUMP), "{after}");
+    assert_eq!(after.lines().count(), wired.lines().count(), "{after}");
+    assert_eq!(lands_after(&after, "pam_fprintd.so", 2), landing, "{after}");
+    assert!(on.message.contains("inactive line holds the place"), "{on}");
+
+    let again = wire_service(&svc, true, true, &keyring_only).unwrap();
+    assert_eq!(
+        read_file(svc.etc),
+        after,
+        "a second enable changes nothing: {again}"
+    );
+
+    wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert_eq!(
+        read_file(svc.etc),
+        wired,
+        "face wanted again: the original file"
+    );
+}
+
+/// The same file while wired: a plan without face login makes the face line
+/// inactive in its place instead of refusing the update, so the keyring line
+/// the jump lands before keeps working and the jump lands where it did.
+#[test]
+fn enable_makes_an_unwanted_face_line_inactive_where_a_jump_counts_it() {
+    let dir = TestDir::new("ovr-refill-face-off");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    let vendor_path = svc.vendor.unwrap();
+    let wired = thinkpad_before(vendor_path);
+    std::fs::write(svc.etc, &wired).unwrap();
+    std::fs::write(vendor_path, fedora_with_oo7()).unwrap();
+    let on = wire_service(&svc, true, true, &keyring_only).unwrap();
+    assert_eq!(change_id(&on), "rewire-override", "{on}");
+    let after = read_file(svc.etc);
+    assert!(!has_live(&after, "auth", "unseal"), "{after}");
+    assert!(has_live(&after, "auth", "keyring"), "{after}");
+    assert_eq!(after.lines().count(), wired.lines().count(), "{after}");
+    assert_eq!(
+        lands_after(&after, "pam_fprintd.so", 2),
+        lands_after(&wired, "pam_fprintd.so", 2),
+        "{after}"
+    );
+}
+
+/// A line irlume wants that has no place in the file, where adding one would
+/// move a jump, is still refused: here face login is wanted again in a file
+/// rebuilt without it, whose fingerprint jump skips only the password line.
+#[test]
+fn enable_still_refuses_a_line_that_needs_a_new_place_inside_a_jump() {
+    let dir = TestDir::new("ovr-refill-no-place");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    let vendor_path = svc.vendor.unwrap();
+    let (rebuilt, ok) = keyring_only(&unwire_lines(UPSTREAM_FEDORA).0);
+    assert!(ok);
+    let jump =
+        "auth       [success=1 default=ignore]   pam_fprintd.so max-tries=1 timeout=5   # local";
+    let before = with_line(&legacy_override(vendor_path, &rebuilt), jump);
+    std::fs::write(svc.etc, &before).unwrap();
+    std::fs::write(vendor_path, fedora_with_oo7()).unwrap();
+    let on = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert_eq!(change_id(&on), "keep-edited-override", "{on}");
+    assert!(on.unmet, "{on}");
+    assert_eq!(read_file(svc.etc), before, "nothing written");
 }

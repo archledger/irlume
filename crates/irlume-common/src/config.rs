@@ -170,6 +170,26 @@ pub fn observe_kv(file: &str, key: &str) -> KvObservation {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return KvObservation::Absent,
         Err(e) => return KvObservation::Unknown(e),
     };
+    match scan_kv(&text, key) {
+        KvLine::Value(v) => KvObservation::Value(v.to_string()),
+        KvLine::Empty | KvLine::Absent => KvObservation::Absent,
+    }
+}
+
+/// How `key` appears in one snapshot of a `key=value` file.
+enum KvLine<'a> {
+    /// The first line naming the key with a non-empty value has this one.
+    Value(&'a str),
+    /// Lines name the key, all with an empty value (`key=`).
+    Empty,
+    /// No line names the key.
+    Absent,
+}
+
+/// The one line grammar [`observe_kv`] reads: blank and `#` lines skipped, the
+/// first non-empty value of `key` wins.
+fn scan_kv<'a>(text: &'a str, key: &str) -> KvLine<'a> {
+    let mut named = false;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -179,12 +199,17 @@ pub fn observe_kv(file: &str, key: &str) -> KvObservation {
             if k.trim() == key {
                 let v = v.trim();
                 if !v.is_empty() {
-                    return KvObservation::Value(v.to_string());
+                    return KvLine::Value(v);
                 }
+                named = true;
             }
         }
     }
-    KvObservation::Absent
+    if named {
+        KvLine::Empty
+    } else {
+        KvLine::Absent
+    }
 }
 
 /// Read a single key from a `key=value` file. Returns the trimmed value, or
@@ -982,37 +1007,31 @@ pub fn privileged_grouped_pad_evidence_enabled() -> bool {
     if let Some(v) = std::env::var_os("IRLUME_PRIVILEGED_GROUPED_PAD") {
         return v.to_str().is_some_and(truthy);
     }
-    match observe_kv("settings.conf", "privileged_grouped_pad_evidence") {
-        KvObservation::Value(v) => truthy(&v),
-        // `observe_kv` reports `key=` and a dangling settings.conf symlink as
-        // absent; for a default-on key the first is a set value that is not an
-        // affirmative and the second a policy that cannot be read.
-        KvObservation::Absent => {
-            !absent_only_in_name("settings.conf", "privileged_grouped_pad_evidence")
-        }
-        KvObservation::Unknown(_) => false,
+    // One read decides, so a settings.conf replaced meanwhile cannot mix two
+    // versions. Unlike `observe_kv`, `key=` is a set value that is not an
+    // affirmative, and a name that exists without resolving is a policy that
+    // cannot be read.
+    let path = config_path("settings.conf");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match scan_kv(&text, "privileged_grouped_pad_evidence") {
+            KvLine::Value(v) => truthy(v),
+            KvLine::Empty => false,
+            KvLine::Absent => true,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => no_dangling_link_on(&path),
+        Err(_) => false,
     }
 }
 
-/// Whether an [`observe_kv`] "absent" for `key` hides something a default-on
-/// caller must read as off: the key present with an empty value (`key=`), or a
-/// `file` whose name exists while its content cannot be read (a dangling
-/// symlink, for example to a volume not mounted yet, as
-/// [`observe_camera_conf`] treats it). Only a missing name is plainly absent.
-fn absent_only_in_name(file: &str, key: &str) -> bool {
-    let path = config_path(file);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => text
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .filter_map(|line| line.split_once('='))
-            .any(|(k, v)| k.trim() == key && v.trim().is_empty()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::symlink_metadata(&path).is_ok()
-        }
-        Err(_) => true,
-    }
+/// Whether a `NotFound` for `path` is a plain absence: no component of it,
+/// from the file up through the configuration directory, is a name that exists
+/// without resolving. A dangling symlink at `settings.conf` or at
+/// `/etc/irlume` itself (for example to a volume not mounted yet) is
+/// configuration that cannot be read, as [`observe_camera_conf`] treats it.
+fn no_dangling_link_on(path: &std::path::Path) -> bool {
+    path.ancestors()
+        .filter(|p| !p.as_os_str().is_empty())
+        .all(|p| std::fs::symlink_metadata(p).is_err() || std::fs::metadata(p).is_ok())
 }
 
 #[cfg(test)]
@@ -1109,6 +1128,16 @@ mod tests {
         std::fs::create_dir(dir.join("settings.conf")).unwrap();
         assert!(!privileged_grouped_pad_evidence_enabled());
         std::fs::remove_dir(dir.join("settings.conf")).unwrap();
+
+        // So does a configuration directory that is itself a dangling symlink;
+        // one that is simply missing is absent.
+        let linked = dir.join("linked-config");
+        std::os::unix::fs::symlink(dir.join("not-mounted"), &linked).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &linked);
+        assert!(!privileged_grouped_pad_evidence_enabled());
+        std::env::set_var("IRLUME_CONFIG_DIR", dir.join("never-created"));
+        assert!(privileged_grouped_pad_evidence_enabled());
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
 
         write_kv("settings.conf", "privileged_grouped_pad_evidence", "1").unwrap();
         assert!(privileged_grouped_pad_evidence_enabled());

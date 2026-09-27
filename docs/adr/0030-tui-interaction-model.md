@@ -621,6 +621,12 @@ own background qualification, which are daemon-wide.
   many operations wait: that is what keeps clients from queueing camera
   work behind an authentication. What it no longer sees is whose work it
   is and what kind.
+- The ring classes as `authentication` every operation that checks the
+  account's password and may hand a credential out, not only face and
+  fingerprint authentications and credential releases: a disarm's token
+  release (`ReleaseTokenForDisarm`) and every keyring arm
+  (`SealPassword`), which returns the GNOME keyring token when that is
+  what it seals, a choice made only when it runs.
 - `SupportProbe` stays root-only and its snapshot unchanged. The support
   report's privacy checklist says when the report lists authentication
   times and outcomes, and whether they are every account's (a report run

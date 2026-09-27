@@ -6248,11 +6248,17 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         // `ReleaseTokenForDisarm` checks the account's password against the
         // token's wrap and hands the GNOME keyring token out: a credential
         // release like `UnsealKeyring`, so its events are the account's
-        // history too (`diagnostic_owner`).
+        // history too (`diagnostic_owner`). `SealPassword` checks the
+        // password against the account's login hash where the daemon can
+        // read it, and one that resolves to a GNOME keyring token returns
+        // that token in `TokenSealed`, on a re-arm the one already armed.
+        // What it seals is decided only when it runs, so every one is
+        // classed with the credential releases.
         Authenticate { .. }
         | UnsealPassword { .. }
         | UnsealKeyring { .. }
-        | ReleaseTokenForDisarm { .. } => OperationClass::Authentication,
+        | ReleaseTokenForDisarm { .. }
+        | SealPassword { .. } => OperationClass::Authentication,
         Enroll { .. }
         | EnrollmentSession { .. }
         | AddScan { .. }
@@ -6287,7 +6293,6 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | SupportSnapshot { .. }
         | LiveStatus
         | TraceSubscribe { .. }
-        | SealPassword { .. }
         | HasSealedPassword { .. }
         | KeyringMetadata { .. }
         | KeyringInfo { .. }
@@ -13216,6 +13221,116 @@ mod tests {
         let failed = [ShareSafeEventKind::OperationFinished {
             outcome: CategoricalOutcome::Failed,
         }];
+        assert_eq!(events_of(0, operation), failed);
+        assert_eq!(events_of(euid, operation), failed);
+        assert!(events_of(stranger, operation).is_empty());
+    }
+
+    /// A password seal checks the account's password where the daemon can
+    /// read its hash and may hand a GNOME keyring token out, which is
+    /// decided only when it runs, so every one is a credential operation of
+    /// the account it names: its outcome is classed with the
+    /// authentications and read by root and that account only, and another
+    /// account reads it as unknown work while it runs.
+    #[test]
+    fn a_password_seal_is_a_credential_operation_shown_to_root_and_its_account_only() {
+        use irlume_common::diagnostics::{
+            CategoricalOutcome, OperationClass, OperationId, ShareSafeEventKind,
+        };
+        use irlume_common::live::LiveOperationKind;
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let _g = env_lock();
+        let _sandbox = sandbox("password-seal-owner");
+        // SAFETY: geteuid takes no arguments, reads only this process's own
+        // effective uid, and always succeeds.
+        let euid = unsafe { libc::geteuid() };
+        let account = users::name_for_uid(euid).expect("the running account resolves");
+        let stranger = if euid == 60_002 { 60_003 } else { 60_002 };
+        let state = diagnostics::DiagnosticState::default();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let ask = |uid: u32, wire: String| {
+            with_serve_as_peer_and_diagnostics(&arbiter, &ready, &state, peer(uid), |client| {
+                (&*client).write_all(wire.as_bytes()).unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                serde_json::from_str::<Response>(line.trim()).unwrap()
+            })
+        };
+        let running = |uid: u32| {
+            let Response::LiveStatus(live) = ask(uid, "\"LiveStatus\"\n".into()) else {
+                panic!("expected live status");
+            };
+            let worker = live.worker.expect("the seal is running");
+            (worker.operation_id, worker.kind)
+        };
+        let events_of = |uid: u32, operation: OperationId| {
+            let Response::SupportSnapshot(snapshot) =
+                ask(uid, "{\"SupportSnapshot\":{\"since_ms\":60000}}\n".into())
+            else {
+                panic!("expected a support snapshot");
+            };
+            snapshot
+                .events()
+                .iter()
+                .filter(|event| event.operation_id == operation)
+                .map(|event| (event.operation, event.kind.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut wire = serde_json::to_string(&Request::SealPassword {
+            user: account.clone(),
+            password: irlume_common::SecretBytes::new(b"not-the-password".to_vec()),
+            kind: None,
+            wallet_salt: None,
+            wallet_salt_checked: false,
+        })
+        .unwrap();
+        wire.push('\n');
+
+        let (claimed, on_claim) = std::sync::mpsc::channel();
+        let (release, on_release) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let arbiter = std::sync::Arc::clone(&arbiter);
+            std::thread::spawn(move || {
+                let job = arbiter.take().expect("root's password seal queued");
+                let Queued {
+                    reply, link, scope, ..
+                } = job.payload;
+                assert!(link.claim());
+                claimed.send(()).unwrap();
+                on_release.recv().unwrap();
+                let response = Response::Error("the password does not match".into());
+                scope.finish(categorical_outcome(&response));
+                link.released();
+                link.finish_activity();
+                arbiter.finish(job.class, job.uid);
+                reply.send(response.into()).unwrap();
+            })
+        };
+        let operation = std::thread::scope(|scope| {
+            // Owned here, so a failed assertion drops it before the scope
+            // joins: the worker stops waiting and the client is answered.
+            let release = release;
+            let client = scope.spawn(|| ask(0, wire));
+            on_claim
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the worker claims the password seal");
+            let (operation, kind) = running(0);
+            assert_eq!(kind, LiveOperationKind::WalletUpdate);
+            assert_eq!(running(euid), (operation, LiveOperationKind::WalletUpdate));
+            assert_eq!(running(stranger), (operation, LiveOperationKind::Unknown));
+            release.send(()).unwrap();
+            assert!(matches!(client.join().unwrap(), Response::Error(_)));
+            operation
+        });
+        worker.join().unwrap();
+        arbiter.close();
+        let failed = [(
+            OperationClass::Authentication,
+            ShareSafeEventKind::OperationFinished {
+                outcome: CategoricalOutcome::Failed,
+            },
+        )];
         assert_eq!(events_of(0, operation), failed);
         assert_eq!(events_of(euid, operation), failed);
         assert!(events_of(stranger, operation).is_empty());

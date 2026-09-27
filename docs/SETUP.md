@@ -54,9 +54,9 @@ and the existing-person versus new-person enrollment flow.
    face login opens your wallet with no prompt. You'll enter your login password
    once; it is sealed in the TPM, never stored in plaintext. Skip it and your
    wallet just prompts separately after login.
-4. **Recovery** *(recommended)*: set a recovery passphrase. It restores your
-   templates after a TPM clear or firmware update without re-enrolling; without
-   it, such a change forces a full re-enroll.
+4. **Recovery** *(recommended)*: set a recovery passphrase of at least 12
+   characters. It restores your templates after a TPM clear or firmware update
+   without re-enrolling; without it, such a change forces a full re-enroll.
 5. **Login & Apps**: press `[w]` to connect irlume to the **greeter and lock screen**
    (runs `sudo irlume login enable --apply`). Face-`sudo` is opt-in and *not*
    included by `[w]`; see [face-sudo](#face-sudo-optional) below.
@@ -510,8 +510,9 @@ to **re-enroll from scratch**. With it, you restore in seconds. That's why
 irlume recovery setup
 ```
 
-It prompts for a passphrase separate from your login password. Store it
-somewhere safe (like a disk-encryption recovery key).
+It prompts for a passphrase separate from your login password, at least 12
+characters long; irlumed refuses a shorter one from any client, the TUI
+included. Store it somewhere safe (like a disk-encryption recovery key).
 
 ---
 

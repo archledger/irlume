@@ -6728,6 +6728,14 @@ fn dispatch_scoped_session_inner(
                 .into(),
         );
     }
+    // A recovery passphrase the policy refuses is refused here, above the
+    // cache invalidation below, for the same reason as the eyes-open enable:
+    // a request about to be refused may not change state.
+    if let Request::RecoverySetup { passphrase, .. } = &req {
+        if let Err(e) = irlume_core::recovery::check_new_passphrase(passphrase.expose()) {
+            return Response::Error(e.to_string());
+        }
+    }
     // AFTER the gate, BEFORE the mutation runs. After the gate because the
     // cache is state, and a request that is about to be refused may not
     // change state: an unprivileged peer could otherwise evict root's summary
@@ -7656,6 +7664,10 @@ fn dispatch_scoped_session_inner(
         }
         // --- template-key recovery passphrase -------------------------------
         Request::RecoverySetup { user, passphrase } => {
+            // irlumed enforces the recovery passphrase minimum itself, so the
+            // TUI and every client get the same floor: checked above, before
+            // the summary cache is touched, so a refused passphrase changes
+            // nothing; `setup_recovery` checks again for any other caller.
             // If templates are still plaintext (pre-encryption enrollment), mint
             // and seal a template key now by re-saving; encryption takes effect
             // and there's a key for the recovery passphrase to wrap. A no-op when
@@ -18100,6 +18112,109 @@ mod tests {
         drop(client);
     }
 
+    /// irlumed enforces the recovery passphrase minimum itself, so the TUI
+    /// and every socket client get the same floor as the CLI. A refused
+    /// passphrase leaves the existing envelope as it was; 12 characters pass
+    /// the floor and reach the key lookup. Restore has no floor: a short
+    /// passphrase still reaches the envelope (a wrong one here, so nothing is
+    /// resealed and no TPM is needed).
+    /// A recovery passphrase the policy refuses (too short, or not UTF-8)
+    /// is refused before the enrollment summary cache is touched, like the
+    /// eyes-open enable: a request about to be refused may not change state.
+    #[test]
+    fn a_refused_recovery_passphrase_does_not_evict_the_summary_cache() {
+        let _g = env_lock();
+        let mut e = engine();
+        let root = peer(0);
+        clear_enrollment_summaries();
+        let has_summary = || {
+            enrollment_summaries()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("carol")
+        };
+        publish_enrollment_summary(
+            "carol",
+            EnrollmentSummary {
+                profiles: Vec::new(),
+                ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
+                primary_camera: None,
+                primary_digest: PrimaryDigest::Absent,
+                camera_store: CameraStoreSnapshot::default(),
+            },
+        );
+        for passphrase in [&b"elevenchars"[..], &[0xff; 12]] {
+            let reply = dispatch(
+                Request::RecoverySetup {
+                    user: "carol".into(),
+                    passphrase: irlume_common::SecretBytes::new(passphrase.to_vec()),
+                },
+                &root,
+                &mut e,
+            );
+            assert!(
+                matches!(&reply, Response::Error(msg) if msg.starts_with("policy: recovery passphrase")),
+                "{reply:?}"
+            );
+            assert!(
+                has_summary(),
+                "a refused passphrase must leave the published summary in place"
+            );
+        }
+        clear_enrollment_summaries();
+    }
+
+    #[test]
+    fn recovery_setup_refuses_a_passphrase_below_the_floor() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("recovery-floor");
+        let root = peer(0);
+        let envelope = irlume_core::recovery::wrap(b"1234", &[7; 32]).unwrap();
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        let path = sb.dir.join("recovery").join("ghost.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let setup = |passphrase: &[u8]| Request::RecoverySetup {
+            user: "ghost".into(),
+            passphrase: irlume_common::SecretBytes::new(passphrase.to_vec()),
+        };
+        let too_short = "policy: recovery passphrase too short (minimum 12 characters)";
+        // Eleven characters each; the third is 22 bytes.
+        for (passphrase, want) in [
+            (&b""[..], "policy: empty recovery passphrase"),
+            (b"elevenchars", too_short),
+            ("ééééééééééé".as_bytes(), too_short),
+        ] {
+            match dispatch(setup(passphrase), &root, &mut e) {
+                Response::Error(msg) => assert_eq!(msg, want, "{passphrase:?}"),
+                other => panic!("a short passphrase must be refused, got {other:?}"),
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        match dispatch(setup(b"twelve chars"), &root, &mut e) {
+            Response::Error(msg) => {
+                assert!(msg.contains("no template key sealed for 'ghost'"), "{msg}")
+            }
+            other => panic!("setup without a key must Error, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        match dispatch(
+            Request::RecoveryRestore {
+                user: "ghost".into(),
+                passphrase: irlume_common::SecretBytes::new(b"4321".to_vec()),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::Error(msg) => assert!(msg.contains("wrong recovery passphrase"), "{msg}"),
+            other => panic!("a wrong passphrase must not restore, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
     #[test]
     fn recovery_arms_report_status_and_error_without_a_template_key() {
         let _g = env_lock();
@@ -18126,7 +18241,7 @@ mod tests {
         match dispatch(
             Request::RecoverySetup {
                 user: "ghost".into(),
-                passphrase: irlume_common::SecretBytes::new(b"phrase".to_vec()),
+                passphrase: irlume_common::SecretBytes::new(b"a longer phrase".to_vec()),
             },
             &root,
             &mut e,

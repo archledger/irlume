@@ -305,6 +305,10 @@ token armed on Fedora 43 or 44, the page and Diagnostics say to run
 Recovery shows whether the face templates are encrypted and whether a recovery
 passphrase is set. Its actions share one row too: set (`s`), restore (`t`) and
 forget (`f`). Passphrases are typed into a masked field, and forget asks first.
+A new recovery passphrase needs at least 12 characters, as
+`irlume recovery setup` requires: the page refuses a shorter one before
+sending it, and irlumed applies the same minimum to every client. A passphrase
+set earlier still restores.
 
 A fact the daemon has not answered reads unknown with the reason: `daemon not
 answering`, `daemon still starting`, `this account may not connect to the

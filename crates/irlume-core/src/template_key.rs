@@ -493,8 +493,12 @@ pub(crate) fn forget_key_unlocked(user: &str) -> Result<()> {
 
 /// Create (or replace) `user`'s recovery envelope: wrap the live template key
 /// under `passphrase`. Requires a sealed template key to already exist.
+/// A passphrase below the recovery floor
+/// ([`crate::recovery::check_new_passphrase`]) is refused before any file is
+/// read or written, so an existing envelope stays as it was.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn setup_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
+    crate::recovery::check_new_passphrase(passphrase)?;
     let _state = UserStateLock::acquire(user)?;
     let key = load_key_unlocked(user)?;
     let env = crate::recovery::wrap(passphrase, &key)?;
@@ -966,6 +970,18 @@ mod tests {
             "restored key must match original"
         );
 
+        // Only setting a passphrase has the floor: an envelope written under
+        // a short one before it existed still restores.
+        save_recovery("rt", &crate::recovery::wrap(b"1234", &k1).unwrap()).unwrap();
+        assert!(setup_recovery("rt", b"1234").is_err());
+        forget_key("rt").unwrap();
+        restore_from_recovery("rt", b"1234").unwrap();
+        assert_eq!(
+            &*load_key("rt").unwrap(),
+            &*k1,
+            "an envelope under a short passphrase must still restore"
+        );
+
         forget_key("rt").unwrap();
         forget_recovery("rt").unwrap();
         std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
@@ -1000,6 +1016,50 @@ mod tests {
         );
 
         forget_recovery("rt").unwrap();
+        std::env::remove_var("IRLUME_RECOVERY_DIR");
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+    }
+
+    /// Setting a recovery passphrase below the floor is refused before the
+    /// state lock or any file is touched, so an envelope set earlier stays as
+    /// it was; 12 characters pass the floor and reach the key lookup (no
+    /// sealed key here, so no TPM is needed).
+    #[test]
+    fn setup_recovery_refuses_a_short_passphrase_and_keeps_the_envelope() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let rec = crate::test_tmp_dir("rec-floor");
+        let tk = crate::test_tmp_dir("tk-floor");
+        let _ = std::fs::remove_dir_all(&rec);
+        let _ = std::fs::remove_dir_all(&tk);
+        std::env::set_var("IRLUME_RECOVERY_DIR", &rec);
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &tk);
+
+        let env = crate::recovery::wrap(b"1234", &crypto::generate_key()).unwrap();
+        save_recovery("rt", &env).unwrap();
+        let before = std::fs::read(recovery_path("rt")).unwrap();
+
+        for short in [&b""[..], b"elevenchars", "ééééééééééé".as_bytes()] {
+            let err = setup_recovery("rt", short).unwrap_err();
+            assert!(
+                matches!(&err, Error::Policy(message) if message.contains("recovery passphrase")),
+                "{short:?}: {err:?}"
+            );
+            assert_eq!(std::fs::read(recovery_path("rt")).unwrap(), before);
+        }
+        assert!(
+            !std::path::Path::new(&tk).exists(),
+            "a refused passphrase must not reach the state lock"
+        );
+
+        let err = setup_recovery("rt", b"twelve chars").unwrap_err();
+        assert!(
+            err.to_string().contains("no template key sealed for 'rt'"),
+            "got: {err}"
+        );
+        assert_eq!(std::fs::read(recovery_path("rt")).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&rec);
+        let _ = std::fs::remove_dir_all(&tk);
         std::env::remove_var("IRLUME_RECOVERY_DIR");
         std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
     }

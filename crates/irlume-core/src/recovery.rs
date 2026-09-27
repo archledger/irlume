@@ -42,6 +42,57 @@ const T_COST: u32 = 2;
 const P_COST: u32 = 1;
 const CURRENT_VERSION: u32 = 1;
 
+/// Fewest characters a new recovery passphrase may have. The passphrase is
+/// the only secret on the recovery envelope, so it is a recovery key rather
+/// than a PIN; 12 characters still allows a memorable phrase. irlumed applies
+/// it whenever a passphrase is set ([`crate::template_key::setup_recovery`]),
+/// so the TUI and every client get the same floor, and the CLI and TUI check
+/// it first so a short entry never leaves them. Reading an envelope has no
+/// floor: one set earlier still opens with its passphrase.
+pub const MIN_PASSPHRASE_CHARS: usize = 12;
+
+/// Characters in `passphrase`, counted as the CLI and TUI count their text:
+/// Unicode scalar values, as [`str::chars`] yields them. A byte that is not
+/// part of valid UTF-8 counts one on its own, and the characters around it
+/// still count as characters. Reads the borrowed bytes in place; nothing is
+/// copied.
+#[must_use]
+pub fn passphrase_chars(passphrase: &[u8]) -> usize {
+    passphrase
+        .utf8_chunks()
+        .map(|chunk| chunk.valid().chars().count() + chunk.invalid().len())
+        .sum()
+}
+
+/// Check that `passphrase` may become a new recovery passphrase: not empty,
+/// UTF-8 text (the CLI and TUI, which restore with it, read only text), and
+/// at least [`MIN_PASSPHRASE_CHARS`] characters ([`passphrase_chars`]).
+/// Only setting a passphrase is checked; [`unwrap`] opens an existing
+/// envelope whatever its passphrase.
+///
+/// # Errors
+///
+/// [`Error::Policy`] when the passphrase is empty, not UTF-8, or shorter
+/// than the minimum, which the message names.
+pub fn check_new_passphrase(passphrase: &[u8]) -> Result<()> {
+    if passphrase.is_empty() {
+        return Err(Error::Policy("empty recovery passphrase".into()));
+    }
+    if std::str::from_utf8(passphrase).is_err() {
+        return Err(Error::Policy(
+            "recovery passphrase is not UTF-8 text, which `irlume recovery restore` could \
+             not enter"
+                .into(),
+        ));
+    }
+    if passphrase_chars(passphrase) < MIN_PASSPHRASE_CHARS {
+        return Err(Error::Policy(format!(
+            "recovery passphrase too short (minimum {MIN_PASSPHRASE_CHARS} characters)"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryEnvelope {
     pub version: u32,
@@ -71,6 +122,9 @@ fn derive_key(
 }
 
 /// Wrap `template_key` under a fresh Argon2id-derived key from `passphrase`.
+/// Refuses only an empty passphrase: the keyring's login-password wrap shares
+/// this function, so the recovery floor is [`check_new_passphrase`], which
+/// [`crate::template_key::setup_recovery`] applies.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn wrap(passphrase: &[u8], template_key: &[u8]) -> Result<RecoveryEnvelope> {
     if passphrase.is_empty() {
@@ -141,6 +195,59 @@ mod tests {
     fn empty_passphrase_rejected() {
         let key = crypto::generate_key();
         assert!(wrap(b"", &key).is_err());
+    }
+
+    /// A new recovery passphrase needs 12 characters, counted as the CLI
+    /// counts them: 11 are refused whatever their byte length, 12 pass.
+    #[test]
+    fn new_passphrase_floor_counts_characters() {
+        assert_eq!(MIN_PASSPHRASE_CHARS, 12);
+        assert!(matches!(
+            check_new_passphrase(b""),
+            Err(Error::Policy(message)) if message == "empty recovery passphrase"
+        ));
+        // Eleven characters each; the second is 22 bytes.
+        for short in [&b"elevenchars"[..], "ééééééééééé".as_bytes()] {
+            assert!(
+                matches!(
+                    check_new_passphrase(short),
+                    Err(Error::Policy(message))
+                        if message == "recovery passphrase too short (minimum 12 characters)"
+                ),
+                "{short:?}"
+            );
+        }
+        for enough in [&b"twelve chars"[..], "éééééééééééé".as_bytes()] {
+            assert_eq!(passphrase_chars(enough), 12, "{enough:?}");
+            assert!(check_new_passphrase(enough).is_ok(), "{enough:?}");
+        }
+        // Bytes that are not UTF-8 count one each, and the characters around
+        // them still count as characters: three 4-byte emoji and one stray
+        // byte are four, not 13.
+        let mixed = ["😀😀😀".as_bytes(), &[0xff_u8][..]].concat();
+        assert_eq!(passphrase_chars(&mixed), 4);
+        assert_eq!(passphrase_chars(&[0xff; 12]), 12);
+        // A new passphrase must be text, however long.
+        let long_mixed = ["twelve chars".as_bytes(), &[0xff_u8][..]].concat();
+        for bytes in [&long_mixed[..], &[0xff; 12]] {
+            assert!(
+                matches!(
+                    check_new_passphrase(bytes),
+                    Err(Error::Policy(message)) if message.contains("not UTF-8 text")
+                ),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    /// Only setting a recovery passphrase has the floor. `wrap` also seals
+    /// the keyring's login-password wrap, and an envelope set earlier under a
+    /// short passphrase must still open with it.
+    #[test]
+    fn wrap_and_unwrap_take_a_short_passphrase() {
+        let key = crypto::generate_key();
+        let env = wrap(b"1234", &key).unwrap();
+        assert_eq!(&*unwrap(b"1234", &env).unwrap(), &*key);
     }
 
     #[test]

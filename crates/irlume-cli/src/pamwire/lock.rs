@@ -404,7 +404,8 @@ fn wait_for_legacy_lock(
 /// `Err` says why `/proc` cannot rule that out: the holders cannot be read,
 /// none is listed (a holder outside this PID namespace is not), or what one of
 /// them runs as or has open cannot be read. Only a process shown not to be one
-/// is passed over.
+/// is passed over; so is this process, which has the file open itself (a
+/// pid `/proc/locks` still lists for an exited taker may since be reused).
 fn earlier_irlumes(
     users: Option<LockUsers>,
     open_as: impl Fn(u32) -> Option<bool>,
@@ -416,7 +417,7 @@ fn earlier_irlumes(
     }
     let own = |pids: Vec<u32>| {
         let mut own = Vec::new();
-        for pid in pids {
+        for pid in pids.into_iter().filter(|&pid| pid != std::process::id()) {
             match open_as(pid) {
                 Some(true) => own.push(pid),
                 Some(false) => {}
@@ -1111,6 +1112,12 @@ mod tests {
         );
         assert_eq!(
             earlier_irlumes(users(&[4242], &[4343]), |_| Some(false)),
+            Ok(LockUsers::default())
+        );
+        // This process, which has the file open, is never an earlier irlume.
+        let me = std::process::id();
+        assert_eq!(
+            earlier_irlumes(users(&[me], &[me]), |_| Some(true)),
             Ok(LockUsers::default())
         );
     }

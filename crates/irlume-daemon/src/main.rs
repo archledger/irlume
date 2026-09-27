@@ -561,14 +561,25 @@ fn carry_camera_pair(
 
 fn main() {
     // Before any model, template or request is touched: no core dumps
-    // (`disable_core_dumps`). A failure is logged once and startup continues;
-    // under the packaged unit, LimitCORE=0 still applies.
-    let failures = disable_core_dumps();
-    if !failures.is_empty() {
-        jout_warn!(
-            "irlumed: WARNING: core dumps are not fully disabled ({}); starting anyway",
-            failures.join("; ")
-        );
+    // (`disable_core_dumps`). A daemon that stays dumpable does not start:
+    // face authentication is then unavailable and the password still works.
+    // A core limit that cannot be lowered is logged; the cleared dumpable
+    // flag already keeps the kernel from starting a dump.
+    match disable_core_dumps() {
+        Ok(warnings) => {
+            if !warnings.is_empty() {
+                jout_warn!(
+                    "irlumed: WARNING: the core limit is not lowered ({}); the dumpable flag is cleared",
+                    warnings.join("; ")
+                );
+            }
+        }
+        Err(e) => {
+            jout_err!(
+                "irlumed: cannot clear the dumpable flag ({e}); not starting, so no process memory can reach a core dump. Face authentication is unavailable; passwords still work"
+            );
+            std::process::exit(1);
+        }
     }
     // Next, before models load. The watchdog deadline starts ticking the moment
     // systemd execs us, and loading the ONNX sessions takes tens of seconds on a
@@ -3031,9 +3042,15 @@ fn worker_wedged(limit: std::time::Duration) -> bool {
 ///   kernel identifies.
 ///
 /// The unit's `LimitCORE=0` sets the same limit before exec; this call also
-/// covers a daemon started another way. Returns one line per setting that
-/// could not be applied, for the caller to log; neither stops startup.
-fn disable_core_dumps() -> Vec<String> {
+/// covers a daemon started another way.
+///
+/// # Errors
+///
+/// The line to log when the dumpable flag cannot be cleared: the caller does
+/// not start, since the core limit alone does not keep a piped
+/// `core_pattern` handler from receiving a dump. `Ok` carries one line per
+/// core-limit failure, which the caller logs and starts anyway.
+fn disable_core_dumps() -> Result<Vec<String>, String> {
     let mut failures = Vec::new();
     let no_core = libc::rlimit {
         rlim_cur: 0,
@@ -3059,12 +3076,12 @@ fn disable_core_dumps() -> Vec<String> {
         )
     };
     if dumpable != 0 {
-        failures.push(format!(
+        return Err(format!(
             "prctl(PR_SET_DUMPABLE): {}",
             std::io::Error::last_os_error()
         ));
     }
-    failures
+    Ok(failures)
 }
 
 /// Send one `WATCHDOG=1` to the notify socket systemd handed us.
@@ -13640,7 +13657,7 @@ mod tests {
         const CHILD: &str = "IRLUME_TEST_NO_CORE_DUMP_CHILD";
         const MARKER: &str = "irlume-no-core-dump-child-checked";
         if std::env::var_os(CHILD).is_some() {
-            assert_eq!(disable_core_dumps(), Vec::<String>::new());
+            assert_eq!(disable_core_dumps(), Ok(Vec::<String>::new()));
             let mut limit = libc::rlimit {
                 rlim_cur: 1,
                 rlim_max: 1,

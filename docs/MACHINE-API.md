@@ -619,12 +619,20 @@ for any local process, and the engine already refuses to let one account's face
 be tested against another's enrolment for the same reason.
 
 One session per user runs at a time. A second concurrent invocation is refused
-with `session-busy`, which is retryable. A lock that cannot be taken at all,
-because the runtime directory is unwritable, is `operation-failed` and is not
-retryable: the two mean opposite things to a caller, and reporting both as busy
-would tell a consumer to keep trying against a permission error. The lock is held by the running process
-and released by the kernel when it exits, so a panel that is killed mid-capture
-does not strand the user.
+with `session-busy`, which is retryable. The session lock is
+`machine-session.lock` in the caller's runtime directory (`$XDG_RUNTIME_DIR`),
+used only when that is an absolute path to a directory, not a symlink, owned by
+the caller and not writable by group or others, as systemd creates
+`/run/user/<uid>`. Root without such a directory, as under `sudo`, uses
+`/run/irlume`, a root-owned directory created at 0700 on first use; no other
+account has a fallback, and no shared directory such as `/tmp` is used. The
+lock is opened without following a symlink and must be a regular file the
+caller owns. A lock that cannot be taken at all, because no directory
+qualifies or the runtime directory is unwritable, is `operation-failed` and is
+not retryable: the two mean opposite things to a caller, and reporting both as
+busy would tell a consumer to keep trying against a permission error. The lock
+is held by the running process and released by the kernel when it exits, so a
+panel that is killed mid-capture does not strand the user.
 
 `--preview` is refused. Preview frames are a separate capability that this
 build does not advertise; accepting the flag and ignoring it would suggest that

@@ -978,6 +978,10 @@ fn auth_camera_busy_is_typed_retryable_and_does_not_repeat_capture() {
         let dir =
             std::env::temp_dir().join(format!("irlume-auth-busy-{}-{index}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        // The session lock needs a runtime directory no other account can
+        // write, as systemd creates it, whatever the test's umask.
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
         let socket = dir.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {

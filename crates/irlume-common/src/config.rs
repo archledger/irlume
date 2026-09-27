@@ -954,8 +954,12 @@ pub fn privileged_face_consent_required() -> bool {
 /// run the bounded sequential PAD collection the greeter and lock screen already
 /// use (`privileged_grouped_pad_evidence`).
 ///
-/// Defaults **off**, and an unreadable settings.conf reads as off, so without the
-/// key privileged surfaces behave exactly as they do upstream.
+/// Defaults **on**: an absent key or file lets privileged prompts use the
+/// collector. Only a pair whose stored qualification says it captures
+/// sequentially ever reaches it, so a concurrent pair is unaffected either way.
+/// `privileged_grouped_pad_evidence=0` turns it off; so does a value that is not
+/// one of the [`truthy`] spellings and a settings.conf this process cannot read,
+/// both of which keep the narrower pre-0.15 scope rather than guess.
 ///
 /// It exists for a camera pair that cannot capture RGB and IR concurrently.
 /// There one authentication attempt scores exactly one RGB frame, so it casts
@@ -974,15 +978,17 @@ pub fn privileged_face_consent_required() -> bool {
 /// liveness and PAD threshold is untouched.
 #[must_use]
 pub fn privileged_grouped_pad_evidence_enabled() -> bool {
-    // Opt-in, so only an explicit affirmative turns it on: a typo, an empty or a
-    // non-Unicode value leaves the upstream scope in place.
+    // On unless something says otherwise, but a set value must be an explicit
+    // affirmative: a typo, an empty or a non-Unicode value keeps the narrower
+    // scope, as does a settings.conf this process cannot read.
     if let Some(v) = std::env::var_os("IRLUME_PRIVILEGED_GROUPED_PAD") {
         return v.to_str().is_some_and(truthy);
     }
-    matches!(
-        observe_kv("settings.conf", "privileged_grouped_pad_evidence"),
-        KvObservation::Value(v) if truthy(&v)
-    )
+    match observe_kv("settings.conf", "privileged_grouped_pad_evidence") {
+        KvObservation::Value(v) => truthy(&v),
+        KvObservation::Absent => true,
+        KvObservation::Unknown(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -1021,11 +1027,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The grouped-PAD scope key is the mirror image of the consent one: it
-    /// widens which services may collect evidence, so only an explicit
-    /// affirmative turns it on and everything else leaves upstream scope alone.
+    /// The grouped-PAD scope key defaults on, but a value that is set must be
+    /// an explicit affirmative: `0`, a typo and an unreadable file all keep the
+    /// narrower scope.
     #[test]
-    fn privileged_grouped_pad_defaults_off_and_env_wins_over_settings() {
+    fn privileged_grouped_pad_defaults_on_and_env_wins_over_settings() {
         let _g = testenv::lock();
         let dir = std::env::temp_dir().join(format!("irlume-cfg-grouped-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1033,10 +1039,16 @@ mod tests {
         std::env::set_var("IRLUME_CONFIG_DIR", &dir);
         std::env::remove_var("IRLUME_PRIVILEGED_GROUPED_PAD");
 
-        // Absent key and absent file: upstream scope.
+        // Absent file, then a file without the key: on.
+        assert!(privileged_grouped_pad_evidence_enabled());
+        write_kv("settings.conf", "face_sensor_policy", "dual").unwrap();
+        assert!(privileged_grouped_pad_evidence_enabled());
+
+        // The owner's opt-out.
+        write_kv("settings.conf", "privileged_grouped_pad_evidence", "0").unwrap();
         assert!(!privileged_grouped_pad_evidence_enabled());
 
-        // An unrecognized value is not an opt-in.
+        // An unrecognized value is not an affirmative.
         write_kv("settings.conf", "privileged_grouped_pad_evidence", "maybe").unwrap();
         assert!(!privileged_grouped_pad_evidence_enabled());
 

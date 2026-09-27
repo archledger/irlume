@@ -975,10 +975,13 @@ pub const GRACE_WINDOW_MS: u64 = 15000;
 // an effectively unlimited presence window. This is an operator policy bound,
 // not a latency target; ordinary service defaults remain substantially shorter.
 const MAX_GRACE_OVERRIDE_MS: u64 = 60_000;
-/// Shorter window for `sudo` (and `su`): at a terminal the user is already
-/// looking at the screen, so a match lands on the first attempt; if they look
-/// away they want a quick drop to the password prompt, not a long freeze.
-pub const SUDO_GRACE_WINDOW_MS: u64 = 5000;
+/// Shorter window for `sudo`, `su`, `doas` and polkit: the user typed `yes` at
+/// the prompt and is looking at the screen, so a refused attempt should drop to
+/// the password prompt sooner than a greeter does. Ten seconds, not the earlier
+/// five: a concurrent pair that needs about 4 s to establish its stream rates
+/// (NexiGo N930W, 2026-09-26) granted the lock screen in 6.7 to 8.1 s and could
+/// never finish inside five. A grant still returns as soon as it is decided.
+pub const SUDO_GRACE_WINDOW_MS: u64 = 10_000;
 
 /// The longest a capture path wired through [`irlume_camera::Progress`] can go
 /// without reporting watchdog progress (#336), against ANY defined camera

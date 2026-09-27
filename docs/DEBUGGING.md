@@ -155,8 +155,8 @@ starts after PAM confirmation. Capture attempts repeat while no usable face is i
 so walking up or settling into position still works (`grace:` debug lines show
 the attempts).
 The window is per-service: ~15 seconds for login and lock screens (you may be
-walking up), ~5 seconds for `sudo`/`su` (you're already at the terminal, so it
-drops to the password prompt quickly). Only presence-class failures retry (no
+walking up), ~10 seconds for `sudo`, `su`, `doas` and polkit (you typed `yes` at
+the prompt, so a refusal drops to the password prompt sooner). Only presence-class failures retry (no
 face, off-angle, or the transient "RGB face / no IR face" a user makes while
 settling); a below-threshold match or a real spoof verdict settles immediately.
 `IRLUME_GRACE_MS` on the daemon accepts 0–60,000 milliseconds and overrides

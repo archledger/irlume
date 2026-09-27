@@ -653,8 +653,14 @@ fn wait_for_legacy_lock(
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(Some(file));
         }
-        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EWOULDBLOCK) {
-            return Ok(None);
+        // Only contention is waited out. Any other failure (no lock left in
+        // the kernel, a descriptor flock cannot lock) stops the operation
+        // rather than letting it go on without the lock.
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EWOULDBLOCK) => {}
+            Some(libc::EINTR) => continue,
+            _ => return Err(format!("lock {}: {error}", path.display())),
         }
         let by = || {
             lock_holders(&file)
@@ -2017,6 +2023,29 @@ mod tests {
             assert_eq!(mode(&foreign), 0o644, "another account's file was changed");
             assert!(!held(&foreign), "errno {errno}: a lock was kept");
         }
+    }
+
+    /// A lock that fails for another reason than contention stops the
+    /// operation instead of letting it go on without the lock.
+    #[test]
+    fn stops_when_the_legacy_lock_fails_for_another_reason() {
+        use std::os::fd::FromRawFd;
+        let scratch = Scratch::new("legacy-flock-error");
+        let path = scratch.file("irlume-pam.lock", 0o600);
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid C string; the descriptor is handed to `File` below.
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: `fd` is a fresh descriptor this test owns; flock on an
+        // O_PATH descriptor fails with EBADF.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let error = wait_for_legacy_lock(&path, file, uid(), Duration::from_millis(200), deadline)
+            .unwrap_err();
+        assert!(
+            error.starts_with(&format!("lock {}", path.display())),
+            "{error}"
+        );
     }
 
     /// A write lease on a legacy lock another account owns, which that account

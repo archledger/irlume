@@ -556,7 +556,7 @@ struct UdevCameraGroup {
 }
 
 fn devpath(path: &Path) -> String {
-    match path.strip_prefix("/sys") {
+    match path.strip_prefix(crate::hostfs::sys_root()) {
         Ok(relative) => format!("/{}", relative.to_string_lossy()),
         Err(_) => path.to_string_lossy().into_owned(),
     }
@@ -582,7 +582,7 @@ impl SnapshotSource for SysfsSnapshotSource {
         for entry in entries {
             let entry = entry.map_err(|error| LifecycleError::Snapshot(error.to_string()))?;
             let name = entry.file_name();
-            let devnode = PathBuf::from("/dev").join(&name);
+            let devnode = crate::hostfs::dev_root().join(&name);
             let devnode_text = devnode.to_string_lossy().into_owned();
             // v4l2loopback class entries are themselves symlinks into this virtual
             // subtree and have no UVC-style `videoN/device` child. Both checks are
@@ -1296,6 +1296,7 @@ mod tests {
 
     #[test]
     fn vanished_video_class_entry_does_not_abort_snapshot() {
+        let _fixture = crate::hostfs::test::empty_fixture();
         let root = std::env::temp_dir().join(format!(
             "irlume-vanished-video4linux-{}",
             std::process::id()
@@ -1313,44 +1314,68 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let _guard = crate::testenv::env_lock();
-        let root =
-            std::env::temp_dir().join(format!("irlume-virtual-video4linux-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let rgb = root.join("devices/virtual/video4linux/video8");
-        let ir = root.join("devices/virtual/video4linux/video9");
-        let excluded = root.join("devices/virtual/video4linux/video10");
-        std::fs::create_dir_all(root.join("class/video4linux")).unwrap();
-        std::fs::create_dir_all(&rgb).unwrap();
-        std::fs::create_dir_all(&ir).unwrap();
-        std::fs::create_dir_all(&excluded).unwrap();
-        symlink(&rgb, root.join("class/video4linux/video8")).unwrap();
-        symlink(&ir, root.join("class/video4linux/video9")).unwrap();
-        symlink(&excluded, root.join("class/video4linux/video10")).unwrap();
+        let fixture = crate::hostfs::test::fixture_with(|dev, sys| {
+            std::fs::create_dir_all(sys.join("class/video4linux")).unwrap();
+            for node in ["video8", "video9", "video10"] {
+                let target = sys.join("devices/virtual/video4linux").join(node);
+                std::fs::create_dir_all(&target).unwrap();
+                symlink(target, sys.join("class/video4linux").join(node)).unwrap();
+                std::fs::write(dev.join(node), b"").unwrap();
+            }
+        });
+        let rgb = fixture.dev().join("video8").to_string_lossy().into_owned();
+        let ir = fixture.dev().join("video9").to_string_lossy().into_owned();
+        let excluded = fixture.dev().join("video10").to_string_lossy().into_owned();
         let _allow = crate::testenv::EnvGuard::set(
             "IRLUME_TEST_ALLOW_VIRTUAL_CAMERA",
-            "/dev/video8,/dev/video9",
+            format!("{rgb},{ir}"),
         );
 
-        let mut source = SysfsSnapshotSource {
-            root: root.join("class/video4linux"),
-        };
+        let mut source = SysfsSnapshotSource::default();
         let observations = source.snapshot().unwrap();
         assert_eq!(observations.len(), 1);
         let evidence = observations[0].lifecycle_evidence();
-        assert!(evidence.iter().any(|item| item.contains("/dev/video8")));
-        assert!(evidence.iter().any(|item| item.contains("/dev/video9")));
-        assert!(!evidence.iter().any(|item| item.contains("/dev/video10")));
+        assert!(evidence.iter().any(|item| item.contains(&rgb)));
+        assert!(evidence.iter().any(|item| item.contains(&ir)));
+        assert!(!evidence.iter().any(|item| item.contains(&excluded)));
 
         let mut inventory = CameraInventory::new();
         inventory.reconcile(observations).unwrap();
-        assert!(inventory
-            .reference_for_endpoints(&["/dev/video8", "/dev/video9"])
-            .is_ok());
+        assert!(inventory.reference_for_endpoints(&[&rgb, &ir]).is_ok());
         assert!(matches!(
-            inventory.reference_for_endpoints(&["/dev/video10"]),
+            inventory.reference_for_endpoints(&[&excluded]),
             Err(CameraInventoryError::UnknownCamera)
         ));
-        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_default_snapshot_keeps_physical_endpoints_in_the_fixture() {
+        let _env = crate::testenv::env_lock();
+        let fixture = crate::hostfs::test::fixture_with(|dev, sys| {
+            let usb = sys.join("devices/pci0000:00/usb1/1-2");
+            let interface = usb.join("1-2:1.0");
+            let driver = sys.join("bus/usb/drivers/uvcvideo");
+            let class = sys.join("class/video4linux/video0");
+            for dir in [&interface, &driver, &class] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            std::fs::write(usb.join("idVendor"), "1234").unwrap();
+            std::fs::write(usb.join("idProduct"), "5678").unwrap();
+            std::fs::write(interface.join("bInterfaceNumber"), "00").unwrap();
+            std::os::unix::fs::symlink(driver, interface.join("driver")).unwrap();
+            std::os::unix::fs::symlink(interface, class.join("device")).unwrap();
+            std::fs::write(dev.join("video0"), b"").unwrap();
+        });
+        let observations = SysfsSnapshotSource::default().snapshot().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert!(
+            observations[0].lifecycle_evidence()[0].starts_with("/devices/pci0000:00/usb1/1-2/")
+        );
+        let mut inventory = CameraInventory::new();
+        inventory.reconcile(observations).unwrap();
+        let node = fixture.dev().join("video0").to_string_lossy().into_owned();
+        assert!(inventory.reference_for_endpoints(&[&node]).is_ok());
+        assert!(inventory.reference_for_endpoints(&["/dev/video0"]).is_err());
     }
 
     #[test]

@@ -27,6 +27,7 @@ struct HostDevices;
 
 impl DeviceAccess for HostDevices {
     fn resolve_endpoint(&self, path: &str) -> Result<ResolvedEndpoint, IrTargetError> {
+        crate::hostfs::check_probe(path);
         let resolved = std::fs::canonicalize(path).map_err(|_| {
             IrTargetError::InvalidEndpoint(format!("configured endpoint {path} is missing"))
         })?;
@@ -46,7 +47,10 @@ impl DeviceAccess for HostDevices {
     }
 
     fn endpoint_for_node(&self, node: &str) -> String {
-        format!("/dev/{node}")
+        crate::hostfs::dev_root()
+            .join(node.trim_start_matches('/'))
+            .to_string_lossy()
+            .into_owned()
     }
 }
 

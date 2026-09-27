@@ -346,7 +346,9 @@ fn facts_for(
         let virtual_by_path = node_name
             .as_deref()
             .and_then(|dir| std::fs::canonicalize(dir).ok())
-            .is_some_and(|resolved| resolved.starts_with("/sys/devices/virtual/"));
+            .is_some_and(|resolved| {
+                resolved.starts_with(crate::hostfs::sys_root().join("devices/virtual"))
+            });
         if virtual_by_path {
             return ("virtual-device".into(), false);
         }
@@ -614,6 +616,24 @@ mod tests {
             privacy: Some(false),
             paired: true,
         }
+    }
+
+    #[test]
+    fn a_fixture_virtual_node_without_a_driver_link_is_a_dummy_node() {
+        let _env = crate::testenv::env_lock();
+        let fixture = crate::hostfs::test::fixture_with(|dev, sys| {
+            let target = sys.join("devices/virtual/video4linux/video0");
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::create_dir_all(sys.join("class/video4linux")).unwrap();
+            std::os::unix::fs::symlink(target, sys.join("class/video4linux/video0")).unwrap();
+            std::fs::write(dev.join("video0"), b"").unwrap();
+        });
+        let path = fixture.dev().join("video0").to_string_lossy().into_owned();
+        let facts = facts_for(&path, Role::Rgb, &Default::default());
+        assert_eq!(facts.driver, "virtual-device");
+        let entry = node_entry_from_facts(&facts);
+        assert_eq!(entry.class, CensusClass::DummyNode);
+        assert!(matches!(entry.verdict, CensusVerdict::NotHardware(_)));
     }
 
     #[test]

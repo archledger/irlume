@@ -197,6 +197,17 @@ pub fn run(args: &[String]) -> ExitCode {
         srk_outcome_line(&report.srk_eviction)
     );
 
+    // A stack the disable had to leave as it is still names pam_irlume.so.
+    // Removing the module under it would turn that rule into one PAM cannot
+    // load, which a `required` rule an administrator wrote turns into a failed
+    // login even with the right password. irlume stays installed until no
+    // stack references it.
+    if let Some(refusal) = removal_refusal(&report) {
+        println!();
+        println!("[uninstall] {refusal}");
+        return ExitCode::FAILURE;
+    }
+
     // Now actually remove irlume: the package via its manager, or the
     // hand-placed files for a source install. Done last, because it deletes the
     // binary running this very command (fine on Linux: the inode survives until
@@ -246,6 +257,19 @@ pub fn run(args: &[String]) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Why irlume itself is not removed after this teardown, when it is not: a
+/// PAM stack still references `pam_irlume.so` (one `login disable` keeps as
+/// it is, such as a stack with a line that ends in `\`).
+fn removal_refusal(report: &TeardownReport) -> Option<String> {
+    (!report.pam_unwired).then(|| {
+        "irlume stays installed: a PAM stack still references pam_irlume.so (the lines \
+         above name it), and removing the module under it can make that stack fail. \
+         Take irlume's lines out of it by hand (`irlume login status` shows which), \
+         then run `sudo irlume uninstall` again."
+            .to_string()
+    })
 }
 
 /// Remove irlume itself. Package installs go through the package manager (so the
@@ -1594,6 +1618,19 @@ mod tests {
                 SrkOutcome::Kept
             },
         }
+    }
+
+    /// irlume itself is removed only once no PAM stack references it.
+    #[test]
+    fn irlume_is_not_removed_while_a_pam_stack_references_it() {
+        let mut wired = report(true, true, &[]);
+        assert_eq!(removal_refusal(&wired), None);
+        wired.pam_unwired = false;
+        let refusal = removal_refusal(&wired).expect("a refusal");
+        assert!(
+            refusal.contains("stays installed") && refusal.contains("sudo irlume uninstall"),
+            "{refusal}"
+        );
     }
 
     // The closing line is the uninstall's last word, and the PR #337 review

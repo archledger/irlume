@@ -853,9 +853,10 @@ All notable changes to irlume are documented here. This project adheres to
   next one. A stack that is its `.pre-irlume` backup plus irlume's lines
   is still restored from the backup. `login enable` leaves such a stack
   as it is too while irlume's lines are in it, a `\` at the end of one of
-  them included. `irlume uninstall`, which runs the disable, now warns
-  that a PAM stack may still reference irlume when `sudo` or `polkit-1`
-  does, not only when a login screen or the lock screen does.
+  them included. `irlume uninstall`, which runs the disable, counts
+  `sudo` and `polkit-1` among the stacks that may still reference
+  irlume, and while one does it leaves irlume installed and exits 1
+  instead of removing the module that stack names.
 
 - irlumed does not write core dumps, so a crash or a watchdog restart
   leaves no core file with its memory: it sets a zero core limit and

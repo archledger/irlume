@@ -66,6 +66,12 @@ fn rebuild_parent(
     assert!(parent != Path::new("/"), "a destination below a directory");
     let below_root = parent.strip_prefix("/").expect("an absolute destination");
     let view = Path::new("/run/irlume-test-host").join(below_root);
+    // The same view reached from inside `parent`: bubblewrap 0.9 (Ubuntu
+    // 24.04) creates later mount points before it pivots into the new root,
+    // where an absolute link into /run resolves on the host and fails; a
+    // relative one resolves inside the new root either way.
+    let up: PathBuf = below_root.components().map(|_| "..").collect();
+    let relative_view = up.join("run/irlume-test-host").join(below_root);
     let built = root.join("namespace-parents").join(below_root);
     let _ = std::fs::remove_dir_all(&built);
     std::fs::create_dir_all(&built).expect("create the rebuilt parent");
@@ -87,7 +93,8 @@ fn rebuild_parent(
         let entry = entry.expect("a directory entry");
         let name = entry.file_name();
         if !real_dirs.contains(&name) {
-            let target = std::fs::read_link(entry.path()).unwrap_or_else(|_| view.join(&name));
+            let target =
+                std::fs::read_link(entry.path()).unwrap_or_else(|_| relative_view.join(&name));
             std::os::unix::fs::symlink(target, built.join(&name))
                 .expect("link a host entry into the rebuilt parent");
         }

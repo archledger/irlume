@@ -875,7 +875,9 @@ All notable changes to irlume are documented here. This project adheres to
   removed automatically. Records written by
   earlier releases carry no uid; they are accepted and record it on
   their next write, except that moving a template key to a stronger
-  policy keeps it unbound. Older releases ignore the new field
+  policy keeps it unbound. A keyring envelope records it at the first
+  login whose verified password matches it, also when nothing else
+  about it changes. Older releases ignore the new field
   (SECURITY_AT_REST.md "Records belong to an account uid").
 
 - A reason about the capture rather than the match (no face, a liveness

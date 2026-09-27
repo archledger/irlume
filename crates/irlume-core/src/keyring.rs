@@ -441,7 +441,9 @@ pub enum Reseal {
     /// auto-arm from the login hook; arming stays an explicit `keyring arm`.
     NotArmed,
     /// The existing envelope already unseals to this exact password under the
-    /// current PCR policy; left untouched (the steady-state on every login).
+    /// current PCR policy; left untouched (the steady-state on every login),
+    /// except that an envelope an earlier release wrote without a uid records
+    /// the account's uid, with its sealed blob and policy kept.
     Unchanged,
     /// The envelope was re-sealed against the current PCR policy. Either it no
     /// longer unsealed (PCRs moved: dbx/Secure Boot update) or the password
@@ -478,6 +480,10 @@ pub enum Reseal {
 /// The "unseal fails" branch is what fixes a dbx/Secure-Boot update: the old
 /// envelope's PCR7 policy no longer satisfies, so we rebind to today's PCRs
 /// using the password the user just proved (via a successful login) they know.
+///
+/// An envelope an earlier release wrote without a uid records the account's
+/// uid on the first such login that finds it holds this password's secret,
+/// also when the answer is `Unchanged`: only the uid field is written.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) -> Result<Reseal> {
     if password.is_empty() {
@@ -548,12 +554,40 @@ pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) 
                         return Ok(Reseal::Upgraded);
                     }
                 }
+                record_uid_on_unbound(user, env, &mut account)?;
             }
             return Ok(Reseal::Unchanged);
         }
     }
     seal_secret_for(user, password, kind, &mut account, recorded)?;
     Ok(Reseal::Resealed)
+}
+
+/// Record the account's uid on `env`, `user`'s envelope as a verified login
+/// found it: it holds the secret that login's password gives, under the
+/// policy it already has. Only for an envelope an earlier release wrote
+/// without a uid; the sealed blob and its policy are kept as they are, so no
+/// TPM operation is needed. Without this, an envelope that neither changes
+/// nor moves to a stronger policy would stay without a uid, and be released
+/// to any later account of the name. Nothing is written when the envelope
+/// records a uid already, the name resolves to no account, or the uid cannot
+/// be resolved (a later login records it).
+///
+/// # Errors
+/// Returns the save error; the envelope is then left as it was.
+fn record_uid_on_unbound(
+    user: &str,
+    mut env: SealedEnvelope,
+    account: &mut Account<'_>,
+) -> Result<()> {
+    if env.uid.is_some() {
+        return Ok(());
+    }
+    let Ok(Some(uid)) = account.uid_to_record(record_for(env.secret), None) else {
+        return Ok(());
+    };
+    env.uid = Some(uid);
+    env.save(&envelope_path(user))
 }
 
 /// `env`'s token sealed under a strictly stronger policy, with its kind and
@@ -587,7 +621,8 @@ fn climbed_token(
 /// wrap each recover the other.
 ///
 ///   * seal unseals, wrap opens under `password`  -> `Unchanged` (or the same
-///     tier climb the password kinds get)
+///     tier climb the password kinds get); an envelope without a uid
+///     records the account's uid
 ///   * seal unseals, wrap does not open           -> the user changed their
 ///     password; re-wrap under the new one (and take a stronger policy in
 ///     the same write when one is available), `Resealed`
@@ -627,7 +662,10 @@ fn reseal_token(
                     stronger.save(&envelope_path(user))?;
                     Ok(Reseal::Upgraded)
                 }
-                None => Ok(Reseal::Unchanged),
+                None => {
+                    record_uid_on_unbound(user, env, account)?;
+                    Ok(Reseal::Unchanged)
+                }
             }
         }
         Err(unseal_err) => {
@@ -980,6 +1018,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The uid a verified login records on an envelope without one: the
+    /// account's, with the rest of the envelope kept. Nothing is written for
+    /// an envelope that records a uid, for a name no account has, or when
+    /// the uid cannot be resolved. No TPM operation is involved.
+    #[test]
+    fn a_verified_login_records_the_uid_only_on_an_envelope_without_one() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = crate::test_tmp_dir("kr-uid-record");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
+        let user = "kr-uid-record";
+        let record = |user: &str| {
+            let env = SealedEnvelope::load(&envelope_path(user)).unwrap();
+            record_uid_on_unbound(user, env, &mut Account::new(user)).unwrap();
+            SealedEnvelope::load(&envelope_path(user)).unwrap()
+        };
+        for secret in [SecretKind::LoginPassword, SecretKind::GnomeKeyringToken] {
+            let before = plant_envelope(user, secret, None);
+            for unresolved in [
+                crate::account::Resolution::NoAccount,
+                crate::account::Resolution::Unknown,
+            ] {
+                let _unresolved = crate::account::remember_resolution(user, unresolved);
+                record(user);
+                assert_eq!(
+                    std::fs::read(envelope_path(user)).unwrap(),
+                    before,
+                    "{unresolved:?}"
+                );
+            }
+            let _now = crate::account::remember(user, 4552);
+            let recorded = record(user);
+            assert_eq!(recorded.uid, Some(4552), "{secret:?}");
+            assert_eq!(recorded.secret, secret);
+            assert_eq!(
+                recorded.password_wrap.is_some(),
+                secret == SecretKind::GnomeKeyringToken
+            );
+
+            let before = plant_envelope(user, secret, Some(4551));
+            record(user);
+            assert_eq!(std::fs::read(envelope_path(user)).unwrap(), before);
+        }
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// No TPM: only the envelope file is read.
     #[test]
     fn read_sealed_kind_tells_nothing_armed_from_unreadable() {
@@ -1051,7 +1139,9 @@ mod tests {
     /// Every arm and re-seal records the account's uid; the envelope is not
     /// released once the account resolves to another uid; an envelope
     /// without one (an earlier release) is released and gets the uid on its
-    /// next re-seal.
+    /// next re-seal, and on the first verified login that finds it holds the
+    /// login's secret even when nothing else changes (the same sealed blob
+    /// and policy, `Unchanged`), for a password and a keyring token alike.
     #[test]
     #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn tpm_a_sealed_secret_records_its_uid_and_is_not_released_to_another_account() {
@@ -1084,11 +1174,15 @@ mod tests {
 
             // An envelope an earlier release wrote carries no uid: released,
             // and a re-seal after a password change records the uid.
+            let unbind = || {
+                let mut legacy = SealedEnvelope::load(&envelope_path(user)).unwrap();
+                legacy.uid = None;
+                legacy.save(&envelope_path(user)).unwrap();
+                legacy
+            };
             forget_password(user).unwrap();
             seal_password(user, b"first password").unwrap();
-            let mut legacy = SealedEnvelope::load(&envelope_path(user)).unwrap();
-            legacy.uid = None;
-            legacy.save(&envelope_path(user)).unwrap();
+            unbind();
             assert_eq!(&*unseal_password(user).unwrap(), b"first password");
             assert_eq!(
                 reseal_password(user, b"second password", None).unwrap(),
@@ -1096,6 +1190,48 @@ mod tests {
             );
             assert_eq!(recorded(), Some(5002));
             assert_eq!(&*unseal_password(user).unwrap(), b"second password");
+
+            // A verified login with the password it already holds records
+            // the uid too, keeping the sealed blob and its policy; the
+            // envelope is then not released once the name resolves to
+            // another uid.
+            let legacy = unbind();
+            assert_eq!(
+                reseal_password(user, b"second password", None).unwrap(),
+                Reseal::Unchanged
+            );
+            let stamped = SealedEnvelope::load(&envelope_path(user)).unwrap();
+            assert_eq!(stamped.uid, Some(5002));
+            assert_eq!(
+                (&stamped.public, &stamped.private, &stamped.policy),
+                (&legacy.public, &legacy.private, &legacy.policy)
+            );
+            assert_eq!(&*unseal_password(user).unwrap(), b"second password");
+            {
+                let _c = crate::account::remember(user, 5003);
+                let error = unseal_password(user).map(|_| ()).unwrap_err().to_string();
+                assert!(error.contains("uid 5002"), "{error}");
+            }
+
+            // So does a keyring token whose password wrap opens under the
+            // login's password.
+            forget_password(user).unwrap();
+            let token = arm_gnome_token(user, b"second password").expect("arm");
+            let legacy = unbind();
+            assert_eq!(
+                reseal_password(user, b"second password", None).unwrap(),
+                Reseal::Unchanged
+            );
+            let stamped = SealedEnvelope::load(&envelope_path(user)).unwrap();
+            assert_eq!(stamped.uid, Some(5002));
+            assert_eq!(stamped.private, legacy.private);
+            assert_eq!(stamped.secret, SecretKind::GnomeKeyringToken);
+            assert!(stamped.password_wrap.is_some());
+            assert_eq!(&*unseal_secret(user).unwrap().secret, token.as_bytes());
+            {
+                let _c = crate::account::remember(user, 5003);
+                assert!(unseal_secret(user).is_err());
+            }
         }
         forget_password(user).unwrap();
         std::env::remove_var("IRLUME_KEYRING_DIR");

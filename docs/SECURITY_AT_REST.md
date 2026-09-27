@@ -206,7 +206,11 @@ each record it does not use, with the uids and the next step.
 - A record written before the uid was recorded (0.14.0 and earlier) is
   accepted, and its next write records the uid: an enrollment write (enroll,
   add scans, rename or delete a profile), a template key or keyring re-seal,
-  a keyring arm, or `irlume recovery setup`. Such a write for a name that has
+  a keyring arm, or `irlume recovery setup`. A keyring envelope also records
+  it at the first login whose verified password matches the sealed secret
+  (or opens a keyring token's password wrap), in the check irlumed makes
+  when the session opens, even when neither the secret nor its TPM policy
+  changes: only the uid field is written. Such a write for a name that has
   no account records no uid. Moving a template key to a stronger policy
   (at irlumed's start, or on a load) keeps the uid it records, or none: the
   name may by then resolve to another account than the one whose enrollment

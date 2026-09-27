@@ -1934,8 +1934,10 @@ pub enum Response {
     PasswordForgotten,
     /// Outcome of a `ResealPassword`. `changed` is true when the envelope was
     /// (re-)written: either the old one no longer unsealed (PCRs moved) or the
-    /// password differed. `armed` is false when the user has no sealed password
-    /// at all, in which case nothing was done (we never auto-arm).
+    /// password differed. Recording the account's uid on an envelope an
+    /// earlier release wrote without one, with the sealed secret kept, does
+    /// not count. `armed` is false when the user has no sealed password at
+    /// all, in which case nothing was done (we never auto-arm).
     PasswordResealed {
         armed: bool,
         changed: bool,

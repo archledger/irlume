@@ -90,7 +90,13 @@ pub(crate) fn video_class_entry(node: &str) -> PathBuf {
     {
         let roots = installed();
         if !roots.is_host {
-            if let Ok(relative) = std::path::Path::new(node).strip_prefix(&roots.dev) {
+            // Existing readers strip /dev/ before calling us, which also
+            // strips a fixture prefix when TMPDIR is beneath /dev/shm.
+            let with_dev = std::path::Path::new("/dev").join(node);
+            if let Ok(relative) = std::path::Path::new(node)
+                .strip_prefix(&roots.dev)
+                .or_else(|_| with_dev.strip_prefix(&roots.dev))
+            {
                 if let Some(name) = relative.file_name() {
                     return video_class_root().join(name);
                 }
@@ -144,7 +150,7 @@ pub(crate) fn check_probe(device: &str) {
         if roots.is_host {
             return;
         }
-        if names_host_camera_node(device) {
+        if names_host_camera_node(device, &roots.dev) {
             panic!(
                 "irlume-camera unit test probed {device}, a host camera node, under fixture \
                  roots; point the test at hostfs::test fixture paths, or install \
@@ -165,17 +171,24 @@ pub(crate) fn open_video(device: &str) -> std::io::Result<v4l::Device> {
 /// Whether `device` names or resolves to host hardware, including an alias
 /// under a fixture root. This reads metadata and links, never a device.
 #[cfg(test)]
-fn names_host_camera_node(device: &str) -> bool {
+fn names_host_camera_node(device: &str, fixture_dev: &std::path::Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
+    let resolved_fixture = std::fs::canonicalize(fixture_dev).ok();
+    let inside_fixture = |path: &std::path::Path| {
+        path.starts_with(fixture_dev)
+            || resolved_fixture
+                .as_ref()
+                .is_some_and(|root| path.starts_with(root))
+    };
     let mut path = PathBuf::from(device);
     // Resolve aliases before any open. Walking a dangling final symlink also
     // catches fixture mistakes on camera-less CI hosts. Cycles fail closed.
     for _ in 0..40 {
-        if names_host_camera_path(&path) {
+        if !inside_fixture(&path) && names_host_camera_path(&path) {
             return true;
         }
         if let Ok(resolved) = std::fs::canonicalize(&path) {
-            return names_host_camera_path(&resolved)
+            return (!inside_fixture(&resolved) && names_host_camera_path(&resolved))
                 || (resolved != std::path::Path::new("/dev/null")
                     && std::fs::metadata(&resolved)
                         .is_ok_and(|meta| meta.file_type().is_char_device()));

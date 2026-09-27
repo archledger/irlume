@@ -110,6 +110,11 @@ descriptor walk is strict: it steps by `bLength` through one configuration,
 and anything truncated, overrunning or inconsistent fails the attestation.
 A Processing Unit or extension unit whose `bLength` ends before its
 closing string index (`iProcessing`, `iExtension`) counts as truncated.
+For UVC 1.1 and later, a Processing Unit must also carry the final
+`bmVideoStandards` byte, as documented in Microsoft's
+[UVC 1.0 and 1.1 differences](https://learn.microsoft.com/en-us/windows-hardware/drivers/stream/differences-between-uvc-1-0-and-uvc-1-1).
+The target VideoControl interface must occur once at alternate zero;
+duplicate or nonzero alternates cannot supply evidence for it.
 It does not read `wTotalLength`: the reporter's 5986:2113 `descriptors`
 file carries 996 of the 1026 bytes its configuration header claims (linuxhw
 31A261423C, from a unit with the same bcdDevice 54.22, carries all 1026, and

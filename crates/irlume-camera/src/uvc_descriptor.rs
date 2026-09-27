@@ -370,6 +370,7 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
     let mut found_target_vc = false;
     let mut configurations = 0;
     let mut headers = 0usize;
+    let mut uvc_version = None;
     let mut streaming_interfaces = Vec::new();
     let mut processing_controls = Vec::new();
     let mut extension_units = Vec::new();
@@ -402,6 +403,12 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                     videostreaming[usize::from(d[2])] = true;
                 }
                 in_target_vc = video && d[2] == interface_number && d[6] == SUBCLASS_VIDEOCONTROL;
+                // A VideoControl function has one default alternate. Never
+                // combine a header or PU from one alternate with an XU from
+                // another, including a duplicate default interface.
+                if in_target_vc && (d[3] != 0 || found_target_vc) {
+                    return None;
+                }
                 found_target_vc |= in_target_vc;
             }
             DESC_CS_INTERFACE if in_target_vc => {
@@ -411,15 +418,17 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                 match d[2] {
                     SUBTYPE_VC_HEADER => {
                         headers += 1;
+                        uvc_version = Some(u16::from_le_bytes([*d.get(3)?, *d.get(4)?]));
                         let count = usize::from(*d.get(11)?);
                         streaming_interfaces = d.get(12..12 + count)?.to_vec();
                     }
                     SUBTYPE_PROCESSING_UNIT => {
                         // `iProcessing` follows `bmControls` in every UVC
-                        // version (1.5 adds `bmVideoStandards`), so a unit
-                        // shorter than 9 + bControlSize is truncated.
+                        // version. UVC 1.1 and later also require the final
+                        // `bmVideoStandards` byte.
                         let size = usize::from(*d.get(7)?);
-                        if len < 9 + size {
+                        let minimum = if uvc_version? >= 0x0110 { 10 } else { 9 };
+                        if len < minimum + size {
                             return None;
                         }
                         processing_controls.push(processing_unit_controls(d)?);
@@ -2174,6 +2183,49 @@ mod tests {
 
     /// Truncation anywhere refuses the whole answer, as it does for the
     /// emitter parser: no prefix may attest.
+    #[test]
+    fn processing_unit_tail_matches_the_declared_uvc_version() {
+        let header_at = 18 + 9 + 9;
+        let pu_at = header_at + 13;
+        for version in [0x0100u16, 0x0110, 0x0150] {
+            let mut whole = attested_shape();
+            whole[header_at + 3..header_at + 5].copy_from_slice(&version.to_le_bytes());
+            assert!(ir_function_evidence(&whole, 0).is_ok());
+            let length = usize::from(whole[pu_at]);
+            whole[pu_at] -= 1;
+            whole.remove(pu_at + length - 1);
+            if version == 0x0100 {
+                assert!(ir_function_evidence(&whole, 0).is_ok());
+            } else {
+                assert_eq!(
+                    ir_function_evidence(&whole, 0),
+                    Err(IrFunctionRefusal::Malformed)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_video_control_alternate_cannot_supply_another_alternates_unit() {
+        let whole = attested_shape();
+        let unit_at = whole
+            .windows(16)
+            .position(|w| w == t480::guid(MSXU))
+            .unwrap()
+            - 4;
+        for alternate in [0, 1] {
+            let mut split = whole.clone();
+            split.splice(
+                unit_at..unit_at,
+                t480::interface(0, alternate, 1, SUBCLASS_VIDEOCONTROL, 1, 0),
+            );
+            assert_eq!(
+                ir_function_evidence(&split, 0),
+                Err(IrFunctionRefusal::Malformed)
+            );
+        }
+    }
+
     #[test]
     fn a_truncated_header_unit_or_tail_is_malformed() {
         let whole = attested_shape();

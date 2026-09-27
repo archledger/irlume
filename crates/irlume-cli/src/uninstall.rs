@@ -1150,11 +1150,13 @@ fn unreadable_refuses(owner: Option<u32>, root_uid: u32) -> bool {
 /// not what it points to. An entry that `owners` do not own is left in place
 /// and added to `kept`, named below the tree (`at`): an account could have
 /// moved it in, and root removing it would delete what that account cannot.
+/// `links` counts the symbolic links removed.
 fn clear_dir(
     dir: &std::fs::File,
     at: &Path,
     owners: &[u32],
     kept: &mut Vec<PathBuf>,
+    links: &mut usize,
 ) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
     let here = fd_path(dir)?;
@@ -1178,6 +1180,9 @@ fn clear_dir(
         }
         if !seen.is_dir() {
             gone(std::fs::remove_file(here.join(&name)))?;
+            if seen.file_type().is_symlink() {
+                *links += 1;
+            }
             continue;
         }
         let child = match open_child_dir(dir, &name)? {
@@ -1194,7 +1199,7 @@ fn clear_dir(
             kept.push(shown);
             continue;
         }
-        clear_dir(&child, &shown, owners, kept)?;
+        clear_dir(&child, &shown, owners, kept, links)?;
         match std::fs::remove_dir(here.join(&name)) {
             Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
                 if !kept.iter().any(|path| path.starts_with(&shown)) {
@@ -1214,9 +1219,11 @@ impl VerifiedTree {
     }
 
     /// Whether the tree's keyring directory is a real directory owned by
-    /// `uid` (root outside tests), which only a root irlumed writes. One
-    /// that cannot be opened is judged by its own owner, not followed; when
-    /// that cannot be read either, the answer is unknown.
+    /// `uid` (root outside tests), which only a root irlumed writes, or a
+    /// link to one ([`Self::linked_root_store`]), which [`Self::sweep`] then
+    /// counts as that store. One that cannot be opened is judged by its own
+    /// owner, not followed; when that cannot be read either, the answer is
+    /// unknown.
     fn keeps_store_of(&self, uid: u32) -> Result<bool, String> {
         use std::os::unix::fs::MetadataExt as _;
         let shown = self.path.join("keyring");
@@ -1225,6 +1232,7 @@ impl VerifiedTree {
                 .metadata()
                 .map(|meta| meta.uid() == uid)
                 .map_err(|e| format!("{}: {e}", shown.display())),
+            Ok(Child::Link) => self.linked_root_store(uid).map(|store| store.is_some()),
             Ok(_) => Ok(false),
             Err(e) => match self.keyring_owner() {
                 Some(owner) => Ok(owner == uid),
@@ -1283,13 +1291,14 @@ impl VerifiedTree {
 
     /// Remove the tree through the directory that holds it, and only while
     /// the name there is still the directory that was verified. A tree that
-    /// is gone already counts as removed.
-    fn wipe(&self) -> std::io::Result<()> {
+    /// is gone already counts as removed. The number of symbolic links the
+    /// removal took ([`Self::remove_held`]).
+    fn wipe(&self) -> std::io::Result<usize> {
         use std::os::unix::fs::MetadataExt as _;
         let path = fd_path(&self.parent)?.join("irlume");
         let now = match std::fs::symlink_metadata(&path) {
             Ok(meta) => meta,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(e),
         };
         let verified = self.dir.metadata()?;
@@ -1306,13 +1315,15 @@ impl VerifiedTree {
     /// renamed away and replaced after the check is still the one emptied,
     /// and what took its name is never read; that name is then removed only
     /// as an empty directory. What `owners` do not own is left in place and
-    /// named in the error.
-    fn remove_held(&self, owners: &[u32]) -> std::io::Result<()> {
-        let mut kept = Vec::new();
-        clear_dir(&self.dir, Path::new(""), owners, &mut kept)?;
+    /// named in the error. The number of symbolic links removed: what they
+    /// led to was not examined, and the account could have changed where one
+    /// led up to its removal.
+    fn remove_held(&self, owners: &[u32]) -> std::io::Result<usize> {
+        let (mut kept, mut links) = (Vec::new(), 0);
+        clear_dir(&self.dir, Path::new(""), owners, &mut kept, &mut links)?;
         match std::fs::remove_dir(fd_path(&self.parent)?.join("irlume")) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && kept.is_empty() => Ok(()),
+            Ok(()) => Ok(links),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && kept.is_empty() => Ok(links),
             Err(_) if !kept.is_empty() => Err(std::io::Error::other(terminal_safe(&format!(
                 "{} owned by another account, left in place",
                 kept.iter()
@@ -1429,46 +1440,32 @@ fn wipe_home_trees(homes: &[HomeTree]) -> Vec<String> {
     wipe_home_trees_as(homes, 0)
 }
 
-/// [`wipe_home_trees`] with root's uid injected. The removal takes only a
-/// link at the keyring's name, so a root store it leads to keeps whatever
-/// envelopes it holds, and those need the SRK: one with any entry, or one
-/// that cannot be read, is reported as data left, which keeps the SRK.
-fn wipe_home_trees_as(homes: &[HomeTree], root_uid: u32) -> Vec<String> {
+/// [`wipe_home_trees`] with root's uid injected (kept for the tests that
+/// stand in for root). A symbolic link the removal takes is removed, never
+/// followed, so a store it led to, which a root irlumed's envelopes may be
+/// in, stays; and the account could have pointed it anywhere until the
+/// moment it went. A tree whose removal took a link is therefore reported
+/// among what may still hold data, which keeps the SRK (a key left in the
+/// TPM does no harm; one evicted under a surviving envelope strands it).
+fn wipe_home_trees_as(homes: &[HomeTree], _root_uid: u32) -> Vec<String> {
     let mut left = Vec::new();
     for home in homes {
         match home {
-            HomeTree::Verified(tree) => {
-                if matches!(tree.keyring(), Ok(Child::Link)) {
-                    let linked = tree.linked_root_store(root_uid).and_then(|store| {
-                        store
-                            .map(|dir| {
-                                let dir = fd_path(&dir).map_err(|e| e.to_string())?;
-                                std::fs::read_dir(dir)
-                                    .map(|mut entries| entries.next().is_some())
-                                    .map_err(|e| e.to_string())
-                            })
-                            .transpose()
-                    });
-                    match linked {
-                        Ok(None | Some(false)) => {}
-                        Ok(Some(true)) => left.push(format!(
-                            "{} (links to a keyring store root owns; the link is removed, the store kept)",
-                            tree.path.join("keyring").display()
-                        )),
-                        Err(e) => left.push(terminal_safe(&format!(
-                            "{} (links to a keyring store that could not be read: {e})",
-                            tree.path.join("keyring").display()
-                        ))),
-                    }
-                }
-                if let Err(e) = tree.wipe() {
+            HomeTree::Verified(tree) => match tree.wipe() {
+                Ok(0) => {}
+                Ok(links) => left.push(format!(
+                    "{} (removed; it held {links} symbolic link(s), removed without following them, \
+                     so what they led to was not examined and the TPM storage key is kept)",
+                    tree.path.display()
+                )),
+                Err(e) => {
                     eprintln!(
                         "[uninstall] could not remove {}: {e} (files remain)",
                         tree.path.display()
                     );
                     left.push(format!("{} (user state)", tree.path.display()));
                 }
-            }
+            },
             HomeTree::Skipped { path, reason, .. } => left.push(format!(
                 "{} (user state, not removed: {reason})",
                 path.display()
@@ -2434,7 +2431,7 @@ mod tests {
     // remove_dir_all on a regular FILE fails on any filesystem, root or not, so
     // the failure fixture is deterministic.
     #[test]
-    fn only_a_real_keyring_directory_root_owns_counts_for_the_login_guards() {
+    fn a_keyring_directory_or_link_root_owns_counts_for_the_login_guards() {
         let base = std::env::temp_dir().join(format!("irlume-root-owned-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let alice = test_account(&base, "alice");
@@ -2445,8 +2442,8 @@ mod tests {
         std::os::unix::fs::symlink("/", tree_path.join("keyring")).unwrap();
         assert_eq!(
             tree.keeps_store_of(0),
-            Ok(false),
-            "a link to a root-owned directory"
+            Ok(true),
+            "a link to a root-owned directory is followed to it"
         );
         std::fs::remove_file(tree_path.join("keyring")).unwrap();
         std::fs::create_dir(tree_path.join("keyring")).unwrap();
@@ -3263,15 +3260,21 @@ mod tests {
                 "{target:?}: {sweep:?}"
             );
         }
-        // The login guards do not follow it.
+        // The login guards follow it to root's store too, and the wipe,
+        // which removes only the link, reports that it did.
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&store, &link).unwrap();
         let homes = home_trees(std::slice::from_ref(&alice), &default);
         let HomeTree::Verified(tree) = &homes[0] else {
             panic!("{homes:?}");
         };
-        assert_eq!(tree.keeps_store_of(owner), Ok(false));
-        assert!(wipe_home_trees(&homes).is_empty());
+        assert_eq!(tree.keeps_store_of(owner), Ok(true));
+        assert_eq!(tree.keeps_store_of(owner.wrapping_add(1)), Ok(false));
+        let left = wipe_home_trees(&homes);
+        assert!(
+            left.len() == 1 && left[0].contains("1 symbolic link"),
+            "{left:?}"
+        );
         assert!(!tree_path.exists(), "the tree and its link are removed");
         assert!(store.join("carol.json").is_file(), "the store is not");
         let _ = std::fs::remove_dir_all(&base);
@@ -3391,39 +3394,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A keyring link to a root store that holds anything is data left: the
-    /// removal takes only the link, and the store's envelopes need the SRK.
+    /// A tree whose removal takes a symbolic link is reported among what
+    /// may still hold data, which keeps the SRK: the link is removed, never
+    /// followed, and the account could point it anywhere until then. A tree
+    /// without one is not.
     #[test]
-    fn a_keyring_link_to_a_root_store_with_envelopes_keeps_the_srk() {
-        use std::os::unix::fs::MetadataExt as _;
+    fn a_tree_whose_removal_takes_a_link_keeps_the_srk() {
         let base =
             std::env::temp_dir().join(format!("irlume-home-linked-left-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let store = base.join("srv/keyring");
         std::fs::create_dir_all(&store).unwrap();
-        let owner = std::fs::metadata(&store).unwrap().uid();
+        std::fs::write(store.join("alice.json"), PASSWORD_ENVELOPE).unwrap();
         let alice = test_account(&base, "alice");
-        let wipe_linked = |root_uid: u32| {
-            let tree_path = home_state_path(&alice.home);
-            std::fs::create_dir_all(&tree_path).unwrap();
-            std::os::unix::fs::symlink(&store, tree_path.join("keyring")).unwrap();
+        let tree_path = home_state_path(&alice.home);
+        let wipe = |link: bool| {
+            std::fs::create_dir_all(tree_path.join("runner")).unwrap();
+            if link {
+                std::os::unix::fs::symlink(&store, tree_path.join("keyring")).unwrap();
+            }
             let homes = home_trees(std::slice::from_ref(&alice), &base.join("default-state"));
-            let left = wipe_home_trees_as(&homes, root_uid);
-            assert!(!tree_path.exists(), "the tree and its link are removed");
+            let left = wipe_home_trees(&homes);
+            assert!(!tree_path.exists(), "the tree is removed");
             left
         };
+        assert!(wipe(false).is_empty(), "no link, nothing left");
+        let left = wipe(true);
         assert!(
-            wipe_linked(owner).is_empty(),
-            "an empty store holds nothing"
-        );
-        std::fs::write(store.join("alice.json"), PASSWORD_ENVELOPE).unwrap();
-        let left = wipe_linked(owner);
-        assert!(
-            left.len() == 1 && left[0].contains("links to a keyring store root owns"),
+            left.len() == 1
+                && left[0].contains("1 symbolic link")
+                && left[0].contains("the TPM storage key is kept"),
             "{left:?}"
         );
-        assert!(store.join("alice.json").is_file(), "the store is kept");
-        assert!(wipe_linked(owner.wrapping_add(1)).is_empty(), "not root's");
+        assert!(store.join("alice.json").is_file(), "what it led to stays");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -3476,7 +3479,11 @@ mod tests {
         );
         // --keep-data disarms, and must not reach through the link.
         assert_eq!(disarm_home_trees(&homes), 1);
-        assert!(wipe_home_trees(&homes).is_empty());
+        let left = wipe_home_trees(&homes);
+        assert!(
+            left.len() == 1 && left[0].contains("2 symbolic link"),
+            "{left:?}"
+        );
         assert!(!tree_path.exists());
         assert!(outside_intact(&outside));
         let _ = std::fs::remove_dir_all(&base);
@@ -3541,8 +3548,16 @@ mod tests {
         std::os::unix::fs::symlink(&outside, tree.join("link")).unwrap();
         let uid = std::fs::metadata(&tree).unwrap().uid();
         let dir = open_dir(&tree).unwrap();
-        let mut kept = Vec::new();
-        clear_dir(&dir, Path::new(""), &[uid.wrapping_add(1)], &mut kept).unwrap();
+        let (mut kept, mut links) = (Vec::new(), 0);
+        clear_dir(
+            &dir,
+            Path::new(""),
+            &[uid.wrapping_add(1)],
+            &mut kept,
+            &mut links,
+        )
+        .unwrap();
+        assert_eq!(links, 0, "a link another account owns is kept, not removed");
         kept.sort();
         assert_eq!(
             kept,
@@ -3553,8 +3568,9 @@ mod tests {
             ]
         );
         assert!(tree.join("sub/deeper/file").is_file() && tree.join("file").is_file());
-        let mut kept = Vec::new();
-        clear_dir(&dir, Path::new(""), &[uid], &mut kept).unwrap();
+        let (mut kept, mut links) = (Vec::new(), 0);
+        clear_dir(&dir, Path::new(""), &[uid], &mut kept, &mut links).unwrap();
+        assert_eq!(links, 1, "the removed link is counted");
         assert!(kept.is_empty(), "{kept:?}");
         assert_eq!(std::fs::read_dir(&tree).unwrap().count(), 0);
         assert!(

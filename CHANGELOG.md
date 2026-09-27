@@ -849,18 +849,19 @@ All notable changes to irlume are documented here. This project adheres to
   real directory owned by root or by that account, and removes it
   through the directory it checked, entry by entry without following a
   link, leaving in place what another account owns; anything else there
-  is named in the output as left in place. Sealed envelopes are read only as regular
-  files of at most 64 KiB, never through a symbolic link at their own
-  name. In an account's tree, an envelope that cannot be read and that
-  root does not own is named against that account instead of stopping
-  the uninstall; one root owns, or one whose owner cannot be read, still
+  is named in the output as left in place. Sealed envelopes are read
+  only as regular files of at most 1 MiB, never through a symbolic link
+  at their own name, and irlume no longer writes one larger than that.
+  In an account's tree, an envelope that cannot be read and that root
+  does not own is named against that account instead of stopping the
+  uninstall; one root owns, or one whose owner cannot be read, still
   stops it, as before. A `keyring` link in that tree, or in one the
   uninstall skips, is followed only to a directory root owns, whose
-  tokens then count like any root store's;
-  the removal takes only the link, and a store it leads to that holds
-  anything is reported as left, so the TPM's storage key is kept. File
-  names from an account's tree are printed with control characters
-  escaped.
+  tokens then count like any root store's, for the uninstall and the
+  login guards alike. A tree whose removal took a symbolic link is
+  reported as possibly leaving data behind, so the TPM's storage key is
+  kept. File names from an account's tree are printed with control
+  characters escaped. `IRLUME_PCRS` names each PCR once.
 
 - `irlume login disable` leaves a stack irlume edits in place (an `/etc`
   file with no vendor copy, such as `sudo` or `polkit-1` on Debian, Ubuntu

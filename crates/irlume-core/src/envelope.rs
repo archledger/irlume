@@ -32,8 +32,10 @@ pub const CURRENT_VERSION: u32 = 1;
 
 /// The largest envelope file [`SealedEnvelope::load`] reads, in bytes. One
 /// irlume writes holds two TPM blobs, the PCR list and at most a signing key
-/// and a password wrap, all as base64 in pretty JSON: a few KiB.
-pub const MAX_ENVELOPE_BYTES: u64 = 64 * 1024;
+/// and a password wrap, all as base64 in pretty JSON: a few KiB. The limit
+/// leaves room for an envelope an earlier release wrote from an
+/// `IRLUME_PCRS` that repeated PCRs (the list was not deduplicated then).
+pub const MAX_ENVELOPE_BYTES: u64 = 1024 * 1024;
 
 /// How the sealed object's `authPolicy` is satisfied at unseal time. Older
 /// envelopes have no `policy` field and default to [`PolicyKind::PcrLiteral`],
@@ -349,13 +351,13 @@ mod tests {
         };
         envelope(vec![7], Vec::new()).save(&path).unwrap();
         let before = fs::read(&path).unwrap();
-        let values = (0..2_000)
+        let values = (0..20_000)
             .map(|_| PcrValue {
                 pcr: 7,
                 value: vec![0; 32],
             })
             .collect();
-        let large = envelope(vec![7; 2_000], values);
+        let large = envelope(vec![7; 20_000], values);
         let err = large.save(&path).unwrap_err();
         assert!(err.to_string().contains("nothing was written"), "{err}");
         assert_eq!(

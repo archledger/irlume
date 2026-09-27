@@ -277,6 +277,38 @@ pub fn list_sealed_kinds_at(dir: &Path) -> Result<Vec<(String, SecretKind)>> {
 }
 
 fn sealed_kinds_at(dir: &Path) -> Result<Vec<(String, SecretKind)>> {
+    inspect_sealed_at(dir)?
+        .into_iter()
+        .map(|entry| entry.kind.map(|kind| (entry.user, kind)))
+        .collect()
+}
+
+/// One `*.json` entry of a keyring directory, as [`inspect_sealed_at`] found
+/// it.
+#[derive(Debug)]
+pub struct SealedEntry {
+    /// The account the file name names; lossy for a name that is not UTF-8,
+    /// which irlume never writes.
+    pub user: String,
+    /// The entry's file name.
+    pub file_name: std::ffi::OsString,
+    /// The uid owning the entry itself (a link, never its target), `None`
+    /// when that could not be read.
+    pub owner: Option<u32>,
+    /// What the envelope seals, or why it could not be read.
+    pub kind: Result<SecretKind>,
+}
+
+/// Every `*.json` entry of the keyring directory `dir`, sorted by account,
+/// each with its own outcome. For a caller that weighs an entry it cannot
+/// read by who owns it, such as the uninstaller's sweep of per-account state;
+/// [`list_sealed_kinds_at`] is the fail-closed reading, where the first entry
+/// that cannot be read is the error.
+///
+/// # Errors
+/// The directory cannot be listed. A missing directory is an empty list.
+pub fn inspect_sealed_at(dir: &Path) -> Result<Vec<SealedEntry>> {
+    use std::os::unix::fs::MetadataExt as _;
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         // A machine that never armed anything has no directory, which is a
@@ -291,17 +323,32 @@ fn sealed_kinds_at(dir: &Path) -> Result<Vec<(String, SecretKind)>> {
         if path.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
-        let user = path
-            .file_stem()
-            .and_then(|x| x.to_str())
-            .ok_or_else(|| {
-                Error::Protocol(format!("unreadable envelope name: {}", path.display()))
-            })?
-            .to_string();
-        let env = SealedEnvelope::load(&path)?;
-        out.push((user, env.secret));
+        // Read relative to the listed directory, without following a link.
+        let owner = entry.metadata().ok().map(|meta| meta.uid());
+        let (user, kind) = match path.file_stem().and_then(|x| x.to_str()) {
+            Some(user) => (
+                user.to_string(),
+                SealedEnvelope::load(&path).map(|env| env.secret),
+            ),
+            None => (
+                path.file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                Err(Error::Protocol(format!(
+                    "unreadable envelope name: {}",
+                    path.display()
+                ))),
+            ),
+        };
+        out.push(SealedEntry {
+            user,
+            file_name: entry.file_name(),
+            owner,
+            kind,
+        });
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.sort_by(|a, b| a.user.cmp(&b.user));
     Ok(out)
 }
 
@@ -662,6 +709,48 @@ mod tests {
         assert!(!keyring.join("alice.json").exists());
         forget_password_in(&root, "alice").unwrap();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Each entry keeps its own outcome and owner, a FIFO among them answers
+    /// at once, and the fail-closed listing still fails on the first bad one.
+    #[test]
+    fn inspecting_a_keyring_directory_reports_each_entry_on_its_own() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = PathBuf::from(crate::test_tmp_dir("kr-inspect"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(inspect_sealed_at(&dir).unwrap().is_empty(), "no directory");
+        std::fs::create_dir_all(&dir).unwrap();
+        let me = std::fs::metadata(&dir).unwrap().uid();
+        std::fs::write(
+            dir.join("carol.json"),
+            r#"{"version":1,"secret":"GnomeKeyringToken","pcrs":[],"public":"","private":""}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("dave.json"), "{}").unwrap();
+        std::fs::write(dir.join("notes.txt"), "not an envelope name").unwrap();
+        let fifo = std::ffi::CString::new(dir.join("erin.json").as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let listed = dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(inspect_sealed_at(&listed).map_err(|e| e.to_string()));
+        });
+        let entries = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a FIFO among the envelopes must not block")
+            .unwrap();
+        let users: Vec<&str> = entries.iter().map(|e| e.user.as_str()).collect();
+        assert_eq!(users, ["carol", "dave", "erin"]);
+        assert!(entries.iter().all(|e| e.owner == Some(me)));
+        assert!(matches!(entries[0].kind, Ok(SecretKind::GnomeKeyringToken)));
+        assert!(entries[1].kind.is_err(), "malformed");
+        assert!(entries[2].kind.is_err(), "a FIFO");
+        assert_eq!(entries[2].file_name, "erin.json");
+        assert!(list_sealed_kinds_at(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// No TPM: only the envelope file is read.

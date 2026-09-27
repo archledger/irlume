@@ -984,27 +984,34 @@ pub fn privileged_grouped_pad_evidence_enabled() -> bool {
     }
     match observe_kv("settings.conf", "privileged_grouped_pad_evidence") {
         KvObservation::Value(v) => truthy(&v),
-        // `observe_kv` reports `key=` as absent; for a default-on key that
-        // empty value is a set value that is not an affirmative.
+        // `observe_kv` reports `key=` and a dangling settings.conf symlink as
+        // absent; for a default-on key the first is a set value that is not an
+        // affirmative and the second a policy that cannot be read.
         KvObservation::Absent => {
-            !names_key_without_value("settings.conf", "privileged_grouped_pad_evidence")
+            !absent_only_in_name("settings.conf", "privileged_grouped_pad_evidence")
         }
         KvObservation::Unknown(_) => false,
     }
 }
 
-/// Whether `key` appears in `file` with an empty value (`key=`), which
-/// [`observe_kv`] reports as absent. A file that has gone unreadable since
-/// counts as naming it, so a default-on caller reads it as off.
-fn names_key_without_value(file: &str, key: &str) -> bool {
-    match std::fs::read_to_string(config_path(file)) {
+/// Whether an [`observe_kv`] "absent" for `key` hides something a default-on
+/// caller must read as off: the key present with an empty value (`key=`), or a
+/// `file` whose name exists while its content cannot be read (a dangling
+/// symlink, for example to a volume not mounted yet, as
+/// [`observe_camera_conf`] treats it). Only a missing name is plainly absent.
+fn absent_only_in_name(file: &str, key: &str) -> bool {
+    let path = config_path(file);
+    match std::fs::read_to_string(&path) {
         Ok(text) => text
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
             .filter_map(|line| line.split_once('='))
             .any(|(k, v)| k.trim() == key && v.trim().is_empty()),
-        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::symlink_metadata(&path).is_ok()
+        }
+        Err(_) => true,
     }
 }
 
@@ -1084,6 +1091,17 @@ mod tests {
         assert!(
             privileged_grouped_pad_evidence_enabled(),
             "a commented-out key is absent"
+        );
+
+        // A settings.conf that names a missing target cannot be read, so it
+        // is not an absent file.
+        std::fs::remove_file(dir.join("settings.conf")).unwrap();
+        std::os::unix::fs::symlink(dir.join("not-mounted"), dir.join("settings.conf")).unwrap();
+        assert!(!privileged_grouped_pad_evidence_enabled());
+        std::fs::remove_file(dir.join("settings.conf")).unwrap();
+        assert!(
+            privileged_grouped_pad_evidence_enabled(),
+            "a missing name is absent"
         );
 
         write_kv("settings.conf", "privileged_grouped_pad_evidence", "1").unwrap();

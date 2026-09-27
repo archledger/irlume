@@ -165,6 +165,14 @@ fn namespace_command(
             "/",
         ])
         .args(["--tmpfs", "/run"]);
+    // The namespace's root gets an empty home of its own. The host's /root
+    // belongs to a uid outside the namespace, so a command that looks for
+    // per-account state there (uninstall and the login guards read every
+    // account's ~/.local/share/irlume) would otherwise meet a permission
+    // error no real root does, and refuse.
+    if Path::new("/root").is_dir() {
+        command.args(["--tmpfs", "/root"]);
+    }
     if unshare_pid {
         command.arg("--unshare-pid");
     }

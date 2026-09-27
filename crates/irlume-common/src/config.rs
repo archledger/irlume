@@ -984,8 +984,27 @@ pub fn privileged_grouped_pad_evidence_enabled() -> bool {
     }
     match observe_kv("settings.conf", "privileged_grouped_pad_evidence") {
         KvObservation::Value(v) => truthy(&v),
-        KvObservation::Absent => true,
+        // `observe_kv` reports `key=` as absent; for a default-on key that
+        // empty value is a set value that is not an affirmative.
+        KvObservation::Absent => {
+            !names_key_without_value("settings.conf", "privileged_grouped_pad_evidence")
+        }
         KvObservation::Unknown(_) => false,
+    }
+}
+
+/// Whether `key` appears in `file` with an empty value (`key=`), which
+/// [`observe_kv`] reports as absent. A file that has gone unreadable since
+/// counts as naming it, so a default-on caller reads it as off.
+fn names_key_without_value(file: &str, key: &str) -> bool {
+    match std::fs::read_to_string(config_path(file)) {
+        Ok(text) => text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| line.split_once('='))
+            .any(|(k, v)| k.trim() == key && v.trim().is_empty()),
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
     }
 }
 
@@ -1049,6 +1068,23 @@ mod tests {
         // An unrecognized value is not an affirmative.
         write_kv("settings.conf", "privileged_grouped_pad_evidence", "maybe").unwrap();
         assert!(!privileged_grouped_pad_evidence_enabled());
+
+        // Neither is an empty one, which the plain reader calls absent.
+        std::fs::write(
+            dir.join("settings.conf"),
+            "face_sensor_policy=dual\nprivileged_grouped_pad_evidence=\n",
+        )
+        .unwrap();
+        assert!(!privileged_grouped_pad_evidence_enabled());
+        std::fs::write(
+            dir.join("settings.conf"),
+            "# privileged_grouped_pad_evidence=\nface_sensor_policy=dual\n",
+        )
+        .unwrap();
+        assert!(
+            privileged_grouped_pad_evidence_enabled(),
+            "a commented-out key is absent"
+        );
 
         write_kv("settings.conf", "privileged_grouped_pad_evidence", "1").unwrap();
         assert!(privileged_grouped_pad_evidence_enabled());

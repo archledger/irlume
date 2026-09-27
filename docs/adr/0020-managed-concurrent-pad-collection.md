@@ -99,6 +99,13 @@ verdict from the stored record, because the collector keeps its
 `window >= GRACE_WINDOW_MS` gate. Credential release keeps the local login and
 lock scope.
 
+The default changes for the grouped sequential collector as well. Since 0.13
+the setting was an owner opt-in; from this amendment a machine without the key
+admits its privileged prompts to whichever collector its pair's stored
+qualification selects. `0`, any value that is not an on spelling (an empty
+`key=` included) and an unreadable settings file keep the ordinary short-window
+path, where one attempt casts one ViT vote.
+
 Measured on the NexiGo N930W pair on archhost (maintainer present): the lock
 screen granted in 6.7 and 8.1 s through this collector, while `sudo`, left on
 the ordinary path with one ViT vote per attempt, timed out three times inside

@@ -10236,7 +10236,12 @@ mod tests {
         // Env override off for this check (guarded: another test sets it).
         let _g = env_guard();
         std::env::remove_var("IRLUME_GRACE_MS");
-        assert_eq!(grace_window_ms(Some("sudo")), SUDO_GRACE_WINDOW_MS);
+        // The concrete values, so a change to either constant fails here: a
+        // concurrent pair spending about 4 s in rate establishment per attempt
+        // needs the privileged window to be ten seconds, not five.
+        assert_eq!(grace_window_ms(Some("sudo")), 10_000);
+        assert_eq!(grace_window_ms(Some("polkit-1")), 10_000);
+        assert_eq!(grace_window_ms(Some("kde")), 15_000);
         assert_eq!(grace_window_ms(Some("su")), SUDO_GRACE_WINDOW_MS);
         // Login/lock services and an unknown/absent service get the full window.
         assert_eq!(grace_window_ms(Some("plasmalogin")), GRACE_WINDOW_MS);

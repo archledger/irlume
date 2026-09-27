@@ -853,6 +853,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- A reason about the capture rather than the match (no face, a liveness
+  or PAD refusal, the pose) reaches a non-root caller of `Authenticate`,
+  `Identify` or `IdentifyFor` with each measured value replaced by an
+  ellipsis; root gets it exact, as `SelfTest` and tracing do, and the
+  reason for a face judged live stays exact (THREAT_MODEL.md "Side
+  channels").
+
 - irlumed gives each connection 5 seconds from accept to deliver its
   whole request line, however many reads that takes, instead of 15
   seconds for each read, which let a line sent a byte at a time keep its

@@ -4232,6 +4232,18 @@ fn unwired_login_line(user: &str, nixos: bool) -> String {
     }
 }
 
+/// Doctor's line when the enrolled account's login screen is one irlume keeps
+/// face off (a LightDM serving remote login screens), in place of
+/// [`unwired_login_line`]: no regeneration stripped it, and re-running
+/// `login enable` leaves it as it is.
+fn face_kept_off_login_line(user: &str, dm: &str) -> String {
+    format!(
+        "[doctor] ⚠ {user} is enrolled, but {dm}'s login screen has no face line: irlume\n     \
+         keeps face off it while it serves remote login screens (the {dm} note below\n     \
+         says why and how to turn that off). `irlume login enable` does not change that."
+    )
+}
+
 /// Doctor's line when polkit app prompts are not wired. On NixOS `irlume
 /// login enable` refuses, so it points to docs/NIXOS.md instead.
 fn polkit_unwired_line(bitwarden_action: bool, nixos: bool) -> &'static str {
@@ -4956,7 +4968,11 @@ fn doctor_run(
     // misleads: a distro update that strips the active greeter while a stale
     // inactive greeter file keeps the line leaves it true and the real login
     // broken. Doctor exists to catch exactly that, and was passing it.
-    let login_ok = crate::pamwire::active_login_wired();
+    // Read from the greeter's authentication mode, as `login status` reads
+    // it: a greeter left with only irlume's reseal lines (a LightDM serving
+    // remote login screens) authenticates nothing, though reconcile counts
+    // it as intact.
+    let login_ok = crate::pamwire::active_login_wired_by_mode();
     report.check(
         "login-wiring",
         if login_ok {
@@ -4967,12 +4983,17 @@ fn doctor_run(
             State::Info
         },
     );
+    // A login screen irlume deliberately leaves unwired (a LightDM serving
+    // XDMCP or VNC login screens to remote users); the display-manager check
+    // below reports it.
+    let unwired = crate::pamwire::active_dm_face_blocked();
     if enrolled && !login_ok {
-        dout!(
-            report,
-            "{}",
-            unwired_login_line(&user, crate::nixos::host_is_nixos())
-        );
+        let nixos = crate::nixos::host_is_nixos();
+        let line = match &unwired {
+            Some((dm, _)) if !nixos => face_kept_off_login_line(&user, dm),
+            _ => unwired_login_line(&user, nixos),
+        };
+        dout!(report, "{line}");
     }
     // irlume's own /etc copies of vendor PAM files: whether each is in step
     // with its vendor copy. Emitted on every run; `pass` covers a machine with
@@ -5024,10 +5045,8 @@ fn doctor_run(
     // PAM message. Without it a desktop integration reading `doctor --json` would
     // see `pass` while the human output shows a warning, and this file's own rule
     // is that the two must not disagree.
-    // A login screen irlume deliberately leaves unwired (a LightDM serving
-    // XDMCP or VNC login screens to remote users) is one it cannot target
-    // either, so the same check warns and says why.
-    let unwired = crate::pamwire::active_dm_face_blocked();
+    // A login screen irlume deliberately leaves unwired (`unwired` above) is
+    // one it cannot target either, so the same check warns and says why.
     match (crate::pamwire::active_dm_recognized(), &unwired) {
         (Some((dm, true)), Some((_, why))) => report.check_detail(
             "display-manager",
@@ -5371,7 +5390,25 @@ mod tests {
             assert_eq!(polkit.contains("Bitwarden"), bitwarden_action, "{polkit}");
         }
     }
+
     use super::*;
+
+    /// On a login screen irlume keeps face off (a LightDM serving remote
+    /// login screens, #859), doctor's unwired-login line names that login
+    /// manager and does not send the user to re-run `login enable`, which
+    /// leaves that stack as it is.
+    #[test]
+    fn doctor_names_a_login_screen_face_is_kept_off() {
+        let line = face_kept_off_login_line("alice", "lightdm");
+        assert!(
+            line.contains("alice is enrolled")
+                && line.contains("lightdm's login screen has no face line")
+                && line.contains("remote login screens"),
+            "{line}"
+        );
+        assert!(!line.contains("sudo irlume login enable --apply"), "{line}");
+        assert!(!line.contains('\u{2014}'), "{line}");
+    }
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()

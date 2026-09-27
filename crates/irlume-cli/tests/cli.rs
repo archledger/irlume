@@ -2927,6 +2927,20 @@ impl LightdmBed {
         self.stack()
             .contains("session    optional                     pam_irlume.so reseal")
     }
+
+    /// The check `id` from `doctor --json`.
+    fn doctor_check(&self, id: &str) -> serde_json::Value {
+        let (_, out, err) = self.run(&["doctor", "--json"]);
+        let report: serde_json::Value =
+            serde_json::from_str(&out).unwrap_or_else(|error| panic!("{error}: {out}\n{err}"));
+        report["data"]["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .find(|check| check["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {id} check: {out}"))
+    }
 }
 
 /// While LightDM's XDMCP server is on, `login enable` keeps irlume's face and
@@ -3106,6 +3120,47 @@ fn reconcile_keeps_face_off_lightdm_while_it_serves_xdmcp() {
         "{err}"
     );
     assert!(!bed.face() && bed.reseal(), "{}", bed.stack());
+}
+
+/// Doctor's `login-wiring` check reads the active greeter's authentication
+/// mode, as `login status` does: a LightDM left with only irlume's reseal
+/// lines while it serves remote login screens authenticates nothing, so it
+/// is not wired, although irlume's module is in its stack. Reconcile still
+/// counts that stack as intact. With the face lines back, the check passes
+/// (#859).
+#[test]
+fn doctor_counts_a_reseal_only_lightdm_as_not_wired() {
+    let bed = LightdmBed::new("lightdm-doctor");
+    bed.xdmcp(true);
+    let (code, out, err) = bed.run(&["login", "enable", "--apply"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(!bed.face() && bed.reseal(), "{}", bed.stack());
+    let (_, status, err) = bed.run(&["login", "status", "--json"]);
+    let status: serde_json::Value = serde_json::from_str(&status).expect(&err);
+    let lightdm = status["data"]["surfaces"]
+        .as_array()
+        .expect("surfaces")
+        .iter()
+        .find(|s| s["id"] == "lightdm")
+        .expect("lightdm")
+        .clone();
+    assert_eq!(lightdm["wired"], false, "{lightdm}");
+    let wiring = bed.doctor_check("login-wiring");
+    assert_ne!(wiring["state"], "pass", "{wiring}");
+    let (code, out, err) = bed.run(&["login", "reconcile"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        !err.contains("LightDM") && !err.contains("re-applying"),
+        "reconcile counts the reseal-only stack as intact: {err}"
+    );
+    assert!(!bed.face() && bed.reseal(), "{}", bed.stack());
+
+    bed.xdmcp(false);
+    let (code, out, err) = bed.run(&["login", "enable", "--apply"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(bed.face(), "{}", bed.stack());
+    let wiring = bed.doctor_check("login-wiring");
+    assert_eq!(wiring["state"], "pass", "{wiring}");
 }
 
 /// A stand-in for the gnome-keyring that `pam_gnome_keyring auto_start`

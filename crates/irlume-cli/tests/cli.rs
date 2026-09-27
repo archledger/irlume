@@ -2674,6 +2674,68 @@ session    optional                     pam_irlume.so reseal\n\
     );
 }
 
+/// `login disable --apply` as root on a `sudo` stack irlume edits in place
+/// (no vendor copy, as on Debian), where a rule that ends in `\` sits
+/// directly above irlume's line, with and without a backup that no longer
+/// matches it. PAM joins that rule with irlume's line, and taking the line
+/// out would join it with `@include common-auth`, so the stack stays byte
+/// for byte and the run exits 1 and says why.
+#[test]
+fn login_disable_keeps_an_in_place_stack_with_a_continued_line() {
+    let stock = "#%PAM-1.0\n\nsession    required   pam_limits.so\n\n@include common-auth\n\
+                 @include common-account\n@include common-session-noninteractive\n";
+    let sudo = "#%PAM-1.0\n\nsession    required   pam_limits.so\n\n\
+                auth       required   pam_faillock.so preauth \\\n\
+                auth       sufficient                   pam_irlume.so\n\
+                @include common-auth\n@include common-account\n\
+                @include common-session-noninteractive\n";
+    for with_backup in [false, true] {
+        let mut sb = Sandbox::new(if with_backup {
+            "disable-continued-bak"
+        } else {
+            "disable-continued"
+        });
+        sb.hidden.push("/etc/systemd/system");
+        let etc = sb.path("pam-etc");
+        let vendor = sb.path("pam-vendor");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(etc.join("sudo"), sudo).unwrap();
+        if with_backup {
+            std::fs::write(etc.join("sudo.pre-irlume"), stock).unwrap();
+        }
+        sb.fake_tool("semodule", "exit 0");
+        let (code, out, err) = run(support::isolated_root_command(
+            &sb.root,
+            BIN,
+            &["login", "disable", "--apply"],
+            &["semodule"],
+            &sb.hidden,
+            &[(&etc, "/etc/pam.d"), (&vendor, "/usr/lib/pam.d")],
+        )
+        .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
+        .env("IRLUME_PAM_LOCK", sb.path("pam.lock")));
+        assert_eq!(code, 1, "{out}\n{err}");
+        assert_eq!(std::fs::read_to_string(etc.join("sudo")).unwrap(), sudo);
+        assert_eq!(
+            std::fs::read_to_string(etc.join("sudo.pre-irlume")).ok(),
+            with_backup.then(|| stock.to_string())
+        );
+        assert!(
+            out.contains(
+                "⚠ /etc/pam.d/sudo: kept as it is: a line in it ends in `\\`, which PAM joins \
+                 with the next line, and irlume does not change such a file line by line; join \
+                 those lines or take irlume's lines out by hand\n"
+            ),
+            "{out}\n{err}"
+        );
+        assert!(
+            err.contains("[login] /etc/pam.d/sudo: not updated (see the ⚠ line above)"),
+            "{out}\n{err}"
+        );
+    }
+}
+
 /// `login disable --apply` as root refuses while an account's GNOME keyring is
 /// keyed to an irlume token and a login stack carries the session line that
 /// delivers it: the stack stays byte for byte. `--force` goes ahead.

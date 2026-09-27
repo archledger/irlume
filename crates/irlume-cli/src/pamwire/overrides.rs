@@ -1316,27 +1316,32 @@ fn no_anchor(etc: &str) -> Decision {
 /// password stack included. Every wiring recipe refuses such a file for the
 /// same reason.
 fn continued(i: &Input<'_>) -> Decision {
-    let (etc, vendor_path) = (i.etc, i.vendor_path);
-    let way = if i.enable {
-        "join those lines by hand and run this again".to_string()
-    } else if i.vendor.is_some() {
-        format!(
-            "join those lines or take irlume's lines out by hand, or delete it to use \
-             {vendor_path}"
-        )
-    } else {
-        "join those lines or take irlume's lines out by hand".to_string()
-    };
     Decision {
         unmet: true,
         ..keep(
             PlannedChange::KeepEditedOverride,
-            format!(
-                "⚠ {etc}: kept as it is: a line in it ends in `\\`, which PAM joins with the \
-                 next line, and irlume does not change such a file line by line; {way}"
-            ),
+            continued_message(i.etc, i.enable, i.vendor.map(|_| i.vendor_path)),
         )
     }
+}
+
+/// The line that reports a file kept as it is because a line in it ends in
+/// `\`, for an override and for a stack irlume edits in place alike.
+/// `vendor_path` names the vendor copy a disable can fall back to by deleting
+/// the file, when there is one.
+pub(super) fn continued_message(etc: &str, enable: bool, vendor_path: Option<&str>) -> String {
+    let way = match (enable, vendor_path) {
+        (true, _) => "join those lines by hand and run this again".to_string(),
+        (false, Some(vendor_path)) => format!(
+            "join those lines or take irlume's lines out by hand, or delete it to use \
+             {vendor_path}"
+        ),
+        (false, None) => "join those lines or take irlume's lines out by hand".to_string(),
+    };
+    format!(
+        "⚠ {etc}: kept as it is: a line in it ends in `\\`, which PAM joins with the next \
+         line, and irlume does not change such a file line by line; {way}"
+    )
 }
 
 /// How to take the vendor file after all when irlume's lines would move one

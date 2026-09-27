@@ -363,7 +363,10 @@ sudo irlume uninstall            # add --keep-data to preserve enrollment
 The teardown runs in the only safe order: un-wire PAM first (so no line can
 reference a module that is about to vanish), stop and disable the daemon,
 disarm every user's TPM keyring seal, then wipe templates, sealed secrets,
-third-party models, and config (unless `--keep-data`). After it finishes,
+third-party models, and config (unless `--keep-data`). When a stack is left
+as it is (a line that ends in `\`, for example), irlume itself stays
+installed and the uninstall exits 1: take irlume's lines out of that stack by
+hand, then run it again. After it finishes,
 remove the package through your manager, which also stops the daemon and
 reconcile units:
 

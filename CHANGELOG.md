@@ -843,6 +843,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- `irlume login disable` leaves a stack irlume edits in place (an `/etc`
+  file with no vendor copy, such as `sudo` or `polkit-1` on Debian, Ubuntu
+  and Arch) as it is, irlume's lines included, when a line in it ends in
+  `\`, which PAM joins with the next line into one rule, and exits 1
+  (`login apply` reports the surface as kept), as it does for an
+  override, instead of removing irlume's lines from it: taking out one
+  physical line of such a file can make the rule before it take in the
+  next one. A stack that is its `.pre-irlume` backup plus irlume's lines
+  is still restored from the backup. `login enable` leaves such a stack
+  as it is too while irlume's lines are in it, a `\` at the end of one of
+  them included. `irlume uninstall`, which runs the disable, counts
+  `sudo` and `polkit-1` among the stacks that may still reference
+  irlume, and while one does it leaves irlume installed and exits 1
+  instead of removing the module that stack names.
+
 - irlumed does not write core dumps, so a crash or a watchdog restart
   leaves no core file with its memory: it sets a zero core limit and
   clears its dumpable flag at startup, and `irlumed.service` and the NixOS module

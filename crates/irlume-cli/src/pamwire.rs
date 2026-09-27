@@ -1092,9 +1092,9 @@ pub(crate) fn reconcile_needed() -> bool {
 
 /// Whether any login surface's stack (a greeter, the fingerprint-keyring
 /// service or the lock screen) carries irlume's module, whatever its lines
-/// do, so a greeter holding only the reseal lines counts. What reconcile,
-/// uninstall and doctor's regeneration guard go by; reports of face login
-/// use [`login_wired_by_mode`].
+/// do, so a greeter holding only the reseal lines counts. What reconcile and
+/// doctor's regeneration guard go by; reports of face login use
+/// [`login_wired_by_mode`], and uninstall uses [`any_stack_wired`].
 pub(crate) fn login_wired() -> bool {
     let (lock_svc, _) = lock_surface();
     for s in GREETERS
@@ -1109,6 +1109,14 @@ pub(crate) fn login_wired() -> bool {
         }
     }
     false
+}
+
+/// Whether any stack `login disable` unwires still carries irlume's module: a
+/// login surface ([`login_wired`]), sudo or polkit-1. Uninstall reports by it
+/// after its disable, which leaves some stacks as they are (one with a line
+/// that ends in `\`, say), sudo and polkit-1 among them.
+pub(crate) fn any_stack_wired() -> bool {
+    login_wired() || sudo_wired() || polkit_wired() == Some(true)
 }
 
 /// polkit-1 wiring state for doctor: `None` when the service file is absent
@@ -3018,6 +3026,13 @@ fn wire_service_with(
                 );
             }
             let current = read(s.etc)?;
+            // The recipes refuse a continued line in the lines irlume did not
+            // write, but a `\` added to one of irlume's own lines is gone once
+            // they are taken out, so the whole file is checked, as for an
+            // override.
+            if continued_with_irlume_lines(&current) {
+                return Ok(kept_continued(s.etc, true));
+            }
             // Rebuild from the CURRENT file with irlume's own lines stripped,
             // not from the backup.
             //
@@ -3119,7 +3134,8 @@ fn wire_service_with(
                 // restoring the stale snapshot would silently revert their
                 // change (e.g. a faillock line added to sudo): strip in place
                 // instead and keep the backup for inspection.
-                let (stripped, _) = unwire_lines(&read(s.etc)?);
+                let current = read(s.etc)?;
+                let (stripped, _) = unwire_lines(&current);
                 let bak_content = read(&bak.to_string_lossy())?;
                 if stripped == bak_content {
                     if apply {
@@ -3137,8 +3153,14 @@ fn wire_service_with(
                         PlannedChange::RestoreBackup,
                         format!("✓ {}: restored from backup", s.etc),
                     )
+                } else if continued_with_irlume_lines(&current) {
+                    // Stripping takes out single physical lines, which a line
+                    // that ends in `\` makes unsafe. Restoring the backup above
+                    // puts back the whole file irlume first read, as deleting
+                    // an override nobody edited does.
+                    Ok(kept_continued(s.etc, false))
                 } else {
-                    let (body, change, message) = strip_in_place(s.etc, &read(s.etc)?);
+                    let (body, change, message) = strip_in_place(s.etc, &current);
                     if let (true, Some(body)) = (apply, &body) {
                         write_atomic(etc, body)?;
                     }
@@ -3155,7 +3177,10 @@ fn wire_service_with(
             {
                 // The module, or only inactive lines a disable left holding
                 // irlume's places: either way there are lines of irlume's to
-                // take out once no jump counts them.
+                // take out once no jump counts them, unless a line ends in `\`.
+                if continued_with_irlume_lines(&current) {
+                    return Ok(kept_continued(s.etc, false));
+                }
                 let (body, change, message) = strip_in_place(s.etc, &current);
                 if let (true, Some(body)) = (apply, &body) {
                     write_atomic(etc, body)?;
@@ -3170,7 +3195,30 @@ fn wire_service_with(
     }
 }
 
+/// A stack irlume edits in place, kept as it is because it holds irlume's
+/// lines and a line that ends in `\` ([`continued_with_irlume_lines`]): the
+/// outcome and line an override in the same state gets, so `login enable`
+/// and `login disable` exit 1 and a machine apply fails the surface.
+fn kept_continued(etc: &str, enable: bool) -> WireOutcome {
+    WireOutcome {
+        change: PlannedChange::KeepEditedOverride,
+        message: overrides::continued_message(etc, enable, None),
+        detail: None,
+        unmet: true,
+    }
+}
+
 // ---- pure PAM-text mechanics (unit-tested) -----------------------------------
+
+/// Whether a stack irlume edits in place is left as it is: it holds lines of
+/// irlume's and a line that ends in `\`. PAM joins such a line with the next
+/// one into one rule, so taking out or rewriting one physical line can change
+/// another rule: remove irlume's line after a continued one and that rule
+/// takes in the next line instead, the password line included. A stack
+/// without irlume's lines has nothing to take out and is judged as ever.
+fn continued_with_irlume_lines(current: &str) -> bool {
+    has_line_continuation(current) && current.lines().any(is_irlume_line)
+}
 
 /// irlume's lines taken out of a stack irlume edits in place, for a disable:
 /// removed, unless that moves a numeric jump another line carries (an
@@ -5246,6 +5294,200 @@ mod tests {
         assert!(msg.message.contains("restored from backup"), "{msg}");
         assert_eq!(std::fs::read_to_string(&etc).unwrap(), SUDO_STOCK);
         assert!(!dir.0.join(format!("sudo{BACKUP}")).exists());
+    }
+
+    /// Debian's `sudo` stack, which irlume edits in place.
+    const DEBIAN_SUDO: &str = "#%PAM-1.0\n\n\
+        session    required   pam_limits.so\n\n\
+        @include common-auth\n\
+        @include common-account\n\
+        @include common-session-noninteractive\n";
+
+    /// A rule that ends in `\`: PAM joins it with the next line.
+    const CONTINUED_RULE: &str = "auth       required   pam_faillock.so preauth \\";
+
+    /// `DEBIAN_SUDO` wired by `wire`, with `CONTINUED_RULE` directly above
+    /// irlume's line (`stanza`), so PAM joins the two. Without irlume's line
+    /// the rule would take in the next one, `@include common-auth`.
+    fn continued_above_irlume(stanza: &str, wire: &dyn Fn(&str) -> (String, bool)) -> String {
+        let (wired, changed) = wire(DEBIAN_SUDO);
+        assert!(changed);
+        continue_into_irlume(&wired, stanza)
+    }
+
+    /// `wired` with `CONTINUED_RULE` put directly above irlume's line.
+    fn continue_into_irlume(wired: &str, stanza: &str) -> String {
+        let text = wired.replacen(stanza, &format!("{CONTINUED_RULE}\n{stanza}"), 1);
+        assert!(has_line_continuation(&text), "{text}");
+        assert_eq!(
+            text.lines()
+                .skip_while(|l| *l != CONTINUED_RULE)
+                .nth(1)
+                .map(|l| l.contains(MODULE)),
+            Some(true),
+            "{text}"
+        );
+        text
+    }
+
+    /// The outcome for a stack irlume edits in place and keeps as it is
+    /// because a line in it ends in `\`: the kept, unmet outcome and the line
+    /// an override without a vendor copy gets, so the run exits 1.
+    fn assert_kept_continued(outcome: &WireOutcome, enable: bool) {
+        assert_eq!(
+            outcome.change,
+            PlannedChange::KeepEditedOverride,
+            "{outcome}"
+        );
+        assert!(outcome.unmet, "{outcome}");
+        assert!(
+            outcome
+                .message
+                .contains(": kept as it is: a line in it ends in `\\`, which PAM joins"),
+            "{outcome}"
+        );
+        let way = if enable {
+            "; join those lines by hand and run this again"
+        } else {
+            "; join those lines or take irlume's lines out by hand"
+        };
+        assert!(outcome.message.ends_with(way), "{outcome}");
+    }
+
+    /// `login disable` on a stack irlume edits in place, whose backup no
+    /// longer matches it because a rule that ends in `\` was added directly
+    /// above irlume's line after wiring. Taking irlume's line out would make
+    /// that rule take in `@include common-auth`, so the file is kept byte
+    /// for byte, irlume's line included, and so is the backup.
+    #[test]
+    fn disable_keeps_an_in_place_stack_with_a_continued_line_when_the_backup_differs() {
+        let dir = TestDir::new("continued-backup");
+        let current = continued_above_irlume(VERIFY_STANZA, &wire_verify_service);
+        let etc = dir.0.join("sudo");
+        let bak = dir.0.join(format!("sudo{BACKUP}"));
+        std::fs::write(&etc, &current).unwrap();
+        std::fs::write(&bak, DEBIAN_SUDO).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        for apply in [false, true] {
+            let off = wire_service(&svc, false, apply, &wire_verify_service).unwrap();
+            assert_kept_continued(&off, false);
+        }
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), current);
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), DEBIAN_SUDO);
+    }
+
+    /// The same without a backup, for both verify recipes, and also where a
+    /// numeric jump counts irlume's line (which would otherwise turn it into
+    /// an inactive line in its place): the file is kept byte for byte.
+    #[test]
+    fn disable_keeps_an_in_place_stack_with_a_continued_line_without_a_backup() {
+        type Wire = fn(&str) -> (String, bool);
+        for (tag, stanza, wire) in [
+            ("continued-sudo", VERIFY_STANZA, wire_verify_service as Wire),
+            (
+                "continued-polkit",
+                POLKIT_VERIFY_STANZA,
+                wire_polkit_service as Wire,
+            ),
+        ] {
+            let plain = continued_above_irlume(stanza, &wire);
+            let counted = continue_into_irlume(&counted_verify_stack(stanza), stanza);
+            assert!(
+                !overrides::jump_shifts(&counted, &unwire_lines(&counted).0).is_empty(),
+                "{counted}"
+            );
+            for current in [plain, counted] {
+                let dir = TestDir::new(tag);
+                let etc = dir.0.join("stack");
+                std::fs::write(&etc, &current).unwrap();
+                let svc = Svc {
+                    etc: leak(&etc),
+                    vendor: None,
+                };
+                for apply in [false, true] {
+                    let off = wire_service(&svc, false, apply, &wire).unwrap();
+                    assert_kept_continued(&off, false);
+                }
+                assert_eq!(std::fs::read_to_string(&etc).unwrap(), current, "{tag}");
+                assert!(!dir.0.join(format!("stack{BACKUP}")).exists(), "{tag}");
+            }
+        }
+    }
+
+    /// `login enable` on a stack irlume edits in place keeps it as it is
+    /// when it holds irlume's line and a line that ends in `\`, irlume's own
+    /// line included: the recipe sees the stack without irlume's lines, where
+    /// that `\` is gone, and rewriting irlume's line would part it from the
+    /// line PAM now joins to it. A stack without irlume's lines is judged by
+    /// the recipe, which finds no anchor in it, as before.
+    #[test]
+    fn enable_keeps_an_in_place_stack_with_a_continued_line() {
+        let dir = TestDir::new("continued-enable");
+        let etc = dir.0.join("sudo");
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let (wired, _) = wire_verify_service(DEBIAN_SUDO);
+        let own = wired.replacen(VERIFY_STANZA, &format!("{VERIFY_STANZA} \\"), 1);
+        let above = continued_above_irlume(VERIFY_STANZA, &wire_verify_service);
+        for current in [own, above] {
+            std::fs::write(&etc, &current).unwrap();
+            for apply in [false, true] {
+                let on = wire_service(&svc, true, apply, &wire_verify_service).unwrap();
+                assert_kept_continued(&on, true);
+            }
+            assert_eq!(std::fs::read_to_string(&etc).unwrap(), current);
+            assert!(!dir.0.join(format!("sudo{BACKUP}")).exists());
+        }
+        let bare = DEBIAN_SUDO.replacen(
+            "@include common-auth",
+            &format!("{CONTINUED_RULE}\n@include common-auth"),
+            1,
+        );
+        std::fs::write(&etc, &bare).unwrap();
+        let on = wire_service(&svc, true, true, &wire_verify_service).unwrap();
+        assert_eq!(on.change, PlannedChange::NoAnchor, "{on}");
+        assert!(!on.unmet, "{on}");
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), bare);
+    }
+
+    /// A machine-API disable of that stack fails its surface as kept, as for
+    /// an override (see `a_kept_override_fails_its_surface_in_a_machine_apply`),
+    /// with nothing written.
+    #[test]
+    fn a_kept_in_place_stack_fails_its_surface_in_a_machine_apply() {
+        let dir = TestDir::new("continued-apply");
+        let current = continued_above_irlume(VERIFY_STANZA, &wire_verify_service);
+        let etc = dir.0.join("sudo");
+        std::fs::write(&etc, &current).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let planned = [plan_surface(
+            &svc,
+            ROLE_SUDO,
+            &wire_verify_service,
+            false,
+            false,
+        )];
+        assert_eq!(planned[0].change, PlannedChange::KeepEditedOverride);
+        let applied = apply_surface(
+            &svc,
+            ROLE_SUDO,
+            &wire_verify_service,
+            false,
+            false,
+            &planned,
+        );
+        let error = applied.error.clone().expect("the surface fails");
+        assert!(error.contains("kept as it is"), "{error}");
+        assert!(applied.kept);
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), current);
     }
 
     // ---- keyring hand-off (KWallet / gnome-keyring) --------------------------

@@ -863,7 +863,8 @@ All notable changes to irlume are documented here. This project adheres to
   While a release that used the old lock may still be running, as
   during an upgrade, `/run/lock/irlume-pam.lock` is taken as well. It
   is created at 0600 when it is missing, so such a release reaching its
-  lock later waits for the operation; a symlink there is not followed,
+  lock later waits for the operation; a symlink or other special file
+  root owns there stops the operation with the command that removes it,
   and the file loses its group and other permissions when root owns it.
   Whatever another account owns there is replaced, in one rename, by a
   new 0600 file of root's that the operation holds and leaves in place,

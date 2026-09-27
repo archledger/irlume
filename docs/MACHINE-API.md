@@ -872,8 +872,9 @@ be a regular file root owns. A second operation waits for the first, naming its
 process on stderr. While an irlume release that kept the lock at
 `/run/lock/irlume-pam.lock` may still be running, as during an upgrade, that file
 is taken too. It is created at 0600 when it is missing, so such a release that
-reaches its lock later waits for the operation; a symlink there is not followed,
-and group and other permissions are removed from a file root owns. Whatever
+reaches its lock later waits for the operation; a symlink or other special file
+root owns there stops the operation with the command that removes it, and group
+and other permissions are removed from a file root owns. Whatever
 another account owns there is replaced, in one rename (`RENAME_EXCHANGE`), by a
 new 0600 file root owns, which the operation holds and leaves in place, so that
 account cannot move the lock off its name while the operation runs. A regular

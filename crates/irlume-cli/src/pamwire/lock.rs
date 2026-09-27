@@ -226,18 +226,38 @@ fn take_legacy_lock(path: &Path, uid: u32, wait: Duration) -> Result<Vec<File>, 
     let deadline = Instant::now() + wait;
     let wait_for = |file| wait_for_legacy_lock(path, file, uid, wait, deadline);
     match open_legacy_lock(path, uid)? {
-        LegacyLock::Skipped => Ok(Vec::new()),
         LegacyLock::Own(file) => Ok(wait_for(file)?.into_iter().collect()),
         LegacyLock::Foreign(found) => replace_legacy_lock(path, &found, wait_for),
     }
 }
 
+/// The refusal for a symlink, FIFO, socket or device at the name of the lock of
+/// earlier releases ([`open_legacy_lock`]).
+fn not_a_lock_file(path: &Path, meta: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::FileTypeExt;
+    let kind = meta.file_type();
+    let what = if kind.is_symlink() {
+        "a symlink"
+    } else if kind.is_fifo() {
+        "a FIFO"
+    } else if kind.is_socket() {
+        "a socket"
+    } else if kind.is_dir() {
+        "a directory"
+    } else {
+        "a device"
+    };
+    format!(
+        "{} is {what}, not the lock file earlier releases use, and one of them may hold a lock \
+         through it; remove it (`sudo rm {}`) and run this again",
+        path.display(),
+        path.display()
+    )
+}
+
 /// What [`open_legacy_lock`] found at the name of the lock of earlier releases.
 #[derive(Debug)]
 enum LegacyLock {
-    /// Nothing to take: a symlink, or something other than a regular file,
-    /// that `uid` owns.
-    Skipped,
     /// A regular file `uid` owns, or one just created, opened for reading.
     Own(File),
     /// Whatever another account owns at the name, opened with `O_PATH` and
@@ -246,8 +266,8 @@ enum LegacyLock {
 }
 
 /// Opens `path`, the lock of earlier releases, the file one of them running now
-/// would lock, creating it at 0600 when it is missing. Nothing is found when
-/// `uid` owns what is at the name and it is a symlink or not a regular file.
+/// would lock, creating it at 0600 when it is missing. A symlink or anything
+/// else that is not a regular file, owned by `uid`, stops the operation.
 ///
 /// It is created with `O_EXCL`, which neither follows a symlink nor opens a
 /// file another process created first, in a directory created at 0755 when
@@ -265,10 +285,13 @@ enum LegacyLock {
 /// other error opening or creating it stops the operation, as it stopped those
 /// releases.
 ///
-/// A symlink `uid` owns is left alone, as is a FIFO, a socket or a device.
+/// A symlink `uid` owns, or a FIFO, a socket or a device, stops the
+/// operation with the command that removes it: an earlier release opened the
+/// name with an ordinary open, so it may have followed the symlink or opened
+/// the FIFO and hold its lock, which this operation cannot take or wait for.
 /// Only root can create one where `/run/lock` is root's alone, and only root
 /// can remove one where every account can write it, since the directory is
-/// sticky.
+/// sticky, so no account can make an operation stop this way.
 ///
 /// Group and other permissions are removed from a file owned by `uid`, so an
 /// account that has not opened it by then cannot. Whatever another account
@@ -312,8 +335,7 @@ fn open_legacy_lock(path: &Path, uid: u32) -> Result<LegacyLock, String> {
                     return Ok(LegacyLock::Foreign(found));
                 }
                 if !meta.is_file() {
-                    // A symlink, a FIFO, a socket or a device.
-                    return Ok(LegacyLock::Skipped);
+                    return Err(not_a_lock_file(path, &meta));
                 }
                 open_for_reading(path, &found)?
             }
@@ -332,7 +354,7 @@ fn open_legacy_lock(path: &Path, uid: u32) -> Result<LegacyLock, String> {
             .metadata()
             .map_err(|error| format!("stat {}: {error}", path.display()))?;
         if !meta.is_file() {
-            return Ok(LegacyLock::Skipped);
+            return Err(not_a_lock_file(path, &meta));
         }
         if meta.uid() == uid && meta.mode() & 0o077 != 0 {
             // Best effort: the lock is taken either way.
@@ -1611,17 +1633,26 @@ mod tests {
         }
     }
 
-    /// A legacy lock the caller owns that is not a regular file at its name is
-    /// left alone and not waited for: a symlink (its target is neither changed,
-    /// locked nor created) or a FIFO (opened without waiting for a writer).
+    /// A legacy lock the caller owns that is not a regular file at its name
+    /// stops the operation, naming the command that removes it: a symlink (its
+    /// target is neither changed, locked nor created) or a FIFO (not opened,
+    /// so nothing waits for a writer).
     #[test]
-    fn leaves_a_symlinked_or_special_legacy_lock_alone() {
-        let scratch = Scratch::new("legacy-skip");
+    fn refuses_a_symlinked_or_special_legacy_lock_it_owns() {
+        let scratch = Scratch::new("legacy-special");
         let long = Duration::from_secs(30);
+        let refused = |path: &Path, what: &str| {
+            let error = take_legacy_lock(path, uid(), long).expect_err("must refuse");
+            assert!(
+                error.contains(&format!("is {what}, not the lock file"))
+                    && error.contains(&format!("sudo rm {}", path.display())),
+                "{error}"
+            );
+        };
         let target = scratch.file("target", 0o644);
         let link = scratch.path("link.lock");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(matches!(take_legacy_lock(&link, uid(), long), Ok(held) if held.is_empty()));
+        refused(&link, "a symlink");
         assert_eq!(mode(&target), 0o644, "the symlink's target was changed");
         assert!(!held(&target), "the symlink's target was locked");
         assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
@@ -1629,7 +1660,7 @@ mod tests {
         let absent = scratch.path("absent");
         let dangling = scratch.path("dangling.lock");
         std::os::unix::fs::symlink(&absent, &dangling).unwrap();
-        assert!(matches!(take_legacy_lock(&dangling, uid(), long), Ok(held) if held.is_empty()));
+        refused(&dangling, "a symlink");
         assert!(!absent.exists(), "the symlink's target was created");
 
         let fifo = scratch.path("fifo.lock");
@@ -1639,15 +1670,15 @@ mod tests {
             .expect("run mkfifo");
         assert!(made.success(), "mkfifo failed");
         let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
         std::thread::spawn(move || {
-            let _ = tx
-                .send(matches!(take_legacy_lock(&fifo, uid(), long), Ok(held) if held.is_empty()));
+            let _ = tx.send(take_legacy_lock(&path, uid(), long).err());
         });
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(10)),
-            Ok(true),
-            "a FIFO at the legacy lock's name must be passed over without blocking"
-        );
+        let error = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a FIFO at the legacy lock's name must be refused without blocking")
+            .expect("must refuse");
+        assert!(error.contains("is a FIFO, not the lock file"), "{error}");
     }
 
     /// A symlink or a FIFO another account owns at the legacy lock's name is

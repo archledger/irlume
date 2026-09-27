@@ -677,6 +677,10 @@ fn is_irlume_srk(public: &Public) -> Result<bool> {
 /// persistent handle; every later call just loads that handle. The persisted key
 /// is bit-for-bit identical, so envelopes sealed earlier still load.
 ///
+/// When another key holds the persistent handle, a transient SRK is derived
+/// for this call in either mode. [`SrkMode::ReadOnly`] refuses only to
+/// persist a new SRK at a free handle.
+///
 /// Returns the handle and whether it is persistent (a persistent handle must NOT
 /// be flushed by the caller).
 fn load_or_create_srk(ctx: &mut Context, mode: SrkMode) -> Result<(KeyHandle, bool)> {
@@ -703,8 +707,10 @@ fn load_or_create_srk(ctx: &mut Context, mode: SrkMode) -> Result<(KeyHandle, bo
                 return Ok((key_handle, true));
             }
             // Persistent handle occupied by a foreign key: leave it untouched and
-            // use a transient SRK this run (correct, just slower).
-            let transient = mode.initialize(|| create_srk(ctx))?;
+            // use a transient SRK this run (correct, just slower). The
+            // transient key persists nothing, so a read-only unseal takes this
+            // path too; only persisting a new SRK needs `SrkMode::Initialize`.
+            let transient = create_srk(ctx)?;
             return Ok((transient, false));
         }
     }
@@ -746,7 +752,10 @@ fn with_srk<T>(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SrkMode {
+    /// Persist irlume's SRK at its free handle on first use.
     Initialize,
+    /// Never persist an SRK: use the one at the handle, or a transient one
+    /// while another key holds the handle.
     ReadOnly,
 }
 
@@ -968,10 +977,13 @@ pub fn unseal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
     unseal_with_mode(env, SrkMode::Initialize)
 }
 
-/// Unseal without creating or persisting a storage root key.
+/// Unseal without persisting a storage root key. Where another key holds
+/// irlume's SRK handle, this derives a transient SRK for the call, as a seal
+/// there does; it persists nothing.
 ///
 /// # Errors
-/// Returns an error if the existing SRK is unavailable, or policy unsealing fails.
+/// Returns an error if the TPM cannot be opened, irlume's SRK handle is free
+/// (no SRK was persisted there), or policy unsealing fails.
 pub(crate) fn unseal_read_only(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
     unseal_with_mode(env, SrkMode::ReadOnly)
 }
@@ -2798,15 +2810,13 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         );
     }
 
-    /// A foreign RSA-2048 key with our exact template at our handle must
-    /// survive an eviction attempt (the destructive-path identity contract).
-    /// Built with `create` + `load` under a transient SRK: an ordinary child
-    /// key's modulus comes from the TPM RNG, so it cannot match the
-    /// deterministic primary's - exactly the discriminator the #757 review
-    /// demanded a test for.
-    #[test]
-    #[ignore = "requires a TPM: real /dev/tpmrm0 (root), or swtpm via IRLUME_TCTI (CI does this)"]
-    fn evict_persistent_srk_never_touches_a_same_template_foreign_key() {
+    /// Puts a foreign key created from `template` at our handle. Built with
+    /// `create` + `load` under a transient SRK: an ordinary child key's
+    /// modulus comes from the TPM RNG, so even with our exact template it
+    /// cannot match the deterministic primary's - exactly the discriminator
+    /// the #757 review demanded a test for.
+    /// [`remove_foreign_key_at_srk_handle`] takes it away again.
+    fn plant_foreign_key_at_srk_handle(template: Public) {
         // The CI lane serializes many irlume tests through one swtpm, and an
         // earlier test (any seal) may already have persisted OUR SRK at the
         // handle; the fixture below must own the handle, so clear our key
@@ -2822,14 +2832,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         // same nullauth-session pattern the seal path uses.
         let foreign = ctx
             .execute_with_nullauth_session(|ctx| {
-                let created = ctx.create(
-                    parent,
-                    srk_template().expect("template"),
-                    None,
-                    None,
-                    None,
-                    None,
-                )?;
+                let created = ctx.create(parent, template, None, None, None, None)?;
                 ctx.load(parent, created.out_private, created.out_public)
             })
             .expect("foreign fixture");
@@ -2844,16 +2847,12 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         .expect("place foreign key at irlume's handle");
         let _ = ctx.flush_context(parent.into());
         let _ = ctx.flush_context(foreign.into());
-        drop(ctx);
+    }
 
-        assert_eq!(
-            evict_persistent_srk().expect("evict probe"),
-            SrkEviction::Foreign,
-            "a same-template key with a foreign modulus must be reported, never evicted"
-        );
-
-        // The foreign key is still there; remove it so the instance is clean,
-        // then the handle reports Absent as the post-uninstall state.
+    /// Evicts the key [`plant_foreign_key_at_srk_handle`] placed, leaving the
+    /// handle free.
+    fn remove_foreign_key_at_srk_handle() {
+        let persistent = persistent_srk_handle().expect("handle");
         let mut ctx = open_context().expect("context");
         let wanted = TpmHandle::Persistent(persistent);
         let object = ctx
@@ -2867,9 +2866,90 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             )
         })
         .expect("manual foreign cleanup");
-        drop(ctx);
+    }
+
+    /// A foreign RSA-2048 key with our exact template at our handle must
+    /// survive an eviction attempt (the destructive-path identity contract).
+    #[test]
+    #[ignore = "requires a TPM: real /dev/tpmrm0 (root), or swtpm via IRLUME_TCTI (CI does this)"]
+    fn evict_persistent_srk_never_touches_a_same_template_foreign_key() {
+        plant_foreign_key_at_srk_handle(srk_template().expect("template"));
+        assert_eq!(
+            evict_persistent_srk().expect("evict probe"),
+            SrkEviction::Foreign,
+            "a same-template key with a foreign modulus must be reported, never evicted"
+        );
+
+        // The foreign key is still there; remove it so the instance is clean,
+        // then the handle reports Absent as the post-uninstall state.
+        remove_foreign_key_at_srk_handle();
         assert_eq!(
             evict_persistent_srk().expect("post-cleanup probe"),
+            SrkEviction::Absent
+        );
+    }
+
+    /// Our SRK template with a non-empty authPolicy, as another stack's
+    /// storage keys (clevis, systemd-cryptenroll) carry: a key irlume never
+    /// takes for its own SRK.
+    fn policy_bound_srk_template() -> Public {
+        let Public::Rsa {
+            object_attributes,
+            parameters,
+            ..
+        } = srk_template().expect("template")
+        else {
+            unreachable!("the SRK template is RSA")
+        };
+        PublicBuilder::new()
+            .with_public_algorithm(PublicAlgorithm::Rsa)
+            .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+            .with_object_attributes(object_attributes)
+            .with_auth_policy(Digest::try_from(vec![0x5a; 32]).expect("policy digest"))
+            .with_rsa_parameters(parameters)
+            .with_rsa_unique_identifier(PublicKeyRsa::default())
+            .build()
+            .expect("policy-bound template")
+    }
+
+    /// While another key holds irlume's SRK handle, seals use a transient
+    /// SRK, and a read-only unseal must too: a transient SRK persists
+    /// nothing. The foreign key stays, and once the handle is free a
+    /// read-only unseal still refuses to persist irlume's own SRK there.
+    #[test]
+    #[ignore = "requires a TPM: real /dev/tpmrm0 (root), or swtpm via IRLUME_TCTI (CI does this)"]
+    fn a_read_only_unseal_uses_a_transient_srk_while_another_key_holds_the_handle() {
+        let secret = b"irlume-read-only-foreign-handle";
+        let template = policy_bound_srk_template();
+        assert!(
+            !is_irlume_srk(&template).expect("identity check"),
+            "precondition: irlume must not take the fixture for its SRK"
+        );
+        plant_foreign_key_at_srk_handle(template);
+        let sealed = seal_with_pcrs(secret, &[7]);
+        let unsealed = sealed.as_ref().ok().map(unseal_read_only);
+        let occupant = evict_persistent_srk();
+        remove_foreign_key_at_srk_handle();
+
+        let env = sealed.expect("seal under a transient SRK");
+        let got = unsealed
+            .expect("sealed")
+            .expect("a read-only unseal under a transient SRK");
+        assert_eq!(&*got, secret);
+        assert_eq!(
+            occupant.expect("handle probe"),
+            SrkEviction::Foreign,
+            "the foreign key stays at the handle"
+        );
+
+        // With the handle free, a read-only unseal would have to persist
+        // irlume's SRK first, which it never does.
+        assert!(
+            unseal_read_only(&env).is_err(),
+            "a read-only unseal persisted a storage root key"
+        );
+        assert_eq!(
+            evict_persistent_srk().expect("post-unseal probe"),
             SrkEviction::Absent
         );
     }

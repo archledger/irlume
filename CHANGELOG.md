@@ -864,7 +864,11 @@ All notable changes to irlume are documented here. This project adheres to
   read of that store, opens it with the account's existing template key
   only and no longer seals a new key for an account that has none; the
   store's first encrypted write still creates the key, now under the
-  account lock (ADR-0024 §4.3).
+  account lock (ADR-0024 §4.3). Reads that unseal the template key without
+  persisting a TPM storage root key, these and authentication's among them,
+  also work where another program's key holds irlume's storage root key
+  handle (`IRLUME_SRK_HANDLE`): there they derive a transient storage root
+  key for the read, as a seal already does, and still persist none.
 
 - The face enrollment, the sealed template key, the keyring envelope and
   the recovery envelope record the uid of the account they were written

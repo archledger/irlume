@@ -210,7 +210,11 @@ each record it does not use, with the uids and the next step.
   no account records no uid. Moving a template key to a stronger policy
   (at irlumed's start, or on a load) keeps the uid it records, or none: the
   name may by then resolve to another account than the one whose enrollment
-  the key opens.
+  the key opens. An enrollment write for the account does not reuse such a
+  key when the enrollment under it records another uid (the write reads the
+  stored enrollment with the key to find out): as for a key sealed for
+  another uid, the account gets a new key, and the old key's recovery
+  envelope is removed once the new enrollment is saved.
 - A write never changes the uid a record carries. An operation that loads a
   record and writes it back (add scans, rename a profile, delete one that is
   not the last, turn require-eyes-open off, a template key or keyring re-seal,

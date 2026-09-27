@@ -7,7 +7,7 @@
 //! else `/var/lib/irlume`), mode 0600. We store L2-normalized embeddings, never
 //! raw images. The old single-profile format is migrated transparently on load.
 
-use crate::account::{Account, Record};
+use crate::account::{Account, Owner, Record};
 use crate::{crypto, template_key};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
@@ -677,19 +677,42 @@ fn deserialize_enrollment(data: &[u8], key: Option<&[u8]>) -> irlume_common::Res
 
 /// Resolve the key to encrypt `user`'s templates with: the TPM-sealed template
 /// key on a TPM host (generated on first save, and replaced when it was
-/// sealed for another uid), or `None` on a no-TPM host (plaintext fallback so
-/// dev boxes still work). `account` is the save's view of the account.
+/// sealed for another uid or opens an enrollment recorded for one), or `None`
+/// on a no-TPM host (plaintext fallback so dev boxes still work). `account`
+/// is the save's view of the account.
 fn save_key(
     user: &str,
     account: &mut Account<'_>,
 ) -> irlume_common::Result<Option<template_key::WriteKey>> {
     if template_key::tpm_available() {
         Ok(Some(template_key::ensure_enrollment_key_unlocked(
-            user, account,
+            user,
+            account,
+            &key_opens_another_accounts_enrollment,
         )?))
     } else {
         Ok(None)
     }
+}
+
+/// Whether the enrollment stored for `user`, read with `key`, records a uid
+/// that `account` resolves as another account's
+/// ([`template_key::OpensOtherEnrollment`]). A key an earlier release sealed
+/// without a uid carries no uid of its own to check, but the enrollment
+/// under it records one once it has been written again. A write for this
+/// account then does not reuse the key: it protects that account's
+/// templates, and its recovery envelope restores it. `false` when no
+/// enrollment is stored or `key` does not read it.
+fn key_opens_another_accounts_enrollment(
+    user: &str,
+    key: &[u8],
+    account: &mut Account<'_>,
+) -> bool {
+    let Ok(data) = fs::read(profile_path(user)) else {
+        return false;
+    };
+    deserialize_enrollment(&data, Some(key))
+        .is_ok_and(|stored| matches!(account.owner(stored.uid), Owner::Other { .. }))
 }
 
 /// Publish `bytes` as the enrollment at `path`; [`publication_result`] turns
@@ -755,7 +778,15 @@ fn replacement_key(
     if template_key::has_key(user) || encrypted_store {
         // Never mint a replacement key or fall back to plaintext on unseal
         // failure. The user can restore recovery or explicitly delete state.
-        load_existing(user, account).map(|key| Some(template_key::WriteKey::kept(key)))
+        let key = load_existing(user, account)?;
+        // A key that opens an enrollment recorded for another uid (one an
+        // earlier release sealed without a uid) is that account's key: the
+        // first-save path replaces it, as it does a key sealed for another
+        // uid.
+        if key_opens_another_accounts_enrollment(user, &key, account) {
+            return first_save(user, account);
+        }
+        Ok(Some(template_key::WriteKey::kept(key)))
     } else {
         first_save(user, account)
     }
@@ -1770,7 +1801,14 @@ mod tests {
         replacement.profiles = sample().profiles;
         let replace = |reseal: &FakeSeal| {
             save_with_key(&replacement, |user, account| {
-                template_key::ensure_key_with(user, account, true, fake_load, reseal).map(Some)
+                template_key::ensure_key_with(
+                    user,
+                    account,
+                    Some(&key_opens_another_accounts_enrollment),
+                    fake_load,
+                    reseal,
+                )
+                .map(Some)
             })
         };
         let unchanged = |what: &str| {
@@ -1811,6 +1849,114 @@ mod tests {
             deserialize_enrollment(&fs::read(profile_path(user)).unwrap(), Some(&key.private))
                 .unwrap();
         assert_eq!(saved.uid, Some(6102));
+        leave_uid_sandbox(&dir);
+    }
+
+    /// A template key an earlier release sealed without a uid records none,
+    /// but the enrollment under it records the uid its last write recorded.
+    /// Once the name resolves to another uid, neither a replacement
+    /// enrollment nor a first save for that account reuses the key: the
+    /// account gets a key of its own, and the old key's recovery envelope
+    /// goes once the new enrollment is published. A failed seal leaves the
+    /// key, the enrollment and the recovery envelope as they were. Under the
+    /// same key, an enrollment recorded for the current uid, or for none,
+    /// keeps the key and its recovery envelope.
+    #[test]
+    fn a_key_without_a_uid_is_replaced_when_its_enrollment_records_another_uid() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("uid-unbound-key");
+        let user = "uid-unbound-key";
+        let old_key = [5u8; 32];
+        let recovery = template_key::recovery_path(user);
+        fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+        // The enrollment under `old_key` records `uid`; the key records none.
+        let plant = |uid: Option<u32>| {
+            let mut old = sample();
+            old.user = user.into();
+            old.uid = uid;
+            let enrollment = serialize_enrollment(&old, Some(&old_key)).unwrap();
+            fs::write(profile_path(user), &enrollment).unwrap();
+            fake_seal(user, &old_key, None).unwrap();
+            fs::write(&recovery, b"synthetic recovery of the key").unwrap();
+            (enrollment, fs::read(template_key::key_path(user)).unwrap())
+        };
+        let _now = crate::account::remember(user, 6602);
+        let mut replacement = Enrollment::new(user);
+        replacement.profiles = sample().profiles;
+        fn enrollment_key(
+            user: &str,
+            account: &mut Account<'_>,
+            reseal: &FakeSeal,
+        ) -> irlume_common::Result<Option<template_key::WriteKey>> {
+            template_key::ensure_key_with(
+                user,
+                account,
+                Some(&key_opens_another_accounts_enrollment),
+                fake_load,
+                reseal,
+            )
+            .map(Some)
+        }
+        // The key choice of `save_replacement` (`replacing`) or of `save`.
+        let write_with = |replacing: bool, reseal: &FakeSeal| {
+            save_with_key(&replacement, |user, account| {
+                if replacing {
+                    replacement_key(user, account, fake_load, |user, account| {
+                        enrollment_key(user, account, reseal)
+                    })
+                } else {
+                    enrollment_key(user, account, reseal)
+                }
+            })
+        };
+        let failing_seal: &FakeSeal =
+            &|_, _, _| Err(irlume_common::Error::Policy("injected seal failure".into()));
+        let no_seal: &FakeSeal = &|_, _, _| panic!("a key this account may use is kept");
+
+        for (what, replacing) in [("a replacement", true), ("a first save", false)] {
+            let write = |reseal: &FakeSeal| write_with(replacing, reseal);
+            let (enrollment_before, key_before) = plant(Some(6601));
+            let error = write(failing_seal).unwrap_err().to_string();
+            assert!(error.contains("injected seal failure"), "{what}: {error}");
+            assert_eq!(
+                fs::read(template_key::key_path(user)).unwrap(),
+                key_before,
+                "{what}: a failed seal keeps the key"
+            );
+            assert_eq!(fs::read(profile_path(user)).unwrap(), enrollment_before);
+            assert!(recovery.exists(), "{what}: and its recovery envelope");
+
+            write(&fake_seal).unwrap();
+            let key = crate::envelope::SealedEnvelope::load(&template_key::key_path(user)).unwrap();
+            assert_eq!(key.uid, Some(6602), "{what}: a key of the account's own");
+            assert_ne!(key.private, old_key, "{what}");
+            assert!(
+                !recovery.exists(),
+                "{what}: the old key's recovery envelope goes"
+            );
+            let saved =
+                deserialize_enrollment(&fs::read(profile_path(user)).unwrap(), Some(&key.private))
+                    .unwrap();
+            assert_eq!(saved.uid, Some(6602), "{what}");
+
+            for uid in [Some(6602), None] {
+                let (_, key_before) = plant(uid);
+                write(no_seal).unwrap();
+                assert_eq!(
+                    fs::read(template_key::key_path(user)).unwrap(),
+                    key_before,
+                    "{what}: an enrollment recorded for {uid:?} keeps the key"
+                );
+                assert!(recovery.exists(), "{what}: {uid:?}");
+                let saved =
+                    deserialize_enrollment(&fs::read(profile_path(user)).unwrap(), Some(&old_key))
+                        .unwrap();
+                assert_eq!(saved.uid, Some(6602), "{what}: {uid:?}");
+            }
+        }
         leave_uid_sandbox(&dir);
     }
 
@@ -2007,7 +2153,14 @@ mod tests {
         loaded.profiles[0].name = "Renamed".into();
         let save = |loaded: &Enrollment| {
             save_with_key(loaded, |user, account| {
-                template_key::ensure_key_with(user, account, true, fake_load, fake_seal).map(Some)
+                template_key::ensure_key_with(
+                    user,
+                    account,
+                    Some(&key_opens_another_accounts_enrollment),
+                    fake_load,
+                    fake_seal,
+                )
+                .map(Some)
             })
         };
         {

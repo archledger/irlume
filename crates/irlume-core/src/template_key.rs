@@ -176,26 +176,40 @@ pub(crate) fn ensure_key_unlocked(user: &str) -> Result<Zeroizing<Vec<u8>>> {
     ensure_key_with(
         user,
         &mut Account::new(user),
-        false,
+        None,
         load_key_as,
         reseal_key_unlocked,
     )
     .map(|key| key.key)
 }
 
+/// Whether an unsealed template key opens an enrollment recorded for another
+/// uid, given the user, the key and the enrollment write's view of the
+/// account ([`crate::storage`] reads the enrollment).
+pub(crate) type OpensOtherEnrollment<'f> = &'f dyn Fn(&str, &[u8], &mut Account<'_>) -> bool;
+
 /// The key an enrollment write encrypts under: [`ensure_key_unlocked`],
-/// except that a sealed key recorded for another uid is replaced. The
-/// enrollment written with it replaces that account's enrollment, so the
-/// account gets a key of its own. Nothing else replaces it. The replacement
-/// is final only once that enrollment is published: the write settles it
-/// with [`WriteKey::settle`]. `account` is the enrollment write's view of the
-/// account, so the key is chosen against the uid the enrollment is written
-/// for.
+/// except that a sealed key recorded for another uid is replaced, and so is
+/// one that `opens_other` finds opens an enrollment recorded for another uid
+/// (a key an earlier release sealed without a uid, under which that
+/// account's enrollment recorded its own). The enrollment written with it
+/// replaces that account's enrollment, so the account gets a key of its own.
+/// Nothing else replaces it. The replacement is final only once that
+/// enrollment is published: the write settles it with [`WriteKey::settle`].
+/// `account` is the enrollment write's view of the account, so the key is
+/// chosen against the uid the enrollment is written for.
 pub(crate) fn ensure_enrollment_key_unlocked(
     user: &str,
     account: &mut Account<'_>,
+    opens_other: OpensOtherEnrollment<'_>,
 ) -> Result<WriteKey> {
-    ensure_key_with(user, account, true, load_key_as, reseal_key_unlocked)
+    ensure_key_with(
+        user,
+        account,
+        Some(opens_other),
+        load_key_as,
+        reseal_key_unlocked,
+    )
 }
 
 /// The template key an enrollment write encrypts under.
@@ -274,24 +288,29 @@ impl WriteKey {
 }
 
 /// [`ensure_key_unlocked`] with the unseal (`load`) and the seal (`reseal`)
-/// passed in. A key sealed for another uid is replaced only with
-/// `replace_other`, and set aside first: a failed seal or round trip puts it
-/// back, and the enrollment write settles the rest ([`WriteKey::settle`]).
+/// passed in. Only with `replace_other` (an enrollment write's
+/// [`OpensOtherEnrollment`]) is a key replaced: one sealed for another uid,
+/// or one that opens an enrollment recorded for another uid. It is set aside
+/// first: a failed seal or round trip puts it back, and the enrollment write
+/// settles the rest ([`WriteKey::settle`]).
 pub(crate) fn ensure_key_with(
     user: &str,
     account: &mut Account<'_>,
-    replace_other: bool,
+    replace_other: Option<OpensOtherEnrollment<'_>>,
     mut load: impl FnMut(&str, &mut Account<'_>) -> Result<Zeroizing<Vec<u8>>>,
     reseal: impl FnOnce(&str, &[u8], Option<u32>) -> Result<()>,
 ) -> Result<WriteKey> {
     let mut replaced = None;
     if has_key(user) {
-        match load(user, account) {
-            Ok(key) => return Ok(WriteKey::kept(key)),
-            Err(_) if replace_other && account.found_other() => {
+        match (load(user, account), replace_other) {
+            (Ok(key), Some(opens_other)) if opens_other(user, &key, account) => {
                 replaced = Some(ReplacedKey::set_aside(user)?);
             }
-            Err(error) => return Err(error),
+            (Ok(key), _) => return Ok(WriteKey::kept(key)),
+            (Err(_), Some(_)) if account.found_other() => {
+                replaced = Some(ReplacedKey::set_aside(user)?);
+            }
+            (Err(error), _) => return Err(error),
         }
     }
     let uid = account.uid_to_record(Record::TemplateKey, None)?;
@@ -1420,7 +1439,8 @@ mod tests {
         assert!(has_recovery(user));
         let replace = || {
             let _state = UserStateLock::acquire(user).unwrap();
-            ensure_enrollment_key_unlocked(user, &mut Account::new(user)).unwrap()
+            // No enrollment here: only the key's own uid decides.
+            ensure_enrollment_key_unlocked(user, &mut Account::new(user), &|_, _, _| false).unwrap()
         };
         let unpublished = replace();
         assert_eq!(recorded(), Some(5102));

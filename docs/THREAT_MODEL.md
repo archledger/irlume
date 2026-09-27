@@ -387,6 +387,14 @@ installs and loads by hand.
   their members see these lines too; `irlume logs debug on` makes them exact
   until it is turned off, and `irlume doctor` (`debug-tracing`) and `irlume
   status` report it while it is on.
+- **Liveness measurements reach root only.** A reason that describes the
+  capture rather than a match (no face, a liveness or PAD refusal, the
+  pose) carries measured values such as IR contrast, brightness or head
+  angle, and those do not depend on the account. `Authenticate`,
+  `Identify` and `IdentifyFor` give them exact to root, as `SelfTest` and
+  tracing do; a non-root caller gets the same reason with each number
+  replaced by an ellipsis. The reason for a face judged live, the owner's
+  own match, stays exact.
 - **Memory hygiene.** Secrets are zeroized where the exposure is real: sealed
   keys, decrypted template plaintext, passwords, and the IPC wire buffers that
   may carry them (`zeroize`). Camera frames and embeddings are transient

@@ -6772,6 +6772,9 @@ struct VerifyReplyInputs {
     window: irlume_auth::AuthenticationWindow,
     convenience: bool,
     started: std::time::Instant,
+    /// The requesting peer's uid: the reply's reason is given as
+    /// [`reply_reason`] gives it to that peer.
+    peer_uid: u32,
 }
 
 /// The Authenticate arm's reply for an engine outcome: the completion and
@@ -6791,6 +6794,7 @@ fn verify_reply(
         window,
         convenience,
         started,
+        peer_uid,
     } = inputs;
     bounded_face_response(
         o.granted,
@@ -6842,7 +6846,7 @@ fn verify_reply(
                         .unwrap_or_default()
                         .to_string()
                 },
-                reason: o.reason.clone(),
+                reason: reply_reason(&o.reason, o.live, peer_uid),
                 // ADR-0030 §5: the engine decided the cause where it built
                 // the outcome; the daemon passes it on, never derives it.
                 cause: o.cause,
@@ -7221,6 +7225,7 @@ fn dispatch_scoped_session_inner(
                 window,
                 convenience,
                 started: t,
+                peer_uid: peer.uid,
             });
             let mut early: Option<Response> = None;
             let auth_result = {
@@ -8303,7 +8308,7 @@ fn identify_reply(
                 profile: o.profile,
                 score: o.score,
                 live: o.live,
-                reason: o.reason,
+                reason: reply_reason(&o.reason, o.live, peer.uid),
             }
         }
         // An engine failure is a typed refusal in the reply shape
@@ -8587,13 +8592,34 @@ const REASON_PROSE_KEEP: &[&str] = &["2D", "3D", "850nm"];
 /// Journal-side deny-reason display. Deny reasons embed measured values
 /// ("IR too flat (1.02)", "rgb 0.35") as coaching for a genuine false reject,
 /// but in the JOURNAL those same numbers are per-attempt feedback a spoofer
-/// could tune against. The exact reason still goes back over IPC to the
-/// session's own TUI/CLI; here we strip every numeric payload unless tracing is
-/// on, keeping only the [`REASON_PROSE_KEEP`] tokens.
+/// could tune against. Over IPC the reason goes back as
+/// [`reply_reason`] gives it; here we strip every numeric payload unless
+/// tracing is on, keeping only the [`REASON_PROSE_KEEP`] tokens.
 fn deny_reason(r: &str) -> String {
     if irlume_common::dbglog::on() {
         return r.to_string();
     }
+    strip_measurements(r)
+}
+
+/// The reason an `Authenticate`, `Identify` or `IdentifyFor` reply carries.
+/// Root gets it exact, as `SelfTest` and tracing do. A face that was judged
+/// live is the caller's own match against its own account, so its reason
+/// (the owner's score) stays exact too. Any other reason (no face, a
+/// liveness refusal, the pose) describes the capture rather than an
+/// account, so a non-root peer gets it without its measurements
+/// ([`strip_measurements`]).
+fn reply_reason(reason: &str, live: bool, peer_uid: u32) -> String {
+    if peer_uid == 0 || live {
+        reason.to_string()
+    } else {
+        strip_measurements(reason)
+    }
+}
+
+/// `r` with every numeric payload replaced by an ellipsis, keeping only the
+/// [`REASON_PROSE_KEEP`] tokens and identifiers such as `PCR7`.
+fn strip_measurements(r: &str) -> String {
     let cs: Vec<char> = r.chars().collect();
     let mut out = String::with_capacity(r.len());
     let mut i = 0;
@@ -10373,6 +10399,33 @@ mod tests {
             }
             other => panic!("new enroll must answer Enrolled, got {other:?}"),
         }
+    }
+
+    /// A reason about the capture (no face, liveness, pose) reaches a
+    /// non-root caller without its measurements; root, and a live face's
+    /// reason (the owner's own match), get it exact.
+    #[test]
+    fn a_non_root_reply_carries_no_liveness_measurements() {
+        let flat = "liveness Spoof: IR too flat (center/edge 1.02); looks 2D";
+        assert_eq!(
+            reply_reason(flat, false, 1000),
+            "liveness Spoof: IR too flat (center/edge …); looks 2D"
+        );
+        assert_eq!(reply_reason(flat, false, 0), flat);
+        assert_eq!(
+            reply_reason(
+                "no RGB face: not facing the camera (yaw 0.52, pitch 0.31)",
+                false,
+                1000
+            ),
+            "no RGB face: not facing the camera (yaw …, pitch …)"
+        );
+        assert_eq!(
+            reply_reason("IR face too dark (42)", false, 1000),
+            "IR face too dark (…)"
+        );
+        let matched = "below threshold (rgb 0.35, fusion+ir-fallback miss)";
+        assert_eq!(reply_reason(matched, true, 1000), matched);
     }
 
     #[test]

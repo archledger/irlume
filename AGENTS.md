@@ -253,10 +253,12 @@ cargo build --release --locked
   attempt record (ADR-0030 section 5), and none in a reply to anyone but root
   or the account's own caller (`Authenticate`, `Identify` and `IdentifyFor`
   return the owner's score and reason by design, and `irlume identify` prints
-  them); nothing biometric in logs. Journal deny lines go through
-  `deny_score` (one decimal) and `deny_reason` (numbers stripped), exact only
-  under `IRLUME_LOG=debug`; grant lines log the score to the system journal
-  (readable by root and the `adm`, `wheel` or `systemd-journal` groups).
+  them; a reason about the capture, not the match, reaches a non-root caller
+  without its measurements, `reply_reason`); nothing biometric in logs.
+  Journal deny lines go through `deny_score` (one decimal) and `deny_reason`
+  (numbers stripped), exact only under `IRLUME_LOG=debug`; grant lines log
+  the score to the system journal (readable by root and the `adm`, `wheel`
+  or `systemd-journal` groups).
   Matching never exits early (THREAT_MODEL.md "Side channels").
 - Keep every secret buffer in `SecretBytes` or `Zeroizing` and never log it;
   a new plain `Vec<u8>` holding a secret is a defect. State files are 0600

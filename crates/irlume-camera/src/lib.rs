@@ -5778,23 +5778,40 @@ fn negotiate_ir_format_via(
     let offered: Vec<[u8; 4]> = Capture::enum_formats(dev)
         .map(|v| v.into_iter().map(|d| d.fourcc.repr).collect())
         .unwrap_or_default();
+    ir_candidate_walk(
+        device,
+        &offered,
+        || {
+            uvc_descriptor::identity_from_fd(dev.handle().fd())
+                .is_ok_and(|identity| identity.ir_function_evidence().is_ok())
+        },
+        |cc| discrete_frame_sizes(dev, cc),
+        |fmt| apply(dev, fmt),
+    )
+}
+
+/// [`negotiate_ir_format_via`] with every device read injected: the
+/// fd-bound attestation, the discrete-size enumeration and the format
+/// ioctl. The walk itself (which candidates are tried, which size each is
+/// requested at and which echo is accepted) is the same code on a camera and
+/// in a test, so a test can see the exact format handed to the ioctl.
+fn ir_candidate_walk(
+    device: &str,
+    offered: &[[u8; 4]],
+    attested: impl Fn() -> bool,
+    sizes: impl Fn(&[u8; 4]) -> Vec<(u32, u32)>,
+    apply: impl Fn(&Format) -> std::io::Result<Format>,
+) -> irlume_common::Result<IrNegotiation> {
     for (cc, pix) in IR_CANDIDATES {
         // If enumeration is unavailable, keep the historical behaviour and try
         // each candidate blind; otherwise only ask for formats it advertises.
         if !offered.is_empty() && !offered.contains(cc) {
             continue;
         }
-        let (requested, luma_attested) = ir_candidate_request(
-            pix,
-            &offered,
-            || {
-                uvc_descriptor::identity_from_fd(dev.handle().fd())
-                    .is_ok_and(|identity| identity.ir_function_evidence().is_ok())
-            },
-            || discrete_frame_sizes(dev, cc),
-        );
+        let (requested, luma_attested) =
+            ir_candidate_request(pix, offered, &attested, || sizes(cc));
         let fmt = Format::new(requested.0, requested.1, FourCC::new(cc));
-        let fmt = apply(dev, &fmt).map_err(|e| map_io(device, e))?;
+        let fmt = apply(&fmt).map_err(|e| map_io(device, e))?;
         if &fmt.fourcc.repr == cc {
             return Ok(IrNegotiation {
                 format: fmt,
@@ -17121,16 +17138,37 @@ mod tests {
         );
     }
 
-    /// Discovery, the census and the doctor decide a YUYV-only node's role
-    /// from sysfs alone (ADR-0031 §1; ADR-0029 §1, §9). They reach the
-    /// attestation only through `ir_function_evidence_for_node`, never the
-    /// fd-bound form capture uses, and neither those paths nor the reader
-    /// itself stream a frame, fire the emitter or write a control for it.
-    /// CI has no camera, so no behavioural test would notice a later call
-    /// site that streamed during a scan; this pins the rule in the idiom of
+    /// The text of the function that starts at `signature` in `source`, up to
+    /// its closing brace at column 0, for the source-shape tests below.
+    fn source_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} moved; update this test"));
+        let end = source[start..]
+            .find("\n}\n")
+            .expect("a function that ends at column 0");
+        &source[start..start + end]
+    }
+
+    /// The lines of `text` that are not line comments.
+    fn source_code_lines(text: &str) -> impl Iterator<Item = &str> {
+        text.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+    }
+
+    /// Discovery and the census decide a YUYV-only node's role from sysfs
+    /// alone (ADR-0031 §1; ADR-0029 §1, §9): they reach the attestation only
+    /// through `ir_function_evidence_for_node`, never the fd-bound form. The
+    /// doctor's IR stream line reuses the capture walk
+    /// (`negotiate_ir_format_via`), whose fd-bound attestation is also a
+    /// read, `fstat` and sysfs on the file descriptor the probe already
+    /// holds. None of those paths, and not the sysfs reader itself, streams
+    /// a frame, fires the emitter or writes a control for it. CI has no
+    /// camera, so no behavioural test would notice a later call site that
+    /// streamed during a scan; this pins the rule in the idiom of
     /// `irlume-auth/tests/no_probe_on_the_auth_path.rs`.
     #[test]
-    fn role_attestation_on_discovery_census_and_doctor_reads_sysfs_only() {
+    fn discovery_and_census_attest_from_sysfs_and_nothing_streams_to_classify() {
         const STREAMING: [&str; 15] = [
             "MmapStream",
             "SafeStream",
@@ -17156,26 +17194,13 @@ mod tests {
             "\"/dev/",
             "identity_from_fd",
         ];
-        fn body<'a>(source: &'a str, signature: &str) -> &'a str {
-            let start = source
-                .find(signature)
-                .unwrap_or_else(|| panic!("{signature} moved; update this test"));
-            let end = source[start..]
-                .find("\n}\n")
-                .expect("a function that ends at column 0");
-            &source[start..start + end]
-        }
-        fn code_lines(text: &str) -> impl Iterator<Item = &str> {
-            text.lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
-        }
         let lib = include_str!("lib.rs");
         let census = include_str!("census.rs");
         let uvc = include_str!("uvc_descriptor.rs");
         let census_code = census.split("#[cfg(test)]").next().expect("census source");
 
         let scanners = [
-            ("classify_node", body(lib, "\npub fn classify_node(")),
+            ("classify_node", source_body(lib, "\npub fn classify_node(")),
             ("census.rs", census_code),
         ];
         for (label, text) in scanners {
@@ -17190,10 +17215,10 @@ mod tests {
         }
         let doctor_probe = (
             "negotiated_stream",
-            body(lib, "\npub fn negotiated_stream("),
+            source_body(lib, "\npub fn negotiated_stream("),
         );
         for (label, text) in scanners.into_iter().chain([doctor_probe]) {
-            for line in code_lines(text) {
+            for line in source_code_lines(text) {
                 for token in STREAMING {
                     assert!(
                         !line.contains(token),
@@ -17204,12 +17229,14 @@ mod tests {
         }
         for signature in [
             "\npub(crate) fn ir_function_evidence_for_node(",
+            "\nfn ir_function_evidence_from_dirs(",
+            "\nfn raw_descriptors_from_dirs(",
             "\npub(crate) fn ir_function_evidence(",
             "\npub fn video_control_function(",
+            "\nfn video_control_walk(",
             "\nfn processing_unit_controls(",
-            "\npub fn usb_context(",
         ] {
-            for line in code_lines(body(uvc, signature)) {
+            for line in source_code_lines(source_body(uvc, signature)) {
                 for token in STREAMING.iter().chain(&OPENS) {
                     assert!(
                         !line.contains(token),
@@ -17218,6 +17245,168 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The walk hands the format ioctl the size it chose (ADR-0031 §5): an
+    /// attested YUYV node is asked for 340x340, the negotiation records that
+    /// request beside the echo, and only then is the node's size list read.
+    /// Unattested YUYV and GREY are asked for 640x400, and a GREY node's
+    /// attestation is never read. Every device read is injected, so this runs
+    /// the same walk capture and the doctor's probe run.
+    #[test]
+    fn the_ir_candidate_walk_applies_the_size_it_chose() {
+        use super::{ir_candidate_walk, IrPixel};
+        use std::cell::{Cell, RefCell};
+        let t480_sizes = || vec![(640, 480), (340, 340)];
+        let run = |offered: &[[u8; 4]], attested: bool| {
+            let applied = RefCell::new(Vec::new());
+            let attestation_reads = Cell::new(0);
+            let size_reads = Cell::new(0);
+            let negotiation = ir_candidate_walk(
+                "/dev/video0",
+                offered,
+                || {
+                    attestation_reads.set(attestation_reads.get() + 1);
+                    attested
+                },
+                |_| {
+                    size_reads.set(size_reads.get() + 1);
+                    t480_sizes()
+                },
+                |fmt| {
+                    applied
+                        .borrow_mut()
+                        .push((fmt.width, fmt.height, fmt.fourcc.repr));
+                    Ok(*fmt)
+                },
+            )
+            .expect("the echo keeps the fourcc");
+            (
+                negotiation,
+                applied.into_inner(),
+                attestation_reads.get(),
+                size_reads.get(),
+            )
+        };
+
+        let (yuyv, applied, attestation_reads, size_reads) = run(&[*b"YUYV"], true);
+        assert_eq!(applied, [(340, 340, *b"YUYV")]);
+        assert_eq!(yuyv.requested, (340, 340));
+        assert_eq!((yuyv.format.width, yuyv.format.height), (340, 340));
+        assert_eq!(yuyv.pixel, IrPixel::YuyvLuma);
+        assert!(yuyv.luma_attested);
+        assert_eq!((attestation_reads, size_reads), (1, 1));
+
+        let (plain, applied, _, size_reads) = run(&[*b"YUYV"], false);
+        assert_eq!(applied, [(640, 400, *b"YUYV")]);
+        assert_eq!(plain.requested, (640, 400));
+        assert!(!plain.luma_attested);
+        assert_eq!(size_reads, 0, "an unattested node's sizes are not read");
+
+        let (grey, applied, attestation_reads, size_reads) = run(&[*b"GREY"], true);
+        assert_eq!(applied, [(640, 400, *b"GREY")]);
+        assert_eq!(grey.pixel, IrPixel::Grey8);
+        assert_eq!((attestation_reads, size_reads), (0, 0));
+    }
+
+    /// Capture binds the attestation to the open file descriptor and records
+    /// the request it made (ADR-0031 §4, §5). The fd-bound read is what keeps
+    /// an `IRLUME_IR_DEVICE` override, a saved pin or the fallback path from
+    /// borrowing a role discovery computed for another node, and the
+    /// qualification contract must describe the negotiation that happened.
+    /// Neither is reachable without a camera, so the wiring is pinned by
+    /// shape; the walk itself is exercised in
+    /// `the_ir_candidate_walk_applies_the_size_it_chose`.
+    #[test]
+    fn ir_capture_attests_from_the_open_fd_and_records_its_request() {
+        let lib = include_str!("lib.rs");
+        let walk = source_body(lib, "\nfn negotiate_ir_format_via(");
+        for needed in [
+            "uvc_descriptor::identity_from_fd(dev.handle().fd())",
+            ".ir_function_evidence()",
+            "ir_candidate_walk(",
+        ] {
+            assert!(
+                walk.contains(needed),
+                "negotiate_ir_format_via lost {needed}"
+            );
+        }
+        assert!(
+            !walk.contains("ir_function_evidence_for_node"),
+            "capture must not attest from the node path"
+        );
+        assert!(
+            source_body(lib, "\nfn ir_candidate_walk(")
+                .contains("Format::new(requested.0, requested.1, FourCC::new(cc))"),
+            "the walk must request the size ir_candidate_request chose"
+        );
+        assert!(
+            source_body(lib, "\npub fn negotiated_stream(").contains("negotiate_ir_format_via("),
+            "the doctor's IR probe must share the capture walk"
+        );
+
+        let ir_impl = &lib[lib
+            .find("\nimpl IrCamera {")
+            .expect("impl IrCamera moved; update this test")..];
+        let method = |signature: &str| {
+            let start = ir_impl
+                .find(signature)
+                .unwrap_or_else(|| panic!("IrCamera {signature} moved; update this test"));
+            let end = ir_impl[start..]
+                .find("\n    }\n")
+                .expect("a method that ends at column 4");
+            &ir_impl[start..start + end]
+        };
+        assert!(
+            method("fn open_uvc(").contains("requested: negotiation.requested,"),
+            "IrCamera must keep the request its negotiation made"
+        );
+        let facts = method("pub fn qualification_facts(");
+        assert!(
+            facts.contains("ir_stream_contract(") && facts.contains("self.requested,"),
+            "the IR qualification contract must be built from the recorded request"
+        );
+        assert!(
+            !facts.contains("IR_W") && !facts.contains("IR_H"),
+            "the IR qualification contract must not record the 640x400 constant"
+        );
+    }
+
+    /// ADR-0031 §5 on a real camera: an attested YUYV-only IR node, such as
+    /// the ThinkPad T480's 5986:1141, opens for IR at its 340x340 mode, and
+    /// the qualification contract records that request. The pure walk and
+    /// the wiring are covered without a camera above; this is the check a
+    /// person with the camera runs by name, and CI never selects it.
+    #[test]
+    #[ignore = "needs a YUYV-only, descriptor-attested IR camera; set IRLUME_TEST_YUYV_IR_DEVICE"]
+    fn attested_yuyv_ir_camera_opens_at_its_hello_size() {
+        let device = std::env::var("IRLUME_TEST_YUYV_IR_DEVICE").unwrap_or_else(|_| {
+            panic!(
+                "IRLUME_TEST_YUYV_IR_DEVICE is unset. This test is #[ignore]d, so running it is \
+                 a request for an attested YUYV IR camera; it will not silently pass without one."
+            )
+        });
+        assert_eq!(
+            node_capture_formats_probed(&device).as_deref(),
+            Some(&[*b"YUYV"][..]),
+            "{device} must offer exactly YUYV"
+        );
+        assert!(
+            crate::uvc_descriptor::ir_function_evidence_for_node(&device).is_ok(),
+            "{device} must be attested by its USB descriptor"
+        );
+        let cam = IrCamera::open(&device).expect("open the IR camera");
+        assert_eq!(cam.requested, (340, 340));
+        assert_eq!((cam.width, cam.height), (340, 340), "the driver's echo");
+        let (_, contract) = cam.qualification_facts().expect("qualification facts");
+        let expected = super::ir_stream_contract(
+            (340, 340),
+            cam.requested_interval,
+            &cam.negotiated,
+            cam.accepted_interval,
+        )
+        .expect("a representable contract");
+        assert_eq!(contract.requested(), expected.requested());
     }
 
     /// The open-time line for a YUYV IR stream nobody attested, which only

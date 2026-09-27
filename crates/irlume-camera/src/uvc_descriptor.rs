@@ -1973,12 +1973,21 @@ mod tests {
 
     /// Clause d: each colour control alone refuses, and the controls a
     /// monochrome sensor may carry do not.
+    ///
+    /// The expected answer for each bit comes from this list, written out
+    /// from the Processing Unit `bmControls` layout in UVC 1.5 section
+    /// 3.7.2.5 (D2 hue, D3 saturation, D6 white balance temperature, D7 white
+    /// balance component, D11 hue auto, D12 white balance temperature auto,
+    /// D13 white balance component auto), not from `PU_COLOUR_CONTROLS`, so a
+    /// change to the mask that drops or adds a bit fails here.
     #[test]
     fn each_colour_control_alone_refuses_and_the_others_do_not() {
-        for bit in (0..19).map(|d| 1u32 << d) {
+        const UVC_COLOUR_BITS: [u32; 7] = [2, 3, 6, 7, 11, 12, 13];
+        for d in 0..19u32 {
+            let bit = 1u32 << d;
             let shape = function(&[1], &[1], &[bit], &[(8, MSXU, 2, &[0x22, 0x00])]);
             let got = ir_function_evidence(&shape, 0);
-            if bit & PU_COLOUR_CONTROLS != 0 {
+            if UVC_COLOUR_BITS.contains(&d) {
                 assert_eq!(
                     got,
                     Err(IrFunctionRefusal::ColourProcessing(bit)),

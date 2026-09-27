@@ -326,8 +326,34 @@ pub struct VideoControlFunction {
 /// a new consumer is a parser whose next change can move that decision.
 /// This walker reuses only its unit parsing, and a test and the fuzz target
 /// pin that both return the same units.
+///
+/// A well-formed configuration with no VideoControl interface numbered
+/// `interface_number` is also `None` here; [`video_control_walk`] keeps that
+/// case apart for the role check.
 #[doc(hidden)]
 pub fn video_control_function(desc: &[u8], interface_number: u8) -> Option<VideoControlFunction> {
+    match video_control_walk(desc, interface_number)? {
+        VideoControlWalk::Function(function) => Some(function),
+        VideoControlWalk::NotVideoControl => None,
+    }
+}
+
+/// What a strict walk of one configuration found at an interface number.
+///
+/// `None` from [`video_control_walk`] is malformed framing or an
+/// inconsistent function. A walk that consumed the whole configuration
+/// without meeting a VideoControl interface with that number says so
+/// separately, because the descriptor is then well formed and the node is
+/// simply not behind a UVC VideoControl interface (a vendor-class video
+/// grabber, for example), and the census reports the two differently.
+enum VideoControlWalk {
+    Function(VideoControlFunction),
+    NotVideoControl,
+}
+
+/// The walk behind [`video_control_function`], with the "no such
+/// VideoControl interface" outcome kept apart from malformed input.
+fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlWalk> {
     let mut in_target_vc = false;
     let mut found_target_vc = false;
     let mut configurations = 0;
@@ -388,7 +414,10 @@ pub fn video_control_function(desc: &[u8], interface_number: u8) -> Option<Video
         i = end;
     }
 
-    if !found_target_vc || headers != 1 {
+    if !found_target_vc {
+        return Some(VideoControlWalk::NotVideoControl);
+    }
+    if headers != 1 {
         return None;
     }
     if streaming_interfaces
@@ -397,11 +426,11 @@ pub fn video_control_function(desc: &[u8], interface_number: u8) -> Option<Video
     {
         return None;
     }
-    Some(VideoControlFunction {
+    Some(VideoControlWalk::Function(VideoControlFunction {
         streaming_interfaces,
         processing_controls,
         extension_units,
-    })
+    }))
 }
 
 /// `bmControls` of one `VC_PROCESSING_UNIT` (UVC 1.5 section 3.7.2.5):
@@ -437,10 +466,17 @@ pub(crate) enum IrFunctionRefusal {
     /// loopback or platform node), sysfs is absent or restricted, or the
     /// active configuration changed during the read.
     Unreadable,
-    /// The descriptor chain is truncated or inconsistent, the function has
-    /// no single `VC_HEADER`, or its header lists an interface that is not
+    /// The descriptor file holds no complete active configuration, the
+    /// descriptor chain is truncated or inconsistent, the function has no
+    /// single `VC_HEADER`, or its header lists an interface that is not
     /// VideoStreaming.
     Malformed,
+    /// The descriptor is well formed, but the node's USB interface is not a
+    /// UVC VideoControl interface of the active configuration, as for a
+    /// video grabber that uvcvideo does not drive. Kept apart from
+    /// [`Self::Malformed`] so the census never calls a sound descriptor
+    /// malformed.
+    NotVideoControl,
     /// The function lists this many streaming interfaces instead of one, so
     /// its claims cannot be attributed to one node (clause b).
     StreamingInterfaces(usize),
@@ -461,6 +497,9 @@ impl std::fmt::Display for IrFunctionRefusal {
         match self {
             Self::Unreadable => formatter.write_str("no readable USB descriptor"),
             Self::Malformed => formatter.write_str("the USB descriptor is malformed"),
+            Self::NotVideoControl => {
+                formatter.write_str("its USB interface is not a UVC VideoControl interface")
+            }
             Self::StreamingInterfaces(count) => {
                 write!(
                     formatter,
@@ -506,8 +545,11 @@ pub(crate) fn ir_function_evidence(
     view: &[u8],
     vc_interface: u8,
 ) -> Result<IrFunctionEvidence, IrFunctionRefusal> {
-    let function =
-        video_control_function(view, vc_interface).ok_or(IrFunctionRefusal::Malformed)?;
+    let function = match video_control_walk(view, vc_interface) {
+        Some(VideoControlWalk::Function(function)) => function,
+        Some(VideoControlWalk::NotVideoControl) => return Err(IrFunctionRefusal::NotVideoControl),
+        None => return Err(IrFunctionRefusal::Malformed),
+    };
     let streaming_interface = match function.streaming_interfaces.as_slice() {
         [only] => *only,
         other => return Err(IrFunctionRefusal::StreamingInterfaces(other.len())),
@@ -549,8 +591,27 @@ pub(crate) fn ir_function_evidence(
 pub(crate) fn ir_function_evidence_for_node(
     video_device: &str,
 ) -> Result<IrFunctionEvidence, IrFunctionRefusal> {
-    let (view, vc_interface) =
-        usb_context(video_device).map_err(|_| IrFunctionRefusal::Unreadable)?;
+    let iface_dir = interface_dir(video_device).map_err(|_| IrFunctionRefusal::Unreadable)?;
+    let dev_dir = ancestor_with(&iface_dir, "descriptors").ok_or(IrFunctionRefusal::Unreadable)?;
+    ir_function_evidence_from_dirs(&iface_dir, &dev_dir)
+}
+
+/// [`ir_function_evidence_for_node`] once the node's USB interface and
+/// device directories are known.
+///
+/// Reading and parsing fail differently on purpose: a missing or restricted
+/// file, or a configuration change during the read, is
+/// [`IrFunctionRefusal::Unreadable`], while a file that was read but holds
+/// no complete active configuration is [`IrFunctionRefusal::Malformed`].
+/// The census prints the refusal as the reason a node stayed RGB, and a
+/// descriptor that was read is not "unreadable".
+fn ir_function_evidence_from_dirs(
+    iface_dir: &Path,
+    dev_dir: &Path,
+) -> Result<IrFunctionEvidence, IrFunctionRefusal> {
+    let (raw, configuration, vc_interface) =
+        raw_descriptors_from_dirs(iface_dir, dev_dir).map_err(|_| IrFunctionRefusal::Unreadable)?;
+    let view = active_descriptor_view(&raw, configuration).ok_or(IrFunctionRefusal::Malformed)?;
     ir_function_evidence(&view, vc_interface)
 }
 
@@ -782,11 +843,22 @@ fn descriptor_context_from_dirs(
     iface_dir: &Path,
     dev_dir: &Path,
 ) -> std::io::Result<(Vec<u8>, u8, u8)> {
-    let (configuration, interface) = configuration_from_dirs(iface_dir, dev_dir)?;
-    let raw = std::fs::read(dev_dir.join("descriptors"))?;
+    let (raw, configuration, interface) = raw_descriptors_from_dirs(iface_dir, dev_dir)?;
     active_descriptor_view(&raw, configuration).ok_or_else(|| {
         bad("USB descriptors do not contain one complete active configuration".into())
     })?;
+    Ok((raw, configuration, interface))
+}
+
+/// The device's whole `descriptors` file with the active configuration and
+/// the interface number, read between two reads of the configuration so a
+/// change during the read is an error. The bytes are not parsed here.
+fn raw_descriptors_from_dirs(
+    iface_dir: &Path,
+    dev_dir: &Path,
+) -> std::io::Result<(Vec<u8>, u8, u8)> {
+    let (configuration, interface) = configuration_from_dirs(iface_dir, dev_dir)?;
+    let raw = std::fs::read(dev_dir.join("descriptors"))?;
     if configuration_from_dirs(iface_dir, dev_dir)? != (configuration, interface) {
         return Err(bad(
             "USB configuration changed while reading descriptors".into()
@@ -1783,10 +1855,12 @@ mod tests {
             [0x177F],
             "the RGB function advertises hue, saturation and white balance"
         );
+        // Its streaming, audio and absent interfaces are sound descriptors
+        // that simply are not a VideoControl interface.
         for not_videocontrol in [1, 3, 4, 5, 9] {
             assert_eq!(
                 ir_function_evidence(ASUS, not_videocontrol),
-                Err(IrFunctionRefusal::Malformed),
+                Err(IrFunctionRefusal::NotVideoControl),
                 "interface {not_videocontrol}"
             );
         }
@@ -2067,7 +2141,7 @@ mod tests {
         let streaming = UsbFixture::new("t480-vs", 1, 1, &t480::ir_1141());
         assert_eq!(
             streaming.identity().unwrap().ir_function_evidence(),
-            Err(IrFunctionRefusal::Malformed),
+            Err(IrFunctionRefusal::NotVideoControl),
             "a streaming interface is not a VideoControl function"
         );
         let rgb = UsbFixture::new("t480-rgb", 1, 0, &t480::rgb_2113());
@@ -2091,6 +2165,84 @@ mod tests {
         }
     }
 
+    /// A descriptor file that was read but does not hold one complete
+    /// active configuration is malformed, not unreadable: the census prints
+    /// the refusal as the reason, and "no readable USB descriptor" would
+    /// send a reporter looking for a permissions problem. A file that is
+    /// missing, or a configuration that cannot be read, stays unreadable.
+    #[test]
+    fn a_descriptor_file_that_was_read_but_is_malformed_is_not_unreadable() {
+        let sound = UsbFixture::new("887-sound", 1, 0, &t480::ir_1141());
+        assert!(ir_function_evidence_from_dirs(&sound.interface, &sound.device).is_ok());
+
+        let mut miscounted = t480::ir_1141();
+        miscounted[17] = 2;
+        let mut zero_length = t480::ir_1141();
+        zero_length.extend_from_slice(&[0, 0]);
+        let mut duplicate = t480::ir_1141();
+        duplicate[17] = 2;
+        duplicate.extend(t480::configuration(0, 2, 0));
+        for (label, bytes) in [
+            ("887-miscounted", miscounted),
+            ("887-zero-length", zero_length),
+            ("887-duplicate", duplicate),
+        ] {
+            let fixture = UsbFixture::new(label, 1, 0, &bytes);
+            assert_eq!(
+                ir_function_evidence_from_dirs(&fixture.interface, &fixture.device),
+                Err(IrFunctionRefusal::Malformed),
+                "{label}"
+            );
+        }
+
+        let missing = UsbFixture::new("887-missing", 1, 0, &t480::ir_1141());
+        std::fs::remove_file(missing.device.join("descriptors")).unwrap();
+        assert_eq!(
+            ir_function_evidence_from_dirs(&missing.interface, &missing.device),
+            Err(IrFunctionRefusal::Unreadable)
+        );
+        let unconfigured = UsbFixture::new("887-unconfigured", 1, 0, &t480::ir_1141());
+        std::fs::write(unconfigured.device.join("bConfigurationValue"), "\n").unwrap();
+        assert_eq!(
+            ir_function_evidence_from_dirs(&unconfigured.interface, &unconfigured.device),
+            Err(IrFunctionRefusal::Unreadable)
+        );
+    }
+
+    /// A video node on USB that uvcvideo does not drive, such as a
+    /// vendor-class analogue grabber offering only YUYV, sits behind an
+    /// interface that is not a UVC VideoControl interface. Its descriptor is
+    /// well formed, and the refusal says what it is instead of calling it
+    /// malformed.
+    #[test]
+    fn a_well_formed_interface_that_is_not_videocontrol_is_named_as_such() {
+        // A Fushicai USBTV007 (1b71:3002) shape: one configuration whose
+        // interface 0 is vendor class 0xFF with one bulk endpoint.
+        let mut grabber = vec![
+            18, 0x01, 0x00, 0x02, 0, 0, 0, 64, 0x71, 0x1B, 0x02, 0x30, 0x00, 0x01, 1, 2, 0, 1,
+        ];
+        grabber.extend(t480::configuration(0, 1, 0));
+        grabber.extend_from_slice(&[9, DESC_INTERFACE, 0, 0, 1, 0xFF, 0, 0, 0]);
+        grabber.extend_from_slice(&[7, 0x05, 0x81, 0x02, 0x00, 0x02, 0]);
+        assert_eq!(active_descriptor_view(&grabber, 1), Some(grabber.clone()));
+        assert_eq!(
+            ir_function_evidence(&grabber, 0),
+            Err(IrFunctionRefusal::NotVideoControl)
+        );
+        let fixture = UsbFixture::new("887-grabber", 1, 0, &grabber);
+        assert_eq!(
+            ir_function_evidence_from_dirs(&fixture.interface, &fixture.device),
+            Err(IrFunctionRefusal::NotVideoControl)
+        );
+        // Framing that breaks before the walk can tell stays malformed.
+        let mut broken = grabber.clone();
+        broken.push(0);
+        assert_eq!(
+            ir_function_evidence(&broken, 0),
+            Err(IrFunctionRefusal::Malformed)
+        );
+    }
+
     /// The census prints these as "not IR by USB descriptor: ...".
     #[test]
     fn refusals_name_the_clause_that_failed() {
@@ -2099,6 +2251,10 @@ mod tests {
             (
                 IrFunctionRefusal::Malformed,
                 "the USB descriptor is malformed",
+            ),
+            (
+                IrFunctionRefusal::NotVideoControl,
+                "its USB interface is not a UVC VideoControl interface",
             ),
             (
                 IrFunctionRefusal::StreamingInterfaces(2),

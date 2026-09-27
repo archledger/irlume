@@ -175,12 +175,16 @@ pub(crate) fn node_entry_from_facts(facts: &NodeFacts) -> CensusEntry {
 
     // A YUYV-only node's role rests on its USB descriptor (ADR-0031 §1), so
     // the row prints what the descriptor said: the attestation, or the
-    // clause that kept the node RGB. A dummy node has no descriptor, and
-    // its row stays driver and placement facts.
+    // clause that kept the node RGB. The rule covers no other format list,
+    // so no other row carries the line even when its facts hold an answer,
+    // and a dummy node has no descriptor, so its row stays driver and
+    // placement facts.
+    let luma_ir =
+        matches!(&facts.fourccs, Some(list) if crate::offers_only_luma_ir_container(list));
     let descriptor_answer = facts
         .luma_ir_check
         .as_ref()
-        .filter(|_| !DUMMY_DRIVERS.contains(&facts.driver.as_str()));
+        .filter(|_| luma_ir && !DUMMY_DRIVERS.contains(&facts.driver.as_str()));
     if let Some(check) = descriptor_answer {
         evidence.push(match check {
             Ok(attested) => format!(
@@ -191,8 +195,6 @@ pub(crate) fn node_entry_from_facts(facts: &NodeFacts) -> CensusEntry {
             Err(refusal) => format!("not IR by USB descriptor: {refusal}"),
         });
     }
-    let luma_ir =
-        matches!(&facts.fourccs, Some(list) if crate::offers_only_luma_ir_container(list));
 
     let y8_only = |fourccs: &Option<Vec<[u8; 4]>>| match fourccs {
         None => false,
@@ -816,6 +818,14 @@ mod tests {
                 IrFunctionRefusal::Unreadable,
                 "not IR by USB descriptor: no readable USB descriptor",
             ),
+            (
+                IrFunctionRefusal::Malformed,
+                "not IR by USB descriptor: the USB descriptor is malformed",
+            ),
+            (
+                IrFunctionRefusal::NotVideoControl,
+                "not IR by USB descriptor: its USB interface is not a UVC VideoControl interface",
+            ),
         ] {
             let mut f = facts("/dev/video2", Role::Rgb, &[b"YUYV"]);
             f.paired = false;
@@ -835,22 +845,34 @@ mod tests {
     }
 
     /// The rule covers YUYV-only nodes; every other row carries no
-    /// descriptor line, because no descriptor was read for it.
+    /// descriptor line, because no descriptor was read for it. The row
+    /// builder holds that line itself rather than trusting the facts: an
+    /// answer on a GREY or MJPG+YUYV row would claim the rule decided a
+    /// role it never applies to (ADR-0031 §1).
     #[test]
     fn grey_ir_and_mjpg_rgb_nodes_have_no_descriptor_line() {
         for (node, role, fourccs) in [
             ("/dev/video2", Role::Ir, &[b"GREY"][..]),
             ("/dev/video0", Role::Rgb, &[b"MJPG", b"YUYV"][..]),
+            ("/dev/video4", Role::Rgb, &[b"YUYV", b"GREY"][..]),
         ] {
-            let entry = node_entry_from_facts(&facts(node, role, fourccs));
-            assert!(
-                !entry
-                    .evidence
-                    .iter()
-                    .any(|e| e.contains("by USB descriptor")),
-                "{node}: {:?}",
-                entry.evidence
-            );
+            for check in [
+                None,
+                Some(Ok(T480_IR)),
+                Some(Err(IrFunctionRefusal::NoMicrosoftXu)),
+            ] {
+                let mut f = facts(node, role, fourccs);
+                f.luma_ir_check = check;
+                let entry = node_entry_from_facts(&f);
+                assert!(
+                    !entry
+                        .evidence
+                        .iter()
+                        .any(|e| e.contains("by USB descriptor")),
+                    "{node} {check:?}: {:?}",
+                    entry.evidence
+                );
+            }
         }
     }
 

@@ -4513,6 +4513,15 @@ mod tests {
             &format!("{consumer}\n{VERIFY_STANZA}\n{step}\n"),
             &format!("{VERIFY_STANZA}\n{consumer}\n{step}\n"),
         ));
+        // irlume's own tagged keyring consumer is ordered the same way: it
+        // must stay below the keyring unseal line the recipe puts above it.
+        let tagged =
+            format!("auth       optional                     pam_gnome_keyring.so {KEYRING_TAG}");
+        assert!(is_irlume_line(&tagged), "{tagged}");
+        assert!(!overrides::recipe_lines_above_stay_above(
+            &format!("{tagged}\n{KEYRING_UNSEAL}\n{step}\n"),
+            &format!("{KEYRING_UNSEAL}\n{tagged}\n{step}\n"),
+        ));
         // Comments and blank lines do not order anything.
         assert!(overrides::recipe_lines_above_stay_above(
             &format!("{VERIFY_STANZA}\n# moved by hand\n\n{gate}\n{step}\n"),

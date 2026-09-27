@@ -431,16 +431,26 @@ pub(super) fn refill(current: &str, wired: &str) -> Option<String> {
 /// recipe puts below it may sit above it in `filled` only when it carries a
 /// numeric jump, the jump the held place is kept for; any other line there,
 /// such as a keyring consumer that must run after irlume's unseal line to see
-/// the released password, refuses the refill. Lines without a PAM directive
+/// the released password, refuses the refill. irlume's own tagged keyring
+/// consumer counts as such a line too. Lines without a PAM directive
 /// (comments, blank lines) do not count.
 pub(super) fn recipe_lines_above_stay_above(filled: &str, wired: &str) -> bool {
+    // Every line that runs, except irlume's module lines and the inactive
+    // and landing lines that hold its places (their places are checked by
+    // the jump landings).
+    let ordered = |l: &str| {
+        !directive(l).trim().is_empty()
+            && (!is_irlume_line(l)
+                || (grammar::rule_names_module(l, "pam_gnome_keyring.so")
+                    && l.contains(KEYRING_TAG)))
+    };
     let others_above = |text: &str, line: &str| -> Option<Vec<String>> {
         let lines: Vec<&str> = text.lines().collect();
         let at = lines.iter().position(|l| l.trim() == line)?;
         Some(
             lines[..at]
                 .iter()
-                .filter(|l| !is_irlume_line(l) && !directive(l).trim().is_empty())
+                .filter(|l| ordered(l))
                 .map(|l| l.trim().to_string())
                 .collect(),
         )

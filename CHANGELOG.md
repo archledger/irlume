@@ -796,6 +796,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- `login enable --with-sudo` and `--with-polkit` put irlume's line just
+  above the password step (the password include or substack, or the
+  `pam_unix.so` line) instead of above the first auth line, so a gate an
+  administrator put above that step, such as a `requisite` group check,
+  still runs first; a numeric jump that would count irlume's line keeps it
+  higher, where nothing counts it. `login disable` on a stack irlume edits
+  in place turns irlume's lines into inactive `pam_permit.so` lines in
+  their places when removing them would make a numeric jump land
+  elsewhere, as it already did for an override. Omarchy's lock lane keeps
+  its placement (#872).
+
 - pam_irlume stands down when `PAM_XDISPLAY`, or a `PAM_TTY` a display
   manager filled with its display, names an X display on another host
   (`host:N`), as a login screen served over XDMCP does while leaving

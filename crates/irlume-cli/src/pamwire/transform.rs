@@ -324,8 +324,9 @@ pub(super) fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
 }
 
 /// Wire a single-stanza verify service (`sudo`, `polkit-1`): the stanza goes
-/// ABOVE the first auth-phase line, whether that is Fedora's `auth include
-/// system-auth` or Debian/Ubuntu's `@include common-auth`. An anchor that only
+/// ABOVE the password step, whether that is Fedora's `auth include
+/// system-auth` or Debian/Ubuntu's `@include common-auth`, below any line an
+/// administrator put above it ([`insert_verify_stanza`]). An anchor that only
 /// matched a literal `auth` token missed the include layout entirely and the
 /// stanza got appended at EOF, i.e. AFTER the password modules, where it is dead:
 /// a wrong password already hit common-auth's pam_deny, a right one already
@@ -340,21 +341,51 @@ pub(super) fn wire_verify_service(content: &str) -> (String, bool) {
     if content_has_module(content) {
         return (content.to_string(), false);
     }
+    insert_verify_stanza(content, VERIFY_STANZA)
+}
+
+/// Put `stanza` into a verify service's stack: just above its password step
+/// (the password include or substack, or the `pam_unix.so` line), so every
+/// line above that step (an administrator's gate such as a `requisite`
+/// group check, `pam_nologin`, faillock's preauth) still runs first. When an
+/// existing numeric jump would then count irlume's line and land elsewhere,
+/// the stanza goes higher, up to the first auth line, where no jump can count
+/// it. `(content, false)` when the file has no auth line to anchor at.
+fn insert_verify_stanza(content: &str, stanza: &str) -> (String, bool) {
     let lines: Vec<&str> = content.lines().collect();
-    let anchor = lines
-        .iter()
-        .position(|l| is_include_auth_layout(l) || is_auth_directive(l));
-    let Some(anchor) = anchor else {
+    let is_auth = |l: &str| is_auth_directive(l) || is_include_auth_layout(l);
+    let Some(first) = lines.iter().position(|l| is_auth(l)) else {
         return (content.to_string(), false);
     };
-    let mut out = Vec::with_capacity(lines.len() + 1);
-    for (i, l) in lines.iter().enumerate() {
-        if i == anchor {
-            out.push(VERIFY_STANZA.to_string());
+    let password = lines
+        .iter()
+        .position(|l| {
+            is_include_auth_layout(l)
+                || is_passwd_substack(l, "auth")
+                || is_auth_substack_anchor(l)
+                || (is_auth_directive(l) && rule_names_module(l, "pam_unix.so"))
+        })
+        .map_or(first, |at| at.max(first));
+    let with_stanza_at = |at: usize| {
+        let mut out = Vec::with_capacity(lines.len() + 1);
+        for (i, l) in lines.iter().enumerate() {
+            if i == at {
+                out.push(stanza.to_string());
+            }
+            out.push((*l).to_string());
         }
-        out.push((*l).to_string());
+        format!("{}\n", out.join("\n"))
+    };
+    for at in (first + 1..=password).rev() {
+        if !is_auth(lines[at]) {
+            continue;
+        }
+        let wired = with_stanza_at(at);
+        if super::overrides::jumps_moved_by_irlume(content, &wired).is_empty() {
+            return (wired, true);
+        }
     }
-    (format!("{}\n", out.join("\n")), true)
+    (with_stanza_at(first), true)
 }
 
 /// Wire the polkit consent dialog. Identical to [`wire_verify_service`] except it
@@ -376,6 +407,18 @@ pub(super) fn wire_polkit_service(content: &str) -> (String, bool) {
         return (content.to_string(), false);
     }
     if content_has_module(content) {
+        return (content.to_string(), false);
+    }
+    insert_verify_stanza(content, POLKIT_VERIFY_STANZA)
+}
+
+/// Omarchy's stock lock lane: the polkit consent stanza above the first auth
+/// line, ahead of the whole stack including faillock's preauth, the placement
+/// the lane was validated with on hardware. A lock screen's stack is the
+/// vendor's own lane, not a verify service an administrator gates, so it keeps
+/// that placement rather than [`insert_verify_stanza`]'s.
+pub(super) fn wire_omarchy_lock(content: &str) -> (String, bool) {
+    if has_line_continuation(content) || content_has_module(content) {
         return (content.to_string(), false);
     }
     let lines: Vec<&str> = content.lines().collect();

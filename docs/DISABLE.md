@@ -127,7 +127,9 @@ The disable also:
   them into inactive `pam_permit.so` lines tagged `# irlume-inert` in the
   same places instead; the stack then runs as it does when irlume's module
   declines, and a later `disable` removes them once the jump no longer
-  counts them. It does the same when it could not tell where to put its
+  counts them. A stack irlume edits in place (an `/etc` file with no vendor
+  copy, such as `sudo` or `polkit-1` on Debian, Ubuntu and Arch) gets the
+  same treatment when there is no backup to restore. It does the same when it could not tell where to put its
   lines back without them (the file has no password line irlume can tell
   from one of yours, such as a copy of the vendor's), so the next `enable`
   puts them back in the same places. If the machine's configuration

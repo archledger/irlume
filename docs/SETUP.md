@@ -526,7 +526,11 @@ sudo irlume login enable --with-sudo --apply
 ```
 
 The password still works for `sudo` too; face is `sufficient`, not required.
-Test it in a fresh terminal with `sudo -k` (clear the cached credential) then
+irlume's line goes just above the password step (the `@include common-auth`,
+`auth include system-auth` or `pam_unix.so` line), so a gate you put above
+that step, such as a `requisite` group check, still runs first; only a numeric
+jump that would otherwise count irlume's line keeps it higher. `--with-polkit`
+places its line the same way. Test it in a fresh terminal with `sudo -k` (clear the cached credential) then
 `sudo true`. PAM shows `Type yes to use face authentication` above the normal
 hidden field. Type `yes` for one face attempt, or type the ordinary password
 once for the password/fingerprint path. Empty Enter never starts the camera and

@@ -2452,10 +2452,11 @@ fn login_force_is_refused_outside_enable_and_disable() {
 }
 
 /// Without `IRLUME_PAM_LOCK`, the PAM lock is `pam.lock` in the root-only
-/// `/run/irlume`, and `/run/lock/irlume-pam.lock`, the lock earlier releases
-/// created at 0644, is not created. One an earlier release left is still taken,
-/// and loses its group and other permissions. The namespace's `/run` is its
-/// own tmpfs, with a sandbox directory at `/run/lock`.
+/// `/run/irlume`. `/run/lock/irlume-pam.lock`, the lock earlier releases
+/// created at 0644, is taken too: created at 0600 when it is missing, and one
+/// an earlier release left loses its group and other permissions. The
+/// namespace's `/run` is its own tmpfs, with a sandbox directory at
+/// `/run/lock`.
 #[test]
 fn the_pam_lock_is_kept_where_only_root_can_open_it() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -2479,9 +2480,16 @@ fn the_pam_lock_is_kept_where_only_root_can_open_it() {
     let (code, out, err) = reconcile(&sb);
     assert_eq!(code, 0, "{out}\n{err}");
     assert!(!err.contains("cannot serialise"), "{err}");
-    assert!(!legacy.exists(), "the lock was created in /run/lock");
+    let mode = std::fs::symlink_metadata(&legacy)
+        .expect("the lock of earlier releases was not created")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        mode, 0o600,
+        "the lock of earlier releases was created {mode:o}"
+    );
 
-    std::fs::write(&legacy, "").unwrap();
     std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o644)).unwrap();
     let (code, out, err) = reconcile(&sb);
     assert_eq!(code, 0, "{out}\n{err}");
@@ -3052,7 +3060,7 @@ fn login_disable_keeps_an_in_place_stack_with_a_continued_line() {
             &[(&etc, "/etc/pam.d"), (&vendor, "/usr/lib/pam.d")],
         )
         .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
-        .env("IRLUME_PAM_LOCK", sb.path("pam.lock")));
+        .env("IRLUME_PAM_LOCK", sb.pam_lock()));
         assert_eq!(code, 1, "{out}\n{err}");
         assert_eq!(std::fs::read_to_string(etc.join("sudo")).unwrap(), sudo);
         assert_eq!(

@@ -871,13 +871,14 @@ account can open or hold it. It is opened without following a symlink and must
 be a regular file root owns. A second operation waits for the first, naming its
 process on stderr. While an irlume release that kept the lock at
 `/run/lock/irlume-pam.lock` may still be running, as during an upgrade, that file
-is taken too if it exists and root owns it; it is never created, and its group
-and other permissions are removed. A process holding it is waited for at most 60
-seconds. If a root process that has the file open still holds it then, or
-`/proc` cannot show which process holds it, the operation fails, as
-`operation-failed` with `retryable` true, rather than write beside what may be
-an earlier irlume; a holder `/proc` shows to be something else, such as another
-account's process, is passed over.
+is taken too. It is created at 0600 when it is missing, so such a release that
+reaches its lock later waits for the operation; a symlink there is not followed,
+and group and other permissions are removed from a file root owns. A process
+holding it is waited for at most 60 seconds. If a root process that has the file
+open still holds it or waits for it then, or `/proc` cannot show which process
+holds it, the operation fails, as `operation-failed` with `retryable` true,
+rather than write beside what may be an earlier irlume; a holder `/proc` shows
+to be something else, such as another account's process, is passed over.
 
 irlume refuses to write a PAM path that is a symlink or that has more than one
 hard link, on every one of those paths. Renaming over a symlink would silently

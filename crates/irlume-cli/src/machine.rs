@@ -2116,22 +2116,8 @@ impl SessionGuard {
         uid: u32,
         fallback: Option<&std::path::Path>,
     ) -> std::result::Result<Self, SessionRefusal> {
-        use std::os::unix::io::AsRawFd;
         let dir = session_dir(runtime_dir, uid, fallback).ok_or(SessionRefusal::Unavailable)?;
-        let file = open_session_lock(&dir, uid).ok_or(SessionRefusal::Unavailable)?;
-        // SAFETY: fd is owned by `file` and outlives the call.
-        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if locked != 0 {
-            // EWOULDBLOCK is the lock being held, which is the ordinary case
-            // and the only retryable one. Anything else is the lock mechanism
-            // failing, and telling a consumer to retry that would spin.
-            let errno = std::io::Error::last_os_error().raw_os_error();
-            return Err(if errno == Some(libc::EWOULDBLOCK) {
-                SessionRefusal::Busy
-            } else {
-                SessionRefusal::Unavailable
-            });
-        }
+        let file = open_session_lock(&dir, uid)?;
         Ok(Self {
             id: random_id(),
             _file: file,
@@ -2197,7 +2183,10 @@ fn owned_dir(path: &std::path::Path, uid: u32) -> Option<std::fs::File> {
 /// lands in the directory [`owned_dir`] checked even if the path that named it
 /// has changed since. `O_NOFOLLOW` refuses a symlink at the lock's name, and
 /// `O_NONBLOCK` keeps a FIFO there from stalling the open.
-fn open_session_lock(dir: &std::fs::File, uid: u32) -> Option<std::fs::File> {
+fn open_session_lock(
+    dir: &std::fs::File,
+    uid: u32,
+) -> std::result::Result<std::fs::File, SessionRefusal> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::os::unix::io::AsRawFd;
     let path = format!("/proc/self/fd/{}/{SESSION_LOCK_NAME}", dir.as_raw_fd());
@@ -2212,28 +2201,59 @@ fn open_session_lock(dir: &std::fs::File, uid: u32) -> Option<std::fs::File> {
         } else {
             options.create(true).truncate(false);
         }
-        options.open(&path).ok()
+        options.open(&path)
     };
     let owned = |file: &std::fs::File| {
         file.metadata()
             .ok()
             .filter(|meta| meta.is_file() && meta.uid() == uid)
+            .ok_or(SessionRefusal::Unavailable)
     };
-    let file = open(false)?;
+    let file = open(false).map_err(|_| SessionRefusal::Unavailable)?;
     let meta = owned(&file)?;
+    lock_exclusive(&file)?;
     if meta.mode() & 0o077 == 0 {
-        return Some(file);
+        return Ok(file);
     }
     // Earlier builds created the lock under the umask. A group or other
     // reader may already hold a descriptor to it, which a mode change does
-    // not revoke, so the lock is replaced: removed from the checked
-    // directory, where no other account can create a file, and created anew
-    // owner-only.
+    // not revoke, so the lock is replaced while this process holds it: a run
+    // still using it (an earlier build's, say) makes this one busy above, and
+    // the new owner-only file is locked before the old lock is let go. The
+    // checked directory is one no other account can create a file in.
+    std::fs::remove_file(&path).map_err(|_| SessionRefusal::Unavailable)?;
+    let replaced = match open(true) {
+        Ok(replaced) => replaced,
+        // Another run of this account created it after the unlink.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(SessionRefusal::Busy)
+        }
+        Err(_) => return Err(SessionRefusal::Unavailable),
+    };
+    let meta = owned(&replaced)?;
+    if meta.mode() & 0o077 != 0 {
+        return Err(SessionRefusal::Unavailable);
+    }
+    lock_exclusive(&replaced)?;
     drop(file);
-    std::fs::remove_file(&path).ok()?;
-    let file = open(true)?;
-    let meta = owned(&file)?;
-    (meta.mode() & 0o077 == 0).then_some(file)
+    Ok(replaced)
+}
+
+/// Take the session lock on `file` without waiting. Held elsewhere is the
+/// ordinary, retryable case; any other failure is the lock mechanism
+/// failing, and telling a consumer to retry that would spin.
+fn lock_exclusive(file: &std::fs::File) -> std::result::Result<(), SessionRefusal> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: fd is owned by `file` and outlives the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(());
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    Err(if errno == Some(libc::EWOULDBLOCK) {
+        SessionRefusal::Busy
+    } else {
+        SessionRefusal::Unavailable
+    })
 }
 
 pub(crate) const CAMERA_BUSY_MESSAGE: &str =
@@ -3792,6 +3812,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A readable lock an earlier build left, still held by a run using it,
+    /// makes this run busy; it is not replaced, so two runs never hold two
+    /// different locks at once.
+    #[test]
+    fn a_held_readable_lock_is_busy_and_not_replaced() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::io::AsRawFd;
+        let dir = runtime_sandbox("held-legacy");
+        let lock = dir.join(SESSION_LOCK_NAME);
+        std::fs::write(&lock, b"").expect("lock");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let holder = std::fs::File::open(&lock).expect("open the old lock");
+        // SAFETY: fd is owned by `holder` and outlives the call.
+        let held = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(held, 0);
+        let old_inode = holder.metadata().expect("old lock").ino();
+        assert_eq!(
+            outcome(SessionGuard::acquire_in(Some(&dir), own_uid(), None)),
+            "busy"
+        );
+        assert_eq!(
+            std::fs::metadata(&lock).expect("lock").ino(),
+            old_inode,
+            "a held lock is not replaced"
+        );
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A symlink at the lock's name is refused, and the path it names is not
     /// created.
     #[test]
@@ -3865,8 +3914,8 @@ mod tests {
         let dir = runtime_sandbox("foreign-lock");
         std::fs::write(dir.join(SESSION_LOCK_NAME), b"").expect("lock");
         let handle = owned_dir(&dir, own_uid()).expect("the sandbox qualifies");
-        assert!(open_session_lock(&handle, own_uid().wrapping_add(1)).is_none());
-        assert!(open_session_lock(&handle, own_uid()).is_some());
+        assert!(open_session_lock(&handle, own_uid().wrapping_add(1)).is_err());
+        assert!(open_session_lock(&handle, own_uid()).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -9,11 +9,12 @@
 //! [`test::fixture_with`] (or [`test::empty_fixture`]) points every reader
 //! at a temporary tree, and [`test::host`] is the explicit opt-in to the
 //! real machine, reserved for the `#[ignore]`d hardware and v4l2loopback
-//! lanes. A unit test that reaches for the host's `/dev/video*`,
-//! `/dev/media*` or `/sys/class/video4linux` without installing roots
-//! panics on the spot instead of quietly probing a developer's camera:
-//! CI has no cameras, so an unrouted test passes there by accident and
-//! opens real hardware on any laptop that has one (#887 incident).
+//! lanes (plus this module's own self-test of the opt-in). A unit test that
+//! reaches for the host's `/dev/video*`, `/dev/media*` or
+//! `/sys/class/video4linux` without installing roots panics on the spot
+//! instead of quietly probing a developer's camera: CI has no cameras, so
+//! an unrouted test passes there by accident and opens real hardware on any
+//! laptop that has one.
 //!
 //! The roots are thread-local so parallel tests stay isolated: each test
 //! thread installs its own, and a thread that installs none gets the
@@ -213,8 +214,11 @@ pub(crate) mod test {
         fixture_with(|_, _| {})
     }
 
-    /// The explicit opt-in to the real machine, for the `#[ignore]d` lanes
-    /// whose subject is real hardware (v4l2loopback, UVC acceptance). Sticky
+    /// The explicit opt-in to the real machine, for the `#[ignore]`d lanes
+    /// whose subject is real hardware (v4l2loopback, UVC acceptance), either
+    /// through the loopback helpers `loopback_pair` and `spare_device` or
+    /// directly at the top of the test. The one non-ignored caller is this
+    /// module's self-test of the opt-in, which reads no host tree. Sticky
     /// for the thread on purpose: those tests are the last thing their
     /// thread runs, and the host roots own nothing to clean up.
     pub(crate) fn host() {
@@ -306,8 +310,10 @@ mod tests {
     /// node like /dev/null) is fine, but a probe naming the host's
     /// `/dev/video*`, `/dev/media*` or `/dev/v4l-subdev*` refuses: that is
     /// the touch of real hardware this seam exists to prevent. Only the
-    /// explicit host opt-in lifts it, which is why every call to
-    /// `test::host` sits in an `#[ignore]`d hardware-lane test.
+    /// explicit host opt-in lifts it. Apart from the `test::host` call at
+    /// the end of this test, which probes nothing but the gate, every call
+    /// to it sits in an `#[ignore]`d hardware-lane test or in a helper only
+    /// those tests use.
     #[test]
     fn probes_of_host_camera_nodes_need_the_explicit_host_opt_in() {
         let guard = test::empty_fixture();

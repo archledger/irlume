@@ -17323,9 +17323,10 @@ mod tests {
     /// the hardware it is named for is worse than no test.
     fn loopback_pair() -> (String, String) {
         // These tests are the real-machine lane: the feeders, the sysfs
-        // entries behind them and the emitter walk all live on the host.
-        // This is the one explicit host opt-in; every other test installs a
-        // fixture instead (see hostfs).
+        // entries behind them and the emitter walk all live on the host, so
+        // they opt in to it explicitly, as the other ignored hardware lanes
+        // do. Unit tests that read /dev or /sys install a hostfs fixture
+        // instead.
         crate::hostfs::test::host();
         let var = |k: &str| {
             std::env::var(k).unwrap_or_else(|_| {

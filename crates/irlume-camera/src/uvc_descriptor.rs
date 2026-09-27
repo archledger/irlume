@@ -789,11 +789,33 @@ mod tests {
 
     #[test]
     fn budget_hint_metadata_rejects_non_usb_paths_without_opening_them() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+
         // /dev/null is a character device, so the refusal must come from the
-        // sysfs walk; the fixture's empty /sys/dev/char is that answer on
-        // every machine, not just one whose /sys has no 1:3 entry.
-        let _roots = crate::hostfs::test::empty_fixture();
-        assert!(super::identity_and_connection_for_budget_hint("/dev/null").is_err());
+        // sysfs walk. The fixture lists it the way every kernel does: its
+        // /sys/dev/char entry resolves to /sys/devices/virtual/mem/null,
+        // which has no USB interface above it, so the lookup reaches the
+        // ancestor walk and is refused there rather than at a missing entry.
+        let rdev = std::fs::metadata("/dev/null").unwrap().rdev();
+        let char_entry = format!("{}:{}", libc::major(rdev), libc::minor(rdev));
+        let roots = crate::hostfs::test::fixture_with(|_, sys| {
+            std::fs::create_dir_all(sys.join("devices/virtual/mem/null")).unwrap();
+            std::fs::create_dir_all(sys.join("dev/char")).unwrap();
+            symlink(
+                "../../devices/virtual/mem/null",
+                sys.join("dev/char").join(&char_entry),
+            )
+            .unwrap();
+        });
+        let Err(refused) = super::identity_and_connection_for_budget_hint("/dev/null") else {
+            panic!("/dev/null must not yield a USB identity");
+        };
+        let refused = refused.to_string();
+        let null_node = roots.sys().join("devices/virtual/mem/null");
+        assert!(
+            refused.contains(&format!("no USB interface above {}", null_node.display())),
+            "/dev/null must be refused by the ancestor walk from its sysfs node: {refused}"
+        );
         assert!(
             super::identity_and_connection_for_budget_hint("/dev/irlume-missing-budget-hint")
                 .is_err()

@@ -19367,6 +19367,7 @@ mod tests {
         publish_enrollment_summary(
             "carol",
             EnrollmentSummary {
+                owner: irlume_core::account::resolve("carol"),
                 profiles: Vec::new(),
                 ir_ratio_calibrated: false,
                 camera_groups: Vec::new(),

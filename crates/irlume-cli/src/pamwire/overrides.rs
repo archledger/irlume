@@ -433,10 +433,10 @@ pub(super) fn refill(current: &str, wired: &str) -> Option<String> {
 /// such as a keyring consumer that must run after irlume's unseal line to see
 /// the released password, refuses the refill. irlume's own tagged keyring
 /// consumer counts as such a line too. Only lines of the same PAM phase as
-/// irlume's line count, since each phase runs as its own chain (an
-/// `@include` counts for the phase its file name names, `common-auth` for
-/// auth; one whose phase cannot be told counts for every phase). Lines
-/// without a PAM directive (comments, blank lines) do not count.
+/// irlume's line count, since each phase runs as its own chain; an
+/// `@include`, which brings in every phase of its file, counts for every
+/// phase. Lines without a PAM directive (comments, blank lines) do not
+/// count.
 pub(super) fn recipe_lines_above_stay_above(filled: &str, wired: &str) -> bool {
     // Every line that runs, except irlume's module lines and the inactive
     // and landing lines that hold its places (their places are checked by
@@ -447,15 +447,6 @@ pub(super) fn recipe_lines_above_stay_above(filled: &str, wired: &str) -> bool {
                 || (grammar::rule_names_module(l, "pam_gnome_keyring.so")
                     && l.contains(KEYRING_TAG)))
     };
-    let phase_of = |l: &str| -> Option<&'static str> {
-        phase(l).or_else(|| {
-            let target = directive(l).trim().strip_prefix("@include")?.trim();
-            PHASES
-                .iter()
-                .copied()
-                .find(|p| target.split(['-', '_', '.']).any(|part| part == *p))
-        })
-    };
     let others_above = |text: &str, line: &str| -> Option<Vec<String>> {
         let lines: Vec<&str> = text.lines().collect();
         let at = lines.iter().position(|l| l.trim() == line)?;
@@ -464,7 +455,7 @@ pub(super) fn recipe_lines_above_stay_above(filled: &str, wired: &str) -> bool {
             lines[..at]
                 .iter()
                 .filter(|l| ordered(l))
-                .filter(|l| match (own, phase_of(l)) {
+                .filter(|l| match (own, phase(l)) {
                     (Some(own), Some(other)) => own == other,
                     _ => true,
                 })
@@ -497,9 +488,10 @@ pub(super) fn recipe_lines_above_stay_above(filled: &str, wired: &str) -> bool {
 /// recipe puts a verify or face line above it and a reseal line below it. A
 /// place a disable held stops being that line's place once the step has
 /// moved across it, as when an administrator moves `pam_unix.so` above it:
-/// a verify line refilled below the step would never be reached. True when
+/// a verify line refilled below the step would never be reached. Only auth
+/// lines are compared: the other phases run as their own chains. True when
 /// either stack has no password step.
-fn same_side_of_the_password_step(filled: &str, wired: &str) -> bool {
+pub(super) fn same_side_of_the_password_step(filled: &str, wired: &str) -> bool {
     let sides = |text: &str| -> Option<Vec<(String, bool)>> {
         let lines: Vec<&str> = text.lines().collect();
         let step = lines
@@ -509,7 +501,9 @@ fn same_side_of_the_password_step(filled: &str, wired: &str) -> bool {
             lines
                 .iter()
                 .enumerate()
-                .filter(|(_, l)| is_irlume_line(l) && !l.contains(INERT_TAG))
+                .filter(|(_, l)| {
+                    is_irlume_line(l) && !l.contains(INERT_TAG) && phase(l) == Some("auth")
+                })
                 .map(|(at, l)| (l.trim().to_string(), at < step))
                 .collect(),
         )

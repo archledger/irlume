@@ -4538,6 +4538,12 @@ mod tests {
             &format!("{VERIFY_STANZA}\n@include common-auth\n"),
             &format!("@include common-auth\n{VERIFY_STANZA}\n"),
         ));
+        // An `@include` brings in every phase of its file, whatever its
+        // name: one the recipe puts above irlume's session line stays above.
+        assert!(!overrides::recipe_lines_above_stay_above(
+            &format!("{RESEAL_SESSION}\n@include system-auth\n"),
+            &format!("@include system-auth\n{RESEAL_SESSION}\n"),
+        ));
         // Comments and blank lines do not order anything.
         assert!(overrides::recipe_lines_above_stay_above(
             &format!("{VERIFY_STANZA}\n# moved by hand\n\n{gate}\n{step}\n"),
@@ -4579,6 +4585,13 @@ mod tests {
                 ),
                 "{moved}"
             );
+            // Only auth lines are held to the step's side: a session line on
+            // either side of it does not matter.
+            let step = "auth required pam_unix.so";
+            assert!(overrides::same_side_of_the_password_step(
+                &format!("{stanza}\n{RESEAL_SESSION}\n{step}\n"),
+                &format!("{stanza}\n{step}\n{RESEAL_SESSION}\n"),
+            ));
             // The unmoved stack is still refilled in its place.
             let (wired, _) = wire(&unwire_lines(&held).0);
             assert!(

@@ -2547,7 +2547,7 @@ fn process_while_draining<T: Send, R: Send>(
     mut drain: impl FnMut() -> irlume_common::Result<()>,
 ) -> irlume_common::Result<R> {
     std::thread::scope(|scope| {
-        let worker = scope.spawn(move || process(frame));
+        let worker = scope.spawn(hostfs::inherit(move || process(frame)));
         let mut transport = Ok(());
         let mut drained = 0;
         while !worker.is_finished() {
@@ -2656,12 +2656,16 @@ fn establish_concurrent_rate_with_cancel<A: ValidatedStream + Send, B: Validated
         let a = {
             let count = std::sync::Arc::clone(&ready_count);
             let cancelled = std::sync::Arc::clone(&cancelled);
-            scope.spawn(move || drain_until_both_ready(primary, &count, &cancelled))
+            scope.spawn(hostfs::inherit(move || {
+                drain_until_both_ready(primary, &count, &cancelled)
+            }))
         };
         let b = {
             let count = std::sync::Arc::clone(&ready_count);
             let cancelled = std::sync::Arc::clone(&cancelled);
-            scope.spawn(move || drain_until_both_ready(secondary, &count, &cancelled))
+            scope.spawn(hostfs::inherit(move || {
+                drain_until_both_ready(secondary, &count, &cancelled)
+            }))
         };
         // A panic in a fill thread is a software defect, never a camera
         // verdict: re-raise it (mirrors the capture-mode probe's rule, #263).
@@ -7069,12 +7073,12 @@ pub fn capture_pair_with<R: Send, I: Send>(
 ) -> (irlume_common::Result<R>, irlume_common::Result<I>) {
     let completed = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        let ir_thread = scope.spawn(|| {
+        let ir_thread = scope.spawn(hostfs::inherit(|| {
             let lease = ir.cam.lease.clone();
             lease.run_active(|| {
                 capture_and_drain(ir, &completed, capture_ir, |ir| ir.discard_frame())
             })
-        });
+        }));
         let lease = rgb.cam.lease.clone();
         let rgb = lease.run_active(|| {
             capture_and_drain(rgb, &completed, capture_rgb, |rgb| {
@@ -19105,12 +19109,15 @@ mod tests {
 
     #[test]
     fn framing_processing_keeps_consuming_while_the_processor_waits() {
+        let fixture = hostfs::test::empty_fixture();
+        let expected_dev = fixture.dev().to_path_buf();
         let (release, waiting) = std::sync::mpsc::sync_channel(0);
         let mut release = Some(release);
         let mut drained = 0;
         let result = process_while_draining(
             7,
             move |frame| {
+                assert_eq!(hostfs::dev_root(), expected_dev);
                 waiting
                     .recv_timeout(std::time::Duration::from_secs(2))
                     .unwrap();

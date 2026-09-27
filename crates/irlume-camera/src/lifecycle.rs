@@ -744,14 +744,9 @@ pub(crate) fn spawn(supervisor: Weak<CameraSupervisor>) -> Result<(), LifecycleE
         }
     };
     let worker_supervisor = supervisor.clone();
-    // Under test the worker rescans with the spawning thread's roots.
-    #[cfg(test)]
-    let roots = crate::hostfs::test::current();
     let spawned = std::thread::Builder::new()
         .name("irlume-camera-udev".into())
-        .spawn(move || {
-            #[cfg(test)]
-            crate::hostfs::test::adopt(roots);
+        .spawn(crate::hostfs::inherit(move || {
             let _exit_guard = WorkerExitGuard::new(worker_supervisor.as_ref());
             let mut delay = INITIAL_RETRY_DELAY;
             let mut recovering = coordinator.is_none();
@@ -799,7 +794,7 @@ pub(crate) fn spawn(supervisor: Weak<CameraSupervisor>) -> Result<(), LifecycleE
                     recovering = true;
                 }
             }
-        });
+        }));
     finish_spawn(supervisor.as_ref(), spawned)
 }
 

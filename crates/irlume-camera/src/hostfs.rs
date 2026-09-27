@@ -18,10 +18,8 @@
 //!
 //! The roots are thread-local so parallel tests stay isolated: each test
 //! thread installs its own, and a thread that installs none gets the
-//! refusal. The lifecycle monitor's worker thread reads them too (its
-//! rescans after a device event and its recovery), so under test it adopts
-//! the roots of the thread that spawned it ([`test::current`],
-//! [`test::adopt`]).
+//! refusal. Camera workers use [`inherit`] to carry the spawning thread's
+//! roots into callbacks, drains and lifecycle rescans.
 
 use std::path::PathBuf;
 
@@ -88,7 +86,29 @@ pub(crate) fn video_class_root() -> PathBuf {
 /// leading `/` (as in `/dev//video0` once `/dev/` is stripped) stays inside
 /// the class root, where `Path::join` would replace the root with it.
 pub(crate) fn video_class_entry(node: &str) -> PathBuf {
+    #[cfg(test)]
+    {
+        let roots = installed();
+        if !roots.is_host {
+            if let Ok(relative) = std::path::Path::new(node).strip_prefix(&roots.dev) {
+                if let Some(name) = relative.file_name() {
+                    return video_class_root().join(name);
+                }
+            }
+        }
+    }
     video_class_root().join(node.trim_start_matches('/'))
+}
+
+/// Carry test roots into a camera worker. Production calls the closure as is.
+pub(crate) fn inherit<F: FnOnce() -> T, T>(work: F) -> impl FnOnce() -> T {
+    #[cfg(test)]
+    let roots = test::current();
+    move || {
+        #[cfg(test)]
+        test::adopt(roots);
+        work()
+    }
 }
 
 /// `/sys/bus/usb/devices`, the USB device and interface listing.
@@ -110,8 +130,8 @@ pub(crate) fn sys_dev_char_root() -> PathBuf {
 /// Gate for the "open this node and ask it something" probes
 /// ([`crate::classify_node`] and friends): under test, a probe naming a
 /// host camera node is a touch of real hardware and must carry the explicit
-/// host opt-in. A fixture path, or any node that is not a camera node
-/// (say `/dev/null`), passes unchanged.
+/// host opt-in. Fixture files and `/dev/null` pass unchanged; other character
+/// devices and camera aliases require the opt-in even under another name.
 ///
 /// # Panics
 /// Under `cfg(test)`, when the calling thread installed no roots at all, or
@@ -136,22 +156,56 @@ pub(crate) fn check_probe(device: &str) {
     let _ = device;
 }
 
-/// Whether `device` names a camera node under the real `/dev`. A path under
-/// a fixture root never matches, which is exactly the distinction the probe
-/// gate needs.
+/// Whether `device` names or resolves to host hardware, including an alias
+/// under a fixture root. This reads metadata and links, never a device.
 #[cfg(test)]
 fn names_host_camera_node(device: &str) -> bool {
-    let path = std::path::Path::new(device);
-    path.starts_with("/dev/")
-        .then(|| path.file_name())
-        .flatten()
-        .is_some_and(|name| {
-            name.to_str().is_some_and(|name| {
-                name.starts_with("video")
-                    || name.starts_with("media")
-                    || name.starts_with("v4l-subdev")
+    use std::os::unix::fs::FileTypeExt;
+    let mut path = PathBuf::from(device);
+    // Resolve aliases before any open. Walking a dangling final symlink also
+    // catches fixture mistakes on camera-less CI hosts. Cycles fail closed.
+    for _ in 0..40 {
+        if names_host_camera_path(&path) {
+            return true;
+        }
+        if let Ok(resolved) = std::fs::canonicalize(&path) {
+            return names_host_camera_path(&resolved)
+                || (resolved != std::path::Path::new("/dev/null")
+                    && std::fs::metadata(&resolved)
+                        .is_ok_and(|meta| meta.file_type().is_char_device()));
+        }
+        match std::fs::read_link(&path) {
+            Ok(target) => {
+                path = path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join(target);
+            }
+            Err(error) => {
+                return !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                );
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+fn names_host_camera_path(path: &std::path::Path) -> bool {
+    path.starts_with("/dev/v4l")
+        || path
+            .starts_with("/dev/")
+            .then(|| path.file_name())
+            .flatten()
+            .is_some_and(|name| {
+                name.to_str().is_some_and(|name| {
+                    name.starts_with("video")
+                        || name.starts_with("media")
+                        || name.starts_with("v4l-subdev")
+                })
             })
-        })
 }
 
 /// The test-side installers. [`fixture_with`] builds a tree,
@@ -350,14 +404,73 @@ mod tests {
     #[test]
     fn a_spawned_thread_adopts_the_roots_of_the_thread_that_spawned_it() {
         let fixture = test::empty_fixture();
-        let roots = test::current();
-        let dev = std::thread::spawn(move || {
-            test::adopt(roots);
-            super::dev_root()
-        })
-        .join()
-        .expect("the adopting thread must see the fixture");
+        let dev = std::thread::spawn(inherit(super::dev_root))
+            .join()
+            .expect("the adopting thread must see the fixture");
         assert_eq!(dev, fixture.dev());
+    }
+
+    #[test]
+    fn alias_probes_cannot_leave_the_fixture_for_a_host_camera() {
+        let fixture = test::empty_fixture();
+        for (name, target) in [
+            ("camera", "/dev/video99999"),
+            ("media", "/dev/media99999"),
+            ("persistent", "/dev/v4l/by-id/usb-fixture-video-index0"),
+            ("chained", "camera"),
+            ("cycle", "cycle"),
+        ] {
+            let alias = fixture.dev().join(name);
+            std::os::unix::fs::symlink(target, &alias).unwrap();
+            assert!(
+                refusal_of(|| check_probe(alias.to_str().unwrap())).contains("host camera node")
+            );
+        }
+        let file = fixture.dev().join("video0");
+        std::fs::write(&file, b"").unwrap();
+        let alias = fixture.dev().join("safe-alias");
+        std::os::unix::fs::symlink("video0", &alias).unwrap();
+        check_probe(alias.to_str().unwrap());
+        check_probe("/dev/null");
+        assert!(
+            refusal_of(|| check_probe("/dev/v4l/by-path/pci-fixture-video-index0"))
+                .contains("host camera node")
+        );
+    }
+
+    #[test]
+    fn populated_fixture_nodes_resolve_identity_and_pinning_from_their_class_entry() {
+        let _env = crate::testenv::ENV_LOCK.lock().unwrap();
+        let fixture = test::fixture_with(|dev, sys| {
+            let usb = sys.join("devices/pci0000:00/usb1/1-2");
+            let interface = usb.join("1-2:1.0");
+            let class = sys.join("class/video4linux/video0");
+            std::fs::create_dir_all(&interface).unwrap();
+            std::fs::create_dir_all(&class).unwrap();
+            std::fs::write(dev.join("video0"), b"").unwrap();
+            for (attr, value) in [
+                ("idVendor", "1234"),
+                ("idProduct", "5678"),
+                ("serial", "fixture"),
+                ("removable", "fixed"),
+            ] {
+                std::fs::write(usb.join(attr), value).unwrap();
+            }
+            std::os::unix::fs::symlink(interface, class.join("device")).unwrap();
+        });
+        let paths = crate::video_node_paths().paths;
+        assert_eq!(paths.len(), 1);
+        let node = &paths[0];
+        assert_eq!(
+            crate::device_identity(node).as_deref(),
+            Some("1234:5678:fixture")
+        );
+        assert_eq!(
+            crate::physical_device_id(node),
+            Some(fixture.sys().join("devices/pci0000:00/usb1/1-2"))
+        );
+        assert_eq!(crate::present_device_identities(), ["1234:5678:fixture"]);
+        crate::verify_pinned(node).unwrap();
     }
 
     #[test]

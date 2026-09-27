@@ -2198,32 +2198,42 @@ fn owned_dir(path: &std::path::Path, uid: u32) -> Option<std::fs::File> {
 /// has changed since. `O_NOFOLLOW` refuses a symlink at the lock's name, and
 /// `O_NONBLOCK` keeps a FIFO there from stalling the open.
 fn open_session_lock(dir: &std::fs::File, uid: u32) -> Option<std::fs::File> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::os::unix::io::AsRawFd;
     let path = format!("/proc/self/fd/{}/{SESSION_LOCK_NAME}", dir.as_raw_fd());
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-        .ok()?;
-    let meta = file.metadata().ok()?;
-    if !meta.is_file() || meta.uid() != uid {
-        return None;
-    }
-    // Earlier builds created the lock under the umask. Only its owner needs
-    // to open it, and a group or other reader could hold the lock, so a lock
-    // that does not read back as owner-only after narrowing is not used.
-    if meta.mode() & 0o077 != 0 {
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .ok()?;
-        if file.metadata().ok()?.mode() & 0o077 != 0 {
-            return None;
+    let open = |create_new: bool| {
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        if create_new {
+            options.create_new(true);
+        } else {
+            options.create(true).truncate(false);
         }
+        options.open(&path).ok()
+    };
+    let owned = |file: &std::fs::File| {
+        file.metadata()
+            .ok()
+            .filter(|meta| meta.is_file() && meta.uid() == uid)
+    };
+    let file = open(false)?;
+    let meta = owned(&file)?;
+    if meta.mode() & 0o077 == 0 {
+        return Some(file);
     }
-    Some(file)
+    // Earlier builds created the lock under the umask. A group or other
+    // reader may already hold a descriptor to it, which a mode change does
+    // not revoke, so the lock is replaced: removed from the checked
+    // directory, where no other account can create a file, and created anew
+    // owner-only.
+    drop(file);
+    std::fs::remove_file(&path).ok()?;
+    let file = open(true)?;
+    let meta = owned(&file)?;
+    (meta.mode() & 0o077 == 0).then_some(file)
 }
 
 pub(crate) const CAMERA_BUSY_MESSAGE: &str =
@@ -3769,11 +3779,15 @@ mod tests {
         let lock = dir.join(SESSION_LOCK_NAME);
         std::fs::write(&lock, b"").expect("lock");
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        // A descriptor opened while the lock was readable keeps pointing at
+        // that file; the session takes a new one instead.
+        let earlier = std::fs::File::open(&lock).expect("open the old lock");
+        let old_inode = earlier.metadata().expect("old lock").ino();
         let session = acquired(SessionGuard::acquire_in(Some(&dir), own_uid(), None));
-        assert_eq!(
-            std::fs::metadata(&lock).expect("lock").mode() & 0o7777,
-            0o600
-        );
+        let now = std::fs::metadata(&lock).expect("lock");
+        assert_eq!(now.mode() & 0o7777, 0o600);
+        assert_ne!(now.ino(), old_inode, "the readable lock was replaced");
+        drop(earlier);
         drop(session);
         let _ = std::fs::remove_dir_all(&dir);
     }

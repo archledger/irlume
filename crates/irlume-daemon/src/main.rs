@@ -4966,6 +4966,27 @@ fn summarize_enrollment(
     }
 }
 
+/// How `user` resolves for a worker-side load of its enrollment, held until
+/// the returned guard drops: a non-root caller's uid is already held from the
+/// gate, and root's request resolves the name here, so the load checks the
+/// records against that answer. A summary built from the load records it as
+/// its owner, so the status path serves it ([`EnrollmentSummary::serves`]).
+fn summary_owner(
+    user: &str,
+) -> (
+    irlume_core::account::Resolution,
+    Option<irlume_core::account::RememberedUid>,
+) {
+    let owner = irlume_core::account::resolve(user);
+    let held = match owner {
+        irlume_core::account::Resolution::Uid(uid) => {
+            Some(irlume_core::account::remember(user, uid))
+        }
+        _ => None,
+    };
+    (owner, held)
+}
+
 fn publish_enrollment_summary(user: &str, summary: EnrollmentSummary) {
     enrollment_summaries()
         .lock()
@@ -7109,16 +7130,7 @@ fn dispatch_scoped_session_inner(
                     Response::Error(prose)
                 }
             };
-            // The account as this load checks the records against: a
-            // non-root caller's uid is already held from the gate; root's
-            // request resolves the name here, and the load uses that answer.
-            let owner = irlume_core::account::resolve(&user);
-            let _owner_uid = match owner {
-                irlume_core::account::Resolution::Uid(uid) => {
-                    Some(irlume_core::account::remember(&user, uid))
-                }
-                _ => None,
-            };
+            let (owner, _owner_uid) = summary_owner(&user);
             let digest_before = primary_digest_now(&user);
             match irlume_core::storage::load(&user) {
                 Ok(enr) => {
@@ -8608,6 +8620,7 @@ fn remove_camera_group(
 }
 
 fn set_require_eyes_open_off(user: &str, engine: &irlume_auth::Engine) -> Response {
+    let (owner, _owner_uid) = summary_owner(user);
     let mut enrollment = match irlume_core::storage::load(user) {
         Ok(Some(enrollment)) => enrollment,
         Ok(None) => return Response::Error(format!("'{user}' is not enrolled")),
@@ -8624,6 +8637,7 @@ fn set_require_eyes_open_off(user: &str, engine: &irlume_auth::Engine) -> Respon
             );
             summarize_camera_groups(&mut summary, user, engine);
             summary.primary_digest = primary_digest_now(user);
+            summary.owner = owner;
             publish_enrollment_summary(user, summary);
             Response::Ok("require-eyes-open disabled".into())
         }
@@ -10750,6 +10764,7 @@ mod tests {
             // did (`EnrollmentSummary::serves`), which asks NSS for a root
             // peer.
             "account::resolve(",
+            "summary_owner(",
             "dispatch_status(",
         ];
         /// Drops char literals, string literals and line comments so a brace
@@ -17658,6 +17673,13 @@ mod tests {
                     }
                 ),
                 "OFF attempt {attempt} must report the retired fields as false"
+            );
+            // The published summary names the account the load resolved, so
+            // the next listing is served from it instead of queueing to the
+            // worker for another load.
+            assert!(
+                dispatch_status(&list_profiles_of("carol"), &root).is_some(),
+                "OFF attempt {attempt}: the status path serves the published summary"
             );
         }
     }

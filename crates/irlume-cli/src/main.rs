@@ -1559,8 +1559,17 @@ pub(crate) fn print_token_upgrade_notice(user: &str) {
 /// sealed secret's policy may be one another operating system reproduces
 /// (`seal_storage`). Reads the envelope's policy with `KeyringMetadata`
 /// (`KeyringInfo` from an older daemon) and the template key with
-/// `RecoveryStatus`.
-fn print_seal_storage_note(user: &str) {
+/// `RecoveryStatus`. Every flow that seals a keyring secret shows it: `keyring
+/// arm`, `irlume setup`, `keyring reseal` and the TUI's Password Wallet.
+pub(crate) fn print_seal_storage_note(user: &str) {
+    if let Some(advice) = seal_storage_advice(user) {
+        println!("{}", seal_storage::arm_note(&advice));
+    }
+}
+
+/// The guidance [`print_seal_storage_note`] prints, for a flow that shows it
+/// its own way.
+pub(crate) fn seal_storage_advice(user: &str) -> Option<seal_storage::SealAdvice> {
     // The arm just sealed a keyring secret: a daemon that does not describe
     // it still has one, under a policy it did not name.
     let keyring = match seal_storage::keyring_seal_for(user, daemon_request) {
@@ -1579,9 +1588,7 @@ fn print_seal_storage_note(user: &str) {
         )),
         pcrlock_seals: irlume_core::tpm::pcrlock_for_sealing().is_some(),
     };
-    if let Some(advice) = seal_storage::state_dir_guidance(&sealed) {
-        println!("{}", seal_storage::arm_note(&advice));
-    }
+    seal_storage::state_dir_guidance(&sealed)
 }
 
 /// `irlume keyring <arm|status|forget>`: manage the TPM-sealed login password

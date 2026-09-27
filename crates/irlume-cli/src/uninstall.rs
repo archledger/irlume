@@ -1568,7 +1568,7 @@ const UNIT_LAYERS: [&str; 7] = [
 /// one's, applied in name order; the last assignment wins, and an empty
 /// `Environment=` resets. A file that exists and cannot be read is an error:
 /// the directory it would name is unknown.
-fn unit_env(var: &str) -> Result<Option<PathBuf>, String> {
+pub(crate) fn unit_env(var: &str) -> Result<Option<PathBuf>, String> {
     unit_env_under(Path::new("/"), var)
 }
 

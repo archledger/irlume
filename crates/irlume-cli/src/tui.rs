@@ -6650,7 +6650,7 @@ impl App {
                                 wallet_salt_checked: true,
                             })
                         });
-                        match reply {
+                        let armed = match reply {
                             Ok(Response::TokenSealed { token, minted }) => {
                                 match crate::finish_token_arm(&user, &pw, token.expose(), minted) {
                                     Ok(()) => {
@@ -6671,7 +6671,8 @@ impl App {
                             }
                             Ok(resp) => map_sealed(resp),
                             Err(e) => (false, e),
-                        }
+                        };
+                        with_seal_note(&user, armed)
                     }),
                 );
             }
@@ -11653,6 +11654,21 @@ fn map_confirm(resp: Response) -> (bool, String) {
 }
 
 /// Arm the TPM-sealed login password (a slow op worth keeping off the UI thread).
+/// A keyring arm's result, with the sealed-storage guidance after a
+/// successful one, as `keyring arm` prints it ([`crate::seal_storage_advice`]).
+fn with_seal_note(user: &str, (ok, msg): (bool, String)) -> (bool, String) {
+    if !ok {
+        return (ok, msg);
+    }
+    match crate::seal_storage_advice(user) {
+        Some(advice) => {
+            let label = if advice.warn { "Warning" } else { "Note" };
+            (ok, format!("{msg}. {label}: {}", advice.text))
+        }
+        None => (ok, msg),
+    }
+}
+
 fn map_sealed(resp: Response) -> (bool, String) {
     match resp {
         Response::PasswordSealed => (

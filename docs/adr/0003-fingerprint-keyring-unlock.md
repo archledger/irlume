@@ -108,7 +108,10 @@ PCR 4 (PCRs 0 to 3 measure this machine's firmware, which is the same
 whatever it boots), a signed PCR 11 policy (Tier 1) from an earlier release,
 and a pcrlock policy (Tier 2) without PCR 4, which systemd-pcrlock makes
 when the binaries measured there are not locked (`lock-pe`, `lock-uki`). A
-pcrlock policy that covers PCR 4 closes the second path, not the first.
+policy that covers PCR 4 closes the second path only where the boot loader
+also measures what it loads next (a unified kernel image does; a GRUB boot
+leaves the initrd and the kernel command line to PCRs 9 and 8), and never
+closes the first.
 
 What protects the sealed secret at rest on this machine is full-disk
 encryption unlocked by a passphrase or PIN (a volume the TPM or a key file
@@ -122,7 +125,8 @@ Keyring arming stays opt-in and every tier stays supported. `irlume keyring
 arm` (after an arm) and `irlume doctor` (check `sealed-storage`) report this
 for the account's keyring secret and template key: a warning when either is
 sealed and no dm-crypt layer is found under the state directory, or the
-storage cannot be established, and information when it is on dm-crypt and a
-sealed secret's policy may be one another operating system reproduces (the
-template key's policy is not reported, so a sealed template key counts)
-([SECURITY_AT_REST.md](../SECURITY_AT_REST.md), layer 3).
+storage cannot be established, and information whenever it is on dm-crypt,
+since the storage does not show how that volume unlocks, naming each sealed
+secret's policy another operating system may reproduce
+([SECURITY_AT_REST.md](../SECURITY_AT_REST.md), layer 3). `irlume setup`,
+`irlume keyring reseal` and the TUI show the same guidance after a seal.

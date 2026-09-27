@@ -870,14 +870,16 @@ All notable changes to irlume are documented here. This project adheres to
   `/usr/lib/systemd/systemd-pcrlock` steps. The check reports `warn` when a
   keyring secret or a template key is sealed and no dm-crypt layer is found
   under the state directory, or the storage cannot be established; `info`
-  when it is on dm-crypt and a sealed secret's policy may be one another
-  operating system reproduces (the template key's is not reported, so a
-  sealed template key counts), since the storage does not show whether the
-  volume asks for a passphrase; `info` when nothing is sealed; `pass` when
-  only a keyring secret under a policy that covers PCR 4 is sealed and the
-  state directory is on dm-crypt; and `unknown` when irlumed does not say
-  what is sealed. `keyring arm` prints the same guidance after an arm, also
-  when irlumed then does not describe the new secret. An irlumed from before
+  whenever it is on dm-crypt, since the storage does not show whether the
+  volume asks for a passphrase, naming each sealed secret's policy another
+  operating system may reproduce (a policy with PCR 4 included where the
+  boot loader does not measure what it loads next, as on a GRUB boot);
+  `info` when nothing is sealed; and `unknown` when irlumed does not say
+  what is sealed. The state directory probed is irlumed's, the one its
+  unit sets for a source install included. `keyring arm`, `irlume setup`,
+  `irlume keyring reseal` and the TUI's Password Wallet show the same
+  guidance after a seal, also when irlumed then does not describe the new
+  secret. An irlumed from before
   `KeyringMetadata` is asked `KeyringInfo` instead. The storage probe
   follows the state directory's block device through device-mapper
   (dm-crypt, LVM), md RAID and partitions, and every device of a btrfs

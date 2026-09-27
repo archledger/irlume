@@ -266,11 +266,19 @@ fn pcr_list(pcrs: &[u32]) -> String {
     format!("{noun} {list}")
 }
 
+/// What a policy that covers the boot loader (PCR 4) still leaves open: PCR 4
+/// measures the boot loaders that run, not always what they load next.
+const BOOT_LOADER_CAVEAT: &str = "the boot loader (PCR 4) closes a direct unseal only where \
+     the boot loader also measures what it loads next, as a unified kernel image does; a GRUB \
+     boot leaves the initrd and the kernel command line to PCRs 9 and 8, so another system \
+     started through the same signed boot loaders can still reproduce";
+
 /// The sentence for `who` sealed under the literal PCR policy over `pcrs`
 /// (an empty list is the default, PCR 7). A set with PCR 4 binds the boot
-/// loader, which another operating system changes, and is named without the
-/// point on it; any other set is reproduced by another operating system,
-/// signed with the same keys where the set includes PCR 7.
+/// loader, which is reproducible only where the boot loaders do not measure
+/// what they load next; any other set is reproduced by another operating
+/// system, signed with the same keys where the set includes PCR 7. Each is
+/// treated as one that may be reproduced.
 fn literal_binding(who: Who, pcrs: &[u32]) -> PolicyNote {
     let Who { subject, object } = who;
     let pcrs = if pcrs.is_empty() { &[7][..] } else { pcrs };
@@ -280,9 +288,10 @@ fn literal_binding(who: Who, pcrs: &[u32]) -> PolicyNote {
         return PolicyNote {
             text: format!(
                 "{subject} sealed under a literal PCR policy over {list} (Tier 3, set by \
-                 IRLUME_PCRS), which does not change that."
+                 IRLUME_PCRS). Covering {BOOT_LOADER_CAVEAT} what it binds and unseal {object} \
+                 directly."
             ),
-            reproducible: false,
+            reproducible: true,
         };
     }
     // PCRs 0 to 3, 5 and 6: firmware, its configuration, option ROMs and the
@@ -326,11 +335,18 @@ fn literal_binding(who: Who, pcrs: &[u32]) -> PolicyNote {
 }
 
 /// The sentence for a keyring secret sealed under a pcrlock policy over
-/// `pcrs`: `None` when the policy covers the boot loader (PCR 4), which
-/// closes the direct unseal.
+/// `pcrs`. One that covers the boot loader (PCR 4) still gets the caveat on
+/// what PCR 4 measures, as information.
 fn pcrlock_binding(pcrs: &[u32]) -> Option<PolicyNote> {
     if pcrs.contains(&BOOT_LOADER_PCR) {
-        return None;
+        return Some(PolicyNote {
+            text: format!(
+                "The keyring secret is sealed under a pcrlock policy (Tier 2) over {}. Covering \
+                 {BOOT_LOADER_CAVEAT} what it binds and unseal the keyring secret directly.",
+                pcr_list(pcrs)
+            ),
+            reproducible: true,
+        });
     }
     let over = if pcrs.is_empty() {
         String::new()
@@ -475,9 +491,9 @@ pub(crate) struct SealAdvice {
 }
 
 /// The guidance for what `sealed` describes, given what the storage probe
-/// found for `state_dir`: `None` when nothing is sealed, or when the state
-/// directory is on encrypted storage and no sealed secret's policy may be
-/// one another operating system reproduces.
+/// found for `state_dir`: `None` when nothing is sealed. On encrypted
+/// storage it is always information: the storage cannot show whether the
+/// volume asks for a passphrase or PIN.
 pub(crate) fn guidance(
     sealed: &Sealed,
     storage: StorageEncryption,
@@ -491,19 +507,15 @@ pub(crate) fn guidance(
             let reproducible = notes
                 .into_iter()
                 .filter(|note| note.reproducible)
-                .map(|note| note.text)
-                .collect::<Vec<_>>();
-            if reproducible.is_empty() {
-                return None;
-            }
+                .map(|note| note.text + " ")
+                .collect::<String>();
             return Some(SealAdvice {
                 text: format!(
-                    "{} {dir} is on encrypted storage, which protects the sealed secrets at rest \
-                     only if that volume asks for a passphrase or PIN to unlock; a volume the TPM \
-                     or a key file unlocks alone does not count. A pcrlock policy (Tier 2) that \
-                     covers the boot loader (PCR 4) is worth having in addition: {PCRLOCK_STEPS} \
-                     ({DOC}).",
-                    reproducible.join(" ")
+                    "{reproducible}{dir} is on encrypted storage, which protects the sealed \
+                     secrets at rest only if that volume asks for a passphrase or PIN to unlock; a \
+                     volume the TPM or a key file unlocks alone does not count. A pcrlock policy \
+                     (Tier 2) that covers the boot loader (PCR 4) is worth having in addition: \
+                     {PCRLOCK_STEPS} ({DOC})."
                 ),
                 warn: false,
             });
@@ -542,11 +554,23 @@ pub(crate) fn guidance(
     })
 }
 
-/// [`guidance`] for irlume's state directory on this system's storage. The
-/// storage is probed only when something is sealed.
+/// irlumed's state directory: this process's `IRLUME_STATE_DIR` when it is
+/// set, else the one irlumed's unit sets (a source install writes it into the
+/// unit, not the shell), else the default.
+fn daemon_state_dir() -> std::path::PathBuf {
+    if std::env::var_os("IRLUME_STATE_DIR").is_none() {
+        if let Ok(Some(dir)) = crate::uninstall::unit_env("IRLUME_STATE_DIR") {
+            return dir;
+        }
+    }
+    irlume_common::state_dir()
+}
+
+/// [`guidance`] for irlumed's state directory ([`daemon_state_dir`]) on this
+/// system's storage. The storage is probed only when something is sealed.
 pub(crate) fn state_dir_guidance(sealed: &Sealed) -> Option<SealAdvice> {
     Subject::of(sealed)?;
-    let dir = irlume_common::state_dir();
+    let dir = daemon_state_dir();
     guidance(
         sealed,
         irlume_common::storage_encryption::path_encryption(&dir),
@@ -561,18 +585,19 @@ pub(crate) fn arm_note(advice: &SealAdvice) -> String {
     format!("[keyring] {label}: {}", advice.text)
 }
 
-/// Doctor's `sealed-storage` check for `user`: `warn` with the guidance,
-/// `info` with it where it is information or when nothing is sealed, `pass`
-/// when something is sealed, the daemon said what else is and there is no
-/// guidance, and `unknown` when the daemon did not say what is sealed.
-/// `probe` answers for `state_dir` and runs only when something is sealed.
+/// Doctor's `sealed-storage` check for `user`: `warn` with the guidance
+/// where no dm-crypt layer is found under the state directory (or that
+/// cannot be established), `info` with it on encrypted storage (whose unlock
+/// method the storage does not show) and when nothing is sealed, and
+/// `unknown` when the daemon did not say what is sealed. `probe` answers for
+/// `state_dir` and runs only when something is sealed.
 pub(crate) fn check(
     user: &str,
     sealed: &Sealed,
     state_dir: &Path,
     probe: impl FnOnce(&Path) -> StorageEncryption,
 ) -> (State, String) {
-    let Some(subject) = Subject::of(sealed) else {
+    if Subject::of(sealed).is_none() {
         return if sealed.keyring == KeyringSeal::NotArmed && sealed.template_key == Some(false) {
             (
                 State::Info,
@@ -587,46 +612,25 @@ pub(crate) fn check(
                 format!("irlumed did not say what is sealed for {user}"),
             )
         };
-    };
-    let dir = state_dir.display();
+    }
     match guidance(sealed, probe(state_dir), state_dir) {
         Some(advice) if advice.warn => (State::Warn, advice.text),
         Some(advice) => (State::Info, advice.text),
-        // What the daemon did not describe may be sealed under a policy
-        // that would make this information, so it is not a pass.
-        None if sealed.keyring == KeyringSeal::Unknown || sealed.template_key.is_none() => (
-            State::Unknown,
-            format!(
-                "irlumed did not say whether {} for {user}; {} {} sealed, and {dir} is on \
-                 encrypted storage",
-                if sealed.keyring == KeyringSeal::Unknown {
-                    "a keyring secret is armed"
-                } else {
-                    "a template key is sealed"
-                },
-                subject.what,
-                subject.verb()
-            ),
-        ),
+        // Not reached: something is sealed, so there is guidance.
         None => (
-            State::Pass,
-            format!(
-                "{} {} sealed, and {dir} is on encrypted storage, which protects {} at rest if \
-                 that volume asks for a passphrase or PIN to unlock",
-                subject.what,
-                subject.verb(),
-                subject.pronoun()
-            ),
+            State::Unknown,
+            format!("irlumed did not say what is sealed for {user}"),
         ),
     }
 }
 
-/// [`check`] against irlume's state directory and this system's storage.
+/// [`check`] against irlumed's state directory ([`daemon_state_dir`]) and
+/// this system's storage.
 pub(crate) fn state_dir_check(user: &str, sealed: &Sealed) -> (State, String) {
     check(
         user,
         sealed,
-        &irlume_common::state_dir(),
+        &daemon_state_dir(),
         irlume_common::storage_encryption::path_encryption,
     )
 }
@@ -640,6 +644,7 @@ mod tests {
     const OFFLINE: &str = "someone with this machine can change the installed system offline";
     const DIRECT: &str = "another operating system signed with the same keys reproduces it";
     const REMEDY: &str = "full-disk encryption unlocked by a passphrase or PIN";
+    const GRUB: &str = "a GRUB boot leaves the initrd and the kernel command line to PCRs 9 and 8";
     const VERITY: &str = "an integrity-verified root filesystem (dm-verity) that covers \
                           everything the boot runs and reads configuration from, with its root \
                           hash bound by a pcrlock policy or a signature, together with a pcrlock \
@@ -815,11 +820,14 @@ mod tests {
                 && text.contains("a pcrlock policy that does not cover the boot loader (PCR 4)"),
             "{text}"
         );
-        // A keyring secret whose pcrlock policy covers PCR 4 adds nothing.
-        assert_eq!(
-            information(&sealed(pcrlock(), Some(true))),
-            text,
-            "only the template key is named"
+        // A keyring secret whose pcrlock policy covers PCR 4 adds its caveat
+        // before the template key's.
+        let both = information(&sealed(pcrlock(), Some(true)));
+        assert!(
+            both.starts_with("The keyring secret is sealed under a pcrlock policy (Tier 2)")
+                && both.contains(GRUB)
+                && both.ends_with(&text),
+            "{both}"
         );
     }
 
@@ -894,7 +902,8 @@ mod tests {
             "{text}"
         );
 
-        // A keyring set with PCR 4 is not taken for the template key's.
+        // A keyring set with PCR 4 is not taken for the template key's; it
+        // carries the caveat on what PCR 4 measures.
         let text = warning(
             &sealed(literal(vec![4, 7]), Some(true)),
             StorageEncryption::NotEncrypted,
@@ -902,16 +911,24 @@ mod tests {
         assert!(
             text.contains(
                 "The keyring secret is sealed under a literal PCR policy over PCRs 4, 7 (Tier 3, \
-                 set by IRLUME_PCRS), which does not change that. The template key goes through"
-            ),
+                 set by IRLUME_PCRS). Covering the boot loader (PCR 4) closes a direct unseal \
+                 only where"
+            ) && text.contains(GRUB)
+                && text.contains(TEMPLATE_LITERAL),
             "{text}"
         );
         let text = information(&sealed(literal(vec![4, 7]), Some(true)));
-        assert!(text.starts_with(TEMPLATE_LITERAL), "{text}");
+        assert!(
+            text.starts_with(
+                "The keyring secret is sealed under a literal PCR policy over PCRs 4, 7"
+            ) && text.contains(TEMPLATE_LITERAL),
+            "{text}"
+        );
     }
 
-    /// A pcrlock policy that covers PCR 4 closes the direct unseal, not the
-    /// offline change.
+    /// A pcrlock policy that covers PCR 4 does not close the offline change,
+    /// and closes the direct unseal only where the boot loader measures what
+    /// it loads next: it warns off encrypted storage and informs on it.
     #[test]
     fn a_pcrlock_keyring_secret_off_encrypted_storage_still_warns() {
         let text = warning(
@@ -919,17 +936,13 @@ mod tests {
             StorageEncryption::NotEncrypted,
         );
         assert!(text.contains(OFFLINE) && text.contains(REMEDY), "{text}");
-        assert!(
-            !text.contains("Tier 3") && !text.contains("another operating system"),
-            "{text}"
-        );
-        assert_eq!(
-            advise(
-                &sealed(pcrlock(), Some(false)),
-                StorageEncryption::Encrypted
-            ),
-            None
-        );
+        assert!(!text.contains("Tier 3") && text.contains(GRUB), "{text}");
+        let info = advise(
+            &sealed(pcrlock(), Some(false)),
+            StorageEncryption::Encrypted,
+        )
+        .expect("information on encrypted storage");
+        assert!(!info.warn && info.text.contains(GRUB), "{}", info.text);
     }
 
     /// systemd-pcrlock leaves out a PCR it cannot match to locked
@@ -1049,18 +1062,28 @@ mod tests {
         }
     }
 
+    /// On encrypted storage the guidance is always information: the storage
+    /// cannot show whether the volume asks for a passphrase, and a policy
+    /// that covers the boot loader (PCR 4) carries the caveat on what PCR 4
+    /// measures.
     #[test]
-    fn encrypted_storage_under_a_policy_that_covers_the_boot_loader_gets_none() {
+    fn encrypted_storage_under_a_policy_that_covers_the_boot_loader_is_information() {
         for sealed in [
             sealed(pcrlock(), Some(false)),
             sealed(pcrlock(), None),
             sealed(literal(vec![4, 7]), Some(false)),
             sealed(literal(vec![0, 2, 4, 7, 11]), None),
         ] {
-            assert_eq!(
-                advise(&sealed, StorageEncryption::Encrypted),
-                None,
-                "{sealed:?}"
+            let advice =
+                advise(&sealed, StorageEncryption::Encrypted).expect("information, not none");
+            assert!(
+                !advice.warn
+                    && advice.text.contains(GRUB)
+                    && advice
+                        .text
+                        .contains("only if that volume asks for a passphrase"),
+                "{sealed:?}: {}",
+                advice.text
             );
         }
     }
@@ -1110,8 +1133,8 @@ mod tests {
     }
 
     /// A literal set with the boot loader (PCR 4) is still open to an
-    /// offline change of the installed system: it warns, naming the set,
-    /// without the point about another operating system.
+    /// offline change of the installed system: it warns, naming the set, with
+    /// the caveat on what PCR 4 measures.
     #[test]
     fn a_literal_set_with_the_boot_loader_off_encrypted_storage_warns() {
         for (pcrs, named) in [
@@ -1129,12 +1152,11 @@ mod tests {
             assert!(text.contains(OFFLINE) && text.contains(REMEDY), "{text}");
             assert!(
                 text.contains(&format!(
-                    "The keyring secret is sealed under a literal PCR policy {named}, which does \
-                     not change that."
-                )),
+                    "The keyring secret is sealed under a literal PCR policy {named}. Covering the \
+                     boot loader (PCR 4)"
+                )) && text.contains(GRUB),
                 "{text}"
             );
-            assert!(!text.contains("another operating system"), "{text}");
         }
     }
 
@@ -1329,27 +1351,21 @@ mod tests {
                 StorageEncryption::Encrypted
             },
         );
-        assert_eq!(state, State::Pass);
-        assert_eq!(
-            detail,
-            "the keyring secret is sealed, and /srv/irlume-state is on encrypted storage, which \
-             protects it at rest if that volume asks for a passphrase or PIN to unlock"
+        assert_eq!(state, State::Info);
+        assert!(
+            detail.contains("/srv/irlume-state is on encrypted storage") && detail.contains(GRUB),
+            "{detail}"
         );
         assert_eq!(
             asked.borrow().as_deref(),
             Some(Path::new("/srv/irlume-state"))
         );
 
-        // What the daemon did not describe is not folded into a pass.
-        let (state, detail) = check("tester", &sealed(pcrlock(), None), dir, |_| {
+        // Nothing on encrypted storage is a pass.
+        let (state, _) = check("tester", &sealed(pcrlock(), None), dir, |_| {
             StorageEncryption::Encrypted
         });
-        assert_eq!(state, State::Unknown);
-        assert_eq!(
-            detail,
-            "irlumed did not say whether a template key is sealed for tester; the keyring \
-             secret is sealed, and /var/lib/irlume is on encrypted storage"
-        );
+        assert_eq!(state, State::Info);
         let unknown_keyring = sealed(KeyringSeal::Unknown, Some(true));
         let (state, detail) = check("tester", &unknown_keyring, dir, |_| {
             StorageEncryption::Encrypted

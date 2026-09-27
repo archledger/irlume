@@ -87,8 +87,11 @@ matching also requires passing IR liveness; an inverted RGB image can't.)
    cannot match to locked components, so PCR 4 is covered only once the
    binaries measured there are locked before `make-policy`: `lock-pe` for a
    boot loader, `lock-uki` for a unified kernel image (the tool is
-   `/usr/lib/systemd/systemd-pcrlock`, outside `PATH`). A pcrlock policy that
-   covers PCR 4 closes the second path, not the first.
+   `/usr/lib/systemd/systemd-pcrlock`, outside `PATH`). A policy that covers
+   PCR 4 closes the second path only where the boot loader also measures what
+   it loads next, as a unified kernel image does; a GRUB boot leaves the
+   initrd and the kernel command line to PCRs 9 and 8, which a pcrlock policy
+   leaves out by default. It never closes the first.
 
    What protects the sealed secrets at rest is full-disk encryption unlocked
    by a passphrase or PIN (a volume the TPM or a key file unlocks alone does
@@ -112,12 +115,17 @@ matching also requires passing IR liveness; an inverted RGB image can't.)
    unlocks from the TPM or a key file alone. The report is a warning when a
    keyring secret or a template key is sealed and no dm-crypt layer is found,
    or the storage cannot be established, so it stays a warning on a verified
-   root. It is information when the state directory is on dm-crypt and a
-   sealed secret's policy may be one another operating system reproduces: the
-   keyring secret's, when it does not cover PCR 4 or irlume cannot read it,
-   and the template key's, which the daemon does not report (where no pcrlock
-   policy is used for sealing it is the literal one). With an `IRLUME_PCRS`
-   override the guidance names the PCRs the keyring seal binds.
+   root. It is information whenever the state directory is on dm-crypt,
+   since the storage does not show how that volume unlocks, and it names each
+   sealed secret's policy another operating system may reproduce: the keyring
+   secret's (one without PCR 4, one with PCR 4 on a boot loader that does not
+   measure what it loads next, or one irlume cannot read) and the template
+   key's, which the daemon does not report (where no pcrlock policy is used
+   for sealing it is the literal one). With an `IRLUME_PCRS` override the
+   guidance names the PCRs the keyring seal binds. The state directory probed
+   is irlumed's, the one its unit sets for a source install included; `irlume
+   setup`, `irlume keyring reseal` and the TUI's Password Wallet show the same
+   guidance after a seal.
 
 ### Compared with Windows Enhanced Sign-in Security
 

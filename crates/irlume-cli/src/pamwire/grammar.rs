@@ -284,6 +284,16 @@ pub(super) fn is_auth_substack_anchor(line: &str) -> bool {
     toks.first() == Some(&"auth") && toks.get(1) == Some(&"substack")
 }
 
+/// Whether `line` is a password step the verify stanza goes above: an inline
+/// include of the auth stack, a shared password substack, any auth substack,
+/// or the `pam_unix.so` auth line.
+pub(super) fn is_password_step(line: &str) -> bool {
+    is_include_auth_layout(line)
+        || is_passwd_substack(line, "auth")
+        || is_auth_substack_anchor(line)
+        || (is_auth_directive(line) && rule_names_module(line, "pam_unix.so"))
+}
+
 /// Where the face block anchors, in descending order of confidence: a shared
 /// stack we recognize by name, then any `substack` whatever its name, and only
 /// then the first `auth` line. The last tier is a guess and is kept last

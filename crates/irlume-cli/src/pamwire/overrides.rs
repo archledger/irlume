@@ -407,6 +407,115 @@ fn filled_in_place(body: &str, wired: &str, edited: bool) -> Option<(String, Jum
     }
 }
 
+/// [`fill_slots`] for a stack irlume edits in place: `current` with each of
+/// irlume's lines, an inactive line holding a place included, taking the line
+/// `wired` has for the same job. The filled text when every numeric jump of
+/// the other lines lands where it does in `current`, irlume's own jumps land
+/// as they do in `wired`, and each of irlume's lines sits on the side of the
+/// password step the recipe puts it on; `None` when irlume's lines do not fit
+/// those places.
+pub(super) fn refill(current: &str, wired: &str) -> Option<String> {
+    let filled = fill_slots(current, wired)?;
+    (own_landings(&filled) == own_landings(wired)
+        && jump_shifts(current, &filled).is_empty()
+        && same_side_of_the_password_step(&filled, wired)
+        && recipe_lines_above_stay_above(&filled, wired))
+    .then_some(filled)
+}
+
+/// Whether the refill keeps the recipe's order around each of irlume's
+/// active lines. Every line the recipe puts above one of them is still above
+/// it in `filled`: a gate an administrator moves or adds between a held place
+/// and the password step after a disable is such a line, and refilled above
+/// it, a face match would end the stack before the gate ran. A line the
+/// recipe puts below it may sit above it in `filled` only when it carries a
+/// numeric jump, the jump the held place is kept for; any other line there,
+/// such as a keyring consumer that must run after irlume's unseal line to see
+/// the released password, refuses the refill. irlume's own tagged keyring
+/// consumer counts as such a line too. Only lines of the same PAM phase as
+/// irlume's line count, since each phase runs as its own chain; an
+/// `@include`, which brings in every phase of its file, counts for every
+/// phase. Lines without a PAM directive (comments, blank lines) do not
+/// count.
+pub(super) fn recipe_lines_above_stay_above(filled: &str, wired: &str) -> bool {
+    // Every line that runs, except irlume's module lines and the inactive
+    // and landing lines that hold its places (their places are checked by
+    // the jump landings).
+    let ordered = |l: &str| {
+        !directive(l).trim().is_empty()
+            && (!is_irlume_line(l)
+                || (grammar::rule_names_module(l, "pam_gnome_keyring.so")
+                    && l.contains(KEYRING_TAG)))
+    };
+    let others_above = |text: &str, line: &str| -> Option<Vec<String>> {
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines.iter().position(|l| l.trim() == line)?;
+        let own = phase(line);
+        Some(
+            lines[..at]
+                .iter()
+                .filter(|l| ordered(l))
+                .filter(|l| match (own, phase(l)) {
+                    (Some(own), Some(other)) => own == other,
+                    _ => true,
+                })
+                .map(|l| l.trim().to_string())
+                .collect(),
+        )
+    };
+    wired
+        .lines()
+        .filter(|l| is_irlume_line(l) && !l.contains(INERT_TAG))
+        .all(|line| {
+            let line = line.trim();
+            match (others_above(wired, line), others_above(filled, line)) {
+                (Some(needed), Some(mut have)) => {
+                    needed.iter().all(|other| {
+                        have.iter()
+                            .position(|h| h == other)
+                            .map(|at| have.remove(at))
+                            .is_some()
+                    }) && have.iter().all(|moved| !numeric_actions(moved).is_empty())
+                }
+                // The recipe's line is not in the refill: nothing it keeps.
+                (Some(_), None) | (None, _) => true,
+            }
+        })
+}
+
+/// Whether each of irlume's active lines in `wired` sits on the same side of
+/// the first password step ([`grammar::is_password_step`]) in `filled`: the
+/// recipe puts a verify or face line above it and a reseal line below it. A
+/// place a disable held stops being that line's place once the step has
+/// moved across it, as when an administrator moves `pam_unix.so` above it:
+/// a verify line refilled below the step would never be reached. Only auth
+/// lines are compared: the other phases run as their own chains. True when
+/// either stack has no password step.
+pub(super) fn same_side_of_the_password_step(filled: &str, wired: &str) -> bool {
+    let sides = |text: &str| -> Option<Vec<(String, bool)>> {
+        let lines: Vec<&str> = text.lines().collect();
+        let step = lines
+            .iter()
+            .position(|l| !is_irlume_line(l) && grammar::is_password_step(l))?;
+        Some(
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| {
+                    is_irlume_line(l) && !l.contains(INERT_TAG) && phase(l) == Some("auth")
+                })
+                .map(|(at, l)| (l.trim().to_string(), at < step))
+                .collect(),
+        )
+    };
+    match (sides(filled), sides(wired)) {
+        (Some(filled), Some(wired)) => wired
+            .iter()
+            .all(|line| filled.iter().any(|placed| placed == line)),
+        _ => true,
+    }
+}
+
 // ---- numeric jumps -------------------------------------------------------------
 //
 // A control such as `[success=2 default=ignore]` skips the next two modules of

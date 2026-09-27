@@ -4522,6 +4522,22 @@ mod tests {
             &format!("{tagged}\n{KEYRING_UNSEAL}\n{step}\n"),
             &format!("{KEYRING_UNSEAL}\n{tagged}\n{step}\n"),
         ));
+        // Only lines of irlume's line's own phase are ordered: a session line
+        // moved across an auth line is not, in either direction, while an
+        // `@include common-auth` is an auth line.
+        let session = "session optional pam_umask.so";
+        assert!(overrides::recipe_lines_above_stay_above(
+            &format!("{session}\n{VERIFY_STANZA}\n{gate}\n{step}\n"),
+            &format!("{VERIFY_STANZA}\n{gate}\n{session}\n{step}\n"),
+        ));
+        assert!(overrides::recipe_lines_above_stay_above(
+            &format!("{VERIFY_STANZA}\n{gate}\n{step}\n{session}\n"),
+            &format!("{session}\n{VERIFY_STANZA}\n{gate}\n{step}\n"),
+        ));
+        assert!(!overrides::recipe_lines_above_stay_above(
+            &format!("{VERIFY_STANZA}\n@include common-auth\n"),
+            &format!("@include common-auth\n{VERIFY_STANZA}\n"),
+        ));
         // Comments and blank lines do not order anything.
         assert!(overrides::recipe_lines_above_stay_above(
             &format!("{VERIFY_STANZA}\n# moved by hand\n\n{gate}\n{step}\n"),

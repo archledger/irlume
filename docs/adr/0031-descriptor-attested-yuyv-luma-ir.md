@@ -112,7 +112,13 @@ Every failure, an unreadable or absent descriptor included, keeps the node
 and the fuzz target pin that both return the same units.
 
 `irlume camera census` and `irlume doctor` print, for every `{YUYV}`-only
-node, either the attestation or the clause that refused it. The census
+camera row, either the attestation or the clause that refused it. A dummy
+node such as a v4l2loopback feeder has no USB descriptor, and its row
+carries no such line. The refusal keeps three failures apart: a descriptor
+that could not be read, a descriptor file that is malformed (including one
+without a complete active configuration), and a node whose USB interface
+is not a UVC VideoControl interface, so a readable, well-formed descriptor
+is never reported as unreadable or malformed. The census
 classes (`uvc_ir`, `uvc_rgb`) and the doctor's section header do not change,
 because `scripts/ir-node-from-doctor.sh` and the machine API depend on them.
 While §4 is pending, a YUYV IR sensor that completes a pair is reported as
@@ -240,13 +246,14 @@ than the 640x400 constant.
 
 | Boundary | Required result |
 |---|---|
-| Descriptor rule | The ASUS 3277:0059 IR function (interface 2) is attested and its RGB function (interface 0) is not; the T480 5986:1141 function is attested and 5986:2113 is not; two streams, each colour bit alone, a Microsoft unit without selector 0x06 or with more bits than `bNumControls`, two Microsoft units, a truncated header, Processing Unit or tail, a listed interface that is not VideoStreaming, a face-authentication unit on another interface, and a node without a USB parent are each refused with the named reason |
+| Descriptor rule | The ASUS 3277:0059 IR function (interface 2) is attested and its RGB function (interface 0) is not; the T480 5986:1141 function is attested and 5986:2113 is not; two streams, each colour bit alone, a Microsoft unit without selector 0x06 or with more bits than `bNumControls`, two Microsoft units, a truncated header, Processing Unit or tail, a listed interface that is not VideoStreaming, a face-authentication unit on another interface, a node interface that is not a VideoControl interface, a descriptor file without one complete active configuration, and a node without a USB parent are each refused with the named reason |
 | Parser agreement | The new walker and the emitter's extension-unit parser return the same units for every interface of the ASUS fixture, and the fuzz target asserts it on arbitrary input |
 | Classification | `[YUYV]` with the attestation is `Role::Ir` and without it `Role::Rgb`; MJPG+YUYV, YUYV+RGB3, NV12, NV12+YUYV and YUYV+GREY stay what their formats say whatever the attestation; the descriptor is not consulted for GREY, Y16, metadata or empty format lists |
-| Frame size | GREY and Y16 ignore the size list and request 640x400; unattested YUYV requests 640x400; attested YUYV requests 340x340 from `{640x480, 340x340}` in either order, 400x400 from `{400x480, 400x400}`, 640x400 from an empty or too-small list, and the first of two equal areas; a replica of uvcvideo's nearest-size rule shows 640x400 landing on 640x480 |
-| Qualification | The IR stream contract records the requested size it is given, not 640x400 |
-| Census | An attested node is `uvc_ir`, unpaired, supported with limits, with the descriptor line; an unattested YUYV node names its refusal; a GREY IR node and a loopback YUYV node carry no descriptor line |
-| No probe | Discovery, the census and the doctor reach the attestation only through the sysfs reader; nothing on those paths streams frames for it |
+| Frame size | GREY and Y16 ignore the size list and request 640x400; unattested YUYV requests 640x400; attested YUYV requests 340x340 from `{640x480, 340x340}` in either order, 400x400 from `{400x480, 400x400}`, 640x400 from an empty or too-small list, and the first of two equal areas; a replica of uvcvideo's nearest-size rule shows 640x400 landing on 640x480; the candidate walk hands the format ioctl the size it chose |
+| Qualification | The IR stream contract records the requested size it is given, not 640x400, and the open IR camera builds it from the request it made |
+| Capture binding | IR negotiation reads the attestation from the open file descriptor, never from the node path; an ignored hardware test opens an attested YUYV IR camera and checks the 340x340 request and echo |
+| Census | An attested node is `uvc_ir`, unpaired, supported with limits, with the descriptor line; an unattested YUYV node names its refusal; a GREY IR node, an MJPG+YUYV node and a loopback YUYV node carry no descriptor line, whatever descriptor answer their facts hold |
+| No probe | Discovery and the census decide the role only through the sysfs reader; the doctor's IR stream line reuses the capture walk, whose fd-bound attestation is also a read (`fstat` and sysfs on the file descriptor the probe already holds); nothing on those paths streams frames for it |
 | Lease | Nodes on two inventory entries refuse with the split-device error; one entry holding both nodes still leases |
 
 The T480 fixtures are transcribed from the published `lsusb -v` report

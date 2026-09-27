@@ -7145,7 +7145,17 @@ fn dispatch_scoped_session_inner(
                         engine.ir_space(),
                         engine.ir_dim(),
                     );
-                    summarize_camera_groups(&mut sum, &user, engine);
+                    if enr.is_none() && digest_before != PrimaryDigest::Absent {
+                        // A primary enrollment that is there but did not
+                        // load was recorded for another uid, or its key
+                        // was (`storage::load` reads it as absent). The
+                        // camera store beside it records no uid and is that
+                        // account's as well: not summarized. Its file state
+                        // is kept, so the status path serves this summary.
+                        sum.camera_store.file = camera_store_digest_now(&user);
+                    } else {
+                        summarize_camera_groups(&mut sum, &user, engine);
+                    }
                     // Tied to the bytes the load read: a file that changed
                     // under the load is not filed under its new digest.
                     sum.primary_digest =
@@ -16505,6 +16515,66 @@ mod tests {
             0,
             "the worker reads the enrollment as another uid's"
         );
+    }
+
+    /// A primary enrollment recorded for another uid reads as not enrolled,
+    /// and the camera store beside it, which records no uid, is that
+    /// account's as well: a listing for the account the name now resolves
+    /// to shows none of its groups, from the worker or from the cache. For
+    /// the uid the enrollment records, the same files list the profile and
+    /// the group.
+    #[test]
+    fn a_listing_leaves_out_the_camera_store_of_an_enrollment_recorded_for_another_uid() {
+        let _g = enrollment_summary_test_lock();
+        let mut e = engine();
+        let sb = sandbox("summary-other-camera-store");
+        let user = "nobody";
+        let recorded = uid_of(user).expect("NSS account nobody");
+        let (mut enrollment, mut store) = camera_group_fixture(&sb.dir);
+        enrollment.user = user.into();
+        enrollment.uid = Some(recorded);
+        write_enrollment(&sb.dir, &enrollment);
+        store.owner = user.into();
+        store.primary_snapshot_sha256 = irlume_common::sha256_hex(
+            &std::fs::read(sb.dir.join(format!("{user}.json"))).expect("primary bytes"),
+        );
+        // Plaintext, as a host without a TPM writes it: no key involved.
+        irlume_core::multi_camera::save_secondary_resolved(
+            &irlume_core::multi_camera::secondary_store_path(user),
+            &store,
+            |_| Ok(None),
+        )
+        .expect("plant the camera store");
+        let listing = |response: Response| match response {
+            Response::Enrollment {
+                profiles,
+                camera_groups,
+                camera_store_error,
+                ..
+            } => {
+                assert!(camera_store_error.is_none(), "{camera_store_error:?}");
+                (profiles.len(), camera_groups.len())
+            }
+            other => panic!("expected a listing, got {other:?}"),
+        };
+        let root = peer(0);
+        {
+            let _then = irlume_core::account::remember(user, recorded);
+            assert_eq!(
+                listing(dispatch(list_profiles_of(user), &root, &mut e)),
+                (1, 1),
+                "the account the records belong to"
+            );
+        }
+        let _recreated = irlume_core::account::remember(user, recorded.wrapping_add(1));
+        assert_eq!(
+            listing(dispatch(list_profiles_of(user), &root, &mut e)),
+            (0, 0),
+            "the worker leaves the other account's camera store out"
+        );
+        let cached = dispatch_status(&list_profiles_of(user), &root)
+            .expect("the published summary answers from the cache");
+        assert_eq!(listing(cached), (0, 0));
     }
 
     #[test]

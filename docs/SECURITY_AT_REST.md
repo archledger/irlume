@@ -237,7 +237,9 @@ each record it does not use, with the uids and the next step.
 - Added-camera stores (`cameras/<user>.json`) record no uid. They are
   encrypted under the template key and used only together with the primary
   enrollment, whose check covers them; on a host without a TPM they are
-  plaintext, but still unusable without a primary enrollment for the uid.
+  plaintext, but still unusable without a primary enrollment for the uid. A
+  profile listing leaves the store out when the primary enrollment beside it
+  was recorded for another uid, or its template key was.
 - Retry records (`retry/<uid>.json`) and the attempt record are kept by uid
   already.
 - The field is additive: an older irlumed ignores it and keeps using records

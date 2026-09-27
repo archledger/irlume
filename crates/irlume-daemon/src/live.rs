@@ -389,7 +389,12 @@ pub(crate) fn request_kind(req: &Request) -> Option<(LiveOperationKind, bool)> {
     use Request::*;
     Some(match req {
         Authenticate { .. } => (K::Authentication, false),
-        UnsealPassword { .. } | UnsealKeyring { .. } => (K::WalletAuthentication, false),
+        // A disarm's token release checks the account's password and hands
+        // the token out: a credential release, shown to root and its account
+        // only (`LiveState::snapshot_for`).
+        UnsealPassword { .. } | UnsealKeyring { .. } | ReleaseTokenForDisarm { .. } => {
+            (K::WalletAuthentication, false)
+        }
         Enroll { .. } | EnrollmentSession { .. } | AddScan { .. } | AddCameraGroup { .. } => {
             (K::Enrollment, true)
         }
@@ -417,7 +422,6 @@ pub(crate) fn request_kind(req: &Request) -> Option<(LiveOperationKind, bool)> {
         SealPassword { .. } | ResealPassword { .. } | ForgetPassword { .. } => {
             (K::WalletUpdate, true)
         }
-        ReleaseTokenForDisarm { .. } => (K::WalletRead, false),
         RecoverySetup { .. } | RecoveryRestore { .. } | RecoveryForget { .. } => {
             (K::RecoveryUpdate, true)
         }

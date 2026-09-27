@@ -6245,9 +6245,14 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
     use irlume_common::diagnostics::OperationClass;
     use Request::*;
     match req {
-        Authenticate { .. } | UnsealPassword { .. } | UnsealKeyring { .. } => {
-            OperationClass::Authentication
-        }
+        // `ReleaseTokenForDisarm` checks the account's password against the
+        // token's wrap and hands the GNOME keyring token out: a credential
+        // release like `UnsealKeyring`, so its events are the account's
+        // history too (`diagnostic_owner`).
+        Authenticate { .. }
+        | UnsealPassword { .. }
+        | UnsealKeyring { .. }
+        | ReleaseTokenForDisarm { .. } => OperationClass::Authentication,
         Enroll { .. }
         | EnrollmentSession { .. }
         | AddScan { .. }
@@ -6287,7 +6292,6 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | KeyringMetadata { .. }
         | KeyringInfo { .. }
         | ForgetPassword { .. }
-        | ReleaseTokenForDisarm { .. }
         | ResealPassword { .. }
         | RecoverySetup { .. }
         | RecoveryRestore { .. }
@@ -6302,11 +6306,11 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
 /// its diagnostic events and live-status entry so that an account other
 /// than root reads only its own authentications there
 /// (`diagnostics::authentication_visible_to`). A peer other than root may
-/// authenticate only itself (anything else is refused), so its request is
-/// its own; for root (a greeter, `sudo`, a keyring release) it is the named
-/// account, resolved here, or `None` when the name is invalid or does not
-/// resolve, which leaves the operation visible to root alone. Other classes
-/// carry none.
+/// authenticate or release a credential only for itself (anything else is
+/// refused), so its request is its own; for root (a greeter, `sudo`, a
+/// keyring release, a disarm) it is the named account, resolved here, or
+/// `None` when the name is invalid or does not resolve, which leaves the
+/// operation visible to root alone. Other classes carry none.
 fn diagnostic_owner(req: &Request, peer: &Peer) -> Option<u32> {
     if diagnostic_operation_class(req) != irlume_common::diagnostics::OperationClass::Authentication
     {
@@ -12884,9 +12888,10 @@ mod tests {
         assert!(arbiter.take().is_none(), "observers must never queue");
     }
 
-    /// A peer other than root may authenticate only itself, so whatever it
-    /// names, its authentication is its own; root's acts for the account it
-    /// names, and one that does not resolve is left to root.
+    /// A peer other than root may authenticate or release a credential only
+    /// for itself, so whatever it names, the operation is its own; root's
+    /// acts for the account it names, and one that does not resolve is left
+    /// to root.
     #[test]
     fn an_authentication_acts_for_its_peer_or_the_account_root_names() {
         let _g = test_support::env_read();
@@ -12902,12 +12907,20 @@ mod tests {
             have_password: false,
             auth_phase: false,
         };
+        let release_token = |user: &str| Request::ReleaseTokenForDisarm {
+            user: user.into(),
+            password: irlume_common::SecretBytes::new(b"pw".to_vec()),
+        };
         assert_eq!(
             diagnostic_owner(&authenticate("root"), &peer(60_001)),
             Some(60_001)
         );
         assert_eq!(
             diagnostic_owner(&unseal_keyring("root"), &peer(60_001)),
+            Some(60_001)
+        );
+        assert_eq!(
+            diagnostic_owner(&release_token("root"), &peer(60_001)),
             Some(60_001)
         );
         // SAFETY: geteuid takes no arguments, reads only this process's own
@@ -12926,6 +12939,10 @@ mod tests {
                 },
                 &peer(0)
             ),
+            Some(euid)
+        );
+        assert_eq!(
+            diagnostic_owner(&release_token(&account), &peer(0)),
             Some(euid)
         );
         assert_eq!(
@@ -13061,6 +13078,109 @@ mod tests {
         assert!(authentications(euid).contains(&completed));
         assert!(authentications(stranger).is_empty());
         assert_eq!(authentications(0).len(), 2);
+    }
+
+    /// A disarm's token release checks the account's password and hands the
+    /// GNOME keyring token out, a credential release like `UnsealKeyring`:
+    /// another account reads it as unknown work while it runs and never
+    /// reads its outcome; root and the account read both.
+    #[test]
+    fn a_token_release_for_disarm_is_shown_to_root_and_its_account_only() {
+        use irlume_common::diagnostics::{CategoricalOutcome, OperationId, ShareSafeEventKind};
+        use irlume_common::live::LiveOperationKind;
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let _g = env_lock();
+        let _sandbox = sandbox("token-release-owner");
+        // SAFETY: geteuid takes no arguments, reads only this process's own
+        // effective uid, and always succeeds.
+        let euid = unsafe { libc::geteuid() };
+        let account = users::name_for_uid(euid).expect("the running account resolves");
+        let stranger = if euid == 60_002 { 60_003 } else { 60_002 };
+        let state = diagnostics::DiagnosticState::default();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let ask = |uid: u32, wire: String| {
+            with_serve_as_peer_and_diagnostics(&arbiter, &ready, &state, peer(uid), |client| {
+                (&*client).write_all(wire.as_bytes()).unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                serde_json::from_str::<Response>(line.trim()).unwrap()
+            })
+        };
+        let running = |uid: u32| {
+            let Response::LiveStatus(live) = ask(uid, "\"LiveStatus\"\n".into()) else {
+                panic!("expected live status");
+            };
+            let worker = live.worker.expect("the release is running");
+            (worker.operation_id, worker.kind)
+        };
+        let events_of = |uid: u32, operation: OperationId| {
+            let Response::SupportSnapshot(snapshot) =
+                ask(uid, "{\"SupportSnapshot\":{\"since_ms\":60000}}\n".into())
+            else {
+                panic!("expected a support snapshot");
+            };
+            snapshot
+                .events()
+                .iter()
+                .filter(|event| event.operation_id == operation)
+                .map(|event| event.kind.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut wire = serde_json::to_string(&Request::ReleaseTokenForDisarm {
+            user: account.clone(),
+            password: irlume_common::SecretBytes::new(b"not-the-password".to_vec()),
+        })
+        .unwrap();
+        wire.push('\n');
+
+        let (claimed, on_claim) = std::sync::mpsc::channel();
+        let (release, on_release) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let arbiter = std::sync::Arc::clone(&arbiter);
+            std::thread::spawn(move || {
+                let job = arbiter.take().expect("root's token release queued");
+                let Queued {
+                    reply, link, scope, ..
+                } = job.payload;
+                assert!(link.claim());
+                claimed.send(()).unwrap();
+                on_release.recv().unwrap();
+                let response = Response::Error("keyring: the password does not open it".into());
+                scope.finish(categorical_outcome(&response));
+                link.released();
+                link.finish_activity();
+                arbiter.finish(job.class, job.uid);
+                reply.send(response.into()).unwrap();
+            })
+        };
+        let operation = std::thread::scope(|scope| {
+            // Owned here, so a failed assertion drops it before the scope
+            // joins: the worker stops waiting and the client is answered.
+            let release = release;
+            let client = scope.spawn(|| ask(0, wire));
+            on_claim
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the worker claims the token release");
+            let (operation, kind) = running(0);
+            assert_eq!(kind, LiveOperationKind::WalletAuthentication);
+            assert_eq!(
+                running(euid),
+                (operation, LiveOperationKind::WalletAuthentication)
+            );
+            assert_eq!(running(stranger), (operation, LiveOperationKind::Unknown));
+            release.send(()).unwrap();
+            assert!(matches!(client.join().unwrap(), Response::Error(_)));
+            operation
+        });
+        worker.join().unwrap();
+        arbiter.close();
+        let failed = [ShareSafeEventKind::OperationFinished {
+            outcome: CategoricalOutcome::Failed,
+        }];
+        assert_eq!(events_of(0, operation), failed);
+        assert_eq!(events_of(euid, operation), failed);
+        assert!(events_of(stranger, operation).is_empty());
     }
 
     #[test]

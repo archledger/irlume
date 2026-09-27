@@ -189,7 +189,9 @@ impl DiagnosticState {
     /// of other accounts or of an unknown one, and its snapshot always
     /// lists recent events as `NotAuthorized` in `unavailable`, whether or
     /// not an event was left out, so the reader knows the list is partial
-    /// and learns nothing from the marker itself.
+    /// and learns nothing from the marker itself. Its events are numbered
+    /// from 1 in order: the ring's own sequence counts every event, so its
+    /// gaps would count the ones left out.
     pub(crate) fn snapshot_for(&self, since: Duration, peer_uid: u32) -> SupportSnapshot {
         let now_ms = self.shared.clock.now_ms();
         let since_ms = u64::try_from(since.as_millis())
@@ -201,7 +203,7 @@ impl DiagnosticState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         prune_expired(&mut inner.events, now_ms);
-        let events = inner
+        let mut events: Vec<ShareSafeEvent> = inner
             .events
             .iter()
             .filter(|event| {
@@ -222,6 +224,11 @@ impl DiagnosticState {
         let capture = inner.capture.clone();
         let cameras = inner.cameras.clone();
         drop(inner);
+        if peer_uid != 0 {
+            for (sequence, event) in (1_u64..).zip(&mut events) {
+                event.sequence = sequence;
+            }
+        }
         let unavailable = if peer_uid == 0 {
             Vec::new()
         } else {
@@ -976,6 +983,59 @@ mod tests {
             quiet.snapshot_for(since, 3_000).unavailable(),
             withheld.as_slice()
         );
+    }
+
+    /// The ring numbers every event it keeps, so a reader other than root
+    /// reads its events numbered afresh from 1, and its view is the same
+    /// whether or not other accounts authenticated in between. Root reads
+    /// the ring's own numbers.
+    #[test]
+    fn a_reader_other_than_root_reads_no_gap_where_events_were_left_out() {
+        let since = Duration::from_secs(60);
+        let record = |state: &DiagnosticState, others: bool| {
+            state
+                .begin(OperationClass::Enrollment)
+                .finish(CategoricalOutcome::Completed);
+            if others {
+                let theirs = state.begin_for(OperationClass::Authentication, Some(1_000));
+                theirs.emit(selected());
+                theirs.finish(CategoricalOutcome::Denied);
+                state
+                    .begin_for(OperationClass::Authentication, None)
+                    .finish(CategoricalOutcome::Granted);
+            }
+            state
+                .begin_for(OperationClass::Authentication, Some(2_000))
+                .finish(CategoricalOutcome::Granted);
+            state
+                .begin(OperationClass::CameraDiagnostics)
+                .finish(CategoricalOutcome::Completed);
+        };
+        let busy = DiagnosticState::default();
+        record(&busy, true);
+        let quiet = DiagnosticState::default();
+        record(&quiet, false);
+        let view = |state: &DiagnosticState, uid: u32| {
+            state
+                .snapshot_for(since, uid)
+                .events()
+                .iter()
+                .map(|event| (event.sequence, event.operation, event.kind.clone()))
+                .collect::<Vec<_>>()
+        };
+        let numbers = |state: &DiagnosticState, uid: u32| {
+            view(state, uid)
+                .into_iter()
+                .map(|(sequence, ..)| sequence)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(numbers(&busy, 2_000), [1, 2, 3]);
+        assert_eq!(view(&busy, 2_000), view(&quiet, 2_000));
+        assert_eq!(numbers(&busy, 3_000), [1, 2]);
+        assert_eq!(view(&busy, 3_000), view(&quiet, 3_000));
+        assert_eq!(numbers(&busy, 0), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(numbers(&quiet, 0), [1, 2, 3]);
     }
 
     #[test]

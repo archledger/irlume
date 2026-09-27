@@ -224,8 +224,9 @@ each record it does not use, with the uids and the next step.
   For a key that records no uid, over an enrollment that records none (or
   none stored), the recovery envelope it would replace decides: it was set
   up for the key it wraps, so one recorded for another uid is kept and the
-  setup refused. Either refusal names the next step (`irlume enroll`, after
-  which the enrollment records the account's uid and a setup goes ahead).
+  setup refused; `irlume recovery forget` keeps such an envelope too.
+  Either refusal names the next step (`irlume enroll`, after which the
+  enrollment records the account's uid and a setup goes ahead).
   `irlume recovery restore` seals nothing when the enrollment the restored
   key opens records another uid.
 - A write never changes the uid a record carries. An operation that loads a

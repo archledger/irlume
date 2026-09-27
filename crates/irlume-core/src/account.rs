@@ -232,7 +232,8 @@ impl Record {
                 "remove it with `irlume keyring forget --force`, then run `irlume keyring arm`"
             }
             Record::Recovery => {
-                "after enrolling again, run `irlume recovery setup` to set a new recovery passphrase"
+                "run `irlume enroll` to enroll again, then `irlume recovery setup` to set a new \
+                 recovery passphrase"
             }
         }
     }

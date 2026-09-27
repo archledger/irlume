@@ -2121,12 +2121,21 @@ mod tests {
                 error.contains("no recovery passphrase was set")
                     && error.contains(refused_as)
                     && error.contains("uid 6801")
-                    && error.contains("now uid 6802"),
+                    && error.contains("now uid 6802")
+                    && error.contains("irlume enroll"),
                 "{case}: {error}"
             );
             assert!(!error.contains('\u{2014}'));
             assert_eq!(fs::read(&recovery).unwrap(), before, "{case}: kept");
         }
+        // Nor can the envelope be erased first to get past that check.
+        let before = plant(None, None, Some(6801));
+        let error = template_key::forget_recovery(user).unwrap_err().to_string();
+        assert!(
+            error.contains("recovery envelope") && error.contains("uid 6801"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&recovery).unwrap(), before, "forget kept it");
         for (key_uid, enrollment_uid, recovery_before) in [
             (None, Some(Some(6802)), Some(6801)),
             (None, Some(None), None),

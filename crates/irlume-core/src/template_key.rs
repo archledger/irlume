@@ -828,10 +828,18 @@ pub(crate) fn restore_with(
     reseal(user, &key, uid)
 }
 
-/// Erase `user`'s recovery envelope. Idempotent.
+/// Erase `user`'s recovery envelope. Idempotent. An envelope recorded for
+/// another uid is kept and the request refused: it was set up for the key it
+/// wraps, and while it is there a recovery setup cannot wrap that key for
+/// this account (see `setup_recovery`). Enrolling again, then a setup,
+/// replaces it. Removals a write makes (a replaced key, a deleted enrollment)
+/// go through `forget_recovery_unlocked`.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn forget_recovery(user: &str) -> Result<()> {
     let _state = UserStateLock::acquire(user)?;
+    if let Ok(env) = load_recovery(user) {
+        Account::new(user).require(Record::Recovery, env.uid)?;
+    }
     forget_recovery_unlocked(user)
 }
 

@@ -207,7 +207,10 @@ each record it does not use, with the uids and the next step.
   accepted, and its next write records the uid: an enrollment write (enroll,
   add scans, rename or delete a profile), a template key or keyring re-seal,
   a keyring arm, or `irlume recovery setup`. Such a write for a name that has
-  no account records no uid.
+  no account records no uid. Moving a template key to a stronger policy
+  (at irlumed's start, or on a load) keeps the uid it records, or none: the
+  name may by then resolve to another account than the one whose enrollment
+  the key opens.
 - A write never changes the uid a record carries. An operation that loads a
   record and writes it back (add scans, rename a profile, delete one that is
   not the last, turn require-eyes-open off, a template key or keyring re-seal,

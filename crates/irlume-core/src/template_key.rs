@@ -538,14 +538,14 @@ fn move_with(
     if !stronger_tier_available(&env) {
         return Ok(false);
     }
-    // A key sealed for another uid is not unsealed, and not moved; nor is a
-    // key without one while there is no uid to record on it.
-    let mut account = Account::new(user);
-    account.require(Record::TemplateKey, env.uid)?;
-    let uid = account.uid_to_record(Record::TemplateKey, env.uid)?;
+    // A key sealed for another uid is not unsealed, and not moved. A move
+    // changes the policy only: a key an earlier release sealed without a uid
+    // keeps none, since the name may no longer resolve to the account whose
+    // enrollment the key opens; that enrollment's next write records it.
+    Account::new(user).require(Record::TemplateKey, env.uid)?;
     let key = unseal(&env)?;
     let mut candidate = seal(&key)?;
-    candidate.uid = uid;
+    candidate.uid = env.uid;
     if candidate.strength_rank() <= env.strength_rank() {
         return Ok(false);
     }
@@ -611,15 +611,12 @@ pub(crate) fn load_key_with(
     // unseals again. The check short-circuits to a no-op once the envelope is
     // already at the best policy. Never fail the load on it: the key unsealed
     // fine and the weaker envelope stays usable.
-    // Without a uid to record on it, the key waits for a later load.
+    // The move keeps the uid the key records, or none (see `move_with`).
     if policy == KeyLoadPolicy::Upgrade && stronger_tier_available(&env) {
-        if let Ok(uid) = account.uid_to_record(Record::TemplateKey, env.uid) {
-            if let Ok(mut candidate) = seal(&key) {
-                candidate.uid = uid;
-                if candidate.strength_rank() > env.strength_rank() && candidate.save(&path).is_ok()
-                {
-                    set_0600(&path);
-                }
+        if let Ok(mut candidate) = seal(&key) {
+            candidate.uid = env.uid;
+            if candidate.strength_rank() > env.strength_rank() && candidate.save(&path).is_ok() {
+                set_0600(&path);
             }
         }
     }
@@ -943,10 +940,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A move to a stronger policy records the current uid on a key an
-    /// earlier release sealed without one.
+    /// A move to a stronger policy keeps a key an earlier release sealed
+    /// without a uid unbound: the name may resolve to another account than
+    /// the one whose enrollment the key opens. A key with a uid keeps it.
     #[test]
-    fn the_startup_move_records_the_uid_on_a_key_without_one() {
+    fn the_startup_move_keeps_the_uid_a_key_records_or_none() {
         let _env = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -961,15 +959,27 @@ mod tests {
             .save(&key_path(user))
             .unwrap();
         let _now = crate::account::remember(user, 4111);
+        let stronger = || {
+            let mut stronger: SealedEnvelope = serde_json::from_str(legacy).unwrap();
+            stronger.policy = crate::envelope::PolicyKind::PcrlockNv { nv_index: 1 };
+            Ok(stronger)
+        };
         assert!(move_with(
             user,
             |_| Ok(Zeroizing::new(vec![5; 32])),
             |_| true,
-            |_| {
-                let mut stronger: SealedEnvelope = serde_json::from_str(legacy).unwrap();
-                stronger.policy = crate::envelope::PolicyKind::PcrlockNv { nv_index: 1 };
-                Ok(stronger)
-            },
+            |_| stronger()
+        )
+        .unwrap());
+        assert_eq!(SealedEnvelope::load(&key_path(user)).unwrap().uid, None);
+        let mut bound: SealedEnvelope = serde_json::from_str(legacy).unwrap();
+        bound.uid = Some(4111);
+        bound.save(&key_path(user)).unwrap();
+        assert!(move_with(
+            user,
+            |_| Ok(Zeroizing::new(vec![5; 32])),
+            |_| true,
+            |_| stronger()
         )
         .unwrap());
         assert_eq!(

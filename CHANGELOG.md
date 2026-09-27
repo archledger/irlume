@@ -867,7 +867,8 @@ All notable changes to irlume are documented here. This project adheres to
   a re-seal) is refused, with nothing written, when the name resolves to
   another uid or to no account by the time it is saved. Nothing is
   removed automatically. Records written by earlier releases carry no
-  uid; they are accepted and record it on their next write. Older
+  uid; they are accepted and record it on their next write, except that
+  moving a template key to a stronger policy keeps it unbound. Older
   releases ignore the new field (SECURITY_AT_REST.md "Records belong to
   an account uid").
 

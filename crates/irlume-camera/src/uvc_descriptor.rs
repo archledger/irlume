@@ -321,6 +321,15 @@ pub struct VideoControlFunction {
 /// short for the bitmap it declares, and a header that lists an interface
 /// which is not a VideoStreaming interface of the same configuration.
 ///
+/// Like [`active_descriptor_view`], it does not read `wTotalLength`. The
+/// ThinkPad T480's colour camera (USB 5986:2113) returns 996 of the 1026
+/// bytes its configuration header claims, and the kernel keeps what arrived,
+/// so its `descriptors` file is a clean chain shorter than its header says.
+/// The device writes both the header and the chain, so a length check would
+/// prove nothing a device could not also fake, and it would refuse a real IR
+/// camera whose firmware miscounts the same way. A chain is judged on the
+/// descriptors it holds; one cut inside a descriptor is still malformed.
+///
 /// `extension_units_for_interface` is left as it is on purpose: it decides
 /// which bytes irlume may write to a camera (#159), and a parser shared with
 /// a new consumer is a parser whose next change can move that decision.
@@ -1811,17 +1820,28 @@ mod tests {
         }
         assert_eq!(i, ASUS.len());
     }
-    /// The transcription reproduces every byte `lsusb` accounted for: each
-    /// configuration is exactly as long as its printed `wTotalLength`, the
-    /// walk consumes it with no slop, and the single configuration is its
-    /// own active view.
+
+    /// The ThinkPad T480 IR camera (USB 5986:1141): the #887 reporter's
+    /// sysfs `descriptors` file, one complete configuration.
+    const T480_IR: &[u8] = include_bytes!("../tests/fixtures/bison-5986-1141.descriptors");
+
+    /// The ThinkPad T480 colour camera (USB 5986:2113), from the same
+    /// machine. Its configuration header claims a `wTotalLength` of 1026,
+    /// and the device returns 996 bytes: the MJPEG format counts nine frame
+    /// descriptors and carries eight (960x540 is missing). The kernel keeps
+    /// the bytes that arrived, header included, so the file is a clean
+    /// descriptor chain shorter than the `wTotalLength` it carries.
+    const T480_RGB: &[u8] = include_bytes!("../tests/fixtures/bison-5986-2113.descriptors");
+
+    /// Both T480 files walk by `bLength` to their last byte with no slop,
+    /// and each single configuration is its own active view. The colour
+    /// camera's configuration is 30 bytes shorter than its header says,
+    /// and that is a fact about the device, pinned here so a re-capture
+    /// that differs is noticed.
     #[test]
-    fn transcribed_t480_configurations_match_their_printed_total_lengths() {
-        for (label, bytes, total) in [
-            ("5986:1141", t480::ir_1141(), t480::IR_1141_TOTAL),
-            ("5986:2113", t480::rgb_2113(), t480::RGB_2113_TOTAL),
-        ] {
-            assert_eq!(bytes.len(), 18 + usize::from(total), "{label}");
+    fn t480_descriptor_files_walk_cleanly_and_are_their_own_active_view() {
+        for (label, bytes, total) in [("5986:1141", T480_IR, 412), ("5986:2113", T480_RGB, 1026)] {
+            assert_eq!(u16::from_le_bytes([bytes[20], bytes[21]]), total, "{label}");
             let mut at = 0usize;
             while at < bytes.len() {
                 let len = usize::from(bytes[at]);
@@ -1829,7 +1849,36 @@ mod tests {
                 at += len;
             }
             assert_eq!(at, bytes.len(), "{label}");
-            assert_eq!(active_descriptor_view(&bytes, 1), Some(bytes), "{label}");
+            assert_eq!(
+                active_descriptor_view(bytes, 1).as_deref(),
+                Some(bytes),
+                "{label}"
+            );
+        }
+        assert_eq!(T480_IR.len(), 18 + 412);
+        assert_eq!(T480_RGB.len(), 18 + 996);
+    }
+
+    /// The builders the synthetic counter-cases use lay each descriptor out
+    /// exactly as the real 5986:1141 file does, so a counter-case differs
+    /// from a real attested function only in the field it names.
+    #[test]
+    fn the_counter_case_builders_match_the_real_t480_bytes() {
+        assert!(T480_IR.starts_with(&t480::device(0x1141, 0x3759, [3, 1, 2])));
+        for piece in [
+            t480::configuration(0x019C, 2, 4),
+            t480::interface(0, 0, 1, SUBCLASS_VIDEOCONTROL, 1, 5),
+            t480::vc_header(0x0150, 0x0088, 15_000_000, &[1]),
+            t480::processing_unit(2, 1, 0, 3, 0, &[0, 0]),
+            t480::extension_unit(8, MSXU, 2, 6, &[0x22, 0x00], 7),
+            t480::interrupt_endpoint(0x83, 6),
+            t480::interface(1, 0, 0, SUBCLASS_VIDEOSTREAMING, 1, 0),
+            t480::vs_input_header(0x0075, 3, &[0]),
+        ] {
+            assert!(
+                T480_IR.windows(piece.len()).any(|window| window == piece),
+                "{piece:02x?}"
+            );
         }
     }
 
@@ -1869,30 +1918,80 @@ mod tests {
     /// #887: the ThinkPad T480 IR camera offers only YUYV, and its
     /// descriptor names it an IR function: one stream, the Microsoft unit 8
     /// with face authentication (`22 00`, two controls), no colour controls.
+    /// Unit 4, a vendor unit whose `00 06` would read as selectors 0x0A and
+    /// 0x0B, is not the Microsoft unit and plays no part.
     #[test]
     fn t480_bison_1141_is_attested() {
         assert_eq!(
-            ir_function_evidence(&t480::ir_1141(), 0),
+            ir_function_evidence(T480_IR, 0),
             Ok(IrFunctionEvidence {
                 msxu_unit: 8,
                 streaming_interface: 1,
             })
         );
+        let function = video_control_function(T480_IR, 0).expect("a well-formed UVC 1.5 function");
+        assert_eq!(function.streaming_interfaces, [1]);
+        assert_eq!(function.processing_controls, [0]);
+        let microsoft: Vec<&ExtensionUnit> = function
+            .extension_units
+            .iter()
+            .filter(|unit| unit.is_microsoft_xu())
+            .collect();
+        assert_eq!(microsoft.len(), 1);
+        assert_eq!(microsoft[0].unit_id, 8);
+        assert_eq!(microsoft[0].num_controls, 2);
+        assert_eq!(microsoft[0].bm_controls, [0x22, 0x00]);
+        assert!(microsoft[0].advertises(MSXU_FACE_AUTHENTICATION));
+        assert!(microsoft[0].advertises(0x02));
+        assert!(!microsoft[0].advertises(MSXU_IR_TORCH));
+        let vendor = &function.extension_units[0];
+        assert_eq!((vendor.unit_id, vendor.is_microsoft_xu()), (4, false));
+        assert_eq!(vendor.bm_controls, [0x00, 0x06]);
     }
 
     /// The T480's colour camera has no Microsoft unit, and its colour
     /// controls would refuse it on their own.
+    ///
+    /// Its configuration is shorter than its own `wTotalLength` (see
+    /// [`T480_RGB`]), and the walk judges it on the descriptors it holds:
+    /// no walker in this module reads `wTotalLength`, so a chain that ends
+    /// cleanly at a descriptor boundary is not malformed, while a
+    /// descriptor cut in the middle still is. The same holds for an IR
+    /// function, which stays attested with its header overstating its
+    /// length by the same 30 bytes, so firmware that miscounts does not
+    /// cost a real IR camera its role.
     #[test]
     fn t480_2113_is_not() {
-        let rgb = t480::rgb_2113();
         assert_eq!(
-            ir_function_evidence(&rgb, 0),
+            ir_function_evidence(T480_RGB, 0),
             Err(IrFunctionRefusal::NoMicrosoftXu)
         );
-        let function = video_control_function(&rgb, 0).expect("a well-formed UVC 1.00 function");
+        let function =
+            video_control_function(T480_RGB, 0).expect("a well-formed UVC 1.00 function");
         assert_eq!(function.streaming_interfaces, [1]);
         assert_eq!(function.processing_controls, [0x157F]);
         assert_eq!(0x157F & PU_COLOUR_CONTROLS, 0x104C);
+        assert_eq!(
+            function
+                .extension_units
+                .iter()
+                .map(|unit| (unit.unit_id, unit.is_microsoft_xu()))
+                .collect::<Vec<_>>(),
+            [(3, false), (4, false)]
+        );
+
+        let mut overstated = T480_IR.to_vec();
+        overstated[20..22].copy_from_slice(&(412u16 + 30).to_le_bytes());
+        assert_eq!(
+            ir_function_evidence(&overstated, 0),
+            ir_function_evidence(T480_IR, 0)
+        );
+        let mut cut = T480_RGB.to_vec();
+        cut.pop();
+        assert_eq!(
+            ir_function_evidence(&cut, 0),
+            Err(IrFunctionRefusal::Malformed)
+        );
     }
 
     const MSXU: &str = "0f3f95dc-2632-4c4e-92c9-a04782f43bc8";
@@ -1903,9 +2002,10 @@ mod tests {
 
     /// A one-configuration device whose VideoControl interface 0 lists
     /// `streams` in its header, followed by a VideoStreaming interface for
-    /// each of `videostreaming`. Built from the T480 transcription's pieces
-    /// with the attested shape as the default, so each counter-case differs
-    /// from an attested function only in the field it names.
+    /// each of `videostreaming`. Built from pieces laid out as the real
+    /// 5986:1141 file lays them out, with the attested shape as the default,
+    /// so each counter-case differs from an attested function only in the
+    /// field it names.
     fn function(
         streams: &[u8],
         videostreaming: &[u8],
@@ -2074,13 +2174,13 @@ mod tests {
         );
 
         // A tail that stops mid-descriptor, or leaves one stray byte.
-        let mut short_tail = t480::ir_1141();
+        let mut short_tail = T480_IR.to_vec();
         short_tail.pop();
         assert_eq!(
             ir_function_evidence(&short_tail, 0),
             Err(IrFunctionRefusal::Malformed)
         );
-        let mut stray = t480::ir_1141();
+        let mut stray = T480_IR.to_vec();
         stray.push(0);
         assert_eq!(
             ir_function_evidence(&stray, 0),
@@ -2139,7 +2239,7 @@ mod tests {
     /// interface.
     #[test]
     fn the_camera_identity_attests_from_its_own_descriptor() {
-        let fixture = UsbFixture::new("t480-ir", 1, 0, &t480::ir_1141());
+        let fixture = UsbFixture::new("t480-ir", 1, 0, T480_IR);
         assert_eq!(
             fixture.identity().unwrap().ir_function_evidence(),
             Ok(IrFunctionEvidence {
@@ -2147,13 +2247,13 @@ mod tests {
                 streaming_interface: 1,
             })
         );
-        let streaming = UsbFixture::new("t480-vs", 1, 1, &t480::ir_1141());
+        let streaming = UsbFixture::new("t480-vs", 1, 1, T480_IR);
         assert_eq!(
             streaming.identity().unwrap().ir_function_evidence(),
             Err(IrFunctionRefusal::NotVideoControl),
             "a streaming interface is not a VideoControl function"
         );
-        let rgb = UsbFixture::new("t480-rgb", 1, 0, &t480::rgb_2113());
+        let rgb = UsbFixture::new("t480-rgb", 1, 0, T480_RGB);
         assert_eq!(
             rgb.identity().unwrap().ir_function_evidence(),
             Err(IrFunctionRefusal::NoMicrosoftXu)
@@ -2181,14 +2281,14 @@ mod tests {
     /// missing, or a configuration that cannot be read, stays unreadable.
     #[test]
     fn a_descriptor_file_that_was_read_but_is_malformed_is_not_unreadable() {
-        let sound = UsbFixture::new("887-sound", 1, 0, &t480::ir_1141());
+        let sound = UsbFixture::new("887-sound", 1, 0, T480_IR);
         assert!(ir_function_evidence_from_dirs(&sound.interface, &sound.device).is_ok());
 
-        let mut miscounted = t480::ir_1141();
+        let mut miscounted = T480_IR.to_vec();
         miscounted[17] = 2;
-        let mut zero_length = t480::ir_1141();
+        let mut zero_length = T480_IR.to_vec();
         zero_length.extend_from_slice(&[0, 0]);
-        let mut duplicate = t480::ir_1141();
+        let mut duplicate = T480_IR.to_vec();
         duplicate[17] = 2;
         duplicate.extend(t480::configuration(0, 2, 0));
         for (label, bytes) in [
@@ -2204,13 +2304,13 @@ mod tests {
             );
         }
 
-        let missing = UsbFixture::new("887-missing", 1, 0, &t480::ir_1141());
+        let missing = UsbFixture::new("887-missing", 1, 0, T480_IR);
         std::fs::remove_file(missing.device.join("descriptors")).unwrap();
         assert_eq!(
             ir_function_evidence_from_dirs(&missing.interface, &missing.device),
             Err(IrFunctionRefusal::Unreadable)
         );
-        let unconfigured = UsbFixture::new("887-unconfigured", 1, 0, &t480::ir_1141());
+        let unconfigured = UsbFixture::new("887-unconfigured", 1, 0, T480_IR);
         std::fs::write(unconfigured.device.join("bConfigurationValue"), "\n").unwrap();
         assert_eq!(
             ir_function_evidence_from_dirs(&unconfigured.interface, &unconfigured.device),
@@ -2291,16 +2391,16 @@ mod tests {
     }
 
     /// The role walker and the emitter's parser read extension units the
-    /// same way, on real and transcribed bytes and on every interface. The
+    /// same way, on three real devices' bytes and on every interface. The
     /// fuzz target asserts the same on arbitrary input.
     #[test]
     fn video_control_function_xus_match_the_emitter_parser() {
-        let mut short = t480::ir_1141();
+        let mut short = T480_IR.to_vec();
         short.pop();
         for (label, bytes) in [
             ("ASUS", ASUS.to_vec()),
-            ("5986:1141", t480::ir_1141()),
-            ("5986:2113", t480::rgb_2113()),
+            ("5986:1141", T480_IR.to_vec()),
+            ("5986:2113", T480_RGB.to_vec()),
             ("truncated", short),
         ] {
             for interface in 0..=5u8 {
@@ -2324,7 +2424,7 @@ mod tests {
             extension_units_for_interface(ASUS, 2),
         );
         assert_eq!(
-            video_control_function(&t480::ir_1141(), 0)
+            video_control_function(T480_IR, 0)
                 .unwrap()
                 .extension_units
                 .iter()

@@ -4,12 +4,13 @@
 
 Accepted 2026-09-27 for §1, §2, §3 and §5, which land with the change that
 fixes the classification half of #887. §4, a sensor ceiling for YUYV luma,
-is recorded here and pending: it waits for measurements from the reporter's
-ThinkPad T480 and is not implemented, so every YUYV IR frame stays refused as
-exposure unmeasurable. Depends on ADR-0029 §1 and §9 (camera-free
-classification; selection never opens a device it will not use). Changes
-nothing in ADR-0023 §3 (profiles still cannot classify), ADR-0024's pair
-authorization, ADR-0019 or the exposure refusal of #358 and #371.
+is recorded here and pending: §4 records what the reporter measured on the
+ThinkPad T480, and the ceiling is not implemented, so every YUYV IR frame
+stays refused as exposure unmeasurable. Depends on ADR-0029 §1 and §9
+(camera-free classification; selection never opens a device it will not
+use). Changes nothing in ADR-0023 §3 (profiles still cannot classify),
+ADR-0024's pair authorization, ADR-0019 or the exposure refusal of #358 and
+#371.
 
 ## Context
 
@@ -21,11 +22,11 @@ so a node that offers only YUYV is always an RGB camera.
 #887 reports the first IR camera on record that streams in that container:
 the ThinkPad T480's "Integrated IR Camera" (USB 5986:1141). It offers one
 format, YUYV, at 340x340 (the descriptor's default frame) and 640x480, both
-at 30 fps; its frames carry luma with neutral chroma (U = V = 128). On that
-machine irlume lists the IR node as a UVC RGB camera, and RGB-only operation
-takes the first RGB node in numeric order (`select_rgb`), which there is
-usually the IR node at `/dev/video0` rather than the colour camera
-(USB 5986:2113) at `/dev/video2`.
+at 30 fps; its frames carry luma with flat chroma (§4). On that machine
+irlume lists the IR node as a UVC RGB camera, and RGB-only operation takes
+the first RGB node in numeric order (`select_rgb`), which there is usually
+the IR node at `/dev/video0` rather than the colour camera (USB 5986:2113)
+at `/dev/video2`.
 
 Treating "offers only YUYV" as IR would be wrong in the other direction, and
 that direction matters more: a node classified `Role::Ir` can complete a
@@ -41,13 +42,14 @@ not. Microsoft's UVC 1.5 extensions define an extension unit,
 its `FACE_AUTHENTICATION` control (selector 0x06, section 2.2.2.6) that it
 is only applicable to cameras that can produce infrared data. In the
 published descriptor of 5986:1141 (linuxhw LsUSB report 31A261423C, a T480
-on Gentoo) the video function has one streaming interface, a Microsoft unit
-(unit 8) whose `bmControls` is `22 00` (selectors 0x02 and 0x06, with
-`bNumControls` 2), and a Processing Unit with no controls. The paired colour
-camera 5986:2113 has no Microsoft unit and a Processing Unit advertising
-hue, saturation and white balance (`bmControls` 0x157f). A ThinkPad P16s
-Gen 2 colour function carries a Microsoft unit without selector 0x06, so the
-unit's presence alone is not the signal; the selector is.
+on Gentoo), and in the reporter's own, the video function has one
+streaming interface, a Microsoft unit (unit 8) whose `bmControls` is
+`22 00` (selectors 0x02 and 0x06, with `bNumControls` 2), and a Processing
+Unit with no controls. The paired colour camera 5986:2113 has no Microsoft
+unit and a Processing Unit advertising hue, saturation and white balance
+(`bmControls` 0x157f). A ThinkPad P16s Gen 2 colour function carries a
+Microsoft unit without selector 0x06, so the unit's presence alone is not
+the signal; the selector is.
 
 #428 removed a descriptor-derived *format* route because a node's sysfs
 parent names the VideoControl function, not which of the function's
@@ -106,6 +108,10 @@ for a node whose formats are exactly `{YUYV}`. No extension-unit request is
 sent, no frame is captured, and no name or `vid:pid` table is consulted. The
 descriptor walk is strict: it steps by `bLength` through one configuration,
 and anything truncated, overrunning or inconsistent fails the attestation.
+It does not read `wTotalLength`: the T480's colour camera returns 996 of the
+1026 bytes its configuration header claims, the kernel keeps what arrived,
+and the device writes both numbers, so the walk judges the descriptors the
+file holds.
 Every failure, an unreadable or absent descriptor included, keeps the node
 `Role::Rgb`. The extension-unit parser that authorizes emitter writes
 (#159) is not changed; the new walker shares its unit parsing, and a test
@@ -166,16 +172,37 @@ descriptor and the frames being judged rather than to the cached role:
   or XV709, read through a raw `VIDIOC_G_FMT` because the pinned v4l crate
   drops the Y'CbCr encoding;
 - footroom: no frame with more than 0.5% of its pixels below raw luma 15;
-- neutral chroma: every U and V byte within 2 of 128, latched for the
-  session so a later neutral frame cannot clear a violation;
+- flat chroma: in each frame, the U and V bytes span a few codes at most
+  (2 on the T480, below), latched for the session so a later flat frame
+  cannot clear a violation;
 - an observed emitter alternation on the burst being judged
   (`D1OpticalEvidence` in `ir_emitter.rs`);
 - a decode that expands limited range to full range, so the ceiling after
   expansion is 255.
 
-The reporter's 340x340 statistics decide whether this goes ahead: limited
-range, U = V = 128 on dark frames as well as lit ones, and bright pixels
-that stop at 235. Until then #385's item 2 stays unbuilt.
+Measured on the T480 (5986:1141), by the reporter on #887:
+
+- The node offers YUYV only, at 340x340 and 640x480, both at 30 fps. The
+  640x400 request irlume made before §5 lands on 640x480, the near-black
+  mode; §5 requests 340x340.
+- Quantization is limited range (`VIDIOC_G_FMT` reports the default, which
+  maps to limited, with a BT.601 encoding). Luma never falls below 16, and
+  bright pixels stop at 235, never 255: every lit frame of a capture with a
+  palm close to the lens reached 235.
+- The camera's emitter strobes on alternate frames.
+- Lit frames have chroma of exactly 128. Dark frames have a constant 137 to
+  138, and one dark frame, the first dark frame of one capture, read 115 to
+  117. A chroma test for closeness to 128 would refuse every dark frame, so
+  a chroma gate must test flatness within a frame instead.
+- Auto-exposure ramps over the first frames of a capture. After the first
+  frame, lit-frame means climbed from 39 to 57 over 30 frames with a face at
+  the usual distance and from 139 to 229 with a palm about 5 cm from the
+  lens, and a capture that skipped no frames showed lit means near 121 for
+  its first four frames before they fell to about 55. A statistic taken from
+  one window depends on where in the ramp it lands.
+
+The ceiling stays unbuilt, and #385's item 2 with it, until a change
+implements these conditions against the measurement.
 
 ### 5. The IR frame size for attested YUYV
 
@@ -214,10 +241,11 @@ than the 640x400 constant.
 - Known gaps: an IR camera that offers MJPG beside YUYV (the Chicony
   04f2:b613 module some T480s carry), NV12-only IR nodes, a VideoControl
   function shared by several streams (#704), and an IR function whose
-  Microsoft unit does not advertise selector 0x06. If the reporter's
-  descriptor lacks that bit, the fallback is an exact `vid:pid` table
-  following the `known_control` and `MIPI_BRIDGE_IDS` precedent, still
-  behind §1's other clauses, recorded as an amendment here.
+  Microsoft unit does not advertise selector 0x06. The reporter's
+  descriptor carries that bit; for an IR camera that lacks it, the fallback
+  is an exact `vid:pid` table following the `known_control` and
+  `MIPI_BRIDGE_IDS` precedent, still behind §1's other clauses, recorded as
+  an amendment here.
 
 ## Rejected alternatives
 
@@ -237,7 +265,7 @@ than the 640x400 constant.
   insufficient.
 - **The kernel's `UVC_QUIRK_FORCE_Y8`.** It rewrites YUYV as GREY at twice
   the width, for modules that send packed 8-bit grey; the T480 sends real
-  YUYV with neutral chroma.
+  YUYV with flat chroma bytes (§4).
 - **A `cameras.d` profile that reclassifies the node.** ADR-0023 §3 forbids
   profiles from classifying endpoints; this rule is production code in the
   camera crate, keyed on a standards bit rather than on a device list.
@@ -246,8 +274,8 @@ than the 640x400 constant.
 
 | Boundary | Required result |
 |---|---|
-| Descriptor rule | The ASUS 3277:0059 IR function (interface 2) is attested and its RGB function (interface 0) is not; the T480 5986:1141 function is attested and 5986:2113 is not; two streams, each colour bit alone, a Microsoft unit without selector 0x06 or with more bits than `bNumControls`, two Microsoft units, a truncated header, Processing Unit or tail, a listed interface that is not VideoStreaming, a face-authentication unit on another interface, a node interface that is not a VideoControl interface, a descriptor file without one complete active configuration, and a node without a USB parent are each refused with the named reason |
-| Parser agreement | The new walker and the emitter's extension-unit parser return the same units for every interface of the ASUS fixture, and the fuzz target asserts it on arbitrary input |
+| Descriptor rule | The ASUS 3277:0059 IR function (interface 2) is attested and its RGB function (interface 0) is not; the T480 5986:1141 function is attested and 5986:2113 is not, from the reporter's descriptor files, with the 5986:2113 configuration 30 bytes shorter than its `wTotalLength` refused only for its missing Microsoft unit; two streams, each colour bit alone, a Microsoft unit without selector 0x06 or with more bits than `bNumControls`, two Microsoft units, a truncated header, Processing Unit or tail, a listed interface that is not VideoStreaming, a face-authentication unit on another interface, a node interface that is not a VideoControl interface, a descriptor file without one complete active configuration, and a node without a USB parent are each refused with the named reason |
+| Parser agreement | The new walker and the emitter's extension-unit parser return the same units for every interface of the ASUS and both T480 fixtures, and the fuzz target asserts it on arbitrary input |
 | Classification | `[YUYV]` with the attestation is `Role::Ir` and without it `Role::Rgb`; MJPG+YUYV, YUYV+RGB3, NV12, NV12+YUYV and YUYV+GREY stay what their formats say whatever the attestation; the descriptor is not consulted for GREY, Y16, metadata or empty format lists |
 | Frame size | GREY and Y16 ignore the size list and request 640x400; unattested YUYV requests 640x400; attested YUYV requests 340x340 from `{640x480, 340x340}` in either order, 400x400 from `{400x480, 400x400}`, 640x400 from an empty or too-small list, and the first of two equal areas; a replica of uvcvideo's nearest-size rule shows 640x400 landing on 640x480; the candidate walk hands the format ioctl the size it chose |
 | Qualification | The IR stream contract records the requested size it is given, not 640x400, and the open IR camera builds it from the request it made |
@@ -256,5 +284,8 @@ than the 640x400 constant.
 | No probe | Discovery and the census decide the role only through the sysfs reader; the doctor's IR stream line reuses the capture walk, whose fd-bound attestation is also a read (`fstat` and sysfs on the file descriptor the probe already holds); nothing on those paths streams frames for it |
 | Lease | Nodes on two inventory entries refuse with the split-device error; one entry holding both nodes still leases |
 
-The T480 fixtures are transcribed from the published `lsusb -v` report
-until the reporter's own `descriptors` files replace them (#575).
+The T480 tests read the reporter's own `descriptors` files
+(`crates/irlume-camera/tests/fixtures/bison-5986-1141.descriptors` and
+`bison-5986-2113.descriptors`, #575), which are also fuzz seeds; builders
+laid out like the 5986:1141 bytes remain only for the synthetic
+counter-cases.

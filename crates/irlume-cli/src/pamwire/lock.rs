@@ -101,7 +101,8 @@ fn lock_pam_at(
         // Only processes running as `uid` can open the lock, so the wait lasts
         // as long as one of them holds it; the reconcile unit's start timeout
         // bounds it there.
-        let holder = processes(&lock_holders(&file))
+        let holder = lock_holders(&file)
+            .and_then(|pids| processes(&pids))
             .map(|who| format!(" ({who})"))
             .unwrap_or_default();
         eprintln!("irlume: another irlume PAM operation{holder} is in progress, waiting for it…");
@@ -207,9 +208,10 @@ fn open_lock(path: &Path, uid: u32) -> Result<File, String> {
 /// necessarily an irlume: it is waited for at most `wait` and named on stderr.
 /// If a process running as `uid` with the file open still holds it then, it may
 /// be an earlier irlume changing PAM, and the operation stops with an error
-/// rather than write beside it. Otherwise the holder is another account's
-/// process, or one that has exited while another keeps the file open, and the
-/// operation goes on without this lock.
+/// rather than write beside it. It stops too when `/proc` cannot show that no
+/// holder is such a process (see [`earlier_irlume_holders`]). Otherwise the
+/// holder is another account's process, or one that has exited while another
+/// keeps the file open, and the operation goes on without this lock.
 fn take_legacy_lock(path: &Path, uid: u32, wait: Duration) -> Result<Option<File>, String> {
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
@@ -239,32 +241,37 @@ fn take_legacy_lock(path: &Path, uid: u32, wait: Duration) -> Result<Option<File
             return Ok(None);
         }
         let by = || {
-            processes(&lock_holders(&file))
+            lock_holders(&file)
+                .and_then(|pids| processes(&pids))
                 .map(|who| format!(" by {who}"))
                 .unwrap_or_default()
         };
         let now = Instant::now();
         if now >= deadline {
-            let own: Vec<u32> = lock_holders(&file)
-                .into_iter()
-                .filter(|&pid| has_open_as(pid, uid, &meta))
-                .collect();
-            if let Some(who) = processes(&own) {
-                return Err(format!(
-                    "{}, the PAM lock of earlier irlume releases, is still held after {} s \
-                     by {who}, running as uid {uid}; an earlier irlume may still be \
-                     changing PAM, so try again once it has finished",
-                    path.display(),
-                    wait.as_secs()
-                ));
-            }
-            eprintln!(
-                "irlume: {} is still held{}; no process running as uid {uid} has it open, \
-                 so it is not an earlier irlume, and this operation goes on without it",
+            let detail = match earlier_irlume_holders(lock_holders(&file), |pid| {
+                has_open_as(pid, uid, &meta)
+            }) {
+                Ok(own) => match processes(&own) {
+                    Some(who) => format!(" by {who}, running as uid {uid}"),
+                    None => {
+                        eprintln!(
+                            "irlume: {} is still held{}; no process running as uid {uid} has \
+                             it open, so it is not an earlier irlume, and this operation goes \
+                             on without it",
+                            path.display(),
+                            by()
+                        );
+                        return Ok(None);
+                    }
+                },
+                Err(why) => format!(", and {why}"),
+            };
+            return Err(format!(
+                "{}, the PAM lock of earlier irlume releases, is still held after {} s{detail}; \
+                 an earlier irlume may still be changing PAM, so try again once it has finished",
                 path.display(),
-                by()
-            );
-            return Ok(None);
+                wait.as_secs()
+            ));
         }
         if !waiting {
             eprintln!(
@@ -280,26 +287,89 @@ fn take_legacy_lock(path: &Path, uid: u32, wait: Duration) -> Result<Option<File
     }
 }
 
-/// Whether process `pid` runs as `uid`, by its real and effective uid, and has
-/// the file `meta` describes open, as an earlier irlume holding its lock does.
+/// Which of `holders`, the processes `/proc/locks` lists as holding the lock of
+/// earlier releases (`None` when they cannot be read), may be an earlier
+/// irlume, as `open_as` ([`has_open_as`]) tells.
 ///
-/// `false` when either cannot be read. `/proc/locks` goes on naming the process
-/// that took a lock after it has exited while another keeps the file open, and
-/// a later process can be given that number, so the number alone proves
-/// nothing. The real uid is checked too, so a set-user-ID program another
-/// account runs does not count.
-fn has_open_as(pid: u32, uid: u32, meta: &std::fs::Metadata) -> bool {
-    let runs_as = std::fs::read_to_string(format!("/proc/{pid}/status"))
+/// `Err` says why `/proc` cannot rule that out: the holders cannot be read,
+/// none is listed (a holder outside this PID namespace is not), or what one of
+/// them runs as or has open cannot be read. Only a holder shown not to be one
+/// is passed over.
+fn earlier_irlume_holders(
+    holders: Option<Vec<u32>>,
+    open_as: impl Fn(u32) -> Option<bool>,
+) -> Result<Vec<u32>, String> {
+    let holders =
+        holders.ok_or_else(|| "the processes holding it cannot be read from /proc".to_owned())?;
+    if holders.is_empty() {
+        return Err("/proc/locks does not list the process holding it".to_owned());
+    }
+    let mut own = Vec::new();
+    for pid in holders {
+        match open_as(pid) {
+            Some(true) => own.push(pid),
+            Some(false) => {}
+            None => {
+                return Err(format!(
+                    "/proc cannot show what process {pid} runs as or has open"
+                ))
+            }
+        }
+    }
+    Ok(own)
+}
+
+/// Whether process `pid` runs as `uid`, by its real and effective uid, and has
+/// the file `meta` describes open, as an earlier irlume holding its lock does:
+/// `Some(false)` when it has exited, runs as another account or does not have
+/// the file open, and `None` when `/proc` cannot show which.
+///
+/// `/proc/locks` goes on naming the process that took a lock after it has
+/// exited while another keeps the file open, and a later process can be given
+/// that number, so the number alone proves nothing. The real uid is checked
+/// too, so a set-user-ID program another account runs does not count. What
+/// cannot be read counts as settled only when the process has exited
+/// ([`has_exited`]), since a `/proc` mount can also hide a process that runs.
+fn has_open_as(pid: u32, uid: u32, meta: &std::fs::Metadata) -> Option<bool> {
+    let unreadable = || has_exited(pid).then_some(false);
+    let Some((real, effective)) = std::fs::read_to_string(format!("/proc/{pid}/status"))
         .ok()
         .and_then(|status| status_uids(&status))
-        .is_some_and(|(real, effective)| real == uid && effective == uid);
-    runs_as
-        && std::fs::read_dir(format!("/proc/{pid}/fd")).is_ok_and(|fds| {
-            fds.flatten().any(|fd| {
-                std::fs::metadata(fd.path())
-                    .is_ok_and(|open| open.dev() == meta.dev() && open.ino() == meta.ino())
-            })
-        })
+    else {
+        return unreadable();
+    };
+    if real != uid || effective != uid {
+        return Some(false);
+    }
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return unreadable();
+    };
+    let mut unread = false;
+    for fd in fds {
+        match fd.and_then(|fd| std::fs::metadata(fd.path())) {
+            Ok(open) if open.dev() == meta.dev() && open.ino() == meta.ino() => return Some(true),
+            Ok(_) => {}
+            // Closed since the directory was read.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => unread = true,
+        }
+    }
+    if unread {
+        unreadable()
+    } else {
+        Some(false)
+    }
+}
+
+/// Whether no process `pid` exists any more: `kill` with signal 0 sends
+/// nothing and fails with `ESRCH` only then, whatever `/proc` shows.
+fn has_exited(pid: u32) -> bool {
+    let Some(pid) = libc::pid_t::try_from(pid).ok().filter(|&pid| pid > 0) else {
+        return false;
+    };
+    // SAFETY: signal 0 is never delivered; `kill` only looks the process up.
+    let found = unsafe { libc::kill(pid, 0) } == 0;
+    !found && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 /// The real and effective uid from the `Uid:` line of `/proc/<pid>/status`,
@@ -328,16 +398,16 @@ fn processes(pids: &[u32]) -> Option<String> {
 }
 
 /// The processes `/proc/locks` lists as holding a `flock` lock on `file`, or
-/// none when that cannot be read.
-fn lock_holders(file: &File) -> Vec<u32> {
+/// `None` when that, or the file's mount, cannot be read.
+fn lock_holders(file: &File) -> Option<Vec<u32>> {
     let (Ok(meta), Some(device), Ok(locks)) = (
         file.metadata(),
         superblock_device(file),
         std::fs::read_to_string("/proc/locks"),
     ) else {
-        return Vec::new();
+        return None;
     };
-    flock_holders(&locks, device, meta.ino())
+    Some(flock_holders(&locks, device, meta.ino()))
 }
 
 /// The device number of the filesystem `file` is on, as `/proc/locks` gives it:
@@ -666,13 +736,13 @@ mod tests {
         let path = scratch.file("pam.lock", 0o600);
         let file = File::open(&path).unwrap();
         let holder = Holder::new(&path);
-        assert_eq!(lock_holders(&file), vec![holder.pid()]);
+        assert_eq!(lock_holders(&file), Some(vec![holder.pid()]));
         assert_eq!(
-            processes(&lock_holders(&file)),
+            lock_holders(&file).and_then(|pids| processes(&pids)),
             Some(format!("process {}", holder.pid()))
         );
         drop(holder);
-        assert_eq!(lock_holders(&file), Vec::<u32>::new());
+        assert_eq!(lock_holders(&file), Some(Vec::new()));
     }
 
     /// Only the holders of `flock` locks on the one file count: not a process
@@ -770,25 +840,94 @@ mod tests {
     /// A legacy lock no process running as the caller's uid has open, here
     /// because the process that took it has exited while another keeps the file
     /// open, is waited for only as long as the limit: it cannot be an earlier
-    /// irlume, so the operation then goes on, holding its own lock.
+    /// irlume, so the operation then goes on, holding its own lock. Only in the
+    /// initial PID namespace does `/proc/locks` go on listing a holder that has
+    /// exited; elsewhere it lists none, and the operation stops, as for any
+    /// holder `/proc` cannot rule out.
     #[test]
     fn goes_on_at_the_limit_when_the_legacy_lock_holder_is_not_an_earlier_irlume() {
         let scratch = Scratch::new("legacy-orphan");
         let legacy = scratch.file("irlume-pam.lock", 0o600);
         let holder = OrphanedHolder::new(&legacy);
+        let listed =
+            lock_holders(&File::open(&legacy).unwrap()).is_some_and(|pids| !pids.is_empty());
         let path = scratch.path("run/pam.lock");
         let started = Instant::now();
-        let lock = lock_pam_at(&path, Some(&legacy), uid(), Duration::from_millis(300))
-            .expect("take the lock");
+        let taken = lock_pam_at(&path, Some(&legacy), uid(), Duration::from_millis(300));
         let waited = started.elapsed();
         assert!(
             waited >= Duration::from_millis(300) && waited < Duration::from_secs(10),
             "waited {waited:?} for a limit of 300 ms"
         );
+        if !listed {
+            let refused = taken.expect_err("went on beside a holder /proc/locks does not list");
+            assert!(refused.contains("does not list"), "{refused}");
+            return;
+        }
+        let lock = taken.expect("take the lock");
         assert!(held(&path), "the lock itself is held");
         assert!(held(&legacy), "the orphaned lock was released");
         drop(lock);
         drop(holder);
+    }
+
+    /// At the limit, a holder of the legacy lock is passed over only when
+    /// `/proc` shows it is not an earlier irlume. When the holders cannot be
+    /// read, none is listed, as for one outside this PID namespace, or what one
+    /// runs as or has open cannot be read, the operation stops.
+    #[test]
+    fn stops_when_proc_cannot_rule_out_an_earlier_irlume_holding_the_legacy_lock() {
+        let refused = earlier_irlume_holders(None, |_| Some(false))
+            .expect_err("unreadable holders were passed over");
+        assert!(refused.contains("cannot be read"), "{refused}");
+        let refused = earlier_irlume_holders(Some(Vec::new()), |_| Some(false))
+            .expect_err("a holder /proc/locks does not list was passed over");
+        assert!(refused.contains("does not list"), "{refused}");
+        let refused =
+            earlier_irlume_holders(Some(vec![4242, 4343]), |pid| (pid == 4242).then_some(false))
+                .expect_err("a holder /proc cannot show was passed over");
+        assert!(refused.contains("process 4343"), "{refused}");
+
+        assert_eq!(
+            earlier_irlume_holders(Some(vec![4242, 4343]), |pid| Some(pid == 4343)),
+            Ok(vec![4343])
+        );
+        assert_eq!(
+            earlier_irlume_holders(Some(vec![4242]), |_| Some(false)),
+            Ok(Vec::new())
+        );
+    }
+
+    /// A process is an earlier irlume holding the lock only while it runs as
+    /// the account with the file open. One that has exited is not, and one
+    /// whose open files cannot be read is left undecided.
+    #[test]
+    fn tells_what_a_legacy_lock_holder_runs_as_and_has_open() {
+        let scratch = Scratch::new("open-as");
+        let path = scratch.file("irlume-pam.lock", 0o600);
+        let file = File::open(&path).unwrap();
+        let meta = file.metadata().unwrap();
+        let me = std::process::id();
+        assert_eq!(has_open_as(me, uid(), &meta), Some(true));
+        assert_eq!(has_open_as(me, uid().wrapping_add(1), &meta), Some(false));
+        let closed = std::fs::metadata(scratch.file("closed", 0o600)).unwrap();
+        assert_eq!(has_open_as(me, uid(), &closed), Some(false));
+
+        let mut child = Command::new("true").spawn().expect("run true");
+        let exited = child.id();
+        child.wait().expect("wait for true");
+        assert!(has_exited(exited));
+        assert!(!has_exited(me));
+        assert_eq!(has_open_as(exited, uid(), &meta), Some(false));
+
+        // Process 1 runs as root, and an account that may not trace it cannot
+        // list its open files.
+        let init = std::fs::read_to_string("/proc/1/status")
+            .ok()
+            .and_then(|status| status_uids(&status));
+        if uid() != 0 && init == Some((0, 0)) && std::fs::read_dir("/proc/1/fd").is_err() {
+            assert_eq!(has_open_as(1, 0, &meta), None);
+        }
     }
 
     /// The real and effective uid are the first two of the four on `Uid:`.

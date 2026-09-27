@@ -853,6 +853,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- irlumed gives each connection 5 seconds from accept to deliver its
+  whole request line, however many reads that takes, instead of 15
+  seconds for each read, which let a line sent a byte at a time keep its
+  connection until it reached the 64 KiB limit. A non-root uid may hold
+  at most 12 of the 48 connections non-root accounts share, and one more
+  is answered "daemon busy"; root keeps its 16 reserved connections.
+  THREAT_MODEL.md "Intent, throttling, and privilege elevation" records
+  the limit that remains.
+
 - The Arch `PKGBUILD` builds the release tag only after makepkg has
   checked its signature (`?signed`, with `validpgpkeys` naming the key
   `scripts/install.sh` pins). Import that key before building (#895).

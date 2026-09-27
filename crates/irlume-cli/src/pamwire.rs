@@ -4479,6 +4479,34 @@ mod tests {
     /// as it is when irlume's lines do not fit them; every other stack is
     /// wired as the recipe has it, except one whose irlume lines are already
     /// the recipe's in the places a jump counts, which is already correct.
+    /// A gate an administrator adds between a held place and the password
+    /// step after a disable is a line the recipe puts above irlume's line;
+    /// refilling the place would put irlume's `sufficient` line above the
+    /// gate, and a face match would end the stack before the gate ran. The
+    /// refill is refused; a line the recipe puts below irlume's line (the
+    /// jump the place is kept for) may stay above it.
+    #[test]
+    fn an_in_place_refill_keeps_the_recipes_gates_above_irlumes_line() {
+        let jump = "auth [success=1 default=ignore] pam_succeed_if.so user ingroup fast";
+        let gate = "auth requisite pam_succeed_if.so user ingroup wheel";
+        let step = "auth substack system-login";
+        let current = overrides::neutralize(&format!("{jump}\n{VERIFY_STANZA}\n{gate}\n{step}\n"));
+        assert!(current.contains(INERT_TAG), "{current}");
+        let below_gate = format!("{jump}\n{gate}\n{VERIFY_STANZA}\n{step}\n");
+        assert_eq!(overrides::refill(&current, &below_gate), None);
+        assert!(!overrides::recipe_lines_above_stay_above(
+            &format!("{jump}\n{VERIFY_STANZA}\n{gate}\n{step}\n"),
+            &below_gate
+        ));
+        // The recipe putting the line above the jump and the gate leaves the
+        // refill free to hold the jump's place.
+        let on_top = format!("{VERIFY_STANZA}\n{jump}\n{gate}\n{step}\n");
+        assert!(overrides::recipe_lines_above_stay_above(
+            &format!("{jump}\n{VERIFY_STANZA}\n{gate}\n{step}\n"),
+            &on_top
+        ));
+    }
+
     /// A place a disable held stops being the verify line's place once the
     /// password step moves across it: an administrator who moves
     /// `pam_unix.so` above the inactive line, while the jump still counts it,

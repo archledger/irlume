@@ -418,8 +418,45 @@ pub(super) fn refill(current: &str, wired: &str) -> Option<String> {
     let filled = fill_slots(current, wired)?;
     (own_landings(&filled) == own_landings(wired)
         && jump_shifts(current, &filled).is_empty()
-        && same_side_of_the_password_step(&filled, wired))
+        && same_side_of_the_password_step(&filled, wired)
+        && recipe_lines_above_stay_above(&filled, wired))
     .then_some(filled)
+}
+
+/// Whether every line the recipe puts above one of irlume's active lines is
+/// still above it in `filled`. A gate an administrator moves or adds between
+/// a held place and the password step after a disable is a line the recipe
+/// puts above irlume's line; refilled above it, a face match would end the
+/// stack before the gate ran. A line the recipe puts below irlume's line may
+/// sit above it in `filled`: that is the jump the held place is kept for.
+pub(super) fn recipe_lines_above_stay_above(filled: &str, wired: &str) -> bool {
+    let others_above = |text: &str, line: &str| -> Option<Vec<String>> {
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines.iter().position(|l| l.trim() == line)?;
+        Some(
+            lines[..at]
+                .iter()
+                .filter(|l| !is_irlume_line(l) && !l.trim().is_empty())
+                .map(|l| l.trim().to_string())
+                .collect(),
+        )
+    };
+    wired
+        .lines()
+        .filter(|l| is_irlume_line(l) && !l.contains(INERT_TAG))
+        .all(|line| {
+            let line = line.trim();
+            match (others_above(wired, line), others_above(filled, line)) {
+                (Some(needed), Some(mut have)) => needed.iter().all(|other| {
+                    have.iter()
+                        .position(|h| h == other)
+                        .map(|at| have.remove(at))
+                        .is_some()
+                }),
+                // The recipe's line is not in the refill: nothing it keeps.
+                (Some(_), None) | (None, _) => true,
+            }
+        })
 }
 
 /// Whether each of irlume's active lines in `wired` sits on the same side of

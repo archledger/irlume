@@ -329,6 +329,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The enrollment camera guide shows why it could not start, such as
+  `main camera stream stop is unconfirmed`, when the daemon's capture fails
+  right after the guide starts, instead of `unsolicited framing replies`.
+  The daemon writes the start reply and that error together; the client now
+  returns the error that follows the start reply and still refuses any other
+  second reply (#874).
+
 - `irlume login reconcile` keeps irlume's overrides in step with their
   vendor files on the run that adopts a missing `login.wired` marker (an
   upgrade, or a state directory recovered without it), as a run with the

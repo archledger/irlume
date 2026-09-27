@@ -35,7 +35,7 @@ impl PositionSession {
         (&session.stream).write_all(&super::serialize_request(&Request::PositionSession {
             user: Some(user.to_owned()),
         })?)?;
-        match session.reply(cancelled)? {
+        match session.read_reply(cancelled, true)? {
             Response::PositionSessionStarted => Ok(Some(session)),
             Response::Error(error) if error == "bad request" => Ok(None),
             Response::Error(error) => Err(io::Error::other(error)),
@@ -112,6 +112,22 @@ impl PositionSession {
     }
 
     fn reply(&mut self, cancelled: &AtomicBool) -> io::Result<Response> {
+        self.read_reply(cancelled, false)
+    }
+
+    /// One reply. `start` admits the one exception to "one credit, one
+    /// reply": the daemon writes `PositionSessionStarted` and, when the
+    /// capture worker fails at once, its error right behind it, and both can
+    /// arrive in one read. That error is why the guide cannot start, so it is
+    /// returned as the error (#874). Anything else after the start reply, or
+    /// after any other reply, is still refused.
+    fn read_reply(&mut self, cancelled: &AtomicBool, start: bool) -> io::Result<Response> {
+        let unsolicited =
+            || io::Error::new(io::ErrorKind::InvalidData, "unsolicited framing replies");
+        let parse = |line: &[u8]| -> io::Result<Response> {
+            serde_json::from_slice(line.trim_ascii())
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        };
         let mut reader = super::CancellableReply {
             stream: &self.stream,
             cancelled,
@@ -134,17 +150,28 @@ impl PositionSession {
                     "oversized framing reply",
                 ));
             }
-            if let Some(end) = bytes.iter().position(|b| *b == b'\n') {
-                // One credit permits exactly one reply, never a queue of old
-                // reports for future countdown beats.
-                if end + 1 != bytes.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unsolicited framing replies",
-                    ));
+            let Some(end) = bytes.iter().position(|b| *b == b'\n') else {
+                continue;
+            };
+            if end + 1 == bytes.len() {
+                return parse(&bytes[..end]);
+            }
+            // One credit permits exactly one reply, never a queue of old
+            // reports for future countdown beats.
+            if !start || !matches!(parse(&bytes[..end])?, Response::PositionSessionStarted) {
+                return Err(unsolicited());
+            }
+            let rest = &bytes[end + 1..];
+            match rest.iter().position(|b| *b == b'\n') {
+                // The rest of the second line is still on its way.
+                None => {}
+                Some(second) if second + 1 == rest.len() => {
+                    return match parse(&rest[..second])? {
+                        Response::Error(error) => Err(io::Error::other(error)),
+                        _ => Err(unsolicited()),
+                    };
                 }
-                return serde_json::from_slice(bytes.trim_ascii())
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+                Some(_) => return Err(unsolicited()),
             }
         }
     }
@@ -218,6 +245,80 @@ mod tests {
             server.join().unwrap();
             assert_eq!(result.unwrap_err().kind(), expected);
         }
+    }
+
+    /// The daemon writes the start reply and, when capture fails at once, the
+    /// error right behind it (#874). The guide must show that error, not
+    /// "unsolicited framing replies", whether the two lines arrive in one
+    /// read or the error trails in a later one; anything else after the start
+    /// reply is still refused.
+    #[test]
+    fn a_start_reply_followed_by_an_error_returns_the_error() {
+        let started = serde_json::to_string(&Response::PositionSessionStarted).unwrap();
+        let error = serde_json::to_string(&Response::Error(
+            "main camera stream stop is unconfirmed".into(),
+        ))
+        .unwrap();
+        let position =
+            serde_json::to_string(&Response::Position(PositionReport::default())).unwrap();
+        let unsolicited = Err((io::ErrorKind::InvalidData, "unsolicited framing replies"));
+        // Each case: the daemon's writes, then Ok for a started session or
+        // the error kind and text the client must return.
+        type Expected = Result<(), (io::ErrorKind, &'static str)>;
+        let cases: Vec<(Vec<Vec<u8>>, Expected)> = vec![
+            (
+                vec![format!("{started}\n{error}\n").into_bytes()],
+                Err((
+                    io::ErrorKind::Other,
+                    "main camera stream stop is unconfirmed",
+                )),
+            ),
+            (
+                vec![
+                    format!("{started}\n{}", &error[..10]).into_bytes(),
+                    format!("{}\n", &error[10..]).into_bytes(),
+                ],
+                Err((
+                    io::ErrorKind::Other,
+                    "main camera stream stop is unconfirmed",
+                )),
+            ),
+            (
+                vec![format!("{started}\n{position}\n").into_bytes()],
+                unsolicited,
+            ),
+            (
+                vec![format!("{started}\n{error}\n{error}\n").into_bytes()],
+                unsolicited,
+            ),
+            (vec![format!("{started}\n").into_bytes()], Ok(())),
+        ];
+        for (writes, expected) in cases {
+            let (mut session, mut peer) = local_session();
+            let server = std::thread::spawn(move || {
+                for bytes in writes {
+                    peer.write_all(&bytes).unwrap();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                peer
+            });
+            let result = session.read_reply(&AtomicBool::new(false), true);
+            let _peer = server.join().unwrap();
+            match (result, expected) {
+                (Ok(Response::PositionSessionStarted), Ok(())) => {}
+                (Err(got), Err((kind, text))) => {
+                    assert_eq!((got.kind(), got.to_string().as_str()), (kind, text));
+                }
+                (got, want) => panic!("got {got:?}, want {want:?}"),
+            }
+        }
+        // Outside the start reply, a trailing error is as unsolicited as any
+        // other second line.
+        let (mut session, mut peer) = local_session();
+        peer.write_all(format!("{started}\n{error}\n").as_bytes())
+            .unwrap();
+        let got = session.reply(&AtomicBool::new(false)).unwrap_err();
+        assert_eq!(got.to_string(), "unsolicited framing replies");
     }
 
     #[test]

@@ -251,6 +251,13 @@ pub(crate) fn node_entry_from_facts(facts: &NodeFacts) -> CensusEntry {
                      ceiling yet, so face authentication refuses it as exposure unmeasurable",
                 ),
             ),
+            Role::Ir if facts.paired && facts.fourccs.as_ref().is_none_or(Vec::is_empty) => (
+                CensusClass::UvcIr { paired: true },
+                CensusVerdict::SupportedWithLimits(
+                    "supported with limits: IR capture formats could not be confirmed; \
+                     secure IR support is unverified",
+                ),
+            ),
             Role::Ir if facts.paired => (
                 CensusClass::UvcIr { paired: true },
                 CensusVerdict::Supported(Some("secure IR tier")),
@@ -798,6 +805,22 @@ mod tests {
             grey.verdict,
             CensusVerdict::Supported(Some("secure IR tier"))
         );
+    }
+
+    #[test]
+    fn a_paired_ir_node_with_no_reprobe_does_not_claim_the_secure_tier() {
+        let mut f = facts("/dev/video2", Role::Ir, &[b"YUYV"]);
+        for formats in [None, Some(Vec::new())] {
+            f.fourccs = formats;
+            f.luma_ir_check = None;
+            let entry = node_entry_from_facts(&f);
+            assert_eq!(entry.class, CensusClass::UvcIr { paired: true });
+            assert!(
+                matches!(entry.verdict, CensusVerdict::SupportedWithLimits(note)
+                if note.contains("secure IR support is unverified"))
+            );
+            assert!(!render_line(&entry).contains("secure IR tier"));
+        }
     }
 
     /// A YUYV-only colour webcam stays RGB and says which clause kept it

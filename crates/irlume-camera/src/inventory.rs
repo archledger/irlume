@@ -826,6 +826,12 @@ impl CameraInventory {
             });
             match (holders.next(), holders.next()) {
                 (Some(entry), None) => {
+                    if self
+                        .invalidated_instance_ids
+                        .contains(entry.descriptor.camera_instance_id())
+                    {
+                        return CameraInventoryError::ContinuityLost;
+                    }
                     cameras.insert(entry.descriptor.camera_instance_id().clone());
                 }
                 _ => return CameraInventoryError::UnknownCamera,
@@ -1268,6 +1274,17 @@ mod tests {
                 "{request:?}"
             );
         }
+        // An old observation is not evidence of a live split during refresh.
+        inventory.invalidate_topologies(&BTreeSet::from(["/devices/pci/usb1/1-8".into()]));
+        assert_eq!(
+            inventory.reference_for_endpoints(&["/dev/video2", "/dev/video0"]),
+            Err(CameraInventoryError::ContinuityLost)
+        );
+        inventory.invalidate_all();
+        assert_eq!(
+            inventory.reference_for_endpoints(&["/dev/video2", "/dev/video0"]),
+            Err(CameraInventoryError::ContinuityLost)
+        );
     }
 
     fn generation(event: &CameraInventoryEvent) -> u64 {

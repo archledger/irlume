@@ -4465,17 +4465,7 @@ pub fn camera_display_name(dev_dir: &std::path::Path, node: &str) -> Option<Stri
     // it. Only visible characters reach a screen, bounded, and never an
     // empty or whitespace-only name.
     let clean = |text: String| {
-        let text: String = text
-            .chars()
-            .map(|c| {
-                if c.is_control() || is_invisible_format(c) {
-                    ' '
-                } else {
-                    c
-                }
-            })
-            .take(64)
-            .collect();
+        let text = camera_text(&text);
         let text = text.trim();
         (!text.is_empty()).then(|| text.to_owned())
     };
@@ -4491,6 +4481,20 @@ pub fn camera_display_name(dev_dir: &std::path::Path, node: &str) -> Option<Stri
                 .ok()
                 .and_then(clean)
         })
+}
+
+/// Bound device text and keep it on one visible line, for display and logs.
+fn camera_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() || is_invisible_format(c) || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .take(64)
+        .collect()
 }
 
 /// Unicode format characters that change how neighbouring text displays
@@ -5910,6 +5914,7 @@ fn discrete_frame_sizes(dev: &Device, fourcc: &[u8; 4]) -> Vec<(u32, u32)> {
 /// journal instead of leaving only the refusal.
 fn unattested_luma_ir_warning(device: &str, pix: IrPixel, attested: bool) -> Option<String> {
     (pix == IrPixel::YuyvLuma && !attested).then(|| {
+        let device = camera_text(device);
         format!(
             "[ir] {device}: streams IR as YUYV luma without descriptor attestation; \
              credential release will refuse (exposure unmeasurable)"
@@ -17428,6 +17433,17 @@ mod tests {
         for pix in [IrPixel::Grey8, IrPixel::Grey16, IrPixel::Nv12Luma] {
             assert_eq!(unattested_luma_ir_warning("/dev/video2", pix, false), None);
         }
+    }
+
+    #[test]
+    fn unattested_yuyv_warning_bounds_and_cleans_the_device_path() {
+        let device = "/dev/cam\n\r\t\x1b\x7f\u{0085}\u{202e}\u{2028}\u{2029}";
+        let line = unattested_luma_ir_warning(device, IrPixel::YuyvLuma, false).unwrap();
+        assert!(line.starts_with("[ir] /dev/cam         :"), "{line:?}");
+        assert!(!line.chars().any(char::is_control));
+        assert!(!line.chars().any(is_invisible_format));
+        let line = unattested_luma_ir_warning(&"é".repeat(100), IrPixel::YuyvLuma, false).unwrap();
+        assert!(line.starts_with(&format!("[ir] {}: streams", "é".repeat(64))));
     }
 
     #[test]

@@ -30,12 +30,13 @@ const LOCK_NAME: &str = "pam.lock";
 
 /// Where releases before this one kept the PAM lock: `/run/lock`, which every
 /// account can search, with the file at the default mode 0644.
-pub(crate) const LEGACY_PAM_LOCK: &str = "/run/lock/irlume-pam.lock";
+const LEGACY_PAM_LOCK: &str = "/run/lock/irlume-pam.lock";
 
-/// How long a PAM operation waits for a process holding [`LEGACY_PAM_LOCK`]
-/// before it goes on without that lock. An earlier release holds it for one
-/// `login` command or reconcile run; the longest of those load the SELinux
-/// module and restart irlumed.
+/// How long a PAM operation waits for a process holding [`LEGACY_PAM_LOCK`].
+/// An earlier release holds it for one `login` command or reconcile run; the
+/// longest of those load the SELinux module and restart irlumed. After that
+/// the operation stops, or goes on without the lock when the holder cannot be
+/// an earlier irlume (see [`take_legacy_lock`]).
 const LEGACY_WAIT: Duration = Duration::from_secs(60);
 
 /// How often [`take_legacy_lock`] tries again while it waits.
@@ -113,7 +114,10 @@ fn lock_pam_at(
             ));
         }
     }
-    let legacy = legacy.and_then(|legacy| take_legacy_lock(legacy, uid, legacy_wait));
+    let legacy = match legacy {
+        Some(legacy) => take_legacy_lock(legacy, uid, legacy_wait)?,
+        None => None,
+    };
     Ok(PamLock {
         _file: file,
         _legacy: legacy,
@@ -189,7 +193,7 @@ fn open_lock(path: &Path, uid: u32) -> Result<File, String> {
 
 /// Also take `path`, the lock releases before this one took, so a PAM operation
 /// of one of them still running, as during a package upgrade, cannot interleave
-/// with this one. `None` when there is nothing to take or it is not taken.
+/// with this one. `Ok(None)` when there is nothing to take or it is not taken.
 ///
 /// Only an existing regular file owned by `uid` is considered: one of those
 /// releases, running as root, created it. A file another account created is not
@@ -200,17 +204,25 @@ fn open_lock(path: &Path, uid: u32) -> Result<File, String> {
 /// an account that has not opened it by then cannot.
 ///
 /// Any account could open the file before, so a process holding it is not
-/// necessarily an irlume: it is waited for at most `wait`, named on stderr, and
-/// the operation then goes on without this lock.
-fn take_legacy_lock(path: &Path, uid: u32, wait: Duration) -> Option<File> {
-    let file = std::fs::OpenOptions::new()
+/// necessarily an irlume: it is waited for at most `wait` and named on stderr.
+/// If a process running as `uid` with the file open still holds it then, it may
+/// be an earlier irlume changing PAM, and the operation stops with an error
+/// rather than write beside it. Otherwise the holder is another account's
+/// process, or one that has exited while another keeps the file open, and the
+/// operation goes on without this lock.
+fn take_legacy_lock(path: &Path, uid: u32, wait: Duration) -> Result<Option<File>, String> {
+    let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
-        .ok()?;
-    let meta = file.metadata().ok()?;
+    else {
+        return Ok(None);
+    };
+    let Ok(meta) = file.metadata() else {
+        return Ok(None);
+    };
     if !meta.is_file() || meta.uid() != uid {
-        return None;
+        return Ok(None);
     }
     if meta.mode() & 0o077 != 0 {
         // Best effort: the lock is taken either way.
@@ -221,10 +233,10 @@ fn take_legacy_lock(path: &Path, uid: u32, wait: Duration) -> Option<File> {
     loop {
         // SAFETY: the descriptor is owned by `file`, which outlives the call.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Some(file);
+            return Ok(Some(file));
         }
         if std::io::Error::last_os_error().raw_os_error() != Some(libc::EWOULDBLOCK) {
-            return None;
+            return Ok(None);
         }
         let by = || {
             processes(&lock_holders(&file))
@@ -233,12 +245,26 @@ fn take_legacy_lock(path: &Path, uid: u32, wait: Duration) -> Option<File> {
         };
         let now = Instant::now();
         if now >= deadline {
+            let own: Vec<u32> = lock_holders(&file)
+                .into_iter()
+                .filter(|&pid| has_open_as(pid, uid, &meta))
+                .collect();
+            if let Some(who) = processes(&own) {
+                return Err(format!(
+                    "{}, the PAM lock of earlier irlume releases, is still held after {} s \
+                     by {who}, running as uid {uid}; an earlier irlume may still be \
+                     changing PAM, so try again once it has finished",
+                    path.display(),
+                    wait.as_secs()
+                ));
+            }
             eprintln!(
-                "irlume: {} is still held{}; going on without it",
+                "irlume: {} is still held{}; no process running as uid {uid} has it open, \
+                 so it is not an earlier irlume, and this operation goes on without it",
                 path.display(),
                 by()
             );
-            return None;
+            return Ok(None);
         }
         if !waiting {
             eprintln!(
@@ -252,6 +278,38 @@ fn take_legacy_lock(path: &Path, uid: u32, wait: Duration) -> Option<File> {
         }
         std::thread::sleep(LEGACY_POLL.min(deadline - now));
     }
+}
+
+/// Whether process `pid` runs as `uid`, by its real and effective uid, and has
+/// the file `meta` describes open, as an earlier irlume holding its lock does.
+///
+/// `false` when either cannot be read. `/proc/locks` goes on naming the process
+/// that took a lock after it has exited while another keeps the file open, and
+/// a later process can be given that number, so the number alone proves
+/// nothing. The real uid is checked too, so a set-user-ID program another
+/// account runs does not count.
+fn has_open_as(pid: u32, uid: u32, meta: &std::fs::Metadata) -> bool {
+    let runs_as = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|status| status_uids(&status))
+        .is_some_and(|(real, effective)| real == uid && effective == uid);
+    runs_as
+        && std::fs::read_dir(format!("/proc/{pid}/fd")).is_ok_and(|fds| {
+            fds.flatten().any(|fd| {
+                std::fs::metadata(fd.path())
+                    .is_ok_and(|open| open.dev() == meta.dev() && open.ino() == meta.ino())
+            })
+        })
+}
+
+/// The real and effective uid from the `Uid:` line of `/proc/<pid>/status`,
+/// which lists the real, effective, saved and filesystem uid in that order.
+fn status_uids(status: &str) -> Option<(u32, u32)> {
+    let mut ids = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace();
+    Some((ids.next()?.parse().ok()?, ids.next()?.parse().ok()?))
 }
 
 /// `process 1234` or `processes 1234, 5678`, or `None` for no processes.
@@ -408,6 +466,21 @@ mod tests {
             .success()
     }
 
+    /// Whether the lock on `path` is let go within 5 s. A child another test
+    /// thread is starting holds a copy of each descriptor of this process until
+    /// it runs its program, and the lock with it, so a release can take a
+    /// moment to show; a lock never released still fails.
+    fn released(path: &Path) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while held(path) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+
     /// A `flock` process holding `path` until dropped. `-o` keeps the lock out
     /// of the `cat` it runs, so the lock is `flock`'s own and goes when `cat`
     /// ends at the end of its input.
@@ -452,6 +525,41 @@ mod tests {
         }
     }
 
+    /// A lock on `path` whose taker has exited: a shell opens the file, a
+    /// `flock` it starts takes the lock on that descriptor and exits, and the
+    /// `sleep` the shell becomes keeps the file open and the lock held until
+    /// dropped. `/proc/locks` names the `flock` process, which no longer runs.
+    struct OrphanedHolder(Child);
+
+    impl OrphanedHolder {
+        fn new(path: &Path) -> Self {
+            let child = Command::new("sh")
+                .args(["-c", "exec 9<\"$1\" && flock -x 9 && exec sleep 60", "sh"])
+                .arg(path)
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("run sh");
+            let holder = Self(child);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !held(path) {
+                assert!(
+                    Instant::now() < deadline,
+                    "flock never took {}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            holder
+        }
+    }
+
+    impl Drop for OrphanedHolder {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     /// The directory is created 0700 and the lock 0600, so no other account can
     /// open the lock, and the lock excludes another process until it is dropped.
     #[test]
@@ -464,7 +572,7 @@ mod tests {
         assert_eq!(mode(&path), 0o600);
         assert!(held(&path), "the lock is held while the guard lives");
         drop(lock);
-        assert!(!held(&path), "the lock was not released when dropped");
+        assert!(released(&path), "the lock was not released when dropped");
     }
 
     /// A lock file that group or others could open loses those permissions.
@@ -625,18 +733,49 @@ mod tests {
         assert_eq!(mode(&legacy), 0o600);
         drop(lock);
         assert!(
-            !held(&legacy),
+            released(&legacy),
             "the legacy lock was not released when dropped"
         );
     }
 
-    /// A process holding the legacy lock is waited for only as long as the
-    /// limit: the operation then goes on, holding its own lock.
+    /// A process running as the caller's uid with the legacy lock open, as an
+    /// earlier irlume holding it is, that still holds it at the limit stops the
+    /// operation with an error naming it, instead of letting it write beside
+    /// that process. The operation's own lock is released with the error.
     #[test]
-    fn stops_waiting_for_the_legacy_lock_at_the_limit() {
+    fn refuses_at_the_limit_while_a_process_of_the_account_holds_the_legacy_lock() {
         let scratch = Scratch::new("legacy-limit");
         let legacy = scratch.file("irlume-pam.lock", 0o600);
         let holder = Holder::new(&legacy);
+        let path = scratch.path("run/pam.lock");
+        let started = Instant::now();
+        let refused = lock_pam_at(&path, Some(&legacy), uid(), Duration::from_millis(300))
+            .expect_err("went on beside a process of the account holding the legacy lock");
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(300) && waited < Duration::from_secs(10),
+            "waited {waited:?} for a limit of 300 ms"
+        );
+        assert!(
+            refused.contains(&format!("process {}", holder.pid())),
+            "{refused}"
+        );
+        assert!(
+            released(&path),
+            "the lock itself was kept after the refusal"
+        );
+        drop(holder);
+    }
+
+    /// A legacy lock no process running as the caller's uid has open, here
+    /// because the process that took it has exited while another keeps the file
+    /// open, is waited for only as long as the limit: it cannot be an earlier
+    /// irlume, so the operation then goes on, holding its own lock.
+    #[test]
+    fn goes_on_at_the_limit_when_the_legacy_lock_holder_is_not_an_earlier_irlume() {
+        let scratch = Scratch::new("legacy-orphan");
+        let legacy = scratch.file("irlume-pam.lock", 0o600);
+        let holder = OrphanedHolder::new(&legacy);
         let path = scratch.path("run/pam.lock");
         let started = Instant::now();
         let lock = lock_pam_at(&path, Some(&legacy), uid(), Duration::from_millis(300))
@@ -647,8 +786,18 @@ mod tests {
             "waited {waited:?} for a limit of 300 ms"
         );
         assert!(held(&path), "the lock itself is held");
+        assert!(held(&legacy), "the orphaned lock was released");
         drop(lock);
         drop(holder);
+    }
+
+    /// The real and effective uid are the first two of the four on `Uid:`.
+    #[test]
+    fn reads_the_real_and_effective_uid_from_proc_status() {
+        let status = "Name:\tsu\nUmask:\t0022\nUid:\t1000\t0\t0\t0\nGid:\t1000\t1000\t1000\t1000\n";
+        assert_eq!(status_uids(status), Some((1000, 0)));
+        assert_eq!(status_uids("Name:\tx\n"), None);
+        assert_eq!(status_uids("Uid:\t0\n"), None);
     }
 
     /// The legacy lock is left alone when it is missing (it is not created), a
@@ -659,20 +808,23 @@ mod tests {
         let scratch = Scratch::new("legacy-skip");
         let long = Duration::from_secs(30);
         let missing = scratch.path("missing.lock");
-        assert!(take_legacy_lock(&missing, uid(), long).is_none());
+        assert!(matches!(take_legacy_lock(&missing, uid(), long), Ok(None)));
         assert!(!missing.exists(), "a missing legacy lock was created");
 
         let target = scratch.file("target", 0o644);
         let link = scratch.path("link.lock");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(take_legacy_lock(&link, uid(), long).is_none());
+        assert!(matches!(take_legacy_lock(&link, uid(), long), Ok(None)));
         assert_eq!(mode(&target), 0o644, "the symlink's target was changed");
         assert!(!held(&target), "the symlink's target was locked");
 
         let foreign = scratch.file("foreign.lock", 0o644);
         let holder = Holder::new(&foreign);
         let started = Instant::now();
-        assert!(take_legacy_lock(&foreign, uid().wrapping_add(1), long).is_none());
+        assert!(matches!(
+            take_legacy_lock(&foreign, uid().wrapping_add(1), long),
+            Ok(None)
+        ));
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "waited for a legacy lock another account owns"

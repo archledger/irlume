@@ -60,7 +60,7 @@ use transform::*;
 #[cfg(test)]
 pub(crate) use files::restore_surface_with;
 pub(crate) use files::{is_managed_path, restore_surface, UNREADABLE};
-pub(crate) use lock::{lock_pam, LEGACY_PAM_LOCK};
+pub(crate) use lock::lock_pam;
 // The PAM-grammar items shared outside this module: `fingerprint.rs` and the
 // TUI must read stack lines with the same comment and rule-field semantics
 // the wiring uses, or the two would disagree about what a file configures.

@@ -862,9 +862,14 @@ All notable changes to irlume are documented here. This project adheres to
   owns, and an operation waiting for it names the process holding it.
   While a release that used the old lock may still be running, as
   during an upgrade, `/run/lock/irlume-pam.lock` is taken as well when
-  it exists and root owns it: a process holding it is waited for at
-  most 60 seconds, and the file loses its group and other permissions.
-  It is no longer created, and `irlume uninstall` removes it.
+  it exists and root owns it, and the file loses its group and other
+  permissions. A process holding it is waited for at most 60 seconds;
+  if a root process with the file open still holds it then, the
+  operation stops with an error, and otherwise, as for another
+  account's process, it goes on without that lock. It is no longer
+  created. `irlume uninstall` leaves both lock files in place, since
+  another operation may hold them; they are empty and on the `/run`
+  tmpfs.
   `irlume-reconcile.service` now stops a run after 5 minutes
   (`TimeoutStartSec`), so a run that does not finish no longer keeps
   later triggers from starting it.

@@ -2092,7 +2092,7 @@ enum SessionRefusal {
 }
 
 /// The session lock's file name inside the directory [`session_dir`] opens.
-const SESSION_LOCK_NAME: &str = "machine-session.lock";
+pub(crate) const SESSION_LOCK_NAME: &str = "machine-session.lock";
 
 /// Where root keeps its session lock when it has no runtime directory of its
 /// own, as under sudo, pkexec, a system unit or a cron job: a root-owned 0700

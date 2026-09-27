@@ -35,6 +35,11 @@ RestartSec=2
 # Generous on purpose: an enrolment captures many scans, and it reports progress
 # between them, so this only has to exceed one capture plus inference.
 WatchdogSec=90s
+# irlumed does not write core dumps, so a crash or the watchdog's SIGABRT (the
+# WatchdogSignal= default) leaves no process memory on disk. The daemon also
+# sets this limit and clears its dumpable flag at startup; the unit applies the
+# limit from exec on.
+LimitCORE=0
 # Redundant, and kept as documentation rather than as a mechanism: systemd.service(5)
 # says that when WatchdogSec= is set and NotifyAccess= is not, NotifyAccess is
 # implicitly main. Type= does not enter into it, which the previous comment here

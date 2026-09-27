@@ -843,6 +843,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- irlumed does not write core dumps, so a crash or a watchdog restart
+  leaves no process memory on disk: it sets a zero core limit and clears
+  its dumpable flag at startup, and `irlumed.service` and the NixOS module
+  set `LimitCORE=0`. A failure to apply either setting is logged and does
+  not stop the daemon.
+
 - pam_irlume also stands down at `sudo`, `su`, `doas` and the other
   elevation services when the process running the transaction belongs to
   a remote login session, or to none it can resolve (a cron job or a

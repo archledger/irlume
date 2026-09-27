@@ -156,11 +156,12 @@ impl LiveState {
     /// The view of the peer with uid `peer_uid`. For a reader other than
     /// root, every operation of another account, or of one that did not
     /// resolve, reads as [`LiveOperationKind::Unknown`] whatever its kind:
-    /// it keeps its place, elapsed time and stop request, so the worker
-    /// still reads busy and a client does not queue camera work behind it,
-    /// but the kind does not say what another account is doing, and an
-    /// authentication reads the same as that account's enrollment, profile
-    /// or wallet work (ADR-0030 §5). Daemon-wide work keeps its kind
+    /// it keeps its place and elapsed time, so the worker still reads busy
+    /// and a client does not queue camera work behind it, but the kind does
+    /// not say what another account is doing, and an authentication reads
+    /// the same as that account's enrollment, profile or wallet work
+    /// (ADR-0030 §5). Its stop request follows the kind the reader reads
+    /// ([`stop_requested`]). Daemon-wide work keeps its kind
     /// ([`Owner::visible_to`]).
     pub(crate) fn snapshot_for(
         &self,
@@ -171,21 +172,17 @@ impl LiveState {
         // Capture once: elapsed must never exceed the same snapshot's uptime.
         let now_ms = self.0.clock.now_ms();
         let worker = inner.worker.as_ref().map(|worker| {
+            let kind = visible_kind(worker.kind, worker.owner, peer_uid);
             // Read the shared stop bit under the tracker lock. The previous
             // worker is removed before the next arbiter.take resets that bit.
-            let requested = self.0.cancel.get().is_some_and(|token| {
-                if matches!(
-                    worker.kind,
-                    LiveOperationKind::Authentication | LiveOperationKind::WalletAuthentication
-                ) {
-                    token.cancel_requested()
-                } else {
-                    token.stop_requested()
-                }
-            });
+            let requested = self
+                .0
+                .cancel
+                .get()
+                .is_some_and(|token| stop_requested(token, kind));
             LiveWorkerOperation {
                 operation_id: worker.id,
-                kind: visible_kind(worker.kind, worker.owner, peer_uid),
+                kind,
                 elapsed_ms: now_ms.saturating_sub(worker.started_ms),
                 cancellation_requested: worker.cancelled || requested,
             }
@@ -231,6 +228,21 @@ fn visible_kind(kind: LiveOperationKind, owner: Owner, peer_uid: u32) -> LiveOpe
         kind
     } else {
         LiveOperationKind::Unknown
+    }
+}
+/// Whether the shared token asks the running worker, of `kind` as its reader
+/// reads it, to stop. Authentications and credential releases stop only
+/// when their client leaves; other work also yields to a queued
+/// authentication. An operation the reader may not see reads as `Unknown`
+/// and shows only the request every kind honours, its client leaving:
+/// showing the yield would tell an authentication, which never yields,
+/// from any other kind.
+fn stop_requested(token: &CancelToken, kind: LiveOperationKind) -> bool {
+    match kind {
+        LiveOperationKind::Authentication
+        | LiveOperationKind::WalletAuthentication
+        | LiveOperationKind::Unknown => token.cancel_requested(),
+        _ => token.stop_requested(),
     }
 }
 impl LiveGuard {
@@ -648,9 +660,10 @@ mod tests {
     }
     /// A reader other than root sees every operation of another account, or
     /// of an unresolved one, as unknown work whatever its kind, with its
-    /// place, elapsed time and stop request intact; its own operations and
-    /// daemon-wide work under the kind they registered. Root sees every
-    /// kind. Relabelled waiting rows merge into one valid row per kind.
+    /// place, elapsed time and a departed client's stop request intact; its
+    /// own operations and daemon-wide work under the kind they registered.
+    /// Root sees every kind. Relabelled waiting rows merge into one valid
+    /// row per kind.
     #[test]
     fn live_status_shows_other_accounts_operations_of_every_kind_as_unknown_work() {
         use LiveOperationKind as K;
@@ -746,6 +759,86 @@ mod tests {
             .snapshot_for(CameraInventorySnapshot::default(), 3_000)
             .waiting
             .is_empty());
+    }
+    /// A reader other than root reads the same stop request for another
+    /// account's running operation, or an unresolved one's, whatever its
+    /// kind: a queued authentication's yield, which only some kinds honour,
+    /// does not show, and a departed client's cancel, which every kind
+    /// honours, does. Root and the account itself read the kind's own
+    /// request, and daemon-wide work keeps it for every reader.
+    #[test]
+    fn live_status_shows_one_stop_request_for_hidden_operations_of_every_kind() {
+        use LiveOperationKind as K;
+        let (state, _) = setup();
+        let token = CancelToken::new();
+        state.set_cancel_token(token.clone());
+        let flag = |peer_uid| {
+            state
+                .snapshot_for(CameraInventorySnapshot::default(), peer_uid)
+                .worker
+                .expect("the worker stays busy for every reader")
+                .cancellation_requested
+        };
+        let kinds = [
+            K::Authentication,
+            K::WalletAuthentication,
+            K::Enrollment,
+            K::Framing,
+            K::Identification,
+            K::CameraEnumeration,
+            K::CameraSetup,
+            K::CaptureQualification,
+            K::CameraDiagnostics,
+            K::ProfileRead,
+            K::ProfileUpdate,
+            K::SensorReadiness,
+            K::WalletRead,
+            K::WalletUpdate,
+            K::RecoveryUpdate,
+            K::Compatibility,
+            K::Status,
+        ];
+        for owner in [Owner::Account(1_000), Owner::Unresolved, Owner::Daemon] {
+            for kind in kinds {
+                let worker = state.register(OperationId::from_bytes([2; 16]), kind, false, owner);
+                worker.running();
+                let yields = !matches!(kind, K::Authentication | K::WalletAuthentication);
+                for peer_uid in [0, 1_000, 2_000] {
+                    assert!(!flag(peer_uid), "{owner:?} {kind:?}: nothing asked yet");
+                }
+                token.request_stop();
+                assert_eq!(flag(0), yields, "{owner:?} {kind:?}: root reads the kind's");
+                let owners_view = if owner == Owner::Unresolved {
+                    false
+                } else {
+                    yields
+                };
+                assert_eq!(
+                    flag(1_000),
+                    owners_view,
+                    "{owner:?} {kind:?}: uid 1000 reads the kind's for its own work"
+                );
+                let others_view = if owner == Owner::Daemon {
+                    yields
+                } else {
+                    false
+                };
+                assert_eq!(
+                    flag(2_000),
+                    others_view,
+                    "{owner:?} {kind:?}: another account reads no yield"
+                );
+                token.request_cancel();
+                for peer_uid in [0, 1_000, 2_000] {
+                    assert!(
+                        flag(peer_uid),
+                        "{owner:?} {kind:?}: a departed client reads for {peer_uid}"
+                    );
+                }
+                worker.finish();
+                token.reset();
+            }
+        }
     }
     #[test]
     fn live_tracker_revision_overflow_and_poison_report_unavailable() {

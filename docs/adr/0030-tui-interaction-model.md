@@ -612,11 +612,15 @@ own background qualification, which are daemon-wide.
   partial and the marker itself tells nothing.
 - `LiveStatus` answered to any other account reports every operation of
   another account, or of an unresolved one, running or waiting, as
-  `unknown` whatever its kind, with its operation ID, elapsed time and
-  stop request unchanged. The worker still reads busy, so a client does
-  not send camera work that the arbiter would refuse while an
-  authentication is pending. The reader's own operations and daemon-wide
-  work keep their kind.
+  `unknown` whatever its kind, with its operation ID and elapsed time
+  unchanged. The worker still reads busy, so a client does not send
+  camera work that the arbiter would refuse while an authentication is
+  pending. Its `cancellation_requested` reports only the stop every kind
+  honours, its client leaving, and not the yield to a queued
+  authentication: other work yields and authentications and credential
+  releases do not, so showing the yield would say which kind it is. The
+  reader's own operations and daemon-wide work keep their kind and their
+  stop request.
 - Every reader still sees when the worker is busy, for how long, and how
   many operations wait: that is what keeps clients from queueing camera
   work behind an authentication. What it no longer sees is whose work it

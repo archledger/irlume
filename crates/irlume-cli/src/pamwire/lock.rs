@@ -1447,20 +1447,74 @@ mod tests {
         drop(holder);
     }
 
-    /// A legacy lock no process running as the caller's uid has open, here
-    /// because the process that took it has exited while another keeps the file
-    /// open, is waited for only as long as the limit: it cannot be an earlier
-    /// irlume, so the operation then goes on, holding its own lock. Only in the
-    /// initial PID namespace does `/proc/locks` go on listing a holder that has
-    /// exited; elsewhere it lists none, and the operation stops, as for any
-    /// holder `/proc` cannot rule out.
+    /// At the limit, a holder of the legacy lock that `/proc/locks` lists and
+    /// shows runs as another account than the caller is passed over, since it
+    /// cannot be an earlier irlume of the caller's: the operation goes on
+    /// without the lock, which stays its holder's, and nothing the operation
+    /// took is left on the file. A test cannot run a process as another
+    /// account, so the holder runs as this one and the operation is given
+    /// another account: the verdict asks only whether holder and caller are
+    /// the same account, so it comes out the same either way. A holder that
+    /// runs is listed in every PID namespace, unlike the exited taker the
+    /// next test waits behind, so this side of the limit does not depend on
+    /// where the test runs.
     #[test]
-    fn goes_on_at_the_limit_when_the_legacy_lock_holder_is_not_an_earlier_irlume() {
+    fn goes_on_at_the_limit_when_the_listed_legacy_lock_holder_runs_as_another_account() {
+        let scratch = Scratch::new("legacy-other-account");
+        let legacy = scratch.file("irlume-pam.lock", 0o600);
+        let holder = Holder::new(&legacy);
+        let file = match open_legacy_lock(&legacy, uid()) {
+            Ok(LegacyLock::Own(file)) => file,
+            other => panic!("{} was not the caller's own: {other:?}", legacy.display()),
+        };
+        let probe = File::open(&legacy).unwrap();
+        assert_eq!(
+            lock_holders(&probe),
+            Some(vec![holder.pid()]),
+            "the holder is not listed, so its side of the limit cannot be forced"
+        );
+        let other = uid().wrapping_add(1);
+        let limit = Duration::from_millis(300);
+        let started = Instant::now();
+        let past = wait_for_legacy_lock(&legacy, file, other, limit, started + limit)
+            .expect("stopped beside a holder that runs as another account");
+        let waited = started.elapsed();
+        assert!(
+            waited >= limit && waited < Duration::from_secs(10),
+            "waited {waited:?} for a limit of 300 ms"
+        );
+        assert!(
+            past.is_none(),
+            "took the legacy lock although its holder still holds it"
+        );
+        assert!(
+            held(&legacy),
+            "the legacy lock was let go although its holder still holds it"
+        );
+        drop(holder);
+        assert!(
+            released(&legacy),
+            "a lock the operation took was left on the legacy lock"
+        );
+    }
+
+    /// At the limit over a legacy lock whose taker has exited while another
+    /// process keeps the file open, the operation goes on only where
+    /// `/proc/locks` still lists that taker, as the initial PID namespace
+    /// does: a pid that has exited is not an earlier irlume, so the operation
+    /// then holds its own lock alone while the orphaned lock stays held.
+    /// Where the listing hides an exited taker, as outside the initial PID
+    /// namespace, it lists no holder at all, and the operation stops with the
+    /// refusal that says so, having let go of its own lock. Which of the two
+    /// the listing answers is not this test's to choose, and a sample of it
+    /// taken before the wait was once seen, under load in CI, to disagree
+    /// with the reading at the deadline, so the side is taken from what the
+    /// operation returns and only that side's invariants are checked.
+    #[test]
+    fn goes_on_or_stops_at_the_limit_by_whether_proc_locks_lists_the_orphaned_legacy_holder() {
         let scratch = Scratch::new("legacy-orphan");
         let legacy = scratch.file("irlume-pam.lock", 0o600);
         let holder = OrphanedHolder::new(&legacy);
-        let listed =
-            lock_holders(&File::open(&legacy).unwrap()).is_some_and(|pids| !pids.is_empty());
         let path = scratch.path("run/pam.lock");
         let started = Instant::now();
         let taken = lock_pam_at(&path, Some(&legacy), uid(), Duration::from_millis(300));
@@ -1469,15 +1523,26 @@ mod tests {
             waited >= Duration::from_millis(300) && waited < Duration::from_secs(10),
             "waited {waited:?} for a limit of 300 ms"
         );
-        if !listed {
-            let refused = taken.expect_err("went on beside a holder /proc/locks does not list");
-            assert!(refused.contains("does not list"), "{refused}");
-            return;
+        assert!(
+            held(&legacy),
+            "the orphaned lock was let go before its holder ended"
+        );
+        match taken {
+            Ok(lock) => {
+                assert!(held(&path), "the lock itself is held");
+                drop(lock);
+            }
+            Err(refused) => {
+                assert!(
+                    refused.contains("does not list"),
+                    "an exited taker this PID namespace hides was passed over: {refused}"
+                );
+                assert!(
+                    released(&path),
+                    "the lock itself was kept after the refusal"
+                );
+            }
         }
-        let lock = taken.expect("take the lock");
-        assert!(held(&path), "the lock itself is held");
-        assert!(held(&legacy), "the orphaned lock was released");
-        drop(lock);
         drop(holder);
     }
 
@@ -2208,8 +2273,12 @@ mod tests {
     /// is not an earlier irlume: the waiter takes the lock once the holder
     /// lets go, which may be while the operation runs. Here the holder has
     /// exited while another process keeps the file open, which `/proc/locks`
-    /// lists only in the initial PID namespace; elsewhere the operation stops
-    /// because it lists no holder.
+    /// lists only in the initial PID namespace; elsewhere it lists no holder,
+    /// and the operation stops for that instead. Which of the two refusals
+    /// that is does not depend on a sample of `/proc/locks` taken before the
+    /// wait, which under load once disagreed with the reading at the
+    /// deadline: the refusal itself says which, and only its invariants are
+    /// checked.
     #[test]
     fn refuses_at_the_limit_while_a_process_of_the_account_waits_for_the_legacy_lock() {
         let scratch = Scratch::new("legacy-waiter");
@@ -2223,25 +2292,23 @@ mod tests {
             .expect("run flock");
         let probe = File::open(&legacy).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        let listed = loop {
-            let users = lock_users(&probe).unwrap_or_default();
-            if users.waiters.contains(&waiter.id()) {
-                break !users.holders.is_empty();
-            }
+        while !lock_users(&probe)
+            .unwrap_or_default()
+            .waiters
+            .contains(&waiter.id())
+        {
             assert!(Instant::now() < deadline, "flock never waited for the lock");
             std::thread::sleep(Duration::from_millis(20));
-        };
+        }
         let path = scratch.path("run/pam.lock");
         let refused = lock_pam_at(&path, Some(&legacy), uid(), Duration::from_millis(300))
             .expect_err("went on while a process of the account waits for the legacy lock");
-        if listed {
+        if !refused.contains("does not list") {
             assert!(
                 refused.contains(&format!("process {}", waiter.id()))
                     && refused.contains("waiting for it"),
                 "{refused}"
             );
-        } else {
-            assert!(refused.contains("does not list"), "{refused}");
         }
         drop(holder);
         let _ = waiter.wait();

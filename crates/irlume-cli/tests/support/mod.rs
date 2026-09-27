@@ -48,7 +48,9 @@ pub(crate) fn isolated_root_command_with_host_pids(
 /// cannot become a mount point under the read-only root. The host's `parent`
 /// is bound read-only at a path under `/run`, and a directory built in the
 /// sandbox is mounted over `parent`: one symlink per host entry, pointing into
-/// that view, a real directory for each missing destination, and a real
+/// that view (a host symlink is copied with its own target, so a relative one
+/// such as `../lib32/ld-linux.so.2` still resolves from `parent`), a real
+/// directory for each missing destination, and a real
 /// directory for each later mount directly below `parent` (bubblewrap refuses
 /// a mount whose destination is a symlink). Re-binding every host entry
 /// instead took three arguments per entry and exceeded bubblewrap's 9000 on
@@ -81,9 +83,11 @@ fn rebuild_parent(
         }
     }
     for entry in std::fs::read_dir(parent).expect("read the destination's parent") {
-        let name = entry.expect("a directory entry").file_name();
+        let entry = entry.expect("a directory entry");
+        let name = entry.file_name();
         if !real_dirs.contains(&name) {
-            std::os::unix::fs::symlink(view.join(&name), built.join(&name))
+            let target = std::fs::read_link(entry.path()).unwrap_or_else(|_| view.join(&name));
+            std::os::unix::fs::symlink(target, built.join(&name))
                 .expect("link a host entry into the rebuilt parent");
         }
     }

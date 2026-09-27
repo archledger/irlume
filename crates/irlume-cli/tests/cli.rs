@@ -2211,6 +2211,21 @@ fn the_namespace_binds_below_a_parent_with_thousands_of_entries() {
     for i in 0..4000 {
         std::fs::write(parent.join(format!("entry-{i}")), "host\n").unwrap();
     }
+    // A host symlink whose relative target leaves the parent, as
+    // `/usr/lib/ld-linux.so.2 -> ../lib32/ld-linux.so.2` does, must still
+    // resolve from the parent.
+    let sibling =
+        std::env::temp_dir().join(format!("irlume-cli-it-wide-sibling-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sibling);
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(sibling.join("target"), "sibling\n").unwrap();
+    std::os::unix::fs::symlink(
+        std::path::Path::new("..")
+            .join(sibling.file_name().unwrap())
+            .join("target"),
+        parent.join("escape"),
+    )
+    .unwrap();
     let fixture = sb.path("probe");
     std::fs::create_dir_all(&fixture).unwrap();
     std::fs::write(fixture.join("marker"), "bound\n").unwrap();
@@ -2219,9 +2234,10 @@ fn the_namespace_binds_below_a_parent_with_thousands_of_entries() {
     let wide = parent.display();
     // Shell builtins only: the namespace's /usr/bin holds just the shell.
     let script = format!(
-        "set -- {wide}/*; [ $# = 4002 ] || {{ echo \"$# entries\" >&2; exit 1; }}; \
+        "set -- {wide}/*; [ $# = 4003 ] || {{ echo \"$# entries\" >&2; exit 1; }}; \
          read line < {dest}/marker && [ \"$line\" = bound ] && \
          read host < {wide}/entry-3999 && [ \"$host\" = host ] && [ -d {wide}/kept-dir ] && \
+         read far < {wide}/escape && [ \"$far\" = sibling ] && \
          echo ok > {dest}/written"
     );
     let output = support::isolated_root_command(
@@ -2235,6 +2251,7 @@ fn the_namespace_binds_below_a_parent_with_thousands_of_entries() {
     .output()
     .expect("spawn the namespace");
     let _ = std::fs::remove_dir_all(&parent);
+    let _ = std::fs::remove_dir_all(&sibling);
     assert!(
         output.status.success(),
         "{}",

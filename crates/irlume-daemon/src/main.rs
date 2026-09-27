@@ -576,7 +576,7 @@ fn main() {
         }
         Err(e) => {
             jout_err!(
-                "irlumed: cannot clear the dumpable flag ({e}); not starting, so no process memory can reach a core dump. Face authentication is unavailable; passwords still work"
+                "irlumed: cannot clear the dumpable flag ({e}); not starting, so no core file can hold its memory. Face authentication is unavailable; passwords still work"
             );
             std::process::exit(1);
         }
@@ -3024,7 +3024,8 @@ fn worker_wedged(limit: std::time::Duration) -> bool {
 /// Keep irlumed's memory out of core dumps.
 ///
 /// irlumed does not write core dumps, so a crash or a watchdog abort leaves no
-/// process memory on disk. That memory holds camera frames, embeddings,
+/// core file with its memory (swap is separate; see SECURITY_AT_REST). That
+/// memory holds camera frames, embeddings,
 /// decrypted templates and request buffers that can carry a password, and
 /// only `SecretBytes` pages are marked to be left out of a dump.
 ///

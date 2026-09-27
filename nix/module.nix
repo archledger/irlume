@@ -266,7 +266,7 @@ in
         WatchdogSec = "90s";
         NotifyAccess = "main";
         # No core dumps, matching packaging/systemd/irlumed.service: a crash or
-        # the watchdog's SIGABRT leaves no process memory on disk. The daemon
+        # the watchdog's SIGABRT leaves no core file with its memory. The daemon
         # also sets this limit and clears its dumpable flag at startup.
         LimitCORE = 0;
         # Sandboxing, mirroring packaging/systemd/irlumed.service so the hardening

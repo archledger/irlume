@@ -36,7 +36,7 @@ RestartSec=2
 # between them, so this only has to exceed one capture plus inference.
 WatchdogSec=90s
 # irlumed does not write core dumps, so a crash or the watchdog's SIGABRT (the
-# WatchdogSignal= default) leaves no process memory on disk. The daemon also
+# WatchdogSignal= default) leaves no core file with its memory. The daemon also
 # sets this limit and clears its dumpable flag at startup; the unit applies the
 # limit from exec on.
 LimitCORE=0

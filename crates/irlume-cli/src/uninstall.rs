@@ -618,7 +618,9 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
         Some("disable"),
         &["--apply".to_string(), "--with-sudo".to_string()],
     );
-    let pam_unwired = !pamwire::login_wired();
+    // Every stack the disable covers, sudo and polkit-1 included: it keeps a
+    // stack it cannot change safely as it is, and says so above.
+    let pam_unwired = !pamwire::any_stack_wired();
 
     // 2. Stop and disable the daemon, and the self-heal units with it. Leaving
     //    those enabled means a uninstalled irlume still wakes up on a PAM change

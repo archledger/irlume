@@ -415,9 +415,27 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                         streaming_interfaces = d.get(12..12 + count)?.to_vec();
                     }
                     SUBTYPE_PROCESSING_UNIT => {
+                        // `iProcessing` follows `bmControls` in every UVC
+                        // version (1.5 adds `bmVideoStandards`), so a unit
+                        // shorter than 9 + bControlSize is truncated.
+                        let size = usize::from(*d.get(7)?);
+                        if len < 9 + size {
+                            return None;
+                        }
                         processing_controls.push(processing_unit_controls(d)?);
                     }
-                    SUBTYPE_EXTENSION_UNIT => extension_units.push(parse_extension_unit(d)?),
+                    SUBTYPE_EXTENSION_UNIT => {
+                        // bLength is 24 + bNrInPins + bControlSize, closed
+                        // by `iExtension`. The emitter's parser is left as
+                        // it is; this walk decides a role, so a unit cut
+                        // short is refused.
+                        let pins = usize::from(*d.get(21)?);
+                        let size = usize::from(*d.get(22 + pins)?);
+                        if len < 24 + pins + size {
+                            return None;
+                        }
+                        extension_units.push(parse_extension_unit(d)?);
+                    }
                     _ => {}
                 }
             }
@@ -2179,6 +2197,35 @@ mod tests {
         short_pu.drain(pu_at + 10..pu_at + 13);
         assert_eq!(
             ir_function_evidence(&short_pu, 0),
+            Err(IrFunctionRefusal::Malformed)
+        );
+
+        // A Processing Unit whose bLength stops right after bmControls,
+        // leaving out iProcessing.
+        let pu_len = usize::from(whole[pu_at]);
+        let control_size = usize::from(whole[pu_at + 7]);
+        let mut no_i_processing = whole.clone();
+        no_i_processing[pu_at] = (8 + control_size) as u8;
+        no_i_processing.drain(pu_at + 8 + control_size..pu_at + pu_len);
+        assert_eq!(
+            ir_function_evidence(&no_i_processing, 0),
+            Err(IrFunctionRefusal::Malformed)
+        );
+
+        // A Microsoft unit whose bLength stops right after bmControls,
+        // leaving out iExtension, with the face-authentication bit set.
+        let guid_at = whole
+            .windows(16)
+            .position(|window| window == t480::guid(MSXU))
+            .expect("the Microsoft unit");
+        let xu_at = guid_at - 4;
+        assert_eq!(whole[xu_at + 2], 0x06);
+        let xu_len = usize::from(whole[xu_at]);
+        let mut no_i_extension = whole.clone();
+        no_i_extension[xu_at] = (xu_len - 1) as u8;
+        no_i_extension.remove(xu_at + xu_len - 1);
+        assert_eq!(
+            ir_function_evidence(&no_i_extension, 0),
             Err(IrFunctionRefusal::Malformed)
         );
 

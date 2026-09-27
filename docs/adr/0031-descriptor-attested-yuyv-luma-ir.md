@@ -108,6 +108,8 @@ for a node whose formats are exactly `{YUYV}`. No extension-unit request is
 sent, no frame is captured, and no name or `vid:pid` table is consulted. The
 descriptor walk is strict: it steps by `bLength` through one configuration,
 and anything truncated, overrunning or inconsistent fails the attestation.
+A Processing Unit or extension unit whose `bLength` ends before its
+closing string index (`iProcessing`, `iExtension`) counts as truncated.
 It does not read `wTotalLength`: the reporter's 5986:2113 `descriptors`
 file carries 996 of the 1026 bytes its configuration header claims (linuxhw
 31A261423C, from a unit with the same bcdDevice 54.22, carries all 1026, and
@@ -276,7 +278,7 @@ than the 640x400 constant.
 
 | Boundary | Required result |
 |---|---|
-| Descriptor rule | The ASUS 3277:0059 IR function (interface 2) is attested and its RGB function (interface 0) is not; the T480 5986:1141 function is attested and 5986:2113 is not, from the reporter's descriptor files, with the 5986:2113 file's configuration 30 bytes shorter than its `wTotalLength` refused only for its missing Microsoft unit; two streams, each colour bit alone, a Microsoft unit without selector 0x06 or with more bits than `bNumControls`, two Microsoft units, a truncated header, Processing Unit or tail, a listed interface that is not VideoStreaming, a face-authentication unit on another interface, a node interface that is not a VideoControl interface, a descriptor file without one complete active configuration, and a node without a USB parent are each refused with the named reason |
+| Descriptor rule | The ASUS 3277:0059 IR function (interface 2) is attested and its RGB function (interface 0) is not; the T480 5986:1141 function is attested and 5986:2113 is not, from the reporter's descriptor files, with the 5986:2113 file's configuration 30 bytes shorter than its `wTotalLength` refused only for its missing Microsoft unit; two streams, each colour bit alone, a Microsoft unit without selector 0x06 or with more bits than `bNumControls`, two Microsoft units, a truncated header, Processing Unit, extension unit (including one that stops before its string index) or tail, a listed interface that is not VideoStreaming, a face-authentication unit on another interface, a node interface that is not a VideoControl interface, a descriptor file without one complete active configuration, and a node without a USB parent are each refused with the named reason |
 | Parser agreement | The new walker and the emitter's extension-unit parser return the same units for every interface of the ASUS and both T480 fixtures, and the fuzz target asserts it on arbitrary input |
 | Classification | `[YUYV]` with the attestation is `Role::Ir` and without it `Role::Rgb`; MJPG+YUYV, YUYV+RGB3, NV12, NV12+YUYV and YUYV+GREY stay what their formats say whatever the attestation; the descriptor is not consulted for GREY, Y16, metadata or empty format lists |
 | Frame size | GREY and Y16 ignore the size list and request 640x400; unattested YUYV requests 640x400; attested YUYV requests 340x340 from `{640x480, 340x340}` in either order, 400x400 from `{400x480, 400x400}`, 640x400 from an empty or too-small list, and the first of two equal areas; a replica of uvcvideo's nearest-size rule shows 640x400 landing on 640x480; the candidate walk hands the format ioctl the size it chose |

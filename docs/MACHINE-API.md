@@ -515,7 +515,7 @@ observation rather than absent records.
 | `usage-error` | The command line was not one this contract accepts. Exits 2. | no |
 | `unsupported-contract` | The engine does not implement the requested contract. Refused before any side effect. Exits 2. | no |
 | `daemon-unavailable` | The daemon could not be reached. | yes |
-| `not-authorized` | The caller may not act on the named account. | no |
+| `not-authorized` | The caller may not act on the named account. From `auth test`, it can also mean the calling account does not hold the active local session on a seat, which a request that turns the camera on needs unless it comes from root. | no |
 | `operation-failed` | The engine could not carry out a well-formed request. | no |
 | `camera-busy` | The camera driver reported contention. Close apps using the camera, then retry. Auth tests include a fixed human-readable `message`. | yes |
 | `deadline-expired` | The authentication window elapsed before a decision; the attempt ended without a verdict. Not retryable as this transaction; a fresh attempt starts a new window. | no |

@@ -410,6 +410,42 @@ with a fabricated print.
   disk rollback and the ambiguity between socket delivery and durable reset are
   outside an exactly-once guarantee. Ordinary password login remains available.
 
+## Camera use by local accounts
+
+Linux grants the camera devices only to the user of the active local session
+on a seat: udev's `uaccess` rule, applied by logind. irlumed opens the camera
+as root on its clients' behalf, so it applies the same rule itself. A request
+that turns a camera on (streams frames from it or lights its IR emitter) from
+a non-root peer is served only while the peer's uid is the active user of a
+seat, as logind records it (`ACTIVE_UID=` in `/run/systemd/seats/<seat>`). The
+requests this covers are face authentication for the account's own user (a
+lock screen that runs PAM as the user), `Identify` and `IdentifyFor`
+(`irlume identify`, the TUI's recognition test), the framing guide
+(`PositionSample`, `PositionSession`), `CameraDiagnostics`, and enrollment
+(`Enroll`, `EnrollmentSession`, `AddScan`, `AddCameraGroup`). Root peers are
+not asked: greeters, `sudo`, `su` and the polkit helper authenticate as root,
+and the remaining camera requests are root-only already.
+
+- The refusal comes before any camera work and before the account's retry
+  budget is charged, like the other authorization refusals. An
+  authentication gets the pre-camera policy refusal (`cause: policy`, or
+  `not-authorized` for a client that asked for typed errors), so the PAM
+  module falls back to the password; other requests get an error that says
+  why.
+- Seat state that cannot be read refuses. A machine with no logind seats
+  (no `/run/systemd/seats`) turns the camera on for root only.
+- The rule is per uid, like `uaccess`: while an account holds a seat, its
+  other processes (an SSH login of the same account included) are served
+  too. Any seat counts on a multi-seat machine.
+- It is checked when the request arrives and again when the camera worker
+  takes it. A framing session or an enrollment already running is not
+  stopped by a session switch, just as an open device node is not revoked
+  by one.
+- `ListCameras` and `CaptureModeStatus` open camera nodes to classify them or
+  read their capture qualification, but start no stream and light no
+  emitter; any peer may still send them, and the arbiter serializes them as
+  camera work.
+
 ## Remote sessions
 
 The camera answers for whoever sits at this machine, so pam_irlume stands down

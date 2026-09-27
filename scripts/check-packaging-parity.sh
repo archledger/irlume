@@ -564,6 +564,10 @@ APPARMOR_RUNTIME_RULES=(
   "/dev/tpmrm[0-9] rw,"
   "/dev/tpm[0-9] rw,"
   "/run/lock/irlume/tpm-raw-conversation rw,"
+  # The camera gate for a non-root account reads logind's seat state; a
+  # profile without these refuses every non-root capture.
+  "/run/systemd/seats/ r,"
+  "/run/systemd/seats/* r,"
 )
 for profile in "${APPARMOR_PROFILES[@]}"; do
   for rule in "${APPARMOR_RUNTIME_RULES[@]}"; do

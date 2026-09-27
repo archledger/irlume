@@ -198,8 +198,19 @@ fn sessions_root() -> std::path::PathBuf {
 }
 
 fn local_graphical_session_in(sessions_root: &Path, uid: u32) -> Option<bool> {
-    let entries = std::fs::read_dir(sessions_root).ok()?;
-    let (mut live, mut unknown) = (false, false);
+    scan_logind_dir(sessions_root, |facts| {
+        local_graphical_session_of(facts, uid)
+    })
+}
+
+/// Whether any file in one of logind's state directories (`sessions`,
+/// `seats`) satisfies `matches`. `None` when the directory, or a file in it,
+/// cannot be read and none matched; a match found anywhere is conclusive. A
+/// file that disappears while it is read belongs to a session or seat that
+/// just went away and does not count.
+fn scan_logind_dir(root: &Path, matches: impl Fn(&str) -> bool) -> Option<bool> {
+    let entries = std::fs::read_dir(root).ok()?;
+    let (mut found, mut unknown) = (false, false);
     for entry in entries {
         let Ok(entry) = entry else {
             unknown = true;
@@ -216,19 +227,62 @@ fn local_graphical_session_in(sessions_root: &Path, uid: u32) -> Option<bool> {
             }
         }
         match std::fs::read_to_string(entry.path()) {
-            Ok(facts) => live |= local_graphical_session_of(&facts, uid),
-            // The session ended while the directory was read.
+            Ok(facts) => found |= matches(&facts),
+            // The session or seat ended while the directory was read.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => unknown = true,
         }
     }
-    if live {
+    if found {
         Some(true)
     } else if unknown {
         None
     } else {
         Some(false)
     }
+}
+
+/// Whether `uid` holds the active session on a seat: logind's `ACTIVE_UID`
+/// in `/run/systemd/seats/<seat>`, the account udev's `uaccess` rule grants
+/// that seat's camera devices to. Any seat counts. A seat with no active
+/// session names no `ACTIVE_UID`, and a machine without seats has none to
+/// hold. `None` when logind's seat state cannot be read (the directory, or a
+/// seat file in it), so a caller can refuse rather than guess.
+pub(crate) fn holds_an_active_seat(uid: u32) -> Option<bool> {
+    #[cfg(test)]
+    let root = match SEATS_ROOT.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        Some(root) => root,
+        // No fixture: the test process stands for the account at the seat,
+        // so a test that is not about this rule is served as that account
+        // and any other uid is refused. Never the host's seats.
+        None => {
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let euid = unsafe { libc::geteuid() };
+            return Some(uid == euid);
+        }
+    };
+    #[cfg(not(test))]
+    let root = PathBuf::from("/run/systemd/seats");
+    holds_an_active_seat_in(&root, uid)
+}
+
+/// Test-only: logind's seat directory, when a test has pointed it at a
+/// fixture. `None` means the test process's own uid holds the seat.
+#[cfg(test)]
+pub(crate) static SEATS_ROOT: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+fn holds_an_active_seat_in(seats_root: &Path, uid: u32) -> Option<bool> {
+    scan_logind_dir(seats_root, |facts| seat_is_held_by(facts, uid))
+}
+
+/// Whether one logind seat file names `uid` as the seat's active user.
+fn seat_is_held_by(facts: &str, uid: u32) -> bool {
+    facts
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIVE_UID="))
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        == Some(uid)
 }
 
 /// Whether one logind session file describes a live local graphical session
@@ -885,6 +939,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(local_graphical_session_in(&dir, 1000), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only the seat's active user holds it: `ACTIVE_UID`, not a uid that
+    /// merely has a session on the seat (`UIDS`), and not a seat with no
+    /// active session at all.
+    #[test]
+    fn only_the_active_uid_holds_a_seat() {
+        let seat = |extra: &str| {
+            format!(
+                "# This is private data. Do not parse.\nIS_SEAT0=1\nCAN_MULTI_SESSION=1\n\
+                 CAN_TTY=1\nCAN_GRAPHICAL=1\n{extra}SESSIONS=3 c1\nUIDS=1000 1001\n"
+            )
+        };
+        assert!(seat_is_held_by(&seat("ACTIVE=3\nACTIVE_UID=1000\n"), 1000));
+        assert!(!seat_is_held_by(&seat("ACTIVE=3\nACTIVE_UID=1000\n"), 1001));
+        assert!(!seat_is_held_by(&seat(""), 1000), "no active session");
+        assert!(!seat_is_held_by(&seat("ACTIVE_UID=\n"), 1000));
+        assert!(!seat_is_held_by(&seat("ACTIVE_UID=10x0\n"), 1000));
+        assert!(!seat_is_held_by("", 0), "an empty file names nobody");
+    }
+
+    /// Any seat counts; a missing directory or a seat file that is not
+    /// text is unknown, never "not at the seat", and a seat held by the uid
+    /// found beside such a file is still conclusive.
+    #[test]
+    fn the_seat_scan_finds_the_active_user_on_any_seat_and_reports_what_it_cannot_read() {
+        let dir = std::env::temp_dir().join(format!("irlume-seats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(holds_an_active_seat_in(&dir, 1000), None, "no directory");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(holds_an_active_seat_in(&dir, 1000), Some(false), "no seats");
+        std::fs::write(dir.join("seat0"), "IS_SEAT0=1\nACTIVE=c1\nACTIVE_UID=42\n").unwrap();
+        assert_eq!(
+            holds_an_active_seat_in(&dir, 1000),
+            Some(false),
+            "the greeter holds seat0"
+        );
+        std::fs::write(dir.join("seat1"), [0xff_u8, 0xfe, 0x00, 0x41]).unwrap();
+        assert_eq!(
+            holds_an_active_seat_in(&dir, 1000),
+            None,
+            "a seat file that is not text"
+        );
+        std::fs::write(dir.join("seat1"), "ACTIVE=4\nACTIVE_UID=1000\n").unwrap();
+        assert_eq!(holds_an_active_seat_in(&dir, 1000), Some(true));
+        assert_eq!(holds_an_active_seat_in(&dir, 42), Some(true));
+        assert_eq!(holds_an_active_seat_in(&dir, 1001), Some(false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

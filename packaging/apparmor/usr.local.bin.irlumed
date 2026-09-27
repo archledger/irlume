@@ -152,6 +152,10 @@ profile irlumed /usr/local/bin/irlumed {
   /proc/[0-9]*/cgroup r,
   /run/systemd/sessions/ r,
   /run/systemd/sessions/* r,
+  # The camera seat rule: the account holding the active local session on
+  # each seat (ACTIVE_UID), which udev's uaccess rule also follows.
+  /run/systemd/seats/ r,
+  /run/systemd/seats/* r,
   /var/lib/irlume/ rw,
   /var/lib/irlume/** rw,
 

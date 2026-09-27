@@ -66,6 +66,15 @@ flowchart LR
   login password is released only to a root peer. (We use a raw Unix socket +
   explicit peer check rather than D-Bus policy; that is the concrete hardening
   over the `visage` reference design.)
+- **Camera use follows the seat:** a request that turns a camera on
+  (authentication, identification, enrollment, the framing guide, camera
+  diagnostics) from a non-root peer is served only while the peer's uid holds
+  the active local session on a seat, as logind reports it, which is the rule
+  udev's `uaccess` applies to the camera devices. Root peers (greeters, `sudo`,
+  the polkit helper) are not asked, and seat state `irlumed` cannot read
+  refuses. The posture table declares which requests turn a camera on, and the
+  shared pre-gate enforces it before any camera work
+  ([THREAT_MODEL.md](THREAT_MODEL.md#camera-use-by-local-accounts)).
 
 ## Live interface observations
 

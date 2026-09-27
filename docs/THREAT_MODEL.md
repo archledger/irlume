@@ -325,6 +325,29 @@ only** and do not transfer. For reference, Windows Hello certification
 equivalent claim. Treat it as convenience-tier against a determined attacker
 with a fabricated print.
 
+## Confinement
+
+irlumed runs as root with systemd sandboxing (`packaging/systemd/irlumed.service`:
+a reduced capability set, `ProtectSystem=full` and more; not
+`ProtectHome` or `PrivateDevices`, since it opens cameras and the TPM). What a
+mandatory access control policy adds depends on the distribution:
+
+- **AppArmor** (Debian, Ubuntu, and other systems that load
+  `packaging/apparmor/usr.bin.irlumed`): the profile enforces and confines the
+  daemon to the paths it lists. It also allows each account's
+  `~/.local/share/irlume` and models in `~/irlume/models`, which only a source
+  install uses; `usr.local.bin.irlumed` is the profile for that install.
+- **SELinux** (Fedora, the `irlume-selinux` subpackage): irlumed runs as
+  `unconfined_service_t`, with no domain of its own, so SELinux does not
+  confine it. The module only lets the confined greeter (`xdm_t`) and polkit
+  helper (`policykit_auth_t`) domains reach the socket: writing to it is
+  scoped to its own label, `irlume_runtime_t`, but `connectto` names the
+  listening process's domain, so it covers any socket a process in
+  `unconfined_service_t` listens on. Narrowing that needs a domain for
+  irlumed.
+- **Neither** (Arch by default): the systemd sandbox and `SO_PEERCRED`
+  authorization of every request are what applies.
+
 ## Side channels
 
 - **No early-out in matching.** Every enrolled scan is scored: fixed-length

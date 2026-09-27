@@ -58,7 +58,10 @@ NotifyAccess=main
 # aborts that one operation; it drains nothing.
 TimeoutStopSec=10s
 
-# Sandboxing, layered UNDER the SELinux/AppArmor policies (defense in depth).
+# Sandboxing. On AppArmor systems the profile in packaging/apparmor confines the
+# daemon as well; Fedora's SELinux module does not confine it (irlumed runs as
+# unconfined_service_t), so there this sandbox is the confinement
+# (docs/THREAT_MODEL.md "Confinement").
 # Scoped to what the daemon actually needs: it opens /dev/video* and the TPM,
 # binds a Unix socket, and reads/writes each target user's enrollment (which is
 # why ProtectHome and PrivateDevices are deliberately NOT set). The capability

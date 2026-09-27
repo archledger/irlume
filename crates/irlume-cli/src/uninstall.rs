@@ -1841,18 +1841,37 @@ fn sealed_token_holders_with(
 }
 
 /// Text that may hold a name an account chose, for the terminal: each
-/// control character is written as its escape (`\u{1b}`, `\n`), so a crafted
-/// file name cannot move the cursor, recolor or forge a line of the output.
+/// control character, and each invisible formatting character that changes
+/// how the text around it is shown (bidirectional marks, embeddings,
+/// overrides and isolates, zero-width characters), is written as its escape
+/// (`\u{1b}`, `\n`, `\u{202e}`), so a crafted file name cannot move the
+/// cursor, recolor, reorder or forge a line of the output.
 fn terminal_safe(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if c.is_control() {
+        if c.is_control() || is_format_char(c) {
             out.extend(c.escape_default());
         } else {
             out.push(c);
         }
     }
     out
+}
+
+/// Invisible Unicode formatting characters that change how the text around
+/// them is displayed: the Arabic letter mark, zero-width space, joiners and
+/// direction marks, bidirectional embeddings and overrides, the word joiner
+/// and invisible operators, bidirectional isolates, and the byte-order mark.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
 }
 
 fn sweep_sealed_token_holders(
@@ -3408,6 +3427,12 @@ mod tests {
     #[test]
     fn a_crafted_envelope_name_is_escaped_in_the_notes() {
         assert_eq!(terminal_safe("a\u{1b}[2Jb\nc"), "a\\u{1b}[2Jb\\nc");
+        // Bidirectional overrides and isolates, and zero-width characters,
+        // are escaped too; ordinary text, accents included, is left alone.
+        assert_eq!(
+            terminal_safe("x\u{202e}y\u{2066}z\u{200b}é"),
+            "x\\u{202e}y\\u{2066}z\\u{200b}é"
+        );
         let base = std::env::temp_dir().join(format!("irlume-home-escape-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let alice = test_account(&base, "alice");

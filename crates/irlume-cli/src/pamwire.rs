@@ -4505,6 +4505,19 @@ mod tests {
             &format!("{jump}\n{VERIFY_STANZA}\n{gate}\n{step}\n"),
             &on_top
         ));
+        // Only a line with a numeric jump may move above irlume's line: a
+        // keyring consumer the recipe keeps below it (it reads the password
+        // irlume's line releases) refuses the refill.
+        let consumer = "auth optional pam_gnome_keyring.so";
+        assert!(!overrides::recipe_lines_above_stay_above(
+            &format!("{consumer}\n{VERIFY_STANZA}\n{step}\n"),
+            &format!("{VERIFY_STANZA}\n{consumer}\n{step}\n"),
+        ));
+        // Comments and blank lines do not order anything.
+        assert!(overrides::recipe_lines_above_stay_above(
+            &format!("{VERIFY_STANZA}\n# moved by hand\n\n{gate}\n{step}\n"),
+            &format!("# moved by hand\n{VERIFY_STANZA}\n{gate}\n{step}\n"),
+        ));
     }
 
     /// A place a disable held stops being the verify line's place once the

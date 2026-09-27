@@ -423,12 +423,16 @@ pub(super) fn refill(current: &str, wired: &str) -> Option<String> {
     .then_some(filled)
 }
 
-/// Whether every line the recipe puts above one of irlume's active lines is
-/// still above it in `filled`. A gate an administrator moves or adds between
-/// a held place and the password step after a disable is a line the recipe
-/// puts above irlume's line; refilled above it, a face match would end the
-/// stack before the gate ran. A line the recipe puts below irlume's line may
-/// sit above it in `filled`: that is the jump the held place is kept for.
+/// Whether the refill keeps the recipe's order around each of irlume's
+/// active lines. Every line the recipe puts above one of them is still above
+/// it in `filled`: a gate an administrator moves or adds between a held place
+/// and the password step after a disable is such a line, and refilled above
+/// it, a face match would end the stack before the gate ran. A line the
+/// recipe puts below it may sit above it in `filled` only when it carries a
+/// numeric jump, the jump the held place is kept for; any other line there,
+/// such as a keyring consumer that must run after irlume's unseal line to see
+/// the released password, refuses the refill. Lines without a PAM directive
+/// (comments, blank lines) do not count.
 pub(super) fn recipe_lines_above_stay_above(filled: &str, wired: &str) -> bool {
     let others_above = |text: &str, line: &str| -> Option<Vec<String>> {
         let lines: Vec<&str> = text.lines().collect();
@@ -436,7 +440,7 @@ pub(super) fn recipe_lines_above_stay_above(filled: &str, wired: &str) -> bool {
         Some(
             lines[..at]
                 .iter()
-                .filter(|l| !is_irlume_line(l) && !l.trim().is_empty())
+                .filter(|l| !is_irlume_line(l) && !directive(l).trim().is_empty())
                 .map(|l| l.trim().to_string())
                 .collect(),
         )
@@ -447,12 +451,14 @@ pub(super) fn recipe_lines_above_stay_above(filled: &str, wired: &str) -> bool {
         .all(|line| {
             let line = line.trim();
             match (others_above(wired, line), others_above(filled, line)) {
-                (Some(needed), Some(mut have)) => needed.iter().all(|other| {
-                    have.iter()
-                        .position(|h| h == other)
-                        .map(|at| have.remove(at))
-                        .is_some()
-                }),
+                (Some(needed), Some(mut have)) => {
+                    needed.iter().all(|other| {
+                        have.iter()
+                            .position(|h| h == other)
+                            .map(|at| have.remove(at))
+                            .is_some()
+                    }) && have.iter().all(|moved| !numeric_actions(moved).is_empty())
+                }
                 // The recipe's line is not in the refill: nothing it keeps.
                 (Some(_), None) | (None, _) => true,
             }

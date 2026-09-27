@@ -182,7 +182,7 @@ descriptor and the frames being judged rather than to the cached role:
 - a decode that expands limited range to full range, so the ceiling after
   expansion is 255.
 
-Measured on the T480 (5986:1141), by the reporter on #887:
+Measured on the T480 (5986:1141) by @maurerr, the reporter of #887:
 
 - The node offers YUYV only, at 340x340 and 640x480, both at 30 fps. The
   640x400 request irlume made before §5 lands on 640x480, the near-black
@@ -286,7 +286,7 @@ than the 640x400 constant.
 | No probe | Discovery and the census decide the role only through the sysfs reader; the doctor's IR stream line reuses the capture walk, whose fd-bound attestation is also a read (`fstat` and sysfs on the file descriptor the probe already holds); nothing on those paths streams frames for it |
 | Lease | Nodes on two inventory entries refuse with the split-device error; one entry holding both nodes still leases |
 
-The T480 tests read the reporter's own `descriptors` files
+The T480 tests read the `descriptors` files @maurerr supplied on #887
 (`crates/irlume-camera/tests/fixtures/bison-5986-1141.descriptors` and
 `bison-5986-2113.descriptors`, #575), which are also fuzz seeds; builders
 laid out like the 5986:1141 bytes remain only for the synthetic

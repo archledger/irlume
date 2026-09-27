@@ -354,7 +354,8 @@ All notable changes to irlume are documented here. This project adheres to
   descriptor and prints nothing). Face authentication with such a camera
   still refuses: its YUYV frames have no measured exposure ceiling yet, and
   the T480's RGB and IR cameras are two USB devices, which irlume does not
-  pair (#887).
+  pair (#887). Thanks to @maurerr for the report and diagnosis, and for the
+  USB descriptors and measurements these checks were built and tested on.
 
 - IR capture from such a node requests the smallest advertised frame size
   of at least 340x340 instead of the size nearest 640x400, which on the

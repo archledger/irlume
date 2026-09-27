@@ -4,7 +4,8 @@
 //! Descriptor builders for synthetic shapes, laid out byte for byte as the
 //! ThinkPad T480 IR camera (USB 5986:1141) lays out the same descriptors.
 //!
-//! The T480 tests read the #887 reporter's own sysfs `descriptors` files,
+//! The T480 tests read the sysfs `descriptors` files @maurerr supplied on
+//! #887,
 //! `tests/fixtures/bison-5986-1141.descriptors` (the IR camera) and
 //! `tests/fixtures/bison-5986-2113.descriptors` (the colour camera), as the
 //! census verification rule (#575) wants: bytes a real camera emitted, like

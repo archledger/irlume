@@ -2263,6 +2263,54 @@ fn the_namespace_binds_below_a_parent_with_thousands_of_entries() {
     );
 }
 
+/// Missing destinations whose parents nest, as `/etc/pam.d` and
+/// `/etc/systemd/system` do on a host that has neither: the outer parent is
+/// rebuilt first and keeps a real directory for the inner one, so the inner
+/// rebuild has somewhere to mount and both binds land.
+#[test]
+fn the_namespace_binds_below_nested_missing_parents() {
+    let sb = Sandbox::new("bind-nested-parents");
+    let outer = std::env::temp_dir().join(format!(
+        "irlume-cli-it-nested-parent-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&outer);
+    std::fs::create_dir_all(outer.join("inner")).unwrap();
+    std::fs::write(outer.join("inner").join("kept"), "inner\n").unwrap();
+    std::fs::write(outer.join("kept"), "outer\n").unwrap();
+    let (first, second) = (sb.path("first"), sb.path("second"));
+    for (dir, text) in [(&first, "first\n"), (&second, "second\n")] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("marker"), text).unwrap();
+    }
+    let top = outer.join("probe");
+    let nested = outer.join("inner").join("probe");
+    let (top, nested) = (top.to_str().unwrap(), nested.to_str().unwrap());
+    let o = outer.display();
+    let script = format!(
+        "read a < {top}/marker && [ \"$a\" = first ] && \
+         read b < {nested}/marker && [ \"$b\" = second ] && \
+         read c < {o}/kept && [ \"$c\" = outer ] && \
+         read d < {o}/inner/kept && [ \"$d\" = inner ]"
+    );
+    let output = support::isolated_root_command(
+        &sb.root,
+        "/usr/bin/sh",
+        &["-c", &script],
+        &[],
+        &[],
+        &[(&first, top), (&second, nested)],
+    )
+    .output()
+    .expect("spawn the namespace");
+    let _ = std::fs::remove_dir_all(&outer);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// The lines of a PAM file that are irlume's, sorted: what reconcile's
 /// maintenance step must carry over when it rebuilds an override.
 fn irlume_lines(text: &str) -> Vec<String> {

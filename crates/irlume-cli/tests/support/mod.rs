@@ -50,11 +50,12 @@ pub(crate) fn isolated_root_command_with_host_pids(
 /// sandbox is mounted over `parent`: one symlink per host entry, pointing into
 /// that view (a host symlink is copied with its own target, so a relative one
 /// such as `../lib32/ld-linux.so.2` still resolves from `parent`), a real
-/// directory for each missing destination, and a real
-/// directory for each later mount directly below `parent` (bubblewrap refuses
-/// a mount whose destination is a symlink). Re-binding every host entry
-/// instead took three arguments per entry and exceeded bubblewrap's 9000 on
-/// hosts whose `/usr/lib` holds thousands of entries (Arch, CachyOS).
+/// directory for each missing destination, and a real directory for each
+/// later mount directly below `parent`, including a rebuilt parent nested in
+/// this one, so that mount lands in the rebuilt parent rather than through a
+/// symlink into the read-only host view. Re-binding every host entry instead
+/// took three arguments per entry and exceeded bubblewrap's 9000 on hosts
+/// whose `/usr/lib` holds thousands of entries (Arch, CachyOS).
 fn rebuild_parent(
     command: &mut Command,
     root: &Path,
@@ -174,16 +175,6 @@ fn namespace_command(
         .filter_map(|dir| std::fs::canonicalize(dir).ok())
         .filter(|canonical| canonical.is_dir())
         .collect();
-    let later: Vec<PathBuf> = hidden
-        .iter()
-        .cloned()
-        .chain(
-            present
-                .iter()
-                .map(|(_, destination)| PathBuf::from(destination)),
-        )
-        .chain(masked.iter().cloned())
-        .collect();
     let mut parents: Vec<(&Path, Vec<&str>)> = Vec::new();
     for (_, destination) in &missing {
         let parent = Path::new(destination)
@@ -194,6 +185,21 @@ fn namespace_command(
             None => parents.push((parent, vec![destination])),
         }
     }
+    // An ancestor is rebuilt before a parent nested in it, and keeps a real
+    // directory for it (`/etc` before `/etc/systemd` when both `/etc/pam.d`
+    // and `/etc/systemd/system` are missing).
+    parents.sort_by_key(|(parent, _)| parent.components().count());
+    let later: Vec<PathBuf> = hidden
+        .iter()
+        .cloned()
+        .chain(
+            present
+                .iter()
+                .map(|(_, destination)| PathBuf::from(destination)),
+        )
+        .chain(masked.iter().cloned())
+        .chain(parents.iter().map(|(parent, _)| parent.to_path_buf()))
+        .collect();
     for (parent, names) in &parents {
         rebuild_parent(&mut command, root, parent, names, &later);
     }

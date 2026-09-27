@@ -1654,7 +1654,7 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
 /// are recorded in the report, not errors: a control that will not answer a
 /// read would certainly not survive a write.
 pub fn microsoft_xu_report(device: &str) -> irlume_common::Result<String> {
-    let dev = v4l::Device::with_path(device).map_err(|e| crate::map_io(device, e))?;
+    let dev = crate::hostfs::open_video(device).map_err(|e| crate::map_io(device, e))?;
     let fd = dev.handle().fd();
     let id = crate::uvc_descriptor::identity_from_fd(fd)
         .map_err(|e| crate::Error::Hardware(format!("{device}: identity: {e}")))?;

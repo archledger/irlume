@@ -156,6 +156,12 @@ pub(crate) fn check_probe(device: &str) {
     let _ = device;
 }
 
+/// The V4L open boundary, guarded in unit-test builds.
+pub(crate) fn open_video(device: &str) -> std::io::Result<v4l::Device> {
+    check_probe(device);
+    v4l::Device::with_path(device)
+}
+
 /// Whether `device` names or resolves to host hardware, including an alias
 /// under a fixture root. This reads metadata and links, never a device.
 #[cfg(test)]
@@ -215,17 +221,14 @@ fn names_host_camera_path(path: &std::path::Path) -> bool {
 #[cfg(test)]
 pub(crate) mod test {
     use super::HostRoots;
+    use std::os::unix::fs::DirBuilderExt;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    /// Fixture trees share the process id, so a counter keeps parallel tests
-    /// from colliding on one directory name.
-    static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
     /// A live fixture install. While alive, this thread's hostfs readers
     /// resolve the fixture's `dev` and `sys` trees; dropping it restores the
     /// previous roots and removes the tree.
     pub(crate) struct FixtureGuard {
+        directory: PathBuf,
         roots: HostRoots,
         previous: Option<HostRoots>,
     }
@@ -246,29 +249,49 @@ pub(crate) mod test {
     impl Drop for FixtureGuard {
         fn drop(&mut self) {
             super::ROOTS.with(|roots| *roots.borrow_mut() = self.previous.take());
-            let _ = std::fs::remove_dir_all(&self.roots.dev);
-            let _ = std::fs::remove_dir_all(&self.roots.sys);
+            let _ = std::fs::remove_dir_all(&self.directory);
         }
     }
 
     /// A fresh fixture tree with `populate` given its empty `dev` and `sys`
     /// roots.
     pub(crate) fn fixture_with(populate: impl FnOnce(&Path, &Path)) -> FixtureGuard {
-        let dir = std::env::temp_dir().join(format!(
-            "irlume-hostfs-{}-{}",
-            std::process::id(),
-            FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
+        let dir = private_directory();
         let dev = dir.join("dev");
         let sys = dir.join("sys");
-        std::fs::create_dir_all(&dev).expect("create the fixture dev root");
-        std::fs::create_dir_all(&sys).expect("create the fixture sysfs root");
-        populate(&dev, &sys);
-        install(HostRoots {
-            dev,
-            sys,
-            is_host: false,
-        })
+        let guard = install(
+            HostRoots {
+                dev,
+                sys,
+                is_host: false,
+            },
+            dir,
+        );
+        std::fs::create_dir(guard.dev()).expect("create the fixture dev root");
+        std::fs::create_dir(guard.sys()).expect("create the fixture sysfs root");
+        populate(guard.dev(), guard.sys());
+        guard
+    }
+
+    fn private_directory() -> PathBuf {
+        for _ in 0..64 {
+            let dir = std::env::temp_dir().join(format!(
+                "irlume-hostfs-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            match create_private_directory(&dir) {
+                Ok(()) => return dir,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create private fixture root: {error}"),
+            }
+        }
+        panic!("could not allocate a fresh fixture root")
+    }
+
+    pub(super) fn create_private_directory(path: &Path) -> std::io::Result<()> {
+        // Atomic mkdir: an existing directory or symlink is never accepted.
+        std::fs::DirBuilder::new().mode(0o700).create(path)
     }
 
     /// The machine with no camera: an empty `/dev` and an empty `/sys`.
@@ -291,9 +314,13 @@ pub(crate) mod test {
         });
     }
 
-    fn install(roots: HostRoots) -> FixtureGuard {
+    fn install(roots: HostRoots, directory: PathBuf) -> FixtureGuard {
         let previous = super::ROOTS.with(|slot| slot.borrow_mut().replace(roots.clone()));
-        FixtureGuard { roots, previous }
+        FixtureGuard {
+            directory,
+            roots,
+            previous,
+        }
     }
 
     /// The roots this thread installed, for a thread it spawns to adopt.
@@ -471,6 +498,45 @@ mod tests {
         );
         assert_eq!(crate::present_device_identities(), ["1234:5678:fixture"]);
         crate::verify_pinned(node).unwrap();
+        // Regular fixture files have no kernel device number. The walk must
+        // stay in the fixture rather than borrow the host's /dev/video0.
+        assert!(crate::connected_camera_locations().is_empty());
+    }
+
+    #[test]
+    fn fixture_allocation_refuses_existing_paths_and_cleans_up_its_private_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = test::empty_fixture();
+        let directory = fixture.dev().parent().unwrap().to_path_buf();
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            test::create_private_directory(&directory)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        let alias = fixture.dev().join("preexisting");
+        std::os::unix::fs::symlink(fixture.sys(), &alias).unwrap();
+        assert_eq!(
+            test::create_private_directory(&alias).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        drop(fixture);
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn direct_diagnostics_refuse_host_paths_before_open_or_lease() {
+        let _fixture = test::empty_fixture();
+        assert!(refusal_of(|| crate::rgb_node_formats("/dev/video0")).contains("host camera node"));
+        assert!(
+            refusal_of(|| crate::ir_emitter::microsoft_xu_report("/dev/video0"))
+                .contains("host camera node")
+        );
+        assert!(refusal_of(|| open_video("/dev/video0")).contains("host camera node"));
     }
 
     #[test]

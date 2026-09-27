@@ -3350,7 +3350,7 @@ pub fn classify_node(device: &str) -> Result<NodeKind, Unreadable> {
     };
     let _permit = lease::permit_for_discovery(device, std::time::Duration::from_secs(2))
         .map_err(|error| unreadable(FailedAt::Open, std::io::Error::other(error)))?;
-    let dev = Device::with_path(device).map_err(|e| unreadable(FailedAt::Open, e))?;
+    let dev = hostfs::open_video(device).map_err(|e| unreadable(FailedAt::Open, e))?;
     let caps = queried_caps(&dev).map_err(|e| unreadable(FailedAt::QueryCaps, e))?;
     if let Some(mc) = mc_centric_verdict(&caps) {
         return Ok(NodeKind::McCentric(mc));
@@ -3691,7 +3691,7 @@ pub fn privacy_engaged(device: &str) -> bool {
 
 fn privacy_engaged_with_permit(device: &str) -> bool {
     hostfs::check_probe(device);
-    let Ok(dev) = Device::with_path(device) else {
+    let Ok(dev) = hostfs::open_video(device) else {
         return false;
     };
     matches!(privacy_state(&dev), Ok(Some(true)))
@@ -3821,7 +3821,7 @@ pub fn node_backend(device: &str) -> std::io::Result<(String, bool)> {
         std::time::Duration::from_secs(2),
     )
     .map_err(std::io::Error::other)?;
-    let dev = Device::with_path(device)?;
+    let dev = hostfs::open_video(device)?;
     let caps = dev.query_caps()?;
     Ok(backend_from_caps(caps.driver, &caps.bus))
 }
@@ -4315,6 +4315,7 @@ impl CameraLocation {
 /// Never authorizes capture.
 #[must_use]
 pub fn camera_location(node: &str) -> Option<CameraLocation> {
+    hostfs::check_probe(node);
     let identity = uvc_descriptor::identity_for_location(node).ok()?;
     let fingerprint = identity.descriptor_fingerprint();
     let dev_dir = hostfs::sys_root().join(identity.usb_devpath.trim_start_matches('/'));
@@ -4344,7 +4345,7 @@ pub fn connected_camera_locations() -> Vec<CameraLocation> {
     let mut locations: Vec<CameraLocation> = entries
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
-            camera_location(&format!("/dev/{}", entry.file_name().to_string_lossy()))
+            camera_location(&hostfs::dev_root().join(entry.file_name()).to_string_lossy())
         })
         .collect();
     // One entry per unit: a device's nodes share its location but may carry
@@ -4718,7 +4719,7 @@ impl RgbCamera {
                 "{device}: hardware privacy switch is ON"
             )));
         }
-        let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+        let dev = hostfs::open_video(device).map_err(|e| map_io(device, e))?;
         // Pick an uncompressed format the camera actually offers. Some webcams
         // advertise RGB only as MJPEG (or NV12) and reject YUYV; classify()
         // still labels them usable, so without this negotiation they would
@@ -5026,7 +5027,7 @@ pub fn negotiated_stream(device: &str, role: Role) -> irlume_common::Result<Stre
             "{device}: hardware privacy switch is ON"
         )));
     }
-    let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+    let dev = hostfs::open_video(device).map_err(|e| map_io(device, e))?;
     let (fmt, fourcc) = match role {
         Role::Rgb => {
             let chosen = negotiate_rgb_format(device, &dev)?;
@@ -5550,6 +5551,7 @@ fn bridge_in(devices_root: &std::path::Path) -> Option<String> {
 
 /// A node's advertised pixel formats (fourcc), for negotiation and `doctor`.
 pub fn rgb_node_formats(device: &str) -> Vec<[u8; 4]> {
+    hostfs::check_probe(device);
     let Ok(_permit) = lease::permit_for_endpoint(
         device,
         lease::CameraOperationKind::Diagnostics,
@@ -5557,7 +5559,7 @@ pub fn rgb_node_formats(device: &str) -> Vec<[u8; 4]> {
     ) else {
         return Vec::new();
     };
-    let Ok(dev) = Device::with_path(device) else {
+    let Ok(dev) = hostfs::open_video(device) else {
         return Vec::new();
     };
     Capture::enum_formats(&dev)
@@ -5578,7 +5580,7 @@ pub(crate) fn node_capture_formats_probed(device: &str) -> Option<Vec<[u8; 4]>> 
         std::time::Duration::from_secs(2),
     )
     .ok()?;
-    let dev = Device::with_path(device).ok()?;
+    let dev = hostfs::open_video(device).ok()?;
     Capture::enum_formats(&dev)
         .ok()
         .map(|v| v.into_iter().map(|d| d.fourcc.repr).collect())
@@ -6109,7 +6111,7 @@ impl IrCamera {
             .require_endpoint()
             .map_err(|error| Error::Hardware(error.to_string()))?;
         verify_pinned(device)?;
-        let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+        let dev = hostfs::open_video(device).map_err(|e| map_io(device, e))?;
         require_ir_privacy_released(device, &dev, "before IR negotiation")?;
         let (fmt, pix) = negotiate_ir_format_state(device, &dev, &state)?;
         let interval = negotiate_interval_after_format(&state, device, &dev, &fmt)?;
@@ -7099,7 +7101,6 @@ pub fn capture_pair_with<R: Send, I: Send>(
 /// example and the capture path share one implementation.
 pub mod ir_probe {
     use super::negotiate_ir_format_and_interval;
-    use super::Device;
     use super::{map_delivery, map_io, verify_pinned, Error, Frame, Spectrum};
 
     /// Mean brightness of an 8-bit greyscale buffer.
@@ -7229,7 +7230,7 @@ pub mod ir_probe {
             std::time::Duration::from_secs(2),
         )
         .map_err(|error| Error::Hardware(error.to_string()))?;
-        let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+        let dev = super::hostfs::open_video(device).map_err(|e| map_io(device, e))?;
         super::require_ir_privacy_released(device, &dev, "before IR negotiation")?;
         let (fmt, pix, interval) = negotiate_ir_format_and_interval(device, &dev, &permit)?;
         let mut dec = super::IrDecoder::new(pix, fmt.quantization);
@@ -7537,7 +7538,7 @@ pub fn capture_ir_streaming<B>(
         std::time::Duration::from_secs(2),
     )
     .map_err(|error| Error::Hardware(error.to_string()))?;
-    let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+    let dev = hostfs::open_video(device).map_err(|e| map_io(device, e))?;
     require_ir_privacy_released(device, &dev, "before IR negotiation")?;
     let (fmt, pix, interval) = negotiate_ir_format_and_interval(device, &dev, &permit)?;
     let mut dec = IrDecoder::new(pix, fmt.quantization);
@@ -7688,7 +7689,7 @@ pub fn capture_ir_sequence(
         std::time::Duration::from_secs(2),
     )
     .map_err(|error| Error::Hardware(error.to_string()))?;
-    let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+    let dev = hostfs::open_video(device).map_err(|e| map_io(device, e))?;
     require_ir_privacy_released(device, &dev, "before IR negotiation")?;
     let (fmt, pix, interval) = negotiate_ir_format_and_interval(device, &dev, &permit)?;
     let mut dec = IrDecoder::new(pix, fmt.quantization);
@@ -10308,7 +10309,7 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     // durable, `doctor` reports it, and recovery re-runs on the next capture
     // or setup once the shutter is released — the same stance as
     // `IRLUME_IR_EMITTER=off`.
-    let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+    let dev = hostfs::open_video(device).map_err(|e| map_io(device, e))?;
     privacy_permits_setup(privacy_state(&dev))
         .map_err(|why| Error::Hardware(format!("{device}: {why}")))?;
     // Declared before the stream and the guards below, so it is dropped LAST:
@@ -16837,6 +16838,7 @@ mod tests {
     /// the product fallback is what these cases exercise.
     #[test]
     fn usb_port_chains_come_from_the_device_directory_name() {
+        let _fixture = hostfs::test::empty_fixture();
         assert_eq!(
             usb_port_chain("/sys/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2.3"),
             Some("1-2.3".into())

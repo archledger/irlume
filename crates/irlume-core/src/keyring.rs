@@ -47,7 +47,7 @@ pub fn seal_password(user: &str, password: &[u8]) -> Result<()> {
 /// has no business knowing what they mean.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn seal_secret(user: &str, secret: &[u8], kind: SecretKind) -> Result<()> {
-    seal_secret_for(user, secret, kind, Account::new(user).uid_to_record(None))
+    seal_secret_for(user, secret, kind, &mut Account::new(user), None)
 }
 
 /// The record kind a keyring envelope of `kind` is refused as.
@@ -58,8 +58,15 @@ fn record_for(kind: SecretKind) -> Record {
     }
 }
 
-/// [`seal_secret`], recording `uid` as the account the envelope belongs to.
-fn seal_secret_for(user: &str, secret: &[u8], kind: SecretKind, uid: Option<u32>) -> Result<()> {
+/// [`seal_secret`], recording the account's uid through `account`
+/// (`existing`: the uid the envelope it replaces carries).
+fn seal_secret_for(
+    user: &str,
+    secret: &[u8],
+    kind: SecretKind,
+    account: &mut Account<'_>,
+    existing: Option<u32>,
+) -> Result<()> {
     if kind == SecretKind::GnomeKeyringToken {
         // Tokens are armed through [`arm_gnome_token`], which mints the bytes
         // and writes the password wrap in the same envelope. Accepting one here
@@ -91,6 +98,7 @@ fn seal_secret_for(user: &str, secret: &[u8], kind: SecretKind, uid: Option<u32>
             secret.len()
         )));
     }
+    let uid = account.uid_to_record(record_for(kind), existing)?;
     let mut env = tpm::seal(secret)?;
     env.secret = kind;
     env.uid = uid;
@@ -135,11 +143,12 @@ pub fn arm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<String>>
             "refusing to arm a keyring token for an empty password".into(),
         ));
     }
+    let uid = Account::new(user).uid_to_record(Record::KeyringToken, None)?;
     let token = mint_gnome_token();
     let mut env = tpm::seal(token.as_bytes())?;
     env.secret = SecretKind::GnomeKeyringToken;
     env.password_wrap = Some(crate::recovery::wrap(password, token.as_bytes())?);
-    env.uid = Account::new(user).uid_to_record(None);
+    env.uid = uid;
     env.save(&envelope_path(user))?;
     Ok(token)
 }
@@ -183,10 +192,11 @@ pub fn rearm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<Vec<u8
             })?
         }
     };
+    let uid = account.uid_to_record(Record::KeyringToken, env.uid)?;
     let mut fresh = tpm::seal(&token)?;
     fresh.secret = SecretKind::GnomeKeyringToken;
     fresh.password_wrap = Some(crate::recovery::wrap(password, &token)?);
-    fresh.uid = account.uid_to_record(env.uid);
+    fresh.uid = uid;
     fresh.save(&path)?;
     Ok(token)
 }
@@ -521,14 +531,18 @@ pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) 
             // round-trip-verifies internally), so a machine already at its
             // best policy writes nothing.
             if let Ok(env) = SealedEnvelope::load(&envelope_path(user)) {
-                if tpm::stronger_tier_available_than(&env) {
+                // Without a uid to record, the move waits for a later login.
+                let upgrade = tpm::stronger_tier_available_than(&env)
+                    .then(|| account.uid_to_record(record_for(kind), env.uid).ok())
+                    .flatten();
+                if let Some(uid) = upgrade {
                     let mut candidate = tpm::seal(password)?;
                     // Carry the kind across the upgrade. tpm::seal defaults it,
                     // so without this a tier climb would rewrite a wallet-key
                     // envelope as a login-password one and the next login would
                     // hand 56 bytes of key to pam_gnome_keyring as an AUTHTOK.
                     candidate.secret = kind;
-                    candidate.uid = account.uid_to_record(env.uid);
+                    candidate.uid = uid;
                     if candidate.strength_rank() > env.strength_rank() {
                         candidate.save(&envelope_path(user))?;
                         return Ok(Reseal::Upgraded);
@@ -538,14 +552,14 @@ pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) 
             return Ok(Reseal::Unchanged);
         }
     }
-    let uid = account.uid_to_record(recorded);
-    seal_secret_for(user, password, kind, uid)?;
+    seal_secret_for(user, password, kind, &mut account, recorded)?;
     Ok(Reseal::Resealed)
 }
 
 /// `env`'s token sealed under a strictly stronger policy, with its kind and
-/// recovery wrap carried over, or `None` when no stronger policy is available
-/// or the ladder did not reach one.
+/// recovery wrap carried over, or `None` when no stronger policy is available,
+/// the ladder did not reach one, or there is no uid to record (the climb then
+/// waits for a later login).
 fn climbed_token(
     env: &SealedEnvelope,
     token: &[u8],
@@ -554,8 +568,11 @@ fn climbed_token(
     if !tpm::stronger_tier_available_than(env) {
         return Ok(None);
     }
+    let Ok(uid) = account.uid_to_record(Record::KeyringToken, env.uid) else {
+        return Ok(None);
+    };
     let mut candidate = tpm::seal(token)?;
-    candidate.uid = account.uid_to_record(env.uid);
+    candidate.uid = uid;
     // tpm::seal knows nothing of kinds or wraps; dropping either here would
     // downgrade the envelope to a password seal (next login routes the token
     // into PAM_AUTHTOK) or amputate the recovery path until the next password
@@ -598,7 +615,7 @@ fn reseal_token(
                 // as it is, so the refreshed wrap still lands.
                 let mut env = env;
                 env.password_wrap = Some(crate::recovery::wrap(password, &token)?);
-                env.uid = account.uid_to_record(env.uid);
+                env.uid = account.uid_to_record(Record::KeyringToken, env.uid)?;
                 if let Ok(Some(stronger)) = climbed_token(&env, &token, account) {
                     env = stronger;
                 }
@@ -627,10 +644,11 @@ fn reseal_token(
                      password?); envelope left untouched"
                 ))
             })?;
+            let uid = account.uid_to_record(Record::KeyringToken, env.uid)?;
             let mut fresh = tpm::seal(&token)?;
             fresh.secret = SecretKind::GnomeKeyringToken;
             fresh.password_wrap = Some(crate::recovery::wrap(password, &token)?);
-            fresh.uid = account.uid_to_record(env.uid);
+            fresh.uid = uid;
             fresh.save(&envelope_path(user))?;
             Ok(Reseal::Resealed)
         }
@@ -883,7 +901,8 @@ mod tests {
     }
 
     /// When the account's uid cannot be resolved, or no account has the name,
-    /// an envelope that records a uid is not released.
+    /// an envelope that records a uid is not released. When it cannot be
+    /// resolved, no new envelope is armed either.
     #[test]
     fn a_sealed_secret_is_not_released_when_the_account_cannot_be_resolved() {
         let _g = crate::testenv::ENV_LOCK
@@ -894,7 +913,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("IRLUME_KEYRING_DIR", &dir);
         let user = "kr-uid-unresolved";
-        plant_envelope(user, SecretKind::LoginPassword, Some(4401));
+        let before = plant_envelope(user, SecretKind::LoginPassword, Some(4401));
         {
             let _unknown =
                 crate::account::remember_resolution(user, crate::account::Resolution::Unknown);
@@ -904,6 +923,23 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("could not be resolved"), "{error}");
+            // Nor is a new envelope armed with no uid to record on it; the
+            // refusal comes before the TPM.
+            let error = seal_password(user, b"new password")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("could not be resolved") && error.contains("sealed secret"),
+                "{error}"
+            );
+            let error = arm_gnome_token(user, b"new password")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("could not be resolved") && error.contains("keyring token"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(envelope_path(user)).unwrap(), before);
         }
         {
             let _gone =

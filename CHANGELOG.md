@@ -861,8 +861,8 @@ All notable changes to irlume are documented here. This project adheres to
   enrollment and its key), a sealed secret is not released or re-sealed
   (`irlume keyring arm` arms again), and a recovery envelope restores
   nothing. When the uid cannot be resolved, a record that carries one is
-  not used and face falls back to the password. Nothing is removed
-  automatically. Records written by earlier releases carry no uid; they
+  not used and face falls back to the password, and a write that has no
+  uid to record is refused. Nothing is removed automatically. Records written by earlier releases carry no uid; they
   are accepted and record it on their next write. Older releases ignore
   the new field (SECURITY_AT_REST.md "Records belong to an account uid").
 

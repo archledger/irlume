@@ -18,13 +18,18 @@
 //! - when the current uid cannot be resolved, a record that carries a uid is
 //!   not used (an error, never a release).
 //!
+//! A write records the account's current uid. When the lookup fails, it keeps
+//! the uid the record carries, and a record that carries none is not written.
+//!
 //! Nothing here deletes a record: an explicit enrollment or arm for the
 //! account replaces it, and an administrator can move it away.
 //!
-//! Resolving a name goes through NSS. On an authentication request irlumed
-//! has already resolved the account for its retry record; it registers that
-//! answer with [`remember`] so the record checks of the same request reuse it
-//! instead of asking NSS again.
+//! Resolving a name goes through NSS. When irlumed already knows the uid for
+//! a request, it registers it with [`remember`] so the record checks and
+//! writes of that request use it instead of asking NSS again: a non-root
+//! caller passes the daemon's gate only as the account itself, so its own uid
+//! is the account's, and an authentication request resolves the account for
+//! its retry record.
 
 use irlume_common::{Error, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -118,10 +123,11 @@ pub struct RememberedUid {
 
 /// Register `uid` as `user`'s current uid until the returned guard drops.
 ///
-/// For a caller that has just resolved the account itself (irlumed resolves
-/// it for the retry record before an authentication request), so the record
-/// checks of that request do not ask NSS a second time. Loader threads the
-/// request starts see it too. The latest registration for a name wins.
+/// For a caller that already knows the account's uid for a request (irlumed:
+/// the uid its gate established for a non-root caller, or the one it resolved
+/// for the retry record), so the record checks and writes of that request use
+/// it and do not ask NSS again. Loader threads the request starts see it too.
+/// The latest registration for a name wins.
 pub fn remember(user: &str, uid: u32) -> RememberedUid {
     remember_resolution(user, Resolution::Uid(uid))
 }
@@ -307,13 +313,29 @@ impl<'a> Account<'a> {
         self.other.is_some()
     }
 
-    /// The uid a write records: the account's current uid, or `existing`
-    /// when it cannot be resolved (a write never fails on the lookup; the
-    /// record then stays as the earlier release left it).
-    pub(crate) fn uid_to_record(&mut self, existing: Option<u32>) -> Option<u32> {
-        match self.resolution() {
-            Resolution::Uid(uid) => Some(uid),
-            Resolution::NoAccount | Resolution::Unknown => existing,
+    /// The uid a write of `record` records: the account's current uid. For a
+    /// name no account has, `existing` (only root writes for such a name:
+    /// irlumed pins a non-root caller's own uid for its whole request). When
+    /// the lookup fails, `existing` if the record carries a uid.
+    ///
+    /// # Errors
+    /// The lookup failed and the record carries no uid: writing it would
+    /// leave a record that any later account of this name accepts, so the
+    /// write is refused before anything is written.
+    pub(crate) fn uid_to_record(
+        &mut self,
+        record: Record,
+        existing: Option<u32>,
+    ) -> Result<Option<u32>> {
+        match (self.resolution(), existing) {
+            (Resolution::Uid(uid), _) => Ok(Some(uid)),
+            (Resolution::NoAccount, _) | (Resolution::Unknown, Some(_)) => Ok(existing),
+            (Resolution::Unknown, None) => Err(Error::Policy(format!(
+                "the current uid of '{}' could not be resolved, so the {} was not written; \
+                 try again when the account resolves",
+                self.user,
+                record.noun()
+            ))),
         }
     }
 
@@ -452,7 +474,10 @@ mod tests {
         let user = "irlume-test-account-once";
         let _uid = remember(user, 4300);
         let mut account = Account::new(user);
-        assert_eq!(account.uid_to_record(None), Some(4300));
+        assert_eq!(
+            account.uid_to_record(Record::Enrollment, None).unwrap(),
+            Some(4300)
+        );
         assert!(account.require(Record::Enrollment, Some(4300)).is_ok());
         assert!(!account.found_other());
         let error = account
@@ -465,9 +490,43 @@ mod tests {
         // A name no account has: a write keeps what the record had, and a
         // record that carries a uid is not used.
         let mut missing = Account::new(NO_SUCH_USER);
-        assert_eq!(missing.uid_to_record(None), None);
-        assert_eq!(missing.uid_to_record(Some(7)), Some(7));
+        assert_eq!(
+            missing.uid_to_record(Record::Enrollment, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            missing.uid_to_record(Record::Enrollment, Some(7)).unwrap(),
+            Some(7)
+        );
         assert!(missing.require(Record::Enrollment, None).is_ok());
         assert!(missing.require(Record::Enrollment, Some(7)).is_err());
+    }
+
+    /// When the lookup fails, a write keeps the uid its record carries, and
+    /// a write of a record without one is refused: it would otherwise leave a
+    /// record that a later account of the same name accepts.
+    #[test]
+    fn a_write_without_a_uid_to_record_is_refused_when_the_lookup_fails() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let user = "irlume-test-account-unknown";
+        let _unknown = remember_resolution(user, Resolution::Unknown);
+        let mut account = Account::new(user);
+        assert_eq!(
+            account
+                .uid_to_record(Record::SealedSecret, Some(4400))
+                .unwrap(),
+            Some(4400)
+        );
+        let error = account
+            .uid_to_record(Record::SealedSecret, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("could not be resolved") && error.contains("sealed secret"),
+            "{error}"
+        );
+        assert!(!error.contains('\u{2014}'));
     }
 }

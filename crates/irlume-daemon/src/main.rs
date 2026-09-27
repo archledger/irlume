@@ -4512,6 +4512,10 @@ struct EnrollmentSummary {
     primary_digest: PrimaryDigest,
     /// The secondary camera store as `camera_groups` was built from it.
     camera_store: CameraStoreSnapshot,
+    /// The account as the load that built this summary resolved it
+    /// (`irlume_core::account`): the records it read were checked against
+    /// that uid. A hit needs the same answer now ([`EnrollmentSummary::serves`]).
+    owner: irlume_core::account::Resolution,
 }
 
 /// What a cached summary keeps about the secondary camera store, so a
@@ -4743,6 +4747,14 @@ fn correlate_handles(
 }
 
 impl EnrollmentSummary {
+    /// Whether this summary may answer for the account as it resolves `now`:
+    /// only for the resolution its load checked the records against. A name
+    /// that now resolves to another uid, or cannot be resolved, is a miss, so
+    /// the worker's load checks the records again.
+    fn serves(&self, now: irlume_core::account::Resolution) -> bool {
+        now != irlume_core::account::Resolution::Unknown && now == self.owner
+    }
+
     /// The reply for `peer`: handles correlated against the identities
     /// sysfs reports now (no device opens); identities and group ids
     /// redacted for a non-root peer that correlates by handle. The cached
@@ -4899,6 +4911,7 @@ fn summarize_enrollment(
             }),
             primary_digest: PrimaryDigest::Absent,
             camera_store: CameraStoreSnapshot::default(),
+            owner: irlume_core::account::Resolution::Unknown,
             profiles: enr
                 .profiles
                 .iter()
@@ -4946,6 +4959,7 @@ fn summarize_enrollment(
             primary_camera: None,
             primary_digest: PrimaryDigest::Absent,
             camera_store: CameraStoreSnapshot::default(),
+            owner: irlume_core::account::Resolution::Unknown,
             profiles: Vec::new(),
             ir_ratio_calibrated: false,
         },
@@ -5274,6 +5288,25 @@ fn note_camera_seat_refusal(uid: u32, unknown: bool) {
     }
 }
 
+/// The uid [`pregate`] established for the account a request names, held
+/// for the request (`irlume_core::account::remember`): a non-root peer passes
+/// a [`Privilege::RootOrTarget`] gate only as that account, so the account's
+/// uid is the peer's. The records the request checks and writes are then
+/// bound to the account that was authorized, whatever a later lookup of the
+/// name answers. `None` for root, for which the gate resolves no account.
+///
+/// Only for a request the gate admitted: a refused peer's uid says nothing
+/// about the account it named.
+fn gate_account_uid(req: &Request, peer: &Peer) -> Option<irlume_core::account::RememberedUid> {
+    let posture = posture(req);
+    match (posture.privilege, posture.user) {
+        (Privilege::RootOrTarget { .. }, Some(user)) if peer.uid != 0 => {
+            Some(irlume_core::account::remember(user, peer.uid))
+        }
+        _ => None,
+    }
+}
+
 /// Say in the journal why a non-root peer's `UnsealPassword` was refused.
 ///
 /// Refusing SILENTLY is what was wrong before: the request returned before
@@ -5355,6 +5388,7 @@ fn dispatch_status_with_diagnostics(
     if let Some(resp) = pregate(req, peer) {
         return Some(resp);
     }
+    let _gate_uid = gate_account_uid(req, peer);
     if matches!(req, Request::LiveStatus) {
         return Some(match diagnostic_state {
             Some(state) => Response::LiveStatus(Box::new(
@@ -5456,6 +5490,9 @@ fn dispatch_status_with_diagnostics(
             // publishes. Serving the real load here would put a TPM command
             // and a potential template-key WRITE on a connection thread.
             let mut sum = cached_enrollment_summary(user)?;
+            if !sum.serves(irlume_core::account::resolve(user)) {
+                return None;
+            }
             let primary = primary_digest_now(user);
             // A primary rewritten by a legacy writer since publication
             // sends no request: its binding may have changed, so the
@@ -6926,6 +6963,7 @@ fn dispatch_scoped_session_inner(
     if let Some(resp) = pregate(&req, peer) {
         return resp;
     }
+    let _gate_uid = gate_account_uid(&req, peer);
     if operation_authorization::required(&req, peer) {
         let result = authorization
             .ok_or_else(|| operation_authorization::REFUSED.to_owned())
@@ -7071,6 +7109,16 @@ fn dispatch_scoped_session_inner(
                     Response::Error(prose)
                 }
             };
+            // The account as this load checks the records against: a
+            // non-root caller's uid is already held from the gate; root's
+            // request resolves the name here, and the load uses that answer.
+            let owner = irlume_core::account::resolve(&user);
+            let _owner_uid = match owner {
+                irlume_core::account::Resolution::Uid(uid) => {
+                    Some(irlume_core::account::remember(&user, uid))
+                }
+                _ => None,
+            };
             let digest_before = primary_digest_now(&user);
             match irlume_core::storage::load(&user) {
                 Ok(enr) => {
@@ -7090,6 +7138,7 @@ fn dispatch_scoped_session_inner(
                     // under the load is not filed under its new digest.
                     sum.primary_digest =
                         PrimaryDigest::settled(digest_before, primary_digest_now(&user));
+                    sum.owner = owner;
                     publish_enrollment_summary(&user, sum.clone());
                     sum.into_response_for(peer, handles)
                 }
@@ -10697,6 +10746,11 @@ mod tests {
             "identify_target(",
             "identify_account(",
             "serve(",
+            // A cached listing is served only while the name resolves as it
+            // did (`EnrollmentSummary::serves`), which asks NSS for a root
+            // peer.
+            "account::resolve(",
+            "dispatch_status(",
         ];
         /// Drops char literals, string literals and line comments so a brace
         /// inside one is not counted as structure.
@@ -13185,6 +13239,7 @@ mod tests {
         publish_enrollment_summary(
             &me,
             EnrollmentSummary {
+                owner: irlume_core::account::resolve(&me),
                 profiles: vec![irlume_common::ProfileSummary {
                     name: "Alice".into(),
                     scans: vec!["s1".into()],
@@ -13328,6 +13383,7 @@ mod tests {
             publish_enrollment_summary(
                 user,
                 EnrollmentSummary {
+                    owner: irlume_core::account::resolve(user),
                     profiles: Vec::new(),
                     ir_ratio_calibrated: false,
                     camera_groups: Vec::new(),
@@ -13369,6 +13425,7 @@ mod tests {
     #[test]
     fn enrollment_reply_correlates_handles_and_redacts_identities_for_ordinary_peers() {
         let summary = || EnrollmentSummary {
+            owner: irlume_core::account::Resolution::Unknown,
             profiles: Vec::new(),
             ir_ratio_calibrated: false,
             camera_groups: vec![
@@ -13499,6 +13556,7 @@ mod tests {
         publish_enrollment_summary(
             user,
             EnrollmentSummary {
+                owner: irlume_core::account::resolve(user),
                 profiles: Vec::new(),
                 ir_ratio_calibrated: false,
                 camera_groups: Vec::new(),
@@ -13539,6 +13597,7 @@ mod tests {
         publish_enrollment_summary(
             user,
             EnrollmentSummary {
+                owner: irlume_core::account::resolve(user),
                 profiles: Vec::new(),
                 ir_ratio_calibrated: false,
                 camera_groups: Vec::new(),
@@ -13563,6 +13622,7 @@ mod tests {
         publish_enrollment_summary(
             user,
             EnrollmentSummary {
+                owner: irlume_core::account::resolve(user),
                 profiles: Vec::new(),
                 ir_ratio_calibrated: false,
                 camera_groups: Vec::new(),
@@ -13582,6 +13642,7 @@ mod tests {
         publish_enrollment_summary(
             user,
             EnrollmentSummary {
+                owner: irlume_core::account::resolve(user),
                 profiles: Vec::new(),
                 ir_ratio_calibrated: false,
                 camera_groups: Vec::new(),
@@ -13609,6 +13670,7 @@ mod tests {
         publish_enrollment_summary(
             user,
             EnrollmentSummary {
+                owner: irlume_core::account::resolve(user),
                 profiles: Vec::new(),
                 ir_ratio_calibrated: false,
                 camera_groups: Vec::new(),
@@ -13670,6 +13732,7 @@ mod tests {
         publish_enrollment_summary(
             SAMPLE_USER,
             EnrollmentSummary {
+                owner: irlume_core::account::resolve(SAMPLE_USER),
                 profiles: Vec::new(),
                 ir_ratio_calibrated: false,
                 camera_groups: Vec::new(),
@@ -14017,7 +14080,8 @@ mod tests {
     fn dispatch_status_keeps_the_authorization_gate() {
         // A non-root peer asking about another user is refused on the
         // connection thread exactly as the worker refused it: moving the
-        // arms must not have moved the gate.
+        // arms must not have moved the gate. The gate resolves "root".
+        let _passwd = passwd_lock();
         let peer = Peer {
             uid: 65534,
             gid: 65534,
@@ -16312,6 +16376,147 @@ mod tests {
         }
     }
 
+    /// The profile count of a listing reply.
+    fn listed_profiles(response: Response) -> usize {
+        match response {
+            Response::Enrollment { profiles, .. } => profiles.len(),
+            other => panic!("expected a listing, got {other:?}"),
+        }
+    }
+
+    fn list_profiles_of(user: &str) -> Request {
+        Request::ListProfiles {
+            user: user.into(),
+            structured_errors: false,
+            handles: false,
+        }
+    }
+
+    /// A non-root peer passes the gate only as the account it names, so its
+    /// request checks that account's records against the peer's uid, not
+    /// against a later lookup of the name (stood in for here by a registered
+    /// answer for another uid). Root's request, for which the gate resolves
+    /// no account, goes by the lookup.
+    #[test]
+    fn a_request_checks_records_against_the_uid_the_gate_established() {
+        let _g = enrollment_summary_test_lock();
+        let mut e = engine();
+        let sb = sandbox("gate-uid-read");
+        let user = "nobody";
+        let owner = peer(uid_of(user).expect("NSS account nobody"));
+        assert_ne!(owner.uid, 0);
+        let mut enrollment = enrollment_with(user, &["Face Scan 1"]);
+        enrollment.uid = Some(owner.uid);
+        write_enrollment(&sb.dir, &enrollment);
+        let _later = irlume_core::account::remember(user, owner.uid.wrapping_add(1));
+        assert_eq!(
+            listed_profiles(dispatch(list_profiles_of(user), &owner, &mut e)),
+            1,
+            "the account's own enrollment"
+        );
+        invalidate_enrollment_summary(user);
+        assert_eq!(
+            listed_profiles(dispatch(list_profiles_of(user), &peer(0), &mut e)),
+            0,
+            "root's request goes by the lookup"
+        );
+    }
+
+    /// The same for a write: the account's own rename records the peer's uid
+    /// on an enrollment an earlier release wrote without one, although a
+    /// later lookup of the name answers another uid.
+    #[test]
+    fn a_write_records_the_uid_the_gate_established() {
+        // Ends in storage::save, which seals a template key on a TPM host;
+        // same convention as the other mutation tests.
+        if irlume_core::template_key::tpm_available() {
+            jout_debug!("skipping: TPM present; storage::save would touch real hardware");
+            return;
+        }
+        let _g = enrollment_summary_test_lock();
+        let mut e = engine();
+        let sb = sandbox("gate-uid-write");
+        let user = "nobody";
+        let owner = peer(uid_of(user).expect("NSS account nobody"));
+        assert_ne!(owner.uid, 0);
+        write_enrollment(&sb.dir, &enrollment_with(user, &["Face Scan 1"]));
+        let _later = irlume_core::account::remember(user, owner.uid.wrapping_add(1));
+        let rename = Request::RenameProfile {
+            user: user.into(),
+            profile: "Face Profile 1".into(),
+            new_name: "Renamed".into(),
+        };
+        if let Response::Error(message) = dispatch(rename, &owner, &mut e) {
+            panic!("the account's own rename must succeed: {message}");
+        }
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(sb.dir.join(format!("{user}.json"))).unwrap())
+                .unwrap();
+        assert_eq!(saved["profiles"][0]["name"], "Renamed");
+        assert_eq!(saved["uid"], owner.uid, "{saved}");
+    }
+
+    /// A cached listing answers only while the name resolves as it did for
+    /// the load that built it. Once the name resolves to another uid, with
+    /// the enrollment file unchanged, the listing goes to the worker, whose
+    /// load reads the enrollment as another uid's.
+    #[test]
+    fn a_cached_listing_is_not_served_once_the_name_resolves_to_another_uid() {
+        let _g = enrollment_summary_test_lock();
+        let mut e = engine();
+        let sb = sandbox("summary-owner");
+        let user = "nobody";
+        let recorded = uid_of(user).expect("NSS account nobody");
+        let mut enrollment = enrollment_with(user, &["Face Scan 1"]);
+        enrollment.uid = Some(recorded);
+        write_enrollment(&sb.dir, &enrollment);
+        let root = peer(0);
+        assert_eq!(
+            listed_profiles(dispatch(list_profiles_of(user), &root, &mut e)),
+            1
+        );
+        assert!(
+            dispatch_status(&list_profiles_of(user), &root).is_some(),
+            "the published summary answers while the name resolves the same way"
+        );
+        let _recreated = irlume_core::account::remember(user, recorded.wrapping_add(1));
+        assert!(
+            dispatch_status(&list_profiles_of(user), &root).is_none(),
+            "the name resolves to another uid: a miss"
+        );
+        assert_eq!(
+            listed_profiles(dispatch(list_profiles_of(user), &root, &mut e)),
+            0,
+            "the worker reads the enrollment as another uid's"
+        );
+    }
+
+    #[test]
+    fn a_summary_serves_only_the_resolution_it_was_built_for() {
+        use irlume_core::account::Resolution;
+        let mut summary = summarize_enrollment(None, "embed:test", "ir:test", 0);
+        assert!(
+            !summary.serves(Resolution::Unknown),
+            "never built for a known account"
+        );
+        summary.owner = Resolution::Uid(4242);
+        assert!(summary.serves(Resolution::Uid(4242)));
+        for now in [
+            Resolution::Uid(4243),
+            Resolution::NoAccount,
+            Resolution::Unknown,
+        ] {
+            assert!(!summary.serves(now), "{now:?}");
+        }
+        summary.owner = Resolution::NoAccount;
+        assert!(summary.serves(Resolution::NoAccount));
+        summary.owner = Resolution::Unknown;
+        assert!(
+            !summary.serves(Resolution::Unknown),
+            "an unresolved owner never serves"
+        );
+    }
+
     /// A keyring envelope recorded for another uid is not released on the
     /// fingerprint path; the refusal names the uids and `irlume keyring arm`.
     #[test]
@@ -16773,6 +16978,7 @@ mod tests {
         publish_enrollment_summary(
             "carol",
             EnrollmentSummary {
+                owner: irlume_core::account::resolve("carol"),
                 profiles: vec![irlume_common::ProfileSummary {
                     name: "Profile From A Dead Sandbox".into(),
                     scans: vec!["Face Scan 9".into()],
@@ -17197,6 +17403,7 @@ mod tests {
             publish_enrollment_summary(
                 "carol",
                 EnrollmentSummary {
+                    owner: irlume_core::account::resolve("carol"),
                     profiles: Vec::new(),
                     ir_ratio_calibrated: false,
                     camera_groups: Vec::new(),
@@ -17316,6 +17523,7 @@ mod tests {
         publish_enrollment_summary(
             "carol",
             EnrollmentSummary {
+                owner: irlume_core::account::resolve("carol"),
                 profiles: Vec::new(),
                 ir_ratio_calibrated: false,
                 camera_groups: Vec::new(),
@@ -21075,6 +21283,7 @@ mod tests {
     ) -> EnrollmentSummary {
         let mut summary =
             summarize_enrollment(Some(enr), e.embed_space(), e.ir_space(), e.ir_dim());
+        summary.owner = irlume_core::account::resolve("carol");
         summarize_camera_groups_keyed(&mut summary, "carol", e, key_for);
         summary.primary_digest = primary_digest_now("carol");
         publish_enrollment_summary("carol", summary.clone());
@@ -21226,6 +21435,7 @@ mod tests {
         store: &irlume_core::multi_camera::SecondaryStore,
     ) -> EnrollmentSummary {
         EnrollmentSummary {
+            owner: irlume_core::account::resolve("carol"),
             profiles: Vec::new(),
             ir_ratio_calibrated: false,
             camera_groups: vec![irlume_common::CameraGroupSummary {
@@ -21364,6 +21574,7 @@ mod tests {
     fn cached_group_flags_refresh_from_present_identities_and_live_pair() {
         let _g = env_lock();
         let mut summary = EnrollmentSummary {
+            owner: irlume_core::account::Resolution::Unknown,
             profiles: Vec::new(),
             ir_ratio_calibrated: false,
             camera_groups: vec![irlume_common::CameraGroupSummary {

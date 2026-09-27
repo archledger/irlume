@@ -186,13 +186,17 @@ envelopes carry it in their JSON beside the sealed blob. The code is
 `crates/irlume-core/src/account.rs`.
 
 Each load compares that uid with the account's current uid, resolved through
-NSS (so LDAP, SSSD and systemd-homed accounts resolve too). On an
+NSS (so LDAP, SSSD and systemd-homed accounts resolve too). A request from
+the account itself (not root) passes irlumed's authorization check only when
+the name resolves to the caller's uid, so every record that request loads or
+writes is checked against, and records, the caller's uid. On an
 authentication request irlumed reuses the lookup it already makes for the
-retry record, so the check adds no second lookup there.
+retry record, so the check adds no second lookup there. A cached profile
+listing is served only while the name resolves to the uid its load used.
 
 | Record | Recorded uid differs from the current one | Current uid cannot be resolved |
 |---|---|---|
-| Enrollment and template key | The account reads as not enrolled; the key is not unsealed. `irlume enroll` enrolls again: it writes a new enrollment under a new key and removes the recovery envelope of the replaced key | Error; face falls back to the password |
+| Enrollment and template key | The account reads as not enrolled; the key is not unsealed. `irlume enroll` enrolls again: it writes a new enrollment under a new key, and once that enrollment is saved it removes the recovery envelope of the replaced key (an enrollment that fails to save puts the replaced key back) | Error; face falls back to the password |
 | Keyring envelope | Not released (face or fingerprint path), not re-sealed, and not returned for a re-arm or a disarm. `irlume keyring arm` arms again; a GNOME keyring token has to be removed first with `irlume keyring forget --force` | Not released |
 | Recovery envelope | `irlume recovery restore` refuses it; `irlume recovery setup` after enrolling again writes a new one | Refused |
 
@@ -204,6 +208,10 @@ each record it does not use, with the uids and the next step.
   add scans, rename or delete a profile), a template key or keyring re-seal,
   a keyring arm, or `irlume recovery setup`. A write for a name that has no
   account records no uid.
+- When the current uid cannot be resolved, a write keeps the uid its record
+  carries, and a write that would leave a record without one (a new
+  enrollment, key, arm or recovery envelope, or the rewrite of an earlier
+  release's record) is refused before anything is written.
 - A record that is not used is never removed automatically: an account whose
   uid changed and is changed back finds its records usable again. To remove
   them by hand, stop irlumed and delete the account's files under

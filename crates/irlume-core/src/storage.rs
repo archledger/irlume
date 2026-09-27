@@ -667,7 +667,7 @@ fn deserialize_enrollment(data: &[u8], key: Option<&[u8]>) -> irlume_common::Res
 /// key on a TPM host (generated on first save, and replaced when it was
 /// sealed for another uid), or `None` on a no-TPM host (plaintext fallback so
 /// dev boxes still work).
-fn save_key(user: &str) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>> {
+fn save_key(user: &str) -> irlume_common::Result<Option<template_key::WriteKey>> {
     if template_key::tpm_available() {
         Ok(Some(template_key::ensure_enrollment_key_unlocked(user)?))
     } else {
@@ -675,8 +675,13 @@ fn save_key(user: &str) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>> {
     }
 }
 
-fn persist_enrollment(path: &std::path::Path, bytes: &[u8]) -> irlume_common::Result<()> {
-    publication_result(irlume_common::write_atomic_reporting(path, bytes, 0o600))
+/// Publish `bytes` as the enrollment at `path`; [`publication_result`] turns
+/// the outcome into the write's result.
+fn persist_enrollment(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<irlume_common::AtomicWrite> {
+    irlume_common::write_atomic_reporting(path, bytes, 0o600)
 }
 
 fn publication_result(
@@ -712,8 +717,8 @@ pub fn save_replacement(e: &Enrollment) -> irlume_common::Result<()> {
 fn replacement_key(
     user: &str,
     load_existing: impl FnOnce(&str) -> irlume_common::Result<Zeroizing<Vec<u8>>>,
-    first_save: impl FnOnce(&str) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>>,
-) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>> {
+    first_save: impl FnOnce(&str) -> irlume_common::Result<Option<template_key::WriteKey>>,
+) -> irlume_common::Result<Option<template_key::WriteKey>> {
     // Probe first even when a key exists: the probe admits the stored format,
     // and short-circuiting it would let replacement overwrite a future schema.
     let encrypted_store = store_is_encrypted(user)? == Some(true);
@@ -727,7 +732,7 @@ fn replacement_key(
     if template_key::has_key(user) || encrypted_store {
         // Never mint a replacement key or fall back to plaintext on unseal
         // failure. The user can restore recovery or explicitly delete state.
-        load_existing(user).map(Some)
+        load_existing(user).map(|key| Some(template_key::WriteKey::kept(key)))
     } else {
         first_save(user)
     }
@@ -735,17 +740,17 @@ fn replacement_key(
 
 fn save_with_key(
     e: &Enrollment,
-    resolve_key: impl FnOnce(&str) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>>,
+    resolve_key: impl FnOnce(&str) -> irlume_common::Result<Option<template_key::WriteKey>>,
 ) -> irlume_common::Result<()> {
     let _state = template_key::UserStateLock::acquire(&e.user)?;
     let dir = state_dir();
     fs::create_dir_all(&dir).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
     let path = profile_path(&e.user);
-    let key = resolve_key(&e.user)?;
     // Record the account's current uid; an enrollment written before it was
     // recorded gets it here. When the uid cannot be resolved the enrollment
-    // keeps the one it has.
-    let uid = Account::new(&e.user).uid_to_record(e.uid);
+    // keeps the one it has, and one without a uid is not written.
+    let uid = Account::new(&e.user).uid_to_record(Record::Enrollment, e.uid)?;
+    let key = resolve_key(&e.user)?;
     let stamped;
     let e = if uid == e.uid {
         e
@@ -753,8 +758,17 @@ fn save_with_key(
         stamped = Enrollment { uid, ..e.clone() };
         &stamped
     };
-    let bytes = serialize_enrollment(e, key.as_ref().map(|k| k.as_slice()))?;
-    persist_enrollment(&path, &bytes)
+    let written = serialize_enrollment(e, key.as_ref().map(template_key::WriteKey::as_slice))
+        .map(|bytes| persist_enrollment(&path, &bytes));
+    // A key that replaced another uid's becomes final only once this
+    // enrollment is published under it; otherwise the replaced key goes back.
+    if let Some(key) = key {
+        key.settle(match &written {
+            Ok(Ok(published)) => Some(published),
+            _ => None,
+        })?;
+    }
+    publication_result(written?)
 }
 
 /// Load an enrollment, transparently decrypting v2/v3 and migrating the legacy
@@ -1622,6 +1636,148 @@ mod tests {
         assert!(load_with_key(user).is_err());
         plant_plaintext(&dir, user, None);
         assert!(load(user).unwrap().is_some());
+        leave_uid_sandbox(&dir);
+    }
+
+    /// When the account's uid cannot be resolved, an enrollment write keeps
+    /// the uid the enrollment carries, and one without a uid is refused
+    /// before anything is written: it would otherwise be a record that any
+    /// later account of the same name accepts.
+    #[test]
+    fn an_enrollment_without_a_uid_is_not_written_when_the_account_cannot_be_resolved() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("uid-unknown-write");
+        let user = "uid-unknown-writer";
+        let _unknown =
+            crate::account::remember_resolution(user, crate::account::Resolution::Unknown);
+        let mut enrollment = Enrollment::new(user);
+        enrollment.profiles = sample().profiles;
+        let error = save_with_key(&enrollment, |_| {
+            panic!("no key is resolved for a write that is refused")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("could not be resolved") && error.contains("face enrollment"),
+            "{error}"
+        );
+        assert!(!profile_path(user).exists(), "nothing was written");
+
+        enrollment.uid = Some(4811);
+        save_with_key(&enrollment, |_| Ok(None)).unwrap();
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(profile_path(user)).unwrap()).unwrap();
+        assert_eq!(on_disk["uid"], 4811);
+        leave_uid_sandbox(&dir);
+    }
+
+    /// A seal for [`template_key::ensure_key_with`] in the replacement tests.
+    type FakeSeal = dyn Fn(&str, &[u8], Option<u32>) -> irlume_common::Result<()>;
+
+    /// The fake TPM of the replacement tests: the "sealed blob" is the key.
+    fn fake_seal(user: &str, key: &[u8], uid: Option<u32>) -> irlume_common::Result<()> {
+        let mut env: crate::envelope::SealedEnvelope =
+            serde_json::from_str(r#"{"version":1,"pcrs":[7],"public":"","private":""}"#).unwrap();
+        env.private = key.to_vec();
+        env.uid = uid;
+        env.save(&template_key::key_path(user))
+    }
+
+    fn fake_load(
+        user: &str,
+        account: &mut Account<'_>,
+    ) -> irlume_common::Result<Zeroizing<Vec<u8>>> {
+        template_key::load_key_with(
+            user,
+            account,
+            template_key::KeyLoadPolicy::Keep,
+            |env| Ok(Zeroizing::new(env.private.clone())),
+            |_| false,
+            |_| panic!("a replacement does not move a key to another policy"),
+        )
+    }
+
+    /// Replacing a template key sealed for another uid is final only once
+    /// the new enrollment is published under the new key. A failed seal, or
+    /// an enrollment write that publishes nothing, leaves that account's key,
+    /// enrollment and recovery envelope as they were; a published one
+    /// removes the recovery envelope, which can only restore the replaced
+    /// key.
+    #[test]
+    fn a_failed_replacement_leaves_the_replaced_key_and_its_recovery_in_place() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("uid-replace-settle");
+        let user = "uid-replace-owner";
+        let old_key = [7u8; 32];
+        let mut old = sample();
+        old.user = user.into();
+        old.uid = Some(6101);
+        let enrollment_before = serialize_enrollment(&old, Some(&old_key)).unwrap();
+        fs::write(profile_path(user), &enrollment_before).unwrap();
+        fake_seal(user, &old_key, Some(6101)).unwrap();
+        let key_before = fs::read(template_key::key_path(user)).unwrap();
+        let recovery = template_key::recovery_path(user);
+        fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+        fs::write(&recovery, b"synthetic recovery of the replaced key").unwrap();
+        let _now = crate::account::remember(user, 6102);
+        let mut replacement = Enrollment::new(user);
+        replacement.profiles = sample().profiles;
+        let replace = |reseal: &FakeSeal| {
+            save_with_key(&replacement, |user| {
+                template_key::ensure_key_with(
+                    user,
+                    &mut Account::new(user),
+                    true,
+                    fake_load,
+                    reseal,
+                )
+                .map(Some)
+            })
+        };
+        let unchanged = |what: &str| {
+            assert_eq!(
+                fs::read(template_key::key_path(user)).unwrap(),
+                key_before,
+                "{what}: the replaced key"
+            );
+            assert!(recovery.exists(), "{what}: its recovery envelope");
+        };
+
+        let error =
+            replace(&|_, _, _| Err(irlume_common::Error::Policy("injected seal failure".into())))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("injected seal failure"), "{error}");
+        unchanged("a failed seal");
+        assert_eq!(fs::read(profile_path(user)).unwrap(), enrollment_before);
+
+        // The new key is sealed, but the enrollment write publishes nothing:
+        // a directory stands where the enrollment goes.
+        fs::remove_file(profile_path(user)).unwrap();
+        fs::create_dir(profile_path(user)).unwrap();
+        assert!(replace(&fake_seal).is_err());
+        unchanged("an unpublished enrollment");
+        fs::remove_dir(profile_path(user)).unwrap();
+        fs::write(profile_path(user), &enrollment_before).unwrap();
+
+        replace(&fake_seal).unwrap();
+        let key = crate::envelope::SealedEnvelope::load(&template_key::key_path(user)).unwrap();
+        assert_eq!(key.uid, Some(6102), "the account has a key of its own");
+        assert_ne!(key.private, old_key);
+        assert!(
+            !recovery.exists(),
+            "the replaced key's recovery envelope goes"
+        );
+        let saved =
+            deserialize_enrollment(&fs::read(profile_path(user)).unwrap(), Some(&key.private))
+                .unwrap();
+        assert_eq!(saved.uid, Some(6102));
         leave_uid_sandbox(&dir);
     }
 

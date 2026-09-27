@@ -556,26 +556,43 @@ pub(crate) fn guidance(
 
 /// irlumed's state directory: this process's `IRLUME_STATE_DIR` when it is
 /// set, else the one irlumed's unit sets (a source install writes it into the
-/// unit, not the shell), else the default.
-fn daemon_state_dir() -> std::path::PathBuf {
-    if std::env::var_os("IRLUME_STATE_DIR").is_none() {
-        if let Ok(Some(dir)) = crate::uninstall::unit_env("IRLUME_STATE_DIR") {
-            return dir;
-        }
+/// unit, not the shell), else the default. `None` when a unit file or drop-in
+/// that could set it cannot be read: which directory irlumed uses is then
+/// unknown, and so is its storage.
+fn daemon_state_dir() -> Option<std::path::PathBuf> {
+    if std::env::var_os("IRLUME_STATE_DIR").is_some() {
+        return Some(irlume_common::state_dir());
     }
-    irlume_common::state_dir()
+    match crate::uninstall::unit_env("IRLUME_STATE_DIR") {
+        Ok(Some(dir)) => Some(dir),
+        Ok(None) => Some(irlume_common::state_dir()),
+        Err(_) => None,
+    }
+}
+
+/// What stands for an unknown state directory in the guidance text.
+const UNKNOWN_STATE_DIR: &str = "irlumed's state directory (its unit could not be read)";
+
+/// The directory to name and the storage probe to use for irlumed's state
+/// directory: an unknown directory is unknown storage, never the default's.
+fn daemon_storage(
+    probe: impl FnOnce(&Path) -> StorageEncryption,
+) -> (std::path::PathBuf, StorageEncryption) {
+    match daemon_state_dir() {
+        Some(dir) => {
+            let storage = probe(&dir);
+            (dir, storage)
+        }
+        None => (UNKNOWN_STATE_DIR.into(), StorageEncryption::Unknown),
+    }
 }
 
 /// [`guidance`] for irlumed's state directory ([`daemon_state_dir`]) on this
 /// system's storage. The storage is probed only when something is sealed.
 pub(crate) fn state_dir_guidance(sealed: &Sealed) -> Option<SealAdvice> {
     Subject::of(sealed)?;
-    let dir = daemon_state_dir();
-    guidance(
-        sealed,
-        irlume_common::storage_encryption::path_encryption(&dir),
-        &dir,
-    )
+    let (dir, storage) = daemon_storage(irlume_common::storage_encryption::path_encryption);
+    guidance(sealed, storage, &dir)
 }
 
 /// The line `keyring arm` prints for `advice`: a warning, or a note for
@@ -625,12 +642,17 @@ pub(crate) fn check(
 }
 
 /// [`check`] against irlumed's state directory ([`daemon_state_dir`]) and
-/// this system's storage.
+/// this system's storage; an unknown directory is unknown storage.
 pub(crate) fn state_dir_check(user: &str, sealed: &Sealed) -> (State, String) {
+    let Some(dir) = daemon_state_dir() else {
+        return check(user, sealed, Path::new(UNKNOWN_STATE_DIR), |_| {
+            StorageEncryption::Unknown
+        });
+    };
     check(
         user,
         sealed,
-        &daemon_state_dir(),
+        &dir,
         irlume_common::storage_encryption::path_encryption,
     )
 }
@@ -1060,6 +1082,28 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// An unknown state directory is unknown storage: it warns, naming the
+    /// directory as unknown rather than the default's.
+    #[test]
+    fn an_unknown_state_directory_warns() {
+        let sealed = sealed(literal(vec![7]), Some(true));
+        let advice = guidance(
+            &sealed,
+            StorageEncryption::Unknown,
+            Path::new(UNKNOWN_STATE_DIR),
+        )
+        .expect("guidance");
+        assert!(advice.warn, "{}", advice.text);
+        assert!(
+            advice.text.contains(
+                "irlume could not confirm that irlumed's state directory (its unit could not be \
+                 read) is on encrypted storage"
+            ),
+            "{}",
+            advice.text
+        );
     }
 
     /// On encrypted storage the guidance is always information: the storage

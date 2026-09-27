@@ -3488,6 +3488,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A dangling link at an envelope's name in an account's keyring is the
+    /// account's (its owner is read without following it), so it is only
+    /// named and does not stop the uninstall.
+    #[test]
+    fn a_dangling_link_in_an_accounts_keyring_is_only_named() {
+        let base =
+            std::env::temp_dir().join(format!("irlume-home-dangling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let keyring = home_state_path(&alice.home).join("keyring");
+        std::fs::create_dir_all(&keyring).unwrap();
+        std::os::unix::fs::symlink(base.join("nowhere.json"), keyring.join("foo.json")).unwrap();
+        let homes = home_trees(std::slice::from_ref(&alice), &base.join("default-state"));
+        let sweep =
+            sealed_token_holders_with(Ok(Vec::new()), &homes, &[], &[], alice.uid.wrapping_add(1))
+                .expect("a link the account owns does not refuse");
+        assert!(
+            sweep.holders.is_empty()
+                && sweep.notes.len() == 1
+                && sweep.notes[0].contains("foo.json"),
+            "{sweep:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A tree whose removal takes a symbolic link is reported among what
     /// may still hold data, which keeps the SRK: the link is removed, never
     /// followed, and the account could point it anywhere until then. A tree

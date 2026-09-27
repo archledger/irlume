@@ -850,7 +850,7 @@ All notable changes to irlume are documented here. This project adheres to
   through the directory it checked, entry by entry without following a
   link, leaving in place what another account owns; anything else there
   is named in the output as left in place. Sealed envelopes are read
-  only as regular files of at most 1 MiB, never through a symbolic link
+  only as regular files of at most 8 MiB, never through a symbolic link
   at their own name, and irlume no longer writes one larger than that.
   In an account's tree, an envelope that cannot be read and that root
   does not own is named against that account instead of stopping the

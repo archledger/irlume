@@ -33,9 +33,12 @@ pub const CURRENT_VERSION: u32 = 1;
 /// The largest envelope file [`SealedEnvelope::load`] reads, in bytes. One
 /// irlume writes holds two TPM blobs, the PCR list and at most a signing key
 /// and a password wrap, all as base64 in pretty JSON: a few KiB. The limit
-/// leaves room for an envelope an earlier release wrote from an
-/// `IRLUME_PCRS` that repeated PCRs (the list was not deduplicated then).
-pub const MAX_ENVELOPE_BYTES: u64 = 1024 * 1024;
+/// also covers every envelope an earlier release could write, when
+/// `IRLUME_PCRS` was not deduplicated and each listed PCR, repeats included,
+/// was stored with its value: the kernel caps one environment string at
+/// 128 KiB (`MAX_ARG_STRLEN`), so the daemon saw at most about 65,500 entries
+/// (`7,` each), about 6 MiB of envelope.
+pub const MAX_ENVELOPE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// How the sealed object's `authPolicy` is satisfied at unseal time. Older
 /// envelopes have no `policy` field and default to [`PolicyKind::PcrLiteral`],
@@ -332,6 +335,40 @@ mod b64 {
 mod tests {
     use super::*;
 
+    /// The largest envelope an earlier release could write, from a
+    /// 128 KiB `IRLUME_PCRS` of repeated PCRs stored one value each, still
+    /// loads.
+    #[test]
+    fn the_largest_envelope_an_earlier_release_could_write_still_loads() {
+        let dir =
+            std::env::temp_dir().join(format!("irlume-envelope-legacy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let entries = (128 * 1024 - "IRLUME_PCRS=".len()) / "7,".len() + 1;
+        let envelope = SealedEnvelope {
+            secret: SecretKind::default(),
+            version: CURRENT_VERSION,
+            policy: PolicyKind::PcrLiteral,
+            pcrs: vec![7; entries],
+            public: vec![0; 512],
+            private: vec![0; 512],
+            pcr_values: (0..entries)
+                .map(|_| PcrValue {
+                    pcr: 7,
+                    value: vec![0xab; 32],
+                })
+                .collect(),
+            password_wrap: None,
+        };
+        let path = dir.join("legacy.json");
+        // Written the way an earlier release did: no size check.
+        fs::write(&path, serde_json::to_string_pretty(&envelope).unwrap()).unwrap();
+        let size = fs::metadata(&path).unwrap().len();
+        assert!(size < MAX_ENVELOPE_BYTES, "{size} bytes");
+        assert!(SealedEnvelope::load(&path).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// An envelope larger than every reader accepts is never written, and
     /// the file already there is kept.
     #[test]
@@ -351,13 +388,13 @@ mod tests {
         };
         envelope(vec![7], Vec::new()).save(&path).unwrap();
         let before = fs::read(&path).unwrap();
-        let values = (0..20_000)
+        let values = (0..120_000)
             .map(|_| PcrValue {
                 pcr: 7,
                 value: vec![0; 32],
             })
             .collect();
-        let large = envelope(vec![7; 20_000], values);
+        let large = envelope(vec![7; 120_000], values);
         let err = large.save(&path).unwrap_err();
         assert!(err.to_string().contains("nothing was written"), "{err}");
         assert_eq!(

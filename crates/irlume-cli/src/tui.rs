@@ -5950,7 +5950,10 @@ impl App {
             // Recovery: masked in-TUI entry.
             (SC_RECOVERY, KeyCode::Char('s')) => {
                 self.input = Some((
-                    "New recovery passphrase (OS approval follows):".into(),
+                    format!(
+                        "New recovery passphrase, at least {} characters (OS approval follows):",
+                        irlume_core::recovery::MIN_PASSPHRASE_CHARS
+                    ),
                     String::new(),
                     Pending::RecoveryPw(None),
                 ));
@@ -6673,8 +6676,11 @@ impl App {
                 );
             }
             Pending::RecoveryPw(None) => {
-                if buf.is_empty() {
-                    self.set_error("empty passphrase; aborted");
+                // The CLI's floor and words, checked before the confirmation
+                // so a passphrase irlumed would refuse is never asked twice
+                // and never sent; an older irlumed does not check it.
+                if let Some(what) = crate::recovery::setup_refusal(&buf) {
+                    self.set_error(format!("{what}; aborted (nothing set)"));
                     return;
                 }
                 self.input = Some((
@@ -17882,9 +17888,16 @@ mod tests {
         let _sock = dead_socket();
         let mut app = test_app();
         app.screen = SC_RECOVERY;
+        // Twelve characters: the recovery passphrase floor.
+        let phrase = "twelve chars";
+        let type_phrase = |app: &mut App| {
+            for c in phrase.chars() {
+                app.on_key(KeyCode::Char(c));
+            }
+        };
         // Set: double entry, mismatch aborts.
         app.on_key(KeyCode::Char('s'));
-        app.on_key(KeyCode::Char('a'));
+        type_phrase(&mut app);
         app.on_key(KeyCode::Enter);
         assert!(matches!(
             app.input,
@@ -17897,9 +17910,9 @@ mod tests {
         assert!(err.contains("don't match"), "got: {err}");
         // Set: matching entries fire RecoverySetup.
         app.on_key(KeyCode::Char('s'));
-        app.on_key(KeyCode::Char('a'));
+        type_phrase(&mut app);
         app.on_key(KeyCode::Enter);
-        app.on_key(KeyCode::Char('a'));
+        type_phrase(&mut app);
         app.on_key(KeyCode::Enter);
         assert_eq!(
             app.op.as_ref().map(|o| o.label.as_str()),
@@ -17927,6 +17940,98 @@ mod tests {
             Some("RecoveryRestore")
         );
         wait_op_done(&mut app);
+    }
+
+    /// The recovery entry applies the CLI's floor, in the CLI's words, before
+    /// the confirmation: fewer than 12 characters (counted as characters, not
+    /// bytes) never reach the daemon, and 12 go through unchanged.
+    #[test]
+    fn recovery_setup_refuses_a_short_passphrase_before_sending() {
+        use std::io::BufRead;
+        let _guard = dead_socket();
+        let path = std::env::temp_dir().join(format!(
+            "irlume-tui-recovery-floor-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let mut app = test_app();
+        app.screen = SC_RECOVERY;
+        let type_text = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                app.on_key(KeyCode::Char(c));
+            }
+        };
+        // Eleven characters each; the second is 22 bytes.
+        for short in ["elevenchars", "ééééééééééé"] {
+            app.on_key(KeyCode::Char('s'));
+            type_text(&mut app, short);
+            app.on_key(KeyCode::Enter);
+            assert!(
+                app.input.is_none(),
+                "{short:?} must not ask for confirmation"
+            );
+            assert!(app.op.is_none(), "{short:?} must not start a request");
+            let err = app.error.take().expect("a short passphrase is refused");
+            assert_eq!(
+                err,
+                "passphrase too short (minimum 12 characters); aborted (nothing set)"
+            );
+        }
+        // Nothing reached the fake daemon. A worker another test left running
+        // may still connect, so only a RecoverySetup counts.
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut line = String::new();
+                    let _ = std::io::BufReader::new(stream).read_line(&mut line);
+                    assert!(
+                        !matches!(
+                            serde_json::from_str::<Request>(&line),
+                            Ok(Request::RecoverySetup { .. })
+                        ),
+                        "a short recovery passphrase reached the daemon"
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("fake daemon accept failed: {error}"),
+            }
+        }
+        drop(listener);
+        // Twelve characters are sent as typed.
+        let server = serve_one(
+            &path,
+            |request| matches!(request, Request::RecoverySetup { .. }),
+            Response::Ok("recovery passphrase set".into()),
+            Duration::ZERO,
+        );
+        let twelve = "twelve chars";
+        app.on_key(KeyCode::Char('s'));
+        type_text(&mut app, twelve);
+        app.on_key(KeyCode::Enter);
+        type_text(&mut app, twelve);
+        app.on_key(KeyCode::Enter);
+        assert_eq!(
+            app.op.as_ref().map(|o| o.label.as_str()),
+            Some("RecoverySetup")
+        );
+        wait_op_done(&mut app);
+        wait_live_done(&mut app);
+        match server.join().unwrap() {
+            Request::RecoverySetup { passphrase, .. } => {
+                assert_eq!(passphrase.expose(), twelve.as_bytes());
+            }
+            other => panic!("expected RecoverySetup, got {other:?}"),
+        }
     }
 
     // ---- confirm & merge flows --------------------------------------------

@@ -201,22 +201,31 @@ fn read_passphrase_confirmed() -> Option<zeroize::Zeroizing<String>> {
     // that cannot apply there; when the floor lived beside it, `irlume recovery
     // setup </dev/null` wrapped the template key under an EMPTY passphrase and
     // reported success.
-    if pass.chars().count() < MIN_RECOVERY_PASSPHRASE_CHARS {
-        let what = if pass.is_empty() {
-            "empty passphrase".to_string()
-        } else {
-            format!("passphrase too short (minimum {MIN_RECOVERY_PASSPHRASE_CHARS} characters)")
-        };
+    if let Some(what) = setup_refusal(&pass) {
         eprintln!("[recovery] {what}; aborted (nothing set).");
         return None;
     }
     Some(pass)
 }
 
-/// Minimum recovery-passphrase length. A recovery key protects the template-key
-/// envelope against an offline/stolen-disk attacker, so it should not be a PIN;
-/// 12 characters is a modest floor that still allows a memorable phrase.
-const MIN_RECOVERY_PASSPHRASE_CHARS: usize = 12;
+/// Why `pass` cannot become a new recovery passphrase, in the words the CLI
+/// and the TUI both show, or `None` when it meets the floor irlumed applies
+/// ([`irlume_core::recovery::MIN_PASSPHRASE_CHARS`], counted by
+/// [`irlume_core::recovery::passphrase_chars`]). Checking here as well keeps a
+/// short entry from ever leaving the client, and covers an older irlumed that
+/// does not check.
+pub(crate) fn setup_refusal(pass: &str) -> Option<String> {
+    use irlume_core::recovery::{passphrase_chars, MIN_PASSPHRASE_CHARS};
+    if pass.is_empty() {
+        Some("empty passphrase".into())
+    } else if passphrase_chars(pass.as_bytes()) < MIN_PASSPHRASE_CHARS {
+        Some(format!(
+            "passphrase too short (minimum {MIN_PASSPHRASE_CHARS} characters)"
+        ))
+    } else {
+        None
+    }
+}
 
 fn read_passphrase_once(prompt: &str) -> Option<zeroize::Zeroizing<String>> {
     let pass = crate::read_password(prompt).ok()?;
@@ -229,7 +238,25 @@ fn read_passphrase_once(prompt: &str) -> Option<zeroize::Zeroizing<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_passphrase_confirmed, read_passphrase_once};
+    use super::{read_passphrase_confirmed, read_passphrase_once, setup_refusal};
+
+    /// The CLI and the TUI refuse by this one check: irlumed's floor, counted
+    /// in characters rather than bytes, in the words both clients show.
+    #[test]
+    fn setup_refusal_applies_the_shared_floor_in_characters() {
+        assert_eq!(setup_refusal("").as_deref(), Some("empty passphrase"));
+        // Eleven characters each; the second is 22 bytes.
+        for short in ["elevenchars", "ééééééééééé"] {
+            assert_eq!(
+                setup_refusal(short).as_deref(),
+                Some("passphrase too short (minimum 12 characters)"),
+                "{short:?}"
+            );
+        }
+        for enough in ["twelve chars", "éééééééééééé"] {
+            assert_eq!(setup_refusal(enough), None, "{enough:?}");
+        }
+    }
 
     #[test]
     fn both_passphrase_prompts_hand_back_a_wiping_string() {

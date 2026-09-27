@@ -523,7 +523,7 @@ struct SysfsSnapshotSource {
 impl Default for SysfsSnapshotSource {
     fn default() -> Self {
         Self {
-            root: PathBuf::from("/sys/class/video4linux"),
+            root: crate::hostfs::video_class_root(),
         }
     }
 }
@@ -1720,6 +1720,7 @@ mod tests {
     fn production_monitor_observes_live_uvc_continuity_loss_and_recovery() {
         use std::io::Write;
 
+        crate::hostfs::test::host();
         let inventory = TestInventory::new();
         let mut coordinator =
             bind_monitor_before_snapshot(UdevEventSource::new, SysfsSnapshotSource::default)
@@ -1781,6 +1782,7 @@ mod tests {
     #[test]
     #[ignore = "requires a real initialized UVC camera in udev"]
     fn production_snapshot_matches_shinetech_four_node_topology_without_capture() {
+        crate::hostfs::test::host();
         let observations = SysfsSnapshotSource::default().snapshot().unwrap();
         let camera = observations
             .iter()

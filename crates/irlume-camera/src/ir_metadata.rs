@@ -1210,10 +1210,10 @@ pub(crate) fn metadata_node_for(ir_device: &str) -> Option<String> {
         irlume_common::dlog!("{ir_device}: illumination metadata disabled (IRLUME_NO_ILLUM_META)");
         return None;
     }
-    let sysfs = std::path::Path::new("/sys/class/video4linux");
+    let sysfs = crate::hostfs::video_class_root();
     let found = pick_metadata_sibling(
         ir_device,
-        siblings_on_same_interface(ir_device, sysfs),
+        siblings_on_same_interface(ir_device, &sysfs),
         offers_uvcm,
     );
     if found.is_none() {

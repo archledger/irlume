@@ -57,6 +57,7 @@ pub mod ir_emitter;
 pub mod ir_metadata;
 mod ir_target;
 pub use ir_target::{configured_ir_target, IrCaptureTarget, IrTargetError};
+mod hostfs;
 pub mod lease;
 mod lifecycle;
 
@@ -3331,6 +3332,7 @@ fn classify_without_open(device: &str) -> Option<NodeKind> {
 /// lesson).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn classify_node(device: &str) -> Result<NodeKind, Unreadable> {
+    hostfs::check_probe(device);
     if let Some(kind) = classify_without_open(device) {
         return Ok(kind);
     }
@@ -3563,7 +3565,7 @@ pub(crate) fn video_node_paths_in(dir: &std::path::Path) -> NodeListing {
 }
 
 pub(crate) fn video_node_paths() -> NodeListing {
-    video_node_paths_in(std::path::Path::new("/dev"))
+    video_node_paths_in(&hostfs::dev_root())
 }
 
 /// Every video node split into the ones that answered and the ones that could
@@ -3684,6 +3686,7 @@ pub fn privacy_engaged(device: &str) -> bool {
 }
 
 fn privacy_engaged_with_permit(device: &str) -> bool {
+    hostfs::check_probe(device);
     let Ok(dev) = Device::with_path(device) else {
         return false;
     };
@@ -3807,6 +3810,7 @@ fn backend_from_caps(driver: String, bus: &str) -> (String, bool) {
 /// diagnostic surface has to say "unknown" (#195 review).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn node_backend(device: &str) -> std::io::Result<(String, bool)> {
+    hostfs::check_probe(device);
     let _permit = lease::permit_for_endpoint(
         device,
         lease::CameraOperationKind::Diagnostics,
@@ -3829,13 +3833,14 @@ fn is_physical_camera_path(p: &str) -> bool {
 /// Walk up from `start` to the first ancestor dir holding `attr` (e.g. the USB
 /// device dir that carries `idVendor`/`removable`, above the interface node).
 fn find_attr_dir(start: &std::path::Path, attr: &str) -> Option<std::path::PathBuf> {
+    let devices = hostfs::sys_root().join("devices");
     let mut p = start.to_path_buf();
     loop {
         if p.join(attr).exists() {
             return Some(p);
         }
         p = p.parent()?.to_path_buf();
-        if !p.starts_with("/sys/devices") {
+        if !p.starts_with(&devices) {
             return None;
         }
     }
@@ -3888,7 +3893,7 @@ fn removable_class(raw: Option<&str>) -> &'static str {
 /// prints `unknown` for many legitimate internal devices; honesty over guess).
 pub fn node_removable_class(device: &str) -> &'static str {
     let node = device.strip_prefix("/dev/").unwrap_or(device);
-    let link = format!("/sys/class/video4linux/{node}/device");
+    let link = hostfs::video_class_root().join(node).join("device");
     let Ok(real) = std::fs::canonicalize(&link) else {
         return "unknown";
     };
@@ -3934,12 +3939,12 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
         return Ok(());
     }
     let node = device.strip_prefix("/dev/").unwrap_or(device);
-    let link = format!("/sys/class/video4linux/{node}/device");
-    let real = std::fs::canonicalize(&link).map_err(|_| {
-        Error::CameraUnavailable(format!(
-            "{device}: no physical device in sysfs (virtual camera?); refusing to authenticate"
-        ))
-    })?;
+    let real = std::fs::canonicalize(hostfs::video_class_root().join(node).join("device"))
+        .map_err(|_| {
+            Error::CameraUnavailable(format!(
+                "{device}: no physical device in sysfs (virtual camera?); refusing to authenticate"
+            ))
+        })?;
     let p = real.to_string_lossy();
     if !is_physical_camera_path(&p) {
         return Err(Error::CameraUnavailable(format!(
@@ -4040,7 +4045,7 @@ pub(crate) fn usb_device_facts(dev_dir: &std::path::Path) -> Option<inventory::U
 /// lowercase). `None` if the node has no USB descriptors (e.g. a virtual cam).
 pub fn device_identity(device: &str) -> Option<String> {
     let node = device.strip_prefix("/dev/").unwrap_or(device);
-    let real = std::fs::canonicalize(format!("/sys/class/video4linux/{node}/device")).ok()?;
+    let real = std::fs::canonicalize(hostfs::video_class_root().join(node).join("device")).ok()?;
     let dev_dir = find_attr_dir(&real, "idVendor")?;
     let vidpid = read_vidpid(&dev_dir)?;
     let serial = std::fs::read_to_string(dev_dir.join("serial")).ok();
@@ -4052,7 +4057,7 @@ pub fn device_identity(device: &str) -> Option<String> {
 /// class) request paths may call it. One entry per distinct identity
 /// (both interfaces of one camera share it).
 pub fn present_device_identities() -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir("/sys/class/video4linux") else {
+    let Ok(entries) = std::fs::read_dir(hostfs::video_class_root()) else {
         return Vec::new();
     };
     let mut identities: Vec<String> = entries
@@ -4068,7 +4073,7 @@ pub fn present_device_identities() -> Vec<String> {
 /// camera; two `/dev/videoN` nodes with the same id are the same camera.
 fn physical_device_id(device: &str) -> Option<std::path::PathBuf> {
     let node = device.strip_prefix("/dev/").unwrap_or(device);
-    let real = std::fs::canonicalize(format!("/sys/class/video4linux/{node}/device")).ok()?;
+    let real = std::fs::canonicalize(hostfs::video_class_root().join(node).join("device")).ok()?;
     find_attr_dir(&real, "idVendor")
 }
 
@@ -4308,7 +4313,7 @@ impl CameraLocation {
 pub fn camera_location(node: &str) -> Option<CameraLocation> {
     let identity = uvc_descriptor::identity_for_location(node).ok()?;
     let fingerprint = identity.descriptor_fingerprint();
-    let dev_dir = std::path::Path::new("/sys").join(identity.usb_devpath.trim_start_matches('/'));
+    let dev_dir = hostfs::sys_root().join(identity.usb_devpath.trim_start_matches('/'));
     // The identity above follows a symlinked node (a `/dev/v4l/by-id` pin);
     // the name must come from the same node, as the Cameras page names it.
     let resolved = std::fs::canonicalize(node).ok();
@@ -4329,7 +4334,7 @@ pub fn camera_location(node: &str) -> Option<CameraLocation> {
 /// so a record's camera can be matched against what is attached now.
 #[must_use]
 pub fn connected_camera_locations() -> Vec<CameraLocation> {
-    let Ok(entries) = std::fs::read_dir("/sys/class/video4linux") else {
+    let Ok(entries) = std::fs::read_dir(hostfs::video_class_root()) else {
         return Vec::new();
     };
     let mut locations: Vec<CameraLocation> = entries
@@ -4396,7 +4401,7 @@ pub fn camera_display_name(dev_dir: &std::path::Path, node: &str) -> Option<Stri
     // ADR-0029: the node's sysfs name first (the driver-given name people
     // see elsewhere), then the USB product string.
     let node = node.strip_prefix("/dev/").unwrap_or(node);
-    std::fs::read_to_string(format!("/sys/class/video4linux/{node}/name"))
+    std::fs::read_to_string(hostfs::video_class_root().join(node).join("name"))
         .ok()
         .and_then(clean)
         .map(|name| collapse_repeated_name(&name))
@@ -5371,24 +5376,13 @@ fn choose_rgb_format(offered: &[[u8; 4]]) -> Option<[u8; 4]> {
 /// a bound PCI device under the driver, or the module loaded, or (hardware
 /// present but driver/firmware missing) a known IPU PCI device ID.
 pub fn intel_ipu_present() -> Option<&'static str> {
+    let sys = hostfs::sys_root();
     for (gen, drv, module) in [
-        (
-            "IPU7",
-            "/sys/bus/pci/drivers/intel-ipu7",
-            "/sys/module/intel_ipu7",
-        ),
-        (
-            "IPU6",
-            "/sys/bus/pci/drivers/intel-ipu6",
-            "/sys/module/intel_ipu6",
-        ),
-        (
-            "IPU3",
-            "/sys/bus/pci/drivers/ipu3-cio2",
-            "/sys/module/ipu3_cio2",
-        ),
+        ("IPU7", "bus/pci/drivers/intel-ipu7", "module/intel_ipu7"),
+        ("IPU6", "bus/pci/drivers/intel-ipu6", "module/intel_ipu6"),
+        ("IPU3", "bus/pci/drivers/ipu3-cio2", "module/ipu3_cio2"),
     ] {
-        if driver_has_bound_device(drv) || std::path::Path::new(module).exists() {
+        if driver_has_bound_device(&sys.join(drv)) || sys.join(module).exists() {
             return Some(gen);
         }
     }
@@ -5397,7 +5391,7 @@ pub fn intel_ipu_present() -> Option<&'static str> {
 
 /// True if a `/sys/bus/pci/drivers/<name>` directory has at least one bound PCI
 /// device (a `0000:*` symlink), i.e. the driver is actually driving hardware.
-fn driver_has_bound_device(driver_dir: &str) -> bool {
+fn driver_has_bound_device(driver_dir: &std::path::Path) -> bool {
     std::fs::read_dir(driver_dir)
         .map(|rd| {
             rd.flatten()
@@ -5410,7 +5404,7 @@ fn driver_has_bound_device(driver_dir: &str) -> bool {
 /// the "hardware present but no driver bound" case, the one where the user has
 /// both no camera and no working stack. IDs from the mainline ipu6/ipu7 drivers.
 fn ipu_pci_generation() -> Option<&'static str> {
-    let rd = std::fs::read_dir("/sys/bus/pci/devices").ok()?;
+    let rd = std::fs::read_dir(hostfs::pci_devices_root()).ok()?;
     for entry in rd.flatten() {
         let dir = entry.path();
         let vendor = std::fs::read_to_string(dir.join("vendor")).unwrap_or_default();
@@ -5489,7 +5483,7 @@ fn is_vendor_mipi_bridge(
 /// `doctor` uses this to explain a cameraless machine whose camera is really
 /// a MIPI sensor behind an ISP: the bridge is the one USB-visible fact.
 pub fn vendor_mipi_bridge_present() -> Option<String> {
-    bridge_in(std::path::Path::new("/sys/bus/usb/devices"))
+    bridge_in(&hostfs::usb_devices_root())
 }
 
 /// [`vendor_mipi_bridge_present`] with the sysfs devices root passed in, so a
@@ -5573,6 +5567,7 @@ pub fn rgb_node_formats(device: &str) -> Vec<[u8; 4]> {
 /// is a real answer (a metadata node advertises no capture format). Callers
 /// that only need best-effort formats keep [`rgb_node_formats`].
 pub(crate) fn node_capture_formats_probed(device: &str) -> Option<Vec<[u8; 4]>> {
+    hostfs::check_probe(device);
     let _permit = lease::permit_for_endpoint(
         device,
         lease::CameraOperationKind::Diagnostics,
@@ -13693,6 +13688,7 @@ mod tests {
     /// this needs no camera, no privilege, and no hardware in CI.
     #[test]
     fn a_node_that_answers_no_v4l2_ioctl_is_reported_not_dropped() {
+        let _roots = hostfs::test::empty_fixture();
         let u = classify_node("/dev/null")
             .expect_err("a device that answers no V4L2 ioctl must not classify as a role");
         assert_eq!(u.at, FailedAt::QueryCaps);
@@ -16608,6 +16604,9 @@ mod tests {
         // a concurrent setter cannot flip the verdict mid-assertion (this test
         // otherwise passes alone but flakes under full-workspace parallelism).
         let _lock = env_lock();
+        // The sysfs side reads the host trees, so this test gets the empty
+        // camera-less fixture instead of the machine it happens to run on.
+        let _roots = hostfs::test::empty_fixture();
         let _a = EnvGuard::unset("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA");
         let _b = EnvGuard::unset("IRLUME_CAMERA_PIN");
         let _c = EnvGuard::unset("IRLUME_CAMERA_REQUIRE_FIXED");
@@ -16651,6 +16650,7 @@ mod tests {
 
     #[test]
     fn device_identity_absent_for_non_usb_nodes() {
+        let _roots = hostfs::test::empty_fixture();
         assert_eq!(device_identity("/dev/null"), None);
         assert_eq!(device_identity("/dev/irlume-test-missing"), None);
     }
@@ -16801,6 +16801,9 @@ mod tests {
         // ids: resolve re-searches by identity, finds nothing, and returns None
         // so select_pair falls through to auto-discovery instead of opening the
         // wrong sensor. Exercises the identity branch and find_node_by_identity.
+        // The empty fixture makes discovery deterministic: no node is listed,
+        // on any machine, instead of whatever this host has plugged in.
+        let _roots = hostfs::test::empty_fixture();
         assert_eq!(
             resolve_saved_pair(
                 "/dev/null",
@@ -16816,6 +16819,9 @@ mod tests {
 
     #[test]
     fn classify_unreadable_or_non_video_nodes_as_other() {
+        // The no-open classification reads the video4linux class first, and
+        // the open probe of /dev/null must not reach for a fixture-less host.
+        let _roots = hostfs::test::empty_fixture();
         assert_eq!(classify("/dev/irlume-test-missing"), Role::Other);
         // /dev/null opens but answers no V4L2 format ioctls.
         assert_eq!(classify("/dev/null"), Role::Other);
@@ -16905,6 +16911,7 @@ mod tests {
 
     #[test]
     fn camera_display_name_prefers_node_name_then_product_and_bounds_it() {
+        let _roots = hostfs::test::empty_fixture();
         let dir = std::env::temp_dir().join(format!("irlume-camname-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -16948,6 +16955,9 @@ mod tests {
 
     #[test]
     fn find_attr_dir_walks_up_only_inside_sysfs() {
+        // The walk's boundary reads the host sysfs root, so the test installs
+        // the fixture roots; its tree is separate and stays where it was.
+        let _roots = hostfs::test::empty_fixture();
         let dir = std::env::temp_dir().join(format!("irlume-attr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let leaf = dir.join("iface");
@@ -17021,6 +17031,7 @@ mod tests {
     #[test]
     #[ignore = "needs connected UVC RGB+IR cameras; run on the reference hardware"]
     fn connected_pairs_agree_with_list_pairs_on_real_hardware() {
+        crate::hostfs::test::host();
         initialize_camera_monitor();
         let listed = list_pairs();
         let view = connected_pairs();
@@ -17092,7 +17103,9 @@ mod tests {
     #[test]
     fn node_backend_errors_off_the_video_class() {
         // Missing nodes and non-V4L2 paths are observation FAILURES, reported
-        // as Err for the caller to render, never a silent nothing.
+        // as Err for the caller to render, never a silent nothing. The probes
+        // go through the host-root seam, so the test declares its roots.
+        let _roots = hostfs::test::empty_fixture();
         assert!(node_backend("/dev/irlume-test-missing").is_err());
         assert!(node_backend("/dev/null").is_err());
         assert!(node_backend("not-even-a-dev-path").is_err());
@@ -17122,7 +17135,9 @@ mod tests {
     #[test]
     fn privacy_engaged_is_false_without_a_camera() {
         // Missing node or a non-V4L2 node: the check degrades to "not engaged"
-        // (the capture path then surfaces the real error).
+        // (the capture path then surfaces the real error). The probe declares
+        // its host roots; neither path is a camera node.
+        let _roots = hostfs::test::empty_fixture();
         assert!(!privacy_engaged("/dev/irlume-test-missing"));
         assert!(!privacy_engaged("/dev/null"));
     }
@@ -17307,6 +17322,11 @@ mod tests {
     /// `irlume-core/src/tpm.rs`: a test that reports success without observing
     /// the hardware it is named for is worse than no test.
     fn loopback_pair() -> (String, String) {
+        // These tests are the real-machine lane: the feeders, the sysfs
+        // entries behind them and the emitter walk all live on the host.
+        // This is the one explicit host opt-in; every other test installs a
+        // fixture instead (see hostfs).
+        crate::hostfs::test::host();
         let var = |k: &str| {
             std::env::var(k).unwrap_or_else(|_| {
                 panic!(
@@ -17322,6 +17342,8 @@ mod tests {
     /// `#[ignore]`d test that returns early still prints `ok` and still counts
     /// toward the lane's `--min` pass total.
     fn spare_device() -> String {
+        // Same real-machine lane as `loopback_pair`.
+        crate::hostfs::test::host();
         std::env::var("IRLUME_TEST_SPARE_DEVICE").unwrap_or_else(|_| {
             panic!(
                 "IRLUME_TEST_SPARE_DEVICE is unset. This test is #[ignore]d, so running it is a \
@@ -17674,6 +17696,7 @@ mod tests {
     #[test]
     #[ignore = "needs real physical RGB and optional IR cameras"]
     fn physical_timestamp_continuity_stress() {
+        crate::hostfs::test::host();
         assert!(
             std::env::var_os("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA").is_none(),
             "physical evidence forbids the virtual-camera escape"
@@ -17886,6 +17909,7 @@ mod tests {
     #[test]
     #[ignore = "needs real physical RGB + IR cameras that cannot stream concurrently"]
     fn physical_timestamp_continuity_stress_sequential() {
+        crate::hostfs::test::host();
         assert!(
             std::env::var_os("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA").is_none(),
             "physical evidence forbids the virtual-camera escape"
@@ -18412,8 +18436,11 @@ mod tests {
 
     #[test]
     fn virtual_camera_escape_is_exact_path_only() {
-        // The escape must match the exact device path, nothing looser.
+        // The escape must match the exact device path, nothing looser. The
+        // unlisted-node arm reads sysfs, so the camera-less fixture stands in
+        // for the host's video4linux class.
         let _lock = env_lock();
+        let _roots = hostfs::test::empty_fixture();
         let _esc = EnvGuard::set("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA", "/dev/null, /dev/zero");
         assert!(
             verify_pinned("/dev/null").is_ok(),
@@ -18440,16 +18467,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _conf = EnvGuard::set("IRLUME_CONFIG_DIR", dir.to_str().unwrap());
+        // Discovery and pairing scan the host trees; the empty fixture is the
+        // machine with no camera, on every machine, so the discovery arms
+        // assert their real answer instead of skipping on a laptop that has
+        // one.
+        let _roots = hostfs::test::empty_fixture();
 
         // With no env override, no persisted pair and no discoverable Hello
         // pair, there is no node-number fallback: `None`, never a guessed
-        // `/dev/videoN`. Loopback nodes can never form a pair (no USB
-        // descriptors in sysfs), so this holds on CI; a dev box with a real
-        // Hello camera legitimately discovers its own pair instead, so the
-        // fallback assert is skipped there.
-        if list_pairs().is_empty() {
-            assert_eq!(select_pair(), None);
-        }
+        // `/dev/videoN`.
+        assert_eq!(select_pair(), None);
 
         // A persisted pair whose nodes are GONE (stale cameras.conf after a
         // USB re-shuffle) is ignored rather than trusted.
@@ -18458,9 +18485,7 @@ mod tests {
             "rgb=/dev/irlume-gone0\nir=/dev/irlume-gone1\n",
         )
         .unwrap();
-        if list_pairs().is_empty() {
-            assert_eq!(select_pair(), None);
-        }
+        assert_eq!(select_pair(), None);
 
         // A persisted pair whose nodes EXIST wins over discovery and defaults.
         // /dev/null and /dev/zero exist everywhere; select_pair checks only

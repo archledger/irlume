@@ -883,6 +883,7 @@ mod tests {
     #[test]
     #[ignore = "requires the Shinetech four-node UVC camera"]
     fn production_standalone_rgb_transfers_lease_ownership() {
+        crate::hostfs::test::host();
         let camera = crate::RgbCamera::open("/dev/video0").expect("standalone RGB open");
         let _session = camera.session().expect("stream under transferred lease");
     }
@@ -890,6 +891,7 @@ mod tests {
     #[test]
     #[ignore = "requires the Shinetech four-node UVC camera"]
     fn production_pair_lease_is_atomic_for_real_rgb_and_ir_endpoints() {
+        crate::hostfs::test::host();
         let first = acquire_camera_operation(
             &["/dev/video0", "/dev/video2"],
             CameraOperationKind::Diagnostics,
@@ -1002,6 +1004,7 @@ mod tests {
     fn production_active_pair_lease_becomes_stale_on_uvc_loss() {
         use std::io::Write;
 
+        crate::hostfs::test::host();
         let operation = acquire_camera_operation(
             &["/dev/video0", "/dev/video2"],
             CameraOperationKind::Authentication,

@@ -115,6 +115,7 @@ For UVC 1.1 and later, a Processing Unit must also carry the final
 [UVC 1.0 and 1.1 differences](https://learn.microsoft.com/en-us/windows-hardware/drivers/stream/differences-between-uvc-1-0-and-uvc-1-1).
 The target VideoControl interface must occur once at alternate zero;
 duplicate or nonzero alternates cannot supply evidence for it.
+Its header precedes every other class-specific VideoControl descriptor.
 It does not read `wTotalLength`: the reporter's 5986:2113 `descriptors`
 file carries 996 of the 1026 bytes its configuration header claims (linuxhw
 31A261423C, from a unit with the same bcdDevice 54.22, carries all 1026, and
@@ -126,8 +127,10 @@ Every failure, an unreadable or absent descriptor included, keeps the node
 (#159) is not changed; the new walker shares its unit parsing, and a test
 and the fuzz target pin that both return the same units.
 
-`irlume camera census` and `irlume doctor` print, for every `{YUYV}`-only
-camera row, either the attestation or the clause that refused it. A dummy
+`irlume camera census` and `irlume doctor` print, for a `{YUYV}`-only
+camera row, the attestation or refusal when it agrees with the scanned role.
+A contradictory descriptor reread is omitted, and a paired IR node whose
+formats could not be rechecked has unverified secure IR support. A dummy
 node such as a v4l2loopback feeder has no USB descriptor, and its row
 carries no such line. The refusal keeps three failures apart: a descriptor
 that could not be read, a descriptor file that is malformed (including one

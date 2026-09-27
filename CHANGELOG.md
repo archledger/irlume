@@ -843,6 +843,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- pam_irlume also stands down at `sudo`, `su`, `doas` and the other
+  elevation services when the process running the transaction belongs to
+  a remote login session, or to none it can resolve (a cron job or a
+  system service), read from its cgroup and logind as for a polkit
+  consent prompt, not only from the `SSH_CONNECTION` and `SSH_TTY`
+  variables. A terminal the user's service manager runs, as KDE Plasma
+  and GNOME start them, is judged by the user's display session, which
+  must be local and the user's own.
+
 - The session lock of `irlume auth test --events=jsonl` uses only the
   caller's own runtime directory: `$XDG_RUNTIME_DIR` when it is a
   directory, not a symlink, owned by the caller and not writable by group

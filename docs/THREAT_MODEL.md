@@ -421,6 +421,9 @@ transaction it can tell is remote:
   blanks trimmed. Every other value counts as remote, other loopback
   spellings such as `127.0.0.2` or `::ffff:127.0.0.1` included.
 - `SSH_CONNECTION` or `SSH_TTY` is set, as for `sudo` in an ssh shell.
+  These come from the calling process's environment, which its user can
+  change, so for a consent prompt or a privilege elevation the module also
+  reads a login session (below) rather than relying on them alone.
 - The service is remote by name: the shared service table's `sshd`, `remote`
   and `cockpit`, and the remote-desktop names (`xrdp*`, any name containing
   `vnc`, `xpra*`, NoMachine's `nx*`). A web console behind a local reverse
@@ -435,13 +438,20 @@ transaction it can tell is remote:
   polkit's agent helper carries no `PAM_RHOST` and no ssh variables, so this
   is how a prompt answered at pkttyagent in an SSH session stays off the
   camera. The agent is the process at the other end of the helper's socket
-  (the socket-activated helper) or the helper's parent (the setuid one). Its
-  cgroup names its logind session only where logind puts one
-  (`user.slice/user-<uid>.slice/session-<id>.scope`), and the session must
-  be that user's. A process the user's service manager runs, such as a
-  desktop's own polkit agent or a scope the user created under any name,
-  belongs to no session, and the module then takes the user's display
-  session, as polkit does.
+  (the socket-activated helper) or the helper's parent (the setuid one).
+- The service is a privilege elevation (`sudo`, `sudo-i`, `su`, `su-l`,
+  `runuser`, `runuser-l`, `doas`), and the process running the transaction,
+  the elevation command itself, is in a remote login session, or its
+  session cannot be resolved. A command run from cron or a system service
+  belongs to no login session, so face stays off there as well.
+
+For the last two, a process's cgroup names its logind session only where
+logind puts one (`user.slice/user-<uid>.slice/session-<id>.scope`), and the
+session must be that user's and say `REMOTE=0`. A process the user's service
+manager runs, such as a desktop's own polkit agent, a terminal that KDE
+Plasma or GNOME starts, or a scope the user created under any name, belongs
+to no session, and the module then takes the user's display session, as
+polkit does.
 
 LightDM's XDMCP and VNC servers give remote users a login screen through the
 same `lightdm` service as the local one, and set no `PAM_RHOST`; an Xvnc
@@ -479,8 +489,11 @@ What the module cannot tell apart, and has to be handled outside it:
   login. Do not enable fingerprint login together with LightDM's remote
   servers.
 - A command an SSH user starts inside their service manager
-  (`systemd-run --user`) is judged by their display session, which is local
-  while they are also logged in at the machine.
+  (`systemd-run --user`), a consent agent or an elevation command alike, is
+  judged by their display session, which is local while they are also
+  logged in at the machine. A process keeps the session it was started in:
+  a shell in a terminal multiplexer (`tmux`, `screen`) started at the
+  machine and later attached over SSH is judged local.
 - A remote login through a service irlume does not know by name, into which
   pam_irlume was added by hand, that sets neither `PAM_RHOST`, the ssh
   variables nor a remote X display.

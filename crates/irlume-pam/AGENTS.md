@@ -52,7 +52,8 @@ login or locks a person out. It is critical-tier
   non-local `PAM_RHOST`, an X display on another host in `PAM_XDISPLAY` or
   `PAM_TTY` (`names_remote_x_display`), the names in
   `is_remote_desktop_service`, a consent prompt whose requesting agent is in a
-  remote or unresolvable logind session (`consent_requester_is_local`), and
+  remote or unresolvable logind session (`consent_requester_is_local`), an
+  elevation service whose own process is (`elevation_caller_is_local`), and
   `SSH_CONNECTION` or `SSH_TTY` in the calling process's environment. Known
   blind spots include remote control of the genuine local seat and a GNOME
   Remote Desktop headless login through `gdm-password` without `PAM_RHOST`

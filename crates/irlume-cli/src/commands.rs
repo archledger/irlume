@@ -705,6 +705,12 @@ pub fn status(args: &[String]) -> ExitCode {
             DaemonReach::Down => format!("NOT reachable {NO} (systemctl status irlumed)"),
         }
     );
+    if crate::logs::debug_active() {
+        println!(
+            "  debug tracing : ON {WARN} ({})",
+            crate::logs::DEBUG_ACTIVE_DETAIL
+        );
+    }
     let method = irlume_core::policy::method();
     println!(
         "  auth method   : {:?}{}",

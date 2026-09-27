@@ -5844,3 +5844,55 @@ fn auth_sensor_preflight_requires_ir_policy_even_if_readiness_claims_ready() {
     }
     assert_eq!(requests.lock().unwrap().len(), 4);
 }
+
+/// `irlume logs debug on` leaves a drop-in that survives reboots, and while
+/// it is there the journal gets exact scores. doctor warns about it (and
+/// passes without it), and `irlume status` names it.
+#[test]
+fn doctor_and_status_report_persistent_debug_tracing() {
+    const DROPIN_DIR: &str = "/etc/systemd/system/irlumed.service.d";
+    let sb = Sandbox::new("debug-tracing");
+    let dropins = sb.path("dropins");
+    std::fs::create_dir_all(&dropins).unwrap();
+    let in_namespace = |args: &[&str]| {
+        run(&mut support::isolated_root_command(
+            &sb.root,
+            BIN,
+            args,
+            &[],
+            &sb.hidden,
+            &[(&dropins, DROPIN_DIR)],
+        ))
+    };
+    let tracing_check = || -> serde_json::Value {
+        let (_, out, err) = in_namespace(&["doctor", "--json"]);
+        let report: serde_json::Value =
+            serde_json::from_str(&out).unwrap_or_else(|error| panic!("{error}: {out} {err}"));
+        report["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "debug-tracing")
+            .cloned()
+            .unwrap_or_else(|| panic!("no debug-tracing check: {out}"))
+    };
+    assert_eq!(tracing_check()["state"], "pass");
+    let (_, out, _) = in_namespace(&["status"]);
+    assert!(!out.contains("debug tracing"), "{out}");
+
+    std::fs::write(
+        dropins.join("50-irlume-debug.conf"),
+        "[Service]\nEnvironment=IRLUME_LOG=debug\n",
+    )
+    .unwrap();
+    let check = tracing_check();
+    assert_eq!(check["state"], "warn", "{check}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("sudo irlume logs debug off")),
+        "{check}"
+    );
+    let (_, out, err) = in_namespace(&["status"]);
+    assert!(out.contains("debug tracing : ON"), "{out} {err}");
+}

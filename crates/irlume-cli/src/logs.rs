@@ -27,10 +27,16 @@ const DROPIN: &str = "/etc/systemd/system/irlumed.service.d/50-irlume-debug.conf
 const PATTERN: &str = "irlume|pam_kwallet|pam_gnome_keyring|gkr-pam|pam_oo7|oo7-daemon";
 
 /// Whether the debug-logging drop-in is active (the TUI's toggle reads this
-/// to know which way `logs debug` should flip).
+/// to know which way `logs debug` should flip; doctor and `irlume status`
+/// report it).
 pub(crate) fn debug_active() -> bool {
     Path::new(DROPIN).exists()
 }
+
+/// What doctor and `irlume status` say while the drop-in is active.
+pub(crate) const DEBUG_ACTIVE_DETAIL: &str = "the daemon logs exact scores and liveness \
+    measurements to the system journal until `sudo irlume logs debug off`; the drop-in \
+    survives reboots";
 
 pub fn run(sub: Option<&str>, args: &[String]) -> ExitCode {
     match sub {

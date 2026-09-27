@@ -15076,7 +15076,14 @@ mod tests {
             "served for {elapsed:?} past a 400 ms deadline"
         );
         let mut reply = Vec::new();
-        (&ours).read_to_end(&mut reply).unwrap();
+        match (&ours).read_to_end(&mut reply) {
+            Ok(_) => {}
+            // The server closed while bytes the writer trickled in after the
+            // deadline were still unread on its side, which a Unix socket
+            // reports to this end as a reset: no reply either way.
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(error) => panic!("reading the closed connection: {error}"),
+        }
         assert!(reply.is_empty(), "no reply is owed to an incomplete line");
         drop(ours);
         writer.join().unwrap();

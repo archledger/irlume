@@ -263,7 +263,7 @@ any capture-code debugging:
 |---|---|
 | `PROBE_MINMAX` | probe/commit answers lie about limits: format or rate negotiation errors that make no sense against the advertised formats |
 | `FIX_BANDWIDTH` | bandwidth miscounting on dual-camera hosts: the second stream fails to start while the first works |
-| `FORCE_Y8` | the unbranded-IR path: the driver advertises Y8 to a module that only half supports it (`irlume camera census` classifies the node as an unbranded Y8 IR sensor) |
+| `FORCE_Y8` | a module that sends packed 8-bit grey inside a YUYV format: the driver lists that format as GREY at twice the width, so `irlume camera census` classifies the node as a UVC IR sensor. A camera whose YUYV frames carry real chroma is a different case; see [YUYV IR camera listed as UVC RGB](#yuyv-ir-camera-listed-as-uvc-rgb) |
 | `NO_RESET_RESUME` | suspend or reset, pick one: the camera is dead after resume until replugged |
 | `RESTRICT_FRAME_RATE` | advertised frame rates are not all real: delivered-rate floors fail or qualification measures less than the menu promised |
 | `RESTORE_CTRLS_ON_INIT` | controls are reset on every open: IR emitter state surprises across processes |
@@ -283,6 +283,53 @@ upgrade run `sudo irlume camera-tune` and one capture qualification, and
 watch the skew in `irlume camera diagnostics --json` for drift. This has
 been fleet practice since the capture-path program landed, for exactly that
 reason.
+
+## YUYV IR camera listed as UVC RGB
+
+By its formats, a camera node that offers only YUYV is an RGB camera: most
+YUYV-only webcams are colour cameras. irlume lists such a node as an IR
+sensor only when its USB video function says it is one
+([ADR-0031](adr/0031-descriptor-attested-yuyv-luma-ir.md) §1): the function
+has one streaming interface, exactly one Microsoft camera-control extension
+unit `{0f3f95dc-2632-4c4e-92c9-a04782f43bc8}` that advertises the
+face-authentication control (selector 0x06), and no Processing Unit colour
+controls. `irlume camera census` and `irlume doctor` print the answer on
+every YUYV-only row, as `IR by USB descriptor: ...` or
+`not IR by USB descriptor: <reason>`.
+
+When an IR camera still reads as `UVC RGB camera`, check the fields the rule
+reads. They come from the same sysfs `descriptors` file irlume reads:
+
+```sh
+sudo lsusb -v -d <vid:pid> | grep -E 'bInCollection|baInterfaceNr|PROCESSING_UNIT|bmControls|guidExtensionCode|bNumControl'
+```
+
+| Field | What the rule needs |
+|---|---|
+| `bInCollection` in the VideoControl `HEADER` | `1`: one streaming interface, so the function's claim belongs to this node |
+| `guidExtensionCode` `{0f3f95dc-2632-4c4e-92c9-a04782f43bc8}` | exactly one such unit on the node's VideoControl interface |
+| that unit's `bNumControl` and `bmControls( 0)` | bit `0x20` of the first byte set (selector 0x06, face authentication), with no more bits set than `bNumControl` |
+| `bmControls` of each `PROCESSING_UNIT` | none of hue, saturation, white balance or their automatic variants (bits `0x38cc`) |
+
+On the ThinkPad T480 IR camera (USB 5986:1141) these read `bInCollection 1`,
+the Microsoft unit 8 with `bNumControl 2` and `bmControls` `0x22 0x00`, and a
+Processing Unit with `bmControls 0x00000000`. The T480's colour camera
+(5986:2113) has no Microsoft unit, and its Processing Unit advertises
+`0x0000157f`. A report about a camera this rule misreads should carry the
+census line, the output above, and
+`base64 -w0 /sys/bus/usb/devices/<device>/descriptors` (the descriptor holds
+string indices, not the serial). A camera that offers MJPG beside YUYV, such
+as the Chicony 04f2:b613 module some T480s carry, is outside the rule and
+stays RGB.
+
+Classification changes the listing and the IR frame size (the smallest
+advertised size of at least 340x340), not what authentication accepts. YUYV
+IR frames have no measured exposure ceiling yet, so face authentication on
+such a camera refuses as "IR exposure unmeasurable", and an IR camera on a
+different USB device from the RGB camera does not pair
+([LIMITATIONS.md](LIMITATIONS.md)). `sudo irlume ir-setup --dry-run` reads
+the camera's extension units without writing; avoid tools that write to
+vendor extension units on these modules.
 
 ## Fingerprint reader stopped responding
 

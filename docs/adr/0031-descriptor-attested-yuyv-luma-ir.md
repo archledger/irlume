@@ -115,6 +115,9 @@ and the fuzz target pin that both return the same units.
 node, either the attestation or the clause that refused it. The census
 classes (`uvc_ir`, `uvc_rgb`) and the doctor's section header do not change,
 because `scripts/ir-node-from-doctor.sh` and the machine API depend on them.
+While §4 is pending, a YUYV IR sensor that completes a pair is reported as
+supported with limits rather than at the secure tier, since every
+credential-releasing attempt on it refuses.
 
 ### 2. `VIDIOC_ENUM_FMT` stays the format authority
 

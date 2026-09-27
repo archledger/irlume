@@ -369,6 +369,9 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
     let mut in_target_vc = false;
     let mut found_target_vc = false;
     let mut configurations = 0;
+    let mut declared_interfaces = 0usize;
+    let mut vc_block_closed = false;
+    let mut entity_ids = std::collections::BTreeSet::new();
     let mut headers = 0usize;
     let mut uvc_version = None;
     let mut streaming_interfaces = Vec::new();
@@ -393,6 +396,7 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                 if configurations != 1 || len < 9 || d[5] == 0 {
                     return None;
                 }
+                declared_interfaces = usize::from(d[4]);
                 in_target_vc = false;
             }
             DESC_INTERFACE => {
@@ -415,13 +419,21 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                     return None;
                 }
                 found_target_vc |= in_target_vc;
+                vc_block_closed = false;
             }
             DESC_CS_INTERFACE if in_target_vc => {
-                if len < 3 {
+                if len < 3 || vc_block_closed {
                     return None;
                 }
                 if d[2] != SUBTYPE_VC_HEADER && headers != 1 {
                     return None;
+                }
+                // UVC terminals and units share one entity-ID namespace.
+                if matches!(d[2], 2..=7) {
+                    let id = *d.get(3)?;
+                    if id == 0 || !entity_ids.insert(id) {
+                        return None;
+                    }
                 }
                 match d[2] {
                     SUBTYPE_VC_HEADER => {
@@ -456,11 +468,20 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                     _ => {}
                 }
             }
+            _ if in_target_vc => vc_block_closed = true,
             _ => {}
         }
         i = end;
     }
 
+    let interface_count = interface_alternates
+        .iter()
+        .map(|(number, _)| number)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    if interface_count != declared_interfaces {
+        return None;
+    }
     if !found_target_vc {
         return Some(VideoControlWalk::NotVideoControl);
     }
@@ -2057,11 +2078,24 @@ mod tests {
         units: &[Unit<'_>],
     ) -> Vec<u8> {
         let mut bytes = t480::device(0x1141, 0x3759, [3, 1, 2]);
-        bytes.extend(t480::configuration(0, 2, 0));
+        let interface_count = videostreaming
+            .iter()
+            .copied()
+            .chain([0])
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        bytes.extend(t480::configuration(0, interface_count as u8, 0));
         bytes.extend(t480::interface(0, 0, 1, SUBCLASS_VIDEOCONTROL, 1, 0));
         bytes.extend(t480::vc_header(0x0150, 0, 15_000_000, streams));
-        for controls in processing {
-            bytes.extend(t480::processing_unit(2, 1, 0, 3, *controls, &[0, 0]));
+        for (index, controls) in processing.iter().enumerate() {
+            bytes.extend(t480::processing_unit(
+                2 + index as u8,
+                1,
+                0,
+                3,
+                *controls,
+                &[0, 0],
+            ));
         }
         for (unit, guid, count, bitmap) in units {
             bytes.extend(t480::extension_unit(*unit, guid, *count, 2, bitmap, 0));
@@ -2293,6 +2327,63 @@ mod tests {
     }
 
     #[test]
+    fn units_after_an_endpoint_do_not_contribute_ir_evidence() {
+        let whole = attested_shape();
+        let xu_at = whole
+            .windows(16)
+            .position(|w| w == t480::guid(MSXU))
+            .unwrap()
+            - 4;
+        let mut bytes = whole;
+        bytes.splice(xu_at..xu_at, t480::interrupt_endpoint(0x83, 6));
+        assert_eq!(
+            ir_function_evidence(&bytes, 0),
+            Err(IrFunctionRefusal::Malformed)
+        );
+    }
+
+    #[test]
+    fn terminals_and_units_cannot_reuse_entity_ids() {
+        let whole = attested_shape();
+        let xu_at = whole
+            .windows(16)
+            .position(|w| w == t480::guid(MSXU))
+            .unwrap()
+            - 4;
+        for id in [0, 2] {
+            let mut bytes = whole.clone();
+            bytes[xu_at + 3] = id;
+            assert_eq!(
+                ir_function_evidence(&bytes, 0),
+                Err(IrFunctionRefusal::Malformed)
+            );
+        }
+        let mut bytes = whole;
+        // A complete USB input terminal with the XU's ID.
+        bytes.splice(xu_at..xu_at, [8, DESC_CS_INTERFACE, 2, 8, 0, 2, 0, 0]);
+        assert_eq!(
+            ir_function_evidence(&bytes, 0),
+            Err(IrFunctionRefusal::Malformed)
+        );
+    }
+
+    #[test]
+    fn the_configuration_counts_interfaces_without_counting_alternates() {
+        let whole = attested_shape();
+        for count in [0, 1, 3] {
+            let mut bytes = whole.clone();
+            bytes[18 + 4] = count;
+            assert_eq!(
+                ir_function_evidence(&bytes, 0),
+                Err(IrFunctionRefusal::Malformed)
+            );
+        }
+        let mut bytes = whole;
+        bytes.extend(t480::interface(1, 1, 0, SUBCLASS_VIDEOSTREAMING, 1, 0));
+        assert!(ir_function_evidence(&bytes, 0).is_ok());
+    }
+
+    #[test]
     fn a_truncated_header_unit_or_tail_is_malformed() {
         let whole = attested_shape();
         let header_at = 18 + 9 + 9;
@@ -2391,6 +2482,7 @@ mod tests {
     #[test]
     fn a_face_authentication_unit_on_another_interface_attests_nothing_here() {
         let mut bytes = function(&[1], &[1], &[0], &[]);
+        bytes[18 + 4] = 4;
         bytes.extend(t480::interface(2, 0, 1, SUBCLASS_VIDEOCONTROL, 1, 0));
         bytes.extend(t480::vc_header(0x0150, 0, 15_000_000, &[3]));
         bytes.extend(t480::extension_unit(14, MSXU, 2, 2, &[0x22, 0x00], 0));

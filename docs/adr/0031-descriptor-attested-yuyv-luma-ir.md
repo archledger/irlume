@@ -117,6 +117,9 @@ The target VideoControl interface must occur once at alternate zero;
 duplicate or nonzero alternates cannot supply evidence for it.
 Its header precedes every other class-specific VideoControl descriptor.
 Each interface-number/alternate-setting pair occurs at most once.
+The configuration's interface count matches distinct interface numbers,
+not alternate settings. The control descriptors form one block before
+the endpoints, and terminals and units have unique nonzero entity IDs.
 It does not read `wTotalLength`: the reporter's 5986:2113 `descriptors`
 file carries 996 of the 1026 bytes its configuration header claims (linuxhw
 31A261423C, from a unit with the same bcdDevice 54.22, carries all 1026, and

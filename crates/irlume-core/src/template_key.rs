@@ -141,8 +141,19 @@ pub fn recovery_path(user: &str) -> PathBuf {
 /// Whether a TPM is present. When false, [`crate::storage`] keeps templates as
 /// root-only plaintext (dev boxes / no-TPM hosts) instead of failing.
 pub fn tpm_available() -> bool {
+    #[cfg(test)]
+    if let Some(present) = *TPM_PRESENT.lock().unwrap_or_else(|e| e.into_inner()) {
+        return present;
+    }
     Path::new("/dev/tpmrm0").exists() || Path::new("/dev/tpm0").exists()
 }
+
+/// Test-only: what [`tpm_available`] answers, when a test has set it. The
+/// swtpm lane reaches its TPM through `IRLUME_TCTI` and has no device node,
+/// so a test of the TPM branch sets this instead. Taken under
+/// `testenv::ENV_LOCK` and cleared by the test that set it.
+#[cfg(test)]
+pub(crate) static TPM_PRESENT: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
 
 /// Whether a sealed template key exists for `user`.
 pub fn has_key(user: &str) -> bool {

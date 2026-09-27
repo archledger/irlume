@@ -1294,6 +1294,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// On a host with a TPM, reading an encrypted store whose account has no
+    /// sealed template key fails and seals no new key: the read resolves the
+    /// key read-only, never through the path that mints one (ADR-0024 §4.3).
+    /// The swtpm lane has no TPM device node, so the test reports a TPM
+    /// present itself; with the minting resolver this read would seal a key.
+    #[test]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
+    fn tpm_loading_an_encrypted_store_whose_key_is_gone_seals_no_new_key() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("sec-load-no-key-tpm"));
+        let keys = PathBuf::from(crate::test_tmp_dir("sec-load-no-key-tpm-keys"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&keys);
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &keys);
+        *crate::template_key::TPM_PRESENT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(true);
+        let path = secondary_store_path("alice");
+        save_secondary_with_key(&path, &store(), Some(&test_key())).expect("plant");
+        let loaded = load_secondary(&path);
+        let minted = crate::template_key::has_key("alice");
+        *crate::template_key::TPM_PRESENT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&keys);
+        assert!(loaded.is_err(), "the store opened without its key");
+        assert!(!minted, "a read sealed a new template key");
+    }
+
     #[test]
     fn staging_files_of_the_store_and_its_journal_match_and_other_names_do_not() {
         let store = Path::new("/state/cameras/alice.json");

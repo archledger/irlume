@@ -5457,8 +5457,8 @@ fn dispatch_status_with_diagnostics(
         return Some(resp);
     }
     let _gate_uid = gate_account_uid(req, peer);
-    // Both views depend on the reader: root sees every authentication, any
-    // other account only its own (`diagnostics::authentication_visible_to`).
+    // Both views depend on the reader: root sees every operation, any other
+    // account only its own and daemon-wide ones (`diagnostics::Owner`).
     if matches!(req, Request::LiveStatus) {
         return Some(match diagnostic_state {
             Some(state) => Response::LiveStatus(Box::new(
@@ -6302,27 +6302,31 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
     }
 }
 
-/// The account an authentication-class operation acts for, recorded with
-/// its diagnostic events and live-status entry so that an account other
-/// than root reads only its own authentications there
-/// (`diagnostics::authentication_visible_to`). A peer other than root may
-/// authenticate or release a credential only for itself (anything else is
-/// refused), so its request is its own; for root (a greeter, `sudo`, a
-/// keyring release, a disarm) it is the named account, resolved here, or
-/// `None` when the name is invalid or does not resolve, which leaves the
-/// operation visible to root alone. Other classes carry none.
-fn diagnostic_owner(req: &Request, peer: &Peer) -> Option<u32> {
-    if diagnostic_operation_class(req) != irlume_common::diagnostics::OperationClass::Authentication
-    {
-        return None;
-    }
+/// Whose history an operation is ([`diagnostics::Owner`]), recorded with its
+/// diagnostic events and live-status entry so that an account other than
+/// root reads there only its own operations and daemon-wide ones, whatever
+/// their kind. A peer other than root acts for itself whatever it names:
+/// posture refuses it another account's authentication, credential,
+/// enrollment, profile, wallet or recovery work, and what it may still name
+/// (a framing guide's pitch hint) is its own work, as is camera work that
+/// names no account. Root (a greeter, `sudo`, a keyring release, a disarm,
+/// an administrator) acts for the account the request names, resolved here,
+/// or for an unresolved one when the name is invalid or does not resolve,
+/// which leaves the operation to root alone; root's requests that name no
+/// account (camera setup and qualification, diagnostics, a support probe, a
+/// recognition test) are daemon-wide.
+fn diagnostic_owner(req: &Request, peer: &Peer) -> diagnostics::Owner {
+    use diagnostics::Owner;
     if peer.uid != 0 {
-        return Some(peer.uid);
+        return Owner::Account(peer.uid);
     }
-    posture(req)
-        .user
-        .filter(|user| valid_username(user))
-        .and_then(uid_of)
+    match posture(req).user {
+        None => Owner::Daemon,
+        Some(user) => Some(user)
+            .filter(|user| valid_username(user))
+            .and_then(uid_of)
+            .map_or(Owner::Unresolved, Owner::Account),
+    }
 }
 
 fn categorical_outcome(response: &Response) -> irlume_common::diagnostics::CategoricalOutcome {
@@ -12655,7 +12659,7 @@ mod tests {
             irlume_common::diagnostics::OperationClass::Authentication,
             // SAFETY: geteuid takes no arguments, reads only this process's
             // own effective uid, and always succeeds.
-            Some(unsafe { libc::geteuid() }),
+            diagnostics::Owner::Account(unsafe { libc::geteuid() }),
         );
         seeded.emit(
             irlume_common::diagnostics::ShareSafeEventKind::CaptureScheduleSelected {
@@ -12733,13 +12737,14 @@ mod tests {
     }
 
     /// The recent-event ring and live status answer any local peer, so an
-    /// account other than root reads only its own authentications there
-    /// (ADR-0030 §5): no other account's outcome, capture events or
-    /// in-progress kind. Root reads every account's. An authentication
-    /// still in progress keeps its place for everyone, so the worker reads
-    /// busy.
+    /// account other than root reads only its own operations and daemon-wide
+    /// ones there (ADR-0030 §5): no other account's authentication or
+    /// enrollment outcome, capture events or in-progress kind. Root reads
+    /// every account's. Work still in progress keeps its place for everyone,
+    /// so the worker reads busy.
     #[test]
-    fn support_snapshot_and_live_status_show_authentications_to_root_and_their_account_only() {
+    fn support_snapshot_and_live_status_show_operations_to_root_and_their_account_only() {
+        use diagnostics::Owner;
         use irlume_common::diagnostics::{
             CaptureSchedule, CaptureScheduleSource, CategoricalOutcome, OperationClass,
             ShareSafeEventKind, SupportSection, SupportSnapshot, SupportUnavailable,
@@ -12755,16 +12760,19 @@ mod tests {
         state
             .begin(OperationClass::CameraDiagnostics)
             .finish(CategoricalOutcome::Completed);
-        let denied = state.begin_for(OperationClass::Authentication, Some(OWNER));
+        let denied = state.begin_for(OperationClass::Authentication, Owner::Account(OWNER));
         denied.emit(ShareSafeEventKind::CaptureScheduleSelected {
             schedule: CaptureSchedule::Sequential,
             source: CaptureScheduleSource::SequentialDefault,
         });
         denied.finish(CategoricalOutcome::Denied);
         state
-            .begin_for(OperationClass::Authentication, None)
+            .begin_for(OperationClass::Enrollment, Owner::Account(OWNER))
+            .finish(CategoricalOutcome::Completed);
+        state
+            .begin_for(OperationClass::Authentication, Owner::Unresolved)
             .finish(CategoricalOutcome::Granted);
-        let running = state.begin_for(OperationClass::Authentication, Some(OWNER));
+        let running = state.begin_for(OperationClass::Authentication, Owner::Account(OWNER));
         let activity = state.live().register(
             running.operation_id(),
             LiveOperationKind::Authentication,
@@ -12772,7 +12780,7 @@ mod tests {
             running.owner(),
         );
         activity.running();
-        let queued = state.begin_for(OperationClass::Authentication, None);
+        let queued = state.begin_for(OperationClass::Authentication, Owner::Unresolved);
         let waiting = state.live().register(
             queued.operation_id(),
             LiveOperationKind::WalletAuthentication,
@@ -12780,6 +12788,14 @@ mod tests {
             queued.owner(),
         );
         waiting.waiting();
+        let rename = state.begin_for(OperationClass::Status, Owner::Account(OWNER));
+        let renaming = state.live().register(
+            rename.operation_id(),
+            LiveOperationKind::ProfileUpdate,
+            true,
+            rename.owner(),
+        );
+        renaming.waiting();
 
         let ask = |uid: u32, wire: &[u8]| {
             with_serve_as_peer_and_diagnostics(&arbiter, &ready, &state, peer(uid), |client| {
@@ -12839,6 +12855,7 @@ mod tests {
                     CategoricalOutcome::Completed
                 ),
                 (OperationClass::Authentication, CategoricalOutcome::Denied),
+                (OperationClass::Enrollment, CategoricalOutcome::Completed),
                 (OperationClass::Authentication, CategoricalOutcome::Granted),
             ]
         );
@@ -12848,7 +12865,10 @@ mod tests {
         assert_eq!(worker.kind, LiveOperationKind::Authentication);
         assert_eq!(
             waiting_kinds(&live),
-            [(LiveOperationKind::WalletAuthentication, 1)]
+            [
+                (LiveOperationKind::WalletAuthentication, 1),
+                (LiveOperationKind::ProfileUpdate, 1)
+            ]
         );
 
         let (snapshot, live) = view(OWNER);
@@ -12860,13 +12880,20 @@ mod tests {
                     CategoricalOutcome::Completed
                 ),
                 (OperationClass::Authentication, CategoricalOutcome::Denied),
+                (OperationClass::Enrollment, CategoricalOutcome::Completed),
             ]
         );
         assert_eq!(authentication_events(&snapshot), 2);
         assert_eq!(snapshot.unavailable(), withheld.as_slice());
         let worker = live.worker.as_ref().expect("the running authentication");
         assert_eq!(worker.kind, LiveOperationKind::Authentication);
-        assert_eq!(waiting_kinds(&live), [(LiveOperationKind::Unknown, 1)]);
+        assert_eq!(
+            waiting_kinds(&live),
+            [
+                (LiveOperationKind::ProfileUpdate, 1),
+                (LiveOperationKind::Unknown, 1)
+            ]
+        );
 
         let (snapshot, live) = view(OTHER);
         assert_eq!(
@@ -12881,19 +12908,20 @@ mod tests {
         let worker = live.worker.as_ref().expect("still busy for every reader");
         assert_eq!(worker.kind, LiveOperationKind::Unknown);
         assert_eq!(worker.operation_id, running.operation_id());
-        assert_eq!(waiting_kinds(&live), [(LiveOperationKind::Unknown, 1)]);
+        assert_eq!(waiting_kinds(&live), [(LiveOperationKind::Unknown, 2)]);
 
-        drop((activity, waiting));
+        drop((activity, waiting, renaming));
         arbiter.close();
         assert!(arbiter.take().is_none(), "observers must never queue");
     }
 
-    /// A peer other than root may authenticate or release a credential only
-    /// for itself, so whatever it names, the operation is its own; root's
-    /// acts for the account it names, and one that does not resolve is left
-    /// to root.
+    /// A peer other than root acts for itself, so whatever it names or
+    /// asks, the operation is its own; root's acts for the account it
+    /// names, one that does not resolve is left to root, and root's work
+    /// that names no account is daemon-wide.
     #[test]
-    fn an_authentication_acts_for_its_peer_or_the_account_root_names() {
+    fn an_operation_acts_for_its_peer_or_the_account_root_names() {
+        use diagnostics::Owner;
         let _g = test_support::env_read();
         let authenticate = |user: &str| Request::Authenticate {
             structured_errors: false,
@@ -12911,54 +12939,64 @@ mod tests {
             user: user.into(),
             password: irlume_common::SecretBytes::new(b"pw".to_vec()),
         };
-        assert_eq!(
-            diagnostic_owner(&authenticate("root"), &peer(60_001)),
-            Some(60_001)
-        );
-        assert_eq!(
-            diagnostic_owner(&unseal_keyring("root"), &peer(60_001)),
-            Some(60_001)
-        );
-        assert_eq!(
-            diagnostic_owner(&release_token("root"), &peer(60_001)),
-            Some(60_001)
-        );
+        let keyring_info = |user: &str| Request::KeyringInfo { user: user.into() };
+        let identify_for = |user: &str| Request::IdentifyFor { user: user.into() };
         // SAFETY: geteuid takes no arguments, reads only this process's own
         // effective uid, and always succeeds.
         let euid = unsafe { libc::geteuid() };
         let account = users::name_for_uid(euid).expect("the running account resolves");
-        assert_eq!(
-            diagnostic_owner(&authenticate(&account), &peer(0)),
-            Some(euid)
-        );
-        assert_eq!(
-            diagnostic_owner(
-                &Request::UnsealPassword {
-                    user: account.clone(),
-                    service: None,
-                },
-                &peer(0)
-            ),
-            Some(euid)
-        );
-        assert_eq!(
-            diagnostic_owner(&release_token(&account), &peer(0)),
-            Some(euid)
-        );
-        assert_eq!(
-            diagnostic_owner(&unseal_keyring("irlume-no-such-account"), &peer(0)),
-            None
-        );
-        assert_eq!(diagnostic_owner(&authenticate("../root"), &peer(0)), None);
         for req in [
+            authenticate("root"),
+            unseal_keyring("root"),
+            release_token("root"),
+            keyring_info("root"),
+            identify_for(&account),
+            Request::Identify,
+            Request::ListCameras,
             Request::Ping,
-            Request::IdentifyFor {
-                user: account.clone(),
-            },
             Request::SupportSnapshot { since_ms: 60_000 },
         ] {
-            assert_eq!(diagnostic_owner(&req, &peer(0)), None, "{req:?}");
-            assert_eq!(diagnostic_owner(&req, &peer(60_001)), None, "{req:?}");
+            assert_eq!(
+                diagnostic_owner(&req, &peer(60_001)),
+                Owner::Account(60_001),
+                "{req:?}"
+            );
+        }
+        for req in [
+            authenticate(&account),
+            Request::UnsealPassword {
+                user: account.clone(),
+                service: None,
+            },
+            release_token(&account),
+            keyring_info(&account),
+            identify_for(&account),
+        ] {
+            assert_eq!(
+                diagnostic_owner(&req, &peer(0)),
+                Owner::Account(euid),
+                "{req:?}"
+            );
+        }
+        for req in [
+            unseal_keyring("irlume-no-such-account"),
+            authenticate("../root"),
+            keyring_info("irlume-no-such-account"),
+        ] {
+            assert_eq!(
+                diagnostic_owner(&req, &peer(0)),
+                Owner::Unresolved,
+                "{req:?}"
+            );
+        }
+        for req in [
+            Request::Identify,
+            Request::ListCameras,
+            Request::CameraDiagnostics,
+            Request::Ping,
+            Request::SupportSnapshot { since_ms: 60_000 },
+        ] {
+            assert_eq!(diagnostic_owner(&req, &peer(0)), Owner::Daemon, "{req:?}");
         }
     }
 
@@ -13201,7 +13239,7 @@ mod tests {
                         .operation_id(),
                     LiveOperationKind::Enrollment,
                     true,
-                    None,
+                    diagnostics::Owner::Daemon,
                 ),
             ),
             ..ClientLink::default()
@@ -13222,7 +13260,7 @@ mod tests {
                         .operation_id(),
                     LiveOperationKind::Authentication,
                     false,
-                    None,
+                    diagnostics::Owner::Daemon,
                 ),
             ),
             ..ClientLink::default()

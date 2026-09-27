@@ -3,7 +3,10 @@
 
 //! Bounded copied worker observations. Guards never own cameras or requests.
 
-use crate::{arbiter::CancelToken, diagnostics::Clock};
+use crate::{
+    arbiter::CancelToken,
+    diagnostics::{Clock, Owner},
+};
 use irlume_common::{
     diagnostics::OperationId, live::*, live_camera::CameraInventorySnapshot, Request,
 };
@@ -24,9 +27,9 @@ struct Shared {
 struct Inner {
     stage: LiveStage,
     revision: u64,
-    /// Waiting counts by kind and by the account an authentication acts for,
-    /// so a reader's view can relabel another account's without miscounting.
-    waiting: BTreeMap<(LiveOperationKind, Option<u32>), u64>,
+    /// Waiting counts by kind and by whose operation it is, so a reader's
+    /// view can relabel another account's without miscounting.
+    waiting: BTreeMap<(LiveOperationKind, Owner), u64>,
     worker: Option<Worker>,
     background: Vec<Worker>,
     available: bool,
@@ -34,7 +37,7 @@ struct Inner {
 struct Worker {
     id: OperationId,
     kind: LiveOperationKind,
-    owner: Option<u32>,
+    owner: Owner,
     started_ms: u64,
     cancelled: bool,
 }
@@ -62,8 +65,8 @@ struct Registration {
     state: LiveState,
     id: OperationId,
     kind: LiveOperationKind,
-    /// The account an authentication acts for (`OperationScope::owner`).
-    owner: Option<u32>,
+    /// Whose operation it is (`OperationScope::owner`).
+    owner: Owner,
     changes_state: bool,
     lane: Lane,
     // Only accessed under state.inner; Atomic supplies interior mutability for
@@ -107,14 +110,14 @@ impl LiveState {
             inner.stage = stage;
         }
     }
-    /// `owner` is the uid of the account an authentication acts for, as the
-    /// operation's diagnostic scope records it; see [`LiveState::snapshot_for`].
+    /// `owner` is whose operation it is, as its diagnostic scope records it;
+    /// see [`LiveState::snapshot_for`].
     pub(crate) fn register(
         &self,
         id: OperationId,
         kind: LiveOperationKind,
         changes_state: bool,
-        owner: Option<u32>,
+        owner: Owner,
     ) -> LiveGuard {
         self.register_in_lane(id, kind, changes_state, owner, Lane::Worker)
     }
@@ -123,7 +126,7 @@ impl LiveState {
         id: OperationId,
         kind: LiveOperationKind,
         changes_state: bool,
-        owner: Option<u32>,
+        owner: Owner,
         lane: Lane,
     ) -> LiveGuard {
         LiveGuard(Arc::new(Registration {
@@ -141,7 +144,7 @@ impl LiveState {
             id,
             LiveOperationKind::CaptureQualification,
             true,
-            None,
+            Owner::Daemon,
             Lane::Background,
         )
     }
@@ -151,12 +154,14 @@ impl LiveState {
         self.snapshot_for(cameras, 0)
     }
     /// The view of the peer with uid `peer_uid`. For a reader other than
-    /// root, an authentication or credential release that acts for another
-    /// account, or for one that did not resolve, reads as
-    /// [`LiveOperationKind::Unknown`]: it keeps its place, elapsed time and
-    /// stop request, so the worker still reads busy and a client does not
-    /// queue camera work behind it, but the kind does not say that another
-    /// account is signing in (ADR-0030 §5).
+    /// root, every operation of another account, or of one that did not
+    /// resolve, reads as [`LiveOperationKind::Unknown`] whatever its kind:
+    /// it keeps its place, elapsed time and stop request, so the worker
+    /// still reads busy and a client does not queue camera work behind it,
+    /// but the kind does not say what another account is doing, and an
+    /// authentication reads the same as that account's enrollment, profile
+    /// or wallet work (ADR-0030 §5). Daemon-wide work keeps its kind
+    /// ([`Owner::visible_to`]).
     pub(crate) fn snapshot_for(
         &self,
         cameras: CameraInventorySnapshot,
@@ -218,19 +223,14 @@ impl LiveState {
         }
     }
 }
-/// The kind the peer with uid `peer_uid` reads for an operation: an
-/// authentication or credential release is `Unknown` unless the reader may
-/// see that account's authentications
-/// ([`crate::diagnostics::authentication_visible_to`]).
-fn visible_kind(kind: LiveOperationKind, owner: Option<u32>, peer_uid: u32) -> LiveOperationKind {
-    if matches!(
-        kind,
-        LiveOperationKind::Authentication | LiveOperationKind::WalletAuthentication
-    ) && !crate::diagnostics::authentication_visible_to(owner, peer_uid)
-    {
-        LiveOperationKind::Unknown
-    } else {
+/// The kind the peer with uid `peer_uid` reads for an operation: its own
+/// unless the reader may not see that operation ([`Owner::visible_to`]),
+/// else `Unknown`.
+fn visible_kind(kind: LiveOperationKind, owner: Owner, peer_uid: u32) -> LiveOperationKind {
+    if owner.visible_to(peer_uid) {
         kind
+    } else {
+        LiveOperationKind::Unknown
     }
 }
 impl LiveGuard {
@@ -322,7 +322,7 @@ impl LiveGuard {
         self.0.finish();
     }
 }
-fn remove_waiter(inner: &mut Inner, kind: LiveOperationKind, owner: Option<u32>) {
+fn remove_waiter(inner: &mut Inner, kind: LiveOperationKind, owner: Owner) {
     match inner.waiting.get_mut(&(kind, owner)) {
         Some(count) if *count > 1 => *count -= 1,
         Some(_) => {
@@ -468,7 +468,7 @@ mod tests {
             OperationId::from_bytes([id; 16]),
             LiveOperationKind::Enrollment,
             mutation,
-            None,
+            Owner::Daemon,
         )
     }
     #[test]
@@ -631,7 +631,7 @@ mod tests {
             OperationId::from_bytes([2; 16]),
             LiveOperationKind::Authentication,
             false,
-            None,
+            Owner::Daemon,
         );
         auth.running();
         token.request_stop();
@@ -646,28 +646,34 @@ mod tests {
         token.request_stop();
         assert!(snapshot(&state).worker.unwrap().cancellation_requested);
     }
-    /// A reader other than root sees another account's authentication, or
-    /// an unattributed one, as unknown work with its place, elapsed time and
-    /// stop request intact; its own and every other kind as registered.
-    /// Root sees every kind. Relabelled waiting rows merge into one valid
-    /// row per kind.
+    /// A reader other than root sees every operation of another account, or
+    /// of an unresolved one, as unknown work whatever its kind, with its
+    /// place, elapsed time and stop request intact; its own operations and
+    /// daemon-wide work under the kind they registered. Root sees every
+    /// kind. Relabelled waiting rows merge into one valid row per kind.
     #[test]
-    fn live_status_shows_other_accounts_authentications_as_unknown_work() {
+    fn live_status_shows_other_accounts_operations_of_every_kind_as_unknown_work() {
+        use LiveOperationKind as K;
         let (state, clock) = setup();
         let register = |id: u8, kind, owner| {
             state.register(OperationId::from_bytes([id; 16]), kind, false, owner)
         };
-        let running = register(2, LiveOperationKind::Authentication, Some(1_000));
+        let running = register(2, K::Enrollment, Owner::Account(1_000));
         running.running();
-        let own_waiting = register(3, LiveOperationKind::Authentication, Some(1_000));
+        let own_waiting = register(3, K::Authentication, Owner::Account(1_000));
         own_waiting.waiting();
-        let other_waiting = register(4, LiveOperationKind::WalletAuthentication, Some(2_000));
-        other_waiting.waiting();
-        let unattributed = register(5, LiveOperationKind::Authentication, None);
-        unattributed.waiting();
-        let enrollment = guard(&state, 6, true);
-        enrollment.waiting();
+        let other_release = register(4, K::WalletAuthentication, Owner::Account(2_000));
+        other_release.waiting();
+        let other_update = register(5, K::WalletUpdate, Owner::Account(2_000));
+        other_update.waiting();
+        let unresolved = register(6, K::Authentication, Owner::Unresolved);
+        unresolved.waiting();
+        let daemon = register(7, K::CameraSetup, Owner::Daemon);
+        daemon.waiting();
+        let background = state.register_background(OperationId::from_bytes([8; 16]));
+        background.running();
         clock.0.store(40, Ordering::Relaxed);
+        running.cancel();
         let view = |peer_uid| {
             let live = state.snapshot_for(CameraInventorySnapshot::default(), peer_uid);
             let encoded =
@@ -680,6 +686,15 @@ mod tests {
             let worker = live.worker.expect("the worker stays busy for every reader");
             assert_eq!(worker.operation_id, OperationId::from_bytes([2; 16]));
             assert_eq!(worker.elapsed_ms, 40);
+            assert!(worker.cancellation_requested, "the stop request stays");
+            assert_eq!(
+                live.background
+                    .iter()
+                    .map(|task| (task.operation_id, task.kind))
+                    .collect::<Vec<_>>(),
+                [(OperationId::from_bytes([8; 16]), K::CaptureQualification)],
+                "daemon-wide work keeps its kind"
+            );
             let waiting = live
                 .waiting
                 .iter()
@@ -687,7 +702,6 @@ mod tests {
                 .collect::<Vec<_>>();
             (worker.kind, waiting)
         };
-        use LiveOperationKind as K;
         assert_eq!(
             snapshot(&state),
             state.snapshot_for(CameraInventorySnapshot::default(), 0)
@@ -695,19 +709,20 @@ mod tests {
         assert_eq!(
             view(0),
             (
-                K::Authentication,
+                K::Enrollment,
                 vec![
                     (K::Authentication, 2),
                     (K::WalletAuthentication, 1),
-                    (K::Enrollment, 1)
+                    (K::CameraSetup, 1),
+                    (K::WalletUpdate, 1),
                 ]
             )
         );
         assert_eq!(
             view(1_000),
             (
-                K::Authentication,
-                vec![(K::Authentication, 1), (K::Enrollment, 1), (K::Unknown, 2)]
+                K::Enrollment,
+                vec![(K::Authentication, 1), (K::CameraSetup, 1), (K::Unknown, 3)]
             )
         );
         assert_eq!(
@@ -716,16 +731,17 @@ mod tests {
                 K::Unknown,
                 vec![
                     (K::WalletAuthentication, 1),
-                    (K::Enrollment, 1),
+                    (K::CameraSetup, 1),
+                    (K::WalletUpdate, 1),
                     (K::Unknown, 2)
                 ]
             )
         );
         assert_eq!(
             view(3_000),
-            (K::Unknown, vec![(K::Enrollment, 1), (K::Unknown, 3)])
+            (K::Unknown, vec![(K::CameraSetup, 1), (K::Unknown, 4)])
         );
-        drop((own_waiting, other_waiting, unattributed, enrollment));
+        drop((own_waiting, other_release, other_update, unresolved, daemon));
         assert!(state
             .snapshot_for(CameraInventorySnapshot::default(), 3_000)
             .waiting

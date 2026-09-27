@@ -93,20 +93,44 @@ struct TimedShareSafeEvent {
     sequence: u64,
     operation_id: OperationId,
     operation: OperationClass,
-    /// The account the operation acted for ([`OperationScope::owner`]).
-    /// Kept in memory to choose who may read the event; never on the wire.
-    owner: Option<u32>,
+    /// Whose operation it was ([`OperationScope::owner`]). Kept in memory
+    /// to choose who may read the event; never on the wire.
+    owner: Owner,
     kind: ShareSafeEventKind,
 }
 
-/// Whether facts about an authentication that acted for `owner` may reach
-/// the peer with uid `peer_uid`: root, and the account itself. The times and
-/// outcomes of an account's logins, unlocks, elevations and credential
-/// releases are that account's history (ADR-0030 §5), and the recent-event
-/// ring and live status answer any local peer. An authentication whose
-/// account is unknown (`None`) reaches root only.
-pub(crate) fn authentication_visible_to(owner: Option<u32>, peer_uid: u32) -> bool {
-    peer_uid == 0 || owner == Some(peer_uid)
+/// Whose history an operation is, which decides who reads it in the two
+/// views any local peer may ask for: the recent-event ring
+/// (`SupportSnapshot`) and live status (`LiveStatus`). What an account does
+/// through the daemon (a login, unlock, elevation or credential release, an
+/// enrollment, a profile, wallet or recovery change) is that account's
+/// history (ADR-0030 §5), readable by the account and root, whatever its
+/// kind: hiding only authentications would let a reader tell them from the
+/// account's other work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Owner {
+    /// Work root started that names no account (camera setup and
+    /// qualification, camera diagnostics, a support probe, a recognition
+    /// test) and the daemon's own background work: no account's history,
+    /// so every reader sees it.
+    Daemon,
+    /// Work for the account with this uid: that account and root see it.
+    Account(u32),
+    /// Work root started for an account that did not resolve: root alone
+    /// sees it.
+    Unresolved,
+}
+
+impl Owner {
+    /// Whether the peer with uid `peer_uid` may read this operation: its
+    /// events in the ring and its kind in live status.
+    pub(crate) const fn visible_to(self, peer_uid: u32) -> bool {
+        match self {
+            Self::Daemon => true,
+            Self::Account(uid) => peer_uid == 0 || uid == peer_uid,
+            Self::Unresolved => peer_uid == 0,
+        }
+    }
 }
 
 impl Default for DiagnosticState {
@@ -153,21 +177,16 @@ impl DiagnosticState {
         guard
     }
 
-    /// An operation that acts for no account (tests; production scopes come
-    /// from [`DiagnosticState::begin_for`]).
+    /// A daemon-wide operation, which every reader sees (tests; production
+    /// scopes come from [`DiagnosticState::begin_for`]).
     #[cfg(test)]
     pub(crate) fn begin(&self, operation: OperationClass) -> OperationScope {
-        self.begin_for(operation, None)
+        self.begin_for(operation, Owner::Daemon)
     }
 
-    /// Begin an operation that acts for the account with uid `owner`. Only
-    /// authentications use it: their events reach a non-root reader only
-    /// when that reader is the owner ([`authentication_visible_to`]).
-    pub(crate) fn begin_for(
-        &self,
-        operation: OperationClass,
-        owner: Option<u32>,
-    ) -> OperationScope {
+    /// Begin an operation whose history belongs to `owner`: its events reach
+    /// a reader other than root only when [`Owner::visible_to`] says so.
+    pub(crate) fn begin_for(&self, operation: OperationClass, owner: Owner) -> OperationScope {
         OperationScope {
             state: self.clone(),
             operation_id: self.next_operation_id(),
@@ -185,8 +204,9 @@ impl DiagnosticState {
     }
 
     /// The events the peer with uid `peer_uid` may read. Root reads them
-    /// all. Another account does not read the authentication-class events
-    /// of other accounts or of an unknown one, and its snapshot always
+    /// all. Another account reads those of its own operations and of
+    /// daemon-wide ones ([`Owner::visible_to`]), never another account's or
+    /// an unresolved one's, whatever their class, and its snapshot always
     /// lists recent events as `NotAuthorized` in `unavailable`, whether or
     /// not an event was left out, so the reader knows the list is partial
     /// and learns nothing from the marker itself. Its events are numbered
@@ -206,10 +226,7 @@ impl DiagnosticState {
         let mut events: Vec<ShareSafeEvent> = inner
             .events
             .iter()
-            .filter(|event| {
-                event.operation != OperationClass::Authentication
-                    || authentication_visible_to(event.owner, peer_uid)
-            })
+            .filter(|event| event.owner.visible_to(peer_uid))
             .filter_map(|event| {
                 let age_ms = now_ms.saturating_sub(event.recorded_ms);
                 (age_ms <= since_ms).then(|| ShareSafeEvent {
@@ -359,7 +376,7 @@ impl DiagnosticState {
         &self,
         operation_id: OperationId,
         operation: OperationClass,
-        owner: Option<u32>,
+        owner: Owner,
         kind: ShareSafeEventKind,
     ) {
         let now_ms = self.shared.clock.now_ms();
@@ -375,7 +392,7 @@ impl DiagnosticState {
         &self,
         operation_id: OperationId,
         operation: OperationClass,
-        owner: Option<u32>,
+        owner: Owner,
         kind: ShareSafeEventKind,
         finished: &AtomicBool,
     ) -> bool {
@@ -597,7 +614,7 @@ fn record_locked(
     now_ms: u64,
     operation_id: OperationId,
     operation: OperationClass,
-    owner: Option<u32>,
+    owner: Owner,
     kind: ShareSafeEventKind,
 ) {
     prune_expired(&mut inner.events, now_ms);
@@ -621,9 +638,8 @@ pub(crate) struct OperationScope {
     state: DiagnosticState,
     operation_id: OperationId,
     operation: OperationClass,
-    /// The uid of the account an authentication acts for; `None` for other
-    /// operations and for an authentication whose account did not resolve.
-    owner: Option<u32>,
+    /// Whose history the operation is; see [`Owner`].
+    owner: Owner,
     finished: Arc<AtomicBool>,
     /// The capture time for the attempt record's `capture_ms` (ADR-0030
     /// §5), accumulated per capture round from the stage timings this
@@ -683,9 +699,9 @@ impl OperationScope {
         self.operation_id
     }
 
-    /// The account this operation acts for, as [`DiagnosticState::begin_for`]
+    /// Whose history this operation is, as [`DiagnosticState::begin_for`]
     /// was given it; live status uses it for the same reader rule.
-    pub(crate) const fn owner(&self) -> Option<u32> {
+    pub(crate) const fn owner(&self) -> Owner {
         self.owner
     }
 
@@ -911,22 +927,29 @@ mod tests {
     }
 
     /// Root reads every retained event. Another account reads the events of
-    /// other classes and of its own authentications only, never another
-    /// account's or an unattributed one, and is told the list is partial
-    /// even when nothing was left out.
+    /// its own operations and of daemon-wide ones only, never another
+    /// account's or an unresolved one's, whatever their class, and is told
+    /// the list is partial even when nothing was left out.
     #[test]
-    fn a_reader_other_than_root_sees_only_its_own_authentications() {
+    fn a_reader_other_than_root_sees_only_its_own_and_daemon_wide_operations() {
         let state = DiagnosticState::default();
-        let theirs = state.begin_for(OperationClass::Authentication, Some(1_000));
+        let theirs = state.begin_for(OperationClass::Authentication, Owner::Account(1_000));
         theirs.emit(selected());
         theirs.finish(CategoricalOutcome::Denied);
-        let mine = state.begin_for(OperationClass::Authentication, Some(2_000));
+        let mine = state.begin_for(OperationClass::Authentication, Owner::Account(2_000));
         mine.finish(CategoricalOutcome::Granted);
-        let unattributed = state.begin_for(OperationClass::Authentication, None);
-        unattributed.finish(CategoricalOutcome::Granted);
-        let enrollment = state.begin(OperationClass::Enrollment);
-        enrollment.emit(selected());
-        enrollment.finish(CategoricalOutcome::Completed);
+        let unresolved = state.begin_for(OperationClass::Authentication, Owner::Unresolved);
+        unresolved.finish(CategoricalOutcome::Granted);
+        let their_enrollment = state.begin_for(OperationClass::Enrollment, Owner::Account(1_000));
+        their_enrollment.emit(selected());
+        their_enrollment.finish(CategoricalOutcome::Completed);
+        let my_update = state.begin_for(OperationClass::Status, Owner::Account(2_000));
+        my_update.finish(CategoricalOutcome::Completed);
+        let unresolved_update = state.begin_for(OperationClass::Status, Owner::Unresolved);
+        unresolved_update.finish(CategoricalOutcome::Failed);
+        let daemon = state.begin(OperationClass::CameraDiagnostics);
+        daemon.emit(selected());
+        daemon.finish(CategoricalOutcome::Completed);
         let since = Duration::from_secs(60);
         let operations = |snapshot: &SupportSnapshot| {
             snapshot
@@ -948,9 +971,13 @@ mod tests {
                 theirs.operation_id,
                 theirs.operation_id,
                 mine.operation_id,
-                unattributed.operation_id,
-                enrollment.operation_id,
-                enrollment.operation_id,
+                unresolved.operation_id,
+                their_enrollment.operation_id,
+                their_enrollment.operation_id,
+                my_update.operation_id,
+                unresolved_update.operation_id,
+                daemon.operation_id,
+                daemon.operation_id,
             ]
         );
         assert!(root.unavailable().is_empty());
@@ -960,8 +987,9 @@ mod tests {
             operations(&own),
             [
                 mine.operation_id,
-                enrollment.operation_id,
-                enrollment.operation_id,
+                my_update.operation_id,
+                daemon.operation_id,
+                daemon.operation_id,
             ]
         );
         assert_eq!(own.unavailable(), withheld.as_slice());
@@ -969,12 +997,12 @@ mod tests {
         let stranger = state.snapshot_for(since, 3_000);
         assert_eq!(
             operations(&stranger),
-            [enrollment.operation_id, enrollment.operation_id]
+            [daemon.operation_id, daemon.operation_id]
         );
         assert_eq!(stranger.unavailable(), withheld.as_slice());
 
-        // With no authentication retained the marker is the same, so it
-        // says nothing about whether one happened.
+        // With nothing of another account retained the marker is the same,
+        // so it says nothing about whether another account did anything.
         let quiet = DiagnosticState::default();
         quiet
             .begin(OperationClass::Enrollment)
@@ -997,15 +1025,15 @@ mod tests {
                 .begin(OperationClass::Enrollment)
                 .finish(CategoricalOutcome::Completed);
             if others {
-                let theirs = state.begin_for(OperationClass::Authentication, Some(1_000));
+                let theirs = state.begin_for(OperationClass::Authentication, Owner::Account(1_000));
                 theirs.emit(selected());
                 theirs.finish(CategoricalOutcome::Denied);
                 state
-                    .begin_for(OperationClass::Authentication, None)
+                    .begin_for(OperationClass::Authentication, Owner::Unresolved)
                     .finish(CategoricalOutcome::Granted);
             }
             state
-                .begin_for(OperationClass::Authentication, Some(2_000))
+                .begin_for(OperationClass::Authentication, Owner::Account(2_000))
                 .finish(CategoricalOutcome::Granted);
             state
                 .begin(OperationClass::CameraDiagnostics)

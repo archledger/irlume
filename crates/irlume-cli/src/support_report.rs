@@ -414,7 +414,7 @@ pub(crate) fn render_text(report: &SupportReport) -> Result<Vec<u8>, &'static st
             if withholds_other_accounts(snapshot) {
                 writeln!(
                     body,
-                    "  authentications of other accounts: withheld, a report run as root lists them"
+                    "  events of other accounts: withheld, a report run as root lists them"
                 )
                 .unwrap();
             }
@@ -857,7 +857,7 @@ fn runtime_violation_name(value: RuntimeViolationLabel) -> &'static str {
     }
 }
 
-/// Whether the daemon left other accounts' authentications out of the recent
+/// Whether the daemon left other accounts' operations out of the recent
 /// events: it marks recent events `NotAuthorized` for every reader but root.
 /// An older daemon does not, and lists every account's.
 fn withholds_other_accounts(snapshot: &SupportSnapshot) -> bool {
@@ -1154,7 +1154,7 @@ mod tests {
         assert!(checklist.contains(
             "  [!] recent authentications of every account: when each happened and its outcome\n"
         ));
-        assert!(!text.contains("authentications of other accounts: withheld"));
+        assert!(!text.contains("events of other accounts: withheld"));
 
         let (text, checklist) = render(&fixture_report_with_events(
             EffectivePrivilege::User,
@@ -1165,7 +1165,7 @@ mod tests {
             "  [!] this account's recent authentications: when each happened and its outcome\n"
         ));
         assert!(text.contains(
-            "Recent typed events\n  #1 age=1000ms id=OperationId(\"01010101010101010101010101010101\") operation=Authentication operation_finished outcome=Denied\n  authentications of other accounts: withheld, a report run as root lists them\n"
+            "Recent typed events\n  #1 age=1000ms id=OperationId(\"01010101010101010101010101010101\") operation=Authentication operation_finished outcome=Denied\n  events of other accounts: withheld, a report run as root lists them\n"
         ));
 
         let (text, checklist) = render(&fixture_report_with_events(
@@ -1174,7 +1174,7 @@ mod tests {
             withheld,
         ));
         assert!(checklist.contains("  [x] no authentication times or outcomes\n"));
-        assert!(text.contains("authentications of other accounts: withheld"));
+        assert!(text.contains("events of other accounts: withheld"));
 
         let (_, checklist) = render(&fixture_report());
         assert!(checklist.contains("  [x] no authentication times or outcomes\n"));

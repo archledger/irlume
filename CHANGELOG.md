@@ -855,14 +855,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 - The daemon's recent-event history (`SupportSnapshot`, which
   `irlume support-report` reads) and its live status (`LiveStatus`) show
-  an account other than root only its own authentications: other
-  accounts' login, unlock, elevation and credential-release events,
-  outcomes included, are left out, with recent events marked
-  `not_authorized`, and another account's authentication in progress
-  reads as unknown work, still busy. Root's view is unchanged. A support
-  report's privacy checklist says when it lists authentication times and
-  outcomes, and whether they are every account's or the account's own
-  (ADR-0030 §5, amended 2026-09-27).
+  an account other than root only its own operations and daemon-wide
+  work: other accounts' login, unlock, elevation, credential-release,
+  enrollment, profile and wallet events, outcomes included, are left
+  out, with recent events marked `not_authorized`, and another account's
+  operation in progress reads as unknown work, whatever its kind, still
+  busy. Root's view is unchanged. A support report's privacy checklist
+  says when it lists authentication times and outcomes, and whether they
+  are every account's or the account's own (ADR-0030 §5, amended
+  2026-09-27).
 
 - Removing an account's last face profile, with `irlume profiles delete`,
   `profiles forget-model` or the TUI, also removes its added cameras'

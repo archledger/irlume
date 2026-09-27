@@ -30,6 +30,16 @@ use std::path::Path;
 /// Current envelope schema version for newly written envelopes.
 pub const CURRENT_VERSION: u32 = 1;
 
+/// The largest envelope file [`SealedEnvelope::load`] reads, in bytes. One
+/// irlume writes holds two TPM blobs, the PCR list and at most a signing key
+/// and a password wrap, all as base64 in pretty JSON: a few KiB. The limit
+/// also covers every envelope an earlier release could write, when
+/// `IRLUME_PCRS` was not deduplicated and each listed PCR, repeats included,
+/// was stored with its value: the kernel caps one environment string at
+/// 128 KiB (`MAX_ARG_STRLEN`), so the daemon saw at most about 65,500 entries
+/// (`7,` each), about 6 MiB of envelope.
+pub const MAX_ENVELOPE_BYTES: u64 = 8 * 1024 * 1024;
+
 /// How the sealed object's `authPolicy` is satisfied at unseal time. Older
 /// envelopes have no `policy` field and default to [`PolicyKind::PcrLiteral`],
 /// so they keep loading unchanged.
@@ -207,11 +217,19 @@ impl SealedEnvelope {
         Ok(())
     }
 
-    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    /// Read the envelope at `path`: only a regular file that `path` itself
+    /// names (a symbolic link there is refused, not followed), opened
+    /// non-blocking so a FIFO is refused at once, and at most
+    /// [`MAX_ENVELOPE_BYTES`] of it.
+    ///
+    /// # Errors
+    /// [`Error::Io`] when the file cannot be opened or read, is not a regular
+    /// file, or is larger than [`MAX_ENVELOPE_BYTES`]; [`Error::Protocol`]
+    /// when it is not an envelope of the current version.
     pub fn load(path: &Path) -> Result<Self> {
-        let s = fs::read_to_string(path).map_err(|e| Error::Io(e.to_string()))?;
+        let bytes = read_envelope_file(path).map_err(|e| Error::Io(e.to_string()))?;
         let envelope: Self =
-            serde_json::from_str(&s).map_err(|e| Error::Protocol(e.to_string()))?;
+            serde_json::from_slice(&bytes).map_err(|e| Error::Protocol(e.to_string()))?;
         envelope.validate_version()?;
         Ok(envelope)
     }
@@ -239,6 +257,15 @@ impl SealedEnvelope {
             fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
         }
         let s = serde_json::to_string_pretty(self).map_err(|e| Error::Protocol(e.to_string()))?;
+        // Every reader refuses an envelope above MAX_ENVELOPE_BYTES, so one
+        // that large is never written: the live seal stays as it was.
+        if s.len() as u64 > MAX_ENVELOPE_BYTES {
+            return Err(Error::Protocol(format!(
+                "sealed envelope would be {} bytes, more than the {MAX_ENVELOPE_BYTES} a reader \
+                 accepts; nothing was written",
+                s.len()
+            )));
+        }
         // Atomic: a failed rewrite (ENOSPC, power loss, kill) must never corrupt
         // the live seal. Every seal writer (keyring arm/reseal, template-key
         // reseal) goes through here, so this one change protects them all; the
@@ -246,6 +273,47 @@ impl SealedEnvelope {
         irlume_common::write_atomic_reporting(path, s.as_bytes(), 0o600)
             .map_err(|e| Error::Io(e.to_string()))
     }
+}
+
+/// The bytes of the envelope file at `path`, under the rules
+/// [`SealedEnvelope::load`] states. The type and size come from the opened
+/// file itself, so nothing can be swapped in between the check and the read.
+fn read_envelope_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error as IoError, ErrorKind, Read as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let too_large = || {
+        IoError::new(
+            ErrorKind::FileTooLarge,
+            format!("larger than {MAX_ENVELOPE_BYTES} bytes"),
+        )
+    };
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                IoError::new(ErrorKind::InvalidInput, "a symbolic link, not followed")
+            } else {
+                e
+            }
+        })?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(IoError::new(ErrorKind::InvalidInput, "not a regular file"));
+    }
+    if meta.len() > MAX_ENVELOPE_BYTES {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    // The limit holds even for a file that grows after the size check.
+    (&file)
+        .take(MAX_ENVELOPE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_ENVELOPE_BYTES {
+        return Err(too_large());
+    }
+    Ok(bytes)
 }
 
 mod b64 {
@@ -266,6 +334,77 @@ mod b64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The largest envelope an earlier release could write, from a
+    /// 128 KiB `IRLUME_PCRS` of repeated PCRs stored one value each, still
+    /// loads.
+    #[test]
+    fn the_largest_envelope_an_earlier_release_could_write_still_loads() {
+        let dir =
+            std::env::temp_dir().join(format!("irlume-envelope-legacy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let entries = (128 * 1024 - "IRLUME_PCRS=".len()) / "7,".len() + 1;
+        let envelope = SealedEnvelope {
+            secret: SecretKind::default(),
+            version: CURRENT_VERSION,
+            policy: PolicyKind::PcrLiteral,
+            pcrs: vec![7; entries],
+            public: vec![0; 512],
+            private: vec![0; 512],
+            pcr_values: (0..entries)
+                .map(|_| PcrValue {
+                    pcr: 7,
+                    value: vec![0xab; 32],
+                })
+                .collect(),
+            password_wrap: None,
+        };
+        let path = dir.join("legacy.json");
+        // Written the way an earlier release did: no size check.
+        fs::write(&path, serde_json::to_string_pretty(&envelope).unwrap()).unwrap();
+        let size = fs::metadata(&path).unwrap().len();
+        assert!(size < MAX_ENVELOPE_BYTES, "{size} bytes");
+        assert!(SealedEnvelope::load(&path).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An envelope larger than every reader accepts is never written, and
+    /// the file already there is kept.
+    #[test]
+    fn an_envelope_larger_than_a_reader_accepts_is_not_written() {
+        let dir = std::env::temp_dir().join(format!("irlume-envelope-cap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("alice.json");
+        let envelope = |pcrs: Vec<u32>, pcr_values: Vec<PcrValue>| SealedEnvelope {
+            secret: SecretKind::default(),
+            version: CURRENT_VERSION,
+            policy: PolicyKind::PcrLiteral,
+            pcrs,
+            public: Vec::new(),
+            private: Vec::new(),
+            pcr_values,
+            password_wrap: None,
+        };
+        envelope(vec![7], Vec::new()).save(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+        let values = (0..120_000)
+            .map(|_| PcrValue {
+                pcr: 7,
+                value: vec![0; 32],
+            })
+            .collect();
+        let large = envelope(vec![7; 120_000], values);
+        let err = large.save(&path).unwrap_err();
+        assert!(err.to_string().contains("nothing was written"), "{err}");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "the envelope there is kept"
+        );
+        assert!(SealedEnvelope::load(&path).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// A literal or pcrlock envelope over no firmware-measured PCR (an
     /// `IRLUME_PCRS` such as `11`, a pcrlock policy over OS PCRs only) ranks
@@ -514,6 +653,93 @@ mod tests {
                 Err(Error::Protocol(message)) if message.contains("unsupported TPM envelope version")
             ));
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The largest envelope irlume writes: a signed policy with a 4096-bit
+    /// key, every PCR bound with its value, and a password wrap.
+    fn largest_envelope() -> SealedEnvelope {
+        SealedEnvelope {
+            version: CURRENT_VERSION,
+            policy: PolicyKind::Authorized {
+                pubkey_pem: "k".repeat(800),
+                policy_ref: vec![0x5a; 64],
+            },
+            secret: SecretKind::GnomeKeyringToken,
+            pcrs: (0..24).collect(),
+            public: vec![0xa5; 512],
+            private: vec![0x5a; 512],
+            pcr_values: (0..24)
+                .map(|pcr| PcrValue {
+                    pcr,
+                    value: vec![0x11; 32],
+                })
+                .collect(),
+            password_wrap: Some(crate::recovery::RecoveryEnvelope {
+                version: 1,
+                kdf: "argon2id".into(),
+                salt: "s".repeat(24),
+                m_cost: 19_456,
+                t_cost: 2,
+                p_cost: 1,
+                wrapped: "w".repeat(128),
+            }),
+        }
+    }
+
+    #[test]
+    fn load_reads_only_a_bounded_regular_file_at_the_path() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = std::env::temp_dir().join(format!("irlume-env-bounded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let io_error = |path: &Path| match SealedEnvelope::load(path) {
+            Err(Error::Io(message)) => message,
+            other => panic!(
+                "expected an I/O error for {}, got {other:?}",
+                path.display()
+            ),
+        };
+
+        // What irlume writes stays far below the limit, and loads.
+        let real = dir.join("real.json");
+        largest_envelope().save(&real).unwrap();
+        let size = std::fs::metadata(&real).unwrap().len();
+        assert!(size * 8 < MAX_ENVELOPE_BYTES, "{size} bytes");
+        assert!(SealedEnvelope::load(&real).is_ok());
+
+        // A link to a real envelope is refused, not followed.
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(io_error(&link).contains("symbolic link"));
+
+        // A file past the limit is refused before it is parsed.
+        let large = dir.join("large.json");
+        let mut text = serde_json::to_string(&largest_envelope()).unwrap();
+        text.push_str(&" ".repeat(MAX_ENVELOPE_BYTES as usize));
+        std::fs::write(&large, text).unwrap();
+        assert!(io_error(&large).contains("larger than"));
+
+        assert!(io_error(&dir).contains("not a regular file"));
+
+        // A FIFO with no writer is refused at once instead of blocking.
+        let fifo = dir.join("fifo.json");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_fifo` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(SealedEnvelope::load(&reader).map(|_| ()));
+        });
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("reading a FIFO must not block");
+        assert!(
+            matches!(&outcome, Err(Error::Io(message)) if message.contains("not a regular file")),
+            "{outcome:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

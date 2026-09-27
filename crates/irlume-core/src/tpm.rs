@@ -346,13 +346,22 @@ fn note_marker_unavailable_once(path: &std::path::Path) {
 pub fn policy_pcrs() -> Vec<u32> {
     std::env::var("IRLUME_PCRS")
         .ok()
-        .map(|s| {
-            s.split(',')
-                .filter_map(|p| p.trim().parse::<u32>().ok())
-                .collect::<Vec<_>>()
-        })
+        .map(|s| parse_pcrs(&s))
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| DEFAULT_PCRS.to_vec())
+}
+
+/// The PCRs a comma-separated list names, each once, in the order first
+/// given: a PCR named twice binds nothing more, and every copy would be
+/// stored in the envelope.
+fn parse_pcrs(list: &str) -> Vec<u32> {
+    let mut pcrs = Vec::new();
+    for pcr in list.split(',').filter_map(|p| p.trim().parse::<u32>().ok()) {
+        if !pcrs.contains(&pcr) {
+            pcrs.push(pcr);
+        }
+    }
+    pcrs
 }
 
 fn pcr_selection(pcrs: &[u32]) -> Result<PcrSelectionList> {
@@ -2419,6 +2428,15 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         // Default when unset is PCR 7.
         std::env::remove_var("IRLUME_PCRS");
         assert_eq!(policy_pcrs(), vec![7]);
+    }
+
+    /// Each PCR once, in the order first given; what does not parse is
+    /// skipped.
+    #[test]
+    fn a_pcr_list_names_each_pcr_once() {
+        assert_eq!(parse_pcrs("7,0,7, 0 ,x,11"), vec![7, 0, 11]);
+        assert_eq!(parse_pcrs(&"7,".repeat(10_000)), vec![7]);
+        assert!(parse_pcrs("").is_empty());
     }
 
     /// Real seal→unseal round-trip on the host TPM. Ignored by default: needs

@@ -165,6 +165,14 @@ fn namespace_command(
             "/",
         ])
         .args(["--tmpfs", "/run"]);
+    // The namespace's root gets an empty home of its own. The host's /root
+    // belongs to a uid outside the namespace, so a command that looks for
+    // per-account state there (uninstall and the login guards read every
+    // account's ~/.local/share/irlume) would otherwise meet a permission
+    // error no real root does, and refuse.
+    if Path::new("/root").is_dir() {
+        command.args(["--tmpfs", "/root"]);
+    }
     if unshare_pid {
         command.arg("--unshare-pid");
     }
@@ -178,11 +186,21 @@ fn namespace_command(
         .partition(|(_, destination)| !Path::new(destination).is_dir());
     // Same canonical spelling rule as the tool prefixes below; a directory the
     // host lacks is already absent under the read-only root.
-    let hidden: Vec<PathBuf> = hidden
+    let mut hidden: Vec<PathBuf> = hidden
         .iter()
         .filter_map(|dir| std::fs::canonicalize(dir).ok())
         .filter(|canonical| canonical.is_dir())
         .collect();
+    // Another account's home this user cannot list is emptied for the same
+    // reason as /root: its owner is outside the namespace, and the sweep of
+    // every account's ~/.local/share/irlume would meet the permission error
+    // a root-squashed home gives real root, and refuse (CI runner images
+    // ship such a home).
+    for home in unreadable_account_homes() {
+        if !hidden.contains(&home) {
+            hidden.push(home);
+        }
+    }
     let mut parents: Vec<(&Path, Vec<&str>)> = Vec::new();
     for (_, destination) in &missing {
         let parent = Path::new(destination)
@@ -261,6 +279,37 @@ fn namespace_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
+}
+
+/// The homes of the accounts uninstall sweeps (uid 1000 to 60000, as
+/// `human_accounts_in` reads `/etc/passwd`) that this process cannot list.
+fn unreadable_account_homes() -> Vec<PathBuf> {
+    let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+    let mut homes: Vec<PathBuf> = Vec::new();
+    for line in passwd.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        let (Some(uid), Some(home)) = (fields.get(2), fields.get(5)) else {
+            continue;
+        };
+        if !uid
+            .parse::<u32>()
+            .is_ok_and(|uid| (1000..=60000).contains(&uid))
+        {
+            continue;
+        }
+        let Ok(canonical) = std::fs::canonicalize(home) else {
+            continue;
+        };
+        if canonical.is_dir()
+            && canonical != Path::new("/")
+            && std::fs::read_dir(&canonical)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+            && !homes.contains(&canonical)
+        {
+            homes.push(canonical);
+        }
+    }
+    homes
 }
 
 /// Fixture scripts use `#!/bin/sh`. A split `/bin` needs its own restored

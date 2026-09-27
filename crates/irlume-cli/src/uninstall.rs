@@ -91,14 +91,21 @@ pub fn run(args: &[String]) -> ExitCode {
     // `storage::list_users()`. And an envelope this cannot READ is not an
     // envelope that holds no token; the enumerator errors rather than skipping,
     // because guessing here erases the only copy of the secret a login keyring
-    // is encrypted under.
+    // is encrypted under. The one exception is what root does not own inside
+    // an account's own ~/.local/share/irlume: only a root irlumed writes a
+    // store there, so one that account wrote is named instead.
     // The sweep covers EVERY state root, not just the one this process's
     // environment resolves: a source install (install-host.sh) points the
     // daemon at the admin's ~/.local/share/irlume, which a root shell never
     // sees, and the homes wipe below would delete that envelope without this
     // refusal ever firing (2026-09-17 uninstall audit).
     let token_users = match sealed_token_holders() {
-        Ok(users) => users,
+        Ok(sweep) => {
+            for note in &sweep.notes {
+                eprintln!("[uninstall] {note}");
+            }
+            sweep.holders
+        }
         Err(store) => {
             eprintln!(
                 "[uninstall] refusing: could not read the sealed-envelope store ({store}). \
@@ -631,8 +638,19 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     // read the same roots before the teardown began and refused on an error;
     // one that appears only now (the unit became unreadable since) keeps the
     // wipe from counting as complete, and with it the SRK eviction.
-    let (extra_roots, roots_unknown) = match extra_state_roots() {
-        Ok(roots) => (roots, None),
+    // Each account's own tree is held open from here on, and one that is not
+    // a real directory of that account's or root's is only named. The unit's
+    // root is used here only when it is no account's tree, since those are
+    // never reached through a path again.
+    let default_root = irlume_common::state_dir();
+    let accounts = sweep_accounts();
+    let homes = home_trees(&accounts, &default_root);
+    let account_trees: Vec<PathBuf> = accounts.iter().map(|a| home_state_path(&a.home)).collect();
+    let (extra_roots, roots_unknown) = match unit_state_roots(&default_root) {
+        Ok(mut roots) => {
+            roots.retain(|root| !account_trees.contains(root));
+            (roots, None)
+        }
         Err(e) => (Vec::new(), Some(e)),
     };
     // 1. PAM FIRST. Un-wire every greeter, the lock screen, sudo, and polkit
@@ -756,7 +774,7 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     // count must reflect every user this teardown actually disarmed (the
     // default-root enumeration above is blind to these roots for the same
     // environment reason as the token guard; 2026-09-17 audit).
-    let mut users_cleared = users.len();
+    let mut users_cleared = users.len() + disarm_home_trees(&homes);
     for root in &extra_roots {
         for user in irlume_core::storage::list_users_at(root) {
             let _ = irlume_core::keyring::forget_password_in(root, &user);
@@ -782,23 +800,20 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
             data_left.push(dir.display().to_string());
         }
         // Per-user XDG state (~/.local/share/irlume): login-runner records and
-        // similar. Root cannot know every human's $HOME, so sweep the HOMEs of
-        // human accounts (uid >= 1000). Files owned by root inside a user HOME
-        // (written by a past `sudo irlume` run) still remove fine here because
-        // teardown itself runs as root; the residue the 0.11.0rc1 audit found
-        // was exactly such a root-owned file a non-root sweep would miss.
-        for home in human_homes() {
-            let p = home.join(".local/share/irlume");
-            for dir in wipe_data_trees(&[p]) {
-                data_left.push(format!("{} (user state)", dir.display()));
-            }
-        }
-        // And the source-install roots the sweep above does not reach:
-        // root's own, and the one irlumed's unit named (a human home's root
-        // is already gone, which counts as wiped). The unit's value comes
-        // from a configuration file, so only a directory named `irlume`, as
-        // install-host.sh writes it, is removed whole; any other is left and
-        // reported rather than trusted with a recursive delete.
+        // similar, and a source install's state. Root cannot know every
+        // human's $HOME, so sweep the HOMEs of human accounts (uid >= 1000)
+        // and root's own. Files owned by root inside a user HOME (written by a
+        // past `sudo irlume` run) still remove fine here because teardown
+        // itself runs as root; the residue the 0.11.0rc1 audit found was
+        // exactly such a root-owned file a non-root sweep would miss. Only a
+        // tree verified inside its home is removed, through the directory
+        // that holds it; anything else there is named and left.
+        data_left.extend(wipe_home_trees(&homes));
+        // And the root irlumed's unit named, when it is no account's tree.
+        // The unit's value comes from a configuration file, so only a
+        // directory named `irlume`, as install-host.sh writes it, is removed
+        // whole; any other is left and reported rather than trusted with a
+        // recursive delete.
         let (ours, other): (Vec<PathBuf>, Vec<PathBuf>) = extra_roots
             .iter()
             .cloned()
@@ -823,12 +838,16 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     // `IRLUME_TEMPLATE_KEY_DIR`) that the wipe never touched, so an active
     // override blocks eviction outright - and the multi-root envelope
     // enumeration must re-run EMPTY after the wipe (an unreadable store also
-    // blocks it; the guard's own contract). Absent and Foreign are successes;
-    // a TPM error is non-fatal (the key is a benign orphan).
+    // blocks it; the guard's own contract, and so does anything it only
+    // named). Absent and Foreign are successes; a TPM error is non-fatal (the
+    // key is a benign orphan).
     let srk_eviction = if may_evict_srk(
         data_wiped,
         srk_override_dirs_active(),
-        sealed_token_holders(),
+        sealed_token_holders().and_then(|sweep| match sweep.notes.first() {
+            Some(note) => Err(note.clone()),
+            None => Ok(sweep.holders),
+        }),
     ) {
         match irlume_core::tpm::evict_persistent_srk() {
             Ok(irlume_core::tpm::SrkEviction::Evicted) => SrkOutcome::Evicted,
@@ -877,58 +896,649 @@ fn may_evict_srk(
     data_wiped && !override_active && matches!(token_holders, Ok(holders) if holders.is_empty())
 }
 
-/// HOME directories of human accounts (uid >= 1000, below the nobody range),
-/// via /etc/passwd. Used only to sweep per-user XDG state at uninstall; an
-/// unreadable passwd entry is skipped, not fatal.
-fn human_homes() -> Vec<std::path::PathBuf> {
-    let Ok(passwd) = std::fs::read_to_string("/etc/passwd") else {
-        return Vec::new();
-    };
+/// An account whose home may hold per-user irlume state.
+struct Account {
+    name: String,
+    uid: u32,
+    home: PathBuf,
+}
+
+/// The accounts whose homes the uninstaller sweeps, from /etc/passwd: the
+/// human ones and root. An unreadable passwd names none.
+fn sweep_accounts() -> Vec<Account> {
+    sweep_accounts_in(&std::fs::read_to_string("/etc/passwd").unwrap_or_default())
+}
+
+fn sweep_accounts_in(passwd: &str) -> Vec<Account> {
+    let mut accounts = human_accounts_in(passwd);
+    accounts.extend(root_home_in(passwd).map(|home| Account {
+        name: "root".into(),
+        uid: 0,
+        home,
+    }));
+    accounts
+}
+
+/// Human accounts (uid 1000 to 60000, below the nobody range) with an
+/// absolute home. A malformed line is skipped, not fatal.
+fn human_accounts_in(passwd: &str) -> Vec<Account> {
     passwd
         .lines()
-        .filter_map(|l| {
-            let f: Vec<&str> = l.split(':').collect();
-            match (f.first(), f.get(2), f.get(5)) {
-                (Some(_), Some(uid), Some(home)) => {
-                    let uid: u32 = uid.parse().ok()?;
-                    (1000..=60000).contains(&uid).then(|| (*home).into())
-                }
-                _ => None,
-            }
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            let (name, uid, home) = (fields.first()?, fields.get(2)?, fields.get(5)?);
+            let uid: u32 = uid.parse().ok()?;
+            ((1000..=60000).contains(&uid) && home.starts_with('/')).then(|| Account {
+                name: (*name).to_string(),
+                uid,
+                home: PathBuf::from(home),
+            })
         })
         .collect()
 }
 
-/// State roots outside the environment-resolved default: each human account's
-/// `~/.local/share/irlume`, where a source install keeps the machine state
-/// (`install-host.sh` writes `IRLUME_STATE_DIR` into the unit, not the shell)
-/// and the login runner keeps its records, and root's own, where
-/// `install-host.sh` run directly as root keeps it. Only existing directories
-/// are named, and the default root is never duplicated into the list.
-/// The state root the installed irlumed unit names, which `install-host.sh`
-/// writes for a source install whatever account ran it (one resolved through
-/// NSS, or with a UID outside the human range), is swept too.
-fn extra_state_roots() -> Result<Vec<PathBuf>, String> {
-    let default = irlume_common::state_dir();
-    let mut roots = home_state_roots(&default);
-    for root in unit_state_roots(&default)? {
-        if !roots.contains(&root) {
-            roots.push(root);
-        }
-    }
-    Ok(roots)
+/// Where an account's own irlume state lives below its home.
+const HOME_STATE: [&str; 3] = [".local", "share", "irlume"];
+
+fn home_state_path(home: &Path) -> PathBuf {
+    home.join(HOME_STATE.iter().collect::<PathBuf>())
 }
 
-/// The per-account state roots: each human account's and root's own.
-fn home_state_roots(default: &Path) -> Vec<PathBuf> {
-    let mut homes = human_homes();
-    homes.extend(root_home());
-    extra_state_roots_with(&homes, default)
+/// A per-account state tree, `<home>/.local/share/irlume`, as the uninstaller
+/// found it. Every step below the home is opened without following a
+/// symbolic link, so a tree is always the one inside that home.
+#[derive(Debug)]
+enum HomeTree {
+    /// A real directory owned by root or by the account: its envelopes are
+    /// read, its seals disarmed and the tree removed.
+    Verified(VerifiedTree),
+    /// Something else is there. It is neither read nor removed, and the
+    /// output names it with the reason.
+    Skipped {
+        path: PathBuf,
+        account: String,
+        reason: String,
+    },
+}
+
+/// A verified per-account tree, held open. Everything done to it goes
+/// through these descriptors, never through its path again.
+#[derive(Debug)]
+struct VerifiedTree {
+    /// For messages only.
+    path: PathBuf,
+    account: String,
+    /// `<home>/.local/share`, the directory holding the tree.
+    parent: std::fs::File,
+    /// The tree itself.
+    dir: std::fs::File,
+}
+
+/// The per-account trees below `accounts`' homes, each path once, leaving out
+/// `default_root`, the state root this process already uses. A human
+/// account's tree is where a source install keeps the machine state
+/// (`install-host.sh` writes `IRLUME_STATE_DIR` into the unit, not the shell)
+/// and the login runner keeps its records; root's is where `install-host.sh`
+/// run directly as root keeps it.
+fn home_trees(accounts: &[Account], default_root: &Path) -> Vec<HomeTree> {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut trees = Vec::new();
+    for account in accounts {
+        let path = home_state_path(&account.home);
+        if path == default_root || seen.contains(&path) {
+            continue;
+        }
+        seen.push(path);
+        trees.extend(resolve_home_tree(account));
+    }
+    trees
+}
+
+/// `account`'s state tree, `None` when there is none.
+fn resolve_home_tree(account: &Account) -> Option<HomeTree> {
+    use std::os::unix::fs::MetadataExt as _;
+    let path = home_state_path(&account.home);
+    let skipped = |reason: String| {
+        Some(HomeTree::Skipped {
+            path: path.clone(),
+            account: account.name.clone(),
+            reason,
+        })
+    };
+    let (parent, dir) = match open_home_tree(&account.home, &path) {
+        Ok(found) => found,
+        Err(None) => return None,
+        Err(Some(reason)) => return skipped(reason),
+    };
+    let owner = match dir.metadata() {
+        Ok(meta) => meta.uid(),
+        Err(e) => return skipped(format!("could not be inspected: {e}")),
+    };
+    if owner != 0 && owner != account.uid {
+        return skipped(format!(
+            "it is owned by uid {owner}, neither root nor {}",
+            account.name
+        ));
+    }
+    Some(HomeTree::Verified(VerifiedTree {
+        path,
+        account: account.name.clone(),
+        parent,
+        dir,
+    }))
+}
+
+/// `<home>/.local/share` and the tree in it (`path`), each step below the
+/// home opened without following a link. `Err(None)` when there is no tree,
+/// `Err(Some(reason))` when something is there that is not one.
+fn open_home_tree(
+    home: &Path,
+    path: &Path,
+) -> Result<(std::fs::File, std::fs::File), Option<String>> {
+    let uninspectable = |e: std::io::Error| Some(format!("could not be inspected: {e}"));
+    // The home itself comes from the account database, which only root
+    // writes, and may be reached through a link (/home is one on Fedora
+    // Atomic).
+    let mut dir = match open_dir(home) {
+        Ok(dir) => dir,
+        Err(e) if is_absent(&e) => return Err(None),
+        Err(e) => return Err(uninspectable(e)),
+    };
+    let mut parent = None;
+    for (at, name) in HOME_STATE.iter().enumerate() {
+        let child = match open_child_dir(&dir, name).map_err(uninspectable)? {
+            Child::Dir(child) => child,
+            Child::Absent => return Err(None),
+            // Name a link only when something is there through it.
+            Child::Link => {
+                return match std::fs::metadata(path) {
+                    Err(e) if is_absent(&e) => Err(None),
+                    _ => Err(Some(format!(
+                        "{} is a symbolic link, which is not followed",
+                        HOME_STATE[..=at].join("/")
+                    ))),
+                }
+            }
+            // A file on the way means there is no tree; one in its place is
+            // named, since a plain removal could not take it.
+            Child::Other if at + 1 < HOME_STATE.len() => return Err(None),
+            Child::Other => return Err(Some("it is not a directory".into())),
+        };
+        parent = Some(std::mem::replace(&mut dir, child));
+    }
+    Ok((parent.ok_or(None)?, dir))
+}
+
+/// Whether an error means the path is not there: missing, or a file where a
+/// directory would have to be.
+fn is_absent(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// What [`open_child_dir`] found under a name.
+enum Child {
+    /// A real directory, open.
+    Dir(std::fs::File),
+    Absent,
+    /// A symbolic link, not followed.
+    Link,
+    /// Anything else that is not a directory (a file, a FIFO, a device).
+    Other,
+}
+
+/// Open the directory `path`, following links in it.
+fn open_dir(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(path)
+}
+
+/// Open `name` in the open directory `parent` as a directory, never through
+/// a link. O_DIRECTORY refuses a FIFO or device before any open can block.
+fn open_child_dir(parent: &std::fs::File, name: impl AsRef<Path>) -> std::io::Result<Child> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let path = fd_path(parent)?.join(name);
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(dir) => Ok(Child::Dir(dir)),
+        Err(e) => match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => Ok(Child::Link),
+            Ok(meta) if !meta.is_dir() => Ok(Child::Other),
+            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(Child::Absent),
+            _ => Err(e),
+        },
+    }
+}
+
+/// The path of the open directory `dir` through `/proc/self/fd`. A name
+/// joined to it resolves inside that very directory, wherever it has since
+/// moved, and never through a link above it. Checked, so that a missing
+/// `/proc` is an error rather than an empty directory.
+fn fd_path(dir: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    let (held, seen) = (dir.metadata()?, std::fs::metadata(&path)?);
+    if (held.dev(), held.ino()) != (seen.dev(), seen.ino()) {
+        return Err(std::io::Error::other(
+            "/proc/self/fd does not resolve to the open directory",
+        ));
+    }
+    Ok(path)
+}
+
+/// Whether an envelope or keyring directory in an account's tree that
+/// cannot be read refuses the uninstall, by its own `owner`: root's does,
+/// and so does one whose owner cannot be read, which is never taken from
+/// the directory above it. The account's own is only named.
+fn unreadable_refuses(owner: Option<u32>, root_uid: u32) -> bool {
+    owner.is_none_or(|uid| uid == root_uid)
+}
+
+/// Remove everything in the open directory `dir`, each entry relative to
+/// the directory that holds it and never through a link: an entry is
+/// examined without following it, a directory is opened without following
+/// it and emptied only when it is the one examined, and a link is removed,
+/// not what it points to. An entry that `owners` do not own is left in place
+/// and added to `kept`, named below the tree (`at`): an account could have
+/// moved it in, and root removing it would delete what that account cannot.
+/// `links` counts the symbolic links removed.
+fn clear_dir(
+    dir: &std::fs::File,
+    at: &Path,
+    owners: &[u32],
+    kept: &mut Vec<PathBuf>,
+    links: &mut usize,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let here = fd_path(dir)?;
+    let names = std::fs::read_dir(&here)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let gone = |result: std::io::Result<()>| match result {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    };
+    for name in names {
+        let shown = at.join(&name);
+        let seen = match std::fs::symlink_metadata(here.join(&name)) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if !owners.contains(&seen.uid()) {
+            kept.push(shown);
+            continue;
+        }
+        if !seen.is_dir() {
+            gone(std::fs::remove_file(here.join(&name)))?;
+            if seen.file_type().is_symlink() {
+                *links += 1;
+            }
+            continue;
+        }
+        let child = match open_child_dir(dir, &name)? {
+            Child::Dir(child) => child,
+            Child::Absent => continue,
+            // It changed since it was examined.
+            Child::Link | Child::Other => {
+                kept.push(shown);
+                continue;
+            }
+        };
+        let held = child.metadata()?;
+        if (held.dev(), held.ino()) != (seen.dev(), seen.ino()) {
+            kept.push(shown);
+            continue;
+        }
+        clear_dir(&child, &shown, owners, kept, links)?;
+        match std::fs::remove_dir(here.join(&name)) {
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                if !kept.iter().any(|path| path.starts_with(&shown)) {
+                    kept.push(shown);
+                }
+            }
+            other => gone(other)?,
+        }
+    }
+    Ok(())
+}
+
+impl VerifiedTree {
+    /// The tree's keyring directory, never through a link.
+    fn keyring(&self) -> std::io::Result<Child> {
+        open_child_dir(&self.dir, "keyring")
+    }
+
+    /// Whether the tree's keyring directory is a real directory owned by
+    /// `uid` (root outside tests), which only a root irlumed writes, or a
+    /// link to one ([`Self::linked_root_store`]), which [`Self::sweep`] then
+    /// counts as that store. One that cannot be opened is judged by its own
+    /// owner, not followed; when that cannot be read either, the answer is
+    /// unknown.
+    fn keeps_store_of(&self, uid: u32) -> Result<bool, String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let shown = self.path.join("keyring");
+        match self.keyring() {
+            Ok(Child::Dir(dir)) => dir
+                .metadata()
+                .map(|meta| meta.uid() == uid)
+                .map_err(|e| format!("{}: {e}", shown.display())),
+            Ok(Child::Link) => self.linked_root_store(uid).map(|store| store.is_some()),
+            Ok(_) => Ok(false),
+            Err(e) => match self.keyring_owner() {
+                Some(owner) => Ok(owner == uid),
+                None => Err(format!("{}: {e}", shown.display())),
+            },
+        }
+    }
+
+    /// The owner of the tree's `keyring` entry itself, not followed; `None`
+    /// when it cannot be read.
+    fn keyring_owner(&self) -> Option<u32> {
+        use std::os::unix::fs::MetadataExt as _;
+        let tree = fd_path(&self.dir).ok()?;
+        std::fs::symlink_metadata(tree.join("keyring"))
+            .ok()
+            .map(|meta| meta.uid())
+    }
+
+    /// Where a link at the tree's `keyring` leads, opened, when that is a
+    /// directory `root_uid` owns: a root irlumed's store linked into the
+    /// tree, whose tokens the wipe would strand by removing only the link.
+    /// `None` when the link leads nowhere, into a loop, or to anything else;
+    /// an error when where it leads cannot be established.
+    fn linked_root_store(&self, root_uid: u32) -> Result<Option<std::fs::File>, String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let shown = self.path.join("keyring");
+        let fail = |e: std::io::Error| format!("{}: {e}", shown.display());
+        let tree = fd_path(&self.dir).map_err(fail)?;
+        let dir = match open_dir(&tree.join("keyring")) {
+            Ok(dir) => dir,
+            Err(e) if is_absent(&e) || e.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
+            Err(e) => return Err(fail(e)),
+        };
+        let owner = dir.metadata().map_err(fail)?.uid();
+        Ok((owner == root_uid).then_some(dir))
+    }
+
+    /// The accounts with an enrollment in the tree.
+    fn users(&self) -> Vec<String> {
+        fd_path(&self.dir)
+            .map(|dir| irlume_core::storage::list_users_at(&dir))
+            .unwrap_or_default()
+    }
+
+    /// Delete `user`'s sealed envelope in the tree, if there is one. A
+    /// keyring directory reached through a link is left alone.
+    fn forget(&self, user: &str) -> std::io::Result<()> {
+        let Child::Dir(keyring) = self.keyring()? else {
+            return Ok(());
+        };
+        match std::fs::remove_file(fd_path(&keyring)?.join(format!("{user}.json"))) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    }
+
+    /// Remove the tree through the directory that holds it, and only while
+    /// the name there is still the directory that was verified. A tree that
+    /// is gone already counts as removed. The number of symbolic links the
+    /// removal took ([`Self::remove_held`]).
+    fn wipe(&self) -> std::io::Result<usize> {
+        use std::os::unix::fs::MetadataExt as _;
+        let path = fd_path(&self.parent)?.join("irlume");
+        let now = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let verified = self.dir.metadata()?;
+        if !now.is_dir() || (now.dev(), now.ino()) != (verified.dev(), verified.ino()) {
+            return Err(std::io::Error::other(
+                "it was replaced after it was checked",
+            ));
+        }
+        self.remove_held(&[verified.uid(), 0])
+    }
+
+    /// The removal after [`Self::wipe`]'s check. The tree is emptied through
+    /// the directory held since it was verified ([`clear_dir`]), so a tree
+    /// renamed away and replaced after the check is still the one emptied,
+    /// and what took its name is never read; that name is then removed only
+    /// as an empty directory. What `owners` do not own is left in place and
+    /// named in the error. The number of symbolic links removed: what they
+    /// led to was not examined, and the account could have changed where one
+    /// led up to its removal.
+    fn remove_held(&self, owners: &[u32]) -> std::io::Result<usize> {
+        let (mut kept, mut links) = (Vec::new(), 0);
+        clear_dir(&self.dir, Path::new(""), owners, &mut kept, &mut links)?;
+        match std::fs::remove_dir(fd_path(&self.parent)?.join("irlume")) {
+            Ok(()) => Ok(links),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && kept.is_empty() => Ok(links),
+            Err(_) if !kept.is_empty() => Err(std::io::Error::other(terminal_safe(&format!(
+                "{} owned by another account, left in place",
+                kept.iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )))),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Count the tree's sealed envelopes into `sweep`. An envelope, or a
+    /// keyring directory, that cannot be read refuses the uninstall when
+    /// `root_uid` (root outside tests) owns it, or when whose it is cannot
+    /// be read (never taken from the directory above it), as one a root
+    /// irlumed wrote may hold the only copy of a keyring token. A link at the keyring's name is followed only to a
+    /// directory root owns, which counts as that root store. Anything else in
+    /// the tree the account could have put there itself, so it is named in
+    /// `sweep` instead, and removed with the tree.
+    fn sweep(&self, root_uid: u32, sweep: &mut TokenSweep) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let shown = self.path.join("keyring");
+        let refuses = |owner: Option<u32>| unreadable_refuses(owner, root_uid);
+        let note = |sweep: &mut TokenSweep, what: &Path, why: &str| {
+            sweep
+                .notes
+                .push(format!("{}: {} {why}", self.account, what.display()));
+        };
+        let unread = |e: &dyn std::fmt::Display| {
+            format!(
+                "could not be read ({e}); root does not own it, so it does not stop the uninstall"
+            )
+        };
+        let dir = match self.keyring() {
+            Ok(Child::Dir(dir)) => dir,
+            Ok(Child::Absent) => return Ok(()),
+            // The wipe removes only the link; a root store it leads to
+            // stays, and the SRK eviction after the wipe would strand a token
+            // there, so that store counts as any root store does.
+            Ok(Child::Link) => match self.linked_root_store(root_uid)? {
+                Some(dir) => dir,
+                None => {
+                    note(
+                        sweep,
+                        &shown,
+                        "is a symbolic link to no directory root owns, which is not followed",
+                    );
+                    return Ok(());
+                }
+            },
+            Ok(Child::Other) => {
+                note(sweep, &shown, "is not a directory, so it was not read");
+                return Ok(());
+            }
+            // Judged by its own owner, not the tree's: a root store inside an
+            // account's tree cannot be opened (a root-squashed or FUSE mount,
+            // an I/O error), or whose it is cannot be read.
+            Err(e) => match self.keyring_owner() {
+                Some(owner) if owner != root_uid => {
+                    note(sweep, &shown, &unread(&e));
+                    return Ok(());
+                }
+                _ => return Err(format!("{}: {e}", shown.display())),
+            },
+        };
+        let dir_owner = dir.metadata().ok().map(|meta| meta.uid());
+        let listed = fd_path(&dir).map_err(|e| e.to_string()).and_then(|pinned| {
+            irlume_core::keyring::inspect_sealed_at(&pinned).map_err(|e| {
+                e.to_string()
+                    .replace(&pinned.display().to_string(), &shown.display().to_string())
+            })
+        });
+        let entries = match listed {
+            Ok(entries) => entries,
+            Err(e) if refuses(dir_owner) => return Err(format!("{}: {e}", shown.display())),
+            Err(e) => {
+                note(sweep, &shown, &unread(&e));
+                return Ok(());
+            }
+        };
+        for entry in entries {
+            let file = shown.join(&entry.file_name);
+            match entry.kind {
+                Ok(kind) => sweep.count(entry.user, kind),
+                // An envelope root owns, linked in under an envelope's name:
+                // the wipe removes only the link, so its token counts.
+                Err(e) => match linked_root_envelope(&dir, &entry.file_name, root_uid) {
+                    Some(kind) => sweep.count(entry.user, kind),
+                    None if refuses(entry.owner) => {
+                        return Err(format!("{}: {e}", file.display()));
+                    }
+                    None => note(sweep, &file, &unread(&e)),
+                },
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What a link at an envelope's name in the open keyring directory `keyring`
+/// seals, when it leads to a regular file `root_uid` owns that loads as an
+/// envelope: one a root irlumed wrote, linked there. `None` for an entry that
+/// is no link, and for a link to anything else, which stays only named, so
+/// an account cannot stop the uninstall by linking to some file of root's.
+fn linked_root_envelope(
+    keyring: &std::fs::File,
+    name: &std::ffi::OsStr,
+    root_uid: u32,
+) -> Option<irlume_core::envelope::SecretKind> {
+    use std::os::unix::fs::MetadataExt as _;
+    let entry = fd_path(keyring).ok()?.join(name);
+    if !std::fs::symlink_metadata(&entry)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
+    let target = std::fs::canonicalize(&entry).ok()?;
+    let meta = std::fs::symlink_metadata(&target).ok()?;
+    if !meta.is_file() || meta.uid() != root_uid {
+        return None;
+    }
+    irlume_core::envelope::SealedEnvelope::load(&target)
+        .ok()
+        .map(|envelope| envelope.secret)
+}
+
+/// Disarm every seal in the verified trees of `homes`; the number of
+/// enrolled accounts found in them.
+fn disarm_home_trees(homes: &[HomeTree]) -> usize {
+    let mut disarmed = 0;
+    for home in homes {
+        if let HomeTree::Verified(tree) = home {
+            for user in tree.users() {
+                let _ = tree.forget(&user);
+                disarmed += 1;
+            }
+        }
+    }
+    disarmed
+}
+
+/// Remove the verified trees of `homes`, and return what still holds data
+/// for the report: a tree that could not be removed, every skipped one, and
+/// a keyring store a tree links to.
+fn wipe_home_trees(homes: &[HomeTree]) -> Vec<String> {
+    wipe_home_trees_as(homes, 0)
+}
+
+/// [`wipe_home_trees`] with root's uid injected (kept for the tests that
+/// stand in for root). A symbolic link the removal takes is removed, never
+/// followed, so a store it led to, which a root irlumed's envelopes may be
+/// in, stays; and the account could have pointed it anywhere until the
+/// moment it went. A tree whose removal took a link is therefore reported
+/// among what may still hold data, which keeps the SRK (a key left in the
+/// TPM does no harm; one evicted under a surviving envelope strands it).
+fn wipe_home_trees_as(homes: &[HomeTree], _root_uid: u32) -> Vec<String> {
+    let mut left = Vec::new();
+    for home in homes {
+        match home {
+            HomeTree::Verified(tree) => match tree.wipe() {
+                Ok(0) => {}
+                Ok(links) => left.push(format!(
+                    "{} (removed; it held {links} symbolic link(s), removed without following them, \
+                     so what they led to was not examined and the TPM storage key is kept)",
+                    tree.path.display()
+                )),
+                Err(e) => {
+                    eprintln!(
+                        "[uninstall] could not remove {}: {e} (files remain)",
+                        tree.path.display()
+                    );
+                    left.push(format!("{} (user state)", tree.path.display()));
+                }
+            },
+            HomeTree::Skipped { path, reason, .. } => left.push(format!(
+                "{} (user state, not removed: {reason})",
+                path.display()
+            )),
+        }
+    }
+    left
+}
+
+/// What the token guard found.
+#[derive(Debug, Default)]
+struct TokenSweep {
+    /// The accounts whose sealed envelope is a GNOME keyring token.
+    holders: Vec<String>,
+    /// What it passed over, by path, for the output.
+    notes: Vec<String>,
+}
+
+impl TokenSweep {
+    fn collect(&mut self, sealed: Vec<(String, irlume_core::envelope::SecretKind)>) {
+        for (user, kind) in sealed {
+            self.count(user, kind);
+        }
+    }
+
+    fn count(&mut self, user: String, kind: irlume_core::envelope::SecretKind) {
+        if kind == irlume_core::envelope::SecretKind::GnomeKeyringToken
+            && !self.holders.contains(&user)
+        {
+            self.holders.push(user);
+        }
+    }
 }
 
 /// The state root irlumed's unit names, when it is not `default` and exists
 /// or cannot be inspected (reading it then fails and the sweep refuses,
 /// instead of quietly leaving out the store the daemon uses).
+/// `install-host.sh` writes it for a source install whatever account ran it
+/// (one resolved through NSS, or with a UID outside the human range).
 fn unit_state_roots(default: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(unit_env("IRLUME_STATE_DIR")?
         .filter(|root| root != default)
@@ -1063,11 +1673,7 @@ fn unit_env_in(unit: &str, var: &str, mut found: Option<PathBuf>) -> Option<Path
     found.filter(|dir| dir.is_absolute())
 }
 
-/// Root's home from `/etc/passwd` (uid 0), `None` when it cannot be read.
-fn root_home() -> Option<PathBuf> {
-    root_home_in(&std::fs::read_to_string("/etc/passwd").ok()?)
-}
-
+/// Root's home in a passwd text (uid 0), `None` when it names none.
 fn root_home_in(passwd: &str) -> Option<PathBuf> {
     passwd.lines().find_map(|line| {
         let fields: Vec<&str> = line.split(':').collect();
@@ -1078,28 +1684,19 @@ fn root_home_in(passwd: &str) -> Option<PathBuf> {
     })
 }
 
-/// [`extra_state_roots`] with the homes and default root injected, so the
-/// selection rules are testable without touching `/etc/passwd`.
-fn extra_state_roots_with(homes: &[PathBuf], default_root: &Path) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    for home in homes {
-        let root = home.join(".local/share/irlume");
-        if root.is_dir() && root != default_root && !roots.contains(&root) {
-            roots.push(root);
-        }
-    }
-    roots
-}
-
 /// Users whose sealed envelope anywhere on this host is a GNOME keyring
-/// token, or the store description on a read failure. Read failures are
-/// errors, never skips: an envelope this cannot read is not an envelope that
-/// holds no token (the guard's own contract).
-fn sealed_token_holders() -> Result<Vec<String>, String> {
+/// token, with what the sweep passed over, or the store description on a
+/// read failure that refuses. An envelope this cannot read is not one that
+/// holds no token (the guard's own contract), so a failure refuses, except in
+/// a per-account tree for what root does not own ([`VerifiedTree::sweep`]).
+fn sealed_token_holders() -> Result<TokenSweep, String> {
+    let default = irlume_common::state_dir();
     sealed_token_holders_with(
         irlume_core::keyring::list_sealed_kinds(),
-        &extra_state_roots()?,
+        &home_trees(&sweep_accounts(), &default),
+        &unit_state_roots(&default)?,
         &unit_keyring_dirs()?,
+        0,
     )
 }
 
@@ -1109,19 +1706,29 @@ fn sealed_token_holders() -> Result<Vec<String>, String> {
 /// a root irlumed writes. A user owns their home, so without that anyone
 /// could plant an envelope, or an unreadable one, that makes a root disable
 /// refuse, and the machine API has no `--force` past it. The uninstall sweep
-/// deletes those trees, so it keeps counting every envelope in them.
+/// deletes those trees, so it counts every envelope in them that it can
+/// read, and refuses on one it cannot only when root owns it.
 pub(crate) fn root_sealed_token_holders() -> Result<Vec<String>, String> {
     let default = irlume_common::state_dir();
-    let mut roots = Vec::new();
-    for root in home_state_roots(&default) {
-        if root_owned_dir(&root.join("keyring"))? {
-            roots.push(root);
+    let mut homes = Vec::new();
+    let mut dirs = Vec::new();
+    for home in home_trees(&sweep_accounts(), &default) {
+        match home {
+            HomeTree::Verified(tree) => {
+                if tree.keeps_store_of(0)? {
+                    homes.push(HomeTree::Verified(tree));
+                }
+            }
+            // A tree uninstall does not remove can still hold a keyring
+            // store a root irlumed wrote, and a login stack may deliver its
+            // token: the guards keep counting it, through the directory the
+            // check held (sealed_token_holders_with).
+            skipped @ HomeTree::Skipped { .. } => homes.push(skipped),
         }
     }
     // What irlumed's own unit names is trusted by where it comes from (a unit
     // file only root writes), links followed as irlumed follows them.
-    roots.extend(unit_state_roots(&default)?);
-    let mut dirs = Vec::new();
+    let roots = unit_state_roots(&default)?;
     for dir in unit_keyring_dirs()? {
         match std::fs::metadata(&dir) {
             Ok(meta) if meta.is_dir() => dirs.push(dir),
@@ -1130,52 +1737,194 @@ pub(crate) fn root_sealed_token_holders() -> Result<Vec<String>, String> {
             Err(e) => return Err(format!("{}: {e}", dir.display())),
         }
     }
-    sealed_token_holders_with(irlume_core::keyring::list_sealed_kinds(), &roots, &dirs)
+    Ok(sealed_token_holders_with(
+        irlume_core::keyring::list_sealed_kinds(),
+        &homes,
+        &roots,
+        &dirs,
+        0,
+    )?
+    .holders)
 }
 
-/// Whether `path` is a real directory (not a link to one) owned by root. A
-/// path that is missing is not; one whose metadata cannot be read is an
-/// error, since it may be the store that holds a token.
-fn root_owned_dir(path: &Path) -> Result<bool, String> {
-    use std::os::unix::fs::MetadataExt as _;
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => Ok(meta.is_dir() && meta.uid() == 0),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(format!("{}: {e}", path.display())),
+/// A keyring store in a tree uninstall skips, held open: the directory the
+/// ownership check was made on, and the path it is named by in messages.
+struct HeldStore {
+    shown: PathBuf,
+    dir: std::fs::File,
+}
+
+impl HeldStore {
+    /// The sealed envelopes in the held directory, read through its
+    /// descriptor (so a directory put at its path since the check is never
+    /// read), bounded and without following a link at an envelope's name.
+    fn sealed_kinds(&self) -> Result<Vec<(String, irlume_core::envelope::SecretKind)>, String> {
+        let shown = self.shown.display().to_string();
+        let pinned = fd_path(&self.dir).map_err(|e| format!("{shown}: {e}"))?;
+        irlume_core::keyring::list_sealed_kinds_at(&pinned).map_err(|e| {
+            format!(
+                "{shown}: {}",
+                e.to_string().replace(&pinned.display().to_string(), &shown)
+            )
+        })
     }
 }
 
-/// [`sealed_token_holders`] with the default-root enumeration and the extra
-/// roots injected, so the sweep and the failure contract are unit-testable.
+/// The keyring store in a per-account tree uninstall skips, when it is a
+/// directory that `root_uid` owns: the uninstall and login guards count its
+/// tokens although the tree is not removed. A link at the store's name is
+/// followed only to such a directory (a root irlumed's store linked there),
+/// and the store is then named by where the link leads, as
+/// [`VerifiedTree::linked_root_store`] does for a tree that is removed; a
+/// link to anything else, to nothing or into a loop is no store, and so is a
+/// path that cannot be followed because of a loop above it. The directory is
+/// opened once and its owner is read from the open directory, which is what
+/// the guards then read ([`HeldStore::sealed_kinds`]). `Ok(None)` when there
+/// is no such store; an error when whether there is one cannot be
+/// established, so the guards stay fail-closed.
+fn skipped_tree_keyring(tree: &Path, root_uid: u32) -> Result<Option<HeldStore>, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let keyring = tree.join("keyring");
+    let fail = |e: std::io::Error| format!("{}: {e}", keyring.display());
+    let nothing = |e: &std::io::Error| is_absent(e) || e.raw_os_error() == Some(libc::ELOOP);
+    let meta = match std::fs::symlink_metadata(&keyring) {
+        Ok(meta) => meta,
+        Err(e) if nothing(&e) => return Ok(None),
+        Err(e) => return Err(fail(e)),
+    };
+    let (shown, opened) = if meta.file_type().is_symlink() {
+        let target = match std::fs::canonicalize(&keyring) {
+            Ok(target) => target,
+            Err(e) if nothing(&e) => return Ok(None),
+            Err(e) => return Err(fail(e)),
+        };
+        let opened = open_dir(&target);
+        (target, opened)
+    } else if meta.is_dir() {
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&keyring);
+        (keyring.clone(), opened)
+    } else {
+        return Ok(None);
+    };
+    let dir = match opened {
+        Ok(dir) => dir,
+        Err(e) if nothing(&e) => return Ok(None),
+        Err(e) => return Err(fail(e)),
+    };
+    let owner = dir.metadata().map_err(fail)?.uid();
+    Ok((owner == root_uid).then_some(HeldStore { shown, dir }))
+}
+
+/// [`sealed_token_holders`] with the default-root enumeration, the
+/// per-account trees, the unit's roots and keyring directories, and root's
+/// uid injected, so the sweep and the failure contract are unit-testable.
+/// Its notes, holders and error name files an account named, so they come
+/// back [`terminal_safe`].
 fn sealed_token_holders_with(
     default: irlume_common::Result<Vec<(String, irlume_core::envelope::SecretKind)>>,
+    homes: &[HomeTree],
     roots: &[PathBuf],
     keyring_dirs: &[PathBuf],
-) -> Result<Vec<String>, String> {
-    let mut holders: Vec<String> = Vec::new();
-    let mut collect = |sealed: Vec<(String, irlume_core::envelope::SecretKind)>| {
-        for (user, kind) in sealed {
-            if kind == irlume_core::envelope::SecretKind::GnomeKeyringToken
-                && !holders.contains(&user)
-            {
-                holders.push(user);
+    root_uid: u32,
+) -> Result<TokenSweep, String> {
+    match sweep_sealed_token_holders(default, homes, roots, keyring_dirs, root_uid) {
+        Ok(sweep) => Ok(TokenSweep {
+            holders: sweep.holders.iter().map(|h| terminal_safe(h)).collect(),
+            notes: sweep.notes.iter().map(|n| terminal_safe(n)).collect(),
+        }),
+        Err(e) => Err(terminal_safe(&e)),
+    }
+}
+
+/// Text that may hold a name an account chose, for the terminal: each
+/// control character, and each invisible formatting character that changes
+/// how the text around it is shown (bidirectional marks, embeddings,
+/// overrides and isolates, zero-width characters), is written as its escape
+/// (`\u{1b}`, `\n`, `\u{202e}`), so a crafted file name cannot move the
+/// cursor, recolor, reorder or forge a line of the output.
+fn terminal_safe(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() || is_format_char(c) {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Invisible Unicode formatting characters that change how the text around
+/// them is displayed: the Arabic letter mark, zero-width space, joiners and
+/// direction marks, bidirectional embeddings and overrides, the word joiner
+/// and invisible operators, bidirectional isolates, and the byte-order mark.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
+}
+
+fn sweep_sealed_token_holders(
+    default: irlume_common::Result<Vec<(String, irlume_core::envelope::SecretKind)>>,
+    homes: &[HomeTree],
+    roots: &[PathBuf],
+    keyring_dirs: &[PathBuf],
+    root_uid: u32,
+) -> Result<TokenSweep, String> {
+    let mut sweep = TokenSweep::default();
+    sweep.collect(default.map_err(|e| format!("{e}"))?);
+    for home in homes {
+        match home {
+            HomeTree::Verified(tree) => tree.sweep(root_uid, &mut sweep)?,
+            HomeTree::Skipped {
+                path,
+                account,
+                reason,
+            } => {
+                sweep.notes.push(format!(
+                    "{account}: {} is neither read nor removed: {reason}",
+                    path.display()
+                ));
+                // The tree is not removed, but a keyring store in it that
+                // root owns may hold a token a login stack delivers: it
+                // counts, fail-closed, as a root store does.
+                if let Some(store) = skipped_tree_keyring(path, root_uid)? {
+                    sweep.collect(store.sealed_kinds()?);
+                }
             }
         }
+    }
+    // A unit root that is an account's verified tree was swept above, under
+    // the rules for what that account could have put there itself, as the
+    // teardown handles it.
+    let swept = |root: &PathBuf| {
+        homes
+            .iter()
+            .any(|home| matches!(home, HomeTree::Verified(tree) if tree.path == *root))
     };
-    collect(default.map_err(|e| format!("{e}"))?);
-    for root in roots {
-        collect(
+    for root in roots.iter().filter(|root| !swept(root)) {
+        sweep.collect(
             irlume_core::keyring::list_sealed_kinds_in(root)
                 .map_err(|e| format!("{}: {e}", root.join("keyring").display()))?,
         );
     }
     for dir in keyring_dirs {
-        collect(
+        sweep.collect(
             irlume_core::keyring::list_sealed_kinds_at(dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))?,
         );
     }
-    Ok(holders)
+    Ok(sweep)
 }
 
 /// Delete the given data trees and return the ones that still exist afterwards.
@@ -1735,37 +2484,152 @@ mod tests {
     // remove_dir_all on a regular FILE fails on any filesystem, root or not, so
     // the failure fixture is deterministic.
     #[test]
-    fn only_a_real_root_owned_directory_is_trusted() {
-        assert_eq!(root_owned_dir(Path::new("/")), Ok(true));
-        let dir = std::env::temp_dir().join(format!("irlume-root-owned-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let link = dir.join("link");
-        std::os::unix::fs::symlink("/", &link).unwrap();
+    fn a_keyring_directory_or_link_root_owns_counts_for_the_login_guards() {
+        let base = std::env::temp_dir().join(format!("irlume-root-owned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let tree_path = home_state_path(&alice.home);
+        std::fs::create_dir_all(&tree_path).unwrap();
+        let tree = verified(resolve_home_tree(&alice));
+        assert_eq!(tree.keeps_store_of(0), Ok(false), "no keyring directory");
+        std::os::unix::fs::symlink("/", tree_path.join("keyring")).unwrap();
         assert_eq!(
-            root_owned_dir(&link),
-            Ok(false),
-            "a link to a root-owned directory"
+            tree.keeps_store_of(0),
+            Ok(true),
+            "a link to a root-owned directory is followed to it"
         );
+        std::fs::remove_file(tree_path.join("keyring")).unwrap();
+        std::fs::create_dir(tree_path.join("keyring")).unwrap();
+        assert_eq!(tree.keeps_store_of(alice.uid), Ok(true), "its owner's");
         if !is_root() {
             assert_eq!(
-                root_owned_dir(&dir),
+                tree.keeps_store_of(0),
                 Ok(false),
                 "a directory this user owns"
             );
-        }
-        assert_eq!(root_owned_dir(&dir.join("missing")), Ok(false));
-        // Under a directory this process cannot search, the answer is unknown.
-        if !is_root() {
+            // Inside a tree this process cannot search, the answer is unknown.
             use std::os::unix::fs::PermissionsExt as _;
-            let closed = dir.join("closed");
-            std::fs::create_dir_all(closed.join("keyring")).unwrap();
-            std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
-            let answer = root_owned_dir(&closed.join("keyring"));
-            std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
-            assert!(answer.is_err_and(|e| e.contains("closed/keyring")));
+            std::fs::set_permissions(&tree_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let answer = tree.keeps_store_of(0);
+            std::fs::set_permissions(&tree_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(answer.is_err_and(|e| e.contains("irlume/keyring")));
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A tree uninstall skips (for example one another account owns) can
+    /// still hold a real keyring store root owns; the login guards count it.
+    /// A link at the store's own name, or a store root does not own, is not.
+    #[test]
+    fn a_skipped_trees_root_owned_keyring_still_counts_for_the_login_guards() {
+        use std::os::unix::fs::MetadataExt as _;
+        // What the guards are handed: the store's path in messages.
+        let shown = |answer: Result<Option<HeldStore>, String>| answer.map(|o| o.map(|h| h.shown));
+        let base =
+            std::env::temp_dir().join(format!("irlume-skipped-keyring-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let tree = base.join("irlume");
+        std::fs::create_dir_all(&tree).unwrap();
+        assert_eq!(
+            shown(skipped_tree_keyring(&tree, 0)),
+            Ok(None),
+            "no keyring directory"
+        );
+        std::fs::create_dir(tree.join("keyring")).unwrap();
+        let owner = std::fs::metadata(tree.join("keyring")).unwrap().uid();
+        // This process stands in for root: the store is "root's" when the
+        // injected root uid is its owner.
+        assert_eq!(
+            shown(skipped_tree_keyring(&tree, owner)),
+            Ok(Some(tree.join("keyring")))
+        );
+        assert_eq!(
+            shown(skipped_tree_keyring(&tree, owner + 1)),
+            Ok(None),
+            "not root's"
+        );
+        std::fs::remove_dir(tree.join("keyring")).unwrap();
+        // A link counts only when it leads to a directory root owns, named by
+        // where it leads; one to nothing or into a loop is no store.
+        let store = base.join("store");
+        std::fs::create_dir(&store).unwrap();
+        std::os::unix::fs::symlink(&store, tree.join("keyring")).unwrap();
+        assert_eq!(
+            shown(skipped_tree_keyring(&tree, owner)),
+            Ok(Some(std::fs::canonicalize(&store).unwrap())),
+            "a link to root's store"
+        );
+        // Its tokens count for the guards although the tree is skipped.
+        std::fs::write(store.join("carol.json"), TOKEN_ENVELOPE).unwrap();
+        let skipped = HomeTree::Skipped {
+            path: tree.clone(),
+            account: "bob".into(),
+            reason: "owned by another account".into(),
+        };
+        assert_eq!(
+            sealed_token_holders_with(Ok(Vec::new()), &[skipped], &[], &[], owner)
+                .unwrap()
+                .holders,
+            vec!["carol".to_string()]
+        );
+        std::fs::remove_file(store.join("carol.json")).unwrap();
+        assert_eq!(
+            shown(skipped_tree_keyring(&tree, owner + 1)),
+            Ok(None),
+            "a link to a store root does not own"
+        );
+        for target in [base.join("nowhere"), tree.join("keyring")] {
+            std::fs::remove_file(tree.join("keyring")).unwrap();
+            std::os::unix::fs::symlink(&target, tree.join("keyring")).unwrap();
+            assert_eq!(
+                shown(skipped_tree_keyring(&tree, owner)),
+                Ok(None),
+                "{target:?}"
+            );
+        }
+        // Inside a tree this process cannot search, whether a store is there
+        // cannot be established: an error, so the guards refuse.
+        if !is_root() {
+            std::fs::remove_file(tree.join("keyring")).unwrap();
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let answer = shown(skipped_tree_keyring(&tree, owner));
+            std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(answer.is_err(), "{answer:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The guards read a skipped tree's store through the directory the
+    /// check held: one renamed away and replaced by an empty directory after
+    /// the check still counts its token. A loop above the store, which no
+    /// store can be inside, is no store rather than an error.
+    #[test]
+    fn a_skipped_store_is_read_through_the_held_directory_and_a_loop_above_it_is_none() {
+        use std::os::unix::fs::MetadataExt as _;
+        let base = std::env::temp_dir().join(format!("irlume-skipped-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let tree = base.join("irlume");
+        std::fs::create_dir_all(tree.join("keyring")).unwrap();
+        std::fs::write(tree.join("keyring/carol.json"), TOKEN_ENVELOPE).unwrap();
+        let owner = std::fs::metadata(tree.join("keyring")).unwrap().uid();
+        let held = skipped_tree_keyring(&tree, owner)
+            .unwrap()
+            .expect("root's store");
+        std::fs::rename(tree.join("keyring"), base.join("moved")).unwrap();
+        std::fs::create_dir(tree.join("keyring")).unwrap();
+        let kinds = held.sealed_kinds().unwrap();
+        assert_eq!(kinds.len(), 1, "{kinds:?}");
+        assert_eq!(kinds[0].0, "carol");
+        // A self-referential link above the store: the path cannot be
+        // followed, and nothing is there.
+        let looped = base.join("loop");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        assert!(matches!(
+            skipped_tree_keyring(&looped.join("share/irlume"), owner),
+            Ok(None)
+        ));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1849,17 +2713,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("irlume-unit-keyring-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("carol.json"),
-            r#"{"version":1,"secret":"GnomeKeyringToken","pcrs":[],"public":"","private":""}"#,
-        )
-        .unwrap();
-        let holders =
-            sealed_token_holders_with(Ok(Vec::new()), &[], std::slice::from_ref(&dir)).unwrap();
-        assert_eq!(holders, vec!["carol".to_string()]);
+        std::fs::write(dir.join("carol.json"), TOKEN_ENVELOPE).unwrap();
+        let sweep = |dirs: &[PathBuf]| sealed_token_holders_with(Ok(Vec::new()), &[], &[], dirs, 0);
+        assert_eq!(
+            sweep(std::slice::from_ref(&dir)).unwrap().holders,
+            vec!["carol".to_string()]
+        );
         std::fs::write(dir.join("dave.json"), b"not an envelope").unwrap();
-        let err =
-            sealed_token_holders_with(Ok(Vec::new()), &[], std::slice::from_ref(&dir)).unwrap_err();
+        let err = sweep(std::slice::from_ref(&dir)).unwrap_err();
         assert!(err.contains(dir.to_str().unwrap()), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
@@ -1927,17 +2788,32 @@ mod tests {
 
     #[test]
     fn human_homes_skips_system_accounts_and_malformed_lines() {
-        // Invariant test (no /etc/passwd fixture): every returned home is an
-        // absolute path belonging to a human account; a machine with no human
-        // users legitimately returns an empty vec. System accounts (root,
-        // nobody, daemons) never appear because of the uid >= 1000 filter.
-        for h in human_homes() {
-            assert!(
-                h.is_absolute(),
-                "a passwd HOME must be absolute: {}",
-                h.display()
-            );
-        }
+        let passwd = "root:x:0:0:root:/root:/bin/sh\n\
+            bin:x:1:1::/:/sbin/nologin\n\
+            alice:x:1000:1000::/home/alice:/bin/sh\n\
+            broken line\n\
+            relative:x:1001:1001::home/relative:/bin/sh\n\
+            nouid:x:abc:1002::/home/nouid:/bin/sh\n\
+            nobody:x:65534:65534::/:/sbin/nologin\n\
+            bob:x:60000:60000::/home/bob:/bin/bash\n";
+        let named = |accounts: Vec<Account>| -> Vec<(String, u32, PathBuf)> {
+            accounts
+                .into_iter()
+                .map(|a| (a.name, a.uid, a.home))
+                .collect()
+        };
+        assert_eq!(
+            named(human_accounts_in(passwd)),
+            vec![
+                ("alice".into(), 1000, PathBuf::from("/home/alice")),
+                ("bob".into(), 60000, PathBuf::from("/home/bob")),
+            ]
+        );
+        // The sweep adds root's own home.
+        assert_eq!(
+            named(sweep_accounts_in(passwd)).last(),
+            Some(&("root".into(), 0, PathBuf::from("/root")))
+        );
     }
 
     #[test]
@@ -2084,34 +2960,44 @@ mod tests {
     fn extra_state_roots_name_existing_home_state_only() {
         let base = std::env::temp_dir().join(format!("irlume-extra-roots-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let with_state = base.join("a");
-        let without = base.join("b");
-        let duplicated = base.join("a");
+        let with_state = test_account(&base, "a");
+        let without = test_account(&base, "b");
+        let duplicated = test_account(&base, "a");
         let default = base.join("default-state");
-        std::fs::create_dir_all(with_state.join(".local/share/irlume")).unwrap();
-        std::fs::create_dir_all(&without).unwrap();
+        std::fs::create_dir_all(home_state_path(&with_state.home)).unwrap();
         // Existing home state is named once; a home without it and the
         // default root (however the environment resolved it) never appear.
-        let roots = extra_state_roots_with(&[with_state.clone(), without, duplicated], &default);
-        assert_eq!(roots, vec![with_state.join(".local/share/irlume")]);
+        let paths = |trees: Vec<HomeTree>| -> Vec<PathBuf> {
+            trees
+                .into_iter()
+                .map(|tree| verified(Some(tree)).path)
+                .collect()
+        };
+        let accounts = [with_state, without, duplicated];
+        assert_eq!(
+            paths(home_trees(&accounts, &default)),
+            vec![home_state_path(&accounts[0].home)]
+        );
         // The default root is excluded even when a home points at it.
-        let as_default = with_state.join(".local/share/irlume");
-        assert!(extra_state_roots_with(std::slice::from_ref(&with_state), &as_default).is_empty());
+        let as_default = home_state_path(&accounts[0].home);
+        assert!(home_trees(&accounts[..1], &as_default).is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn token_guard_sweeps_extra_roots_and_fails_closed_on_unreadable_ones() {
-        // A source-lane root holding an envelope the loader cannot parse must
-        // surface as a REFUSAL-grade error naming that root: skipping it is
-        // what let the homes wipe destroy a token nobody examined (audit F1).
+        // A root irlumed's unit names holding an envelope the loader cannot
+        // parse must surface as a REFUSAL-grade error naming that root:
+        // skipping it is what let the homes wipe destroy a token nobody
+        // examined (audit F1).
         let base = std::env::temp_dir().join(format!("irlume-token-guard-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let root = base.join("home/.local/share/irlume");
+        let root = base.join("srv/irlume");
         std::fs::create_dir_all(root.join("keyring")).unwrap();
         std::fs::write(root.join("keyring/carol.json"), b"not an envelope").unwrap();
-        let err = sealed_token_holders_with(Ok(Vec::new()), std::slice::from_ref(&root), &[])
-            .unwrap_err();
+        let err =
+            sealed_token_holders_with(Ok(Vec::new()), &[], std::slice::from_ref(&root), &[], 0)
+                .unwrap_err();
         assert!(
             err.contains(root.join("keyring").to_str().unwrap()),
             "error must name the swept root: {err}"
@@ -2119,15 +3005,731 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         // An empty sweep is an empty holder list, and non-token kinds in the
         // default root stay irrelevant.
-        let holders = sealed_token_holders_with(
+        let sweep = sealed_token_holders_with(
             Ok(vec![(
                 "alice".into(),
                 irlume_core::envelope::SecretKind::LoginPassword,
             )]),
             &[],
             &[],
+            &[],
+            0,
         )
         .unwrap();
-        assert!(holders.is_empty());
+        assert!(sweep.holders.is_empty() && sweep.notes.is_empty());
+    }
+
+    // ---- per-account trees: read and removed only inside each home --------
+
+    const TOKEN_ENVELOPE: &str =
+        r#"{"version":1,"secret":"GnomeKeyringToken","pcrs":[],"public":"","private":""}"#;
+    const PASSWORD_ENVELOPE: &str = r#"{"version":1,"pcrs":[],"public":"","private":""}"#;
+
+    /// An account named `name` with a fresh home under `base`, whose uid is
+    /// this process's, so the home and everything the test puts in it is
+    /// that account's own.
+    fn test_account(base: &Path, name: &str) -> Account {
+        use std::os::unix::fs::MetadataExt as _;
+        let home = base.join(name);
+        std::fs::create_dir_all(&home).unwrap();
+        let uid = std::fs::metadata(&home).unwrap().uid();
+        Account {
+            name: name.into(),
+            uid,
+            home,
+        }
+    }
+
+    fn verified(tree: Option<HomeTree>) -> VerifiedTree {
+        match tree {
+            Some(HomeTree::Verified(tree)) => tree,
+            other => panic!("expected a verified tree, got {other:?}"),
+        }
+    }
+
+    fn skipped(tree: Option<HomeTree>) -> String {
+        match tree {
+            Some(HomeTree::Skipped { reason, .. }) => reason,
+            other => panic!("expected a skipped tree, got {other:?}"),
+        }
+    }
+
+    /// A directory named `irlume` somewhere else, as another account's
+    /// checkout or data would be, with an envelope and an enrollment in it.
+    fn outside_tree(base: &Path) -> PathBuf {
+        let outside = base.join("bob/irlume");
+        std::fs::create_dir_all(outside.join("keyring")).unwrap();
+        std::fs::write(outside.join("keep.txt"), b"not irlume's").unwrap();
+        std::fs::write(outside.join("dana.json"), b"{}").unwrap();
+        std::fs::write(outside.join("keyring/dana.json"), PASSWORD_ENVELOPE).unwrap();
+        std::fs::write(outside.join("keyring/bob.json"), b"not an envelope").unwrap();
+        outside
+    }
+
+    fn outside_intact(outside: &Path) -> bool {
+        [
+            "keep.txt",
+            "dana.json",
+            "keyring/dana.json",
+            "keyring/bob.json",
+        ]
+        .iter()
+        .all(|name| outside.join(name).exists())
+    }
+
+    #[test]
+    fn a_home_tree_reached_through_a_link_is_neither_read_nor_removed() {
+        let base = std::env::temp_dir().join(format!("irlume-home-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let outside = outside_tree(&base);
+        let default = base.join("default-state");
+        // A link at each step below the home, to a place holding `irlume`.
+        let cases: [(&str, &str, PathBuf); 3] = [
+            (".local", ".local", base.join("bob").join("..").join("up")),
+            (".local/share", ".local/share", base.join("bob")),
+            (
+                ".local/share/irlume",
+                ".local/share/irlume",
+                outside.clone(),
+            ),
+        ];
+        std::fs::create_dir_all(base.join("up/share")).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("up/share/irlume")).unwrap();
+        for (at, named, target) in cases {
+            let dana = test_account(&base, "dana");
+            let link = dana.home.join(at);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+
+            let reason = skipped(resolve_home_tree(&dana));
+            assert!(
+                reason.contains(&format!("{named} is a symbolic link")),
+                "{reason}"
+            );
+            let homes = home_trees(std::slice::from_ref(&dana), &default);
+            let sweep = sealed_token_holders_with(Ok(Vec::new()), &homes, &[], &[], 0)
+                .expect("what is behind the link is not read");
+            assert!(sweep.holders.is_empty());
+            assert!(
+                sweep.notes.len() == 1 && sweep.notes[0].starts_with("dana: "),
+                "{:?}",
+                sweep.notes
+            );
+            assert_eq!(disarm_home_trees(&homes), 0);
+            let left = wipe_home_trees(&homes);
+            assert!(
+                left.len() == 1 && left[0].contains("not removed"),
+                "{left:?}"
+            );
+            assert!(outside_intact(&outside), "a link at {at} was followed");
+            std::fs::remove_dir_all(&dana.home).unwrap();
+        }
+        // A link to nothing is no tree at all, and nothing is named.
+        let dana = test_account(&base, "dana");
+        std::fs::create_dir_all(dana.home.join(".local")).unwrap();
+        std::os::unix::fs::symlink(base.join("nowhere"), dana.home.join(".local/share")).unwrap();
+        assert!(resolve_home_tree(&dana).is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_home_tree_another_account_owns_is_skipped() {
+        let base = std::env::temp_dir().join(format!("irlume-home-owner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut alice = test_account(&base, "alice");
+        std::fs::create_dir_all(home_state_path(&alice.home)).unwrap();
+        if alice.uid != 0 {
+            // The tree is this process's, which is now neither root nor alice.
+            alice.uid += 1;
+            let reason = skipped(resolve_home_tree(&alice));
+            assert!(reason.contains("owned by uid"), "{reason}");
+        }
+        // Something that is not a directory in the tree's place is named.
+        let bob = test_account(&base, "bob");
+        std::fs::create_dir_all(bob.home.join(".local/share")).unwrap();
+        std::fs::write(home_state_path(&bob.home), b"x").unwrap();
+        assert!(skipped(resolve_home_tree(&bob)).contains("not a directory"));
+        // A FIFO there, or on the way, is never opened for reading.
+        use std::os::unix::ffi::OsStrExt as _;
+        let carol = test_account(&base, "carol");
+        std::fs::create_dir_all(carol.home.join(".local/share")).unwrap();
+        for fifo in [home_state_path(&carol.home), bob.home.join(".local/share")] {
+            let _ = std::fs::remove_file(&fifo);
+            let _ = std::fs::remove_dir_all(&fifo);
+            let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `c_fifo` is a valid NUL-terminated path that outlives the call.
+            assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        }
+        let accounts = [bob, carol];
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                accounts
+                    .iter()
+                    .map(|account| resolve_home_tree(account).map(|tree| format!("{tree:?}")))
+                    .collect::<Vec<_>>(),
+            );
+        });
+        let found = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a FIFO in a home must not block the sweep");
+        assert!(found[0].is_none(), "a FIFO on the way means no tree");
+        assert!(
+            found[1]
+                .as_deref()
+                .is_some_and(|tree| tree.contains("not a directory")),
+            "{found:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_envelope_that_is_a_fifo_or_too_large_neither_hangs_nor_blocks() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let base = std::env::temp_dir().join(format!("irlume-home-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let keyring = home_state_path(&alice.home).join("keyring");
+        std::fs::create_dir_all(&keyring).unwrap();
+        let fifo =
+            std::ffi::CString::new(keyring.join("fifo.json").as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let large = irlume_core::envelope::MAX_ENVELOPE_BYTES as usize + 1;
+        std::fs::write(keyring.join("large.json"), " ".repeat(large)).unwrap();
+        let default = base.join("default-state");
+        let sweep_as = |root_uid: u32| {
+            let homes = home_trees(std::slice::from_ref(&alice), &default);
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(sealed_token_holders_with(
+                    Ok(Vec::new()),
+                    &homes,
+                    &[],
+                    &[],
+                    root_uid,
+                ));
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("reading the envelopes must not block")
+        };
+        // The account's own files are named, not a refusal.
+        let sweep = sweep_as(0).expect("the account's own files do not refuse");
+        assert!(sweep.holders.is_empty());
+        assert_eq!(sweep.notes.len(), 2, "{:?}", sweep.notes);
+        assert!(
+            sweep.notes[0].contains("fifo.json") && sweep.notes[0].contains("not a regular file")
+        );
+        assert!(sweep.notes[1].contains("large.json") && sweep.notes[1].contains("larger than"));
+        // Owned by root, the same files refuse, still at once.
+        let err = sweep_as(alice.uid).unwrap_err();
+        assert!(err.contains("keyring/fifo.json"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_malformed_envelope_the_account_owns_is_named_and_does_not_block() {
+        let base =
+            std::env::temp_dir().join(format!("irlume-home-malformed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let keyring = home_state_path(&alice.home).join("keyring");
+        std::fs::create_dir_all(&keyring).unwrap();
+        std::fs::write(keyring.join("x.json"), "{}").unwrap();
+        let default = base.join("default-state");
+        let sweep_as = |root_uid: u32| {
+            let homes = home_trees(std::slice::from_ref(&alice), &default);
+            sealed_token_holders_with(Ok(Vec::new()), &homes, &[], &[], root_uid)
+        };
+        let sweep = sweep_as(0).expect("a malformed file the account owns does not refuse");
+        assert!(sweep.holders.is_empty());
+        assert!(
+            sweep.notes.len() == 1
+                && sweep.notes[0].starts_with("alice: ")
+                && sweep.notes[0].contains(keyring.join("x.json").to_str().unwrap()),
+            "{:?}",
+            sweep.notes
+        );
+        // Owned by root it refuses, naming the file.
+        let err = sweep_as(alice.uid).unwrap_err();
+        assert!(
+            err.contains(keyring.join("x.json").to_str().unwrap()),
+            "{err}"
+        );
+        // An envelope that parses still counts: a token refuses as before.
+        std::fs::write(keyring.join("carol.json"), TOKEN_ENVELOPE).unwrap();
+        assert_eq!(sweep_as(0).unwrap().holders, vec!["carol".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A link at the keyring's name that leads to a directory root owns is
+    /// that root store: its tokens count, and what in it cannot be read
+    /// refuses. The wipe removes only the link. A link to anything else is
+    /// named, not followed.
+    #[test]
+    fn a_keyring_link_to_a_root_store_counts_and_any_other_link_is_named() {
+        use std::os::unix::fs::MetadataExt as _;
+        let base =
+            std::env::temp_dir().join(format!("irlume-home-keyring-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let tree_path = home_state_path(&alice.home);
+        std::fs::create_dir_all(&tree_path).unwrap();
+        let store = base.join("srv/keyring");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("carol.json"), TOKEN_ENVELOPE).unwrap();
+        let link = tree_path.join("keyring");
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+        let owner = std::fs::metadata(&store).unwrap().uid();
+        let default = base.join("default-state");
+        let sweep_as = |root_uid: u32| {
+            let homes = home_trees(std::slice::from_ref(&alice), &default);
+            sealed_token_holders_with(Ok(Vec::new()), &homes, &[], &[], root_uid)
+        };
+        // This process stands in for root: the store is root's when the
+        // injected root uid owns it.
+        assert_eq!(sweep_as(owner).unwrap().holders, vec!["carol".to_string()]);
+        std::fs::write(store.join("x.json"), "{}").unwrap();
+        let err = sweep_as(owner).unwrap_err();
+        assert!(err.contains("x.json"), "{err}");
+        std::fs::remove_file(store.join("x.json")).unwrap();
+        let sweep = sweep_as(owner.wrapping_add(1)).unwrap();
+        assert!(sweep.holders.is_empty(), "{sweep:?}");
+        assert!(
+            sweep.notes.len() == 1
+                && sweep.notes[0].contains("symbolic link to no directory root owns"),
+            "{:?}",
+            sweep.notes
+        );
+        // A link to nothing, or into a loop, is named too.
+        for target in [base.join("nowhere"), link.clone()] {
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let sweep = sweep_as(owner).unwrap();
+            assert!(
+                sweep.holders.is_empty()
+                    && sweep.notes.len() == 1
+                    && sweep.notes[0].contains("symbolic link"),
+                "{target:?}: {sweep:?}"
+            );
+        }
+        // The login guards follow it to root's store too, and the wipe,
+        // which removes only the link, reports that it did.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+        let homes = home_trees(std::slice::from_ref(&alice), &default);
+        let HomeTree::Verified(tree) = &homes[0] else {
+            panic!("{homes:?}");
+        };
+        assert_eq!(tree.keeps_store_of(owner), Ok(true));
+        assert_eq!(tree.keeps_store_of(owner.wrapping_add(1)), Ok(false));
+        let left = wipe_home_trees(&homes);
+        assert!(
+            left.len() == 1 && left[0].contains("1 symbolic link"),
+            "{left:?}"
+        );
+        assert!(!tree_path.exists(), "the tree and its link are removed");
+        assert!(store.join("carol.json").is_file(), "the store is not");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A keyring directory that cannot be opened is judged by its own owner:
+    /// the account's is named, root's refuses, and one whose owner cannot be
+    /// read refuses whoever owns the tree.
+    #[test]
+    fn an_unopenable_keyring_directory_is_judged_by_its_own_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if is_root() {
+            return; // root opens any mode
+        }
+        let base =
+            std::env::temp_dir().join(format!("irlume-home-keyring-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let tree_path = home_state_path(&alice.home);
+        let keyring = tree_path.join("keyring");
+        std::fs::create_dir_all(&keyring).unwrap();
+        let default = base.join("default-state");
+        let homes = home_trees(std::slice::from_ref(&alice), &default);
+        let sweep_as =
+            |root_uid: u32| sealed_token_holders_with(Ok(Vec::new()), &homes, &[], &[], root_uid);
+        let mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(&keyring, 0o000);
+        let (as_account, as_root) = (sweep_as(alice.uid + 1), sweep_as(alice.uid));
+        mode(&keyring, 0o700);
+        let sweep = as_account.expect("the account's own store does not refuse");
+        assert!(
+            sweep.notes.len() == 1 && sweep.notes[0].contains("could not be read"),
+            "{:?}",
+            sweep.notes
+        );
+        assert!(as_root.is_err_and(|e| e.contains("irlume/keyring")));
+        // The tree cannot be searched: whose the store is is unknown.
+        mode(&tree_path, 0o000);
+        let unknown = sweep_as(alice.uid + 1);
+        mode(&tree_path, 0o700);
+        assert!(unknown.is_err_and(|e| e.contains("irlume/keyring")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A unit root that is an account's verified tree is swept once, under
+    /// the account-tree rules, as the teardown treats it; another unit root
+    /// is still read strictly.
+    #[test]
+    fn a_unit_root_that_is_an_accounts_tree_is_swept_once() {
+        let base =
+            std::env::temp_dir().join(format!("irlume-home-unit-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let tree_path = home_state_path(&alice.home);
+        std::fs::create_dir_all(tree_path.join("keyring")).unwrap();
+        std::fs::write(tree_path.join("keyring/x.json"), "{}").unwrap();
+        let homes = home_trees(std::slice::from_ref(&alice), &base.join("default-state"));
+        let sweep = sealed_token_holders_with(
+            Ok(Vec::new()),
+            &homes,
+            std::slice::from_ref(&tree_path),
+            &[],
+            alice.uid.wrapping_add(1),
+        )
+        .expect("what the account wrote in its own tree does not refuse");
+        assert!(
+            sweep.notes.len() == 1 && sweep.notes[0].contains("x.json"),
+            "{:?}",
+            sweep.notes
+        );
+        let other = base.join("srv/irlume");
+        std::fs::create_dir_all(other.join("keyring")).unwrap();
+        std::fs::write(other.join("keyring/x.json"), "{}").unwrap();
+        let err = sealed_token_holders_with(
+            Ok(Vec::new()),
+            &homes,
+            &[tree_path, other.clone()],
+            &[],
+            alice.uid.wrapping_add(1),
+        )
+        .unwrap_err();
+        assert!(err.contains(other.to_str().unwrap()), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_unreadable_entry_whose_owner_is_unknown_refuses() {
+        assert!(unreadable_refuses(None, 0));
+        assert!(unreadable_refuses(Some(0), 0));
+        assert!(!unreadable_refuses(Some(1000), 0));
+    }
+
+    /// A file name an account chose reaches the terminal with its control
+    /// characters escaped.
+    #[test]
+    fn a_crafted_envelope_name_is_escaped_in_the_notes() {
+        assert_eq!(terminal_safe("a\u{1b}[2Jb\nc"), "a\\u{1b}[2Jb\\nc");
+        // Bidirectional overrides and isolates, and zero-width characters,
+        // are escaped too; ordinary text, accents included, is left alone.
+        assert_eq!(
+            terminal_safe("x\u{202e}y\u{2066}z\u{200b}é"),
+            "x\\u{202e}y\\u{2066}z\\u{200b}é"
+        );
+        let base = std::env::temp_dir().join(format!("irlume-home-escape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let keyring = home_state_path(&alice.home).join("keyring");
+        std::fs::create_dir_all(&keyring).unwrap();
+        std::fs::write(keyring.join("\u{1b}[31mforged\n.json"), "{}").unwrap();
+        let homes = home_trees(std::slice::from_ref(&alice), &base.join("default-state"));
+        let sweep =
+            sealed_token_holders_with(Ok(Vec::new()), &homes, &[], &[], alice.uid.wrapping_add(1))
+                .unwrap();
+        assert_eq!(sweep.notes.len(), 1, "{:?}", sweep.notes);
+        assert!(
+            !sweep.notes[0].chars().any(char::is_control)
+                && sweep.notes[0].contains("\\u{1b}[31mforged\\n.json"),
+            "{:?}",
+            sweep.notes
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An envelope root owns, linked into an account's keyring under an
+    /// envelope's name, counts: the wipe removes only the link. A link to a
+    /// root file that is no envelope, or to one root does not own, is only
+    /// named.
+    #[test]
+    fn a_linked_root_envelope_counts_and_other_linked_entries_are_named() {
+        use std::os::unix::fs::MetadataExt as _;
+        let base =
+            std::env::temp_dir().join(format!("irlume-home-linked-entry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let keyring = home_state_path(&alice.home).join("keyring");
+        std::fs::create_dir_all(&keyring).unwrap();
+        let outside = base.join("srv");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("token.json"), TOKEN_ENVELOPE).unwrap();
+        std::fs::write(outside.join("other.txt"), "not an envelope").unwrap();
+        std::os::unix::fs::symlink(outside.join("token.json"), keyring.join("carol.json")).unwrap();
+        let owner = std::fs::metadata(&outside).unwrap().uid();
+        let default = base.join("default-state");
+        let sweep_as = |root_uid: u32| {
+            let homes = home_trees(std::slice::from_ref(&alice), &default);
+            sealed_token_holders_with(Ok(Vec::new()), &homes, &[], &[], root_uid)
+        };
+        // This process stands in for root: the linked envelope is "root's",
+        // and its token counts.
+        assert_eq!(sweep_as(owner).unwrap().holders, vec!["carol".to_string()]);
+        // Neither link leads to a file of root's here: both are only named.
+        std::os::unix::fs::symlink(outside.join("other.txt"), keyring.join("dana.json")).unwrap();
+        let sweep = sweep_as(owner.wrapping_add(1)).unwrap();
+        assert!(sweep.holders.is_empty(), "{sweep:?}");
+        assert_eq!(sweep.notes.len(), 2, "{:?}", sweep.notes);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A dangling link at an envelope's name in an account's keyring is the
+    /// account's (its owner is read without following it), so it is only
+    /// named and does not stop the uninstall.
+    #[test]
+    fn a_dangling_link_in_an_accounts_keyring_is_only_named() {
+        let base =
+            std::env::temp_dir().join(format!("irlume-home-dangling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let keyring = home_state_path(&alice.home).join("keyring");
+        std::fs::create_dir_all(&keyring).unwrap();
+        std::os::unix::fs::symlink(base.join("nowhere.json"), keyring.join("foo.json")).unwrap();
+        let homes = home_trees(std::slice::from_ref(&alice), &base.join("default-state"));
+        let sweep =
+            sealed_token_holders_with(Ok(Vec::new()), &homes, &[], &[], alice.uid.wrapping_add(1))
+                .expect("a link the account owns does not refuse");
+        assert!(
+            sweep.holders.is_empty()
+                && sweep.notes.len() == 1
+                && sweep.notes[0].contains("foo.json"),
+            "{sweep:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A tree whose removal takes a symbolic link is reported among what
+    /// may still hold data, which keeps the SRK: the link is removed, never
+    /// followed, and the account could point it anywhere until then. A tree
+    /// without one is not.
+    #[test]
+    fn a_tree_whose_removal_takes_a_link_keeps_the_srk() {
+        let base =
+            std::env::temp_dir().join(format!("irlume-home-linked-left-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = base.join("srv/keyring");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("alice.json"), PASSWORD_ENVELOPE).unwrap();
+        let alice = test_account(&base, "alice");
+        let tree_path = home_state_path(&alice.home);
+        let wipe = |link: bool| {
+            std::fs::create_dir_all(tree_path.join("runner")).unwrap();
+            if link {
+                std::os::unix::fs::symlink(&store, tree_path.join("keyring")).unwrap();
+            }
+            let homes = home_trees(std::slice::from_ref(&alice), &base.join("default-state"));
+            let left = wipe_home_trees(&homes);
+            assert!(!tree_path.exists(), "the tree is removed");
+            left
+        };
+        assert!(wipe(false).is_empty(), "no link, nothing left");
+        let left = wipe(true);
+        assert!(
+            left.len() == 1
+                && left[0].contains("1 symbolic link")
+                && left[0].contains("the TPM storage key is kept"),
+            "{left:?}"
+        );
+        assert!(store.join("alice.json").is_file(), "what it led to stays");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_accounts_own_tree_is_found_disarmed_and_removed() {
+        let base = std::env::temp_dir().join(format!("irlume-home-normal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let tree_path = home_state_path(&alice.home);
+        std::fs::create_dir_all(tree_path.join("keyring")).unwrap();
+        std::fs::create_dir_all(tree_path.join("runner")).unwrap();
+        std::fs::write(tree_path.join("alice.json"), b"{}").unwrap();
+        std::fs::write(tree_path.join("runner/record"), b"x").unwrap();
+        std::fs::write(tree_path.join("keyring/alice.json"), PASSWORD_ENVELOPE).unwrap();
+        let homes = home_trees(std::slice::from_ref(&alice), &base.join("default-state"));
+        assert_eq!(homes.len(), 1);
+        let sweep = sealed_token_holders_with(Ok(Vec::new()), &homes, &[], &[], 0).unwrap();
+        assert!(
+            sweep.holders.is_empty() && sweep.notes.is_empty(),
+            "{sweep:?}"
+        );
+        assert_eq!(disarm_home_trees(&homes), 1);
+        assert!(!tree_path.join("keyring/alice.json").exists(), "disarmed");
+        assert!(wipe_home_trees(&homes).is_empty());
+        assert!(!tree_path.exists(), "the tree is removed");
+        assert!(
+            alice.home.join(".local/share").is_dir(),
+            "and only the tree"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn nothing_a_link_inside_the_tree_points_at_is_disarmed_or_removed() {
+        let base = std::env::temp_dir().join(format!("irlume-home-inner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let outside = outside_tree(&base);
+        let dana = test_account(&base, "dana");
+        let tree_path = home_state_path(&dana.home);
+        std::fs::create_dir_all(&tree_path).unwrap();
+        std::fs::write(tree_path.join("dana.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(outside.join("keyring"), tree_path.join("keyring")).unwrap();
+        std::os::unix::fs::symlink(&outside, tree_path.join("elsewhere")).unwrap();
+        let homes = home_trees(std::slice::from_ref(&dana), &base.join("default-state"));
+        let sweep = sealed_token_holders_with(Ok(Vec::new()), &homes, &[], &[], 0).unwrap();
+        assert!(
+            sweep.notes[0].contains("symbolic link"),
+            "{:?}",
+            sweep.notes
+        );
+        // --keep-data disarms, and must not reach through the link.
+        assert_eq!(disarm_home_trees(&homes), 1);
+        let left = wipe_home_trees(&homes);
+        assert!(
+            left.len() == 1 && left[0].contains("2 symbolic link"),
+            "{left:?}"
+        );
+        assert!(!tree_path.exists());
+        assert!(outside_intact(&outside));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The removal after the check goes through the directory held since
+    /// it was verified: a tree renamed away and replaced then is still the
+    /// one emptied, and a replacement that is not empty is left whole.
+    #[test]
+    fn a_tree_replaced_after_the_check_is_emptied_where_it_went_and_its_replacement_kept() {
+        let base = std::env::temp_dir().join(format!("irlume-home-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let tree_path = home_state_path(&alice.home);
+        std::fs::create_dir_all(tree_path.join("keyring")).unwrap();
+        std::fs::write(tree_path.join("alice.json"), b"{}").unwrap();
+        std::fs::write(tree_path.join("keyring/alice.json"), PASSWORD_ENVELOPE).unwrap();
+        let homes = home_trees(std::slice::from_ref(&alice), &base.join("default-state"));
+        let tree = match &homes[0] {
+            HomeTree::Verified(tree) => tree,
+            other => panic!("{other:?}"),
+        };
+        // Between the check and the removal the tree moves aside and a real
+        // directory with someone's data takes its name.
+        let moved = tree_path.with_file_name("moved");
+        std::fs::rename(&tree_path, &moved).unwrap();
+        std::fs::create_dir(&tree_path).unwrap();
+        std::fs::write(tree_path.join("victim.txt"), b"not irlume's").unwrap();
+        let owner = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(&moved).unwrap().uid()
+        };
+        assert!(tree.remove_held(&[owner]).is_err());
+        assert!(
+            tree_path.join("victim.txt").is_file(),
+            "the replacement is kept"
+        );
+        assert_eq!(
+            std::fs::read_dir(&moved).unwrap().count(),
+            0,
+            "the tree is emptied"
+        );
+        // An empty replacement is removed: it held nothing.
+        std::fs::remove_file(tree_path.join("victim.txt")).unwrap();
+        assert!(tree.remove_held(&[owner]).is_ok());
+        assert!(!tree_path.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// What the given owners do not own is left in place and named, with
+    /// everything below it; a link is removed, never what it points to.
+    #[test]
+    fn clearing_a_tree_leaves_what_another_account_owns() {
+        use std::os::unix::fs::MetadataExt as _;
+        let base = std::env::temp_dir().join(format!("irlume-home-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let tree = base.join("tree");
+        std::fs::create_dir_all(tree.join("sub/deeper")).unwrap();
+        std::fs::write(tree.join("file"), b"x").unwrap();
+        std::fs::write(tree.join("sub/deeper/file"), b"x").unwrap();
+        let outside = outside_tree(&base);
+        std::os::unix::fs::symlink(&outside, tree.join("link")).unwrap();
+        let uid = std::fs::metadata(&tree).unwrap().uid();
+        let dir = open_dir(&tree).unwrap();
+        let (mut kept, mut links) = (Vec::new(), 0);
+        clear_dir(
+            &dir,
+            Path::new(""),
+            &[uid.wrapping_add(1)],
+            &mut kept,
+            &mut links,
+        )
+        .unwrap();
+        assert_eq!(links, 0, "a link another account owns is kept, not removed");
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec![
+                PathBuf::from("file"),
+                PathBuf::from("link"),
+                PathBuf::from("sub")
+            ]
+        );
+        assert!(tree.join("sub/deeper/file").is_file() && tree.join("file").is_file());
+        let (mut kept, mut links) = (Vec::new(), 0);
+        clear_dir(&dir, Path::new(""), &[uid], &mut kept, &mut links).unwrap();
+        assert_eq!(links, 1, "the removed link is counted");
+        assert!(kept.is_empty(), "{kept:?}");
+        assert_eq!(std::fs::read_dir(&tree).unwrap().count(), 0);
+        assert!(
+            outside_intact(&outside),
+            "the link was removed, not followed"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_tree_replaced_after_it_was_checked_is_left_in_place() {
+        let base = std::env::temp_dir().join(format!("irlume-home-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let outside = outside_tree(&base);
+        let alice = test_account(&base, "alice");
+        let tree_path = home_state_path(&alice.home);
+        std::fs::create_dir_all(&tree_path).unwrap();
+        let homes = home_trees(std::slice::from_ref(&alice), &base.join("default-state"));
+        // The tree moves aside and a link takes its name.
+        std::fs::rename(&tree_path, tree_path.with_file_name("moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, &tree_path).unwrap();
+        let left = wipe_home_trees(&homes);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(outside_intact(&outside));
+        // So does a fresh directory, which was never checked.
+        std::fs::remove_file(&tree_path).unwrap();
+        std::fs::create_dir(&tree_path).unwrap();
+        assert_eq!(wipe_home_trees(&homes).len(), 1);
+        assert!(tree_path.is_dir() && tree_path.with_file_name("moved").is_dir());
+        // The parent moving away does not redirect the removal either: it is
+        // made through the directory that was opened.
+        let share = alice.home.join(".local/share");
+        std::fs::remove_dir(&tree_path).unwrap();
+        std::fs::rename(tree_path.with_file_name("moved"), &tree_path).unwrap();
+        let homes = home_trees(std::slice::from_ref(&alice), &base.join("default-state"));
+        std::fs::rename(&share, alice.home.join(".local/share-moved")).unwrap();
+        std::os::unix::fs::symlink(base.join("bob"), &share).unwrap();
+        assert!(wipe_home_trees(&homes).is_empty());
+        assert!(!alice.home.join(".local/share-moved/irlume").exists());
+        assert!(outside_intact(&outside));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

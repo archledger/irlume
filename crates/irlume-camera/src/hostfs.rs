@@ -1,0 +1,579 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
+//! The host trees this crate reads, as one seam.
+//!
+//! Production resolves the real roots (`/dev`, `/sys`). Under `cfg(test)`
+//! the same readers resolve whatever roots the running test installed and
+//! REFUSE the real ones until a test says which it wants:
+//! [`test::fixture_with`] (or [`test::empty_fixture`]) points every reader
+//! at a temporary tree, and [`test::host`] is the explicit opt-in to the
+//! real machine, reserved for the `#[ignore]`d hardware and v4l2loopback
+//! lanes (plus this module's own self-test of the opt-in). A unit test that
+//! reaches for the host's `/dev/video*`, `/dev/media*` or
+//! `/sys/class/video4linux` without installing roots panics on the spot
+//! instead of quietly probing a developer's camera: CI has no cameras, so
+//! an unrouted test passes there by accident and opens real hardware on any
+//! laptop that has one.
+//!
+//! The roots are thread-local so parallel tests stay isolated: each test
+//! thread installs its own, and a thread that installs none gets the
+//! refusal. Camera workers use [`inherit`] to carry the spawning thread's
+//! roots into callbacks, drains and lifecycle rescans.
+
+use std::path::PathBuf;
+
+/// One resolution of the host roots: where `/dev` and `/sys` are right now.
+/// Test-only: production has exactly one answer, built into the readers
+/// below.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct HostRoots {
+    dev: PathBuf,
+    sys: PathBuf,
+    /// Set only by [`test::host`]: the reader is deliberately looking at the
+    /// real machine, so nothing is refused.
+    is_host: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROOTS: std::cell::RefCell<Option<HostRoots>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The roots this thread reads, or the refusal. Test-only: production has
+/// exactly one answer, built into the readers below.
+///
+/// # Panics
+/// When the calling thread installed no roots. That is the guard: an
+/// unrouted unit test fails here instead of reading the host's camera state.
+#[cfg(test)]
+fn installed() -> HostRoots {
+    ROOTS.with(|roots| roots.borrow().clone().unwrap_or_else(|| refuse_unrouted()))
+}
+
+#[cfg(test)]
+fn refuse_unrouted() -> ! {
+    panic!(
+        "irlume-camera unit test read a host tree (/dev or /sys) without installing roots; \
+         install hostfs::test::empty_fixture() for a hermetic fixture, or \
+         hostfs::test::host() for the ignored hardware lanes"
+    )
+}
+
+pub(crate) fn dev_root() -> PathBuf {
+    #[cfg(test)]
+    return installed().dev;
+    #[cfg(not(test))]
+    PathBuf::from("/dev")
+}
+
+pub(crate) fn sys_root() -> PathBuf {
+    #[cfg(test)]
+    return installed().sys;
+    #[cfg(not(test))]
+    PathBuf::from("/sys")
+}
+
+/// `/sys/class/video4linux`, where the kernel lists every video node.
+pub(crate) fn video_class_root() -> PathBuf {
+    sys_root().join("class/video4linux")
+}
+
+/// The entry for video node `node` under [`video_class_root`], resolved as
+/// the readers' earlier `format!("/sys/class/video4linux/{node}")` did: a
+/// leading `/` (as in `/dev//video0` once `/dev/` is stripped) stays inside
+/// the class root, where `Path::join` would replace the root with it.
+pub(crate) fn video_class_entry(node: &str) -> PathBuf {
+    #[cfg(test)]
+    {
+        let roots = installed();
+        if !roots.is_host {
+            // Existing readers strip /dev/ before calling us, which also
+            // strips a fixture prefix when TMPDIR is beneath /dev/shm.
+            let with_dev = std::path::Path::new("/dev").join(node);
+            if let Ok(relative) = std::path::Path::new(node)
+                .strip_prefix(&roots.dev)
+                .or_else(|_| with_dev.strip_prefix(&roots.dev))
+            {
+                if let Some(name) = relative.file_name() {
+                    return video_class_root().join(name);
+                }
+            }
+        }
+    }
+    video_class_root().join(node.trim_start_matches('/'))
+}
+
+/// Carry test roots into a camera worker. Production calls the closure as is.
+pub(crate) fn inherit<F: FnOnce() -> T, T>(work: F) -> impl FnOnce() -> T {
+    #[cfg(test)]
+    let roots = test::current();
+    move || {
+        #[cfg(test)]
+        test::adopt(roots);
+        work()
+    }
+}
+
+/// `/sys/bus/usb/devices`, the USB device and interface listing.
+pub(crate) fn usb_devices_root() -> PathBuf {
+    sys_root().join("bus/usb/devices")
+}
+
+/// `/sys/bus/pci/devices`, the PCI device listing.
+pub(crate) fn pci_devices_root() -> PathBuf {
+    sys_root().join("bus/pci/devices")
+}
+
+/// `/sys/dev/char`, where a character device's major:minor resolves back to
+/// its sysfs node.
+pub(crate) fn sys_dev_char_root() -> PathBuf {
+    sys_root().join("dev/char")
+}
+
+/// Gate for the "open this node and ask it something" probes
+/// ([`crate::classify_node`] and friends): under test, a probe naming a
+/// host camera node is a touch of real hardware and must carry the explicit
+/// host opt-in. Fixture files and `/dev/null` pass unchanged; other character
+/// devices and camera aliases require the opt-in even under another name.
+///
+/// # Panics
+/// Under `cfg(test)`, when the calling thread installed no roots at all, or
+/// installed a fixture and then probed a `/dev/video*`, `/dev/media*` or
+/// `/dev/v4l-subdev*` path anyway.
+pub(crate) fn check_probe(device: &str) {
+    #[cfg(test)]
+    {
+        let roots = installed();
+        if roots.is_host {
+            return;
+        }
+        if names_host_camera_node(device, &roots.dev) {
+            panic!(
+                "irlume-camera unit test probed {device}, a host camera node, under fixture \
+                 roots; point the test at hostfs::test fixture paths, or install \
+                 hostfs::test::host() for the ignored hardware lanes"
+            );
+        }
+    }
+    #[cfg(not(test))]
+    let _ = device;
+}
+
+/// The V4L open boundary, guarded in unit-test builds.
+pub(crate) fn open_video(device: &str) -> std::io::Result<v4l::Device> {
+    check_probe(device);
+    v4l::Device::with_path(device)
+}
+
+/// Whether `device` names or resolves to host hardware, including an alias
+/// under a fixture root. This reads metadata and links, never a device.
+#[cfg(test)]
+fn names_host_camera_node(device: &str, fixture_dev: &std::path::Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    let resolved_fixture = std::fs::canonicalize(fixture_dev).ok();
+    let inside_fixture = |path: &std::path::Path| {
+        path.starts_with(fixture_dev)
+            || resolved_fixture
+                .as_ref()
+                .is_some_and(|root| path.starts_with(root))
+    };
+    let mut path = PathBuf::from(device);
+    // Resolve aliases before any open. Walking a dangling final symlink also
+    // catches fixture mistakes on camera-less CI hosts. Cycles fail closed.
+    for _ in 0..40 {
+        if !inside_fixture(&path) && names_host_camera_path(&path) {
+            return true;
+        }
+        if let Ok(resolved) = std::fs::canonicalize(&path) {
+            return (!inside_fixture(&resolved) && names_host_camera_path(&resolved))
+                || (resolved != std::path::Path::new("/dev/null")
+                    && std::fs::metadata(&resolved)
+                        .is_ok_and(|meta| meta.file_type().is_char_device()));
+        }
+        match std::fs::read_link(&path) {
+            Ok(target) => {
+                path = path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join(target);
+            }
+            Err(error) => {
+                return !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                );
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+fn names_host_camera_path(path: &std::path::Path) -> bool {
+    path.starts_with("/dev/v4l")
+        || path
+            .starts_with("/dev/")
+            .then(|| path.file_name())
+            .flatten()
+            .is_some_and(|name| {
+                name.to_str().is_some_and(|name| {
+                    name.starts_with("video")
+                        || name.starts_with("media")
+                        || name.starts_with("v4l-subdev")
+                })
+            })
+}
+
+/// The test-side installers. [`fixture_with`] builds a tree,
+/// [`empty_fixture`] is the camera-less machine, and [`host`] is the
+/// explicit real-machine opt-in for the ignored hardware lanes; the readers
+/// above refuse everything until one of them ran on this thread.
+#[cfg(test)]
+pub(crate) mod test {
+    use super::HostRoots;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::path::{Path, PathBuf};
+
+    /// A live fixture install. While alive, this thread's hostfs readers
+    /// resolve the fixture's `dev` and `sys` trees; dropping it restores the
+    /// previous roots and removes the tree.
+    pub(crate) struct FixtureGuard {
+        directory: PathBuf,
+        roots: HostRoots,
+        previous: Option<HostRoots>,
+    }
+
+    impl FixtureGuard {
+        /// The fixture `/dev`, for building node paths under it.
+        pub(crate) fn dev(&self) -> &Path {
+            &self.roots.dev
+        }
+
+        /// The fixture `/sys`, for building class, bus or device trees
+        /// under it.
+        pub(crate) fn sys(&self) -> &Path {
+            &self.roots.sys
+        }
+    }
+
+    impl Drop for FixtureGuard {
+        fn drop(&mut self) {
+            super::ROOTS.with(|roots| *roots.borrow_mut() = self.previous.take());
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    /// A fresh fixture tree with `populate` given its empty `dev` and `sys`
+    /// roots.
+    pub(crate) fn fixture_with(populate: impl FnOnce(&Path, &Path)) -> FixtureGuard {
+        let dir = private_directory();
+        let dev = dir.join("dev");
+        let sys = dir.join("sys");
+        let guard = install(
+            HostRoots {
+                dev,
+                sys,
+                is_host: false,
+            },
+            dir,
+        );
+        std::fs::create_dir(guard.dev()).expect("create the fixture dev root");
+        std::fs::create_dir(guard.sys()).expect("create the fixture sysfs root");
+        populate(guard.dev(), guard.sys());
+        guard
+    }
+
+    fn private_directory() -> PathBuf {
+        for _ in 0..64 {
+            let dir = std::env::temp_dir().join(format!(
+                "irlume-hostfs-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            match create_private_directory(&dir) {
+                Ok(()) => return dir,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create private fixture root: {error}"),
+            }
+        }
+        panic!("could not allocate a fresh fixture root")
+    }
+
+    pub(super) fn create_private_directory(path: &Path) -> std::io::Result<()> {
+        // Atomic mkdir: an existing directory or symlink is never accepted.
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+
+    /// The machine with no camera: an empty `/dev` and an empty `/sys`.
+    pub(crate) fn empty_fixture() -> FixtureGuard {
+        fixture_with(|_, _| {})
+    }
+
+    /// The explicit opt-in to the real machine, for the `#[ignore]`d lanes
+    /// whose subject is real hardware (v4l2loopback, UVC acceptance), either
+    /// through the loopback helpers `loopback_pair` and `spare_device` or
+    /// directly at the top of the test. The one non-ignored caller is this
+    /// module's self-test of the opt-in, which reads no host tree. Sticky
+    /// for the thread on purpose: those tests are the last thing their
+    /// thread runs, and the host roots own nothing to clean up.
+    pub(crate) fn host() {
+        install_sticky(HostRoots {
+            dev: PathBuf::from("/dev"),
+            sys: PathBuf::from("/sys"),
+            is_host: true,
+        });
+    }
+
+    fn install(roots: HostRoots, directory: PathBuf) -> FixtureGuard {
+        let previous = super::ROOTS.with(|slot| slot.borrow_mut().replace(roots.clone()));
+        FixtureGuard {
+            directory,
+            roots,
+            previous,
+        }
+    }
+
+    /// The roots this thread installed, for a thread it spawns to adopt.
+    pub(crate) fn current() -> Option<HostRoots> {
+        super::ROOTS.with(|slot| slot.borrow().clone())
+    }
+
+    /// Install `roots`, taken from the spawning thread ([`current`]), on
+    /// this thread for its lifetime; `None` leaves the refusal.
+    pub(crate) fn adopt(roots: Option<HostRoots>) {
+        if let Some(roots) = roots {
+            install_sticky(roots);
+        }
+    }
+
+    fn install_sticky(roots: HostRoots) {
+        super::ROOTS.with(|slot| *slot.borrow_mut() = Some(roots));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::catch_unwind;
+
+    /// The panic text of a refused call, for asserting the guard names the
+    /// seam a failing test must use.
+    fn refusal_of<R>(call: impl FnOnce() -> R + std::panic::UnwindSafe) -> String {
+        catch_unwind(call)
+            .err()
+            .and_then(|payload| {
+                payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            })
+            .unwrap_or_default()
+    }
+
+    /// The regression guard this module exists for: with nothing installed,
+    /// every host-tree reader refuses rather than reading the machine the
+    /// test happens to run on. A test that reaches one of these without
+    /// installing roots fails here, on every machine, instead of opening a
+    /// developer's cameras (CI has none, so before this seam such a test
+    /// passed there by accident).
+    #[test]
+    fn root_readers_refuse_the_host_until_a_test_chooses_roots() {
+        for refused in [
+            refusal_of(dev_root),
+            refusal_of(sys_root),
+            refusal_of(video_class_root),
+            refusal_of(usb_devices_root),
+            refusal_of(pci_devices_root),
+            refusal_of(sys_dev_char_root),
+            refusal_of(|| {
+                let _ = crate::video_node_paths();
+            }),
+        ] {
+            assert!(
+                refused.contains("without installing roots") && refused.contains("hostfs::test"),
+                "the refusal must name the seam and the fix: {refused}"
+            );
+        }
+    }
+
+    /// An installed fixture is what every reader sees, and dropping the guard
+    /// brings the refusal back, so one test's roots cannot leak into the next
+    /// test on a reused thread.
+    #[test]
+    fn a_fixture_redirects_the_readers_and_its_drop_restores_the_refusal() {
+        let guard = test::fixture_with(|dev, sys| {
+            std::fs::write(dev.join("video0"), b"").unwrap();
+            std::fs::create_dir_all(sys.join("class/video4linux")).unwrap();
+        });
+        assert!(dev_root().starts_with(guard.dev()));
+        assert_eq!(video_class_root(), guard.sys().join("class/video4linux"));
+        assert_eq!(
+            crate::video_node_paths().paths,
+            [guard.dev().join("video0").to_string_lossy().into_owned()]
+        );
+        drop(guard);
+        assert!(
+            refusal_of(video_class_root).contains("without installing roots"),
+            "a dropped fixture must leave the refusal behind"
+        );
+    }
+
+    /// Under a fixture, probing a node under the fixture (or a non-camera
+    /// node like /dev/null) is fine, but a probe naming the host's
+    /// `/dev/video*`, `/dev/media*` or `/dev/v4l-subdev*` refuses: that is
+    /// the touch of real hardware this seam exists to prevent. Only the
+    /// explicit host opt-in lifts it. Apart from the `test::host` call at
+    /// the end of this test, which probes nothing but the gate, every call
+    /// to it sits in an `#[ignore]`d hardware-lane test or in a helper only
+    /// those tests use.
+    #[test]
+    fn a_class_entry_stays_under_the_class_root_for_a_node_with_a_leading_slash() {
+        let _fixture = test::empty_fixture();
+        let class = super::video_class_root();
+        assert_eq!(super::video_class_entry("video0"), class.join("video0"));
+        assert_eq!(super::video_class_entry("/video0"), class.join("video0"));
+        assert_eq!(
+            super::video_class_entry("/run/cam0"),
+            class.join("run/cam0")
+        );
+    }
+
+    #[test]
+    fn a_spawned_thread_adopts_the_roots_of_the_thread_that_spawned_it() {
+        let fixture = test::empty_fixture();
+        let dev = std::thread::spawn(inherit(super::dev_root))
+            .join()
+            .expect("the adopting thread must see the fixture");
+        assert_eq!(dev, fixture.dev());
+    }
+
+    #[test]
+    fn alias_probes_cannot_leave_the_fixture_for_a_host_camera() {
+        let fixture = test::empty_fixture();
+        for (name, target) in [
+            ("camera", "/dev/video99999"),
+            ("media", "/dev/media99999"),
+            ("persistent", "/dev/v4l/by-id/usb-fixture-video-index0"),
+            ("chained", "camera"),
+            ("cycle", "cycle"),
+        ] {
+            let alias = fixture.dev().join(name);
+            std::os::unix::fs::symlink(target, &alias).unwrap();
+            assert!(
+                refusal_of(|| check_probe(alias.to_str().unwrap())).contains("host camera node")
+            );
+        }
+        let file = fixture.dev().join("video0");
+        std::fs::write(&file, b"").unwrap();
+        let alias = fixture.dev().join("safe-alias");
+        std::os::unix::fs::symlink("video0", &alias).unwrap();
+        check_probe(alias.to_str().unwrap());
+        check_probe("/dev/null");
+        assert!(
+            refusal_of(|| check_probe("/dev/v4l/by-path/pci-fixture-video-index0"))
+                .contains("host camera node")
+        );
+    }
+
+    #[test]
+    fn populated_fixture_nodes_resolve_identity_and_pinning_from_their_class_entry() {
+        let _env = crate::testenv::ENV_LOCK.lock().unwrap();
+        let fixture = test::fixture_with(|dev, sys| {
+            let usb = sys.join("devices/pci0000:00/usb1/1-2");
+            let interface = usb.join("1-2:1.0");
+            let class = sys.join("class/video4linux/video0");
+            std::fs::create_dir_all(&interface).unwrap();
+            std::fs::create_dir_all(&class).unwrap();
+            std::fs::write(dev.join("video0"), b"").unwrap();
+            for (attr, value) in [
+                ("idVendor", "1234"),
+                ("idProduct", "5678"),
+                ("serial", "fixture"),
+                ("removable", "fixed"),
+            ] {
+                std::fs::write(usb.join(attr), value).unwrap();
+            }
+            std::os::unix::fs::symlink(interface, class.join("device")).unwrap();
+        });
+        let paths = crate::video_node_paths().paths;
+        assert_eq!(paths.len(), 1);
+        let node = &paths[0];
+        assert_eq!(
+            crate::device_identity(node).as_deref(),
+            Some("1234:5678:fixture")
+        );
+        assert_eq!(
+            crate::physical_device_id(node),
+            Some(fixture.sys().join("devices/pci0000:00/usb1/1-2"))
+        );
+        assert_eq!(crate::present_device_identities(), ["1234:5678:fixture"]);
+        crate::verify_pinned(node).unwrap();
+        // Regular fixture files have no kernel device number. The walk must
+        // stay in the fixture rather than borrow the host's /dev/video0.
+        assert!(crate::connected_camera_locations().is_empty());
+    }
+
+    #[test]
+    fn fixture_allocation_refuses_existing_paths_and_cleans_up_its_private_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = test::empty_fixture();
+        let directory = fixture.dev().parent().unwrap().to_path_buf();
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            test::create_private_directory(&directory)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        let alias = fixture.dev().join("preexisting");
+        std::os::unix::fs::symlink(fixture.sys(), &alias).unwrap();
+        assert_eq!(
+            test::create_private_directory(&alias).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        drop(fixture);
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn direct_diagnostics_refuse_host_paths_before_open_or_lease() {
+        let _fixture = test::empty_fixture();
+        assert!(refusal_of(|| crate::rgb_node_formats("/dev/video0")).contains("host camera node"));
+        assert!(
+            refusal_of(|| crate::ir_emitter::microsoft_xu_report("/dev/video0"))
+                .contains("host camera node")
+        );
+        assert!(refusal_of(|| open_video("/dev/video0")).contains("host camera node"));
+    }
+
+    #[test]
+    fn probes_of_host_camera_nodes_need_the_explicit_host_opt_in() {
+        let guard = test::empty_fixture();
+        check_probe(&guard.dev().join("video0").to_string_lossy());
+        check_probe("/dev/null");
+        for host_node in ["/dev/video0", "/dev/media1", "/dev/v4l-subdev3"] {
+            let refused = refusal_of(move || check_probe(host_node));
+            assert!(
+                refused.contains("host camera node"),
+                "probing {host_node} must be refused under a fixture: {refused}"
+            );
+        }
+        drop(guard);
+        let refused = refusal_of(|| check_probe("/dev/null"));
+        assert!(
+            refused.contains("without installing roots"),
+            "a probe with no roots at all must refuse: {refused}"
+        );
+        // The explicit opt-in, and nothing else, allows the host's camera
+        // nodes. Sticky by design: it belongs to the ignored hardware lanes.
+        test::host();
+        check_probe("/dev/video0");
+        check_probe("/dev/media1");
+    }
+}

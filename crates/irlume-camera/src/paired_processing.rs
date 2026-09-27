@@ -134,8 +134,12 @@ pub(super) fn process_with_pair_drains<T>(
         // Declare before spawning: a failed second spawn must not strand the
         // first worker while the scope waits for it to terminate.
         let completion = Finished(&finished);
-        let rgb = scope.spawn(|| drain_until_finished(&finished, rgb_drain));
-        let ir = scope.spawn(|| drain_until_finished(&finished, ir_drain));
+        let rgb = scope.spawn(crate::hostfs::inherit(|| {
+            drain_until_finished(&finished, rgb_drain)
+        }));
+        let ir = scope.spawn(crate::hostfs::inherit(|| {
+            drain_until_finished(&finished, ir_drain)
+        }));
         let processed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(process));
         drop(completion);
         let rgb = rgb.join();

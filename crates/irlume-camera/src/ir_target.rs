@@ -27,6 +27,7 @@ struct HostDevices;
 
 impl DeviceAccess for HostDevices {
     fn resolve_endpoint(&self, path: &str) -> Result<ResolvedEndpoint, IrTargetError> {
+        crate::hostfs::check_probe(path);
         let resolved = std::fs::canonicalize(path).map_err(|_| {
             IrTargetError::InvalidEndpoint(format!("configured endpoint {path} is missing"))
         })?;
@@ -46,7 +47,10 @@ impl DeviceAccess for HostDevices {
     }
 
     fn endpoint_for_node(&self, node: &str) -> String {
-        format!("/dev/{node}")
+        crate::hostfs::dev_root()
+            .join(node.trim_start_matches('/'))
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -132,7 +136,7 @@ impl IrCaptureTarget {
     /// # Errors
     /// Returns the concrete configuration, identity, topology, or change refusal.
     pub fn validate(&self) -> Result<(), IrTargetError> {
-        self.validate_in(Path::new("/sys/class/video4linux"))
+        self.validate_in(&crate::hostfs::video_class_root())
     }
 
     /// Revalidate the target before routing its image open through an existing
@@ -248,7 +252,7 @@ fn finish_capture<R, S>(
 pub fn configured_ir_target() -> Result<IrCaptureTarget, IrTargetError> {
     resolve_configured_pair_with(
         crate::configured_pair_no_probe(),
-        Path::new("/sys/class/video4linux"),
+        &crate::hostfs::video_class_root(),
         &HostDevices,
     )
 }
@@ -1102,6 +1106,10 @@ mod tests {
             atomic::{AtomicBool, Ordering},
             Arc,
         };
+        // The nested privacy probe runs through the host-root seam; the
+        // fixture path it is given is not a camera node and must not reach
+        // for the host's trees either.
+        let _roots = crate::hostfs::test::empty_fixture();
         crate::backend::tests::with_test_camera_operation(MISSING_IR, |operation| {
             let reused = Arc::new(AtomicBool::new(false));
             let observed = reused.clone();

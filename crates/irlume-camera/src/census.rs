@@ -326,7 +326,7 @@ fn facts_for(
         let node_name = std::path::Path::new(path)
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| std::path::Path::new("/sys/class/video4linux").join(n));
+            .map(|n| crate::hostfs::video_class_root().join(n));
         // A driver symlink on the class entry names the driver directly.
         let driver_link = node_name
             .as_deref()
@@ -346,7 +346,9 @@ fn facts_for(
         let virtual_by_path = node_name
             .as_deref()
             .and_then(|dir| std::fs::canonicalize(dir).ok())
-            .is_some_and(|resolved| resolved.starts_with("/sys/devices/virtual/"));
+            .is_some_and(|resolved| {
+                resolved.starts_with(crate::hostfs::sys_root().join("devices/virtual"))
+            });
         if virtual_by_path {
             return ("virtual-device".into(), false);
         }
@@ -389,7 +391,7 @@ fn machine_entries() -> Vec<CensusEntry> {
 /// USB camera-class devices with no driver bound, as `(vid:pid, sysfs name)`.
 #[must_use]
 pub fn unbound_camera_class() -> Vec<(String, String)> {
-    unbound_camera_class_in(Path::new("/sys/bus/usb/devices"))
+    unbound_camera_class_in(&crate::hostfs::usb_devices_root())
 }
 
 /// [`unbound_camera_class`] with the sysfs devices root passed in, so a
@@ -614,6 +616,24 @@ mod tests {
             privacy: Some(false),
             paired: true,
         }
+    }
+
+    #[test]
+    fn a_fixture_virtual_node_without_a_driver_link_is_a_dummy_node() {
+        let _env = crate::testenv::env_lock();
+        let fixture = crate::hostfs::test::fixture_with(|dev, sys| {
+            let target = sys.join("devices/virtual/video4linux/video0");
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::create_dir_all(sys.join("class/video4linux")).unwrap();
+            std::os::unix::fs::symlink(target, sys.join("class/video4linux/video0")).unwrap();
+            std::fs::write(dev.join("video0"), b"").unwrap();
+        });
+        let path = fixture.dev().join("video0").to_string_lossy().into_owned();
+        let facts = facts_for(&path, Role::Rgb, &Default::default());
+        assert_eq!(facts.driver, "virtual-device");
+        let entry = node_entry_from_facts(&facts);
+        assert_eq!(entry.class, CensusClass::DummyNode);
+        assert!(matches!(entry.verdict, CensusVerdict::NotHardware(_)));
     }
 
     #[test]
@@ -956,29 +976,41 @@ mod tests {
 
     #[test]
     fn node_rows_render_in_numeric_order_across_buckets() {
+        // The facts walk behind census_from probes the paths a scan carries,
+        // so the scan names nodes under the fixture /dev, never the host's:
+        // on a machine with cameras the host nodes would be opened for real.
+        let roots = crate::hostfs::test::empty_fixture();
+        let dev = roots.dev();
         let scan = crate::NodeScan {
-            other: vec!["/dev/video1".into()],
+            other: vec![dev.join("video1").to_string_lossy().into_owned()],
             classified: vec![
-                ("/dev/video10".into(), Role::Rgb),
-                ("/dev/video2".into(), Role::Ir),
+                (
+                    dev.join("video10").to_string_lossy().into_owned(),
+                    Role::Rgb,
+                ),
+                (dev.join("video2").to_string_lossy().into_owned(), Role::Ir),
             ],
             unreadable: Vec::new(),
             mc_centric: Vec::new(),
             listing_error: None,
         };
+        let want: Vec<String> = ["video1", "video2", "video10"]
+            .into_iter()
+            .map(|node| dev.join(node).to_string_lossy().into_owned())
+            .collect();
         let nodes: Vec<String> = census_from(&scan)
             .into_iter()
             .filter_map(|entry| entry.node)
             .collect();
         assert_eq!(
-            nodes,
-            vec!["/dev/video1", "/dev/video2", "/dev/video10"],
+            nodes, want,
             "numeric order, double digits after single, buckets interleaved"
         );
     }
 
     #[test]
     fn census_from_covers_every_bucket_of_a_scan_exactly_once() {
+        let _roots = crate::hostfs::test::empty_fixture();
         let scan = crate::NodeScan {
             other: vec!["/dev/fixture-meta".into()],
             classified: vec![

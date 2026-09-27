@@ -665,6 +665,7 @@ impl IlluminationLog {
     }
 
     fn open_node(ir_device: &str, node: &str) -> Result<Self, String> {
+        crate::hostfs::check_probe(node);
         // SAFETY: a NUL-terminated path built directly below.
         let path = std::ffi::CString::new(node.as_bytes())
             .map_err(|_| "metadata node path contains NUL".to_string())?;
@@ -1210,10 +1211,10 @@ pub(crate) fn metadata_node_for(ir_device: &str) -> Option<String> {
         irlume_common::dlog!("{ir_device}: illumination metadata disabled (IRLUME_NO_ILLUM_META)");
         return None;
     }
-    let sysfs = std::path::Path::new("/sys/class/video4linux");
+    let sysfs = crate::hostfs::video_class_root();
     let found = pick_metadata_sibling(
         ir_device,
-        siblings_on_same_interface(ir_device, sysfs),
+        siblings_on_same_interface(ir_device, &sysfs, &crate::hostfs::dev_root()),
         offers_uvcm,
     );
     if found.is_none() {
@@ -1283,7 +1284,11 @@ fn pick_metadata_sibling(
 /// machine with a loopback device present — measured on a box where a real
 /// camera's metadata node existed and was never found because dummy nodes were
 /// enumerated first.
-fn siblings_on_same_interface(video_device: &str, sysfs: &std::path::Path) -> Vec<String> {
+fn siblings_on_same_interface(
+    video_device: &str,
+    sysfs: &std::path::Path,
+    dev: &std::path::Path,
+) -> Vec<String> {
     let Some(name) = std::path::Path::new(video_device).file_name() else {
         return Vec::new();
     };
@@ -1305,7 +1310,11 @@ fn siblings_on_same_interface(video_device: &str, sysfs: &std::path::Path) -> Ve
         if interface != want {
             continue;
         }
-        if let Some(node) = entry.file_name().to_str().map(|n| format!("/dev/{n}")) {
+        if let Some(node) = entry
+            .file_name()
+            .to_str()
+            .map(|n| dev.join(n).to_string_lossy().into_owned())
+        {
             candidates.push(node);
         }
     }
@@ -1340,6 +1349,7 @@ pub(crate) fn node_number(node: &str) -> u32 {
 /// format it does not support instead of refusing it, so the only reliable
 /// question is whether the value sticks.
 fn offers_uvcm(node: &str) -> bool {
+    crate::hostfs::check_probe(node);
     let Ok(path) = std::ffi::CString::new(node.as_bytes()) else {
         return false;
     };
@@ -1414,6 +1424,9 @@ mod tests {
 
     #[test]
     fn explicit_absence_and_exact_failure_never_fall_back_to_discovery() {
+        let _env = crate::testenv::env_lock();
+        let fixture = crate::hostfs::test::empty_fixture();
+        let missing = fixture.dev().join("missing-metadata");
         assert!(IlluminationLog::open_selected(
             "/dev/a-configured-ir-node",
             MetadataSelection::Absent
@@ -1422,7 +1435,7 @@ mod tests {
         .is_none());
         let error = IlluminationLog::open_selected(
             "/dev/a-configured-ir-node",
-            MetadataSelection::Exact("/definitely/missing/metadata"),
+            MetadataSelection::Exact(missing.to_str().unwrap()),
         )
         .err()
         .expect("required exact metadata must fail");
@@ -2191,8 +2204,12 @@ mod tests {
                 ("video10", None),
             ],
         );
-        let found = siblings_on_same_interface("/dev/video2", &root.join("class"));
-        assert_eq!(found, vec!["/dev/video3".to_string()]);
+        let found =
+            siblings_on_same_interface("/dev/video2", &root.join("class"), &root.join("dev"));
+        assert_eq!(
+            found,
+            vec![root.join("dev/video3").to_string_lossy().into_owned()]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2210,13 +2227,14 @@ mod tests {
                 ("video9", Some("1-1:1.0")),
             ],
         );
-        let found = siblings_on_same_interface("/dev/video4", &root.join("class"));
+        let found =
+            siblings_on_same_interface("/dev/video4", &root.join("class"), &root.join("dev"));
         assert_eq!(
             found,
             vec![
-                "/dev/video2".to_string(),
-                "/dev/video9".to_string(),
-                "/dev/video10".to_string(),
+                root.join("dev/video2").to_string_lossy().into_owned(),
+                root.join("dev/video9").to_string_lossy().into_owned(),
+                root.join("dev/video10").to_string_lossy().into_owned(),
             ]
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -2244,16 +2262,56 @@ mod tests {
                 ("video3", Some("3-5:1.2")),
             ],
         );
-        let found = siblings_on_same_interface("/dev/video2", &root.join("class"));
-        assert_eq!(found, vec!["/dev/video3".to_string()]);
+        let found =
+            siblings_on_same_interface("/dev/video2", &root.join("class"), &root.join("dev"));
+        assert_eq!(
+            found,
+            vec![root.join("dev/video3").to_string_lossy().into_owned()]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn a_device_that_is_not_in_sysfs_yields_no_siblings() {
         let root = fake_sysfs("missing", &[("video0", Some("3-5:1.0"))]);
-        assert!(siblings_on_same_interface("/dev/video99", &root.join("class")).is_empty());
+        assert!(
+            siblings_on_same_interface("/dev/video99", &root.join("class"), &root.join("dev"))
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn metadata_candidates_and_opens_stay_inside_the_installed_fixture() {
+        let _env = crate::testenv::env_lock();
+        let _enabled = crate::testenv::EnvGuard::set("IRLUME_NO_ILLUM_META", "0");
+        let fixture = crate::hostfs::test::fixture_with(|dev, sys| {
+            let interface = sys.join("devices/fixture-interface");
+            std::fs::create_dir_all(&interface).unwrap();
+            for name in ["video2", "video3"] {
+                let class = sys.join("class/video4linux").join(name);
+                std::fs::create_dir_all(&class).unwrap();
+                std::os::unix::fs::symlink(&interface, class.join("device")).unwrap();
+                std::fs::write(dev.join(name), b"").unwrap();
+            }
+        });
+        let image = fixture.dev().join("video2").to_string_lossy().into_owned();
+        let metadata = fixture.dev().join("video3").to_string_lossy().into_owned();
+        assert_eq!(
+            siblings_on_same_interface(
+                &image,
+                &crate::hostfs::video_class_root(),
+                &crate::hostfs::dev_root()
+            ),
+            [metadata]
+        );
+        // The fixture regular file cannot answer UVCM, but the real open path
+        // reaches it without falling back to a host video node.
+        assert_eq!(metadata_node_for(&image), None);
+        assert!(std::panic::catch_unwind(|| offers_uvcm("/dev/video3")).is_err());
+        assert!(
+            std::panic::catch_unwind(|| IlluminationLog::open_node(&image, "/dev/video3")).is_err()
+        );
     }
 
     #[test]

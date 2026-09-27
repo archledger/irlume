@@ -1654,7 +1654,7 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
 /// are recorded in the report, not errors: a control that will not answer a
 /// read would certainly not survive a write.
 pub fn microsoft_xu_report(device: &str) -> irlume_common::Result<String> {
-    let dev = v4l::Device::with_path(device).map_err(|e| crate::map_io(device, e))?;
+    let dev = crate::hostfs::open_video(device).map_err(|e| crate::map_io(device, e))?;
     let fd = dev.handle().fd();
     let id = crate::uvc_descriptor::identity_from_fd(fd)
         .map_err(|e| crate::Error::Hardware(format!("{device}: identity: {e}")))?;
@@ -10308,6 +10308,7 @@ mod tests {
     fn enable_honors_off_env_and_config_precedence() {
         const DEV: &str = "/dev/irlume-test-missing";
         let _g = env_guard();
+        let _roots = crate::hostfs::test::empty_fixture();
         let dir = std::env::temp_dir().join(format!("irlume-emitter-en-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -10721,6 +10722,7 @@ mod tests {
     #[test]
     fn a_camera_that_will_not_answer_is_not_written_to() {
         let _g = env_guard();
+        let _roots = crate::hostfs::test::empty_fixture();
         let asus = identity(0x3277, 0x0059);
         let f = non_uvc_fd();
         use std::os::fd::AsRawFd;
@@ -10756,6 +10758,7 @@ mod tests {
         use std::sync::atomic::Ordering::SeqCst;
 
         let _g = env_guard();
+        let _roots = crate::hostfs::test::empty_fixture();
         let h = non_uvc_handle();
         std::env::set_var("IRLUME_IR_EMITTER", "14:6:1,3,2,0,0,0,0,0,0");
         let before = writes_attempted().load(SeqCst);

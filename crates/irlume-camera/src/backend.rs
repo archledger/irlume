@@ -960,6 +960,11 @@ pub(crate) mod tests {
 
     #[test]
     fn default_supervisor_is_process_wide_and_uses_exact_uvc_delegates() {
+        // Initializing the default supervisor runs the lifecycle monitor's
+        // initial sysfs snapshot on this thread; the camera-less fixture is
+        // the machine that snapshot sees, so the test does not read the
+        // host's video4linux class (and does not open its /dev/media* nodes).
+        let _roots = crate::hostfs::test::empty_fixture();
         assert!(std::ptr::eq(
             default_camera_supervisor(),
             default_camera_supervisor()

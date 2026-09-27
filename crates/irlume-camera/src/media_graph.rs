@@ -205,7 +205,8 @@ pub(crate) fn node_is_capture_in(
 pub(crate) fn node_is_capture(video_device: &str) -> Option<bool> {
     let node = Path::new(video_device).file_name()?.to_str()?;
     // "81:2" from sysfs; no /dev stat, no open.
-    let devno = std::fs::read_to_string(format!("/sys/class/video4linux/{node}/dev")).ok()?;
+    let devno =
+        std::fs::read_to_string(crate::hostfs::video_class_root().join(node).join("dev")).ok()?;
     let (major, minor) = devno.trim().split_once(':')?;
     let (major, minor) = (major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?);
 
@@ -220,10 +221,9 @@ pub(crate) fn node_is_capture(video_device: &str) -> Option<bool> {
         name.starts_with("media").then(|| name.to_string())
     })?;
 
-    let media = std::fs::OpenOptions::new()
-        .read(true)
-        .open(format!("/dev/{media_name}"))
-        .ok()?;
+    let media = crate::hostfs::dev_root().join(&media_name);
+    crate::hostfs::check_probe(&media.to_string_lossy());
+    let media = std::fs::OpenOptions::new().read(true).open(&media).ok()?;
     let (interfaces, links, pads) = read_topology(media.as_raw_fd())?;
     node_is_capture_in(&interfaces, &links, &pads, major, minor)
 }

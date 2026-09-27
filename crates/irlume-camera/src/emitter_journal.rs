@@ -1672,6 +1672,7 @@ mod tests {
         use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
+        crate::hostfs::test::host();
         let _env = env_lock();
         let device_path = std::env::var("IRLUME_TEST_EMITTER_LOCK_DEVICE").expect(
             "IRLUME_TEST_EMITTER_LOCK_DEVICE is unset; running an ignored test requests the harness",

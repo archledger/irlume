@@ -382,7 +382,7 @@ pub(crate) fn identity_and_connection_from_fd(
     let (iface_dir, dev_dir) = fd_usb_dirs(fd)?;
     Ok(FdCameraContext {
         identity: identity_from_dirs(&iface_dir, &dev_dir)?,
-        connection: connection_facts_from_dirs(&dev_dir, &iface_dir, Path::new("/sys"))?,
+        connection: connection_facts_from_dirs(&dev_dir, &iface_dir, &crate::hostfs::sys_root())?,
     })
 }
 
@@ -407,7 +407,7 @@ pub(crate) fn identity_and_connection_for_budget_hint(
         usb_dirs_for_numbers(libc::major(metadata.rdev()), libc::minor(metadata.rdev()))?;
     Ok((
         identity_from_dirs(&iface_dir, &dev_dir)?,
-        connection_facts_from_dirs(&dev_dir, &iface_dir, Path::new("/sys"))?,
+        connection_facts_from_dirs(&dev_dir, &iface_dir, &crate::hostfs::sys_root())?,
     ))
 }
 
@@ -430,7 +430,8 @@ pub(crate) fn identity_for_location(path: &str) -> std::io::Result<CameraIdentit
 }
 
 fn usb_dirs_for_numbers(major: u32, minor: u32) -> std::io::Result<(PathBuf, PathBuf)> {
-    let node = std::fs::canonicalize(format!("/sys/dev/char/{major}:{minor}"))?;
+    let node =
+        std::fs::canonicalize(crate::hostfs::sys_dev_char_root().join(format!("{major}:{minor}")))?;
 
     let iface_dir = ancestor_with(&node, "bInterfaceNumber").ok_or_else(|| {
         bad(format!(
@@ -476,7 +477,7 @@ fn identity_from_dirs_with(
         // says `/devices/pci0000:00/...`. A hardware run is what showed it: the
         // record on disk did not match the path printed beside it.
         usb_devpath: dev_dir
-            .strip_prefix("/sys")
+            .strip_prefix(crate::hostfs::sys_root())
             .map(|p| std::path::Path::new("/").join(p))
             .unwrap_or_else(|_| dev_dir.to_path_buf())
             .to_string_lossy()
@@ -757,11 +758,7 @@ pub(crate) fn interface_dir(video_device: &str) -> std::io::Result<PathBuf> {
     let node = Path::new(video_device)
         .file_name()
         .ok_or_else(|| bad(format!("{video_device} is not a device node path")))?;
-    std::fs::canonicalize(
-        PathBuf::from("/sys/class/video4linux")
-            .join(node)
-            .join("device"),
-    )
+    std::fs::canonicalize(crate::hostfs::video_class_root().join(node).join("device"))
 }
 
 /// Walk up to the USB device directory, the one carrying `descriptors`.
@@ -792,7 +789,33 @@ mod tests {
 
     #[test]
     fn budget_hint_metadata_rejects_non_usb_paths_without_opening_them() {
-        assert!(super::identity_and_connection_for_budget_hint("/dev/null").is_err());
+        use std::os::unix::fs::{symlink, MetadataExt};
+
+        // /dev/null is a character device, so the refusal must come from the
+        // sysfs walk. The fixture lists it the way every kernel does: its
+        // /sys/dev/char entry resolves to /sys/devices/virtual/mem/null,
+        // which has no USB interface above it, so the lookup reaches the
+        // ancestor walk and is refused there rather than at a missing entry.
+        let rdev = std::fs::metadata("/dev/null").unwrap().rdev();
+        let char_entry = format!("{}:{}", libc::major(rdev), libc::minor(rdev));
+        let roots = crate::hostfs::test::fixture_with(|_, sys| {
+            std::fs::create_dir_all(sys.join("devices/virtual/mem/null")).unwrap();
+            std::fs::create_dir_all(sys.join("dev/char")).unwrap();
+            symlink(
+                "../../devices/virtual/mem/null",
+                sys.join("dev/char").join(&char_entry),
+            )
+            .unwrap();
+        });
+        let Err(refused) = super::identity_and_connection_for_budget_hint("/dev/null") else {
+            panic!("/dev/null must not yield a USB identity");
+        };
+        let refused = refused.to_string();
+        let null_node = roots.sys().join("devices/virtual/mem/null");
+        assert!(
+            refused.contains(&format!("no USB interface above {}", null_node.display())),
+            "/dev/null must be refused by the ancestor walk from its sysfs node: {refused}"
+        );
         assert!(
             super::identity_and_connection_for_budget_hint("/dev/irlume-missing-budget-hint")
                 .is_err()
@@ -921,10 +944,15 @@ mod tests {
         root: PathBuf,
         device: PathBuf,
         interface: PathBuf,
+        /// Identity collection resolves the sysfs root (the recorded devpath
+        /// is prefixed with it), so the fixture carries the host roots its
+        /// test thread reads: the empty camera-less trees, never the host's.
+        _roots: crate::hostfs::test::FixtureGuard,
     }
 
     impl UsbFixture {
         fn new(label: &str, configuration: u8, interface: u8, descriptors: &[u8]) -> Self {
+            let _roots = crate::hostfs::test::empty_fixture();
             let root =
                 std::env::temp_dir().join(format!("irlume-ms02-{label}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
@@ -948,6 +976,7 @@ mod tests {
                 root,
                 device,
                 interface: interface_path,
+                _roots,
             }
         }
 

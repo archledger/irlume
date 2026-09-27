@@ -3893,7 +3893,7 @@ fn removable_class(raw: Option<&str>) -> &'static str {
 /// prints `unknown` for many legitimate internal devices; honesty over guess).
 pub fn node_removable_class(device: &str) -> &'static str {
     let node = device.strip_prefix("/dev/").unwrap_or(device);
-    let link = hostfs::video_class_root().join(node).join("device");
+    let link = hostfs::video_class_entry(node).join("device");
     let Ok(real) = std::fs::canonicalize(&link) else {
         return "unknown";
     };
@@ -3939,8 +3939,8 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
         return Ok(());
     }
     let node = device.strip_prefix("/dev/").unwrap_or(device);
-    let real = std::fs::canonicalize(hostfs::video_class_root().join(node).join("device"))
-        .map_err(|_| {
+    let real =
+        std::fs::canonicalize(hostfs::video_class_entry(node).join("device")).map_err(|_| {
             Error::CameraUnavailable(format!(
                 "{device}: no physical device in sysfs (virtual camera?); refusing to authenticate"
             ))
@@ -4045,7 +4045,7 @@ pub(crate) fn usb_device_facts(dev_dir: &std::path::Path) -> Option<inventory::U
 /// lowercase). `None` if the node has no USB descriptors (e.g. a virtual cam).
 pub fn device_identity(device: &str) -> Option<String> {
     let node = device.strip_prefix("/dev/").unwrap_or(device);
-    let real = std::fs::canonicalize(hostfs::video_class_root().join(node).join("device")).ok()?;
+    let real = std::fs::canonicalize(hostfs::video_class_entry(node).join("device")).ok()?;
     let dev_dir = find_attr_dir(&real, "idVendor")?;
     let vidpid = read_vidpid(&dev_dir)?;
     let serial = std::fs::read_to_string(dev_dir.join("serial")).ok();
@@ -4073,7 +4073,7 @@ pub fn present_device_identities() -> Vec<String> {
 /// camera; two `/dev/videoN` nodes with the same id are the same camera.
 fn physical_device_id(device: &str) -> Option<std::path::PathBuf> {
     let node = device.strip_prefix("/dev/").unwrap_or(device);
-    let real = std::fs::canonicalize(hostfs::video_class_root().join(node).join("device")).ok()?;
+    let real = std::fs::canonicalize(hostfs::video_class_entry(node).join("device")).ok()?;
     find_attr_dir(&real, "idVendor")
 }
 
@@ -4401,7 +4401,7 @@ pub fn camera_display_name(dev_dir: &std::path::Path, node: &str) -> Option<Stri
     // ADR-0029: the node's sysfs name first (the driver-given name people
     // see elsewhere), then the USB product string.
     let node = node.strip_prefix("/dev/").unwrap_or(node);
-    std::fs::read_to_string(hostfs::video_class_root().join(node).join("name"))
+    std::fs::read_to_string(hostfs::video_class_entry(node).join("name"))
         .ok()
         .and_then(clean)
         .map(|name| collapse_repeated_name(&name))

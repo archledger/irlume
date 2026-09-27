@@ -18,10 +18,10 @@
 //!
 //! The roots are thread-local so parallel tests stay isolated: each test
 //! thread installs its own, and a thread that installs none gets the
-//! refusal. One background thread reads these roots too (the lifecycle
-//! monitor's initial snapshot, on the thread that spawned it); its quiet
-//! loop never polls the trees, so only the spawning test thread's install
-//! matters.
+//! refusal. The lifecycle monitor's worker thread reads them too (its
+//! rescans after a device event and its recovery), so under test it adopts
+//! the roots of the thread that spawned it ([`test::current`],
+//! [`test::adopt`]).
 
 use std::path::PathBuf;
 
@@ -81,6 +81,14 @@ pub(crate) fn sys_root() -> PathBuf {
 /// `/sys/class/video4linux`, where the kernel lists every video node.
 pub(crate) fn video_class_root() -> PathBuf {
     sys_root().join("class/video4linux")
+}
+
+/// The entry for video node `node` under [`video_class_root`], resolved as
+/// the readers' earlier `format!("/sys/class/video4linux/{node}")` did: a
+/// leading `/` (as in `/dev//video0` once `/dev/` is stripped) stays inside
+/// the class root, where `Path::join` would replace the root with it.
+pub(crate) fn video_class_entry(node: &str) -> PathBuf {
+    video_class_root().join(node.trim_start_matches('/'))
 }
 
 /// `/sys/bus/usb/devices`, the USB device and interface listing.
@@ -234,6 +242,19 @@ pub(crate) mod test {
         FixtureGuard { roots, previous }
     }
 
+    /// The roots this thread installed, for a thread it spawns to adopt.
+    pub(crate) fn current() -> Option<HostRoots> {
+        super::ROOTS.with(|slot| slot.borrow().clone())
+    }
+
+    /// Install `roots`, taken from the spawning thread ([`current`]), on
+    /// this thread for its lifetime; `None` leaves the refusal.
+    pub(crate) fn adopt(roots: Option<HostRoots>) {
+        if let Some(roots) = roots {
+            install_sticky(roots);
+        }
+    }
+
     fn install_sticky(roots: HostRoots) {
         super::ROOTS.with(|slot| *slot.borrow_mut() = Some(roots));
     }
@@ -314,6 +335,31 @@ mod tests {
     /// the end of this test, which probes nothing but the gate, every call
     /// to it sits in an `#[ignore]`d hardware-lane test or in a helper only
     /// those tests use.
+    #[test]
+    fn a_class_entry_stays_under_the_class_root_for_a_node_with_a_leading_slash() {
+        let _fixture = test::empty_fixture();
+        let class = super::video_class_root();
+        assert_eq!(super::video_class_entry("video0"), class.join("video0"));
+        assert_eq!(super::video_class_entry("/video0"), class.join("video0"));
+        assert_eq!(
+            super::video_class_entry("/run/cam0"),
+            class.join("run/cam0")
+        );
+    }
+
+    #[test]
+    fn a_spawned_thread_adopts_the_roots_of_the_thread_that_spawned_it() {
+        let fixture = test::empty_fixture();
+        let roots = test::current();
+        let dev = std::thread::spawn(move || {
+            test::adopt(roots);
+            super::dev_root()
+        })
+        .join()
+        .expect("the adopting thread must see the fixture");
+        assert_eq!(dev, fixture.dev());
+    }
+
     #[test]
     fn probes_of_host_camera_nodes_need_the_explicit_host_opt_in() {
         let guard = test::empty_fixture();

@@ -4154,7 +4154,19 @@ fn physical_device_id(device: &str) -> Option<std::path::PathBuf> {
 /// so a pin naming nodes on two devices cannot run an RGB and IR
 /// operation. Opens nothing.
 pub fn nodes_share_usb_device(first: &str, second: &str) -> Option<bool> {
-    Some(physical_device_id(first)? == physical_device_id(second)?)
+    nodes_share_usb_device_with(first, second, physical_device_id)
+}
+
+fn nodes_share_usb_device_with(
+    first: &str,
+    second: &str,
+    parent: impl Fn(&str) -> Option<std::path::PathBuf>,
+) -> Option<bool> {
+    // Stable by-id/by-path pins name aliases, not video4linux class entries.
+    // Resolve both names before asking which USB device owns the nodes.
+    let first = std::fs::canonicalize(first).ok()?;
+    let second = std::fs::canonicalize(second).ok()?;
+    Some(parent(first.to_str()?)? == parent(second.to_str()?)?)
 }
 
 /// The configured pair, using ONLY sources that never open a device: the
@@ -17605,6 +17617,42 @@ mod tests {
     /// the USB `product` string, then nothing; it is trimmed and bounded
     /// and never feeds identification. The fixture has no sysfs node, so
     /// the product fallback is what these cases exercise.
+    #[test]
+    fn stable_node_aliases_are_resolved_before_comparing_usb_parents() {
+        let root = std::env::temp_dir().join(format!(
+            "irlume-split-alias-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        for name in ["video0", "video1", "video2"] {
+            std::fs::write(root.join(name), b"").unwrap();
+        }
+        for (alias, target) in [
+            ("stable-rgb", "video0"),
+            ("stable-ir", "video2"),
+            ("same-camera", "video1"),
+        ] {
+            std::os::unix::fs::symlink(target, root.join(alias)).unwrap();
+        }
+        let parent = |path: &str| match std::path::Path::new(path).file_name()?.to_str()? {
+            "video0" | "video1" => Some(std::path::PathBuf::from("/devices/usb/first")),
+            "video2" => Some(std::path::PathBuf::from("/devices/usb/second")),
+            _ => None,
+        };
+        let compare = |other: &str| {
+            nodes_share_usb_device_with(
+                root.join("stable-rgb").to_str().unwrap(),
+                root.join(other).to_str().unwrap(),
+                parent,
+            )
+        };
+        assert_eq!(compare("stable-ir"), Some(false));
+        assert_eq!(compare("same-camera"), Some(true));
+        assert_eq!(compare("missing"), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn usb_port_chains_come_from_the_device_directory_name() {
         let _fixture = hostfs::test::empty_fixture();

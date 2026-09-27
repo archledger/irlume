@@ -415,6 +415,9 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                 if len < 3 {
                     return None;
                 }
+                if d[2] != SUBTYPE_VC_HEADER && headers != 1 {
+                    return None;
+                }
                 match d[2] {
                     SUBTYPE_VC_HEADER => {
                         headers += 1;
@@ -2224,6 +2227,19 @@ mod tests {
                 Err(IrFunctionRefusal::Malformed)
             );
         }
+    }
+
+    #[test]
+    fn an_extension_unit_before_the_control_header_is_malformed() {
+        let mut bytes = function(&[1], &[1], &[], &[(8, MSXU, 2, &[0x22, 0x00])]);
+        let header_at = 18 + 9 + 9;
+        let header: Vec<_> = bytes.drain(header_at..header_at + 13).collect();
+        let unit_end = header_at + usize::from(bytes[header_at]);
+        bytes.splice(unit_end..unit_end, header);
+        assert_eq!(
+            ir_function_evidence(&bytes, 0),
+            Err(IrFunctionRefusal::Malformed)
+        );
     }
 
     #[test]

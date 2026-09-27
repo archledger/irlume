@@ -2389,6 +2389,7 @@ mod tests {
     /// attestation.
     #[test]
     fn node_evidence_fails_closed_without_a_usb_parent() {
+        let _fixture = crate::hostfs::test::empty_fixture();
         for node in ["/dev/null", "/dev/irlume-no-such-node"] {
             assert_eq!(
                 ir_function_evidence_for_node(node),

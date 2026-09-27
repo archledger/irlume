@@ -17397,6 +17397,7 @@ mod tests {
     #[test]
     #[ignore = "needs a YUYV-only, descriptor-attested IR camera; set IRLUME_TEST_YUYV_IR_DEVICE"]
     fn attested_yuyv_ir_camera_opens_at_its_hello_size() {
+        hostfs::test::host();
         let device = std::env::var("IRLUME_TEST_YUYV_IR_DEVICE").unwrap_or_else(|_| {
             panic!(
                 "IRLUME_TEST_YUYV_IR_DEVICE is unset. This test is #[ignore]d, so running it is \

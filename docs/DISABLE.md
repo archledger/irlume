@@ -166,6 +166,20 @@ not the active one is not re-created until the next `irlume login enable`. To
 go back to the vendor files for good, run `sudo irlume login disable
 --apply`.
 
+To keep the wiring but stop the automatic re-apply, disable the three
+reconcile units:
+
+```sh
+sudo systemctl disable --now irlume-reconcile.path irlume-reconcile.timer irlume-reconcile.service
+```
+
+Package upgrades leave them disabled (or masked) and run no reconcile then.
+A fresh install enables all three, and so does an Arch upgrade from before
+0.6.1. An upgrade from before 0.7.0, the release that added the timer, also
+enables and starts the timer once, and the timer starts
+`irlume-reconcile.service` even while that is disabled: after such an
+upgrade, run the command above again.
+
 ## Keep some surfaces
 
 Turn everything off, then re-add only what you want:

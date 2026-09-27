@@ -1,5 +1,8 @@
-# AppArmor profile for the irlume face-authentication daemon (Debian/Ubuntu
-# parity with the enforced Fedora SELinux module in packaging/selinux/).
+# AppArmor profile for the irlume face-authentication daemon (Debian, Ubuntu
+# and other AppArmor systems). Fedora's SELinux module in packaging/selinux/ is
+# not an equivalent: it does not confine irlumed, it only lets the confined
+# greeter and polkit domains reach its socket (docs/THREAT_MODEL.md
+# "Confinement").
 #
 # ENFORCE by default. Soak-validated 2026-07-09 on Ubuntu 26.04 (ThinkPad X13,
 # TPM + IR/RGB camera): the profile loaded in complain first and every auth

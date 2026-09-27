@@ -20,8 +20,12 @@ policy_module(irlume, 1.1.0)
 # socket once broke lock-screen face unlock while this comment claimed the path
 # "works". DAC and MAC are independent; both have to permit the connect.
 #
-# We give the socket its own type via a name-based transition so the grant to
-# xdm_t is scoped to *our* socket rather than every var_run_t sock_file.
+# We give the socket its own type via a name-based transition so the sock_file
+# write granted to xdm_t is scoped to *our* socket rather than every var_run_t
+# sock_file. The connectto grants below name the listening process's domain,
+# unconfined_service_t, so they cover any socket a process in that domain
+# listens on (an abstract socket carries no file label at all); narrowing them
+# needs a domain of irlumed's own. SELinux does not confine irlumed itself.
 #
 ########################################
 
@@ -51,7 +55,7 @@ allow xdm_t unconfined_service_t:unix_stream_socket connectto;
 
 # polkit's PAM helper (polkit-agent-helper-1, domain policykit_auth_t) may
 # connect so a polkit prompt (Bitwarden unlock, pkexec) can be satisfied by
-# face verify. Same scoped grant as xdm_t: only irlume's socket, nothing else.
+# face verify. The same grants as xdm_t, with the same scope (see the header).
 # NOTE: when the helper is spawned setuid from an unconfined user session it
 # may stay unconfined (already allowed); this rule covers the confined domain
 # Fedora assigns it under the socket-activated polkit-agent-helper@.service

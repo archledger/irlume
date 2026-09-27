@@ -58,10 +58,14 @@ NotifyAccess=main
 # aborts that one operation; it drains nothing.
 TimeoutStopSec=10s
 
-# Sandboxing, layered UNDER the SELinux/AppArmor policies (defense in depth).
-# Scoped to what the daemon actually needs: it opens /dev/video* and the TPM,
-# binds a Unix socket, and reads/writes each target user's enrollment (which is
-# why ProtectHome and PrivateDevices are deliberately NOT set). The capability
+# Sandboxing. On AppArmor systems the profile in packaging/apparmor, loaded in
+# enforce mode, confines the daemon as well; Fedora's SELinux module does not
+# confine it (irlumed runs as unconfined_service_t), so there this sandbox is
+# the confinement (docs/THREAT_MODEL.md "Confinement").
+# Scoped to what the daemon actually needs: it opens /dev/video* and the TPM
+# (why PrivateDevices is deliberately NOT set), binds a Unix socket, and reads
+# users' home directories to tell which keyring an account keeps there before a
+# keyring arm (why ProtectHome is deliberately NOT set). The capability
 # set is CAP_DAC_OVERRIDE and CAP_FOWNER; see the note beside
 # CapabilityBoundingSet below for why CAP_CHOWN is NOT among them.
 # MemoryDenyWriteExecute stays off because the ONNX runtime JITs.

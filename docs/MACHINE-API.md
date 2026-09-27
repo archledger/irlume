@@ -873,8 +873,13 @@ process on stderr. While an irlume release that kept the lock at
 `/run/lock/irlume-pam.lock` may still be running, as during an upgrade, that file
 is taken too. It is created at 0600 when it is missing, so such a release that
 reaches its lock later waits for the operation; a symlink there is not followed,
-and group and other permissions are removed from a file root owns. A process
-holding it is waited for at most 60 seconds. If a root process that has the file
+and group and other permissions are removed from a file root owns. Whatever
+another account owns there is replaced, in one rename (`RENAME_EXCHANGE`), by a
+new 0600 file root owns, which the operation holds and leaves in place, so that
+account cannot move the lock off its name while the operation runs; a regular
+file replaced this way is still locked, and where the rename cannot be made the
+operation fails, as `operation-failed` with `retryable` true. A process holding
+the old lock is waited for at most 60 seconds. If a root process that has the file
 open still holds it or waits for it then, or `/proc` cannot show which process
 holds it, the operation fails, as `operation-failed` with `retryable` true,
 rather than write beside what may be an earlier irlume; a holder `/proc` shows

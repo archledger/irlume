@@ -864,9 +864,14 @@ All notable changes to irlume are documented here. This project adheres to
   during an upgrade, `/run/lock/irlume-pam.lock` is taken as well. It
   is created at 0600 when it is missing, so such a release reaching its
   lock later waits for the operation; a symlink there is not followed,
-  and the file loses its group and other permissions when root owns it
-  (one another account owns is locked but not changed). A process
-  holding it is waited for at most 60 seconds; if a root process with
+  and the file loses its group and other permissions when root owns it.
+  Whatever another account owns there is replaced, in one rename, by a
+  new 0600 file of root's that the operation holds and leaves in place,
+  since that account could otherwise rename or remove its own while the
+  operation ran and let such a release lock a new file at the name; a
+  regular file replaced this way is still locked, unchanged, and the
+  operation stops when the rename cannot be made. A process holding the
+  old lock is waited for at most 60 seconds; if a root process with
   the file open still holds it or waits for it then, or `/proc` cannot
   show which process holds it, the operation stops with an error, and
   otherwise, as for another account's process, it goes on without that

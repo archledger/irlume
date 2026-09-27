@@ -1051,13 +1051,13 @@ fn put_back(aside: &Path, path: &Path) -> std::io::Result<()> {
 }
 
 /// `renameat2(2)` with `RENAME_NOREPLACE`: `EEXIST` when `to` exists.
-fn renameat2_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(super) fn renameat2_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     renameat2(from, to, libc::RENAME_NOREPLACE)
 }
 
 /// Swap the two names in one step: each then refers to the file the other
 /// did.
-fn renameat2_exchange(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(super) fn renameat2_exchange(from: &Path, to: &Path) -> std::io::Result<()> {
     renameat2(from, to, libc::RENAME_EXCHANGE)
 }
 

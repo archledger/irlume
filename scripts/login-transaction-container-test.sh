@@ -177,6 +177,21 @@ assert "the old PAM lock is a regular file" "missing" test -f /run/lock/irlume-p
 assert "the old PAM lock is root-only" \
     "mode and uid $(stat -c '%a %u' /run/lock/irlume-pam.lock 2>/dev/null)" \
     test "$(stat -c '%a %u' /run/lock/irlume-pam.lock 2>/dev/null)" = "600 0"
+# Another account can own the old lock where /run/lock is 1777, and could
+# remove or rename it while an operation holds it. The operation replaces it
+# with a file of root's in one rename and leaves no other name behind.
+if chown 65534:65534 /run/lock/irlume-pam.lock 2>/dev/null; then
+    chmod 0644 /run/lock/irlume-pam.lock
+    $B login disable --apply >/dev/null 2>&1
+    assert "another account's old PAM lock is replaced by root's" \
+        "mode and uid $(stat -c '%a %u' /run/lock/irlume-pam.lock 2>/dev/null)" \
+        test "$(stat -c '%a %u' /run/lock/irlume-pam.lock 2>/dev/null)" = "600 0"
+    assert "no other name is left beside the old PAM lock" \
+        "found $(find /run/lock -maxdepth 1 -name '.irlume-pam.lock.*' 2>/dev/null)" \
+        test -z "$(find /run/lock -maxdepth 1 -name '.irlume-pam.lock.*' 2>/dev/null)"
+else
+    echo "  skip    uid 65534 is not mapped, so another account's old PAM lock is not tried"
+fi
 
 echo "=== 12. a stopped rollback resumes instead of refusing itself ==="
 # A rollback restores surfaces one at a time. Stopping partway used to be

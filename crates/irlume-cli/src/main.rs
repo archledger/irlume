@@ -4332,15 +4332,24 @@ fn doctor_run(
     report.check_detail("install-origin", State::Info, origin.describe());
     // `irlume logs debug on` persists across reboots, and while it is on the
     // journal gets exact scores and liveness measurements.
-    if logs::debug_active() {
-        dout!(
-            report,
-            "[doctor] \u{26a0} debug tracing is on: {}",
-            logs::DEBUG_ACTIVE_DETAIL
-        );
-        report.check_detail("debug-tracing", State::Warn, logs::DEBUG_ACTIVE_DETAIL);
-    } else {
-        report.check("debug-tracing", State::Pass);
+    match logs::debug_state() {
+        Some(true) => {
+            dout!(
+                report,
+                "[doctor] \u{26a0} debug tracing is on: {}",
+                logs::DEBUG_ACTIVE_DETAIL
+            );
+            report.check_detail("debug-tracing", State::Warn, logs::DEBUG_ACTIVE_DETAIL);
+        }
+        Some(false) => report.check("debug-tracing", State::Pass),
+        None => {
+            dout!(
+                report,
+                "[doctor] debug tracing: unknown: {}",
+                logs::DEBUG_UNKNOWN_DETAIL
+            );
+            report.check_detail("debug-tracing", State::Unknown, logs::DEBUG_UNKNOWN_DETAIL);
+        }
     }
     match tpm_device() {
         Some(d) => {

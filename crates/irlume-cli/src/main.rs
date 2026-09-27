@@ -1553,16 +1553,34 @@ pub(crate) fn print_token_upgrade_notice(user: &str) {
     }
 }
 
-/// After an arm: where the new envelope is sealed under the literal PCR 7
-/// policy (Tier 3) and the state directory is not on encrypted storage, or
-/// that cannot be established, say so and name the remedies. Reads the
-/// envelope's policy with `KeyringMetadata`, which does not wait on the TPM.
-fn print_literal_seal_note(user: &str) {
-    let reply = daemon_request(&irlume_common::Request::KeyringMetadata {
-        user: user.to_string(),
-    });
-    if let Some(advice) = seal_storage::state_dir_advice_for(&reply) {
-        println!("[keyring] NOTE: {}", advice.text);
+/// After an arm: what protects the sealed secrets at rest, as a warning where
+/// no dm-crypt layer is found under the state directory, or the storage
+/// cannot be established, and as information where it is encrypted but a
+/// sealed secret's policy may be one another operating system reproduces
+/// (`seal_storage`). Reads the envelope's policy with `KeyringMetadata`
+/// (`KeyringInfo` from an older daemon) and the template key with
+/// `RecoveryStatus`.
+fn print_seal_storage_note(user: &str) {
+    // The arm just sealed a keyring secret: a daemon that does not describe
+    // it still has one, under a policy it did not name.
+    let keyring = match seal_storage::keyring_seal_for(user, daemon_request) {
+        seal_storage::KeyringSeal::Unknown => seal_storage::KeyringSeal::Armed {
+            policy: None,
+            pcrs: Vec::new(),
+        },
+        keyring => keyring,
+    };
+    let sealed = seal_storage::Sealed {
+        keyring,
+        template_key: seal_storage::template_key_sealed(&daemon_request(
+            &irlume_common::Request::RecoveryStatus {
+                user: user.to_string(),
+            },
+        )),
+        pcrlock_seals: irlume_core::tpm::pcrlock_for_sealing().is_some(),
+    };
+    if let Some(advice) = seal_storage::state_dir_guidance(&sealed) {
+        println!("{}", seal_storage::arm_note(&advice));
     }
 }
 
@@ -1679,7 +1697,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                 Ok(irlume_common::Response::PasswordSealed) => {
                     println!("[keyring] \u{2705} armed. After a face login, your wallet will unlock automatically.");
                     println!("[keyring] NOTE: if you change your login password, re-run `irlume keyring arm`.");
-                    print_literal_seal_note(&user);
+                    print_seal_storage_note(&user);
                     std::process::ExitCode::SUCCESS
                 }
                 // GNOME token arm (#250): the daemon minted and sealed a token;
@@ -1701,7 +1719,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                                  directly; `irlume keyring forget` re-keys it back."
                             );
                             print_token_upgrade_notice(&user);
-                            print_literal_seal_note(&user);
+                            print_seal_storage_note(&user);
                             std::process::ExitCode::SUCCESS
                         }
                         Err(e) => {
@@ -4437,36 +4455,14 @@ fn doctor_run(
         irlume_core::tpm::pcrlock_provisioned(),
         irlume_core::tpm::pcrlock_for_sealing(),
     );
-    // The account's keyring secret, when one is armed under the literal PCR 7
-    // policy (Tier 3) and the state directory is not on encrypted storage, or
-    // that cannot be established, warns with the remedies, whatever tier a
-    // new seal would get: the envelope on disk keeps its policy until it is
-    // sealed again.
-    let seal_user = user_arg(args);
-    let seal_advice = seal_storage::state_dir_advice_for(&daemon_request(
-        &irlume_common::Request::KeyringMetadata {
-            user: seal_user.clone(),
+    report.check(
+        "pcrlock",
+        if pcrlock.1.is_some() {
+            State::Pass
+        } else {
+            State::Info
         },
-    ));
-    match &seal_advice {
-        Some(advice) => report.check_detail(
-            "pcrlock",
-            if advice.warn {
-                State::Warn
-            } else {
-                State::Info
-            },
-            &advice.text,
-        ),
-        None => report.check(
-            "pcrlock",
-            if pcrlock.1.is_some() {
-                State::Pass
-            } else {
-                State::Info
-            },
-        ),
-    }
+    );
     dout!(
         report,
         "[doctor] pcrlock: {}",
@@ -4485,14 +4481,6 @@ fn doctor_run(
                     .to_string(),
         }
     );
-    if let Some(advice) = &seal_advice {
-        let mark = if advice.warn { "\u{26a0}" } else { "\u{b7}" };
-        dout!(
-            report,
-            "[doctor] {mark} keyring seal ({seal_user}): {}",
-            advice.text
-        );
-    }
 
     // --- cameras -----------------------------------------------------------
     dout!(
@@ -4799,7 +4787,8 @@ fn doctor_run(
     // pushed the user to the password, a mistype or two can escalate into
     // what looks like a broken password (live incident, 2026-09-17).
     report_faillock_state(report, &user);
-    match daemon_request(&irlume_common::Request::RecoveryStatus { user: user.clone() }) {
+    let recovery = daemon_request(&irlume_common::Request::RecoveryStatus { user: user.clone() });
+    match recovery {
         Ok(irlume_common::Response::RecoveryStatus {
             encrypted,
             recovery_set,
@@ -4862,6 +4851,28 @@ fn doctor_run(
             report.check("recovery-passphrase", State::Unknown);
         }
     }
+    // What protects the sealed secrets at rest: the keyring secret (with its
+    // policy) and the template key, against the state directory's storage.
+    // A TPM seal binds the boot chain, not the root filesystem, so this
+    // applies whatever tier a new seal would get (`seal_storage`). The
+    // template key's policy is not reported; whether seals use a pcrlock
+    // policy here tells which it can be.
+    let sealed = seal_storage::Sealed {
+        keyring: seal_storage::keyring_seal_for(&user, daemon_request),
+        template_key: seal_storage::template_key_sealed(&recovery),
+        pcrlock_seals: pcrlock.1.is_some(),
+    };
+    let (state, detail) = seal_storage::state_dir_check(&user, &sealed);
+    dout!(
+        report,
+        "[doctor] {}sealed storage ({user}): {detail}",
+        if state == State::Warn {
+            "\u{26a0} "
+        } else {
+            ""
+        }
+    );
+    report.check_detail("sealed-storage", state, detail);
 
     // --- polkit app prompts ------------------------------------------------
     // Apps like Bitwarden implement "biometric unlock" on Linux as a polkit

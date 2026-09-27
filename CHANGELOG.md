@@ -853,24 +853,40 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
-- `irlume keyring arm` and `irlume doctor` name the remedies when an
-  armed keyring secret is sealed under the literal PCR 7 policy (Tier 3).
-  That policy binds the Secure Boot state only: another operating system
-  signed with the same keys reproduces it. The remedies are a pcrlock
-  policy (Tier 2) or full-disk encryption unlocked by a passphrase.
-  `keyring arm` prints a note; doctor's `pcrlock` check reports `warn`
-  with them in its detail when irlume's state directory is not on
-  encrypted storage or that cannot be established, and `info` when it is
-  on dm-crypt, whose unlock method (passphrase, or the TPM or a key file)
-  the storage does not show. The storage probe follows the
-  state directory's block device through device-mapper (dm-crypt, LVM),
-  md RAID and partitions, and every device of a btrfs filesystem; what it
-  cannot establish counts as unencrypted. With an `IRLUME_PCRS`
-  override the note names the PCRs the seal binds, and a set that
-  includes a firmware-measured PCR other than 7 gets none.
-  docs/SECURITY_AT_REST.md, docs/SETUP.md and ADR-0003 (amendment
-  2026-09-27) now say what the literal PCR 7 policy binds and what it
-  does not.
+- `irlume keyring arm` and a new doctor check, `sealed-storage`, say what
+  protects the sealed secrets at rest. A TPM seal binds the boot chain it
+  measures, not the root filesystem: where irlume's state directory is not
+  on encrypted storage, an installed system changed offline and booted on
+  the unchanged boot chain unseals the keyring secret and the template key
+  under any policy, and under a policy that does not cover the boot loader
+  code (PCR 4) another operating system signed with the same keys can also
+  unseal them directly. That includes the literal PCR 7 policy (Tier 3), an
+  `IRLUME_PCRS` set without PCR 4, a signed PCR 11 policy (Tier 1) and a
+  pcrlock policy (Tier 2) that systemd-pcrlock made without PCR 4. What
+  protects them is full-disk encryption unlocked by a passphrase or PIN, or
+  a verified root (dm-verity) whose root hash is bound, with a pcrlock
+  policy that covers PCR 4; such a pcrlock policy is worth having in
+  addition to encryption, not instead of it, and the guidance gives the
+  `/usr/lib/systemd/systemd-pcrlock` steps. The check reports `warn` when a
+  keyring secret or a template key is sealed and no dm-crypt layer is found
+  under the state directory, or the storage cannot be established; `info`
+  when it is on dm-crypt and a sealed secret's policy may be one another
+  operating system reproduces (the template key's is not reported, so a
+  sealed template key counts), since the storage does not show whether the
+  volume asks for a passphrase; `info` when nothing is sealed; `pass` when
+  only a keyring secret under a policy that covers PCR 4 is sealed and the
+  state directory is on dm-crypt; and `unknown` when irlumed does not say
+  what is sealed. `keyring arm` prints the same guidance after an arm, also
+  when irlumed then does not describe the new secret. An irlumed from before
+  `KeyringMetadata` is asked `KeyringInfo` instead. The storage probe
+  follows the state directory's block device through device-mapper
+  (dm-crypt, LVM), md RAID and partitions, and every device of a btrfs
+  filesystem; what it cannot establish counts as unencrypted, and it does
+  not detect a drive's hardware encryption, a filesystem's own encryption
+  or a verified root. With an `IRLUME_PCRS` override the guidance names the
+  PCRs the keyring seal binds. docs/SECURITY_AT_REST.md, docs/SETUP.md and
+  ADR-0003 (amendment 2026-09-27) say what a seal binds on the machine
+  itself.
 
 - irlumed turns a camera on for an account's own request only while that
   account holds the active local session on a seat, as udev's `uaccess`

@@ -81,6 +81,9 @@ impl Sandbox {
             // os-release (on NixOS the keyring and login paths differ), and
             // one that wants NixOS sets its own.
             .env("IRLUME_OS_RELEASE", self.root.join("no-os-release"))
+            // Absent, so no pcrlock policy: doctor and the sealed-storage
+            // guidance never follow the host's.
+            .env("IRLUME_PCRLOCK_JSON", self.root.join("no-pcrlock.json"))
             .env_remove("IRLUME_DEV")
             .env_remove("ORT_DYLIB_PATH")
             .env_remove("IRLUME_MODEL")
@@ -1563,6 +1566,13 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_forget_before_upgrading_to_45() {
         out.contains(NOTICE) && out.contains(FORGET),
         "a token arm must give the pre-upgrade step: {out}"
     );
+    // A token arm also says what protects the sealed token at rest. The fake
+    // names no policy, and that sentence is in both the warning and the
+    // information, so this holds whatever the host's storage.
+    assert!(
+        out.contains("irlume could not read which policy the keyring secret"),
+        "a token arm must give the sealed-storage note: {out}"
+    );
     let (_, out, err) = run(&mut command(&sb, &["doctor", "--user", "tester"]));
     assert!(
         out.contains(NOTICE) && out.contains(FORGET),
@@ -1612,8 +1622,9 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_forget_before_upgrading_to_45() {
     let sb = sandbox("debian-token", DEBIAN, true, Some(K::GnomeKeyringToken));
     assert!(!status(&sb).contains(NOTICE));
 
-    // doctor reads the envelope's metadata, never the live PCR diagnosis
-    // behind KeyringInfo; a daemon from before that query leaves it unknown.
+    // doctor reads the envelope's metadata, and asks KeyringInfo, with its
+    // live PCR diagnosis, only of a daemon from before that query (it
+    // answers "bad request"); a failed query leaves the check unknown.
     for (tag, metadata, state) in [
         ("fedora44-metadata-only", true, "warn"),
         ("fedora44-no-metadata", false, "unknown"),
@@ -1644,36 +1655,88 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_forget_before_upgrading_to_45() {
     }
 }
 
-/// A keyring secret armed under the literal PCR 7 policy (Tier 3) gets the
-/// remedies from `keyring arm` and from doctor's `pcrlock` check whenever the
-/// state directory is not established to be on encrypted storage. A pcrlock
-/// envelope, or nothing armed, leaves both as they were. The expectation
-/// comes from the same read-only probe the binary runs on the sandbox's state
-/// directory, so it holds on a host whose temp directory is encrypted too.
+/// What protects the sealed secrets at rest is reported by `keyring arm`
+/// after an arm and by doctor's `sealed-storage` check on every run: a
+/// warning with the remedies where no dm-crypt layer is found under irlume's
+/// state directory, or the storage cannot be established, whatever the
+/// policy and whether the keyring secret, the template key or both are
+/// sealed; information on encrypted storage when a sealed secret's policy may
+/// be one another operating system reproduces (the literal PCR 7 one, an
+/// unnamed one, or the template key's, which is not reported); nothing, or
+/// `pass`, otherwise. Doctor's `pcrlock` check keeps its meaning and carries
+/// no detail. A daemon from before `KeyringMetadata` is asked `KeyringInfo`
+/// instead, and one that answers neither after an arm still gets the note.
+/// The expectation comes from the same read-only probe the binary runs on
+/// the sandbox's state directory, so it holds on a host whose temp directory
+/// is encrypted too.
 #[test]
-fn a_tier_3_keyring_seal_off_encrypted_storage_is_told_the_remedies() {
+fn sealed_secrets_off_encrypted_storage_are_told_the_remedies() {
     use irlume_common::storage_encryption::{path_encryption, StorageEncryption};
-    const TIER_3: &str = "literal PolicyPCR (Tier 3)";
-    const TIER_2: &str = "pcrlock NV 0x1a2b (Tier 2)";
-    const ADVICE: &str = "sealed under the literal PCR 7 policy (Tier 3)";
-    const REMEDY: &str = "full-disk encryption unlocked by a passphrase";
-    let sandbox = |tag: &str, policy: Option<&'static str>| {
+    /// How the fake daemon answers `KeyringMetadata`.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Metadata {
+        Answered,
+        /// As a daemon from before it: "bad request", then `KeyringInfo`.
+        Older,
+        /// Any other error: the keyring secret is not described.
+        Failing,
+    }
+    const TIER_3: (&str, &[u32]) = ("literal PolicyPCR (Tier 3)", &[7]);
+    // A pcrlock policy that covers the boot loader (PCR 4).
+    const TIER_2: (&str, &[u32]) = ("pcrlock NV 0x1a2b (Tier 2)", &[0, 2, 4, 7]);
+    const OFFLINE: &str = "can change the installed system offline";
+    const DIRECT: &str = "another operating system signed with the same keys reproduces it";
+    const REMEDY: &str = "full-disk encryption unlocked by a passphrase or PIN";
+    const UNLOCK: &str = "only if that volume asks for a passphrase or PIN to unlock";
+    const BOTH: &str = "The keyring secret and the template key that protects the face \
+                        templates are sealed by the TPM";
+    const TEMPLATE_KEY: &str = "The template key that protects the face templates is sealed";
+    const TEMPLATE_POLICY: &str = "The template key goes through the same choice of policy";
+    const UNNAMED: &str = "irlume could not read which policy the keyring secret";
+    // A daemon holding a keyring secret under `policy` (None: nothing armed)
+    // and, with `template_key`, a sealed template key.
+    let sandbox = |tag: &str,
+                   policy: Option<(&'static str, &'static [u32])>,
+                   template_key: bool,
+                   metadata: Metadata| {
         let sb = Sandbox::new(tag);
         for tool in ["rpm", "dnf", "dpkg-query", "apt-cache", "pacman"] {
             sb.fake_tool(tool, "exit 1");
         }
-        serve(&sock(&sb), move |request| match request {
-            Request::KeyringMetadata { .. } => Response::KeyringInfo {
-                armed: policy.is_some(),
-                policy: policy.map(str::to_string),
-                pcrs: vec![7],
-                drifted: None,
-                kind: policy.map(|_| irlume_common::KeyringSecretKind::LoginPassword),
+        let log = serve(&sock(&sb), move |request| match request {
+            Request::KeyringMetadata { .. } if metadata == Metadata::Older => {
+                Response::Error("bad request".into())
+            }
+            Request::KeyringMetadata { .. } | Request::KeyringInfo { .. }
+                if metadata == Metadata::Failing =>
+            {
+                Response::Error("fixture unavailable".into())
+            }
+            Request::KeyringMetadata { .. } | Request::KeyringInfo { .. } => {
+                Response::KeyringInfo {
+                    armed: policy.is_some(),
+                    policy: policy.map(|(name, _)| name.to_string()),
+                    pcrs: policy.map(|(_, pcrs)| pcrs.to_vec()).unwrap_or_default(),
+                    drifted: None,
+                    kind: policy.map(|_| irlume_common::KeyringSecretKind::LoginPassword),
+                }
+            }
+            Request::RecoveryStatus { .. } => Response::RecoveryStatus {
+                encrypted: template_key,
+                recovery_set: false,
+                tpm_present: true,
+                key_present: template_key,
             },
             Request::SealPassword { .. } => Response::PasswordSealed,
             _ => Response::Error("fixture unavailable".into()),
         });
-        sb
+        (sb, log)
+    };
+    let asked_keyring_info = |log: &std::sync::Arc<std::sync::Mutex<Vec<Request>>>| {
+        log.lock()
+            .unwrap()
+            .iter()
+            .any(|request| matches!(request, Request::KeyringInfo { .. }))
     };
     let arm = |sb: &Sandbox| -> String {
         let (code, out, err) = run_stdin(
@@ -1684,54 +1747,165 @@ fn a_tier_3_keyring_seal_off_encrypted_storage_is_told_the_remedies() {
         assert!(out.contains("armed. After a face login"), "{out}");
         out
     };
-    let pcrlock_check = |sb: &Sandbox| -> serde_json::Value {
+    let checks = |sb: &Sandbox| -> (serde_json::Value, serde_json::Value) {
         let (_, out, err) = run(sb
             .cmd_with_fakes(&["doctor", "--json"])
             .env("USER", "tester")
             .env_remove("SUDO_USER"));
         let report: serde_json::Value =
             serde_json::from_str(&out).unwrap_or_else(|error| panic!("{error}: {out} {err}"));
-        report["data"]["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|check| check["id"] == "pcrlock")
-            .cloned()
-            .unwrap_or_else(|| panic!("no pcrlock check: {out}"))
+        let find = |id: &str| {
+            report["data"]["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["id"] == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("no {id} check: {out}"))
+        };
+        let pcrlock = find("pcrlock");
+        assert!(
+            ["pass", "info"].contains(&pcrlock["state"].as_str().unwrap_or_default())
+                && pcrlock.get("detail").is_none(),
+            "pcrlock keeps its meaning: {pcrlock}"
+        );
+        (find("sealed-storage"), pcrlock)
     };
+    let detail =
+        |check: &serde_json::Value| check["detail"].as_str().unwrap_or_default().to_string();
 
-    // A Tier 3 secret is always told the remedies: as a warning off encrypted
-    // storage (or where that cannot be confirmed), as information on it,
-    // since dm-crypt does not show whether it asks for a passphrase.
-    let sb = sandbox("tier3-seal", Some(TIER_3));
-    let warned = path_encryption(&sb.path("state")) != StorageEncryption::Encrypted;
+    // A Tier 3 keyring secret and a template key: a warning naming both, the
+    // offline change and the direct unseal off encrypted storage, and
+    // information on it, since the storage does not show whether it asks
+    // for a passphrase.
+    let (sb, log) = sandbox("seal-tier3-both", Some(TIER_3), true, Metadata::Answered);
+    let encrypted = path_encryption(&sb.path("state")) == StorageEncryption::Encrypted;
     let out = arm(&sb);
-    assert!(out.contains(ADVICE) && out.contains(REMEDY), "{out}");
+    if encrypted {
+        assert!(
+            out.contains(
+                "[keyring] NOTE: The keyring secret and the template key are sealed under the \
+                 literal PCR 7"
+            ) && out.contains(DIRECT)
+                && out.contains(UNLOCK),
+            "{out}"
+        );
+    } else {
+        assert!(
+            out.contains(&format!("[keyring] WARNING: {BOTH}"))
+                && out.contains(OFFLINE)
+                && out.contains(DIRECT)
+                && out.contains(REMEDY),
+            "{out}"
+        );
+    }
     let (_, out, err) = run(&mut sb.cmd_with_fakes(&["doctor", "--user", "tester"]));
     assert!(
-        out.contains("keyring seal (tester)") && out.contains(ADVICE),
+        out.contains("sealed storage (tester): ") && out.contains(DIRECT),
         "{out} {err}"
     );
-    let check = pcrlock_check(&sb);
+    let (check, _) = checks(&sb);
     assert_eq!(
         check["state"],
-        if warned { "warn" } else { "info" },
+        if encrypted { "info" } else { "warn" },
         "{check}"
     );
-    let detail = check["detail"].as_str().unwrap_or_default();
+    assert!(detail(&check).contains(DIRECT), "{check}");
     assert!(
-        detail.contains(ADVICE) && detail.contains(REMEDY),
+        detail(&check).contains(if encrypted { UNLOCK } else { BOTH }),
+        "{check}"
+    );
+    assert!(!asked_keyring_info(&log), "{:?}", log.lock().unwrap());
+
+    // A template key alone, which no keyring check covered: with no pcrlock
+    // policy that seals use, it is under the literal PCR policy, so it is
+    // warned off encrypted storage and information on it, with no word on
+    // the keyring.
+    let (sb, _) = sandbox("seal-template-key", None, true, Metadata::Answered);
+    let (check, _) = checks(&sb);
+    assert_eq!(
+        check["state"],
+        if encrypted { "info" } else { "warn" },
+        "{check}"
+    );
+    assert!(
+        detail(&check).contains(TEMPLATE_POLICY) && !detail(&check).contains("keyring"),
+        "{check}"
+    );
+    if !encrypted {
+        assert!(
+            detail(&check).contains(TEMPLATE_KEY) && detail(&check).contains(OFFLINE),
+            "{check}"
+        );
+    }
+
+    // A keyring secret under a pcrlock (Tier 2) policy that covers the boot
+    // loader is still warned off encrypted storage, without the point on
+    // another operating system, and passes on it.
+    let (sb, _) = sandbox("seal-tier2", Some(TIER_2), false, Metadata::Answered);
+    let out = arm(&sb);
+    assert!(!out.contains("another operating system"), "{out}");
+    assert_eq!(out.contains(OFFLINE), !encrypted, "{out}");
+    let (check, _) = checks(&sb);
+    assert_eq!(
+        check["state"],
+        if encrypted { "pass" } else { "warn" },
+        "{check}"
+    );
+    assert!(
+        !detail(&check).contains("another operating system"),
         "{check}"
     );
 
-    for (tag, policy) in [("tier2-seal", Some(TIER_2)), ("unarmed-seal", None)] {
-        let sb = sandbox(tag, policy);
-        let out = arm(&sb);
-        assert!(!out.contains(ADVICE), "{tag}: {out}");
-        let check = pcrlock_check(&sb);
-        assert_ne!(check["state"], "warn", "{tag}: {check}");
-        assert!(check.get("detail").is_none(), "{tag}: {check}");
+    // Nothing sealed: information that says so, and no note after an arm
+    // the fake does not record.
+    let (sb, _) = sandbox("seal-nothing", None, false, Metadata::Answered);
+    let out = arm(&sb);
+    assert!(
+        !out.contains("sealed by the TPM") && !out.contains(DIRECT),
+        "{out}"
+    );
+    let (check, _) = checks(&sb);
+    assert_eq!(check["state"], "info", "{check}");
+    assert!(
+        detail(&check).contains("nothing is sealed for tester"),
+        "{check}"
+    );
+
+    // A daemon from before `KeyringMetadata` is asked `KeyringInfo`, and its
+    // Tier 3 secret is still reported.
+    let (sb, log) = sandbox("seal-older-daemon", Some(TIER_3), false, Metadata::Older);
+    let out = arm(&sb);
+    assert!(out.contains(DIRECT), "{out}");
+    assert!(asked_keyring_info(&log), "{:?}", log.lock().unwrap());
+    let (check, _) = checks(&sb);
+    assert_eq!(
+        check["state"],
+        if encrypted { "info" } else { "warn" },
+        "{check}"
+    );
+    assert!(detail(&check).contains(DIRECT), "{check}");
+
+    // The arm just sealed a keyring secret: a daemon that then does not
+    // describe it still gets the note, for a policy it did not name. Doctor,
+    // which has not just armed one, cannot say.
+    let (sb, _) = sandbox("seal-undescribed", Some(TIER_3), false, Metadata::Failing);
+    let out = arm(&sb);
+    let label = if encrypted { "NOTE" } else { "WARNING" };
+    assert!(
+        out.contains(&format!("[keyring] {label}: ")) && out.contains(UNNAMED),
+        "{out}"
+    );
+    let (check, _) = checks(&sb);
+    assert_eq!(check["state"], "unknown", "{check}");
+
+    // No daemon: the check could not be carried out.
+    let sb = Sandbox::new("seal-no-daemon");
+    for tool in ["rpm", "dnf", "dpkg-query", "apt-cache", "pacman"] {
+        sb.fake_tool(tool, "exit 1");
     }
+    let (check, _) = checks(&sb);
+    assert_eq!(check["state"], "unknown", "{check}");
 }
 
 /// A sandbox whose fake `busctl` names `provider` as the owner of
@@ -1964,8 +2138,9 @@ fn keyring_arm_on_nixos_seals_only_the_login_password() {
     assert_eq!(sealed(&log), [(Some(K::LoginPassword), false)]);
 
     // Off NixOS nothing changes: the daemon judges, with the salt it needs,
-    // and is asked nothing else before the seal. After it, the arm reads the
-    // new envelope's policy once, for the literal PCR 7 storage note.
+    // and is asked nothing else before the seal. After it, the arm asks what
+    // is sealed (the new envelope's policy and the template key) once each,
+    // for the sealed-storage note.
     let sb = Sandbox::new("keyring-fedora-kde");
     kde_salt_helper(&sb);
     let log = daemon(&sb, None);
@@ -1978,7 +2153,8 @@ fn keyring_arm_on_nixos_seals_only_the_login_password() {
             requests.as_slice(),
             [
                 Request::SealPassword { .. },
-                Request::KeyringMetadata { .. }
+                Request::KeyringMetadata { .. },
+                Request::RecoveryStatus { .. }
             ]
         ),
         "{requests:?}"

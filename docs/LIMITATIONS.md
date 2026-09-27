@@ -61,9 +61,11 @@ summary lives on the [README](../README.md); this is the detail.
 - **Root on the live machine is the trust boundary.** The daemon holds decrypted
   embeddings in RAM during a match, unlike Hello's VBS enclave. Disk theft is
   covered: templates copied to another machine fail to decrypt
-  ([tested](SECURITY_AT_REST.md)). On the original machine, the literal PCR 7
-  policy binds only the Secure Boot state; where irlume's state is not on
-  encrypted storage, prefer a pcrlock policy or full-disk encryption
-  ([SECURITY_AT_REST](SECURITY_AT_REST.md)).
+  ([tested](SECURITY_AT_REST.md)). On the original machine the TPM seal binds
+  the boot chain, not the root filesystem, so what protects the sealed secrets
+  there is full-disk encryption unlocked by a passphrase or PIN, or a verified
+  root whose root hash is bound, with a pcrlock policy that covers the boot
+  loader (PCR 4); a pcrlock policy alone does not
+  ([SECURITY_AT_REST](SECURITY_AT_REST.md), layer 3).
 
 Every claim here maps to something you can run yourself: [docs/VERIFY.md](VERIFY.md).

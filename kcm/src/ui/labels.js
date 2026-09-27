@@ -160,6 +160,7 @@ var checkTitles = {
     "fingerprint-reader": "Fingerprint reader",
     "templates": "Face template encryption",
     "recovery-passphrase": "Recovery passphrase",
+    "sealed-storage": "Sealed secrets at rest",
     "polkit-app-prompts": "Face login in app prompts (polkit)",
     "polkit-helper-sandbox": "polkit helper sandbox",
     "ir-calibration": "IR liveness calibration",

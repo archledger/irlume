@@ -341,6 +341,9 @@ device.
   carrier for authentication history: it is readable by any local peer on
   the mode-0666 socket, is process-local, is erased on restart and is
   bounded to 30 minutes. Nothing about attempts is added to it.
+  (Amended 2026-09-27: the events it holds of an account's operations,
+  authentications included, and `LiveStatus`'s kinds for them, now reach
+  only root and that account; see the amendment at the end.)
 - Instead the daemon keeps, per account, a small **attempt record**
   file under its state directory (root-only, like the retry journal):
   the latest attempt of each kind and the last five per camera, bounded
@@ -582,3 +585,55 @@ device.
   more than eight.
 - Command echo: every `Suspend::*` variant logs a line beginning with the
   command it runs.
+
+## Amendment 2026-09-27: other accounts' operations in the any-peer views
+
+§5 treats the times and outcomes of an account's authentications as that
+account's history, readable by the account and root. The event ring
+already held an `operation_finished` event with a categorical outcome
+(`granted`, `denied`, `failed`) for every authentication and credential
+release, together with the capture events of the same operation, and
+`LiveStatus` named an authentication in progress; both answer any local
+peer. They now follow the same rule, applied to every operation an
+account asks for, whatever its kind: were only authentications hidden, a
+reader who still saw the account's other work could tell them apart. The
+daemon records with each operation whose history it is: the peer itself
+when the peer is not root, since such a peer acts only for itself; for
+root, the account the request names, resolved when the request arrives,
+or an unresolved account when it does not resolve; and no account for
+root's requests that name none (camera setup and qualification, camera
+diagnostics, a support probe, a recognition test) and for the daemon's
+own background qualification, which are daemon-wide.
+
+- `SupportSnapshot` answered to root is unchanged. Answered to any other
+  account, it lists only the events of that account's operations and of
+  daemon-wide ones, numbered from 1, and always lists `recent_events` as
+  `not_authorized` in `unavailable`, so the reader knows the list may be
+  partial and the marker itself tells nothing.
+- `LiveStatus` answered to any other account reports every operation of
+  another account, or of an unresolved one, running or waiting, as
+  `unknown` whatever its kind, with its operation ID and elapsed time
+  unchanged. The worker still reads busy, so a client does not send
+  camera work that the arbiter would refuse while an authentication is
+  pending. Its `cancellation_requested` reports only the stop every kind
+  honours, its client leaving, and not the yield to a queued
+  authentication: other work yields and authentications and credential
+  releases do not, so showing the yield would say which kind it is. The
+  reader's own operations and daemon-wide work keep their kind and their
+  stop request.
+- Every reader still sees when the worker is busy, for how long, and how
+  many operations wait: that is what keeps clients from queueing camera
+  work behind an authentication. What it no longer sees is whose work it
+  is and what kind.
+- The ring classes as `authentication` every operation that checks the
+  account's password and may hand a credential out, not only face and
+  fingerprint authentications and credential releases: a disarm's token
+  release (`ReleaseTokenForDisarm`) and every keyring arm
+  (`SealPassword`), which returns the GNOME keyring token when that is
+  what it seals, a choice made only when it runs.
+- `SupportProbe` stays root-only and its snapshot unchanged. The support
+  report's privacy checklist says when the report lists authentication
+  times and outcomes, and whether they are every account's (a report run
+  as root, or one from an older daemon) or the account's own.
+- The wire does not change: `unknown` and `not_authorized` are values
+  released clients already decode.

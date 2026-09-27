@@ -5,10 +5,10 @@
 
 use irlume_common::diagnostics::{
     CaptureStatus, CategoricalOutcome, DiagnosticSink, OperationClass, OperationId,
-    SanitizedCameraContext, ShareSafeEvent, ShareSafeEventKind, SupportSnapshot, TraceEventKind,
-    TraceLimits, TraceRecord, TraceWarning, CURRENT_TRACE_SCHEMA_VERSION,
-    LEGACY_TRACE_SCHEMA_VERSION, MAX_HISTORY_MS, MAX_SHARE_SAFE_EVENTS, MAX_TRACE_LINE_BYTES,
-    V2_TRACE_SCHEMA_VERSION, V3_TRACE_SCHEMA_VERSION,
+    SanitizedCameraContext, ShareSafeEvent, ShareSafeEventKind, SupportSection, SupportSnapshot,
+    SupportUnavailable, TraceEventKind, TraceLimits, TraceRecord, TraceWarning, UnavailableReason,
+    CURRENT_TRACE_SCHEMA_VERSION, LEGACY_TRACE_SCHEMA_VERSION, MAX_HISTORY_MS,
+    MAX_SHARE_SAFE_EVENTS, MAX_TRACE_LINE_BYTES, V2_TRACE_SCHEMA_VERSION, V3_TRACE_SCHEMA_VERSION,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
@@ -93,7 +93,44 @@ struct TimedShareSafeEvent {
     sequence: u64,
     operation_id: OperationId,
     operation: OperationClass,
+    /// Whose operation it was ([`OperationScope::owner`]). Kept in memory
+    /// to choose who may read the event; never on the wire.
+    owner: Owner,
     kind: ShareSafeEventKind,
+}
+
+/// Whose history an operation is, which decides who reads it in the two
+/// views any local peer may ask for: the recent-event ring
+/// (`SupportSnapshot`) and live status (`LiveStatus`). What an account does
+/// through the daemon (a login, unlock, elevation or credential release, an
+/// enrollment, a profile, wallet or recovery change) is that account's
+/// history (ADR-0030 §5), readable by the account and root, whatever its
+/// kind: hiding only authentications would let a reader tell them from the
+/// account's other work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Owner {
+    /// Work root started that names no account (camera setup and
+    /// qualification, camera diagnostics, a support probe, a recognition
+    /// test) and the daemon's own background work: no account's history,
+    /// so every reader sees it.
+    Daemon,
+    /// Work for the account with this uid: that account and root see it.
+    Account(u32),
+    /// Work root started for an account that did not resolve: root alone
+    /// sees it.
+    Unresolved,
+}
+
+impl Owner {
+    /// Whether the peer with uid `peer_uid` may read this operation: its
+    /// events in the ring and its kind in live status.
+    pub(crate) const fn visible_to(self, peer_uid: u32) -> bool {
+        match self {
+            Self::Daemon => true,
+            Self::Account(uid) => peer_uid == 0 || uid == peer_uid,
+            Self::Unresolved => peer_uid == 0,
+        }
+    }
 }
 
 impl Default for DiagnosticState {
@@ -140,17 +177,42 @@ impl DiagnosticState {
         guard
     }
 
+    /// A daemon-wide operation, which every reader sees (tests; production
+    /// scopes come from [`DiagnosticState::begin_for`]).
+    #[cfg(test)]
     pub(crate) fn begin(&self, operation: OperationClass) -> OperationScope {
+        self.begin_for(operation, Owner::Daemon)
+    }
+
+    /// Begin an operation whose history belongs to `owner`: its events reach
+    /// a reader other than root only when [`Owner::visible_to`] says so.
+    pub(crate) fn begin_for(&self, operation: OperationClass, owner: Owner) -> OperationScope {
         OperationScope {
             state: self.clone(),
             operation_id: self.next_operation_id(),
             operation,
+            owner,
             finished: Arc::new(AtomicBool::new(false)),
             capture: Arc::new(Mutex::new(CaptureSpan::default())),
         }
     }
 
+    /// Every retained event: root's view, and what the root-only
+    /// `SupportProbe` returns.
     pub(crate) fn snapshot(&self, since: Duration) -> SupportSnapshot {
+        self.snapshot_for(since, 0)
+    }
+
+    /// The events the peer with uid `peer_uid` may read. Root reads them
+    /// all. Another account reads those of its own operations and of
+    /// daemon-wide ones ([`Owner::visible_to`]), never another account's or
+    /// an unresolved one's, whatever their class, and its snapshot always
+    /// lists recent events as `NotAuthorized` in `unavailable`, whether or
+    /// not an event was left out, so the reader knows the list is partial
+    /// and learns nothing from the marker itself. Its events are numbered
+    /// from 1 in order: the ring's own sequence counts every event, so its
+    /// gaps would count the ones left out.
+    pub(crate) fn snapshot_for(&self, since: Duration, peer_uid: u32) -> SupportSnapshot {
         let now_ms = self.shared.clock.now_ms();
         let since_ms = u64::try_from(since.as_millis())
             .unwrap_or(u64::MAX)
@@ -161,9 +223,10 @@ impl DiagnosticState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         prune_expired(&mut inner.events, now_ms);
-        let events = inner
+        let mut events: Vec<ShareSafeEvent> = inner
             .events
             .iter()
+            .filter(|event| event.owner.visible_to(peer_uid))
             .filter_map(|event| {
                 let age_ms = now_ms.saturating_sub(event.recorded_ms);
                 (age_ms <= since_ms).then(|| ShareSafeEvent {
@@ -178,7 +241,27 @@ impl DiagnosticState {
         let capture = inner.capture.clone();
         let cameras = inner.cameras.clone();
         drop(inner);
-        SupportSnapshot::bounded(now_ms, MAX_HISTORY_MS, capture, cameras, events, Vec::new())
+        if peer_uid != 0 {
+            for (sequence, event) in (1_u64..).zip(&mut events) {
+                event.sequence = sequence;
+            }
+        }
+        let unavailable = if peer_uid == 0 {
+            Vec::new()
+        } else {
+            vec![SupportUnavailable {
+                section: SupportSection::RecentEvents,
+                reason: UnavailableReason::NotAuthorized,
+            }]
+        };
+        SupportSnapshot::bounded(
+            now_ms,
+            MAX_HISTORY_MS,
+            capture,
+            cameras,
+            events,
+            unavailable,
+        )
     }
 
     fn publish_support_context(
@@ -293,6 +376,7 @@ impl DiagnosticState {
         &self,
         operation_id: OperationId,
         operation: OperationClass,
+        owner: Owner,
         kind: ShareSafeEventKind,
     ) {
         let now_ms = self.shared.clock.now_ms();
@@ -301,13 +385,14 @@ impl DiagnosticState {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        record_locked(&mut inner, now_ms, operation_id, operation, kind);
+        record_locked(&mut inner, now_ms, operation_id, operation, owner, kind);
     }
 
     fn record_if_unfinished(
         &self,
         operation_id: OperationId,
         operation: OperationClass,
+        owner: Owner,
         kind: ShareSafeEventKind,
         finished: &AtomicBool,
     ) -> bool {
@@ -323,7 +408,7 @@ impl DiagnosticState {
         if finished.load(Ordering::Acquire) {
             return false;
         }
-        record_locked(&mut inner, now_ms, operation_id, operation, kind);
+        record_locked(&mut inner, now_ms, operation_id, operation, owner, kind);
         true
     }
 
@@ -529,6 +614,7 @@ fn record_locked(
     now_ms: u64,
     operation_id: OperationId,
     operation: OperationClass,
+    owner: Owner,
     kind: ShareSafeEventKind,
 ) {
     prune_expired(&mut inner.events, now_ms);
@@ -542,6 +628,7 @@ fn record_locked(
         sequence,
         operation_id,
         operation,
+        owner,
         kind,
     });
 }
@@ -551,6 +638,8 @@ pub(crate) struct OperationScope {
     state: DiagnosticState,
     operation_id: OperationId,
     operation: OperationClass,
+    /// Whose history the operation is; see [`Owner`].
+    owner: Owner,
     finished: Arc<AtomicBool>,
     /// The capture time for the attempt record's `capture_ms` (ADR-0030
     /// §5), accumulated per capture round from the stage timings this
@@ -610,6 +699,12 @@ impl OperationScope {
         self.operation_id
     }
 
+    /// Whose history this operation is, as [`DiagnosticState::begin_for`]
+    /// was given it; live status uses it for the same reader rule.
+    pub(crate) const fn owner(&self) -> Owner {
+        self.owner
+    }
+
     /// The capture evidence so far (ADR-0030 §5); a still-open capture
     /// round closes here.
     pub(crate) fn capture_evidence(&self) -> CaptureEvidence {
@@ -633,6 +728,7 @@ impl OperationScope {
         if self.state.record_if_unfinished(
             self.operation_id,
             self.operation,
+            self.owner,
             kind.clone(),
             &self.finished,
         ) {
@@ -650,7 +746,7 @@ impl OperationScope {
         }
         let kind = ShareSafeEventKind::OperationFinished { outcome };
         self.state
-            .record(self.operation_id, self.operation, kind.clone());
+            .record(self.operation_id, self.operation, self.owner, kind.clone());
         self.state.emit_trace(
             self.operation_id,
             self.operation,
@@ -828,6 +924,166 @@ mod tests {
             .snapshot(std::time::Duration::from_secs(1_800))
             .events()
             .is_empty());
+    }
+
+    /// Root reads every retained event. Another account reads the events of
+    /// its own operations and of daemon-wide ones only, never another
+    /// account's or an unresolved one's, whatever their class, and is told
+    /// the list is partial even when nothing was left out.
+    #[test]
+    fn a_reader_other_than_root_sees_only_its_own_and_daemon_wide_operations() {
+        let state = DiagnosticState::default();
+        let theirs = state.begin_for(OperationClass::Authentication, Owner::Account(1_000));
+        theirs.emit(selected());
+        theirs.finish(CategoricalOutcome::Denied);
+        let mine = state.begin_for(OperationClass::Authentication, Owner::Account(2_000));
+        mine.finish(CategoricalOutcome::Granted);
+        let unresolved = state.begin_for(OperationClass::Authentication, Owner::Unresolved);
+        unresolved.finish(CategoricalOutcome::Granted);
+        let their_enrollment = state.begin_for(OperationClass::Enrollment, Owner::Account(1_000));
+        their_enrollment.emit(selected());
+        their_enrollment.finish(CategoricalOutcome::Completed);
+        let my_update = state.begin_for(OperationClass::Status, Owner::Account(2_000));
+        my_update.finish(CategoricalOutcome::Completed);
+        let unresolved_update = state.begin_for(OperationClass::Status, Owner::Unresolved);
+        unresolved_update.finish(CategoricalOutcome::Failed);
+        let daemon = state.begin(OperationClass::CameraDiagnostics);
+        daemon.emit(selected());
+        daemon.finish(CategoricalOutcome::Completed);
+        let since = Duration::from_secs(60);
+        let operations = |snapshot: &SupportSnapshot| {
+            snapshot
+                .events()
+                .iter()
+                .map(|event| event.operation_id)
+                .collect::<Vec<_>>()
+        };
+        let withheld = [SupportUnavailable {
+            section: SupportSection::RecentEvents,
+            reason: UnavailableReason::NotAuthorized,
+        }];
+
+        let root = state.snapshot_for(since, 0);
+        // Root's view is the unfiltered snapshot. Taken a moment apart, the
+        // two may differ in their clock fields (uptime, event ages), so
+        // everything but those is compared.
+        let untimed = |snapshot: &SupportSnapshot| {
+            (
+                snapshot
+                    .events()
+                    .iter()
+                    .map(|event| {
+                        (
+                            event.sequence,
+                            event.operation_id,
+                            event.operation,
+                            format!("{:?}", event.kind),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                snapshot.unavailable().to_vec(),
+            )
+        };
+        assert_eq!(untimed(&root), untimed(&state.snapshot(since)));
+        assert_eq!(
+            operations(&root),
+            [
+                theirs.operation_id,
+                theirs.operation_id,
+                mine.operation_id,
+                unresolved.operation_id,
+                their_enrollment.operation_id,
+                their_enrollment.operation_id,
+                my_update.operation_id,
+                unresolved_update.operation_id,
+                daemon.operation_id,
+                daemon.operation_id,
+            ]
+        );
+        assert!(root.unavailable().is_empty());
+
+        let own = state.snapshot_for(since, 2_000);
+        assert_eq!(
+            operations(&own),
+            [
+                mine.operation_id,
+                my_update.operation_id,
+                daemon.operation_id,
+                daemon.operation_id,
+            ]
+        );
+        assert_eq!(own.unavailable(), withheld.as_slice());
+
+        let stranger = state.snapshot_for(since, 3_000);
+        assert_eq!(
+            operations(&stranger),
+            [daemon.operation_id, daemon.operation_id]
+        );
+        assert_eq!(stranger.unavailable(), withheld.as_slice());
+
+        // With nothing of another account retained the marker is the same,
+        // so it says nothing about whether another account did anything.
+        let quiet = DiagnosticState::default();
+        quiet
+            .begin(OperationClass::Enrollment)
+            .finish(CategoricalOutcome::Completed);
+        assert_eq!(
+            quiet.snapshot_for(since, 3_000).unavailable(),
+            withheld.as_slice()
+        );
+    }
+
+    /// The ring numbers every event it keeps, so a reader other than root
+    /// reads its events numbered afresh from 1, and its view is the same
+    /// whether or not other accounts authenticated in between. Root reads
+    /// the ring's own numbers.
+    #[test]
+    fn a_reader_other_than_root_reads_no_gap_where_events_were_left_out() {
+        let since = Duration::from_secs(60);
+        let record = |state: &DiagnosticState, others: bool| {
+            state
+                .begin(OperationClass::Enrollment)
+                .finish(CategoricalOutcome::Completed);
+            if others {
+                let theirs = state.begin_for(OperationClass::Authentication, Owner::Account(1_000));
+                theirs.emit(selected());
+                theirs.finish(CategoricalOutcome::Denied);
+                state
+                    .begin_for(OperationClass::Authentication, Owner::Unresolved)
+                    .finish(CategoricalOutcome::Granted);
+            }
+            state
+                .begin_for(OperationClass::Authentication, Owner::Account(2_000))
+                .finish(CategoricalOutcome::Granted);
+            state
+                .begin(OperationClass::CameraDiagnostics)
+                .finish(CategoricalOutcome::Completed);
+        };
+        let busy = DiagnosticState::default();
+        record(&busy, true);
+        let quiet = DiagnosticState::default();
+        record(&quiet, false);
+        let view = |state: &DiagnosticState, uid: u32| {
+            state
+                .snapshot_for(since, uid)
+                .events()
+                .iter()
+                .map(|event| (event.sequence, event.operation, event.kind.clone()))
+                .collect::<Vec<_>>()
+        };
+        let numbers = |state: &DiagnosticState, uid: u32| {
+            view(state, uid)
+                .into_iter()
+                .map(|(sequence, ..)| sequence)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(numbers(&busy, 2_000), [1, 2, 3]);
+        assert_eq!(view(&busy, 2_000), view(&quiet, 2_000));
+        assert_eq!(numbers(&busy, 3_000), [1, 2]);
+        assert_eq!(view(&busy, 3_000), view(&quiet, 3_000));
+        assert_eq!(numbers(&busy, 0), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(numbers(&quiet, 0), [1, 2, 3]);
     }
 
     #[test]

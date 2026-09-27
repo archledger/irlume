@@ -5,10 +5,10 @@
 
 use irlume_common::artifact::SecureArtifact;
 use irlume_common::diagnostics::{
-    CaptureSchedule, CaptureScheduleSource, DigestToken, ExactStreamContract, ProbeOutcome,
-    ProbeRoleOutcome, QualificationReason, QualificationState, RateShortfallEvidence,
+    CaptureSchedule, CaptureScheduleSource, DigestToken, ExactStreamContract, OperationClass,
+    ProbeOutcome, ProbeRoleOutcome, QualificationReason, QualificationState, RateShortfallEvidence,
     RateShortfallsByArm, RateShortfallsByRole, RuntimeViolationLabel, ShareSafeEventKind,
-    SupportProbeResult, SupportSnapshot, SupportUnavailable, UnavailableReason,
+    SupportProbeResult, SupportSection, SupportSnapshot, SupportUnavailable, UnavailableReason,
 };
 use irlume_common::{Request, Response};
 use serde::Serialize;
@@ -395,8 +395,10 @@ pub(crate) fn render_text(report: &SupportReport) -> Result<Vec<u8>, &'static st
     writeln!(body).unwrap();
     writeln!(body, "Recent typed events").unwrap();
     match &report.daemon {
-        Some(snapshot) if snapshot.events().is_empty() => writeln!(body, "  none").unwrap(),
         Some(snapshot) => {
+            if snapshot.events().is_empty() {
+                writeln!(body, "  none").unwrap();
+            }
             for event in snapshot.events() {
                 writeln!(
                     body,
@@ -406,6 +408,13 @@ pub(crate) fn render_text(report: &SupportReport) -> Result<Vec<u8>, &'static st
                     event.operation_id,
                     event.operation,
                     event_summary(&event.kind)
+                )
+                .unwrap();
+            }
+            if withholds_other_accounts(snapshot) {
+                writeln!(
+                    body,
+                    "  events of other accounts: withheld, a report run as root lists them"
                 )
                 .unwrap();
             }
@@ -445,6 +454,7 @@ pub(crate) fn render_text(report: &SupportReport) -> Result<Vec<u8>, &'static st
         "  [x] no raw device paths, serials, emitter payloads, or journals"
     )
     .unwrap();
+    writeln!(body, "{}", authentication_checklist_line(report)).unwrap();
 
     if body.len() as u64 > MAX_REPORT_BYTES.saturating_sub(96) {
         return Err("support report exceeds 1 MiB");
@@ -847,6 +857,48 @@ fn runtime_violation_name(value: RuntimeViolationLabel) -> &'static str {
     }
 }
 
+/// Whether the daemon left other accounts' operations out of the recent
+/// events: it marks recent events `NotAuthorized` for every reader but root.
+/// An older daemon does not, and lists every account's.
+fn withholds_other_accounts(snapshot: &SupportSnapshot) -> bool {
+    snapshot.unavailable().iter().any(|unavailable| {
+        unavailable.section == SupportSection::RecentEvents
+            && unavailable.reason == UnavailableReason::NotAuthorized
+    })
+}
+
+/// The privacy checklist's line for the authentication timeline: when the
+/// recent events include authentications, whose they are, since their
+/// times and outcomes (granted, denied, failed) are account history.
+fn authentication_checklist_line(report: &SupportReport) -> &'static str {
+    let Some(snapshot) = report.daemon.as_ref() else {
+        return "  [x] no authentication times or outcomes";
+    };
+    let has = |class: OperationClass| {
+        snapshot
+            .events()
+            .iter()
+            .any(|event| event.operation == class)
+    };
+    if !has(OperationClass::Authentication) {
+        // An irlumed from before this release labels keyring arms and token
+        // releases, which are credential operations, as status events, and
+        // does not withhold other accounts'. Without the withholding mark
+        // the report cannot tell such a daemon from root's view of this
+        // one, so status events are not taken as proof there are none.
+        if has(OperationClass::Status) && !withholds_other_accounts(snapshot) {
+            return "  [!] recent status events, which an older irlumed also uses for keyring \
+                    arms and token releases: when each happened and its outcome";
+        }
+        return "  [x] no authentication times or outcomes";
+    }
+    if withholds_other_accounts(snapshot) {
+        "  [!] this account's recent authentications: when each happened and its outcome"
+    } else {
+        "  [!] recent authentications of every account: when each happened and its outcome"
+    }
+}
+
 fn event_summary(value: &ShareSafeEventKind) -> String {
     match value {
         ShareSafeEventKind::LifecycleChanged { role, generation } => {
@@ -1051,6 +1103,117 @@ mod tests {
 
         assert!(text.contains("authoritative rate shortfalls: unavailable"));
         assert!(text.contains("latest-attempt rate shortfalls: unavailable"));
+    }
+
+    fn fixture_report_with_events(
+        privilege: EffectivePrivilege,
+        operations: &[OperationClass],
+        unavailable: Vec<SupportUnavailable>,
+    ) -> SupportReport {
+        let events = operations
+            .iter()
+            .zip(1_u64..)
+            .map(
+                |(&operation, sequence)| irlume_common::diagnostics::ShareSafeEvent {
+                    sequence,
+                    age_ms: 1_000,
+                    operation_id: irlume_common::diagnostics::OperationId::from_bytes(
+                        [u8::try_from(sequence).unwrap(); 16],
+                    ),
+                    operation,
+                    kind: ShareSafeEventKind::OperationFinished {
+                        outcome: irlume_common::diagnostics::CategoricalOutcome::Denied,
+                    },
+                },
+            )
+            .collect();
+        let mut report = fixture_report();
+        report.effective_privilege = privilege;
+        report.daemon = Some(SupportSnapshot::bounded(
+            42_000,
+            60_000,
+            None,
+            Vec::new(),
+            events,
+            unavailable,
+        ));
+        report
+    }
+
+    /// The privacy checklist names the authentication timeline when the
+    /// recent events carry one, and whose it is: every account's in a
+    /// report from root (or from an older daemon), only the account's own
+    /// when the daemon withheld the others.
+    #[test]
+    fn privacy_checklist_names_the_authentication_timeline_it_contains() {
+        let withheld = vec![SupportUnavailable {
+            section: SupportSection::RecentEvents,
+            reason: UnavailableReason::NotAuthorized,
+        }];
+        let render = |report: &SupportReport| {
+            let text = String::from_utf8(render_text(report).unwrap()).unwrap();
+            let checklist = text.split_once("Privacy checklist\n").unwrap().1.to_owned();
+            (text, checklist)
+        };
+
+        let (text, checklist) = render(&fixture_report_with_events(
+            EffectivePrivilege::Root,
+            &[
+                OperationClass::CameraDiagnostics,
+                OperationClass::Authentication,
+            ],
+            Vec::new(),
+        ));
+        assert!(checklist.contains(
+            "  [!] recent authentications of every account: when each happened and its outcome\n"
+        ));
+        assert!(!text.contains("events of other accounts: withheld"));
+
+        let (text, checklist) = render(&fixture_report_with_events(
+            EffectivePrivilege::User,
+            &[OperationClass::Authentication],
+            withheld.clone(),
+        ));
+        assert!(checklist.contains(
+            "  [!] this account's recent authentications: when each happened and its outcome\n"
+        ));
+        assert!(text.contains(
+            "Recent typed events\n  #1 age=1000ms id=OperationId(\"01010101010101010101010101010101\") operation=Authentication operation_finished outcome=Denied\n  events of other accounts: withheld, a report run as root lists them\n"
+        ));
+
+        let (text, checklist) = render(&fixture_report_with_events(
+            EffectivePrivilege::User,
+            &[OperationClass::Enrollment],
+            withheld,
+        ));
+        assert!(checklist.contains("  [x] no authentication times or outcomes\n"));
+        assert!(text.contains("events of other accounts: withheld"));
+
+        let (_, checklist) = render(&fixture_report());
+        assert!(checklist.contains("  [x] no authentication times or outcomes\n"));
+
+        // Status events with no withholding mark may be an older daemon's
+        // credential operations, so they are not taken as proof there are
+        // none; with the mark they are status events only.
+        let (_, checklist) = render(&fixture_report_with_events(
+            EffectivePrivilege::User,
+            &[OperationClass::Status],
+            Vec::new(),
+        ));
+        assert!(
+            checklist.contains("  [!] recent status events, which an older irlumed also uses"),
+            "{checklist}"
+        );
+        assert!(!checklist.contains("[x] no authentication times or outcomes"));
+        let (_, checklist) = render(&fixture_report_with_events(
+            EffectivePrivilege::User,
+            &[OperationClass::Status],
+            vec![SupportUnavailable {
+                section: SupportSection::RecentEvents,
+                reason: UnavailableReason::NotAuthorized,
+            }],
+        ));
+        assert!(checklist.contains("  [x] no authentication times or outcomes\n"));
     }
 
     #[test]

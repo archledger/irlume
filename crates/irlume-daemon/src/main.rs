@@ -3727,7 +3727,10 @@ fn serve_peer_until(
                 // queues: retain its failed Status diagnostic before replying,
                 // and file a refused face attempt (ADR-0030 §5) — it named
                 // no camera.
-                let scope = diagnostic_state.begin(diagnostic_operation_class(&req));
+                let scope = diagnostic_state.begin_for(
+                    diagnostic_operation_class(&req),
+                    diagnostic_owner(&req, &peer),
+                );
                 scope.finish(categorical_outcome(&resp));
                 if peer_may_file_for(&req, &peer) {
                     if let Some(attempt) = AttemptContext::for_request(&req, &peer, || None) {
@@ -3779,7 +3782,10 @@ fn serve_peer_until(
                 } else {
                     (None, None)
                 };
-            let scope = diagnostic_state.begin(diagnostic_operation_class(&req));
+            let scope = diagnostic_state.begin_for(
+                diagnostic_operation_class(&req),
+                diagnostic_owner(&req, &peer),
+            );
             // The ingress boundary covers the connection thread's work up to
             // this scope: the read deadline wait, request parse, posture gate
             // and authorization. Measured from before the read (the scope
@@ -3791,9 +3797,12 @@ fn serve_peer_until(
             );
             let (reply, answer) = std::sync::mpsc::channel();
             let activity = live::request_kind(&req).map(|(kind, changes_state)| {
-                diagnostic_state
-                    .live()
-                    .register(scope.operation_id(), kind, changes_state)
+                diagnostic_state.live().register(
+                    scope.operation_id(),
+                    kind,
+                    changes_state,
+                    scope.owner(),
+                )
             });
             let link = std::sync::Arc::new(ClientLink {
                 activity: activity.clone(),
@@ -5448,12 +5457,14 @@ fn dispatch_status_with_diagnostics(
         return Some(resp);
     }
     let _gate_uid = gate_account_uid(req, peer);
+    // Both views depend on the reader: root sees every operation, any other
+    // account only its own and daemon-wide ones (`diagnostics::Owner`).
     if matches!(req, Request::LiveStatus) {
         return Some(match diagnostic_state {
             Some(state) => Response::LiveStatus(Box::new(
                 state
                     .live()
-                    .snapshot(irlume_auth::camera_inventory_snapshot()),
+                    .snapshot_for(irlume_auth::camera_inventory_snapshot(), peer.uid),
             )),
             None => Response::OperationError {
                 code: irlume_common::OperationErrorCode::OperationFailed,
@@ -5465,7 +5476,7 @@ fn dispatch_status_with_diagnostics(
     if let Request::SupportSnapshot { since_ms } = req {
         return Some(match diagnostic_state {
             Some(state) => Response::SupportSnapshot(Box::new(
-                state.snapshot(std::time::Duration::from_millis(*since_ms)),
+                state.snapshot_for(std::time::Duration::from_millis(*since_ms), peer.uid),
             )),
             None => Response::OperationError {
                 code: irlume_common::OperationErrorCode::OperationFailed,
@@ -6234,9 +6245,20 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
     use irlume_common::diagnostics::OperationClass;
     use Request::*;
     match req {
-        Authenticate { .. } | UnsealPassword { .. } | UnsealKeyring { .. } => {
-            OperationClass::Authentication
-        }
+        // `ReleaseTokenForDisarm` checks the account's password against the
+        // token's wrap and hands the GNOME keyring token out: a credential
+        // release like `UnsealKeyring`, so its events are the account's
+        // history too (`diagnostic_owner`). `SealPassword` checks the
+        // password against the account's login hash where the daemon can
+        // read it, and one that resolves to a GNOME keyring token returns
+        // that token in `TokenSealed`, on a re-arm the one already armed.
+        // What it seals is decided only when it runs, so every one is
+        // classed with the credential releases.
+        Authenticate { .. }
+        | UnsealPassword { .. }
+        | UnsealKeyring { .. }
+        | ReleaseTokenForDisarm { .. }
+        | SealPassword { .. } => OperationClass::Authentication,
         Enroll { .. }
         | EnrollmentSession { .. }
         | AddScan { .. }
@@ -6271,12 +6293,10 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | SupportSnapshot { .. }
         | LiveStatus
         | TraceSubscribe { .. }
-        | SealPassword { .. }
         | HasSealedPassword { .. }
         | KeyringMetadata { .. }
         | KeyringInfo { .. }
         | ForgetPassword { .. }
-        | ReleaseTokenForDisarm { .. }
         | ResealPassword { .. }
         | RecoverySetup { .. }
         | RecoveryRestore { .. }
@@ -6284,6 +6304,33 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | RecoveryForget { .. }
         | RetryStatus { .. }
         | RetryReset { .. } => OperationClass::Status,
+    }
+}
+
+/// Whose history an operation is ([`diagnostics::Owner`]), recorded with its
+/// diagnostic events and live-status entry so that an account other than
+/// root reads there only its own operations and daemon-wide ones, whatever
+/// their kind. A peer other than root acts for itself whatever it names:
+/// posture refuses it another account's authentication, credential,
+/// enrollment, profile, wallet or recovery work, and what it may still name
+/// (a framing guide's pitch hint) is its own work, as is camera work that
+/// names no account. Root (a greeter, `sudo`, a keyring release, a disarm,
+/// an administrator) acts for the account the request names, resolved here,
+/// or for an unresolved one when the name is invalid or does not resolve,
+/// which leaves the operation to root alone; root's requests that name no
+/// account (camera setup and qualification, diagnostics, a support probe, a
+/// recognition test) are daemon-wide.
+fn diagnostic_owner(req: &Request, peer: &Peer) -> diagnostics::Owner {
+    use diagnostics::Owner;
+    if peer.uid != 0 {
+        return Owner::Account(peer.uid);
+    }
+    match posture(req).user {
+        None => Owner::Daemon,
+        Some(user) => Some(user)
+            .filter(|user| valid_username(user))
+            .and_then(uid_of)
+            .map_or(Owner::Unresolved, Owner::Account),
     }
 }
 
@@ -10827,6 +10874,7 @@ mod tests {
             "identify_scope(",
             "identify_target(",
             "identify_account(",
+            "diagnostic_owner(",
             "serve(",
             // A cached listing is served only while the name resolves as it
             // did (`EnrollmentSummary::serves`), which asks NSS for a root
@@ -12610,8 +12658,14 @@ mod tests {
         let arbiter = arbiter::Arbiter::<Queued>::new();
         let ready = std::sync::atomic::AtomicBool::new(false);
         let diagnostic_state = diagnostics::DiagnosticState::default();
-        let seeded =
-            diagnostic_state.begin(irlume_common::diagnostics::OperationClass::Authentication);
+        // Owned by the account running the test, the socket pair's peer, which
+        // reads its own authentications whether or not it is root.
+        let seeded = diagnostic_state.begin_for(
+            irlume_common::diagnostics::OperationClass::Authentication,
+            // SAFETY: geteuid takes no arguments, reads only this process's
+            // own effective uid, and always succeeds.
+            diagnostics::Owner::Account(unsafe { libc::geteuid() }),
+        );
         seeded.emit(
             irlume_common::diagnostics::ShareSafeEventKind::CaptureScheduleSelected {
                 schedule: irlume_common::diagnostics::CaptureSchedule::Sequential,
@@ -12687,6 +12741,601 @@ mod tests {
         assert!(arbiter.take().is_none(), "observer must never queue");
     }
 
+    /// The recent-event ring and live status answer any local peer, so an
+    /// account other than root reads only its own operations and daemon-wide
+    /// ones there (ADR-0030 §5): no other account's authentication or
+    /// enrollment outcome, capture events or in-progress kind. Root reads
+    /// every account's. Work still in progress keeps its place for everyone,
+    /// so the worker reads busy.
+    #[test]
+    fn support_snapshot_and_live_status_show_operations_to_root_and_their_account_only() {
+        use diagnostics::Owner;
+        use irlume_common::diagnostics::{
+            CaptureSchedule, CaptureScheduleSource, CategoricalOutcome, OperationClass,
+            ShareSafeEventKind, SupportSection, SupportSnapshot, SupportUnavailable,
+            UnavailableReason,
+        };
+        use irlume_common::live::{LiveOperationKind, LiveStatusSnapshot, LiveWaitingCount};
+        use std::io::{BufRead as _, BufReader, Write as _};
+        const OWNER: u32 = 60_001;
+        const OTHER: u32 = 60_002;
+        let arbiter = arbiter::Arbiter::<Queued>::new();
+        let ready = std::sync::atomic::AtomicBool::new(false);
+        let state = diagnostics::DiagnosticState::default();
+        state
+            .begin(OperationClass::CameraDiagnostics)
+            .finish(CategoricalOutcome::Completed);
+        let denied = state.begin_for(OperationClass::Authentication, Owner::Account(OWNER));
+        denied.emit(ShareSafeEventKind::CaptureScheduleSelected {
+            schedule: CaptureSchedule::Sequential,
+            source: CaptureScheduleSource::SequentialDefault,
+        });
+        denied.finish(CategoricalOutcome::Denied);
+        state
+            .begin_for(OperationClass::Enrollment, Owner::Account(OWNER))
+            .finish(CategoricalOutcome::Completed);
+        state
+            .begin_for(OperationClass::Authentication, Owner::Unresolved)
+            .finish(CategoricalOutcome::Granted);
+        let running = state.begin_for(OperationClass::Authentication, Owner::Account(OWNER));
+        let activity = state.live().register(
+            running.operation_id(),
+            LiveOperationKind::Authentication,
+            false,
+            running.owner(),
+        );
+        activity.running();
+        let queued = state.begin_for(OperationClass::Authentication, Owner::Unresolved);
+        let waiting = state.live().register(
+            queued.operation_id(),
+            LiveOperationKind::WalletAuthentication,
+            false,
+            queued.owner(),
+        );
+        waiting.waiting();
+        let rename = state.begin_for(OperationClass::Status, Owner::Account(OWNER));
+        let renaming = state.live().register(
+            rename.operation_id(),
+            LiveOperationKind::ProfileUpdate,
+            true,
+            rename.owner(),
+        );
+        renaming.waiting();
+
+        let ask = |uid: u32, wire: &[u8]| {
+            with_serve_as_peer_and_diagnostics(&arbiter, &ready, &state, peer(uid), |client| {
+                (&*client).write_all(wire).unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                serde_json::from_str::<Response>(line.trim()).unwrap()
+            })
+        };
+        let view = |uid: u32| -> (SupportSnapshot, LiveStatusSnapshot) {
+            let Response::SupportSnapshot(snapshot) =
+                ask(uid, b"{\"SupportSnapshot\":{\"since_ms\":60000}}\n")
+            else {
+                panic!("expected a support snapshot");
+            };
+            let Response::LiveStatus(live) = ask(uid, b"\"LiveStatus\"\n") else {
+                panic!("expected live status");
+            };
+            (*snapshot, *live)
+        };
+        let finished = |snapshot: &SupportSnapshot| {
+            snapshot
+                .events()
+                .iter()
+                .filter_map(|event| match event.kind {
+                    ShareSafeEventKind::OperationFinished { outcome } => {
+                        Some((event.operation, outcome))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let authentication_events = |snapshot: &SupportSnapshot| {
+            snapshot
+                .events()
+                .iter()
+                .filter(|event| event.operation == OperationClass::Authentication)
+                .count()
+        };
+        let withheld = [SupportUnavailable {
+            section: SupportSection::RecentEvents,
+            reason: UnavailableReason::NotAuthorized,
+        }];
+        let waiting_kinds = |live: &LiveStatusSnapshot| {
+            live.waiting
+                .iter()
+                .map(|LiveWaitingCount { kind, count }| (*kind, *count))
+                .collect::<Vec<_>>()
+        };
+
+        let (snapshot, live) = view(0);
+        assert_eq!(
+            finished(&snapshot),
+            [
+                (
+                    OperationClass::CameraDiagnostics,
+                    CategoricalOutcome::Completed
+                ),
+                (OperationClass::Authentication, CategoricalOutcome::Denied),
+                (OperationClass::Enrollment, CategoricalOutcome::Completed),
+                (OperationClass::Authentication, CategoricalOutcome::Granted),
+            ]
+        );
+        assert_eq!(authentication_events(&snapshot), 3);
+        assert!(snapshot.unavailable().is_empty());
+        let worker = live.worker.as_ref().expect("the running authentication");
+        assert_eq!(worker.kind, LiveOperationKind::Authentication);
+        assert_eq!(
+            waiting_kinds(&live),
+            [
+                (LiveOperationKind::WalletAuthentication, 1),
+                (LiveOperationKind::ProfileUpdate, 1)
+            ]
+        );
+
+        let (snapshot, live) = view(OWNER);
+        assert_eq!(
+            finished(&snapshot),
+            [
+                (
+                    OperationClass::CameraDiagnostics,
+                    CategoricalOutcome::Completed
+                ),
+                (OperationClass::Authentication, CategoricalOutcome::Denied),
+                (OperationClass::Enrollment, CategoricalOutcome::Completed),
+            ]
+        );
+        assert_eq!(authentication_events(&snapshot), 2);
+        assert_eq!(snapshot.unavailable(), withheld.as_slice());
+        let worker = live.worker.as_ref().expect("the running authentication");
+        assert_eq!(worker.kind, LiveOperationKind::Authentication);
+        assert_eq!(
+            waiting_kinds(&live),
+            [
+                (LiveOperationKind::ProfileUpdate, 1),
+                (LiveOperationKind::Unknown, 1)
+            ]
+        );
+
+        let (snapshot, live) = view(OTHER);
+        assert_eq!(
+            finished(&snapshot),
+            [(
+                OperationClass::CameraDiagnostics,
+                CategoricalOutcome::Completed
+            )]
+        );
+        assert_eq!(authentication_events(&snapshot), 0);
+        assert_eq!(snapshot.unavailable(), withheld.as_slice());
+        let worker = live.worker.as_ref().expect("still busy for every reader");
+        assert_eq!(worker.kind, LiveOperationKind::Unknown);
+        assert_eq!(worker.operation_id, running.operation_id());
+        assert_eq!(waiting_kinds(&live), [(LiveOperationKind::Unknown, 2)]);
+
+        drop((activity, waiting, renaming));
+        arbiter.close();
+        assert!(arbiter.take().is_none(), "observers must never queue");
+    }
+
+    /// A peer other than root acts for itself, so whatever it names or
+    /// asks, the operation is its own; root's acts for the account it
+    /// names, one that does not resolve is left to root, and root's work
+    /// that names no account is daemon-wide.
+    #[test]
+    fn an_operation_acts_for_its_peer_or_the_account_root_names() {
+        use diagnostics::Owner;
+        let _g = test_support::env_read();
+        let authenticate = |user: &str| Request::Authenticate {
+            structured_errors: false,
+            user: user.into(),
+            service: Some("sudo".into()),
+            intent_confirmation: None,
+        };
+        let unseal_keyring = |user: &str| Request::UnsealKeyring {
+            user: user.into(),
+            service: None,
+            have_password: false,
+            auth_phase: false,
+        };
+        let release_token = |user: &str| Request::ReleaseTokenForDisarm {
+            user: user.into(),
+            password: irlume_common::SecretBytes::new(b"pw".to_vec()),
+        };
+        let keyring_info = |user: &str| Request::KeyringInfo { user: user.into() };
+        let identify_for = |user: &str| Request::IdentifyFor { user: user.into() };
+        // SAFETY: geteuid takes no arguments, reads only this process's own
+        // effective uid, and always succeeds.
+        let euid = unsafe { libc::geteuid() };
+        let account = users::name_for_uid(euid).expect("the running account resolves");
+        for req in [
+            authenticate("root"),
+            unseal_keyring("root"),
+            release_token("root"),
+            keyring_info("root"),
+            identify_for(&account),
+            Request::Identify,
+            Request::ListCameras,
+            Request::Ping,
+            Request::SupportSnapshot { since_ms: 60_000 },
+        ] {
+            assert_eq!(
+                diagnostic_owner(&req, &peer(60_001)),
+                Owner::Account(60_001),
+                "{req:?}"
+            );
+        }
+        for req in [
+            authenticate(&account),
+            Request::UnsealPassword {
+                user: account.clone(),
+                service: None,
+            },
+            release_token(&account),
+            keyring_info(&account),
+            identify_for(&account),
+        ] {
+            assert_eq!(
+                diagnostic_owner(&req, &peer(0)),
+                Owner::Account(euid),
+                "{req:?}"
+            );
+        }
+        for req in [
+            unseal_keyring("irlume-no-such-account"),
+            authenticate("../root"),
+            keyring_info("irlume-no-such-account"),
+        ] {
+            assert_eq!(
+                diagnostic_owner(&req, &peer(0)),
+                Owner::Unresolved,
+                "{req:?}"
+            );
+        }
+        for req in [
+            Request::Identify,
+            Request::ListCameras,
+            Request::CameraDiagnostics,
+            Request::Ping,
+            Request::SupportSnapshot { since_ms: 60_000 },
+        ] {
+            assert_eq!(diagnostic_owner(&req, &peer(0)), Owner::Daemon, "{req:?}");
+        }
+    }
+
+    /// The serving path records each authentication for its account: one
+    /// refused at the door and one queued to the worker, whose live entry
+    /// another account reads as unknown work while it runs.
+    #[test]
+    fn served_authentications_are_recorded_for_their_account() {
+        use irlume_common::diagnostics::{CategoricalOutcome, OperationClass, ShareSafeEventKind};
+        use irlume_common::live::LiveOperationKind;
+        use std::io::{BufRead as _, BufReader, Write as _};
+        const REFUSED: u32 = 60_001;
+        let _g = env_lock();
+        let _sandbox = sandbox("authentication-owner");
+        // SAFETY: geteuid takes no arguments, reads only this process's own
+        // effective uid, and always succeeds.
+        let euid = unsafe { libc::geteuid() };
+        let account = users::name_for_uid(euid).expect("the running account resolves");
+        let stranger = if euid == 60_002 { 60_003 } else { 60_002 };
+        let state = diagnostics::DiagnosticState::default();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let ask = |uid: u32, wire: String| {
+            with_serve_as_peer_and_diagnostics(&arbiter, &ready, &state, peer(uid), |client| {
+                (&*client).write_all(wire.as_bytes()).unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                serde_json::from_str::<Response>(line.trim()).unwrap()
+            })
+        };
+        let wire = |user: &str| {
+            let mut line = serde_json::to_string(&Request::Authenticate {
+                structured_errors: false,
+                user: user.into(),
+                service: Some("sudo".into()),
+                intent_confirmation: Some(IntentAttestation::PamConversation),
+            })
+            .unwrap();
+            line.push('\n');
+            line
+        };
+        let authentications = |uid: u32| {
+            let Response::SupportSnapshot(snapshot) =
+                ask(uid, "{\"SupportSnapshot\":{\"since_ms\":60000}}\n".into())
+            else {
+                panic!("expected a support snapshot");
+            };
+            snapshot
+                .events()
+                .iter()
+                .filter(|event| event.operation == OperationClass::Authentication)
+                .map(|event| event.kind.clone())
+                .collect::<Vec<_>>()
+        };
+        let running_kind = |uid: u32| {
+            let Response::LiveStatus(live) = ask(uid, "\"LiveStatus\"\n".into()) else {
+                panic!("expected live status");
+            };
+            live.worker.map(|worker| worker.kind)
+        };
+
+        // Only root may attest the PAM conversation: refused before the queue.
+        assert!(matches!(
+            ask(REFUSED, wire("root")),
+            Response::AuthResult {
+                granted: false,
+                refused_by_policy: true,
+                ..
+            }
+        ));
+        let refusal = vec![ShareSafeEventKind::OperationFinished {
+            outcome: CategoricalOutcome::Denied,
+        }];
+        assert_eq!(authentications(REFUSED), refusal);
+        assert!(authentications(stranger).is_empty());
+        assert_eq!(authentications(0), refusal);
+
+        let (claimed, on_claim) = std::sync::mpsc::channel();
+        let (release, on_release) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let arbiter = std::sync::Arc::clone(&arbiter);
+            std::thread::spawn(move || {
+                let job = arbiter.take().expect("root's authentication queued");
+                let Queued {
+                    reply, link, scope, ..
+                } = job.payload;
+                assert!(link.claim());
+                claimed.send(()).unwrap();
+                on_release.recv().unwrap();
+                let response = Response::Ok("queued".into());
+                scope.finish(categorical_outcome(&response));
+                link.released();
+                link.finish_activity();
+                arbiter.finish(job.class, job.uid);
+                reply.send(response.into()).unwrap();
+            })
+        };
+        std::thread::scope(|scope| {
+            let client = scope.spawn(|| ask(0, wire(&account)));
+            on_claim
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the worker claims the authentication");
+            assert_eq!(running_kind(0), Some(LiveOperationKind::Authentication));
+            assert_eq!(running_kind(euid), Some(LiveOperationKind::Authentication));
+            assert_eq!(running_kind(stranger), Some(LiveOperationKind::Unknown));
+            release.send(()).unwrap();
+            assert!(matches!(
+                client.join().unwrap(),
+                Response::Ok(ref message) if message == "queued"
+            ));
+        });
+        worker.join().unwrap();
+        arbiter.close();
+        let completed = ShareSafeEventKind::OperationFinished {
+            outcome: CategoricalOutcome::Completed,
+        };
+        assert!(authentications(euid).contains(&completed));
+        assert!(authentications(stranger).is_empty());
+        assert_eq!(authentications(0).len(), 2);
+    }
+
+    /// A disarm's token release checks the account's password and hands the
+    /// GNOME keyring token out, a credential release like `UnsealKeyring`:
+    /// another account reads it as unknown work while it runs and never
+    /// reads its outcome; root and the account read both.
+    #[test]
+    fn a_token_release_for_disarm_is_shown_to_root_and_its_account_only() {
+        use irlume_common::diagnostics::{CategoricalOutcome, OperationId, ShareSafeEventKind};
+        use irlume_common::live::LiveOperationKind;
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let _g = env_lock();
+        let _sandbox = sandbox("token-release-owner");
+        // SAFETY: geteuid takes no arguments, reads only this process's own
+        // effective uid, and always succeeds.
+        let euid = unsafe { libc::geteuid() };
+        let account = users::name_for_uid(euid).expect("the running account resolves");
+        let stranger = if euid == 60_002 { 60_003 } else { 60_002 };
+        let state = diagnostics::DiagnosticState::default();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let ask = |uid: u32, wire: String| {
+            with_serve_as_peer_and_diagnostics(&arbiter, &ready, &state, peer(uid), |client| {
+                (&*client).write_all(wire.as_bytes()).unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                serde_json::from_str::<Response>(line.trim()).unwrap()
+            })
+        };
+        let running = |uid: u32| {
+            let Response::LiveStatus(live) = ask(uid, "\"LiveStatus\"\n".into()) else {
+                panic!("expected live status");
+            };
+            let worker = live.worker.expect("the release is running");
+            (worker.operation_id, worker.kind)
+        };
+        let events_of = |uid: u32, operation: OperationId| {
+            let Response::SupportSnapshot(snapshot) =
+                ask(uid, "{\"SupportSnapshot\":{\"since_ms\":60000}}\n".into())
+            else {
+                panic!("expected a support snapshot");
+            };
+            snapshot
+                .events()
+                .iter()
+                .filter(|event| event.operation_id == operation)
+                .map(|event| event.kind.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut wire = serde_json::to_string(&Request::ReleaseTokenForDisarm {
+            user: account.clone(),
+            password: irlume_common::SecretBytes::new(b"not-the-password".to_vec()),
+        })
+        .unwrap();
+        wire.push('\n');
+
+        let (claimed, on_claim) = std::sync::mpsc::channel();
+        let (release, on_release) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let arbiter = std::sync::Arc::clone(&arbiter);
+            std::thread::spawn(move || {
+                let job = arbiter.take().expect("root's token release queued");
+                let Queued {
+                    reply, link, scope, ..
+                } = job.payload;
+                assert!(link.claim());
+                claimed.send(()).unwrap();
+                on_release.recv().unwrap();
+                let response = Response::Error("keyring: the password does not open it".into());
+                scope.finish(categorical_outcome(&response));
+                link.released();
+                link.finish_activity();
+                arbiter.finish(job.class, job.uid);
+                reply.send(response.into()).unwrap();
+            })
+        };
+        let operation = std::thread::scope(|scope| {
+            // Owned here, so a failed assertion drops it before the scope
+            // joins: the worker stops waiting and the client is answered.
+            let release = release;
+            let client = scope.spawn(|| ask(0, wire));
+            on_claim
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the worker claims the token release");
+            let (operation, kind) = running(0);
+            assert_eq!(kind, LiveOperationKind::WalletAuthentication);
+            assert_eq!(
+                running(euid),
+                (operation, LiveOperationKind::WalletAuthentication)
+            );
+            assert_eq!(running(stranger), (operation, LiveOperationKind::Unknown));
+            release.send(()).unwrap();
+            assert!(matches!(client.join().unwrap(), Response::Error(_)));
+            operation
+        });
+        worker.join().unwrap();
+        arbiter.close();
+        let failed = [ShareSafeEventKind::OperationFinished {
+            outcome: CategoricalOutcome::Failed,
+        }];
+        assert_eq!(events_of(0, operation), failed);
+        assert_eq!(events_of(euid, operation), failed);
+        assert!(events_of(stranger, operation).is_empty());
+    }
+
+    /// A password seal checks the account's password where the daemon can
+    /// read its hash and may hand a GNOME keyring token out, which is
+    /// decided only when it runs, so every one is a credential operation of
+    /// the account it names: its outcome is classed with the
+    /// authentications and read by root and that account only, and another
+    /// account reads it as unknown work while it runs.
+    #[test]
+    fn a_password_seal_is_a_credential_operation_shown_to_root_and_its_account_only() {
+        use irlume_common::diagnostics::{
+            CategoricalOutcome, OperationClass, OperationId, ShareSafeEventKind,
+        };
+        use irlume_common::live::LiveOperationKind;
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let _g = env_lock();
+        let _sandbox = sandbox("password-seal-owner");
+        // SAFETY: geteuid takes no arguments, reads only this process's own
+        // effective uid, and always succeeds.
+        let euid = unsafe { libc::geteuid() };
+        let account = users::name_for_uid(euid).expect("the running account resolves");
+        let stranger = if euid == 60_002 { 60_003 } else { 60_002 };
+        let state = diagnostics::DiagnosticState::default();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let ask = |uid: u32, wire: String| {
+            with_serve_as_peer_and_diagnostics(&arbiter, &ready, &state, peer(uid), |client| {
+                (&*client).write_all(wire.as_bytes()).unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                serde_json::from_str::<Response>(line.trim()).unwrap()
+            })
+        };
+        let running = |uid: u32| {
+            let Response::LiveStatus(live) = ask(uid, "\"LiveStatus\"\n".into()) else {
+                panic!("expected live status");
+            };
+            let worker = live.worker.expect("the seal is running");
+            (worker.operation_id, worker.kind)
+        };
+        let events_of = |uid: u32, operation: OperationId| {
+            let Response::SupportSnapshot(snapshot) =
+                ask(uid, "{\"SupportSnapshot\":{\"since_ms\":60000}}\n".into())
+            else {
+                panic!("expected a support snapshot");
+            };
+            snapshot
+                .events()
+                .iter()
+                .filter(|event| event.operation_id == operation)
+                .map(|event| (event.operation, event.kind.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut wire = serde_json::to_string(&Request::SealPassword {
+            user: account.clone(),
+            password: irlume_common::SecretBytes::new(b"not-the-password".to_vec()),
+            kind: None,
+            wallet_salt: None,
+            wallet_salt_checked: false,
+        })
+        .unwrap();
+        wire.push('\n');
+
+        let (claimed, on_claim) = std::sync::mpsc::channel();
+        let (release, on_release) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let arbiter = std::sync::Arc::clone(&arbiter);
+            std::thread::spawn(move || {
+                let job = arbiter.take().expect("root's password seal queued");
+                let Queued {
+                    reply, link, scope, ..
+                } = job.payload;
+                assert!(link.claim());
+                claimed.send(()).unwrap();
+                on_release.recv().unwrap();
+                let response = Response::Error("the password does not match".into());
+                scope.finish(categorical_outcome(&response));
+                link.released();
+                link.finish_activity();
+                arbiter.finish(job.class, job.uid);
+                reply.send(response.into()).unwrap();
+            })
+        };
+        let operation = std::thread::scope(|scope| {
+            // Owned here, so a failed assertion drops it before the scope
+            // joins: the worker stops waiting and the client is answered.
+            let release = release;
+            let client = scope.spawn(|| ask(0, wire));
+            on_claim
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the worker claims the password seal");
+            let (operation, kind) = running(0);
+            assert_eq!(kind, LiveOperationKind::WalletUpdate);
+            assert_eq!(running(euid), (operation, LiveOperationKind::WalletUpdate));
+            assert_eq!(running(stranger), (operation, LiveOperationKind::Unknown));
+            release.send(()).unwrap();
+            assert!(matches!(client.join().unwrap(), Response::Error(_)));
+            operation
+        });
+        worker.join().unwrap();
+        arbiter.close();
+        let failed = [(
+            OperationClass::Authentication,
+            ShareSafeEventKind::OperationFinished {
+                outcome: CategoricalOutcome::Failed,
+            },
+        )];
+        assert_eq!(events_of(0, operation), failed);
+        assert_eq!(events_of(euid, operation), failed);
+        assert!(events_of(stranger, operation).is_empty());
+    }
+
     #[test]
     fn live_status_client_link_preserves_owner_and_completion_after_disconnect() {
         use irlume_common::live::LiveOperationKind;
@@ -12705,6 +13354,7 @@ mod tests {
                         .operation_id(),
                     LiveOperationKind::Enrollment,
                     true,
+                    diagnostics::Owner::Daemon,
                 ),
             ),
             ..ClientLink::default()
@@ -12725,6 +13375,7 @@ mod tests {
                         .operation_id(),
                     LiveOperationKind::Authentication,
                     false,
+                    diagnostics::Owner::Daemon,
                 ),
             ),
             ..ClientLink::default()

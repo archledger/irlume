@@ -843,6 +843,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- irlumed turns a camera on for an account's own request only while that
+  account holds the active local session on a seat, as udev's `uaccess`
+  grants camera devices. This covers face authentication from a lock
+  screen that runs PAM as the user, `irlume identify` and the TUI's
+  recognition test, the framing guide, `irlume camera diagnostics` and
+  enrollment. From an SSH login, or a session that is not the active one
+  on its seat, these are refused before any camera work and without a
+  charge to the retry budget; run them from the active session or as
+  root. Root peers (greeters, `sudo`, the polkit helper) are unchanged,
+  and seat state irlumed cannot read refuses (THREAT_MODEL.md "Camera
+  use by local accounts").
+
 - irlumed enforces the recovery passphrase minimum of 12 characters
   itself, so the TUI and every client get the same floor as
   `irlume recovery setup`. The TUI's Recovery page refuses a shorter

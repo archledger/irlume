@@ -10,6 +10,15 @@ Conventions that apply everywhere:
 - Commands that change system state (PAM wiring, SELinux, camera config,
   the daemon) need `sudo`; the tables below mark them. Everything else runs
   as your own user.
+- Commands that turn the camera on (`enroll`, `profiles add-scan`,
+  `identify`, `auth test`, `camera diagnostics`, and the TUI's framing guide
+  and recognition test) run as your own user only from the session that is
+  active on a seat: the desktop or text console you are logged in at, as
+  for the camera device itself. From an SSH login, or a session that is not
+  the active one on its seat, irlumed refuses them; run them from the active
+  session, or with `sudo`. When irlumed cannot read logind's seat state, only
+  root can turn the camera on. Status, listing and settings commands are not
+  affected.
 - `irlume tui` wraps most of these in a guided interface. If you forget a
   command, the TUI is the fallback: enrollment, profiles, wiring, keyring,
   recovery, and fingerprint are all reachable from it.

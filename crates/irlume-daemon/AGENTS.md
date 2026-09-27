@@ -56,7 +56,7 @@ does not compile until its posture is chosen. Never add `_ =>`.
 
 | Function | File | Decides |
 |---|---|---|
-| `posture` | `src/main.rs` | privilege (`AnyPeer`, `RootOrTarget`, `RootOnly`), target user, `EnrollmentEffect` |
+| `posture` | `src/main.rs` | privilege (`AnyPeer`, `RootOrTarget`, `RootOnly`), target user, `EnrollmentEffect`, `CameraUse` (a capture needs a non-root peer at the active seat) |
 | `classify` | `src/arbiter.rs` | `Auth`, `Camera`, `Plain` or `Status` |
 | `approval_operation` | `src/operation_authorization.rs` | polkit action or `None`; adding trust needs one |
 | `request_kind` | `src/live.rs` | live-status kind and whether it mutates |

@@ -1019,12 +1019,15 @@ fn main() {
             // cannot forge it through protocol input (unix(7)). fprintd, the closest
             // analogue, likewise keeps its endpoint reachable and authorizes per method.
             //
-            // What this widens is reachability, not authority: every request still
-            // requires peer uid 0 or `target == peer`, root-only operations stay
-            // root-only, requests are bounded to MAX_REQUEST_BYTES with read/write
+            // What this widens is reachability, not authority: every request that
+            // names an account still requires peer uid 0 or `target == peer`,
+            // root-only operations stay root-only, a request that turns a camera on
+            // for a non-root peer is served only while that uid holds the active
+            // local session on a seat (the rule udev's uaccess applies to the camera
+            // nodes), requests are bounded to MAX_REQUEST_BYTES with read/write
             // deadlines, each connection is isolated behind catch_unwind, and camera
-            // work carries a per-uid throttle. On Fedora the SELinux module remains the
-            // mandatory-access layer.
+            // work holds at most one slot per uid. On Fedora the SELinux module
+            // remains the mandatory-access layer.
             jout_info!("irlumed: serving on {socket} (0666; SO_PEERCRED authorizes every request)");
             if irlume_common::dbglog::on() {
                 jout_info!("irlumed: diagnostic tracing ON (IRLUME_LOG=debug): per-stage pipeline lines follow; numbers only, never frames/embeddings");
@@ -2625,10 +2628,11 @@ mod worker_engine {
             let inline = ["early_refusal(", "EarlyRefusal::"].concat();
             let sites = flat.matches(&wrapped).count() + flat.matches(&inline).count();
             assert_eq!(
-                sites, 8,
-                "the eight pre-camera refusal sites (daemon starting, root \
-                 gate, method, configuration, cosmic binding, convenience \
-                 tier, biopolicy, retry throttle) each name their cause"
+                sites, 9,
+                "the nine pre-camera refusal sites (daemon starting, root \
+                 gate, camera seat, method, configuration, cosmic binding, \
+                 convenience tier, biopolicy, retry throttle) each name their \
+                 cause"
             );
         }
 
@@ -3945,6 +3949,8 @@ enum Privilege {
     /// `RootOrTarget`; `PositionSample` drops a band hint for an
     /// account the peer may not act for) or charge the camera-probe interval.
     /// Neither refuses the request, so neither is a privilege requirement.
+    /// One that turns a camera on also meets the seat rule of [`CameraUse`],
+    /// whatever its privilege.
     AnyPeer,
     /// Root, or the account the request names ([`authorized_for`]). `verb`
     /// completes `not authorized to {verb} '{user}'`, which is the wording the
@@ -3969,6 +3975,18 @@ enum EnrollmentEffect {
     AddsTrust,
 }
 
+/// Whether serving a request turns a camera on: streams frames from it, or
+/// lights its IR emitter. Opening a node only to enumerate or classify it,
+/// and reading sysfs, is not a capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CameraUse {
+    /// Turns no camera on.
+    NoCapture,
+    /// Turns a camera on. A non-root peer is served only while its uid
+    /// holds the active local session on a seat ([`camera_seat_gate`]).
+    Captures,
+}
+
 /// Everything the daemon must know about a request before it runs it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RequestPosture<'a> {
@@ -3978,18 +3996,21 @@ struct RequestPosture<'a> {
     /// screens; it is also the target [`Privilege::RootOrTarget`] checks.
     user: Option<&'a str>,
     enrollment: EnrollmentEffect,
+    camera: CameraUse,
 }
 
 /// The security posture of every request, in one place (#344).
 ///
 /// Exhaustive with NO wildcard arm on purpose: a new [`Request`] variant does
 /// not compile until whoever adds it says what privilege it needs, whether it
-/// names an account, and whether it rewrites an enrollment. The variant that
-/// prompted this, `ReleaseTokenForDisarm`, carried a username that the
-/// traversal guard never saw because it was missing from one of three
-/// hand-maintained lists, and a `_ => None` arm meant neither the compiler nor
-/// the test that existed to catch exactly that could see the omission.
+/// names an account, whether it rewrites an enrollment, and whether it turns a
+/// camera on. The variant that prompted this, `ReleaseTokenForDisarm`, carried
+/// a username that the traversal guard never saw because it was missing from
+/// one of three hand-maintained lists, and a `_ => None` arm meant neither the
+/// compiler nor the test that existed to catch exactly that could see the
+/// omission.
 fn posture(req: &Request) -> RequestPosture<'_> {
+    use CameraUse::{Captures, NoCapture};
     use EnrollmentEffect::{AddsTrust, Mutates, Reads};
     use Privilege::{AnyPeer, RootOnly, RootOrTarget};
     use Request::*;
@@ -4005,16 +4026,19 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             privilege: RootOrTarget { verb: "modify" },
             user: Some(user.as_str()),
             enrollment: Mutates,
+            camera: NoCapture,
         },
         AddScan { user, .. } => RequestPosture {
             privilege: RootOrTarget { verb: "modify" },
             user: Some(user.as_str()),
             enrollment: AddsTrust,
+            camera: Captures,
         },
         Enroll { user, .. } | EnrollmentSession { user, .. } => RequestPosture {
             privilege: RootOrTarget { verb: "enroll" },
             user: Some(user.as_str()),
             enrollment: AddsTrust,
+            camera: Captures,
         },
         // A camera-group addition is an enrollment addition on another
         // camera (ADR-0024 §4): same trust, same approval class. Removal
@@ -4024,6 +4048,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             privilege: RootOrTarget { verb: "enroll" },
             user: Some(user.as_str()),
             enrollment: AddsTrust,
+            camera: Captures,
         },
         RemoveCameraGroup { user, .. } => RequestPosture {
             privilege: RootOrTarget { verb: "modify" },
@@ -4032,6 +4057,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             // it, or listings would serve the removed group until the next
             // invalidation.
             enrollment: Mutates,
+            camera: NoCapture,
         },
         // Recovery counts as a mutation: it changes the key material the
         // enrollment is sealed under.
@@ -4041,6 +4067,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: Some(user.as_str()),
             enrollment: Mutates,
+            camera: NoCapture,
         },
         RecoveryRestore { user, .. } => RequestPosture {
             privilege: RootOrTarget {
@@ -4048,6 +4075,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: Some(user.as_str()),
             enrollment: Mutates,
+            camera: NoCapture,
         },
         RecoveryForget { user } => RequestPosture {
             privilege: RootOrTarget {
@@ -4055,6 +4083,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: Some(user.as_str()),
             enrollment: Mutates,
+            camera: NoCapture,
         },
         // Reads and keyring operations that leave the enrollment summary
         // valid. Each keeps the refusal verb its arm used.
@@ -4064,11 +4093,13 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: Some(user.as_str()),
             enrollment: Reads,
+            camera: Captures,
         },
         ListProfiles { user, .. } => RequestPosture {
             privilege: RootOrTarget { verb: "list" },
             user: Some(user.as_str()),
             enrollment: Reads,
+            camera: NoCapture,
         },
         // Retains the old root-or-target posture, but the retired tombstone
         // neither reads nor rewrites the enrollment.
@@ -4076,6 +4107,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             privilege: RootOrTarget { verb: "modify" },
             user: Some(user.as_str()),
             enrollment: Reads,
+            camera: NoCapture,
         },
         RetryReset { user, .. } | RetryStatus { user } => RequestPosture {
             user: Some(user),
@@ -4083,6 +4115,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
                 verb: "manage retry state for",
             },
             enrollment: Reads,
+            camera: NoCapture,
         },
         HasSealedPassword { user }
         | KeyringMetadata { user }
@@ -4091,6 +4124,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             privilege: RootOrTarget { verb: "query" },
             user: Some(user.as_str()),
             enrollment: Reads,
+            camera: NoCapture,
         },
         SealPassword { user, .. } => RequestPosture {
             privilege: RootOrTarget {
@@ -4098,6 +4132,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: Some(user.as_str()),
             enrollment: Reads,
+            camera: NoCapture,
         },
         ForgetPassword { user } => RequestPosture {
             privilege: RootOrTarget {
@@ -4105,6 +4140,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: Some(user.as_str()),
             enrollment: Reads,
+            camera: NoCapture,
         },
         ReleaseTokenForDisarm { user, .. } => RequestPosture {
             privilege: RootOrTarget {
@@ -4112,6 +4148,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: Some(user.as_str()),
             enrollment: Reads,
+            camera: NoCapture,
         },
         // Root only: the one sender is pam_irlume's `reseal` session line,
         // and every stack that carries it opens its session in a root process
@@ -4123,6 +4160,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: Some(user.as_str()),
             enrollment: Reads,
+            camera: NoCapture,
         },
         // Root-only and account-naming: the sealed credential is released to a
         // root peer alone. The retired calibration request keeps its historical
@@ -4133,6 +4171,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: Some(user.as_str()),
             enrollment: Reads,
+            camera: Captures,
         },
         UnsealKeyring { user, .. } => RequestPosture {
             privilege: RootOnly {
@@ -4140,6 +4179,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: Some(user.as_str()),
             enrollment: Reads,
+            camera: NoCapture,
         },
         CaptureEarMedian { user } => RequestPosture {
             privilege: RootOnly {
@@ -4147,6 +4187,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: Some(user.as_str()),
             enrollment: Reads,
+            camera: NoCapture,
         },
         // Root-only and account-free: system-wide camera policy under /etc,
         // and a self-test whose raw liveness numbers are a spoof-tuning oracle.
@@ -4156,6 +4197,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: None,
             enrollment: Reads,
+            camera: NoCapture,
         },
         TuneCaptureMode { .. } => RequestPosture {
             privilege: RootOnly {
@@ -4163,6 +4205,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: None,
             enrollment: Reads,
+            camera: Captures,
         },
         SelfTest { .. } => RequestPosture {
             privilege: RootOnly {
@@ -4170,6 +4213,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: None,
             enrollment: Reads,
+            camera: Captures,
         },
         SupportProbe { .. } => RequestPosture {
             privilege: RootOnly {
@@ -4177,6 +4221,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: None,
             enrollment: Reads,
+            camera: Captures,
         },
         TraceSubscribe { .. } => RequestPosture {
             privilege: RootOnly {
@@ -4184,6 +4229,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: None,
             enrollment: Reads,
+            camera: NoCapture,
         },
         // A dry run reads the camera's USB descriptors out of sysfs and sends
         // the device nothing, so it stays open to any peer (the arm charges it
@@ -4199,6 +4245,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: None,
             enrollment: Reads,
+            camera: if *dry_run { NoCapture } else { Captures },
         },
         // Framing guide: the optional user only tunes the pitch band, but it is
         // still interpolated into a state path, so it is screened like the rest.
@@ -4206,6 +4253,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             privilege: AnyPeer,
             user: user.as_deref(),
             enrollment: Reads,
+            camera: Captures,
         },
         FaceSensorStatus { user } => RequestPosture {
             privilege: if user.is_some() {
@@ -4215,6 +4263,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: user.as_deref(),
             enrollment: Reads,
+            camera: NoCapture,
         },
         // The attempt record is the account's own non-biometric history
         // (ADR-0030 §5): the account and root, like FaceSensorStatus.
@@ -4222,6 +4271,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             privilege: RootOrTarget { verb: "query" },
             user: Some(user.as_str()),
             enrollment: Reads,
+            camera: NoCapture,
         },
         // A recognition test against one account's enrollment (ADR-0030 §2):
         // the account and root, checked here before the request is queued,
@@ -4233,19 +4283,32 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             user: Some(user.as_str()),
             enrollment: Reads,
+            camera: Captures,
         },
+        // Any peer may ask, and the seat rule decides whether its camera
+        // turns on: `Identify` captures RGB and IR for the peer's own
+        // account, `CameraDiagnostics` streams every present role.
+        Identify | CameraDiagnostics => RequestPosture {
+            privilege: AnyPeer,
+            user: None,
+            enrollment: Reads,
+            camera: Captures,
+        },
+        // `ListCameras` and `CaptureModeStatus` open camera nodes to
+        // classify them or read their qualification, but start no stream
+        // and light no emitter; the arbiter still serializes them as camera
+        // work.
         Ping
         | PreferencesStatus
         | Health
-        | Identify
         | ListCameras
-        | CameraDiagnostics
         | CaptureModeStatus
         | SupportSnapshot { .. }
         | LiveStatus => RequestPosture {
             privilege: AnyPeer,
             user: None,
             enrollment: Reads,
+            camera: NoCapture,
         },
     }
 }
@@ -4953,10 +5016,12 @@ fn intent_confirmation_gate(req: &Request, peer: &Peer) -> Option<Response> {
 /// The gate every request passes before any arm runs, shared by the worker
 /// dispatch and the connection-thread status dispatch: the username the
 /// request names is screened for traversal, then the privilege the [`posture`]
-/// table declares is enforced. `None` means the request may proceed.
+/// table declares is enforced, then a request that turns a camera on for a
+/// non-root peer meets the seat rule ([`camera_seat_gate`]). `None` means
+/// the request may proceed.
 ///
-/// Both checks read the same table, so a variant cannot pass one and skip the
-/// other the way `ReleaseTokenForDisarm` did (#344).
+/// The checks read the same table, so a variant cannot pass one and skip
+/// another the way `ReleaseTokenForDisarm` did (#344).
 fn pregate(req: &Request, peer: &Peer) -> Option<Response> {
     if let Request::EnrollmentSession {
         scans,
@@ -4982,7 +5047,7 @@ fn pregate(req: &Request, peer: &Peer) -> Option<Response> {
     if let Some(response) = intent_confirmation_gate(req, peer) {
         return Some(response);
     }
-    match posture.privilege {
+    let refused = match posture.privilege {
         Privilege::AnyPeer => None,
         Privilege::RootOrTarget { verb } => {
             // Fail closed: a variant that demands "root or the target account"
@@ -5000,10 +5065,8 @@ fn pregate(req: &Request, peer: &Peer) -> Option<Response> {
                 Some(not_authorized(req, verb, user))
             }
         }
+        Privilege::RootOnly { .. } if peer.uid == 0 => None,
         Privilege::RootOnly { command } => {
-            if peer.uid == 0 {
-                return None;
-            }
             if matches!(req, Request::UnsealPassword { .. }) {
                 note_unseal_password_refusal(peer.uid);
                 return Some(Response::UnsealUnavailable {
@@ -5018,6 +5081,88 @@ fn pregate(req: &Request, peer: &Peer) -> Option<Response> {
                 peer.uid
             )))
         }
+    };
+    refused.or_else(|| camera_seat_gate(req, posture.camera, peer))
+}
+
+/// The refusal text for a non-root request that would turn a camera on
+/// while its account does not hold the active local session on a seat.
+const CAMERA_SEAT_REFUSED: &str = "irlumed turns the camera on for an account's own request \
+    only while that account holds the active local session on a seat; run this from that \
+    session, or as root";
+
+/// The refusal text when logind's seat state could not be read.
+const CAMERA_SEAT_UNKNOWN: &str = "irlumed turns the camera on for an account's own request \
+    only while that account holds the active local session on a seat, and the seat state \
+    could not be read; run this as root";
+
+/// Serve a request that turns a camera on ([`CameraUse::Captures`]) for a
+/// non-root peer only while the peer's uid holds the active local session on
+/// a seat: logind's `ACTIVE_UID`, the account udev's `uaccess` rule grants
+/// the camera devices to. irlumed opens the camera as root on the peer's
+/// behalf, so it applies the same rule the device nodes carry. Root peers
+/// (greeters, sudo, the polkit helper, the CLI run as root) are not asked.
+/// Seat state that cannot be read refuses.
+///
+/// Decided before any camera work, with the other posture refusals, so it
+/// is not charged to the account's retry budget: that is reserved only once
+/// a face request has passed its gates and is about to reach the engine.
+fn camera_seat_gate(req: &Request, camera: CameraUse, peer: &Peer) -> Option<Response> {
+    if camera == CameraUse::NoCapture || peer.uid == 0 {
+        return None;
+    }
+    let held = attempt_record::holds_an_active_seat(peer.uid);
+    if held == Some(true) {
+        return None;
+    }
+    let unknown = held.is_none();
+    note_camera_seat_refusal(peer.uid, unknown);
+    let reason = if unknown {
+        CAMERA_SEAT_UNKNOWN
+    } else {
+        CAMERA_SEAT_REFUSED
+    };
+    Some(match req {
+        // An opted-in authentication gets the typed authorization error it
+        // already handles, with the policy cause (ADR-0030 §5); a legacy one
+        // gets the pre-camera policy refusal PAM already falls back on.
+        Request::Authenticate {
+            structured_errors: true,
+            ..
+        } => Response::OperationError {
+            code: irlume_common::OperationErrorCode::NotAuthorized,
+            retryable: false,
+            cause: Some(irlume_common::OutcomeCause::Policy),
+        },
+        Request::Authenticate { .. } => early_refusal(EarlyRefusal::Policy, reason),
+        _ => Response::Error(reason.into()),
+    })
+}
+
+/// Say in the journal that a camera request from a non-root account was
+/// refused by the seat rule, so an unlock that falls back to the password
+/// leaves a trace. Once per uid and cause per daemon lifetime, for the
+/// reason [`note_unseal_password_refusal`] gives.
+fn note_camera_seat_refusal(uid: u32, unknown: bool) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(u32, bool)>>> =
+        std::sync::OnceLock::new();
+    let first = match SEEN.get_or_init(Default::default).lock() {
+        Ok(mut seen) => seen.insert((uid, unknown)),
+        Err(e) => e.into_inner().insert((uid, unknown)),
+    };
+    let why = if unknown {
+        "logind's seat state could not be read"
+    } else {
+        "the account does not hold the active local session on a seat"
+    };
+    if first {
+        jout_notice!(
+            "irlumed: camera request refused for uid {uid}: {why}. The camera is turned \
+             on for a non-root account only while it holds the active local session on a \
+             seat, as udev grants camera access. Logged once per uid."
+        );
+    } else {
+        irlume_common::dlog!("camera request refused for uid {uid}: {why}");
     }
 }
 
@@ -11097,8 +11242,11 @@ mod tests {
         // `pregate` resolves a username, which reads the environment inside
         // glibc; see `env_lock`.
         let _g = env_lock();
-        // NOBODY owns no account, so it is neither root nor SAMPLE_USER.
+        // NOBODY owns no account, so it is neither root nor SAMPLE_USER. It
+        // holds the seat here, so what refuses is the privilege alone; the
+        // seat rule has its own walk.
         let stranger = peer(NOBODY);
+        let _seat = seat_fixture("privilege-walk", Some(NOBODY));
         for req in request_samples() {
             let refused = pregate(&req, &stranger);
             match posture(&req).privilege {
@@ -11352,6 +11500,368 @@ mod tests {
             matches!(prose_auth, Some(Response::Error(_))),
             "{prose_auth:?}"
         );
+    }
+
+    /// The requests that turn a camera on, named once so a change to the
+    /// table is a visible decision. Each is camera work to the arbiter too
+    /// (an authentication or a camera job), so it is serialized against the
+    /// login path.
+    #[test]
+    fn the_requests_that_turn_a_camera_on_are_named_and_arbitrated() {
+        let mut captures: Vec<&str> = named_samples(SAMPLE_USER)
+            .into_iter()
+            .filter(|(_, req)| posture(req).camera == CameraUse::Captures)
+            .map(|(name, _)| name)
+            .collect();
+        captures.sort_unstable();
+        assert_eq!(
+            captures,
+            vec![
+                "AddCameraGroup",
+                "AddScan",
+                "Authenticate",
+                "CameraDiagnostics",
+                "Enroll",
+                "EnrollmentSession",
+                "Identify",
+                "IdentifyFor",
+                "PositionSample",
+                "PositionSession",
+                "SelfTest",
+                "SetupIrEmitter",
+                "SupportProbe",
+                "TuneCaptureMode",
+                "UnsealPassword",
+            ]
+        );
+        for req in request_samples() {
+            if posture(&req).camera == CameraUse::Captures {
+                assert!(
+                    matches!(
+                        arbiter::classify(&req),
+                        arbiter::Class::Auth | arbiter::Class::Camera
+                    ),
+                    "{} turns a camera on outside the arbiter's camera classes",
+                    variant_name(&req)
+                );
+            }
+        }
+        // The emitter's dry run reads sysfs and sends the camera nothing.
+        assert_eq!(
+            posture(&Request::SetupIrEmitter { dry_run: true }).camera,
+            CameraUse::NoCapture
+        );
+        assert_eq!(
+            posture(&Request::PositionSample { user: None }).camera,
+            CameraUse::Captures
+        );
+    }
+
+    /// irlumed turns a camera on for a non-root account only while that
+    /// account holds the active local session on a seat, the rule udev's
+    /// `uaccess` applies to the camera nodes. Every request the account's
+    /// privilege admits is walked: with the account at the seat, all of them
+    /// pass; with another account at the seat, no active session on it, or
+    /// seat state that cannot be read, exactly the ones that turn a camera
+    /// on are refused, in the shape their clients decode. Root is never
+    /// asked.
+    #[test]
+    fn a_non_root_camera_request_is_served_only_from_the_active_seat() {
+        use irlume_common::{OperationErrorCode, OutcomeCause};
+        let _g = env_lock();
+        let user = "nobody";
+        let owner = peer(uid_of(user).expect("the test host has a nobody account"));
+        assert_ne!(owner.uid, 0);
+        let root = peer(0);
+        let admitted: Vec<Request> = request_samples_with_user(user)
+            .into_iter()
+            .filter(|req| !matches!(posture(req).privilege, Privilege::RootOnly { .. }))
+            .collect();
+        {
+            let _seat = seat_fixture("walk-held", Some(owner.uid));
+            for req in &admitted {
+                let refused = pregate(req, &owner);
+                assert!(
+                    refused.is_none(),
+                    "{} refused at the seat: {refused:?}",
+                    variant_name(req)
+                );
+            }
+        }
+        for (tag, expected) in [
+            ("walk-other", CAMERA_SEAT_REFUSED),
+            ("walk-empty", CAMERA_SEAT_REFUSED),
+            ("walk-unreadable", CAMERA_SEAT_UNKNOWN),
+        ] {
+            let _seat = match tag {
+                "walk-other" => seat_fixture(tag, Some(owner.uid.wrapping_add(1))),
+                "walk-empty" => seat_fixture(tag, None),
+                _ => unreadable_seats(tag),
+            };
+            for req in &admitted {
+                let name = variant_name(req);
+                let authenticate = matches!(req, Request::Authenticate { .. });
+                match (posture(req).camera, pregate(req, &owner)) {
+                    (CameraUse::NoCapture, None) => {}
+                    (
+                        CameraUse::Captures,
+                        Some(Response::AuthResult {
+                            granted: false,
+                            live: false,
+                            refused_by_policy: true,
+                            reason,
+                            cause: Some(OutcomeCause::Policy),
+                            ..
+                        }),
+                    ) if authenticate => assert_eq!(reason, expected, "{name} ({tag})"),
+                    (CameraUse::Captures, Some(Response::Error(message))) if !authenticate => {
+                        assert_eq!(message, expected, "{name} ({tag})")
+                    }
+                    (camera, other) => {
+                        panic!("{name} ({camera:?}) away from the seat ({tag}): {other:?}")
+                    }
+                }
+            }
+            // A client that asked for typed errors gets the authorization
+            // code with the policy cause.
+            let typed = pregate(
+                &Request::Authenticate {
+                    structured_errors: true,
+                    user: user.into(),
+                    service: Some("kde".into()),
+                    intent_confirmation: None,
+                },
+                &owner,
+            );
+            assert!(
+                matches!(
+                    typed,
+                    Some(Response::OperationError {
+                        code: OperationErrorCode::NotAuthorized,
+                        retryable: false,
+                        cause: Some(OutcomeCause::Policy),
+                    })
+                ),
+                "{tag}: {typed:?}"
+            );
+            for req in request_samples_with_user(user) {
+                let refused = pregate(&req, &root);
+                assert!(
+                    refused.is_none(),
+                    "root is never asked ({tag}), {}: {refused:?}",
+                    variant_name(&req)
+                );
+            }
+        }
+    }
+
+    /// Through the worker's own dispatch: an account at the seat reaches the
+    /// camera (absent here, so each request reports or fails for want of
+    /// it), and its authentication is charged to its retry budget as face
+    /// work. Away from
+    /// the seat, or when the seat state cannot be read, the same requests
+    /// are refused before any camera and charge nothing. Root reaches the
+    /// camera whatever the seats say.
+    #[test]
+    fn a_seat_holder_reaches_the_camera_and_a_refused_peer_never_does() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("seat-dispatch");
+        let user = "nobody";
+        let owner = peer(uid_of(user).expect("the test host has a nobody account"));
+        assert_ne!(owner.uid, 0);
+        // Enrolled, so its authentication gets as far as the camera.
+        write_enrollment(&sb.dir, &enrollment_with(user, &["Face Scan 1"]));
+        let requests = || {
+            vec![
+                Request::PositionSample { user: None },
+                Request::CameraDiagnostics,
+                Request::Identify,
+                Request::IdentifyFor { user: user.into() },
+                Request::Authenticate {
+                    structured_errors: false,
+                    user: user.into(),
+                    service: Some("kde".into()),
+                    intent_confirmation: None,
+                },
+            ]
+        };
+        let reached_camera = |response: &Response| {
+            // Diagnostics report on the (absent) pair; every capture fails
+            // for want of a camera.
+            matches!(response, Response::CameraDiagnostics(_))
+                || format!("{response:?}").contains("no camera found")
+        };
+        let seat_refusal = |response: &Response| match response {
+            Response::Error(message) => Some(message.clone()),
+            Response::AuthResult {
+                reason,
+                refused_by_policy: true,
+                ..
+            } => Some(reason.clone()),
+            _ => None,
+        };
+        let retry = sb.dir.join("retry");
+        {
+            let _seat = seat_fixture("dispatch-held", Some(owner.uid));
+            for req in requests() {
+                clear_camera_probe_rate_state();
+                let name = variant_name(&req);
+                let response = dispatch(req, &owner, &mut e);
+                assert!(
+                    reached_camera(&response),
+                    "{name} from the seat must reach the camera: {response:?}"
+                );
+            }
+            assert!(
+                retry.exists(),
+                "the served authentication is charged as face work"
+            );
+        }
+        std::fs::remove_dir_all(&retry).unwrap();
+        for (tag, expected) in [
+            ("dispatch-other", CAMERA_SEAT_REFUSED),
+            ("dispatch-unreadable", CAMERA_SEAT_UNKNOWN),
+        ] {
+            let _seat = if tag == "dispatch-other" {
+                seat_fixture(tag, Some(owner.uid.wrapping_add(1)))
+            } else {
+                unreadable_seats(tag)
+            };
+            for req in requests() {
+                clear_camera_probe_rate_state();
+                let name = variant_name(&req);
+                let response = dispatch(req, &owner, &mut e);
+                assert_eq!(
+                    seat_refusal(&response).as_deref(),
+                    Some(expected),
+                    "{name} ({tag}) must be refused before the camera: {response:?}"
+                );
+            }
+            assert!(
+                !retry.exists(),
+                "{tag}: a seat refusal is not charged to the retry budget"
+            );
+            let root = dispatch(Request::PositionSample { user: None }, &peer(0), &mut e);
+            assert!(reached_camera(&root), "{tag}: root: {root:?}");
+        }
+        clear_camera_probe_rate_state();
+    }
+
+    /// On the connection thread: a capturing request from an account away
+    /// from the seat is answered before it reaches the arbiter, so it holds
+    /// no camera slot and never waits on the worker. From the seat, the same
+    /// request queues.
+    #[test]
+    fn a_seat_refusal_is_answered_before_the_queue() {
+        use irlume_common::{OperationErrorCode, OutcomeCause};
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let _g = env_lock();
+        let _sb = sandbox("seat-serve");
+        let diagnostic_state = diagnostics::DiagnosticState::default();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let user = "nobody";
+        let owner = peer(uid_of(user).expect("the test host has a nobody account"));
+        assert_ne!(owner.uid, 0);
+        let ask = |arbiter: &arbiter::Arbiter<Queued>, request: &Request| {
+            let mut wire = serde_json::to_string(request).unwrap();
+            wire.push('\n');
+            with_serve_as_peer_and_diagnostics(
+                arbiter,
+                &ready,
+                &diagnostic_state,
+                owner.clone(),
+                |client| {
+                    (&*client).write_all(wire.as_bytes()).unwrap();
+                    let mut line = String::new();
+                    BufReader::new(client).read_line(&mut line).unwrap();
+                    serde_json::from_str::<Response>(line.trim()).unwrap()
+                },
+            )
+        };
+        let authenticate = |structured_errors| Request::Authenticate {
+            structured_errors,
+            user: user.into(),
+            service: Some("kde".into()),
+            intent_confirmation: None,
+        };
+        {
+            let _seat = seat_fixture("serve-away", Some(owner.uid.wrapping_add(1)));
+            // Closed: anything that got past the gate would be answered with
+            // the arbiter's own refusal instead.
+            let refused = arbiter::Arbiter::<Queued>::new();
+            refused.close();
+            for request in [
+                Request::Identify,
+                Request::PositionSession { user: None },
+                Request::CameraDiagnostics,
+                Request::Enroll {
+                    user: user.into(),
+                    profile: None,
+                    scans: None,
+                    reset: false,
+                },
+            ] {
+                let response = ask(&refused, &request);
+                assert!(
+                    matches!(response, Response::Error(ref message) if message == CAMERA_SEAT_REFUSED),
+                    "{}: {response:?}",
+                    variant_name(&request)
+                );
+            }
+            match ask(&refused, &authenticate(false)) {
+                Response::AuthResult {
+                    granted: false,
+                    refused_by_policy: true,
+                    reason,
+                    cause: Some(OutcomeCause::Policy),
+                    ..
+                } => assert_eq!(reason, CAMERA_SEAT_REFUSED),
+                other => panic!("legacy authentication: {other:?}"),
+            }
+            let typed = ask(&refused, &authenticate(true));
+            assert!(
+                matches!(
+                    typed,
+                    Response::OperationError {
+                        code: OperationErrorCode::NotAuthorized,
+                        retryable: false,
+                        cause: Some(OutcomeCause::Policy),
+                    }
+                ),
+                "{typed:?}"
+            );
+            assert!(refused.take().is_none(), "a seat refusal never queues");
+        }
+        let _seat = seat_fixture("serve-held", Some(owner.uid));
+        let open = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let worker = {
+            let open = std::sync::Arc::clone(&open);
+            std::thread::spawn(move || {
+                let job = open.take().expect("the request from the seat queued");
+                let Queued {
+                    req,
+                    reply,
+                    link,
+                    scope,
+                    ..
+                } = job.payload;
+                assert!(matches!(req, Request::Identify));
+                assert!(link.claim());
+                let response = Response::Ok("queued".into());
+                scope.finish(categorical_outcome(&response));
+                link.released();
+                open.finish(job.class, job.uid);
+                reply.send(response.into()).unwrap();
+            })
+        };
+        let response = ask(&open, &Request::Identify);
+        assert!(
+            matches!(response, Response::Ok(ref message) if message == "queued"),
+            "{response:?}"
+        );
+        open.close();
+        worker.join().unwrap();
     }
 
     #[test]
@@ -12605,6 +13115,9 @@ mod tests {
         let user = "nobody";
         let owner = peer(uid_of(user).unwrap());
         assert_ne!(owner.uid, 0);
+        // The owner holds the seat, so the capturing requests below reach
+        // the grant check this test is about.
+        let _seat = seat_fixture("enrollment-authorization", Some(owner.uid));
         for request in [
             Request::Enroll {
                 user: user.into(),
@@ -14438,6 +14951,58 @@ mod tests {
         }
     }
 
+    /// logind's seat state for the seat rule ([`camera_seat_gate`]): while
+    /// the guard lives, the reader sees a fixture instead of the test
+    /// process's own uid at the seat. Caller holds `env_lock()`, declared
+    /// before this guard so the guard drops under it.
+    struct SeatFixture {
+        dir: std::path::PathBuf,
+    }
+
+    fn seat_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("irlume-daemon-seats-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn point_seats_at(root: std::path::PathBuf) {
+        *attempt_record::SEATS_ROOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(root);
+    }
+
+    /// seat0, with `holder` as its active user; `None` is a seat with no
+    /// active session (a text console nobody has logged in on).
+    fn seat_fixture(tag: &str, holder: Option<u32>) -> SeatFixture {
+        let dir = seat_dir(tag);
+        let active = holder.map_or_else(String::new, |uid| format!("ACTIVE=2\nACTIVE_UID={uid}\n"));
+        std::fs::write(
+            dir.join("seat0"),
+            format!("IS_SEAT0=1\nCAN_MULTI_SESSION=1\nCAN_TTY=1\nCAN_GRAPHICAL=1\n{active}"),
+        )
+        .unwrap();
+        point_seats_at(dir.clone());
+        SeatFixture { dir }
+    }
+
+    /// Seat state that cannot be read: the directory is missing.
+    fn unreadable_seats(tag: &str) -> SeatFixture {
+        let dir = seat_dir(tag);
+        point_seats_at(dir.join("missing"));
+        SeatFixture { dir }
+    }
+
+    impl Drop for SeatFixture {
+        fn drop(&mut self) {
+            *attempt_record::SEATS_ROOT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     /// Write a PLAINTEXT enrollment (what a no-TPM host stores) straight into
     /// the sandbox state dir; never through storage::save, which would seal a
     /// template key against this machine's real TPM.
@@ -15652,6 +16217,9 @@ mod tests {
         let mut e = engine();
         let sb = sandbox("identify");
         let _ = &sb;
+        // NOBODY holds the seat here, so what answers is the arm's own
+        // scoping; the seat rule has tests of its own.
+        let _seat = seat_fixture("identify", Some(NOBODY));
         // A peer with no local account gets an empty identify, no capture at all.
         match dispatch(Request::Identify, &peer(NOBODY), &mut e) {
             Response::Identified {
@@ -19015,6 +19583,9 @@ mod tests {
         let mut e = engine();
         let sb = sandbox("selftest");
         let _ = &sb;
+        // NOBODY holds the seat, so the framing sample below reaches the
+        // (absent) camera.
+        let _seat = seat_fixture("selftest", Some(NOBODY));
         for kind in [
             irlume_common::SelfTestKind::Liveness,
             irlume_common::SelfTestKind::AlignmentIdentity,

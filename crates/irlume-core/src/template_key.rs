@@ -157,6 +157,22 @@ pub(crate) fn key_is_for_another_account(user: &str, account: &mut Account<'_>) 
         .is_ok_and(|env| matches!(account.owner(env.uid), crate::account::Owner::Other { .. }))
 }
 
+/// Whether `user`'s sealed template key records no uid while its recovery
+/// envelope records one that `account` resolves as another account's. A
+/// recovery setup wraps the key as it is and records the uid it was set up
+/// for, so for a key an earlier release sealed without a uid the envelope
+/// names the account the key belongs to. Only the envelope's `uid` field is
+/// read; nothing is unwrapped. `false` when the key records a uid or cannot
+/// be read, and when no recovery envelope can be read.
+pub(crate) fn unbound_key_has_another_accounts_recovery(
+    user: &str,
+    account: &mut Account<'_>,
+) -> bool {
+    SealedEnvelope::load(&key_path(user)).is_ok_and(|env| env.uid.is_none())
+        && load_recovery(user)
+            .is_ok_and(|env| matches!(account.owner(env.uid), crate::account::Owner::Other { .. }))
+}
+
 /// Whether a recovery envelope exists for `user`.
 pub fn has_recovery(user: &str) -> bool {
     recovery_path(user).exists()
@@ -183,30 +199,33 @@ pub(crate) fn ensure_key_unlocked(user: &str) -> Result<Zeroizing<Vec<u8>>> {
     .map(|key| key.key)
 }
 
-/// Whether an unsealed template key opens an enrollment recorded for another
-/// uid, given the user, the key and the enrollment write's view of the
-/// account ([`crate::storage`] reads the enrollment).
-pub(crate) type OpensOtherEnrollment<'f> = &'f dyn Fn(&str, &[u8], &mut Account<'_>) -> bool;
+/// Whether an unsealed template key is another account's by the records
+/// coupled to it, given the user, the key and the enrollment write's view of
+/// the account ([`crate::storage`] reads the enrollment under the key).
+pub(crate) type KeyIsAnotherAccounts<'f> = &'f dyn Fn(&str, &[u8], &mut Account<'_>) -> bool;
 
 /// The key an enrollment write encrypts under: [`ensure_key_unlocked`],
 /// except that a sealed key recorded for another uid is replaced, and so is
-/// one that `opens_other` finds opens an enrollment recorded for another uid
-/// (a key an earlier release sealed without a uid, under which that
-/// account's enrollment recorded its own). The enrollment written with it
-/// replaces that account's enrollment, so the account gets a key of its own.
-/// Nothing else replaces it. The replacement is final only once that
-/// enrollment is published: the write settles it with [`WriteKey::settle`].
+/// one that `is_other` finds is another account's: it opens an enrollment
+/// recorded for another uid (a key an earlier release sealed without a uid,
+/// under which that account's enrollment recorded its own), or neither it
+/// nor that enrollment records a uid and its recovery envelope records
+/// another ([`unbound_key_has_another_accounts_recovery`]). The enrollment
+/// written with it replaces that account's enrollment, so the account gets a
+/// key of its own. Nothing else replaces it. The replacement is final only
+/// once that enrollment is published: the write settles it with
+/// [`WriteKey::settle`], which removes the replaced key's recovery envelope.
 /// `account` is the enrollment write's view of the account, so the key is
 /// chosen against the uid the enrollment is written for.
 pub(crate) fn ensure_enrollment_key_unlocked(
     user: &str,
     account: &mut Account<'_>,
-    opens_other: OpensOtherEnrollment<'_>,
+    is_other: KeyIsAnotherAccounts<'_>,
 ) -> Result<WriteKey> {
     ensure_key_with(
         user,
         account,
-        Some(opens_other),
+        Some(is_other),
         load_key_as,
         reseal_key_unlocked,
     )
@@ -295,21 +314,21 @@ impl WriteKey {
 
 /// [`ensure_key_unlocked`] with the unseal (`load`) and the seal (`reseal`)
 /// passed in. Only with `replace_other` (an enrollment write's
-/// [`OpensOtherEnrollment`]) is a key replaced: one sealed for another uid,
-/// or one that opens an enrollment recorded for another uid. It is set aside
+/// [`KeyIsAnotherAccounts`]) is a key replaced: one sealed for another uid,
+/// or one that `replace_other` finds is another account's. It is set aside
 /// first: a failed seal or round trip puts it back, and the enrollment write
 /// settles the rest ([`WriteKey::settle`]).
 pub(crate) fn ensure_key_with(
     user: &str,
     account: &mut Account<'_>,
-    replace_other: Option<OpensOtherEnrollment<'_>>,
+    replace_other: Option<KeyIsAnotherAccounts<'_>>,
     mut load: impl FnMut(&str, &mut Account<'_>) -> Result<Zeroizing<Vec<u8>>>,
     reseal: impl FnOnce(&str, &[u8], Option<u32>) -> Result<()>,
 ) -> Result<WriteKey> {
     let mut replaced = None;
     if has_key(user) {
         match (load(user, account), replace_other) {
-            (Ok(key), Some(opens_other)) if opens_other(user, &key, account) => {
+            (Ok(key), Some(is_other)) if is_other(user, &key, account) => {
                 replaced = Some(ReplacedKey::set_aside(user)?);
             }
             (Ok(key), _) => return Ok(WriteKey::kept(key)),

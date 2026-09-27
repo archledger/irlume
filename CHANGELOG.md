@@ -861,7 +861,8 @@ All notable changes to irlume are documented here. This project adheres to
   enrollment and its key), a sealed secret is not released or re-sealed
   (`irlume keyring arm` arms again), and a recovery envelope restores
   nothing. That enrollment also replaces a key an earlier release sealed
-  without a uid when the enrollment under it records another uid.
+  without a uid when the enrollment under it records another uid, or
+  records none while the key's recovery envelope records another uid.
   `irlume recovery setup` and `irlume recovery restore` refuse a
   template key whose enrollment records another uid, and the setup keeps
   a recovery envelope recorded for another uid when neither the key nor

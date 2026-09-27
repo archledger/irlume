@@ -216,7 +216,10 @@ each record it does not use, with the uids and the next step.
   name may by then resolve to another account than the one whose enrollment
   the key opens. An enrollment write for the account does not reuse such a
   key when the enrollment under it records another uid (the write reads the
-  stored enrollment with the key to find out): as for a key sealed for
+  stored enrollment with the key to find out), or when that enrollment
+  records no uid either (or none is stored) and the key's recovery envelope
+  records another uid: `irlume recovery setup` records the uid it wrapped
+  the key for, and the write reads only that field. As for a key sealed for
   another uid, the account gets a new key, and the old key's recovery
   envelope is removed once the new enrollment is saved.
 - `irlume recovery setup` does not wrap a template key for the account when

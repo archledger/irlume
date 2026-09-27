@@ -650,6 +650,10 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
         // the uninstall's own cleanliness standard removed the stale socket
         // for exactly this residue class (0.11.0rc1 audit).
         let _ = std::fs::remove_dir_all("/run/lock/irlume");
+        // The machine-API session lock's directory for root without a
+        // runtime directory (`machine::ROOT_SESSION_DIR`); only root can
+        // create it under /run.
+        let _ = std::fs::remove_dir_all(crate::machine::ROOT_SESSION_DIR);
     }
     // `systemctl enable` copies units into /etc/systemd/system/ (Arch's
     // systemd does this for units with [Install] aliases) — files pacman/apt

@@ -2097,7 +2097,7 @@ const SESSION_LOCK_NAME: &str = "machine-session.lock";
 /// Where root keeps its session lock when it has no runtime directory of its
 /// own, as under sudo, pkexec, a system unit or a cron job: a root-owned 0700
 /// directory on the `/run` tmpfs, created on first use.
-const ROOT_SESSION_DIR: &str = "/run/irlume";
+pub(crate) const ROOT_SESSION_DIR: &str = "/run/irlume";
 
 impl SessionGuard {
     fn acquire() -> std::result::Result<Self, SessionRefusal> {
@@ -2214,9 +2214,14 @@ fn open_session_lock(dir: &std::fs::File, uid: u32) -> Option<std::fs::File> {
         return None;
     }
     // Earlier builds created the lock under the umask. Only its owner needs
-    // to open it, and a group or other reader could hold the lock.
+    // to open it, and a group or other reader could hold the lock, so a lock
+    // that does not read back as owner-only after narrowing is not used.
     if meta.mode() & 0o077 != 0 {
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .ok()?;
+        if file.metadata().ok()?.mode() & 0o077 != 0 {
+            return None;
+        }
     }
     Some(file)
 }

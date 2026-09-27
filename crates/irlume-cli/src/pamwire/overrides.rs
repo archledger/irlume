@@ -188,7 +188,7 @@ fn keep_header(p: &Parsed<'_>, body: &str) -> String {
     }
 }
 
-fn normalize(text: &str) -> String {
+pub(super) fn normalize(text: &str) -> String {
     format!("{}\n", text.lines().collect::<Vec<_>>().join("\n"))
 }
 
@@ -322,7 +322,7 @@ fn kind(line: &str) -> String {
 /// pam_irlume.so returns `PAM_IGNORE`, which it does whenever it cannot help
 /// (no daemon, no match, an error): a state the wired stack must already be
 /// safe in.
-fn neutralize(body: &str) -> String {
+pub(super) fn neutralize(body: &str) -> String {
     let lines: Vec<String> = body
         .lines()
         .map(|l| {
@@ -674,7 +674,7 @@ fn strip_shifts(body: &str, stripped: &str, vendor: Option<&str>) -> Vec<Shift> 
         .collect()
 }
 
-fn shift_reason(shifts: &[Shift]) -> String {
+pub(super) fn shift_reason(shifts: &[Shift]) -> String {
     let first = &shifts[0];
     let more = match shifts.len() {
         1 => String::new(),
@@ -723,7 +723,7 @@ enum JumpCheck {
 /// landed where it does now without them: a vendor update that changes where
 /// the jump lands without irlume's lines makes it new, even when irlume's
 /// lines keep it on the line the old file had.
-fn jumps_moved_by_irlume(before: &str, after: &str) -> Vec<Shift> {
+pub(super) fn jumps_moved_by_irlume(before: &str, after: &str) -> Vec<Shift> {
     let old = jumps(before);
     let old_bare = jumps(&base(before));
     let unwired = jumps(&base(after));
@@ -3082,10 +3082,21 @@ session     include       password-auth
             vec![false, true, false, false],
             "only faillock is theirs"
         );
+        // The recipe anchors above the password step, below faillock, which
+        // is the side irlume's line is already on: nothing crosses.
+        assert_eq!(crossing(&body, &wired, &bare, &own), None);
+        // A line of irlume's above the administrator's line, which the recipe
+        // would now put below it, is kept where it is.
+        let above = format!(
+            "#%PAM-1.0\nauth       sufficient                   pam_irlume.so\n{faillock}\nauth       include      system-auth\naccount    include      system-auth\n"
+        );
+        let above_bare = base(&above);
+        let above_own = own_lines(&above_bare, Some(polkit_vendor), true);
+        let (above_wired, _) = wire_polkit_service(&above_bare);
         assert_eq!(
-            crossing(&body, &wired, &bare, &own).as_deref(),
+            crossing(&above, &above_wired, &above_bare, &above_own).as_deref(),
             Some(norm(faillock).as_str()),
-            "the recipe anchors above faillock"
+            "the recipe would move irlume's line past faillock"
         );
         let arranged = arrange(
             &body,

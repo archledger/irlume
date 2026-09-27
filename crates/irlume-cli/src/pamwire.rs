@@ -164,7 +164,7 @@ const CINNAMON_LOCKSCREEN: Svc = Svc {
 
 fn lock_surface_for(omarchy: bool, cinnamon: bool) -> LockSurface {
     if omarchy {
-        (&OMARCHY_LOCKSCREEN, wire_polkit_service)
+        (&OMARCHY_LOCKSCREEN, wire_omarchy_lock)
     } else if cinnamon {
         (&CINNAMON_LOCKSCREEN, wire_lock)
     } else {
@@ -3091,20 +3091,29 @@ fn wire_service_with(
                         format!("✓ {}: restored from backup", s.etc),
                     )
                 } else {
-                    if apply {
-                        write_atomic(etc, &stripped)?;
+                    let (body, change, message) = strip_in_place(s.etc, &read(s.etc)?);
+                    if let (true, Some(body)) = (apply, &body) {
+                        write_atomic(etc, body)?;
                     }
-                    out(PlannedChange::StripInPlace, format!("✓ {}: stripped irlume lines (file changed since wiring; backup kept at {}{})", s.etc, s.etc, BACKUP))
+                    out(
+                        change,
+                        format!(
+                            "{message} (file changed since wiring; backup kept at {}{})",
+                            s.etc, BACKUP
+                        ),
+                    )
                 }
-            } else if file_has_module(etc) {
-                let (clean, _) = unwire_lines(&read(s.etc)?);
-                if apply {
-                    write_atomic(etc, &clean)?;
+            } else if let Some(current) =
+                read_optional(etc)?.filter(|text| text.lines().any(is_irlume_line))
+            {
+                // The module, or only inactive lines a disable left holding
+                // irlume's places: either way there are lines of irlume's to
+                // take out once no jump counts them.
+                let (body, change, message) = strip_in_place(s.etc, &current);
+                if let (true, Some(body)) = (apply, &body) {
+                    write_atomic(etc, body)?;
                 }
-                out(
-                    PlannedChange::StripInPlace,
-                    format!("✓ {}: stripped irlume lines", s.etc),
-                )
+                out(change, message)
             } else {
                 out(PlannedChange::NotWired, format!("· {}: not wired", s.etc))
             }
@@ -3115,6 +3124,46 @@ fn wire_service_with(
 }
 
 // ---- pure PAM-text mechanics (unit-tested) -----------------------------------
+
+/// irlume's lines taken out of a stack irlume edits in place, for a disable:
+/// removed, unless that moves a numeric jump another line carries (an
+/// administrator who wrote one counted irlume's lines as they stand). Then,
+/// as for an override, each of irlume's rules becomes an inactive
+/// pam_permit.so line in its place, so every jump lands where it does now.
+/// The text to write (`None` when the file stays as it is), the change, and
+/// the line that reports it. A later disable takes the inactive lines out
+/// once no jump counts them.
+fn strip_in_place(etc: &str, current: &str) -> (Option<String>, PlannedChange, String) {
+    let (stripped, _) = unwire_lines(current);
+    let shifts = overrides::jump_shifts(current, &stripped);
+    if shifts.is_empty() {
+        return (
+            Some(stripped),
+            PlannedChange::StripInPlace,
+            format!("✓ {etc}: stripped irlume lines"),
+        );
+    }
+    let why = overrides::shift_reason(&shifts).replacen("would then land on", "would land on", 1);
+    let inert = overrides::neutralize(current);
+    if inert == overrides::normalize(current) {
+        return (
+            None,
+            PlannedChange::NotWired,
+            format!(
+                "· {etc}: not wired; inactive lines hold the places of irlume's lines, because \
+                 without them {why}"
+            ),
+        );
+    }
+    (
+        Some(inert),
+        PlannedChange::StripInPlace,
+        format!(
+            "✓ {etc}: turned irlume's lines into inactive pam_permit.so lines; removing them \
+             would change a jump: without them {why}"
+        ),
+    )
+}
 
 /// `Some(true/false)` when semodule could be queried (root), `None` otherwise.
 fn selinux_loaded() -> Option<bool> {
@@ -4171,6 +4220,88 @@ mod tests {
         );
         assert_eq!(settle_surface(None, io.clone(), false), (io, false));
         assert_eq!(settle_surface(None, None, false), (None, false));
+    }
+
+    /// An administrator's gate above the password step stays above irlume's
+    /// line, so a face cannot answer a prompt the gate refuses: the stanza
+    /// goes just above the password step, not above the first auth line. A
+    /// numeric jump that would then count irlume's line keeps the stanza
+    /// above that jump, where nothing counts it.
+    #[test]
+    fn verify_stanza_stays_below_an_administrators_gate() {
+        let gated = "#%PAM-1.0\n\
+                     auth       requisite    pam_succeed_if.so user ingroup wheel\n\
+                     auth       include      system-auth\n\
+                     account    include      system-auth\n";
+        for (wired, changed) in [wire_verify_service(gated), wire_polkit_service(gated)] {
+            assert!(changed);
+            let at = |needle: &str| wired.lines().position(|l| l.contains(needle)).unwrap();
+            assert!(at("pam_succeed_if.so") < at(MODULE), "{wired}");
+            assert!(at(MODULE) < at("auth       include"), "{wired}");
+        }
+        let unix = "auth required pam_env.so\n\
+                    auth requisite pam_nologin.so\n\
+                    auth required pam_unix.so\n";
+        let (wired, _) = wire_verify_service(unix);
+        let at = |needle: &str| wired.lines().position(|l| l.contains(needle)).unwrap();
+        assert!(
+            at("pam_nologin.so") < at(MODULE) && at(MODULE) < at("pam_unix.so"),
+            "{wired}"
+        );
+        // `success=1` skips the password include for some users; a line between
+        // them would be what it skips instead, so the stanza goes above it.
+        let jumped = "auth [success=1 default=ignore] pam_succeed_if.so user ingroup nopasswd\n\
+                      auth include system-auth\n\
+                      auth required pam_deny.so\n";
+        let (wired, _) = wire_verify_service(jumped);
+        assert_eq!(
+            wired.lines().position(|l| l.contains(MODULE)),
+            Some(0),
+            "{wired}"
+        );
+    }
+
+    /// Disabling a stack irlume edits in place removes its lines, unless a
+    /// numeric jump another line carries counts them: then they become
+    /// inactive lines in their places, as in an override, so the jump lands
+    /// where it did.
+    #[test]
+    fn an_in_place_strip_keeps_jumps_that_count_irlumes_lines() {
+        let plain = format!("{VERIFY_STANZA}\nauth include system-auth\n");
+        let (body, _, message) = strip_in_place("/etc/pam.d/sudo", &plain);
+        assert_eq!(body.as_deref(), Some("auth include system-auth\n"));
+        assert!(message.contains("stripped irlume lines"), "{message}");
+
+        let counted = format!(
+            "auth [success=2 default=ignore] pam_succeed_if.so user ingroup fast\n\
+             {VERIFY_STANZA}\n\
+             auth required pam_unix.so\n\
+             auth required pam_deny.so\n\
+             auth required pam_permit.so\n"
+        );
+        let (body, change, message) = strip_in_place("/etc/pam.d/sudo", &counted);
+        let body = body.expect("inactive lines written");
+        assert_eq!(change, PlannedChange::StripInPlace);
+        assert!(!body.contains(MODULE), "{body}");
+        assert_eq!(body.lines().count(), counted.lines().count(), "{body}");
+        assert!(body.lines().nth(1).unwrap().contains(INERT_TAG), "{body}");
+        assert!(
+            message.contains("inactive pam_permit.so lines"),
+            "{message}"
+        );
+        assert!(message.contains("would land on"), "{message}");
+        // The next disable while the jump still counts them writes nothing;
+        // once the jump is gone it takes the inactive lines out.
+        let (again, change, message) = strip_in_place("/etc/pam.d/sudo", &body);
+        assert_eq!(
+            (again, change),
+            (None, PlannedChange::NotWired),
+            "{message}"
+        );
+        let unjumped = body.replacen("[success=2 default=ignore]", "requisite", 1);
+        let (clean, change, _) = strip_in_place("/etc/pam.d/sudo", &unjumped);
+        assert_eq!(change, PlannedChange::StripInPlace);
+        assert!(!clean.unwrap().contains(INERT_TAG));
     }
 
     #[test]

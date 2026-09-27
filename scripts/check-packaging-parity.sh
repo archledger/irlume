@@ -568,6 +568,12 @@ APPARMOR_RUNTIME_RULES=(
   # profile without these refuses every non-root capture.
   "/run/systemd/seats/ r,"
   "/run/systemd/seats/* r,"
+  # Sealed-storage diagnostics read mount topology and enumerate every btrfs
+  # member so a partially encrypted filesystem is never reported encrypted.
+  "/proc/[0-9]*/mountinfo r,"
+  "/sys/fs/btrfs/ r,"
+  "/sys/fs/btrfs/*/devices/ r,"
+  "/sys/fs/btrfs/*/devices/* r,"
 )
 for profile in "${APPARMOR_PROFILES[@]}"; do
   for rule in "${APPARMOR_RUNTIME_RULES[@]}"; do

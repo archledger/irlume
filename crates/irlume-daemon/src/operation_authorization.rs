@@ -83,6 +83,7 @@ fn approval_operation(req: &Request) -> Option<(&'static str, &'static str)> {
         | Request::LastAttempts { .. }
         | Request::IdentifyFor { .. }
         | Request::PreferencesStatus
+        | Request::SealedStorage
         | Request::SelfTest { .. }
         | Request::ListCameras
         | Request::CameraDiagnostics

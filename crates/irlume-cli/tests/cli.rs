@@ -1668,29 +1668,59 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_forget_before_upgrading_to_45() {
 
 /// What protects the sealed secrets at rest is reported by `keyring arm`
 /// after an arm and by doctor's `sealed-storage` check on every run: a
-/// warning with the remedies where no dm-crypt layer is found under irlume's
-/// state directory, or the storage cannot be established, whatever the
-/// policy and whether the keyring secret, the template key or both are
-/// sealed; information on encrypted storage when a sealed secret's policy may
-/// be one another operating system reproduces (the literal PCR 7 one, an
-/// unnamed one, or the template key's, which is not reported); nothing, or
-/// `pass`, otherwise. Doctor's `pcrlock` check keeps its meaning and carries
-/// no detail. A daemon from before `KeyringMetadata` is asked `KeyringInfo`
-/// instead, and one that answers neither after an arm still gets the note.
-/// The expectation comes from the same read-only probe the binary runs on
-/// the sandbox's state directory, so it holds on a host whose temp directory
-/// is encrypted too.
+/// warning with the remedies where no dm-crypt layer is found under a
+/// directory irlumed keeps a sealed secret in or under the installed system,
+/// or the storage cannot be established, whatever the policy and whether the
+/// keyring secret, the template key or both are sealed; information on
+/// encrypted storage when a sealed secret's policy may be one another
+/// operating system reproduces (the literal PCR 7 one, an unnamed one, or the
+/// template key's, which is not reported); nothing, or `pass`, otherwise.
+/// Doctor's `pcrlock` check keeps its meaning and carries no detail. The
+/// storage is irlumed's `SealedStorage` report, here a fixed one for
+/// encrypted and for unencrypted storage, and the guidance names the
+/// daemon's directories. A daemon from before `KeyringMetadata` is asked
+/// `KeyringInfo` instead and answers `SealedStorage` with "bad request" too,
+/// so the CLI probes the storage itself; that expectation comes from the same
+/// read-only probe the binary runs, so it holds on any host. Any other daemon
+/// error leaves the storage unknown and names the error once, and a daemon
+/// that describes nothing after an arm still gets the note.
 #[test]
 fn sealed_secrets_off_encrypted_storage_are_told_the_remedies() {
-    use irlume_common::storage_encryption::{path_encryption, StorageEncryption};
-    /// How the fake daemon answers `KeyringMetadata`.
+    use irlume_common::storage_encryption::{directory_encryption, StorageEncryption};
+    use irlume_common::StorageDirectory;
+    /// How the fake daemon answers `KeyringMetadata` and `SealedStorage`.
     #[derive(Clone, Copy, PartialEq)]
     enum Metadata {
+        /// Both answered, the storage with `storage_reply`.
         Answered,
-        /// As a daemon from before it: "bad request", then `KeyringInfo`.
+        /// As a daemon from before both: "bad request", then `KeyringInfo`.
         Older,
-        /// Any other error: the keyring secret is not described.
+        /// Any other error: neither the keyring secret nor the storage is
+        /// described.
         Failing,
+    }
+    /// irlumed's storage report: every directory on dm-crypt, or `/usr`
+    /// without it.
+    fn storage_reply(encrypted: bool) -> Response {
+        let dir = |path: &str, encryption| StorageDirectory {
+            path: path.into(),
+            encryption,
+            reason: None,
+        };
+        let usr = if encrypted {
+            StorageEncryption::Encrypted
+        } else {
+            StorageEncryption::NotEncrypted
+        };
+        Response::SealedStorage {
+            keyring: dir("/daemon/keyring", StorageEncryption::Encrypted),
+            template_key: dir("/daemon/template-keys", StorageEncryption::Encrypted),
+            system: vec![
+                dir("/", StorageEncryption::Encrypted),
+                dir("/usr", usr),
+                dir("/etc", StorageEncryption::Encrypted),
+            ],
+        }
     }
     const TIER_3: (&str, &[u32]) = ("literal PolicyPCR (Tier 3)", &[7]);
     // A pcrlock policy that covers the boot loader (PCR 4).
@@ -1705,25 +1735,35 @@ fn sealed_secrets_off_encrypted_storage_are_told_the_remedies() {
     const TEMPLATE_POLICY: &str = "The template key is sealed under the policy chosen when it \
                                    was sealed";
     const UNNAMED: &str = "irlume could not read which policy the keyring secret";
+    // The directory irlumed reports without dm-crypt, as the warning names it.
+    const PLAIN_USR: &str = "irlume found no dm-crypt encryption under /usr ";
+    const NOT_REPORTED: &str = "irlumed could not report storage";
     // A daemon holding a keyring secret under `policy` (None: nothing armed)
-    // and, with `template_key`, a sealed template key.
+    // and, with `template_key`, a sealed template key; one that answers
+    // `SealedStorage` reports the storage `encrypted` or not.
     let sandbox = |tag: &str,
                    policy: Option<(&'static str, &'static [u32])>,
                    template_key: bool,
-                   metadata: Metadata| {
+                   metadata: Metadata,
+                   encrypted: bool| {
         let sb = Sandbox::new(tag);
         for tool in ["rpm", "dnf", "dpkg-query", "apt-cache", "pacman"] {
             sb.fake_tool(tool, "exit 1");
         }
         let log = serve(&sock(&sb), move |request| match request {
-            Request::KeyringMetadata { .. } if metadata == Metadata::Older => {
+            Request::KeyringMetadata { .. } | Request::SealedStorage
+                if metadata == Metadata::Older =>
+            {
                 Response::Error("bad request".into())
             }
-            Request::KeyringMetadata { .. } | Request::KeyringInfo { .. }
+            Request::KeyringMetadata { .. }
+            | Request::KeyringInfo { .. }
+            | Request::SealedStorage
                 if metadata == Metadata::Failing =>
             {
                 Response::Error("fixture unavailable".into())
             }
+            Request::SealedStorage => storage_reply(encrypted),
             Request::KeyringMetadata { .. } | Request::KeyringInfo { .. } => {
                 Response::KeyringInfo {
                     armed: policy.is_some(),
@@ -1744,12 +1784,13 @@ fn sealed_secrets_off_encrypted_storage_are_told_the_remedies() {
         });
         (sb, log)
     };
-    let asked_keyring_info = |log: &std::sync::Arc<std::sync::Mutex<Vec<Request>>>| {
-        log.lock()
-            .unwrap()
-            .iter()
-            .any(|request| matches!(request, Request::KeyringInfo { .. }))
+    let asked = |log: &std::sync::Arc<std::sync::Mutex<Vec<Request>>>,
+                 wanted: fn(&Request) -> bool| {
+        log.lock().unwrap().iter().any(wanted)
     };
+    let keyring_info: fn(&Request) -> bool =
+        |request| matches!(request, Request::KeyringInfo { .. });
+    let sealed_storage: fn(&Request) -> bool = |request| matches!(request, Request::SealedStorage);
     let arm = |sb: &Sandbox| -> String {
         let (code, out, err) = run_stdin(
             &mut sb.cmd_with_fakes(&["keyring", "arm", "--user", "tester"]),
@@ -1786,102 +1827,121 @@ fn sealed_secrets_off_encrypted_storage_are_told_the_remedies() {
     let detail =
         |check: &serde_json::Value| check["detail"].as_str().unwrap_or_default().to_string();
 
-    // A Tier 3 keyring secret and a template key: a warning naming both, the
-    // offline change and the direct unseal off encrypted storage, and
-    // information on it, since the storage does not show whether it asks
-    // for a passphrase.
-    let (sb, log) = sandbox("seal-tier3-both", Some(TIER_3), true, Metadata::Answered);
-    // The check also counts the installed system's directories.
-    let encrypted = [sb.path("state"), "/".into(), "/usr".into(), "/etc".into()]
-        .iter()
-        .all(|dir| path_encryption(dir) == StorageEncryption::Encrypted);
-    let out = arm(&sb);
-    if encrypted {
-        assert!(
-            out.contains("[keyring] NOTE: The keyring secret is sealed under the literal PCR 7")
-                && out.contains(TEMPLATE_POLICY)
-                && out.contains(DIRECT)
-                && out.contains(UNLOCK)
-                && !out.contains("can unseal both"),
-            "{out}"
-        );
-    } else {
-        assert!(
-            out.contains(&format!("[keyring] WARNING: {BOTH}"))
-                && out.contains(OFFLINE)
-                && out.contains(DIRECT)
-                && out.contains(REMEDY),
-            "{out}"
-        );
-    }
-    let (_, out, err) = run(&mut sb.cmd_with_fakes(&["doctor", "--user", "tester"]));
-    assert!(
-        out.contains("sealed storage (tester): ") && out.contains(DIRECT),
-        "{out} {err}"
-    );
-    let (check, _) = checks(&sb);
-    assert_eq!(
-        check["state"],
-        if encrypted { "info" } else { "warn" },
-        "{check}"
-    );
-    assert!(detail(&check).contains(DIRECT), "{check}");
-    assert!(
-        detail(&check).contains(if encrypted { UNLOCK } else { BOTH }),
-        "{check}"
-    );
-    assert!(!asked_keyring_info(&log), "{:?}", log.lock().unwrap());
+    for encrypted in [true, false] {
+        let tag = |name: &str| format!("{name}-{}", if encrypted { "enc" } else { "plain" });
+        let state = if encrypted { "info" } else { "warn" };
 
-    // A template key alone, which no keyring check covered: with no pcrlock
-    // policy that seals use, it is under the literal PCR policy, so it is
-    // warned off encrypted storage and information on it, with no word on
-    // the keyring.
-    let (sb, _) = sandbox("seal-template-key", None, true, Metadata::Answered);
-    let (check, _) = checks(&sb);
-    assert_eq!(
-        check["state"],
-        if encrypted { "info" } else { "warn" },
-        "{check}"
-    );
-    assert!(
-        detail(&check).contains(TEMPLATE_POLICY) && !detail(&check).contains("keyring"),
-        "{check}"
-    );
-    if !encrypted {
+        // A Tier 3 keyring secret and a template key: a warning naming both,
+        // the offline change and the direct unseal off encrypted storage, and
+        // information on it, since the storage does not show whether it asks
+        // for a passphrase. The storage is irlumed's, named by its paths.
+        let (sb, log) = sandbox(
+            &tag("seal-tier3-both"),
+            Some(TIER_3),
+            true,
+            Metadata::Answered,
+            encrypted,
+        );
+        let out = arm(&sb);
+        if encrypted {
+            assert!(
+                out.contains(
+                    "[keyring] NOTE: The keyring secret is sealed under the literal PCR 7"
+                ) && out.contains(TEMPLATE_POLICY)
+                    && out.contains(DIRECT)
+                    && out.contains(UNLOCK)
+                    && out.contains("/daemon/keyring and the installed system")
+                    && !out.contains("can unseal both"),
+                "{out}"
+            );
+        } else {
+            assert!(
+                out.contains(&format!("[keyring] WARNING: {BOTH}"))
+                    && out.contains(PLAIN_USR)
+                    && out.contains(OFFLINE)
+                    && out.contains(DIRECT)
+                    && out.contains(REMEDY),
+                "{out}"
+            );
+        }
+        let (_, out, err) = run(&mut sb.cmd_with_fakes(&["doctor", "--user", "tester"]));
         assert!(
-            detail(&check).contains(TEMPLATE_KEY) && detail(&check).contains(OFFLINE),
+            out.contains("sealed storage (tester): ") && out.contains(DIRECT),
+            "{out} {err}"
+        );
+        let (check, _) = checks(&sb);
+        assert_eq!(check["state"], state, "{check}");
+        assert!(detail(&check).contains(DIRECT), "{check}");
+        assert!(
+            detail(&check).contains(if encrypted { UNLOCK } else { BOTH }),
             "{check}"
         );
-    }
+        assert!(!detail(&check).contains(NOT_REPORTED), "{check}");
+        assert!(!asked(&log, keyring_info), "{:?}", log.lock().unwrap());
+        assert!(asked(&log, sealed_storage), "{:?}", log.lock().unwrap());
 
-    // A keyring secret under a pcrlock (Tier 2) policy that covers the boot
-    // loader is still warned off encrypted storage, without the point on
-    // another operating system, and is information on it, with the caveat on
-    // what PCR 4 measures.
-    let (sb, _) = sandbox("seal-tier2", Some(TIER_2), false, Metadata::Answered);
-    let out = arm(&sb);
-    assert!(!out.contains("another operating system"), "{out}");
-    assert_eq!(out.contains(OFFLINE), !encrypted, "{out}");
-    let (check, _) = checks(&sb);
-    assert_eq!(
-        check["state"],
-        if encrypted { "info" } else { "warn" },
-        "{check}"
-    );
-    assert!(
-        !detail(&check).contains("another operating system"),
-        "{check}"
-    );
-    if encrypted {
+        // A template key alone, which no keyring check covered: with no
+        // pcrlock policy that seals use, it is under the literal PCR policy,
+        // so it is warned off encrypted storage and information on it, with
+        // no word on the keyring or its directory.
+        let (sb, _) = sandbox(
+            &tag("seal-template-key"),
+            None,
+            true,
+            Metadata::Answered,
+            encrypted,
+        );
+        let (check, _) = checks(&sb);
+        assert_eq!(check["state"], state, "{check}");
         assert!(
-            detail(&check).contains(UNLOCK) && detail(&check).contains("PCRs 9 and 8"),
+            detail(&check).contains(TEMPLATE_POLICY) && !detail(&check).contains("keyring"),
             "{check}"
         );
+        if encrypted {
+            assert!(
+                detail(&check).contains("/daemon/template-keys and the installed system"),
+                "{check}"
+            );
+        } else {
+            assert!(
+                detail(&check).contains(TEMPLATE_KEY)
+                    && detail(&check).contains(OFFLINE)
+                    && detail(&check).contains(PLAIN_USR),
+                "{check}"
+            );
+        }
+
+        // A keyring secret under a pcrlock (Tier 2) policy that covers the
+        // boot loader is still warned off encrypted storage, without the
+        // point on another operating system, and is information on it, with
+        // the caveat on what PCR 4 measures.
+        let (sb, _) = sandbox(
+            &tag("seal-tier2"),
+            Some(TIER_2),
+            false,
+            Metadata::Answered,
+            encrypted,
+        );
+        let out = arm(&sb);
+        assert!(!out.contains("another operating system"), "{out}");
+        assert_eq!(out.contains(OFFLINE), !encrypted, "{out}");
+        let (check, _) = checks(&sb);
+        assert_eq!(check["state"], state, "{check}");
+        assert!(
+            !detail(&check).contains("another operating system"),
+            "{check}"
+        );
+        if encrypted {
+            assert!(
+                detail(&check).contains(UNLOCK) && detail(&check).contains("PCRs 9 and 8"),
+                "{check}"
+            );
+        }
     }
 
-    // Nothing sealed: information that says so, and no note after an arm
-    // the fake does not record.
-    let (sb, _) = sandbox("seal-nothing", None, false, Metadata::Answered);
+    // Nothing sealed: information that says so, no note after an arm the
+    // fake does not record, and no storage asked about.
+    let (sb, log) = sandbox("seal-nothing", None, false, Metadata::Answered, false);
     let out = arm(&sb);
     assert!(
         !out.contains("sealed by the TPM") && !out.contains(DIRECT),
@@ -1893,31 +1953,97 @@ fn sealed_secrets_off_encrypted_storage_are_told_the_remedies() {
         detail(&check).contains("nothing is sealed for tester"),
         "{check}"
     );
+    assert!(!asked(&log, sealed_storage), "{:?}", log.lock().unwrap());
 
-    // A daemon from before `KeyringMetadata` is asked `KeyringInfo`, and its
-    // Tier 3 secret is still reported.
-    let (sb, log) = sandbox("seal-older-daemon", Some(TIER_3), false, Metadata::Older);
+    // A daemon from before `KeyringMetadata` and `SealedStorage` is asked
+    // `KeyringInfo`, and its Tier 3 secret is still reported, against the
+    // storage the CLI probes itself: the sandbox's keyring directory and the
+    // installed system, the least protected of them named and each unknown
+    // one given with its reason.
+    let (sb, log) = sandbox(
+        "seal-older-daemon",
+        Some(TIER_3),
+        false,
+        Metadata::Older,
+        true,
+    );
+    let local: Vec<StorageDirectory> =
+        [sb.path("keyring"), "/".into(), "/usr".into(), "/etc".into()]
+            .iter()
+            .map(|dir| directory_encryption(dir))
+            .collect();
+    let named = local
+        .iter()
+        .min_by_key(|dir| match dir.encryption {
+            StorageEncryption::NotEncrypted => 0,
+            StorageEncryption::Unknown => 1,
+            StorageEncryption::Encrypted => 2,
+        })
+        .unwrap();
+    let phrase = match named.encryption {
+        StorageEncryption::Encrypted => format!("{} and the installed system", named.path),
+        StorageEncryption::NotEncrypted => {
+            format!("irlume found no dm-crypt encryption under {} ", named.path)
+        }
+        StorageEncryption::Unknown => format!(
+            "irlume could not confirm that {} is on encrypted storage",
+            named.path
+        ),
+    };
+    let probed_locally = |text: &str| {
+        text.contains(DIRECT)
+            && text.contains(&phrase)
+            && !text.contains(NOT_REPORTED)
+            && local
+                .iter()
+                .filter(|dir| dir.encryption == StorageEncryption::Unknown)
+                .all(|dir| {
+                    text.contains(&dir.path) && text.contains(dir.reason.as_deref().unwrap())
+                })
+    };
     let out = arm(&sb);
-    assert!(out.contains(DIRECT), "{out}");
-    assert!(asked_keyring_info(&log), "{:?}", log.lock().unwrap());
+    assert!(probed_locally(&out), "{local:?}: {out}");
+    assert!(asked(&log, keyring_info), "{:?}", log.lock().unwrap());
+    assert!(asked(&log, sealed_storage), "{:?}", log.lock().unwrap());
     let (check, _) = checks(&sb);
     assert_eq!(
         check["state"],
-        if encrypted { "info" } else { "warn" },
+        if named.encryption == StorageEncryption::Encrypted {
+            "info"
+        } else {
+            "warn"
+        },
         "{check}"
     );
-    assert!(detail(&check).contains(DIRECT), "{check}");
+    assert!(probed_locally(&detail(&check)), "{local:?}: {check}");
 
-    // The arm just sealed a keyring secret: a daemon that then does not
-    // describe it still gets the note, for a policy it did not name. Doctor,
-    // which has not just armed one, cannot say.
-    let (sb, _) = sandbox("seal-undescribed", Some(TIER_3), false, Metadata::Failing);
+    // The arm just sealed a keyring secret: a daemon that then describes
+    // neither it nor the storage still gets the note, for a policy it did
+    // not name, as a warning: the daemon's answer stands, so the storage is
+    // unknown, and its error is given once. Doctor, which has not just armed
+    // one, cannot say.
+    let (sb, log) = sandbox(
+        "seal-undescribed",
+        Some(TIER_3),
+        false,
+        Metadata::Failing,
+        true,
+    );
     let out = arm(&sb);
-    let label = if encrypted { "NOTE" } else { "WARNING" };
     assert!(
-        out.contains(&format!("[keyring] {label}: ")) && out.contains(UNNAMED),
+        out.contains("[keyring] WARNING: ")
+            && out.contains(UNNAMED)
+            && out.contains(
+                "irlume could not confirm that keyring directory (IRLUME_KEYRING_DIR) is on \
+                 encrypted storage"
+            )
+            && out
+                .matches(&format!("{NOT_REPORTED}: fixture unavailable"))
+                .count()
+                == 1,
         "{out}"
     );
+    assert!(asked(&log, sealed_storage), "{:?}", log.lock().unwrap());
     let (check, _) = checks(&sb);
     assert_eq!(check["state"], "unknown", "{check}");
 

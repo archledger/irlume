@@ -329,6 +329,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume doctor`'s `sealed-storage` check and the guidance after a seal
+  ask irlumed to probe its own keyring and template-key directories and
+  the installed system. The daemon's directory settings take precedence
+  over the CLI's, and links inside its private state directory are
+  resolved by the daemon. An older or unreachable daemon uses the CLI
+  probe, which now treats inaccessible directories as unknown. The
+  guidance names each unresolved directory with its reason, giving a
+  reason several directories share, such as a daemon error, once (#900).
+
 - Package upgrades leave the reconcile units (`irlume-reconcile.path`,
   `.timer`, `.service`) disabled or masked when an administrator turned
   them off: the Arch hook no longer enables them on every upgrade, or

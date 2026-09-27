@@ -125,9 +125,24 @@ matching also requires passing IR liveness; an inverted RGB image can't.)
    measure what it loads next, or one irlume cannot read) and the template
    key's, which the daemon does not report (where no pcrlock policy is used
    for sealing it is the literal one). With an `IRLUME_PCRS` override the
-   guidance names the PCRs the keyring seal binds. The directories probed
-   are irlumed's, as systemd gives them to it (a source install's unit
-   included). On dm-crypt the information also says that what the boot
+   guidance names the PCRs the keyring seal binds.
+
+   The CLI first asks irlumed to probe its own directories and the installed
+   system. This read-only request is available to any local peer. Root receives
+   paths and detailed reasons for unknown results; other callers receive
+   `keyring` and `template-key` labels and generic reasons. Both receive the
+   same storage results, without per-account data, camera access or TPM access.
+   The daemon resolves links inside its state directory and relative overrides
+   against its working directory. It uses its own environment, so the CLI's
+   directory overrides do not change the answer. Only an older daemon's
+   `bad request` reply or a proven absent daemon falls back to the CLI's
+   probe, which resolves paths from its environment and systemd. A directory
+   not created yet is judged by its nearest existing parent. A directory
+   the caller cannot look into stays unknown, since a hidden link may lead
+   to different storage. The guidance names each unresolved directory and
+   the reason. A timeout or denied connection leaves storage unknown.
+
+   On dm-crypt the information also says that what the boot
    reads before the volume is unlocked (the EFI system partition, an
    unencrypted /boot) is not encrypted and can be changed offline to
    capture the passphrase or PIN, whatever the TPM policy measures; Secure

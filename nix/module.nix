@@ -265,6 +265,10 @@ in
         # than an indefinite hang. NotifyAccess is required for Type=simple.
         WatchdogSec = "90s";
         NotifyAccess = "main";
+        # No core dumps, matching packaging/systemd/irlumed.service: a crash or
+        # the watchdog's SIGABRT leaves no core file with its memory. The daemon
+        # also sets this limit and clears its dumpable flag at startup.
+        LimitCORE = 0;
         # Sandboxing, mirroring packaging/systemd/irlumed.service so the hardening
         # holds on NixOS too. Scoped to what the daemon needs: it opens
         # /dev/video* and the TPM, binds a Unix socket, and writes root-owned

@@ -560,7 +560,28 @@ fn carry_camera_pair(
 }
 
 fn main() {
-    // FIRST, before models load. The watchdog deadline starts ticking the moment
+    // Before any model, template or request is touched: no core dumps
+    // (`disable_core_dumps`). A daemon that stays dumpable does not start:
+    // face authentication is then unavailable and the password still works.
+    // A core limit that cannot be lowered is logged; the cleared dumpable
+    // flag already keeps the kernel from starting a dump.
+    match disable_core_dumps() {
+        Ok(warnings) => {
+            if !warnings.is_empty() {
+                jout_warn!(
+                    "irlumed: WARNING: the core limit is not lowered ({}); the dumpable flag is cleared",
+                    warnings.join("; ")
+                );
+            }
+        }
+        Err(e) => {
+            jout_err!(
+                "irlumed: cannot clear the dumpable flag ({e}); not starting, so no core file can hold its memory. Face authentication is unavailable; passwords still work"
+            );
+            std::process::exit(1);
+        }
+    }
+    // Next, before models load. The watchdog deadline starts ticking the moment
     // systemd execs us, and loading the ONNX sessions takes tens of seconds on a
     // cold cache; starting the pings after that made the daemon miss its own
     // deadline during startup and get killed in a restart loop (measured with
@@ -2998,6 +3019,70 @@ fn worker_wedged(limit: std::time::Duration) -> bool {
         Err(e) => e.into_inner(),
     };
     p.is_some_and(|since| since.elapsed() > limit)
+}
+
+/// Keep irlumed's memory out of core dumps.
+///
+/// irlumed does not write core dumps, so a crash or a watchdog abort leaves no
+/// core file with its memory (swap is separate; see SECURITY_AT_REST). That
+/// memory holds camera frames, embeddings,
+/// decrypted templates and request buffers that can carry a password, and
+/// only `SecretBytes` pages are marked to be left out of a dump.
+///
+/// Both settings are applied, as each covers a case the other does not:
+/// - `RLIMIT_CORE` 0, soft and hard: the kernel writes no core file, a
+///   `core_pattern` handler such as systemd-coredump stores nothing, every
+///   helper the daemon starts inherits the limit, and it still holds if the
+///   kernel resets dumpability after a credential change.
+/// - `PR_SET_DUMPABLE` 0: the kernel starts no dump at all. It also makes
+///   the daemon's `/proc/<pid>` files root-owned and their ptrace-checked
+///   entries need `CAP_SYS_PTRACE`. The daemon's reads of its own entries
+///   (the AppArmor label, the camera holder scan, `/proc/self/fd` paths) are
+///   unaffected, since the kernel always lets a process read its own, and
+///   the systemd notify and watchdog path is a datagram whose sender the
+///   kernel identifies.
+///
+/// The unit's `LimitCORE=0` sets the same limit before exec; this call also
+/// covers a daemon started another way.
+///
+/// # Errors
+///
+/// The line to log when the dumpable flag cannot be cleared: the caller does
+/// not start, since the core limit alone does not keep a piped
+/// `core_pattern` handler from receiving a dump. `Ok` carries one line per
+/// core-limit failure, which the caller logs and starts anyway.
+fn disable_core_dumps() -> Result<Vec<String>, String> {
+    let mut failures = Vec::new();
+    let no_core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: setrlimit reads the initialized struct it is given; lowering
+    // this process's own limit needs no privilege.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) } != 0 {
+        failures.push(format!(
+            "setrlimit(RLIMIT_CORE): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: PR_SET_DUMPABLE takes integer arguments and no pointers, and
+    // changes only this process's own attribute.
+    let dumpable = unsafe {
+        libc::prctl(
+            libc::PR_SET_DUMPABLE,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        )
+    };
+    if dumpable != 0 {
+        return Err(format!(
+            "prctl(PR_SET_DUMPABLE): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(failures)
 }
 
 /// Send one `WATCHDOG=1` to the notify socket systemd handed us.
@@ -13560,6 +13645,88 @@ mod tests {
         note_worker_idle();
         std::thread::sleep(std::time::Duration::from_millis(70));
         assert!(!worker_wedged(short), "idle after a job is still healthy");
+    }
+
+    /// Startup leaves the process with a zero core limit and not dumpable.
+    ///
+    /// Both settings are process-wide, so they are applied in a child copy of
+    /// this test binary and never in the process running the other tests. The
+    /// child prints a marker, so if a rename leaves `--exact` matching nothing,
+    /// this fails rather than passing on an empty run.
+    #[test]
+    fn disable_core_dumps_sets_a_zero_core_limit_and_clears_dumpable_in_a_child() {
+        const CHILD: &str = "IRLUME_TEST_NO_CORE_DUMP_CHILD";
+        const MARKER: &str = "irlume-no-core-dump-child-checked";
+        if std::env::var_os(CHILD).is_some() {
+            assert_eq!(disable_core_dumps(), Ok(Vec::<String>::new()));
+            let mut limit = libc::rlimit {
+                rlim_cur: 1,
+                rlim_max: 1,
+            };
+            // SAFETY: `limit` is writable storage of the platform rlimit type.
+            let got = unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) };
+            assert_eq!(got, 0, "getrlimit: {}", std::io::Error::last_os_error());
+            assert_eq!((limit.rlim_cur, limit.rlim_max), (0, 0));
+            // SAFETY: PR_GET_DUMPABLE reads this process's own flag and takes
+            // no pointers.
+            let dumpable = unsafe {
+                libc::prctl(
+                    libc::PR_GET_DUMPABLE,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                )
+            };
+            assert_eq!(dumpable, 0, "the process must not be dumpable");
+            println!("{MARKER}");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "tests::disable_core_dumps_sets_a_zero_core_limit_and_clears_dumpable_in_a_child",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains(MARKER),
+            "child run failed or ran nothing: {}\nstdout: {stdout}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The packaged unit and the NixOS module set a zero core limit before
+    /// exec, as `disable_core_dumps` does again at startup. The two files are
+    /// kept in sync by hand, so both are checked.
+    #[test]
+    fn irlumed_units_set_a_zero_core_limit() {
+        let unit = include_str!("../../../packaging/systemd/irlumed.service");
+        assert!(
+            unit.lines().any(|line| line.trim() == "LimitCORE=0"),
+            "packaging/systemd/irlumed.service must set LimitCORE=0"
+        );
+        let module = include_str!("../../../nix/module.nix");
+        let service = module
+            .split_once("systemd.services.irlumed = {")
+            .map(|(_, rest)| rest)
+            .expect("nix/module.nix defines systemd.services.irlumed");
+        let service_config = service
+            .split_once("serviceConfig = {")
+            .and_then(|(_, rest)| rest.split_once("environment = {"))
+            .map(|(config, _)| config)
+            .expect("irlumed's serviceConfig precedes its environment");
+        assert!(
+            service_config
+                .lines()
+                .any(|line| line.trim() == "LimitCORE = 0;"),
+            "nix/module.nix irlumed serviceConfig must set LimitCORE = 0"
+        );
     }
 
     /// A tamper gate must not be switched off by a capitalisation (#365).

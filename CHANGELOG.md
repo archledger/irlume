@@ -843,6 +843,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- irlumed does not write core dumps, so a crash or a watchdog restart
+  leaves no core file with its memory: it sets a zero core limit and
+  clears its dumpable flag at startup, and `irlumed.service` and the NixOS module
+  set `LimitCORE=0`. When the dumpable flag cannot be cleared, irlumed
+  does not start (face authentication is unavailable, passwords still
+  work); a core limit it cannot lower is logged.
+
 - pam_irlume also stands down at `sudo`, `su`, `doas` and the other
   elevation services when the process running the transaction belongs to
   a remote login session, or to none it can resolve (a cron job or a

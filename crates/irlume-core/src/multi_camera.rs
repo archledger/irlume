@@ -116,6 +116,55 @@ pub fn secondary_store_path(user: &str) -> PathBuf {
         .join(format!("{user}.json"))
 }
 
+/// The staging tag of [`save_secondary`]'s writes.
+const SAVE_STAGING_TAG: &str = "tmp";
+
+/// The staging tag of the commit protocol's writes, of the store and of its
+/// journal ([`commit::publish_with_intent`]).
+const COMMIT_STAGING_TAG: &str = "commit-tmp";
+
+/// The file a writer stages `path`'s new bytes in before renaming it over
+/// `path`: `.<file name>.<tag>-<pid>` in the same directory. A crash, or a
+/// failed write or sync, before the rename leaves it behind with those
+/// bytes, which are plaintext embeddings on a host without a TPM.
+fn staging_path(path: &Path, tag: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .map_or_else(|| "secondary".into(), |n| n.to_string_lossy().into_owned());
+    path.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{name}.{tag}-{}", std::process::id()))
+}
+
+/// Whether `name`, an entry of the directory of the store at `store`, is a
+/// staging file a writer of that store or of its commit journal left behind
+/// ([`staging_path`], any process id). Another account's files never match:
+/// the file name must be followed by exactly one staging tag and a decimal
+/// process id.
+pub(crate) fn is_staging_file_of(store: &Path, name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let journal = commit::intent_path_for(store);
+    let staged_by = |file: &str, tag: &str| {
+        name.strip_prefix('.')
+            .and_then(|rest| rest.strip_prefix(file))
+            .and_then(|rest| rest.strip_prefix('.'))
+            .and_then(|rest| rest.strip_prefix(tag))
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let (Some(store), Some(journal)) = (
+        store.file_name().and_then(std::ffi::OsStr::to_str),
+        journal.file_name().and_then(std::ffi::OsStr::to_str),
+    ) else {
+        return false;
+    };
+    staged_by(store, SAVE_STAGING_TAG)
+        || staged_by(store, COMMIT_STAGING_TAG)
+        || staged_by(journal, COMMIT_STAGING_TAG)
+}
+
 /// The primary enrollment's on-disk path for `user` - the exact file whose
 /// bytes the secondary store's activation digest is taken over. Delegates
 /// to the loader's own resolution so the two can never drift apart.
@@ -856,13 +905,7 @@ pub(crate) fn save_secondary_with_key(
     // Writers create the store's directory before publication (the fixed
     // location sits in a `cameras/` subdirectory legacy code never made).
     std::fs::create_dir_all(dir).map_err(|error| SecondaryStoreError::Io(error.to_string()))?;
-    let temp = dir.join(format!(
-        ".{}.tmp-{}",
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "secondary".into()),
-        std::process::id()
-    ));
+    let temp = staging_path(path, SAVE_STAGING_TAG);
     use std::io::Write;
     let write_all = |temp: &Path| -> std::io::Result<()> {
         // Owner-only regardless of umask (ADR-0024 s1.2 permission clause).
@@ -1249,6 +1292,46 @@ mod tests {
         );
         std::env::remove_var("IRLUME_STATE_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_files_of_the_store_and_its_journal_match_and_other_names_do_not() {
+        let store = Path::new("/state/cameras/alice.json");
+        let journal = commit::intent_path_for(store);
+        // Exactly the names the writers stage in, so the deletion sweep and
+        // the writers cannot drift apart.
+        for staged in [
+            staging_path(store, SAVE_STAGING_TAG),
+            staging_path(store, COMMIT_STAGING_TAG),
+            staging_path(&journal, COMMIT_STAGING_TAG),
+        ] {
+            assert_eq!(staged.parent(), store.parent());
+            let name = staged.file_name().expect("a staging file name");
+            assert!(is_staging_file_of(store, name), "{}", staged.display());
+            assert!(
+                !is_staging_file_of(Path::new("/state/cameras/bob.json"), name),
+                "another account's deletion took {}",
+                staged.display()
+            );
+        }
+        for name in [
+            "alice.json",
+            "alice.json.intent",
+            ".alice.json.tmp-",
+            ".alice.json.tmp-12a",
+            ".alice.json.tmp-1.swp",
+            ".alice.json.intent.tmp-x",
+            "alice.json.tmp-1",
+            ".alice.json.bak",
+            ".alice.json.json.tmp-1",
+            ".alicee.json.tmp-1",
+            ".bob.json.commit-tmp-1",
+        ] {
+            assert!(
+                !is_staging_file_of(store, std::ffi::OsStr::new(name)),
+                "{name} is not a staging file of alice's store"
+            );
+        }
     }
 
     #[test]

@@ -118,13 +118,7 @@ fn fsync_dir(dir: &Path) -> Result<(), CommitError> {
 fn durable_write(path: &Path, bytes: &[u8]) -> Result<(), CommitError> {
     use std::io::Write;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let temp = dir.join(format!(
-        ".{}.commit-tmp-{}",
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "store".into()),
-        std::process::id()
-    ));
+    let temp = super::staging_path(path, super::COMMIT_STAGING_TAG);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

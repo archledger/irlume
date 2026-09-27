@@ -1146,13 +1146,14 @@ pub fn store_is_encrypted(user: &str) -> irlume_common::Result<Option<bool>> {
 pub struct Deleted {
     /// The primary enrollment file existed and was removed.
     pub enrollment: bool,
-    /// The added cameras' store (`cameras/<user>.json`) or its commit
-    /// journal existed and was removed.
+    /// The added cameras' store (`cameras/<user>.json`), its commit journal
+    /// or a staging file one of their writers left existed and was removed.
     pub camera_store: bool,
 }
 
 /// Deletes all of `user`'s face data under the user state lock: the added
-/// cameras' store and its commit journal (removing the account's face data
+/// cameras' store, its commit journal and any staging file an interrupted
+/// write of either left beside them (removing the account's face data
 /// covers every camera group, ADR-0024 §4.2), then the primary enrollment,
 /// then the now-orphaned template key and recovery envelope (a fresh
 /// enrollment mints a new key).
@@ -1182,15 +1183,21 @@ pub fn delete(user: &str) -> irlume_common::Result<Deleted> {
     })
 }
 
-/// Removes `user`'s added-camera commit journal, then the store, syncing the
+/// Removes `user`'s added-camera commit journal, then the store, then the
+/// staging files their writers left ([`camera_staging_files`]), syncing the
 /// directory after each removal so the journal cannot outlive the store
-/// after a crash. The caller holds the user state lock. `Ok(true)` when
-/// either file existed.
+/// after a crash. The caller holds the user state lock. `Ok(true)` when any
+/// of these files existed.
 fn delete_camera_store_unlocked(user: &str) -> irlume_common::Result<bool> {
     let store = crate::multi_camera::secondary_store_path(user);
-    let journal = crate::multi_camera::commit::intent_path_for(&store);
+    let dir = store.parent().unwrap_or_else(|| Path::new("."));
+    let mut paths = vec![
+        crate::multi_camera::commit::intent_path_for(&store),
+        store.clone(),
+    ];
+    paths.extend(camera_staging_files(&store, dir)?);
     let mut removed = false;
-    for path in [&journal, &store] {
+    for path in &paths {
         match fs::remove_file(path) {
             Ok(()) => removed = true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1201,12 +1208,35 @@ fn delete_camera_store_unlocked(user: &str) -> irlume_common::Result<bool> {
                 )))
             }
         }
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
         fs::File::open(dir)
             .and_then(|dir| dir.sync_all())
             .map_err(|e| irlume_common::Error::Io(format!("sync {}: {e}", dir.display())))?;
     }
     Ok(removed)
+}
+
+/// The staging files in `dir` that a writer of the added cameras' store at
+/// `store`, or of its commit journal, left before its rename: an interrupted
+/// or failed write keeps the new store bytes there
+/// ([`crate::multi_camera::is_staging_file_of`]). A missing directory has
+/// none.
+fn camera_staging_files(store: &Path, dir: &Path) -> irlume_common::Result<Vec<PathBuf>> {
+    let list_error =
+        |e: std::io::Error| irlume_common::Error::Io(format!("list {}: {e}", dir.display()));
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(list_error(e)),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(list_error)?;
+        if crate::multi_camera::is_staging_file_of(store, &entry.file_name()) {
+            found.push(entry.path());
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 /// Has the startup IR compatibility sweep already run for this space?
@@ -1414,6 +1444,56 @@ mod tests {
             }
         );
         assert!(!store.exists() && !primary.exists());
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_an_account_removes_the_staging_files_its_camera_store_writers_left() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("delete-camera-staging"));
+        let (primary, store, journal, other) = plant_account_state(&dir);
+        fs::remove_file(&store).unwrap();
+        fs::remove_file(&journal).unwrap();
+        let cameras = store.parent().unwrap();
+        // What an interrupted save_secondary, and an interrupted commit of
+        // the store or of its journal, leave: the store's bytes under a
+        // staging name.
+        let left = [
+            ".u.json.tmp-4242",
+            ".u.json.commit-tmp-17",
+            ".u.json.intent.commit-tmp-17",
+        ];
+        // Another account's staging files ("v", and "u.json" whose store is
+        // u.json.json), and names that only resemble u's.
+        let kept = [
+            ".v.json.tmp-4242",
+            ".u.json.json.tmp-17",
+            ".u.json.tmp-",
+            ".u.json.tmp-17.swp",
+            "u.json.tmp-17",
+            ".u.json.bak",
+        ];
+        for name in left.iter().chain(&kept) {
+            fs::write(cameras.join(name), b"{}").unwrap();
+        }
+
+        assert_eq!(
+            delete("u").unwrap(),
+            Deleted {
+                enrollment: true,
+                camera_store: true
+            }
+        );
+        for name in left {
+            assert!(!cameras.join(name).exists(), "{name} outlived the deletion");
+        }
+        for name in kept {
+            assert!(cameras.join(name).exists(), "{name} is not u's and stays");
+        }
+        assert!(!primary.exists() && other.exists());
         std::env::remove_var("IRLUME_STATE_DIR");
         let _ = fs::remove_dir_all(&dir);
     }

@@ -294,8 +294,9 @@ has one streaming interface, exactly one Microsoft camera-control extension
 unit `{0f3f95dc-2632-4c4e-92c9-a04782f43bc8}` that advertises the
 face-authentication control (selector 0x06), and no Processing Unit colour
 controls. `irlume camera census` and `irlume doctor` print the answer on
-every YUYV-only row, as `IR by USB descriptor: ...` or
-`not IR by USB descriptor: <reason>`.
+every YUYV-only camera row, as `IR by USB descriptor: ...` or
+`not IR by USB descriptor: <reason>`; a v4l2loopback or other dummy node
+has no USB descriptor and carries no such line.
 
 When an IR camera still reads as `UVC RGB camera`, check the fields the rule
 reads. They come from the same sysfs `descriptors` file irlume reads:
@@ -327,9 +328,13 @@ advertised size of at least 340x340), not what authentication accepts. YUYV
 IR frames have no measured exposure ceiling yet, so face authentication on
 such a camera refuses as "IR exposure unmeasurable", and an IR camera on a
 different USB device from the RGB camera does not pair
-([LIMITATIONS.md](LIMITATIONS.md)). `sudo irlume ir-setup --dry-run` reads
-the camera's extension units without writing; avoid tools that write to
-vendor extension units on these modules.
+([LIMITATIONS.md](LIMITATIONS.md)). `sudo irlume ir-setup --dry-run` lists,
+without writing, the extension units of the IR node irlumed has selected.
+When the RGB and IR cameras are two USB devices, no IR node is selected
+unless the pair is pinned with `set-cameras` or `IRLUME_IR_DEVICE`, so the
+dry run fails with `no camera found`. That does not mean the camera is
+missing: the `lsusb -v` output above shows the same units. Avoid tools
+that write to vendor extension units on these modules.
 
 ## Fingerprint reader stopped responding
 

@@ -349,8 +349,9 @@ All notable changes to irlume are documented here. This project adheres to
   face-authentication control and no colour controls (ADR-0031 §1). The
   ThinkPad T480 IR camera (USB 5986:1141) was listed as a colour camera,
   and RGB-only operation could select it instead of the RGB camera.
-  YUYV-only colour webcams stay RGB, and every YUYV-only node's row now
-  prints what its descriptor said. Face authentication with such a camera
+  YUYV-only colour webcams stay RGB, and every YUYV-only camera row now
+  prints what its descriptor said (a loopback or other dummy node has no
+  descriptor and prints nothing). Face authentication with such a camera
   still refuses: its YUYV frames have no measured exposure ceiling yet, and
   the T480's RGB and IR cameras are two USB devices, which irlume does not
   pair (#887).

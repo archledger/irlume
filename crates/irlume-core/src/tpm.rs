@@ -715,6 +715,14 @@ fn load_or_create_srk(ctx: &mut Context, mode: SrkMode) -> Result<(KeyHandle, bo
         }
     }
 
+    // A read-only unseal never persists an SRK. The deterministic template
+    // derives the same primary transiently, which is the parent an envelope
+    // sealed while another key held the handle has, and which also opens one
+    // sealed under a persistent SRK that has since been evicted.
+    if mode == SrkMode::ReadOnly {
+        let transient = create_srk(ctx)?;
+        return Ok((transient, false));
+    }
     mode.initialize(|| {
         // First run: derive the primary (one-time slow step) and persist it.
         // Said in our words, because the library's logging for the expected
@@ -755,7 +763,8 @@ enum SrkMode {
     /// Persist irlume's SRK at its free handle on first use.
     Initialize,
     /// Never persist an SRK: use the one at the handle, or a transient one
-    /// while another key holds the handle.
+    /// derived from the same template when the handle is free or another key
+    /// holds it.
     ReadOnly,
 }
 
@@ -2914,8 +2923,9 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
 
     /// While another key holds irlume's SRK handle, seals use a transient
     /// SRK, and a read-only unseal must too: a transient SRK persists
-    /// nothing. The foreign key stays, and once the handle is free a
-    /// read-only unseal still refuses to persist irlume's own SRK there.
+    /// nothing. The foreign key stays. Once the handle is free a read-only
+    /// unseal derives the same SRK transiently, opens the envelope, and
+    /// persists nothing at the handle.
     #[test]
     #[ignore = "requires a TPM: real /dev/tpmrm0 (root), or swtpm via IRLUME_TCTI (CI does this)"]
     fn a_read_only_unseal_uses_a_transient_srk_while_another_key_holds_the_handle() {
@@ -2942,11 +2952,11 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             "the foreign key stays at the handle"
         );
 
-        // With the handle free, a read-only unseal would have to persist
-        // irlume's SRK first, which it never does.
-        assert!(
-            unseal_read_only(&env).is_err(),
-            "a read-only unseal persisted a storage root key"
+        // With the handle free, a read-only unseal derives the SRK
+        // transiently instead of persisting it.
+        assert_eq!(
+            &*unseal_read_only(&env).expect("a read-only unseal once the handle is free"),
+            secret
         );
         assert_eq!(
             evict_persistent_srk().expect("post-unseal probe"),

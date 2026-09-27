@@ -41,15 +41,21 @@ pub(crate) fn isolated_root_command_with_host_pids(
     namespace_command(root, bin, args, tools, hidden, binds, false)
 }
 
+/// Where the namespace sees the whole host root, read-only, while a missing
+/// destination's parent is rebuilt ([`rebuild_parent`]).
+const HOST_VIEW: &str = "/run/irlume-test-host";
+
 /// Give the missing destinations under one host `parent` somewhere to be
 /// created, without hiding anything else there.
 ///
 /// A destination the host lacks (Debian and Ubuntu have no `/usr/lib/pam.d`)
-/// cannot become a mount point under the read-only root. The host's `parent`
-/// is bound read-only at a path under `/run`, and a directory built in the
-/// sandbox is mounted over `parent`: one symlink per host entry, pointing into
-/// that view (a host symlink is copied with its own target, so a relative one
-/// such as `../lib32/ld-linux.so.2` still resolves from `parent`), a real
+/// cannot become a mount point under the read-only root. A directory built in
+/// the sandbox is mounted over `parent`: one symlink per host entry, pointing
+/// into the read-only view of the whole host root at [`HOST_VIEW`] (a host
+/// symlink is copied with its own target, so a relative one such as
+/// `../lib32/ld-linux.so.2` still resolves from `parent`, and a relative link
+/// deeper in a host directory, which is reached through the view, climbs
+/// within the view as it does on the host), a real
 /// directory for each missing destination, and a real directory for each
 /// later mount directly below `parent`, including a rebuilt parent nested in
 /// this one, so that mount lands in the rebuilt parent rather than through a
@@ -65,13 +71,14 @@ fn rebuild_parent(
 ) {
     assert!(parent != Path::new("/"), "a destination below a directory");
     let below_root = parent.strip_prefix("/").expect("an absolute destination");
-    let view = Path::new("/run/irlume-test-host").join(below_root);
-    // The same view reached from inside `parent`: bubblewrap 0.9 (Ubuntu
-    // 24.04) creates later mount points before it pivots into the new root,
-    // where an absolute link into /run resolves on the host and fails; a
-    // relative one resolves inside the new root either way.
+    // The view reached from inside `parent`: bubblewrap 0.9 (Ubuntu 24.04)
+    // creates later mount points before it pivots into the new root, where an
+    // absolute link into /run resolves on the host and fails; a relative one
+    // resolves inside the new root either way.
     let up: PathBuf = below_root.components().map(|_| "..").collect();
-    let relative_view = up.join("run/irlume-test-host").join(below_root);
+    let relative_view = up
+        .join(HOST_VIEW.strip_prefix('/').expect("an absolute view"))
+        .join(below_root);
     let built = root.join("namespace-parents").join(below_root);
     let _ = std::fs::remove_dir_all(&built);
     std::fs::create_dir_all(&built).expect("create the rebuilt parent");
@@ -102,17 +109,11 @@ fn rebuild_parent(
     for name in &real_dirs {
         std::fs::create_dir_all(built.join(name)).expect("create a mount point");
     }
-    command
-        .args([
-            "--ro-bind",
-            parent.to_str().unwrap(),
-            view.to_str().unwrap(),
-        ])
-        .args([
-            "--ro-bind",
-            built.to_str().unwrap(),
-            parent.to_str().unwrap(),
-        ]);
+    command.args([
+        "--ro-bind",
+        built.to_str().unwrap(),
+        parent.to_str().unwrap(),
+    ]);
 }
 
 fn namespace_command(
@@ -207,6 +208,9 @@ fn namespace_command(
         .chain(masked.iter().cloned())
         .chain(parents.iter().map(|(parent, _)| parent.to_path_buf()))
         .collect();
+    if !parents.is_empty() {
+        command.args(["--ro-bind", "/", HOST_VIEW]);
+    }
     for (parent, names) in &parents {
         rebuild_parent(&mut command, root, parent, names, &later);
     }

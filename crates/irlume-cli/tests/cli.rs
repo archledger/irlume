@@ -2226,6 +2226,15 @@ fn the_namespace_binds_below_a_parent_with_thousands_of_entries() {
         parent.join("escape"),
     )
     .unwrap();
+    // And one deeper in a host directory that climbs above the parent, as
+    // `/usr/lib/bfd-plugins/liblto_plugin.so -> ../../libexec/...` does.
+    std::os::unix::fs::symlink(
+        std::path::Path::new("../..")
+            .join(sibling.file_name().unwrap())
+            .join("target"),
+        parent.join("kept-dir").join("deep-escape"),
+    )
+    .unwrap();
     let fixture = sb.path("probe");
     std::fs::create_dir_all(&fixture).unwrap();
     std::fs::write(fixture.join("marker"), "bound\n").unwrap();
@@ -2238,6 +2247,7 @@ fn the_namespace_binds_below_a_parent_with_thousands_of_entries() {
          read line < {dest}/marker && [ \"$line\" = bound ] && \
          read host < {wide}/entry-3999 && [ \"$host\" = host ] && [ -d {wide}/kept-dir ] && \
          read far < {wide}/escape && [ \"$far\" = sibling ] && \
+         read deep < {wide}/kept-dir/deep-escape && [ \"$deep\" = sibling ] && \
          echo ok > {dest}/written"
     );
     let output = support::isolated_root_command(

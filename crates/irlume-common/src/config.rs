@@ -1104,6 +1104,12 @@ mod tests {
             "a missing name is absent"
         );
 
+        // A settings.conf this process cannot read (a directory at its path;
+        // mode 000 does not stop root) keeps the narrower scope.
+        std::fs::create_dir(dir.join("settings.conf")).unwrap();
+        assert!(!privileged_grouped_pad_evidence_enabled());
+        std::fs::remove_dir(dir.join("settings.conf")).unwrap();
+
         write_kv("settings.conf", "privileged_grouped_pad_evidence", "1").unwrap();
         assert!(privileged_grouped_pad_evidence_enabled());
 

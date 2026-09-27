@@ -3553,7 +3553,10 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
 }
 
 /// Give an accepted connection a slot, or answer it "daemon busy" and close
-/// it. `peer_uid` is `None` when its credentials could not be read.
+/// it. `peer_uid` is `None` when its credentials could not be read. A refusal
+/// is charged to the peer's uid ([`record_refusal`]), so a peer that keeps
+/// reconnecting over its cap is held in the penalty box at accept, as one
+/// spinning on other refusals is, instead of being answered at once each time.
 fn admit(
     slots: &std::sync::Arc<connection_slots::ConnectionSlots>,
     stream: UnixStream,
@@ -3562,6 +3565,9 @@ fn admit(
     match slots.take(peer_uid) {
         Ok(slot) => Some((stream, slot)),
         Err(refusal) => {
+            if let Some(uid) = peer_uid {
+                record_refusal(uid);
+            }
             let _ = respond(stream, &Response::Error(refusal.message().into()));
             None
         }
@@ -14254,6 +14260,34 @@ mod tests {
         held.pop();
         let (_again, admitted) = connect(Some(ALICE));
         assert!(admitted.is_some(), "a slot given back can be taken again");
+    }
+
+    /// An account that keeps reconnecting over its cap spends its refusal
+    /// budget, so the accept loop holds its next connections in the penalty
+    /// box instead of answering each at once. Root is never charged.
+    #[test]
+    fn refusals_at_the_account_cap_are_paced_like_other_refusals() {
+        let _g = env_lock();
+        std::env::remove_var("IRLUME_REFUSAL_RATE");
+        const CAROL: u32 = 4_100_006;
+        let slots = std::sync::Arc::new(connection_slots::ConnectionSlots::with_limits(8, 2, 1));
+        let connect = |uid: u32| {
+            let (_client, server) = UnixStream::pair().unwrap();
+            admit(&slots, server, Some(uid))
+        };
+        let _held = connect(CAROL).expect("under the cap");
+        assert!(!refusal_throttled(CAROL));
+        // The bucket holds one second's worth (100 by default); each refusal
+        // takes one.
+        for _ in 0..150 {
+            assert!(connect(CAROL).is_none(), "over the cap");
+        }
+        assert!(
+            refusal_throttled(CAROL),
+            "cap refusals must reach the pacing the accept loop checks"
+        );
+        let _root = connect(0).expect("root has its own slots");
+        assert!(!refusal_throttled(0));
     }
 
     #[test]

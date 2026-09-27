@@ -6465,16 +6465,24 @@ fn camera_conf_startup_warnings(
 
 /// Shared mutation after request posture and any continuity guard have passed.
 fn set_camera_devices(rgb: &str, ir: &str, engine: &mut irlume_auth::Engine) -> Response {
-    set_camera_devices_with(rgb, ir, engine, irlume_auth::device_identity)
+    set_camera_devices_with(
+        rgb,
+        ir,
+        engine,
+        irlume_auth::device_identity,
+        irlume_auth::nodes_share_usb_device,
+    )
 }
 
-/// [`set_camera_devices`] over an injected identity source, so a device serial
-/// that cannot be saved is testable without a camera.
+/// [`set_camera_devices`] over injected identity and USB-device sources, so a
+/// device serial that cannot be saved and a pair spanning two USB devices are
+/// testable without a camera.
 fn set_camera_devices_with(
     rgb: &str,
     ir: &str,
     engine: &mut irlume_auth::Engine,
     identity: impl Fn(&str) -> Option<String>,
+    share_usb_device: impl Fn(&str, &str) -> Option<bool>,
 ) -> Response {
     use irlume_common::config::{
         config_value_is_serializable, observe_camera_conf, CameraSelectionObservation,
@@ -6526,6 +6534,18 @@ fn set_camera_devices_with(
     engine.set_devices(rgb, ir);
     publish_engine_camera_selection(engine);
     let mut msg = format!("cameras set to rgb={rgb} ir={ir}");
+    // Warn, never refuse: a pin whose nodes sit on two USB devices still
+    // serves the paths that lease one node (the IR-only target, the RGB-only
+    // tier), and refusing it would break a configuration that works there.
+    // RGB and IR operations on it are refused by the camera lease, which
+    // names the same cause (ADR-0031 §3).
+    if !rgb.is_empty() && !ir.is_empty() && share_usb_device(rgb, ir) == Some(false) {
+        msg = format!(
+            "{msg} (warning: the RGB and IR nodes are on different USB devices; irlume \
+             pairs them only within one physical camera, so enrollment and authentication \
+             with both refuse this pair)"
+        );
+    }
     // One publication, under the file's own lock. The four writes were
     // individually atomic and collectively not: a reader racing the
     // sequence could see one camera's RGB path beside another's IR path,
@@ -21100,16 +21120,24 @@ mod tests {
             )
         };
 
-        match set_camera_devices_with(rgb, ir, &mut e, |p: &str| {
-            (p == rgb).then(|| "046d:085e:x\nmode=automatic".to_owned())
-        }) {
+        match set_camera_devices_with(
+            rgb,
+            ir,
+            &mut e,
+            |p: &str| (p == rgb).then(|| "046d:085e:x\nmode=automatic".to_owned()),
+            |_: &str, _: &str| Some(true),
+        ) {
             Response::Error(msg) => assert_eq!(msg, refusal("RGB")),
             other => panic!("an RGB identity with a line break must be refused, got {other:?}"),
         }
         assert_camera_selection_unchanged(&e, (NO_RGB, NO_IR), &previous_bits);
-        match set_camera_devices_with(rgb, ir, &mut e, |p: &str| {
-            (p == ir).then(|| "046d:085e:x\u{2028}y".to_owned())
-        }) {
+        match set_camera_devices_with(
+            rgb,
+            ir,
+            &mut e,
+            |p: &str| (p == ir).then(|| "046d:085e:x\u{2028}y".to_owned()),
+            |_: &str, _: &str| Some(true),
+        ) {
             Response::Error(msg) => assert_eq!(msg, refusal("IR")),
             other => panic!("an IR identity with U+2028 must be refused, got {other:?}"),
         }
@@ -21117,22 +21145,74 @@ mod tests {
         assert!(!path.exists() && !lock.exists(), "nothing may be written");
 
         // What the injected source returns is what gets saved.
-        match set_camera_devices_with(rgb, ir, &mut e, |p: &str| {
-            Some(
-                if p == rgb {
-                    "046d:085e:a1"
-                } else {
-                    "046d:085e:b2"
-                }
-                .to_owned(),
-            )
-        }) {
+        match set_camera_devices_with(
+            rgb,
+            ir,
+            &mut e,
+            |p: &str| {
+                Some(
+                    if p == rgb {
+                        "046d:085e:a1"
+                    } else {
+                        "046d:085e:b2"
+                    }
+                    .to_owned(),
+                )
+            },
+            |_: &str, _: &str| Some(true),
+        ) {
             Response::Ok(msg) => assert_eq!(msg, format!("cameras set to rgb={rgb} ir={ir}")),
             other => panic!("savable identities must be accepted, got {other:?}"),
         }
         let pin = irlume_common::config::read_camera_pin();
         assert_eq!(pin.rgb_id.as_deref(), Some("046d:085e:a1"));
         assert_eq!(pin.ir_id.as_deref(), Some("046d:085e:b2"));
+
+        e.set_devices(NO_RGB, NO_IR);
+        publish_engine_bits_raw(previous_bits);
+    }
+
+    /// A pin whose RGB and IR nodes are on two USB devices (the ThinkPad
+    /// T480's cameras, #887) is saved with a warning rather than refused: it
+    /// still serves the paths that lease one node, and the camera lease
+    /// refuses RGB and IR operations on it with the same cause.
+    #[test]
+    fn set_cameras_warns_when_the_nodes_are_on_different_usb_devices() {
+        let _g = env_lock();
+        let mut e = engine();
+        let previous_bits = engine_bits().lock().unwrap().clone();
+        let sb = sandbox("setcam-split");
+        let _ = &sb;
+        let (rgb, ir) = ("/dev/irlume-test-alt-rgb", "/dev/irlume-test-alt-ir");
+        let identity = |p: &str| Some(if p == rgb { "5986:2113" } else { "5986:1141" }.to_owned());
+        let warning = "(warning: the RGB and IR nodes are on different USB devices; irlume \
+                       pairs them only within one physical camera, so enrollment and \
+                       authentication with both refuse this pair)";
+
+        match set_camera_devices_with(rgb, ir, &mut e, identity, |a: &str, b: &str| {
+            assert_eq!((a, b), (rgb, ir), "the RGB node first, then the IR node");
+            Some(false)
+        }) {
+            Response::Ok(msg) => {
+                assert_eq!(msg, format!("cameras set to rgb={rgb} ir={ir} {warning}"));
+            }
+            other => panic!("a split pair must be saved with a warning, got {other:?}"),
+        }
+        assert_eq!((e.rgb_device(), e.ir_device()), (rgb, ir));
+        let pin = irlume_common::config::read_camera_pin();
+        assert_eq!(pin.rgb.as_deref(), Some(rgb));
+        assert_eq!(pin.ir.as_deref(), Some(ir));
+        assert_eq!(pin.ir_id.as_deref(), Some("5986:1141"));
+
+        // One USB device, or nodes sysfs cannot place, carry no warning.
+        for same in [Some(true), None] {
+            match set_camera_devices_with(rgb, ir, &mut e, identity, |_: &str, _: &str| same) {
+                Response::Ok(msg) => {
+                    assert_eq!(msg, format!("cameras set to rgb={rgb} ir={ir}"), "{same:?}");
+                }
+                other => panic!("an ordinary pin must be accepted, got {other:?}"),
+            }
+        }
 
         e.set_devices(NO_RGB, NO_IR);
         publish_engine_bits_raw(previous_bits);

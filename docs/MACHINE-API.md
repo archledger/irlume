@@ -478,7 +478,7 @@ Row fields:
 | `class` | One of `uvc_rgb`, `uvc_ir`, `y8_ir`, `metadata_only`, `dummy_node`, `unreadable_node`, `mc_centric`, `mipi_ipu`, `mipi_vendor_bridge`, `usb_camera_without_driver`. Class-specific side fields (`paired`, `generation`, `usb_id`) sit beside it |
 | `verdict` | `supported` (with a tier `note`), `supported_with_limits`, `informational`, `not_hardware`, `unsupported`, or `broken`. Every `note` names the supported path or the next step |
 | `privacy_engaged` | The hardware privacy shutter is engaged on that node: nothing is wrong, the shutter needs opening. `null` on machine-level rows (no node to probe) or when the control could not be read |
-| `evidence` | The facts the classification keyed on (driver, USB identity, format fourccs, internal/external, cause). Never empty |
+| `evidence` | The facts the classification keyed on (driver, USB identity, format fourccs, internal/external, cause). Never empty. A `uvc_ir` or `uvc_rgb` row whose node offers only YUYV also carries its USB descriptor's answer (ADR-0031 §1): `IR by USB descriptor: one video stream (interface N), Microsoft face-authentication control (unit N), no colour controls` on a `uvc_ir` row, or `not IR by USB descriptor: <reason>` on a `uvc_rgb` row. A `dummy_node` row, such as a v4l2loopback feeder, carries neither. Evidence strings are for people; no new class or field |
 
 `listing_error` is non-null when `/dev` could not be listed: the census may
 be incomplete, which is not the same as empty.

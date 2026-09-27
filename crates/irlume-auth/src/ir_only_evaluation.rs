@@ -985,6 +985,10 @@ mod tests {
             ),
             (E::Stale, "camera_lease_refused"),
             (E::UnknownEndpoint, "camera_lease_refused"),
+            (
+                E::SplitPhysicalCamera { cameras: 2 },
+                "camera_lease_refused",
+            ),
             (E::Poisoned, "camera_lease_refused"),
             (
                 E::InvalidEndpoint("private path".into()),

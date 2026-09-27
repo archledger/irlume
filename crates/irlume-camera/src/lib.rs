@@ -418,13 +418,18 @@ pub struct IrCaptureStats {
     /// either arm against.
     ///
     /// The `None` is also load-bearing, which matters more than either.
-    /// `role_from_formats` calls any node advertising either fourcc
-    /// `Role::Rgb`, whatever else it advertises, so no DISCOVERED pair ever
-    /// reaches an IR decode with them. The ones that do arrive by the
-    /// `IRLUME_CAMERA_*` override, a saved pin, or the `/dev/video2` fallback,
-    /// and there this `None` is what makes `exposure_refusal` refuse. Do not
-    /// add a ceiling here without first adding something that guarantees the
-    /// selected node is an emitter-lit IR source (#385).
+    /// Discovery calls a node advertising NV12 `Role::Rgb`, and a node
+    /// advertising YUYV too unless it offers nothing else and its USB
+    /// descriptor attests an infrared function (ADR-0031 §1). Such attested
+    /// nodes are discovered as IR since #887, and every other NV12 or YUYV
+    /// node that reaches an IR decode arrives by the `IRLUME_CAMERA_*`
+    /// override, a saved pin, or the `/dev/video2` fallback. In both cases
+    /// this `None` is what makes `exposure_refusal` refuse. The descriptor is
+    /// a firmware claim about a function, not a guarantee about the frames
+    /// being judged, so it does not lift that refusal: do not add a ceiling
+    /// here until the gates of ADR-0031 §4 hold on the opened device and the
+    /// frames themselves, which is what guarantees the selected node is an
+    /// emitter-lit IR source (#385).
     pub white_level: Option<u8>,
     /// Whole-frame clipping in the selected metadata-lit frame. This is
     /// diagnostic evidence only, not a grant gate. `None` means the capture
@@ -2914,7 +2919,19 @@ impl<S: CameraState> Drop for CameraStateStream<'_, S> {
 
 /// Colour pixel formats imply an RGB sensor; greyscale-only implies the IR
 /// companion. linhello lesson: classify by advertised FourCC, never hardcode.
+///
+/// YUYV stays a colour format even though one IR camera on record streams
+/// luma in it (the ThinkPad T480's 5986:1141, #887): fourteen of the forty
+/// most-reported UVC webcams offer nothing but YUYV, and so does the CI's
+/// loopback RGB feeder. A YUYV-only node becomes IR only on its USB
+/// descriptor's word, through [`role_with_ir_attestation`] (ADR-0031 §1),
+/// never through this table.
 const COLOUR_FOURCCS: [&[u8; 4]; 5] = [b"YUYV", b"MJPG", b"RGB3", b"BGR3", b"NV12"];
+/// The one colour container an infrared function may stream luma in and
+/// still be classified IR, when its descriptor attests it (ADR-0031 §1).
+/// NV12 is left out: no NV12 IR camera's descriptor is on record to test
+/// the rule against.
+const LUMA_IR_FOURCCS: [&[u8; 4]; 1] = [b"YUYV"];
 const GREY_FOURCCS: [&[u8; 4]; 3] = [b"GREY", b"Y8  ", b"Y800"];
 /// 16-bit grey family (16-bit LE words, LSB-aligned data per the V4L2 spec);
 /// classification treats these as IR too, and capture decodes them to 8-bit.
@@ -3125,7 +3142,13 @@ fn holder_verdict(saw_self: bool, blind: bool) -> Holders {
     }
 }
 
-/// What a video node is, by its advertised formats.
+/// What a video node is, by its advertised formats, with one exception: a
+/// node that offers only YUYV is `Ir` when its USB descriptor attests an
+/// infrared function (ADR-0031 §1), and `Rgb` otherwise.
+///
+/// `Ir` is evidence of a format or of that attestation, not proof of
+/// infrared sensing (#403): pairing still requires both roles on one
+/// physical camera, and the IR capture path keeps its own gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Rgb,
@@ -3306,6 +3329,12 @@ impl Unreadable {
 /// reports. Until all three can be reproduced faithfully, ENUM_FMT on the
 /// node is the only sound format authority (Codex round on this PR).
 ///
+/// ADR-0031 §1 reads the descriptor for a different question: the role of a
+/// node whose formats ENUM_FMT has already listed, and only when its
+/// function has exactly one streaming interface, which is what lets the
+/// function's claim be attributed to this node. It runs after the open, in
+/// [`classify_node`], and never supplies a format.
+///
 /// Every other `None` is the same honest fall-through: loopback nodes have
 /// no USB parent, MC-centric platform stacks keep meeting the #425
 /// QUERYCAP gate, and a failed sysfs read proves nothing. One asymmetry is
@@ -3358,7 +3387,11 @@ pub fn classify_node(device: &str) -> Result<NodeKind, Unreadable> {
     capture_formats_answered(&dev).map_err(|e| unreadable(FailedAt::EnumFormats, e))?;
     let formats = Capture::enum_formats(&dev).map_err(|e| unreadable(FailedAt::EnumFormats, e))?;
     let fourccs: Vec<[u8; 4]> = formats.iter().map(|f| f.fourcc.repr).collect();
-    Ok(NodeKind::Camera(role_from_formats(&fourccs)))
+    // The attestation reads the USB device's sysfs descriptor and nothing
+    // else: no further ioctl, no stream, no emitter (ADR-0031 §1).
+    Ok(NodeKind::Camera(role_with_ir_attestation(&fourccs, || {
+        uvc_descriptor::ir_function_evidence_for_node(device).is_ok()
+    })))
 }
 
 /// `VIDIOC_QUERYCAP`, raw. The pinned v4l crate's `Device::query_caps` cannot
@@ -3507,6 +3540,36 @@ pub(crate) fn role_from_formats(fourccs: &[[u8; 4]]) -> Role {
         (true, _) => Role::Rgb,
         (false, true) => Role::Ir,
         _ => Role::Other,
+    }
+}
+
+/// Whether a node's advertised formats are exactly the luma container an
+/// attested IR function may use (ADR-0031 §1, clause a). A node offering
+/// YUYV beside anything else keeps the answer its formats give: MJPG beside
+/// YUYV is the shape of most colour webcams, and a grey format already
+/// makes a node IR on its own.
+pub(crate) fn offers_only_luma_ir_container(fourccs: &[[u8; 4]]) -> bool {
+    !fourccs.is_empty() && fourccs.iter().all(|cc| LUMA_IR_FOURCCS.contains(&cc))
+}
+
+/// [`role_from_formats`], with the one exception ADR-0031 §1 makes: a node
+/// whose formats say `Rgb` only because it offers YUYV is `Ir` when
+/// `attested` says its USB function declares an infrared stream.
+///
+/// `attested` runs only for that shape, so a GREY camera, a metadata node
+/// or an MJPG webcam never costs a descriptor read, and it can only turn
+/// `Rgb` into `Ir`: an unreadable, malformed or refusing descriptor keeps
+/// the format answer. Pure over the closure, so every row of the rule is
+/// testable without a camera.
+pub(crate) fn role_with_ir_attestation(
+    fourccs: &[[u8; 4]],
+    attested: impl FnOnce() -> bool,
+) -> Role {
+    let role = role_from_formats(fourccs);
+    if role == Role::Rgb && offers_only_luma_ir_container(fourccs) && attested() {
+        Role::Ir
+    } else {
+        role
     }
 }
 
@@ -4081,6 +4144,31 @@ fn physical_device_id(device: &str) -> Option<std::path::PathBuf> {
     find_attr_dir(&real, "idVendor")
 }
 
+/// Whether two `/dev/videoN` nodes belong to one USB device, from sysfs
+/// alone: `Some(true)` for one device, `Some(false)` for two, `None` when
+/// either node has no USB device to compare (a loopback node, a missing
+/// path, unreadable sysfs).
+///
+/// irlume pairs RGB and IR only within one physical camera (ADR-0029 §1,
+/// ADR-0031 §3), and the camera lease covers one USB device per operation,
+/// so a pin naming nodes on two devices cannot run an RGB and IR
+/// operation. Opens nothing.
+pub fn nodes_share_usb_device(first: &str, second: &str) -> Option<bool> {
+    nodes_share_usb_device_with(first, second, physical_device_id)
+}
+
+fn nodes_share_usb_device_with(
+    first: &str,
+    second: &str,
+    parent: impl Fn(&str) -> Option<std::path::PathBuf>,
+) -> Option<bool> {
+    // Stable by-id/by-path pins name aliases, not video4linux class entries.
+    // Resolve both names before asking which USB device owns the nodes.
+    let first = std::fs::canonicalize(first).ok()?;
+    let second = std::fs::canonicalize(second).ok()?;
+    Some(parent(first.to_str()?)? == parent(second.to_str()?)?)
+}
+
 /// The configured pair, using ONLY sources that never open a device: the
 /// explicit env override, then the pair persisted in `cameras.conf` exactly as
 /// saved. `None` when neither is set, because answering then would require
@@ -4389,17 +4477,7 @@ pub fn camera_display_name(dev_dir: &std::path::Path, node: &str) -> Option<Stri
     // it. Only visible characters reach a screen, bounded, and never an
     // empty or whitespace-only name.
     let clean = |text: String| {
-        let text: String = text
-            .chars()
-            .map(|c| {
-                if c.is_control() || is_invisible_format(c) {
-                    ' '
-                } else {
-                    c
-                }
-            })
-            .take(64)
-            .collect();
+        let text = camera_text(&text);
         let text = text.trim();
         (!text.is_empty()).then(|| text.to_owned())
     };
@@ -4415,6 +4493,20 @@ pub fn camera_display_name(dev_dir: &std::path::Path, node: &str) -> Option<Stri
                 .ok()
                 .and_then(clean)
         })
+}
+
+/// Bound device text and keep it on one visible line, for display and logs.
+fn camera_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() || is_invisible_format(c) || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .take(64)
+        .collect()
 }
 
 /// Unicode format characters that change how neighbouring text displays
@@ -5047,7 +5139,7 @@ pub fn negotiated_stream(device: &str, role: Role) -> irlume_common::Result<Stre
             (fmt, cc)
         }
         Role::Ir => {
-            let (fmt, _pix) = negotiate_ir_format_via(device, &dev, try_format)?;
+            let fmt = negotiate_ir_format_via(device, &dev, try_format)?.format;
             let cc = fourcc_str(&fmt.fourcc.repr);
             (fmt, cc)
         }
@@ -5648,12 +5740,27 @@ const IR_CANDIDATES: [(&[u8; 4], IrPixel); 8] = [
     (b"YUYV", IrPixel::YuyvLuma),
 ];
 
+/// What the IR candidate walk settled on: the format the driver echoed, how
+/// its bytes decode, the frame size irlume asked for, and whether the node
+/// is a descriptor-attested YUYV IR function (ADR-0031 §1).
+///
+/// The request is kept beside the echo because the two differ by design:
+/// uvcvideo answers a request with the advertised size nearest to it, and
+/// the capture qualification contract records both.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IrNegotiation {
+    pub(crate) format: Format,
+    pub(crate) pixel: IrPixel,
+    pub(crate) requested: (u32, u32),
+    pub(crate) luma_attested: bool,
+}
+
 /// Negotiate an IR-decodable format through the injected camera state.
 fn negotiate_ir_format_state<S: CameraState<Device = Device>>(
     device: &str,
     dev: &Device,
     state: &S,
-) -> irlume_common::Result<(Format, IrPixel)> {
+) -> irlume_common::Result<IrNegotiation> {
     negotiate_ir_format_via(device, dev, |dev, fmt| state.set_format(dev, fmt))
 }
 
@@ -5663,9 +5770,9 @@ fn negotiate_ir_format_and_interval(
     lease: &lease::CameraLease,
 ) -> irlume_common::Result<(Format, IrPixel, NegotiatedInterval)> {
     let state = V4l2CameraState::new(device, lease.clone());
-    let (format, pixel) = negotiate_ir_format_state(device, dev, &state)?;
-    let interval = negotiate_interval_after_format(&state, device, dev, &format)?;
-    Ok((format, pixel, interval))
+    let negotiation = negotiate_ir_format_state(device, dev, &state)?;
+    let interval = negotiate_interval_after_format(&state, device, dev, &negotiation.format)?;
+    Ok((negotiation.format, negotiation.pixel, interval))
 }
 
 /// The IR candidate walk with the format ioctl injected: capture applies it
@@ -5673,24 +5780,61 @@ fn negotiate_ir_format_and_interval(
 /// read-only probe applies the SAME walk through `VIDIOC_TRY_FMT`
 /// ([`negotiated_stream`]). One walk, two ioctls, so the probe cannot drift
 /// from what capture negotiates.
+///
+/// The frame size comes from [`ir_request_size`]. For every format but an
+/// attested YUYV node it is the historical 640x400; for that node the walk
+/// reads the attestation from the open file descriptor (never from the role
+/// discovery cached, which an override or pin can bypass) and enumerates
+/// the node's discrete YUYV sizes. Both are reads: no stream starts here.
 fn negotiate_ir_format_via(
     device: &str,
     dev: &Device,
     apply: impl Fn(&Device, &Format) -> std::io::Result<Format>,
-) -> irlume_common::Result<(Format, IrPixel)> {
+) -> irlume_common::Result<IrNegotiation> {
     let offered: Vec<[u8; 4]> = Capture::enum_formats(dev)
         .map(|v| v.into_iter().map(|d| d.fourcc.repr).collect())
         .unwrap_or_default();
+    ir_candidate_walk(
+        device,
+        &offered,
+        || {
+            uvc_descriptor::identity_from_fd(dev.handle().fd())
+                .is_ok_and(|identity| identity.ir_function_evidence().is_ok())
+        },
+        |cc| discrete_frame_sizes(dev, cc),
+        |fmt| apply(dev, fmt),
+    )
+}
+
+/// [`negotiate_ir_format_via`] with every device read injected: the
+/// fd-bound attestation, the discrete-size enumeration and the format
+/// ioctl. The walk itself (which candidates are tried, which size each is
+/// requested at and which echo is accepted) is the same code on a camera and
+/// in a test, so a test can see the exact format handed to the ioctl.
+fn ir_candidate_walk(
+    device: &str,
+    offered: &[[u8; 4]],
+    attested: impl Fn() -> bool,
+    sizes: impl Fn(&[u8; 4]) -> Vec<(u32, u32)>,
+    apply: impl Fn(&Format) -> std::io::Result<Format>,
+) -> irlume_common::Result<IrNegotiation> {
     for (cc, pix) in IR_CANDIDATES {
         // If enumeration is unavailable, keep the historical behaviour and try
         // each candidate blind; otherwise only ask for formats it advertises.
         if !offered.is_empty() && !offered.contains(cc) {
             continue;
         }
-        let fmt = Format::new(IR_W, IR_H, FourCC::new(cc));
-        let fmt = apply(dev, &fmt).map_err(|e| map_io(device, e))?;
+        let (requested, luma_attested) =
+            ir_candidate_request(pix, offered, &attested, || sizes(cc));
+        let fmt = Format::new(requested.0, requested.1, FourCC::new(cc));
+        let fmt = apply(&fmt).map_err(|e| map_io(device, e))?;
         if &fmt.fourcc.repr == cc {
-            return Ok((fmt, pix));
+            return Ok(IrNegotiation {
+                format: fmt,
+                pixel: pix,
+                requested,
+                luma_attested,
+            });
         }
     }
     let offered_str: Vec<String> = offered.iter().map(fourcc_str).collect();
@@ -5700,6 +5844,94 @@ fn negotiate_ir_format_via(
          (NV12/YUYV). MJPEG-only IR nodes are not supported yet.",
         offered_str.join(", ")
     )))
+}
+
+/// The frame size one IR candidate is requested at, and whether the node is
+/// a descriptor-attested YUYV IR function (ADR-0031 §1, §5), with the two
+/// device reads injected: the fd-bound attestation and the discrete-size
+/// enumeration.
+///
+/// Each read runs only when its answer can change the request: the
+/// attestation only for the YUYV candidate of a node that offers nothing
+/// but YUYV (clause a, the same shape discovery requires), and the
+/// enumeration only once the node is attested. A GREY camera, an MJPG
+/// webcam's YUYV fallback, or a node whose format list could not be read
+/// negotiates exactly as before, with no descriptor read at all.
+fn ir_candidate_request(
+    pix: IrPixel,
+    offered: &[[u8; 4]],
+    attested: impl FnOnce() -> bool,
+    sizes: impl FnOnce() -> Vec<(u32, u32)>,
+) -> ((u32, u32), bool) {
+    let attested = pix == IrPixel::YuyvLuma && offers_only_luma_ir_container(offered) && attested();
+    let sizes = if attested { sizes() } else { Vec::new() };
+    (ir_request_size(pix, attested, &sizes), attested)
+}
+
+/// The frame size an IR open asks the driver for (ADR-0031 §5).
+///
+/// Every format keeps the historical 640x400 request except a YUYV node
+/// whose descriptor attests an infrared function. uvcvideo answers a request
+/// with the advertised frame nearest to it by non-overlapping area, so
+/// 640x400 lands on 640x480 on the ThinkPad T480's IR camera (5986:1141),
+/// a mode whose frames are near black, instead of the 340x340 mode the
+/// descriptor names as its default and in which the emitter strobes. For
+/// that node the request is the smallest `sizes` entry of at least
+/// `HELLO_IR_MIN` (Windows Hello's IR stream minimum), the first one listed
+/// when two have the same area, and 640x400 when none qualifies.
+///
+/// GREY, the Y16 family and NV12 keep 640x400 whatever sizes they offer:
+/// the ASUS (640x400), NexiGo N930W (640x360) and Logitech BRIO (340x340)
+/// all reach their sizes through that request, and their stored capture
+/// qualifications record it. Unattested YUYV keeps it too, so a colour node
+/// reaching the IR slot by an override or pin negotiates as it always did.
+fn ir_request_size(pix: IrPixel, attested: bool, sizes: &[(u32, u32)]) -> (u32, u32) {
+    if pix != IrPixel::YuyvLuma || !attested {
+        return (IR_W, IR_H);
+    }
+    sizes
+        .iter()
+        .copied()
+        .filter(|&(w, h)| w >= HELLO_IR_MIN.width && h >= HELLO_IR_MIN.height)
+        .min_by_key(|&(w, h)| u64::from(w) * u64::from(h))
+        .unwrap_or((IR_W, IR_H))
+}
+
+/// The discrete frame sizes `dev` advertises for `fourcc`, in the driver's
+/// order. Stepwise and continuous ranges are skipped rather than expanded:
+/// expanding one can yield sizes no mode backs, and uvcvideo reports every
+/// UVC frame descriptor as discrete. A failed enumeration is an empty list,
+/// which [`ir_request_size`] answers with the historical request.
+fn discrete_frame_sizes(dev: &Device, fourcc: &[u8; 4]) -> Vec<(u32, u32)> {
+    Capture::enum_framesizes(dev, FourCC::new(fourcc))
+        .map(|sizes| {
+            sizes
+                .into_iter()
+                .filter_map(|size| match size.size {
+                    v4l::framesize::FrameSizeEnum::Discrete(d) => Some((d.width, d.height)),
+                    v4l::framesize::FrameSizeEnum::Stepwise(_) => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The line an IR open prints when it streams YUYV luma from a node whose
+/// descriptor does not attest an infrared function (ADR-0031 §1), or `None`.
+///
+/// Such a node reaches the IR slot only through the `IRLUME_IR_DEVICE`
+/// override, a saved pin or the fallback path, never through discovery, and
+/// every credential-releasing attempt on it refuses as exposure
+/// unmeasurable. Saying so at open puts the cause next to the camera in the
+/// journal instead of leaving only the refusal.
+fn unattested_luma_ir_warning(device: &str, pix: IrPixel, attested: bool) -> Option<String> {
+    (pix == IrPixel::YuyvLuma && !attested).then(|| {
+        let device = camera_text(device);
+        format!(
+            "[ir] {device}: streams IR as YUYV luma without descriptor attestation; \
+             credential release will refuse (exposure unmeasurable)"
+        )
+    })
 }
 
 /// Convert one dequeued IR buffer to the 8-bit GREY layout the pipeline uses.
@@ -6055,6 +6287,32 @@ fn capture_ir_with_control_and_startup(
     shot
 }
 
+/// The IR stream contract for one negotiation: the size and fourcc the open
+/// requested beside every field the driver echoed.
+///
+/// The requested size is the one [`ir_request_size`] chose, not the 640x400
+/// constant: an attested YUYV node asks for its smallest Hello-sized mode
+/// (ADR-0031 §5), and a record claiming a request that was never made would
+/// describe a different negotiation from the one qualified. The requested
+/// fourcc is the echoed one because the candidate walk only accepts an echo
+/// that kept the fourcc it asked for.
+fn ir_stream_contract(
+    requested: (u32, u32),
+    requested_interval: frame_interval::FrameInterval,
+    negotiated: &v4l::Format,
+    accepted_interval: frame_interval::FrameInterval,
+) -> Result<capture_qualification::StreamContract, capture_qualification::QualificationError> {
+    capture_qualification::StreamContract::from_negotiated(
+        capture_qualification::QualifiedStreamRole::Ir,
+        requested.0,
+        requested.1,
+        negotiated.fourcc.repr,
+        requested_interval,
+        negotiated,
+        accepted_interval,
+    )
+}
+
 /// An opened, format-negotiated IR camera. The companion to [`RgbCamera`]; see
 /// there for why a device and a session are separate types.
 pub struct IrCamera {
@@ -6074,6 +6332,10 @@ pub struct IrCamera {
     /// buffers (#427); see `format_moved` for why the geometry alone is not
     /// enough.
     negotiated: v4l::Format,
+    /// The frame size the open asked for, which [`ir_request_size`] chose
+    /// and the driver answered with `negotiated`'s nearest advertised size.
+    /// Kept so the qualification contract records the real request.
+    requested: (u32, u32),
     /// Immutable negotiation evidence published by the delivered-rate slice.
     requested_interval: frame_interval::FrameInterval,
     accepted_interval: frame_interval::FrameInterval,
@@ -6113,7 +6375,11 @@ impl IrCamera {
         verify_pinned(device)?;
         let dev = hostfs::open_video(device).map_err(|e| map_io(device, e))?;
         require_ir_privacy_released(device, &dev, "before IR negotiation")?;
-        let (fmt, pix) = negotiate_ir_format_state(device, &dev, &state)?;
+        let negotiation = negotiate_ir_format_state(device, &dev, &state)?;
+        let (fmt, pix) = (negotiation.format, negotiation.pixel);
+        if let Some(line) = unattested_luma_ir_warning(device, pix, negotiation.luma_attested) {
+            eprintln!("{line}");
+        }
         let interval = negotiate_interval_after_format(&state, device, &dev, &fmt)?;
         let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
         Ok(Self {
@@ -6125,6 +6391,7 @@ impl IrCamera {
             quantization: fmt.quantization,
             fourcc: fourcc_str(&fmt.fourcc.repr),
             negotiated: fmt,
+            requested: negotiation.requested,
             requested_interval: interval.requested,
             accepted_interval: interval.accepted,
             width: fmt.width,
@@ -6165,11 +6432,8 @@ impl IrCamera {
                 capture_qualification::QualifiedStreamRole::Ir,
                 "uvc-v4l2",
             )?,
-            capture_qualification::StreamContract::from_negotiated(
-                capture_qualification::QualifiedStreamRole::Ir,
-                IR_W,
-                IR_H,
-                self.negotiated.fourcc.repr,
+            ir_stream_contract(
+                self.requested,
                 self.requested_interval,
                 &self.negotiated,
                 self.accepted_interval,
@@ -15796,10 +16060,12 @@ mod tests {
     /// The YUV pair is a different case and this comment used to get it wrong:
     /// irlume does carry their raw quantization, but resolving `Default` also
     /// needs the colorspace, which `IrCamera` discards. The `None` is there
-    /// mainly because no discovered pair reaches an IR decode with those
-    /// fourccs, and the refusal it produces is what stops a colour node that
-    /// arrives in the IR slot some other way (#385). Saying None keeps #221's
-    /// corpus interpretable either way.
+    /// mainly because the refusal it produces is what stops a colour node that
+    /// arrives in the IR slot some other way (#385). Discovery reaches a YUYV
+    /// IR decode since #887, for descriptor-attested nodes only, and the
+    /// `None` holds for them too until ADR-0031 §4's frame gates exist: the
+    /// descriptor is a firmware claim, not a measurement of the frames.
+    /// Saying None keeps #221's corpus interpretable either way.
     #[test]
     fn only_native_8bit_grey_can_claim_a_clipping_ceiling() {
         for q in [
@@ -16672,9 +16938,525 @@ mod tests {
         // Colour still wins (an RGB cam also advertising grey is an RGB cam).
         assert_eq!(role_from_formats(&[*b"YUYV", *b"GREY"]), Role::Rgb);
         assert_eq!(role_from_formats(&[*b"NV12"]), Role::Rgb);
+        // YUYV alone is colour by format; only its descriptor can say IR
+        // (ADR-0031 §1, `role_with_ir_attestation`).
+        assert_eq!(role_from_formats(&[*b"YUYV"]), Role::Rgb);
         // Metadata/unknown-only nodes stay Other.
         assert_eq!(role_from_formats(&[*b"UVCM"]), Role::Other);
         assert_eq!(role_from_formats(&[]), Role::Other);
+    }
+
+    /// #887: the ThinkPad T480 IR camera offers only YUYV. With its
+    /// descriptor's attestation it is IR; without it, as for every YUYV-only
+    /// webcam and the CI loopback feeder, it stays RGB.
+    #[test]
+    fn yuyv_only_node_is_ir_only_with_attestation() {
+        use super::role_with_ir_attestation;
+        assert_eq!(role_with_ir_attestation(&[*b"YUYV"], || true), Role::Ir);
+        assert_eq!(role_with_ir_attestation(&[*b"YUYV"], || false), Role::Rgb);
+    }
+
+    /// The attestation turns a YUYV-only answer into IR and nothing else:
+    /// another colour format beside YUYV, NV12 in any shape, or a grey
+    /// format keeps the answer the formats give (ADR-0031 §1, clause a).
+    #[test]
+    fn attestation_never_overrides_another_colour_format() {
+        use super::role_with_ir_attestation;
+        for formats in [
+            vec![*b"MJPG", *b"YUYV"],
+            vec![*b"YUYV", *b"RGB3"],
+            vec![*b"NV12"],
+            vec![*b"NV12", *b"YUYV"],
+            vec![*b"YUYV", *b"GREY"],
+        ] {
+            assert_eq!(
+                role_with_ir_attestation(&formats, || true),
+                Role::Rgb,
+                "{formats:?}"
+            );
+        }
+        assert_eq!(role_with_ir_attestation(&[*b"GREY"], || false), Role::Ir);
+        assert_eq!(role_with_ir_attestation(&[*b"UVCM"], || true), Role::Other);
+        assert_eq!(role_with_ir_attestation(&[], || true), Role::Other);
+    }
+
+    /// Only a YUYV-only node costs a descriptor read: a GREY camera, a
+    /// metadata node or an MJPG webcam never runs the attestation.
+    #[test]
+    fn attestation_is_consulted_only_for_yuyv_only() {
+        use super::role_with_ir_attestation;
+        let calls = std::cell::Cell::new(0);
+        let attested = || {
+            calls.set(calls.get() + 1);
+            true
+        };
+        for formats in [
+            vec![*b"GREY"],
+            vec![*b"Y16 "],
+            vec![*b"UVCM"],
+            vec![],
+            vec![*b"MJPG", *b"YUYV"],
+            vec![*b"NV12"],
+        ] {
+            role_with_ir_attestation(&formats, attested);
+        }
+        assert_eq!(calls.get(), 0);
+        role_with_ir_attestation(&[*b"YUYV"], attested);
+        assert_eq!(calls.get(), 1);
+    }
+
+    /// ADR-0031 §5: only an attested YUYV node leaves the 640x400 request,
+    /// for its smallest Hello-sized discrete mode.
+    #[test]
+    fn ir_request_size_changes_only_for_attested_yuyv() {
+        use super::{ir_request_size, IrPixel};
+        let t480 = [(340, 340), (640, 480)];
+        // The GREY and Y16 fleet (ASUS, NexiGo, BRIO) keeps its request,
+        // whatever sizes it advertises and whatever the descriptor says.
+        for pix in [IrPixel::Grey8, IrPixel::Grey16, IrPixel::Nv12Luma] {
+            for attested in [false, true] {
+                assert_eq!(ir_request_size(pix, attested, &t480), (640, 400), "{pix:?}");
+            }
+        }
+        assert_eq!(ir_request_size(IrPixel::YuyvLuma, false, &t480), (640, 400));
+        assert_eq!(ir_request_size(IrPixel::YuyvLuma, true, &t480), (340, 340));
+        assert_eq!(
+            ir_request_size(IrPixel::YuyvLuma, true, &[(640, 480), (340, 340)]),
+            (340, 340),
+            "order does not matter"
+        );
+        // The Chicony T480 IR module's YUYV sizes.
+        assert_eq!(
+            ir_request_size(IrPixel::YuyvLuma, true, &[(400, 480), (400, 400)]),
+            (400, 400)
+        );
+        // Nothing qualifies: the historical request.
+        assert_eq!(ir_request_size(IrPixel::YuyvLuma, true, &[]), (640, 400));
+        assert_eq!(
+            ir_request_size(IrPixel::YuyvLuma, true, &[(320, 240), (160, 120)]),
+            (640, 400)
+        );
+        assert_eq!(
+            ir_request_size(IrPixel::YuyvLuma, true, &[(339, 480), (480, 339)]),
+            (640, 400),
+            "both dimensions must meet the minimum"
+        );
+        // Equal areas: the first one listed.
+        assert_eq!(
+            ir_request_size(IrPixel::YuyvLuma, true, &[(480, 360), (360, 480)]),
+            (480, 360)
+        );
+        assert_eq!(
+            ir_request_size(IrPixel::YuyvLuma, true, &[(360, 480), (480, 360)]),
+            (360, 480)
+        );
+    }
+
+    /// The capture walk reads the descriptor and the frame sizes only for a
+    /// YUYV-only node, and requests the attested size only when both say
+    /// so; every other candidate keeps 640x400 with no extra read.
+    #[test]
+    fn ir_candidate_request_reads_the_device_only_for_a_yuyv_only_node() {
+        use super::{ir_candidate_request, IrPixel};
+        let never = || -> bool { panic!("the descriptor must not be read here") };
+        let no_sizes = || -> Vec<(u32, u32)> { panic!("the sizes must not be enumerated here") };
+        for (pix, offered) in [
+            (IrPixel::Grey8, vec![*b"GREY"]),
+            (IrPixel::Grey16, vec![*b"Y16 "]),
+            (IrPixel::Nv12Luma, vec![*b"NV12"]),
+            (IrPixel::YuyvLuma, vec![*b"MJPG", *b"YUYV"]),
+            // Enumeration failed and the walk tries candidates blind.
+            (IrPixel::YuyvLuma, vec![]),
+        ] {
+            assert_eq!(
+                ir_candidate_request(pix, &offered, never, no_sizes),
+                ((640, 400), false),
+                "{pix:?} {offered:?}"
+            );
+        }
+        assert_eq!(
+            ir_candidate_request(IrPixel::YuyvLuma, &[*b"YUYV"], || false, no_sizes),
+            ((640, 400), false),
+            "an unattested YUYV node keeps its request"
+        );
+        assert_eq!(
+            ir_candidate_request(
+                IrPixel::YuyvLuma,
+                &[*b"YUYV"],
+                || true,
+                || vec![(640, 480), (340, 340)]
+            ),
+            ((340, 340), true)
+        );
+        assert_eq!(
+            ir_candidate_request(IrPixel::YuyvLuma, &[*b"YUYV"], || true, Vec::new),
+            ((640, 400), true),
+            "attested, but no size could be enumerated"
+        );
+    }
+
+    /// Why the T480 streamed black frames: uvcvideo's `uvc_v4l2_try_format`
+    /// answers a request with the advertised frame of least non-overlapping
+    /// area (first on ties), replicated here. 640x400 lands on 640x480; the
+    /// request ADR-0031 §5 makes lands on the 340x340 mode exactly.
+    #[test]
+    fn uvc_nearest_size_explains_the_black_mode() {
+        use super::{ir_request_size, IrPixel};
+        fn distance((rw, rh): (u32, u32), (w, h): (u32, u32)) -> u64 {
+            let overlap = u64::from(w.min(rw)) * u64::from(h.min(rh));
+            u64::from(w) * u64::from(h) + u64::from(rw) * u64::from(rh) - 2 * overlap
+        }
+        fn nearest(request: (u32, u32), frames: &[(u32, u32)]) -> (u32, u32) {
+            let mut best = frames[0];
+            let mut best_distance = u64::MAX;
+            for frame in frames {
+                let d = distance(request, *frame);
+                if d < best_distance {
+                    best_distance = d;
+                    best = *frame;
+                }
+            }
+            best
+        }
+        let t480 = [(340, 340), (640, 480)];
+        assert_eq!(distance((640, 400), (640, 480)), 51_200);
+        assert_eq!(distance((640, 400), (340, 340)), 140_400);
+        assert_eq!(nearest((640, 400), &t480), (640, 480));
+        let request = ir_request_size(IrPixel::YuyvLuma, true, &t480);
+        assert_eq!(nearest(request, &t480), (340, 340));
+        assert_eq!(distance(request, (340, 340)), 0);
+    }
+
+    /// The qualification record states the request that was made: an
+    /// attested YUYV node asked for 340x340, and recording the 640x400
+    /// constant would describe a negotiation that never happened.
+    #[test]
+    fn qualification_contract_records_the_actual_request() {
+        use crate::capture_qualification::{ExactInterval, RequestedStream};
+        let interval = frame_interval::FrameInterval::new(1, 30).unwrap();
+        let mut echoed = Format::new(340, 340, FourCC::new(b"YUYV"));
+        (echoed.stride, echoed.size) = (680, 231_200);
+        let contract = super::ir_stream_contract((340, 340), interval, &echoed, interval).unwrap();
+        let requested = |w, h| {
+            RequestedStream::new(w, h, "YUYV".into(), ExactInterval::new(1, 30).unwrap()).unwrap()
+        };
+        assert_eq!(contract.requested(), &requested(340, 340));
+        assert_ne!(contract.requested(), &requested(super::IR_W, super::IR_H));
+        // A GREY node's request is still the constant it was.
+        let mut grey = Format::new(640, 400, FourCC::new(b"GREY"));
+        (grey.stride, grey.size) = (640, 256_000);
+        let contract =
+            super::ir_stream_contract((super::IR_W, super::IR_H), interval, &grey, interval)
+                .unwrap();
+        assert_eq!(
+            contract.requested(),
+            &RequestedStream::new(640, 400, "GREY".into(), ExactInterval::new(1, 30).unwrap())
+                .unwrap()
+        );
+    }
+
+    /// The text of the function that starts at `signature` in `source`, up to
+    /// its closing brace at column 0, for the source-shape tests below.
+    fn source_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} moved; update this test"));
+        let end = source[start..]
+            .find("\n}\n")
+            .expect("a function that ends at column 0");
+        &source[start..start + end]
+    }
+
+    /// The lines of `text` that are not line comments.
+    fn source_code_lines(text: &str) -> impl Iterator<Item = &str> {
+        text.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+    }
+
+    /// Discovery and the census decide a YUYV-only node's role from sysfs
+    /// alone (ADR-0031 §1; ADR-0029 §1, §9): they reach the attestation only
+    /// through `ir_function_evidence_for_node`, never the fd-bound form. The
+    /// doctor's IR stream line reuses the capture walk
+    /// (`negotiate_ir_format_via`), whose fd-bound attestation is also a
+    /// read, `fstat` and sysfs on the file descriptor the probe already
+    /// holds. None of those paths, and not the sysfs reader itself, streams
+    /// a frame, fires the emitter or writes a control for it. CI has no
+    /// camera, so no behavioural test would notice a later call site that
+    /// streamed during a scan; this pins the rule in the idiom of
+    /// `irlume-auth/tests/no_probe_on_the_auth_path.rs`.
+    #[test]
+    fn discovery_and_census_attest_from_sysfs_and_nothing_streams_to_classify() {
+        const STREAMING: [&str; 15] = [
+            "MmapStream",
+            "SafeStream",
+            "TrackedStream",
+            "stream_on",
+            "dequeue",
+            ".session(",
+            "capture_ir",
+            "capture_rgb",
+            "capture_with_stats",
+            "capture_raw",
+            "IrCamera::open",
+            "RgbCamera::open",
+            "enable_ir_emitter",
+            "D1OpticalEvidence",
+            "SET_CUR",
+        ];
+        const OPENS: [&str; 6] = [
+            "Device::with_path",
+            "ioctl",
+            "OpenOptions",
+            "File::open",
+            "\"/dev/",
+            "identity_from_fd",
+        ];
+        let lib = include_str!("lib.rs");
+        let census = include_str!("census.rs");
+        let uvc = include_str!("uvc_descriptor.rs");
+        let census_code = census.split("#[cfg(test)]").next().expect("census source");
+
+        let scanners = [
+            ("classify_node", source_body(lib, "\npub fn classify_node(")),
+            ("census.rs", census_code),
+        ];
+        for (label, text) in scanners {
+            assert!(
+                text.contains("uvc_descriptor::ir_function_evidence_for_node("),
+                "{label} no longer reads the attestation; if it moved, move this test with it"
+            );
+            assert!(
+                !text.contains(".ir_function_evidence()") && !text.contains("identity_from_fd"),
+                "{label} must not use the fd-bound attestation"
+            );
+        }
+        let doctor_probe = (
+            "negotiated_stream",
+            source_body(lib, "\npub fn negotiated_stream("),
+        );
+        for (label, text) in scanners.into_iter().chain([doctor_probe]) {
+            for line in source_code_lines(text) {
+                for token in STREAMING {
+                    assert!(
+                        !line.contains(token),
+                        "{label} must not stream to classify ({token}): {line}"
+                    );
+                }
+            }
+        }
+        for signature in [
+            "\npub(crate) fn ir_function_evidence_for_node(",
+            "\nfn ir_function_evidence_from_dirs(",
+            "\nfn raw_descriptors_from_dirs(",
+            "\npub(crate) fn ir_function_evidence(",
+            "\npub fn video_control_function(",
+            "\nfn video_control_walk(",
+            "\nfn processing_unit_controls(",
+        ] {
+            for line in source_code_lines(source_body(uvc, signature)) {
+                for token in STREAMING.iter().chain(&OPENS) {
+                    assert!(
+                        !line.contains(token),
+                        "the sysfs reader {signature:?} must not open or stream ({token}): {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The walk hands the format ioctl the size it chose (ADR-0031 §5): an
+    /// attested YUYV node is asked for 340x340, the negotiation records that
+    /// request beside the echo, and only then is the node's size list read.
+    /// Unattested YUYV and GREY are asked for 640x400, and a GREY node's
+    /// attestation is never read. Every device read is injected, so this runs
+    /// the same walk capture and the doctor's probe run.
+    #[test]
+    fn the_ir_candidate_walk_applies_the_size_it_chose() {
+        use super::{ir_candidate_walk, IrPixel};
+        use std::cell::{Cell, RefCell};
+        let t480_sizes = || vec![(640, 480), (340, 340)];
+        let run = |offered: &[[u8; 4]], attested: bool| {
+            let applied = RefCell::new(Vec::new());
+            let attestation_reads = Cell::new(0);
+            let size_reads = Cell::new(0);
+            let negotiation = ir_candidate_walk(
+                "/dev/video0",
+                offered,
+                || {
+                    attestation_reads.set(attestation_reads.get() + 1);
+                    attested
+                },
+                |_| {
+                    size_reads.set(size_reads.get() + 1);
+                    t480_sizes()
+                },
+                |fmt| {
+                    applied
+                        .borrow_mut()
+                        .push((fmt.width, fmt.height, fmt.fourcc.repr));
+                    Ok(*fmt)
+                },
+            )
+            .expect("the echo keeps the fourcc");
+            (
+                negotiation,
+                applied.into_inner(),
+                attestation_reads.get(),
+                size_reads.get(),
+            )
+        };
+
+        let (yuyv, applied, attestation_reads, size_reads) = run(&[*b"YUYV"], true);
+        assert_eq!(applied, [(340, 340, *b"YUYV")]);
+        assert_eq!(yuyv.requested, (340, 340));
+        assert_eq!((yuyv.format.width, yuyv.format.height), (340, 340));
+        assert_eq!(yuyv.pixel, IrPixel::YuyvLuma);
+        assert!(yuyv.luma_attested);
+        assert_eq!((attestation_reads, size_reads), (1, 1));
+
+        let (plain, applied, _, size_reads) = run(&[*b"YUYV"], false);
+        assert_eq!(applied, [(640, 400, *b"YUYV")]);
+        assert_eq!(plain.requested, (640, 400));
+        assert!(!plain.luma_attested);
+        assert_eq!(size_reads, 0, "an unattested node's sizes are not read");
+
+        let (grey, applied, attestation_reads, size_reads) = run(&[*b"GREY"], true);
+        assert_eq!(applied, [(640, 400, *b"GREY")]);
+        assert_eq!(grey.pixel, IrPixel::Grey8);
+        assert_eq!((attestation_reads, size_reads), (0, 0));
+    }
+
+    /// Capture binds the attestation to the open file descriptor and records
+    /// the request it made (ADR-0031 §4, §5). The fd-bound read is what keeps
+    /// an `IRLUME_IR_DEVICE` override, a saved pin or the fallback path from
+    /// borrowing a role discovery computed for another node, and the
+    /// qualification contract must describe the negotiation that happened.
+    /// Neither is reachable without a camera, so the wiring is pinned by
+    /// shape; the walk itself is exercised in
+    /// `the_ir_candidate_walk_applies_the_size_it_chose`.
+    #[test]
+    fn ir_capture_attests_from_the_open_fd_and_records_its_request() {
+        let lib = include_str!("lib.rs");
+        let walk = source_body(lib, "\nfn negotiate_ir_format_via(");
+        for needed in [
+            "uvc_descriptor::identity_from_fd(dev.handle().fd())",
+            ".ir_function_evidence()",
+            "ir_candidate_walk(",
+        ] {
+            assert!(
+                walk.contains(needed),
+                "negotiate_ir_format_via lost {needed}"
+            );
+        }
+        assert!(
+            !walk.contains("ir_function_evidence_for_node"),
+            "capture must not attest from the node path"
+        );
+        assert!(
+            source_body(lib, "\nfn ir_candidate_walk(")
+                .contains("Format::new(requested.0, requested.1, FourCC::new(cc))"),
+            "the walk must request the size ir_candidate_request chose"
+        );
+        assert!(
+            source_body(lib, "\npub fn negotiated_stream(").contains("negotiate_ir_format_via("),
+            "the doctor's IR probe must share the capture walk"
+        );
+
+        let ir_impl = &lib[lib
+            .find("\nimpl IrCamera {")
+            .expect("impl IrCamera moved; update this test")..];
+        let method = |signature: &str| {
+            let start = ir_impl
+                .find(signature)
+                .unwrap_or_else(|| panic!("IrCamera {signature} moved; update this test"));
+            let end = ir_impl[start..]
+                .find("\n    }\n")
+                .expect("a method that ends at column 4");
+            &ir_impl[start..start + end]
+        };
+        assert!(
+            method("fn open_uvc(").contains("requested: negotiation.requested,"),
+            "IrCamera must keep the request its negotiation made"
+        );
+        let facts = method("pub fn qualification_facts(");
+        assert!(
+            facts.contains("ir_stream_contract(") && facts.contains("self.requested,"),
+            "the IR qualification contract must be built from the recorded request"
+        );
+        assert!(
+            !facts.contains("IR_W") && !facts.contains("IR_H"),
+            "the IR qualification contract must not record the 640x400 constant"
+        );
+    }
+
+    /// ADR-0031 §5 on a real camera: an attested YUYV-only IR node, such as
+    /// the ThinkPad T480's 5986:1141, opens for IR at its 340x340 mode, and
+    /// the qualification contract records that request. The pure walk and
+    /// the wiring are covered without a camera above; this is the check a
+    /// person with the camera runs by name, and CI never selects it.
+    #[test]
+    #[ignore = "needs a YUYV-only, descriptor-attested IR camera; set IRLUME_TEST_YUYV_IR_DEVICE"]
+    fn attested_yuyv_ir_camera_opens_at_its_hello_size() {
+        hostfs::test::host();
+        let device = std::env::var("IRLUME_TEST_YUYV_IR_DEVICE").unwrap_or_else(|_| {
+            panic!(
+                "IRLUME_TEST_YUYV_IR_DEVICE is unset. This test is #[ignore]d, so running it is \
+                 a request for an attested YUYV IR camera; it will not silently pass without one."
+            )
+        });
+        assert_eq!(
+            node_capture_formats_probed(&device).as_deref(),
+            Some(&[*b"YUYV"][..]),
+            "{device} must offer exactly YUYV"
+        );
+        assert!(
+            crate::uvc_descriptor::ir_function_evidence_for_node(&device).is_ok(),
+            "{device} must be attested by its USB descriptor"
+        );
+        let cam = IrCamera::open(&device).expect("open the IR camera");
+        assert_eq!(cam.requested, (340, 340));
+        assert_eq!((cam.width, cam.height), (340, 340), "the driver's echo");
+        let (_, contract) = cam.qualification_facts().expect("qualification facts");
+        let expected = super::ir_stream_contract(
+            (340, 340),
+            cam.requested_interval,
+            &cam.negotiated,
+            cam.accepted_interval,
+        )
+        .expect("a representable contract");
+        assert_eq!(contract.requested(), expected.requested());
+    }
+
+    /// The open-time line for a YUYV IR stream nobody attested, which only
+    /// an override, a pin or the fallback path can produce.
+    #[test]
+    fn unattested_yuyv_ir_is_named_at_open() {
+        use super::{unattested_luma_ir_warning, IrPixel};
+        assert_eq!(
+            unattested_luma_ir_warning("/dev/video8", IrPixel::YuyvLuma, false).as_deref(),
+            Some(
+                "[ir] /dev/video8: streams IR as YUYV luma without descriptor attestation; \
+                 credential release will refuse (exposure unmeasurable)"
+            )
+        );
+        assert_eq!(
+            unattested_luma_ir_warning("/dev/video0", IrPixel::YuyvLuma, true),
+            None
+        );
+        for pix in [IrPixel::Grey8, IrPixel::Grey16, IrPixel::Nv12Luma] {
+            assert_eq!(unattested_luma_ir_warning("/dev/video2", pix, false), None);
+        }
+    }
+
+    #[test]
+    fn unattested_yuyv_warning_bounds_and_cleans_the_device_path() {
+        let device = "/dev/cam\n\r\t\x1b\x7f\u{0085}\u{202e}\u{2028}\u{2029}";
+        let line = unattested_luma_ir_warning(device, IrPixel::YuyvLuma, false).unwrap();
+        assert!(line.starts_with("[ir] /dev/cam         :"), "{line:?}");
+        assert!(!line.chars().any(char::is_control));
+        assert!(!line.chars().any(is_invisible_format));
+        let line = unattested_luma_ir_warning(&"é".repeat(100), IrPixel::YuyvLuma, false).unwrap();
+        assert!(line.starts_with(&format!("[ir] {}: streams", "é".repeat(64))));
     }
 
     #[test]
@@ -16836,6 +17618,42 @@ mod tests {
     /// the USB `product` string, then nothing; it is trimmed and bounded
     /// and never feeds identification. The fixture has no sysfs node, so
     /// the product fallback is what these cases exercise.
+    #[test]
+    fn stable_node_aliases_are_resolved_before_comparing_usb_parents() {
+        let root = std::env::temp_dir().join(format!(
+            "irlume-split-alias-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        for name in ["video0", "video1", "video2"] {
+            std::fs::write(root.join(name), b"").unwrap();
+        }
+        for (alias, target) in [
+            ("stable-rgb", "video0"),
+            ("stable-ir", "video2"),
+            ("same-camera", "video1"),
+        ] {
+            std::os::unix::fs::symlink(target, root.join(alias)).unwrap();
+        }
+        let parent = |path: &str| match std::path::Path::new(path).file_name()?.to_str()? {
+            "video0" | "video1" => Some(std::path::PathBuf::from("/devices/usb/first")),
+            "video2" => Some(std::path::PathBuf::from("/devices/usb/second")),
+            _ => None,
+        };
+        let compare = |other: &str| {
+            nodes_share_usb_device_with(
+                root.join("stable-rgb").to_str().unwrap(),
+                root.join(other).to_str().unwrap(),
+                parent,
+            )
+        };
+        assert_eq!(compare("stable-ir"), Some(false));
+        assert_eq!(compare("same-camera"), Some(true));
+        assert_eq!(compare("missing"), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn usb_port_chains_come_from_the_device_directory_name() {
         let _fixture = hostfs::test::empty_fixture();

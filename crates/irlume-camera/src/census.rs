@@ -119,6 +119,13 @@ pub(crate) struct NodeFacts {
     pub privacy: Option<bool>,
     /// Whether a pairing exists that includes this node.
     pub paired: bool,
+    /// The USB descriptor's answer for a node that offers only YUYV: the
+    /// infrared function it attests, or the clause that refused
+    /// (ADR-0031 §1). `None` for every other node, which the rule does not
+    /// apply to and whose descriptor is never read for it.
+    pub luma_ir_check: Option<
+        Result<crate::uvc_descriptor::IrFunctionEvidence, crate::uvc_descriptor::IrFunctionRefusal>,
+    >,
 }
 
 /// Classify one answering node from gathered facts. Pure, and the part worth
@@ -166,6 +173,37 @@ pub(crate) fn node_entry_from_facts(facts: &NodeFacts) -> CensusEntry {
         evidence.retain(|e| !e.starts_with("formats "));
     }
 
+    // A YUYV-only node's role rests on its USB descriptor (ADR-0031 §1), so
+    // the row prints what the descriptor said: the attestation, or the
+    // clause that kept the node RGB. The rule covers no other format list,
+    // so no other row carries the line even when its facts hold an answer,
+    // and a dummy node has no descriptor, so its row stays driver and
+    // placement facts.
+    let luma_ir =
+        matches!(&facts.fourccs, Some(list) if crate::offers_only_luma_ir_container(list));
+    let descriptor_answer = facts.luma_ir_check.as_ref().filter(|check| {
+        luma_ir
+                && !DUMMY_DRIVERS.contains(&facts.driver.as_str())
+                // The role came from an earlier scan. A second descriptor
+                // read can disagree across a reconfiguration; do not print
+                // that new answer as evidence for the old role.
+                && match facts.role {
+                    Role::Ir => check.is_ok(),
+                    Role::Rgb => check.is_err(),
+                    Role::Other => false,
+                }
+    });
+    if let Some(check) = descriptor_answer {
+        evidence.push(match check {
+            Ok(attested) => format!(
+                "IR by USB descriptor: one video stream (interface {}), Microsoft \
+                 face-authentication control (unit {}), no colour controls",
+                attested.streaming_interface, attested.msxu_unit
+            ),
+            Err(refusal) => format!("not IR by USB descriptor: {refusal}"),
+        });
+    }
+
     let y8_only = |fourccs: &Option<Vec<[u8; 4]>>| match fourccs {
         None => false,
         Some(list) => {
@@ -207,6 +245,27 @@ pub(crate) fn node_entry_from_facts(facts: &NodeFacts) -> CensusEntry {
                 CensusVerdict::Informational(
                     "nothing to fix; this row exists so a metadata interface never reads \
                      as a missing or broken camera",
+                ),
+            ),
+            // A paired YUYV IR sensor completes a pair, but no YUYV frame
+            // has a measured sensor ceiling yet (ADR-0031 §4), so every
+            // credential-releasing attempt on it refuses as exposure
+            // unmeasurable. "secure IR tier" would promise what the capture
+            // path refuses.
+            Role::Ir if facts.paired && luma_ir => (
+                CensusClass::UvcIr { paired: true },
+                CensusVerdict::SupportedWithLimits(
+                    "supported with limits: IR delivered as YUYV has no measured exposure \
+                     ceiling yet, so face authentication refuses it as exposure unmeasurable",
+                ),
+            ),
+            Role::Ir if facts.paired && !facts.fourccs.as_ref().is_some_and(|formats| {
+                !formats.is_empty() && crate::role_from_formats(formats) == Role::Ir
+            }) => (
+                CensusClass::UvcIr { paired: true },
+                CensusVerdict::SupportedWithLimits(
+                    "supported with limits: IR capture formats could not be confirmed; \
+                     secure IR support is unverified",
                 ),
             ),
             Role::Ir if facts.paired => (
@@ -356,6 +415,12 @@ fn facts_for(
     });
     let usb_id = crate::physical_device_id(path).and_then(|dir| crate::read_vidpid(&dir));
     let fourccs = crate::node_capture_formats_probed(path);
+    // sysfs only, and only for the one format shape the rule covers: the
+    // census never streams a frame to decide a role (ADR-0031 §1).
+    let luma_ir_check = fourccs
+        .as_deref()
+        .filter(|list| crate::offers_only_luma_ir_container(list))
+        .map(|_| crate::uvc_descriptor::ir_function_evidence_for_node(path));
     NodeFacts {
         node: path.to_string(),
         role,
@@ -370,6 +435,7 @@ fn facts_for(
         },
         privacy: Some(crate::privacy_engaged(path)),
         paired: paired.contains(path),
+        luma_ir_check,
     }
 }
 
@@ -615,6 +681,7 @@ mod tests {
             removable: Some(false),
             privacy: Some(false),
             paired: true,
+            luma_ir_check: None,
         }
     }
 
@@ -686,6 +753,197 @@ mod tests {
             evidence.contains("Y8") && evidence.contains("Y800"),
             "the Y8 shape must be printed as the evidence: {evidence}"
         );
+    }
+
+    use crate::uvc_descriptor::{IrFunctionEvidence, IrFunctionRefusal};
+
+    const T480_IR: IrFunctionEvidence = IrFunctionEvidence {
+        msxu_unit: 8,
+        streaming_interface: 1,
+    };
+
+    /// #887: the ThinkPad T480 IR camera, a YUYV-only node its descriptor
+    /// attests, reads as an unpaired UVC IR sensor and prints the
+    /// attestation. The class phrase stays the one
+    /// `scripts/ir-node-from-doctor.sh` maps to Ir.
+    #[test]
+    fn attested_yuyv_ir_node_is_uvc_ir_with_descriptor_evidence() {
+        let mut f = facts("/dev/video0", Role::Ir, &[b"YUYV"]);
+        f.usb_id = Some("5986:1141".into());
+        f.paired = false;
+        f.luma_ir_check = Some(Ok(T480_IR));
+        let entry = node_entry_from_facts(&f);
+        assert_eq!(entry.class, CensusClass::UvcIr { paired: false });
+        assert!(matches!(
+            entry.verdict,
+            CensusVerdict::SupportedWithLimits(note) if note.contains("standalone IR sensor")
+        ));
+        assert!(
+            entry.evidence.contains(
+                &"IR by USB descriptor: one video stream (interface 1), Microsoft \
+                  face-authentication control (unit 8), no colour controls"
+                    .to_string()
+            ),
+            "{:?}",
+            entry.evidence
+        );
+        assert!(
+            render_line(&entry).starts_with("/dev/video0: UVC IR sensor (unpaired), "),
+            "{}",
+            render_line(&entry)
+        );
+    }
+
+    /// A paired YUYV IR sensor would complete a pair, but YUYV has no
+    /// measured exposure ceiling yet (ADR-0031 §4): the row must not promise
+    /// the secure tier the capture path refuses.
+    #[test]
+    fn a_paired_yuyv_ir_node_does_not_claim_the_secure_tier() {
+        let mut f = facts("/dev/video2", Role::Ir, &[b"YUYV"]);
+        f.luma_ir_check = Some(Ok(T480_IR));
+        let entry = node_entry_from_facts(&f);
+        assert_eq!(entry.class, CensusClass::UvcIr { paired: true });
+        assert!(
+            matches!(entry.verdict, CensusVerdict::SupportedWithLimits(note)
+                if note.contains("exposure unmeasurable")),
+            "{:?}",
+            entry.verdict
+        );
+        // A paired GREY sensor is unaffected.
+        let grey = node_entry_from_facts(&facts("/dev/video2", Role::Ir, &[b"GREY"]));
+        assert_eq!(
+            grey.verdict,
+            CensusVerdict::Supported(Some("secure IR tier"))
+        );
+    }
+
+    #[test]
+    fn a_paired_ir_node_with_no_reprobe_does_not_claim_the_secure_tier() {
+        let mut f = facts("/dev/video2", Role::Ir, &[b"YUYV"]);
+        for formats in [
+            None,
+            Some(Vec::new()),
+            Some(vec![*b"MJPG", *b"YUYV"]),
+            Some(vec![*b"GREY", *b"YUYV"]),
+        ] {
+            f.fourccs = formats;
+            f.luma_ir_check = None;
+            let entry = node_entry_from_facts(&f);
+            assert_eq!(entry.class, CensusClass::UvcIr { paired: true });
+            assert!(
+                matches!(entry.verdict, CensusVerdict::SupportedWithLimits(note)
+                if note.contains("secure IR support is unverified"))
+            );
+            assert!(!render_line(&entry).contains("secure IR tier"));
+        }
+    }
+
+    #[test]
+    fn changed_descriptor_evidence_does_not_contradict_the_scanned_role() {
+        for (role, check) in [
+            (Role::Ir, Err(IrFunctionRefusal::Unreadable)),
+            (Role::Rgb, Ok(T480_IR)),
+        ] {
+            let mut f = facts("/dev/video2", role, &[b"YUYV"]);
+            f.luma_ir_check = Some(check);
+            let entry = node_entry_from_facts(&f);
+            assert!(!entry
+                .evidence
+                .iter()
+                .any(|line| line.contains("IR by USB descriptor")));
+        }
+    }
+
+    /// A YUYV-only colour webcam stays RGB and says which clause kept it
+    /// there, so a reporter can tell "not an IR function" from "could not
+    /// read the descriptor".
+    #[test]
+    fn unattested_yuyv_rgb_node_names_why_it_is_not_ir() {
+        for (refusal, text) in [
+            (
+                IrFunctionRefusal::NoMicrosoftXu,
+                "not IR by USB descriptor: no Microsoft camera-control unit",
+            ),
+            (
+                IrFunctionRefusal::ColourProcessing(0x104C),
+                "not IR by USB descriptor: colour controls advertised (Processing Unit bits 0x104c)",
+            ),
+            (
+                IrFunctionRefusal::Unreadable,
+                "not IR by USB descriptor: no readable USB descriptor",
+            ),
+            (
+                IrFunctionRefusal::Malformed,
+                "not IR by USB descriptor: the USB descriptor is malformed",
+            ),
+            (
+                IrFunctionRefusal::NotVideoControl,
+                "not IR by USB descriptor: its USB interface is not a UVC VideoControl interface",
+            ),
+        ] {
+            let mut f = facts("/dev/video2", Role::Rgb, &[b"YUYV"]);
+            f.paired = false;
+            f.luma_ir_check = Some(Err(refusal));
+            let entry = node_entry_from_facts(&f);
+            assert_eq!(entry.class, CensusClass::UvcRgb { paired: false });
+            assert_eq!(
+                entry.verdict,
+                CensusVerdict::Supported(Some("RGB-only convenience tier"))
+            );
+            assert!(
+                entry.evidence.contains(&text.to_string()),
+                "{:?}",
+                entry.evidence
+            );
+        }
+    }
+
+    /// The rule covers YUYV-only nodes; every other row carries no
+    /// descriptor line, because no descriptor was read for it. The row
+    /// builder holds that line itself rather than trusting the facts: an
+    /// answer on a GREY or MJPG+YUYV row would claim the rule decided a
+    /// role it never applies to (ADR-0031 §1).
+    #[test]
+    fn grey_ir_and_mjpg_rgb_nodes_have_no_descriptor_line() {
+        for (node, role, fourccs) in [
+            ("/dev/video2", Role::Ir, &[b"GREY"][..]),
+            ("/dev/video0", Role::Rgb, &[b"MJPG", b"YUYV"][..]),
+            ("/dev/video4", Role::Rgb, &[b"YUYV", b"GREY"][..]),
+        ] {
+            for check in [
+                None,
+                Some(Ok(T480_IR)),
+                Some(Err(IrFunctionRefusal::NoMicrosoftXu)),
+            ] {
+                let mut f = facts(node, role, fourccs);
+                f.luma_ir_check = check;
+                let entry = node_entry_from_facts(&f);
+                assert!(
+                    !entry
+                        .evidence
+                        .iter()
+                        .any(|e| e.contains("by USB descriptor")),
+                    "{node} {check:?}: {:?}",
+                    entry.evidence
+                );
+            }
+        }
+    }
+
+    /// The CI loopback feeder offers only YUYV and has no USB descriptor.
+    /// Its row is a dummy node exactly as before: no descriptor line.
+    #[test]
+    fn the_loopback_yuyv_feeder_row_is_unchanged() {
+        let mut feeder = facts("/dev/video8", Role::Rgb, &[b"YUYV"]);
+        feeder.driver = "v4l2loopback".into();
+        feeder.on_usb = false;
+        feeder.usb_id = None;
+        feeder.paired = false;
+        let before = node_entry_from_facts(&feeder);
+        feeder.luma_ir_check = Some(Err(IrFunctionRefusal::Unreadable));
+        let after = node_entry_from_facts(&feeder);
+        assert_eq!(after, before);
+        assert_eq!(after.class, CensusClass::DummyNode);
     }
 
     #[test]

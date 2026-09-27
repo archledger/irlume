@@ -56,6 +56,20 @@ summary lives on the [README](../README.md); this is the detail.
   settings have been retired; see [migration notes](HEAD-GESTURE-REMOVAL.md).
 - **RGB-only laptops get screen unlock only**, never `sudo`, login, or the
   keyring. By design.
+- **An RGB camera and an IR camera on separate USB devices do not pair.**
+  Some laptops, the ThinkPad T480 among them (#887), expose the colour
+  camera and the IR camera as two USB devices. irlume pairs RGB and IR only
+  within one physical camera ([ADR-0031](adr/0031-descriptor-attested-yuyv-luma-ir.md)
+  §3), so such a machine runs the RGB-only tier; enrollment and
+  authentication with both cameras refuse and say that the two nodes are on
+  different USB devices.
+- **IR cameras that stream luma in YUYV or NV12 are refused.** Those formats
+  carry no sensor ceiling irlume can measure yet, so every face attempt on
+  them falls back to the password as "IR exposure unmeasurable". A
+  YUYV-only IR camera whose USB descriptor declares it (the T480's
+  5986:1141) is classified as IR and still refused this way until its
+  exposure ceiling is measured (ADR-0031 §4). An IR camera that offers MJPG,
+  alone or beside YUYV, is not supported.
 - **Not lab-certified.** Self-tested against ISO/IEC 30107-3, with no iBeta pass.
   Demographic tuning ([FAIRNESS.md](FAIRNESS.md)) is ongoing.
 - **Root on the live machine is the trust boundary.** The daemon holds decrypted

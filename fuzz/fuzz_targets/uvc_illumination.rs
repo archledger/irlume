@@ -14,7 +14,8 @@
 //! a camera-flagged-dark frame beat a flagged-lit one while a lit one exists.
 use irlume_camera::ir_metadata::{brightest_lit, parse_illumination, Illumination};
 use irlume_camera::uvc_descriptor::{
-    active_descriptor_view, extension_units_for_interface, CameraIdentity, MS_CAMERA_CONTROL_XU,
+    active_descriptor_view, extension_units_for_interface, video_control_function,
+    CameraIdentity, MS_CAMERA_CONTROL_XU,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -55,6 +56,22 @@ fuzz_target!(|data: &[u8]| {
     // case checks meaning even when random input mostly fails framing.
     let arbitrary_view = active_descriptor_view(data, data[0]);
     assert_eq!(arbitrary_view, active_descriptor_view(data, data[0]));
+    // The role walker (ADR-0031 §1) shares the emitter parser's framing and
+    // unit parsing and must never disagree with it about units: whenever it
+    // answers at all, its units are exactly the emitter parser's. It is also
+    // deterministic, like every parser here.
+    for view in [Some(data), arbitrary_view.as_deref()].into_iter().flatten() {
+        for interface in [data[0], 0, 1, 2] {
+            let function = video_control_function(view, interface);
+            assert_eq!(function, video_control_function(view, interface));
+            if let Some(function) = function {
+                assert_eq!(
+                    function.extension_units,
+                    extension_units_for_interface(view, interface)
+                );
+            }
+        }
+    }
     if let Some(view) = arbitrary_view {
         assert!(view.len() <= data.len());
         let _ = extension_units_for_interface(&view, data[0]);

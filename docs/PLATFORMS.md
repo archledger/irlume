@@ -205,6 +205,10 @@ than assuming every desktop has the same prompt or cancellation behavior.
   that offers **only** `Y16`/`Y10`/`Y12`/`NV12`/`YUYV` is refused rather than
   untested: those formats name no sensor ceiling, so the IR exposure check
   cannot run, and irlume refuses instead of judging a frame it never read
-  (#358). No such camera has been reported; every module in the record,
-  including the two user-reported ones, offers grey.
+  (#358). The ThinkPad T480 IR camera (USB 5986:1141, #887) is the first
+  such camera reported: it offers only YUYV, irlume classifies it as IR from
+  its USB descriptor
+  ([ADR-0031](adr/0031-descriptor-attested-yuyv-luma-ir.md)), and its frames
+  are refused this way until their exposure ceiling is measured. Every other
+  module in the record offers grey.
 - musl-based distros (Alpine): untested; the release binaries assume glibc.

@@ -892,6 +892,7 @@ pub fn seal_with_pcrs(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
             private: created.out_private.to_vec(),
             pcr_values: pcr_values.clone(),
             password_wrap: None,
+            uid: None,
         })
     })
 }
@@ -1009,6 +1010,7 @@ mod envelope_version_tests {
             private: Vec::new(),
             pcr_values,
             password_wrap: None,
+            uid: None,
         }
     }
 
@@ -1166,6 +1168,7 @@ pub(crate) fn seal_authorized(secret: &[u8]) -> Result<SealedEnvelope> {
             private: created.out_private.to_vec(),
             pcr_values: pcr_values.clone(),
             password_wrap: None,
+            uid: None,
         })
     })
 }
@@ -1815,6 +1818,7 @@ fn seal_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope> {
             private: created.out_private.to_vec(),
             pcr_values: pcr_values.clone(),
             password_wrap: None,
+            uid: None,
         })
     })
 }

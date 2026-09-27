@@ -174,6 +174,109 @@ a claim of equivalence.
    *Tested:* a CLI peer asking for another user's profiles → **"not
    authorized"**.
 
+## Records belong to an account uid
+
+irlume stores each account's records under the account name. The
+enrollment (`<user>.json`), the sealed template key
+(`template-keys/<user>.json`), the keyring envelope (`keyring/<user>.json`)
+and the recovery envelope (`recovery/<user>.json`) also record the numeric
+uid of the account they were written for, as a `uid` field. On an encrypted
+store the enrollment's uid is inside the ciphertext; the sealed key and the
+envelopes carry it in their JSON beside the sealed blob. The code is
+`crates/irlume-core/src/account.rs`.
+
+Each load compares that uid with the account's current uid, resolved through
+NSS (so LDAP, SSSD and systemd-homed accounts resolve too). A request from
+the account itself (not root) passes irlumed's authorization check only when
+the name resolves to the caller's uid, so every record that request loads or
+writes is checked against, and records, the caller's uid. A root request that
+names an account resolves the name once, when irlumed starts serving it, and
+its records are checked against, and record, that uid until it ends: an
+enrollment captured, or a keyring password checked, while the name resolved
+to one account is saved or sealed for that account's uid even when the name
+resolves to another uid by the time of the write. A name no account has, or
+whose lookup fails, is looked up again by each record check. On an
+authentication request irlumed reuses the lookup it already makes for the
+retry record, so the check adds no second lookup there. A cached profile
+listing is served only while the name resolves to the uid its load used.
+
+| Record | Recorded uid differs from the current one | Current uid cannot be resolved |
+|---|---|---|
+| Enrollment and template key | The account reads as not enrolled; the key is not unsealed. `irlume enroll` enrolls again: it writes a new enrollment under a new key, and once that enrollment is saved it removes the recovery envelope of the replaced key and the added-camera store beside the replaced enrollment (an enrollment that fails to save puts the replaced key back and removes neither) | Error; face falls back to the password |
+| Keyring envelope | Not released (face or fingerprint path), not re-sealed, and not returned for a re-arm or a disarm. `irlume keyring arm` arms again; a GNOME keyring token has to be removed first with `irlume keyring forget --force` | Not released |
+| Recovery envelope | `irlume recovery restore` refuses it; `irlume recovery setup` after enrolling again writes a new one | Refused |
+
+A name that no account has any more counts as a different uid. irlumed logs
+each record it does not use, with the uids and the next step.
+
+- A record written before the uid was recorded (0.14.0 and earlier) is
+  accepted, and its next write records the uid: an enrollment write (enroll,
+  add scans, rename or delete a profile), a template key or keyring re-seal,
+  a keyring arm, or `irlume recovery setup`. A keyring envelope also records
+  it at the first login whose verified password matches the sealed secret
+  (or opens a keyring token's password wrap), in the check irlumed makes
+  when the session opens, even when neither the secret nor its TPM policy
+  changes: only the uid field is written. Such a write for a name that has
+  no account records no uid. Moving a template key to a stronger policy
+  (at irlumed's start, or on a load) keeps the uid it records, or none: the
+  name may by then resolve to another account than the one whose enrollment
+  the key opens. An enrollment write for the account does not reuse such a
+  key when the enrollment under it records another uid (the write reads the
+  stored enrollment with the key to find out), or when that enrollment
+  records no uid either (or none is stored) and the key's recovery envelope
+  records another uid: `irlume recovery setup` records the uid it wrapped
+  the key for, and the write reads only that field. As for a key sealed for
+  another uid, the account gets a new key, and the old key's recovery
+  envelope is removed once the new enrollment is saved.
+- `irlume recovery setup` does not wrap a template key for the account when
+  the enrollment under it records another uid, whatever the key records.
+  For a key that records no uid, over an enrollment that records none (or
+  none stored), the recovery envelope it would replace decides: it was set
+  up for the key it wraps, so one recorded for another uid is kept and the
+  setup refused; `irlume recovery forget` keeps such an envelope too.
+  Either refusal names the next step (`irlume enroll`, after which the
+  enrollment records the account's uid and a setup goes ahead).
+  `irlume recovery restore` seals nothing when the enrollment the restored
+  key opens records another uid.
+- A write never changes the uid a record carries. An operation that loads a
+  record and writes it back (add scans, rename a profile, delete one that is
+  not the last, turn require-eyes-open off, a template key or keyring re-seal,
+  a restore from the recovery passphrase) writes it for the uid its load
+  checked, and is refused before anything is written when the name resolves
+  to another uid, or to no account, by then. Deleting the last profile
+  removes the account's records rather than writing them. An enrollment an
+  earlier release wrote counts as its template key's uid when the key records
+  one, so its save neither records the new uid nor replaces the key. When
+  neither records one, the enrollment counts as the uid the name resolved to
+  when it was loaded, so the save is refused, rather than recording the new
+  uid on those templates, when the name resolves to another uid by then. A
+  new enrollment, key, arm or recovery envelope records the current uid.
+- When the current uid cannot be resolved, a write keeps the uid its record
+  carries, and a write that would leave a record without one (a new
+  enrollment, key, arm or recovery envelope, or the rewrite of an earlier
+  release's record) is refused before anything is written.
+- A record that is not used is never removed automatically: an account whose
+  uid changed and is changed back finds its records usable again. To remove
+  them by hand, stop irlumed and delete the account's files under
+  `/var/lib/irlume` (`<user>.json`, `cameras/<user>.json`,
+  `template-keys/<user>.json`, `recovery/<user>.json`, `keyring/<user>.json`).
+- Added-camera stores (`cameras/<user>.json`) record no uid. They are
+  encrypted under the template key and used only together with the primary
+  enrollment, whose check covers them; on a host without a TPM they are
+  plaintext, but still unusable without a primary enrollment for the uid. A
+  profile listing leaves the store out when the primary enrollment beside it
+  was recorded for another uid, or its template key was. An enrollment write
+  that replaces that enrollment removes the store, and its commit journal,
+  once the new enrollment is saved; a write that fails, or whose publication
+  is not confirmed durable, leaves them. A store left beside no primary
+  enrollment (after the last profile is deleted, or the file is removed by
+  hand) is not tied to a uid: a listing for the name shows its groups as
+  stale until they are removed.
+- Retry records (`retry/<uid>.json`) and the attempt record are kept by uid
+  already.
+- The field is additive: an older irlumed ignores it and keeps using records
+  by name.
+
 ## Disk-theft test
 
 Simulated a full exfiltration: copied **both** the encrypted enrollment and the

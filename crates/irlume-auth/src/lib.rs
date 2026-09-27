@@ -11085,6 +11085,8 @@ mod tests {
         let face2 = vec![0.0, 1.0, 0.0];
         let enr = Enrollment {
             user: "u".into(),
+            uid: None,
+            loaded_for: None,
             require_eyes_open: false,
             camera_binding: None,
             closure_calibration: None,
@@ -15995,6 +15997,8 @@ mod engine_tests {
             &dir,
             &Enrollment {
                 user: "lbuser".into(),
+                uid: None,
+                loaded_for: None,
                 require_eyes_open: false,
                 camera_binding: None,
                 closure_calibration: None,

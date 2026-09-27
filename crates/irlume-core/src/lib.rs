@@ -16,6 +16,7 @@
 //! or a random release token) is SEALED IN THE TPM, gated by PCR policy, and
 //! released only on a successful live+match, not the template itself.
 
+pub mod account;
 pub mod biopolicy;
 pub mod calib;
 pub mod crypto;
@@ -206,4 +207,26 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod testenv {
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points `IRLUME_TCTI` at a device that does not exist until dropped, so
+    /// a test whose path wrongly reaches a TPM call fails there instead of
+    /// opening the host TPM. Take [`ENV_LOCK`] first.
+    pub(crate) struct NoTpm(Option<std::ffi::OsString>);
+
+    impl NoTpm {
+        pub(crate) fn set() -> Self {
+            let previous = std::env::var_os("IRLUME_TCTI");
+            std::env::set_var("IRLUME_TCTI", "device:/nonexistent/irlume-test-tpm");
+            Self(previous)
+        }
+    }
+
+    impl Drop for NoTpm {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(previous) => std::env::set_var("IRLUME_TCTI", previous),
+                None => std::env::remove_var("IRLUME_TCTI"),
+            }
+        }
+    }
 }

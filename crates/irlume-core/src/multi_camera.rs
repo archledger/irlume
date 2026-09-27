@@ -124,6 +124,27 @@ pub fn primary_enrollment_path(user: &str) -> PathBuf {
     crate::storage::profile_path(user)
 }
 
+/// Removes `user`'s secondary store and the commit journal beside it, the
+/// journal first so that recovery cannot publish the store again
+/// ([`commit::resolve_commit`]). `Ok(false)` when neither was there.
+pub(crate) fn remove_store(user: &str) -> std::io::Result<bool> {
+    let store = secondary_store_path(user);
+    let mut removed = false;
+    for path in [commit::intent_path_for(&store), store.clone()] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if removed {
+        if let Some(dir) = store.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+    }
+    Ok(removed)
+}
+
 /// Derives a group id from the pair's device identities: stable for the
 /// same pair, unique within `existing` by suffixing. Assigned once at
 /// group creation and immutable afterwards; never a display name or list

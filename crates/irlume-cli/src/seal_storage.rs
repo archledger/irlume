@@ -511,9 +511,10 @@ pub(crate) fn guidance(
                 .collect::<String>();
             return Some(SealAdvice {
                 text: format!(
-                    "{reproducible}{dir} is on encrypted storage, which protects the sealed \
-                     secrets at rest only if that volume asks for a passphrase or PIN to unlock; a \
-                     volume the TPM or a key file unlocks alone does not count. A pcrlock policy \
+                    "{reproducible}{dir} and the installed system (/, /usr and /etc) are on \
+                     encrypted storage, which protects the sealed secrets at rest only if those \
+                     volumes ask for a passphrase or PIN to unlock; a volume the TPM or a key file \
+                     unlocks alone does not count. A pcrlock policy \
                      (Tier 2) that covers the boot loader (PCR 4) is worth having in addition: \
                      {PCRLOCK_STEPS} ({DOC})."
                 ),
@@ -573,11 +574,18 @@ fn daemon_dir(var: &str, default: std::path::PathBuf) -> Option<std::path::PathB
     }
 }
 
-/// The directories that hold what `sealed` names, each resolved by `dir`
-/// from its variable and default ([`daemon_dir`]): the keyring directory for
-/// a keyring secret and the template-key directory for a template key (each
-/// may be its own filesystem, through an override or a mount), else the
-/// state directory. `None` when one is unknown.
+/// Where the installed system keeps what it runs and the configuration it
+/// reads, each possibly its own filesystem. Changing them offline is what
+/// unseals a secret on this machine, so they count with the directories
+/// that hold the secrets.
+const SYSTEM_DIRS: [&str; 3] = ["/", "/usr", "/etc"];
+
+/// The directories whose storage decides what protects what `sealed` names,
+/// each resolved by `dir` from its variable and default ([`daemon_dir`]):
+/// the keyring directory for a keyring secret and the template-key directory
+/// for a template key (each may be its own filesystem, through an override
+/// or a mount), else the state directory, then the installed system's
+/// ([`SYSTEM_DIRS`]). `None` when one is unknown.
 fn sealed_dirs(
     sealed: &Sealed,
     dir: impl Fn(&str, std::path::PathBuf) -> Option<std::path::PathBuf>,
@@ -593,6 +601,7 @@ fn sealed_dirs(
     if dirs.is_empty() {
         dirs.push(state);
     }
+    dirs.extend(SYSTEM_DIRS.map(std::path::PathBuf::from));
     Some(dirs)
 }
 
@@ -816,8 +825,9 @@ mod tests {
         assert!(!advice.warn, "{}", advice.text);
         assert!(
             advice.text.contains(
-                "/var/lib/irlume is on encrypted storage, which protects the sealed secrets at \
-                 rest only if that volume asks for a passphrase or PIN to unlock"
+                "/var/lib/irlume and the installed system (/, /usr and /etc) are on encrypted \
+                 storage, which protects the sealed secrets at rest only if those volumes ask \
+                 for a passphrase or PIN to unlock"
             ) && advice.text.contains(STEPS),
             "{}",
             advice.text
@@ -1171,7 +1181,8 @@ mod tests {
     /// Each sealed secret's directory is its own: the keyring directory for
     /// a keyring secret, the template-key directory for a template key (or
     /// both when the daemon did not say), each as its variable resolves, and
-    /// an unknown one makes them all unknown.
+    /// an unknown one makes them all unknown. The installed system's
+    /// directories always follow.
     #[test]
     fn each_sealed_secret_is_probed_where_it_is_kept() {
         let resolve = |overrides: &'static [(&'static str, Option<&'static str>)]| {
@@ -1180,11 +1191,16 @@ mod tests {
                 None => Some(default),
             }
         };
+        let with_system = |dirs: &[PathBuf]| {
+            let mut dirs = dirs.to_vec();
+            dirs.extend(["/", "/usr", "/etc"].map(PathBuf::from));
+            Some(dirs)
+        };
         let state = irlume_common::state_dir();
         let keyring = sealed(literal(vec![7]), Some(false));
         assert_eq!(
             sealed_dirs(&keyring, resolve(&[])),
-            Some(vec![state.join("keyring")])
+            with_system(&[state.join("keyring")])
         );
         let template = Sealed {
             keyring: KeyringSeal::NotArmed,
@@ -1196,12 +1212,12 @@ mod tests {
                 &template,
                 resolve(&[("IRLUME_TEMPLATE_KEY_DIR", Some("/keys/t"))])
             ),
-            Some(vec![PathBuf::from("/keys/t")])
+            with_system(&[PathBuf::from("/keys/t")])
         );
         let both = sealed(literal(vec![7]), None);
         assert_eq!(
             sealed_dirs(&both, resolve(&[("IRLUME_STATE_DIR", Some("/srv/irlume"))])),
-            Some(vec![
+            with_system(&[
                 PathBuf::from("/srv/irlume/keyring"),
                 PathBuf::from("/srv/irlume/template-keys"),
             ])
@@ -1290,7 +1306,7 @@ mod tests {
                     && advice.text.contains(GRUB)
                     && advice
                         .text
-                        .contains("only if that volume asks for a passphrase"),
+                        .contains("only if those volumes ask for a passphrase"),
                 "{sealed:?}: {}",
                 advice.text
             );
@@ -1562,7 +1578,7 @@ mod tests {
         );
         assert_eq!(state, State::Info);
         assert!(
-            detail.contains("/srv/irlume-state is on encrypted storage") && detail.contains(GRUB),
+            detail.contains("/srv/irlume-state and the installed system") && detail.contains(GRUB),
             "{detail}"
         );
         assert_eq!(

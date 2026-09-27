@@ -110,8 +110,9 @@ matching also requires passing IR liveness; an inverted RGB image can't.)
    `irlume keyring arm` (after an arm) and `irlume doctor` (check
    `sealed-storage`) report this for the account. The storage probe looks for
    a dm-crypt layer under the directories that hold what is sealed (the
-   keyring and template-key directories, as irlumed resolves them; the
-   least protected one decides). It does not detect a drive's
+   keyring and template-key directories, as irlumed resolves them) and
+   under the installed system (`/`, `/usr` and `/etc`, which an offline
+   change would alter); the least protected one decides. It does not detect a drive's
    hardware encryption, a filesystem's own encryption or a verified root, and
    it cannot show whether a dm-crypt volume asks for a passphrase or PIN or
    unlocks from the TPM or a key file alone. The report is a warning when a

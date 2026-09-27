@@ -124,8 +124,9 @@ addition to encryption, not instead of it.
 Keyring arming stays opt-in and every tier stays supported. `irlume keyring
 arm` (after an arm) and `irlume doctor` (check `sealed-storage`) report this
 for the account's keyring secret and template key: a warning when either is
-sealed and no dm-crypt layer is found under the directory that holds it, or
-the storage cannot be established, and information whenever it is on
+sealed and no dm-crypt layer is found under the directory that holds it or
+under the installed system (`/`, `/usr`, `/etc`), or the storage cannot be
+established, and information whenever it is on
 dm-crypt,
 since the storage does not show how that volume unlocks, naming each sealed
 secret's policy another operating system may reproduce

@@ -1687,7 +1687,7 @@ fn sealed_secrets_off_encrypted_storage_are_told_the_remedies() {
     const OFFLINE: &str = "can change the installed system offline";
     const DIRECT: &str = "another operating system signed with the same keys reproduces it";
     const REMEDY: &str = "full-disk encryption unlocked by a passphrase or PIN";
-    const UNLOCK: &str = "only if that volume asks for a passphrase or PIN to unlock";
+    const UNLOCK: &str = "only if those volumes ask for a passphrase or PIN to unlock";
     const BOTH: &str = "The keyring secret and the template key that protects the face \
                         templates are sealed by the TPM";
     const TEMPLATE_KEY: &str = "The template key that protects the face templates is sealed";
@@ -1779,7 +1779,10 @@ fn sealed_secrets_off_encrypted_storage_are_told_the_remedies() {
     // information on it, since the storage does not show whether it asks
     // for a passphrase.
     let (sb, log) = sandbox("seal-tier3-both", Some(TIER_3), true, Metadata::Answered);
-    let encrypted = path_encryption(&sb.path("state")) == StorageEncryption::Encrypted;
+    // The check also counts the installed system's directories.
+    let encrypted = [sb.path("state"), "/".into(), "/usr".into(), "/etc".into()]
+        .iter()
+        .all(|dir| path_encryption(dir) == StorageEncryption::Encrypted);
     let out = arm(&sb);
     if encrypted {
         assert!(
@@ -1841,7 +1844,8 @@ fn sealed_secrets_off_encrypted_storage_are_told_the_remedies() {
 
     // A keyring secret under a pcrlock (Tier 2) policy that covers the boot
     // loader is still warned off encrypted storage, without the point on
-    // another operating system, and passes on it.
+    // another operating system, and is information on it, with the caveat on
+    // what PCR 4 measures.
     let (sb, _) = sandbox("seal-tier2", Some(TIER_2), false, Metadata::Answered);
     let out = arm(&sb);
     assert!(!out.contains("another operating system"), "{out}");
@@ -1849,13 +1853,19 @@ fn sealed_secrets_off_encrypted_storage_are_told_the_remedies() {
     let (check, _) = checks(&sb);
     assert_eq!(
         check["state"],
-        if encrypted { "pass" } else { "warn" },
+        if encrypted { "info" } else { "warn" },
         "{check}"
     );
     assert!(
         !detail(&check).contains("another operating system"),
         "{check}"
     );
+    if encrypted {
+        assert!(
+            detail(&check).contains(UNLOCK) && detail(&check).contains("PCRs 9 and 8"),
+            "{check}"
+        );
+    }
 
     // Nothing sealed: information that says so, and no note after an arm
     // the fake does not record.

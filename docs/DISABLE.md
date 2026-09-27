@@ -217,9 +217,10 @@ sudo irlume fingerprint disable
 - **In `irlume tui`:** Esc cancels guided enrollment immediately; q or Esc
   backs out of a stalled identify or self-test instead of trapping you.
 - **If you just wait:** default admission windows are 15 seconds for login/lock
-  and 10 seconds for short privileged services. On a camera pair that captures
-  sequentially, the `privileged_grouped_pad_evidence` route (on by default)
-  extends the latter to 15 seconds;
+  and 10 seconds for short privileged services. When the pair's stored
+  qualification selects a bounded PAD collection, the
+  `privileged_grouped_pad_evidence` route (on by default) extends the latter
+  to 15 seconds;
   `IRLUME_GRACE_MS` overrides either. These are admission deadlines, not fixed
   attempt counts or physical camera-off guarantees. See [bounded attempts and
   cleanup](DESKTOP-AUTH.md#bounded-attempts-and-cleanup).

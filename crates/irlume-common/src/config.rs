@@ -951,27 +951,25 @@ pub fn privileged_face_consent_required() -> bool {
 }
 
 /// Whether privileged services (`sudo`/`su`/`doas` and polkit app prompts) may
-/// run the bounded sequential PAD collection the greeter and lock screen already
-/// use (`privileged_grouped_pad_evidence`).
+/// run the bounded PAD collections the greeter and lock screen already use
+/// (`privileged_grouped_pad_evidence`): grouped sequential on a measured
+/// sequential pair, managed concurrent (ADR-0020) on a qualified concurrent one.
 ///
-/// Defaults **on**: an absent key or file lets privileged prompts use the
-/// collector. Only a pair whose stored qualification says it captures
-/// sequentially ever reaches it, so a concurrent pair is unaffected either way.
+/// Defaults **on**: an absent key or file lets privileged prompts use them.
+/// Only a pair with a conclusive stored qualification reaches either.
 /// `privileged_grouped_pad_evidence=0` turns it off; so does a value that is not
 /// one of the [`truthy`] spellings and a settings.conf this process cannot read,
 /// both of which keep the narrower pre-0.15 scope rather than guess.
 ///
-/// It exists for a camera pair that cannot capture RGB and IR concurrently.
-/// There one authentication attempt scores exactly one RGB frame, so it casts
+/// An ordinary authentication attempt scores exactly one RGB frame, so it casts
 /// one ViT vote, and the retry loop needs `VIT_PAD_VOTE_N` observed-cost
-/// attempts to fill the vote ring. That fits a budget large enough for them —
-/// the ordinary path does complete when it fits — but not the privileged
-/// default, and not the login window either on a pair whose attempt costs
-/// several seconds: the request settles as `RgbPadPending` with the ring part
-/// filled. The greeter and lock screen avoid the arithmetic entirely because the
-/// grouped collector gathers the whole vote window inside one transaction, at
-/// one attempt's cost; this key lets `sudo` and polkit use the same collector
-/// rather than pay for five.
+/// attempts to fill the vote ring, each re-opening the cameras. That fits a
+/// budget large enough for them, but not the privileged default on a pair whose
+/// attempt costs seconds: the request settles as `RgbPadPending` with the ring
+/// part filled. The greeter and lock screen avoid the arithmetic because both
+/// collectors gather the whole vote window inside one transaction, at one
+/// attempt's cost; this key lets `sudo` and polkit use them rather than pay for
+/// five.
 ///
 /// Turning it on changes WHICH SERVICES may collect the evidence, never how much
 /// evidence a grant needs: the full vote window still has to close, and every

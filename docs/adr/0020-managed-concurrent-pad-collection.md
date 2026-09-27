@@ -42,7 +42,8 @@ identity score.
 
 Eligibility requires the live runtime pair contract, enabled IR and both PAD
 models, non-demoted concurrent authority, and the existing login/lock operation
-and grace-window scope. Stored measured concurrent qualification permits
+and grace-window scope. (Amended 2026-09-26: the privileged prompts join that
+scope under `privileged_grouped_pad_evidence`; see the amendment below.) Stored measured concurrent qualification permits
 automatic selection. The existing explicit concurrent override can exercise
 this path under the same runtime validation without changing stored
 qualification. Grouped sequential, IR-only, RGB-only, enrollment and support
@@ -85,3 +86,27 @@ concurrent skew limit and identity thresholds do not change.
 - Deterministic transport, provenance, policy and cleanup tests complement
   attended hardware comparisons. They do not establish camera stability or
   additional spoof resistance on their own.
+
+## Amendment 2026-09-26: privileged prompts
+
+`sudo`, `su`, `doas` and polkit prompts may use this collector on a pair whose
+stored qualification is qualified concurrent, under the same owner setting
+that already admits them to the grouped sequential collector,
+`privileged_grouped_pad_evidence`, which now defaults on (`0` turns it off for
+both collectors). Such a request reserves the login grace window through the
+same metadata-only hint the grouped route uses, now reading either conclusive
+verdict from the stored record, because the collector keeps its
+`window >= GRACE_WINDOW_MS` gate. Credential release keeps the local login and
+lock scope.
+
+Measured on the NexiGo N930W pair on archhost (maintainer present): the lock
+screen granted in 6.7 and 8.1 s through this collector, while `sudo`, left on
+the ordinary path with one ViT vote per attempt, timed out three times inside
+the old 5-second privileged window and was refused as liveness twice inside a
+10-second one, each attempt paying about 4 s of rate establishment. The
+privileged prompts ask for a typed `yes` before any scan (ADR-0010), so the
+longer reservation is spent only after the person at the prompt chose face.
+
+Nothing downstream moves: the rate window, the five-sample bound, PAD
+operating points, the skew limit and identity thresholds are the lock
+screen's, and every other rule of this ADR applies unchanged.

@@ -25,9 +25,17 @@ pub(super) fn eligible(
             window,
             purpose,
             service,
+            irlume_common::config::privileged_grouped_pad_evidence_enabled(),
         )
 }
 
+// The owner's setting is read by the caller, as for the grouped collector, so
+// this stays a pure policy decision testable without a config file.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the privileged setting is read by the caller so this stays a pure \
+              policy decision, testable without a config file on the test host"
+)]
 pub(super) fn eligible_configuration(
     mode: &CaptureModeSelection,
     has_ir: bool,
@@ -36,6 +44,7 @@ pub(super) fn eligible_configuration(
     window: u64,
     purpose: AuthenticationPurpose,
     service: Option<&str>,
+    privileged_opt_in: bool,
 ) -> bool {
     let service_kind = service.and_then(irlume_common::pam_service::classify);
     let local_session = matches!(
@@ -45,10 +54,23 @@ pub(super) fn eligible_configuration(
                 | irlume_common::pam_service::ServiceKind::ScreenUnlock
         )
     );
+    // `privileged_grouped_pad_evidence` (on by default) admits the privileged
+    // prompts here as it does to the grouped collector (ADR-0020 amendment
+    // 2026-09-26). Scope only: every sample, threshold and vote count below is
+    // the lock screen's. Credential release stays with the local login and
+    // lock services.
+    let privileged = privileged_opt_in
+        && matches!(
+            service_kind,
+            Some(
+                irlume_common::pam_service::ServiceKind::Elevation
+                    | irlume_common::pam_service::ServiceKind::AppConsent
+            )
+        );
     let in_scope = match purpose {
-        AuthenticationPurpose::Verify => local_session || service_kind.is_none(),
+        AuthenticationPurpose::Verify => local_session || privileged || service_kind.is_none(),
         AuthenticationPurpose::CredentialRelease => local_session,
-        AuthenticationPurpose::AppConsent => false,
+        AuthenticationPurpose::AppConsent => privileged,
     };
     let authority = mode.source == ENV_CAPTURE_MODE_SOURCE
         || (mode.source == STORED_CAPTURE_MODE_SOURCE

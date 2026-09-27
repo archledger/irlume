@@ -545,44 +545,45 @@ word. Do it only if you accept what follows: every
 and one run from a script. Passive PAD still applies, and the password still
 works.
 
-### Privileged face on a camera pair that captures sequentially
+### Privileged face and PAD evidence collection
 
-On a camera pair that cannot capture RGB and IR at the same time, a single
-attempt scores one RGB frame, so it casts one of the five ViT votes the RGB PAD
-decision needs. The ordinary retry loop does fill that ring when the budget
-holds five attempts of the observed cost, but the privileged default is 10
-seconds, and on a pair whose attempt costs several seconds even the 15-second
-login window does not hold five, so the request settles as `collecting RGB PAD
+An ordinary face attempt scores one RGB frame, so it casts one of the five ViT
+votes the RGB PAD decision needs. Filling that ring takes five attempts of the
+observed cost, and each attempt opens the cameras and establishes their stream
+rates again (about 4 s on a NexiGo N930W). The privileged default is 10
+seconds, so on most USB pairs the request settles as `collecting RGB PAD
 evidence` with no score (the attempt record files it as `liveness-refused`).
-The greeter and lock screen never pay that arithmetic: grouped collection
-gathers the whole vote window inside one transaction, at one attempt's cost.
-`camera-tune` or `irlume camera-mode` reports such a pair as
-`measured_sequential`.
+The greeter and lock screen never pay that arithmetic: they gather the whole
+vote window inside one transaction, at one attempt's cost, through grouped
+collection on a pair `camera-tune` or `irlume camera-mode` reports as
+`measured_sequential`, or managed concurrent collection (ADR-0020) on one it
+reports as `qualified_concurrent`.
 
-`sudo`, `su`, `doas` and polkit use the same collection on such a pair by
-default (`privileged_grouped_pad_evidence`, on since 0.15). Eligible privileged
-dual-camera requests may reserve its login grace window using a metadata-only
-hint from the pair's validated stored sequential record. No camera is opened for that hint. Opt-out, experimental
-IR-only, missing-model, forced-schedule and explicit-window cases skip it;
-missing, mismatched or invalid records keep the short default. The window starts
+`sudo`, `su`, `doas` and polkit use the same collections by default
+(`privileged_grouped_pad_evidence`, on since 0.15). Eligible privileged
+dual-camera requests may reserve the login grace window using a metadata-only
+hint from the pair's validated stored qualification record. No camera is
+opened for that hint. Opt-out, experimental IR-only, missing-model,
+forced-schedule and explicit-window cases skip it; missing, mismatched,
+inconclusive or invalid records keep the short default. The window starts
 before configuration/hint reads, and an explicit `IRLUME_GRACE_MS` still decides
 the budget on its own. The hint is not capture qualification: a changed live
-stream contract or later runtime demotion can still prevent grouped collection
+stream contract or later runtime demotion can still prevent either collection
 while that request retains its already chosen deadline.
 Evidence requirements do not move: the full vote window still has to close
 before a grant, and every PAD and liveness threshold is unchanged. Two costs are
 real. A privileged authentication takes as long as that collection (measured at
-6.4 to 7.3 s on sequential pairs, including a Logitech BRIO), and a *refused*
-attempt holds the camera for the login window rather than the short one before
-the password prompt appears. Credential release is not widened: a sealed secret
+6.4 to 7.3 s on sequential pairs, including a Logitech BRIO, and 6.7 to 8.1 s
+for the concurrent NexiGo N930W at the lock screen), and a *refused* attempt
+holds the camera for the login window rather than the short one before the
+password prompt appears. Credential release is not widened: a sealed secret
 still requires a recognized local login or lock service.
 
 To keep privileged prompts on the short window, where such a pair casts one
-vote per attempt and does not finish, set `privileged_grouped_pad_evidence=0` in
-`/etc/irlume/settings.conf` (or `IRLUME_PRIVILEGED_GROUPED_PAD=0`). A value that
-is not `1`, `true`, `yes` or `on`, and a settings file the daemon cannot read,
-read as off too. A pair that captures RGB and IR concurrently never takes this
-route either way.
+vote per attempt and seldom finishes, set `privileged_grouped_pad_evidence=0`
+in `/etc/irlume/settings.conf` (or `IRLUME_PRIVILEGED_GROUPED_PAD=0`). A value
+that is not `1`, `true`, `yes` or `on`, and a settings file the daemon cannot
+read, read as off too.
 
 ### Choosing privileged face confirmation
 
@@ -757,7 +758,7 @@ live in them; sealed envelopes are stored separately (see
 
 | File | Holds | Written by |
 |---|---|---|
-| `/etc/irlume/settings.conf` | `face_sensor_policy=ir-only-experimental` is the explicit experimental IR-only opt-in; absence selects dual, while malformed or unreadable policy fails closed. `privileged_face_consent=0` is the machine owner's waiver of the literal `yes` on privileged services, so the scan starts when the privileged PAM prompt appears, with no per-attempt word (default on: the confirmation is required, and an unreadable settings file keeps it). `privileged_grouped_pad_evidence` lets privileged services (`sudo`/`su`/`doas` and polkit) use the bounded sequential PAD collection the greeter and lock screen already use, with the login grace window that collection requires, for a camera pair that cannot capture RGB and IR concurrently (default on since 0.15; `0` turns it off, and a value that is not an on spelling or an unreadable file reads as off; it widens which services may collect the evidence, never how much evidence a grant needs; the longer budget applies only to requests that can use that collection, an explicit `IRLUME_GRACE_MS` still wins, and credential release is unchanged). `enforce_biopolicy=1` opts into operation-class gating; `forbid_external_cameras=1` restricts face authentication to cameras the kernel reports as `removable: fixed` (internal only; `removable: unknown` fails closed to the password, mirroring Windows ShouldForbidExternalCameras post-CVE-2021-34466); the legacy `third_party_pad` / `third_party_recognizer` keys are ignored with a startup notice (the third-party lane was removed, ADR-0015). Head-gesture settings are retired and ignored; see [migration notes](HEAD-GESTURE-REMOVAL.md) | `sudo irlume auth sensor ...` for the sensor policy; TUI Settings for the other listed settings |
+| `/etc/irlume/settings.conf` | `face_sensor_policy=ir-only-experimental` is the explicit experimental IR-only opt-in; absence selects dual, while malformed or unreadable policy fails closed. `privileged_face_consent=0` is the machine owner's waiver of the literal `yes` on privileged services, so the scan starts when the privileged PAM prompt appears, with no per-attempt word (default on: the confirmation is required, and an unreadable settings file keeps it). `privileged_grouped_pad_evidence` lets privileged services (`sudo`/`su`/`doas` and polkit) use the bounded PAD collections the greeter and lock screen already use (grouped on a measured sequential pair, managed concurrent on a qualified concurrent one), with the login grace window those collections require (default on since 0.15; `0` turns it off, and a value that is not an on spelling or an unreadable file reads as off; it widens which services may collect the evidence, never how much evidence a grant needs; the longer budget applies only to requests that can use that collection, an explicit `IRLUME_GRACE_MS` still wins, and credential release is unchanged). `enforce_biopolicy=1` opts into operation-class gating; `forbid_external_cameras=1` restricts face authentication to cameras the kernel reports as `removable: fixed` (internal only; `removable: unknown` fails closed to the password, mirroring Windows ShouldForbidExternalCameras post-CVE-2021-34466); the legacy `third_party_pad` / `third_party_recognizer` keys are ignored with a startup notice (the third-party lane was removed, ADR-0015). Head-gesture settings are retired and ignored; see [migration notes](HEAD-GESTURE-REMOVAL.md) | `sudo irlume auth sensor ...` for the sensor policy; TUI Settings for the other listed settings |
 | `/etc/irlume/cameras.conf` | the pinned camera pair: `rgb=` / `ir=` device nodes, and `rgb_id=` / `ir_id=` USB identities (`vid:pid[:serial]`) that find the pair again when the nodes are renumbered. Legacy `capture_mode.*` lines are kept and no longer read. At start `irlumed` logs a warning for a camera key set on more than one line or holding a line break or control character, a line without `=`, an unrecognized key, or a file it cannot read | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
 | `/etc/irlume/method` | one line: the active auth method (`auto`, `face`, `fingerprint`, or `both` = face OR fingerprint) | `irlume fingerprint enable/disable` |
 | `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter | `irlume ir-setup` |

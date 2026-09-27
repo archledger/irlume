@@ -312,16 +312,20 @@ All notable changes to irlume are documented here. This project adheres to
 ### Changed
 
 - Face at `sudo`, `su`, `doas` and polkit prompts gets 10 seconds instead of
-  5, and on a camera pair that captures RGB and IR one after the other those
-  prompts use the grouped PAD collection by default
-  (`privileged_grouped_pad_evidence`, now on; `0` turns it off). With 5
-  seconds a concurrent NexiGo N930W, which needs about 4 s to establish its
-  stream rates and grants the lock screen in 6.7 to 8.1 s, could not finish,
-  and a sequential Logitech BRIO settled each attempt as `collecting RGB PAD
-  evidence`; with the grouped collection the BRIO granted `sudo` 4 times out
-  of 4 in 6.4 to 6.6 s. Evidence requirements and thresholds do not change. A
-  refused attempt now waits up to 10 s (15 s on a sequential pair) before the
-  password prompt. Maintainer decision from the 2026-09-26 hardware session.
+  5, and those prompts use the bounded PAD collections the greeter and lock
+  screen use by default (`privileged_grouped_pad_evidence`, now on; `0` turns
+  it off): grouped collection on a measured sequential pair, as before when
+  opted in, and now also managed concurrent collection on a qualified
+  concurrent pair (ADR-0020 amendment 2026-09-26), each reserving the login
+  window. An ordinary attempt casts one of the five RGB PAD votes, so neither
+  a sequential Logitech BRIO nor a concurrent NexiGo N930W (about 4 s of
+  stream start-up per attempt) could finish at `sudo`; with the grouped
+  collection the BRIO granted `sudo` 3 times out of 3 with the setting absent
+  (6.5 to 8.7 s), and the NexiGo grants the lock screen through the managed
+  collection in 6.7 to 8.1 s. Evidence requirements and thresholds do not
+  change. A refused attempt now waits up to 10 s (15 s when a collection
+  applies) before the password prompt. Maintainer decisions from the
+  2026-09-26 hardware session.
 
 ### Fixed
 

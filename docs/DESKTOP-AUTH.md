@@ -81,7 +81,8 @@ required scan durations. A completed denial or a retry that cannot fit may finis
 earlier. `IRLUME_GRACE_MS` remains the explicit 0–60000 ms override; zero retains
 legacy single-attempt behavior. `privileged_grouped_pad_evidence` (on by
 default; `0` turns it off) extends the ten-second privileged window to 15
-seconds when the eligible sequential grouped-PAD route needs it.
+seconds when the pair's stored qualification selects grouped sequential or
+managed concurrent PAD collection.
 An explicit `IRLUME_GRACE_MS` still wins. A measured
 fixed-startup empty-view IR capture on one Minihost took about 5.5 seconds before
 identity work, so prerequisite-ready did not imply the then five-second services

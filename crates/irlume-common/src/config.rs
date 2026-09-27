@@ -170,6 +170,26 @@ pub fn observe_kv(file: &str, key: &str) -> KvObservation {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return KvObservation::Absent,
         Err(e) => return KvObservation::Unknown(e),
     };
+    match scan_kv(&text, key) {
+        KvLine::Value(v) => KvObservation::Value(v.to_string()),
+        KvLine::Empty | KvLine::Absent => KvObservation::Absent,
+    }
+}
+
+/// How `key` appears in one snapshot of a `key=value` file.
+enum KvLine<'a> {
+    /// The first line naming the key with a non-empty value has this one.
+    Value(&'a str),
+    /// Lines name the key, all with an empty value (`key=`).
+    Empty,
+    /// No line names the key.
+    Absent,
+}
+
+/// The one line grammar [`observe_kv`] reads: blank and `#` lines skipped, the
+/// first non-empty value of `key` wins.
+fn scan_kv<'a>(text: &'a str, key: &str) -> KvLine<'a> {
+    let mut named = false;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -179,12 +199,17 @@ pub fn observe_kv(file: &str, key: &str) -> KvObservation {
             if k.trim() == key {
                 let v = v.trim();
                 if !v.is_empty() {
-                    return KvObservation::Value(v.to_string());
+                    return KvLine::Value(v);
                 }
+                named = true;
             }
         }
     }
-    KvObservation::Absent
+    if named {
+        KvLine::Empty
+    } else {
+        KvLine::Absent
+    }
 }
 
 /// Read a single key from a `key=value` file. Returns the trimmed value, or
@@ -951,38 +976,62 @@ pub fn privileged_face_consent_required() -> bool {
 }
 
 /// Whether privileged services (`sudo`/`su`/`doas` and polkit app prompts) may
-/// run the bounded sequential PAD collection the greeter and lock screen already
-/// use (`privileged_grouped_pad_evidence`).
+/// run the bounded PAD collections the greeter and lock screen already use
+/// (`privileged_grouped_pad_evidence`): grouped sequential on a measured
+/// sequential pair, managed concurrent (ADR-0020) on a qualified concurrent one.
 ///
-/// Defaults **off**, and an unreadable settings.conf reads as off, so without the
-/// key privileged surfaces behave exactly as they do upstream.
+/// Defaults **on**: an absent key or file lets privileged prompts use them.
+/// Only a pair with a conclusive stored qualification reaches either.
+/// `privileged_grouped_pad_evidence=0` turns it off; so does a value that is not
+/// one of the [`truthy`] spellings and a settings.conf this process cannot read,
+/// both of which keep the narrower pre-0.15 scope rather than guess.
 ///
-/// It exists for a camera pair that cannot capture RGB and IR concurrently.
-/// There one authentication attempt scores exactly one RGB frame, so it casts
+/// An ordinary authentication attempt scores exactly one RGB frame, so it casts
 /// one ViT vote, and the retry loop needs `VIT_PAD_VOTE_N` observed-cost
-/// attempts to fill the vote ring. That fits a budget large enough for them —
-/// the ordinary path does complete when it fits — but not the privileged
-/// default, and not the login window either on a pair whose attempt costs
-/// several seconds: the request settles as `RgbPadPending` with the ring part
-/// filled. The greeter and lock screen avoid the arithmetic entirely because the
-/// grouped collector gathers the whole vote window inside one transaction, at
-/// one attempt's cost; this key lets `sudo` and polkit use the same collector
-/// rather than pay for five.
+/// attempts to fill the vote ring, each re-opening the cameras. That fits a
+/// budget large enough for them, but not the privileged default on a pair whose
+/// attempt costs seconds: the request settles as `RgbPadPending` with the ring
+/// part filled. The greeter and lock screen avoid the arithmetic because both
+/// collectors gather the whole vote window inside one transaction, at one
+/// attempt's cost; this key lets `sudo` and polkit use them rather than pay for
+/// five.
 ///
 /// Turning it on changes WHICH SERVICES may collect the evidence, never how much
 /// evidence a grant needs: the full vote window still has to close, and every
 /// liveness and PAD threshold is untouched.
 #[must_use]
 pub fn privileged_grouped_pad_evidence_enabled() -> bool {
-    // Opt-in, so only an explicit affirmative turns it on: a typo, an empty or a
-    // non-Unicode value leaves the upstream scope in place.
+    // On unless something says otherwise, but a set value must be an explicit
+    // affirmative: a typo, an empty or a non-Unicode value keeps the narrower
+    // scope, as does a settings.conf this process cannot read.
     if let Some(v) = std::env::var_os("IRLUME_PRIVILEGED_GROUPED_PAD") {
         return v.to_str().is_some_and(truthy);
     }
-    matches!(
-        observe_kv("settings.conf", "privileged_grouped_pad_evidence"),
-        KvObservation::Value(v) if truthy(&v)
-    )
+    // One read decides, so a settings.conf replaced meanwhile cannot mix two
+    // versions. Unlike `observe_kv`, `key=` is a set value that is not an
+    // affirmative, and a name that exists without resolving is a policy that
+    // cannot be read.
+    let path = config_path("settings.conf");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match scan_kv(&text, "privileged_grouped_pad_evidence") {
+            KvLine::Value(v) => truthy(v),
+            KvLine::Empty => false,
+            KvLine::Absent => true,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => no_dangling_link_on(&path),
+        Err(_) => false,
+    }
+}
+
+/// Whether a `NotFound` for `path` is a plain absence: no component of it,
+/// from the file up through the configuration directory, is a name that exists
+/// without resolving. A dangling symlink at `settings.conf` or at
+/// `/etc/irlume` itself (for example to a volume not mounted yet) is
+/// configuration that cannot be read, as [`observe_camera_conf`] treats it.
+fn no_dangling_link_on(path: &std::path::Path) -> bool {
+    path.ancestors()
+        .filter(|p| !p.as_os_str().is_empty())
+        .all(|p| std::fs::symlink_metadata(p).is_err() || std::fs::metadata(p).is_ok())
 }
 
 #[cfg(test)]
@@ -1021,11 +1070,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The grouped-PAD scope key is the mirror image of the consent one: it
-    /// widens which services may collect evidence, so only an explicit
-    /// affirmative turns it on and everything else leaves upstream scope alone.
+    /// The grouped-PAD scope key defaults on, but a value that is set must be
+    /// an explicit affirmative: `0`, a typo and an unreadable file all keep the
+    /// narrower scope.
     #[test]
-    fn privileged_grouped_pad_defaults_off_and_env_wins_over_settings() {
+    fn privileged_grouped_pad_defaults_on_and_env_wins_over_settings() {
         let _g = testenv::lock();
         let dir = std::env::temp_dir().join(format!("irlume-cfg-grouped-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1033,12 +1082,62 @@ mod tests {
         std::env::set_var("IRLUME_CONFIG_DIR", &dir);
         std::env::remove_var("IRLUME_PRIVILEGED_GROUPED_PAD");
 
-        // Absent key and absent file: upstream scope.
+        // Absent file, then a file without the key: on.
+        assert!(privileged_grouped_pad_evidence_enabled());
+        write_kv("settings.conf", "face_sensor_policy", "dual").unwrap();
+        assert!(privileged_grouped_pad_evidence_enabled());
+
+        // The owner's opt-out.
+        write_kv("settings.conf", "privileged_grouped_pad_evidence", "0").unwrap();
         assert!(!privileged_grouped_pad_evidence_enabled());
 
-        // An unrecognized value is not an opt-in.
+        // An unrecognized value is not an affirmative.
         write_kv("settings.conf", "privileged_grouped_pad_evidence", "maybe").unwrap();
         assert!(!privileged_grouped_pad_evidence_enabled());
+
+        // Neither is an empty one, which the plain reader calls absent.
+        std::fs::write(
+            dir.join("settings.conf"),
+            "face_sensor_policy=dual\nprivileged_grouped_pad_evidence=\n",
+        )
+        .unwrap();
+        assert!(!privileged_grouped_pad_evidence_enabled());
+        std::fs::write(
+            dir.join("settings.conf"),
+            "# privileged_grouped_pad_evidence=\nface_sensor_policy=dual\n",
+        )
+        .unwrap();
+        assert!(
+            privileged_grouped_pad_evidence_enabled(),
+            "a commented-out key is absent"
+        );
+
+        // A settings.conf that names a missing target cannot be read, so it
+        // is not an absent file.
+        std::fs::remove_file(dir.join("settings.conf")).unwrap();
+        std::os::unix::fs::symlink(dir.join("not-mounted"), dir.join("settings.conf")).unwrap();
+        assert!(!privileged_grouped_pad_evidence_enabled());
+        std::fs::remove_file(dir.join("settings.conf")).unwrap();
+        assert!(
+            privileged_grouped_pad_evidence_enabled(),
+            "a missing name is absent"
+        );
+
+        // A settings.conf this process cannot read (a directory at its path;
+        // mode 000 does not stop root) keeps the narrower scope.
+        std::fs::create_dir(dir.join("settings.conf")).unwrap();
+        assert!(!privileged_grouped_pad_evidence_enabled());
+        std::fs::remove_dir(dir.join("settings.conf")).unwrap();
+
+        // So does a configuration directory that is itself a dangling symlink;
+        // one that is simply missing is absent.
+        let linked = dir.join("linked-config");
+        std::os::unix::fs::symlink(dir.join("not-mounted"), &linked).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &linked);
+        assert!(!privileged_grouped_pad_evidence_enabled());
+        std::env::set_var("IRLUME_CONFIG_DIR", dir.join("never-created"));
+        assert!(privileged_grouped_pad_evidence_enabled());
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
 
         write_kv("settings.conf", "privileged_grouped_pad_evidence", "1").unwrap();
         assert!(privileged_grouped_pad_evidence_enabled());

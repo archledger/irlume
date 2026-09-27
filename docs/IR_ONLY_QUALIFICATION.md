@@ -220,9 +220,10 @@ target/model/enrollment binding, mandatory IR PAD, consent, password fallback,
 cancellation and late-result rejection, durable retry/recovery accounting, and
 credential release. Production derives its own ordinary authentication outcome; it
 does not grant from the diagnostic category. Camera-free preflight establishes
-prerequisites only. The existing product windows remain 15 seconds for login/lock
-and 5 seconds for short privileged services; a measured fixed-startup Minihost
-empty-view capture of about 5.5 seconds exceeded that short window before identity.
+prerequisites only. The product windows are 15 seconds for login/lock and 10
+seconds for short privileged services (5 seconds when this was measured); a
+measured fixed-startup Minihost empty-view capture of about 5.5 seconds exceeded
+that short window before identity.
 The target-bound IR route now uses the existing adaptive startup strategy: it
 measures the full 30-interval rate window first and uses up to ten additional
 dequeues if that window is too slow. The rate floor, continuity, metadata binding

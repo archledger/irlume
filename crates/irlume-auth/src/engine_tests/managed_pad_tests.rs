@@ -267,42 +267,74 @@ fn concurrent_mode() -> CaptureModeSelection {
 
 #[test]
 fn managed_eligibility_preserves_authority_models_service_and_window_scope() {
+    // (service, local or unknown, credential release, privileged prompt)
     for source in [
         STORED_CAPTURE_MODE_SOURCE,
         ENV_CAPTURE_MODE_SOURCE,
         "default",
         RUNTIME_CAPTURE_MODE_SOURCE,
     ] {
-        for (service, verify, release) in [
-            (Some("login"), true, true),
-            (Some("kde-fingerprint"), true, true),
-            (None, true, false),
-            (Some("unknown-local-service"), true, false),
-            (Some("sudo"), false, false),
-            (Some("sshd"), false, false),
+        for (service, local, release, privileged) in [
+            (Some("login"), true, true, false),
+            (Some("kde-fingerprint"), true, true, false),
+            (None, true, false, false),
+            (Some("unknown-local-service"), true, false, false),
+            (Some("sudo"), false, false, true),
+            (Some("polkit-1"), false, false, true),
+            (Some("sshd"), false, false, false),
         ] {
-            let mut mode = concurrent_mode();
-            mode.source = source;
-            for purpose in [
-                AuthenticationPurpose::Verify,
-                AuthenticationPurpose::CredentialRelease,
-                AuthenticationPurpose::AppConsent,
-            ] {
-                let purpose_allowed = match purpose {
-                    AuthenticationPurpose::Verify => verify,
-                    AuthenticationPurpose::CredentialRelease => release,
-                    AuthenticationPurpose::AppConsent => false,
-                };
-                assert_eq!(
-                    crate::managed_pad::eligible_configuration(
-                        &mode, true, true, true, 15_000, purpose, service
-                    ),
-                    purpose_allowed
-                        && matches!(source, STORED_CAPTURE_MODE_SOURCE | ENV_CAPTURE_MODE_SOURCE)
-                );
+            for opt_in in [false, true] {
+                let mut mode = concurrent_mode();
+                mode.source = source;
+                for purpose in [
+                    AuthenticationPurpose::Verify,
+                    AuthenticationPurpose::CredentialRelease,
+                    AuthenticationPurpose::AppConsent,
+                ] {
+                    let purpose_allowed = match purpose {
+                        AuthenticationPurpose::Verify => local || (opt_in && privileged),
+                        AuthenticationPurpose::CredentialRelease => release,
+                        AuthenticationPurpose::AppConsent => opt_in && privileged,
+                    };
+                    assert_eq!(
+                        crate::managed_pad::eligible_configuration(
+                            &mode, true, true, true, 15_000, purpose, service, opt_in
+                        ),
+                        purpose_allowed
+                            && matches!(
+                                source,
+                                STORED_CAPTURE_MODE_SOURCE | ENV_CAPTURE_MODE_SOURCE
+                            ),
+                        "{service:?} {purpose:?} opt_in={opt_in} source={source}"
+                    );
+                }
             }
         }
     }
+    // A privileged prompt the setting admits still needs the login window and
+    // a concurrent pair.
+    let mut mode = concurrent_mode();
+    assert!(!crate::managed_pad::eligible_configuration(
+        &mode,
+        true,
+        true,
+        true,
+        14_999,
+        AuthenticationPurpose::Verify,
+        Some("sudo"),
+        true
+    ));
+    mode.sequential = true;
+    assert!(!crate::managed_pad::eligible_configuration(
+        &mode,
+        true,
+        true,
+        true,
+        15_000,
+        AuthenticationPurpose::AppConsent,
+        Some("polkit-1"),
+        true
+    ));
     let mut mode = concurrent_mode();
     assert!(
         !crate::managed_pad::eligible(
@@ -329,7 +361,8 @@ fn managed_eligibility_preserves_authority_models_service_and_window_scope() {
             ir_pad,
             window,
             AuthenticationPurpose::Verify,
-            Some("login")
+            Some("login"),
+            false
         ));
     }
     mode.qualification_state = irlume_common::diagnostics::QualificationState::MeasuredSequential;
@@ -340,7 +373,8 @@ fn managed_eligibility_preserves_authority_models_service_and_window_scope() {
         true,
         15_000,
         AuthenticationPurpose::Verify,
-        Some("login")
+        Some("login"),
+        false
     ));
     mode.source = ENV_CAPTURE_MODE_SOURCE;
     assert!(crate::managed_pad::eligible_configuration(
@@ -350,7 +384,8 @@ fn managed_eligibility_preserves_authority_models_service_and_window_scope() {
         true,
         15_000,
         AuthenticationPurpose::Verify,
-        Some("login")
+        Some("login"),
+        false
     ));
     mode.operation_demoted.set(true);
     assert!(!crate::managed_pad::eligible_configuration(
@@ -360,7 +395,8 @@ fn managed_eligibility_preserves_authority_models_service_and_window_scope() {
         true,
         15_000,
         AuthenticationPurpose::Verify,
-        Some("login")
+        Some("login"),
+        false
     ));
 }
 

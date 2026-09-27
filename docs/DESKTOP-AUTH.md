@@ -72,18 +72,21 @@ is inactive because the primary enrollment changed reports
 ## Bounded attempts and cleanup
 
 One monotonic authentication window covers engine setup, presence retries and
-final daemon response admission. The normal defaults are unchanged: 15 seconds
-for login, lock, and unknown services; 5 seconds for short privileged services
-including sudo, doas, and polkit. These are maximum admission windows, not
+final daemon response admission. The defaults are 15 seconds for login, lock,
+and unknown services and 10 seconds for short privileged services including
+sudo, doas, and polkit (5 seconds before 0.15: a concurrent pair that needs
+about 4 seconds to establish its stream rates could not finish inside it). These
+are maximum admission windows, not
 required scan durations. A completed denial or a retry that cannot fit may finish
 earlier. `IRLUME_GRACE_MS` remains the explicit 0–60000 ms override; zero retains
-legacy single-attempt behavior. The separate owner opt-in
-`privileged_grouped_pad_evidence` can extend a default five-second privileged
-window to 15 seconds when the eligible sequential grouped-PAD route needs it.
+legacy single-attempt behavior. `privileged_grouped_pad_evidence` (on by
+default; `0` turns it off) extends the ten-second privileged window to 15
+seconds when the pair's stored qualification selects grouped sequential or
+managed concurrent PAD collection.
 An explicit `IRLUME_GRACE_MS` still wins. A measured
 fixed-startup empty-view IR capture on one Minihost took about 5.5 seconds before
-identity work, so prerequisite-ready does not imply the five-second services can
-complete. The target-bound IR route now uses adaptive startup while retaining the
+identity work, so prerequisite-ready did not imply the then five-second services
+could complete. The target-bound IR route now uses adaptive startup while retaining the
 full 30-interval rate window, rate floor and continuity checks. Healthy startup
 can avoid the fixed ten-dequeue exclusion; a slow stream can use up to ten extra
 dequeues before the ordinary delivery gate accepts or refuses it. IR-only opt-in

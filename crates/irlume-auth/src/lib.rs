@@ -975,10 +975,13 @@ pub const GRACE_WINDOW_MS: u64 = 15000;
 // an effectively unlimited presence window. This is an operator policy bound,
 // not a latency target; ordinary service defaults remain substantially shorter.
 const MAX_GRACE_OVERRIDE_MS: u64 = 60_000;
-/// Shorter window for `sudo` (and `su`): at a terminal the user is already
-/// looking at the screen, so a match lands on the first attempt; if they look
-/// away they want a quick drop to the password prompt, not a long freeze.
-pub const SUDO_GRACE_WINDOW_MS: u64 = 5000;
+/// Shorter window for `sudo`, `su`, `doas` and polkit: the user typed `yes` at
+/// the prompt and is looking at the screen, so a refused attempt should drop to
+/// the password prompt sooner than a greeter does. Ten seconds, not the earlier
+/// five: a concurrent pair that needs about 4 s to establish its stream rates
+/// (NexiGo N930W, 2026-09-26) granted the lock screen in 6.7 to 8.1 s and could
+/// never finish inside five. A grant still returns as soon as it is decided.
+pub const SUDO_GRACE_WINDOW_MS: u64 = 10_000;
 
 /// The longest a capture path wired through [`irlume_camera::Progress`] can go
 /// without reporting watchdog progress (#336), against ANY defined camera
@@ -1167,18 +1170,19 @@ fn default_grace_window_ms(service: Option<&str>) -> u64 {
 /// The privileged budget a request actually needs, once its capture route is
 /// known: `Some(ms)` to replace a short privileged window, `None` to keep it.
 ///
-/// The short window is sized for an attempt that casts the whole ViT vote window
-/// in one capture session (#362 measured what a needlessly long one costs: a
-/// refused attempt holds the camera and the worker before the password prompt).
-/// A pair that can only capture sequentially casts one vote per attempt, so the
-/// owner who opts into `privileged_grouped_pad_evidence` needs the grouped
-/// collector — and that collector is itself gated on
-/// `window >= GRACE_WINDOW_MS`, so nothing would change without this.
+/// The short window is kept short because a refused attempt holds the camera
+/// and the worker before the password prompt (#362). An ordinary attempt casts
+/// one ViT vote, though, so a privileged request only closes the five-vote
+/// window through one of the two bounded collections the greeter and lock
+/// screen use: grouped sequential on a measured sequential pair, managed
+/// concurrent (ADR-0020) on a qualified concurrent one. Both collectors are
+/// gated on `window >= GRACE_WINDOW_MS`, so `privileged_grouped_pad_evidence`
+/// (on by default) would change nothing without this.
 ///
 /// `candidate` contains the inexpensive policy/model checks. The metadata-only
 /// hint is lazy: excluded requests never read camera metadata or stored records.
 /// A true hint reserves time only, not capture or grant authority. Stale stream
-/// contracts or later runtime degradation can still prevent grouped capture.
+/// contracts or later runtime degradation can still prevent either collection.
 ///
 /// Only the DEFAULT short window is replaced. An explicit `IRLUME_GRACE_MS`
 /// still decides the budget on its own, including a smaller one and the legacy
@@ -1200,7 +1204,12 @@ fn privileged_budget_for_route(
 /// The route decision itself, as a value: testable without a qualification
 /// store, a models directory or a process-wide config file.
 ///
-/// IR-only is excluded because it returns on its own route before grouped
+/// `stored_route` says the pair's stored qualification selects one of the two
+/// bounded PAD collections: grouped sequential for a measured sequential pair,
+/// managed concurrent (ADR-0020) for a qualified concurrent one. Both need the
+/// login window, and the privileged opt-in admits the same services to both.
+///
+/// IR-only is excluded because it returns on its own route before either
 /// collection is ever consulted, and credential release because its scope is
 /// the recognized local login and lock services either way.
 fn grouped_route_possible_from(
@@ -1208,7 +1217,7 @@ fn grouped_route_possible_from(
     purpose: AuthenticationPurpose,
     policy: irlume_common::config::FaceSensorPolicy,
     models_ready: bool,
-    stored_sequential: bool,
+    stored_route: bool,
     opt_in: bool,
 ) -> bool {
     use irlume_common::pam_service::ServiceKind;
@@ -1220,7 +1229,7 @@ fn grouped_route_possible_from(
             Some(ServiceKind::Elevation | ServiceKind::AppConsent)
         )
         && models_ready
-        && stored_sequential
+        && stored_route
 }
 
 /// The operator's explicit window, when set and within bounds.
@@ -6019,10 +6028,11 @@ impl Engine {
         policy: irlume_common::config::FaceSensorPolicy,
     ) -> AuthenticationWindow {
         self.authentication_window_from_with_hint(started, service, purpose, policy, || {
-            irlume_camera::capture_qualification::sequential_budget_hint(
+            irlume_camera::capture_qualification::collection_budget_hint(
                 &self.rgb_dev,
                 &self.ir_dev,
             )
+            .is_some()
         })
     }
 
@@ -10226,7 +10236,12 @@ mod tests {
         // Env override off for this check (guarded: another test sets it).
         let _g = env_guard();
         std::env::remove_var("IRLUME_GRACE_MS");
-        assert_eq!(grace_window_ms(Some("sudo")), SUDO_GRACE_WINDOW_MS);
+        // The concrete values, so a change to either constant fails here: a
+        // concurrent pair spending about 4 s in rate establishment per attempt
+        // needs the privileged window to be ten seconds, not five.
+        assert_eq!(grace_window_ms(Some("sudo")), 10_000);
+        assert_eq!(grace_window_ms(Some("polkit-1")), 10_000);
+        assert_eq!(grace_window_ms(Some("kde")), 15_000);
         assert_eq!(grace_window_ms(Some("su")), SUDO_GRACE_WINDOW_MS);
         // Login/lock services and an unknown/absent service get the full window.
         assert_eq!(grace_window_ms(Some("plasmalogin")), GRACE_WINDOW_MS);

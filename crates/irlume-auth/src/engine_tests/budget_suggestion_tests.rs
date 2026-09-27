@@ -70,20 +70,26 @@ fn budget_hint_is_not_evaluated_for_excluded_requests() {
     let mut s = shared();
     let ready = ReadyEngine::new(&mut s.engine);
     for (enabled, policy, purpose, service, expected) in [
-        ("0", Dual, AuthenticationPurpose::Verify, "sudo", 5_000),
+        (
+            "0",
+            Dual,
+            AuthenticationPurpose::Verify,
+            "sudo",
+            SUDO_GRACE_WINDOW_MS,
+        ),
         (
             "1",
             IrOnlyExperimental,
             AuthenticationPurpose::Verify,
             "sudo",
-            5_000,
+            SUDO_GRACE_WINDOW_MS,
         ),
         (
             "1",
             Dual,
             AuthenticationPurpose::CredentialRelease,
             "sudo",
-            5_000,
+            SUDO_GRACE_WINDOW_MS,
         ),
         ("1", Dual, AuthenticationPurpose::Verify, "kde", 15_000),
         ("1", Dual, AuthenticationPurpose::Verify, "sshd", 15_000),
@@ -120,7 +126,7 @@ fn budget_hint_is_not_evaluated_for_excluded_requests() {
             Dual,
             || panic!("forced capture schedule evaluated the hint"),
         );
-        assert_eq!(window.milliseconds, 5_000);
+        assert_eq!(window.milliseconds, SUDO_GRACE_WINDOW_MS);
     }
     std::env::remove_var("IRLUME_SEQUENTIAL_CAPTURE");
     ready.engine.ir_available = false;
@@ -131,7 +137,7 @@ fn budget_hint_is_not_evaluated_for_excluded_requests() {
         Dual,
         || panic!("missing IR evaluated the hint"),
     );
-    assert_eq!(window.milliseconds, 5_000);
+    assert_eq!(window.milliseconds, SUDO_GRACE_WINDOW_MS);
     ready.engine.ir_available = true;
     let old_vit = ready.engine.vit_pad.take();
     let calls = Cell::new(0);
@@ -147,7 +153,7 @@ fn budget_hint_is_not_evaluated_for_excluded_requests() {
     );
     ready.engine.vit_pad = old_vit;
     assert_eq!(calls.get(), 0);
-    assert_eq!(window.milliseconds, 5_000);
+    assert_eq!(window.milliseconds, SUDO_GRACE_WINDOW_MS);
     let old_ir_pad = ready.engine.pad_ir.take();
     let window = ready.engine.authentication_window_from_with_hint(
         Instant::now(),
@@ -161,7 +167,7 @@ fn budget_hint_is_not_evaluated_for_excluded_requests() {
     );
     ready.engine.pad_ir = old_ir_pad;
     assert_eq!(calls.get(), 0);
-    assert_eq!(window.milliseconds, 5_000);
+    assert_eq!(window.milliseconds, SUDO_GRACE_WINDOW_MS);
 }
 
 #[test]
@@ -185,7 +191,7 @@ fn budget_hint_reserves_time_once_and_never_resets_request_origin() {
                     hint
                 },
             );
-            let expected = if hint { 15_000 } else { 5_000 };
+            let expected = if hint { 15_000 } else { SUDO_GRACE_WINDOW_MS };
             assert_eq!(calls.get(), 1);
             assert_eq!(window.milliseconds, expected);
             assert_eq!(window.deadline, started + Duration::from_millis(expected));

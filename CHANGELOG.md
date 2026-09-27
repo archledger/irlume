@@ -309,6 +309,24 @@ All notable changes to irlume are documented here. This project adheres to
   (#797). Schema 3 and older subscribers omit both records; the recorder now
   requests schema 4 and an older daemon refuses it as before.
 
+### Changed
+
+- Face at `sudo`, `su`, `doas` and polkit prompts gets 10 seconds instead of
+  5, and those prompts use the bounded PAD collections the greeter and lock
+  screen use by default (`privileged_grouped_pad_evidence`, now on; `0` turns
+  it off): grouped collection on a measured sequential pair, as before when
+  opted in, and now also managed concurrent collection on a qualified
+  concurrent pair (ADR-0020 amendment 2026-09-26), each reserving the login
+  window. An ordinary attempt casts one of the five RGB PAD votes, so neither
+  a sequential Logitech BRIO nor a concurrent NexiGo N930W (about 4 s of
+  stream start-up per attempt) could finish at `sudo`; with the grouped
+  collection the BRIO granted `sudo` 3 times out of 3 with the setting absent
+  (6.5 to 8.7 s), and the NexiGo grants the lock screen through the managed
+  collection in 6.7 to 8.1 s. Evidence requirements and thresholds do not
+  change. A refused attempt now waits up to 10 s (15 s when a collection
+  applies) before the password prompt. Maintainer decisions from the
+  2026-09-26 hardware session.
+
 ### Fixed
 
 - `irlume login reconcile` keeps irlume's overrides in step with their

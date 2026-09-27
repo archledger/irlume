@@ -172,6 +172,13 @@ pub struct SealedEnvelope {
     /// crack surface for no capability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_wrap: Option<crate::recovery::RecoveryEnvelope>,
+    /// The uid of the account this envelope was written for
+    /// ([`crate::account`]). A loader does not release an envelope whose
+    /// uid differs from the account's current uid. Absent in envelopes
+    /// written before it was recorded: those are accepted, and the next
+    /// write records it. Older releases ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
 }
 
 /// Whether a literal policy over `pcrs` binds anything the firmware measured:
@@ -421,6 +428,7 @@ mod tests {
             private: Vec::new(),
             pcr_values: Vec::new(),
             password_wrap: None,
+            uid: None,
         };
         let signed = PolicyKind::Authorized {
             pubkey_pem: String::new(),
@@ -478,6 +486,7 @@ mod tests {
                 value: vec![0xab; 32],
             }],
             password_wrap: None,
+            uid: None,
         };
         let s = serde_json::to_string(&env).unwrap();
         let back: SealedEnvelope = serde_json::from_str(&s).unwrap();
@@ -536,6 +545,7 @@ mod tests {
             private: vec![2],
             pcr_values: vec![],
             password_wrap: None,
+            uid: None,
         };
         let s = serde_json::to_string(&env).unwrap();
         assert!(s.contains(r#""kind":"Authorized""#), "{s}");
@@ -555,6 +565,7 @@ mod tests {
             private: vec![2],
             pcr_values: vec![],
             password_wrap: None,
+            uid: None,
         };
         let s2 = serde_json::to_string(&env2).unwrap();
         assert!(!s2.contains("policy_ref"), "{s2}");
@@ -594,6 +605,7 @@ mod tests {
                 value: vec![0x11; 32],
             }],
             password_wrap: None,
+            uid: None,
         };
         env.save(&p).unwrap();
 

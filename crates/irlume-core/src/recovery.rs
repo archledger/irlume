@@ -102,6 +102,12 @@ pub struct RecoveryEnvelope {
     pub t_cost: u32,
     pub p_cost: u32,
     pub wrapped: String,
+    /// The uid of the account a recovery file was written for
+    /// ([`crate::account`]); a restore refuses a file recorded for another
+    /// uid. Absent in files written before it was recorded, and in the
+    /// password wrap inside a keyring envelope, which carries its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
 }
 
 fn derive_key(
@@ -142,6 +148,7 @@ pub fn wrap(passphrase: &[u8], template_key: &[u8]) -> Result<RecoveryEnvelope> 
         t_cost: T_COST,
         p_cost: P_COST,
         wrapped: STANDARD.encode(wrapped),
+        uid: None,
     })
 }
 
@@ -270,6 +277,7 @@ mod tests {
                 t_cost: T_COST,
                 p_cost: P_COST,
                 wrapped: "not base64".into(),
+                uid: None,
             };
             assert!(matches!(
                 unwrap(b"passphrase", &env),

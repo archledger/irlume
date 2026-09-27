@@ -14,6 +14,7 @@
 //! the templates live), so the wrapped login secret is never under user control.
 //! It is TPM-wrapped regardless, but defence in depth.
 
+use crate::account::{Account, Record};
 use crate::envelope::{SealedEnvelope, SecretKind};
 use crate::tpm;
 use irlume_common::{Error, Result};
@@ -46,6 +47,19 @@ pub fn seal_password(user: &str, password: &[u8]) -> Result<()> {
 /// has no business knowing what they mean.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn seal_secret(user: &str, secret: &[u8], kind: SecretKind) -> Result<()> {
+    seal_secret_for(user, secret, kind, Account::new(user).uid_to_record(None))
+}
+
+/// The record kind a keyring envelope of `kind` is refused as.
+fn record_for(kind: SecretKind) -> Record {
+    match kind {
+        SecretKind::GnomeKeyringToken => Record::KeyringToken,
+        SecretKind::LoginPassword | SecretKind::KdeWalletKey => Record::SealedSecret,
+    }
+}
+
+/// [`seal_secret`], recording `uid` as the account the envelope belongs to.
+fn seal_secret_for(user: &str, secret: &[u8], kind: SecretKind, uid: Option<u32>) -> Result<()> {
     if kind == SecretKind::GnomeKeyringToken {
         // Tokens are armed through [`arm_gnome_token`], which mints the bytes
         // and writes the password wrap in the same envelope. Accepting one here
@@ -79,6 +93,7 @@ pub fn seal_secret(user: &str, secret: &[u8], kind: SecretKind) -> Result<()> {
     }
     let mut env = tpm::seal(secret)?;
     env.secret = kind;
+    env.uid = uid;
     env.save(&envelope_path(user))
 }
 
@@ -124,6 +139,7 @@ pub fn arm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<String>>
     let mut env = tpm::seal(token.as_bytes())?;
     env.secret = SecretKind::GnomeKeyringToken;
     env.password_wrap = Some(crate::recovery::wrap(password, token.as_bytes())?);
+    env.uid = Account::new(user).uid_to_record(None);
     env.save(&envelope_path(user))?;
     Ok(token)
 }
@@ -141,6 +157,9 @@ pub fn arm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<String>>
 pub fn rearm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let path = envelope_path(user);
     let env = SealedEnvelope::load(&path)?;
+    // A token sealed for another uid is never returned for a re-arm.
+    let mut account = Account::new(user);
+    account.require(record_for(env.secret), env.uid)?;
     if env.secret != SecretKind::GnomeKeyringToken {
         return Err(Error::Policy(format!(
             "'{user}' has a {} armed, not a keyring token",
@@ -167,6 +186,7 @@ pub fn rearm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<Vec<u8
     let mut fresh = tpm::seal(&token)?;
     fresh.secret = SecretKind::GnomeKeyringToken;
     fresh.password_wrap = Some(crate::recovery::wrap(password, &token)?);
+    fresh.uid = account.uid_to_record(env.uid);
     fresh.save(&path)?;
     Ok(token)
 }
@@ -373,6 +393,13 @@ pub struct Unsealed {
 /// password and the wallet stays locked until the user re-arms.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn unseal_secret(user: &str) -> Result<Unsealed> {
+    unseal_secret_as(user, &mut Account::new(user))
+}
+
+/// [`unseal_secret`], resolving the account through `account`. An envelope
+/// recorded for another uid, or carrying a uid when the account's cannot be
+/// resolved, is not released.
+fn unseal_secret_as(user: &str, account: &mut Account<'_>) -> Result<Unsealed> {
     let path = envelope_path(user);
     if !path.exists() {
         return Err(Error::Policy(format!(
@@ -380,6 +407,7 @@ pub fn unseal_secret(user: &str) -> Result<Unsealed> {
         )));
     }
     let env = SealedEnvelope::load(&path)?;
+    account.require(record_for(env.secret), env.uid)?;
     let kind = env.secret;
     Ok(Unsealed {
         secret: tpm::unseal(&env)?,
@@ -457,9 +485,14 @@ pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) 
     // envelope to `LoginPassword` would overwrite it with a password seal
     // below, and the keyring it was re-keyed to would be stranded.
     let env = SealedEnvelope::load(&envelope_path(user))?;
+    // An envelope recorded for another uid is left as it is: re-sealing it
+    // would record this account's uid on it.
+    let mut account = Account::new(user);
+    account.require(record_for(env.secret), env.uid)?;
     let kind = env.secret;
+    let recorded = env.uid;
     if kind == SecretKind::GnomeKeyringToken {
-        return reseal_token(user, password, env);
+        return reseal_token(user, password, env, &mut account);
     }
     let secret = match derive_secret(kind, password, wallet_salt) {
         Ok(s) => s,
@@ -477,7 +510,7 @@ pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) 
     let password = secret.as_slice();
     // If the current envelope still unseals to the same secret, there is nothing
     // to reseal for correctness; don't churn the TPM on every single login.
-    if let Ok(current) = unseal_password(user) {
+    if let Ok(current) = unseal_secret_as(user, &mut account).map(|u| u.secret) {
         if current.as_slice() == password {
             // One exception: if a strictly stronger policy is available than
             // the one this envelope was written under (pcrlock provisioned
@@ -495,6 +528,7 @@ pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) 
                     // envelope as a login-password one and the next login would
                     // hand 56 bytes of key to pam_gnome_keyring as an AUTHTOK.
                     candidate.secret = kind;
+                    candidate.uid = account.uid_to_record(env.uid);
                     if candidate.strength_rank() > env.strength_rank() {
                         candidate.save(&envelope_path(user))?;
                         return Ok(Reseal::Upgraded);
@@ -504,18 +538,24 @@ pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) 
             return Ok(Reseal::Unchanged);
         }
     }
-    seal_secret(user, password, kind)?;
+    let uid = account.uid_to_record(recorded);
+    seal_secret_for(user, password, kind, uid)?;
     Ok(Reseal::Resealed)
 }
 
 /// `env`'s token sealed under a strictly stronger policy, with its kind and
 /// recovery wrap carried over, or `None` when no stronger policy is available
 /// or the ladder did not reach one.
-fn climbed_token(env: &SealedEnvelope, token: &[u8]) -> Result<Option<SealedEnvelope>> {
+fn climbed_token(
+    env: &SealedEnvelope,
+    token: &[u8],
+    account: &mut Account<'_>,
+) -> Result<Option<SealedEnvelope>> {
     if !tpm::stronger_tier_available_than(env) {
         return Ok(None);
     }
     let mut candidate = tpm::seal(token)?;
+    candidate.uid = account.uid_to_record(env.uid);
     // tpm::seal knows nothing of kinds or wraps; dropping either here would
     // downgrade the envelope to a password seal (next login routes the token
     // into PAM_AUTHTOK) or amputate the recovery path until the next password
@@ -539,7 +579,12 @@ fn climbed_token(env: &SealedEnvelope, token: &[u8]) -> Result<Option<SealedEnve
 ///   * both fail                                  -> error, envelope untouched:
 ///     it may still be the only copy of the token, and the caller's password,
 ///     though PAM-verified, may simply be newer than the wrap
-fn reseal_token(user: &str, password: &[u8], env: SealedEnvelope) -> Result<Reseal> {
+fn reseal_token(
+    user: &str,
+    password: &[u8],
+    env: SealedEnvelope,
+    account: &mut Account<'_>,
+) -> Result<Reseal> {
     match tpm::unseal(&env) {
         Ok(token) => {
             let wrap_current = env.password_wrap.as_ref().is_some_and(|w| {
@@ -553,13 +598,14 @@ fn reseal_token(user: &str, password: &[u8], env: SealedEnvelope) -> Result<Rese
                 // as it is, so the refreshed wrap still lands.
                 let mut env = env;
                 env.password_wrap = Some(crate::recovery::wrap(password, &token)?);
-                if let Ok(Some(stronger)) = climbed_token(&env, &token) {
+                env.uid = account.uid_to_record(env.uid);
+                if let Ok(Some(stronger)) = climbed_token(&env, &token, account) {
                     env = stronger;
                 }
                 env.save(&envelope_path(user))?;
                 return Ok(Reseal::Resealed);
             }
-            match climbed_token(&env, &token)? {
+            match climbed_token(&env, &token, account)? {
                 Some(stronger) => {
                     stronger.save(&envelope_path(user))?;
                     Ok(Reseal::Upgraded)
@@ -584,6 +630,7 @@ fn reseal_token(user: &str, password: &[u8], env: SealedEnvelope) -> Result<Rese
             let mut fresh = tpm::seal(&token)?;
             fresh.secret = SecretKind::GnomeKeyringToken;
             fresh.password_wrap = Some(crate::recovery::wrap(password, &token)?);
+            fresh.uid = account.uid_to_record(env.uid);
             fresh.save(&envelope_path(user))?;
             Ok(Reseal::Resealed)
         }
@@ -605,6 +652,9 @@ pub fn release_token_with_password(user: &str, password: &[u8]) -> Result<Zeroiz
         return Err(Error::Policy(format!("no sealed secret for '{user}'")));
     }
     let env = SealedEnvelope::load(&path)?;
+    // A token sealed for another uid is not released, whatever password
+    // opens its wrap.
+    Account::new(user).require(record_for(env.secret), env.uid)?;
     if env.secret != SecretKind::GnomeKeyringToken {
         return Err(Error::Policy(format!(
             "'{user}' has a {} armed, not a keyring token; nothing to release for a disarm",
@@ -753,6 +803,147 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An envelope for `user` with empty TPM blobs, recording `uid`.
+    fn plant_envelope(user: &str, secret: SecretKind, uid: Option<u32>) -> Vec<u8> {
+        let password_wrap = (secret == SecretKind::GnomeKeyringToken)
+            .then(|| crate::recovery::wrap(b"old password", b"old token").unwrap());
+        SealedEnvelope {
+            version: crate::envelope::CURRENT_VERSION,
+            policy: Default::default(),
+            secret,
+            pcrs: vec![7],
+            public: Vec::new(),
+            private: Vec::new(),
+            pcr_values: Vec::new(),
+            password_wrap,
+            uid,
+        }
+        .save(&envelope_path(user))
+        .unwrap();
+        std::fs::read(envelope_path(user)).unwrap()
+    }
+
+    fn unseal_error(user: &str) -> String {
+        match unseal_secret(user) {
+            Ok(_) => panic!("the sealed secret of '{user}' must not be released"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    /// A keyring envelope records the uid it was armed for. One recorded for
+    /// another uid is not released (face or fingerprint path), not returned
+    /// for a re-arm or a disarm, even with the password that opens its wrap,
+    /// and not re-sealed; the file stays as it is.
+    #[test]
+    fn a_sealed_secret_recorded_for_another_uid_is_not_released() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Never the host TPM, even if the check were missing.
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = crate::test_tmp_dir("kr-uid-other");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
+        let user = "kr-uid-owner";
+        let _now = crate::account::remember(user, 4302);
+
+        let before = plant_envelope(user, SecretKind::LoginPassword, Some(4301));
+        let error = unseal_error(user);
+        assert!(
+            error.contains("uid 4301") && error.contains("uid 4302"),
+            "{error}"
+        );
+        assert!(error.contains("irlume keyring arm"), "{error}");
+        let error = reseal_password(user, b"new password", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("uid 4301"), "{error}");
+        assert_eq!(std::fs::read(envelope_path(user)).unwrap(), before);
+
+        let before = plant_envelope(user, SecretKind::GnomeKeyringToken, Some(4301));
+        let error = unseal_error(user);
+        assert!(error.contains("keyring forget --force"), "{error}");
+        let error = release_token_with_password(user, b"old password")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("uid 4301"), "{error}");
+        let error = rearm_gnome_token(user, b"old password")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("uid 4301"), "{error}");
+        assert!(reseal_password(user, b"old password", None).is_err());
+        assert_eq!(std::fs::read(envelope_path(user)).unwrap(), before);
+        // Status reads still see what is on disk.
+        assert_eq!(
+            read_sealed_kind(user).unwrap(),
+            Some(SecretKind::GnomeKeyringToken)
+        );
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When the account's uid cannot be resolved, or no account has the name,
+    /// an envelope that records a uid is not released.
+    #[test]
+    fn a_sealed_secret_is_not_released_when_the_account_cannot_be_resolved() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = crate::test_tmp_dir("kr-uid-unknown");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
+        let user = "kr-uid-unresolved";
+        plant_envelope(user, SecretKind::LoginPassword, Some(4401));
+        {
+            let _unknown =
+                crate::account::remember_resolution(user, crate::account::Resolution::Unknown);
+            let error = unseal_error(user);
+            assert!(error.contains("could not be resolved"), "{error}");
+            let error = release_token_with_password(user, b"old password")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("could not be resolved"), "{error}");
+        }
+        {
+            let _gone =
+                crate::account::remember_resolution(user, crate::account::Resolution::NoAccount);
+            let error = unseal_error(user);
+            assert!(error.contains("no account named"), "{error}");
+        }
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An envelope without a uid (an earlier release) and one recorded for
+    /// the current uid pass the check and go on to the TPM, here a device
+    /// that does not exist.
+    #[test]
+    fn a_sealed_secret_without_a_uid_or_for_the_current_uid_goes_on_to_the_tpm() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = crate::test_tmp_dir("kr-uid-current");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
+        let user = "kr-uid-current";
+        let _now = crate::account::remember(user, 4501);
+        for uid in [None, Some(4501)] {
+            plant_envelope(user, SecretKind::LoginPassword, uid);
+            let error = unseal_error(user);
+            assert!(!error.contains("recorded for uid"), "{uid:?}: {error}");
+            plant_envelope(user, SecretKind::GnomeKeyringToken, uid);
+            assert_eq!(
+                &*release_token_with_password(user, b"old password").unwrap(),
+                b"old token",
+                "{uid:?}"
+            );
+        }
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// No TPM: only the envelope file is read.
     #[test]
     fn read_sealed_kind_tells_nothing_armed_from_unreadable() {
@@ -770,6 +961,7 @@ mod tests {
                 private: Vec::new(),
                 pcr_values: Vec::new(),
                 password_wrap: None,
+                uid: None,
             }
             .save(&envelope_path(user))
             .unwrap();
@@ -817,6 +1009,59 @@ mod tests {
         assert_eq!(&*got, pw);
         forget_password("tester").expect("forget");
         assert!(!has_sealed_password("tester"));
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+    }
+
+    /// Every arm and re-seal records the account's uid; the envelope is not
+    /// released once the account resolves to another uid; an envelope
+    /// without one (an earlier release) is released and gets the uid on its
+    /// next re-seal.
+    #[test]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
+    fn tpm_a_sealed_secret_records_its_uid_and_is_not_released_to_another_account() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        let dir = crate::test_tmp_dir("kr-uid-tpm");
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let user = "kr-uid-tpm";
+        let recorded = || SealedEnvelope::load(&envelope_path(user)).unwrap().uid;
+        {
+            let _a = crate::account::remember(user, 5001);
+            seal_password(user, b"first password").expect("seal");
+            assert_eq!(recorded(), Some(5001));
+            assert_eq!(&*unseal_password(user).unwrap(), b"first password");
+            let token = arm_gnome_token(user, b"first password").expect("arm");
+            assert_eq!(recorded(), Some(5001));
+            assert_eq!(
+                &*rearm_gnome_token(user, b"first password").unwrap(),
+                token.as_bytes()
+            );
+            assert_eq!(recorded(), Some(5001));
+        }
+        {
+            let _b = crate::account::remember(user, 5002);
+            let error = unseal_password(user).map(|_| ()).unwrap_err().to_string();
+            assert!(error.contains("uid 5001"), "{error}");
+            assert!(rearm_gnome_token(user, b"first password").is_err());
+            assert!(reseal_password(user, b"first password", None).is_err());
+            assert_eq!(recorded(), Some(5001), "left as it was");
+
+            // An envelope an earlier release wrote carries no uid: released,
+            // and a re-seal after a password change records the uid.
+            forget_password(user).unwrap();
+            seal_password(user, b"first password").unwrap();
+            let mut legacy = SealedEnvelope::load(&envelope_path(user)).unwrap();
+            legacy.uid = None;
+            legacy.save(&envelope_path(user)).unwrap();
+            assert_eq!(&*unseal_password(user).unwrap(), b"first password");
+            assert_eq!(
+                reseal_password(user, b"second password", None).unwrap(),
+                Reseal::Resealed
+            );
+            assert_eq!(recorded(), Some(5002));
+            assert_eq!(&*unseal_password(user).unwrap(), b"second password");
+        }
+        forget_password(user).unwrap();
         std::env::remove_var("IRLUME_KEYRING_DIR");
     }
 

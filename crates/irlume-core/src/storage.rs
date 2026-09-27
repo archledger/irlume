@@ -7,6 +7,7 @@
 //! else `/var/lib/irlume`), mode 0600. We store L2-normalized embeddings, never
 //! raw images. The old single-profile format is migrated transparently on load.
 
+use crate::account::{Account, Record};
 use crate::{crypto, template_key};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
@@ -218,6 +219,13 @@ pub struct CameraBinding {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Enrollment {
     pub user: String,
+    /// The uid of the account this enrollment was written for
+    /// ([`crate::account`]). A loader treats an enrollment recorded for
+    /// another uid as absent. `None` for an enrollment written before it was
+    /// recorded: accepted, and [`save`] records it on the next write. Inside
+    /// the ciphertext on an encrypted store. Older releases ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
     pub profiles: Vec<FaceProfile>,
     /// Retired eyes-open policy, retained for one release so old files load and
     /// the explicit OFF cleanup can clear it. New saves omit it.
@@ -265,6 +273,7 @@ impl Enrollment {
     pub fn new(user: &str) -> Self {
         Self {
             user: user.into(),
+            uid: None,
             profiles: Vec::new(),
             require_eyes_open: false,
             camera_binding: None,
@@ -490,6 +499,7 @@ fn migrate(old: LegacyProfile) -> Enrollment {
         .collect();
     Enrollment {
         user: old.user,
+        uid: None,
         profiles: vec![FaceProfile {
             ir_calib: None,
             ir_calibs: Default::default(),
@@ -654,11 +664,12 @@ fn deserialize_enrollment(data: &[u8], key: Option<&[u8]>) -> irlume_common::Res
 }
 
 /// Resolve the key to encrypt `user`'s templates with: the TPM-sealed template
-/// key on a TPM host (generated on first save), or `None` on a no-TPM host
-/// (plaintext fallback so dev boxes still work).
+/// key on a TPM host (generated on first save, and replaced when it was
+/// sealed for another uid), or `None` on a no-TPM host (plaintext fallback so
+/// dev boxes still work).
 fn save_key(user: &str) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>> {
     if template_key::tpm_available() {
-        Ok(Some(template_key::ensure_key_unlocked(user)?))
+        Ok(Some(template_key::ensure_enrollment_key_unlocked(user)?))
     } else {
         Ok(None)
     }
@@ -706,6 +717,13 @@ fn replacement_key(
     // Probe first even when a key exists: the probe admits the stored format,
     // and short-circuiting it would let replacement overwrite a future schema.
     let encrypted_store = store_is_encrypted(user)? == Some(true);
+    // A key sealed for another uid protects that account's enrollment, which
+    // this one replaces: the first-save path gives the account its own key
+    // (`template_key::ensure_enrollment_key_unlocked`) and never unseals the
+    // other.
+    if template_key::key_is_for_another_account(user) {
+        return first_save(user);
+    }
     if template_key::has_key(user) || encrypted_store {
         // Never mint a replacement key or fall back to plaintext on unseal
         // failure. The user can restore recovery or explicitly delete state.
@@ -724,6 +742,17 @@ fn save_with_key(
     fs::create_dir_all(&dir).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
     let path = profile_path(&e.user);
     let key = resolve_key(&e.user)?;
+    // Record the account's current uid; an enrollment written before it was
+    // recorded gets it here. When the uid cannot be resolved the enrollment
+    // keeps the one it has.
+    let uid = Account::new(&e.user).uid_to_record(e.uid);
+    let stamped;
+    let e = if uid == e.uid {
+        e
+    } else {
+        stamped = Enrollment { uid, ..e.clone() };
+        &stamped
+    };
     let bytes = serialize_enrollment(e, key.as_ref().map(|k| k.as_slice()))?;
     persist_enrollment(&path, &bytes)
 }
@@ -737,7 +766,7 @@ pub fn load(user: &str) -> irlume_common::Result<Option<Enrollment>> {
     load_with(
         user,
         template_key::UserStateLock::acquire,
-        template_key::load_key_unlocked,
+        template_key::load_key_as,
     )
     .map(|loaded| loaded.map(|(enrollment, _)| enrollment))
 }
@@ -758,7 +787,7 @@ pub fn load_with_key(user: &str) -> irlume_common::Result<Option<LoadedEnrollmen
     load_with(
         user,
         template_key::UserStateLock::acquire,
-        template_key::load_key_for_authentication_unlocked,
+        template_key::load_key_for_authentication_as,
     )
 }
 
@@ -773,7 +802,7 @@ pub fn load_read_only(user: &str) -> irlume_common::Result<Option<Enrollment>> {
     load_with(
         user,
         template_key::UserStateLock::acquire_read_only,
-        template_key::load_key_read_only_unlocked,
+        template_key::load_key_read_only_as,
     )
     .map(|loaded| loaded.map(|(enrollment, _)| enrollment))
 }
@@ -799,7 +828,7 @@ pub fn load_snapshot(user: &str) -> irlume_common::Result<Option<PrimarySnapshot
     load_snapshot_with(
         user,
         template_key::UserStateLock::acquire,
-        template_key::load_key_for_authentication_unlocked,
+        template_key::load_key_for_authentication_as,
     )
 }
 
@@ -811,14 +840,14 @@ pub fn load_snapshot_read_only(user: &str) -> irlume_common::Result<Option<Prima
     load_snapshot_with(
         user,
         template_key::UserStateLock::acquire_read_only,
-        template_key::load_key_read_only_unlocked,
+        template_key::load_key_read_only_as,
     )
 }
 
 fn load_with(
     user: &str,
     acquire_lock: impl FnOnce(&str) -> irlume_common::Result<template_key::UserStateLock>,
-    load_key: impl FnOnce(&str) -> irlume_common::Result<Zeroizing<Vec<u8>>>,
+    load_key: impl FnOnce(&str, &mut Account<'_>) -> irlume_common::Result<Zeroizing<Vec<u8>>>,
 ) -> irlume_common::Result<Option<LoadedEnrollment>> {
     load_snapshot_with(user, acquire_lock, load_key)
         .map(|loaded| loaded.map(|snapshot| (snapshot.enrollment, snapshot.key)))
@@ -827,7 +856,7 @@ fn load_with(
 fn load_snapshot_with(
     user: &str,
     acquire_lock: impl FnOnce(&str) -> irlume_common::Result<template_key::UserStateLock>,
-    load_key: impl FnOnce(&str) -> irlume_common::Result<Zeroizing<Vec<u8>>>,
+    load_key: impl FnOnce(&str, &mut Account<'_>) -> irlume_common::Result<Zeroizing<Vec<u8>>>,
 ) -> irlume_common::Result<Option<PrimarySnapshot>> {
     let _state = acquire_lock(user)?;
     let path = profile_path(user);
@@ -841,8 +870,23 @@ fn load_snapshot_with(
         Ok(value) => is_encrypted_enrollment(&value)?,
         Err(_) => false,
     };
-    let key = if is_enc { Some(load_key(user)?) } else { None };
+    // An enrollment, or the key it is encrypted under, recorded for another
+    // uid reads as absent: the account is not enrolled (`crate::account`).
+    let mut account = Account::new(user);
+    let key = if is_enc {
+        let loaded = load_key(user, &mut account);
+        match account.absent_if_other(loaded)? {
+            Some(key) => Some(key),
+            None => return Ok(None),
+        }
+    } else {
+        None
+    };
     let enrollment = deserialize_enrollment(&data, key.as_ref().map(|k| k.as_slice()))?;
+    let checked = account.require(Record::Enrollment, enrollment.uid);
+    if account.absent_if_other(checked)?.is_none() {
+        return Ok(None);
+    }
     Ok(Some(PrimarySnapshot {
         enrollment,
         key,
@@ -894,15 +938,21 @@ pub fn load_path_with_source(
         Ok(value) => is_encrypted_enrollment(&value)?,
         Err(_) => false,
     };
-    if !is_enc {
-        return deserialize_enrollment(&data, None).map(Some);
-    }
-    let Some(key) = keys.template_key(user)? else {
-        return Err(irlume_common::Error::Policy(format!(
-            "no template key is available to read '{user}'s encrypted store"
-        )));
+    let enrollment = if is_enc {
+        // The key source checks the sealed key's uid before it unseals.
+        let Some(key) = keys.template_key(user)? else {
+            return Err(irlume_common::Error::Policy(format!(
+                "no template key is available to read '{user}'s encrypted store"
+            )));
+        };
+        deserialize_enrollment(&data, Some(key))?
+    } else {
+        deserialize_enrollment(&data, None)?
     };
-    deserialize_enrollment(&data, Some(key)).map(Some)
+    // Recorded for another uid: absent, as in `load`.
+    let mut account = Account::new(user);
+    let checked = account.require(Record::Enrollment, enrollment.uid);
+    Ok(account.absent_if_other(checked)?.map(|()| enrollment))
 }
 
 /// Whether the on-disk store for `user` is encrypted, `Ok(None)` when there
@@ -1093,7 +1143,7 @@ mod tests {
         let loaded = load_with(
             "u",
             template_key::UserStateLock::acquire_read_only,
-            |user| {
+            |user, _| {
                 assert_eq!(user, "u");
                 Ok(Zeroizing::new(vec![42; 32]))
             },
@@ -1111,14 +1161,16 @@ mod tests {
             Some(&[0.5, 0.6][..])
         );
         assert_eq!(fs::read(&path).unwrap(), bytes);
-        assert!(
-            load_with("u", template_key::UserStateLock::acquire_read_only, |_| {
+        assert!(load_with(
+            "u",
+            template_key::UserStateLock::acquire_read_only,
+            |_, _| {
                 Err(irlume_common::Error::Policy(
                     "synthetic unseal refusal".into(),
                 ))
-            })
-            .is_err()
-        );
+            }
+        )
+        .is_err());
         assert_eq!(fs::read(&path).unwrap(), bytes);
         std::env::remove_var("IRLUME_STATE_DIR");
         fs::remove_dir_all(dir).unwrap();
@@ -1437,6 +1489,7 @@ mod tests {
     fn sample() -> Enrollment {
         Enrollment {
             user: "u".into(),
+            uid: None,
             profiles: vec![FaceProfile {
                 ir_calib: None,
                 ir_calibs: Default::default(),
@@ -1457,6 +1510,226 @@ mod tests {
             camera_binding: None,
             closure_calibration: None,
         }
+    }
+
+    /// `sample()` as `user`'s plaintext enrollment recording `uid`.
+    fn plant_plaintext(dir: &Path, user: &str, uid: Option<u32>) -> Vec<u8> {
+        let mut enrollment = sample();
+        enrollment.user = user.into();
+        enrollment.uid = uid;
+        let bytes = serialize_enrollment(&enrollment, None).unwrap();
+        fs::create_dir_all(dir).unwrap();
+        fs::write(profile_path(user), &bytes).unwrap();
+        bytes
+    }
+
+    /// A fresh state dir for one uid test, under `IRLUME_STATE_DIR`.
+    fn uid_sandbox(name: &str) -> PathBuf {
+        let dir = PathBuf::from(crate::test_tmp_dir(name));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        dir
+    }
+
+    fn leave_uid_sandbox(dir: &Path) {
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// An enrollment records the uid it was written for. Every loader reads
+    /// one recorded for another uid as absent (not enrolled), and the file
+    /// stays on disk; the same file loads for the uid it records.
+    #[test]
+    fn an_enrollment_recorded_for_another_uid_reads_as_not_enrolled() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("uid-other-enrollment");
+        let user = "uid-other-owner";
+        let bytes = plant_plaintext(&dir, user, Some(4601));
+        {
+            let _now = crate::account::remember(user, 4602);
+            assert!(load(user).unwrap().is_none());
+            assert!(load_read_only(user).unwrap().is_none());
+            assert!(load_with_key(user).unwrap().is_none());
+            assert!(load_snapshot(user).unwrap().is_none());
+            assert!(load_snapshot_read_only(user).unwrap().is_none());
+            assert!(load_path_unlocked(user, &profile_path(user))
+                .unwrap()
+                .is_none());
+            assert_eq!(fs::read(profile_path(user)).unwrap(), bytes, "kept");
+            assert_eq!(store_is_encrypted(user).unwrap(), Some(false));
+        }
+        {
+            // No account has the name any more: not enrolled either.
+            let _gone =
+                crate::account::remember_resolution(user, crate::account::Resolution::NoAccount);
+            assert!(load(user).unwrap().is_none());
+        }
+        let _then = crate::account::remember(user, 4601);
+        assert_eq!(load(user).unwrap().unwrap().uid, Some(4601));
+        leave_uid_sandbox(&dir);
+    }
+
+    /// An enrollment written before the uid was recorded loads for any uid,
+    /// and its next write records the account's uid. A write for a name no
+    /// account has records none (writes never fail on the lookup).
+    #[test]
+    fn an_enrollment_without_a_uid_loads_and_its_next_write_records_the_uid() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("uid-legacy-enrollment");
+        let user = "uid-legacy-owner";
+        plant_plaintext(&dir, user, None);
+        let _now = crate::account::remember(user, 4701);
+        let loaded = load(user).unwrap().expect("a legacy enrollment loads");
+        assert_eq!(loaded.uid, None);
+        // A plaintext write, as on a host without a TPM.
+        save_with_key(&loaded, |_| Ok(None)).unwrap();
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(profile_path(user)).unwrap()).unwrap();
+        assert_eq!(on_disk["uid"], 4701);
+        assert_eq!(load(user).unwrap().unwrap().uid, Some(4701));
+
+        let missing = "irlume-test-no-such-account";
+        save_with_key(&Enrollment::new(missing), |_| Ok(None)).unwrap();
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(profile_path(missing)).unwrap()).unwrap();
+        assert!(on_disk.get("uid").is_none(), "{on_disk}");
+        leave_uid_sandbox(&dir);
+    }
+
+    /// When the account's uid cannot be resolved, an enrollment that records
+    /// a uid is an error (the password fallback), never a grant or "not
+    /// enrolled"; one without a uid needs no lookup.
+    #[test]
+    fn an_enrollment_with_a_uid_is_an_error_when_the_account_cannot_be_resolved() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("uid-unknown-enrollment");
+        let user = "uid-unknown-owner";
+        let _unknown =
+            crate::account::remember_resolution(user, crate::account::Resolution::Unknown);
+        plant_plaintext(&dir, user, Some(4801));
+        let error = load(user).unwrap_err().to_string();
+        assert!(error.contains("could not be resolved"), "{error}");
+        assert!(load_with_key(user).is_err());
+        plant_plaintext(&dir, user, None);
+        assert!(load(user).unwrap().is_some());
+        leave_uid_sandbox(&dir);
+    }
+
+    /// An encrypted enrollment whose template key was sealed for another uid
+    /// reads as not enrolled without an unseal; under a key for the current
+    /// uid, the enrollment inside is checked as well.
+    #[test]
+    fn an_encrypted_enrollment_under_a_key_sealed_for_another_uid_is_not_unsealed() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("uid-other-key");
+        let user = "uid-key-owner";
+        let _now = crate::account::remember(user, 4902);
+        let write = |key_uid: Option<u32>, enrollment_uid: Option<u32>| {
+            let mut enrollment = sample();
+            enrollment.user = user.into();
+            enrollment.uid = enrollment_uid;
+            fs::write(
+                profile_path(user),
+                serialize_enrollment(&enrollment, Some(&[42; 32])).unwrap(),
+            )
+            .unwrap();
+            let mut key: crate::envelope::SealedEnvelope =
+                serde_json::from_str(r#"{"version":1,"pcrs":[7],"public":"","private":""}"#)
+                    .unwrap();
+            key.uid = key_uid;
+            key.save(&template_key::key_path(user)).unwrap();
+        };
+        let load_keyed = |unsealed: bool| {
+            load_with(
+                user,
+                template_key::UserStateLock::acquire,
+                |user, account| {
+                    template_key::load_key_with(
+                        user,
+                        account,
+                        template_key::KeyLoadPolicy::Keep,
+                        |_| {
+                            assert!(
+                                unsealed,
+                                "a key sealed for another uid must not be unsealed"
+                            );
+                            Ok(Zeroizing::new(vec![42; 32]))
+                        },
+                        |_| panic!("an authentication load does not probe upgrades"),
+                        |_| panic!("an authentication load does not seal"),
+                    )
+                },
+            )
+        };
+
+        write(Some(4901), None);
+        assert!(load_keyed(false).unwrap().is_none());
+        write(Some(4902), Some(4901));
+        assert!(load_keyed(true).unwrap().is_none());
+        for (key_uid, enrollment_uid) in [(Some(4902), Some(4902)), (None, None)] {
+            write(key_uid, enrollment_uid);
+            let (enrollment, key) = load_keyed(true).unwrap().expect("loads");
+            assert_eq!(enrollment.uid, enrollment_uid);
+            assert!(key.is_some());
+        }
+        leave_uid_sandbox(&dir);
+    }
+
+    /// A replacement enrollment never unseals a key sealed for another uid:
+    /// it takes the first-save path, which gives the account its own key.
+    #[test]
+    fn a_replacement_never_unseals_a_key_sealed_for_another_uid() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("uid-replacement");
+        let user = "uid-replacement-owner";
+        let _now = crate::account::remember(user, 5202);
+        let mut old = sample();
+        old.user = user.into();
+        old.uid = Some(5201);
+        fs::write(
+            profile_path(user),
+            serialize_enrollment(&old, Some(&[7; 32])).unwrap(),
+        )
+        .unwrap();
+        let mut key: crate::envelope::SealedEnvelope =
+            serde_json::from_str(r#"{"version":1,"pcrs":[7],"public":"","private":""}"#).unwrap();
+        key.uid = Some(5201);
+        key.save(&template_key::key_path(user)).unwrap();
+        assert!(load(user).unwrap().is_none());
+
+        let mut replacement = Enrollment::new(user);
+        replacement.profiles = sample().profiles;
+        let mut first_saves = 0;
+        save_with_key(&replacement, |user| {
+            replacement_key(
+                user,
+                |_| panic!("a key sealed for another uid must not be unsealed"),
+                |_| {
+                    first_saves += 1;
+                    Ok(None)
+                },
+            )
+        })
+        .unwrap();
+        assert_eq!(first_saves, 1);
+        assert_eq!(load(user).unwrap().unwrap().uid, Some(5202));
+        leave_uid_sandbox(&dir);
     }
 
     #[test]
@@ -1569,7 +1842,7 @@ mod tests {
         fs::write(&path, bytes).unwrap();
 
         assert!(matches!(
-            load_with("u", template_key::UserStateLock::acquire_read_only, |_| {
+            load_with("u", template_key::UserStateLock::acquire_read_only, |_, _| {
                 panic!("unknown versions must be rejected before key loading")
             }),
             Err(irlume_common::Error::Protocol(message))

@@ -3377,9 +3377,16 @@ fn unseal_keyring(
     // tell (logind's session state or the account cannot be read): the
     // typed password still opens a password- or wallet-key-keyed keyring,
     // and a GNOME keyring token still reaches the session phase.
+    // An auth-phase request resolves the account here; the release below
+    // checks the envelope's uid against the same answer.
+    let resolved = if auth_phase {
+        crate::users::uid_for_name(&user)
+    } else {
+        None
+    };
+    let _account_uid = resolved.map(|uid| irlume_core::account::remember(&user, uid));
     if auth_phase {
-        let live =
-            crate::users::uid_for_name(&user).and_then(attempt_record::local_graphical_session);
+        let live = resolved.and_then(attempt_record::local_graphical_session);
         if live != Some(false) {
             let why = if live == Some(true) {
                 "has a live local graphical session"
@@ -7212,6 +7219,9 @@ fn dispatch_scoped_session_inner(
                 Ok(attempt) => attempt,
                 Err(reason) => return retry_verify_refusal(reason),
             };
+            // The enrollment and key loads of this request check the uid
+            // each record was written for against this resolution.
+            let _account_uid = irlume_core::account::remember(&user, retry_attempt.uid());
             let convenience = tier == irlume_core::biopolicy::Tier::Convenience;
             let t = std::time::Instant::now();
             // The reply is built by ONE function whether the engine hands the
@@ -8729,6 +8739,9 @@ fn do_unseal_password_scoped(
         Ok(attempt) => attempt,
         Err(reason) => return retry_unseal_refusal(reason),
     };
+    // The enrollment, key and sealed-secret loads of this request check the
+    // uid each record was written for against this resolution.
+    let _account_uid = irlume_core::account::remember(user, retry_attempt.uid());
     // ADR-0027, same shape as the Authenticate arm: one reply builder, run by
     // the engine's decision hook before the concurrent pair is released, or
     // by the ordinary return path. The credential itself is prepared inside
@@ -15382,6 +15395,7 @@ mod tests {
     fn enrollment_with(user: &str, scans: &[&str]) -> Enrollment {
         Enrollment {
             user: user.into(),
+            uid: None,
             profiles: vec![FaceProfile {
                 name: "Face Profile 1".into(),
                 ir_calib: None,
@@ -16244,6 +16258,97 @@ mod tests {
                 assert_eq!(deny_reason(&reason), reason);
             }
             other => panic!("unenrolled user must deny via AuthResult, got {other:?}"),
+        }
+    }
+
+    /// An enrollment recorded for another uid is not enrolled: the engine
+    /// refuses before the camera, exactly as for no enrollment. The load
+    /// checks the record against the uid the request resolved for its retry
+    /// record. Recorded for the account's own uid, the request goes on to
+    /// the camera, which this host does not have.
+    #[test]
+    fn authenticate_treats_an_enrollment_recorded_for_another_uid_as_not_enrolled() {
+        let _g = env_lock();
+        let user = users::name_for_uid(0).expect("root NSS account");
+        let mut e = engine();
+        let sb = sandbox("auth-other-uid");
+        let authenticate = |e: &mut irlume_auth::Engine| {
+            dispatch(
+                Request::Authenticate {
+                    structured_errors: false,
+                    user: user.clone(),
+                    service: Some("kde".into()),
+                    intent_confirmation: None,
+                },
+                &peer(0),
+                e,
+            )
+        };
+        let not_enrolled = format!("'{user}' is not enrolled");
+        let mut enrollment = enrollment_with(&user, &["Face Scan 1"]);
+        enrollment.uid = Some(4242);
+        write_enrollment(&sb.dir, &enrollment);
+        match authenticate(&mut e) {
+            Response::AuthResult {
+                granted, reason, ..
+            } => {
+                assert!(!granted);
+                assert_eq!(reason, not_enrolled);
+            }
+            other => panic!("another uid's enrollment must deny as not enrolled, got {other:?}"),
+        }
+        enrollment.uid = Some(0);
+        write_enrollment(&sb.dir, &enrollment);
+        match authenticate(&mut e) {
+            Response::AuthResult {
+                granted: false,
+                reason,
+                ..
+            } if reason == not_enrolled => {
+                panic!("an enrollment recorded for this uid must load")
+            }
+            Response::AuthResult { granted: true, .. } => panic!("no camera, no grant"),
+            _ => {}
+        }
+    }
+
+    /// A keyring envelope recorded for another uid is not released on the
+    /// fingerprint path; the refusal names the uids and `irlume keyring arm`.
+    #[test]
+    fn unseal_keyring_does_not_release_a_secret_recorded_for_another_uid() {
+        let _g = env_lock();
+        let user = users::name_for_uid(0).expect("root NSS account");
+        let _sb = sandbox("unseal-keyring-other-uid");
+        // Never the host TPM, even if the check were missing.
+        let previous_tcti = std::env::var_os("IRLUME_TCTI");
+        std::env::set_var("IRLUME_TCTI", "device:/nonexistent/irlume-test-tpm");
+        let envelope = irlume_core::envelope::SealedEnvelope {
+            version: 1,
+            policy: irlume_core::envelope::PolicyKind::PcrLiteral,
+            secret: irlume_core::envelope::SecretKind::LoginPassword,
+            pcrs: vec![7],
+            public: Vec::new(),
+            private: Vec::new(),
+            pcr_values: Vec::new(),
+            password_wrap: None,
+            uid: Some(4242),
+        };
+        envelope
+            .save(&irlume_core::keyring::envelope_path(&user))
+            .unwrap();
+        let response = unseal_keyring(&user, Some("kde"), false, false, &peer(0));
+        match previous_tcti {
+            Some(value) => std::env::set_var("IRLUME_TCTI", value),
+            None => std::env::remove_var("IRLUME_TCTI"),
+        }
+        match response {
+            Response::Error(message) => {
+                assert!(
+                    message.contains("uid 4242") && message.contains("irlume keyring arm"),
+                    "{message}"
+                );
+            }
+            other => panic!("another uid's secret must not be released, got {other:?}"),
         }
     }
 
@@ -18153,6 +18258,7 @@ mod tests {
                 value: vec![0; 32],
             }],
             password_wrap: None,
+            uid: None,
         };
         let path = irlume_core::keyring::envelope_path("carol");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

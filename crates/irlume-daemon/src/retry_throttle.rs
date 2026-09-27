@@ -587,6 +587,13 @@ impl FaceAttempt {
         }))
     }
 
+    /// The uid the account resolved to when this attempt began. The record
+    /// checks of the same request reuse it (`irlume_core::account::remember`)
+    /// rather than asking NSS again.
+    pub(crate) fn uid(&self) -> u32 {
+        self.account.uid
+    }
+
     pub(crate) fn denied(self, outcome: &irlume_auth::Outcome) -> Result<(), &'static str> {
         self.denied_inner(outcome).map_err(|_| UNAVAILABLE)
     }

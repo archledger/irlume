@@ -853,6 +853,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- The face enrollment, the sealed template key, the keyring envelope and
+  the recovery envelope record the uid of the account they were written
+  for, and irlumed checks it against the account's current uid when it
+  loads them. A record whose uid differs is not used: the account reads
+  as not enrolled (`irlume enroll` enrolls again and replaces the
+  enrollment and its key), a sealed secret is not released or re-sealed
+  (`irlume keyring arm` arms again), and a recovery envelope restores
+  nothing. When the uid cannot be resolved, a record that carries one is
+  not used and face falls back to the password. Nothing is removed
+  automatically. Records written by earlier releases carry no uid; they
+  are accepted and record it on their next write. Older releases ignore
+  the new field (SECURITY_AT_REST.md "Records belong to an account uid").
+
 - A reason about the capture rather than the match (no face, a liveness
   or PAD refusal, the pose) reaches a non-root caller of `Authenticate`,
   `Identify` or `IdentifyFor` with each measured value replaced by an

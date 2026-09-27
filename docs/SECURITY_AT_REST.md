@@ -174,6 +174,50 @@ a claim of equivalence.
    *Tested:* a CLI peer asking for another user's profiles → **"not
    authorized"**.
 
+## Records belong to an account uid
+
+irlume stores each account's records under the account name. The
+enrollment (`<user>.json`), the sealed template key
+(`template-keys/<user>.json`), the keyring envelope (`keyring/<user>.json`)
+and the recovery envelope (`recovery/<user>.json`) also record the numeric
+uid of the account they were written for, as a `uid` field. On an encrypted
+store the enrollment's uid is inside the ciphertext; the sealed key and the
+envelopes carry it in their JSON beside the sealed blob. The code is
+`crates/irlume-core/src/account.rs`.
+
+Each load compares that uid with the account's current uid, resolved through
+NSS (so LDAP, SSSD and systemd-homed accounts resolve too). On an
+authentication request irlumed reuses the lookup it already makes for the
+retry record, so the check adds no second lookup there.
+
+| Record | Recorded uid differs from the current one | Current uid cannot be resolved |
+|---|---|---|
+| Enrollment and template key | The account reads as not enrolled; the key is not unsealed. `irlume enroll` enrolls again: it writes a new enrollment under a new key and removes the recovery envelope of the replaced key | Error; face falls back to the password |
+| Keyring envelope | Not released (face or fingerprint path), not re-sealed, and not returned for a re-arm or a disarm. `irlume keyring arm` arms again; a GNOME keyring token has to be removed first with `irlume keyring forget --force` | Not released |
+| Recovery envelope | `irlume recovery restore` refuses it; `irlume recovery setup` after enrolling again writes a new one | Refused |
+
+A name that no account has any more counts as a different uid. irlumed logs
+each record it does not use, with the uids and the next step.
+
+- A record written before the uid was recorded (0.14.0 and earlier) is
+  accepted, and its next write records the uid: an enrollment write (enroll,
+  add scans, rename or delete a profile), a template key or keyring re-seal,
+  a keyring arm, or `irlume recovery setup`. A write for a name that has no
+  account records no uid.
+- A record that is not used is never removed automatically: an account whose
+  uid changed and is changed back finds its records usable again. To remove
+  them by hand, stop irlumed and delete the account's files under
+  `/var/lib/irlume` (`<user>.json`, `cameras/<user>.json`,
+  `template-keys/<user>.json`, `recovery/<user>.json`, `keyring/<user>.json`).
+- Added-camera stores (`cameras/<user>.json`) record no uid. They are
+  encrypted under the template key and used only together with the primary
+  enrollment, whose check covers them; on a host without a TPM they are
+  plaintext, but still unusable without a primary enrollment for the uid.
+- Retry records (`retry/<uid>.json`) and the attempt record are kept by uid
+  already.
+- The field is additive: an older irlumed ignores it and keeps using records
+  by name.
+
 ## Disk-theft test
 
 Simulated a full exfiltration: copied **both** the encrypted enrollment and the

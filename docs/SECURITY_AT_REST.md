@@ -268,8 +268,9 @@ each record it does not use, with the uids and the next step.
   was recorded for another uid, or its template key was. An enrollment write
   that replaces that enrollment removes the store, and its commit journal,
   once the new enrollment is saved; a write that fails, or whose publication
-  is not confirmed durable, leaves them. A store left beside no primary
-  enrollment (after the last profile is deleted, or the file is removed by
+  is not confirmed durable, leaves them. Deleting the last profile removes
+  the store, its journal and their staging files with the enrollment. A
+  store left beside no primary enrollment (the enrollment file removed by
   hand) is not tied to a uid: a listing for the name shows its groups as
   stale until they are removed.
 - Retry records (`retry/<uid>.json`) and the attempt record are kept by uid

@@ -853,6 +853,23 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- Removing an account's last face profile, with `irlume profiles delete`,
+  `profiles forget-model` or the TUI, also removes its added cameras'
+  store, `/var/lib/irlume/cameras/<user>.json`, and that store's commit
+  journal, under the account lock that covers the enrollment, the template
+  key and the recovery passphrase, and before the enrollment, so a failed
+  removal can be repeated. The reply names what was removed. A store an
+  earlier release left behind goes the next time the account's last
+  profile is removed (ADR-0024 §4.2). A profile listing, and any other
+  read of that store, opens it with the account's existing template key
+  only and no longer seals a new key for an account that has none; the
+  store's first encrypted write still creates the key, now under the
+  account lock (ADR-0024 §4.3). Reads that unseal the template key without
+  persisting a TPM storage root key, these and authentication's among them,
+  also work where another program's key holds irlume's storage root key
+  handle (`IRLUME_SRK_HANDLE`): there they derive a transient storage root
+  key for the read, as a seal already does, and still persist none.
+
 - The face enrollment, the sealed template key, the keyring envelope and
   the recovery envelope record the uid of the account they were written
   for, and irlumed checks it against the account's current uid when it

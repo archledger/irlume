@@ -4788,6 +4788,11 @@ impl EnrollmentSummary {
 /// that exists but cannot be summarized reports its diagnostic instead of
 /// pretending to be empty. Also records the store facts a cache hit
 /// refreshes the rows from ([`CameraStoreSnapshot`]).
+///
+/// A summary is a read: an encrypted store opens with the account's
+/// existing template key only, and no key is generated when there is none
+/// (ADR-0024 §4.3), so listing an account whose key is gone reports the
+/// store as unreadable instead of sealing a replacement key.
 fn summarize_camera_groups(
     summary: &mut EnrollmentSummary,
     user: &str,
@@ -4797,12 +4802,12 @@ fn summarize_camera_groups(
         summary,
         user,
         engine,
-        irlume_core::multi_camera::production_key_for,
+        irlume_core::multi_camera::existing_key_for,
     );
 }
 
 /// [`summarize_camera_groups`] with the store's key resolver (production
-/// passes `production_key_for`; tests pass a fake).
+/// passes `existing_key_for`; tests pass a fake).
 fn summarize_camera_groups_keyed(
     summary: &mut EnrollmentSummary,
     user: &str,
@@ -5584,10 +5589,10 @@ fn dispatch_status_with_diagnostics(
 ///
 /// The store file is read only to hash it, never parsed or decrypted: an
 /// encrypted store opens only under the account template key, and
-/// unsealing that key is TPM work (a key write when none is sealed) that
-/// belongs on the worker. A store removed or unreadable since publication
-/// is reported as the worker's load reports it. Store-backed facts
-/// (counts, calibration, generation) stay as published, and so does any
+/// unsealing that key is TPM work that belongs on the worker. A store
+/// removed or unreadable since publication is reported as the worker's load
+/// reports it. Store-backed facts (counts, calibration, generation) stay as
+/// published, and so does any
 /// other store error the worker published (a store that does not parse or
 /// decrypt), until the store file, the primary or the enrollment changes.
 fn refresh_camera_group_flags(
@@ -8485,7 +8490,9 @@ fn enroll_response(outcome: irlume_auth::EnrollOutcome) -> Response {
 }
 
 /// Load `user`'s enrollment, apply `f`, and save. `f` returns an Ok message or an
-/// error string. Used by the storage-only management operations.
+/// error string. Used by the storage-only management operations. When `f`
+/// leaves no profile, the account's face data is deleted instead, the added
+/// cameras' store included (ADR-0024 §4.2), and the reply names what went.
 fn mutate_enrollment(
     user: &str,
     f: impl FnOnce(&mut irlume_core::storage::Enrollment) -> Result<String, String>,
@@ -8498,18 +8505,36 @@ fn mutate_enrollment(
     match f(&mut enr) {
         Ok(msg) => {
             // If no profiles remain, remove the file entirely.
-            let save = if enr.profiles.is_empty() {
-                irlume_core::storage::delete(user).map(|_| ())
+            let saved = if enr.profiles.is_empty() {
+                irlume_core::storage::delete(user)
+                    .map(|deleted| format!("{msg}; {}", last_profile_removed(deleted)))
             } else {
-                irlume_core::storage::save(&enr)
+                irlume_core::storage::save(&enr).map(|()| msg)
             };
-            match save {
-                Ok(()) => Response::Ok(msg),
+            match saved {
+                Ok(msg) => Response::Ok(msg),
                 Err(e) => Response::Error(e.to_string()),
             }
         }
         Err(e) => Response::Error(e),
     }
+}
+
+/// The reply's account of what deleting the last profile removed.
+fn last_profile_removed(deleted: irlume_core::storage::Deleted) -> String {
+    let mut stores = Vec::new();
+    if deleted.enrollment {
+        stores.push("the enrollment");
+    }
+    if deleted.camera_store {
+        stores.push("the added cameras' scans");
+    }
+    let removed = if stores.is_empty() {
+        String::new()
+    } else {
+        format!("removed {}, and ", stores.join(" and "))
+    };
+    format!("no profiles remain: {removed}retired the template key and recovery passphrase")
 }
 
 /// Mints the credential-management authorization for one camera-group
@@ -17362,7 +17387,11 @@ mod tests {
             &root,
             &mut e,
         ) {
-            Response::Ok(msg) => assert_eq!(msg, "deleted profile 'Face Profile 1'"),
+            Response::Ok(msg) => assert_eq!(
+                msg,
+                "deleted profile 'Face Profile 1'; no profiles remain: removed the \
+                 enrollment, and retired the template key and recovery passphrase"
+            ),
             other => panic!("sole-profile delete must succeed, got {other:?}"),
         }
         assert!(
@@ -17380,6 +17409,129 @@ mod tests {
             Response::Error(msg) => assert_eq!(msg, "'carol' is not enrolled"),
             other => panic!("second delete must report unenrolled, got {other:?}"),
         }
+    }
+
+    /// Plants carol's added-camera store, in the plaintext format a host
+    /// without a TPM writes (no key involved), with a commit journal beside
+    /// it, and returns both paths.
+    fn plant_camera_store_and_journal(
+        store: &irlume_core::multi_camera::SecondaryStore,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let path = irlume_core::multi_camera::secondary_store_path("carol");
+        irlume_core::multi_camera::save_secondary_resolved(&path, store, |_| Ok(None))
+            .expect("plant the camera store");
+        let journal = irlume_core::multi_camera::commit::intent_path_for(&path);
+        std::fs::write(&journal, b"{}").expect("plant the journal");
+        (path, journal)
+    }
+
+    #[test]
+    fn deleting_the_last_profile_removes_the_added_cameras_store_and_journal() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("del-last-cams");
+        let (_, store) = camera_group_fixture(&sb.dir);
+        let (path, journal) = plant_camera_store_and_journal(&store);
+        match dispatch(
+            Request::DeleteProfile {
+                user: "carol".into(),
+                profile: "Face Profile 1".into(),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Ok(msg) => assert_eq!(
+                msg,
+                "deleted profile 'Face Profile 1'; no profiles remain: removed the \
+                 enrollment and the added cameras' scans, and retired the template key \
+                 and recovery passphrase"
+            ),
+            other => panic!("sole-profile delete must succeed, got {other:?}"),
+        }
+        assert!(
+            !sb.dir.join("carol.json").exists(),
+            "the enrollment is gone"
+        );
+        assert!(
+            !path.exists(),
+            "the added cameras' store outlived the account's last profile"
+        );
+        assert!(
+            !journal.exists(),
+            "its journal would rewrite the store at the next attempt"
+        );
+    }
+
+    #[test]
+    fn forgetting_the_recognizer_of_the_last_profile_removes_the_added_cameras_store() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("forget-last-cams");
+        // The fixture's scans are untagged: the shipped recognizer's.
+        let (_, store) = camera_group_fixture(&sb.dir);
+        let (path, journal) = plant_camera_store_and_journal(&store);
+        match dispatch(
+            Request::ForgetRecognizer {
+                user: "carol".into(),
+                space: irlume_core::storage::LEGACY_RECOGNIZER_SPACE.into(),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Ok(msg) => assert!(
+                msg.ends_with(
+                    "no profiles remain: removed the enrollment and the added cameras' \
+                     scans, and retired the template key and recovery passphrase"
+                ),
+                "{msg}"
+            ),
+            other => panic!("forgetting the only recognizer must succeed, got {other:?}"),
+        }
+        assert!(
+            !sb.dir.join("carol.json").exists(),
+            "the enrollment is gone"
+        );
+        assert!(
+            !path.exists(),
+            "the added cameras' store outlived the account's last profile"
+        );
+        assert!(
+            !journal.exists(),
+            "its journal would rewrite the store at the next attempt"
+        );
+    }
+
+    #[test]
+    fn a_listing_of_an_account_without_a_template_key_seals_no_new_key() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("list-no-key");
+        // An added cameras' store encrypted under a key that no longer exists,
+        // and no primary enrollment: what deleting the last profile left behind
+        // while the store did not go with it.
+        let (_, store) = camera_group_fixture(&sb.dir);
+        std::fs::remove_file(sb.dir.join("carol.json")).expect("remove the primary");
+        plant_encrypted_camera_store(&store);
+        match dispatch(list_carol(), &peer(0), &mut e) {
+            Response::Enrollment {
+                profiles,
+                camera_groups,
+                camera_store_error,
+                ..
+            } => {
+                assert!(profiles.is_empty());
+                assert!(camera_groups.is_empty());
+                assert!(
+                    camera_store_error.is_some(),
+                    "a store whose key is gone is reported as unreadable"
+                );
+            }
+            other => panic!("expected the listing, got {other:?}"),
+        }
+        assert!(
+            !irlume_core::template_key::has_key("carol"),
+            "a listing sealed a new template key for the account"
+        );
     }
 
     /// A two-model enrollment for the forget-recognizer tests: 'BEN' holds two
@@ -17527,7 +17679,9 @@ mod tests {
                 format!(
                     "forgot recognizer {}: 3 scan(s) removed (profile(s) 'BEN', 'Mixed' \
                      deleted: no scans left); these were the LOADED recognizer's templates, \
-                     so face authentication needs a re-enroll or an add-scan",
+                     so face authentication needs a re-enroll or an add-scan; no profiles \
+                     remain: removed the enrollment, and retired the template key and \
+                     recovery passphrase",
                     irlume_core::storage::LEGACY_RECOGNIZER_SPACE
                 )
             ),

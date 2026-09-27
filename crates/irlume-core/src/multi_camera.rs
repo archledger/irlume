@@ -116,6 +116,55 @@ pub fn secondary_store_path(user: &str) -> PathBuf {
         .join(format!("{user}.json"))
 }
 
+/// The staging tag of [`save_secondary`]'s writes.
+const SAVE_STAGING_TAG: &str = "tmp";
+
+/// The staging tag of the commit protocol's writes, of the store and of its
+/// journal ([`commit::publish_with_intent`]).
+const COMMIT_STAGING_TAG: &str = "commit-tmp";
+
+/// The file a writer stages `path`'s new bytes in before renaming it over
+/// `path`: `.<file name>.<tag>-<pid>` in the same directory. A crash, or a
+/// failed write or sync, before the rename leaves it behind with those
+/// bytes, which are plaintext embeddings on a host without a TPM.
+fn staging_path(path: &Path, tag: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .map_or_else(|| "secondary".into(), |n| n.to_string_lossy().into_owned());
+    path.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{name}.{tag}-{}", std::process::id()))
+}
+
+/// Whether `name`, an entry of the directory of the store at `store`, is a
+/// staging file a writer of that store or of its commit journal left behind
+/// ([`staging_path`], any process id). Another account's files never match:
+/// the file name must be followed by exactly one staging tag and a decimal
+/// process id.
+pub(crate) fn is_staging_file_of(store: &Path, name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let journal = commit::intent_path_for(store);
+    let staged_by = |file: &str, tag: &str| {
+        name.strip_prefix('.')
+            .and_then(|rest| rest.strip_prefix(file))
+            .and_then(|rest| rest.strip_prefix('.'))
+            .and_then(|rest| rest.strip_prefix(tag))
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let (Some(store), Some(journal)) = (
+        store.file_name().and_then(std::ffi::OsStr::to_str),
+        journal.file_name().and_then(std::ffi::OsStr::to_str),
+    ) else {
+        return false;
+    };
+    staged_by(store, SAVE_STAGING_TAG)
+        || staged_by(store, COMMIT_STAGING_TAG)
+        || staged_by(journal, COMMIT_STAGING_TAG)
+}
+
 /// The primary enrollment's on-disk path for `user` - the exact file whose
 /// bytes the secondary store's activation digest is taken over. Delegates
 /// to the loader's own resolution so the two can never drift apart.
@@ -549,14 +598,17 @@ pub enum StrictPairMatch<'a> {
 
 /// Loads the secondary store. A missing file is `Ok(None)` (no secondary
 /// enrollment). Any other failure rejects the WHOLE store (§1.2); callers
-/// must not treat an error as empty.
+/// must not treat an error as empty. An encrypted store is opened with the
+/// account's existing template key ([`existing_key_for`]): a load never
+/// mints a key, so an encrypted store whose key is gone fails closed and
+/// leaves no new key behind.
 ///
 /// # Errors
 ///
 /// Returns [`SecondaryStoreError`] with the diagnostic kind; never a
 /// partial store.
 pub fn load_secondary(path: &Path) -> Result<Option<SecondaryStore>, SecondaryStoreError> {
-    load_secondary_resolved(path, production_key_for)
+    load_secondary_resolved(path, existing_key_for)
 }
 
 /// [`load_secondary`] with an explicit key: `Some` decrypts an envelope (or
@@ -600,34 +652,45 @@ pub fn load_secondary_resolved(
     load_secondary_with_key(path, None)
 }
 
-/// The production key resolver: the account template key, only when a TPM is
-/// present (degraded no-TPM hosts run the legacy plaintext store, matching
-/// the primary store's documented behavior there).
-/// # Errors
-///
-/// Returns [`SecondaryStoreError::Invalid`] when no TPM is present or the
-/// account template key cannot be unsealed.
-/// The production key resolver: the account template key when a TPM is
-/// present; `Ok(None)` on a no-TPM host, which writes the documented
-/// root-only plaintext legacy format - exactly how the primary store
-/// behaves there. On a TPM host an unseal failure is an error (fail
-/// closed; never a silent plaintext downgrade).
+/// The production key resolver for writes: the account template key when a
+/// TPM is present, generated and sealed on the account's first encrypted
+/// write, the way the primary store's first save does, under the user state
+/// lock so the check for an existing key and the new seal are one step;
+/// `Ok(None)` on a no-TPM host, which writes the documented root-only
+/// plaintext legacy format, exactly how the primary store behaves there. On
+/// a TPM host an unseal failure is an error (fail closed; never a silent
+/// plaintext downgrade). Reads use [`existing_key_for`], which never mints.
 ///
 /// # Errors
 ///
 /// Returns [`SecondaryStoreError::Invalid`] when the TPM is present but the
-/// account template key cannot be unsealed.
+/// account template key cannot be unsealed or sealed.
 pub fn production_key_for(user: &str) -> Result<Option<Zeroizing<Vec<u8>>>, SecondaryStoreError> {
     if !crate::template_key::tpm_available() {
         return Ok(None);
     }
-    crate::template_key::ensure_key_unlocked(user)
+    crate::template_key::ensure_key(user)
         .map(Some)
-        .map_err(|error| {
-            SecondaryStoreError::Invalid(format!(
-                "the account template key is unavailable: {error}"
-            ))
-        })
+        .map_err(key_unavailable)
+}
+
+/// The production key resolver for reads: the account's existing template
+/// key, unsealed read-only, when a TPM is present; `Ok(None)` on a no-TPM
+/// host, where an encrypted store then fails closed. It never mints a key
+/// or rewrites key state, so a listing or any other read of an account
+/// whose key is gone creates no replacement key (ADR-0024 §4.3); it is the
+/// resolver [`crate::template_key::RequestTemplateKey::production`] uses.
+///
+/// # Errors
+///
+/// Returns [`SecondaryStoreError::Invalid`] when the TPM is present and no
+/// key is sealed for `user`, or the key cannot be unsealed.
+pub fn existing_key_for(user: &str) -> Result<Option<Zeroizing<Vec<u8>>>, SecondaryStoreError> {
+    crate::template_key::existing_key_read_only(user).map_err(key_unavailable)
+}
+
+fn key_unavailable(error: irlume_common::Error) -> SecondaryStoreError {
+    SecondaryStoreError::Invalid(format!("the account template key is unavailable: {error}"))
 }
 
 /// The account name a secondary store belongs to: the fixed layout is
@@ -842,13 +905,7 @@ pub(crate) fn save_secondary_with_key(
     // Writers create the store's directory before publication (the fixed
     // location sits in a `cameras/` subdirectory legacy code never made).
     std::fs::create_dir_all(dir).map_err(|error| SecondaryStoreError::Io(error.to_string()))?;
-    let temp = dir.join(format!(
-        ".{}.tmp-{}",
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "secondary".into()),
-        std::process::id()
-    ));
+    let temp = staging_path(path, SAVE_STAGING_TAG);
     use std::io::Write;
     let write_all = |temp: &Path| -> std::io::Result<()> {
         // Owner-only regardless of umask (ADR-0024 s1.2 permission clause).
@@ -1210,6 +1267,106 @@ mod tests {
         );
         std::env::remove_var("IRLUME_STATE_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loading_an_encrypted_store_whose_key_is_gone_seals_no_new_key() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("sec-load-no-key"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        let path = secondary_store_path("alice");
+        save_secondary_with_key(&path, &store(), Some(&test_key())).expect("plant");
+        // With a TPM the read finds no sealed key and stops before the TPM;
+        // without one an encrypted store is refused outright. Either way
+        // the load fails closed and leaves no key behind (ADR-0024 §4.3).
+        assert!(
+            load_secondary(&path).is_err(),
+            "the store opened without its key"
+        );
+        assert!(
+            !crate::template_key::has_key("alice"),
+            "a read sealed a new template key"
+        );
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On a host with a TPM, reading an encrypted store whose account has no
+    /// sealed template key fails and seals no new key: the read resolves the
+    /// key read-only, never through the path that mints one (ADR-0024 §4.3).
+    /// The swtpm lane has no TPM device node, so the test reports a TPM
+    /// present itself; with the minting resolver this read would seal a key.
+    #[test]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
+    fn tpm_loading_an_encrypted_store_whose_key_is_gone_seals_no_new_key() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("sec-load-no-key-tpm"));
+        let keys = PathBuf::from(crate::test_tmp_dir("sec-load-no-key-tpm-keys"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&keys);
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &keys);
+        *crate::template_key::TPM_PRESENT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(true);
+        let path = secondary_store_path("alice");
+        save_secondary_with_key(&path, &store(), Some(&test_key())).expect("plant");
+        let loaded = load_secondary(&path);
+        let minted = crate::template_key::has_key("alice");
+        *crate::template_key::TPM_PRESENT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&keys);
+        assert!(loaded.is_err(), "the store opened without its key");
+        assert!(!minted, "a read sealed a new template key");
+    }
+
+    #[test]
+    fn staging_files_of_the_store_and_its_journal_match_and_other_names_do_not() {
+        let store = Path::new("/state/cameras/alice.json");
+        let journal = commit::intent_path_for(store);
+        // Exactly the names the writers stage in, so the deletion sweep and
+        // the writers cannot drift apart.
+        for staged in [
+            staging_path(store, SAVE_STAGING_TAG),
+            staging_path(store, COMMIT_STAGING_TAG),
+            staging_path(&journal, COMMIT_STAGING_TAG),
+        ] {
+            assert_eq!(staged.parent(), store.parent());
+            let name = staged.file_name().expect("a staging file name");
+            assert!(is_staging_file_of(store, name), "{}", staged.display());
+            assert!(
+                !is_staging_file_of(Path::new("/state/cameras/bob.json"), name),
+                "another account's deletion took {}",
+                staged.display()
+            );
+        }
+        for name in [
+            "alice.json",
+            "alice.json.intent",
+            ".alice.json.tmp-",
+            ".alice.json.tmp-12a",
+            ".alice.json.tmp-1.swp",
+            ".alice.json.intent.tmp-x",
+            "alice.json.tmp-1",
+            ".alice.json.bak",
+            ".alice.json.json.tmp-1",
+            ".alicee.json.tmp-1",
+            ".bob.json.commit-tmp-1",
+        ] {
+            assert!(
+                !is_staging_file_of(store, std::ffi::OsStr::new(name)),
+                "{name} is not a staging file of alice's store"
+            );
+        }
     }
 
     #[test]

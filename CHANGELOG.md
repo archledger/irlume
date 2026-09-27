@@ -862,9 +862,14 @@ All notable changes to irlume are documented here. This project adheres to
   (`irlume keyring arm` arms again), and a recovery envelope restores
   nothing. When the uid cannot be resolved, a record that carries one is
   not used and face falls back to the password, and a write that has no
-  uid to record is refused. Nothing is removed automatically. Records written by earlier releases carry no uid; they
-  are accepted and record it on their next write. Older releases ignore
-  the new field (SECURITY_AT_REST.md "Records belong to an account uid").
+  uid to record is refused. A write never changes the uid a record
+  carries: a change to a stored record (adding scans, renaming a profile,
+  a re-seal) is refused, with nothing written, when the name resolves to
+  another uid or to no account by the time it is saved. Nothing is
+  removed automatically. Records written by earlier releases carry no
+  uid; they are accepted and record it on their next write. Older
+  releases ignore the new field (SECURITY_AT_REST.md "Records belong to
+  an account uid").
 
 - A reason about the capture rather than the match (no face, a liveness
   or PAD refusal, the pose) reaches a non-root caller of `Authenticate`,

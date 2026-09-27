@@ -206,8 +206,16 @@ each record it does not use, with the uids and the next step.
 - A record written before the uid was recorded (0.14.0 and earlier) is
   accepted, and its next write records the uid: an enrollment write (enroll,
   add scans, rename or delete a profile), a template key or keyring re-seal,
-  a keyring arm, or `irlume recovery setup`. A write for a name that has no
-  account records no uid.
+  a keyring arm, or `irlume recovery setup`. Such a write for a name that has
+  no account records no uid.
+- A write never changes the uid a record carries. An operation that loads a
+  record and writes it back (add scans, rename or delete a profile, turn
+  require-eyes-open off, a template key or keyring re-seal) writes it for the
+  uid its load checked, and is refused before anything is written when the
+  name resolves to another uid, or to no account, by then. An enrollment an
+  earlier release wrote counts as its template key's uid when the key records
+  one, so its save neither records the new uid nor replaces the key. A new
+  enrollment, key, arm or recovery envelope records the current uid.
 - When the current uid cannot be resolved, a write keeps the uid its record
   carries, and a write that would leave a record without one (a new
   enrollment, key, arm or recovery envelope, or the rewrite of an earlier

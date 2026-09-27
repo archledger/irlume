@@ -150,14 +150,11 @@ pub fn has_key(user: &str) -> bool {
 }
 
 /// Whether `user`'s sealed template key was recorded for another uid
-/// ([`crate::account`]); `false` when there is no key or it cannot be read.
-pub(crate) fn key_is_for_another_account(user: &str) -> bool {
-    SealedEnvelope::load(&key_path(user)).is_ok_and(|env| {
-        matches!(
-            crate::account::owner_of(user, env.uid),
-            crate::account::Owner::Other { .. }
-        )
-    })
+/// ([`crate::account`]), as `account` resolves it; `false` when there is no
+/// key or it cannot be read.
+pub(crate) fn key_is_for_another_account(user: &str, account: &mut Account<'_>) -> bool {
+    SealedEnvelope::load(&key_path(user))
+        .is_ok_and(|env| matches!(account.owner(env.uid), crate::account::Owner::Other { .. }))
 }
 
 /// Whether a recovery envelope exists for `user`.
@@ -191,15 +188,14 @@ pub(crate) fn ensure_key_unlocked(user: &str) -> Result<Zeroizing<Vec<u8>>> {
 /// enrollment written with it replaces that account's enrollment, so the
 /// account gets a key of its own. Nothing else replaces it. The replacement
 /// is final only once that enrollment is published: the write settles it
-/// with [`WriteKey::settle`].
-pub(crate) fn ensure_enrollment_key_unlocked(user: &str) -> Result<WriteKey> {
-    ensure_key_with(
-        user,
-        &mut Account::new(user),
-        true,
-        load_key_as,
-        reseal_key_unlocked,
-    )
+/// with [`WriteKey::settle`]. `account` is the enrollment write's view of the
+/// account, so the key is chosen against the uid the enrollment is written
+/// for.
+pub(crate) fn ensure_enrollment_key_unlocked(
+    user: &str,
+    account: &mut Account<'_>,
+) -> Result<WriteKey> {
+    ensure_key_with(user, account, true, load_key_as, reseal_key_unlocked)
 }
 
 /// The template key an enrollment write encrypts under.
@@ -632,10 +628,17 @@ pub(crate) fn load_key_with(
 
 /// (Re-)seal `key` for `user` against the current TPM PCR policy and persist it.
 /// Used at first enrollment and by recovery-restore to re-bind after a PCR move.
+/// A re-seal keeps the uid the sealed key it overwrites records, and is
+/// refused, with the key left as it is, when the account now resolves to
+/// another uid or to no account ([`crate::account`]).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn reseal_key(user: &str, key: &[u8]) -> Result<()> {
     let _state = UserStateLock::acquire(user)?;
-    let uid = Account::new(user).uid_to_record(Record::TemplateKey, None)?;
+    // A key that cannot be read has no uid to keep, and is overwritten.
+    let existing = SealedEnvelope::load(&key_path(user))
+        .ok()
+        .and_then(|env| env.uid);
+    let uid = Account::new(user).uid_to_record(Record::TemplateKey, existing)?;
     reseal_key_unlocked(user, key, uid)
 }
 
@@ -860,7 +863,7 @@ mod tests {
         );
         assert!(error.contains("irlume enroll"), "{error}");
         assert!(account.found_other());
-        assert!(key_is_for_another_account(user));
+        assert!(key_is_for_another_account(user, &mut Account::new(user)));
         assert!(move_with(
             user,
             |_| panic!("the startup move must not unseal it"),
@@ -872,7 +875,7 @@ mod tests {
 
         for uid in [Some(4102), None] {
             write(uid);
-            assert!(!key_is_for_another_account(user));
+            assert!(!key_is_for_another_account(user, &mut Account::new(user)));
             let key = load_key_with(
                 user,
                 &mut Account::new(user),
@@ -884,6 +887,52 @@ mod tests {
             .unwrap();
             assert_eq!(key.as_slice(), &[3; 32], "{uid:?}");
         }
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A re-seal keeps the uid the sealed key records. When the name now
+    /// resolves to another uid, or to no account, it is refused before any
+    /// seal and the key file stays as it was: the key is not handed to the
+    /// account that took the name.
+    #[test]
+    fn a_reseal_never_records_another_uid_on_a_key() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Never the host TPM, even if the check were missing.
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = PathBuf::from(crate::test_tmp_dir("key-uid-reseal"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &dir);
+        let user = "key-uid-reseal-owner";
+        let mut env: SealedEnvelope =
+            serde_json::from_str(r#"{"version":1,"pcrs":[7],"public":"","private":""}"#).unwrap();
+        env.uid = Some(4131);
+        env.save(&key_path(user)).unwrap();
+        let before = std::fs::read(key_path(user)).unwrap();
+        {
+            let _now = crate::account::remember(user, 4132);
+            let error = reseal_key(user, &[1; crypto::KEY_LEN])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("template key")
+                    && error.contains("belongs to uid 4131")
+                    && error.contains("now uid 4132"),
+                "{error}"
+            );
+        }
+        {
+            let _gone =
+                crate::account::remember_resolution(user, crate::account::Resolution::NoAccount);
+            let error = reseal_key(user, &[1; crypto::KEY_LEN])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("no account named"), "{error}");
+        }
+        assert_eq!(std::fs::read(key_path(user)).unwrap(), before);
         std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1330,6 +1379,8 @@ mod tests {
         assert!(error.contains("uid 5101"), "{error}");
         assert!(restore_from_recovery(user, b"recovery passphrase").is_err());
         assert!(setup_recovery(user, b"another passphrase").is_err());
+        let error = reseal_key(user, &first).unwrap_err().to_string();
+        assert!(error.contains("belongs to uid 5101"), "{error}");
         assert_eq!(recorded(), Some(5101), "left as it was");
 
         // Only an enrollment write replaces it, and only once the enrollment
@@ -1341,7 +1392,7 @@ mod tests {
         assert!(has_recovery(user));
         let replace = || {
             let _state = UserStateLock::acquire(user).unwrap();
-            ensure_enrollment_key_unlocked(user).unwrap()
+            ensure_enrollment_key_unlocked(user, &mut Account::new(user)).unwrap()
         };
         let unpublished = replace();
         assert_eq!(recorded(), Some(5102));

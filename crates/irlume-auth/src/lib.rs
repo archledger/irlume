@@ -11086,6 +11086,7 @@ mod tests {
         let enr = Enrollment {
             user: "u".into(),
             uid: None,
+            loaded_for: None,
             require_eyes_open: false,
             camera_binding: None,
             closure_calibration: None,
@@ -15997,6 +15998,7 @@ mod engine_tests {
             &Enrollment {
                 user: "lbuser".into(),
                 uid: None,
+                loaded_for: None,
                 require_eyes_open: false,
                 camera_binding: None,
                 closure_calibration: None,

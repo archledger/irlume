@@ -15475,6 +15475,7 @@ mod tests {
         Enrollment {
             user: user.into(),
             uid: None,
+            loaded_for: None,
             profiles: vec![FaceProfile {
                 name: "Face Profile 1".into(),
                 ir_calib: None,

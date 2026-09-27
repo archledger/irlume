@@ -20,6 +20,11 @@
 //!
 //! A write records the account's current uid. When the lookup fails, it keeps
 //! the uid the record carries, and a record that carries none is not written.
+//! A write never changes the uid a record carries: when the name now resolves
+//! to another uid, or to no account, the write is refused and nothing is
+//! written. An enrollment loaded and then saved carries the uid its load
+//! checked, so the save is refused, not rebound, when the account changed in
+//! between.
 //!
 //! Nothing here deletes a record: an explicit enrollment or arm for the
 //! account replaces it, and an administrator can move it away.
@@ -191,13 +196,6 @@ impl Owner {
     }
 }
 
-/// Whether `user`'s record carrying `recorded` may be used, resolving the
-/// account only when the record carries a uid. For status and diagnostics.
-#[must_use]
-pub fn owner_of(user: &str, recorded: Option<u32>) -> Owner {
-    Owner::of(recorded, || resolve(user))
-}
-
 /// The kinds of record that carry a uid, for messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Record {
@@ -313,23 +311,46 @@ impl<'a> Account<'a> {
         self.other.is_some()
     }
 
-    /// The uid a write of `record` records: the account's current uid. For a
-    /// name no account has, `existing` (only root writes for such a name:
-    /// irlumed pins a non-root caller's own uid for its whole request). When
-    /// the lookup fails, `existing` if the record carries a uid.
+    /// The uid this operation resolved the account to, if it resolved it to
+    /// one. A load resolves the account only to check a record that carries
+    /// a uid, so after a load that passed its checks this is the uid those
+    /// records belong to, and `None` when none of them carries one.
+    pub(crate) fn resolved_uid(&self) -> Option<u32> {
+        match self.resolution {
+            Some(Resolution::Uid(uid)) => Some(uid),
+            _ => None,
+        }
+    }
+
+    /// The uid a write of `record` records. `existing` is the uid the record
+    /// already belongs to (`None` for a new record, or one an earlier release
+    /// wrote): a write keeps it, and otherwise records the account's current
+    /// uid. For a name no account has, a record without a uid records none.
+    /// When the lookup fails, `existing` if the record carries a uid.
     ///
     /// # Errors
-    /// The lookup failed and the record carries no uid: writing it would
-    /// leave a record that any later account of this name accepts, so the
-    /// write is refused before anything is written.
+    /// - The record belongs to a uid and the name now resolves to another
+    ///   uid, or to no account: recording the current uid would hand the
+    ///   record to another account, so the write is refused before anything
+    ///   is written.
+    /// - The lookup failed and the record carries no uid: writing it would
+    ///   leave a record that any later account of this name accepts, so the
+    ///   write is refused before anything is written.
     pub(crate) fn uid_to_record(
         &mut self,
         record: Record,
         existing: Option<u32>,
     ) -> Result<Option<u32>> {
         match (self.resolution(), existing) {
-            (Resolution::Uid(uid), _) => Ok(Some(uid)),
-            (Resolution::NoAccount, _) | (Resolution::Unknown, Some(_)) => Ok(existing),
+            (Resolution::Uid(uid), None) => Ok(Some(uid)),
+            (Resolution::Uid(uid), Some(recorded)) if uid == recorded => Ok(existing),
+            (Resolution::Uid(uid), Some(recorded)) => {
+                Err(self.changed_owner(record, recorded, Some(uid)))
+            }
+            (Resolution::NoAccount, Some(recorded)) => {
+                Err(self.changed_owner(record, recorded, None))
+            }
+            (Resolution::NoAccount, None) | (Resolution::Unknown, Some(_)) => Ok(existing),
             (Resolution::Unknown, None) => Err(Error::Policy(format!(
                 "the current uid of '{}' could not be resolved, so the {} was not written; \
                  try again when the account resolves",
@@ -337,6 +358,23 @@ impl<'a> Account<'a> {
                 record.noun()
             ))),
         }
+    }
+
+    /// The refusal of a write of a record that belongs to `recorded` while
+    /// the name now resolves to `current` (`None`: no account).
+    fn changed_owner(&self, record: Record, recorded: u32, current: Option<u32>) -> Error {
+        let (user, noun) = (self.user, record.noun());
+        Error::Policy(match current {
+            Some(current) => format!(
+                "the {noun} of '{user}' belongs to uid {recorded}, but '{user}' is now uid \
+                 {current}, so nothing was written; {}",
+                record.next_step()
+            ),
+            None => format!(
+                "the {noun} of '{user}' belongs to uid {recorded}, but no account named \
+                 '{user}' exists now, so nothing was written"
+            ),
+        })
     }
 
     /// `Ok(None)` in place of this operation's refusal of a record written
@@ -487,19 +525,63 @@ mod tests {
         assert!(error.contains("uid 4301"), "{error}");
         assert!(account.found_other());
 
-        // A name no account has: a write keeps what the record had, and a
-        // record that carries a uid is not used.
+        // A name no account has: a record without a uid records none, and a
+        // record that carries a uid is neither used nor written.
         let mut missing = Account::new(NO_SUCH_USER);
         assert_eq!(
             missing.uid_to_record(Record::Enrollment, None).unwrap(),
             None
         );
-        assert_eq!(
-            missing.uid_to_record(Record::Enrollment, Some(7)).unwrap(),
-            Some(7)
+        let error = missing
+            .uid_to_record(Record::Enrollment, Some(7))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("uid 7") && error.contains("no account named"),
+            "{error}"
         );
         assert!(missing.require(Record::Enrollment, None).is_ok());
         assert!(missing.require(Record::Enrollment, Some(7)).is_err());
+    }
+
+    /// A write keeps the uid its record belongs to. When the name now
+    /// resolves to another uid the write is refused rather than recording
+    /// the new uid on the record, and the refusal names both uids and the
+    /// next step. It is not a record turned away on a load, so it never
+    /// reads as absent.
+    #[test]
+    fn a_write_never_changes_the_uid_a_record_carries() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let user = "irlume-test-account-owner-changed";
+        let _now = remember(user, 4502);
+        let mut account = Account::new(user);
+        assert_eq!(
+            account
+                .uid_to_record(Record::Enrollment, Some(4502))
+                .unwrap(),
+            Some(4502)
+        );
+        let error = account
+            .uid_to_record(Record::Enrollment, Some(4501))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("belongs to uid 4501")
+                && error.contains("now uid 4502")
+                && error.contains("nothing was written")
+                && error.contains("irlume enroll"),
+            "{error}"
+        );
+        assert!(!error.contains('\u{2014}'));
+        assert!(!account.found_other());
+        let error = account
+            .uid_to_record(Record::SealedSecret, Some(4501))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("irlume keyring arm"), "{error}");
+        assert_eq!(account.resolved_uid(), Some(4502));
     }
 
     /// When the lookup fails, a write keeps the uid its record carries, and

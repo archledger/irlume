@@ -75,6 +75,10 @@ impl Sandbox {
             .env("IRLUME_CONFIG_DIR", self.root.join("cfg"))
             .env("IRLUME_STATE_DIR", self.root.join("state"))
             .env("IRLUME_KEYRING_DIR", self.root.join("keyring"))
+            .env(
+                "IRLUME_TEMPLATE_KEY_DIR",
+                self.root.join("state").join("template-keys"),
+            )
             .env("IRLUME_METHOD_CONF", self.root.join("cfg").join("method"))
             .env("IRLUME_KWALLET_INIT", self.root.join("wallet-salt-helper"))
             // Absent, so no distribution: a test never follows the host's
@@ -1691,7 +1695,8 @@ fn sealed_secrets_off_encrypted_storage_are_told_the_remedies() {
     const BOTH: &str = "The keyring secret and the template key that protects the face \
                         templates are sealed by the TPM";
     const TEMPLATE_KEY: &str = "The template key that protects the face templates is sealed";
-    const TEMPLATE_POLICY: &str = "The template key goes through the same choice of policy";
+    const TEMPLATE_POLICY: &str = "The template key is sealed under the policy chosen when it \
+                                   was sealed";
     const UNNAMED: &str = "irlume could not read which policy the keyring secret";
     // A daemon holding a keyring secret under `policy` (None: nothing armed)
     // and, with `template_key`, a sealed template key.
@@ -1786,11 +1791,11 @@ fn sealed_secrets_off_encrypted_storage_are_told_the_remedies() {
     let out = arm(&sb);
     if encrypted {
         assert!(
-            out.contains(
-                "[keyring] NOTE: The keyring secret and the template key are sealed under the \
-                 literal PCR 7"
-            ) && out.contains(DIRECT)
-                && out.contains(UNLOCK),
+            out.contains("[keyring] NOTE: The keyring secret is sealed under the literal PCR 7")
+                && out.contains(TEMPLATE_POLICY)
+                && out.contains(DIRECT)
+                && out.contains(UNLOCK)
+                && !out.contains("can unseal both"),
             "{out}"
         );
     } else {

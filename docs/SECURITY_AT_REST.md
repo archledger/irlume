@@ -125,8 +125,14 @@ matching also requires passing IR liveness; an inverted RGB image can't.)
    measure what it loads next, or one irlume cannot read) and the template
    key's, which the daemon does not report (where no pcrlock policy is used
    for sealing it is the literal one). With an `IRLUME_PCRS` override the
-   guidance names the PCRs the keyring seal binds. The state directory probed
-   is irlumed's, the one its unit sets for a source install included; `irlume
+   guidance names the PCRs the keyring seal binds. The directories probed
+   are irlumed's, as systemd gives them to it (a source install's unit
+   included). On dm-crypt the information also says that what the boot
+   reads before the volume is unlocked (the EFI system partition, an
+   unencrypted /boot) is not encrypted and can be changed offline to
+   capture the passphrase or PIN, whatever the TPM policy measures; Secure
+   Boot verifying all of it (a signed unified kernel image) narrows this,
+   and a GRUB configuration and initrd are not verified. `irlume
    setup`, `irlume keyring reseal` and the TUI's Password Wallet show the same
    guidance after a seal.
 

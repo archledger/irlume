@@ -1590,28 +1590,162 @@ fn unit_env_under(root: &Path, var: &str) -> Result<Option<PathBuf>, String> {
     Ok(found)
 }
 
-/// Whether irlumed's unit, with its drop-ins, reads an `EnvironmentFile=`
-/// (an empty one resets the list). [`unit_env`] does not resolve what such a
-/// file assigns, so a caller that needs the daemon's environment treats it
-/// as unknown.
-pub(crate) fn unit_reads_environment_files() -> Result<bool, String> {
-    unit_reads_environment_files_under(Path::new("/"))
+/// A directory variable as irlumed gets it from systemd ([`daemon_env`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DaemonEnv {
+    /// Set to this absolute directory.
+    Set(PathBuf),
+    /// Not set: irlumed uses its default.
+    NotSet,
+    /// Cannot be told from here: the unit reads an `EnvironmentFile=` or
+    /// passes the variable from the manager's own environment
+    /// (`PassEnvironment=`), a value is relative or quoted in a way not
+    /// decoded here, or systemd cannot be asked while irlumed's unit is
+    /// installed.
+    Unknown,
 }
 
-fn unit_reads_environment_files_under(root: &Path) -> Result<bool, String> {
-    let mut files = 0usize;
-    for text in unit_texts_under(root)? {
-        for line in text.lines() {
-            if let Some(value) = line.trim().strip_prefix("EnvironmentFile=") {
-                files = if value.trim().is_empty() {
-                    0
-                } else {
-                    files + 1
-                };
+/// `var` as systemd assembles irlumed's environment (systemd.exec(5),
+/// "Environment variables in spawned processes"), later sources winning:
+/// the manager's global environment (`systemctl show-environment`), the
+/// manager's own environment where `PassEnvironment=` names it, the unit's
+/// `Environment=`, and its `EnvironmentFile=`s; `UnsetEnvironment=` removes
+/// it at the end. The unit's lists come from the manager (`systemctl show
+/// irlumed.service`), which has merged every drop-in. With no irlumed unit
+/// loaded, it is not set.
+pub(crate) fn daemon_env(var: &str) -> DaemonEnv {
+    let systemctl = |args: &[&str]| {
+        let out = std::process::Command::new("systemctl")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        // In a chroot, or offline, systemctl skips these verbs and exits 0
+        // with nothing on stdout.
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        (out.status.success() && !text.trim().is_empty()).then_some(text)
+    };
+    let unit = systemctl(&[
+        "show",
+        "irlumed.service",
+        "-p",
+        "LoadState",
+        "-p",
+        "Environment",
+        "-p",
+        "EnvironmentFiles",
+        "-p",
+        "PassEnvironment",
+        "-p",
+        "UnsetEnvironment",
+    ]);
+    daemon_env_from(
+        var,
+        unit.as_deref(),
+        || systemctl(&["show-environment"]),
+        || unit_texts_under(Path::new("/")).map(|texts| !texts.is_empty()),
+    )
+}
+
+/// [`daemon_env`] over `systemctl show` output (`None` when systemd could not
+/// be asked), the global environment (`None` likewise) and whether an
+/// irlumed unit file is installed.
+fn daemon_env_from(
+    var: &str,
+    unit: Option<&str>,
+    global: impl FnOnce() -> Option<String>,
+    unit_installed: impl FnOnce() -> Result<bool, String>,
+) -> DaemonEnv {
+    let property = |name: &str| {
+        unit?.lines().find_map(|line| {
+            line.strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix('='))
+        })
+    };
+    let words = |name: &str| -> Vec<String> {
+        property(name)
+            .unwrap_or("")
+            .split_whitespace()
+            .map(|word| word.trim_matches('"').to_string())
+            .collect()
+    };
+    match property("LoadState") {
+        Some("loaded") => {}
+        Some(_) => return DaemonEnv::NotSet,
+        // systemd could not be asked: without a unit file irlumed is not a
+        // systemd service here; with one, its environment is unknown.
+        None => {
+            return match unit_installed() {
+                Ok(false) => DaemonEnv::NotSet,
+                _ => DaemonEnv::Unknown,
             }
         }
     }
-    Ok(files > 0)
+    if property("EnvironmentFiles").is_some_and(|files| !files.trim().is_empty()) {
+        return DaemonEnv::Unknown;
+    }
+    let assignment = format!("{var}=");
+    let value = match property("Environment").filter(|env| env.contains(&assignment)) {
+        // A value with a space or an escape is printed in a form not decoded
+        // here.
+        Some(env) if env.contains(['"', '\\', '\'']) => return DaemonEnv::Unknown,
+        Some(env) => env
+            .split_whitespace()
+            .filter_map(|word| word.strip_prefix(&assignment))
+            .next_back()
+            .map(str::to_string),
+        None => None,
+    };
+    let value = match value {
+        Some(value) => value,
+        None if words("PassEnvironment").iter().any(|name| name == var) => {
+            return DaemonEnv::Unknown
+        }
+        None => {
+            let Some(global) = global() else {
+                return DaemonEnv::Unknown;
+            };
+            match global_env_in(&global, var) {
+                Ok(Some(value)) => value,
+                Ok(None) => return DaemonEnv::NotSet,
+                Err(()) => return DaemonEnv::Unknown,
+            }
+        }
+    };
+    let unset = words("UnsetEnvironment");
+    if unset
+        .iter()
+        .any(|word| *word == var || *word == format!("{var}={value}"))
+    {
+        return DaemonEnv::NotSet;
+    }
+    // irlumed takes a relative value against its working directory; it is
+    // not resolved here.
+    if value.starts_with('/') {
+        DaemonEnv::Set(PathBuf::from(value))
+    } else {
+        DaemonEnv::Unknown
+    }
+}
+
+/// `var` in `systemctl show-environment` output, one `NAME=value` per line.
+/// A value systemd had to quote (`$'...'`, for characters outside its plain
+/// set) is not decoded here: `Err`.
+fn global_env_in(text: &str, var: &str) -> Result<Option<String>, ()> {
+    let mut found = None;
+    for line in text.lines() {
+        if let Some(value) = line
+            .strip_prefix(var)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            if value.starts_with("$'") {
+                return Err(());
+            }
+            found = Some(value.to_string());
+        }
+    }
+    Ok(found)
 }
 
 /// The text of irlumed's unit, the highest layer's, then its drop-ins merged
@@ -2665,30 +2799,103 @@ mod tests {
     }
 
     #[test]
-    fn an_environment_file_in_the_unit_is_noticed_and_an_empty_one_resets() {
-        let root = std::env::temp_dir().join(format!("irlume-unit-envfile-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let put = |rel: &str, text: &str| {
-            let path = root.join(rel);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, text).unwrap();
+    fn the_daemon_environment_follows_systemd_and_is_unknown_where_it_cannot_be_read() {
+        const VAR: &str = "IRLUME_STATE_DIR";
+        let env = |unit: Option<&str>, global: Option<&str>| {
+            let global = global.map(str::to_string);
+            daemon_env_from(VAR, unit, || global, || Ok(true))
         };
-        put(
-            "usr/lib/systemd/system/irlumed.service",
-            "[Service]\nExecStart=/x\n",
+        let loaded = |rest: &str| format!("LoadState=loaded\n{rest}");
+        let set = |dir: &str| DaemonEnv::Set(PathBuf::from(dir));
+        let global = Some("LANG=C\nPATH=/usr/bin\nIRLUME_STATE_DIR=/srv/global\n");
+        let plain = Some("LANG=C\nPATH=/usr/bin\n");
+        // No unit loaded, or systemd not asked and no unit file installed.
+        assert_eq!(
+            env(Some("LoadState=not-found\n"), global),
+            DaemonEnv::NotSet
         );
-        assert_eq!(unit_reads_environment_files_under(&root), Ok(false));
-        put(
-            "etc/systemd/system/irlumed.service.d/50-env.conf",
-            "[Service]\nEnvironmentFile=-/etc/default/irlumed\n",
+        assert_eq!(
+            daemon_env_from(VAR, None, || None, || Ok(false)),
+            DaemonEnv::NotSet
         );
-        assert_eq!(unit_reads_environment_files_under(&root), Ok(true));
-        put(
-            "etc/systemd/system/irlumed.service.d/60-reset.conf",
-            "[Service]\nEnvironmentFile=\n",
+        // systemd not asked with a unit file installed, or not readable.
+        assert_eq!(env(None, global), DaemonEnv::Unknown);
+        assert_eq!(
+            daemon_env_from(VAR, None, || None, || Err("unreadable".into())),
+            DaemonEnv::Unknown
         );
-        assert_eq!(unit_reads_environment_files_under(&root), Ok(false));
-        let _ = std::fs::remove_dir_all(&root);
+        // The global environment, then the unit's, which wins.
+        assert_eq!(
+            env(Some(&loaded("Environment=\n")), plain),
+            DaemonEnv::NotSet
+        );
+        assert_eq!(
+            env(Some(&loaded("Environment=\n")), global),
+            set("/srv/global")
+        );
+        assert_eq!(
+            env(Some(&loaded("Environment=\n")), None),
+            DaemonEnv::Unknown
+        );
+        assert_eq!(
+            env(
+                Some(&loaded("Environment=\n")),
+                Some("IRLUME_STATE_DIR=$'/a\\nb'\n")
+            ),
+            DaemonEnv::Unknown
+        );
+        let unit =
+            loaded("Environment=IRLUME_SOCKET=/run/irlume.sock IRLUME_STATE_DIR=/srv/unit\n");
+        assert_eq!(env(Some(&unit), global), set("/srv/unit"));
+        assert_eq!(
+            env(
+                Some(&loaded("Environment=\"IRLUME_STATE_DIR=/srv/a b\"\n")),
+                global
+            ),
+            DaemonEnv::Unknown
+        );
+        // Unset last, whatever the source, bare or with its value.
+        for unset in ["IRLUME_STATE_DIR", "IRLUME_STATE_DIR=/srv/unit"] {
+            let unit = format!("{unit}UnsetEnvironment={unset}\n");
+            assert_eq!(env(Some(&unit), global), DaemonEnv::NotSet, "{unset}");
+        }
+        // A relative or empty value is resolved by irlumed, not here.
+        assert_eq!(
+            env(
+                Some(&loaded("Environment=IRLUME_STATE_DIR=var/x\n")),
+                global
+            ),
+            DaemonEnv::Unknown
+        );
+        assert_eq!(
+            env(Some(&loaded("Environment=IRLUME_STATE_DIR=\n")), global),
+            DaemonEnv::Unknown
+        );
+        // Passed from the manager's own environment, which is not read here,
+        // unless the unit sets it; another variable passed does not count.
+        let pass = loaded("PassEnvironment=LANG IRLUME_STATE_DIR\n");
+        assert_eq!(env(Some(&pass), plain), DaemonEnv::Unknown);
+        assert_eq!(
+            env(
+                Some(&format!("{pass}Environment=IRLUME_STATE_DIR=/srv/unit\n")),
+                plain
+            ),
+            set("/srv/unit")
+        );
+        assert_eq!(
+            env(Some(&loaded("PassEnvironment=LANG\n")), plain),
+            DaemonEnv::NotSet
+        );
+        // An environment file is not read here.
+        assert_eq!(
+            env(
+                Some(&loaded(
+                    "EnvironmentFiles=/etc/default/irlumed (ignore_errors=yes)\n"
+                )),
+                plain
+            ),
+            DaemonEnv::Unknown
+        );
     }
 
     #[test]

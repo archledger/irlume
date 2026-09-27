@@ -90,6 +90,10 @@ impl Sandbox {
             .env("IRLUME_CONFIG_DIR", self.root.join("cfg"))
             .env("IRLUME_STATE_DIR", self.root.join("state"))
             .env("IRLUME_KEYRING_DIR", self.root.join("keyring"))
+            .env(
+                "IRLUME_TEMPLATE_KEY_DIR",
+                self.root.join("state").join("template-keys"),
+            )
             .env("IRLUME_METHOD_CONF", self.root.join("cfg").join("method"))
             .env("IRLUME_KWALLET_INIT", self.root.join("wallet-salt-helper"))
             // Absent, so no distribution: a test never follows the host's

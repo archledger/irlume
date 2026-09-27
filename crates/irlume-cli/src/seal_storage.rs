@@ -249,12 +249,6 @@ const KEYRING: Who = Who {
     object: "the keyring secret",
 };
 
-/// The keyring secret and the template key under the same literal policy.
-const BOTH: Who = Who {
-    subject: "The keyring secret and the template key are",
-    object: "both",
-};
-
 /// `pcrs` as "PCR 7" or "PCRs 0, 7".
 fn pcr_list(pcrs: &[u32]) -> String {
     let list = pcrs
@@ -430,9 +424,9 @@ fn keyring_note(keyring: &KeyringSeal) -> Option<PolicyNote> {
 
 /// The sentence on a sealed template key's policy, which the daemon does
 /// not report. Without a pcrlock policy that seals use (`pcrlock_seals`), it
-/// is the literal PCR policy; with one, the template key moves to it at
-/// irlumed's next start, and that may not cover PCR 4 either. Either way it
-/// is treated as one another operating system may reproduce.
+/// is the one chosen when the key was sealed; with one, the template key
+/// moves to it at irlumed's next start, and that may not cover PCR 4 either.
+/// Either way it is treated as one another operating system may reproduce.
 fn template_key_note(pcrlock_seals: bool) -> PolicyNote {
     let text = if pcrlock_seals {
         "irlume does not report which policy the template key is sealed under; if it is the \
@@ -441,10 +435,12 @@ fn template_key_note(pcrlock_seals: bool) -> PolicyNote {
          (PCR 4), another operating system signed with the same keys can unseal it directly, \
          without changing the installed system."
     } else {
-        "The template key goes through the same choice of policy, which on this machine, with \
-         no pcrlock policy that seals use, is the literal PCR policy (Tier 3): unless \
-         `IRLUME_PCRS` adds the boot loader (PCR 4), another operating system signed with the \
-         same keys can reproduce what it binds and unseal the template key directly, without \
+        "The template key is sealed under the policy chosen when it was sealed: with no pcrlock \
+         policy that seals use, the literal PCR policy (Tier 3) over PCR 7 or the PCRs \
+         `IRLUME_PCRS` named then, or a signed PCR 11 policy (Tier 1) from an earlier release; \
+         irlume does not report which, and a later `IRLUME_PCRS` does not move it. Unless that \
+         policy covers the boot loader (PCR 4), another operating system signed with the same \
+         keys can reproduce what it binds and unseal the template key directly, without \
          changing the installed system."
     };
     PolicyNote {
@@ -454,27 +450,36 @@ fn template_key_note(pcrlock_seals: bool) -> PolicyNote {
 }
 
 /// The sentences on the sealed secrets' policies, the keyring secret's
-/// first. Where both are under the literal policy and the keyring secret's
-/// set leaves out PCR 4, the same daemon sealed both with the same set, so
-/// one sentence names both.
+/// first. Each is described on its own: a template key keeps the policy it
+/// was sealed under until irlumed moves it to a stronger one, so the keyring
+/// secret's PCR set says nothing about it.
 fn policy_notes(sealed: &Sealed) -> Vec<PolicyNote> {
     let template_key = sealed.template_key == Some(true);
-    if template_key && !sealed.pcrlock_seals {
-        if let KeyringSeal::Armed {
-            policy: Some(policy),
-            pcrs,
-        } = &sealed.keyring
-        {
-            if is_literal_pcr_policy(policy) && !pcrs.contains(&BOOT_LOADER_PCR) {
-                return vec![literal_binding(BOTH, pcrs)];
-            }
-        }
-    }
     let mut notes: Vec<PolicyNote> = keyring_note(&sealed.keyring).into_iter().collect();
     if template_key {
         notes.push(template_key_note(sealed.pcrlock_seals));
     }
     notes
+}
+
+/// The sentence, ending the guidance, on a secret irlumed could not say is
+/// sealed or not while the other one is.
+fn unknown_secret_note(sealed: &Sealed) -> String {
+    let keyring = matches!(sealed.keyring, KeyringSeal::Armed { .. });
+    let template_key = sealed.template_key == Some(true);
+    if template_key && sealed.keyring == KeyringSeal::Unknown {
+        " irlume could not learn from irlumed whether the keyring secret is armed as well; if \
+         it is, what is said here about the storage applies to it too, under the policy it was \
+         sealed with."
+            .to_string()
+    } else if keyring && sealed.template_key.is_none() {
+        " irlume could not learn from irlumed whether a template key is sealed as well; if one \
+         is, what is said here about the storage applies to it too, under the policy it was \
+         sealed with, which irlume does not report."
+            .to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// Guidance on what protects the sealed secrets at rest.
@@ -501,6 +506,7 @@ pub(crate) fn guidance(
 ) -> Option<SealAdvice> {
     let subject = Subject::of(sealed)?;
     let notes = policy_notes(sealed);
+    let unknown = unknown_secret_note(sealed);
     let dir = state_dir.display();
     let storage = match storage {
         StorageEncryption::Encrypted => {
@@ -514,9 +520,14 @@ pub(crate) fn guidance(
                     "{reproducible}{dir} and the installed system (/, /usr and /etc) are on \
                      encrypted storage, which protects the sealed secrets at rest only if those \
                      volumes ask for a passphrase or PIN to unlock; a volume the TPM or a key file \
-                     unlocks alone does not count. A pcrlock policy \
+                     unlocks alone does not count. What the boot reads before the volume is \
+                     unlocked (the EFI system partition, an unencrypted /boot) is not encrypted \
+                     and can be changed offline to capture the passphrase or PIN, whatever the \
+                     TPM policy measures; Secure Boot verifying all of it (a signed unified \
+                     kernel image) narrows this, and a GRUB configuration and initrd are not \
+                     verified. A pcrlock policy \
                      (Tier 2) that covers the boot loader (PCR 4) is worth having in addition: \
-                     {PCRLOCK_STEPS} ({DOC})."
+                     {PCRLOCK_STEPS} ({DOC}).{unknown}"
                 ),
                 warn: false,
             });
@@ -547,7 +558,7 @@ pub(crate) fn guidance(
              a signature, together with a pcrlock policy that covers the boot loader; irlume \
              does not detect a verified root, so this warning remains on such a system. A \
              pcrlock policy (Tier 2) that covers the boot loader (PCR 4) is worth having in \
-             addition to encryption, not instead of it: {PCRLOCK_STEPS} ({DOC}).",
+             addition to encryption, not instead of it: {PCRLOCK_STEPS} ({DOC}).{unknown}",
             subject.sentence_start(),
             subject.verb(),
         ),
@@ -556,21 +567,17 @@ pub(crate) fn guidance(
 }
 
 /// A directory as irlumed resolves `var`: this process's value when it is
-/// set, else the one irlumed's unit sets (a source install writes it into the
-/// unit, not the shell), else `default`. `None` when that cannot be told: a
-/// unit file or drop-in cannot be read, or the unit reads an
-/// `EnvironmentFile=`, whose assignments are not resolved here.
+/// set, else the one systemd gives irlumed ([`crate::uninstall::daemon_env`]:
+/// a source install writes it into the unit, not the shell), else
+/// `default`. `None` when that cannot be told.
 fn daemon_dir(var: &str, default: std::path::PathBuf) -> Option<std::path::PathBuf> {
     if let Some(value) = std::env::var_os(var) {
         return Some(value.into());
     }
-    if !matches!(crate::uninstall::unit_reads_environment_files(), Ok(false)) {
-        return None;
-    }
-    match crate::uninstall::unit_env(var) {
-        Ok(Some(dir)) => Some(dir),
-        Ok(None) => Some(default),
-        Err(_) => None,
+    match crate::uninstall::daemon_env(var) {
+        crate::uninstall::DaemonEnv::Set(dir) => Some(dir),
+        crate::uninstall::DaemonEnv::NotSet => Some(default),
+        crate::uninstall::DaemonEnv::Unknown => None,
     }
 }
 
@@ -606,27 +613,57 @@ fn sealed_dirs(
 }
 
 /// What stands for an unknown state directory in the guidance text.
-const UNKNOWN_STATE_DIR: &str = "irlumed's state directory (not resolved from its unit)";
+const UNKNOWN_STATE_DIR: &str =
+    "a directory irlumed keeps sealed secrets in (not resolved from systemd)";
 
-/// `dir` when it exists, else its nearest existing ancestor, whose
-/// filesystem is where irlumed creates it. A path that is there but cannot
-/// be reached (a dangling link, no permission) stays as it is, so that its
-/// probe reads unknown: a mount below an unreachable directory is not seen.
-fn existing_or_ancestor(dir: &Path) -> &Path {
-    let missing = |path: &Path| {
+/// Where to probe for `dir`: `dir` itself when this process can reach it;
+/// else its nearest reachable ancestor when no mount lies between them
+/// (irlumed creates a missing directory on that filesystem, and one this
+/// process may not look into, such as a secret directory inside the 0700
+/// state directory, is on it too); else `dir`, whose probe then reads
+/// unknown. A link inside a directory this process cannot read is not seen;
+/// the parent's name is what the guidance then shows.
+fn probe_path(dir: &Path) -> std::path::PathBuf {
+    probe_path_in(dir, irlume_common::storage_encryption::mount_between)
+}
+
+fn probe_path_in(
+    dir: &Path,
+    mount_between: impl FnOnce(&Path, &Path) -> Option<bool>,
+) -> std::path::PathBuf {
+    let hidden = |path: &Path| {
         matches!(
             std::fs::symlink_metadata(path),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            Err(e) if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            )
         )
     };
     let mut at = dir;
-    while missing(at) {
+    while hidden(at) {
         match at.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => at = parent,
-            _ => return dir,
+            _ => return dir.to_path_buf(),
         }
     }
-    at
+    if at == dir {
+        return dir.to_path_buf();
+    }
+    let (Ok(ancestor), Ok(rest)) = (std::fs::canonicalize(at), dir.strip_prefix(at)) else {
+        return dir.to_path_buf();
+    };
+    // Only plain names can be followed without looking.
+    if !rest
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return dir.to_path_buf();
+    }
+    match mount_between(&ancestor, &ancestor.join(rest)) {
+        Some(false) => ancestor,
+        _ => dir.to_path_buf(),
+    }
 }
 
 /// The directory to name and the storage to report for `dirs` (`None`:
@@ -649,8 +686,11 @@ fn least_protected(
     };
     dirs.into_iter()
         .map(|dir| {
-            let storage = probe(existing_or_ancestor(&dir));
-            (dir, storage)
+            // Named by what was probed: a parent stands in for a directory
+            // not created yet or out of this process's reach.
+            let probed = probe_path(&dir);
+            let storage = probe(&probed);
+            (probed, storage)
         })
         .min_by_key(|(_, storage)| rank(*storage))
         .unwrap_or_else(unknown)
@@ -749,9 +789,9 @@ mod tests {
                          `lock-uki` for a unified kernel image), then run \
                          `/usr/lib/systemd/systemd-pcrlock make-policy`";
     const TEMPLATE_KEY: &str = "the template key that protects the face templates";
-    const TEMPLATE_LITERAL: &str = "The template key goes through the same choice of policy, \
-                                    which on this machine, with no pcrlock policy that seals \
-                                    use, is the literal PCR policy (Tier 3)";
+    const TEMPLATE_LITERAL: &str = "The template key is sealed under the policy chosen when it \
+                                    was sealed: with no pcrlock policy that seals use, the \
+                                    literal PCR policy (Tier 3)";
     const TEMPLATE_UNNAMED: &str =
         "irlume does not report which policy the template key is sealed under";
     const UNNAMED: &str = "irlume could not read which policy the keyring secret";
@@ -828,7 +868,12 @@ mod tests {
                 "/var/lib/irlume and the installed system (/, /usr and /etc) are on encrypted \
                  storage, which protects the sealed secrets at rest only if those volumes ask \
                  for a passphrase or PIN to unlock"
-            ) && advice.text.contains(STEPS),
+            ) && advice.text.contains(STEPS)
+                && advice.text.contains(
+                    "What the boot reads before the volume is unlocked (the EFI system \
+                     partition, an unencrypted /boot) is not encrypted and can be changed \
+                     offline to capture the passphrase or PIN, whatever the TPM policy measures"
+                ),
             "{}",
             advice.text
         );
@@ -889,14 +934,18 @@ mod tests {
         );
         assert!(text.contains(STEPS), "{text}");
         assert!(!text.contains("keyring"), "{text}");
-        // A daemon that could not say what is armed does not hide it.
-        assert_eq!(
-            warning(
-                &sealed(KeyringSeal::Unknown, Some(true)),
-                StorageEncryption::NotEncrypted
-            ),
-            text
+        // A daemon that could not say what is armed does not hide it: the
+        // warning says the keyring secret may be sealed as well.
+        const MAYBE_KEYRING: &str = " irlume could not learn from irlumed whether the keyring \
+                                     secret is armed as well; if it is, what is said here about \
+                                     the storage applies to it too, under the policy it was \
+                                     sealed with.";
+        let unknown = warning(
+            &sealed(KeyringSeal::Unknown, Some(true)),
+            StorageEncryption::NotEncrypted,
         );
+        assert!(unknown.ends_with(MAYBE_KEYRING), "{unknown}");
+        assert_eq!(unknown.replace(MAYBE_KEYRING, ""), text);
     }
 
     #[test]
@@ -952,17 +1001,32 @@ mod tests {
         // The default set and an empty report read the same.
         assert_eq!(
             warning(
-                &sealed(literal(Vec::new()), None),
+                &sealed(literal(Vec::new()), Some(false)),
                 StorageEncryption::NotEncrypted
             ),
             text
         );
+        // A daemon that could not say whether a template key is sealed does
+        // not hide it.
+        let unknown = warning(
+            &sealed(literal(vec![7]), None),
+            StorageEncryption::NotEncrypted,
+        );
+        assert!(
+            unknown.contains(
+                "irlume could not learn from irlumed whether a template key is sealed as well; \
+                 if one is, what is said here about the storage applies to it too, under the \
+                 policy it was sealed with, which irlume does not report."
+            ),
+            "{unknown}"
+        );
     }
 
-    /// Sealed by the same daemon under the literal policy, both are named in
-    /// one sentence.
+    /// Both sealed: the subject names both, and each policy has its own
+    /// sentence, since a template key keeps the policy it was sealed under
+    /// when the keyring secret is armed under another set.
     #[test]
-    fn a_keyring_secret_and_a_template_key_are_named_together() {
+    fn a_keyring_secret_and_a_template_key_are_each_described() {
         let text = warning(
             &sealed(literal(vec![7]), Some(true)),
             StorageEncryption::NotEncrypted,
@@ -979,20 +1043,18 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains(
-                "The keyring secret and the template key are sealed under the literal PCR 7 \
-                 policy (Tier 3)"
-            ) && text.contains(DIRECT)
-                && text.contains("can unseal both directly"),
+            text.contains("The keyring secret is sealed under the literal PCR 7 policy (Tier 3)")
+                && text.contains(DIRECT)
+                && text.contains("can unseal the keyring secret directly")
+                && text.contains(TEMPLATE_LITERAL)
+                && !text.contains("can unseal both directly"),
             "{text}"
         );
-        assert!(!text.contains(TEMPLATE_LITERAL), "{text}");
         let text = information(&sealed(literal(vec![7, 11]), Some(true)));
         assert!(
             text.starts_with(
-                "The keyring secret and the template key are sealed under a literal PCR policy \
-                 over PCRs 7, 11"
-            ),
+                "The keyring secret is sealed under a literal PCR policy over PCRs 7, 11"
+            ) && text.contains(TEMPLATE_LITERAL),
             "{text}"
         );
 
@@ -1170,8 +1232,8 @@ mod tests {
         assert!(advice.warn, "{}", advice.text);
         assert!(
             advice.text.contains(
-                "irlume could not confirm that irlumed's state directory (not resolved from its \
-                 unit) is on encrypted storage"
+                "irlume could not confirm that a directory irlumed keeps sealed secrets in (not \
+                 resolved from systemd) is on encrypted storage"
             ),
             "{}",
             advice.text
@@ -1270,21 +1332,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A directory not created yet is judged by where it would be created;
-    /// one that is there, even as a dangling link, is judged by itself.
+    /// A directory not created yet is judged by where it would be created,
+    /// and one this process may not look into by its reachable parent; one
+    /// that is there, even as a dangling link, is judged by itself.
     #[test]
-    fn a_directory_not_created_yet_is_judged_by_its_nearest_existing_ancestor() {
+    fn a_directory_not_created_yet_or_out_of_reach_is_judged_by_its_parent() {
+        use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("irlume-seal-dirs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("state/keyring")).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        // Restores the locked directory's mode, even when an assertion fails,
+        // so the tree can be removed.
+        struct Unlock(PathBuf);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(
+                    self.0.join("locked"),
+                    std::fs::Permissions::from_mode(0o700),
+                );
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _unlock = Unlock(root.clone());
         let keyring = root.join("state/keyring");
-        assert_eq!(existing_or_ancestor(&keyring), keyring);
+        assert_eq!(probe_path(&keyring), keyring);
         let deeper = root.join("state/template-keys/deeper");
-        assert_eq!(existing_or_ancestor(&deeper), root.join("state"));
+        assert_eq!(probe_path(&deeper), root.join("state"));
         let link = root.join("state/link");
         std::os::unix::fs::symlink(root.join("gone"), &link).unwrap();
-        assert_eq!(existing_or_ancestor(&link), link);
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(probe_path(&link), link);
+        // A directory only its owner may search, as the 0700 state directory
+        // is for anyone but root, who reaches it anyway.
+        std::fs::create_dir_all(root.join("locked/keyring")).unwrap();
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let inside = root.join("locked/keyring");
+        let reachable = std::fs::symlink_metadata(&inside).is_ok();
+        let parent = root.join("locked");
+        let expected = if reachable { &inside } else { &parent };
+        assert_eq!(&probe_path_in(&inside, |_, _| Some(false)), expected);
+        // A mount between them, or mountinfo that cannot be read, leaves the
+        // directory itself, whose probe reads unknown; so does a path that
+        // is not plain names below the reachable parent.
+        assert_eq!(probe_path_in(&inside, |_, _| Some(true)), inside);
+        assert_eq!(probe_path_in(&inside, |_, _| None), inside);
+        let back = root.join("locked/../state");
+        assert_eq!(probe_path_in(&back, |_, _| Some(false)), back);
     }
 
     /// On encrypted storage the guidance is always information: the storage
@@ -1405,7 +1499,7 @@ mod tests {
             assert!(
                 text.contains("over PCR 11 (Tier 3, set by IRLUME_PCRS)")
                     && text.contains("another operating system reproduces them")
-                    && !text.contains("Secure Boot"),
+                    && !text.contains("the Secure Boot state"),
                 "{text}"
             );
         }

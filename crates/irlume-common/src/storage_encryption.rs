@@ -306,6 +306,25 @@ fn unescape(field: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Whether a mount point lies below canonical `ancestor` on the way to
+/// `path` (`path` itself included), read from this process's mountinfo;
+/// `None` when that cannot be read. A caller that cannot reach `path`, such
+/// as a directory inside one only root can read, uses it to tell whether
+/// `ancestor`'s filesystem also holds `path`. `path` is taken as written: a
+/// link inside a directory the caller cannot read is not seen.
+pub fn mount_between(ancestor: &Path, path: &Path) -> Option<bool> {
+    let text = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    Some(mount_between_in(&parse_mountinfo(&text), ancestor, path))
+}
+
+fn mount_between_in(mounts: &[Mount], ancestor: &Path, path: &Path) -> bool {
+    mounts.iter().any(|mount| {
+        mount.mount_point != ancestor
+            && mount.mount_point.starts_with(ancestor)
+            && path.starts_with(&mount.mount_point)
+    })
+}
+
 /// The mount that holds canonical `path`: the longest mount point containing
 /// it, the later entry on a tie (mounted over the earlier).
 fn mount_holding<'a>(mounts: &'a [Mount], path: &Path) -> Option<&'a Mount> {
@@ -358,6 +377,42 @@ fn btrfs_members(sys: &Path, name: &str) -> Option<Vec<String>> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn a_mount_below_an_ancestor_on_the_way_to_a_path_is_found() {
+        let mounts = parse_mountinfo(
+            "22 1 253:0 / / rw - ext4 /dev/mapper/root rw\n\
+             30 22 0:40 / /var/lib/irlume/keyring rw - tmpfs tmpfs rw\n\
+             31 22 0:41 / /var/lib/other rw - tmpfs tmpfs rw\n",
+        );
+        let state = Path::new("/var/lib/irlume");
+        assert!(mount_between_in(
+            &mounts,
+            state,
+            Path::new("/var/lib/irlume/keyring")
+        ));
+        assert!(mount_between_in(
+            &mounts,
+            state,
+            Path::new("/var/lib/irlume/keyring/x")
+        ));
+        assert!(!mount_between_in(
+            &mounts,
+            state,
+            Path::new("/var/lib/irlume/template-keys")
+        ));
+        // The mount that holds the ancestor itself does not count.
+        assert!(!mount_between_in(
+            &mounts,
+            Path::new("/"),
+            Path::new("/etc")
+        ));
+        assert!(!mount_between_in(
+            &mounts,
+            Path::new("/var/lib/irlume/keyring"),
+            Path::new("/var/lib/irlume/keyring/x")
+        ));
+    }
 
     use StorageEncryption::{Encrypted, NotEncrypted, Unknown};
 

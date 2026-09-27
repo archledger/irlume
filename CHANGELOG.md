@@ -870,17 +870,22 @@ All notable changes to irlume are documented here. This project adheres to
   `/usr/lib/systemd/systemd-pcrlock` steps. The check reports `warn` when a
   keyring secret or a template key is sealed and no dm-crypt layer is found
   under a directory that holds it or under the installed system, or the
-  storage cannot be established; `info`
-  whenever it is on dm-crypt, since the storage does not show whether the
-  volume asks for a passphrase, naming each sealed secret's policy another
-  operating system may reproduce (a policy with PCR 4 included where the
-  boot loader does not measure what it loads next, as on a GRUB boot);
-  `info` when nothing is sealed; and `unknown` when irlumed does not say
-  what is sealed. The directories probed are irlumed's keyring and
-  template-key directories, each as irlumed resolves it (the unit's
-  `Environment=` for a source install included), and `/`, `/usr` and
-  `/etc`, and the least protected one decides; where the unit reads an `EnvironmentFile=`, or cannot be
-  read, they count as unknown. `keyring arm`, `irlume setup`,
+  storage cannot be established; `info` whenever it is on dm-crypt, since
+  the storage does not show whether the volume asks for a passphrase,
+  naming each sealed secret's policy another operating system may
+  reproduce (a policy with PCR 4 included where the boot loader does not
+  measure what it loads next, as on a GRUB boot) and saying that what the
+  boot reads before the volume is unlocked (the EFI system partition, an
+  unencrypted /boot) is not encrypted and can be changed offline; `info`
+  when nothing is sealed; and `unknown` when irlumed does not say what is
+  sealed. The directories probed are irlumed's keyring and template-key
+  directories, each as systemd gives it to irlumed (`systemctl show` for
+  the unit's `Environment=`, a source install's included, and `systemctl
+  show-environment` for the manager's global environment), and `/`, `/usr`
+  and `/etc`; the least protected one decides. Where the unit reads an
+  `EnvironmentFile=` or passes the variable with `PassEnvironment=`, a
+  value is relative, or systemd cannot be asked while irlumed's unit is
+  installed, they count as unknown. `keyring arm`, `irlume setup`,
   `irlume keyring reseal` and the TUI's Password Wallet show the same
   guidance after a seal, also when irlumed then does not describe the new
   secret. An irlumed from before

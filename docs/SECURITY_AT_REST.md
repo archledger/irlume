@@ -61,7 +61,23 @@ matching also requires passing IR liveness; an inverted RGB image can't.)
    the default on most machines). Note Tier 3 binds to the Secure Boot
    **state** (PCR 7), not the loaded kernel/initrd, so a validly-signed but
    modified kernel does not move it; Tier 2 is the one that binds
-   boot-component measurements. A signed PCR-11 policy (Tier 1), which earlier
+   boot-component measurements. Another operating system signed with the
+   same keys therefore reproduces PCR 7, and the sealed object needs no
+   authorization beyond its PCR policy. On a Tier 3 machine the sealed
+   secrets are then only as protected as the storage their envelopes sit
+   on: where irlume's state directory (`/var/lib/irlume`) is not on
+   encrypted storage, a system booted with the same Secure Boot state can
+   unseal the template key and any armed keyring secret (for the login
+   password kind, the login password itself). On such a machine, prefer a
+   pcrlock policy (Tier 2) or full-disk encryption unlocked by a passphrase.
+   A volume the TPM unlocks without a passphrase or PIN, under a policy the
+   same boot state satisfies, does not count. `irlume keyring arm` and
+   `irlume doctor` (check `pcrlock`) say so when an armed keyring secret
+   uses Tier 3 and the state directory is not on encrypted storage, or that
+   cannot be established. Once a pcrlock policy is provisioned, existing
+   seals move to it: the keyring secret at `irlume keyring arm` or its next
+   re-seal at a password login, the template key at irlumed's next start.
+   A signed PCR-11 policy (Tier 1), which earlier
    releases preferred on UKI machines, binds only what the operating system
    measures itself, so new seals no longer use it and an existing Tier 1
    envelope moves on its next reseal.
@@ -124,7 +140,7 @@ So the realistic attacks and their outcomes:
 | Normal user account on the box | Can't read either file (0600 root) |
 | Steals the disk / backup image (**TPM host**) | Encrypted primary and migrated secondary ciphertext will not unseal on another TPM; unmigrated v0.13.0 secondary files and old plaintext backups remain exposed |
 | Steals the disk / backup image (**no-TPM host**) | Templates are root-only but **plaintext** (see "Degraded hosts" below): recoverable 512-D embeddings, not an image |
-| Steals disk AND has the physical machine, no root | Must defeat the TPM's PCR policy + get root to run the daemon path |
+| Steals disk AND has the physical machine, no root | Tier 2 (pcrlock): must satisfy a PCR policy that binds the boot components, or get root on the installed system. Tier 3 (literal PCR 7): the policy binds the Secure Boot state only, which another operating system signed with the same keys reproduces, so where the state directory is not on encrypted storage unlocked by a passphrase, the template key and any armed keyring secret unseal on this machine without the installed system. Remedies: a pcrlock policy (Tier 2) or full-disk encryption unlocked by a passphrase (layer 3 above) |
 | Root on the live original machine | Game over: root can ask the daemon to unseal (true of any at-rest scheme; root is the trust boundary) |
 | Recovers only the embedding plaintext (somehow) | Gets a 512-float vector, not a photo; can't replay it past IR liveness |
 

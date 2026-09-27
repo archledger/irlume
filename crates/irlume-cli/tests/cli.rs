@@ -1644,6 +1644,96 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_forget_before_upgrading_to_45() {
     }
 }
 
+/// A keyring secret armed under the literal PCR 7 policy (Tier 3) gets the
+/// remedies from `keyring arm` and from doctor's `pcrlock` check whenever the
+/// state directory is not established to be on encrypted storage. A pcrlock
+/// envelope, or nothing armed, leaves both as they were. The expectation
+/// comes from the same read-only probe the binary runs on the sandbox's state
+/// directory, so it holds on a host whose temp directory is encrypted too.
+#[test]
+fn a_tier_3_keyring_seal_off_encrypted_storage_is_told_the_remedies() {
+    use irlume_common::storage_encryption::{path_encryption, StorageEncryption};
+    const TIER_3: &str = "literal PolicyPCR (Tier 3)";
+    const TIER_2: &str = "pcrlock NV 0x1a2b (Tier 2)";
+    const ADVICE: &str = "sealed under the literal PCR 7 policy (Tier 3)";
+    const REMEDY: &str = "full-disk encryption unlocked by a passphrase";
+    let sandbox = |tag: &str, policy: Option<&'static str>| {
+        let sb = Sandbox::new(tag);
+        for tool in ["rpm", "dnf", "dpkg-query", "apt-cache", "pacman"] {
+            sb.fake_tool(tool, "exit 1");
+        }
+        serve(&sock(&sb), move |request| match request {
+            Request::KeyringMetadata { .. } => Response::KeyringInfo {
+                armed: policy.is_some(),
+                policy: policy.map(str::to_string),
+                pcrs: vec![7],
+                drifted: None,
+                kind: policy.map(|_| irlume_common::KeyringSecretKind::LoginPassword),
+            },
+            Request::SealPassword { .. } => Response::PasswordSealed,
+            _ => Response::Error("fixture unavailable".into()),
+        });
+        sb
+    };
+    let arm = |sb: &Sandbox| -> String {
+        let (code, out, err) = run_stdin(
+            &mut sb.cmd_with_fakes(&["keyring", "arm", "--user", "tester"]),
+            "hunter2\n",
+        );
+        assert_eq!(code, 0, "{out} {err}");
+        assert!(out.contains("armed. After a face login"), "{out}");
+        out
+    };
+    let pcrlock_check = |sb: &Sandbox| -> serde_json::Value {
+        let (_, out, err) = run(sb
+            .cmd_with_fakes(&["doctor", "--json"])
+            .env("USER", "tester")
+            .env_remove("SUDO_USER"));
+        let report: serde_json::Value =
+            serde_json::from_str(&out).unwrap_or_else(|error| panic!("{error}: {out} {err}"));
+        report["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "pcrlock")
+            .cloned()
+            .unwrap_or_else(|| panic!("no pcrlock check: {out}"))
+    };
+
+    let sb = sandbox("tier3-seal", Some(TIER_3));
+    let told = path_encryption(&sb.path("state")) != StorageEncryption::Encrypted;
+    let out = arm(&sb);
+    assert_eq!(out.contains(ADVICE), told, "{out}");
+    assert_eq!(out.contains(REMEDY), told, "{out}");
+    let (_, out, err) = run(&mut sb.cmd_with_fakes(&["doctor", "--user", "tester"]));
+    assert_eq!(
+        out.contains("keyring seal (tester)") && out.contains(ADVICE),
+        told,
+        "{out} {err}"
+    );
+    let check = pcrlock_check(&sb);
+    if told {
+        assert_eq!(check["state"], "warn", "{check}");
+        let detail = check["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains(ADVICE) && detail.contains(REMEDY),
+            "{check}"
+        );
+    } else {
+        assert_ne!(check["state"], "warn", "{check}");
+        assert!(check.get("detail").is_none(), "{check}");
+    }
+
+    for (tag, policy) in [("tier2-seal", Some(TIER_2)), ("unarmed-seal", None)] {
+        let sb = sandbox(tag, policy);
+        let out = arm(&sb);
+        assert!(!out.contains(ADVICE), "{tag}: {out}");
+        let check = pcrlock_check(&sb);
+        assert_ne!(check["state"], "warn", "{tag}: {check}");
+        assert!(check.get("detail").is_none(), "{tag}: {check}");
+    }
+}
+
 /// A sandbox whose fake `busctl` names `provider` as the owner of
 /// `org.freedesktop.secrets`, and a command for it that sees a session bus.
 fn secret_service_sandbox(tag: &str, provider: &str) -> Sandbox {
@@ -1874,14 +1964,25 @@ fn keyring_arm_on_nixos_seals_only_the_login_password() {
     assert_eq!(sealed(&log), [(Some(K::LoginPassword), false)]);
 
     // Off NixOS nothing changes: the daemon judges, with the salt it needs,
-    // and is asked nothing else.
+    // and is asked nothing else before the seal. After it, the arm reads the
+    // new envelope's policy once, for the literal PCR 7 storage note.
     let sb = Sandbox::new("keyring-fedora-kde");
     kde_salt_helper(&sb);
     let log = daemon(&sb, None);
     let (code, out, err) = run_stdin(&mut arm(&sb, fedora), "hunter2\n");
     assert_eq!(code, 0, "{out}\n{err}");
     assert_eq!(sealed(&log), [(None, true)]);
-    assert_eq!(log.lock().unwrap().len(), 1, "{:?}", log.lock().unwrap());
+    let requests = log.lock().unwrap();
+    assert!(
+        matches!(
+            requests.as_slice(),
+            [
+                Request::SealPassword { .. },
+                Request::KeyringMetadata { .. }
+            ]
+        ),
+        "{requests:?}"
+    );
 }
 
 /// On NixOS `reseal` decides before its GNOME token early return, and keeps

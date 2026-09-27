@@ -853,6 +853,20 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- `irlume keyring arm` and `irlume doctor` name the remedies when an
+  armed keyring secret is sealed under the literal PCR 7 policy (Tier 3)
+  and irlume's state directory is not on encrypted storage, or that
+  cannot be established. That policy binds the Secure Boot state only:
+  another operating system signed with the same keys reproduces it. The
+  remedies are a pcrlock policy (Tier 2) or full-disk encryption unlocked
+  by a passphrase. `keyring arm` prints a note; doctor's `pcrlock` check
+  reports `warn` with them in its detail. The storage probe follows the
+  state directory's block device through device-mapper (dm-crypt, LVM),
+  md RAID and partitions, and every device of a btrfs filesystem; what it
+  cannot establish counts as unencrypted. docs/SECURITY_AT_REST.md,
+  docs/SETUP.md and ADR-0003 (amendment 2026-09-27) now say what the
+  literal PCR 7 policy binds and what it does not.
+
 - irlumed turns a camera on for an account's own request only while that
   account holds the active local session on a seat, as udev's `uaccess`
   grants camera devices. This covers face authentication from a lock

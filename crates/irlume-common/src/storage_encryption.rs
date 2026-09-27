@@ -1,0 +1,696 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
+//! Whether a path lives on encrypted block storage (dm-crypt).
+//!
+//! Best effort, read-only and never panics. Anything this cannot establish
+//! reads [`StorageEncryption::Unknown`], never
+//! [`StorageEncryption::Encrypted`].
+//!
+//! Resolution:
+//!
+//! 1. The path's `st_dev`. A filesystem on one block device (ext4, xfs)
+//!    reports that device's number, found as `/sys/dev/block/MAJ:MIN`.
+//! 2. Otherwise, as for btrfs, whose `st_dev` is an anonymous number, the
+//!    mount that holds the path in `/proc/self/mountinfo` (the longest mount
+//!    point containing it; the later entry on a tie, since it is mounted
+//!    over the earlier) names its source device. A btrfs filesystem can span
+//!    several devices, so every device `/sys/fs/btrfs/<fsid>/devices` lists
+//!    for it counts.
+//! 3. The device stack below, in `/sys/class/block/<name>`: a device-mapper
+//!    node whose `dm/uuid` names a cryptsetup encryption type
+//!    (`CRYPT-LUKS2-...`, `CRYPT-PLAIN-...`) is dm-crypt; any other stacked
+//!    device (LVM, md RAID, dm-verity, dm-integrity) is encrypted only when
+//!    every device under its `slaves/` is; a partition is judged by the disk
+//!    that holds it; a disk with nothing below it is not encrypted; a loop
+//!    device, or a stacked device with nothing listed below it, is unknown.
+//!
+//! A self-encrypting drive's hardware encryption is not visible here and
+//! reads as not encrypted.
+//!
+//! [`path_encryption`] reads the fixed system paths; `path_encryption_in`
+//! takes the roots, so the tests run against fixture trees.
+
+use std::ffi::OsStr;
+use std::fs;
+use std::io::ErrorKind;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Component, Path, PathBuf};
+
+/// Whether the block storage under a path is encrypted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageEncryption {
+    /// Every block device under the path has a dm-crypt layer.
+    Encrypted,
+    /// At least one block device under the path has no dm-crypt layer.
+    NotEncrypted,
+    /// Could not be established: an unreadable or unexpected `/proc` or
+    /// `/sys` entry, a mount source that is not a block device, a loop
+    /// device, or a path that does not exist.
+    Unknown,
+}
+
+/// Deepest device stack walked before giving up (a cycle in a broken sysfs
+/// would otherwise recurse forever). Real stacks are 2 to 4 deep.
+const MAX_DEPTH: u8 = 16;
+
+/// cryptsetup's dm uuid types that are encryption. Its other `CRYPT-` types
+/// (`VERITY`, `INTEGRITY`, `SUBDEV`) are integrity layers.
+const CRYPT_TYPES: &[&str] = &[
+    "LUKS1", "LUKS2", "PLAIN", "LOOPAES", "TCRYPT", "BITLK", "FVAULT2",
+];
+
+/// Where the probe reads. Only tests point it anywhere but `/`.
+struct Roots {
+    mountinfo: PathBuf,
+    sys: PathBuf,
+    dev: PathBuf,
+}
+
+impl Roots {
+    fn system() -> Self {
+        Roots {
+            mountinfo: PathBuf::from("/proc/self/mountinfo"),
+            sys: PathBuf::from("/sys"),
+            dev: PathBuf::from("/dev"),
+        }
+    }
+}
+
+/// Whether `path` lives on encrypted block storage, read from this process's
+/// view of `/proc` and `/sys`.
+pub fn path_encryption(path: &Path) -> StorageEncryption {
+    path_encryption_in(path, &Roots::system())
+}
+
+fn path_encryption_in(path: &Path, roots: &Roots) -> StorageEncryption {
+    let (Ok(real), Ok(meta)) = (fs::canonicalize(path), fs::metadata(path)) else {
+        return StorageEncryption::Unknown;
+    };
+    let dev = meta.dev();
+    classify(&real, libc::major(dev), libc::minor(dev), roots)
+}
+
+/// The encryption under canonical path `path`, whose `st_dev` is
+/// `major:minor`.
+fn classify(path: &Path, major: u32, minor: u32, roots: &Roots) -> StorageEncryption {
+    // Major 0 is the kernel's anonymous-device range (btrfs, tmpfs, overlay,
+    // network filesystems): no block device has that number.
+    if major != 0 {
+        if let Some(name) = name_of_dev(&roots.sys, major, minor) {
+            return block_encryption(&roots.sys, &name, 0);
+        }
+    }
+    let Ok(text) = fs::read_to_string(&roots.mountinfo) else {
+        return StorageEncryption::Unknown;
+    };
+    let mounts = parse_mountinfo(&text);
+    let Some(mount) = mount_holding(&mounts, path) else {
+        return StorageEncryption::Unknown;
+    };
+    let Some(name) = source_device(roots, &mount.source) else {
+        return StorageEncryption::Unknown;
+    };
+    if mount.fstype == "btrfs" {
+        return match btrfs_members(&roots.sys, &name) {
+            Some(members) => all_of(
+                members
+                    .iter()
+                    .map(|member| block_encryption(&roots.sys, member, 0)),
+            ),
+            None => StorageEncryption::Unknown,
+        };
+    }
+    block_encryption(&roots.sys, &name, 0)
+}
+
+/// The sysfs name of block device `major:minor`, if sysfs knows it.
+fn name_of_dev(sys: &Path, major: u32, minor: u32) -> Option<String> {
+    let real = fs::canonicalize(sys.join("dev/block").join(format!("{major}:{minor}"))).ok()?;
+    plain_name(real.file_name()?)
+}
+
+/// A name that is one ordinary path component, so joining it cannot leave
+/// the directory it is joined to.
+fn plain_name(name: &OsStr) -> Option<String> {
+    let name = name.to_str()?;
+    let mut parts = Path::new(name).components();
+    match (parts.next(), parts.next()) {
+        (Some(Component::Normal(_)), None) => Some(name.to_string()),
+        _ => None,
+    }
+}
+
+/// `Some(true)` when `path` exists, `Some(false)` when it does not, `None`
+/// when that cannot be told.
+fn present(path: &Path) -> Option<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Some(true),
+        Err(e) if e.kind() == ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// Encrypted only when every part is and there is at least one; one part
+/// without encryption makes the whole not encrypted.
+fn all_of(parts: impl IntoIterator<Item = StorageEncryption>) -> StorageEncryption {
+    let mut any = false;
+    let mut unknown = false;
+    for part in parts {
+        any = true;
+        match part {
+            StorageEncryption::NotEncrypted => return StorageEncryption::NotEncrypted,
+            StorageEncryption::Unknown => unknown = true,
+            StorageEncryption::Encrypted => {}
+        }
+    }
+    if any && !unknown {
+        StorageEncryption::Encrypted
+    } else {
+        StorageEncryption::Unknown
+    }
+}
+
+/// Whether a device-mapper uuid names a cryptsetup encryption mapping.
+fn is_crypt_uuid(uuid: &str) -> bool {
+    uuid.strip_prefix("CRYPT-")
+        .and_then(|rest| rest.split('-').next())
+        .is_some_and(|kind| CRYPT_TYPES.contains(&kind))
+}
+
+/// Walk block device `name` and what it is stacked on.
+fn block_encryption(sys: &Path, name: &str, depth: u8) -> StorageEncryption {
+    if depth > MAX_DEPTH {
+        return StorageEncryption::Unknown;
+    }
+    let Some(name) = plain_name(OsStr::new(name)) else {
+        return StorageEncryption::Unknown;
+    };
+    let Ok(real) = fs::canonicalize(sys.join("class/block").join(&name)) else {
+        return StorageEncryption::Unknown;
+    };
+    match present(&real.join("partition")) {
+        // A partition's sysfs directory sits inside its disk's.
+        Some(true) => {
+            return match real.parent().and_then(Path::file_name).and_then(plain_name) {
+                Some(disk) => block_encryption(sys, &disk, depth + 1),
+                None => StorageEncryption::Unknown,
+            };
+        }
+        Some(false) => {}
+        None => return StorageEncryption::Unknown,
+    }
+    match fs::read_to_string(real.join("dm/uuid")) {
+        Ok(uuid) if is_crypt_uuid(uuid.trim()) => return StorageEncryption::Encrypted,
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(_) => return StorageEncryption::Unknown,
+    }
+    let below = match fs::read_dir(real.join("slaves")) {
+        Ok(entries) => {
+            let mut names = Vec::new();
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    return StorageEncryption::Unknown;
+                };
+                let Some(slave) = plain_name(&entry.file_name()) else {
+                    return StorageEncryption::Unknown;
+                };
+                names.push(slave);
+            }
+            names
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
+        Err(_) => return StorageEncryption::Unknown,
+    };
+    if below.is_empty() {
+        // A stacked or file-backed device with nothing listed below it
+        // cannot be judged; anything else is a disk.
+        let mut stacked = false;
+        for marker in ["dm", "md", "loop"] {
+            match present(&real.join(marker)) {
+                Some(true) => stacked = true,
+                Some(false) => {}
+                None => return StorageEncryption::Unknown,
+            }
+        }
+        return if stacked {
+            StorageEncryption::Unknown
+        } else {
+            StorageEncryption::NotEncrypted
+        };
+    }
+    all_of(
+        below
+            .iter()
+            .map(|slave| block_encryption(sys, slave, depth + 1)),
+    )
+}
+
+/// One `/proc/self/mountinfo` entry, the fields this needs.
+#[derive(Debug, PartialEq, Eq)]
+struct Mount {
+    mount_point: PathBuf,
+    fstype: String,
+    source: String,
+}
+
+/// Parse mountinfo (proc(5)): field 5 is the mount point; after the `-`
+/// separator come the filesystem type and the mount source. Lines that do
+/// not have that shape are skipped.
+fn parse_mountinfo(text: &str) -> Vec<Mount> {
+    let mut mounts = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let Some(sep) = fields.iter().skip(6).position(|f| *f == "-") else {
+            continue;
+        };
+        let sep = sep + 6;
+        let (Some(mount_point), Some(fstype), Some(source)) =
+            (fields.get(4), fields.get(sep + 1), fields.get(sep + 2))
+        else {
+            continue;
+        };
+        mounts.push(Mount {
+            mount_point: PathBuf::from(unescape(mount_point)),
+            fstype: unescape(fstype),
+            source: unescape(source),
+        });
+    }
+    mounts
+}
+
+/// Undo mountinfo's octal escapes (`\040` space, `\011` tab, `\012` newline,
+/// `\134` backslash).
+fn unescape(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let digits = &bytes[i + 1..i + 4];
+            if digits.iter().all(|d| (b'0'..=b'7').contains(d)) {
+                let value = digits
+                    .iter()
+                    .fold(0u32, |acc, d| acc * 8 + u32::from(d - b'0'));
+                if let Ok(byte) = u8::try_from(value) {
+                    out.push(byte);
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The mount that holds canonical `path`: the longest mount point containing
+/// it, the later entry on a tie (mounted over the earlier).
+fn mount_holding<'a>(mounts: &'a [Mount], path: &Path) -> Option<&'a Mount> {
+    let mut best: Option<(&Mount, usize)> = None;
+    for mount in mounts {
+        if !path.starts_with(&mount.mount_point) {
+            continue;
+        }
+        let depth = mount.mount_point.components().count();
+        if best.is_none_or(|(_, d)| depth >= d) {
+            best = Some((mount, depth));
+        }
+    }
+    best.map(|(mount, _)| mount)
+}
+
+/// The sysfs name of the block device a mount source names: a `/dev` node,
+/// followed through its symlinks (`/dev/mapper/luks-...` points at
+/// `../dm-0`). A block device node is looked up by its device number, which
+/// also covers a node whose name differs from its sysfs name.
+fn source_device(roots: &Roots, source: &str) -> Option<String> {
+    let rel = source.strip_prefix("/dev/")?;
+    let node = fs::canonicalize(roots.dev.join(rel)).ok()?;
+    let meta = fs::metadata(&node).ok()?;
+    if meta.file_type().is_block_device() {
+        let rdev = meta.rdev();
+        return name_of_dev(&roots.sys, libc::major(rdev), libc::minor(rdev));
+    }
+    plain_name(node.file_name()?)
+}
+
+/// Every device of the btrfs filesystem that `name` belongs to, or `None`
+/// when sysfs lists no btrfs filesystem with that device.
+fn btrfs_members(sys: &Path, name: &str) -> Option<Vec<String>> {
+    for fs_dir in fs::read_dir(sys.join("fs/btrfs")).ok()? {
+        let devices = fs_dir.ok()?.path().join("devices");
+        if present(&devices.join(name)) != Some(true) {
+            continue;
+        }
+        let mut members = Vec::new();
+        for entry in fs::read_dir(&devices).ok()? {
+            members.push(plain_name(&entry.ok()?.file_name())?);
+        }
+        return Some(members);
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    use StorageEncryption::{Encrypted, NotEncrypted, Unknown};
+
+    /// A fixture tree shaped like sysfs, `/dev` and a mountinfo file.
+    struct Fixture {
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("irlume-crypt-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            for dir in [
+                "sys/class/block",
+                "sys/dev/block",
+                "sys/devices/pci/block",
+                "sys/devices/virtual/block",
+                "sys/fs/btrfs",
+                "dev/mapper",
+            ] {
+                fs::create_dir_all(root.join(dir)).unwrap();
+            }
+            Fixture { root }
+        }
+
+        fn roots(&self) -> Roots {
+            Roots {
+                mountinfo: self.root.join("mountinfo"),
+                sys: self.root.join("sys"),
+                dev: self.root.join("dev"),
+            }
+        }
+
+        /// Register the device directory `dir` as `name` and `majmin`.
+        fn register(&self, dir: &Path, name: &str, majmin: &str) {
+            symlink(dir, self.root.join("sys/class/block").join(name)).unwrap();
+            symlink(dir, self.root.join("sys/dev/block").join(majmin)).unwrap();
+            fs::write(self.root.join("dev").join(name), b"").unwrap();
+        }
+
+        fn disk(&self, name: &str, majmin: &str) {
+            let dir = self.root.join("sys/devices/pci/block").join(name);
+            fs::create_dir_all(dir.join("slaves")).unwrap();
+            self.register(&dir, name, majmin);
+        }
+
+        fn partition(&self, disk: &str, name: &str, majmin: &str) {
+            let dir = self
+                .root
+                .join("sys/devices/pci/block")
+                .join(disk)
+                .join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("partition"), b"3\n").unwrap();
+            self.register(&dir, name, majmin);
+        }
+
+        /// A device-mapper node with `uuid` over `slaves`, and its
+        /// `/dev/mapper/<mapper>` symlink.
+        fn dm(&self, name: &str, majmin: &str, mapper: &str, uuid: &str, slaves: &[&str]) {
+            let dir = self.root.join("sys/devices/virtual/block").join(name);
+            fs::create_dir_all(dir.join("dm")).unwrap();
+            fs::create_dir_all(dir.join("slaves")).unwrap();
+            fs::write(dir.join("dm/uuid"), format!("{uuid}\n")).unwrap();
+            for slave in slaves {
+                fs::write(dir.join("slaves").join(slave), b"").unwrap();
+            }
+            self.register(&dir, name, majmin);
+            symlink(
+                format!("../{name}"),
+                self.root.join("dev/mapper").join(mapper),
+            )
+            .unwrap();
+        }
+
+        fn btrfs(&self, fsid: &str, members: &[&str]) {
+            let devices = self.root.join("sys/fs/btrfs").join(fsid).join("devices");
+            fs::create_dir_all(&devices).unwrap();
+            for member in members {
+                fs::write(devices.join(member), b"").unwrap();
+            }
+        }
+
+        fn mountinfo(&self, text: &str) {
+            fs::write(self.root.join("mountinfo"), text).unwrap();
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    const STATE: &str = "/var/lib/irlume";
+
+    fn probe(fx: &Fixture, major: u32, minor: u32) -> StorageEncryption {
+        classify(Path::new(STATE), major, minor, &fx.roots())
+    }
+
+    const LUKS_UUID: &str =
+        "CRYPT-LUKS2-0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e-luks-0b1c2d3e-4f5a-6b7c-8d9e-0f1a2b3c4d5e";
+
+    #[test]
+    fn a_plain_partition_is_not_encrypted() {
+        let fx = Fixture::new("plain");
+        fx.disk("nvme0n1", "259:0");
+        fx.partition("nvme0n1", "nvme0n1p3", "259:3");
+        assert_eq!(probe(&fx, 259, 3), NotEncrypted);
+        // A whole disk with no partition table reads the same.
+        assert_eq!(probe(&fx, 259, 0), NotEncrypted);
+    }
+
+    #[test]
+    fn a_dm_crypt_device_is_encrypted() {
+        let fx = Fixture::new("dmcrypt");
+        fx.disk("nvme0n1", "259:0");
+        fx.partition("nvme0n1", "nvme0n1p3", "259:3");
+        fx.dm("dm-0", "253:0", "luks-0b1c", LUKS_UUID, &["nvme0n1p3"]);
+        assert_eq!(probe(&fx, 253, 0), Encrypted);
+    }
+
+    #[test]
+    fn lvm_on_luks_is_encrypted_and_lvm_on_a_plain_partition_is_not() {
+        let fx = Fixture::new("lvm");
+        fx.disk("sda", "8:0");
+        fx.partition("sda", "sda2", "8:2");
+        fx.partition("sda", "sda3", "8:3");
+        fx.dm("dm-0", "253:0", "luks-0b1c", LUKS_UUID, &["sda2"]);
+        fx.dm("dm-1", "253:1", "vg-root", "LVM-abcdefAbcdef", &["dm-0"]);
+        fx.dm("dm-2", "253:2", "vg2-var", "LVM-ghijklGhijkl", &["sda3"]);
+        assert_eq!(probe(&fx, 253, 1), Encrypted);
+        assert_eq!(probe(&fx, 253, 2), NotEncrypted);
+        // A logical volume spanning an encrypted and a plain volume is not
+        // encrypted as a whole.
+        fx.dm(
+            "dm-3",
+            "253:3",
+            "vg3-lv",
+            "LVM-mnopqrMnopqr",
+            &["dm-0", "sda3"],
+        );
+        assert_eq!(probe(&fx, 253, 3), NotEncrypted);
+    }
+
+    #[test]
+    fn btrfs_is_resolved_through_mountinfo() {
+        let fx = Fixture::new("btrfs");
+        fx.disk("nvme0n1", "259:0");
+        fx.partition("nvme0n1", "nvme0n1p3", "259:3");
+        fx.dm("dm-0", "253:0", "luks-0b1c", LUKS_UUID, &["nvme0n1p3"]);
+        fx.btrfs("6fdb3276-6661-41e1-9520-9bdbde1102ae", &["dm-0"]);
+        // st_dev 0:37 appears nowhere in mountinfo (btrfs reports the
+        // subvolume's anonymous number); the mount holding the path decides.
+        fx.mountinfo(
+            "43 1 0:35 /root / rw,relatime shared:1 - btrfs /dev/mapper/luks-0b1c rw,subvol=/root\n\
+             52 43 0:25 / /proc rw,nosuid shared:13 - proc proc rw\n\
+             62 43 0:35 /home /home rw,relatime shared:162 - btrfs /dev/mapper/luks-0b1c rw\n\
+             67 43 0:54 / /tmp rw,nosuid,nodev shared:167 - tmpfs tmpfs rw\n",
+        );
+        assert_eq!(probe(&fx, 0, 37), Encrypted);
+    }
+
+    #[test]
+    fn btrfs_on_a_plain_partition_is_not_encrypted() {
+        let fx = Fixture::new("btrfs-plain");
+        fx.disk("nvme0n1", "259:0");
+        fx.partition("nvme0n1", "nvme0n1p3", "259:3");
+        fx.btrfs("6fdb3276-6661-41e1-9520-9bdbde1102ae", &["nvme0n1p3"]);
+        fx.mountinfo(
+            "43 1 0:35 /root / rw,relatime shared:1 - btrfs /dev/nvme0n1p3 rw,subvol=/root\n",
+        );
+        assert_eq!(probe(&fx, 0, 37), NotEncrypted);
+    }
+
+    #[test]
+    fn btrfs_counts_every_device_of_the_filesystem() {
+        let fx = Fixture::new("btrfs-multi");
+        fx.disk("sda", "8:0");
+        fx.disk("sdb", "8:16");
+        fx.dm("dm-0", "253:0", "luks-a", LUKS_UUID, &["sda"]);
+        fx.dm("dm-1", "253:1", "luks-b", LUKS_UUID, &["sdb"]);
+        fx.btrfs("0f0f", &["dm-0", "dm-1"]);
+        fx.mountinfo("43 1 0:35 / / rw shared:1 - btrfs /dev/mapper/luks-a rw\n");
+        assert_eq!(probe(&fx, 0, 37), Encrypted);
+        // One plain member leaves part of the filesystem unencrypted.
+        fx.disk("sdc", "8:32");
+        fx.btrfs("0f0f", &["sdc"]);
+        assert_eq!(probe(&fx, 0, 37), NotEncrypted);
+    }
+
+    #[test]
+    fn btrfs_without_a_sysfs_listing_is_unknown() {
+        let fx = Fixture::new("btrfs-unlisted");
+        fx.disk("sda", "8:0");
+        fx.dm("dm-0", "253:0", "luks-a", LUKS_UUID, &["sda"]);
+        fx.mountinfo("43 1 0:35 / / rw shared:1 - btrfs /dev/mapper/luks-a rw\n");
+        assert_eq!(probe(&fx, 0, 37), Unknown);
+    }
+
+    #[test]
+    fn unreadable_sysfs_is_unknown() {
+        let fx = Fixture::new("unreadable");
+        fx.disk("sda", "8:0");
+        fx.dm("dm-0", "253:0", "luks-a", LUKS_UUID, &["sda"]);
+        fx.mountinfo("43 1 0:35 / / rw shared:1 - ext4 /dev/mapper/luks-a rw\n");
+        // No sysfs at all, then no mountinfo either.
+        let mut roots = fx.roots();
+        roots.sys = fx.root.join("absent");
+        assert_eq!(classify(Path::new(STATE), 253, 0, &roots), Unknown);
+        roots.mountinfo = fx.root.join("absent");
+        assert_eq!(classify(Path::new(STATE), 0, 37, &roots), Unknown);
+        // A dm/uuid that cannot be read (a directory in its place: file
+        // modes do not stop root) is unknown, not a device without one.
+        fx.dm("dm-1", "253:1", "vg-root", "LVM-x", &["dm-0"]);
+        let uuid = fx.root.join("sys/devices/virtual/block/dm-1/dm/uuid");
+        fs::remove_file(&uuid).unwrap();
+        fs::create_dir(&uuid).unwrap();
+        assert_eq!(probe(&fx, 253, 1), Unknown);
+        // So is a slaves entry that is not a directory listing.
+        let slaves = fx.root.join("sys/devices/pci/block/sda/slaves");
+        fs::remove_dir_all(&slaves).unwrap();
+        fs::write(&slaves, b"").unwrap();
+        assert_eq!(
+            probe(&fx, 253, 0),
+            Encrypted,
+            "dm-crypt is decided above sda"
+        );
+        assert_eq!(probe(&fx, 8, 0), Unknown);
+    }
+
+    #[test]
+    fn integrity_layers_are_not_encryption() {
+        let fx = Fixture::new("verity");
+        fx.disk("sda", "8:0");
+        fx.dm(
+            "dm-0",
+            "253:0",
+            "root-verity",
+            "CRYPT-VERITY-abcdef-root",
+            &["sda"],
+        );
+        fx.dm("dm-1", "253:1", "data", "CRYPT-INTEGRITY-data", &["sda"]);
+        fx.dm("dm-2", "253:2", "luks-a", LUKS_UUID, &["dm-1"]);
+        assert_eq!(probe(&fx, 253, 0), NotEncrypted);
+        assert_eq!(probe(&fx, 253, 1), NotEncrypted);
+        assert_eq!(probe(&fx, 253, 2), Encrypted);
+    }
+
+    #[test]
+    fn a_loop_device_or_an_empty_stack_is_unknown() {
+        let fx = Fixture::new("loop");
+        let dir = fx.root.join("sys/devices/virtual/block/loop0");
+        fs::create_dir_all(dir.join("loop")).unwrap();
+        fs::write(dir.join("loop/backing_file"), b"/srv/image\n").unwrap();
+        fx.register(&dir, "loop0", "7:0");
+        assert_eq!(probe(&fx, 7, 0), Unknown);
+        fx.dm("dm-0", "253:0", "empty", "LVM-x", &[]);
+        assert_eq!(probe(&fx, 253, 0), Unknown);
+    }
+
+    #[test]
+    fn a_mount_source_that_is_not_a_block_device_is_unknown() {
+        let fx = Fixture::new("tmpfs");
+        fx.mountinfo(
+            "43 1 0:35 / / rw shared:1 - tmpfs tmpfs rw\n\
+             44 43 0:36 / /var/lib/irlume rw shared:2 - zfs rpool/irlume rw\n",
+        );
+        assert_eq!(probe(&fx, 0, 36), Unknown);
+        fx.mountinfo("43 1 0:35 / / rw shared:1 - tmpfs tmpfs rw\n");
+        assert_eq!(probe(&fx, 0, 35), Unknown);
+        // A /dev source with no node behind it (as /dev/root can be).
+        fx.mountinfo("43 1 0:35 / / rw shared:1 - ext4 /dev/root rw\n");
+        assert_eq!(probe(&fx, 0, 35), Unknown);
+    }
+
+    #[test]
+    fn the_longest_and_latest_mount_holds_the_path() {
+        let mounts = parse_mountinfo(
+            "1 0 0:1 / / rw - ext4 /dev/sda1 rw\n\
+             2 1 0:2 / /var rw shared:5 master:1 - ext4 /dev/sda2 rw\n\
+             3 1 0:3 / /var/lib/irlume\\040old rw - ext4 /dev/sda3 rw\n\
+             4 2 0:4 / /var rw - xfs /dev/sda4 rw\n\
+             not a mountinfo line\n",
+        );
+        assert_eq!(mounts.len(), 4);
+        assert_eq!(mounts[2].mount_point, Path::new("/var/lib/irlume old"));
+        assert_eq!(mounts[1].fstype, "ext4");
+        assert_eq!(mounts[1].source, "/dev/sda2");
+        let at = |p: &str| mount_holding(&mounts, Path::new(p)).map(|m| m.source.clone());
+        assert_eq!(at("/var/lib/irlume").as_deref(), Some("/dev/sda4"));
+        assert_eq!(at("/var/lib/irlume old/x").as_deref(), Some("/dev/sda3"));
+        // Component-wise: /variable is not under /var.
+        assert_eq!(at("/variable").as_deref(), Some("/dev/sda1"));
+        assert_eq!(mount_holding(&mounts[1..2], Path::new("/etc")), None);
+    }
+
+    #[test]
+    fn mountinfo_escapes_decode() {
+        assert_eq!(unescape(r"/a\040b\011c\012d\134e"), "/a b\tc\nd\\e");
+        assert_eq!(unescape(r"/trailing\04"), r"/trailing\04");
+        assert_eq!(unescape(r"/not\999octal"), r"/not\999octal");
+    }
+
+    #[test]
+    fn crypt_uuids_name_the_encryption_types_only() {
+        assert!(is_crypt_uuid(LUKS_UUID));
+        assert!(is_crypt_uuid("CRYPT-LUKS1-abc-name"));
+        assert!(is_crypt_uuid("CRYPT-PLAIN-name"));
+        assert!(!is_crypt_uuid("CRYPT-VERITY-abc-name"));
+        assert!(!is_crypt_uuid("CRYPT-INTEGRITY-name"));
+        assert!(!is_crypt_uuid("LVM-abc"));
+        assert!(!is_crypt_uuid("mpath-abc"));
+        assert!(!is_crypt_uuid(""));
+    }
+
+    #[test]
+    fn a_missing_path_is_unknown() {
+        let fx = Fixture::new("missing");
+        assert_eq!(
+            path_encryption_in(&fx.root.join("no-such-dir"), &fx.roots()),
+            Unknown
+        );
+    }
+
+    #[test]
+    fn names_that_are_not_one_component_are_refused() {
+        assert_eq!(plain_name(OsStr::new("dm-0")).as_deref(), Some("dm-0"));
+        assert_eq!(plain_name(OsStr::new("..")), None);
+        assert_eq!(plain_name(OsStr::new("a/b")), None);
+        assert_eq!(plain_name(OsStr::new("")), None);
+        let fx = Fixture::new("names");
+        assert_eq!(block_encryption(&fx.root.join("sys"), "../x", 0), Unknown);
+    }
+}

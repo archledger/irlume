@@ -36,6 +36,7 @@ mod preferences;
 mod profile_ir;
 mod recovery;
 mod retry;
+mod seal_storage;
 mod secrets;
 mod sensor_policy;
 mod strays;
@@ -1552,6 +1553,19 @@ pub(crate) fn print_token_upgrade_notice(user: &str) {
     }
 }
 
+/// After an arm: where the new envelope is sealed under the literal PCR 7
+/// policy (Tier 3) and the state directory is not on encrypted storage, or
+/// that cannot be established, say so and name the remedies. Reads the
+/// envelope's policy with `KeyringMetadata`, which does not wait on the TPM.
+fn print_literal_seal_note(user: &str) {
+    let reply = daemon_request(&irlume_common::Request::KeyringMetadata {
+        user: user.to_string(),
+    });
+    if let Some(advice) = seal_storage::state_dir_advice_for(&reply) {
+        println!("[keyring] NOTE: {advice}");
+    }
+}
+
 /// `irlume keyring <arm|status|forget>`: manage the TPM-sealed login password
 /// that lets a face login unlock the GNOME-keyring / KWallet. Talks to `irlumed`
 /// over the socket (the daemon owns the TPM + the root-only sealed store).
@@ -1665,6 +1679,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                 Ok(irlume_common::Response::PasswordSealed) => {
                     println!("[keyring] \u{2705} armed. After a face login, your wallet will unlock automatically.");
                     println!("[keyring] NOTE: if you change your login password, re-run `irlume keyring arm`.");
+                    print_literal_seal_note(&user);
                     std::process::ExitCode::SUCCESS
                 }
                 // GNOME token arm (#250): the daemon minted and sealed a token;
@@ -1686,6 +1701,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                                  directly; `irlume keyring forget` re-keys it back."
                             );
                             print_token_upgrade_notice(&user);
+                            print_literal_seal_note(&user);
                             std::process::ExitCode::SUCCESS
                         }
                         Err(e) => {
@@ -4421,14 +4437,28 @@ fn doctor_run(
         irlume_core::tpm::pcrlock_provisioned(),
         irlume_core::tpm::pcrlock_for_sealing(),
     );
-    report.check(
-        "pcrlock",
-        if pcrlock.1.is_some() {
-            State::Pass
-        } else {
-            State::Info
+    // The account's keyring secret, when one is armed under the literal PCR 7
+    // policy (Tier 3) and the state directory is not on encrypted storage, or
+    // that cannot be established, warns with the remedies, whatever tier a
+    // new seal would get: the envelope on disk keeps its policy until it is
+    // sealed again.
+    let seal_user = user_arg(args);
+    let seal_advice = seal_storage::state_dir_advice_for(&daemon_request(
+        &irlume_common::Request::KeyringMetadata {
+            user: seal_user.clone(),
         },
-    );
+    ));
+    match &seal_advice {
+        Some(advice) => report.check_detail("pcrlock", State::Warn, advice),
+        None => report.check(
+            "pcrlock",
+            if pcrlock.1.is_some() {
+                State::Pass
+            } else {
+                State::Info
+            },
+        ),
+    }
     dout!(
         report,
         "[doctor] pcrlock: {}",
@@ -4447,6 +4477,12 @@ fn doctor_run(
                     .to_string(),
         }
     );
+    if let Some(advice) = &seal_advice {
+        dout!(
+            report,
+            "[doctor] \u{26a0} keyring seal ({seal_user}): {advice}"
+        );
+    }
 
     // --- cameras -----------------------------------------------------------
     dout!(

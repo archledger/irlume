@@ -251,7 +251,12 @@ Debian, Ubuntu, Mint and Arch packages install (Arch loads it only when
 AppArmor is on), which keeps it out of `/etc/shadow`. Depending on the
 backend, the TPM seals the login password, the KDE wallet key, or a random
 GNOME keyring token. `irlume keyring status` reports which kind is armed. No
-sealed secret is stored in plaintext.
+sealed secret is stored in plaintext. Under the literal PCR 7 policy (Tier 3)
+the seal binds the Secure Boot state only: another operating system signed
+with the same keys reproduces it. Where `/var/lib/irlume` is not on encrypted
+storage, prefer a pcrlock policy (Tier 2) or full-disk encryption unlocked by
+a passphrase; `keyring arm` and `irlume doctor` say when this applies
+([SECURITY_AT_REST.md](SECURITY_AT_REST.md), layer 3).
 
 Where oo7 keeps the login keyring (Fedora 45 GNOME, whose login screen hands
 the password to `oo7-daemon` through `pam_oo7`), the arm seals the login

@@ -56,7 +56,8 @@ trusted factor is the fingerprint, not the camera.
 **What is preserved.** At-rest protection is unchanged: the password is
 TPM-sealed, so a **stolen disk / backup image cannot unseal it** (needs the live
 TPM). Verified by the same cross-machine test as the face path
-([SECURITY_AT_REST.md](../SECURITY_AT_REST.md)).
+([SECURITY_AT_REST.md](../SECURITY_AT_REST.md)). On the machine itself this
+depends on the policy tier; see the 2026-09-27 amendment below.
 
 **The residual (documented, accepted).** `UnsealKeyring` releases the password to
 *any root peer* in a login-class PAM context; it does not, and cannot, prove a
@@ -88,3 +89,23 @@ match that without the daemon owning the sensor.
   daemon). Rejected *for now*: it means the daemon owns fingerprint auth (async
   D-Bus in a currently-sync daemon, replacing `pam_fprintd`), a large change.
   **Recorded as the future hardening** that closes the live-root residual.
+
+## Amendment 2026-09-27: at-rest protection under the literal PCR 7 policy
+
+"What is preserved" holds for a disk or backup image read on another
+machine. On the machine itself it depends on the policy the secret is sealed
+under. The literal PCR 7 policy (Tier 3, used where no pcrlock policy
+covering a firmware-measured PCR is provisioned) binds the Secure Boot state
+only: another operating system signed with the same keys reproduces it, and
+the sealed object needs no authorization beyond that policy. Where irlume's
+state directory is not on encrypted storage unlocked by a passphrase, the
+sealed keyring secret is therefore protected on this machine by the running
+system's file permissions, not by the TPM. A pcrlock policy (Tier 2), which
+binds the boot components, or full-disk encryption unlocked by a passphrase
+restores that protection.
+
+Keyring arming stays opt-in and Tier 3 stays supported. `irlume keyring arm`
+and `irlume doctor` (check `pcrlock`) name the remedies when an armed secret
+uses Tier 3 and the state directory is not on encrypted storage, or that
+cannot be established ([SECURITY_AT_REST.md](../SECURITY_AT_REST.md),
+layer 3).

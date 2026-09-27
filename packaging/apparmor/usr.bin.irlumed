@@ -108,6 +108,7 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   /proc/[0-9]*/mountinfo r,
   /sys/fs/btrfs/ r,
   /sys/fs/btrfs/*/devices/ r,
+  /sys/fs/btrfs/*/devices/* r,
 
   # IPC socket (thin PAM module and CLI connect here; SO_PEERCRED authz).
   /run/irlume.sock rw,

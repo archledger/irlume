@@ -573,6 +573,7 @@ APPARMOR_RUNTIME_RULES=(
   "/proc/[0-9]*/mountinfo r,"
   "/sys/fs/btrfs/ r,"
   "/sys/fs/btrfs/*/devices/ r,"
+  "/sys/fs/btrfs/*/devices/* r,"
 )
 for profile in "${APPARMOR_PROFILES[@]}"; do
   for rule in "${APPARMOR_RUNTIME_RULES[@]}"; do

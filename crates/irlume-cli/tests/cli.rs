@@ -2196,6 +2196,56 @@ fn the_namespace_binds_a_directory_the_host_lacks() {
     );
 }
 
+/// The same bind below a parent with thousands of entries. Re-binding each
+/// host entry took three bubblewrap arguments per entry and failed past
+/// bubblewrap's 9000 on hosts whose `/usr/lib` holds 5000 to 6000 entries
+/// (the Arch nightly runner); the rebuilt parent must keep every entry
+/// reachable at a constant argument count.
+#[test]
+fn the_namespace_binds_below_a_parent_with_thousands_of_entries() {
+    let sb = Sandbox::new("bind-wide-parent");
+    let parent =
+        std::env::temp_dir().join(format!("irlume-cli-it-wide-parent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&parent);
+    std::fs::create_dir_all(parent.join("kept-dir")).unwrap();
+    for i in 0..4000 {
+        std::fs::write(parent.join(format!("entry-{i}")), "host\n").unwrap();
+    }
+    let fixture = sb.path("probe");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("marker"), "bound\n").unwrap();
+    let destination = parent.join("probe");
+    let dest = destination.to_str().unwrap();
+    let wide = parent.display();
+    // Shell builtins only: the namespace's /usr/bin holds just the shell.
+    let script = format!(
+        "set -- {wide}/*; [ $# = 4002 ] || {{ echo \"$# entries\" >&2; exit 1; }}; \
+         read line < {dest}/marker && [ \"$line\" = bound ] && \
+         read host < {wide}/entry-3999 && [ \"$host\" = host ] && [ -d {wide}/kept-dir ] && \
+         echo ok > {dest}/written"
+    );
+    let output = support::isolated_root_command(
+        &sb.root,
+        "/usr/bin/sh",
+        &["-c", &script],
+        &[],
+        &[],
+        &[(&fixture, dest)],
+    )
+    .output()
+    .expect("spawn the namespace");
+    let _ = std::fs::remove_dir_all(&parent);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.join("written")).unwrap(),
+        "ok\n"
+    );
+}
+
 /// The lines of a PAM file that are irlume's, sorted: what reconcile's
 /// maintenance step must carry over when it rebuilds an override.
 fn irlume_lines(text: &str) -> Vec<String> {

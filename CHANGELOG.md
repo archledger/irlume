@@ -865,9 +865,12 @@ All notable changes to irlume are documented here. This project adheres to
   the storage does not show. The storage probe follows the
   state directory's block device through device-mapper (dm-crypt, LVM),
   md RAID and partitions, and every device of a btrfs filesystem; what it
-  cannot establish counts as unencrypted. docs/SECURITY_AT_REST.md,
-  docs/SETUP.md and ADR-0003 (amendment 2026-09-27) now say what the
-  literal PCR 7 policy binds and what it does not.
+  cannot establish counts as unencrypted. With an `IRLUME_PCRS`
+  override the note names the PCRs the seal binds, and a set that
+  includes a firmware-measured PCR other than 7 gets none.
+  docs/SECURITY_AT_REST.md, docs/SETUP.md and ADR-0003 (amendment
+  2026-09-27) now say what the literal PCR 7 policy binds and what it
+  does not.
 
 - irlumed turns a camera on for an account's own request only while that
   account holds the active local session on a seat, as udev's `uaccess`

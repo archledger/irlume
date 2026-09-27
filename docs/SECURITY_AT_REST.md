@@ -76,7 +76,10 @@ matching also requires passing IR liveness; an inverted RGB image can't.)
    uses Tier 3: as a warning when the state directory is not on encrypted
    storage or that cannot be established, and as information when it is on
    dm-crypt, since the storage does not show whether that volume asks for a
-   passphrase or unlocks from the TPM or a key file. Once a pcrlock policy is provisioned, existing
+   passphrase or unlocks from the TPM or a key file. With an `IRLUME_PCRS`
+   override the note names the PCRs the seal binds; a set that includes a
+   firmware-measured PCR other than 7 (0 to 6) binds more than the Secure
+   Boot state and gets no note. Once a pcrlock policy is provisioned, existing
    seals move to it: the keyring secret at `irlume keyring arm` or its next
    re-seal at a password login, the template key at irlumed's next start.
    A signed PCR-11 policy (Tier 1), which earlier

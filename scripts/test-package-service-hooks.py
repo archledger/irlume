@@ -6,7 +6,9 @@
 Requires dpkg and vercmp so migration decisions use the native comparators.
 The shell executes a copy with only /var/lib/irlume relocated into the fixture
 to isolate the reconcile timer marker; service commands and branches are
-unchanged. All external commands use a private PATH.
+unchanged. Fedora's %post is taken from the spec with its one macro,
+%systemd_post, replaced by the preset call it makes on a first install.
+All external commands use a private PATH.
 These tests cover hook decisions, not systemd's dependency/activation engine.
 """
 import json
@@ -24,6 +26,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DAEMON = "irlumed.service"
 SOCKET = "irlumed.socket"
 RECONCILE = ("irlume-reconcile.path", "irlume-reconcile.timer", "irlume-reconcile.service")
+FEDORA_PRESET = [line.split()[1] for line in
+                 (ROOT / "packaging/fedora/90-irlume.preset").read_text().splitlines()
+                 if line.startswith("enable ")]
 
 # Model the systemctl command boundary, including enable vs. --now and masks.
 # Unsupported commands are recorded as errors even when a hook ignores status.
@@ -50,6 +55,16 @@ if name == "systemctl":
     units = [arg for arg in args[1:] if not arg.startswith("-")]
     if verb == "daemon-reload" and not flags and not units:
         pass
+    elif args[:2] == ["--no-reload", "preset"] and len(args) > 2:
+        # What %systemd_post runs on a first install; a mask stays.
+        for unit_name in args[2:]:
+            unit = state["units"].get(unit_name)
+            if unit is None:
+                status = unexpected()
+            elif unit["enabled"] in {"masked", "masked-runtime"}:
+                status = 1
+            else:
+                unit["enabled"] = "enabled" if unit_name in state["preset"] else "disabled"
     elif verb in {"is-enabled", "is-active"} and flags == ["--quiet"] and len(units) == 1:
         unit = state["units"].get(units[0])
         if unit is None:
@@ -83,6 +98,8 @@ elif name == "systemd-tmpfiles" and args == ["--create", "irlume.conf"]:
     pass
 elif name == "mkdir" and args == ["-p", "-m", "0700", os.environ["HOOK_STATE_DIR"]]:
     Path(args[3]).mkdir(mode=0o700, parents=True, exist_ok=True)
+elif name == "touch" and args == [os.environ["HOOK_STATE_DIR"] + "/.reconcile-timer-armed"]:
+    Path(args[0]).touch()
 elif name == "apparmor_parser" and args == ["-r", "/etc/apparmor.d/usr.bin.irlumed"]:
     pass
 else:
@@ -102,6 +119,24 @@ class PackageServiceHookTests(unittest.TestCase):
                 raise RuntimeError(f"required test dependency missing: {name}")
             cls.commands[name] = executable
 
+    @staticmethod
+    def fedora_post():
+        # The main package's %post, with %systemd_post replaced by what it
+        # expands to (systemd's macros.systemd: on a first install,
+        # systemd-update-helper runs `systemctl --no-reload preset` on the
+        # units) and %% by the % it stands for.
+        spec = (ROOT / "packaging/fedora/irlume.spec").read_text()
+        body = spec.split("\n%post\n", 1)[1].split("\n%preun\n", 1)[0]
+        lines = []
+        for line in body.splitlines():
+            if line.startswith("%systemd_post "):
+                units = line.split(None, 1)[1]
+                line = f"if [ $1 -eq 1 ]; then systemctl --no-reload preset {units} || :; fi"
+            elif "%" in line and not line.lstrip().startswith("#"):
+                raise AssertionError(f"no model for the macro in this %post line: {line}")
+            lines.append(line.replace("%%", "%"))
+        return "\n".join(lines) + "\n"
+
     def run_hook(self, family, service, socket, old="0.11.3", reconcile=("enabled", False),
                  timer_armed=True):
         # reconcile is one (enabled, active) pair for all three units, or a
@@ -119,10 +154,13 @@ class PackageServiceHookTests(unittest.TestCase):
             marker = fixture_state / ".reconcile-timer-armed"
             if timer_armed:
                 marker.touch()
-            source = ROOT / ("packaging/debian/postinstall.sh" if family == "debian"
-                             else "packaging/arch/irlume.install")
+            if family == "fedora":
+                text = self.fedora_post()
+            else:
+                text = (ROOT / ("packaging/debian/postinstall.sh" if family == "debian"
+                                else "packaging/arch/irlume.install")).read_text()
             hook = directory / "hook.sh"
-            hook.write_text(source.read_text().replace("/var/lib/irlume", str(fixture_state)))
+            hook.write_text(text.replace("/var/lib/irlume", str(fixture_state)))
             state_path = directory / "state.json"
             state_path.write_text(json.dumps({
                 "units": {
@@ -131,9 +169,9 @@ class PackageServiceHookTests(unittest.TestCase):
                     **{unit: {"enabled": reconcile[unit][0], "active": reconcile[unit][1],
                               "starts": 0, "restarts": 0} for unit in RECONCILE},
                 },
-                "calls": [], "errors": [],
+                "preset": FEDORA_PRESET, "calls": [], "errors": [],
             }))
-            for name in ("systemctl", "systemd-tmpfiles", "apparmor_parser", "mkdir"):
+            for name in ("systemctl", "systemd-tmpfiles", "apparmor_parser", "mkdir", "touch"):
                 shim = directory / name
                 shim.write_text(f"#!{sys.executable}\n{SHIM}")
                 shim.chmod(0o700)
@@ -148,6 +186,12 @@ class PackageServiceHookTests(unittest.TestCase):
                 command = [self.commands["sh"], str(hook), "configure"]
                 if old is not None:
                     command.append(old)
+            elif family == "fedora":
+                # rpm runs %post with /bin/sh, which is Bash on Fedora, and $1
+                # counts the installed instances: 1 on a first install, 2 on
+                # an upgrade.
+                command = [self.commands["bash"], "--posix", "--noprofile", "--norc", str(hook),
+                           "1" if old is None else "2"]
             else:
                 env["HOOK_SCRIPT"] = str(hook)
                 function = "post_install" if old is None else "post_upgrade"
@@ -255,7 +299,7 @@ class PackageServiceHookTests(unittest.TestCase):
     def test_upgrade_leaves_disabled_or_masked_reconcile_units_alone(self):
         # `systemctl start` runs a disabled unit too, so an upgrade must not
         # start or enable a self-heal unit an administrator turned off.
-        for family in ("debian", "arch"):
+        for family in ("debian", "arch", "fedora"):
             for old in ("0.8.0", "0.11.3"):
                 for choice in ("disabled", "masked", "masked-runtime"):
                     with self.subTest(family=family, old=old, choice=choice):
@@ -274,6 +318,22 @@ class PackageServiceHookTests(unittest.TestCase):
                     self.assert_unit(state, "irlume-reconcile.path", enabled, False)
                     self.assert_unit(state, "irlume-reconcile.timer", enabled, False)
 
+    def test_fedora_upgrade_starts_each_reconcile_unit_only_while_it_is_enabled(self):
+        # Fedora's %post also starts the path and timer units on an upgrade,
+        # so each one is checked on its own.
+        for enabled in RECONCILE:
+            for others in ("disabled", "masked"):
+                with self.subTest(enabled=enabled, others=others):
+                    state = self.run_hook("fedora", ("enabled", True), ("enabled", True),
+                                          reconcile={unit: ("enabled" if unit == enabled
+                                                            else others, False)
+                                                     for unit in RECONCILE})
+                    for unit in RECONCILE:
+                        if unit == enabled:
+                            self.assert_unit(state, unit, "enabled", True, starts=1)
+                        else:
+                            self.assert_unit(state, unit, others, False)
+
     def test_arch_upgrade_from_before_self_heal_enables_it_once(self):
         # Releases before 0.7.0 had no timer, so no marker either.
         for old in ("0.5.0-1", "0.6.0-1"):
@@ -291,7 +351,7 @@ class PackageServiceHookTests(unittest.TestCase):
         # service disabled, and the Debian and Fedora hooks never enabled the
         # path for upgraders from before it existed), so the timer is armed
         # once regardless.
-        for family, old in (("debian", "0.6.1"), ("arch", "0.6.1-1")):
+        for family, old in (("debian", "0.6.1"), ("arch", "0.6.1-1"), ("fedora", "0.6.1")):
             with self.subTest(family=family):
                 state = self.run_hook(family, ("enabled", True), ("enabled", True), old,
                                       reconcile={"irlume-reconcile.path": ("disabled", False),
@@ -320,7 +380,7 @@ class PackageServiceHookTests(unittest.TestCase):
                     self.assert_unit(state, "irlume-reconcile.path", others, False)
 
     def test_first_install_enables_and_starts_the_reconcile_units(self):
-        for family in ("debian", "arch"):
+        for family in ("debian", "arch", "fedora"):
             with self.subTest(family=family):
                 state = self.run_hook(family, ("disabled", False), ("disabled", False), None,
                                       reconcile=("disabled", False))

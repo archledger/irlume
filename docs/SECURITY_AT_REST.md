@@ -209,10 +209,12 @@ each record it does not use, with the uids and the next step.
   a keyring arm, or `irlume recovery setup`. Such a write for a name that has
   no account records no uid.
 - A write never changes the uid a record carries. An operation that loads a
-  record and writes it back (add scans, rename or delete a profile, turn
-  require-eyes-open off, a template key or keyring re-seal) writes it for the
-  uid its load checked, and is refused before anything is written when the
-  name resolves to another uid, or to no account, by then. An enrollment an
+  record and writes it back (add scans, rename a profile, delete one that is
+  not the last, turn require-eyes-open off, a template key or keyring re-seal,
+  a restore from the recovery passphrase) writes it for the uid its load
+  checked, and is refused before anything is written when the name resolves
+  to another uid, or to no account, by then. Deleting the last profile
+  removes the account's records rather than writing them. An enrollment an
   earlier release wrote counts as its template key's uid when the key records
   one, so its save neither records the new uid nor replaces the key. A new
   enrollment, key, arm or recovery envelope records the current uid.

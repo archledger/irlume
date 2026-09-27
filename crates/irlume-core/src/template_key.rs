@@ -711,11 +711,17 @@ pub(crate) fn restore_from_recovery_unlocked(user: &str, passphrase: &[u8]) -> R
         )));
     }
     let env = load_recovery(user)?;
-    // A recovery file written for another uid restores nothing: it would
-    // re-seal that account's key for this one.
+    // A recovery file, or the key it restores, written for another uid
+    // restores nothing: it would re-seal that account's key for this one. A
+    // recovery file from an earlier release records no uid, so the key's
+    // own uid decides; a key that cannot be read has none to keep.
+    let existing = SealedEnvelope::load(&key_path(user))
+        .ok()
+        .and_then(|key| key.uid);
     let mut account = Account::new(user);
     account.require(Record::Recovery, env.uid)?;
-    let uid = account.uid_to_record(Record::TemplateKey, env.uid)?;
+    account.require(Record::TemplateKey, existing)?;
+    let uid = account.uid_to_record(Record::TemplateKey, env.uid.or(existing))?;
     let key = crate::recovery::unwrap(passphrase, &env)?;
     reseal_key_unlocked(user, &key, uid)
 }
@@ -1378,6 +1384,18 @@ mod tests {
         let error = load_key(user).unwrap_err().to_string();
         assert!(error.contains("uid 5101"), "{error}");
         assert!(restore_from_recovery(user, b"recovery passphrase").is_err());
+        // A recovery file from an earlier release, with no uid, does not move
+        // the key either: the key's own uid decides.
+        let written = load_recovery(user).unwrap();
+        let mut legacy_recovery = load_recovery(user).unwrap();
+        legacy_recovery.uid = None;
+        save_recovery(user, &legacy_recovery).unwrap();
+        let error = restore_from_recovery(user, b"recovery passphrase")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("uid 5101"), "{error}");
+        assert_eq!(recorded(), Some(5101), "left as it was");
+        save_recovery(user, &written).unwrap();
         assert!(setup_recovery(user, b"another passphrase").is_err());
         let error = reseal_key(user, &first).unwrap_err().to_string();
         assert!(error.contains("belongs to uid 5101"), "{error}");

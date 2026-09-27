@@ -56,7 +56,8 @@ trusted factor is the fingerprint, not the camera.
 **What is preserved.** At-rest protection is unchanged: the password is
 TPM-sealed, so a **stolen disk / backup image cannot unseal it** (needs the live
 TPM). Verified by the same cross-machine test as the face path
-([SECURITY_AT_REST.md](../SECURITY_AT_REST.md)).
+([SECURITY_AT_REST.md](../SECURITY_AT_REST.md)). On the machine itself this
+depends on the storage and the policy; see the 2026-09-27 amendment below.
 
 **The residual (documented, accepted).** `UnsealKeyring` releases the password to
 *any root peer* in a login-class PAM context; it does not, and cannot, prove a
@@ -88,3 +89,46 @@ match that without the daemon owning the sensor.
   daemon). Rejected *for now*: it means the daemon owns fingerprint auth (async
   D-Bus in a currently-sync daemon, replacing `pam_fprintd`), a large change.
   **Recorded as the future hardening** that closes the live-root residual.
+
+## Amendment 2026-09-27: at-rest protection on the machine itself
+
+"What is preserved" holds for a disk or backup image read on another
+machine. On the machine itself, a TPM seal binds the boot chain it measures,
+not the root filesystem. Where irlume's state directory is not on encrypted
+storage, someone with the machine can change the installed system offline
+(for example, add a service that runs as root) and boot the unchanged boot
+chain; the PCRs then match the policy, whichever it is, and the sealed
+keyring secret unseals on that machine. A policy that does not cover the
+boot loader code (PCR 4) leaves a second path: another operating system
+signed with the same keys reproduces what it binds and can unseal the secret
+directly, without changing the installed system. That holds for the literal
+PCR 7 policy (Tier 3, used where no pcrlock policy covering a
+firmware-measured PCR is provisioned), a literal `IRLUME_PCRS` set without
+PCR 4 (PCRs 0 to 3 measure this machine's firmware, which is the same
+whatever it boots), a signed PCR 11 policy (Tier 1) from an earlier release,
+and a pcrlock policy (Tier 2) without PCR 4, which systemd-pcrlock makes
+when the binaries measured there are not locked (`lock-pe`, `lock-uki`). A
+policy that covers PCR 4 closes the second path only where the boot loader
+also measures what it loads next (a unified kernel image does; a GRUB boot
+leaves the initrd and the kernel command line to PCRs 9 and 8), and never
+closes the first.
+
+What protects the sealed secret at rest on this machine is full-disk
+encryption unlocked by a passphrase or PIN (a volume the TPM or a key file
+unlocks alone does not count), or an integrity-verified root filesystem
+(dm-verity) that covers everything the boot runs and reads configuration
+from, with its root hash bound by a pcrlock policy or a signature, together
+with a pcrlock policy that covers PCR 4. A pcrlock policy is worth having in
+addition to encryption, not instead of it.
+
+Keyring arming stays opt-in and every tier stays supported. `irlume keyring
+arm` (after an arm) and `irlume doctor` (check `sealed-storage`) report this
+for the account's keyring secret and template key: a warning when either is
+sealed and no dm-crypt layer is found under the directory that holds it or
+under the installed system (`/`, `/usr`, `/etc`), or the storage cannot be
+established, and information whenever it is on
+dm-crypt,
+since the storage does not show how that volume unlocks, naming each sealed
+secret's policy another operating system may reproduce
+([SECURITY_AT_REST.md](../SECURITY_AT_REST.md), layer 3). `irlume setup`,
+`irlume keyring reseal` and the TUI show the same guidance after a seal.

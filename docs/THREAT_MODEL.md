@@ -303,7 +303,14 @@ the disk.
 **Fingerprint keyring unlock** ([ADR-0003](adr/0003-fingerprint-keyring-unlock.md))
 releases the sealed secret on *root peer + login-service-class*, without
 a daemon-verified biometric: the fingerprint (`pam_fprintd`) authenticated
-first. At-rest protection is preserved (a stolen disk can't unseal). Residual,
+first. At-rest protection is preserved: a disk moved to another machine can't
+unseal. On the original machine the seal binds the boot chain, not the root
+filesystem: where irlume's state is not on full-disk encryption unlocked by a
+passphrase or PIN, an installed system changed offline and booted on the
+unchanged boot chain unseals it, and under a policy that does not cover the
+boot loader (PCR 4), such as the literal PCR 7 policy (Tier 3), so does
+another operating system signed with the same keys
+([SECURITY_AT_REST](SECURITY_AT_REST.md), layer 3, names the remedies). Residual,
 accepted: a **live root attacker** in a login context can obtain the password.
 That is no new capability (root can already read the running keyring), and root is the
 trust boundary throughout. The face/IR path is strictly stronger here (it

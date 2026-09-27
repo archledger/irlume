@@ -853,6 +853,52 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- `irlume keyring arm` and a new doctor check, `sealed-storage`, say what
+  protects the sealed secrets at rest. A TPM seal binds the boot chain it
+  measures, not the root filesystem: where irlume's state directory is not
+  on encrypted storage, an installed system changed offline and booted on
+  the unchanged boot chain unseals the keyring secret and the template key
+  under any policy, and under a policy that does not cover the boot loader
+  code (PCR 4) another operating system signed with the same keys can also
+  unseal them directly. That includes the literal PCR 7 policy (Tier 3), an
+  `IRLUME_PCRS` set without PCR 4, a signed PCR 11 policy (Tier 1) and a
+  pcrlock policy (Tier 2) that systemd-pcrlock made without PCR 4. What
+  protects them is full-disk encryption unlocked by a passphrase or PIN, or
+  a verified root (dm-verity) whose root hash is bound, with a pcrlock
+  policy that covers PCR 4; such a pcrlock policy is worth having in
+  addition to encryption, not instead of it, and the guidance gives the
+  `/usr/lib/systemd/systemd-pcrlock` steps. The check reports `warn` when a
+  keyring secret or a template key is sealed and no dm-crypt layer is found
+  under a directory that holds it or under the installed system, or the
+  storage cannot be established; `info` whenever it is on dm-crypt, since
+  the storage does not show whether the volume asks for a passphrase,
+  naming each sealed secret's policy another operating system may
+  reproduce (a policy with PCR 4 included where the boot loader does not
+  measure what it loads next, as on a GRUB boot) and saying that what the
+  boot reads before the volume is unlocked (the EFI system partition, an
+  unencrypted /boot) is not encrypted and can be changed offline; `info`
+  when nothing is sealed; and `unknown` when irlumed does not say what is
+  sealed. The directories probed are irlumed's keyring and template-key
+  directories, each as systemd gives it to irlumed (`systemctl show` for
+  the unit's `Environment=`, a source install's included, and `systemctl
+  show-environment` for the manager's global environment), and `/`, `/usr`
+  and `/etc`; the least protected one decides. Where the unit reads an
+  `EnvironmentFile=` or passes the variable with `PassEnvironment=`, a
+  value is relative, or systemd cannot be asked while irlumed's unit is
+  installed, they count as unknown. `keyring arm`, `irlume setup`,
+  `irlume keyring reseal` and the TUI's Password Wallet show the same
+  guidance after a seal, also when irlumed then does not describe the new
+  secret. An irlumed from before
+  `KeyringMetadata` is asked `KeyringInfo` instead. The storage probe
+  follows the state directory's block device through device-mapper
+  (dm-crypt, LVM), md RAID and partitions, and every device of a btrfs
+  filesystem; what it cannot establish counts as unencrypted, and it does
+  not detect a drive's hardware encryption, a filesystem's own encryption
+  or a verified root. With an `IRLUME_PCRS` override the guidance names the
+  PCRs the keyring seal binds. docs/SECURITY_AT_REST.md, docs/SETUP.md and
+  ADR-0003 (amendment 2026-09-27) say what a seal binds on the machine
+  itself.
+
 - irlumed turns a camera on for an account's own request only while that
   account holds the active local session on a seat, as udev's `uaccess`
   grants camera devices. This covers face authentication from a lock

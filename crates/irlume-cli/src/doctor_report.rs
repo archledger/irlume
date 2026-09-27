@@ -27,7 +27,7 @@ pub enum Mode {
 /// `Unknown` is not a synonym for `Fail`: it means the check could not be
 /// carried out, usually because the daemon was unreachable, and a consumer
 /// should say so rather than report a problem the machine may not have.
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum State {
     Pass,

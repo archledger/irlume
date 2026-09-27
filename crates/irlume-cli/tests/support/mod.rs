@@ -269,6 +269,10 @@ fn namespace_command(
         .env("IRLUME_CONFIG_DIR", root.join("cfg"))
         .env("IRLUME_STATE_DIR", root.join("state"))
         .env("IRLUME_KEYRING_DIR", root.join("keyring"))
+        .env(
+            "IRLUME_TEMPLATE_KEY_DIR",
+            root.join("state").join("template-keys"),
+        )
         .env("IRLUME_METHOD_CONF", root.join("cfg").join("method"))
         .env_remove("IRLUME_DEV")
         .env_remove("IRLUME_CONSENT_GESTURE")

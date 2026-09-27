@@ -24,6 +24,7 @@ pub mod pam_service;
 pub mod platform;
 pub mod process;
 pub mod secureboot;
+pub mod storage_encryption;
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;

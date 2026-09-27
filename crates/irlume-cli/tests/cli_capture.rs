@@ -101,6 +101,10 @@ impl Sandbox {
             .env("IRLUME_CONFIG_DIR", self.root.join("cfg"))
             .env("IRLUME_STATE_DIR", self.root.join("state"))
             .env("IRLUME_KEYRING_DIR", self.root.join("keyring"))
+            .env(
+                "IRLUME_TEMPLATE_KEY_DIR",
+                self.root.join("state").join("template-keys"),
+            )
             .env_remove("IRLUME_MODEL")
             .env_remove("IRLUME_DET_MODEL")
             .env_remove("IRLUME_CAMERA_PIN")

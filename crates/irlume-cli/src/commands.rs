@@ -1684,6 +1684,7 @@ pub fn reseal(args: &[String]) -> ExitCode {
     let Some(pw) = prompt_login_password() else {
         return ExitCode::from(2);
     };
+    let user_for_note = user.clone();
     let reply = kind.and_then(|kind| {
         daemon_request(&Request::SealPassword {
             kind,
@@ -1699,6 +1700,7 @@ pub fn reseal(args: &[String]) -> ExitCode {
     match reply {
         Ok(Response::PasswordSealed) => {
             println!("[reseal] re-bound to current PCRs {OK}; face unlock will release it again.");
+            crate::print_seal_storage_note(&user_for_note);
             ExitCode::SUCCESS
         }
         Ok(Response::Error(e)) => {
@@ -1861,7 +1863,10 @@ pub fn setup(args: &[String]) -> ExitCode {
                 })
             });
             match reply {
-                Ok(Response::PasswordSealed) => println!("  armed {OK}"),
+                Ok(Response::PasswordSealed) => {
+                    println!("  armed {OK}");
+                    crate::print_seal_storage_note(&user);
+                }
                 // GNOME token arm: the wizard runs in the user's session, so
                 // it can finish the re-key exactly like `keyring arm`.
                 Ok(Response::TokenSealed { token, minted }) => {
@@ -1869,6 +1874,7 @@ pub fn setup(args: &[String]) -> ExitCode {
                         Ok(()) => {
                             println!("  armed with a keyring token {OK}");
                             crate::print_token_upgrade_notice(&user);
+                            crate::print_seal_storage_note(&user);
                         }
                         Err(e) => eprintln!("  arm failed: {e}"),
                     }

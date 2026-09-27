@@ -22,9 +22,10 @@
 //! the uid the record carries, and a record that carries none is not written.
 //! A write never changes the uid a record carries: when the name now resolves
 //! to another uid, or to no account, the write is refused and nothing is
-//! written. An enrollment loaded and then saved carries the uid its load
-//! checked, so the save is refused, not rebound, when the account changed in
-//! between.
+//! written. An enrollment loaded and then saved carries the uid of the
+//! account its load was for (the uid its records record, or else the uid the
+//! name resolved to at the load), so the save is refused, not rebound, when
+//! the account changed in between.
 //!
 //! Nothing here deletes a record: an explicit enrollment or arm for the
 //! account replaces it, and an administrator can move it away.
@@ -311,14 +312,15 @@ impl<'a> Account<'a> {
         self.other.is_some()
     }
 
-    /// The uid this operation resolved the account to, if it resolved it to
-    /// one. A load resolves the account only to check a record that carries
-    /// a uid, so after a load that passed its checks this is the uid those
-    /// records belong to, and `None` when none of them carries one.
-    pub(crate) fn resolved_uid(&self) -> Option<u32> {
-        match self.resolution {
-            Some(Resolution::Uid(uid)) => Some(uid),
-            _ => None,
+    /// The uid this operation resolves the account to, resolving it now if no
+    /// record check has yet; `None` for a name no account has, or when the
+    /// lookup failed. After a load that passed its checks this is the uid
+    /// its records belong to: the one they record, or, for records that
+    /// record none, the one the name resolved to when they were loaded.
+    pub(crate) fn current_uid(&mut self) -> Option<u32> {
+        match self.resolution() {
+            Resolution::Uid(uid) => Some(uid),
+            Resolution::NoAccount | Resolution::Unknown => None,
         }
     }
 
@@ -581,7 +583,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("irlume keyring arm"), "{error}");
-        assert_eq!(account.resolved_uid(), Some(4502));
+        assert_eq!(account.current_uid(), Some(4502));
     }
 
     /// When the lookup fails, a write keeps the uid its record carries, and

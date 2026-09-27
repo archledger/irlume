@@ -870,7 +870,9 @@ All notable changes to irlume are documented here. This project adheres to
   uid a record carries: a change to a stored record (adding scans,
   renaming a profile, a re-seal) is refused, with nothing written, when
   the name resolves to another uid or to no account by the time it is
-  saved. Nothing else is removed automatically. Records written by
+  saved, also for an enrollment that records no uid yet, which is held
+  to the uid the name resolved to when it was loaded. Nothing else is
+  removed automatically. Records written by
   earlier releases carry no uid; they are accepted and record it on
   their next write, except that moving a template key to a stronger
   policy keeps it unbound. Older releases ignore the new field

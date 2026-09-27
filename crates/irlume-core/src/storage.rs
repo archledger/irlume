@@ -226,14 +226,15 @@ pub struct Enrollment {
     /// the ciphertext on an encrypted store. Older releases ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<u32>,
-    /// The uid the load that returned this enrollment checked its records
-    /// against, when one of them records a uid ([`load`] checks the
-    /// enrollment and its template key). `None` for an enrollment built in
-    /// memory. Never stored or read from a file. [`save`] writes the
-    /// enrollment only for this uid (or the one it records), so an
-    /// enrollment loaded for one account is not saved for an account that
-    /// took the name in between, even when the enrollment itself records no
-    /// uid yet.
+    /// The uid of the account the load that returned this enrollment was
+    /// for: the uid its records record ([`load`] checks the enrollment and
+    /// its template key), or, when neither records one, the uid the name
+    /// resolved to at the load. `None` for an enrollment built in memory, or
+    /// loaded when the name resolved to no account or could not be resolved.
+    /// Never stored or read from a file. [`save`] writes the enrollment only
+    /// for this uid (or the one it records), so an enrollment loaded for one
+    /// account is not saved for an account that took the name in between,
+    /// even when neither the enrollment nor its key records a uid yet.
     #[serde(skip)]
     pub loaded_for: Option<u32>,
     pub profiles: Vec<FaceProfile>,
@@ -837,14 +838,14 @@ fn save_with_key(
     let dir = state_dir();
     fs::create_dir_all(&dir).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
     let path = profile_path(&e.user);
-    // The uid this enrollment belongs to: the one it records, or else the one
-    // its load checked its template key against. The write keeps it, and is
-    // refused with nothing written when the name now resolves to another uid
-    // or to no account, so a load and the save after it act for one account.
-    // A new enrollment, or one written before the uid was recorded, records
-    // the current uid. When the uid cannot be resolved the enrollment keeps
-    // the one it has, and one without a uid is not written. The key is chosen
-    // against the same resolution.
+    // The uid this enrollment belongs to: the one it records, or else the uid
+    // of the account its load was for (`loaded_for`). The write keeps it, and
+    // is refused with nothing written when the name now resolves to another
+    // uid or to no account, so a load and the save after it act for one
+    // account. A new enrollment, or one without a uid loaded while the name
+    // resolved to no uid, records the current uid. When the uid cannot be
+    // resolved the enrollment keeps the one it has, and one without a uid is
+    // not written. The key is chosen against the same resolution.
     let mut account = Account::new(&e.user);
     let uid = account.uid_to_record(Record::Enrollment, e.uid.or(e.loaded_for))?;
     let key = resolve_key(&e.user, &mut account)?;
@@ -1016,8 +1017,11 @@ fn load_snapshot_with(
         return Ok(None);
     }
     // The uid the checks above held the enrollment and its key to, carried
-    // to a save of this enrollment ([`Enrollment::loaded_for`]).
-    enrollment.loaded_for = account.resolved_uid();
+    // to a save of this enrollment ([`Enrollment::loaded_for`]). When neither
+    // records one, the uid the name resolves to now: the save is then held
+    // to the account this load was for, not to one that takes the name in
+    // between.
+    enrollment.loaded_for = account.current_uid();
     Ok(Some(PrimarySnapshot {
         enrollment,
         key,
@@ -1083,8 +1087,11 @@ pub fn load_path_with_source(
     // Recorded for another uid: absent, as in `load`.
     let mut account = Account::new(user);
     let checked = account.require(Record::Enrollment, enrollment.uid);
-    Ok(account.absent_if_other(checked)?.map(|()| Enrollment {
-        loaded_for: account.resolved_uid(),
+    if account.absent_if_other(checked)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Enrollment {
+        loaded_for: account.current_uid(),
         ..enrollment
     }))
 }
@@ -1734,7 +1741,11 @@ mod tests {
         let _now = crate::account::remember(user, 4701);
         let loaded = load(user).unwrap().expect("a legacy enrollment loads");
         assert_eq!(loaded.uid, None);
-        assert_eq!(loaded.loaded_for, None, "no record carried a uid to check");
+        assert_eq!(
+            loaded.loaded_for,
+            Some(4701),
+            "loaded for the uid the name resolved to"
+        );
         // A plaintext write, as on a host without a TPM.
         save_with_key(&loaded, |_, _| Ok(None)).unwrap();
         let on_disk: serde_json::Value =
@@ -2305,6 +2316,100 @@ mod tests {
         let saved =
             deserialize_enrollment(&fs::read(profile_path(user)).unwrap(), Some(&key)).unwrap();
         assert_eq!(saved.uid, Some(6301));
+        assert_eq!(saved.profiles[0].name, "Renamed");
+        leave_uid_sandbox(&dir);
+    }
+
+    /// An enrollment an earlier release wrote, with no template key (a host
+    /// without a TPM) or under a key that records no uid either, is loaded
+    /// for the uid the name resolves to at the load. A save after the name
+    /// resolved to another uid is refused before any key is chosen, and the
+    /// enrollment, the key and its recovery envelope stay as they were: the
+    /// other uid is never recorded on these templates. For the uid it was
+    /// loaded for, the save records that uid and keeps the key.
+    #[test]
+    fn a_save_of_an_enrollment_loaded_without_any_uid_is_held_to_the_load() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("uid-loaded-unbound");
+        let user = "uid-loaded-unbound";
+        let refused = |loaded: &Enrollment| {
+            let _recreated = crate::account::remember(user, 6502);
+            save_with_key(loaded, |_, _| {
+                panic!("no key is chosen for a write that is refused")
+            })
+            .unwrap_err()
+            .to_string()
+        };
+        let loaded_as_the_first_account = |load: &dyn Fn() -> Enrollment| {
+            let _then = crate::account::remember(user, 6501);
+            let mut loaded = load();
+            assert_eq!(loaded.uid, None, "the enrollment records none");
+            assert_eq!(loaded.loaded_for, Some(6501));
+            loaded.profiles[0].name = "Renamed".into();
+            loaded
+        };
+
+        // Plaintext, no key.
+        let before = plant_plaintext(&dir, user, None);
+        let loaded = loaded_as_the_first_account(&|| load(user).unwrap().unwrap());
+        loaded_as_the_first_account(&|| {
+            load_path_unlocked(user, &profile_path(user))
+                .unwrap()
+                .unwrap()
+        });
+        let error = refused(&loaded);
+        assert!(
+            error.contains("belongs to uid 6501") && error.contains("now uid 6502"),
+            "{error}"
+        );
+        assert_eq!(fs::read(profile_path(user)).unwrap(), before);
+
+        // Encrypted under a key that records no uid.
+        let key = [11u8; 32];
+        let mut legacy = sample();
+        legacy.user = user.into();
+        let enrollment_before = serialize_enrollment(&legacy, Some(&key)).unwrap();
+        fs::write(profile_path(user), &enrollment_before).unwrap();
+        fake_seal(user, &key, None).unwrap();
+        let key_before = fs::read(template_key::key_path(user)).unwrap();
+        let recovery = template_key::recovery_path(user);
+        fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+        fs::write(&recovery, b"synthetic recovery of the key").unwrap();
+        let loaded = loaded_as_the_first_account(&|| {
+            load_with(user, template_key::UserStateLock::acquire, fake_load)
+                .unwrap()
+                .unwrap()
+                .0
+        });
+        let error = refused(&loaded);
+        assert!(
+            error.contains("belongs to uid 6501") && error.contains("now uid 6502"),
+            "{error}"
+        );
+        assert_eq!(fs::read(template_key::key_path(user)).unwrap(), key_before);
+        assert_eq!(fs::read(profile_path(user)).unwrap(), enrollment_before);
+        assert!(recovery.exists());
+
+        let _then = crate::account::remember(user, 6501);
+        save_with_key(&loaded, |user, account| {
+            template_key::ensure_key_with(
+                user,
+                account,
+                Some(&key_opens_another_accounts_enrollment),
+                fake_load,
+                |_, _, _| panic!("the key of the loaded account is kept"),
+            )
+            .map(Some)
+        })
+        .unwrap();
+        assert_eq!(fs::read(template_key::key_path(user)).unwrap(), key_before);
+        assert!(recovery.exists());
+        let saved =
+            deserialize_enrollment(&fs::read(profile_path(user)).unwrap(), Some(&key)).unwrap();
+        assert_eq!(saved.uid, Some(6501));
         assert_eq!(saved.profiles[0].name, "Renamed");
         leave_uid_sandbox(&dir);
     }

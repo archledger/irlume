@@ -223,8 +223,11 @@ each record it does not use, with the uids and the next step.
   to another uid, or to no account, by then. Deleting the last profile
   removes the account's records rather than writing them. An enrollment an
   earlier release wrote counts as its template key's uid when the key records
-  one, so its save neither records the new uid nor replaces the key. A new
-  enrollment, key, arm or recovery envelope records the current uid.
+  one, so its save neither records the new uid nor replaces the key. When
+  neither records one, the enrollment counts as the uid the name resolved to
+  when it was loaded, so the save is refused, rather than recording the new
+  uid on those templates, when the name resolves to another uid by then. A
+  new enrollment, key, arm or recovery envelope records the current uid.
 - When the current uid cannot be resolved, a write keeps the uid its record
   carries, and a write that would leave a record without one (a new
   enrollment, key, arm or recovery envelope, or the rewrite of an earlier

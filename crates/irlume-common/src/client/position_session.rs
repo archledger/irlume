@@ -60,9 +60,7 @@ impl PositionSession {
             ));
         }
         self.samples += 1;
-        let mut line = serde_json::to_vec(&PositionSessionControl::Sample)?;
-        line.push(b'\n');
-        (&self.stream).write_all(&line)?;
+        self.send(PositionSessionControl::Sample, cancelled)?;
         match self.reply(cancelled)? {
             Response::Position(report) => Ok(report),
             Response::Error(error) => Err(io::Error::other(error)),
@@ -82,9 +80,7 @@ impl PositionSession {
     /// A failure must stop the guide rather than begin enrollment anyway.
     pub fn finish(mut self, cancelled: &AtomicBool) -> io::Result<()> {
         self.check(cancelled)?;
-        let mut line = serde_json::to_vec(&PositionSessionControl::Finish)?;
-        line.push(b'\n');
-        (&self.stream).write_all(&line)?;
+        self.send(PositionSessionControl::Finish, cancelled)?;
         match self.reply(cancelled)? {
             Response::PositionSessionEnded => Ok(()),
             Response::Error(error) => Err(io::Error::other(error)),
@@ -109,6 +105,23 @@ impl PositionSession {
             ));
         }
         Ok(())
+    }
+
+    /// Send one control line. The daemon writes its start reply and a
+    /// capture error that follows it separately, then closes (#874): when the
+    /// error came after `connect` returned, this write fails with a broken
+    /// pipe while the error is still waiting in the socket, so that error is
+    /// returned instead of the pipe's.
+    fn send(&mut self, control: PositionSessionControl, cancelled: &AtomicBool) -> io::Result<()> {
+        let mut line = serde_json::to_vec(&control)?;
+        line.push(b'\n');
+        match (&self.stream).write_all(&line) {
+            Ok(()) => Ok(()),
+            Err(write) => match self.reply(cancelled) {
+                Ok(Response::Error(error)) => Err(io::Error::other(error)),
+                _ => Err(write),
+            },
+        }
     }
 
     fn reply(&mut self, cancelled: &AtomicBool) -> io::Result<Response> {
@@ -312,6 +325,32 @@ mod tests {
                 (got, want) => panic!("got {got:?}, want {want:?}"),
             }
         }
+        // The error can also trail the start reply by a whole read, after
+        // `connect` returned: the next command then reads it, whether the
+        // daemon still holds the connection or has closed it, and a daemon
+        // that closed without an answer still reports the broken pipe.
+        for closed in [false, true] {
+            let (mut session, mut peer) = local_session();
+            peer.write_all(format!("{error}\n").as_bytes()).unwrap();
+            let peer = if closed {
+                drop(peer);
+                None
+            } else {
+                Some(peer)
+            };
+            let got = session.sample(&AtomicBool::new(false)).unwrap_err();
+            assert_eq!(
+                got.to_string(),
+                "main camera stream stop is unconfirmed",
+                "closed={closed}"
+            );
+            drop(peer);
+        }
+        let (session, peer) = local_session();
+        drop(peer);
+        let got = session.finish(&AtomicBool::new(false)).unwrap_err();
+        assert_eq!(got.kind(), io::ErrorKind::BrokenPipe);
+
         // Outside the start reply, a trailing error is as unsolicited as any
         // other second line.
         let (mut session, mut peer) = local_session();

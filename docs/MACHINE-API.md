@@ -690,7 +690,11 @@ their side of every line an administrator added. `keep-edited-override` writes
 nothing: the copy has lines irlume did not write and its vendor file changed
 since irlume created it (or it predates vendor tracking and differs), or
 updating irlume's lines would move where one of its numeric jumps lands or
-move one of irlume's lines past an administrator's line. `login apply` counts
+move one of irlume's lines past an administrator's line. A stack irlume edits
+in place reports it too when a disable left inactive lines in the places of
+irlume's lines because a numeric jump counts them, and irlume's lines no
+longer fit those places; while they fit, `wire` puts irlume's lines back in
+them, so the jump lands where it did. `login apply` counts
 such a surface as failed (`applied: false`, and the apply fails), since
 irlume's lines are not the ones it was asked for; as on the command line, the
 self-heal marker still follows the other surfaces. A copy nobody edited is not

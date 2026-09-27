@@ -2679,7 +2679,9 @@ pub(crate) enum PlannedChange {
     RewireOverride,
     /// Leave an override as it is: it has lines irlume did not write and its
     /// vendor copy moved on, or a write would change where one of its numeric
-    /// jumps lands. Writes nothing.
+    /// jumps lands. Also a stack irlume edits in place whose inactive lines,
+    /// which a disable left where a numeric jump counts them, irlume's lines
+    /// do not fit. Writes nothing.
     KeepEditedOverride,
     /// Rename the backup back over the live file.
     RestoreBackup,
@@ -3054,11 +3056,44 @@ fn wire_service_with(
                     format!("· {}: no anchor to wire (skipped)", s.etc),
                 );
             }
-            if wired == current {
-                return out(
+            let already = || {
+                out(
                     PlannedChange::AlreadyCorrect,
                     format!("· {}: already correctly wired", s.etc),
-                );
+                )
+            };
+            // A numeric jump that counts irlume's lines, or the inactive lines
+            // a disable left in their places, keeps its landing only while
+            // they stay in those places.
+            let (wired, note) = match keep_places(s.etc, &current, &wired) {
+                None => (wired, String::new()),
+                Some(KeptPlaces::Unchanged) => return already(),
+                Some(KeptPlaces::Filled(text)) => {
+                    let unused = if text.contains(INERT_TAG) {
+                        "; an inactive line still holds the place of each of irlume's lines \
+                         this configuration does not use"
+                    } else {
+                        ""
+                    };
+                    (
+                        text,
+                        format!(
+                            "; irlume's lines take the places inactive lines held, so every \
+                             jump lands where it did{unused}"
+                        ),
+                    )
+                }
+                Some(KeptPlaces::Refused(message)) => {
+                    return Ok(WireOutcome {
+                        change: PlannedChange::KeepEditedOverride,
+                        message,
+                        detail: None,
+                        unmet: true,
+                    });
+                }
+            };
+            if wired == current {
+                return already();
             }
             if apply {
                 backup(etc)?;
@@ -3066,7 +3101,7 @@ fn wire_service_with(
             }
             out(
                 PlannedChange::Wire,
-                format!("✓ {}: wired (backup {}{})", s.etc, s.etc, BACKUP),
+                format!("✓ {}: wired (backup {}{}){note}", s.etc, s.etc, BACKUP),
             )
         }
     } else {
@@ -3173,6 +3208,69 @@ fn strip_in_place(etc: &str, current: &str) -> (Option<String>, PlannedChange, S
              would change a jump: without them {why}"
         ),
     )
+}
+
+/// What an enable does with a stack irlume edits in place when the stack the
+/// recipe makes would move a numeric jump another line carries (see
+/// [`keep_places`]).
+#[derive(Debug, PartialEq, Eq)]
+enum KeptPlaces {
+    /// irlume's lines are already the recipe's, in the places the jump
+    /// counts: nothing to write.
+    Unchanged,
+    /// The stack to write: irlume's lines in the places the inactive lines
+    /// held.
+    Filled(String),
+    /// Nothing is written: irlume's lines do not fit those places. The line
+    /// that says why.
+    Refused(String),
+}
+
+/// irlume's lines for an enable of a stack irlume edits in place. `wired` is
+/// what the recipe makes of the stack without irlume's lines. `None` when the
+/// caller writes `wired`, as for any stack: the stack has none of irlume's
+/// lines, writing `wired` keeps every numeric jump's landing, or the stack
+/// holds no inactive line (see [`strip_in_place`]) and its irlume lines are
+/// not already the recipe's.
+///
+/// Otherwise a jump another line carries counts irlume's lines or the
+/// inactive lines a disable left in their places, and writing `wired` would
+/// move it. Each of irlume's lines, an inactive line included, then takes the
+/// line `wired` has for the same job in its own place, so every jump lands
+/// where it does now ([`overrides::refill`]). When irlume's lines do not fit
+/// the places the inactive lines hold, nothing is written: a jump is never
+/// moved to make room.
+fn keep_places(etc: &str, current: &str, wired: &str) -> Option<KeptPlaces> {
+    if !current.lines().any(is_irlume_line) {
+        return None;
+    }
+    let shifts = overrides::jump_shifts(current, wired);
+    if shifts.is_empty() {
+        return None;
+    }
+    let holds_places = current
+        .lines()
+        .any(|l| is_irlume_line(l) && l.contains(INERT_TAG));
+    match overrides::refill(current, wired) {
+        // Byte for byte, so a file with CRLF line endings, which PAM does not
+        // read, is still rewritten.
+        Some(filled) if filled == current => Some(KeptPlaces::Unchanged),
+        Some(filled) if holds_places => Some(KeptPlaces::Filled(filled)),
+        None if holds_places => {
+            let state = if content_has_module(current) {
+                "left as it is"
+            } else {
+                "not wired, left as it is"
+            };
+            Some(KeptPlaces::Refused(format!(
+                "⚠ {etc}: {state}: irlume's lines do not fit the places its inactive lines \
+                 hold, and wiring them without those places would move a jump: {}; adjust that \
+                 line",
+                overrides::shift_reason(&shifts)
+            )))
+        }
+        _ => None,
+    }
 }
 
 /// `Some(true/false)` when semodule could be queried (root), `None` otherwise.
@@ -4312,6 +4410,210 @@ mod tests {
         let (clean, change, _) = strip_in_place("/etc/pam.d/sudo", &unjumped);
         assert_eq!(change, PlannedChange::StripInPlace);
         assert!(!clean.unwrap().contains(INERT_TAG));
+    }
+
+    /// A stack irlume edits in place whose numeric jump counts irlume's
+    /// line, for each verify recipe: the jump skips the line and
+    /// `pam_unix.so` and lands on `pam_deny.so`.
+    fn counted_verify_stack(stanza: &str) -> String {
+        format!(
+            "auth [success=2 default=ignore] pam_succeed_if.so user ingroup fast\n\
+             {stanza}\n\
+             auth required pam_unix.so\n\
+             auth required pam_deny.so\n\
+             auth required pam_permit.so\n"
+        )
+    }
+
+    /// `login disable` then `login enable` on a stack irlume edits in place,
+    /// where a numeric jump counts irlume's line: the disable leaves an
+    /// inactive line in its place, and the enable puts irlume's line back in
+    /// that place, so the jump lands on the same module throughout. Taking
+    /// the inactive line out and wiring the stack without it made the jump
+    /// land one module further (#859).
+    #[test]
+    fn an_in_place_disable_and_enable_keep_every_landing() {
+        type Wire = fn(&str) -> (String, bool);
+        for (tag, stanza, wire) in [
+            ("refill-sudo", VERIFY_STANZA, wire_verify_service as Wire),
+            (
+                "refill-polkit",
+                POLKIT_VERIFY_STANZA,
+                wire_polkit_service as Wire,
+            ),
+        ] {
+            let dir = TestDir::new(tag);
+            let etc = dir.0.join("stack");
+            let wired = counted_verify_stack(stanza);
+            std::fs::write(&etc, &wired).unwrap();
+            let svc = Svc {
+                etc: leak(&etc),
+                vendor: None,
+            };
+            let off = wire_service(&svc, false, true, &wire).unwrap();
+            assert_eq!(off.change, PlannedChange::StripInPlace, "{off}");
+            let held = std::fs::read_to_string(&etc).unwrap();
+            assert!(held.lines().nth(1).unwrap().contains(INERT_TAG), "{held}");
+            assert!(overrides::jump_shifts(&wired, &held).is_empty(), "{held}");
+
+            let on = wire_service(&svc, true, true, &wire).unwrap();
+            assert_eq!(on.change, PlannedChange::Wire, "{on}");
+            assert!(!on.unmet, "{on}");
+            let rewired = std::fs::read_to_string(&etc).unwrap();
+            assert!(
+                overrides::jump_shifts(&held, &rewired).is_empty(),
+                "the jump must land where it did while the inactive line held the \
+                 place:\n{held}\n{rewired}"
+            );
+            assert_eq!(rewired, wired, "the round trip gives back the wired stack");
+            assert!(on.message.contains("inactive lines held"), "{on}");
+            let again = wire_service(&svc, true, true, &wire).unwrap();
+            assert_eq!(again.change, PlannedChange::AlreadyCorrect, "{again}");
+        }
+    }
+
+    /// The enable decision for a stack irlume edits in place, by the lines it
+    /// holds: inactive lines a jump counts are refilled, or the stack is left
+    /// as it is when irlume's lines do not fit them; every other stack is
+    /// wired as the recipe has it, except one whose irlume lines are already
+    /// the recipe's in the places a jump counts, which is already correct.
+    #[test]
+    fn an_in_place_enable_refills_only_places_a_jump_counts() {
+        let etc = "/etc/pam.d/sudo";
+        let decide = |current: &str, wire: fn(&str) -> (String, bool)| {
+            let (wired, changed) = wire(&unwire_lines(current).0);
+            assert!(changed, "{current}");
+            keep_places(etc, current, &wired)
+        };
+        for (stanza, wire) in [
+            (
+                VERIFY_STANZA,
+                wire_verify_service as fn(&str) -> (String, bool),
+            ),
+            (POLKIT_VERIFY_STANZA, wire_polkit_service),
+        ] {
+            let counted = counted_verify_stack(stanza);
+            let held = overrides::neutralize(&counted);
+            assert!(held.contains(INERT_TAG), "{held}");
+            assert_eq!(
+                decide(&held, wire),
+                Some(KeptPlaces::Filled(counted.clone()))
+            );
+            // Already the recipe's line in the place the jump counts. With
+            // CRLF endings, which PAM does not read, it is the recipe's to
+            // rewrite, as before.
+            assert_eq!(decide(&counted, wire), Some(KeptPlaces::Unchanged));
+            assert_eq!(decide(&counted.replace('\n', "\r\n"), wire), None);
+            // Inactive lines no jump counts: wired as the recipe has it.
+            let unjumped = held.replacen("[success=2 default=ignore]", "requisite", 1);
+            assert_eq!(decide(&unjumped, wire), None);
+            // Stacks without inactive lines are the recipe's to wire.
+            let gated = "auth requisite pam_succeed_if.so user ingroup wheel\n\
+                         auth include system-auth\n";
+            let on_top = format!("{stanza}\n{gated}");
+            for stack in [gated, on_top.as_str(), "auth include system-auth\n"] {
+                assert_eq!(decide(stack, wire), None, "{stack}");
+            }
+        }
+        // A sudo stanza held by a disable is refilled with polkit's, since both
+        // are the plain verify job; an inactive line for another job does not
+        // fit, and the stack is left as it is rather than the jump moved.
+        let held = overrides::neutralize(&counted_verify_stack(VERIFY_STANZA));
+        assert_eq!(
+            decide(&held, wire_polkit_service),
+            Some(KeptPlaces::Filled(counted_verify_stack(
+                POLKIT_VERIFY_STANZA
+            )))
+        );
+        let odd = held.replacen(INERT_TAG, &format!("{INERT_TAG} unseal"), 1);
+        match decide(&odd, wire_verify_service) {
+            Some(KeptPlaces::Refused(message)) => {
+                assert!(
+                    message.starts_with("⚠ /etc/pam.d/sudo: not wired"),
+                    "{message}"
+                );
+                assert!(message.contains("would then land on"), "{message}");
+                assert!(message.contains("pam_succeed_if.so"), "{message}");
+            }
+            other => panic!("expected a refusal: {other:?}"),
+        }
+    }
+
+    /// A refusal on an enable writes nothing and fails the run: a greeter a
+    /// disable left with inactive lines where a jump counts them, and whose
+    /// configuration now wants a face line those lines have no place for.
+    #[test]
+    fn an_in_place_enable_that_would_move_a_jump_leaves_the_stack() {
+        let dir = TestDir::new("refill-refused");
+        let etc = dir.0.join("gdm-password");
+        let base = "auth       required     pam_env.so\n\
+                    auth       [success=2 default=ignore] pam_succeed_if.so user ingroup kiosk\n\
+                    auth       substack     password-auth\n\
+                    auth       optional     pam_gnome_keyring.so\n\
+                    session    substack     password-auth\n";
+        let reseal_only = |c: &str| wire_greeter_impl(c, false, false, false);
+        let with_face = |c: &str| wire_greeter_impl(c, true, false, false);
+        let (wired, _) = reseal_only(base);
+        std::fs::write(&etc, &wired).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let off = wire_service(&svc, false, true, &reseal_only).unwrap();
+        assert_eq!(off.change, PlannedChange::StripInPlace, "{off}");
+        let held = std::fs::read_to_string(&etc).unwrap();
+        assert!(held.contains(INERT_TAG), "{held}");
+        let on = wire_service(&svc, true, true, &with_face).unwrap();
+        assert_eq!(on.change, PlannedChange::KeepEditedOverride, "{on}");
+        assert!(on.unmet, "{on}");
+        assert!(on.message.contains("do not fit"), "{on}");
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), held);
+        assert!(!dir.0.join(format!("gdm-password{BACKUP}")).exists());
+    }
+
+    /// Greeters and lock screens irlume edits in place take the same path:
+    /// with face login turned off between a disable and an enable, the face
+    /// line's place stays held by an inactive line, so the jump that counts
+    /// it lands where it did, and turning face login on again fills it.
+    #[test]
+    fn an_in_place_greeter_keeps_an_unused_place_held() {
+        let dir = TestDir::new("refill-greeter");
+        let etc = dir.0.join("gdm-password");
+        let base = "auth       required     pam_env.so\n\
+                    auth       [success=4 default=ignore] pam_succeed_if.so user ingroup kiosk\n\
+                    auth       substack     password-auth\n\
+                    auth       optional     pam_gnome_keyring.so\n\
+                    session    substack     password-auth\n";
+        let with_face = |c: &str| wire_greeter_impl(c, true, false, false);
+        let reseal_only = |c: &str| wire_greeter_impl(c, false, false, false);
+        let (wired, _) = with_face(base);
+        std::fs::write(&etc, &wired).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let off = wire_service(&svc, false, true, &with_face).unwrap();
+        assert_eq!(off.change, PlannedChange::StripInPlace, "{off}");
+        let held = std::fs::read_to_string(&etc).unwrap();
+        let on = wire_service(&svc, true, true, &reseal_only).unwrap();
+        assert_eq!(on.change, PlannedChange::Wire, "{on}");
+        assert!(on.message.contains("still holds the place"), "{on}");
+        let partial = std::fs::read_to_string(&etc).unwrap();
+        assert!(
+            overrides::jump_shifts(&held, &partial).is_empty(),
+            "{partial}"
+        );
+        assert!(!content_has_module(&held), "{held}");
+        assert!(
+            partial.lines().any(|l| l == RESEAL_AUTH)
+                && partial
+                    .lines()
+                    .any(|l| l.contains(&format!("{INERT_TAG} unseal"))),
+            "{partial}"
+        );
+        let face = wire_service(&svc, true, true, &with_face).unwrap();
+        assert!(!face.unmet, "{face}");
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), wired);
     }
 
     #[test]

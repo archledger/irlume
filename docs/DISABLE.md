@@ -129,14 +129,18 @@ The disable also:
   declines, and a later `disable` removes them once the jump no longer
   counts them. A stack irlume edits in place (an `/etc` file with no vendor
   copy, such as `sudo` or `polkit-1` on Debian, Ubuntu and Arch) gets the
-  same treatment when there is no backup to restore. It does the same when it could not tell where to put its
-  lines back without them (the file has no password line irlume can tell
-  from one of yours, such as a copy of the vendor's), so the next `enable`
-  puts them back in the same places. If the machine's configuration
-  changed in between (for example an RGB-only camera no longer does face
-  login), that `enable` turns on the lines it still uses in their places
-  and leaves an inactive line where one is no longer used, so your jump
-  still lands where it did. A numeric jump from the vendor file that
+  same treatment when there is no backup to restore, and while the jump
+  counts the inactive lines, the next `enable` puts irlume's lines back in
+  their places; when they no longer fit there, it leaves the stack as it
+  is and exits 1 rather than move the jump. For an override irlume does
+  the same when it could not tell where to put its lines back without
+  them (the file has no password line irlume can tell from one of yours,
+  such as a copy of the vendor's), so the next `enable` puts them back in
+  the same places. If the machine's configuration changed in between (for
+  example an RGB-only camera no longer does face login), that `enable`
+  turns on the lines it still uses in their places and leaves an inactive
+  line where one is no longer used, so your jump still lands where it
+  did. A numeric jump from the vendor file that
   irlume's lines had moved lands where the vendor file has it again once
   they are removed. A file with a line that ends in `\`, which PAM joins
   with the next line into one rule, is left as it is, irlume's lines

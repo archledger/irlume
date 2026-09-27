@@ -407,6 +407,18 @@ fn filled_in_place(body: &str, wired: &str, edited: bool) -> Option<(String, Jum
     }
 }
 
+/// [`fill_slots`] for a stack irlume edits in place: `current` with each of
+/// irlume's lines, an inactive line holding a place included, taking the line
+/// `wired` has for the same job. The filled text when every numeric jump of
+/// the other lines lands where it does in `current` and irlume's own jumps
+/// land as they do in `wired`; `None` when irlume's lines do not fit those
+/// places.
+pub(super) fn refill(current: &str, wired: &str) -> Option<String> {
+    let filled = fill_slots(current, wired)?;
+    (own_landings(&filled) == own_landings(wired) && jump_shifts(current, &filled).is_empty())
+        .then_some(filled)
+}
+
 // ---- numeric jumps -------------------------------------------------------------
 //
 // A control such as `[success=2 default=ignore]` skips the next two modules of

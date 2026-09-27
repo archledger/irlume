@@ -329,6 +329,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume login enable` on a stack irlume edits in place (an `/etc` file
+  with no vendor copy, such as `sudo` or `polkit-1` on Debian, Ubuntu and
+  Arch) puts irlume's lines back where `login disable` left inactive
+  lines for them because a numeric jump counts them, so the jump lands on
+  the same module as before, instead of taking the inactive lines out and
+  wiring the stack without them, which made the jump land one module
+  further. A line the configuration no longer uses keeps an inactive line
+  in its place; when irlume's lines do not fit those places, the stack is
+  left as it is and `login enable` exits 1 (`login apply` reports the
+  surface as kept). A stack whose irlume lines are already right in the
+  places such a jump counts is reported as already wired and not
+  rewritten (#859).
+
 - `irlume doctor`'s `login-wiring` check and the TUI count a login screen
   left with only irlume's reseal lines (a LightDM serving remote login
   screens, #866) as not wired, as `irlume login status` does, instead of

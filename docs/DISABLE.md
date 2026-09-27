@@ -166,6 +166,16 @@ not the active one is not re-created until the next `irlume login enable`. To
 go back to the vendor files for good, run `sudo irlume login disable
 --apply`.
 
+To keep the wiring but stop the automatic re-apply, disable the three
+reconcile units:
+
+```sh
+sudo systemctl disable --now irlume-reconcile.path irlume-reconcile.timer irlume-reconcile.service
+```
+
+Package upgrades leave them disabled (or masked) and run no reconcile then;
+only a fresh install, or an upgrade from before 0.6.1, enables them.
+
 ## Keep some surfaces
 
 Turn everything off, then re-add only what you want:

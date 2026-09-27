@@ -220,9 +220,14 @@ fi
 # Start the PAM-file watcher now (else it only becomes active at the next boot),
 # and run one reconcile: on an upgrade this adopts an already-wired install into
 # the self-heal marker, and re-applies wiring a same-transaction strip removed.
-# Both self-gate and no-op on a fresh/un-wired box.
-systemctl start irlume-reconcile.path &>/dev/null || :
-systemctl start irlume-reconcile.timer &>/dev/null || :
+# Both self-gate and no-op on a fresh/un-wired box. Each starts only while it is
+# enabled (the preset enables them on first install): `systemctl start` also
+# runs a disabled unit, which would undo an administrator's disable.
+for unit in irlume-reconcile.path irlume-reconcile.timer; do
+    if systemctl is-enabled --quiet "$unit" &>/dev/null; then
+        systemctl start "$unit" &>/dev/null || :
+    fi
+done
 # The timer is NEW in 0.7.0 and %%systemd_post only applies presets on a FRESH
 # install, so an upgrader would never get the backstop. Arm it once, recorded by
 # a marker, leaving a later deliberate disable alone.
@@ -243,7 +248,9 @@ if [ ! -e /var/lib/irlume/.reconcile-timer-armed ]; then
     mkdir -p -m 0700 /var/lib/irlume 2>/dev/null || :
     touch /var/lib/irlume/.reconcile-timer-armed 2>/dev/null || :
 fi
-systemctl start irlume-reconcile.service &>/dev/null || :
+if systemctl is-enabled --quiet irlume-reconcile.service &>/dev/null; then
+    systemctl start irlume-reconcile.service &>/dev/null || :
+fi
 # PAM wiring is opt-in (irlume login enable); never auto-wire auth on install.
 # The pre-0.2.0 re-enroll notice lives in %%triggerpostun below, because $1 here
 # counts installed packages and cannot tell which version is being replaced.

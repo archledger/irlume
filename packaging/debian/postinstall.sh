@@ -56,8 +56,11 @@ fi
 # built package, `configure 0.8.1` called daemon-reload, is-enabled,
 # enable-socket and try-restart, and no reconcile. Fedora's %post and Arch's
 # post_upgrade both run it. It self-gates on the login.wired marker, so it is a
-# no-op on a box that never wired login.
-if [ -n "${2:-}" ]; then
+# no-op on a box that never wired login, and it runs only while the service is
+# enabled: `systemctl start` also runs a disabled unit, which would undo an
+# administrator's disable.
+if [ -n "${2:-}" ] &&
+    systemctl is-enabled --quiet irlume-reconcile.service 2>/dev/null; then
     systemctl start irlume-reconcile.service 2>/dev/null || true
 fi
 # The socket first shipped in 0.8.1. Migrate older releases only: repeating

@@ -23,6 +23,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 DAEMON = "irlumed.service"
 SOCKET = "irlumed.socket"
+RECONCILE = ("irlume-reconcile.path", "irlume-reconcile.timer", "irlume-reconcile.service")
 
 # Model the systemctl command boundary, including enable vs. --now and masks.
 # Unsupported commands are recorded as errors even when a hook ignores status.
@@ -61,8 +62,6 @@ if name == "systemctl":
         not flags or (verb == "enable" and flags == ["--now"])
     ):
         for unit_name in units:
-            if unit_name.startswith("irlume-reconcile."):
-                continue
             unit = state["units"].get(unit_name)
             if unit is None:
                 status = unexpected()
@@ -101,7 +100,7 @@ class PackageServiceHookTests(unittest.TestCase):
                 raise RuntimeError(f"required test dependency missing: {name}")
             cls.commands[name] = executable
 
-    def run_hook(self, family, service, socket, old="0.11.3"):
+    def run_hook(self, family, service, socket, old="0.11.3", reconcile=("enabled", False)):
         with tempfile.TemporaryDirectory(prefix="irlume-hook-test-") as temp:
             directory = Path(temp)
             # A real marker under a private path works with both dash and Bash.
@@ -118,6 +117,8 @@ class PackageServiceHookTests(unittest.TestCase):
                 "units": {
                     DAEMON: {"enabled": service[0], "active": service[1], "starts": 0, "restarts": 0},
                     SOCKET: {"enabled": socket[0], "active": socket[1], "starts": 0, "restarts": 0},
+                    **{unit: {"enabled": reconcile[0], "active": reconcile[1], "starts": 0,
+                              "restarts": 0} for unit in RECONCILE},
                 },
                 "calls": [], "errors": [],
             }))
@@ -237,6 +238,44 @@ class PackageServiceHookTests(unittest.TestCase):
                     state = self.run_hook(family, ("disabled", active), ("disabled", False), "0.8.0")
                     self.assert_unit(state, DAEMON, "disabled", active, restarts=int(active))
                     self.assert_unit(state, SOCKET, "disabled", False)
+
+    def test_upgrade_leaves_disabled_or_masked_reconcile_units_alone(self):
+        # `systemctl start` runs a disabled unit too, so an upgrade must not
+        # start or enable a self-heal unit an administrator turned off.
+        for family in ("debian", "arch"):
+            for old in ("0.8.0", "0.11.3"):
+                for choice in ("disabled", "masked", "masked-runtime"):
+                    with self.subTest(family=family, old=old, choice=choice):
+                        state = self.run_hook(family, ("enabled", True), ("enabled", True), old,
+                                              reconcile=(choice, False))
+                        for unit in RECONCILE:
+                            self.assert_unit(state, unit, choice, False)
+
+    def test_upgrade_runs_one_reconcile_only_when_its_service_is_enabled(self):
+        for family in ("debian", "arch"):
+            for enabled in ("enabled", "enabled-runtime"):
+                with self.subTest(family=family, enabled=enabled):
+                    state = self.run_hook(family, ("enabled", True), ("enabled", True),
+                                          reconcile=(enabled, False))
+                    self.assert_unit(state, "irlume-reconcile.service", enabled, True, starts=1)
+                    self.assert_unit(state, "irlume-reconcile.path", enabled, False)
+                    self.assert_unit(state, "irlume-reconcile.timer", enabled, False)
+
+    def test_arch_upgrade_from_before_self_heal_enables_it_once(self):
+        for old in ("0.5.0-1", "0.6.0-1"):
+            with self.subTest(old=old):
+                state = self.run_hook("arch", ("enabled", True), ("disabled", False), old,
+                                      reconcile=("disabled", False))
+                self.assert_unit(state, "irlume-reconcile.path", "enabled", True, starts=1)
+                self.assert_unit(state, "irlume-reconcile.service", "enabled", True, starts=1)
+
+    def test_first_install_enables_and_starts_the_reconcile_units(self):
+        for family in ("debian", "arch"):
+            with self.subTest(family=family):
+                state = self.run_hook(family, ("disabled", False), ("disabled", False), None,
+                                      reconcile=("disabled", False))
+                for unit in RECONCILE:
+                    self.assert_unit(state, unit, "enabled", True, starts=1)
 
     def test_socket_release_and_later_package_versions_do_not_migrate(self):
         # pkgrel is part of pacman's old-version argument; Debian versions can

@@ -5,7 +5,7 @@
 
 Requires dpkg and vercmp so migration decisions use the native comparators.
 The shell executes a copy with only /var/lib/irlume relocated into the fixture
-to isolate the unrelated reconcile marker; service commands and branches are
+to isolate the reconcile timer marker; service commands and branches are
 unchanged. All external commands use a private PATH.
 These tests cover hook decisions, not systemd's dependency/activation engine.
 """
@@ -81,6 +81,8 @@ if name == "systemctl":
         status = unexpected()
 elif name == "systemd-tmpfiles" and args == ["--create", "irlume.conf"]:
     pass
+elif name == "mkdir" and args == ["-p", "-m", "0700", os.environ["HOOK_STATE_DIR"]]:
+    Path(args[3]).mkdir(mode=0o700, parents=True, exist_ok=True)
 elif name == "apparmor_parser" and args == ["-r", "/etc/apparmor.d/usr.bin.irlumed"]:
     pass
 else:
@@ -100,14 +102,23 @@ class PackageServiceHookTests(unittest.TestCase):
                 raise RuntimeError(f"required test dependency missing: {name}")
             cls.commands[name] = executable
 
-    def run_hook(self, family, service, socket, old="0.11.3", reconcile=("enabled", False)):
+    def run_hook(self, family, service, socket, old="0.11.3", reconcile=("enabled", False),
+                 timer_armed=True):
+        # reconcile is one (enabled, active) pair for all three units, or a
+        # dict giving each unit its own. timer_armed=False leaves out the
+        # one-time timer marker, as on an install from before 0.7.0 or an
+        # Arch install that has not been upgraded since.
+        if isinstance(reconcile, tuple):
+            reconcile = dict.fromkeys(RECONCILE, reconcile)
         with tempfile.TemporaryDirectory(prefix="irlume-hook-test-") as temp:
             directory = Path(temp)
             # A real marker under a private path works with both dash and Bash.
             # Do not override shell builtins: dash rejects a function named [.
             fixture_state = directory / "var/lib/irlume"
             fixture_state.mkdir(parents=True)
-            (fixture_state / ".reconcile-timer-armed").touch()
+            marker = fixture_state / ".reconcile-timer-armed"
+            if timer_armed:
+                marker.touch()
             source = ROOT / ("packaging/debian/postinstall.sh" if family == "debian"
                              else "packaging/arch/irlume.install")
             hook = directory / "hook.sh"
@@ -117,8 +128,8 @@ class PackageServiceHookTests(unittest.TestCase):
                 "units": {
                     DAEMON: {"enabled": service[0], "active": service[1], "starts": 0, "restarts": 0},
                     SOCKET: {"enabled": socket[0], "active": socket[1], "starts": 0, "restarts": 0},
-                    **{unit: {"enabled": reconcile[0], "active": reconcile[1], "starts": 0,
-                              "restarts": 0} for unit in RECONCILE},
+                    **{unit: {"enabled": reconcile[unit][0], "active": reconcile[unit][1],
+                              "starts": 0, "restarts": 0} for unit in RECONCILE},
                 },
                 "calls": [], "errors": [],
             }))
@@ -130,6 +141,7 @@ class PackageServiceHookTests(unittest.TestCase):
                 (directory / name).symlink_to(self.commands[name])
             env = {
                 "PATH": str(directory), "HOOK_STATE": str(state_path),
+                "HOOK_STATE_DIR": str(fixture_state),
                 "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1",
             }
             if family == "debian":
@@ -159,6 +171,7 @@ class PackageServiceHookTests(unittest.TestCase):
                     process.communicate()
                     raise
             state = json.loads(state_path.read_text())
+            state["timer_armed"] = marker.exists()
             self.assertEqual(process.returncode, 0, stderr)
             self.assertEqual(stderr, "", stdout)
             self.assertEqual(state["errors"], [], "unexpected or unsafe hook command")
@@ -262,12 +275,49 @@ class PackageServiceHookTests(unittest.TestCase):
                     self.assert_unit(state, "irlume-reconcile.timer", enabled, False)
 
     def test_arch_upgrade_from_before_self_heal_enables_it_once(self):
+        # Releases before 0.7.0 had no timer, so no marker either.
         for old in ("0.5.0-1", "0.6.0-1"):
             with self.subTest(old=old):
                 state = self.run_hook("arch", ("enabled", True), ("disabled", False), old,
-                                      reconcile=("disabled", False))
-                self.assert_unit(state, "irlume-reconcile.path", "enabled", True, starts=1)
-                self.assert_unit(state, "irlume-reconcile.service", "enabled", True, starts=1)
+                                      reconcile=("disabled", False), timer_armed=False)
+                for unit in RECONCILE:
+                    self.assert_unit(state, unit, "enabled", True, starts=1)
+                self.assertTrue(state["timer_armed"])
+
+    def test_upgrade_from_before_the_timer_arms_it_once(self):
+        # The one exception DISABLE.md names: 0.7.0 added the timer, and a
+        # path or service left disabled on an older install is not evidence of
+        # an administrator's choice (Fedora presets before 0.9.0 left the
+        # service disabled, and the Debian and Fedora hooks never enabled the
+        # path for upgraders from before it existed), so the timer is armed
+        # once regardless.
+        for family, old in (("debian", "0.6.1"), ("arch", "0.6.1-1")):
+            with self.subTest(family=family):
+                state = self.run_hook(family, ("enabled", True), ("enabled", True), old,
+                                      reconcile={"irlume-reconcile.path": ("disabled", False),
+                                                 "irlume-reconcile.timer": ("disabled", False),
+                                                 "irlume-reconcile.service": ("disabled", False)},
+                                      timer_armed=False)
+                self.assert_unit(state, "irlume-reconcile.path", "disabled", False)
+                self.assert_unit(state, "irlume-reconcile.service", "disabled", False)
+                self.assert_unit(state, "irlume-reconcile.timer", "enabled", True, starts=1)
+                self.assertTrue(state["timer_armed"])
+
+    def test_arch_upgrade_after_an_install_keeps_a_disabled_timer_off(self):
+        # post_install enables the timer and writes no marker, so the first
+        # upgrade of any Arch install made since 0.7.0 finds none. That upgrade
+        # must not take the marker's absence for an install older than the
+        # timer and enable a timer the administrator has since disabled.
+        for old in ("0.7.0-1", "0.14.0-1"):
+            for others in ("enabled", "disabled"):
+                with self.subTest(old=old, others=others):
+                    state = self.run_hook("arch", ("enabled", True), ("enabled", True), old,
+                                          reconcile={"irlume-reconcile.path": (others, False),
+                                                     "irlume-reconcile.timer": ("disabled", False),
+                                                     "irlume-reconcile.service": (others, False)},
+                                          timer_armed=False)
+                    self.assert_unit(state, "irlume-reconcile.timer", "disabled", False)
+                    self.assert_unit(state, "irlume-reconcile.path", others, False)
 
     def test_first_install_enables_and_starts_the_reconcile_units(self):
         for family in ("debian", "arch"):

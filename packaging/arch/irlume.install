@@ -67,9 +67,13 @@ post_upgrade() {
     elif systemctl is-enabled --quiet irlume-reconcile.service 2>/dev/null; then
         systemctl start irlume-reconcile.service 2>/dev/null || true
     fi
-    # The timer is NEW in 0.7.0; arm it once for upgraders too, recorded by a
-    # marker so a later deliberate disable is respected.
-    if [ ! -e /var/lib/irlume/.reconcile-timer-armed ]; then
+    # The timer is NEW in 0.7.0; arm it once for upgraders from an older
+    # release too, recorded by a marker so a later deliberate disable is
+    # respected. post_install enables the timer and writes no marker, so the
+    # version check keeps the first upgrade of a newer install from taking
+    # the missing marker for an old install and undoing a disable.
+    if [ "$(vercmp "$2" 0.7.0)" -lt 0 ] &&
+        [ ! -e /var/lib/irlume/.reconcile-timer-armed ]; then
         # /var/lib is system-owned and already exists; only the leaf is ours.
         # shellcheck disable=SC2174
         mkdir -p -m 0700 /var/lib/irlume

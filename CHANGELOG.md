@@ -331,11 +331,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 - Package upgrades leave the reconcile units (`irlume-reconcile.path`,
   `.timer`, `.service`) disabled or masked when an administrator turned
-  them off: the Arch hook no longer enables them on every upgrade, and
-  the Arch, Debian and Fedora hooks start them only while they are
-  enabled, since `systemctl start` also runs a disabled unit. A fresh
-  install, or an Arch upgrade from before 0.6.1, still enables them.
-  DISABLE.md says how to turn the automatic re-apply off.
+  them off: the Arch hook no longer enables them on every upgrade, or
+  the timer on the first upgrade after an install, and the Arch, Debian
+  and Fedora hooks start them only while they are enabled, since
+  `systemctl start` also runs a disabled unit. A fresh install, or an
+  Arch upgrade from before 0.6.1, still enables them, and an upgrade
+  from before 0.7.0 still enables the timer that release added, once.
+  DISABLE.md says how to turn the automatic re-apply off (#892).
 
 - `irlume login enable` on a stack irlume edits in place (an `/etc` file
   with no vendor copy, such as `sudo` or `polkit-1` on Debian, Ubuntu and

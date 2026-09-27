@@ -120,6 +120,14 @@ Each interface-number/alternate-setting pair occurs at most once.
 The configuration's interface count matches distinct interface numbers,
 not alternate settings. The control descriptors form one block before
 the endpoints, and terminals and units have unique nonzero entity IDs.
+Each interface alternate carries its declared endpoint count, with no
+repeated endpoint address. Every recognized control entity has its full
+mandatory layout, even when its fields do not contribute to the role.
+Only UVC 1.0, 1.1 and 1.5 control layouts are recognized; an unknown
+version or entity subtype does not attest. Terminal and selector sizes
+follow the [Linux UVC descriptor definitions](https://github.com/torvalds/linux/blob/master/include/uapi/linux/usb/video.h);
+the Encoding Unit carries both control arrays described in
+[Microsoft's USBView layout](https://github.com/microsoft/Windows-driver-samples/blob/main/usb/usbview/h264.h).
 It does not read `wTotalLength`: the reporter's 5986:2113 `descriptors`
 file carries 996 of the 1026 bytes its configuration header claims (linuxhw
 31A261423C, from a unit with the same bcdDevice 54.22, carries all 1026, and

@@ -372,6 +372,8 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
     let mut declared_interfaces = 0usize;
     let mut vc_block_closed = false;
     let mut entity_ids = std::collections::BTreeSet::new();
+    let mut endpoint_count = None;
+    let mut endpoint_addresses = std::collections::BTreeSet::new();
     let mut headers = 0usize;
     let mut uvc_version = None;
     let mut streaming_interfaces = Vec::new();
@@ -403,6 +405,11 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                 if len < 9 {
                     return None;
                 }
+                if endpoint_count.is_some_and(|count| count != endpoint_addresses.len()) {
+                    return None;
+                }
+                endpoint_count = Some(usize::from(d[4]));
+                endpoint_addresses.clear();
                 if configurations != 1 || !interface_alternates.insert((d[2], d[3])) {
                     return None;
                 }
@@ -438,7 +445,11 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                 match d[2] {
                     SUBTYPE_VC_HEADER => {
                         headers += 1;
-                        uvc_version = Some(u16::from_le_bytes([*d.get(3)?, *d.get(4)?]));
+                        let version = u16::from_le_bytes([*d.get(3)?, *d.get(4)?]);
+                        if !matches!(version, 0x0100 | 0x0110 | 0x0150) {
+                            return None;
+                        }
+                        uvc_version = Some(version);
                         let count = usize::from(*d.get(11)?);
                         streaming_interfaces = d.get(12..12 + count)?.to_vec();
                     }
@@ -453,6 +464,39 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                         }
                         processing_controls.push(processing_unit_controls(d)?);
                     }
+                    2 => {
+                        // USB input terminals are eight bytes; camera and
+                        // media-transport inputs carry variable control data.
+                        let terminal = u16::from_le_bytes([*d.get(4)?, *d.get(5)?]);
+                        let minimum = match terminal {
+                            0x0201 => 15 + usize::from(*d.get(14)?),
+                            0x0202 => {
+                                let controls = usize::from(*d.get(8)?);
+                                10 + controls + usize::from(*d.get(9 + controls)?)
+                            }
+                            _ => 8,
+                        };
+                        if len < minimum {
+                            return None;
+                        }
+                    }
+                    3 => {
+                        if len < 9 {
+                            return None;
+                        }
+                    }
+                    4 => {
+                        if len < 6 + usize::from(*d.get(4)?) {
+                            return None;
+                        }
+                    }
+                    7 => {
+                        // Both bmControls and bmControlsRuntime have the
+                        // declared bControlSize (UVC 1.5 Encoding Unit).
+                        if len < 7 + 2 * usize::from(*d.get(6)?) {
+                            return None;
+                        }
+                    }
                     SUBTYPE_EXTENSION_UNIT => {
                         // bLength is 24 + bNrInPins + bControlSize, closed
                         // by `iExtension`. The emitter's parser is left as
@@ -465,7 +509,15 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                         }
                         extension_units.push(parse_extension_unit(d)?);
                     }
-                    _ => {}
+                    _ => return None,
+                }
+            }
+            0x05 => {
+                if len < 7 || endpoint_count.is_none() || !endpoint_addresses.insert(d[2]) {
+                    return None;
+                }
+                if in_target_vc {
+                    vc_block_closed = true;
                 }
             }
             _ if in_target_vc => vc_block_closed = true,
@@ -474,6 +526,9 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
         i = end;
     }
 
+    if endpoint_count.is_some_and(|count| count != endpoint_addresses.len()) {
+        return None;
+    }
     let interface_count = interface_alternates
         .iter()
         .map(|(number, _)| number)
@@ -2335,7 +2390,9 @@ mod tests {
             .unwrap()
             - 4;
         let mut bytes = whole;
-        bytes.splice(xu_at..xu_at, t480::interrupt_endpoint(0x83, 6));
+        let endpoint_at = xu_at + usize::from(bytes[xu_at]);
+        let endpoint: Vec<_> = bytes.drain(endpoint_at..endpoint_at + 12).collect();
+        bytes.splice(xu_at..xu_at, endpoint);
         assert_eq!(
             ir_function_evidence(&bytes, 0),
             Err(IrFunctionRefusal::Malformed)
@@ -2381,6 +2438,108 @@ mod tests {
         let mut bytes = whole;
         bytes.extend(t480::interface(1, 1, 0, SUBCLASS_VIDEOSTREAMING, 1, 0));
         assert!(ir_function_evidence(&bytes, 0).is_ok());
+    }
+
+    #[test]
+    fn every_interface_alternate_keeps_its_declared_endpoint_count() {
+        let whole = attested_shape();
+        for count in [0, 2] {
+            let mut bytes = whole.clone();
+            bytes[18 + 9 + 4] = count;
+            assert_eq!(
+                ir_function_evidence(&bytes, 0),
+                Err(IrFunctionRefusal::Malformed)
+            );
+        }
+        let stream_at = whole
+            .windows(9)
+            .rposition(|d| d[0] == 9 && d[1] == DESC_INTERFACE)
+            .unwrap();
+        let mut missing = whole.clone();
+        missing[stream_at + 4] = 1;
+        assert_eq!(
+            ir_function_evidence(&missing, 0),
+            Err(IrFunctionRefusal::Malformed)
+        );
+        let mut repeated = whole;
+        repeated[18 + 9 + 4] = 2;
+        repeated.splice(stream_at..stream_at, t480::interrupt_endpoint(0x83, 6));
+        assert_eq!(
+            ir_function_evidence(&repeated, 0),
+            Err(IrFunctionRefusal::Malformed)
+        );
+    }
+
+    #[test]
+    fn unused_entity_fields_still_require_complete_descriptors() {
+        let whole = attested_shape();
+        let at = 18 + 9 + 9 + 13;
+        let entities = [
+            vec![8, DESC_CS_INTERFACE, 2, 4, 1, 1, 0, 0],
+            vec![
+                18,
+                DESC_CS_INTERFACE,
+                2,
+                4,
+                1,
+                2,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                3,
+                0,
+                0,
+                0,
+            ],
+            vec![12, DESC_CS_INTERFACE, 2, 4, 2, 2, 0, 0, 1, 0, 1, 0],
+            vec![9, DESC_CS_INTERFACE, 3, 4, 1, 1, 0, 2, 0],
+            vec![7, DESC_CS_INTERFACE, 4, 4, 1, 2, 0],
+            vec![13, DESC_CS_INTERFACE, 7, 4, 2, 0, 3, 0, 0, 0, 0, 0, 0],
+        ];
+        for entity in entities {
+            let mut valid = whole.clone();
+            valid.splice(at..at, entity.clone());
+            assert!(ir_function_evidence(&valid, 0).is_ok(), "{entity:?}");
+            for length in 3..entity.len() {
+                let mut short = entity[..length].to_vec();
+                short[0] = length as u8;
+                let mut bytes = whole.clone();
+                bytes.splice(at..at, short);
+                assert_eq!(
+                    ir_function_evidence(&bytes, 0),
+                    Err(IrFunctionRefusal::Malformed),
+                    "{entity:?}, length {length}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_control_versions_and_entity_layouts_do_not_attest() {
+        let whole = attested_shape();
+        let header_at = 18 + 9 + 9;
+        for version in [0u16, 0x0101, 0x0111, 0x0151, 0x0200] {
+            let mut bytes = whole.clone();
+            bytes[header_at + 3..header_at + 5].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(
+                ir_function_evidence(&bytes, 0),
+                Err(IrFunctionRefusal::Malformed)
+            );
+        }
+        let mut bytes = whole;
+        bytes.splice(
+            header_at + 13..header_at + 13,
+            [4, DESC_CS_INTERFACE, 0xff, 4],
+        );
+        assert_eq!(
+            ir_function_evidence(&bytes, 0),
+            Err(IrFunctionRefusal::Malformed)
+        );
     }
 
     #[test]
@@ -2486,6 +2645,7 @@ mod tests {
         bytes.extend(t480::interface(2, 0, 1, SUBCLASS_VIDEOCONTROL, 1, 0));
         bytes.extend(t480::vc_header(0x0150, 0, 15_000_000, &[3]));
         bytes.extend(t480::extension_unit(14, MSXU, 2, 2, &[0x22, 0x00], 0));
+        bytes.extend(t480::interrupt_endpoint(0x84, 6));
         bytes.extend(t480::interface(3, 0, 0, SUBCLASS_VIDEOSTREAMING, 1, 0));
         assert_eq!(
             ir_function_evidence(&bytes, 0),

@@ -186,9 +186,11 @@ fn firewall(body: impl FnOnce() -> PamError) -> PamError {
 /// other network services to the client host); an empty, "localhost", or
 /// loopback (127.0.0.1 / ::1) rhost is local. Then an X display on another
 /// host in PAM_XDISPLAY or PAM_TTY (a login screen served over XDMCP), the
-/// service name, and a consent prompt's requesting session. Falls back to the
-/// SSH_CONNECTION / SSH_TTY environment markers for services that do not set
-/// rhost but run under an ssh session (e.g. `sudo` in an ssh shell).
+/// service name, a consent prompt's requesting session, and an elevation
+/// command's own session. Last, the SSH_CONNECTION / SSH_TTY environment
+/// markers for services that do not set rhost but run under an ssh session;
+/// the caller controls its environment, so these only add to the checks
+/// above.
 fn is_remote_session(pamh: &Pam) -> bool {
     if let Ok(Some(rhost)) = pamh.get_rhost() {
         let h = rhost.to_string_lossy();
@@ -219,25 +221,32 @@ fn is_remote_session(pamh: &Pam) -> bool {
     // NOT the one at the local camera. Deny face auth for those services by name:
     // xrdp-sesman in particular includes common-auth on many distros, which is
     // the exact vector by which a locally-oriented biometric runs during a remote
-    // login (see xrdp issue #1546). Logind seat/session data that could prove a
-    // local seat is not populated yet at authenticate() time (pam_systemd runs in
-    // the later session phase), so the service-name deny-list plus the rhost/SSH_*
-    // checks are the best available authenticate()-time signal. They are NOT a
-    // complete remote-desktop policy (see the residual below).
+    // login (see xrdp issue #1546). For a login, logind seat/session data that
+    // could prove a local seat is not populated yet at authenticate() time
+    // (pam_systemd runs in the later session phase), so the service-name
+    // deny-list plus the rhost/SSH_* checks are the best available
+    // authenticate()-time signal. They are NOT a complete remote-desktop policy
+    // (see the residual below). A consent prompt or an elevation command runs
+    // inside a session that already exists, so for those the process's own
+    // session is read as well.
     if let Ok(Some(svc)) = pamh.get_service() {
         let svc = svc.to_string_lossy();
         if is_remote_desktop_service(&svc) {
             return true;
         }
-        // polkit's agent helper carries no remote marker: it clears its
-        // environment (or starts fresh from a socket), and polkit sets no
-        // PAM_RHOST. An administrator in an SSH session who runs pkexec,
-        // run0 or systemctl answers the prompt at pkttyagent, so the agent
-        // that asked is what says where the requester is.
-        if irlume_common::pam_service::classify(&svc) == Some(ServiceKind::AppConsent)
-            && !consent_requester_is_local()
-        {
-            return true;
+        match irlume_common::pam_service::classify(&svc) {
+            // polkit's agent helper carries no remote marker: it clears its
+            // environment (or starts fresh from a socket), and polkit sets no
+            // PAM_RHOST. An administrator in an SSH session who runs pkexec,
+            // run0 or systemctl answers the prompt at pkttyagent, so the agent
+            // that asked is what says where the requester is.
+            Some(ServiceKind::AppConsent) if !consent_requester_is_local() => return true,
+            // sudo, su and doas set no PAM_RHOST, and the SSH_* variables
+            // below come from the caller's own environment. The elevation
+            // command runs this transaction in its own process, so that
+            // process's login session says where the command was typed.
+            Some(ServiceKind::Elevation) if !elevation_caller_is_local() => return true,
+            _ => {}
         }
     }
     // RESIDUAL (docs/THREAT_MODEL.md, "Remote sessions"): a deny-list by service name
@@ -425,6 +434,34 @@ fn requesting_agent_pid() -> Option<u32> {
 /// the session's remoteness cannot be established: the prompt then goes to
 /// the password, never to the camera.
 fn consent_requester_is_local() -> bool {
+    requesting_agent_pid().is_some_and(|pid| process_session_is_local(Process::Pid(pid)))
+}
+
+/// Whether the process running this PAM transaction is in a local login
+/// session. For an elevation service (`sudo`, `su`, `doas`) that process is
+/// the elevation command itself, started from the user's shell, so its cgroup
+/// names the session the command was typed in. False when that session is
+/// remote, and also when it cannot be established, as for a command run from
+/// cron or a system service: the prompt then goes to the password, never to
+/// the camera.
+fn elevation_caller_is_local() -> bool {
+    process_session_is_local(Process::Current)
+}
+
+/// A process whose login session the module looks up.
+#[derive(Clone, Copy, Debug)]
+enum Process {
+    /// The process running this PAM transaction (`/proc/self`).
+    Current,
+    /// Another process, by pid.
+    Pid(u32),
+}
+
+/// [`session_is_local`] against the real `/proc` and logind state
+/// directory, or the trees `IRLUME_PROC_DIR` and `IRLUME_LOGIND_DIR` name.
+/// Those are read through `secure_env`, so a setuid caller such as `sudo`
+/// always reads the real ones.
+fn process_session_is_local(process: Process) -> bool {
     let proc_dir = irlume_common::client::secure_env("IRLUME_PROC_DIR").map_or_else(
         || std::path::PathBuf::from("/proc"),
         std::path::PathBuf::from,
@@ -433,10 +470,26 @@ fn consent_requester_is_local() -> bool {
         || std::path::PathBuf::from("/run/systemd"),
         std::path::PathBuf::from,
     );
-    let Some(pid) = requesting_agent_pid() else {
-        return false;
+    session_is_local(&proc_dir, &logind_dir, process)
+}
+
+/// Whether `process` is in a local login session, read from its cgroup under
+/// `proc_dir` and logind's state files under `logind_dir`. A process in a
+/// session's scope is judged by that session; one its user's service manager
+/// runs (a desktop's polkit agent, a terminal a desktop started) by the user's
+/// display session. The session must belong to the user whose slice holds the
+/// process and say `REMOTE=0`. Anything that cannot be read or resolved is
+/// not local.
+fn session_is_local(
+    proc_dir: &std::path::Path,
+    logind_dir: &std::path::Path,
+    process: Process,
+) -> bool {
+    let entry = match process {
+        Process::Current => "self".to_string(),
+        Process::Pid(pid) => pid.to_string(),
     };
-    let Ok(cgroup) = std::fs::read_to_string(proc_dir.join(pid.to_string()).join("cgroup")) else {
+    let Ok(cgroup) = std::fs::read_to_string(proc_dir.join(entry).join("cgroup")) else {
         return false;
     };
     let (session, uid) = match cgroup_owner(&cgroup) {
@@ -453,7 +506,7 @@ fn consent_requester_is_local() -> bool {
         }
         None => return false,
     };
-    // The session must be the agent's user's, and say it is local.
+    // The session must be the process's user's, and say it is local.
     std::fs::read_to_string(logind_dir.join("sessions").join(session)).is_ok_and(|text| {
         logind_value(&text, "UID") == Some(uid.to_string().as_str())
             && logind_value(&text, "REMOTE") == Some("0")
@@ -470,8 +523,10 @@ impl PamServiceModule for IrlumePam {
             // Remote-session guard: never fire the local camera for an SSH / remote
             // login or sudo. The camera is physically at the machine, so whoever is
             // in front of it (not the remote user) would grant the remote session.
-            // A non-empty PAM_RHOST (or the SSH_* env markers) means remote; return
-            // IGNORE so the password/other factor authenticates instead. Always-on,
+            // A non-empty PAM_RHOST, a remote or unresolvable session behind a
+            // consent prompt or an elevation command, or the SSH_* env markers mean
+            // remote; return IGNORE so the password/other factor authenticates
+            // instead, before any prompt or daemon request. Always-on,
             // independent of biopolicy or how the stack is wired (a hand-added
             // pam_irlume line in system-auth is covered too).
             if is_remote_session(&pamh) {
@@ -1654,8 +1709,9 @@ mod tests {
     }
 
     /// The cgroup path names the session, or the user manager, of the agent
-    /// behind a consent prompt; anything else (a system service, a malformed
-    /// session id that would become a path) names no owner.
+    /// behind a consent prompt or of an elevation command; anything else (a
+    /// system service, a malformed session id that would become a path)
+    /// names no owner.
     #[test]
     fn cgroup_paths_name_the_session_or_the_user_manager() {
         use super::{cgroup_owner, CgroupOwner};
@@ -1713,6 +1769,165 @@ mod tests {
         assert_eq!(logind_value(session, "REMOTE"), Some("1"));
         assert_eq!(logind_value("NAME=a\nDISPLAY=2\n", "DISPLAY"), Some("2"));
         assert_eq!(logind_value("REMOTE_HOST=h\n", "REMOTE"), None);
+    }
+
+    /// A throwaway `/proc` and logind tree for `session_is_local`, removed on
+    /// drop.
+    struct SessionTree {
+        root: std::path::PathBuf,
+    }
+
+    impl SessionTree {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("irlume-pam-session-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            for dir in ["proc", "logind/sessions", "logind/users"] {
+                std::fs::create_dir_all(root.join(dir)).unwrap();
+            }
+            SessionTree { root }
+        }
+
+        /// Write `/proc/<entry>/cgroup`; `None` removes the entry.
+        fn cgroup(&self, entry: &str, text: Option<&str>) {
+            let dir = self.root.join("proc").join(entry);
+            match text {
+                Some(text) => {
+                    std::fs::create_dir_all(&dir).unwrap();
+                    std::fs::write(dir.join("cgroup"), text).unwrap();
+                }
+                None => {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+        }
+
+        /// Write logind's state file `kind/name` (`sessions/<id>` or
+        /// `users/<uid>`); `None` removes it.
+        fn logind(&self, kind: &str, name: &str, text: Option<&str>) {
+            let path = self.root.join("logind").join(kind).join(name);
+            match text {
+                Some(text) => std::fs::write(path, text).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+
+        fn local(&self, process: super::Process) -> bool {
+            super::session_is_local(&self.root.join("proc"), &self.root.join("logind"), process)
+        }
+    }
+
+    impl Drop for SessionTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    const SESSION_SCOPE: &str = "0::/user.slice/user-1000.slice/session-3.scope\n";
+    /// A shell in a KDE Plasma terminal tab, which the user's service manager
+    /// runs.
+    const TERMINAL_UNDER_USER_MANAGER: &str = "1:net_cls:/\n0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.kde.konsole-4929.scope/tab(6712).scope\n";
+
+    /// An elevation command typed in a session is judged by that session: a
+    /// local one of the same user is local; a remote one, one without a
+    /// `REMOTE=` line, another user's, or one logind does not know is not.
+    #[test]
+    fn an_elevation_caller_is_judged_by_its_own_session() {
+        use super::Process;
+        let tree = SessionTree::new("own-session");
+        tree.cgroup("self", Some(SESSION_SCOPE));
+        tree.logind("sessions", "3", Some("UID=1000\nREMOTE=0\nTYPE=tty\n"));
+        assert!(tree.local(Process::Current));
+        for (why, session) in [
+            ("a remote session", Some("UID=1000\nREMOTE=1\nTYPE=tty\n")),
+            ("no REMOTE= line", Some("UID=1000\nTYPE=tty\n")),
+            ("another user's session", Some("UID=1001\nREMOTE=0\n")),
+            ("a session logind does not know", None),
+        ] {
+            tree.logind("sessions", "3", session);
+            assert!(!tree.local(Process::Current), "{why}");
+        }
+    }
+
+    /// A terminal under the user's service manager, as KDE Plasma and GNOME
+    /// start them, belongs to no session: it takes the user's display
+    /// session, which must be local and the same user's.
+    #[test]
+    fn a_terminal_under_the_user_manager_takes_the_display_session() {
+        use super::Process;
+        let tree = SessionTree::new("display-session");
+        tree.cgroup("self", Some(TERMINAL_UNDER_USER_MANAGER));
+        tree.logind(
+            "users",
+            "1000",
+            Some("NAME=tester\nSTATE=active\nDISPLAY=3\n"),
+        );
+        tree.logind("sessions", "3", Some("UID=1000\nREMOTE=0\nTYPE=wayland\n"));
+        assert!(tree.local(Process::Current));
+        tree.logind("sessions", "3", Some("UID=1000\nREMOTE=1\nTYPE=tty\n"));
+        assert!(!tree.local(Process::Current), "a remote display session");
+        tree.logind("sessions", "3", Some("UID=1001\nREMOTE=0\nTYPE=wayland\n"));
+        assert!(!tree.local(Process::Current), "another user's session");
+        tree.logind("sessions", "3", Some("UID=1000\nREMOTE=0\nTYPE=wayland\n"));
+        for (why, user) in [
+            ("no display session", Some("NAME=tester\nSTATE=online\n")),
+            (
+                "a display id that is not a file name",
+                Some("DISPLAY=../3\n"),
+            ),
+            ("no user state file", None),
+        ] {
+            tree.logind("users", "1000", user);
+            assert!(!tree.local(Process::Current), "{why}");
+        }
+    }
+
+    /// A caller outside any login session, or whose cgroup cannot be read,
+    /// is never local: a command run from cron or a system service, one in
+    /// a container's own cgroup namespace, and a missing `/proc` entry.
+    #[test]
+    fn an_unresolvable_caller_is_not_local() {
+        use super::Process;
+        let tree = SessionTree::new("unresolvable");
+        tree.logind("sessions", "3", Some("UID=1000\nREMOTE=0\nTYPE=tty\n"));
+        tree.logind("users", "1000", Some("DISPLAY=3\n"));
+        tree.logind("users", "0", Some("DISPLAY=3\n"));
+        for cgroup in [
+            "0::/system.slice/cron.service\n",
+            "0::/system.slice/some.service\n",
+            "0::/init.scope\n",
+            "0::/\n",
+            "",
+        ] {
+            tree.cgroup("self", Some(cgroup));
+            assert!(!tree.local(Process::Current), "{cgroup:?}");
+        }
+        tree.cgroup("self", None);
+        assert!(!tree.local(Process::Current), "no /proc entry");
+    }
+
+    /// The current process is read from `/proc/self`, another one from
+    /// `/proc/<pid>`, so an elevation command and a consent agent are each
+    /// judged by their own session.
+    #[test]
+    fn each_process_is_read_from_its_own_proc_entry() {
+        use super::Process;
+        let tree = SessionTree::new("entries");
+        tree.cgroup("self", Some(SESSION_SCOPE));
+        tree.cgroup(
+            "4242",
+            Some("0::/user.slice/user-1000.slice/session-4.scope\n"),
+        );
+        tree.logind("sessions", "3", Some("UID=1000\nREMOTE=0\n"));
+        tree.logind("sessions", "4", Some("UID=1000\nREMOTE=1\n"));
+        assert!(tree.local(Process::Current));
+        assert!(!tree.local(Process::Pid(4242)));
+        tree.logind("sessions", "3", Some("UID=1000\nREMOTE=1\n"));
+        tree.logind("sessions", "4", Some("UID=1000\nREMOTE=0\n"));
+        assert!(!tree.local(Process::Current));
+        assert!(tree.local(Process::Pid(4242)));
     }
 
     /// Only a delivery that actually reached a consumer may continue the stack.

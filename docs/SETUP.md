@@ -534,7 +534,11 @@ places its line the same way. Test it in a fresh terminal with `sudo -k` (clear 
 `sudo true`. PAM shows `Type yes to use face authentication` above the normal
 hidden field. Type `yes` for one face attempt, or type the ordinary password
 once for the password/fingerprint path. Empty Enter never starts the camera and
-falls through to the password provider.
+falls through to the password provider. Face is offered only when the command
+runs in a local login session, or in a desktop terminal while your graphical
+session at the machine is local; from an SSH session, a cron job or a system
+service, `sudo`, `su` and `doas` go straight to the password (see
+[remote sessions](THREAT_MODEL.md#remote-sessions)).
 
 This confirmation is on by default and stays that way unless the machine's
 owner turns it off. `privileged_face_consent=0` in `/etc/irlume/settings.conf`

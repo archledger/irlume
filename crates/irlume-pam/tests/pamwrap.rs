@@ -132,6 +132,15 @@ impl Harness {
             "0::/user.slice/user-1000.slice/session-7.scope\n",
             Some("UID=1000\nREMOTE=0\nTYPE=wayland\n"),
         );
+        // An elevation service (sudo, su, doas) is judged by the process
+        // running it, pamtester itself. Give it a local session of its own,
+        // so the elevation tests reach the daemon; the elevation-origin test
+        // replaces it.
+        caller_session(
+            &root,
+            "0::/user.slice/user-1000.slice/session-8.scope\n",
+            Some("UID=1000\nREMOTE=0\nTYPE=wayland\n"),
+        );
         let salt_helper = root.join("wallet-salt-helper");
         std::fs::write(
             &salt_helper,
@@ -292,27 +301,52 @@ const REMOTE_ENV_MARKERS: [(&str, &str); 2] = [
     ("SSH_TTY", "/dev/pts/9"),
 ];
 
-/// Keep the caller's session out of a run that loads the module: remove
-/// [`REMOTE_ENV_MARKERS`], which a run over ssh inherits, and `PAM_RHOST`,
-/// which a pam_set_items.so line copies into the PAM item the module also
-/// checks. A test that wants a remote run sets one again afterwards.
 /// Describe this test process, pamtester's parent and so the agent behind a
 /// consent prompt, to the module under `root`: its `cgroup` text in a fake
 /// `/proc`, and session 7 in a fake logind directory (`None` removes it).
 fn agent_session(root: &Path, cgroup: &str, session: Option<&str>) {
-    let proc_dir = root.join("proc").join(std::process::id().to_string());
+    process_session(root, &std::process::id().to_string(), cgroup, "7", session);
+}
+
+/// Describe pamtester, the process running an elevation service's
+/// transaction, to the module under `root`: its `cgroup` text as
+/// `/proc/self` in a fake `/proc`, and session 8 in a fake logind directory
+/// (`None` removes it).
+fn caller_session(root: &Path, cgroup: &str, session: Option<&str>) {
+    process_session(root, "self", cgroup, "8", session);
+}
+
+fn process_session(root: &Path, entry: &str, cgroup: &str, id: &str, session: Option<&str>) {
+    let proc_dir = root.join("proc").join(entry);
     std::fs::create_dir_all(&proc_dir).unwrap();
     std::fs::write(proc_dir.join("cgroup"), cgroup).unwrap();
     let sessions = root.join("logind/sessions");
     std::fs::create_dir_all(&sessions).unwrap();
     match session {
-        Some(text) => std::fs::write(sessions.join("7"), text).unwrap(),
+        Some(text) => std::fs::write(sessions.join(id), text).unwrap(),
         None => {
-            let _ = std::fs::remove_file(sessions.join("7"));
+            let _ = std::fs::remove_file(sessions.join(id));
         }
     }
 }
 
+/// Write logind's state file for uid 1000 under `root`, which names the
+/// user's display session (`None` removes it).
+fn logind_user(root: &Path, text: Option<&str>) {
+    let users = root.join("logind/users");
+    std::fs::create_dir_all(&users).unwrap();
+    match text {
+        Some(text) => std::fs::write(users.join("1000"), text).unwrap(),
+        None => {
+            let _ = std::fs::remove_file(users.join("1000"));
+        }
+    }
+}
+
+/// Keep the caller's session out of a run that loads the module: remove
+/// [`REMOTE_ENV_MARKERS`], which a run over ssh inherits, and `PAM_RHOST`,
+/// which a pam_set_items.so line copies into the PAM item the module also
+/// checks. A test that wants a remote run sets one again afterwards.
 fn remove_remote_env(cmd: &mut Command) {
     for (name, _) in REMOTE_ENV_MARKERS {
         cmd.env_remove(name);
@@ -962,6 +996,132 @@ fn pamwrap_consent_from_a_remote_or_unknown_session_makes_no_request() {
     let (ok, out) = h.run("sudo", &["authenticate"], "yes\n", None);
     assert!(ok, "{out}");
     assert_eq!(log.lock().unwrap().len(), 2);
+}
+
+/// An elevation command (`sudo`, `su`, `doas`) never reaches the camera when
+/// the process running it is in a remote login session, or in one that
+/// cannot be resolved, with no ssh variable and no `PAM_RHOST` set: the
+/// module reads that process's own session. A typed `yes` then goes to the
+/// password module like any other input, the typed password authenticates,
+/// and no face offer is shown. The process is pamtester, described through
+/// the module's `/proc` and logind overrides. The controls from a local
+/// session, and from a terminal under the user's service manager while the
+/// user's display session is local, reach the daemon.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_elevation_from_a_remote_or_unknown_session_makes_no_request() {
+    let Some(h) = Harness::try_new("elevation-origin") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| match req {
+        Request::Authenticate { .. } => grant(),
+        _ => Response::Error("unexpected request".into()),
+    });
+    let checker = h.token_checker("elevation-origin", FIXED_TEST_TOKEN);
+    let services = ["sudo", "su", "doas"];
+    for service in services {
+        h.write_service(
+            service,
+            &[
+                h.auth_line("sufficient", ""),
+                format!(
+                    "auth required pam_exec.so expose_authtok {}",
+                    checker.display()
+                ),
+            ],
+        );
+    }
+    let password = format!("{FIXED_TEST_TOKEN}\n");
+    let scope = "0::/user.slice/user-1000.slice/session-8.scope\n";
+    // A shell in a KDE Plasma terminal tab, which the user's service
+    // manager runs, so it belongs to no session.
+    let terminal = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.kde.konsole-4929.scope/tab(6712).scope\n";
+    let local = "UID=1000\nREMOTE=0\nTYPE=wayland\n";
+    let remote = "UID=1000\nREMOTE=1\nTYPE=tty\n";
+    let display = "NAME=tester\nSTATE=active\nDISPLAY=8\n";
+    for (why, cgroup, session, user) in [
+        ("a remote session", scope, Some(remote), None),
+        ("a session logind does not know", scope, None, None),
+        (
+            "a session with no REMOTE= line",
+            scope,
+            Some("UID=1000\nTYPE=tty\n"),
+            None,
+        ),
+        (
+            "another user's local session",
+            scope,
+            Some("UID=1001\nREMOTE=0\n"),
+            None,
+        ),
+        (
+            "no login session at all",
+            "0::/system.slice/cron.service\n",
+            Some(local),
+            Some(display),
+        ),
+        (
+            "a terminal whose user has a remote display session",
+            terminal,
+            Some(remote),
+            Some(display),
+        ),
+        (
+            "a terminal whose user has no display session",
+            terminal,
+            Some(local),
+            None,
+        ),
+    ] {
+        caller_session(&h.root, cgroup, session);
+        logind_user(&h.root, user);
+        for service in services {
+            let (ok, out) = h.run(service, &["authenticate"], "yes\n", None);
+            assert!(!ok, "{service} from {why}: yes must not grant: {out}");
+            let (ok, out) = h.run(service, &["authenticate"], &password, None);
+            assert!(
+                ok,
+                "{service} from {why}: the typed password must authenticate: {out}"
+            );
+            assert!(
+                !out.contains(FACE_INTENT_INFO),
+                "{service} from {why}: the module must not offer face: {out}"
+            );
+        }
+        let reqs = log.lock().unwrap();
+        assert!(
+            reqs.is_empty(),
+            "{why} must keep every request from the daemon: {reqs:?}"
+        );
+    }
+
+    // Controls: a local session, and a terminal under the user's service
+    // manager whose display session is local, reach the daemon.
+    for (why, cgroup, user) in [
+        ("a local session", scope, None),
+        (
+            "a terminal with a local display session",
+            terminal,
+            Some(display),
+        ),
+    ] {
+        caller_session(&h.root, cgroup, Some(local));
+        logind_user(&h.root, user);
+        for service in services {
+            let before = log.lock().unwrap().len();
+            let (ok, out) = h.run(service, &["authenticate"], "yes\n", None);
+            assert!(
+                ok,
+                "{service} from {why}: a confirmed face path must grant: {out}"
+            );
+            assert_eq!(out.matches(FACE_INTENT_INFO).count(), 1, "{out}");
+            assert_eq!(
+                log.lock().unwrap().len(),
+                before + 1,
+                "{service} from {why}: one request"
+            );
+        }
+    }
 }
 
 const FACE_INTENT_INFO: &str = "Type yes to use face authentication";

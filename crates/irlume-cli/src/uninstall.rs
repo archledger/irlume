@@ -1573,6 +1573,51 @@ pub(crate) fn unit_env(var: &str) -> Result<Option<PathBuf>, String> {
 }
 
 fn unit_env_under(root: &Path, var: &str) -> Result<Option<PathBuf>, String> {
+    let texts = unit_texts_under(root)?;
+    let mut found = None;
+    for text in &texts {
+        found = unit_env_in(text, var, found);
+    }
+    // systemd applies `UnsetEnvironment=` after every `Environment=`, whatever
+    // the order of the lines: a variable it names, bare or with the value it
+    // has, is not in the daemon's environment.
+    if let Some(value) = &found {
+        let assignment = format!("{var}={}", value.display());
+        if texts.iter().any(|text| unit_unsets(text, var, &assignment)) {
+            found = None;
+        }
+    }
+    Ok(found)
+}
+
+/// Whether irlumed's unit, with its drop-ins, reads an `EnvironmentFile=`
+/// (an empty one resets the list). [`unit_env`] does not resolve what such a
+/// file assigns, so a caller that needs the daemon's environment treats it
+/// as unknown.
+pub(crate) fn unit_reads_environment_files() -> Result<bool, String> {
+    unit_reads_environment_files_under(Path::new("/"))
+}
+
+fn unit_reads_environment_files_under(root: &Path) -> Result<bool, String> {
+    let mut files = 0usize;
+    for text in unit_texts_under(root)? {
+        for line in text.lines() {
+            if let Some(value) = line.trim().strip_prefix("EnvironmentFile=") {
+                files = if value.trim().is_empty() {
+                    0
+                } else {
+                    files + 1
+                };
+            }
+        }
+    }
+    Ok(files > 0)
+}
+
+/// The text of irlumed's unit, the highest layer's, then its drop-ins merged
+/// by name in name order (see [`unit_env`]). A file that exists and cannot be
+/// read is an error.
+fn unit_texts_under(root: &Path) -> Result<Vec<String>, String> {
     let read = |path: &Path| match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1607,20 +1652,7 @@ fn unit_env_under(root: &Path, var: &str) -> Result<Option<PathBuf>, String> {
     for path in drop_ins.values() {
         texts.extend(read(path)?);
     }
-    let mut found = None;
-    for text in &texts {
-        found = unit_env_in(text, var, found);
-    }
-    // systemd applies `UnsetEnvironment=` after every `Environment=`, whatever
-    // the order of the lines: a variable it names, bare or with the value it
-    // has, is not in the daemon's environment.
-    if let Some(value) = &found {
-        let assignment = format!("{var}={}", value.display());
-        if texts.iter().any(|text| unit_unsets(text, var, &assignment)) {
-            found = None;
-        }
-    }
-    Ok(found)
+    Ok(texts)
 }
 
 /// Whether a unit file's `UnsetEnvironment=` lines name `var`, bare or as the
@@ -2630,6 +2662,33 @@ mod tests {
             Ok(None)
         ));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_environment_file_in_the_unit_is_noticed_and_an_empty_one_resets() {
+        let root = std::env::temp_dir().join(format!("irlume-unit-envfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let put = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        put(
+            "usr/lib/systemd/system/irlumed.service",
+            "[Service]\nExecStart=/x\n",
+        );
+        assert_eq!(unit_reads_environment_files_under(&root), Ok(false));
+        put(
+            "etc/systemd/system/irlumed.service.d/50-env.conf",
+            "[Service]\nEnvironmentFile=-/etc/default/irlumed\n",
+        );
+        assert_eq!(unit_reads_environment_files_under(&root), Ok(true));
+        put(
+            "etc/systemd/system/irlumed.service.d/60-reset.conf",
+            "[Service]\nEnvironmentFile=\n",
+        );
+        assert_eq!(unit_reads_environment_files_under(&root), Ok(false));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

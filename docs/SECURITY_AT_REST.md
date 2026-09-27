@@ -109,13 +109,15 @@ matching also requires passing IR liveness; an inverted RGB image can't.)
 
    `irlume keyring arm` (after an arm) and `irlume doctor` (check
    `sealed-storage`) report this for the account. The storage probe looks for
-   a dm-crypt layer under the state directory. It does not detect a drive's
+   a dm-crypt layer under the directories that hold what is sealed (the
+   keyring and template-key directories, as irlumed resolves them; the
+   least protected one decides). It does not detect a drive's
    hardware encryption, a filesystem's own encryption or a verified root, and
    it cannot show whether a dm-crypt volume asks for a passphrase or PIN or
    unlocks from the TPM or a key file alone. The report is a warning when a
    keyring secret or a template key is sealed and no dm-crypt layer is found,
    or the storage cannot be established, so it stays a warning on a verified
-   root. It is information whenever the state directory is on dm-crypt,
+   root. It is information whenever those directories are on dm-crypt,
    since the storage does not show how that volume unlocks, and it names each
    sealed secret's policy another operating system may reproduce: the keyring
    secret's (one without PCR 4, one with PCR 4 on a boot loader that does not

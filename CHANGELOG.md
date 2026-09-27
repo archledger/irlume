@@ -869,14 +869,17 @@ All notable changes to irlume are documented here. This project adheres to
   addition to encryption, not instead of it, and the guidance gives the
   `/usr/lib/systemd/systemd-pcrlock` steps. The check reports `warn` when a
   keyring secret or a template key is sealed and no dm-crypt layer is found
-  under the state directory, or the storage cannot be established; `info`
+  under a directory that holds it, or the storage cannot be established; `info`
   whenever it is on dm-crypt, since the storage does not show whether the
   volume asks for a passphrase, naming each sealed secret's policy another
   operating system may reproduce (a policy with PCR 4 included where the
   boot loader does not measure what it loads next, as on a GRUB boot);
   `info` when nothing is sealed; and `unknown` when irlumed does not say
-  what is sealed. The state directory probed is irlumed's, the one its
-  unit sets for a source install included. `keyring arm`, `irlume setup`,
+  what is sealed. The directories probed are irlumed's keyring and
+  template-key directories, each as irlumed resolves it (the unit's
+  `Environment=` for a source install included), and the least protected
+  one decides; where the unit reads an `EnvironmentFile=`, or cannot be
+  read, they count as unknown. `keyring arm`, `irlume setup`,
   `irlume keyring reseal` and the TUI's Password Wallet show the same
   guidance after a seal, also when irlumed then does not describe the new
   secret. An irlumed from before

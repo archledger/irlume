@@ -88,6 +88,10 @@ history events, initialize monitors, open camera nodes or read the TPM.
 Worker registration follows admission, claim, cancellation request and actual
 completion. A cancellation request does not clear running work. Closed operation
 categories omit account names, request arguments and biometric outcomes. A
+reader other than root sees an authentication or credential release that acts
+for another account as `unknown` work, still running or waiting, and the
+share-safe event ring gives it only its own account's authentication events
+(ADR-0030 §5, amended 2026-09-27). A
 state revision advances after potentially mutating work; it tells clients to
 invalidate their observations, not that a write succeeded. This is a logical
 mutation hint, not a disk-write audit: best-effort storage upgrades during a

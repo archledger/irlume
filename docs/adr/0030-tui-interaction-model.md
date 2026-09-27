@@ -341,6 +341,9 @@ device.
   carrier for authentication history: it is readable by any local peer on
   the mode-0666 socket, is process-local, is erased on restart and is
   bounded to 30 minutes. Nothing about attempts is added to it.
+  (Amended 2026-09-27: the authentication events it already held, and
+  `LiveStatus`'s authentication kinds, now reach only root and the
+  account they act for; see the amendment at the end.)
 - Instead the daemon keeps, per account, a small **attempt record**
   file under its state directory (root-only, like the retry journal):
   the latest attempt of each kind and the last five per camera, bounded
@@ -582,3 +585,35 @@ device.
   more than eight.
 - Command echo: every `Suspend::*` variant logs a line beginning with the
   command it runs.
+
+## Amendment 2026-09-27: authentication events in the any-peer views
+
+§5 treats the times and outcomes of an account's authentications as that
+account's history, readable by the account and root. The event ring
+already held an `operation_finished` event with a categorical outcome
+(`granted`, `denied`, `failed`) for every authentication and credential
+release, together with the capture events of the same operation, and
+`LiveStatus` named an authentication in progress; both answer any local
+peer. They now follow the same rule. The daemon records with each
+authentication-class operation the account it acts for: the peer itself
+when the peer is not root, since such a peer may authenticate only
+itself, else the account the request names, resolved when the request
+arrives, or none when it does not resolve.
+
+- `SupportSnapshot` answered to root is unchanged. Answered to any other
+  account, it leaves out every authentication-class event of other
+  accounts and of unresolved ones, and always lists `recent_events` as
+  `not_authorized` in `unavailable`, so the reader knows the list may be
+  partial and the marker itself tells nothing.
+- `LiveStatus` answered to any other account reports another account's,
+  or an unresolved, `authentication` or `wallet_authentication`, running
+  or waiting, as `unknown`, with its operation ID, elapsed time and stop
+  request unchanged. The worker still reads busy, so a client does not
+  send camera work that the arbiter would refuse while an authentication
+  is pending.
+- `SupportProbe` stays root-only and its snapshot unchanged. The support
+  report's privacy checklist says when the report lists authentication
+  times and outcomes, and whether they are every account's (a report run
+  as root, or one from an older daemon) or the account's own.
+- The wire does not change: `unknown` and `not_authorized` are values
+  released clients already decode.

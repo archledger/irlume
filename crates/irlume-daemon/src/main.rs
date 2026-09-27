@@ -3697,6 +3697,7 @@ fn serve_peer_until(
                     | Request::SupportSnapshot { .. }
                     | Request::FaceSensorStatus { .. }
                     | Request::PreferencesStatus
+                    | Request::SealedStorage
                     | Request::LastAttempts { .. }
             ) {
                 if let Some(resp) = pregate(&req, &peer) {
@@ -4417,6 +4418,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
         // work.
         Ping
         | PreferencesStatus
+        | SealedStorage
         | Health
         | ListCameras
         | CaptureModeStatus
@@ -5493,6 +5495,18 @@ fn dispatch_status_with_diagnostics(
         Request::PreferencesStatus => {
             Response::PreferencesStatus(irlume_common::PreferencesState::observe())
         }
+        // Only directory storage is reported, with no envelope reads or
+        // account input. Any local peer may inspect these system facts.
+        Request::SealedStorage => {
+            use irlume_common::storage_encryption::directory_encryption;
+            Response::SealedStorage {
+                keyring: directory_encryption(&irlume_core::keyring::keyring_dir()),
+                template_key: directory_encryption(&irlume_core::template_key::key_dir()),
+                system: ["/", "/usr", "/etc"]
+                    .map(|path| directory_encryption(std::path::Path::new(path)))
+                    .into(),
+            }
+        }
         Request::FaceSensorStatus { user: Some(_) } => return None,
         // Root-only file under the state directory; no engine, no camera.
         Request::LastAttempts { user } => {
@@ -6278,6 +6292,7 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | SetCamerasIfCurrent { .. }
         | FaceSensorStatus { .. }
         | PreferencesStatus
+        | SealedStorage
         | LastAttempts { .. }
         | ListProfiles { .. }
         | DeleteProfile { .. }
@@ -7155,13 +7170,14 @@ fn dispatch_scoped_session_inner(
         Request::EnrollmentSession { .. } => {
             Response::Error("guided enrollment requires its live connection".into())
         }
-        // These four are answered by dispatch_status above; the arm is
+        // These requests are answered by dispatch_status above; the arm is
         // unreachable and exists so the match stays exhaustive without a
         // second implementation to drift.
         Request::Ping
         | Request::Health
         | Request::FaceSensorStatus { user: None }
         | Request::PreferencesStatus
+        | Request::SealedStorage
         | Request::LastAttempts { .. }
         | Request::HasSealedPassword { .. }
         | Request::KeyringMetadata { .. }
@@ -11336,6 +11352,7 @@ mod tests {
         LastAttempts => Request::LastAttempts { user: u() },
         IdentifyFor => Request::IdentifyFor { user: u() },
         PreferencesStatus => Request::PreferencesStatus,
+        SealedStorage => Request::SealedStorage,
         SelfTest => Request::SelfTest {
             kind: irlume_common::SelfTestKind::Liveness,
         },
@@ -13896,6 +13913,7 @@ mod tests {
         for req in [
             Request::Ping,
             Request::Health,
+            Request::SealedStorage,
             Request::HasSealedPassword { user: u() },
             Request::KeyringMetadata { user: u() },
             Request::RecoveryStatus { user: u() },
@@ -14498,6 +14516,85 @@ mod tests {
             cached_enrollment_summary(SAMPLE_USER).is_none(),
             "an authorized mutation must drop the summary before it runs"
         );
+    }
+
+    #[test]
+    fn sealed_storage_reports_daemon_directories_to_any_peer_during_startup() {
+        let _guard = env_lock();
+        let sb = sandbox("sealed-storage");
+        let keyring = sb.dir.join("wallet-seals");
+        let keys = sb.dir.join("key-link");
+        let backing = sb.dir.join("backing");
+        std::fs::create_dir(&backing).unwrap();
+        std::os::unix::fs::symlink(&backing, &keys).unwrap();
+        std::env::set_var("IRLUME_KEYRING_DIR", &keyring);
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &keys);
+        let req: Request = serde_json::from_str(r#""SealedStorage""#).unwrap();
+        assert_eq!(arbiter::classify(&req), arbiter::Class::Status);
+        assert_eq!(
+            posture(&req),
+            RequestPosture {
+                privilege: Privilege::AnyPeer,
+                user: None,
+                enrollment: EnrollmentEffect::Reads,
+                camera: CameraUse::NoCapture,
+            }
+        );
+        assert_eq!(
+            diagnostic_operation_class(&req),
+            irlume_common::diagnostics::OperationClass::Status
+        );
+        assert!(live::request_kind(&req).is_none());
+        assert!(!operation_authorization::required(&req, &peer(NOBODY)));
+        let expected = serde_json::to_value(dispatch_status(&req, &peer(NOBODY)).unwrap()).unwrap();
+        let storage = &expected["SealedStorage"];
+        assert_eq!(storage["keyring"]["path"], keyring.to_str().unwrap());
+        assert_eq!(storage["template_key"]["path"], keys.to_str().unwrap());
+        assert_eq!(storage["system"].as_array().unwrap().len(), 3);
+        for (entry, path) in storage["system"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(["/", "/usr", "/etc"])
+        {
+            assert_eq!(entry["path"], path);
+        }
+        assert!(
+            !keyring.exists(),
+            "a storage query must not create a directory"
+        );
+        assert_eq!(storage.as_object().unwrap().len(), 3, "no account data");
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let ready = std::sync::atomic::AtomicBool::new(false);
+        let response = with_serve(&arbiter, &ready, |ours| {
+            writeln!(&*ours, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+            let mut line = String::new();
+            BufReader::new(ours).read_line(&mut line).unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        });
+        assert_eq!(response, expected);
+        arbiter.close();
+    }
+
+    #[test]
+    fn sealed_storage_uses_state_defaults_and_reports_resolution_errors() {
+        let _guard = env_lock();
+        let sb = sandbox("sealed-storage-defaults");
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+        let keyring = sb.dir.join("keyring");
+        std::os::unix::fs::symlink(sb.dir.join("missing-target"), &keyring).unwrap();
+        let req: Request = serde_json::from_str(r#""SealedStorage""#).unwrap();
+        let response = serde_json::to_value(dispatch_status(&req, &peer(NOBODY)).unwrap()).unwrap();
+        let storage = &response["SealedStorage"];
+        assert_eq!(storage["keyring"]["path"], keyring.to_str().unwrap());
+        assert_eq!(storage["keyring"]["encryption"], "unknown");
+        assert!(!storage["keyring"]["reason"].as_str().unwrap().is_empty());
+        assert_eq!(
+            storage["template_key"]["path"],
+            sb.dir.join("template-keys").to_str().unwrap()
+        );
+        assert!(!sb.dir.join("template-keys").exists());
     }
 
     #[test]

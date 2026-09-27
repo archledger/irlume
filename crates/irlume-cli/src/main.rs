@@ -1554,13 +1554,17 @@ pub(crate) fn print_token_upgrade_notice(user: &str) {
 }
 
 /// After an arm: what protects the sealed secrets at rest, as a warning where
-/// no dm-crypt layer is found under the state directory, or the storage
-/// cannot be established, and as information where it is encrypted but a
-/// sealed secret's policy may be one another operating system reproduces
+/// no dm-crypt layer is found under irlumed's keyring or template-key
+/// directory or under `/`, `/usr` or `/etc`, or the storage cannot be
+/// established, and as information where it is encrypted but a sealed
+/// secret's policy may be one another operating system reproduces
 /// (`seal_storage`). Reads the envelope's policy with `KeyringMetadata`
-/// (`KeyringInfo` from an older daemon) and the template key with
-/// `RecoveryStatus`. Every flow that seals a keyring secret shows it: `keyring
-/// arm`, `irlume setup`, `keyring reseal` and the TUI's Password Wallet.
+/// (`KeyringInfo` from an older daemon), the template key with
+/// `RecoveryStatus` and, when something is sealed, the storage with
+/// `SealedStorage` (the CLI's own probe for a daemon that answers "bad
+/// request" or cannot be reached). Every flow that seals a keyring secret
+/// shows it: `keyring arm`, `irlume setup`, `keyring reseal` and the TUI's
+/// Password Wallet.
 pub(crate) fn print_seal_storage_note(user: &str) {
     if let Some(advice) = seal_storage_advice(user) {
         println!("{}", seal_storage::arm_note(&advice));
@@ -4880,9 +4884,11 @@ fn doctor_run(
         }
     }
     // What protects the sealed secrets at rest: the keyring secret (with its
-    // policy) and the template key, against the state directory's storage.
-    // A TPM seal binds the boot chain, not the root filesystem, so this
-    // applies whatever tier a new seal would get (`seal_storage`). The
+    // policy) and the template key, against the storage irlumed reports with
+    // `SealedStorage` for its keyring and template-key directories and `/`,
+    // `/usr` and `/etc` (the CLI's own probe for an older or unreachable
+    // daemon). A TPM seal binds the boot chain, not the root filesystem, so
+    // this applies whatever tier a new seal would get (`seal_storage`). The
     // template key's policy is not reported; whether seals use a pcrlock
     // policy here tells which it can be.
     let sealed = seal_storage::Sealed {

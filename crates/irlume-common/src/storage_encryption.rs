@@ -31,6 +31,7 @@
 //! [`path_encryption`] reads the fixed system paths; `path_encryption_in`
 //! takes the roots, so the tests run against fixture trees.
 
+use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
@@ -38,7 +39,8 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 
 /// Whether the block storage under a path is encrypted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StorageEncryption {
     /// Every block device under the path has a dm-crypt layer.
     Encrypted,
@@ -46,8 +48,23 @@ pub enum StorageEncryption {
     NotEncrypted,
     /// Could not be established: an unreadable or unexpected `/proc` or
     /// `/sys` entry, a mount source that is not a block device, a loop
-    /// device, or a path that does not exist.
+    /// device, or a path that does not exist. A value a later release adds
+    /// reads as this in an earlier client (`Response::SealedStorage`), so
+    /// the reply keeps its other entries.
+    #[serde(other)]
     Unknown,
+}
+
+/// Storage under a configured directory, without any account or secret data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageDirectory {
+    /// The configured directory, retained even when it cannot be resolved.
+    pub path: String,
+    /// Whether every block device beneath the directory is encrypted.
+    pub encryption: StorageEncryption,
+    /// Why an unknown result could not be established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Deepest device stack walked before giving up (a cycle in a broken sysfs
@@ -81,6 +98,93 @@ impl Roots {
 /// view of `/proc` and `/sys`.
 pub fn path_encryption(path: &Path) -> StorageEncryption {
     path_encryption_in(path, &Roots::system())
+}
+
+/// Describe storage beneath a configured directory, resolving existing links
+/// and using a missing directory's nearest existing parent when unambiguous.
+/// Denied traversal stays unknown because an unseen link may lead elsewhere.
+pub fn directory_encryption(path: &Path) -> StorageDirectory {
+    directory_encryption_with(
+        path,
+        |at| fs::symlink_metadata(at),
+        mount_between,
+        path_encryption,
+    )
+}
+
+fn directory_encryption_with(
+    path: &Path,
+    inspect: impl Fn(&Path) -> std::io::Result<fs::Metadata>,
+    mount_between: impl FnOnce(&Path, &Path) -> Option<bool>,
+    probe: impl FnOnce(&Path) -> StorageEncryption,
+) -> StorageDirectory {
+    let resolve = || -> Result<PathBuf, String> {
+        if !path.is_absolute() {
+            return Err("directory path is not absolute".into());
+        }
+        let mut at = path;
+        loop {
+            match inspect(at) {
+                Ok(_) => break,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    at = at.parent().ok_or_else(|| {
+                        "could not resolve an existing parent directory".to_string()
+                    })?;
+                }
+                Err(error) => {
+                    return Err(format!("could not resolve {}: {error}", at.display()));
+                }
+            }
+        }
+        let ancestor = fs::canonicalize(at)
+            .map_err(|error| format!("could not resolve {}: {error}", at.display()))?;
+        let metadata = fs::metadata(&ancestor)
+            .map_err(|error| format!("could not read {}: {error}", ancestor.display()))?;
+        if !metadata.is_dir() {
+            return Err(format!("{} is not a directory", at.display()));
+        }
+        if at != path {
+            let rest = path
+                .strip_prefix(at)
+                .map_err(|error| format!("could not resolve directory suffix: {error}"))?;
+            // Only missing plain components can inherit their parent's storage.
+            if !rest
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+            {
+                return Err("could not resolve non-plain directory components".into());
+            }
+            match mount_between(&ancestor, &ancestor.join(rest)) {
+                Some(false) => {}
+                Some(true) => {
+                    return Err("a mount lies between the missing directory and its parent".into());
+                }
+                None => {
+                    return Err("mount information for the missing directory is unavailable".into())
+                }
+            }
+        }
+        Ok(ancestor)
+    };
+    let result = match resolve() {
+        Ok(resolved) => match probe(&resolved) {
+            StorageEncryption::Unknown => Err(
+                "block-storage encryption could not be established from the available device information"
+                    .to_string(),
+            ),
+            encryption => Ok(encryption),
+        },
+        Err(reason) => Err(reason),
+    };
+    let (encryption, reason) = match result {
+        Ok(encryption) => (encryption, None),
+        Err(reason) => (StorageEncryption::Unknown, Some(reason)),
+    };
+    StorageDirectory {
+        path: path.to_string_lossy().into_owned(),
+        encryption,
+        reason,
+    }
 }
 
 fn path_encryption_in(path: &Path, roots: &Roots) -> StorageEncryption {
@@ -308,10 +412,9 @@ fn unescape(field: &str) -> String {
 
 /// Whether a mount point lies below canonical `ancestor` on the way to
 /// `path` (`path` itself included), read from this process's mountinfo;
-/// `None` when that cannot be read. A caller that cannot reach `path`, such
-/// as a directory inside one only root can read, uses it to tell whether
-/// `ancestor`'s filesystem also holds `path`. `path` is taken as written: a
-/// link inside a directory the caller cannot read is not seen.
+/// `None` when that cannot be read. This checks whether a missing directory
+/// can inherit its parent's storage. It does not resolve symlinks or establish
+/// the storage of an existing directory the caller cannot reach.
 pub fn mount_between(ancestor: &Path, path: &Path) -> Option<bool> {
     let text = fs::read_to_string("/proc/self/mountinfo").ok()?;
     Some(mount_between_in(&parse_mountinfo(&text), ancestor, path))
@@ -377,6 +480,113 @@ fn btrfs_members(sys: &Path, name: &str) -> Option<Vec<String>> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn directory_probe_keeps_configured_path_and_resolves_symlinks() {
+        let fx = Fixture::new("directory-symlink");
+        let actual = fx.root.join("actual");
+        fs::create_dir(&actual).unwrap();
+        let link = fx.root.join("keyring");
+        symlink(&actual, &link).unwrap();
+        let observed = directory_encryption_with(
+            &link,
+            |path| fs::symlink_metadata(path),
+            |_, _| panic!("an existing directory does not need a parent probe"),
+            |path| {
+                assert_eq!(path, actual.canonicalize().unwrap());
+                Encrypted
+            },
+        );
+        assert_eq!(observed.path, link.to_string_lossy());
+        assert_eq!(observed.encryption, Encrypted);
+        assert_eq!(observed.reason, None);
+    }
+
+    #[test]
+    fn directory_probe_uses_the_nearest_parent_only_for_missing_directories() {
+        let fx = Fixture::new("directory-missing");
+        let dir = fx.root.join("missing/template-keys");
+        let parent = fx.root.canonicalize().unwrap();
+        let observed = directory_encryption_with(
+            &dir,
+            |path| fs::symlink_metadata(path),
+            |ancestor, target| {
+                assert_eq!(ancestor, parent);
+                assert_eq!(target, parent.join("missing/template-keys"));
+                Some(false)
+            },
+            |path| {
+                assert_eq!(path, parent);
+                NotEncrypted
+            },
+        );
+        assert_eq!(observed.path, dir.to_string_lossy());
+        assert_eq!(observed.encryption, NotEncrypted);
+        assert_eq!(observed.reason, None);
+    }
+
+    #[test]
+    fn directory_probe_does_not_ascend_after_permission_denied() {
+        let dir = Path::new("/private/keyring");
+        let observed = directory_encryption_with(
+            dir,
+            |path| {
+                assert_eq!(path, dir, "a denied directory must not use its parent");
+                Err(std::io::Error::from(ErrorKind::PermissionDenied))
+            },
+            |_, _| panic!("unreachable directories cannot be resolved through mountinfo"),
+            |_| panic!("an unreachable directory cannot be probed"),
+        );
+        assert_eq!(observed.path, dir.to_string_lossy());
+        assert_eq!(observed.encryption, Unknown);
+        let reason = observed.reason.unwrap();
+        assert!(reason.contains("/private/keyring"), "{reason}");
+        assert!(reason.contains("permission denied"), "{reason}");
+    }
+
+    #[test]
+    fn directory_probe_does_not_follow_the_parent_of_a_dangling_symlink() {
+        let fx = Fixture::new("directory-dangling");
+        let link = fx.root.join("keyring");
+        symlink(fx.root.join("missing"), &link).unwrap();
+        for dir in [&link, &link.join("child")] {
+            let observed = directory_encryption_with(
+                dir,
+                |path| fs::symlink_metadata(path),
+                |_, _| panic!("a dangling symlink has no resolved ancestor"),
+                |_| panic!("a dangling symlink cannot be probed"),
+            );
+            assert_eq!(observed.encryption, Unknown);
+            assert!(observed.reason.unwrap().contains("could not resolve"));
+        }
+    }
+
+    #[test]
+    fn directory_probe_explains_ambiguous_and_unavailable_storage() {
+        let fx = Fixture::new("directory-unknown");
+        let missing = fx.root.join("missing");
+        for mount in [Some(true), None] {
+            let observed = directory_encryption_with(
+                &missing,
+                |path| fs::symlink_metadata(path),
+                |_, _| mount,
+                |_| panic!("ambiguous parent storage cannot be used"),
+            );
+            assert_eq!(observed.encryption, Unknown);
+            assert!(observed.reason.unwrap().contains("mount"));
+        }
+        let observed = directory_encryption_with(
+            &fx.root,
+            |path| fs::symlink_metadata(path),
+            |_, _| panic!("an existing directory does not need a parent probe"),
+            |_| Unknown,
+        );
+        assert_eq!(observed.encryption, Unknown);
+        assert!(observed.reason.unwrap().contains("block-storage"));
+        let relative = directory_encryption(Path::new("relative/keyring"));
+        assert_eq!(relative.encryption, Unknown);
+        assert!(relative.reason.unwrap().contains("absolute"));
+    }
 
     #[test]
     fn a_mount_below_an_ancestor_on_the_way_to_a_path_is_found() {

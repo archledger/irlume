@@ -21,10 +21,11 @@ use irlume_common::{Error, Result};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-/// Root-only directory for sealed-password envelopes.
+/// Return the sealed-password directory used by this process so diagnostics
+/// and envelope operations resolve the same overrides and state directory.
 // See the template-key note: the fallback must honor `IRLUME_STATE_DIR`, or a
 // sandboxed root `keyring forget` deletes the live armed seal.
-fn keyring_dir() -> PathBuf {
+pub fn keyring_dir() -> PathBuf {
     std::env::var("IRLUME_KEYRING_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| irlume_common::state_dir().join("keyring"))

@@ -26,6 +26,8 @@ pub mod process;
 pub mod secureboot;
 pub mod storage_encryption;
 
+pub use storage_encryption::StorageDirectory;
+
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
@@ -890,6 +892,10 @@ pub enum Request {
     /// should use this and fall back to `HasSealedPassword` on old daemons.
     /// Unprivileged: root or `user`.
     KeyringMetadata { user: String },
+    /// Describe storage under the daemon's sealed-secret directories and the
+    /// installed system without reading account data or opening the TPM.
+    /// Unprivileged: any local peer. An older daemon answers `Error("bad request")`.
+    SealedStorage,
     /// Describe `user`'s sealed-password envelope: whether one is armed and,
     /// when it is, the policy tier, bound PCRs, and live PCR drift. The richer
     /// sibling of `HasSealedPassword` for status surfaces (the envelope file
@@ -1930,6 +1936,13 @@ pub enum Response {
         #[serde(default)]
         kind: Option<KeyringSecretKind>,
     },
+    /// Storage observed only in reply to [`Request::SealedStorage`]. The paths
+    /// come from the daemon's environment and contain no per-account data.
+    SealedStorage {
+        keyring: StorageDirectory,
+        template_key: StorageDirectory,
+        system: Vec<StorageDirectory>,
+    },
     /// The sealed password was erased (`ForgetPassword`).
     PasswordForgotten,
     /// Outcome of a `ResealPassword`. `changed` is true when the envelope was
@@ -2507,6 +2520,77 @@ mod tests {
         let back: super::CameraGroupProfileSummary =
             serde_json::from_value(serde_json::to_value(&group).unwrap()).unwrap();
         assert_eq!(back, group);
+    }
+
+    #[test]
+    fn sealed_storage_request_is_explicit_and_unknown_to_older_daemons() {
+        let wire = r#""SealedStorage""#;
+        let parsed = serde_json::from_str::<super::Request>(wire);
+        assert!(
+            parsed.is_ok(),
+            "storage status needs its own request: {parsed:?}"
+        );
+        assert_eq!(serde_json::to_string(&parsed.unwrap()).unwrap(), wire);
+
+        #[derive(serde::Deserialize)]
+        #[expect(dead_code, reason = "old request fixture only tests deserialization")]
+        enum OldRequest {
+            KeyringMetadata { user: String },
+        }
+        assert!(serde_json::from_str::<OldRequest>(wire).is_err());
+        assert!(
+            serde_json::from_str::<OldRequest>(r#"{"KeyringMetadata":{"user":"alice"}}"#).is_ok()
+        );
+    }
+
+    #[test]
+    fn sealed_storage_response_round_trips_directory_results_without_accounts() {
+        let wire = serde_json::json!({"SealedStorage": {
+            "keyring": {"path": "/state/keyring", "encryption": "encrypted"},
+            "template_key": {
+                "path": "/state/template-keys", "encryption": "unknown",
+                "reason": "could not resolve directory: permission denied"
+            },
+            "system": [
+                {"path": "/", "encryption": "not_encrypted"},
+                {"path": "/usr", "encryption": "encrypted"},
+                {"path": "/etc", "encryption": "unknown",
+                 "reason": "block-storage encryption could not be established"}
+            ]
+        }});
+        let parsed = serde_json::from_value::<Response>(wire.clone());
+        assert!(parsed.is_ok(), "storage results need a reply: {parsed:?}");
+        assert_eq!(serde_json::to_value(parsed.unwrap()).unwrap(), wire);
+    }
+
+    #[test]
+    fn a_later_storage_value_reads_as_unknown_and_keeps_the_other_entries() {
+        let wire = serde_json::json!({"SealedStorage": {
+            "keyring": {"path": "/state/keyring", "encryption": "verified"},
+            "template_key": {"path": "/state/template-keys", "encryption": "encrypted"},
+            "system": [{"path": "/", "encryption": "not_encrypted"}]
+        }});
+        match serde_json::from_value::<Response>(wire).expect("the reply still decodes") {
+            Response::SealedStorage {
+                keyring,
+                template_key,
+                system,
+            } => {
+                assert_eq!(
+                    keyring.encryption,
+                    crate::storage_encryption::StorageEncryption::Unknown
+                );
+                assert_eq!(
+                    template_key.encryption,
+                    crate::storage_encryption::StorageEncryption::Encrypted
+                );
+                assert_eq!(
+                    system[0].encryption,
+                    crate::storage_encryption::StorageEncryption::NotEncrypted
+                );
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// ADR-0030 §2: the account-scoped recognition test is its own request

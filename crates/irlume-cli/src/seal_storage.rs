@@ -32,9 +32,10 @@
 //! addition to encryption, not instead of it.
 //!
 //! [`guidance`] turns what is sealed, under which policy, and what the
-//! storage probe found for the state directory into a warning, information
-//! or nothing. `keyring arm` prints it after a successful arm ([`arm_note`]),
-//! and doctor reports it as the `sealed-storage` check ([`check`]). The probe
+//! storage probes found under irlumed's directories and the installed
+//! system into a warning, information or nothing. `keyring arm` prints it
+//! after a successful arm ([`arm_note`]), and doctor reports it as the
+//! `sealed-storage` check ([`check`]). The probe
 //! sees dm-crypt only. It cannot show whether an encrypted volume asks for a
 //! passphrase or unlocks from the TPM or a key file alone, so encrypted
 //! storage under a policy another operating system may reproduce is still
@@ -49,9 +50,9 @@
 
 use crate::doctor_report::State;
 use irlume_common::storage_encryption::StorageEncryption;
-use irlume_common::{Request, Response};
+use irlume_common::{Request, Response, StorageDirectory};
 use irlume_core::envelope::PolicyKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Where the guidance sends the reader for the detail.
 const DOC: &str = "docs/SECURITY_AT_REST.md";
@@ -566,152 +567,232 @@ pub(crate) fn guidance(
     })
 }
 
-/// A directory as irlumed resolves `var`: this process's value when it is
-/// set, else the one systemd gives irlumed ([`crate::uninstall::daemon_env`]:
-/// a source install writes it into the unit, not the shell), else
-/// `default`. `None` when that cannot be told.
-fn daemon_dir(var: &str, default: std::path::PathBuf) -> Option<std::path::PathBuf> {
+/// A directory as the older-daemon fallback can resolve it: the local
+/// override, then systemd's value, then the default. A relative override
+/// cannot establish the running daemon's path because its working directory
+/// may differ from the CLI's.
+fn daemon_dir(var: &str, default: Result<PathBuf, String>) -> Result<PathBuf, String> {
     if let Some(value) = std::env::var_os(var) {
-        return Some(value.into());
+        let path = PathBuf::from(value);
+        return if path.is_absolute() {
+            Ok(path)
+        } else {
+            Err(format!(
+                "{var} is relative and irlumed's working directory is unknown"
+            ))
+        };
     }
     match crate::uninstall::daemon_env(var) {
-        crate::uninstall::DaemonEnv::Set(dir) => Some(dir),
-        crate::uninstall::DaemonEnv::NotSet => Some(default),
-        crate::uninstall::DaemonEnv::Unknown => None,
+        crate::uninstall::DaemonEnv::Set(dir) => Ok(dir),
+        crate::uninstall::DaemonEnv::NotSet => default,
+        crate::uninstall::DaemonEnv::Unknown => Err(format!(
+            "systemd could not establish {var}; its environment sources or installed unit could not be resolved"
+        )),
     }
 }
 
-/// Where the installed system keeps what it runs and the configuration it
-/// reads, each possibly its own filesystem. Changing them offline is what
-/// unseals a secret on this machine, so they count with the directories
-/// that hold the secrets.
+/// The installed system's storage also matters because an offline change
+/// to its executables or configuration can expose the sealed secrets.
 const SYSTEM_DIRS: [&str; 3] = ["/", "/usr", "/etc"];
+const KEYRING_DIR_NAME: &str = "keyring directory (IRLUME_KEYRING_DIR)";
+const TEMPLATE_KEY_DIR_NAME: &str = "template-key directory (IRLUME_TEMPLATE_KEY_DIR)";
 
-/// The directories whose storage decides what protects what `sealed` names,
-/// each resolved by `dir` from its variable and default ([`daemon_dir`]):
-/// the keyring directory for a keyring secret and the template-key directory
-/// for a template key (each may be its own filesystem, through an override
-/// or a mount), else the state directory, then the installed system's
-/// ([`SYSTEM_DIRS`]). `None` when one is unknown.
-fn sealed_dirs(
+fn unknown_directory(path: &str, reason: String) -> StorageDirectory {
+    StorageDirectory {
+        path: path.to_string(),
+        encryption: StorageEncryption::Unknown,
+        reason: Some(reason),
+    }
+}
+
+/// Resolve each secret directory independently, so an unresolved state
+/// directory does not hide an explicit keyring or template-key override.
+/// The shared probe leaves inaccessible directories unknown because their
+/// unseen links or mounts may lead to another filesystem.
+fn fallback_storage(
     sealed: &Sealed,
-    dir: impl Fn(&str, std::path::PathBuf) -> Option<std::path::PathBuf>,
-) -> Option<Vec<std::path::PathBuf>> {
-    let state = dir("IRLUME_STATE_DIR", irlume_common::state_dir())?;
+    dir: impl Fn(&str, Result<PathBuf, String>) -> Result<PathBuf, String>,
+    mut probe: impl FnMut(&Path) -> StorageDirectory,
+) -> Vec<StorageDirectory> {
+    let state = dir("IRLUME_STATE_DIR", Ok(irlume_common::state_dir()));
     let mut dirs = Vec::new();
-    if sealed.keyring != KeyringSeal::NotArmed {
-        dirs.push(dir("IRLUME_KEYRING_DIR", state.join("keyring"))?);
-    }
-    if sealed.template_key != Some(false) {
-        dirs.push(dir("IRLUME_TEMPLATE_KEY_DIR", state.join("template-keys"))?);
-    }
-    if dirs.is_empty() {
-        dirs.push(state);
-    }
-    dirs.extend(SYSTEM_DIRS.map(std::path::PathBuf::from));
-    Some(dirs)
-}
-
-/// What stands for an unknown state directory in the guidance text.
-const UNKNOWN_STATE_DIR: &str =
-    "a directory irlumed keeps sealed secrets in (not resolved from systemd)";
-
-/// Where to probe for `dir`: `dir` itself when this process can reach it;
-/// else its nearest reachable ancestor when no mount lies between them
-/// (irlumed creates a missing directory on that filesystem, and one this
-/// process may not look into, such as a secret directory inside the 0700
-/// state directory, is on it too); else `dir`, whose probe then reads
-/// unknown. A link inside a directory this process cannot read is not seen;
-/// the parent's name is what the guidance then shows.
-fn probe_path(dir: &Path) -> std::path::PathBuf {
-    probe_path_in(dir, irlume_common::storage_encryption::mount_between)
-}
-
-fn probe_path_in(
-    dir: &Path,
-    mount_between: impl FnOnce(&Path, &Path) -> Option<bool>,
-) -> std::path::PathBuf {
-    let hidden = |path: &Path| {
-        matches!(
-            std::fs::symlink_metadata(path),
-            Err(e) if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            )
-        )
-    };
-    let mut at = dir;
-    while hidden(at) {
-        match at.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => at = parent,
-            _ => return dir.to_path_buf(),
+    for (needed, var, name, child) in [
+        (
+            sealed.keyring != KeyringSeal::NotArmed,
+            "IRLUME_KEYRING_DIR",
+            KEYRING_DIR_NAME,
+            "keyring",
+        ),
+        (
+            sealed.template_key != Some(false),
+            "IRLUME_TEMPLATE_KEY_DIR",
+            TEMPLATE_KEY_DIR_NAME,
+            "template-keys",
+        ),
+    ] {
+        if needed {
+            let default = state.clone().map(|state| state.join(child));
+            dirs.push(match dir(var, default) {
+                Ok(path) => probe(&path),
+                Err(reason) => unknown_directory(name, reason),
+            });
         }
     }
-    if at == dir {
-        return dir.to_path_buf();
-    }
-    let (Ok(ancestor), Ok(rest)) = (std::fs::canonicalize(at), dir.strip_prefix(at)) else {
-        return dir.to_path_buf();
-    };
-    // Only plain names can be followed without looking.
-    if !rest
-        .components()
-        .all(|part| matches!(part, std::path::Component::Normal(_)))
-    {
-        return dir.to_path_buf();
-    }
-    match mount_between(&ancestor, &ancestor.join(rest)) {
-        Some(false) => ancestor,
-        _ => dir.to_path_buf(),
-    }
+    dirs.extend(SYSTEM_DIRS.map(|path| probe(Path::new(path))));
+    dirs
 }
 
-/// The directory to name and the storage to report for `dirs` (`None`:
-/// unknown): each directory, or where it would be created, is probed and the
-/// least protected answer wins (no dm-crypt found, then unknown, then
-/// encrypted), named by the directory that gave it. An unknown directory is
-/// unknown storage, never the default's.
-fn least_protected(
-    dirs: Option<Vec<std::path::PathBuf>>,
-    mut probe: impl FnMut(&Path) -> StorageEncryption,
-) -> (std::path::PathBuf, StorageEncryption) {
-    let unknown = || (UNKNOWN_STATE_DIR.into(), StorageEncryption::Unknown);
-    let Some(dirs) = dirs else {
-        return unknown();
+/// A daemon answer is authoritative even when it reports unknown storage.
+/// Only an unsupported request or an unavailable connection permits the
+/// older CLI-side probe. Invalid replies and other daemon errors remain
+/// unknown, rather than being replaced with this process's directories.
+fn storage_for(
+    sealed: &Sealed,
+    ask: impl FnOnce(&Request) -> std::io::Result<Response>,
+    fallback: impl FnOnce() -> Vec<StorageDirectory>,
+) -> Vec<StorageDirectory> {
+    let (keyring, template_key, mut system) = match ask(&Request::SealedStorage) {
+        Ok(Response::SealedStorage {
+            keyring,
+            template_key,
+            system,
+        }) => (keyring, template_key, system),
+        Ok(Response::Error(error)) if error == "bad request" => return fallback(),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            return fallback()
+        }
+        reply => {
+            let reason = match reply {
+                Ok(Response::Error(error)) => format!("irlumed could not report storage: {error}"),
+                Err(error) => format!("irlumed's storage reply could not be read: {error}"),
+                _ => "irlumed returned an unexpected storage reply".to_string(),
+            };
+            (
+                unknown_directory(KEYRING_DIR_NAME, reason.clone()),
+                unknown_directory(TEMPLATE_KEY_DIR_NAME, reason.clone()),
+                SYSTEM_DIRS
+                    .map(|path| unknown_directory(path, reason.clone()))
+                    .to_vec(),
+            )
+        }
     };
-    let rank = |storage: StorageEncryption| match storage {
+    // All three installed-system paths are part of the response contract.
+    // A partial answer cannot establish encryption of the installed system.
+    for path in SYSTEM_DIRS {
+        if !system.iter().any(|dir| dir.path == path) {
+            system.push(unknown_directory(
+                path,
+                "irlumed omitted this installed-system directory from its storage reply".into(),
+            ));
+        }
+    }
+    let mut dirs = Vec::new();
+    if sealed.keyring != KeyringSeal::NotArmed {
+        dirs.push(keyring);
+    }
+    if sealed.template_key != Some(false) {
+        dirs.push(template_key);
+    }
+    dirs.extend(system);
+    dirs
+}
+
+/// The least protected directory decides: no dm-crypt found, then unknown,
+/// then encrypted. Keep the other results so unknown paths retain their
+/// explanations even when an unencrypted directory determines the warning.
+fn least_protected(dirs: &[StorageDirectory]) -> Option<&StorageDirectory> {
+    dirs.iter().min_by_key(|dir| match dir.encryption {
         StorageEncryption::NotEncrypted => 0,
         StorageEncryption::Unknown => 1,
         StorageEncryption::Encrypted => 2,
-    };
-    dirs.into_iter()
-        .map(|dir| {
-            // Named by what was probed: a parent stands in for a directory
-            // not created yet or out of this process's reach.
-            let probed = probe_path(&dir);
-            let storage = probe(&probed);
-            (probed, storage)
-        })
-        .min_by_key(|(_, storage)| rank(*storage))
-        .unwrap_or_else(unknown)
+    })
 }
 
-/// The directory to name and this system's storage under the directories
-/// irlumed keeps what `sealed` names in ([`sealed_dirs`], [`least_protected`]).
-fn sealed_storage(sealed: &Sealed) -> (std::path::PathBuf, StorageEncryption) {
-    least_protected(
-        sealed_dirs(sealed, daemon_dir),
-        irlume_common::storage_encryption::path_encryption,
-    )
+/// Paths and probe errors can contain control characters from filesystem
+/// names. Blank them before adding them to terminal guidance.
+fn storage_text(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
-/// [`guidance`] for the directories irlumed keeps what is sealed in
-/// ([`sealed_storage`]) on this system's storage. The storage is probed only
-/// when something is sealed.
+/// `paths` as "a", "a and b" or "a, b and c".
+fn and_list(paths: &[String]) -> String {
+    match paths {
+        [] => String::new(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// [`guidance`] for the least protected of `dirs`, followed by why each
+/// unknown one could not be established. A reason shared by several
+/// directories, such as a daemon error that leaves all of them unknown, is
+/// given once for all of them.
+fn storage_guidance(sealed: &Sealed, dirs: &[StorageDirectory]) -> Option<SealAdvice> {
+    let missing = unknown_directory(
+        "irlumed's storage directories",
+        "no storage results were returned".into(),
+    );
+    let directory = least_protected(dirs).unwrap_or(&missing);
+    let path = storage_text(&directory.path);
+    let mut advice = guidance(sealed, directory.encryption, Path::new(&path))?;
+    let mut unknown: Vec<(&str, Vec<String>)> = Vec::new();
+    for directory in dirs
+        .iter()
+        .filter(|dir| dir.encryption == StorageEncryption::Unknown)
+    {
+        let reason = directory
+            .reason
+            .as_deref()
+            .unwrap_or("the probe did not report a reason");
+        let path = storage_text(&directory.path);
+        match unknown.iter_mut().find(|(shared, _)| *shared == reason) {
+            Some((_, paths)) => paths.push(path),
+            None => unknown.push((reason, vec![path])),
+        }
+    }
+    for (reason, paths) in unknown {
+        advice.text.push_str(&format!(
+            " Storage under {} could not be established: {}.",
+            and_list(&paths),
+            storage_text(reason),
+        ));
+    }
+    Some(advice)
+}
+
+/// Ask irlumed to inspect its own directories before trying the compatible
+/// local fallback, whose environment may differ from the running daemon's.
+fn sealed_storage(sealed: &Sealed) -> Vec<StorageDirectory> {
+    storage_for(sealed, irlume_common::client::request, || {
+        fallback_storage(
+            sealed,
+            daemon_dir,
+            irlume_common::storage_encryption::directory_encryption,
+        )
+    })
+}
+
+/// Guidance uses the same daemon-owned directories after every seal and in
+/// doctor. Storage is queried only when something is known to be sealed.
 pub(crate) fn state_dir_guidance(sealed: &Sealed) -> Option<SealAdvice> {
     Subject::of(sealed)?;
-    let (dir, storage) = sealed_storage(sealed);
-    guidance(sealed, storage, &dir)
+    storage_guidance(sealed, &sealed_storage(sealed))
 }
 
 /// The line `keyring arm` prints for `advice`: a warning, or a note for
@@ -725,13 +806,12 @@ pub(crate) fn arm_note(advice: &SealAdvice) -> String {
 /// where no dm-crypt layer is found under the directory probed (or that
 /// cannot be established), `info` with it on encrypted storage (whose unlock
 /// method the storage does not show) and when nothing is sealed, and
-/// `unknown` when the daemon did not say what is sealed. `probe` answers for
-/// `state_dir` and runs only when something is sealed.
+/// `unknown` when the daemon did not say what is sealed. `probe` runs only
+/// when something is sealed.
 pub(crate) fn check(
     user: &str,
     sealed: &Sealed,
-    state_dir: &Path,
-    probe: impl FnOnce(&Path) -> StorageEncryption,
+    probe: impl FnOnce() -> Vec<StorageDirectory>,
 ) -> (State, String) {
     if Subject::of(sealed).is_none() {
         return if sealed.keyring == KeyringSeal::NotArmed && sealed.template_key == Some(false) {
@@ -749,7 +829,7 @@ pub(crate) fn check(
             )
         };
     }
-    match guidance(sealed, probe(state_dir), state_dir) {
+    match storage_guidance(sealed, &probe()) {
         Some(advice) if advice.warn => (State::Warn, advice.text),
         Some(advice) => (State::Info, advice.text),
         // Not reached: something is sealed, so there is guidance.
@@ -763,8 +843,7 @@ pub(crate) fn check(
 /// [`check`] against the directories irlumed keeps what is sealed in
 /// ([`sealed_storage`]) and this system's storage.
 pub(crate) fn state_dir_check(user: &str, sealed: &Sealed) -> (State, String) {
-    let (dir, storage) = sealed_storage(sealed);
-    check(user, sealed, &dir, |_| storage)
+    check(user, sealed, || sealed_storage(sealed))
 }
 
 #[cfg(test)]
@@ -1218,134 +1297,353 @@ mod tests {
         }
     }
 
-    /// An unknown state directory is unknown storage: it warns, naming the
-    /// directory as unknown rather than the default's.
     #[test]
-    fn an_unknown_state_directory_warns() {
-        let sealed = sealed(literal(vec![7]), Some(true));
-        let advice = guidance(
+    fn incomplete_daemon_storage_keeps_the_missing_system_directory_unknown() {
+        let sealed = sealed(literal(vec![7]), Some(false));
+        let dirs = storage_for(
             &sealed,
-            StorageEncryption::Unknown,
-            Path::new(UNKNOWN_STATE_DIR),
-        )
-        .expect("guidance");
-        assert!(advice.warn, "{}", advice.text);
+            |_| {
+                let Response::SealedStorage {
+                    keyring,
+                    template_key,
+                    ..
+                } = storage_reply()
+                else {
+                    unreachable!()
+                };
+                Ok(Response::SealedStorage {
+                    keyring,
+                    template_key,
+                    system: Vec::new(),
+                })
+            },
+            || panic!("an incomplete answer must not use local probes"),
+        );
+        let advice = storage_guidance(&sealed, &dirs).unwrap();
+        assert!(advice.warn);
+        for path in SYSTEM_DIRS {
+            let directory = dirs.iter().find(|dir| dir.path == path).unwrap();
+            assert_eq!(directory.encryption, StorageEncryption::Unknown);
+            assert!(directory.reason.as_deref().unwrap().contains("omitted"));
+        }
+    }
+
+    #[test]
+    fn storage_guidance_blanks_control_characters_in_paths_and_reasons() {
+        let dirs = vec![unknown_directory(
+            "/state/\x1b[2Jkeys",
+            "cannot\nresolve".into(),
+        )];
+        let advice = storage_guidance(&sealed(literal(vec![7]), Some(false)), &dirs).unwrap();
+        assert!(!advice.text.chars().any(char::is_control));
+        assert!(advice.text.contains("/state/ [2Jkeys"));
+        assert!(advice.text.contains("cannot resolve"));
+    }
+
+    #[test]
+    fn the_least_protected_directory_decides() {
+        let dirs = [
+            storage_directory("/enc/a", StorageEncryption::Encrypted),
+            storage_directory("/plain/b", StorageEncryption::NotEncrypted),
+            storage_directory("/unknown/c", StorageEncryption::Unknown),
+        ];
+        assert_eq!(least_protected(&dirs).unwrap().path, "/plain/b");
+        assert_eq!(
+            least_protected(&[dirs[0].clone(), dirs[2].clone()])
+                .unwrap()
+                .path,
+            "/unknown/c"
+        );
+        assert_eq!(least_protected(&dirs[..1]).unwrap().path, "/enc/a");
+        assert_eq!(least_protected(&[]), None);
+    }
+
+    #[test]
+    fn each_sealed_secret_is_probed_where_it_is_kept() {
+        for (keyring, template, expected) in [
+            (literal(vec![7]), Some(false), vec!["/state/keyring"]),
+            (
+                KeyringSeal::NotArmed,
+                Some(true),
+                vec!["/override/templates"],
+            ),
+            (
+                literal(vec![7]),
+                None,
+                vec!["/state/keyring", "/override/templates"],
+            ),
+        ] {
+            let dirs = fallback_storage(
+                &sealed(keyring, template),
+                |var, default| match var {
+                    "IRLUME_STATE_DIR" => Ok(PathBuf::from("/state")),
+                    "IRLUME_TEMPLATE_KEY_DIR" => Ok(PathBuf::from("/override/templates")),
+                    _ => default,
+                },
+                |path| storage_directory(path.to_str().unwrap(), StorageEncryption::Encrypted),
+            );
+            let paths: Vec<_> = dirs.iter().map(|dir| dir.path.as_str()).collect();
+            let mut expected = expected;
+            expected.extend(SYSTEM_DIRS);
+            assert_eq!(paths, expected);
+        }
+    }
+
+    #[test]
+    fn a_relative_local_override_is_unknown_in_the_fallback() {
+        let _guard = crate::testenv::ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("IRLUME_KEYRING_DIR");
+        std::env::set_var("IRLUME_KEYRING_DIR", "relative-keyring");
+        let answer = daemon_dir("IRLUME_KEYRING_DIR", Ok(PathBuf::from("/default/keyring")));
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_KEYRING_DIR", value),
+            None => std::env::remove_var("IRLUME_KEYRING_DIR"),
+        }
+        let reason = answer.expect_err("the daemon's working directory is unknown");
+        assert!(reason.contains("IRLUME_KEYRING_DIR") && reason.contains("relative"));
+    }
+
+    fn storage_directory(
+        path: &str,
+        encryption: StorageEncryption,
+    ) -> irlume_common::StorageDirectory {
+        irlume_common::StorageDirectory {
+            path: path.into(),
+            encryption,
+            reason: None,
+        }
+    }
+
+    fn storage_reply() -> Response {
+        Response::SealedStorage {
+            keyring: storage_directory("/daemon/keyring", StorageEncryption::Encrypted),
+            template_key: storage_directory(
+                "/daemon/template-keys",
+                StorageEncryption::NotEncrypted,
+            ),
+            system: SYSTEM_DIRS
+                .iter()
+                .map(|path| storage_directory(path, StorageEncryption::Encrypted))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn daemon_storage_wins_and_only_sealed_directories_count() {
+        for (keyring, template, expected) in [
+            (literal(vec![7]), Some(false), "/daemon/keyring"),
+            (KeyringSeal::NotArmed, Some(true), "/daemon/template-keys"),
+            (literal(vec![7]), None, "/daemon/template-keys"),
+        ] {
+            let sealed = sealed(keyring, template);
+            let dirs = storage_for(
+                &sealed,
+                |request| {
+                    assert!(matches!(request, Request::SealedStorage));
+                    Ok(storage_reply())
+                },
+                || {
+                    panic!("the daemon's answer must take precedence over local environment and probes")
+                },
+            );
+            assert_eq!(least_protected(&dirs).unwrap().path, expected);
+            assert_eq!(
+                dirs.len(),
+                if sealed.template_key.is_none() { 5 } else { 4 }
+            );
+            assert!(dirs.iter().any(|dir| dir.path == "/usr"));
+        }
+    }
+
+    #[test]
+    fn an_unknown_daemon_probe_is_authoritative() {
+        let sealed = sealed(literal(vec![7]), Some(false));
+        let dirs = storage_for(
+            &sealed,
+            |_| {
+                let Response::SealedStorage {
+                    template_key,
+                    system,
+                    ..
+                } = storage_reply()
+                else {
+                    unreachable!()
+                };
+                Ok(Response::SealedStorage {
+                    keyring: unknown_directory(
+                        "/daemon/keyring",
+                        "mount information could not be read".into(),
+                    ),
+                    template_key,
+                    system,
+                })
+            },
+            || panic!("an unknown daemon result must not use local probes"),
+        );
+        let advice = storage_guidance(&sealed, &dirs).unwrap();
+        assert!(advice.warn);
+        assert!(advice.text.contains("/daemon/keyring"));
+        assert!(advice.text.contains("mount information could not be read"));
+    }
+
+    #[test]
+    fn old_or_unreachable_daemons_use_the_local_storage_fallback() {
+        for reply in [
+            Ok(Response::Error("bad request".into())),
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+        ] {
+            let expected = vec![storage_directory(
+                "/fallback/keyring",
+                StorageEncryption::NotEncrypted,
+            )];
+            let dirs = storage_for(
+                &sealed(literal(vec![7]), Some(false)),
+                |_| reply,
+                || expected.clone(),
+            );
+            assert_eq!(dirs, expected);
+        }
+    }
+
+    #[test]
+    fn other_daemon_errors_do_not_use_the_local_storage_fallback() {
+        for reply in [
+            Ok(Response::Error("permission denied".into())),
+            Ok(Response::Error("bad request: policy refused".into())),
+            Ok(Response::Error("storage unavailable".into())),
+            Ok(Response::Ok("unexpected".into())),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid reply",
+            )),
+        ] {
+            let sealed = sealed(literal(vec![7]), Some(false));
+            let dirs = storage_for(&sealed, |_| reply, || panic!("must not probe locally"));
+            let advice = storage_guidance(&sealed, &dirs).unwrap();
+            assert!(advice.warn);
+            assert!(advice.text.contains("irlumed"), "{}", advice.text);
+            assert!(dirs
+                .iter()
+                .all(|dir| dir.encryption == StorageEncryption::Unknown));
+            assert!(dirs.iter().all(|dir| dir.reason.is_some()));
+        }
+    }
+
+    /// A daemon error leaves every directory unknown for one reason, which
+    /// the guidance states once for all of them; a reason that differs keeps
+    /// its own sentence.
+    #[test]
+    fn a_reason_shared_by_several_directories_is_stated_once() {
+        let sealed = sealed(literal(vec![7]), None);
+        let busy = "daemon busy: too many open connections from this user";
+        let mut dirs = storage_for(
+            &sealed,
+            |_| Ok(Response::Error(busy.into())),
+            || panic!("must not probe locally"),
+        );
+        let advice = storage_guidance(&sealed, &dirs).unwrap();
+        assert!(advice.warn);
+        assert_eq!(advice.text.matches(busy).count(), 1, "{}", advice.text);
         assert!(
-            advice.text.contains(
-                "irlume could not confirm that a directory irlumed keeps sealed secrets in (not \
-                 resolved from systemd) is on encrypted storage"
+            advice.text.ends_with(
+                " Storage under keyring directory (IRLUME_KEYRING_DIR), template-key directory \
+                 (IRLUME_TEMPLATE_KEY_DIR), /, /usr and /etc could not be established: irlumed \
+                 could not report storage: daemon busy: too many open connections from this \
+                 user."
             ),
             "{}",
             advice.text
         );
-    }
 
-    /// Each sealed secret's directory is its own: the keyring directory for
-    /// a keyring secret, the template-key directory for a template key (or
-    /// both when the daemon did not say), each as its variable resolves, and
-    /// an unknown one makes them all unknown. The installed system's
-    /// directories always follow.
-    #[test]
-    fn each_sealed_secret_is_probed_where_it_is_kept() {
-        let resolve = |overrides: &'static [(&'static str, Option<&'static str>)]| {
-            move |var: &str, default: PathBuf| match overrides.iter().find(|(v, _)| *v == var) {
-                Some((_, value)) => value.map(PathBuf::from),
-                None => Some(default),
-            }
-        };
-        let with_system = |dirs: &[PathBuf]| {
-            let mut dirs = dirs.to_vec();
-            dirs.extend(["/", "/usr", "/etc"].map(PathBuf::from));
-            Some(dirs)
-        };
-        let state = irlume_common::state_dir();
-        let keyring = sealed(literal(vec![7]), Some(false));
-        assert_eq!(
-            sealed_dirs(&keyring, resolve(&[])),
-            with_system(&[state.join("keyring")])
-        );
-        let template = Sealed {
-            keyring: KeyringSeal::NotArmed,
-            template_key: Some(true),
-            pcrlock_seals: false,
-        };
-        assert_eq!(
-            sealed_dirs(
-                &template,
-                resolve(&[("IRLUME_TEMPLATE_KEY_DIR", Some("/keys/t"))])
-            ),
-            with_system(&[PathBuf::from("/keys/t")])
-        );
-        let both = sealed(literal(vec![7]), None);
-        assert_eq!(
-            sealed_dirs(&both, resolve(&[("IRLUME_STATE_DIR", Some("/srv/irlume"))])),
-            with_system(&[
-                PathBuf::from("/srv/irlume/keyring"),
-                PathBuf::from("/srv/irlume/template-keys"),
-            ])
-        );
-        assert_eq!(
-            sealed_dirs(&both, resolve(&[("IRLUME_KEYRING_DIR", None)])),
-            None
-        );
-        assert_eq!(
-            sealed_dirs(&both, resolve(&[("IRLUME_STATE_DIR", None)])),
-            None
-        );
-    }
-
-    /// The least protected directory decides and is the one named; an
-    /// unknown set of directories is unknown storage.
-    #[test]
-    fn the_least_protected_directory_decides() {
-        let root = std::env::temp_dir().join(format!("irlume-seal-least-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        for dir in ["enc/a", "enc/b", "plain/b", "unknown/c"] {
-            std::fs::create_dir_all(root.join(dir)).unwrap();
+        dirs[1].reason = Some("Permission denied (os error 13)".into());
+        let advice = storage_guidance(&sealed, &dirs).unwrap();
+        assert_eq!(advice.text.matches(busy).count(), 1, "{}", advice.text);
+        for expected in [
+            " Storage under keyring directory (IRLUME_KEYRING_DIR), /, /usr and /etc could not \
+             be established: irlumed could not report storage: daemon busy",
+            " Storage under template-key directory (IRLUME_TEMPLATE_KEY_DIR) could not be \
+             established: Permission denied (os error 13).",
+        ] {
+            assert!(
+                advice.text.contains(expected),
+                "{expected}: {}",
+                advice.text
+            );
         }
-        let answer = |dir: &Path| {
-            if dir.starts_with(root.join("plain")) {
-                StorageEncryption::NotEncrypted
-            } else if dir.starts_with(root.join("unknown")) {
-                StorageEncryption::Unknown
-            } else {
-                StorageEncryption::Encrypted
-            }
-        };
-        let dirs = |names: &[&str]| Some(names.iter().map(|name| root.join(name)).collect());
-        assert_eq!(
-            least_protected(dirs(&["enc/a", "plain/b", "unknown/c"]), answer),
-            (root.join("plain/b"), StorageEncryption::NotEncrypted)
-        );
-        assert_eq!(
-            least_protected(dirs(&["enc/a", "unknown/c"]), answer),
-            (root.join("unknown/c"), StorageEncryption::Unknown)
-        );
-        assert_eq!(
-            least_protected(dirs(&["enc/a", "enc/b"]), answer),
-            (root.join("enc/a"), StorageEncryption::Encrypted)
-        );
-        assert_eq!(
-            least_protected(None, answer),
-            (PathBuf::from(UNKNOWN_STATE_DIR), StorageEncryption::Unknown)
-        );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A directory not created yet is judged by where it would be created,
-    /// and one this process may not look into by its reachable parent; one
-    /// that is there, even as a dangling link, is judged by itself.
     #[test]
-    fn a_directory_not_created_yet_or_out_of_reach_is_judged_by_its_parent() {
+    fn unknown_directories_keep_their_names_and_reasons_when_plain_storage_wins() {
+        let sealed = sealed(literal(vec![7]), Some(true));
+        let dirs = vec![
+            irlume_common::StorageDirectory {
+                path: "keyring directory (IRLUME_KEYRING_DIR)".into(),
+                encryption: StorageEncryption::Unknown,
+                reason: Some("systemd could not establish IRLUME_KEYRING_DIR".into()),
+            },
+            irlume_common::StorageDirectory {
+                path: "/daemon/template-keys".into(),
+                encryption: StorageEncryption::Unknown,
+                reason: Some("Permission denied (os error 13)".into()),
+            },
+            storage_directory("/usr", StorageEncryption::NotEncrypted),
+        ];
+        let advice = storage_guidance(&sealed, &dirs).unwrap();
+        assert!(advice.warn);
+        for expected in [
+            "under /usr",
+            "keyring directory (IRLUME_KEYRING_DIR)",
+            "systemd could not establish IRLUME_KEYRING_DIR",
+            "/daemon/template-keys",
+            "Permission denied",
+        ] {
+            assert!(
+                advice.text.contains(expected),
+                "{expected}: {}",
+                advice.text
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_resolves_each_secret_directory_independently() {
+        let sealed = sealed(literal(vec![7]), Some(true));
+        let dirs = fallback_storage(
+            &sealed,
+            |var, default| match var {
+                "IRLUME_STATE_DIR" => Err("systemd could not establish IRLUME_STATE_DIR".into()),
+                "IRLUME_KEYRING_DIR" => Ok(PathBuf::from("/explicit/keyring")),
+                _ => default,
+            },
+            |path| storage_directory(path.to_str().unwrap(), StorageEncryption::Encrypted),
+        );
+        assert_eq!(dirs[0].path, "/explicit/keyring");
+        assert_eq!(dirs[0].encryption, StorageEncryption::Encrypted);
+        assert_eq!(
+            dirs[1].path,
+            "template-key directory (IRLUME_TEMPLATE_KEY_DIR)"
+        );
+        assert_eq!(dirs[1].encryption, StorageEncryption::Unknown);
+        assert!(dirs[1]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("IRLUME_STATE_DIR"));
+        assert_eq!(dirs.len(), 5);
+    }
+
+    #[test]
+    fn fallback_keeps_unreachable_storage_unknown() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("irlume-seal-dirs-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("irlume-seal-unreachable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("state/keyring")).unwrap();
-        let root = std::fs::canonicalize(&root).unwrap();
-        // Restores the locked directory's mode, even when an assertion fails,
-        // so the tree can be removed.
-        struct Unlock(PathBuf);
-        impl Drop for Unlock {
+        std::fs::create_dir_all(root.join("locked/keyring")).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
             fn drop(&mut self) {
                 let _ = std::fs::set_permissions(
                     self.0.join("locked"),
@@ -1354,31 +1652,37 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
-        let _unlock = Unlock(root.clone());
-        let keyring = root.join("state/keyring");
-        assert_eq!(probe_path(&keyring), keyring);
-        let deeper = root.join("state/template-keys/deeper");
-        assert_eq!(probe_path(&deeper), root.join("state"));
-        let link = root.join("state/link");
-        std::os::unix::fs::symlink(root.join("gone"), &link).unwrap();
-        assert_eq!(probe_path(&link), link);
-        // A directory only its owner may search, as the 0700 state directory
-        // is for anyone but root, who reaches it anyway.
-        std::fs::create_dir_all(root.join("locked/keyring")).unwrap();
+        let _cleanup = Cleanup(root.clone());
         std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000))
             .unwrap();
-        let inside = root.join("locked/keyring");
-        let reachable = std::fs::symlink_metadata(&inside).is_ok();
-        let parent = root.join("locked");
-        let expected = if reachable { &inside } else { &parent };
-        assert_eq!(&probe_path_in(&inside, |_, _| Some(false)), expected);
-        // A mount between them, or mountinfo that cannot be read, leaves the
-        // directory itself, whose probe reads unknown; so does a path that
-        // is not plain names below the reachable parent.
-        assert_eq!(probe_path_in(&inside, |_, _| Some(true)), inside);
-        assert_eq!(probe_path_in(&inside, |_, _| None), inside);
-        let back = root.join("locked/../state");
-        assert_eq!(probe_path_in(&back, |_, _| Some(false)), back);
+        let keyring = root.join("locked/keyring");
+        if std::fs::metadata(&keyring).is_ok() {
+            return;
+        }
+        let dirs = fallback_storage(
+            &sealed(literal(vec![7]), Some(false)),
+            |var, default| {
+                if var == "IRLUME_KEYRING_DIR" {
+                    Ok(keyring.clone())
+                } else {
+                    default
+                }
+            },
+            |path| {
+                if path == keyring {
+                    irlume_common::storage_encryption::directory_encryption(path)
+                } else {
+                    storage_directory(path.to_str().unwrap(), StorageEncryption::Encrypted)
+                }
+            },
+        );
+        assert_eq!(dirs[0].path, keyring.to_string_lossy());
+        assert_eq!(dirs[0].encryption, StorageEncryption::Unknown);
+        assert!(dirs[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("Permission denied"));
     }
 
     /// On encrypted storage the guidance is always information: the storage
@@ -1638,11 +1942,25 @@ mod tests {
         );
     }
 
+    fn check_one(
+        user: &str,
+        sealed: &Sealed,
+        state_dir: &Path,
+        probe: impl FnOnce(&Path) -> StorageEncryption,
+    ) -> (State, String) {
+        check(user, sealed, || {
+            vec![storage_directory(
+                state_dir.to_str().unwrap(),
+                probe(state_dir),
+            )]
+        })
+    }
+
     #[test]
     fn the_doctor_check_states() {
         let never = |_: &Path| -> StorageEncryption { panic!("must not probe") };
         let dir = Path::new(DIR);
-        let (state, detail) = check(
+        let (state, detail) = check_one(
             "tester",
             &sealed(KeyringSeal::NotArmed, Some(false)),
             dir,
@@ -1655,13 +1973,13 @@ mod tests {
             sealed(KeyringSeal::Unknown, Some(false)),
             sealed(KeyringSeal::NotArmed, None),
         ] {
-            let (state, detail) = check("tester", &sealed, dir, never);
+            let (state, detail) = check_one("tester", &sealed, dir, never);
             assert_eq!(state, State::Unknown, "{sealed:?}");
             assert!(detail.contains("irlumed did not say"), "{detail}");
         }
 
         let asked = RefCell::new(None);
-        let (state, detail) = check(
+        let (state, detail) = check_one(
             "tester",
             &sealed(pcrlock(), Some(false)),
             Path::new("/srv/irlume-state"),
@@ -1681,31 +1999,35 @@ mod tests {
         );
 
         // Nothing on encrypted storage is a pass.
-        let (state, _) = check("tester", &sealed(pcrlock(), None), dir, |_| {
+        let (state, _) = check_one("tester", &sealed(pcrlock(), None), dir, |_| {
             StorageEncryption::Encrypted
         });
         assert_eq!(state, State::Info);
         let unknown_keyring = sealed(KeyringSeal::Unknown, Some(true));
-        let (state, detail) = check("tester", &unknown_keyring, dir, |_| {
+        let (state, detail) = check_one("tester", &unknown_keyring, dir, |_| {
             StorageEncryption::Encrypted
         });
         assert_eq!(state, State::Info);
         assert!(detail.starts_with(TEMPLATE_LITERAL), "{detail}");
 
         let tier_3 = sealed(literal(vec![7]), Some(true));
-        let (state, detail) = check("tester", &tier_3, dir, |_| StorageEncryption::Encrypted);
+        let (state, detail) = check_one("tester", &tier_3, dir, |_| StorageEncryption::Encrypted);
         assert_eq!(state, State::Info);
         assert_eq!(
             Some(detail),
             advise(&tier_3, StorageEncryption::Encrypted).map(|advice| advice.text)
         );
         for storage in [StorageEncryption::NotEncrypted, StorageEncryption::Unknown] {
-            let (state, detail) = check("tester", &tier_3, dir, |_| storage);
+            let (state, detail) = check_one("tester", &tier_3, dir, |_| storage);
             assert_eq!(state, State::Warn);
-            assert_eq!(
-                Some(detail),
-                advise(&tier_3, storage).map(|advice| advice.text)
-            );
+            let expected = advise(&tier_3, storage).unwrap().text;
+            assert!(detail.starts_with(&expected), "{detail}");
+            if storage == StorageEncryption::Unknown {
+                assert!(
+                    detail.contains("the probe did not report a reason"),
+                    "{detail}"
+                );
+            }
         }
     }
 

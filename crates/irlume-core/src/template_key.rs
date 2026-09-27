@@ -30,6 +30,8 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
+/// Return the sealed-template-key directory used by this process so
+/// diagnostics report the same location as key operations.
 // The fallback goes through `state_dir()`, NOT the bare `STATE_DIR`
 // constant, so one `IRLUME_STATE_DIR` moves the whole sandbox together.
 // When these two resolved to the literal while the profile store honored
@@ -37,7 +39,7 @@ use zeroize::Zeroizing;
 // 2026-08-05 a sandboxed `profiles forget-model` emptied the real
 // /var/lib/irlume/template-keys and /var/lib/irlume/recovery, leaving an
 // encrypted enrollment whose key no longer existed anywhere.
-fn key_dir() -> PathBuf {
+pub fn key_dir() -> PathBuf {
     std::env::var("IRLUME_TEMPLATE_KEY_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| irlume_common::state_dir().join("template-keys"))

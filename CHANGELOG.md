@@ -856,7 +856,10 @@ All notable changes to irlume are documented here. This project adheres to
   the uninstall; one root owns, or one whose owner cannot be read, still
   stops it, as before. A `keyring` link in that tree is followed only to
   a directory root owns, whose tokens then count like any root store's;
-  the removal takes only the link.
+  the removal takes only the link, and a store it leads to that holds
+  anything is reported as left, so the TPM's storage key is kept. File
+  names from an account's tree are printed with control characters
+  escaped.
 
 - `irlume login disable` leaves a stack irlume edits in place (an `/etc`
   file with no vendor copy, such as `sudo` or `polkit-1` on Debian, Ubuntu

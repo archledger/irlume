@@ -165,8 +165,33 @@ assert "sudo ends with a newline" "truncated mid-line" \
     test -z "$(tail -c 1 "$SUDO_PAM")"
 assert "sudo still has its own auth stack" "lost the original body" \
     grep -qE 'auth|@include' "$SUDO_PAM"
-# And the lock file itself is left behind for the next run, not deleted.
-assert "the PAM lock exists after the race" "missing" test -e /run/lock/irlume-pam.lock
+# And the lock file itself is left behind for the next run, not deleted, in the
+# root-only /run/irlume at 0600; the lock earlier releases kept in /run/lock is
+# created too, at 0600, so one of those releases waits for the operation.
+assert "the PAM lock exists after the race" "missing" test -f /run/irlume/pam.lock
+assert "the PAM lock is root-only" "mode $(stat -c %a /run/irlume/pam.lock 2>/dev/null)" \
+    test "$(stat -c %a /run/irlume/pam.lock 2>/dev/null)" = 600
+assert "the PAM lock's directory is root-only" "mode $(stat -c %a /run/irlume 2>/dev/null)" \
+    test "$(stat -c %a /run/irlume 2>/dev/null)" = 700
+assert "the old PAM lock is a regular file" "missing" test -f /run/lock/irlume-pam.lock
+assert "the old PAM lock is root-only" \
+    "mode and uid $(stat -c '%a %u' /run/lock/irlume-pam.lock 2>/dev/null)" \
+    test "$(stat -c '%a %u' /run/lock/irlume-pam.lock 2>/dev/null)" = "600 0"
+# Another account can own the old lock where /run/lock is 1777, and could
+# remove or rename it while an operation holds it. The operation replaces it
+# with a file of root's in one rename and leaves no other name behind.
+if chown 65534:65534 /run/lock/irlume-pam.lock 2>/dev/null; then
+    chmod 0644 /run/lock/irlume-pam.lock
+    $B login disable --apply >/dev/null 2>&1
+    assert "another account's old PAM lock is replaced by root's" \
+        "mode and uid $(stat -c '%a %u' /run/lock/irlume-pam.lock 2>/dev/null)" \
+        test "$(stat -c '%a %u' /run/lock/irlume-pam.lock 2>/dev/null)" = "600 0"
+    assert "no other name is left beside the old PAM lock" \
+        "found $(find /run/lock -maxdepth 1 -name '.irlume-pam.lock.*' 2>/dev/null)" \
+        test -z "$(find /run/lock -maxdepth 1 -name '.irlume-pam.lock.*' 2>/dev/null)"
+else
+    echo "  skip    uid 65534 is not mapped, so another account's old PAM lock is not tried"
+fi
 
 echo "=== 12. a stopped rollback resumes instead of refusing itself ==="
 # A rollback restores surfaces one at a time. Stopping partway used to be

@@ -865,7 +865,29 @@ the human `login enable`/`disable`, and the self-heal reconcile) holds one
 exclusive lock for the whole operation, so a consumer's transaction cannot
 interleave with another irlume process. The lock does not cover package managers
 or an administrator with an editor, which is why each surface is re-checked
-immediately before it is written.
+immediately before it is written. The lock is `/run/irlume/pam.lock`, a 0600
+file in the root-owned 0700 directory root's session lock uses, so no other
+account can open or hold it. It is opened without following a symlink and must
+be a regular file root owns. A second operation waits for the first, naming its
+process on stderr. While an irlume release that kept the lock at
+`/run/lock/irlume-pam.lock` may still be running, as during an upgrade, that file
+is taken too. It is created at 0600 when it is missing, so such a release that
+reaches its lock later waits for the operation; a symlink or other special file
+root owns there stops the operation with the command that removes it, and group
+and other permissions are removed from a file root owns. Whatever
+another account owns there is replaced, in one rename (`RENAME_EXCHANGE`), by a
+new 0600 file root owns, which the operation holds and leaves in place, so that
+account cannot move the lock off its name while the operation runs. A regular
+file there is locked, as below, before it is replaced, so an operation that
+fails while waiting for it leaves it at the name; a file that took the name
+meanwhile is waited for too, and goes back to the name if the operation fails
+then. Where the rename cannot be made the operation fails, as
+`operation-failed` with `retryable` true. A process holding the old lock is
+waited for at most 60 seconds. If a root process that has the file open still
+holds it or waits for it then, or `/proc` cannot show which process holds it,
+the operation fails, as `operation-failed` with `retryable` true, rather than
+write beside what may be an earlier irlume; a holder `/proc` shows to be
+something else, such as another account's process, is passed over.
 
 irlume refuses to write a PAM path that is a symlink or that has more than one
 hard link, on every one of those paths. Renaming over a symlink would silently

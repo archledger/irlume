@@ -853,6 +853,39 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- The lock irlume holds while it changes PAM (`login enable` and
+  `disable` with `--apply`, `login apply`, `login rollback --apply`, the
+  reconcile unit and `irlume uninstall`) is `/run/irlume/pam.lock`, a
+  0600 file in the root-owned 0700 directory root's session lock uses,
+  so only root can open it; it was a 0644 file in `/run/lock`. It is
+  opened without following a symlink and must be a regular file root
+  owns, and an operation waiting for it names the process holding it.
+  While a release that used the old lock may still be running, as
+  during an upgrade, `/run/lock/irlume-pam.lock` is taken as well. It
+  is created at 0600 when it is missing, so such a release reaching its
+  lock later waits for the operation; a symlink or other special file
+  root owns there stops the operation with the command that removes it,
+  and the file loses its group and other permissions when root owns it.
+  Whatever another account owns there is replaced, in one rename, by a
+  new 0600 file of root's that the operation holds and leaves in place,
+  since that account could otherwise rename or remove its own while the
+  operation ran and let such a release lock a new file at the name. A
+  regular file there is locked, unchanged, before it is replaced, so an
+  operation that stops while waiting for it leaves it at the name; a
+  file that took the name meanwhile is waited for too, and goes back to
+  the name if the operation stops then. The operation stops when the
+  rename cannot be made. A process holding the old lock is waited for
+  at most 60 seconds; if a root process with the file open still holds
+  it or waits for it then, or `/proc` cannot show which process holds
+  it, the operation stops with an error, and otherwise, as for another
+  account's process, it goes on without that lock. `irlume uninstall`
+  leaves both lock files in place, since
+  another operation may hold them; they are empty and on the `/run`
+  tmpfs.
+  `irlume-reconcile.service` now stops a run after 5 minutes
+  (`TimeoutStartSec`), so a run that does not finish no longer keeps
+  later triggers from starting it.
+
 - `irlume doctor` reports `irlume logs debug on` (check `debug-tracing`,
   `warn` while its drop-in is in place) and `irlume status` names it:
   the drop-in survives reboots, and while it is there the daemon logs

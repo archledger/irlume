@@ -496,6 +496,19 @@ fn remove_timer_stamps(dir: &str) {
     }
 }
 
+/// Delete the machine-API session lock from `dir`, root's session directory
+/// (`machine::ROOT_SESSION_DIR`), and nothing else there.
+///
+/// The PAM lock in the same directory stays, as does the one earlier releases
+/// kept in `/run/lock`: the teardown's PAM step has released it, so another
+/// irlume changing PAM may hold it or be waiting for it by now, and once the
+/// file is unlinked the next operation would create and lock a new one and run
+/// beside that holder. Both are empty files on the `/run` tmpfs, gone at the
+/// next boot.
+fn remove_session_lock(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(crate::machine::SESSION_LOCK_NAME));
+}
+
 /// The filesystem facts that say a known snapshot tool is present (#335).
 /// Gathered from cheap existence checks only; the tools' own commands are never
 /// run, because detection must not be able to mutate snapshot state or fail the
@@ -694,10 +707,8 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
         // the uninstall's own cleanliness standard removed the stale socket
         // for exactly this residue class (0.11.0rc1 audit).
         let _ = std::fs::remove_dir_all("/run/lock/irlume");
-        // The machine-API session lock's directory for root without a
-        // runtime directory (`machine::ROOT_SESSION_DIR`); only root can
-        // create it under /run.
-        let _ = std::fs::remove_dir_all(crate::machine::ROOT_SESSION_DIR);
+        // The machine-API session lock root uses without a runtime directory.
+        remove_session_lock(Path::new(crate::machine::ROOT_SESSION_DIR));
     }
     // `systemctl enable` copies units into /etc/systemd/system/ (Arch's
     // systemd does this for units with [Install] aliases) — files pacman/apt
@@ -2515,6 +2526,36 @@ mod tests {
     #[test]
     fn remove_timer_stamps_tolerates_a_missing_directory() {
         remove_timer_stamps("/nonexistent/irlume-timer-stamp-dir");
+    }
+
+    /// The teardown removes root's session lock but leaves the PAM lock beside
+    /// it in place, same inode, while another process holds it: unlinking it
+    /// would let the next PAM operation lock a new file and run beside that
+    /// holder.
+    #[test]
+    fn teardown_leaves_the_pam_lock_another_operation_holds() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::io::AsRawFd as _;
+        let dir = std::env::temp_dir().join(format!("irlume-session-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = dir.join(crate::machine::SESSION_LOCK_NAME);
+        let pam = dir.join("pam.lock");
+        std::fs::write(&session, b"").unwrap();
+        let holder = std::fs::File::create(&pam).unwrap();
+        // SAFETY: the descriptor is owned by `holder`, which outlives the call.
+        let locked = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(locked, 0, "lock the PAM lock");
+        let inode = holder.metadata().unwrap().ino();
+        remove_session_lock(&dir);
+        assert!(!session.exists(), "the session lock was left");
+        assert_eq!(
+            std::fs::metadata(&pam).map(|meta| meta.ino()).ok(),
+            Some(inode),
+            "the PAM lock a process holds was removed"
+        );
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // A report shaped like a run whose only interesting facts are the wipe

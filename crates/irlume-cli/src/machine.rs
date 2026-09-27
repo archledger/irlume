@@ -2092,11 +2092,12 @@ enum SessionRefusal {
 }
 
 /// The session lock's file name inside the directory [`session_dir`] opens.
-const SESSION_LOCK_NAME: &str = "machine-session.lock";
+pub(crate) const SESSION_LOCK_NAME: &str = "machine-session.lock";
 
 /// Where root keeps its session lock when it has no runtime directory of its
 /// own, as under sudo, pkexec, a system unit or a cron job: a root-owned 0700
-/// directory on the `/run` tmpfs, created on first use.
+/// directory on the `/run` tmpfs, created on first use. The PAM lock
+/// (`pamwire::lock_pam`) lives here too.
 pub(crate) const ROOT_SESSION_DIR: &str = "/run/irlume";
 
 impl SessionGuard {

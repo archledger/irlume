@@ -37,6 +37,7 @@ use std::process::{Command, ExitCode};
 mod autologin;
 mod files;
 mod grammar;
+mod lock;
 mod overrides;
 mod remote_seats;
 mod report;
@@ -58,7 +59,8 @@ use transform::*;
 // rather than inherited, which also keeps that surface visible in one place.
 #[cfg(test)]
 pub(crate) use files::restore_surface_with;
-pub(crate) use files::{is_managed_path, lock_pam, restore_surface, UNREADABLE};
+pub(crate) use files::{is_managed_path, restore_surface, UNREADABLE};
+pub(crate) use lock::lock_pam;
 // The PAM-grammar items shared outside this module: `fingerprint.rs` and the
 // TUI must read stack lines with the same comment and rule-field semantics
 // the wiring uses, or the two would disagree about what a file configures.
@@ -3553,9 +3555,14 @@ mod tests {
     /// the split in `act`/`act_holding_lock` can be revisited.
     #[test]
     fn a_second_pam_lock_in_the_same_process_does_not_succeed() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("irlume-lock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let lock_path = dir.join("pam.lock");
+        // In a directory the lock creates at 0700: one the umask left group
+        // writable would be refused.
+        let lock_path = dir.join("run").join("pam.lock");
         std::env::set_var("IRLUME_PAM_LOCK", &lock_path);
 
         let first = super::lock_pam().expect("the first lock must be granted");
@@ -3641,7 +3648,16 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = scratch_dir("pamlock");
-        let lock_path = dir.join("irlume-pam.lock");
+        // The lock refuses a directory group or others can write, as the umask
+        // may leave `dir`, so it gets one of its own at 0700.
+        let lock_dir = dir.join("run");
+        std::fs::create_dir(&lock_dir).expect("create the lock directory");
+        std::fs::set_permissions(
+            &lock_dir,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .expect("make the lock directory private");
+        let lock_path = lock_dir.join("pam.lock");
         let previous = std::env::var_os("IRLUME_PAM_LOCK");
         // SAFETY: the env lock is held for the whole test.
         unsafe { std::env::set_var("IRLUME_PAM_LOCK", &lock_path) };

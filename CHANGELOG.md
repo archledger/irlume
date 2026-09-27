@@ -848,7 +848,9 @@ All notable changes to irlume are documented here. This project adheres to
   `irlume recovery setup`. The TUI's Recovery page refuses a shorter
   passphrase before asking for its confirmation, in the CLI's words, and
   says the minimum in its prompt. Characters are counted as the CLI
-  counts them, and a recovery passphrase set earlier still restores.
+  counts them, a new passphrase must be UTF-8 text (the CLI and TUI
+  restore with text), and a recovery passphrase set earlier still
+  restores.
 
 - `irlume uninstall` reads and removes per-user irlume data only within
   each home. It opens `~/.local/share/irlume` without following a

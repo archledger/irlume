@@ -52,26 +52,38 @@ const CURRENT_VERSION: u32 = 1;
 pub const MIN_PASSPHRASE_CHARS: usize = 12;
 
 /// Characters in `passphrase`, counted as the CLI and TUI count their text:
-/// Unicode scalar values, as [`str::chars`] yields them. Bytes that are not
-/// UTF-8, which no irlume client sends, count one each. Reads the borrowed
-/// bytes in place; nothing is copied.
+/// Unicode scalar values, as [`str::chars`] yields them. A byte that is not
+/// part of valid UTF-8 counts one on its own, and the characters around it
+/// still count as characters. Reads the borrowed bytes in place; nothing is
+/// copied.
 #[must_use]
 pub fn passphrase_chars(passphrase: &[u8]) -> usize {
-    std::str::from_utf8(passphrase).map_or(passphrase.len(), |text| text.chars().count())
+    passphrase
+        .utf8_chunks()
+        .map(|chunk| chunk.valid().chars().count() + chunk.invalid().len())
+        .sum()
 }
 
-/// Check that `passphrase` may become a new recovery passphrase: not empty
-/// and at least [`MIN_PASSPHRASE_CHARS`] characters ([`passphrase_chars`]).
+/// Check that `passphrase` may become a new recovery passphrase: not empty,
+/// UTF-8 text (the CLI and TUI, which restore with it, read only text), and
+/// at least [`MIN_PASSPHRASE_CHARS`] characters ([`passphrase_chars`]).
 /// Only setting a passphrase is checked; [`unwrap`] opens an existing
-/// envelope whatever its passphrase's length.
+/// envelope whatever its passphrase.
 ///
 /// # Errors
 ///
-/// [`Error::Policy`] naming the minimum when the passphrase is empty or
-/// shorter than it.
+/// [`Error::Policy`] when the passphrase is empty, not UTF-8, or shorter
+/// than the minimum, which the message names.
 pub fn check_new_passphrase(passphrase: &[u8]) -> Result<()> {
     if passphrase.is_empty() {
         return Err(Error::Policy("empty recovery passphrase".into()));
+    }
+    if std::str::from_utf8(passphrase).is_err() {
+        return Err(Error::Policy(
+            "recovery passphrase is not UTF-8 text, which `irlume recovery restore` could \
+             not enter"
+                .into(),
+        ));
     }
     if passphrase_chars(passphrase) < MIN_PASSPHRASE_CHARS {
         return Err(Error::Policy(format!(
@@ -194,9 +206,8 @@ mod tests {
             check_new_passphrase(b""),
             Err(Error::Policy(message)) if message == "empty recovery passphrase"
         ));
-        // Eleven characters each; the second is 22 bytes, the third is not
-        // UTF-8 and counts one per byte.
-        for short in [&b"elevenchars"[..], "ééééééééééé".as_bytes(), &[0xff; 11]] {
+        // Eleven characters each; the second is 22 bytes.
+        for short in [&b"elevenchars"[..], "ééééééééééé".as_bytes()] {
             assert!(
                 matches!(
                     check_new_passphrase(short),
@@ -206,9 +217,26 @@ mod tests {
                 "{short:?}"
             );
         }
-        for enough in [&b"twelve chars"[..], "éééééééééééé".as_bytes(), &[0xff; 12]] {
+        for enough in [&b"twelve chars"[..], "éééééééééééé".as_bytes()] {
             assert_eq!(passphrase_chars(enough), 12, "{enough:?}");
             assert!(check_new_passphrase(enough).is_ok(), "{enough:?}");
+        }
+        // Bytes that are not UTF-8 count one each, and the characters around
+        // them still count as characters: three 4-byte emoji and one stray
+        // byte are four, not 13.
+        let mixed = ["😀😀😀".as_bytes(), &[0xff_u8][..]].concat();
+        assert_eq!(passphrase_chars(&mixed), 4);
+        assert_eq!(passphrase_chars(&[0xff; 12]), 12);
+        // A new passphrase must be text, however long.
+        let long_mixed = ["twelve chars".as_bytes(), &[0xff_u8][..]].concat();
+        for bytes in [&long_mixed[..], &[0xff; 12]] {
+            assert!(
+                matches!(
+                    check_new_passphrase(bytes),
+                    Err(Error::Policy(message)) if message.contains("not UTF-8 text")
+                ),
+                "{bytes:?}"
+            );
         }
     }
 

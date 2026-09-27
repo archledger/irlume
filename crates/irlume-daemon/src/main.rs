@@ -6728,6 +6728,14 @@ fn dispatch_scoped_session_inner(
                 .into(),
         );
     }
+    // A recovery passphrase the policy refuses is refused here, above the
+    // cache invalidation below, for the same reason as the eyes-open enable:
+    // a request about to be refused may not change state.
+    if let Request::RecoverySetup { passphrase, .. } = &req {
+        if let Err(e) = irlume_core::recovery::check_new_passphrase(passphrase.expose()) {
+            return Response::Error(e.to_string());
+        }
+    }
     // AFTER the gate, BEFORE the mutation runs. After the gate because the
     // cache is state, and a request that is about to be refused may not
     // change state: an unprivileged peer could otherwise evict root's summary
@@ -7657,12 +7665,9 @@ fn dispatch_scoped_session_inner(
         // --- template-key recovery passphrase -------------------------------
         Request::RecoverySetup { user, passphrase } => {
             // irlumed enforces the recovery passphrase minimum itself, so the
-            // TUI and every client get the same floor. Checked first, so a
-            // refused passphrase changes nothing; `setup_recovery` checks
-            // again for any other caller.
-            if let Err(e) = irlume_core::recovery::check_new_passphrase(passphrase.expose()) {
-                return Response::Error(e.to_string());
-            }
+            // TUI and every client get the same floor: checked above, before
+            // the summary cache is touched, so a refused passphrase changes
+            // nothing; `setup_recovery` checks again for any other caller.
             // If templates are still plaintext (pre-encryption enrollment), mint
             // and seal a template key now by re-saving; encryption takes effect
             // and there's a key for the recovery passphrase to wrap. A no-op when
@@ -18113,6 +18118,54 @@ mod tests {
     /// the floor and reach the key lookup. Restore has no floor: a short
     /// passphrase still reaches the envelope (a wrong one here, so nothing is
     /// resealed and no TPM is needed).
+    /// A recovery passphrase the policy refuses (too short, or not UTF-8)
+    /// is refused before the enrollment summary cache is touched, like the
+    /// eyes-open enable: a request about to be refused may not change state.
+    #[test]
+    fn a_refused_recovery_passphrase_does_not_evict_the_summary_cache() {
+        let _g = env_lock();
+        let mut e = engine();
+        let root = peer(0);
+        clear_enrollment_summaries();
+        let has_summary = || {
+            enrollment_summaries()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("carol")
+        };
+        publish_enrollment_summary(
+            "carol",
+            EnrollmentSummary {
+                profiles: Vec::new(),
+                ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
+                primary_camera: None,
+                primary_digest: PrimaryDigest::Absent,
+                camera_store: CameraStoreSnapshot::default(),
+            },
+        );
+        for passphrase in [&b"elevenchars"[..], &[0xff; 12]] {
+            let reply = dispatch(
+                Request::RecoverySetup {
+                    user: "carol".into(),
+                    passphrase: irlume_common::SecretBytes::new(passphrase.to_vec()),
+                },
+                &root,
+                &mut e,
+            );
+            assert!(
+                matches!(&reply, Response::Error(msg) if msg.starts_with("policy: recovery passphrase")),
+                "{reply:?}"
+            );
+            assert!(
+                has_summary(),
+                "a refused passphrase must leave the published summary in place"
+            );
+        }
+        clear_enrollment_summaries();
+    }
+
     #[test]
     fn recovery_setup_refuses_a_passphrase_below_the_floor() {
         let _g = env_lock();

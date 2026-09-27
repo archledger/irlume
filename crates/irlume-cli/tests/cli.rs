@@ -2196,6 +2196,131 @@ fn the_namespace_binds_a_directory_the_host_lacks() {
     );
 }
 
+/// The same bind below a parent with thousands of entries. Re-binding each
+/// host entry took three bubblewrap arguments per entry and failed past
+/// bubblewrap's 9000 on hosts whose `/usr/lib` holds 5000 to 6000 entries
+/// (the Arch nightly runner); the rebuilt parent must keep every entry
+/// reachable at a constant argument count.
+#[test]
+fn the_namespace_binds_below_a_parent_with_thousands_of_entries() {
+    let sb = Sandbox::new("bind-wide-parent");
+    let parent =
+        std::env::temp_dir().join(format!("irlume-cli-it-wide-parent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&parent);
+    std::fs::create_dir_all(parent.join("kept-dir")).unwrap();
+    for i in 0..4000 {
+        std::fs::write(parent.join(format!("entry-{i}")), "host\n").unwrap();
+    }
+    // A host symlink whose relative target leaves the parent, as
+    // `/usr/lib/ld-linux.so.2 -> ../lib32/ld-linux.so.2` does, must still
+    // resolve from the parent.
+    let sibling =
+        std::env::temp_dir().join(format!("irlume-cli-it-wide-sibling-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sibling);
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(sibling.join("target"), "sibling\n").unwrap();
+    std::os::unix::fs::symlink(
+        std::path::Path::new("..")
+            .join(sibling.file_name().unwrap())
+            .join("target"),
+        parent.join("escape"),
+    )
+    .unwrap();
+    // And one deeper in a host directory that climbs above the parent, as
+    // `/usr/lib/bfd-plugins/liblto_plugin.so -> ../../libexec/...` does.
+    std::os::unix::fs::symlink(
+        std::path::Path::new("../..")
+            .join(sibling.file_name().unwrap())
+            .join("target"),
+        parent.join("kept-dir").join("deep-escape"),
+    )
+    .unwrap();
+    let fixture = sb.path("probe");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("marker"), "bound\n").unwrap();
+    let destination = parent.join("probe");
+    let dest = destination.to_str().unwrap();
+    let wide = parent.display();
+    // Shell builtins only: the namespace's /usr/bin holds just the shell.
+    let script = format!(
+        "set -- {wide}/*; [ $# = 4003 ] || {{ echo \"$# entries\" >&2; exit 1; }}; \
+         read line < {dest}/marker && [ \"$line\" = bound ] && \
+         read host < {wide}/entry-3999 && [ \"$host\" = host ] && [ -d {wide}/kept-dir ] && \
+         read far < {wide}/escape && [ \"$far\" = sibling ] && \
+         read deep < {wide}/kept-dir/deep-escape && [ \"$deep\" = sibling ] && \
+         echo ok > {dest}/written"
+    );
+    let output = support::isolated_root_command(
+        &sb.root,
+        "/usr/bin/sh",
+        &["-c", &script],
+        &[],
+        &[],
+        &[(&fixture, dest)],
+    )
+    .output()
+    .expect("spawn the namespace");
+    let _ = std::fs::remove_dir_all(&parent);
+    let _ = std::fs::remove_dir_all(&sibling);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.join("written")).unwrap(),
+        "ok\n"
+    );
+}
+
+/// Missing destinations whose parents nest, as `/etc/pam.d` and
+/// `/etc/systemd/system` do on a host that has neither: the outer parent is
+/// rebuilt first and keeps a real directory for the inner one, so the inner
+/// rebuild has somewhere to mount and both binds land.
+#[test]
+fn the_namespace_binds_below_nested_missing_parents() {
+    let sb = Sandbox::new("bind-nested-parents");
+    let outer = std::env::temp_dir().join(format!(
+        "irlume-cli-it-nested-parent-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&outer);
+    std::fs::create_dir_all(outer.join("inner")).unwrap();
+    std::fs::write(outer.join("inner").join("kept"), "inner\n").unwrap();
+    std::fs::write(outer.join("kept"), "outer\n").unwrap();
+    let (first, second) = (sb.path("first"), sb.path("second"));
+    for (dir, text) in [(&first, "first\n"), (&second, "second\n")] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("marker"), text).unwrap();
+    }
+    let top = outer.join("probe");
+    let nested = outer.join("inner").join("probe");
+    let (top, nested) = (top.to_str().unwrap(), nested.to_str().unwrap());
+    let o = outer.display();
+    let script = format!(
+        "read a < {top}/marker && [ \"$a\" = first ] && \
+         read b < {nested}/marker && [ \"$b\" = second ] && \
+         read c < {o}/kept && [ \"$c\" = outer ] && \
+         read d < {o}/inner/kept && [ \"$d\" = inner ]"
+    );
+    let output = support::isolated_root_command(
+        &sb.root,
+        "/usr/bin/sh",
+        &["-c", &script],
+        &[],
+        &[],
+        &[(&first, top), (&second, nested)],
+    )
+    .output()
+    .expect("spawn the namespace");
+    let _ = std::fs::remove_dir_all(&outer);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// The lines of a PAM file that are irlume's, sorted: what reconcile's
 /// maintenance step must carry over when it rebuilds an override.
 fn irlume_lines(text: &str) -> Vec<String> {

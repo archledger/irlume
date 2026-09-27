@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright the irlume contributors.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Run the CLI as namespace-root with a private fixed `/usr/bin`, so code that
@@ -41,33 +41,79 @@ pub(crate) fn isolated_root_command_with_host_pids(
     namespace_command(root, bin, args, tools, hidden, binds, false)
 }
 
-/// Bind `source` at `destination` inside the namespace.
+/// Where the namespace sees the whole host root, read-only, while a missing
+/// destination's parent is rebuilt ([`rebuild_parent`]).
+const HOST_VIEW: &str = "/run/irlume-test-host";
+
+/// Give the missing destinations under one host `parent` somewhere to be
+/// created, without hiding anything else there.
 ///
 /// A destination the host lacks (Debian and Ubuntu have no `/usr/lib/pam.d`)
-/// cannot become a mount point under the read-only root. Its parent is then
-/// covered by a tmpfs holding every host entry again, read-only, which gives
-/// the destination somewhere to be created without hiding anything else.
-fn bind_args(command: &mut Command, source: &Path, destination: &str) {
-    let dest = Path::new(destination);
-    if !dest.is_dir() {
-        let parent = dest.parent().expect("a destination below /");
-        let parent_str = parent.to_str().unwrap();
-        command.args(["--tmpfs", parent_str]);
-        for entry in std::fs::read_dir(parent).expect("read the destination's parent") {
-            let path = entry.expect("a directory entry").path();
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
-            let path_str = path.to_str().unwrap();
-            if meta.file_type().is_symlink() {
-                let target = std::fs::read_link(&path).expect("read a symlink");
-                command.args(["--symlink", target.to_str().unwrap(), path_str]);
-            } else if meta.is_dir() || meta.is_file() {
-                command.args(["--ro-bind", path_str, path_str]);
-            }
+/// cannot become a mount point under the read-only root. A directory built in
+/// the sandbox is mounted over `parent`: one symlink per host entry, pointing
+/// into the read-only view of the whole host root at [`HOST_VIEW`] (a host
+/// symlink is copied with its own target, so a relative one such as
+/// `../lib32/ld-linux.so.2` still resolves from `parent`, and a relative link
+/// deeper in a host directory, which is reached through the view, climbs
+/// within the view as it does on the host), a real
+/// directory for each missing destination, and a real directory for each
+/// later mount directly below `parent`, including a rebuilt parent nested in
+/// this one, so that mount lands in the rebuilt parent rather than through a
+/// symlink into the read-only host view. Re-binding every host entry instead
+/// took three arguments per entry and exceeded bubblewrap's 9000 on hosts
+/// whose `/usr/lib` holds thousands of entries (Arch, CachyOS).
+fn rebuild_parent(
+    command: &mut Command,
+    root: &Path,
+    parent: &Path,
+    missing: &[&str],
+    later: &[PathBuf],
+) {
+    assert!(parent != Path::new("/"), "a destination below a directory");
+    let below_root = parent.strip_prefix("/").expect("an absolute destination");
+    // The view reached from inside `parent`: bubblewrap 0.9 (Ubuntu 24.04)
+    // creates later mount points before it pivots into the new root, where an
+    // absolute link into /run resolves on the host and fails; a relative one
+    // resolves inside the new root either way.
+    let up: PathBuf = below_root.components().map(|_| "..").collect();
+    let relative_view = up
+        .join(HOST_VIEW.strip_prefix('/').expect("an absolute view"))
+        .join(below_root);
+    let built = root.join("namespace-parents").join(below_root);
+    let _ = std::fs::remove_dir_all(&built);
+    std::fs::create_dir_all(&built).expect("create the rebuilt parent");
+    let mut real_dirs: Vec<std::ffi::OsString> = missing
+        .iter()
+        .map(|destination| {
+            Path::new(destination)
+                .file_name()
+                .expect("a named destination")
+                .to_owned()
+        })
+        .collect();
+    for mount in later {
+        if mount.parent() == Some(parent) {
+            real_dirs.push(mount.file_name().expect("a named mount").to_owned());
         }
     }
-    command.args(["--bind", source.to_str().unwrap(), destination]);
+    for entry in std::fs::read_dir(parent).expect("read the destination's parent") {
+        let entry = entry.expect("a directory entry");
+        let name = entry.file_name();
+        if !real_dirs.contains(&name) {
+            let target =
+                std::fs::read_link(entry.path()).unwrap_or_else(|_| relative_view.join(&name));
+            std::os::unix::fs::symlink(target, built.join(&name))
+                .expect("link a host entry into the rebuilt parent");
+        }
+    }
+    for name in &real_dirs {
+        std::fs::create_dir_all(built.join(name)).expect("create a mount point");
+    }
+    command.args([
+        "--ro-bind",
+        built.to_str().unwrap(),
+        parent.to_str().unwrap(),
+    ]);
 }
 
 fn namespace_command(
@@ -122,27 +168,60 @@ fn namespace_command(
     if unshare_pid {
         command.arg("--unshare-pid");
     }
-    // A bind to a destination the host lacks re-mounts the parent's host
-    // entries (`bind_args`), which would uncover a hidden directory or an
-    // earlier bind below that parent. Those binds go first, so the hidden
-    // directories and the other binds land on top of them.
+    // A bind to a destination the host lacks rebuilds its parent
+    // (`rebuild_parent`), which would cover a hidden directory or an earlier
+    // bind below that parent. Those parents go first, so the hidden
+    // directories and the other binds land on top of them, and each rebuilt
+    // parent keeps a real directory for every such mount directly below it.
     let (missing, present): (Vec<_>, Vec<_>) = binds
         .iter()
         .partition(|(_, destination)| !Path::new(destination).is_dir());
-    for (source, destination) in missing {
-        bind_args(&mut command, source, destination);
-    }
-    for dir in hidden {
-        // Same canonical spelling rule as the tool prefixes below; a directory
-        // the host lacks is already absent under the read-only root.
-        if let Ok(canonical) = std::fs::canonicalize(dir) {
-            if canonical.is_dir() {
-                command.args(["--tmpfs", canonical.to_str().unwrap()]);
-            }
+    // Same canonical spelling rule as the tool prefixes below; a directory the
+    // host lacks is already absent under the read-only root.
+    let hidden: Vec<PathBuf> = hidden
+        .iter()
+        .filter_map(|dir| std::fs::canonicalize(dir).ok())
+        .filter(|canonical| canonical.is_dir())
+        .collect();
+    let mut parents: Vec<(&Path, Vec<&str>)> = Vec::new();
+    for (_, destination) in &missing {
+        let parent = Path::new(destination)
+            .parent()
+            .expect("a destination below /");
+        match parents.iter_mut().find(|(p, _)| *p == parent) {
+            Some((_, names)) => names.push(destination),
+            None => parents.push((parent, vec![destination])),
         }
     }
-    for (source, destination) in present {
-        bind_args(&mut command, source, destination);
+    // An ancestor is rebuilt before a parent nested in it, and keeps a real
+    // directory for it (`/etc` before `/etc/systemd` when both `/etc/pam.d`
+    // and `/etc/systemd/system` are missing).
+    parents.sort_by_key(|(parent, _)| parent.components().count());
+    let later: Vec<PathBuf> = hidden
+        .iter()
+        .cloned()
+        .chain(
+            present
+                .iter()
+                .map(|(_, destination)| PathBuf::from(destination)),
+        )
+        .chain(masked.iter().cloned())
+        .chain(parents.iter().map(|(parent, _)| parent.to_path_buf()))
+        .collect();
+    if !parents.is_empty() {
+        command.args(["--ro-bind", "/", HOST_VIEW]);
+    }
+    for (parent, names) in &parents {
+        rebuild_parent(&mut command, root, parent, names, &later);
+    }
+    for (source, destination) in &missing {
+        command.args(["--bind", source.to_str().unwrap(), destination]);
+    }
+    for dir in &hidden {
+        command.args(["--tmpfs", dir.to_str().unwrap()]);
+    }
+    for (source, destination) in &present {
+        command.args(["--bind", source.to_str().unwrap(), destination]);
     }
     for prefix in masked {
         command.args(["--tmpfs", prefix.to_str().unwrap()]);

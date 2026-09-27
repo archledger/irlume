@@ -196,7 +196,7 @@ listing is served only while the name resolves to the uid its load used.
 
 | Record | Recorded uid differs from the current one | Current uid cannot be resolved |
 |---|---|---|
-| Enrollment and template key | The account reads as not enrolled; the key is not unsealed. `irlume enroll` enrolls again: it writes a new enrollment under a new key, and once that enrollment is saved it removes the recovery envelope of the replaced key (an enrollment that fails to save puts the replaced key back) | Error; face falls back to the password |
+| Enrollment and template key | The account reads as not enrolled; the key is not unsealed. `irlume enroll` enrolls again: it writes a new enrollment under a new key, and once that enrollment is saved it removes the recovery envelope of the replaced key and the added-camera store beside the replaced enrollment (an enrollment that fails to save puts the replaced key back and removes neither) | Error; face falls back to the password |
 | Keyring envelope | Not released (face or fingerprint path), not re-sealed, and not returned for a re-arm or a disarm. `irlume keyring arm` arms again; a GNOME keyring token has to be removed first with `irlume keyring forget --force` | Not released |
 | Recovery envelope | `irlume recovery restore` refuses it; `irlume recovery setup` after enrolling again writes a new one | Refused |
 
@@ -239,7 +239,13 @@ each record it does not use, with the uids and the next step.
   enrollment, whose check covers them; on a host without a TPM they are
   plaintext, but still unusable without a primary enrollment for the uid. A
   profile listing leaves the store out when the primary enrollment beside it
-  was recorded for another uid, or its template key was.
+  was recorded for another uid, or its template key was. An enrollment write
+  that replaces that enrollment removes the store, and its commit journal,
+  once the new enrollment is saved; a write that fails, or whose publication
+  is not confirmed durable, leaves them. A store left beside no primary
+  enrollment (after the last profile is deleted, or the file is removed by
+  hand) is not tied to a uid: a listing for the name shows its groups as
+  stale until they are removed.
 - Retry records (`retry/<uid>.json`) and the attempt record are kept by uid
   already.
 - The field is additive: an older irlumed ignores it and keeps using records

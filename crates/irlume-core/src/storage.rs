@@ -708,11 +708,45 @@ fn key_opens_another_accounts_enrollment(
     key: &[u8],
     account: &mut Account<'_>,
 ) -> bool {
+    stored_enrollment_is_another_accounts(user, Some(key), account)
+}
+
+/// Whether the enrollment stored for `user`, read with `key` (`None`: only a
+/// plaintext one reads), records a uid that `account` resolves as another
+/// account's. `false` when no enrollment is stored or `key` does not read it.
+fn stored_enrollment_is_another_accounts(
+    user: &str,
+    key: Option<&[u8]>,
+    account: &mut Account<'_>,
+) -> bool {
     let Ok(data) = fs::read(profile_path(user)) else {
         return false;
     };
-    deserialize_enrollment(&data, Some(key))
+    deserialize_enrollment(&data, key)
         .is_ok_and(|stored| matches!(account.owner(stored.uid), Owner::Other { .. }))
+}
+
+/// Remove the added-camera store of an enrollment that a durable write for
+/// another account replaced. Its groups were captured for that enrollment,
+/// are bound to its bytes, and on a host without a TPM are plaintext, so
+/// they are not left for the account the name now resolves to.
+fn remove_replaced_camera_store(user: &str) -> irlume_common::Result<()> {
+    match crate::multi_camera::remove_store(user) {
+        Ok(true) => {
+            irlume_common::jout_notice!(
+                "irlume: removed the added-camera store of the enrollment of '{user}' that was \
+                 recorded for another uid"
+            );
+            Ok(())
+        }
+        Ok(false) => Ok(()),
+        Err(e) => Err(irlume_common::Error::Io(format!(
+            "the enrollment of '{user}' was saved, but the added-camera store of the enrollment \
+             it replaced, which was recorded for another uid, could not be removed ({e}); remove \
+             {} by hand",
+            crate::multi_camera::secondary_store_path(user).display()
+        ))),
+    }
 }
 
 /// Publish `bytes` as the enrollment at `path`; [`publication_result`] turns
@@ -814,6 +848,13 @@ fn save_with_key(
     let mut account = Account::new(&e.user);
     let uid = account.uid_to_record(Record::Enrollment, e.uid.or(e.loaded_for))?;
     let key = resolve_key(&e.user, &mut account)?;
+    // Whether this write replaces another account's enrollment: its key was
+    // replaced as another uid's, or the stored enrollment is plaintext and
+    // records another uid (a host without a TPM).
+    let replaces_other = key
+        .as_ref()
+        .is_some_and(template_key::WriteKey::replaces_another)
+        || stored_enrollment_is_another_accounts(&e.user, None, &mut account);
     let stamped;
     let e = if uid == e.uid {
         e
@@ -823,14 +864,24 @@ fn save_with_key(
     };
     let written = serialize_enrollment(e, key.as_ref().map(template_key::WriteKey::as_slice))
         .map(|bytes| persist_enrollment(&path, &bytes));
+    let published = match &written {
+        Ok(Ok(published)) => Some(published),
+        _ => None,
+    };
     // A key that replaced another uid's becomes final only once this
     // enrollment is published under it; otherwise the replaced key goes back.
-    if let Some(key) = key {
-        key.settle(match &written {
-            Ok(Ok(published)) => Some(published),
-            _ => None,
-        })?;
-    }
+    let settled = key.map_or(Ok(()), |key| key.settle(published));
+    // The replaced enrollment's added-camera store goes once this enrollment
+    // is durable, as the replaced key's recovery envelope does. A write that
+    // failed, or may not survive a power loss, leaves it.
+    let removed =
+        if replaces_other && matches!(published, Some(irlume_common::AtomicWrite::Durable)) {
+            remove_replaced_camera_store(&e.user)
+        } else {
+            Ok(())
+        };
+    settled?;
+    removed?;
     publication_result(written?)
 }
 
@@ -1621,6 +1672,17 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// Plant a synthetic added-camera store for `user` and the commit journal
+    /// beside it; returns both paths.
+    fn plant_camera_store(user: &str) -> (PathBuf, PathBuf) {
+        let store = crate::multi_camera::secondary_store_path(user);
+        let journal = crate::multi_camera::commit::intent_path_for(&store);
+        fs::create_dir_all(store.parent().unwrap()).unwrap();
+        fs::write(&store, b"synthetic camera store").unwrap();
+        fs::write(&journal, b"synthetic commit journal").unwrap();
+        (store, journal)
+    }
+
     /// An enrollment records the uid it was written for. Every loader reads
     /// one recorded for another uid as absent (not enrolled), and the file
     /// stays on disk; the same file loads for the uid it records.
@@ -1860,7 +1922,9 @@ mod tests {
     /// goes once the new enrollment is published. A failed seal leaves the
     /// key, the enrollment and the recovery envelope as they were. Under the
     /// same key, an enrollment recorded for the current uid, or for none,
-    /// keeps the key and its recovery envelope.
+    /// keeps the key and its recovery envelope. The added-camera store beside
+    /// the enrollment, and its commit journal, are removed when the recovery
+    /// envelope is, and kept when it is kept.
     #[test]
     fn a_key_without_a_uid_is_replaced_when_its_enrollment_records_another_uid() {
         let _env = crate::testenv::ENV_LOCK
@@ -1881,8 +1945,10 @@ mod tests {
             fs::write(profile_path(user), &enrollment).unwrap();
             fake_seal(user, &old_key, None).unwrap();
             fs::write(&recovery, b"synthetic recovery of the key").unwrap();
+            plant_camera_store(user);
             (enrollment, fs::read(template_key::key_path(user)).unwrap())
         };
+        let (store, journal) = plant_camera_store(user);
         let _now = crate::account::remember(user, 6602);
         let mut replacement = Enrollment::new(user);
         replacement.profiles = sample().profiles;
@@ -1928,6 +1994,10 @@ mod tests {
             );
             assert_eq!(fs::read(profile_path(user)).unwrap(), enrollment_before);
             assert!(recovery.exists(), "{what}: and its recovery envelope");
+            assert!(
+                store.exists() && journal.exists(),
+                "{what}: and the camera store"
+            );
 
             write(&fake_seal).unwrap();
             let key = crate::envelope::SealedEnvelope::load(&template_key::key_path(user)).unwrap();
@@ -1936,6 +2006,10 @@ mod tests {
             assert!(
                 !recovery.exists(),
                 "{what}: the old key's recovery envelope goes"
+            );
+            assert!(
+                !store.exists() && !journal.exists(),
+                "{what}: so does the camera store and its journal"
             );
             let saved =
                 deserialize_enrollment(&fs::read(profile_path(user)).unwrap(), Some(&key.private))
@@ -1951,12 +2025,63 @@ mod tests {
                     "{what}: an enrollment recorded for {uid:?} keeps the key"
                 );
                 assert!(recovery.exists(), "{what}: {uid:?}");
+                assert!(store.exists() && journal.exists(), "{what}: {uid:?}");
                 let saved =
                     deserialize_enrollment(&fs::read(profile_path(user)).unwrap(), Some(&old_key))
                         .unwrap();
                 assert_eq!(saved.uid, Some(6602), "{what}: {uid:?}");
             }
         }
+        leave_uid_sandbox(&dir);
+    }
+
+    /// On a host without a TPM, an enrollment write over a plaintext
+    /// enrollment recorded for another uid removes the added-camera store
+    /// beside it, and its commit journal, once the new enrollment is durable:
+    /// the store was captured for the replaced enrollment. A write that
+    /// publishes nothing leaves the store, and so does a write over an
+    /// enrollment recorded for the current uid or for none.
+    #[test]
+    fn a_write_over_another_uids_plaintext_enrollment_removes_its_camera_store() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("uid-other-camera-store");
+        let user = "uid-other-camera-store";
+        let _now = crate::account::remember(user, 6702);
+        let mut replacement = Enrollment::new(user);
+        replacement.profiles = sample().profiles;
+
+        for uid in [Some(6702), None] {
+            plant_plaintext(&dir, user, uid);
+            let (store, journal) = plant_camera_store(user);
+            save_with_key(&replacement, |_, _| Ok(None)).unwrap();
+            assert!(store.exists() && journal.exists(), "recorded for {uid:?}");
+        }
+
+        let before = plant_plaintext(&dir, user, Some(6701));
+        let (store, journal) = plant_camera_store(user);
+        // Root writes into a read-only directory, so only another user can
+        // make the publication fail this way.
+        if fs::metadata(&dir).unwrap().uid() != 0 {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+            let failed = save_with_key(&replacement, |_, _| Ok(None));
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            let error = failed.expect_err("the state dir takes no new file");
+            assert_eq!(fs::read(profile_path(user)).unwrap(), before, "{error}");
+            assert!(store.exists() && journal.exists(), "{error}");
+        }
+        save_with_key(&replacement, |_, _| Ok(None)).unwrap();
+        assert!(!store.exists(), "the store goes");
+        assert!(
+            !journal.exists(),
+            "and its journal, so recovery cannot restore it"
+        );
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(profile_path(user)).unwrap()).unwrap();
+        assert_eq!(on_disk["uid"], 6702);
         leave_uid_sandbox(&dir);
     }
 

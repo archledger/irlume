@@ -16517,6 +16517,42 @@ mod tests {
         );
     }
 
+    /// Plant `user`'s plaintext enrollment recorded for `uid` and, beside it,
+    /// a plaintext added-camera store with one group bound to it, as a host
+    /// without a TPM writes them.
+    fn plant_camera_store_beside_enrollment_for(dir: &std::path::Path, user: &str, uid: u32) {
+        let (mut enrollment, mut store) = camera_group_fixture(dir);
+        enrollment.user = user.into();
+        enrollment.uid = Some(uid);
+        write_enrollment(dir, &enrollment);
+        store.owner = user.into();
+        store.primary_snapshot_sha256 = irlume_common::sha256_hex(
+            &std::fs::read(dir.join(format!("{user}.json"))).expect("primary bytes"),
+        );
+        irlume_core::multi_camera::save_secondary_resolved(
+            &irlume_core::multi_camera::secondary_store_path(user),
+            &store,
+            |_| Ok(None),
+        )
+        .expect("plant the camera store");
+    }
+
+    /// The number of profiles and of camera groups a listing shows.
+    fn profiles_and_camera_groups(response: Response) -> (usize, usize) {
+        match response {
+            Response::Enrollment {
+                profiles,
+                camera_groups,
+                camera_store_error,
+                ..
+            } => {
+                assert!(camera_store_error.is_none(), "{camera_store_error:?}");
+                (profiles.len(), camera_groups.len())
+            }
+            other => panic!("expected a listing, got {other:?}"),
+        }
+    }
+
     /// A primary enrollment recorded for another uid reads as not enrolled,
     /// and the camera store beside it, which records no uid, is that
     /// account's as well: a listing for the account the name now resolves
@@ -16530,33 +16566,8 @@ mod tests {
         let sb = sandbox("summary-other-camera-store");
         let user = "nobody";
         let recorded = uid_of(user).expect("NSS account nobody");
-        let (mut enrollment, mut store) = camera_group_fixture(&sb.dir);
-        enrollment.user = user.into();
-        enrollment.uid = Some(recorded);
-        write_enrollment(&sb.dir, &enrollment);
-        store.owner = user.into();
-        store.primary_snapshot_sha256 = irlume_common::sha256_hex(
-            &std::fs::read(sb.dir.join(format!("{user}.json"))).expect("primary bytes"),
-        );
-        // Plaintext, as a host without a TPM writes it: no key involved.
-        irlume_core::multi_camera::save_secondary_resolved(
-            &irlume_core::multi_camera::secondary_store_path(user),
-            &store,
-            |_| Ok(None),
-        )
-        .expect("plant the camera store");
-        let listing = |response: Response| match response {
-            Response::Enrollment {
-                profiles,
-                camera_groups,
-                camera_store_error,
-                ..
-            } => {
-                assert!(camera_store_error.is_none(), "{camera_store_error:?}");
-                (profiles.len(), camera_groups.len())
-            }
-            other => panic!("expected a listing, got {other:?}"),
-        };
+        plant_camera_store_beside_enrollment_for(&sb.dir, user, recorded);
+        let listing = profiles_and_camera_groups;
         let root = peer(0);
         {
             let _then = irlume_core::account::remember(user, recorded);
@@ -16575,6 +16586,39 @@ mod tests {
         let cached = dispatch_status(&list_profiles_of(user), &root)
             .expect("the published summary answers from the cache");
         assert_eq!(listing(cached), (0, 0));
+    }
+
+    /// Once the account the name now resolves to enrolls, its enrollment
+    /// write removes the camera store of the enrollment it replaced, so a
+    /// listing shows the new profile and no camera group, from the worker or
+    /// from the cache.
+    #[test]
+    fn a_listing_shows_no_camera_group_of_the_enrollment_a_new_account_replaced() {
+        // Ends in storage::save, which seals a template key on a TPM host;
+        // same convention as the other mutation tests.
+        if irlume_core::template_key::tpm_available() {
+            jout_debug!("skipping: TPM present; storage::save would touch real hardware");
+            return;
+        }
+        let _g = enrollment_summary_test_lock();
+        let mut e = engine();
+        let sb = sandbox("summary-replaced-camera-store");
+        let user = "nobody";
+        let recorded = uid_of(user).expect("NSS account nobody");
+        plant_camera_store_beside_enrollment_for(&sb.dir, user, recorded);
+        let _recreated = irlume_core::account::remember(user, recorded.wrapping_add(1));
+        // The write `irlume enroll` ends in for the new account.
+        irlume_core::storage::save(&enrollment_with(user, &["Face Scan 1"]))
+            .expect("the new account's enrollment");
+        let root = peer(0);
+        assert_eq!(
+            profiles_and_camera_groups(dispatch(list_profiles_of(user), &root, &mut e)),
+            (1, 0),
+            "the new account's profile, and no group of the replaced enrollment"
+        );
+        let cached = dispatch_status(&list_profiles_of(user), &root)
+            .expect("the published summary answers from the cache");
+        assert_eq!(profiles_and_camera_groups(cached), (1, 0));
     }
 
     #[test]

@@ -260,6 +260,12 @@ impl WriteKey {
         &self.key
     }
 
+    /// Whether this key replaces another uid's: the enrollment written under
+    /// it replaces that account's enrollment.
+    pub(crate) fn replaces_another(&self) -> bool {
+        self.replaced.is_some()
+    }
+
     /// Finish or undo a replacement by how the enrollment write under this
     /// key went (`published`: what the write made visible, `None` when it
     /// published nothing). Published and durable: the replaced key's

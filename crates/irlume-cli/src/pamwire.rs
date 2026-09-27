@@ -474,12 +474,19 @@ fn reconcile() -> ExitCode {
              (sudo={with_sudo}, polkit={with_polkit}, lock={with_lock}); a future distro PAM \
              update will now re-apply it automatically"
         );
+        // The override maintenance a marked run does, on this run too: an
+        // upgrade or a state-directory recovery lands here, and its legacy
+        // overrides get their tracking line and a changed vendor copy is
+        // followed now rather than on the next reconcile.
+        let maintained = maintain_overrides();
         // Package upgrades start this run, so the face lines of a LightDM
         // that serves remote login screens come out here, not on a later one.
-        if remote_seat_change().is_some() {
-            return reconcile_wiring(with_sudo, with_polkit, with_lock, false);
-        }
-        return ExitCode::SUCCESS;
+        let code = if remote_seat_change().is_some() {
+            reconcile_wiring(with_sudo, with_polkit, with_lock, false)
+        } else {
+            ExitCode::SUCCESS
+        };
+        return if maintained { code } else { ExitCode::FAILURE };
     };
     // The marker records what `login enable` wired, and it can drift: a real
     // install was found with an irlume-created /etc/pam.d/polkit-1 while its
@@ -2064,7 +2071,21 @@ fn apply_surface(
             crate::logintx::ABSENT.to_string()
         }
     };
-    let error = error.or(read_error);
+    // Kept means this run wrote nothing there. A file that no longer reads as
+    // it did before (another writer replaced or removed it meanwhile) is not
+    // this run's to record as kept: it is recorded as it stands, untouched,
+    // so neither the marker nor a rollback takes that other change for ours.
+    if kept && read_error.is_none() && changed_since_read(before.as_deref(), &after_sha256) {
+        return untouched_record(
+            svc,
+            role,
+            format!(
+                "{} changed while this run kept it as it was; recorded as it stands",
+                svc.etc
+            ),
+        );
+    }
+    let (error, kept) = settle_surface(error, read_error, kept);
     // The same question for the backup: what did apply leave there. A
     // rollback that overwrites a backup somebody replaced afterwards is
     // the same defect as one that overwrites a stack.
@@ -2083,6 +2104,35 @@ fn apply_surface(
         sidecar_after_sha256: sidecar.after_sha256,
         error,
         kept,
+    }
+}
+
+/// Whether the file at a surface now differs from what this run read before
+/// deciding: `before` is that content (`None` when absent), `after_sha256`
+/// the digest read afterwards (`ABSENT` when gone).
+fn changed_since_read(before: Option<&str>, after_sha256: &str) -> bool {
+    let before_sha256 = before.map_or_else(
+        || crate::logintx::ABSENT.to_string(),
+        |text| crate::logintx::sha256_hex(text.as_bytes()),
+    );
+    before_sha256 != after_sha256
+}
+
+/// A surface's error and whether it was kept, once its after-state has been
+/// read. A kept surface (irlume left it as it was rather than update it)
+/// counts as kept only when that read succeeded: a file another writer made
+/// unreadable meanwhile is an I/O failure, so the read error leads and the
+/// surface is not kept, and `marker_follows` does not take it for a plain
+/// refusal. Otherwise the write's error leads, as before.
+fn settle_surface(
+    error: Option<String>,
+    read_error: Option<String>,
+    kept: bool,
+) -> (Option<String>, bool) {
+    match (error, read_error) {
+        (error, None) => (error, kept),
+        (Some(refusal), Some(io)) if kept => (Some(format!("{io} (after: {refusal})")), false),
+        (error, io) => (error.or(io), false),
     }
 }
 
@@ -4077,6 +4127,50 @@ mod tests {
             let (back, undone) = unwire_lines(&wired);
             assert!(undone && !content_has_module(&back));
         }
+    }
+
+    /// A kept surface is this run's to record only while the file reads as it
+    /// did before: replaced or removed meanwhile, it is recorded as it stands.
+    #[test]
+    fn a_kept_surface_must_read_as_before() {
+        let text = "auth include system-auth\n";
+        let digest = crate::logintx::sha256_hex(text.as_bytes());
+        assert!(!changed_since_read(Some(text), &digest));
+        assert!(changed_since_read(Some(text), crate::logintx::ABSENT));
+        assert!(changed_since_read(
+            Some(text),
+            &crate::logintx::sha256_hex(b"auth include other\n")
+        ));
+        assert!(!changed_since_read(None, crate::logintx::ABSENT));
+        assert!(changed_since_read(None, &digest));
+    }
+
+    /// A kept surface stays kept only once its after-state was read; a read
+    /// failure after the decision leads with the I/O error and is not kept,
+    /// so the marker does not follow it as a plain refusal.
+    #[test]
+    fn a_kept_surface_needs_its_after_state() {
+        let refusal = Some("kept: would move a jump".to_string());
+        let io = Some("read /etc/pam.d/x after changing it: Is a directory".to_string());
+        assert_eq!(
+            settle_surface(refusal.clone(), None, true),
+            (refusal.clone(), true)
+        );
+        let (error, kept) = settle_surface(refusal.clone(), io.clone(), true);
+        assert!(!kept);
+        let error = error.unwrap();
+        assert!(
+            error.starts_with("read /etc/pam.d/x after changing it"),
+            "{error}"
+        );
+        assert!(error.contains("would move a jump"), "{error}");
+        // Not kept: the write's error leads as before, else the read's.
+        assert_eq!(
+            settle_surface(Some("write failed".into()), io.clone(), false),
+            (Some("write failed".to_string()), false)
+        );
+        assert_eq!(settle_surface(None, io.clone(), false), (io, false));
+        assert_eq!(settle_surface(None, None, false), (None, false));
     }
 
     #[test]

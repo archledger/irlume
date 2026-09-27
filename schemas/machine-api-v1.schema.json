@@ -33,6 +33,23 @@
     },
     "error": {
       "$ref": "#/$defs/error"
+    },
+    "transaction_id": {
+      "description": "A failed login.apply that still recorded its transaction (a partial apply): the id to verify or roll back with. Absent on other failures.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "failed": {
+      "description": "A partial login.apply failure: how many surfaces failed. Absent on other failures.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "changes": {
+      "description": "A partial login.apply failure: every surface's result, as the success document's data.changes. Absent on other failures and from builds before 0.15.0.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/loginApplyChange"
+      }
     }
   },
   "allOf": [
@@ -218,6 +235,29 @@
         "properties": {
           "data": {
             "$ref": "#/$defs/cameraCensusData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "command": {
+            "const": "login.apply"
+          }
+        },
+        "required": [
+          "ok",
+          "command"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/loginApplyData"
           }
         }
       }
@@ -1219,6 +1259,78 @@
             "type": "string"
           },
           "minItems": 1
+        }
+      }
+    },
+    "loginApplyData": {
+      "type": "object",
+      "required": [
+        "transaction_id",
+        "plan_id",
+        "action",
+        "changes",
+        "applied",
+        "failed"
+      ],
+      "properties": {
+        "transaction_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "plan_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "action": {
+          "enum": [
+            "enable",
+            "disable"
+          ]
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/loginApplyChange"
+          }
+        },
+        "applied": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "loginApplyChange": {
+      "type": "object",
+      "description": "One surface of a login apply: what the plan did there and whether it landed.",
+      "required": [
+        "surface",
+        "role",
+        "change",
+        "applied"
+      ],
+      "properties": {
+        "surface": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1
+        },
+        "change": {
+          "type": "string",
+          "minLength": 1
+        },
+        "applied": {
+          "type": "boolean"
+        },
+        "kept": {
+          "type": "boolean",
+          "description": "True for a surface irlume left as it was rather than update it (the plan's keep-edited-override); it fails the apply without anything written there. Added in 0.15.0; absent from older builds."
         }
       }
     }

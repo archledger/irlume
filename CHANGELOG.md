@@ -311,6 +311,20 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume login reconcile` keeps irlume's overrides in step with their
+  vendor files on the run that adopts a missing `login.wired` marker (an
+  upgrade, or a state directory recovered without it), as a run with the
+  marker does, instead of leaving that to the next reconcile (#873).
+
+- `irlume login apply --json` names the surfaces a partial apply left
+  behind: its failure document now carries `changes`, one entry per
+  surface as on success, and every change in either document carries
+  `kept`, true for a surface irlume left as it was rather than update
+  it; the machine API schema now describes both documents. A surface is
+  counted as kept only once its after-state could be read; a file made
+  unreadable, replaced or removed meanwhile is reported as such and
+  recorded as it stands (#873).
+
 - A GNOME keyring token is no longer armed where no login delivers it, and
   `irlume login disable` no longer removes the line that delivers one. The
   token reaches the keyring only through irlume's session line in the login

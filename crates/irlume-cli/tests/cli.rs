@@ -2393,6 +2393,64 @@ session    optional                     pam_irlume.so reseal\n",
     );
 }
 
+/// The run that adopts a missing marker (an upgrade, or a state directory
+/// recovered without it) keeps irlume's overrides in step as a marked run
+/// does, instead of leaving that to the next reconcile.
+#[test]
+fn login_reconcile_that_adopts_the_marker_maintains_overrides_too() {
+    let mut sb = Sandbox::new("reconcile-adopt-overrides");
+    sb.hidden.push("/etc/systemd/system");
+    let etc = sb.path("pam-etc");
+    let vendor = sb.path("pam-vendor");
+    std::fs::create_dir_all(&etc).unwrap();
+    std::fs::create_dir_all(&vendor).unwrap();
+    let sddm_vendor = "#%PAM-1.0\nauth     substack       common-auth\naccount  include        common-account\nsession  include        common-session\n";
+    let sddm =
+        "# irlume: created from /usr/lib/pam.d/sddm; delete this file to restore the vendor copy\n\
+#%PAM-1.0\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth     substack       common-auth\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+auth       optional                     pam_irlume.so keyring\n\
+auth       optional                     pam_irlume.so reseal\n\
+account  include        common-account\n\
+session  include        common-session\n\
+session    optional                     pam_irlume.so reseal\n";
+    std::fs::write(vendor.join("sddm"), sddm_vendor).unwrap();
+    std::fs::write(etc.join("sddm"), sddm).unwrap();
+    assert!(!sb.path("state/login.wired").exists());
+    let (code, out, err) = run(support::isolated_root_command(
+        &sb.root,
+        BIN,
+        &["login", "reconcile"],
+        &[],
+        &sb.hidden,
+        &[(&etc, "/etc/pam.d"), (&vendor, "/usr/lib/pam.d")],
+    )
+    .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
+    .env("IRLUME_PAM_LOCK", sb.path("pam.lock")));
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        err.contains("adopted the existing face-login wiring"),
+        "{err}"
+    );
+    assert!(
+        err.contains(
+            "[login] /etc/pam.d/sddm: recorded /usr/lib/pam.d/sddm in the override header; \
+             no PAM line changed"
+        ),
+        "{err}"
+    );
+    let now = std::fs::read_to_string(etc.join("sddm")).unwrap();
+    assert!(
+        now.lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("# irlume: override v1 vendor-sha256="),
+        "{now}"
+    );
+}
+
 /// The auth line `n` modules after the first auth line containing `needle`:
 /// where a `default=n` on that line lands.
 fn auth_lands_after(text: &str, needle: &str, n: usize) -> String {

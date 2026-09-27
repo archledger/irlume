@@ -365,6 +365,23 @@ pub(crate) fn ensure_key_with(
 /// The unsealed template key as the TPM seam returns it: zeroized on drop.
 pub type UnsealedKey = Zeroizing<Vec<u8>>;
 
+/// The key resolver for reads: `user`'s existing template key, unsealed
+/// read-only, or `None` on a host without a TPM. It never mints a key, never
+/// rewrites the key envelope and never persists a storage root key, so a
+/// read cannot create key state for an account whose key is gone (ADR-0024
+/// §4.3). With no key sealed it fails before opening the TPM. Minting stays
+/// on the write paths, under the user state lock ([`ensure_key`]).
+///
+/// # Errors
+/// Returns an error when no key is sealed for `user`, or when the unseal
+/// fails.
+pub(crate) fn existing_key_read_only(user: &str) -> Result<Option<UnsealedKey>> {
+    if !tpm_available() {
+        return Ok(None);
+    }
+    load_key_read_only_unlocked(user).map(Some)
+}
+
 /// Lends the account template key to the readers of one authentication
 /// request (ADR-0025). Implementations unseal at most once per request and
 /// lend a borrow, never a copy.
@@ -417,12 +434,7 @@ impl RequestTemplateKey {
     /// needed, and lends nothing on a host without a TPM.
     #[must_use]
     pub fn production() -> Self {
-        Self::with_unsealer(|user| {
-            if !tpm_available() {
-                return Ok(None);
-            }
-            load_key_read_only_unlocked(user).map(Some)
-        })
+        Self::with_unsealer(existing_key_read_only)
     }
 
     /// A source with an injected unsealer (tests count and script it).

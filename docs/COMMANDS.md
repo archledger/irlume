@@ -135,7 +135,9 @@ Adding or replacing trusted faces requires OS authorization for a non-root accou
 Removing a whole profile (`profiles delete --profile ...` without `--scan`) or
 a recognizer's face data (`profiles forget-model`) also requires the
 `org.irlume.enroll` approval, including the TUI and direct socket clients.
-Removing the final profile retires its template key and recovery passphrase.
+Removing the final profile also removes the added cameras' store
+(`cameras/<user>.json`, ADR-0024) and retires the template key and recovery
+passphrase.
 Denied or cancelled approval leaves the enrollment and recovery files unchanged.
 Deleting individual scans and renaming profiles/scans keep their existing behavior;
 a profile's final scan cannot be deleted individually. Root retains administrative

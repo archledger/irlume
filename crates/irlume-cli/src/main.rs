@@ -721,7 +721,7 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
         Request::DeleteProfile { .. } | Request::ForgetRecognizer { .. }
     ) {
         println!("[profiles] Removing a profile or a recognizer's face data requires OS approval for a non-root user.");
-        println!("[profiles] If no profiles remain, the template key and recovery passphrase are also erased.");
+        println!("[profiles] If no profiles remain, the added cameras' scans, the template key and the recovery passphrase are also erased.");
     }
     match daemon_request(&req) {
         Ok(Response::Enrollment {

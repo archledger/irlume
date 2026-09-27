@@ -1141,19 +1141,72 @@ pub fn store_is_encrypted(user: &str) -> irlume_common::Result<Option<bool>> {
     }
 }
 
-#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-pub fn delete(user: &str) -> irlume_common::Result<bool> {
+/// What [`delete`] found and removed for one account.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Deleted {
+    /// The primary enrollment file existed and was removed.
+    pub enrollment: bool,
+    /// The added cameras' store (`cameras/<user>.json`) or its commit
+    /// journal existed and was removed.
+    pub camera_store: bool,
+}
+
+/// Deletes all of `user`'s face data under the user state lock: the added
+/// cameras' store and its commit journal (removing the account's face data
+/// covers every camera group, ADR-0024 §4.2), then the primary enrollment,
+/// then the now-orphaned template key and recovery envelope (a fresh
+/// enrollment mints a new key).
+///
+/// The camera store goes first, its journal before it: a journal left
+/// behind would let the next authentication's commit recovery rewrite the
+/// store from it. A failure part way leaves the primary enrollment in place,
+/// so the same request can be repeated, rather than an unenrolled account
+/// whose camera store no request removes any more.
+///
+/// # Errors
+/// Returns the lock error, or the I/O error of the first removal that
+/// fails; whatever was removed before it stays removed.
+pub fn delete(user: &str) -> irlume_common::Result<Deleted> {
     let _state = template_key::UserStateLock::acquire(user)?;
+    let camera_store = delete_camera_store_unlocked(user)?;
     let path = profile_path(user);
     let existed = path.exists();
     if existed {
         fs::remove_file(&path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
     }
-    // Deleting all face data also retires the now-orphaned template key and its
-    // recovery envelope (a fresh enrollment mints a new key).
     template_key::forget_key_unlocked(user)?;
     template_key::forget_recovery_unlocked(user)?;
-    Ok(existed)
+    Ok(Deleted {
+        enrollment: existed,
+        camera_store,
+    })
+}
+
+/// Removes `user`'s added-camera commit journal, then the store, syncing the
+/// directory after each removal so the journal cannot outlive the store
+/// after a crash. The caller holds the user state lock. `Ok(true)` when
+/// either file existed.
+fn delete_camera_store_unlocked(user: &str) -> irlume_common::Result<bool> {
+    let store = crate::multi_camera::secondary_store_path(user);
+    let journal = crate::multi_camera::commit::intent_path_for(&store);
+    let mut removed = false;
+    for path in [&journal, &store] {
+        match fs::remove_file(path) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(irlume_common::Error::Io(format!(
+                    "remove {}: {e}",
+                    path.display()
+                )))
+            }
+        }
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::File::open(dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| irlume_common::Error::Io(format!("sync {}: {e}", dir.display())))?;
+    }
+    Ok(removed)
 }
 
 /// Has the startup IR compatibility sweep already run for this space?
@@ -1259,6 +1312,109 @@ mod tests {
             list_users_at(&dir.join("nonexistent")).is_empty(),
             "a missing dir is no users, never an error"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Plants `u`'s enrollment (plaintext), added-camera store and journal,
+    /// sealed-key and recovery files, plus another account's camera store,
+    /// under a fresh state dir. Returns (primary, store, journal, other).
+    fn plant_account_state(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let _ = fs::remove_dir_all(dir);
+        std::env::set_var("IRLUME_STATE_DIR", dir);
+        let primary = profile_path("u");
+        fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        fs::write(&primary, serialize_enrollment(&sample(), None).unwrap()).unwrap();
+        let store = crate::multi_camera::secondary_store_path("u");
+        let journal = crate::multi_camera::commit::intent_path_for(&store);
+        let other = crate::multi_camera::secondary_store_path("v");
+        fs::create_dir_all(store.parent().unwrap()).unwrap();
+        for path in [&store, &journal, &other] {
+            fs::write(path, b"{}").unwrap();
+        }
+        for path in [
+            template_key::key_path("u"),
+            template_key::recovery_path("u"),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"{}").unwrap();
+        }
+        (primary, store, journal, other)
+    }
+
+    #[test]
+    fn deleting_an_account_removes_its_added_camera_store_and_journal() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("delete-camera-store"));
+        let (primary, store, journal, other) = plant_account_state(&dir);
+
+        assert_eq!(
+            delete("u").unwrap(),
+            Deleted {
+                enrollment: true,
+                camera_store: true
+            }
+        );
+        for path in [
+            primary,
+            store.clone(),
+            journal,
+            template_key::key_path("u"),
+            template_key::recovery_path("u"),
+        ] {
+            assert!(!path.exists(), "{} outlived the deletion", path.display());
+        }
+        assert!(
+            other.exists(),
+            "another account's camera store is untouched"
+        );
+
+        // A camera store left without its enrollment goes on the next
+        // deletion too, and a deletion with nothing left is a no-op.
+        fs::write(&store, b"{}").unwrap();
+        assert_eq!(
+            delete("u").unwrap(),
+            Deleted {
+                enrollment: false,
+                camera_store: true
+            }
+        );
+        assert!(!store.exists());
+        assert_eq!(delete("u").unwrap(), Deleted::default());
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_camera_journal_that_cannot_be_removed_keeps_the_store_and_the_enrollment() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("delete-camera-journal"));
+        let (primary, store, journal, _) = plant_account_state(&dir);
+        // A directory in the journal's place cannot be unlinked, even by root.
+        fs::remove_file(&journal).unwrap();
+        fs::create_dir_all(journal.join("blocker")).unwrap();
+
+        delete("u").expect_err("a journal that stays must fail the deletion");
+        assert!(store.exists(), "the store goes only after its journal");
+        assert!(
+            primary.exists(),
+            "the enrollment stays so the deletion can be repeated"
+        );
+        assert!(template_key::key_path("u").exists());
+
+        fs::remove_dir_all(&journal).unwrap();
+        assert_eq!(
+            delete("u").unwrap(),
+            Deleted {
+                enrollment: true,
+                camera_store: true
+            }
+        );
+        assert!(!store.exists() && !primary.exists());
+        std::env::remove_var("IRLUME_STATE_DIR");
         let _ = fs::remove_dir_all(&dir);
     }
 

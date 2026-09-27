@@ -6279,7 +6279,7 @@ impl App {
                 let p = self.profiles[pi].name.clone();
                 self.confirm = Some((
                     format!(
-                        "Delete profile '{p}' and all its scans? OS approval is required for non-root users. Removing the last profile also erases its recovery passphrase."
+                        "Delete profile '{p}' and all its scans? OS approval is required for non-root users. Removing the last profile also erases the added cameras' scans, the template key and the recovery passphrase."
                     ),
                     "Delete",
                     ConfirmAct::Daemon(Request::DeleteProfile {
@@ -15915,6 +15915,7 @@ mod tests {
                 assert!(q.contains("Delete profile 'p1'"), "got: {q}");
                 assert!(q.contains("OS approval"), "got: {q}");
                 assert!(q.contains("recovery"), "got: {q}");
+                assert!(q.contains("added cameras' scans"), "got: {q}");
                 assert_eq!((user.as_str(), profile.as_str()), ("testuser", "p1"));
             }
             _ => panic!("expected the delete-profile confirm"),

@@ -852,7 +852,10 @@ All notable changes to irlume are documented here. This project adheres to
   files of at most 64 KiB, never through a symbolic link at their own
   name. In an account's tree, an envelope that cannot be read and that
   root does not own is named against that account instead of stopping
-  the uninstall; one root owns still stops it, as before.
+  the uninstall; one root owns, or one whose owner cannot be read, still
+  stops it, as before. A `keyring` link in that tree is followed only to
+  a directory root owns, whose tokens then count like any root store's;
+  the removal takes only the link.
 
 - `irlume login disable` leaves a stack irlume edits in place (an `/etc`
   file with no vendor copy, such as `sudo` or `polkit-1` on Debian, Ubuntu

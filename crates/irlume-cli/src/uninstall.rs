@@ -1142,7 +1142,9 @@ impl VerifiedTree {
     }
 
     /// Whether the tree's keyring directory is a real directory owned by
-    /// `uid` (root outside tests), which only a root irlumed writes.
+    /// `uid` (root outside tests), which only a root irlumed writes. One
+    /// that cannot be opened is judged by its own owner, not followed; when
+    /// that cannot be read either, the answer is unknown.
     fn keeps_store_of(&self, uid: u32) -> Result<bool, String> {
         use std::os::unix::fs::MetadataExt as _;
         let shown = self.path.join("keyring");
@@ -1152,8 +1154,40 @@ impl VerifiedTree {
                 .map(|meta| meta.uid() == uid)
                 .map_err(|e| format!("{}: {e}", shown.display())),
             Ok(_) => Ok(false),
-            Err(e) => Err(format!("{}: {e}", shown.display())),
+            Err(e) => match self.keyring_owner() {
+                Some(owner) => Ok(owner == uid),
+                None => Err(format!("{}: {e}", shown.display())),
+            },
         }
+    }
+
+    /// The owner of the tree's `keyring` entry itself, not followed; `None`
+    /// when it cannot be read.
+    fn keyring_owner(&self) -> Option<u32> {
+        use std::os::unix::fs::MetadataExt as _;
+        let tree = fd_path(&self.dir).ok()?;
+        std::fs::symlink_metadata(tree.join("keyring"))
+            .ok()
+            .map(|meta| meta.uid())
+    }
+
+    /// Where a link at the tree's `keyring` leads, opened, when that is a
+    /// directory `root_uid` owns: a root irlumed's store linked into the
+    /// tree, whose tokens the wipe would strand by removing only the link.
+    /// `None` when the link leads nowhere, into a loop, or to anything else;
+    /// an error when where it leads cannot be established.
+    fn linked_root_store(&self, root_uid: u32) -> Result<Option<std::fs::File>, String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let shown = self.path.join("keyring");
+        let fail = |e: std::io::Error| format!("{}: {e}", shown.display());
+        let tree = fd_path(&self.dir).map_err(fail)?;
+        let dir = match open_dir(&tree.join("keyring")) {
+            Ok(dir) => dir,
+            Err(e) if is_absent(&e) || e.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
+            Err(e) => return Err(fail(e)),
+        };
+        let owner = dir.metadata().map_err(fail)?.uid();
+        Ok((owner == root_uid).then_some(dir))
     }
 
     /// The accounts with an enrollment in the tree.
@@ -1204,10 +1238,12 @@ impl VerifiedTree {
 
     /// Count the tree's sealed envelopes into `sweep`. An envelope, or a
     /// keyring directory, that cannot be read refuses the uninstall when
-    /// `root_uid` (root outside tests) owns it, as one a root irlumed wrote
-    /// may hold the only copy of a keyring token. Anything else in the tree
-    /// the account could have put there itself, so it is named in `sweep`
-    /// instead, and removed with the tree.
+    /// `root_uid` (root outside tests) owns it, or when whose it is cannot
+    /// be read, as one a root irlumed wrote may hold the only copy of a
+    /// keyring token. A link at the keyring's name is followed only to a
+    /// directory root owns, which counts as that root store. Anything else in
+    /// the tree the account could have put there itself, so it is named in
+    /// `sweep` instead, and removed with the tree.
     fn sweep(&self, root_uid: u32, sweep: &mut TokenSweep) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt as _;
         let shown = self.path.join("keyring");
@@ -1226,19 +1262,34 @@ impl VerifiedTree {
         let dir = match self.keyring() {
             Ok(Child::Dir(dir)) => dir,
             Ok(Child::Absent) => return Ok(()),
-            Ok(Child::Link) => {
-                note(sweep, &shown, "is a symbolic link, which is not followed");
-                return Ok(());
-            }
+            // The wipe removes only the link; a root store it leads to
+            // stays, and the SRK eviction after the wipe would strand a token
+            // there, so that store counts as any root store does.
+            Ok(Child::Link) => match self.linked_root_store(root_uid)? {
+                Some(dir) => dir,
+                None => {
+                    note(
+                        sweep,
+                        &shown,
+                        "is a symbolic link to no directory root owns, which is not followed",
+                    );
+                    return Ok(());
+                }
+            },
             Ok(Child::Other) => {
                 note(sweep, &shown, "is not a directory, so it was not read");
                 return Ok(());
             }
-            Err(e) if refuses(None) => return Err(format!("{}: {e}", shown.display())),
-            Err(e) => {
-                note(sweep, &shown, &unread(&e));
-                return Ok(());
-            }
+            // Judged by its own owner, not the tree's: a root store inside an
+            // account's tree cannot be opened (a root-squashed or FUSE mount,
+            // an I/O error), or whose it is cannot be read.
+            Err(e) => match self.keyring_owner() {
+                Some(owner) if owner != root_uid => {
+                    note(sweep, &shown, &unread(&e));
+                    return Ok(());
+                }
+                _ => return Err(format!("{}: {e}", shown.display())),
+            },
         };
         let dir_owner = dir.metadata().ok().map(|meta| meta.uid());
         let listed = fd_path(&dir).map_err(|e| e.to_string()).and_then(|pinned| {
@@ -1597,7 +1648,15 @@ fn sealed_token_holders_with(
             }
         }
     }
-    for root in roots {
+    // A unit root that is an account's verified tree was swept above, under
+    // the rules for what that account could have put there itself, as the
+    // teardown handles it.
+    let swept = |root: &PathBuf| {
+        homes
+            .iter()
+            .any(|home| matches!(home, HomeTree::Verified(tree) if tree.path == *root))
+    };
+    for root in roots.iter().filter(|root| !swept(root)) {
         sweep.collect(
             irlume_core::keyring::list_sealed_kinds_in(root)
                 .map_err(|e| format!("{}: {e}", root.join("keyring").display()))?,
@@ -2874,6 +2933,153 @@ mod tests {
         // An envelope that parses still counts: a token refuses as before.
         std::fs::write(keyring.join("carol.json"), TOKEN_ENVELOPE).unwrap();
         assert_eq!(sweep_as(0).unwrap().holders, vec!["carol".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A link at the keyring's name that leads to a directory root owns is
+    /// that root store: its tokens count, and what in it cannot be read
+    /// refuses. The wipe removes only the link. A link to anything else is
+    /// named, not followed.
+    #[test]
+    fn a_keyring_link_to_a_root_store_counts_and_any_other_link_is_named() {
+        use std::os::unix::fs::MetadataExt as _;
+        let base =
+            std::env::temp_dir().join(format!("irlume-home-keyring-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let tree_path = home_state_path(&alice.home);
+        std::fs::create_dir_all(&tree_path).unwrap();
+        let store = base.join("srv/keyring");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("carol.json"), TOKEN_ENVELOPE).unwrap();
+        let link = tree_path.join("keyring");
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+        let owner = std::fs::metadata(&store).unwrap().uid();
+        let default = base.join("default-state");
+        let sweep_as = |root_uid: u32| {
+            let homes = home_trees(std::slice::from_ref(&alice), &default);
+            sealed_token_holders_with(Ok(Vec::new()), &homes, &[], &[], root_uid)
+        };
+        // This process stands in for root: the store is root's when the
+        // injected root uid owns it.
+        assert_eq!(sweep_as(owner).unwrap().holders, vec!["carol".to_string()]);
+        std::fs::write(store.join("x.json"), "{}").unwrap();
+        let err = sweep_as(owner).unwrap_err();
+        assert!(err.contains("x.json"), "{err}");
+        std::fs::remove_file(store.join("x.json")).unwrap();
+        let sweep = sweep_as(owner.wrapping_add(1)).unwrap();
+        assert!(sweep.holders.is_empty(), "{sweep:?}");
+        assert!(
+            sweep.notes.len() == 1
+                && sweep.notes[0].contains("symbolic link to no directory root owns"),
+            "{:?}",
+            sweep.notes
+        );
+        // A link to nothing, or into a loop, is named too.
+        for target in [base.join("nowhere"), link.clone()] {
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let sweep = sweep_as(owner).unwrap();
+            assert!(
+                sweep.holders.is_empty()
+                    && sweep.notes.len() == 1
+                    && sweep.notes[0].contains("symbolic link"),
+                "{target:?}: {sweep:?}"
+            );
+        }
+        // The login guards do not follow it.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+        let homes = home_trees(std::slice::from_ref(&alice), &default);
+        let HomeTree::Verified(tree) = &homes[0] else {
+            panic!("{homes:?}");
+        };
+        assert_eq!(tree.keeps_store_of(owner), Ok(false));
+        assert!(wipe_home_trees(&homes).is_empty());
+        assert!(!tree_path.exists(), "the tree and its link are removed");
+        assert!(store.join("carol.json").is_file(), "the store is not");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A keyring directory that cannot be opened is judged by its own owner:
+    /// the account's is named, root's refuses, and one whose owner cannot be
+    /// read refuses whoever owns the tree.
+    #[test]
+    fn an_unopenable_keyring_directory_is_judged_by_its_own_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if is_root() {
+            return; // root opens any mode
+        }
+        let base =
+            std::env::temp_dir().join(format!("irlume-home-keyring-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let tree_path = home_state_path(&alice.home);
+        let keyring = tree_path.join("keyring");
+        std::fs::create_dir_all(&keyring).unwrap();
+        let default = base.join("default-state");
+        let homes = home_trees(std::slice::from_ref(&alice), &default);
+        let sweep_as =
+            |root_uid: u32| sealed_token_holders_with(Ok(Vec::new()), &homes, &[], &[], root_uid);
+        let mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(&keyring, 0o000);
+        let (as_account, as_root) = (sweep_as(alice.uid + 1), sweep_as(alice.uid));
+        mode(&keyring, 0o700);
+        let sweep = as_account.expect("the account's own store does not refuse");
+        assert!(
+            sweep.notes.len() == 1 && sweep.notes[0].contains("could not be read"),
+            "{:?}",
+            sweep.notes
+        );
+        assert!(as_root.is_err_and(|e| e.contains("irlume/keyring")));
+        // The tree cannot be searched: whose the store is is unknown.
+        mode(&tree_path, 0o000);
+        let unknown = sweep_as(alice.uid + 1);
+        mode(&tree_path, 0o700);
+        assert!(unknown.is_err_and(|e| e.contains("irlume/keyring")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A unit root that is an account's verified tree is swept once, under
+    /// the account-tree rules, as the teardown treats it; another unit root
+    /// is still read strictly.
+    #[test]
+    fn a_unit_root_that_is_an_accounts_tree_is_swept_once() {
+        let base =
+            std::env::temp_dir().join(format!("irlume-home-unit-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let tree_path = home_state_path(&alice.home);
+        std::fs::create_dir_all(tree_path.join("keyring")).unwrap();
+        std::fs::write(tree_path.join("keyring/x.json"), "{}").unwrap();
+        let homes = home_trees(std::slice::from_ref(&alice), &base.join("default-state"));
+        let sweep = sealed_token_holders_with(
+            Ok(Vec::new()),
+            &homes,
+            std::slice::from_ref(&tree_path),
+            &[],
+            alice.uid.wrapping_add(1),
+        )
+        .expect("what the account wrote in its own tree does not refuse");
+        assert!(
+            sweep.notes.len() == 1 && sweep.notes[0].contains("x.json"),
+            "{:?}",
+            sweep.notes
+        );
+        let other = base.join("srv/irlume");
+        std::fs::create_dir_all(other.join("keyring")).unwrap();
+        std::fs::write(other.join("keyring/x.json"), "{}").unwrap();
+        let err = sealed_token_holders_with(
+            Ok(Vec::new()),
+            &homes,
+            &[tree_path, other.clone()],
+            &[],
+            alice.uid.wrapping_add(1),
+        )
+        .unwrap_err();
+        assert!(err.contains(other.to_str().unwrap()), "{err}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

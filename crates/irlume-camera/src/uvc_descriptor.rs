@@ -493,7 +493,7 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                     7 => {
                         // Both bmControls and bmControlsRuntime have the
                         // declared bControlSize (UVC 1.5 Encoding Unit).
-                        if len < 7 + 2 * usize::from(*d.get(6)?) {
+                        if uvc_version? != 0x0150 || len < 7 + 2 * usize::from(*d.get(6)?) {
                             return None;
                         }
                     }
@@ -513,7 +513,12 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                 }
             }
             0x05 => {
-                if len < 7 || endpoint_count.is_none() || !endpoint_addresses.insert(d[2]) {
+                if len < 7
+                    || endpoint_count.is_none()
+                    || d[2] & 0x0f == 0
+                    || d[2] & 0x70 != 0
+                    || !endpoint_addresses.insert(d[2])
+                {
                     return None;
                 }
                 if in_target_vc {
@@ -2443,6 +2448,18 @@ mod tests {
     #[test]
     fn every_interface_alternate_keeps_its_declared_endpoint_count() {
         let whole = attested_shape();
+        let endpoint_at = whole
+            .windows(7)
+            .rposition(|d| d[0] == 7 && d[1] == 5)
+            .unwrap();
+        for address in [0, 0x80, 0x91] {
+            let mut bytes = whole.clone();
+            bytes[endpoint_at + 2] = address;
+            assert_eq!(
+                ir_function_evidence(&bytes, 0),
+                Err(IrFunctionRefusal::Malformed)
+            );
+        }
         for count in [0, 2] {
             let mut bytes = whole.clone();
             bytes[18 + 9 + 4] = count;
@@ -2523,6 +2540,18 @@ mod tests {
     fn unknown_control_versions_and_entity_layouts_do_not_attest() {
         let whole = attested_shape();
         let header_at = 18 + 9 + 9;
+        for version in [0x0100u16, 0x0110] {
+            let mut bytes = whole.clone();
+            bytes[header_at + 3..header_at + 5].copy_from_slice(&version.to_le_bytes());
+            bytes.splice(
+                header_at + 13..header_at + 13,
+                [13, DESC_CS_INTERFACE, 7, 4, 2, 0, 3, 0, 0, 0, 0, 0, 0],
+            );
+            assert_eq!(
+                ir_function_evidence(&bytes, 0),
+                Err(IrFunctionRefusal::Malformed)
+            );
+        }
         for version in [0u16, 0x0101, 0x0111, 0x0151, 0x0200] {
             let mut bytes = whole.clone();
             bytes[header_at + 3..header_at + 5].copy_from_slice(&version.to_le_bytes());

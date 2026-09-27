@@ -259,7 +259,9 @@ pub(crate) fn node_entry_from_facts(facts: &NodeFacts) -> CensusEntry {
                      ceiling yet, so face authentication refuses it as exposure unmeasurable",
                 ),
             ),
-            Role::Ir if facts.paired && facts.fourccs.as_ref().is_none_or(Vec::is_empty) => (
+            Role::Ir if facts.paired && !facts.fourccs.as_ref().is_some_and(|formats| {
+                !formats.is_empty() && crate::role_from_formats(formats) == Role::Ir
+            }) => (
                 CensusClass::UvcIr { paired: true },
                 CensusVerdict::SupportedWithLimits(
                     "supported with limits: IR capture formats could not be confirmed; \
@@ -818,7 +820,12 @@ mod tests {
     #[test]
     fn a_paired_ir_node_with_no_reprobe_does_not_claim_the_secure_tier() {
         let mut f = facts("/dev/video2", Role::Ir, &[b"YUYV"]);
-        for formats in [None, Some(Vec::new())] {
+        for formats in [
+            None,
+            Some(Vec::new()),
+            Some(vec![*b"MJPG", *b"YUYV"]),
+            Some(vec![*b"GREY", *b"YUYV"]),
+        ] {
             f.fourccs = formats;
             f.luma_ir_check = None;
             let entry = node_entry_from_facts(&f);

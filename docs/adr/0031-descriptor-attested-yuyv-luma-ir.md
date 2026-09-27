@@ -106,8 +106,8 @@ all four of these hold:
 The only new input is the USB device's sysfs `descriptors` file, read only
 for a node whose formats are exactly `{YUYV}`. No extension-unit request is
 sent, no frame is captured, and no name or `vid:pid` table is consulted. The
-descriptor walk is strict: it steps by `bLength` through one configuration,
-and anything truncated, overrunning or inconsistent fails the attestation.
+descriptor walk steps by `bLength` through one configuration and refuses
+truncation, overruns and the structural inconsistencies checked below.
 A Processing Unit or extension unit whose `bLength` ends before its
 closing string index (`iProcessing`, `iExtension`) counts as truncated.
 For UVC 1.1 and later, a Processing Unit must also carry the final
@@ -128,7 +128,16 @@ version or entity subtype does not attest. Terminal and selector sizes
 follow the [Linux UVC descriptor definitions](https://github.com/torvalds/linux/blob/master/include/uapi/linux/usb/video.h);
 the Encoding Unit carries both control arrays described in
 [Microsoft's USBView layout](https://github.com/microsoft/Windows-driver-samples/blob/main/usb/usbview/h264.h).
-It does not read `wTotalLength`: the reporter's 5986:2113 `descriptors`
+The Encoding Unit is accepted only in UVC 1.5. Interface endpoints cannot
+name endpoint zero or set reserved address bits.
+
+The remaining source-reference graph checks and the VideoControl header's
+own total-length check are tracked in #913, required before implementing
+the exposure ceiling in §4. This is not a complete USB/UVC validator, and
+even a fully consistent descriptor is a device-supplied modality claim.
+YUYV credential release remains refused while §4 is pending.
+
+The configuration header's `wTotalLength` is not used: the reporter's 5986:2113 `descriptors`
 file carries 996 of the 1026 bytes its configuration header claims (linuxhw
 31A261423C, from a unit with the same bcdDevice 54.22, carries all 1026, and
 whether the reporter's unit or the capture path dropped the rest is not

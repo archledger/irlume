@@ -658,23 +658,7 @@ fn storage_for(
             system,
         }) => (keyring, template_key, system),
         Ok(Response::Error(error)) if error == "bad request" => return fallback(),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound
-                    | std::io::ErrorKind::PermissionDenied
-                    | std::io::ErrorKind::ConnectionRefused
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::NotConnected
-                    | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::TimedOut
-                    | std::io::ErrorKind::WouldBlock
-                    | std::io::ErrorKind::UnexpectedEof
-            ) =>
-        {
-            return fallback()
-        }
+        Err(error) if irlume_common::client::proves_daemon_absent(&error) => return fallback(),
         reply => {
             let reason = match reply {
                 Ok(Response::Error(error)) => format!("irlumed could not report storage: {error}"),
@@ -1492,8 +1476,8 @@ mod tests {
             Ok(Response::Error("bad request".into())),
             Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
             Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
-            Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
         ] {
             let expected = vec![storage_directory(
                 "/fallback/keyring",
@@ -1515,6 +1499,12 @@ mod tests {
             Ok(Response::Error("bad request: policy refused".into())),
             Ok(Response::Error("storage unavailable".into())),
             Ok(Response::Ok("unexpected".into())),
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted)),
+            Err(std::io::Error::from(std::io::ErrorKind::NotConnected)),
+            Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "invalid reply",

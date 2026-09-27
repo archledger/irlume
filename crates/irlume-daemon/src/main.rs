@@ -5500,7 +5500,18 @@ fn dispatch_status_with_diagnostics(
         Request::SealedStorage => {
             use irlume_common::storage_encryption::directory_encryption;
             let configured = |path: &std::path::Path, label: &str| {
-                let mut storage = directory_encryption(path);
+                // Core resolves relative overrides against this process's
+                // working directory. The CLI cannot infer that directory.
+                let mut storage = match std::path::absolute(path) {
+                    Ok(path) => directory_encryption(&path),
+                    Err(error) => irlume_common::StorageDirectory {
+                        path: path.to_string_lossy().into_owned(),
+                        encryption: irlume_common::storage_encryption::StorageEncryption::Unknown,
+                        reason: Some(format!(
+                            "could not resolve the daemon working directory: {error}"
+                        )),
+                    },
+                };
                 if peer.uid != 0 {
                     storage.path = label.into();
                     // Resolution errors can name the configured path or a
@@ -14624,6 +14635,39 @@ mod tests {
         {
             assert_eq!(public["path"], root["path"]);
             assert_eq!(public["encryption"], root["encryption"]);
+        }
+    }
+
+    #[test]
+    fn sealed_storage_resolves_relative_overrides_in_the_daemon_working_directory() {
+        let _guard = env_lock();
+        let _sb = sandbox("sealed-storage-relative");
+        std::env::set_var("IRLUME_STATE_DIR", ".");
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+        let cwd = std::env::current_dir().unwrap();
+        for (keyring, keys) in [("keyring", "template-keys"), (".", "./models")] {
+            if keyring == "." {
+                std::env::set_var("IRLUME_KEYRING_DIR", keyring);
+                std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", keys);
+            }
+            let Response::SealedStorage {
+                keyring: actual_keyring,
+                template_key,
+                ..
+            } = dispatch_status(&Request::SealedStorage, &peer(0)).unwrap()
+            else {
+                panic!("storage reply")
+            };
+            for (actual, relative) in [(actual_keyring, keyring), (template_key, keys)] {
+                let path = std::path::absolute(cwd.join(relative)).unwrap();
+                let expected = irlume_common::storage_encryption::directory_encryption(&path);
+                assert_eq!(actual, expected);
+                assert_ne!(
+                    actual.reason.as_deref(),
+                    Some("directory path is not absolute")
+                );
+            }
         }
     }
 

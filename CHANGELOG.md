@@ -876,7 +876,10 @@ All notable changes to irlume are documented here. This project adheres to
   refused, with nothing written, when the name resolves to another uid
   or to no account by the time it is saved, also for an enrollment that
   records no uid yet, which is held to the uid the name resolved to when
-  it was loaded. Nothing else is removed automatically. Records written
+  it was loaded. A root request that names an account holds the uid the
+  name resolved to when irlumed began serving it until the request ends,
+  so an enrollment captured, or a password checked, is saved or sealed
+  for that uid. Nothing else is removed automatically. Records written
   by earlier releases carry no uid; they are accepted and record it on
   their next write, except that moving a template key to a stronger
   policy keeps it unbound. A keyring envelope records it at the first

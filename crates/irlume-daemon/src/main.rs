@@ -5314,7 +5314,8 @@ fn note_camera_seat_refusal(uid: u32, unknown: bool) {
 /// a [`Privilege::RootOrTarget`] gate only as that account, so the account's
 /// uid is the peer's. The records the request checks and writes are then
 /// bound to the account that was authorized, whatever a later lookup of the
-/// name answers. `None` for root, for which the gate resolves no account.
+/// name answers. `None` for root, for which the gate resolves no account
+/// (the worker resolves it once: [`worker_account_uid`]).
 ///
 /// Only for a request the gate admitted: a refused peer's uid says nothing
 /// about the account it named.
@@ -5324,6 +5325,38 @@ fn gate_account_uid(req: &Request, peer: &Peer) -> Option<irlume_core::account::
         (Privilege::RootOrTarget { .. }, Some(user)) if peer.uid != 0 => {
             Some(irlume_core::account::remember(user, peer.uid))
         }
+        _ => None,
+    }
+}
+
+/// The uid held for a request the worker serves: [`gate_account_uid`], and
+/// for root, for which the gate resolves no account, the uid that the
+/// account the request names ([`Privilege::RootOrTarget`]) resolves to when
+/// the worker starts it. A request can run for a long time before it writes
+/// (an enrollment captures first and saves at the end; `SealPassword`
+/// verifies the password and then seals it), so its records are bound to the
+/// account the name resolved to when it started, whatever a later lookup
+/// answers. A name that resolves to no account, or whose lookup fails, holds
+/// nothing: the request's records then go by the lookups they make. Nor does
+/// root's `Authenticate` here: its arm resolves the account for the retry
+/// record before it loads a record, and holds that uid, so authentication
+/// makes no second lookup.
+fn worker_account_uid(req: &Request, peer: &Peer) -> Option<irlume_core::account::RememberedUid> {
+    if peer.uid != 0 {
+        return gate_account_uid(req, peer);
+    }
+    if matches!(req, Request::Authenticate { .. }) {
+        return None;
+    }
+    let posture = posture(req);
+    match (posture.privilege, posture.user) {
+        (Privilege::RootOrTarget { .. }, Some(user)) => match irlume_core::account::resolve(user) {
+            irlume_core::account::Resolution::Uid(uid) => {
+                Some(irlume_core::account::remember(user, uid))
+            }
+            irlume_core::account::Resolution::NoAccount
+            | irlume_core::account::Resolution::Unknown => None,
+        },
         _ => None,
     }
 }
@@ -6984,7 +7017,7 @@ fn dispatch_scoped_session_inner(
     if let Some(resp) = pregate(&req, peer) {
         return resp;
     }
-    let _gate_uid = gate_account_uid(&req, peer);
+    let _account_uid = worker_account_uid(&req, peer);
     if operation_authorization::required(&req, peer) {
         let result = authorization
             .ok_or_else(|| operation_authorization::REFUSED.to_owned())
@@ -10776,6 +10809,8 @@ mod tests {
             "account::resolve(",
             "summary_owner(",
             "dispatch_status(",
+            // Resolves the account a root peer's request names.
+            "worker_account_uid(",
         ];
         /// Drops char literals, string literals and line comments so a brace
         /// inside one is not counted as structure.
@@ -16421,8 +16456,8 @@ mod tests {
     /// A non-root peer passes the gate only as the account it names, so its
     /// request checks that account's records against the peer's uid, not
     /// against a later lookup of the name (stood in for here by a registered
-    /// answer for another uid). Root's request, for which the gate resolves
-    /// no account, goes by the lookup.
+    /// answer for another uid). Root's request goes by the lookup made when
+    /// the worker starts it.
     #[test]
     fn a_request_checks_records_against_the_uid_the_gate_established() {
         let _g = enrollment_summary_test_lock();
@@ -16446,6 +16481,76 @@ mod tests {
             0,
             "root's request goes by the lookup"
         );
+    }
+
+    /// Root's request resolves the account it names once, when the worker
+    /// starts it, and holds that uid for the whole request: a write made
+    /// after the name resolves to another uid (here the save at the end of a
+    /// reset enrollment's capture) records the uid the request started with,
+    /// since every record check resolves through the held uid. The lookup at
+    /// the start is stood in for by a registered answer, released before the
+    /// write so the name then resolves through NSS to another uid. A name no
+    /// account has holds nothing, and neither does a request that names no
+    /// account, nor an authentication request, whose arm holds the uid it
+    /// resolves for the retry record. A non-root peer's request holds the
+    /// peer's uid.
+    #[test]
+    fn a_root_request_holds_the_uid_its_account_resolved_to_when_it_started() {
+        use irlume_core::account::Resolution;
+        let _g = enrollment_summary_test_lock();
+        let sb = sandbox("root-request-uid");
+        let user = "nobody";
+        let now = uid_of(user).expect("NSS account nobody");
+        let then = now.wrapping_add(1);
+        let enroll = |user: &str| Request::Enroll {
+            user: user.into(),
+            profile: None,
+            scans: None,
+            reset: true,
+        };
+        let start = irlume_core::account::remember(user, then);
+        let held = worker_account_uid(&enroll(user), &peer(0));
+        drop(start);
+        assert!(held.is_some(), "root's request holds a uid");
+        assert_eq!(
+            irlume_core::account::resolve(user),
+            Resolution::Uid(then),
+            "the request's lookups answer the uid it started with"
+        );
+        // The write at the end of the capture, on a host without a TPM.
+        if !irlume_core::template_key::tpm_available() {
+            irlume_core::storage::save(&enrollment_with(user, &["Face Scan 1"]))
+                .expect("the enrollment captured for the account");
+            let saved: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(sb.dir.join(format!("{user}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(saved["uid"], then, "{saved}");
+        }
+        drop(held);
+        assert_eq!(irlume_core::account::resolve(user), Resolution::Uid(now));
+
+        let missing = "irlume-test-no-such-account";
+        assert_eq!(
+            irlume_core::account::resolve(missing),
+            Resolution::NoAccount
+        );
+        assert!(worker_account_uid(&enroll(missing), &peer(0)).is_none());
+        assert!(worker_account_uid(&Request::Ping, &peer(0)).is_none());
+        let authenticate = Request::Authenticate {
+            structured_errors: false,
+            user: user.into(),
+            service: None,
+            intent_confirmation: None,
+        };
+        assert!(
+            worker_account_uid(&authenticate, &peer(0)).is_none(),
+            "its arm resolves the account for the retry record"
+        );
+
+        let own = worker_account_uid(&enroll(user), &peer(then));
+        assert!(own.is_some());
+        assert_eq!(irlume_core::account::resolve(user), Resolution::Uid(then));
     }
 
     /// The same for a write: the account's own rename records the peer's uid

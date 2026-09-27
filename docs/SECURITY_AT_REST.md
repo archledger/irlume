@@ -189,7 +189,13 @@ Each load compares that uid with the account's current uid, resolved through
 NSS (so LDAP, SSSD and systemd-homed accounts resolve too). A request from
 the account itself (not root) passes irlumed's authorization check only when
 the name resolves to the caller's uid, so every record that request loads or
-writes is checked against, and records, the caller's uid. On an
+writes is checked against, and records, the caller's uid. A root request that
+names an account resolves the name once, when irlumed starts serving it, and
+its records are checked against, and record, that uid until it ends: an
+enrollment captured, or a keyring password checked, while the name resolved
+to one account is saved or sealed for that account's uid even when the name
+resolves to another uid by the time of the write. A name no account has, or
+whose lookup fails, is looked up again by each record check. On an
 authentication request irlumed reuses the lookup it already makes for the
 retry record, so the check adds no second lookup there. A cached profile
 listing is served only while the name resolves to the uid its load used.

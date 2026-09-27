@@ -1165,11 +1165,19 @@ pub struct Deleted {
 /// whose camera store no request removes any more.
 ///
 /// # Errors
-/// Returns the lock error, or the I/O error of the first removal that
-/// fails; whatever was removed before it stays removed.
+/// Returns the lock error, or the I/O error of the first removal or
+/// directory sync that fails; whatever was removed before it stays removed.
 pub fn delete(user: &str) -> irlume_common::Result<Deleted> {
+    delete_with(user, sync_directory)
+}
+
+/// [`delete`] with the camera directory's sync supplied (tests fail it).
+fn delete_with(
+    user: &str,
+    mut sync_dir: impl FnMut(&Path) -> std::io::Result<()>,
+) -> irlume_common::Result<Deleted> {
     let _state = template_key::UserStateLock::acquire(user)?;
-    let camera_store = delete_camera_store_unlocked(user)?;
+    let camera_store = delete_camera_store_unlocked(user, &mut sync_dir)?;
     let path = profile_path(user);
     let existed = path.exists();
     if existed {
@@ -1188,7 +1196,15 @@ pub fn delete(user: &str) -> irlume_common::Result<Deleted> {
 /// directory after each removal so the journal cannot outlive the store
 /// after a crash. The caller holds the user state lock. `Ok(true)` when any
 /// of these files existed.
-fn delete_camera_store_unlocked(user: &str) -> irlume_common::Result<bool> {
+///
+/// When every file is already gone the directory is synced anyway: an
+/// earlier attempt may have removed the last of them and then failed to
+/// sync, and the primary enrollment must not go while a power loss could
+/// still bring that file back. Only a missing directory skips the sync.
+fn delete_camera_store_unlocked(
+    user: &str,
+    sync_dir: &mut impl FnMut(&Path) -> std::io::Result<()>,
+) -> irlume_common::Result<bool> {
     let store = crate::multi_camera::secondary_store_path(user);
     let dir = store.parent().unwrap_or_else(|| Path::new("."));
     let mut paths = vec![
@@ -1196,6 +1212,8 @@ fn delete_camera_store_unlocked(user: &str) -> irlume_common::Result<bool> {
         store.clone(),
     ];
     paths.extend(camera_staging_files(&store, dir)?);
+    let sync_error =
+        |e: std::io::Error| irlume_common::Error::Io(format!("sync {}: {e}", dir.display()));
     let mut removed = false;
     for path in &paths {
         match fs::remove_file(path) {
@@ -1208,11 +1226,21 @@ fn delete_camera_store_unlocked(user: &str) -> irlume_common::Result<bool> {
                 )))
             }
         }
-        fs::File::open(dir)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|e| irlume_common::Error::Io(format!("sync {}: {e}", dir.display())))?;
+        sync_dir(dir).map_err(sync_error)?;
+    }
+    if !removed {
+        match sync_dir(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(sync_error(e)),
+        }
     }
     Ok(removed)
+}
+
+/// Makes the removals in `dir` durable.
+fn sync_directory(dir: &Path) -> std::io::Result<()> {
+    fs::File::open(dir)?.sync_all()
 }
 
 /// The staging files in `dir` that a writer of the added cameras' store at
@@ -1444,6 +1472,62 @@ mod tests {
             }
         );
         assert!(!store.exists() && !primary.exists());
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_repeated_deletion_syncs_the_camera_directory_before_the_enrollment_goes() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("delete-camera-resync"));
+        let (primary, store, journal, _) = plant_account_state(&dir);
+        let cameras = store.parent().unwrap().to_path_buf();
+        let failed = || std::io::Error::other("sync failed");
+
+        // The journal's removal is synced, the store's is not: both files
+        // are gone, but a power loss could still bring the store back.
+        let mut syncs = 0;
+        delete_with("u", |_| {
+            syncs += 1;
+            if syncs == 1 {
+                Ok(())
+            } else {
+                Err(failed())
+            }
+        })
+        .expect_err("a failed sync must fail the deletion");
+        assert!(!journal.exists() && !store.exists());
+        assert!(primary.exists(), "the enrollment stays after a failed sync");
+
+        // The repeated request finds nothing left to remove in the camera
+        // directory and still syncs it; a failure keeps the enrollment.
+        delete_with("u", |_| Err(failed()))
+            .expect_err("the camera directory must be synced before the enrollment goes");
+        assert!(primary.exists() && template_key::key_path("u").exists());
+
+        let mut synced = Vec::new();
+        assert_eq!(
+            delete_with("u", |dir| {
+                synced.push(dir.to_path_buf());
+                Ok(())
+            })
+            .unwrap(),
+            Deleted {
+                enrollment: true,
+                camera_store: false
+            }
+        );
+        assert_eq!(synced, [cameras.clone()]);
+        assert!(!primary.exists());
+
+        // Without a camera directory there is nothing to sync.
+        fs::remove_dir_all(&cameras).unwrap();
+        assert_eq!(
+            delete_with("u", sync_directory).unwrap(),
+            Deleted::default()
+        );
         std::env::remove_var("IRLUME_STATE_DIR");
         let _ = fs::remove_dir_all(&dir);
     }

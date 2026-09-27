@@ -1408,14 +1408,48 @@ impl VerifiedTree {
             let file = shown.join(&entry.file_name);
             match entry.kind {
                 Ok(kind) => sweep.count(entry.user, kind),
-                Err(e) if refuses(entry.owner) => {
-                    return Err(format!("{}: {e}", file.display()));
-                }
-                Err(e) => note(sweep, &file, &unread(&e)),
+                // An envelope root owns, linked in under an envelope's name:
+                // the wipe removes only the link, so its token counts.
+                Err(e) => match linked_root_envelope(&dir, &entry.file_name, root_uid) {
+                    Some(kind) => sweep.count(entry.user, kind),
+                    None if refuses(entry.owner) => {
+                        return Err(format!("{}: {e}", file.display()));
+                    }
+                    None => note(sweep, &file, &unread(&e)),
+                },
             }
         }
         Ok(())
     }
+}
+
+/// What a link at an envelope's name in the open keyring directory `keyring`
+/// seals, when it leads to a regular file `root_uid` owns that loads as an
+/// envelope: one a root irlumed wrote, linked there. `None` for an entry that
+/// is no link, and for a link to anything else, which stays only named, so
+/// an account cannot stop the uninstall by linking to some file of root's.
+fn linked_root_envelope(
+    keyring: &std::fs::File,
+    name: &std::ffi::OsStr,
+    root_uid: u32,
+) -> Option<irlume_core::envelope::SecretKind> {
+    use std::os::unix::fs::MetadataExt as _;
+    let entry = fd_path(keyring).ok()?.join(name);
+    if !std::fs::symlink_metadata(&entry)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
+    let target = std::fs::canonicalize(&entry).ok()?;
+    let meta = std::fs::symlink_metadata(&target).ok()?;
+    if !meta.is_file() || meta.uid() != root_uid {
+        return None;
+    }
+    irlume_core::envelope::SealedEnvelope::load(&target)
+        .ok()
+        .map(|envelope| envelope.secret)
 }
 
 /// Disarm every seal in the verified trees of `homes`; the number of
@@ -3391,6 +3425,41 @@ mod tests {
             "{:?}",
             sweep.notes
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An envelope root owns, linked into an account's keyring under an
+    /// envelope's name, counts: the wipe removes only the link. A link to a
+    /// root file that is no envelope, or to one root does not own, is only
+    /// named.
+    #[test]
+    fn a_linked_root_envelope_counts_and_other_linked_entries_are_named() {
+        use std::os::unix::fs::MetadataExt as _;
+        let base =
+            std::env::temp_dir().join(format!("irlume-home-linked-entry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let keyring = home_state_path(&alice.home).join("keyring");
+        std::fs::create_dir_all(&keyring).unwrap();
+        let outside = base.join("srv");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("token.json"), TOKEN_ENVELOPE).unwrap();
+        std::fs::write(outside.join("other.txt"), "not an envelope").unwrap();
+        std::os::unix::fs::symlink(outside.join("token.json"), keyring.join("carol.json")).unwrap();
+        let owner = std::fs::metadata(&outside).unwrap().uid();
+        let default = base.join("default-state");
+        let sweep_as = |root_uid: u32| {
+            let homes = home_trees(std::slice::from_ref(&alice), &default);
+            sealed_token_holders_with(Ok(Vec::new()), &homes, &[], &[], root_uid)
+        };
+        // This process stands in for root: the linked envelope is "root's",
+        // and its token counts.
+        assert_eq!(sweep_as(owner).unwrap().holders, vec!["carol".to_string()]);
+        // Neither link leads to a file of root's here: both are only named.
+        std::os::unix::fs::symlink(outside.join("other.txt"), keyring.join("dana.json")).unwrap();
+        let sweep = sweep_as(owner.wrapping_add(1)).unwrap();
+        assert!(sweep.holders.is_empty(), "{sweep:?}");
+        assert_eq!(sweep.notes.len(), 2, "{:?}", sweep.notes);
         let _ = std::fs::remove_dir_all(&base);
     }
 

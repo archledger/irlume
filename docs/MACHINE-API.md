@@ -876,14 +876,17 @@ reaches its lock later waits for the operation; a symlink there is not followed,
 and group and other permissions are removed from a file root owns. Whatever
 another account owns there is replaced, in one rename (`RENAME_EXCHANGE`), by a
 new 0600 file root owns, which the operation holds and leaves in place, so that
-account cannot move the lock off its name while the operation runs; a regular
-file replaced this way is still locked, and where the rename cannot be made the
-operation fails, as `operation-failed` with `retryable` true. A process holding
-the old lock is waited for at most 60 seconds. If a root process that has the file
-open still holds it or waits for it then, or `/proc` cannot show which process
-holds it, the operation fails, as `operation-failed` with `retryable` true,
-rather than write beside what may be an earlier irlume; a holder `/proc` shows
-to be something else, such as another account's process, is passed over.
+account cannot move the lock off its name while the operation runs. A regular
+file there is locked, as below, before it is replaced, so an operation that
+fails while waiting for it leaves it at the name; a file that took the name
+meanwhile is waited for too, and goes back to the name if the operation fails
+then. Where the rename cannot be made the operation fails, as
+`operation-failed` with `retryable` true. A process holding the old lock is
+waited for at most 60 seconds. If a root process that has the file open still
+holds it or waits for it then, or `/proc` cannot show which process holds it,
+the operation fails, as `operation-failed` with `retryable` true, rather than
+write beside what may be an earlier irlume; a holder `/proc` shows to be
+something else, such as another account's process, is passed over.
 
 irlume refuses to write a PAM path that is a symlink or that has more than one
 hard link, on every one of those paths. Renaming over a symlink would silently

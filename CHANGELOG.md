@@ -868,14 +868,17 @@ All notable changes to irlume are documented here. This project adheres to
   Whatever another account owns there is replaced, in one rename, by a
   new 0600 file of root's that the operation holds and leaves in place,
   since that account could otherwise rename or remove its own while the
-  operation ran and let such a release lock a new file at the name; a
-  regular file replaced this way is still locked, unchanged, and the
-  operation stops when the rename cannot be made. A process holding the
-  old lock is waited for at most 60 seconds; if a root process with
-  the file open still holds it or waits for it then, or `/proc` cannot
-  show which process holds it, the operation stops with an error, and
-  otherwise, as for another account's process, it goes on without that
-  lock. `irlume uninstall` leaves both lock files in place, since
+  operation ran and let such a release lock a new file at the name. A
+  regular file there is locked, unchanged, before it is replaced, so an
+  operation that stops while waiting for it leaves it at the name; a
+  file that took the name meanwhile is waited for too, and goes back to
+  the name if the operation stops then. The operation stops when the
+  rename cannot be made. A process holding the old lock is waited for
+  at most 60 seconds; if a root process with the file open still holds
+  it or waits for it then, or `/proc` cannot show which process holds
+  it, the operation stops with an error, and otherwise, as for another
+  account's process, it goes on without that lock. `irlume uninstall`
+  leaves both lock files in place, since
   another operation may hold them; they are empty and on the `/run`
   tmpfs.
   `irlume-reconcile.service` now stops a run after 5 minutes

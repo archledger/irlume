@@ -208,10 +208,10 @@ fn open_lock(path: &Path, uid: u32) -> Result<File, String> {
 /// one of those releases that has started but not yet reached its lock then
 /// opens the same file and waits for this operation, where it would otherwise
 /// create a file of its own and lock it while this operation runs. A file
-/// another account owns is first replaced at the name by one of this
-/// operation's own, already locked ([`claim_legacy_name`]), and is then waited
-/// for as below, with any other file the replacement took off the name, within
-/// the one `wait`.
+/// another account owns is waited for as below while it keeps the name, and
+/// only then replaced there by one of this operation's own, already locked
+/// ([`replace_legacy_lock`]); any other file the replacement takes off the
+/// name is waited for within the same `wait`.
 ///
 /// Any account could open the file before, so a process holding it is not
 /// necessarily an irlume: it is waited for at most `wait` and named on stderr.
@@ -223,25 +223,26 @@ fn open_lock(path: &Path, uid: u32) -> Result<File, String> {
 /// one that has exited while another keeps the file open, and the operation
 /// goes on without this lock.
 fn take_legacy_lock(path: &Path, uid: u32, wait: Duration) -> Result<Vec<File>, String> {
-    let LegacyFiles { claimed, found } = open_legacy_lock(path, uid)?;
-    let mut held: Vec<File> = claimed.into_iter().collect();
     let deadline = Instant::now() + wait;
-    for file in found {
-        held.extend(wait_for_legacy_lock(path, file, uid, wait, deadline)?);
+    let wait_for = |file| wait_for_legacy_lock(path, file, uid, wait, deadline);
+    match open_legacy_lock(path, uid)? {
+        LegacyLock::Skipped => Ok(Vec::new()),
+        LegacyLock::Own(file) => Ok(wait_for(file)?.into_iter().collect()),
+        LegacyLock::Foreign(found) => replace_legacy_lock(path, &found, wait_for),
     }
-    Ok(held)
 }
 
 /// What [`open_legacy_lock`] found at the name of the lock of earlier releases.
-#[derive(Debug, Default)]
-struct LegacyFiles {
-    /// This operation's own file, created at 0600 and locked, that replaced
-    /// what another account owned at the name ([`claim_legacy_name`]).
-    claimed: Option<File>,
-    /// The files whose lock is to be waited for: the one at the name, or, after
-    /// a replacement, the regular files it took off the name. None when the
-    /// name is a symlink or not a regular file `uid` owns.
-    found: Vec<File>,
+#[derive(Debug)]
+enum LegacyLock {
+    /// Nothing to take: a symlink, or something other than a regular file,
+    /// that `uid` owns.
+    Skipped,
+    /// A regular file `uid` owns, or one just created, opened for reading.
+    Own(File),
+    /// Whatever another account owns at the name, opened with `O_PATH` and
+    /// not followed, for [`replace_legacy_lock`].
+    Foreign(File),
 }
 
 /// Opens `path`, the lock of earlier releases, the file one of them running now
@@ -253,7 +254,8 @@ struct LegacyFiles {
 /// missing, as those releases did. A file that exists is first opened with
 /// `O_PATH` and without following a symlink, which does not wait and does not
 /// open a FIFO or a socket, and only a regular file is then opened for reading,
-/// through that descriptor, so it is the file just checked. That open waits
+/// here or by [`replace_legacy_lock`], through that descriptor, so it is the
+/// file just checked. That open waits
 /// while another process holds a write lease on the file, as the open of those
 /// releases did, where an open that does not wait fails: the kernel asks the
 /// holder to give the lease up and, after `/proc/sys/fs/lease-break-time` (45 s
@@ -270,18 +272,19 @@ struct LegacyFiles {
 ///
 /// Group and other permissions are removed from a file owned by `uid`, so an
 /// account that has not opened it by then cannot. Whatever another account
-/// owns at the name is not changed, but it is taken off the name first:
-/// [`claim_legacy_name`] puts a file of this operation's own there, since that
-/// account can remove its own at any time. A symlink is not followed, and
-/// `protected_symlinks`, which systemd turns on, keeps an earlier release
-/// running as root from following it either. A regular file is still
-/// returned, to be locked and waited for, since where `protected_regular` is
-/// off an earlier release running as root opens it and locks it. That account
-/// can hold a lease on it and then its lock, and so delay each operation by up
-/// to the lease break time and [`LEGACY_WAIT`], as an account that opened the
-/// 0644 file of those releases can delay them; it cannot stop one, since its
-/// process is not an earlier irlume (see [`take_legacy_lock`]).
-fn open_legacy_lock(path: &Path, uid: u32) -> Result<LegacyFiles, String> {
+/// owns at the name is returned as the `O_PATH` descriptor, not changed, for
+/// [`replace_legacy_lock`], which waits for a regular file there and then puts
+/// a file of this operation's own at the name, since that account can remove
+/// its own at any time. A symlink is not followed, and `protected_symlinks`,
+/// which systemd turns on, keeps an earlier release running as root from
+/// following it either. A regular file is waited for, since where
+/// `protected_regular` is off an earlier release running as root opens it and
+/// locks it. That account can hold a lease on it and then its lock, and so
+/// delay each operation by up to the lease break time and [`LEGACY_WAIT`], as
+/// an account that opened the 0644 file of those releases can delay them; it
+/// cannot stop one, since its process is not an earlier irlume (see
+/// [`take_legacy_lock`]).
+fn open_legacy_lock(path: &Path, uid: u32) -> Result<LegacyLock, String> {
     for _ in 0..LEGACY_OPEN_TRIES {
         let created = std::fs::OpenOptions::new()
             .write(true)
@@ -306,22 +309,11 @@ fn open_legacy_lock(path: &Path, uid: u32) -> Result<LegacyFiles, String> {
                     .metadata()
                     .map_err(|error| format!("stat {}: {error}", path.display()))?;
                 if meta.uid() != uid {
-                    let claim = claim_legacy_name(path, &meta)?;
-                    let mut to_wait = Vec::new();
-                    if meta.is_file() {
-                        to_wait.push(open_for_reading(path, &found)?);
-                    }
-                    if let Some(other) = claim.other {
-                        to_wait.push(open_for_reading(path, &other)?);
-                    }
-                    return Ok(LegacyFiles {
-                        claimed: Some(claim.file),
-                        found: to_wait,
-                    });
+                    return Ok(LegacyLock::Foreign(found));
                 }
                 if !meta.is_file() {
                     // A symlink, a FIFO, a socket or a device.
-                    return Ok(LegacyFiles::default());
+                    return Ok(LegacyLock::Skipped);
                 }
                 open_for_reading(path, &found)?
             }
@@ -340,16 +332,13 @@ fn open_legacy_lock(path: &Path, uid: u32) -> Result<LegacyFiles, String> {
             .metadata()
             .map_err(|error| format!("stat {}: {error}", path.display()))?;
         if !meta.is_file() {
-            return Ok(LegacyFiles::default());
+            return Ok(LegacyLock::Skipped);
         }
         if meta.uid() == uid && meta.mode() & 0o077 != 0 {
             // Best effort: the lock is taken either way.
             let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
         }
-        return Ok(LegacyFiles {
-            claimed: None,
-            found: vec![file],
-        });
+        return Ok(LegacyLock::Own(file));
     }
     Err(format!(
         "{} or its directory was removed each time it was opened, {LEGACY_OPEN_TRIES} times",
@@ -357,9 +346,9 @@ fn open_legacy_lock(path: &Path, uid: u32) -> Result<LegacyFiles, String> {
     ))
 }
 
-/// Opens `found`, a regular file [`open_legacy_lock`] opened with `O_PATH`, for
-/// reading, through that descriptor. Without `O_NONBLOCK`, so a lease on the
-/// file is waited for as that function says.
+/// Opens `found`, a regular file opened with `O_PATH`, for reading, through
+/// that descriptor. Without `O_NONBLOCK`, so a lease on the file is waited for
+/// as [`open_legacy_lock`] says.
 fn open_for_reading(path: &Path, found: &File) -> Result<File, String> {
     let at = Path::new("/proc/self/fd").join(found.as_raw_fd().to_string());
     std::fs::OpenOptions::new()
@@ -369,20 +358,36 @@ fn open_for_reading(path: &Path, found: &File) -> Result<File, String> {
         .map_err(|error| format!("open {}: {error}", path.display()))
 }
 
-/// This operation's own file at the name of the lock of earlier releases,
-/// which [`claim_legacy_name`] put there, and what else it took off the name.
-#[derive(Debug)]
-struct Claim {
-    /// Created at 0600 and locked.
-    file: File,
-    /// A regular file other than the one another account owns, opened with
-    /// `O_PATH`.
-    other: Option<File>,
+/// Takes the lock of earlier releases at `path` where another account owns
+/// `found`, what is at the name, opened with `O_PATH`. Returns the files whose
+/// lock this operation then holds.
+///
+/// A regular file there is waited for first, with `wait_for`, as
+/// [`take_legacy_lock`] says, while it keeps the name: an earlier release that
+/// opens `path` meanwhile opens that file and waits for its holder, and the
+/// name is unchanged when the operation stops there or is killed. Only then
+/// does [`claim_legacy_name`] put a file of this operation's own at the name.
+/// A symlink, a FIFO or anything else there is not waited for.
+fn replace_legacy_lock(
+    path: &Path,
+    found: &File,
+    mut wait_for: impl FnMut(File) -> Result<Option<File>, String>,
+) -> Result<Vec<File>, String> {
+    let meta = found
+        .metadata()
+        .map_err(|error| format!("stat {}: {error}", path.display()))?;
+    let mut held = Vec::new();
+    if meta.is_file() {
+        held.extend(wait_for(open_for_reading(path, found)?)?);
+    }
+    held.extend(claim_legacy_name(path, &meta, wait_for)?);
+    Ok(held)
 }
 
 /// Puts a file of this operation's own, created at 0600 and locked, at `path`
 /// in place of `found`, what another account owns there, so an earlier
-/// release that opens `path` from then on waits for this operation.
+/// release that opens `path` from then on waits for this operation. Returns
+/// that file, then any other whose lock `wait_for` took.
 ///
 /// In a directory every account can write, as `/run/lock` is on Debian and
 /// Ubuntu, the sticky bit lets that account rename or remove its own file at
@@ -395,19 +400,33 @@ struct Claim {
 /// The file is created beside `path` under a name of its own, with `O_EXCL`
 /// and `O_NOFOLLOW`, and exchanged with the name in one step
 /// (`RENAME_EXCHANGE`), so a file put at the name after `found` was opened is
-/// taken off it rather than unlinked unseen. What comes out is removed from
-/// the other name; a regular file other than `found`, such as one an earlier
-/// release created and locked after `found` was removed, is returned, to be
-/// waited for as `found` is. When the name is missing, the file takes it only
-/// while nothing else does (`RENAME_NOREPLACE`), and when something does, the
-/// exchange is tried again, up to [`LEGACY_OPEN_TRIES`] times.
+/// taken off it rather than unlinked unseen. When the name is missing, the
+/// file takes it only while nothing else does (`RENAME_NOREPLACE`), and when
+/// something does, the exchange is tried again, up to [`LEGACY_OPEN_TRIES`]
+/// times.
+///
+/// What comes out keeps the other name until the operation is past it. A
+/// regular file other than `found`, such as one an earlier release created and
+/// locked after `found` was removed, is waited for with `wait_for`, as `found`
+/// was, and removed from the other name only once that succeeds, as anything
+/// else that comes out is at once. When the wait stops the operation, or what
+/// came out cannot be opened, it is exchanged back ([`put_back`]), so the name
+/// leads again to the file an earlier release may hold. A process that opened
+/// the name while this operation's file was there still takes that file when
+/// the operation stops, and an operation killed during the wait leaves its
+/// file at the name and what came out at the other; both need that account to
+/// change the name between `found` being opened and the exchange.
 ///
 /// When the file cannot take the name, as on a filesystem without
 /// `RENAME_EXCHANGE`, it is removed and the operation stops, since `found`
 /// would still be the lock at the name.
-fn claim_legacy_name(path: &Path, found: &std::fs::Metadata) -> Result<Claim, String> {
+fn claim_legacy_name(
+    path: &Path,
+    found: &std::fs::Metadata,
+    wait_for: impl FnOnce(File) -> Result<Option<File>, String>,
+) -> Result<Vec<File>, String> {
     let (file, temp) = create_claim_file(path)?;
-    let give_up = |why: String| -> Result<Claim, String> {
+    let give_up = |why: String| -> Result<Vec<File>, String> {
         remove_claim_file(&temp, &file);
         Err(why)
     };
@@ -447,12 +466,25 @@ fn claim_legacy_name(path: &Path, found: &std::fs::Metadata) -> Result<Claim, St
             path.display()
         ));
     };
-    let other = if exchanged {
-        came_out(path, &temp, found)?
-    } else {
-        None
+    if !exchanged {
+        return Ok(vec![file]);
+    }
+    let waited = match came_out(path, &temp, found) {
+        Ok(CameOut::Gone) => return Ok(vec![file]),
+        Ok(CameOut::Done) => Ok(None),
+        Ok(CameOut::Other(other)) => open_for_reading(path, &other).and_then(wait_for),
+        Err(why) => Err(why),
     };
-    Ok(Claim { file, other })
+    match waited {
+        Ok(other) => {
+            remove_came_out(&temp);
+            Ok(std::iter::once(file).chain(other).collect())
+        }
+        Err(why) => {
+            put_back(path, &temp, &file);
+            Err(why)
+        }
+    }
 }
 
 /// Creates the file [`claim_legacy_name`] puts at `path`, beside it under a
@@ -514,44 +546,71 @@ fn remove_claim_file(temp: &Path, file: &File) {
     }
 }
 
+/// What the exchange in [`claim_legacy_name`] took off the name, as
+/// [`came_out`] finds it at the other name.
+#[derive(Debug)]
+enum CameOut {
+    /// Nothing is there: its owner has moved it since.
+    Gone,
+    /// `found` itself, or not a regular file: nothing more to wait for.
+    Done,
+    /// A regular file other than `found`, opened with `O_PATH`.
+    Other(File),
+}
+
 /// What the exchange in [`claim_legacy_name`] took off `path`, which is now at
-/// `temp`: removed from there, and returned, opened with `O_PATH`, when it is a
-/// regular file other than `found`. Nothing is there when its owner has moved
-/// it since. When it cannot be opened, it may be a lock an earlier release
-/// holds, which cannot then be waited for, and the operation stops.
-fn came_out(path: &Path, temp: &Path, found: &std::fs::Metadata) -> Result<Option<File>, String> {
-    // A directory, when another account put one at the name, goes only when
-    // empty; nothing is followed or opened.
-    let remove = || {
-        let _ = std::fs::remove_file(temp).or_else(|_| std::fs::remove_dir(temp));
-    };
+/// `temp`, opened with `O_PATH` and not followed; it stays at `temp`. When it
+/// cannot be opened, it may be a lock an earlier release holds, which cannot
+/// then be waited for, and the operation stops.
+fn came_out(path: &Path, temp: &Path, found: &std::fs::Metadata) -> Result<CameOut, String> {
     let opened = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(temp);
     let out = match opened {
         Ok(out) => out,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(CameOut::Gone),
         Err(error) => {
-            remove();
             return Err(format!(
                 "open {}, taken off {}: {error}",
                 temp.display(),
                 path.display()
-            ));
+            ))
         }
     };
-    let meta = out.metadata();
-    remove();
-    let meta = meta.map_err(|error| {
+    let meta = out.metadata().map_err(|error| {
         format!(
             "stat {}, taken off {}: {error}",
             temp.display(),
             path.display()
         )
     })?;
-    let other = meta.is_file() && (meta.dev(), meta.ino()) != (found.dev(), found.ino());
-    Ok(other.then_some(out))
+    if meta.is_file() && (meta.dev(), meta.ino()) != (found.dev(), found.ino()) {
+        Ok(CameOut::Other(out))
+    } else {
+        Ok(CameOut::Done)
+    }
+}
+
+/// Removes what the exchange in [`claim_legacy_name`] took off the name from
+/// `temp`, where it is. A directory, when another account put one at the name,
+/// goes only when empty; nothing is followed or opened.
+fn remove_came_out(temp: &Path) {
+    let _ = std::fs::remove_file(temp).or_else(|_| std::fs::remove_dir(temp));
+}
+
+/// Exchanges `path`, where [`claim_legacy_name`] put this operation's `file`,
+/// with `temp` again, where what it took off the name is, so the name leads to
+/// that again, and then removes `file` from `temp`. When the exchange fails,
+/// as when the owner of what came out has moved it since, `file` stays at the
+/// name and whatever is at `temp` is removed, so the other name does not
+/// outlast the operation.
+fn put_back(path: &Path, temp: &Path, file: &File) {
+    if super::files::renameat2_exchange(temp, path).is_ok() {
+        remove_claim_file(temp, file);
+    } else {
+        remove_came_out(temp);
+    }
 }
 
 /// Test-only: what another process does to a name, or the error the exchange
@@ -959,6 +1018,33 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .retain(|(armed, _)| *armed != self.0);
         }
+    }
+
+    /// [`take_legacy_lock`] for a file at `path` that another account owns,
+    /// with the processes holding it or waiting for it checked against the
+    /// caller's own uid, as an earlier irlume holding it would run as. A test
+    /// cannot create a file another account owns, so the file is opened with
+    /// another uid as the caller's, which makes it another account's.
+    fn take_foreign(path: &Path, wait: Duration) -> Result<Vec<File>, String> {
+        let deadline = Instant::now() + wait;
+        let found = match open_legacy_lock(path, uid().wrapping_add(1))? {
+            LegacyLock::Foreign(found) => found,
+            other => panic!("{} was not another account's: {other:?}", path.display()),
+        };
+        replace_legacy_lock(path, &found, |file| {
+            wait_for_legacy_lock(path, file, uid(), wait, deadline)
+        })
+    }
+
+    /// The private names beside `path` that a file taking its name had.
+    fn private_names(path: &Path) -> Vec<PathBuf> {
+        let dir = path.parent().expect("a directory");
+        let prefix = format!(".{}.", path.file_name().unwrap().to_string_lossy());
+        entries(dir)
+            .into_iter()
+            .filter(|name| name.starts_with(&prefix))
+            .map(|name| dir.join(name))
+            .collect()
     }
 
     /// Whether some process holds a lock on `path`: `flock -n` fails when it
@@ -1617,14 +1703,14 @@ mod tests {
         );
     }
 
-    /// A legacy lock another account owns is taken off its name, unchanged, by
-    /// a file of the caller's own, created at 0600, that takes the name in one
-    /// rename and stays there after the lock is dropped. Both are held, and no
-    /// other name is left behind; the other account's file is found again by a
-    /// second name, a hard link made first. Its holder is waited for up to the
-    /// limit; here that holder runs as another uid than the caller, so it is
-    /// not an earlier irlume, and the operation then goes on, holding the file
-    /// at the name.
+    /// A legacy lock another account owns is locked, and then taken off its
+    /// name, unchanged, by a file of the caller's own, created at 0600, that
+    /// takes the name in one rename and stays there after the lock is dropped.
+    /// Both are held, and no other name is left behind; the other account's
+    /// file is found again by a second name, a hard link made first. Its holder
+    /// is waited for up to the limit; here that holder runs as another uid than
+    /// the caller, so it is not an earlier irlume, and the operation then goes
+    /// on, holding the file at the name.
     #[test]
     fn replaces_a_legacy_lock_another_account_owns_and_holds_both() {
         let scratch = Scratch::new("legacy-foreign");
@@ -1632,8 +1718,20 @@ mod tests {
         let foreign = scratch.file("foreign.lock", 0o644);
         let kept = scratch.path("kept");
         std::fs::hard_link(&foreign, &kept).unwrap();
+        let locked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen, probe) = (std::sync::Arc::clone(&locked), kept.clone());
+        let armed = arm_before_exchange(&foreign, move |_| {
+            seen.lock().unwrap().push(held(&probe));
+            None
+        });
         let taken =
             take_legacy_lock(&foreign, other, Duration::ZERO).expect("take the legacy lock");
+        drop(armed);
+        assert_eq!(
+            *locked.lock().unwrap(),
+            [true],
+            "another account's file was not locked before it was replaced"
+        );
         assert_eq!(taken.len(), 2, "{taken:?}");
         assert_ne!(
             ino(&foreign),
@@ -1689,11 +1787,14 @@ mod tests {
     /// file there being opened and the rename that replaces it, since that
     /// account can remove or rename its file at any time. Removed, the name is
     /// taken while nothing else has it, and the removed file is still held.
-    /// Replaced by a file an earlier release created and locked, that file
-    /// comes off the name too and is waited for: its holder, running as the
-    /// caller's uid with it open, stops the operation at the limit. Replaced by
-    /// a symlink, nothing is followed. Each time the caller's file ends up at
-    /// the name and no other name is left behind.
+    /// Replaced by a new file, as an earlier release that has not yet locked
+    /// it creates, that file comes off the name too and is held as well.
+    /// Replaced by a symlink, nothing is followed. Each time the caller's file
+    /// ends up at the name. Replaced by a file an earlier release created and
+    /// locked, that file comes off the name and is waited for: its holder,
+    /// running as the caller's uid with it open, stops the operation at the
+    /// limit, and the file goes back to the name, where a second operation
+    /// stops at it too. No other name is left behind.
     #[test]
     fn claims_the_legacy_name_when_it_changes_before_the_rename() {
         let scratch = Scratch::new("legacy-race");
@@ -1717,41 +1818,24 @@ mod tests {
         assert!(held(&kept), "the removed file is not held");
         drop(taken);
 
-        let replaced = scratch.file("replaced.lock", 0o644);
-        let earlier = scratch.file("earlier", 0o600);
-        let holder = Holder::new(&earlier);
-        let earlier_ino = ino(&earlier);
-        let (name, moved) = (replaced.clone(), scratch.path("replaced.moved"));
-        let armed = arm_before_exchange(&replaced, move |_| {
+        let created = scratch.file("created.lock", 0o644);
+        let (name, moved) = (created.clone(), scratch.path("created.moved"));
+        let armed = arm_before_exchange(&created, move |_| {
             let _ = std::fs::rename(&name, &moved);
-            let _ = std::fs::rename(&earlier, &name);
+            let _ = std::fs::write(&name, "");
             None
         });
-        let LegacyFiles { claimed, found } =
-            open_legacy_lock(&replaced, other).expect("open the legacy lock");
+        let taken =
+            take_legacy_lock(&created, other, Duration::ZERO).expect("take the legacy lock");
         drop(armed);
-        assert!(claimed.is_some(), "nothing took the name");
-        assert_eq!(mode(&replaced), 0o600, "the name was not taken");
-        assert_ne!(ino(&replaced), earlier_ino);
-        let [moved_file, earlier_file] =
-            <[File; 2]>::try_from(found).expect("the moved file and the earlier release's");
-        assert_eq!(
-            earlier_file.metadata().unwrap().ino(),
-            earlier_ino,
-            "the earlier release's file was not found"
-        );
-        let wait = Duration::from_millis(300);
-        let deadline = Instant::now() + wait;
-        let first = wait_for_legacy_lock(&replaced, moved_file, uid(), wait, deadline)
-            .expect("lock the moved file");
-        assert!(first.is_some(), "the moved file was not locked");
-        let refused = wait_for_legacy_lock(&replaced, earlier_file, uid(), wait, deadline)
-            .expect_err("went on beside an earlier release holding the file it created");
+        assert_eq!(taken.len(), 3, "{taken:?}");
+        assert_eq!(mode(&created), 0o600, "the name was not taken");
+        assert!(held(&created), "the file at the name is not held");
         assert!(
-            refused.contains(&format!("process {}", holder.pid())),
-            "{refused}"
+            held(&scratch.path("created.moved")),
+            "the moved file is not held"
         );
-        drop((first, claimed, holder));
+        drop(taken);
 
         let linked = scratch.file("linked.lock", 0o644);
         let target = scratch.file("linked.target", 0o644);
@@ -1770,9 +1854,45 @@ mod tests {
         assert!(!held(&target), "the symlink's target was locked");
         drop(taken);
 
+        let replaced = scratch.file("replaced.lock", 0o644);
+        let moved = scratch.path("replaced.moved");
+        let earlier = scratch.file("earlier", 0o600);
+        let holder = Holder::new(&earlier);
+        let earlier_ino = ino(&earlier);
+        let (name, to) = (replaced.clone(), moved.clone());
+        let armed = arm_before_exchange(&replaced, move |_| {
+            let _ = std::fs::rename(&name, &to);
+            let _ = std::fs::rename(&earlier, &name);
+            None
+        });
+        let wait = Duration::from_millis(300);
+        let refused = take_foreign(&replaced, wait)
+            .expect_err("went on beside an earlier release holding the file it created");
+        drop(armed);
+        assert!(
+            refused.contains(&format!("process {}", holder.pid())),
+            "{refused}"
+        );
+        assert_eq!(
+            ino(&replaced),
+            earlier_ino,
+            "the earlier release's file was not put back at the name"
+        );
+        assert!(!held(&moved), "the moved file stayed locked");
+        let refused = take_foreign(&replaced, wait)
+            .expect_err("a second operation went on beside the earlier release");
+        assert!(
+            refused.contains(&format!("process {}", holder.pid())),
+            "{refused}"
+        );
+        assert_eq!(ino(&replaced), earlier_ino, "the name changed");
+        drop(holder);
+
         assert_eq!(
             entries(&scratch.0),
             [
+                "created.lock",
+                "created.moved",
                 "linked.lock",
                 "linked.moved",
                 "linked.target",
@@ -1782,6 +1902,68 @@ mod tests {
                 "replaced.moved",
             ]
         );
+    }
+
+    /// When the operation stops after its file has taken the name of a legacy
+    /// lock another account owns, what came off the name goes back to it and
+    /// the operation's file is removed: here a file put at the name after the
+    /// other account's was opened, which cannot be waited for. When the owner
+    /// of that file has moved it off the other name meanwhile, the operation's
+    /// file stays at the name. Either way no other name is left behind and
+    /// nothing stays locked.
+    #[test]
+    fn puts_back_what_it_took_off_the_legacy_name_when_it_stops() {
+        let scratch = Scratch::new("legacy-put-back");
+        let foreign = scratch.path("foreign.lock");
+        for moved_off in [false, true] {
+            scratch.file("foreign.lock", 0o644);
+            let later = scratch.file("later", 0o644);
+            let later_ino = ino(&later);
+            let (name, aside) = (foreign.clone(), scratch.path("foreign.aside"));
+            let armed = arm_before_exchange(&foreign, move |_| {
+                let _ = std::fs::rename(&name, &aside);
+                let _ = std::fs::rename(&later, &name);
+                None
+            });
+            let found = match open_legacy_lock(&foreign, uid().wrapping_add(1)) {
+                Ok(LegacyLock::Foreign(found)) => found,
+                other => panic!("not another account's: {other:?}"),
+            };
+            let (path, elsewhere) = (foreign.clone(), scratch.path("later.moved"));
+            let refused = replace_legacy_lock(&foreign, &found, |file| {
+                if file.metadata().unwrap().ino() != later_ino {
+                    return Ok(Some(file));
+                }
+                if moved_off {
+                    let [temp] = <[PathBuf; 1]>::try_from(private_names(&path))
+                        .expect("the file that came off the name at its other name");
+                    std::fs::rename(temp, &elsewhere).unwrap();
+                }
+                Err("cannot wait for it".to_owned())
+            })
+            .expect_err("went on past a file it could not wait for");
+            drop(armed);
+            assert_eq!(refused, "cannot wait for it");
+            if moved_off {
+                assert_ne!(ino(&foreign), later_ino, "the moved file came back");
+                assert_eq!(mode(&foreign), 0o600, "the caller's file lost the name");
+            } else {
+                assert_eq!(
+                    ino(&foreign),
+                    later_ino,
+                    "what came off the name was not put back"
+                );
+            }
+            assert_eq!(
+                private_names(&foreign),
+                Vec::<PathBuf>::new(),
+                "moved off: {moved_off}"
+            );
+            assert!(!held(&foreign), "moved off: {moved_off}: a lock was kept");
+            for name in entries(&scratch.0) {
+                std::fs::remove_file(scratch.path(&name)).unwrap();
+            }
+        }
     }
 
     /// Where the caller's file cannot take the name of a legacy lock another
@@ -1842,22 +2024,30 @@ mod tests {
     /// lease to be given up, as the open of earlier releases did, and the lock
     /// is then taken. Here the holder gives it up after 700 ms; the open waits
     /// for one that does not only as long as the kernel's lease break time.
-    /// Replacing the file at its name does not wait for the lease.
+    /// The file keeps its name until then, and is replaced there only once the
+    /// operation holds it.
     #[test]
     fn waits_for_a_lease_on_a_legacy_lock_another_account_owns() {
         let scratch = Scratch::new("legacy-lease");
         let foreign = scratch.file("foreign.lock", 0o644);
         let kept = scratch.path("kept");
         std::fs::hard_link(&foreign, &kept).unwrap();
+        let before = ino(&foreign);
         let lease = LeaseHolder::new(&foreign);
+        let name = foreign.clone();
         let release = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(700));
+            let kept_name = ino(&name) == before;
             drop(lease);
+            kept_name
         });
         let started = Instant::now();
         let taken = take_legacy_lock(&foreign, uid().wrapping_add(1), Duration::from_secs(30));
         let waited = started.elapsed();
-        release.join().unwrap();
+        assert!(
+            release.join().unwrap(),
+            "the leased file lost its name while the operation waited for the lease"
+        );
         let taken = taken.expect("a lease on the legacy lock stopped the operation");
         assert_eq!(taken.len(), 2, "{taken:?}");
         assert!(
@@ -1872,28 +2062,85 @@ mod tests {
     }
 
     /// A legacy lock another account owns still stops the operation at the
-    /// limit while a process running as the caller's uid with it open holds it,
-    /// after the file has left its name. A test cannot create a file another
-    /// account owns, so the file is opened with another uid as the caller's,
-    /// which makes it another account's, and then waited for with the
-    /// caller's own.
+    /// limit while a process running as the caller's uid with it open holds
+    /// it, and it keeps its name: it is waited for before anything replaces
+    /// it. A process that opens the name during the wait, as an earlier
+    /// release reaching its lock then does, waits for that holder rather than
+    /// for the operation, and goes on waiting once the operation has stopped;
+    /// a second operation stops at the holder too. No other name is left
+    /// behind.
     #[test]
     fn refuses_at_the_limit_while_the_account_holds_a_legacy_lock_another_owns() {
         let scratch = Scratch::new("legacy-foreign-limit");
         let foreign = scratch.file("foreign.lock", 0o644);
+        let before = ino(&foreign);
         let holder = Holder::new(&foreign);
-        let LegacyFiles { claimed, found } =
-            open_legacy_lock(&foreign, uid().wrapping_add(1)).expect("open the legacy lock");
-        assert!(claimed.is_some(), "another account's file kept the name");
-        let [file] = <[File; 1]>::try_from(found).expect("the file another account owns");
-        let wait = Duration::from_millis(300);
-        let refused = wait_for_legacy_lock(&foreign, file, uid(), wait, Instant::now() + wait)
+        let name = foreign.clone();
+        let opener = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            Command::new("flock")
+                .arg("-x")
+                .arg(&name)
+                .arg("true")
+                .spawn()
+                .expect("run flock")
+        });
+        let started = Instant::now();
+        let refused = take_foreign(&foreign, Duration::from_millis(600))
             .expect_err("went on beside a process of the account holding the legacy lock");
+        let waited = started.elapsed();
+        let mut earlier = opener.join().unwrap();
+        assert!(
+            waited >= Duration::from_millis(600) && waited < Duration::from_secs(10),
+            "waited {waited:?} for a limit of 600 ms"
+        );
         assert!(
             refused.contains(&format!("process {}", holder.pid())),
             "{refused}"
         );
+        assert_eq!(
+            ino(&foreign),
+            before,
+            "another account's file lost its name"
+        );
+        assert_eq!(mode(&foreign), 0o644, "another account's file was changed");
+        assert_eq!(entries(&scratch.0), ["foreign.lock"]);
+
+        let probe = File::open(&foreign).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !lock_users(&probe).is_some_and(|users| users.waiters.contains(&earlier.id())) {
+            assert!(
+                earlier.try_wait().expect("poll flock").is_none(),
+                "a process that opened the name during the wait did not wait for its holder"
+            );
+            assert!(Instant::now() < deadline, "flock never waited for the lock");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let refused = take_foreign(&foreign, Duration::from_millis(300))
+            .expect_err("a second operation went on beside the holder");
+        assert!(
+            refused.contains(&format!("process {}", holder.pid())),
+            "{refused}"
+        );
+        assert_eq!(
+            ino(&foreign),
+            before,
+            "another account's file lost its name"
+        );
+        assert_eq!(entries(&scratch.0), ["foreign.lock"]);
+        assert!(
+            earlier.try_wait().expect("poll flock").is_none(),
+            "a process that opened the name during the wait stopped waiting for its holder"
+        );
         drop(holder);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while earlier.try_wait().expect("poll flock").is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "flock did not take the lock once its holder let go"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// A process running as the caller's uid with the legacy lock open that

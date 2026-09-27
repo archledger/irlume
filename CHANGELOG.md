@@ -854,13 +854,15 @@ All notable changes to irlume are documented here. This project adheres to
 ### Security
 
 - `irlume keyring arm` and `irlume doctor` name the remedies when an
-  armed keyring secret is sealed under the literal PCR 7 policy (Tier 3)
-  and irlume's state directory is not on encrypted storage, or that
-  cannot be established. That policy binds the Secure Boot state only:
-  another operating system signed with the same keys reproduces it. The
-  remedies are a pcrlock policy (Tier 2) or full-disk encryption unlocked
-  by a passphrase. `keyring arm` prints a note; doctor's `pcrlock` check
-  reports `warn` with them in its detail. The storage probe follows the
+  armed keyring secret is sealed under the literal PCR 7 policy (Tier 3).
+  That policy binds the Secure Boot state only: another operating system
+  signed with the same keys reproduces it. The remedies are a pcrlock
+  policy (Tier 2) or full-disk encryption unlocked by a passphrase.
+  `keyring arm` prints a note; doctor's `pcrlock` check reports `warn`
+  with them in its detail when irlume's state directory is not on
+  encrypted storage or that cannot be established, and `info` when it is
+  on dm-crypt, whose unlock method (passphrase, or the TPM or a key file)
+  the storage does not show. The storage probe follows the
   state directory's block device through device-mapper (dm-crypt, LVM),
   md RAID and partitions, and every device of a btrfs filesystem; what it
   cannot establish counts as unencrypted. docs/SECURITY_AT_REST.md,

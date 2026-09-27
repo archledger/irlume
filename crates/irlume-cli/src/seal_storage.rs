@@ -2,13 +2,16 @@
 // Copyright the irlume contributors.
 
 //! Guidance for a keyring secret sealed under the literal PCR 7 policy
-//! (Tier 3) where irlume's state directory is not on encrypted storage.
+//! (Tier 3).
 //!
 //! The literal PCR 7 policy binds the Secure Boot state only: another
 //! operating system signed with the same keys reproduces it. `keyring arm`
-//! and `doctor`'s `pcrlock` check name the remedies when the state directory
-//! is not on encrypted storage, or when that cannot be established
-//! (docs/SECURITY_AT_REST.md, layer 3).
+//! and `doctor`'s `pcrlock` check name the remedies (docs/SECURITY_AT_REST.md,
+//! layer 3). Where the state directory is not on encrypted storage, or that
+//! cannot be established, it is a warning. Where it is on dm-crypt, the
+//! guidance still shows, as information: the storage alone cannot tell
+//! whether that volume asks for a passphrase or PIN or unlocks from the TPM
+//! or a key file, and only the first protects these secrets.
 
 use irlume_common::storage_encryption::StorageEncryption;
 use irlume_common::Response;
@@ -34,26 +37,47 @@ fn armed_policy(reply: &Result<Response, String>) -> Option<&str> {
     }
 }
 
+/// Guidance for a keyring secret sealed under the literal PCR policy.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SealAdvice {
+    /// The text shown after `keyring arm` and as the doctor detail.
+    pub(crate) text: String,
+    /// A warning: the state directory is not on encrypted storage, or that
+    /// could not be established. Otherwise information: it is on dm-crypt,
+    /// whose unlock method the storage does not show.
+    pub(crate) warn: bool,
+}
+
 /// The guidance for a keyring secret sealed under the literal PCR policy,
-/// given what the probe found for `state_dir`; `None` when it is on
-/// encrypted storage.
-fn literal_seal_advice(storage: StorageEncryption, state_dir: &Path) -> Option<String> {
+/// given what the probe found for `state_dir`.
+fn literal_seal_advice(storage: StorageEncryption, state_dir: &Path) -> SealAdvice {
     let dir = state_dir.display();
-    let storage = match storage {
-        StorageEncryption::Encrypted => return None,
-        StorageEncryption::NotEncrypted => format!("{dir} is not on encrypted storage"),
-        StorageEncryption::Unknown => {
-            format!("irlume could not confirm that {dir} is on encrypted storage")
-        }
+    let (storage, warn) = match storage {
+        StorageEncryption::Encrypted => (
+            format!(
+                "{dir} is on encrypted storage, which protects it only if that volume asks \
+                 for a passphrase or PIN to unlock rather than unlocking from the TPM or a \
+                 key file alone"
+            ),
+            false,
+        ),
+        StorageEncryption::NotEncrypted => (format!("{dir} is not on encrypted storage"), true),
+        StorageEncryption::Unknown => (
+            format!("irlume could not confirm that {dir} is on encrypted storage"),
+            true,
+        ),
     };
-    Some(format!(
-        "The keyring secret is sealed under the literal PCR 7 policy (Tier 3), which binds \
-         the Secure Boot state only: another operating system signed with the same keys \
-         reproduces it, and {storage}. Prefer a pcrlock policy (Tier 2: provision one \
-         with `systemd-pcrlock make-policy` where none is, then run `irlume keyring arm` \
-         again) or full-disk encryption unlocked by a passphrase \
-         (docs/SECURITY_AT_REST.md)."
-    ))
+    SealAdvice {
+        text: format!(
+            "The keyring secret is sealed under the literal PCR 7 policy (Tier 3), which binds \
+             the Secure Boot state only: another operating system signed with the same keys \
+             reproduces it, and {storage}. Prefer a pcrlock policy (Tier 2: provision one \
+             with `systemd-pcrlock make-policy` where none is, then run `irlume keyring arm` \
+             again) or full-disk encryption unlocked by a passphrase \
+             (docs/SECURITY_AT_REST.md)."
+        ),
+        warn,
+    }
 }
 
 /// The guidance for the keyring secret a `KeyringMetadata` reply describes.
@@ -63,17 +87,17 @@ pub(crate) fn advice_for(
     reply: &Result<Response, String>,
     state_dir: &Path,
     probe: impl FnOnce(&Path) -> StorageEncryption,
-) -> Option<String> {
+) -> Option<SealAdvice> {
     let policy = armed_policy(reply)?;
     if !is_literal_pcr_policy(policy) {
         return None;
     }
-    literal_seal_advice(probe(state_dir), state_dir)
+    Some(literal_seal_advice(probe(state_dir), state_dir))
 }
 
 /// [`advice_for`] against irlume's state directory and this system's
 /// storage.
-pub(crate) fn state_dir_advice_for(reply: &Result<Response, String>) -> Option<String> {
+pub(crate) fn state_dir_advice_for(reply: &Result<Response, String>) -> Option<SealAdvice> {
     advice_for(
         reply,
         &irlume_common::state_dir(),
@@ -121,6 +145,8 @@ mod tests {
         let reply = armed(Some(PolicyKind::PcrLiteral.describe()));
         let advice = advice_for(&reply, Path::new(DIR), |_| StorageEncryption::NotEncrypted)
             .expect("advice");
+        assert!(advice.warn);
+        let advice = advice.text;
         assert!(advice.contains("literal PCR 7 policy (Tier 3)"), "{advice}");
         assert!(advice.contains("another operating system signed with the same keys"));
         assert!(advice.contains("/var/lib/irlume is not on encrypted storage"));
@@ -131,19 +157,32 @@ mod tests {
 
         let unknown =
             advice_for(&reply, Path::new(DIR), |_| StorageEncryption::Unknown).expect("advice");
+        assert!(unknown.warn);
         assert!(
             unknown
+                .text
                 .contains("irlume could not confirm that /var/lib/irlume is on encrypted storage"),
-            "{unknown}"
+            "{}",
+            unknown.text
         );
     }
 
     #[test]
-    fn encrypted_storage_or_a_stronger_policy_gets_none() {
+    fn encrypted_storage_informs_and_a_stronger_policy_gets_none() {
+        // dm-crypt does not show whether the volume asks for a passphrase or
+        // unlocks from the TPM or a key file, so the guidance stays, as
+        // information naming that condition.
         let reply = armed(Some(PolicyKind::PcrLiteral.describe()));
-        assert_eq!(
-            advice_for(&reply, Path::new(DIR), |_| StorageEncryption::Encrypted),
-            None
+        let encrypted = advice_for(&reply, Path::new(DIR), |_| StorageEncryption::Encrypted)
+            .expect("advice on encrypted storage");
+        assert!(!encrypted.warn);
+        assert!(
+            encrypted.text.contains(
+                "/var/lib/irlume is on encrypted storage, which protects it only if that \
+                 volume asks for a passphrase or PIN to unlock"
+            ),
+            "{}",
+            encrypted.text
         );
         let probed = Cell::new(false);
         let pcrlock = armed(Some(PolicyKind::PcrlockNv { nv_index: 0x1a2b }.describe()));
@@ -185,6 +224,8 @@ mod tests {
             StorageEncryption::NotEncrypted
         })
         .expect("advice");
-        assert!(advice.contains("/srv/irlume-state is not on encrypted storage"));
+        assert!(advice
+            .text
+            .contains("/srv/irlume-state is not on encrypted storage"));
     }
 }

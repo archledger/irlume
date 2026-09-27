@@ -72,9 +72,11 @@ matching also requires passing IR liveness; an inverted RGB image can't.)
    pcrlock policy (Tier 2) or full-disk encryption unlocked by a passphrase.
    A volume the TPM unlocks without a passphrase or PIN, under a policy the
    same boot state satisfies, does not count. `irlume keyring arm` and
-   `irlume doctor` (check `pcrlock`) say so when an armed keyring secret
-   uses Tier 3 and the state directory is not on encrypted storage, or that
-   cannot be established. Once a pcrlock policy is provisioned, existing
+   `irlume doctor` (check `pcrlock`) say so whenever an armed keyring secret
+   uses Tier 3: as a warning when the state directory is not on encrypted
+   storage or that cannot be established, and as information when it is on
+   dm-crypt, since the storage does not show whether that volume asks for a
+   passphrase or unlocks from the TPM or a key file. Once a pcrlock policy is provisioned, existing
    seals move to it: the keyring secret at `irlume keyring arm` or its next
    re-seal at a password login, the template key at irlumed's next start.
    A signed PCR-11 policy (Tier 1), which earlier

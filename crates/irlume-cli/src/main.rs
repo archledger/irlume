@@ -1562,7 +1562,7 @@ fn print_literal_seal_note(user: &str) {
         user: user.to_string(),
     });
     if let Some(advice) = seal_storage::state_dir_advice_for(&reply) {
-        println!("[keyring] NOTE: {advice}");
+        println!("[keyring] NOTE: {}", advice.text);
     }
 }
 
@@ -4449,7 +4449,15 @@ fn doctor_run(
         },
     ));
     match &seal_advice {
-        Some(advice) => report.check_detail("pcrlock", State::Warn, advice),
+        Some(advice) => report.check_detail(
+            "pcrlock",
+            if advice.warn {
+                State::Warn
+            } else {
+                State::Info
+            },
+            &advice.text,
+        ),
         None => report.check(
             "pcrlock",
             if pcrlock.1.is_some() {
@@ -4478,9 +4486,11 @@ fn doctor_run(
         }
     );
     if let Some(advice) = &seal_advice {
+        let mark = if advice.warn { "\u{26a0}" } else { "\u{b7}" };
         dout!(
             report,
-            "[doctor] \u{26a0} keyring seal ({seal_user}): {advice}"
+            "[doctor] {mark} keyring seal ({seal_user}): {}",
+            advice.text
         );
     }
 

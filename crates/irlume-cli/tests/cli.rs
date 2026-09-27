@@ -1700,29 +1700,29 @@ fn a_tier_3_keyring_seal_off_encrypted_storage_is_told_the_remedies() {
             .unwrap_or_else(|| panic!("no pcrlock check: {out}"))
     };
 
+    // A Tier 3 secret is always told the remedies: as a warning off encrypted
+    // storage (or where that cannot be confirmed), as information on it,
+    // since dm-crypt does not show whether it asks for a passphrase.
     let sb = sandbox("tier3-seal", Some(TIER_3));
-    let told = path_encryption(&sb.path("state")) != StorageEncryption::Encrypted;
+    let warned = path_encryption(&sb.path("state")) != StorageEncryption::Encrypted;
     let out = arm(&sb);
-    assert_eq!(out.contains(ADVICE), told, "{out}");
-    assert_eq!(out.contains(REMEDY), told, "{out}");
+    assert!(out.contains(ADVICE) && out.contains(REMEDY), "{out}");
     let (_, out, err) = run(&mut sb.cmd_with_fakes(&["doctor", "--user", "tester"]));
-    assert_eq!(
+    assert!(
         out.contains("keyring seal (tester)") && out.contains(ADVICE),
-        told,
         "{out} {err}"
     );
     let check = pcrlock_check(&sb);
-    if told {
-        assert_eq!(check["state"], "warn", "{check}");
-        let detail = check["detail"].as_str().unwrap_or_default();
-        assert!(
-            detail.contains(ADVICE) && detail.contains(REMEDY),
-            "{check}"
-        );
-    } else {
-        assert_ne!(check["state"], "warn", "{check}");
-        assert!(check.get("detail").is_none(), "{check}");
-    }
+    assert_eq!(
+        check["state"],
+        if warned { "warn" } else { "info" },
+        "{check}"
+    );
+    let detail = check["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains(ADVICE) && detail.contains(REMEDY),
+        "{check}"
+    );
 
     for (tag, policy) in [("tier2-seal", Some(TIER_2)), ("unarmed-seal", None)] {
         let sb = sandbox(tag, policy);

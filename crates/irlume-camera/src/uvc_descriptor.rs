@@ -375,6 +375,7 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
     let mut processing_controls = Vec::new();
     let mut extension_units = Vec::new();
     let mut videostreaming = [false; 256];
+    let mut interface_alternates = std::collections::BTreeSet::new();
     let mut i = 0usize;
 
     while i < desc.len() {
@@ -396,6 +397,9 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
             }
             DESC_INTERFACE => {
                 if len < 9 {
+                    return None;
+                }
+                if configurations != 1 || !interface_alternates.insert((d[2], d[3])) {
                     return None;
                 }
                 let video = configurations == 1 && d[5] == CLASS_VIDEO;
@@ -2256,6 +2260,31 @@ mod tests {
             desc[header_at + 12] = number;
             desc[stream_at + 2] = number;
             desc[stream_at + 3] = alternate;
+            assert_eq!(
+                ir_function_evidence(&desc, 0),
+                Err(IrFunctionRefusal::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_interface_alternate_pairs_are_malformed() {
+        let whole = attested_shape();
+        let alternate = t480::interface(1, 1, 0, SUBCLASS_VIDEOSTREAMING, 1, 0);
+        let mut valid_alternate = whole.clone();
+        valid_alternate.extend(&alternate);
+        assert!(ir_function_evidence(&valid_alternate, 0).is_ok());
+        let mut duplicate_alternate = valid_alternate;
+        duplicate_alternate.extend(&alternate);
+        assert_eq!(
+            ir_function_evidence(&duplicate_alternate, 0),
+            Err(IrFunctionRefusal::Malformed)
+        );
+        for class in [CLASS_VIDEO, 0xff] {
+            let mut duplicate = t480::interface(1, 0, 0, SUBCLASS_VIDEOSTREAMING, 1, 0);
+            duplicate[5] = class;
+            let mut desc = whole.clone();
+            desc.extend(duplicate);
             assert_eq!(
                 ir_function_evidence(&desc, 0),
                 Err(IrFunctionRefusal::Malformed)

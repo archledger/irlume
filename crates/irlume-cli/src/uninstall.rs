@@ -1521,7 +1521,7 @@ pub(crate) fn root_sealed_token_holders() -> Result<Vec<String>, String> {
             // A tree uninstall does not remove can still hold a keyring
             // store a root irlumed wrote, and a login stack may deliver its
             // token: the guards keep counting it.
-            HomeTree::Skipped { path, .. } => dirs.extend(skipped_tree_keyring(&path, 0)),
+            HomeTree::Skipped { path, .. } => dirs.extend(skipped_tree_keyring(&path, 0)?),
         }
     }
     // What irlumed's own unit names is trusted by where it comes from (a unit
@@ -1546,14 +1546,19 @@ pub(crate) fn root_sealed_token_holders() -> Result<Vec<String>, String> {
 }
 
 /// The keyring store in a per-account tree uninstall skips, when it is a real
-/// directory (not a link at its own name) that `root_uid` owns: the login
-/// guards count its tokens although the tree is not removed. Its envelopes are
-/// read as every envelope is, bounded and without following a link.
-fn skipped_tree_keyring(tree: &Path, root_uid: u32) -> Option<PathBuf> {
+/// directory (not a link at its own name) that `root_uid` owns: the uninstall
+/// and login guards count its tokens although the tree is not removed. Its
+/// envelopes are read as every envelope is, bounded and without following a
+/// link. `Ok(None)` when there is no such store; an error when whether there
+/// is one cannot be established, so the guards stay fail-closed.
+fn skipped_tree_keyring(tree: &Path, root_uid: u32) -> Result<Option<PathBuf>, String> {
     use std::os::unix::fs::MetadataExt as _;
     let keyring = tree.join("keyring");
-    let meta = std::fs::symlink_metadata(&keyring).ok()?;
-    (meta.is_dir() && meta.uid() == root_uid).then_some(keyring)
+    match std::fs::symlink_metadata(&keyring) {
+        Ok(meta) => Ok((meta.is_dir() && meta.uid() == root_uid).then_some(keyring)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", keyring.display())),
+    }
 }
 
 /// [`sealed_token_holders`] with the default-root enumeration, the
@@ -1575,10 +1580,21 @@ fn sealed_token_holders_with(
                 path,
                 account,
                 reason,
-            } => sweep.notes.push(format!(
-                "{account}: {} is neither read nor removed: {reason}",
-                path.display()
-            )),
+            } => {
+                sweep.notes.push(format!(
+                    "{account}: {} is neither read nor removed: {reason}",
+                    path.display()
+                ));
+                // The tree is not removed, but a keyring store in it that
+                // root owns may hold a token a login stack delivers: it
+                // counts, fail-closed, as a root store does.
+                if let Some(dir) = skipped_tree_keyring(path, root_uid)? {
+                    sweep.collect(
+                        irlume_core::keyring::list_sealed_kinds_at(&dir)
+                            .map_err(|e| format!("{}: {e}", dir.display()))?,
+                    );
+                }
+            }
         }
     }
     for root in roots {
@@ -2197,19 +2213,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let tree = base.join("irlume");
         std::fs::create_dir_all(&tree).unwrap();
-        assert_eq!(skipped_tree_keyring(&tree, 0), None, "no keyring directory");
+        assert_eq!(
+            skipped_tree_keyring(&tree, 0),
+            Ok(None),
+            "no keyring directory"
+        );
         std::fs::create_dir(tree.join("keyring")).unwrap();
         let owner = std::fs::metadata(tree.join("keyring")).unwrap().uid();
         // This process stands in for root: the store is "root's" when the
         // injected root uid is its owner.
         assert_eq!(
             skipped_tree_keyring(&tree, owner),
-            Some(tree.join("keyring"))
+            Ok(Some(tree.join("keyring")))
         );
-        assert_eq!(skipped_tree_keyring(&tree, owner + 1), None, "not root's");
+        assert_eq!(
+            skipped_tree_keyring(&tree, owner + 1),
+            Ok(None),
+            "not root's"
+        );
         std::fs::remove_dir(tree.join("keyring")).unwrap();
         std::os::unix::fs::symlink(&base, tree.join("keyring")).unwrap();
-        assert_eq!(skipped_tree_keyring(&tree, owner), None, "a link");
+        assert_eq!(skipped_tree_keyring(&tree, owner), Ok(None), "a link");
+        // Inside a tree this process cannot search, whether a store is there
+        // cannot be established: an error, so the guards refuse.
+        if !is_root() {
+            std::fs::remove_file(tree.join("keyring")).unwrap();
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let answer = skipped_tree_keyring(&tree, owner);
+            std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(answer.is_err(), "{answer:?}");
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

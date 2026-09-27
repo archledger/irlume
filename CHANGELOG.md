@@ -853,6 +853,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- The Arch `PKGBUILD` builds the release tag only after makepkg has
+  checked its signature (`?signed`, with `validpgpkeys` naming the key
+  `scripts/install.sh` pins). Import that key before building (#895).
+
 - The lock irlume holds while it changes PAM (`login enable` and
   `disable` with `--apply`, `login apply`, `login rollback --apply`, the
   reconcile unit and `irlume uninstall`) is `/run/irlume/pam.lock`, a

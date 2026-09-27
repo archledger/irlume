@@ -1100,7 +1100,7 @@ fn open_dir(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// Open `name` in the open directory `parent` as a directory, never through
 /// a link. O_DIRECTORY refuses a FIFO or device before any open can block.
-fn open_child_dir(parent: &std::fs::File, name: &str) -> std::io::Result<Child> {
+fn open_child_dir(parent: &std::fs::File, name: impl AsRef<Path>) -> std::io::Result<Child> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let path = fd_path(parent)?.join(name);
     match std::fs::OpenOptions::new()
@@ -1133,6 +1133,70 @@ fn fd_path(dir: &std::fs::File) -> std::io::Result<PathBuf> {
         ));
     }
     Ok(path)
+}
+
+/// Remove everything in the open directory `dir`, each entry relative to
+/// the directory that holds it and never through a link: an entry is
+/// examined without following it, a directory is opened without following
+/// it and emptied only when it is the one examined, and a link is removed,
+/// not what it points to. An entry that `owners` do not own is left in place
+/// and added to `kept`, named below the tree (`at`): an account could have
+/// moved it in, and root removing it would delete what that account cannot.
+fn clear_dir(
+    dir: &std::fs::File,
+    at: &Path,
+    owners: &[u32],
+    kept: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let here = fd_path(dir)?;
+    let names = std::fs::read_dir(&here)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let gone = |result: std::io::Result<()>| match result {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    };
+    for name in names {
+        let shown = at.join(&name);
+        let seen = match std::fs::symlink_metadata(here.join(&name)) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if !owners.contains(&seen.uid()) {
+            kept.push(shown);
+            continue;
+        }
+        if !seen.is_dir() {
+            gone(std::fs::remove_file(here.join(&name)))?;
+            continue;
+        }
+        let child = match open_child_dir(dir, &name)? {
+            Child::Dir(child) => child,
+            Child::Absent => continue,
+            // It changed since it was examined.
+            Child::Link | Child::Other => {
+                kept.push(shown);
+                continue;
+            }
+        };
+        let held = child.metadata()?;
+        if (held.dev(), held.ino()) != (seen.dev(), seen.ino()) {
+            kept.push(shown);
+            continue;
+        }
+        clear_dir(&child, &shown, owners, kept)?;
+        match std::fs::remove_dir(here.join(&name)) {
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                if !kept.iter().any(|path| path.starts_with(&shown)) {
+                    kept.push(shown);
+                }
+            }
+            other => gone(other)?,
+        }
+    }
+    Ok(())
 }
 
 impl VerifiedTree {
@@ -1226,13 +1290,29 @@ impl VerifiedTree {
                 "it was replaced after it was checked",
             ));
         }
-        // `path` resolves through the held parent, and remove_dir_all opens
-        // every directory below it without following a link and removes a
-        // link rather than what it points to, so nothing outside the tree
-        // is touched.
-        match std::fs::remove_dir_all(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            other => other,
+        self.remove_held(&[verified.uid(), 0])
+    }
+
+    /// The removal after [`Self::wipe`]'s check. The tree is emptied through
+    /// the directory held since it was verified ([`clear_dir`]), so a tree
+    /// renamed away and replaced after the check is still the one emptied,
+    /// and what took its name is never read; that name is then removed only
+    /// as an empty directory. What `owners` do not own is left in place and
+    /// named in the error.
+    fn remove_held(&self, owners: &[u32]) -> std::io::Result<()> {
+        let mut kept = Vec::new();
+        clear_dir(&self.dir, Path::new(""), owners, &mut kept)?;
+        match std::fs::remove_dir(fd_path(&self.parent)?.join("irlume")) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && kept.is_empty() => Ok(()),
+            Err(_) if !kept.is_empty() => Err(std::io::Error::other(format!(
+                "{} owned by another account, left in place",
+                kept.iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+            Err(e) => Err(e),
         }
     }
 
@@ -3135,6 +3215,88 @@ mod tests {
         assert!(wipe_home_trees(&homes).is_empty());
         assert!(!tree_path.exists());
         assert!(outside_intact(&outside));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The removal after the check goes through the directory held since
+    /// it was verified: a tree renamed away and replaced then is still the
+    /// one emptied, and a replacement that is not empty is left whole.
+    #[test]
+    fn a_tree_replaced_after_the_check_is_emptied_where_it_went_and_its_replacement_kept() {
+        let base = std::env::temp_dir().join(format!("irlume-home-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let alice = test_account(&base, "alice");
+        let tree_path = home_state_path(&alice.home);
+        std::fs::create_dir_all(tree_path.join("keyring")).unwrap();
+        std::fs::write(tree_path.join("alice.json"), b"{}").unwrap();
+        std::fs::write(tree_path.join("keyring/alice.json"), PASSWORD_ENVELOPE).unwrap();
+        let homes = home_trees(std::slice::from_ref(&alice), &base.join("default-state"));
+        let tree = match &homes[0] {
+            HomeTree::Verified(tree) => tree,
+            other => panic!("{other:?}"),
+        };
+        // Between the check and the removal the tree moves aside and a real
+        // directory with someone's data takes its name.
+        let moved = tree_path.with_file_name("moved");
+        std::fs::rename(&tree_path, &moved).unwrap();
+        std::fs::create_dir(&tree_path).unwrap();
+        std::fs::write(tree_path.join("victim.txt"), b"not irlume's").unwrap();
+        let owner = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(&moved).unwrap().uid()
+        };
+        assert!(tree.remove_held(&[owner]).is_err());
+        assert!(
+            tree_path.join("victim.txt").is_file(),
+            "the replacement is kept"
+        );
+        assert_eq!(
+            std::fs::read_dir(&moved).unwrap().count(),
+            0,
+            "the tree is emptied"
+        );
+        // An empty replacement is removed: it held nothing.
+        std::fs::remove_file(tree_path.join("victim.txt")).unwrap();
+        assert!(tree.remove_held(&[owner]).is_ok());
+        assert!(!tree_path.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// What the given owners do not own is left in place and named, with
+    /// everything below it; a link is removed, never what it points to.
+    #[test]
+    fn clearing_a_tree_leaves_what_another_account_owns() {
+        use std::os::unix::fs::MetadataExt as _;
+        let base = std::env::temp_dir().join(format!("irlume-home-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let tree = base.join("tree");
+        std::fs::create_dir_all(tree.join("sub/deeper")).unwrap();
+        std::fs::write(tree.join("file"), b"x").unwrap();
+        std::fs::write(tree.join("sub/deeper/file"), b"x").unwrap();
+        let outside = outside_tree(&base);
+        std::os::unix::fs::symlink(&outside, tree.join("link")).unwrap();
+        let uid = std::fs::metadata(&tree).unwrap().uid();
+        let dir = open_dir(&tree).unwrap();
+        let mut kept = Vec::new();
+        clear_dir(&dir, Path::new(""), &[uid.wrapping_add(1)], &mut kept).unwrap();
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec![
+                PathBuf::from("file"),
+                PathBuf::from("link"),
+                PathBuf::from("sub")
+            ]
+        );
+        assert!(tree.join("sub/deeper/file").is_file() && tree.join("file").is_file());
+        let mut kept = Vec::new();
+        clear_dir(&dir, Path::new(""), &[uid], &mut kept).unwrap();
+        assert!(kept.is_empty(), "{kept:?}");
+        assert_eq!(std::fs::read_dir(&tree).unwrap().count(), 0);
+        assert!(
+            outside_intact(&outside),
+            "the link was removed, not followed"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

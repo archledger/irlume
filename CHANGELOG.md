@@ -847,8 +847,9 @@ All notable changes to irlume are documented here. This project adheres to
   each home. It opens `~/.local/share/irlume` without following a
   symbolic link at any step below the home, uses it only when it is a
   real directory owned by root or by that account, and removes it
-  through the directory it checked; anything else there is named in the
-  output as left in place. Sealed envelopes are read only as regular
+  through the directory it checked, entry by entry without following a
+  link, leaving in place what another account owns; anything else there
+  is named in the output as left in place. Sealed envelopes are read only as regular
   files of at most 64 KiB, never through a symbolic link at their own
   name. In an account's tree, an envelope that cannot be read and that
   root does not own is named against that account instead of stopping

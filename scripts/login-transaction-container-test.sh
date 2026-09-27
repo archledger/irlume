@@ -165,8 +165,15 @@ assert "sudo ends with a newline" "truncated mid-line" \
     test -z "$(tail -c 1 "$SUDO_PAM")"
 assert "sudo still has its own auth stack" "lost the original body" \
     grep -qE 'auth|@include' "$SUDO_PAM"
-# And the lock file itself is left behind for the next run, not deleted.
-assert "the PAM lock exists after the race" "missing" test -e /run/lock/irlume-pam.lock
+# And the lock file itself is left behind for the next run, not deleted, in the
+# root-only /run/irlume at 0600; the lock earlier releases kept in /run/lock is
+# not created.
+assert "the PAM lock exists after the race" "missing" test -f /run/irlume/pam.lock
+assert "the PAM lock is root-only" "mode $(stat -c %a /run/irlume/pam.lock 2>/dev/null)" \
+    test "$(stat -c %a /run/irlume/pam.lock 2>/dev/null)" = 600
+assert "the PAM lock's directory is root-only" "mode $(stat -c %a /run/irlume 2>/dev/null)" \
+    test "$(stat -c %a /run/irlume 2>/dev/null)" = 700
+assert_not "the old PAM lock path is not created" "created" test -e /run/lock/irlume-pam.lock
 
 echo "=== 12. a stopped rollback resumes instead of refusing itself ==="
 # A rollback restores surfaces one at a time. Stopping partway used to be

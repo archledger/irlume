@@ -853,6 +853,22 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- The lock irlume holds while it changes PAM (`login enable` and
+  `disable` with `--apply`, `login apply`, `login rollback --apply`, the
+  reconcile unit and `irlume uninstall`) is `/run/irlume/pam.lock`, a
+  0600 file in the root-owned 0700 directory root's session lock uses,
+  so only root can open it; it was a 0644 file in `/run/lock`. It is
+  opened without following a symlink and must be a regular file root
+  owns, and an operation waiting for it names the process holding it.
+  While a release that used the old lock may still be running, as
+  during an upgrade, `/run/lock/irlume-pam.lock` is taken as well when
+  it exists and root owns it: a process holding it is waited for at
+  most 60 seconds, and the file loses its group and other permissions.
+  It is no longer created, and `irlume uninstall` removes it.
+  `irlume-reconcile.service` now stops a run after 5 minutes
+  (`TimeoutStartSec`), so a run that does not finish no longer keeps
+  later triggers from starting it.
+
 - `irlume doctor` reports `irlume logs debug on` (check `debug-tracing`,
   `warn` while its drop-in is in place) and `irlume status` names it:
   the drop-in survives reboots, and while it is there the daemon logs

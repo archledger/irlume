@@ -59,6 +59,13 @@ impl Sandbox {
         self.root.join(rel)
     }
 
+    /// Where a test points `IRLUME_PAM_LOCK`: in a directory the lock creates
+    /// at 0700, because it refuses one that group or others can write, as the
+    /// sandbox root is under a umask of 002.
+    fn pam_lock(&self) -> PathBuf {
+        self.path("pam-lock/pam.lock")
+    }
+
     /// Drop a fake `#!/bin/sh` executable into the sandbox bin dir.
     fn fake_tool(&self, name: &str, body: &str) {
         use std::os::unix::fs::PermissionsExt;
@@ -2382,7 +2389,7 @@ fn login_changes_on_nixos_name_the_module_and_touch_nothing() {
         },
         _ => Response::Error("unexpected request".into()),
     });
-    let lock = sb.path("pam.lock");
+    let lock = sb.pam_lock();
     let mut cases: Vec<(&[&str], i32)> =
         vec![(&["login", "enable"], 1), (&["login", "disable"], 1)];
     // Unprivileged, a build without the refusal cannot write a PAM stack; as
@@ -2420,7 +2427,7 @@ fn login_changes_on_nixos_name_the_module_and_touch_nothing() {
 #[test]
 fn login_force_is_refused_outside_enable_and_disable() {
     let sb = Sandbox::new("login-force-scope");
-    let lock = sb.path("pam.lock");
+    let lock = sb.pam_lock();
     for args in [
         &["login", "reconcile", "--force"][..],
         &["login", "status", "--force"],
@@ -2442,6 +2449,45 @@ fn login_force_is_refused_outside_enable_and_disable() {
     assert!(!err.contains("note: --force"), "{out}\n{err}");
     assert!(out.contains("DRY RUN"), "{out}\n{err}");
     assert!(!lock.exists(), "a dry run takes no lock");
+}
+
+/// Without `IRLUME_PAM_LOCK`, the PAM lock is `pam.lock` in the root-only
+/// `/run/irlume`, and `/run/lock/irlume-pam.lock`, the lock earlier releases
+/// created at 0644, is not created. One an earlier release left is still taken,
+/// and loses its group and other permissions. The namespace's `/run` is its
+/// own tmpfs, with a sandbox directory at `/run/lock`.
+#[test]
+fn the_pam_lock_is_kept_where_only_root_can_open_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut sb = Sandbox::new("pam-lock-place");
+    sb.hidden = vec!["/etc/pam.d", "/usr/lib/pam.d"];
+    let run_lock = sb.path("run-lock");
+    std::fs::create_dir(&run_lock).unwrap();
+    let legacy = run_lock.join("irlume-pam.lock");
+    let reconcile = |sb: &Sandbox| {
+        run(support::isolated_root_command(
+            &sb.root,
+            BIN,
+            &["login", "reconcile"],
+            &[],
+            &sb.hidden,
+            &[(&run_lock, "/run/lock")],
+        )
+        .env("IRLUME_OS_RELEASE", sb.path("no-os-release")))
+    };
+
+    let (code, out, err) = reconcile(&sb);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(!err.contains("cannot serialise"), "{err}");
+    assert!(!legacy.exists(), "the lock was created in /run/lock");
+
+    std::fs::write(&legacy, "").unwrap();
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (code, out, err) = reconcile(&sb);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(!err.contains("cannot serialise"), "{err}");
+    let mode = std::fs::metadata(&legacy).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "an earlier release's lock kept mode {mode:o}");
 }
 
 /// The harness can bind a fixture directory at a system path the host does
@@ -2725,7 +2771,7 @@ session    optional                     pam_irlume.so reseal\n",
             &[(&etc, "/etc/pam.d"), (&vendor, "/usr/lib/pam.d")],
         )
         .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
-        .env("IRLUME_PAM_LOCK", sb.path("pam.lock")))
+        .env("IRLUME_PAM_LOCK", sb.pam_lock()))
     };
     let read = |name: &str| std::fs::read_to_string(etc.join(name)).unwrap();
     let digest = |text: &str| {
@@ -2845,7 +2891,7 @@ session    optional                     pam_irlume.so reseal\n";
         &[(&etc, "/etc/pam.d"), (&vendor, "/usr/lib/pam.d")],
     )
     .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
-    .env("IRLUME_PAM_LOCK", sb.path("pam.lock")));
+    .env("IRLUME_PAM_LOCK", sb.pam_lock()));
     assert_eq!(code, 0, "{out}\n{err}");
     assert!(
         err.contains("adopted the existing face-login wiring"),
@@ -2940,7 +2986,7 @@ session    optional                     pam_irlume.so reseal\n\
         &[(&etc, "/etc/pam.d"), (&vendor, "/usr/lib/pam.d")],
     )
     .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
-    .env("IRLUME_PAM_LOCK", sb.path("pam.lock")));
+    .env("IRLUME_PAM_LOCK", sb.pam_lock()));
     assert_eq!(code, 0, "{out}\n{err}");
     let after = std::fs::read_to_string(etc.join("plasmalogin")).unwrap();
     assert!(
@@ -3071,7 +3117,7 @@ session    optional                     pam_irlume.so reseal\n";
             &[(&etc, "/etc/pam.d"), (&vendor, "/usr/lib/pam.d")],
         )
         .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
-        .env("IRLUME_PAM_LOCK", sb.path("pam.lock")))
+        .env("IRLUME_PAM_LOCK", sb.pam_lock()))
     };
     let (code, out, err) = disable(&["login", "disable", "--apply"]);
     assert_eq!(code, 1, "{out}\n{err}");
@@ -3185,7 +3231,7 @@ session    optional                     pam_irlume.so reseal\n";
             &[(&etc, "/etc/pam.d"), (&vendor, "/usr/lib/pam.d")],
         )
         .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
-        .env("IRLUME_PAM_LOCK", sb.path("pam.lock")))
+        .env("IRLUME_PAM_LOCK", sb.pam_lock()))
     };
     let (code, out, err) = enable(&["login", "enable", "--apply"]);
     assert_eq!(code, 1, "{out}\n{err}");
@@ -3275,7 +3321,7 @@ session    optional                     pam_irlume.so reseal\n";
             &[(&etc, "/etc/pam.d")],
         )
         .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
-        .env("IRLUME_PAM_LOCK", sb.path("pam.lock")))
+        .env("IRLUME_PAM_LOCK", sb.pam_lock()))
     };
     // A rollback that cannot proceed anyway says why, not to forget a token:
     // the same record left unconfirmed needs --accept-unconfirmed first.
@@ -3389,7 +3435,7 @@ impl LightdmBed {
             ],
         )
         .env("IRLUME_OS_RELEASE", self.sb.path("no-os-release"))
-        .env("IRLUME_PAM_LOCK", self.sb.path("pam.lock")))
+        .env("IRLUME_PAM_LOCK", self.sb.pam_lock()))
     }
 
     fn stack(&self) -> String {

@@ -2,11 +2,11 @@
 // Copyright the irlume contributors.
 
 //! Touching the filesystem safely: reading a stack, recording what a surface
-//! looked like, restoring it, and holding the lock that serialises all of it.
+//! looked like and restoring it.
 //!
 //! An auth stack is the one file on the machine a user cannot afford to have
 //! half-written, so the write path stages to a scratch file and renames, and
-//! every mutation runs under `lock_pam`. Kept apart from the rewriting logic so
+//! every mutation runs under `lock_pam` (`super::lock`). Kept apart from the rewriting logic so
 //! that "what do we write" and "how do we write it without losing the file" can
 //! be reviewed and tested separately.
 
@@ -239,70 +239,6 @@ pub(crate) fn restore_surface_with(
             remove_checked_if(path, Some(&bytes), &still).map_err(String::from)
         }
     }
-}
-
-/// Held for as long as a process is changing PAM. Released when dropped.
-pub(crate) struct PamLock {
-    _file: std::fs::File,
-}
-
-/// Where the PAM lock lives. `IRLUME_PAM_LOCK` overrides it for tests and
-/// containers, the same way `IRLUME_STATE_DIR` overrides the state root.
-pub(super) fn pam_lock_path() -> PathBuf {
-    std::env::var_os("IRLUME_PAM_LOCK")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/run/lock/irlume-pam.lock"))
-}
-
-/// Take the exclusive lock every irlume path that changes PAM must hold.
-///
-/// Nothing serialised these before. `login apply`, `login rollback`, human
-/// `login enable`/`disable`, and `reconcile` could all run at once, and the
-/// combinations are not theoretical: the reconcile path unit fires when a PAM
-/// file changes, which is exactly what the other three do. Two of them
-/// interleaving produced a stack that was a mixture of both, and the record
-/// written by either then described a machine state that never existed.
-///
-/// The lock covers the whole operation, not each write: revalidating a plan,
-/// writing the prepared record, every PAM and sidecar write, and the confirming
-/// record all have to be one indivisible unit, or the record still describes
-/// something other than what is on disk.
-///
-/// `flock` is released by the kernel when the process exits however it exits, so
-/// a killed irlume does not strand it. It does not exclude package managers or
-/// an administrator with an editor: only irlume takes it, which is why every
-/// path still re-checks the file it is about to write.
-pub(crate) fn lock_pam() -> Result<PamLock, String> {
-    use std::os::unix::io::AsRawFd as _;
-    let path = pam_lock_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|e| format!("open {}: {e}", path.display()))?;
-    let fd = file.as_raw_fd();
-    // SAFETY: `fd` is owned by `file`, which outlives the call and the guard.
-    let busy = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0;
-    if busy {
-        // Said on stderr, because machine output is JSON on stdout. Then wait:
-        // refusing outright would make the reconcile path unit give up exactly
-        // when an apply is in flight, which is when it most needs to run after.
-        eprintln!("irlume: another irlume PAM operation is in progress, waiting for it…");
-        // SAFETY: as above.
-        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
-            return Err(format!(
-                "lock {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
-    }
-    sweep_abandoned_scratch();
-    Ok(PamLock { _file: file })
 }
 
 /// Remove scratch files a killed irlume left in `/etc/pam.d`.

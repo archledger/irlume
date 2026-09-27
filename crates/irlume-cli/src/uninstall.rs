@@ -695,9 +695,11 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
         // for exactly this residue class (0.11.0rc1 audit).
         let _ = std::fs::remove_dir_all("/run/lock/irlume");
         // The machine-API session lock's directory for root without a
-        // runtime directory (`machine::ROOT_SESSION_DIR`); only root can
-        // create it under /run.
+        // runtime directory (`machine::ROOT_SESSION_DIR`), which also holds
+        // the PAM lock; only root can create it under /run. The PAM lock of
+        // earlier releases goes too: this release never creates it.
         let _ = std::fs::remove_dir_all(crate::machine::ROOT_SESSION_DIR);
+        let _ = std::fs::remove_file(pamwire::LEGACY_PAM_LOCK);
     }
     // `systemctl enable` copies units into /etc/systemd/system/ (Arch's
     // systemd does this for units with [Install] aliases) — files pacman/apt

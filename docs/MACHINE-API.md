@@ -865,7 +865,15 @@ the human `login enable`/`disable`, and the self-heal reconcile) holds one
 exclusive lock for the whole operation, so a consumer's transaction cannot
 interleave with another irlume process. The lock does not cover package managers
 or an administrator with an editor, which is why each surface is re-checked
-immediately before it is written.
+immediately before it is written. The lock is `/run/irlume/pam.lock`, a 0600
+file in the root-owned 0700 directory root's session lock uses, so no other
+account can open or hold it. It is opened without following a symlink and must
+be a regular file root owns. A second operation waits for the first, naming its
+process on stderr. While an irlume release that kept the lock at
+`/run/lock/irlume-pam.lock` may still be running, as during an upgrade, that file
+is taken too if it exists and root owns it, waiting at most 60 seconds for a
+process holding it; it is never created, and its group and other permissions are
+removed.
 
 irlume refuses to write a PAM path that is a symlink or that has more than one
 hard link, on every one of those paths. Renaming over a symlink would silently

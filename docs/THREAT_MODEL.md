@@ -330,8 +330,12 @@ with a fabricated print.
 The packaged unit (`packaging/systemd/irlumed.service`, which the Debian,
 Ubuntu, Fedora and Arch packages install) and the NixOS module run irlumed as
 root with systemd sandboxing: a reduced capability set, `ProtectSystem=full`
-and more; not `ProtectHome` or `PrivateDevices`, since it opens cameras and the
-TPM. What a mandatory access control policy adds depends on the distribution:
+and more. `PrivateDevices` is not set, since it opens cameras and the TPM, and
+`ProtectHome` is not set, since it reads users' home directories: the keyring
+an account keeps there (a GNOME login keyring, oo7's keyrings or a KDE wallet)
+decides what `irlume keyring arm` seals, and an explicit token arm checks that
+the login keyring exists. What a mandatory access control policy adds depends
+on the distribution:
 
 - **AppArmor** (Debian, Ubuntu, and other systems that load
   `packaging/apparmor/usr.bin.irlumed`): loaded in enforce mode, as it ships,

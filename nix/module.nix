@@ -273,8 +273,9 @@ in
         # holds on NixOS too. Scoped to what the daemon needs: it opens
         # /dev/video* and the TPM, binds a Unix socket, and writes root-owned
         # state at mode 0600. ProtectHome / PrivateDevices / MemoryDenyWriteExecute
-        # are deliberately NOT set (per-user $HOME state, camera + TPM access, and
-        # the ONNX runtime JITs).
+        # are deliberately NOT set (it reads users' homes to tell which keyring an
+        # account keeps before a keyring arm, camera + TPM access, and the ONNX
+        # runtime JITs).
         NoNewPrivileges = true;
         RestrictAddressFamilies = [
           "AF_UNIX"

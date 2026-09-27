@@ -227,11 +227,18 @@ fn take_legacy_lock(path: &Path, uid: u32, wait: Duration) -> Result<Option<File
 ///
 /// It is created with `O_EXCL`, which neither follows a symlink nor opens a
 /// file another process created first, in a directory created at 0755 when
-/// missing, as those releases did. A file that exists is opened read-only
-/// without following a symlink, and `O_NONBLOCK` keeps a FIFO from stalling the
-/// open. When the name is removed between the two, creating it is tried again.
-/// Any other error opening or creating it stops the operation, as it stopped
-/// those releases.
+/// missing, as those releases did. A file that exists is first opened with
+/// `O_PATH` and without following a symlink, which does not wait and does not
+/// open a FIFO or a socket, and only a regular file is then opened for reading,
+/// through that descriptor, so it is the file just checked. That open waits
+/// while another process holds a write lease on the file, as the open of those
+/// releases did, where an open that does not wait fails: the kernel asks the
+/// holder to give the lease up and, after `/proc/sys/fs/lease-break-time` (45 s
+/// by default), reduces it to a read lease, which does not delay a reader. No
+/// write lease can be taken on the file while it is open. When the name is
+/// removed between creating and opening it, creating it is tried again. Any
+/// other error opening or creating it stops the operation, as it stopped those
+/// releases.
 ///
 /// A symlink is left alone. Only root can create one where `/run/lock` is
 /// root's alone; where every account can write it, `protected_symlinks`, which
@@ -242,9 +249,10 @@ fn take_legacy_lock(path: &Path, uid: u32, wait: Duration) -> Result<Option<File
 /// account that has not opened it by then cannot. A file another account owns
 /// is not changed but is still returned, to be locked and waited for: where
 /// `protected_regular` is off, an earlier release running as root opens that
-/// file and locks it. That account can hold it and so delay each operation by
-/// up to [`LEGACY_WAIT`], as an account that opened the 0644 file of those
-/// releases can; it cannot stop one, since its process is not an earlier
+/// file and locks it. That account can hold a lease on it and then its lock,
+/// and so delay each operation by up to the lease break time and
+/// [`LEGACY_WAIT`], as an account that opened the 0644 file of those releases
+/// can delay them; it cannot stop one, since its process is not an earlier
 /// irlume (see [`take_legacy_lock`]).
 fn open_legacy_lock(path: &Path, uid: u32) -> Result<Option<File>, String> {
     for _ in 0..LEGACY_OPEN_TRIES {
@@ -257,22 +265,30 @@ fn open_legacy_lock(path: &Path, uid: u32) -> Result<Option<File>, String> {
         let file = match created {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let existing = std::fs::OpenOptions::new()
+                let found = std::fs::OpenOptions::new()
                     .read(true)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                    .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
                     .open(path);
-                match existing {
-                    Ok(file) => file,
+                let found = match found {
+                    Ok(found) => found,
                     // Removed since the create found it.
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    // A symlink, or a socket, which cannot be opened.
-                    Err(error)
-                        if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENXIO)) =>
-                    {
-                        return Ok(None)
-                    }
                     Err(error) => return Err(format!("open {}: {error}", path.display())),
+                };
+                let meta = found
+                    .metadata()
+                    .map_err(|error| format!("stat {}: {error}", path.display()))?;
+                if !meta.is_file() {
+                    // A symlink, a FIFO, a socket or a device.
+                    return Ok(None);
                 }
+                // Without `O_NONBLOCK`, so a lease is waited for as above.
+                let at = Path::new("/proc/self/fd").join(found.as_raw_fd().to_string());
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_CLOEXEC)
+                    .open(&at)
+                    .map_err(|error| format!("open {}: {error}", path.display()))?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let dir = path.parent().unwrap_or(Path::new("/"));
@@ -750,6 +766,52 @@ mod tests {
         }
     }
 
+    /// A `cat` process holding a write lease on `path` until dropped, as the
+    /// account owning a file can take one. The lease is taken between fork and
+    /// exec on a descriptor `cat` inherits, and `SIGIO`, which tells the holder
+    /// an open is waiting for the lease, is ignored, so `cat` does not give the
+    /// lease up: it goes when `cat` ends at the end of its input.
+    struct LeaseHolder {
+        child: Child,
+        input: Option<ChildStdin>,
+    }
+
+    impl LeaseHolder {
+        fn new(path: &Path) -> Self {
+            use std::os::unix::ffi::OsStrExt as _;
+            use std::os::unix::process::CommandExt as _;
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path");
+            let mut command = Command::new("cat");
+            command.stdin(Stdio::piped()).stdout(Stdio::null());
+            // SAFETY: the closure runs in the child between fork and exec and
+            // calls only async-signal-safe functions (signal, open, fcntl) on a
+            // path allocated before the fork. The descriptor it opens is left
+            // open on purpose, for `cat` to inherit with the lease.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::signal(libc::SIGIO, libc::SIG_IGN) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let fd = libc::open(path.as_ptr(), libc::O_RDONLY);
+                    if fd < 0 || libc::fcntl(fd, libc::F_SETLEASE, libc::F_WRLCK) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().expect("take a write lease");
+            let input = child.stdin.take();
+            Self { child, input }
+        }
+    }
+
+    impl Drop for LeaseHolder {
+        fn drop(&mut self) {
+            drop(self.input.take());
+            let _ = self.child.wait();
+        }
+    }
+
     /// The directory is created 0700 and the lock 0600, so no other account can
     /// open the lock, and the lock excludes another process until it is dropped.
     #[test]
@@ -1214,6 +1276,37 @@ mod tests {
         assert!(matches!(taken, Ok(None)), "{taken:?}");
         assert_eq!(mode(&foreign), 0o644, "another account's file was changed");
         drop(holder);
+    }
+
+    /// A write lease on a legacy lock another account owns, which that account
+    /// can take, does not stop the operation: opening the file waits for the
+    /// lease to be given up, as the open of earlier releases did, and the lock
+    /// is then taken. Here the holder gives it up after 700 ms; the open waits
+    /// for one that does not only as long as the kernel's lease break time.
+    #[test]
+    fn waits_for_a_lease_on_a_legacy_lock_another_account_owns() {
+        let scratch = Scratch::new("legacy-lease");
+        let foreign = scratch.file("foreign.lock", 0o644);
+        let lease = LeaseHolder::new(&foreign);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            drop(lease);
+        });
+        let started = Instant::now();
+        let taken = take_legacy_lock(&foreign, uid().wrapping_add(1), Duration::from_secs(30));
+        let waited = started.elapsed();
+        release.join().unwrap();
+        let taken = taken
+            .expect("a lease on the legacy lock stopped the operation")
+            .expect("a leased legacy lock was passed over");
+        assert!(
+            waited >= Duration::from_millis(500) && waited < Duration::from_secs(30),
+            "returned after {waited:?}, while the lease was held for 700 ms"
+        );
+        assert!(held(&foreign), "the legacy lock is not held");
+        assert_eq!(mode(&foreign), 0o644, "another account's file was changed");
+        drop(taken);
+        assert!(released(&foreign), "the legacy lock was not released");
     }
 
     /// A legacy lock another account owns still stops the operation at the

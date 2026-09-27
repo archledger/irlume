@@ -366,6 +366,7 @@ mod tests {
                 })
                 .collect(),
             password_wrap: None,
+            uid: None,
         };
         let path = dir.join("legacy.json");
         // Written the way an earlier release did: no size check.
@@ -392,6 +393,7 @@ mod tests {
             private: Vec::new(),
             pcr_values,
             password_wrap: None,
+            uid: None,
         };
         envelope(vec![7], Vec::new()).save(&path).unwrap();
         let before = fs::read(&path).unwrap();
@@ -696,7 +698,9 @@ mod tests {
                 t_cost: 2,
                 p_cost: 1,
                 wrapped: "w".repeat(128),
+                uid: Some(u32::MAX),
             }),
+            uid: Some(u32::MAX),
         }
     }
 

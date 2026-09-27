@@ -359,12 +359,7 @@ fn insert_verify_stanza(content: &str, stanza: &str) -> (String, bool) {
     };
     let password = lines
         .iter()
-        .position(|l| {
-            is_include_auth_layout(l)
-                || is_passwd_substack(l, "auth")
-                || is_auth_substack_anchor(l)
-                || (is_auth_directive(l) && rule_names_module(l, "pam_unix.so"))
-        })
+        .position(|l| is_password_step(l))
         .map_or(first, |at| at.max(first));
     let with_stanza_at = |at: usize| {
         let mut out = Vec::with_capacity(lines.len() + 1);

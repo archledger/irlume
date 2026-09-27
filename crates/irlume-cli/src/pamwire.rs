@@ -2546,7 +2546,9 @@ fn act_holding_lock(
                 }
                 if requested_scope_unmet(origin, enable, with_polkit, msg.change) {
                     unmet.push(("--with-polkit", "polkit-1", msg.change));
-                } else if enable && apply {
+                } else if enable && apply && !msg.unmet {
+                    // A kept stack (an override or in-place refusal) was
+                    // left as it is, so its prompts did not change.
                     println!(
                         "    polkit prompts (Bitwarden unlock, pkexec) now take your face.\n    \
                          Type yes for one face attempt, or use your password."
@@ -4477,6 +4479,49 @@ mod tests {
     /// as it is when irlume's lines do not fit them; every other stack is
     /// wired as the recipe has it, except one whose irlume lines are already
     /// the recipe's in the places a jump counts, which is already correct.
+    /// A place a disable held stops being the verify line's place once the
+    /// password step moves across it: an administrator who moves
+    /// `pam_unix.so` above the inactive line, while the jump still counts it,
+    /// would otherwise get irlume's line back below the password step, where
+    /// the recipe never puts it. The enable refuses and leaves the stack.
+    #[test]
+    fn an_in_place_refill_keeps_the_verify_line_above_the_password_step() {
+        let etc = "/etc/pam.d/sudo";
+        for (stanza, wire) in [
+            (
+                VERIFY_STANZA,
+                wire_verify_service as fn(&str) -> (String, bool),
+            ),
+            (POLKIT_VERIFY_STANZA, wire_polkit_service),
+        ] {
+            let held = overrides::neutralize(&counted_verify_stack(stanza));
+            let lines: Vec<&str> = held.lines().collect();
+            assert!(lines[1].contains(INERT_TAG) && lines[2].contains("pam_unix.so"));
+            let moved = format!(
+                "{}\n{}\n{}\n{}\n",
+                lines[0],
+                lines[2],
+                lines[1],
+                lines[3..].join("\n")
+            );
+            let (wired, changed) = wire(&unwire_lines(&moved).0);
+            assert!(changed, "{moved}");
+            assert!(
+                matches!(
+                    keep_places(etc, &moved, &wired),
+                    Some(KeptPlaces::Refused(_))
+                ),
+                "{moved}"
+            );
+            // The unmoved stack is still refilled in its place.
+            let (wired, _) = wire(&unwire_lines(&held).0);
+            assert!(
+                matches!(keep_places(etc, &held, &wired), Some(KeptPlaces::Filled(_))),
+                "{held}"
+            );
+        }
+    }
+
     #[test]
     fn an_in_place_enable_refills_only_places_a_jump_counts() {
         let etc = "/etc/pam.d/sudo";

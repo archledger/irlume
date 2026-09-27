@@ -410,13 +410,46 @@ fn filled_in_place(body: &str, wired: &str, edited: bool) -> Option<(String, Jum
 /// [`fill_slots`] for a stack irlume edits in place: `current` with each of
 /// irlume's lines, an inactive line holding a place included, taking the line
 /// `wired` has for the same job. The filled text when every numeric jump of
-/// the other lines lands where it does in `current` and irlume's own jumps
-/// land as they do in `wired`; `None` when irlume's lines do not fit those
-/// places.
+/// the other lines lands where it does in `current`, irlume's own jumps land
+/// as they do in `wired`, and each of irlume's lines sits on the side of the
+/// password step the recipe puts it on; `None` when irlume's lines do not fit
+/// those places.
 pub(super) fn refill(current: &str, wired: &str) -> Option<String> {
     let filled = fill_slots(current, wired)?;
-    (own_landings(&filled) == own_landings(wired) && jump_shifts(current, &filled).is_empty())
-        .then_some(filled)
+    (own_landings(&filled) == own_landings(wired)
+        && jump_shifts(current, &filled).is_empty()
+        && same_side_of_the_password_step(&filled, wired))
+    .then_some(filled)
+}
+
+/// Whether each of irlume's active lines in `wired` sits on the same side of
+/// the first password step ([`grammar::is_password_step`]) in `filled`: the
+/// recipe puts a verify or face line above it and a reseal line below it. A
+/// place a disable held stops being that line's place once the step has
+/// moved across it, as when an administrator moves `pam_unix.so` above it:
+/// a verify line refilled below the step would never be reached. True when
+/// either stack has no password step.
+fn same_side_of_the_password_step(filled: &str, wired: &str) -> bool {
+    let sides = |text: &str| -> Option<Vec<(String, bool)>> {
+        let lines: Vec<&str> = text.lines().collect();
+        let step = lines
+            .iter()
+            .position(|l| !is_irlume_line(l) && grammar::is_password_step(l))?;
+        Some(
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| is_irlume_line(l) && !l.contains(INERT_TAG))
+                .map(|(at, l)| (l.trim().to_string(), at < step))
+                .collect(),
+        )
+    };
+    match (sides(filled), sides(wired)) {
+        (Some(filled), Some(wired)) => wired
+            .iter()
+            .all(|line| filled.iter().any(|placed| placed == line)),
+        _ => true,
+    }
 }
 
 // ---- numeric jumps -------------------------------------------------------------

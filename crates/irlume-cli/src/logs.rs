@@ -29,8 +29,30 @@ const PATTERN: &str = "irlume|pam_kwallet|pam_gnome_keyring|gkr-pam|pam_oo7|oo7-
 /// Whether the debug-logging drop-in is active (the TUI's toggle reads this
 /// to know which way `logs debug` should flip).
 pub(crate) fn debug_active() -> bool {
-    Path::new(DROPIN).exists()
+    debug_state() == Some(true)
 }
+
+/// Whether the debug-logging drop-in is in place, `None` when this user
+/// cannot tell (its directory is not readable, as under a restrictive umask
+/// or when an administrator made it root-only). doctor and `irlume status`
+/// report it.
+pub(crate) fn debug_state() -> Option<bool> {
+    debug_state_at(Path::new(DROPIN))
+}
+
+fn debug_state_at(dropin: &Path) -> Option<bool> {
+    dropin.try_exists().ok()
+}
+
+/// What doctor and `irlume status` say when the drop-in cannot be checked.
+pub(crate) const DEBUG_UNKNOWN_DETAIL: &str = "this user cannot read \
+    /etc/systemd/system/irlumed.service.d; `sudo irlume doctor` tells whether the daemon logs \
+    exact scores and liveness measurements to the system journal";
+
+/// What doctor and `irlume status` say while the drop-in is active.
+pub(crate) const DEBUG_ACTIVE_DETAIL: &str = "the daemon logs exact scores and liveness \
+    measurements to the system journal until `sudo irlume logs debug off`; the drop-in \
+    survives reboots";
 
 pub fn run(sub: Option<&str>, args: &[String]) -> ExitCode {
     match sub {
@@ -303,6 +325,27 @@ fn restart_daemon() {
 
 #[cfg(test)]
 mod tests {
+
+    /// The drop-in is on, off, or unknown when its directory cannot be read
+    /// (root reads it anyway).
+    #[test]
+    fn the_debug_drop_in_is_unknown_where_its_directory_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("irlume-debug-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dropin = dir.join("50-irlume-debug.conf");
+        assert_eq!(debug_state_at(&dropin), Some(false));
+        std::fs::write(&dropin, "[Service]\n").unwrap();
+        assert_eq!(debug_state_at(&dropin), Some(true));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::symlink_metadata(&dropin).is_ok();
+        let state = debug_state_at(&dropin);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(state, if readable { Some(true) } else { None });
+    }
+
     use super::*;
 
     fn opts(v: &[&str]) -> Vec<String> {

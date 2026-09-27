@@ -853,6 +853,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- `irlume doctor` reports `irlume logs debug on` (check `debug-tracing`,
+  `warn` while its drop-in is in place) and `irlume status` names it:
+  the drop-in survives reboots, and while it is there the daemon logs
+  exact scores and liveness measurements to the system journal.
+  THREAT_MODEL and AGENTS.md no longer call that journal root-only: the
+  `adm`, `wheel` or `systemd-journal` group can read it too, depending on
+  the distribution.
+
 - THREAT_MODEL.md has a "Confinement" section that says what each
   mandatory access control policy does for irlumed: the AppArmor profile
   confines it in enforce mode, while on Fedora it runs as

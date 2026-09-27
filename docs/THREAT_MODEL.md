@@ -381,8 +381,12 @@ installs and loads by hand.
   return a score too: `Identify` searches every account only for root and
   otherwise only the caller's own, and `IdentifyFor` (the account-scoped test
   a client runs for one account) is refused before it is queued unless the
-  caller is root or that account. Scores are logged to the root-only journal, never to
-  unprivileged callers.
+  caller is root or that account. Scores are logged to the system journal, never to
+  unprivileged callers. The journal is readable by root and by the groups a
+  distribution gives journal access (`adm`, `wheel` or `systemd-journal`), so
+  their members see these lines too; `irlume logs debug on` makes them exact
+  until it is turned off, and `irlume doctor` (`debug-tracing`) and `irlume
+  status` report it while it is on.
 - **Memory hygiene.** Secrets are zeroized where the exposure is real: sealed
   keys, decrypted template plaintext, passwords, and the IPC wire buffers that
   may carry them (`zeroize`). Camera frames and embeddings are transient

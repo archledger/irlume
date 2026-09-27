@@ -219,6 +219,15 @@ each record it does not use, with the uids and the next step.
   stored enrollment with the key to find out): as for a key sealed for
   another uid, the account gets a new key, and the old key's recovery
   envelope is removed once the new enrollment is saved.
+- `irlume recovery setup` does not wrap a template key for the account when
+  the enrollment under it records another uid, whatever the key records.
+  For a key that records no uid, over an enrollment that records none (or
+  none stored), the recovery envelope it would replace decides: it was set
+  up for the key it wraps, so one recorded for another uid is kept and the
+  setup refused. Either refusal names the next step (`irlume enroll`, after
+  which the enrollment records the account's uid and a setup goes ahead).
+  `irlume recovery restore` seals nothing when the enrollment the restored
+  key opens records another uid.
 - A write never changes the uid a record carries. An operation that loads a
   record and writes it back (add scans, rename a profile, delete one that is
   not the last, turn require-eyes-open off, a template key or keyring re-seal,

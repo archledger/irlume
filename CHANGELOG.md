@@ -861,24 +861,27 @@ All notable changes to irlume are documented here. This project adheres to
   enrollment and its key), a sealed secret is not released or re-sealed
   (`irlume keyring arm` arms again), and a recovery envelope restores
   nothing. That enrollment also replaces a key an earlier release sealed
-  without a uid when the enrollment under it records another uid. A
-  profile listing leaves out the added-camera store beside an enrollment
-  recorded for another uid, and the enrollment that replaces it removes
-  that store once saved. When the uid cannot be resolved, a record that
-  carries one is not used and face falls back to the password, and a
-  write that has no uid to record is refused. A write never changes the
-  uid a record carries: a change to a stored record (adding scans,
-  renaming a profile, a re-seal) is refused, with nothing written, when
-  the name resolves to another uid or to no account by the time it is
-  saved, also for an enrollment that records no uid yet, which is held
-  to the uid the name resolved to when it was loaded. Nothing else is
-  removed automatically. Records written by
-  earlier releases carry no uid; they are accepted and record it on
+  without a uid when the enrollment under it records another uid.
+  `irlume recovery setup` and `irlume recovery restore` refuse a
+  template key whose enrollment records another uid, and the setup keeps
+  a recovery envelope recorded for another uid when neither the key nor
+  its enrollment records one. A profile listing leaves out the
+  added-camera store beside an enrollment recorded for another uid, and
+  the enrollment that replaces it removes that store once saved. When
+  the uid cannot be resolved, a record that carries one is not used and
+  face falls back to the password, and a write that has no uid to record
+  is refused. A write never changes the uid a record carries: a change
+  to a stored record (adding scans, renaming a profile, a re-seal) is
+  refused, with nothing written, when the name resolves to another uid
+  or to no account by the time it is saved, also for an enrollment that
+  records no uid yet, which is held to the uid the name resolved to when
+  it was loaded. Nothing else is removed automatically. Records written
+  by earlier releases carry no uid; they are accepted and record it on
   their next write, except that moving a template key to a stronger
   policy keeps it unbound. A keyring envelope records it at the first
-  login whose verified password matches it, also when nothing else
-  about it changes. Older releases ignore the new field
-  (SECURITY_AT_REST.md "Records belong to an account uid").
+  login whose verified password matches it, also when nothing else about
+  it changes. Older releases ignore the new field (SECURITY_AT_REST.md
+  "Records belong to an account uid").
 
 - A reason about the capture rather than the match (no face, a liveness
   or PAD refusal, the pose) reaches a non-root caller of `Authenticate`,

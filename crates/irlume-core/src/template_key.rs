@@ -704,21 +704,77 @@ pub(crate) fn forget_key_unlocked(user: &str) -> Result<()> {
 /// A passphrase below the recovery floor
 /// ([`crate::recovery::check_new_passphrase`]) is refused before any file is
 /// read or written, so an existing envelope stays as it was.
+///
+/// The key is not wrapped for this account, and an existing envelope stays,
+/// when the enrollment it opens records another uid, or when the key records
+/// no uid, its enrollment records none, and the envelope it would replace
+/// records another uid ([`crate::account`]).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn setup_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
     crate::recovery::check_new_passphrase(passphrase)?;
     let _state = UserStateLock::acquire(user)?;
+    setup_recovery_with(user, passphrase, load_key_as)
+}
+
+/// [`setup_recovery`] once the passphrase passed and the user state lock is
+/// held, with the unseal passed in.
+pub(crate) fn setup_recovery_with(
+    user: &str,
+    passphrase: &[u8],
+    load: impl FnOnce(&str, &mut Account<'_>) -> Result<Zeroizing<Vec<u8>>>,
+) -> Result<()> {
     let mut account = Account::new(user);
-    let key = load_key_as(user, &mut account)?;
+    // `load` refuses a key sealed for another uid; one without a uid is
+    // checked against the records coupled to it.
+    let key_uid = SealedEnvelope::load(&key_path(user))
+        .ok()
+        .and_then(|env| env.uid);
+    let key = load(user, &mut account)?;
+    require_key_is_the_accounts(user, &key, key_uid, &mut account).map_err(|e| match e {
+        Error::Policy(message) => Error::Policy(format!(
+            "no recovery passphrase was set for '{user}': {message}"
+        )),
+        other => other,
+    })?;
     let uid = account.uid_to_record(Record::Recovery, None)?;
     let mut env = crate::recovery::wrap(passphrase, &key)?;
     env.uid = uid;
     save_recovery(user, &env)
 }
 
+/// `Ok` when `key`, `user`'s template key recording `key_uid`, may be wrapped
+/// in a recovery envelope for `account`; otherwise the refusal of the record
+/// that shows it is another account's.
+///
+/// - The enrollment the key opens protects that enrollment's templates, so
+///   one recorded for another uid refuses it, whatever the key records.
+/// - A key an earlier release sealed records no uid. When its enrollment
+///   records none either, the recovery envelope the write would replace
+///   decides: it was set up for the key it wraps, so a uid it records names
+///   that key's account. An envelope that records another uid is refused,
+///   and so kept; once the account has enrolled again its enrollment
+///   records the account's uid, and the envelope is replaced.
+fn require_key_is_the_accounts(
+    user: &str,
+    key: &[u8],
+    key_uid: Option<u32>,
+    account: &mut Account<'_>,
+) -> Result<()> {
+    let enrollment_uid = crate::storage::stored_enrollment_uid(user, Some(key));
+    account.require(Record::Enrollment, enrollment_uid)?;
+    if key_uid.is_none() && enrollment_uid.is_none() {
+        if let Ok(existing) = load_recovery(user) {
+            account.require(Record::Recovery, existing.uid)?;
+        }
+    }
+    Ok(())
+}
+
 /// Restore `user`'s template key from the recovery envelope using `passphrase`,
 /// and re-seal it against the *current* TPM PCRs (healing a PCR move / TPM
-/// clear / disk move). Errors on a wrong passphrase or a missing envelope.
+/// clear / disk move). Errors on a wrong passphrase or a missing envelope,
+/// and, with nothing sealed, when the recovery file, the key it overwrites
+/// or the enrollment the restored key opens records another uid.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn restore_from_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
     let _state = UserStateLock::acquire(user)?;
@@ -726,6 +782,15 @@ pub fn restore_from_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
 }
 
 pub(crate) fn restore_from_recovery_unlocked(user: &str, passphrase: &[u8]) -> Result<()> {
+    restore_with(user, passphrase, reseal_key_unlocked)
+}
+
+/// [`restore_from_recovery_unlocked`] with the seal passed in.
+pub(crate) fn restore_with(
+    user: &str,
+    passphrase: &[u8],
+    reseal: impl FnOnce(&str, &[u8], Option<u32>) -> Result<()>,
+) -> Result<()> {
     let path = recovery_path(user);
     if !path.exists() {
         return Err(Error::Policy(format!(
@@ -745,7 +810,22 @@ pub(crate) fn restore_from_recovery_unlocked(user: &str, passphrase: &[u8]) -> R
     account.require(Record::TemplateKey, existing)?;
     let uid = account.uid_to_record(Record::TemplateKey, env.uid.or(existing))?;
     let key = crate::recovery::unwrap(passphrase, &env)?;
-    reseal_key_unlocked(user, &key, uid)
+    // The enrollment the restored key opens counts too: when neither the
+    // recovery file nor the key records a uid, the enrollment may, and one
+    // recorded for another uid means the key protects that account's
+    // templates, so it is not sealed for this one.
+    account
+        .require(
+            Record::Enrollment,
+            crate::storage::stored_enrollment_uid(user, Some(&key)),
+        )
+        .map_err(|e| match e {
+            Error::Policy(message) => Error::Policy(format!(
+                "the template key of '{user}' was not restored: {message}"
+            )),
+            other => other,
+        })?;
+    reseal(user, &key, uid)
 }
 
 /// Erase `user`'s recovery envelope. Idempotent.

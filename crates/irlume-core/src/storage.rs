@@ -720,11 +720,18 @@ fn stored_enrollment_is_another_accounts(
     key: Option<&[u8]>,
     account: &mut Account<'_>,
 ) -> bool {
-    let Ok(data) = fs::read(profile_path(user)) else {
-        return false;
-    };
-    deserialize_enrollment(&data, key)
-        .is_ok_and(|stored| matches!(account.owner(stored.uid), Owner::Other { .. }))
+    matches!(
+        account.owner(stored_enrollment_uid(user, key)),
+        Owner::Other { .. }
+    )
+}
+
+/// The uid the enrollment stored for `user` records, read with `key`
+/// (`None`: only a plaintext one reads). `None` when no enrollment is
+/// stored, `key` does not read it, or it records no uid.
+pub(crate) fn stored_enrollment_uid(user: &str, key: Option<&[u8]>) -> Option<u32> {
+    let data = fs::read(profile_path(user)).ok()?;
+    deserialize_enrollment(&data, key).ok()?.uid
 }
 
 /// Remove the added-camera store of an enrollment that a durable write for
@@ -2042,6 +2049,124 @@ mod tests {
                         .unwrap();
                 assert_eq!(saved.uid, Some(6602), "{what}: {uid:?}");
             }
+        }
+        leave_uid_sandbox(&dir);
+    }
+
+    /// A recovery setup wraps the template key for the account only when the
+    /// records coupled to the key do not show it is another account's. An
+    /// enrollment under the key recorded for another uid refuses it, whatever
+    /// the key records. Under a key that records no uid, with an enrollment
+    /// that records none (or none stored), a recovery envelope recorded for
+    /// another uid refuses it too. A refusal keeps the envelope as it was.
+    /// An enrollment recorded for the account's uid, or a key recorded for
+    /// it, lets the envelope be replaced whatever it records. A restore seals
+    /// nothing when the enrollment the restored key opens records another
+    /// uid, and otherwise seals the key for the account.
+    #[test]
+    fn recovery_setup_and_restore_check_the_enrollment_a_key_opens() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("uid-recovery-owner");
+        let user = "uid-recovery-owner";
+        let key = [13u8; 32];
+        let passphrase: &[u8] = b"a recovery passphrase";
+        let wrapped = crate::recovery::wrap(passphrase, &key).unwrap();
+        let recovery = template_key::recovery_path(user);
+        fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+        // The enrollment under `key` records `enrollment_uid` (`None` for the
+        // outer option: no enrollment), the key `key_uid`, and the recovery
+        // envelope wrapping it `recovery_uid`.
+        let plant = |key_uid: Option<u32>,
+                     enrollment_uid: Option<Option<u32>>,
+                     recovery_uid: Option<u32>| {
+            let _ = fs::remove_file(profile_path(user));
+            if let Some(uid) = enrollment_uid {
+                let mut enrollment = sample();
+                enrollment.user = user.into();
+                enrollment.uid = uid;
+                let bytes = serialize_enrollment(&enrollment, Some(&key)).unwrap();
+                fs::write(profile_path(user), bytes).unwrap();
+            }
+            fake_seal(user, &key, key_uid).unwrap();
+            let mut envelope = wrapped.clone();
+            envelope.uid = recovery_uid;
+            fs::write(&recovery, serde_json::to_vec(&envelope).unwrap()).unwrap();
+            fs::read(&recovery).unwrap()
+        };
+        let recovery_uid = || {
+            serde_json::from_slice::<crate::recovery::RecoveryEnvelope>(
+                &fs::read(&recovery).unwrap(),
+            )
+            .unwrap()
+            .uid
+        };
+        let _now = crate::account::remember(user, 6802);
+
+        for (key_uid, enrollment_uid, recovery_before, refused_as) in [
+            (None, Some(Some(6801)), Some(6801), "face enrollment"),
+            (None, Some(Some(6801)), None, "face enrollment"),
+            (Some(6802), Some(Some(6801)), None, "face enrollment"),
+            (None, Some(None), Some(6801), "recovery envelope"),
+            (None, None, Some(6801), "recovery envelope"),
+        ] {
+            let case = format!("{key_uid:?} {enrollment_uid:?} {recovery_before:?}");
+            let before = plant(key_uid, enrollment_uid, recovery_before);
+            let error = template_key::setup_recovery_with(user, passphrase, fake_load)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("no recovery passphrase was set")
+                    && error.contains(refused_as)
+                    && error.contains("uid 6801")
+                    && error.contains("now uid 6802"),
+                "{case}: {error}"
+            );
+            assert!(!error.contains('\u{2014}'));
+            assert_eq!(fs::read(&recovery).unwrap(), before, "{case}: kept");
+        }
+        for (key_uid, enrollment_uid, recovery_before) in [
+            (None, Some(Some(6802)), Some(6801)),
+            (None, Some(None), None),
+            (Some(6802), Some(None), Some(6801)),
+        ] {
+            plant(key_uid, enrollment_uid, recovery_before);
+            template_key::setup_recovery_with(user, passphrase, fake_load).unwrap();
+            assert_eq!(
+                recovery_uid(),
+                Some(6802),
+                "{key_uid:?} {enrollment_uid:?} {recovery_before:?}"
+            );
+        }
+
+        // A restore from a recovery file that records no uid, over a key
+        // that records none.
+        plant(None, Some(Some(6801)), None);
+        let key_before = fs::read(template_key::key_path(user)).unwrap();
+        let recovery_before = fs::read(&recovery).unwrap();
+        let error = template_key::restore_with(user, passphrase, |_, _, _| {
+            panic!("a key whose enrollment records another uid is not sealed")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("was not restored")
+                && error.contains("face enrollment")
+                && error.contains("uid 6801")
+                && error.contains("irlume enroll"),
+            "{error}"
+        );
+        assert_eq!(fs::read(template_key::key_path(user)).unwrap(), key_before);
+        assert_eq!(fs::read(&recovery).unwrap(), recovery_before);
+        for enrollment_uid in [Some(Some(6802)), Some(None), None] {
+            plant(None, enrollment_uid, None);
+            template_key::restore_with(user, passphrase, fake_seal).unwrap();
+            let sealed =
+                crate::envelope::SealedEnvelope::load(&template_key::key_path(user)).unwrap();
+            assert_eq!(sealed.uid, Some(6802), "{enrollment_uid:?}");
+            assert_eq!(sealed.private, key);
         }
         leave_uid_sandbox(&dir);
     }

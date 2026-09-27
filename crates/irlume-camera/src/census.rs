@@ -181,10 +181,18 @@ pub(crate) fn node_entry_from_facts(facts: &NodeFacts) -> CensusEntry {
     // placement facts.
     let luma_ir =
         matches!(&facts.fourccs, Some(list) if crate::offers_only_luma_ir_container(list));
-    let descriptor_answer = facts
-        .luma_ir_check
-        .as_ref()
-        .filter(|_| luma_ir && !DUMMY_DRIVERS.contains(&facts.driver.as_str()));
+    let descriptor_answer = facts.luma_ir_check.as_ref().filter(|check| {
+        luma_ir
+                && !DUMMY_DRIVERS.contains(&facts.driver.as_str())
+                // The role came from an earlier scan. A second descriptor
+                // read can disagree across a reconfiguration; do not print
+                // that new answer as evidence for the old role.
+                && match facts.role {
+                    Role::Ir => check.is_ok(),
+                    Role::Rgb => check.is_err(),
+                    Role::Other => false,
+                }
+    });
     if let Some(check) = descriptor_answer {
         evidence.push(match check {
             Ok(attested) => format!(
@@ -820,6 +828,22 @@ mod tests {
                 if note.contains("secure IR support is unverified"))
             );
             assert!(!render_line(&entry).contains("secure IR tier"));
+        }
+    }
+
+    #[test]
+    fn changed_descriptor_evidence_does_not_contradict_the_scanned_role() {
+        for (role, check) in [
+            (Role::Ir, Err(IrFunctionRefusal::Unreadable)),
+            (Role::Rgb, Ok(T480_IR)),
+        ] {
+            let mut f = facts("/dev/video2", role, &[b"YUYV"]);
+            f.luma_ir_check = Some(check);
+            let entry = node_entry_from_facts(&f);
+            assert!(!entry
+                .evidence
+                .iter()
+                .any(|line| line.contains("IR by USB descriptor")));
         }
     }
 

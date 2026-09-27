@@ -854,8 +854,9 @@ All notable changes to irlume are documented here. This project adheres to
   name. In an account's tree, an envelope that cannot be read and that
   root does not own is named against that account instead of stopping
   the uninstall; one root owns, or one whose owner cannot be read, still
-  stops it, as before. A `keyring` link in that tree is followed only to
-  a directory root owns, whose tokens then count like any root store's;
+  stops it, as before. A `keyring` link in that tree, or in one the
+  uninstall skips, is followed only to a directory root owns, whose
+  tokens then count like any root store's;
   the removal takes only the link, and a store it leads to that holds
   anything is reported as left, so the TPM's storage key is kept. File
   names from an account's tree are printed with control characters

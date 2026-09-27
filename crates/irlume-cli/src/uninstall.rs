@@ -1715,19 +1715,32 @@ pub(crate) fn root_sealed_token_holders() -> Result<Vec<String>, String> {
     .holders)
 }
 
-/// The keyring store in a per-account tree uninstall skips, when it is a real
-/// directory (not a link at its own name) that `root_uid` owns: the uninstall
-/// and login guards count its tokens although the tree is not removed. Its
+/// The keyring store in a per-account tree uninstall skips, when it is a
+/// directory that `root_uid` owns: the uninstall and login guards count its
+/// tokens although the tree is not removed. A link at the store's name is
+/// followed only to such a directory (a root irlumed's store linked there),
+/// and the store is then named by where the link leads, as
+/// [`VerifiedTree::linked_root_store`] does for a tree that is removed; a
+/// link to anything else, to nothing or into a loop is no store. Its
 /// envelopes are read as every envelope is, bounded and without following a
 /// link. `Ok(None)` when there is no such store; an error when whether there
 /// is one cannot be established, so the guards stay fail-closed.
 fn skipped_tree_keyring(tree: &Path, root_uid: u32) -> Result<Option<PathBuf>, String> {
     use std::os::unix::fs::MetadataExt as _;
     let keyring = tree.join("keyring");
+    let fail = |e: std::io::Error| format!("{}: {e}", keyring.display());
     match std::fs::symlink_metadata(&keyring) {
+        Ok(meta) if meta.file_type().is_symlink() => match std::fs::canonicalize(&keyring) {
+            Ok(target) => match std::fs::metadata(&target) {
+                Ok(meta) => Ok((meta.is_dir() && meta.uid() == root_uid).then_some(target)),
+                Err(e) => Err(fail(e)),
+            },
+            Err(e) if is_absent(&e) || e.raw_os_error() == Some(libc::ELOOP) => Ok(None),
+            Err(e) => Err(fail(e)),
+        },
         Ok(meta) => Ok((meta.is_dir() && meta.uid() == root_uid).then_some(keyring)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("{}: {e}", keyring.display())),
+        Err(e) => Err(fail(e)),
     }
 }
 
@@ -2443,8 +2456,40 @@ mod tests {
             "not root's"
         );
         std::fs::remove_dir(tree.join("keyring")).unwrap();
-        std::os::unix::fs::symlink(&base, tree.join("keyring")).unwrap();
-        assert_eq!(skipped_tree_keyring(&tree, owner), Ok(None), "a link");
+        // A link counts only when it leads to a directory root owns, named by
+        // where it leads; one to nothing or into a loop is no store.
+        let store = base.join("store");
+        std::fs::create_dir(&store).unwrap();
+        std::os::unix::fs::symlink(&store, tree.join("keyring")).unwrap();
+        assert_eq!(
+            skipped_tree_keyring(&tree, owner),
+            Ok(Some(std::fs::canonicalize(&store).unwrap())),
+            "a link to root's store"
+        );
+        // Its tokens count for the guards although the tree is skipped.
+        std::fs::write(store.join("carol.json"), TOKEN_ENVELOPE).unwrap();
+        let skipped = HomeTree::Skipped {
+            path: tree.clone(),
+            account: "bob".into(),
+            reason: "owned by another account".into(),
+        };
+        assert_eq!(
+            sealed_token_holders_with(Ok(Vec::new()), &[skipped], &[], &[], owner)
+                .unwrap()
+                .holders,
+            vec!["carol".to_string()]
+        );
+        std::fs::remove_file(store.join("carol.json")).unwrap();
+        assert_eq!(
+            skipped_tree_keyring(&tree, owner + 1),
+            Ok(None),
+            "a link to a store root does not own"
+        );
+        for target in [base.join("nowhere"), tree.join("keyring")] {
+            std::fs::remove_file(tree.join("keyring")).unwrap();
+            std::os::unix::fs::symlink(&target, tree.join("keyring")).unwrap();
+            assert_eq!(skipped_tree_keyring(&tree, owner), Ok(None), "{target:?}");
+        }
         // Inside a tree this process cannot search, whether a store is there
         // cannot be established: an error, so the guards refuse.
         if !is_root() {

@@ -964,7 +964,27 @@ mod tests {
         }];
 
         let root = state.snapshot_for(since, 0);
-        assert_eq!(root, state.snapshot(since));
+        // Root's view is the unfiltered snapshot. Taken a moment apart, the
+        // two may differ in their clock fields (uptime, event ages), so
+        // everything but those is compared.
+        let untimed = |snapshot: &SupportSnapshot| {
+            (
+                snapshot
+                    .events()
+                    .iter()
+                    .map(|event| {
+                        (
+                            event.sequence,
+                            event.operation_id,
+                            event.operation,
+                            format!("{:?}", event.kind),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                snapshot.unavailable().to_vec(),
+            )
+        };
+        assert_eq!(untimed(&root), untimed(&state.snapshot(since)));
         assert_eq!(
             operations(&root),
             [

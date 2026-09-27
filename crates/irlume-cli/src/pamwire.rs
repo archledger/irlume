@@ -65,7 +65,8 @@ pub(crate) use files::{is_managed_path, lock_pam, restore_surface, UNREADABLE};
 pub(crate) use grammar::{directive, directive_has_auth_module, has_line_continuation};
 pub(crate) use overrides::Level as OverrideLevel;
 pub(crate) use report::{
-    keyring_handoff_warnings, login_manager_fact, status_report, surface_facts, HandoffWarning,
+    active_login_wired_by_mode, keyring_handoff_warnings, login_manager_fact, login_wired_by_mode,
+    status_report, surface_facts, HandoffWarning,
 };
 pub(crate) use stanzas::BACKUP;
 pub(crate) use token::{
@@ -934,6 +935,10 @@ fn sudo_wired() -> bool {
     etc.exists() && file_has_module(etc)
 }
 
+/// Whether the active greeter's stack carries irlume's module, whatever its
+/// lines do: reconcile's intactness rule, under which a greeter left with
+/// only its reseal lines (`remote_seats`) is intact. Doctor reports face
+/// login from [`active_login_wired_by_mode`] instead.
 pub(crate) fn active_login_wired() -> bool {
     let Some(dm) = active_display_manager() else {
         return login_wired();
@@ -1085,6 +1090,11 @@ pub(crate) fn reconcile_needed() -> bool {
         })
 }
 
+/// Whether any login surface's stack (a greeter, the fingerprint-keyring
+/// service or the lock screen) carries irlume's module, whatever its lines
+/// do, so a greeter holding only the reseal lines counts. What reconcile,
+/// uninstall and doctor's regeneration guard go by; reports of face login
+/// use [`login_wired_by_mode`].
 pub(crate) fn login_wired() -> bool {
     let (lock_svc, _) = lock_surface();
     for s in GREETERS
@@ -6653,9 +6663,10 @@ auth required pam_fprintd.so\n\
                 "polkit (apps)",
             ]
         );
-        // login_wired is exactly "any non-sudo row is wired" (sudo excluded).
-        let any_login = rows[..rows.len() - 1].iter().any(|(_, _, w)| *w);
-        assert_eq!(login_wired(), any_login);
+        // The TUI's login state is exactly "any row but sudo and polkit is
+        // wired", read from the same facts as the rows.
+        let any_login = rows[..rows.len() - 2].iter().any(|(_, _, w)| *w);
+        assert_eq!(login_wired_by_mode(), any_login);
     }
 
     #[test]

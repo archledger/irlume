@@ -329,6 +329,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume doctor`'s `login-wiring` check and the TUI count a login screen
+  left with only irlume's reseal lines (a LightDM serving remote login
+  screens, #866) as not wired, as `irlume login status` does, instead of
+  reporting face login wired because irlume's module is in its stack.
+  Doctor's warning for that case names the login manager rather than
+  suggesting `irlume login enable`, which leaves that stack as it is.
+  Reconcile still counts such a stack as intact (#859).
+
 - The enrollment camera guide shows why it could not start, such as
   `main camera stream stop is unconfirmed`, when the daemon's capture fails
   right after the guide starts, instead of `unsolicited framing replies`.

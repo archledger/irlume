@@ -1032,8 +1032,14 @@ struct Probes {
     selinux_enforcing: bool,
     /// The daemon socket carries the irlume SELinux label.
     selinux_socket_labeled: bool,
-    /// Face login is wired into at least one greeter.
+    /// Face or fingerprint login is wired into at least one login surface,
+    /// read from each stack's authentication mode as `login status` reads
+    /// it: a greeter holding only irlume's reseal lines is not wired.
     login_wired: bool,
+    /// irlume's module is in at least one login surface's stack, reseal
+    /// lines alone included. Those lines reach the daemon at login too, so
+    /// the SELinux row goes by this rather than by `login_wired`.
+    login_module_present: bool,
     /// The fingerprint keyring-unlock line is present in every service the
     /// active login manager consults.
     fp_keyring_wired: bool,
@@ -1190,7 +1196,8 @@ impl Probes {
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).contains("irlume_runtime_t"))
                 .unwrap_or(false),
-            login_wired: crate::pamwire::login_wired(),
+            login_wired: crate::pamwire::login_wired_by_mode(),
+            login_module_present: crate::pamwire::login_wired(),
             fp_keyring_wired: crate::pamwire::fp_keyring_wired(),
             tpm_present: crate::tpm_device().is_some(),
             reconcile_needed: crate::pamwire::reconcile_needed(),
@@ -3199,10 +3206,11 @@ impl App {
 
         if self.probes.selinux_enforcing {
             let labeled = self.probes.selinux_socket_labeled;
-            // Only a FAILURE once login is wired (the greeter actually needs it
-            // then). Pre-wiring it's informational: `login enable --apply`
-            // loads the module itself, so don't alarm a fresh install.
-            let wired = self.probes.login_wired;
+            // Only a FAILURE once a greeter carries irlume's lines (the
+            // greeter actually needs it then, its reseal lines too).
+            // Pre-wiring it's informational: `login enable --apply` loads the
+            // module itself, so don't alarm a fresh install.
+            let wired = self.probes.login_module_present;
             v.push(mk(
                 "SELinux policy",
                 if labeled {

@@ -47,7 +47,18 @@ pub(super) fn surface_fact(
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_default();
-    let mode = wiring_mode(role, &content);
+    surface_fact_from(etc, role, path.is_some(), &content)
+}
+
+/// Testable core of [`surface_fact`]: the fact for the service at `etc`
+/// whose stack reads `content` (empty when absent or unreadable).
+fn surface_fact_from(
+    etc: &'static str,
+    role: &'static str,
+    present: bool,
+    content: &str,
+) -> SurfaceFact {
+    let mode = wiring_mode(role, content);
     // A login stack with only irlume's reseal lines (`remote_seats`) hands a
     // keyring token over and authenticates nothing, so it is not wired.
     let wired = mode.is_some();
@@ -55,10 +66,47 @@ pub(super) fn surface_fact(
         id: service_name(etc),
         role,
         path: etc,
-        present: path.is_some(),
+        present,
         wired,
         mode,
     }
+}
+
+/// Whether any login surface among `facts` is wired: a greeter, the
+/// fingerprint-keyring service or the lock screen. sudo and polkit alone do
+/// not make the login screen work, so they do not count.
+fn any_login_wired(facts: &[SurfaceFact]) -> bool {
+    facts
+        .iter()
+        .any(|f| f.wired && f.role != ROLE_SUDO && f.role != ROLE_POLKIT)
+}
+
+/// Whether face or fingerprint login is wired on any login surface, read
+/// from each stack's authentication mode as `login status` reads it. A
+/// greeter holding only irlume's reseal lines (a LightDM serving remote
+/// login screens, `remote_seats`) is not wired, although the module is in
+/// its stack. For reporting (the TUI); reconcile keeps [`login_wired`],
+/// module presence, as its rule for what is irlume's to maintain.
+pub(crate) fn login_wired_by_mode() -> bool {
+    any_login_wired(&surface_facts())
+}
+
+/// Whether the active display manager's greeter authenticates with face or
+/// fingerprint, read from its authentication mode as [`surface_fact`] does,
+/// so a greeter holding only irlume's reseal lines is not wired. Falls back
+/// to [`login_wired_by_mode`] when the active display manager is unknown or
+/// absent. For doctor's `login-wiring` check; reconcile keeps
+/// [`active_login_wired`], module presence, as its intactness rule.
+pub(crate) fn active_login_wired_by_mode() -> bool {
+    let Some(dm) = active_display_manager() else {
+        return login_wired_by_mode();
+    };
+    let (primary, _fp) = dm_pam_services(&dm);
+    if primary == "(unknown)" {
+        return login_wired_by_mode();
+    }
+    std::fs::read_to_string(format!("/etc/pam.d/{primary}"))
+        .is_ok_and(|content| wiring_mode(ROLE_LOGIN, &content).is_some())
 }
 
 /// Name HOW face fires on a wired service, from its content. Pure: the same
@@ -231,9 +279,11 @@ pub(crate) fn login_manager_fact() -> LoginManagerFact {
     }
 }
 
-/// Structured wiring status for the TUI: `(label, present, wired)` per service
-/// plus a trailing SELinux row. Mirrors what `status()` prints, lock surface
-/// included: the same dynamic chooser the wiring uses (#587's lesson).
+/// Structured wiring status for the TUI: `(label, present, wired)` per
+/// service. Derived from the same surface facts `status()` prints, lock
+/// surface included (the same dynamic chooser the wiring uses, #587's
+/// lesson), so a greeter holding only irlume's reseal lines reads not wired
+/// in both.
 pub(crate) fn status_report() -> Vec<(String, bool, bool)> {
     status_report_for(
         irlume_common::platform::omarchy_present(),
@@ -247,27 +297,22 @@ pub(crate) fn status_report() -> Vec<(String, bool, bool)> {
 /// would fail the exact-label assertion on an Omarchy or Cinnamon box,
 /// including the self-hosted hardware-suite runner).
 pub(super) fn status_report_for(omarchy: bool, cinnamon: bool) -> Vec<(String, bool, bool)> {
-    let (lock_svc, _) = lock_surface_for(omarchy, cinnamon);
-    let mut out = Vec::new();
-    for s in GREETERS
+    status_rows(&surface_facts_with(omarchy, cinnamon))
+}
+
+/// The TUI's `(label, present, wired)` rows for `facts`, in their order.
+fn status_rows(facts: &[SurfaceFact]) -> Vec<(String, bool, bool)> {
+    facts
         .iter()
-        .chain(FP_GREETERS.iter())
-        .chain(std::iter::once(lock_svc))
-    {
-        match service_present(s) {
-            Some(p) => out.push((label_of(s.etc), true, file_has_module(&p))),
-            None => out.push((label_of(s.etc), false, false)),
-        }
-    }
-    match service_present(&SUDO) {
-        Some(p) => out.push(("sudo".into(), true, file_has_module(&p))),
-        None => out.push(("sudo".into(), false, false)),
-    }
-    match service_present(&POLKIT) {
-        Some(p) => out.push(("polkit (apps)".into(), true, file_has_module(&p))),
-        None => out.push(("polkit (apps)".into(), false, false)),
-    }
-    out
+        .map(|f| {
+            let label = if f.role == ROLE_POLKIT {
+                "polkit (apps)".to_string()
+            } else {
+                label_of(f.path)
+            };
+            (label, f.present, f.wired)
+        })
+        .collect()
 }
 
 /// The line `status` prints when the stock Omarchy lock lane is yielded to
@@ -291,9 +336,9 @@ pub(super) fn status() -> ExitCode {
             None => println!("  active login manager: {dm}  (uses {greeter})"),
         }
     }
-    let mut any = false;
+    let facts = surface_facts();
     let mut ondemand_hints = std::collections::BTreeSet::new();
-    for f in surface_facts() {
+    for f in &facts {
         if !f.present {
             continue;
         }
@@ -311,9 +356,6 @@ pub(super) fn status() -> ExitCode {
             // keyring-only line
             (_, Some(_)) => "● wired",
         };
-        // face-sudo alone does not make the login screen work, so it does not
-        // silence the "enable with" hint below.
-        any |= f.wired && f.role != ROLE_SUDO && f.role != ROLE_POLKIT;
         println!("  {:<34} {}", f.path, label);
     }
     for hint in ondemand_hints {
@@ -346,7 +388,9 @@ pub(super) fn status() -> ExitCode {
             None => "unknown (run as root to check)",
         }
     );
-    if !any {
+    // face-sudo alone does not make the login screen work, so it does not
+    // silence the "enable with" hint. The TUI reads the same answer.
+    if !any_login_wired(&facts) {
         println!("{}", enable_hint(crate::nixos::host_is_nixos()));
     }
     ExitCode::SUCCESS
@@ -454,6 +498,38 @@ mod tests {
         let facefirst = "auth [success=1 default=ignore] pam_irlume.so unseal facefirst\n\
              auth optional pam_exec.so /usr/local/bin/log ondemand\n";
         assert_eq!(wiring_mode(ROLE_LOGIN, facefirst), Some("face-first"));
+    }
+
+    /// A greeter left with only irlume's reseal lines (a LightDM serving
+    /// remote login screens, #866) authenticates nothing: the TUI's Login &
+    /// Apps row and its login state read it as not wired, as `login status`
+    /// does, although the module is in its stack. The same greeter with its
+    /// face lines reads wired, and a wired sudo alone is not a wired login
+    /// (#859).
+    #[test]
+    fn the_tui_reads_a_reseal_only_greeter_as_not_wired() {
+        let base = "#%PAM-1.0\n@include common-auth\n@include common-account\n\
+                    @include common-session\n";
+        let (reseal_only, changed) = wire_greeter_impl(base, false, false, false);
+        assert!(changed && content_has_module(&reseal_only), "{reseal_only}");
+        let (face, changed) = wire_greeter_impl(base, true, false, false);
+        assert!(changed, "{face}");
+        let sudo = "auth sufficient pam_irlume.so\n@include common-auth\n";
+        for (stack, wired) in [(reseal_only.as_str(), false), (face.as_str(), true)] {
+            let facts = [
+                surface_fact_from("/etc/pam.d/lightdm", ROLE_LOGIN, true, stack),
+                surface_fact_from("/etc/pam.d/sudo", ROLE_SUDO, true, sudo),
+            ];
+            assert_eq!(any_login_wired(&facts), wired, "{stack}");
+            assert_eq!(
+                status_rows(&facts),
+                vec![
+                    ("lightdm".to_string(), true, wired),
+                    ("sudo".to_string(), true, true)
+                ],
+                "{stack}"
+            );
+        }
     }
 
     #[test]

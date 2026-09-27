@@ -59,6 +59,8 @@ pub enum StorageEncryption {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageDirectory {
     /// The configured directory, retained even when it cannot be resolved.
+    /// A daemon reply to a non-root peer uses a logical label for its
+    /// configured secret directories instead.
     pub path: String,
     /// Whether every block device beneath the directory is encrypted.
     pub encryption: StorageEncryption,

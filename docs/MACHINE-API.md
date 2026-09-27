@@ -267,6 +267,13 @@ reused for a different meaning. The registry as of this contract:
 | `camera-groups` | enrolled secondary-camera groups (ADR-0024): present and healthy, stale, or the secondary store unreadable. Conditionally present: emitted only when groups exist or the store cannot be read |
 | `pam-faillock` | the `pam_faillock` tally for the target account (the OS-level lockout counter, distinct from irlume's own retry throttle): quiet when clean, `warn` with the count and the `faillock --reset` remedy at/above the threshold. Conditionally present: root-only and requires the `faillock` binary |
 
+For `SealedStorage`, the keyring and template-key `path` fields contain
+`keyring` and `template-key` labels for non-root callers. Only root receives
+the configured paths and detailed resolution errors. Non-root unknown
+results carry a generic reason, including for the system directories, so
+an error cannot disclose a resolved link target. Encryption results are
+the same for both callers; the system labels remain `/`, `/usr` and `/etc`.
+
 `CaptureModeStatus` includes `qualification_state` (`qualified_concurrent`,
 `measured_sequential`, `unqualified_no_authority`,
 `unqualified_context_changed`, `inconclusive`, `unreadable`, or `no_ir_pair`), an optional

@@ -5499,11 +5499,23 @@ fn dispatch_status_with_diagnostics(
         // account input. Any local peer may inspect these system facts.
         Request::SealedStorage => {
             use irlume_common::storage_encryption::directory_encryption;
+            let configured = |path: &std::path::Path, label: &str| {
+                let mut storage = directory_encryption(path);
+                if peer.uid != 0 {
+                    storage.path = label.into();
+                    // Resolution errors can name the configured path or a
+                    // symlink target too. Keep those details with root.
+                    if storage.reason.is_some() {
+                        storage.reason = Some("directory storage could not be established".into());
+                    }
+                }
+                storage
+            };
             Response::SealedStorage {
-                keyring: directory_encryption(&irlume_core::keyring::keyring_dir()),
-                template_key: directory_encryption(&irlume_core::template_key::key_dir()),
+                keyring: configured(&irlume_core::keyring::keyring_dir(), "keyring"),
+                template_key: configured(&irlume_core::template_key::key_dir(), "template-key"),
                 system: ["/", "/usr", "/etc"]
-                    .map(|path| directory_encryption(std::path::Path::new(path)))
+                    .map(|path| configured(std::path::Path::new(path), path))
                     .into(),
             }
         }
@@ -14548,8 +14560,8 @@ mod tests {
         assert!(!operation_authorization::required(&req, &peer(NOBODY)));
         let expected = serde_json::to_value(dispatch_status(&req, &peer(NOBODY)).unwrap()).unwrap();
         let storage = &expected["SealedStorage"];
-        assert_eq!(storage["keyring"]["path"], keyring.to_str().unwrap());
-        assert_eq!(storage["template_key"]["path"], keys.to_str().unwrap());
+        assert_eq!(storage["keyring"]["path"], "keyring");
+        assert_eq!(storage["template_key"]["path"], "template-key");
         assert_eq!(storage["system"].as_array().unwrap().len(), 3);
         for (entry, path) in storage["system"]
             .as_array()
@@ -14572,8 +14584,47 @@ mod tests {
             BufReader::new(ours).read_line(&mut line).unwrap();
             serde_json::from_str::<serde_json::Value>(&line).unwrap()
         });
-        assert_eq!(response, expected);
+        // SAFETY: geteuid has no preconditions.
+        let serving_uid = unsafe { libc::geteuid() };
+        let serving_expected =
+            serde_json::to_value(dispatch_status(&req, &peer(serving_uid)).unwrap()).unwrap();
+        assert_eq!(response, serving_expected);
         arbiter.close();
+    }
+
+    #[test]
+    fn sealed_storage_keeps_configured_paths_and_resolution_details_for_root() {
+        let _guard = env_lock();
+        let _sb = sandbox("sealed-storage-paths");
+        // Metadata only: neither this request nor this test opens a device.
+        std::env::set_var("IRLUME_KEYRING_DIR", "/dev/shm/irlume-test-keyring");
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", "/dev/null");
+        let req = Request::SealedStorage;
+        let root = serde_json::to_value(dispatch_status(&req, &peer(0)).unwrap()).unwrap();
+        let public = serde_json::to_value(dispatch_status(&req, &peer(NOBODY)).unwrap()).unwrap();
+        let root = &root["SealedStorage"];
+        let public = &public["SealedStorage"];
+        assert_eq!(root["keyring"]["path"], "/dev/shm/irlume-test-keyring");
+        assert_eq!(root["template_key"]["path"], "/dev/null");
+        assert!(root["template_key"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("/dev/null"));
+        assert_eq!(public["keyring"]["path"], "keyring");
+        assert_eq!(public["template_key"]["path"], "template-key");
+        assert!(!public.to_string().contains("/dev/"));
+        for field in ["keyring", "template_key"] {
+            assert_eq!(public[field]["encryption"], root[field]["encryption"]);
+        }
+        for (public, root) in public["system"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(root["system"].as_array().unwrap())
+        {
+            assert_eq!(public["path"], root["path"]);
+            assert_eq!(public["encryption"], root["encryption"]);
+        }
     }
 
     #[test]
@@ -14587,13 +14638,10 @@ mod tests {
         let req: Request = serde_json::from_str(r#""SealedStorage""#).unwrap();
         let response = serde_json::to_value(dispatch_status(&req, &peer(NOBODY)).unwrap()).unwrap();
         let storage = &response["SealedStorage"];
-        assert_eq!(storage["keyring"]["path"], keyring.to_str().unwrap());
+        assert_eq!(storage["keyring"]["path"], "keyring");
         assert_eq!(storage["keyring"]["encryption"], "unknown");
         assert!(!storage["keyring"]["reason"].as_str().unwrap().is_empty());
-        assert_eq!(
-            storage["template_key"]["path"],
-            sb.dir.join("template-keys").to_str().unwrap()
-        );
+        assert_eq!(storage["template_key"]["path"], "template-key");
         assert!(!sb.dir.join("template-keys").exists());
     }
 

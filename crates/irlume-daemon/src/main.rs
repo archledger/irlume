@@ -60,6 +60,7 @@ pub(crate) mod test_support {
 
 mod arbiter;
 mod attempt_record;
+mod connection_slots;
 mod diagnostics;
 mod enrollment_session;
 mod live;
@@ -1252,14 +1253,9 @@ fn main() {
     }
 
     // A cap on connection threads, so a peer that opens sockets faster than it
-    // sends requests cannot exhaust memory. Well above any real client: the
-    // greeter, the lock screen, a TUI and sudo together are a handful.
-    const MAX_CONNECTION_THREADS: usize = 64;
-    /// Slots an unprivileged peer may not take. The greeter, the lock screen
-    /// and a sudo stack together are a handful, so a small reserve is enough to
-    /// keep the login path answerable while an unprivileged peer floods.
-    const ROOT_RESERVED_SLOTS: usize = 16;
-    let live_threads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // sends requests cannot exhaust memory, with a reserve for root and a cap
+    // per non-root account (`connection_slots`).
+    let slots = std::sync::Arc::new(connection_slots::ConnectionSlots::new());
 
     // How long a throttled connection is held before being closed, and how many
     // may be held at once. The hold is what actually paces an abusive peer: its
@@ -1296,6 +1292,10 @@ fn main() {
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
+                // The request line's deadline runs from here, once, however
+                // many reads the line takes (`read_request`).
+                let request_deadline = std::time::Instant::now() + REQUEST_LINE_DEADLINE;
+                let peer_uid = peer_cred(&stream).ok().map(|p| p.uid);
                 // A peer spinning on refusals is HELD, not answered and not
                 // dropped: its read blocks until the penalty expires, which
                 // paces it. Dropping was measured to be worse than useless, as
@@ -1303,7 +1303,7 @@ fn main() {
                 // refusals/s became 15k connection attempts a second and the
                 // daemon still burned 206% of a core. Holding costs a file
                 // descriptor and no thread, no parse and no arbiter round trip.
-                if peer_cred(&stream).is_ok_and(|p| refusal_throttled(p.uid)) {
+                if peer_uid.is_some_and(refusal_throttled) {
                     let mut held = match penalty_box.lock() {
                         Ok(h) => h,
                         Err(e) => e.into_inner(),
@@ -1315,58 +1315,35 @@ fn main() {
                     // descriptors one abusive peer can pin.
                     continue;
                 }
-                // Reserve the top of the pool for root.
-                //
-                // The cap is global, and a connection occupies a slot from
-                // accept until its read times out 15 seconds later, so an
-                // unprivileged peer that opens 64 sockets and sends NOTHING is
-                // never charged by `refusal_throttled` (which only counts
-                // arbiter refusals) and locks the socket for everyone: measured,
-                // a root peer's Ping got "daemon busy" for as long as the
-                // attacker held them. Root is where the login path lives, so it
-                // keeps slots an ordinary uid cannot take. The fallback when the
-                // peer cannot be identified is to treat it as unprivileged.
-                let peer_is_root = peer_cred(&stream).is_ok_and(|p| p.uid == 0);
-                let ceiling = if peer_is_root {
-                    MAX_CONNECTION_THREADS
-                } else {
-                    MAX_CONNECTION_THREADS - ROOT_RESERVED_SLOTS
-                };
-                let live = std::sync::Arc::clone(&live_threads);
-                if live.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= ceiling {
-                    live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    let _ = respond(
-                        stream,
-                        &Response::Error("daemon busy: too many open connections".into()),
-                    );
+                // A connection holds its slot from accept until its thread
+                // ends. Root keeps slots no other uid can take, and each other
+                // uid may hold only a few of the rest, so one account cannot
+                // take every slot the other accounts' clients share. Measured
+                // before the reserve existed: 64 idle sockets from one
+                // unprivileged peer made a root peer's Ping answer "daemon
+                // busy" for as long as they were held.
+                let Some((stream, slot)) = admit(&slots, stream, peer_uid) else {
                     continue;
-                }
+                };
                 let arbiter = std::sync::Arc::clone(&arbiter);
                 let engine_ready = std::sync::Arc::clone(&engine_ready);
                 let diagnostic_state = std::sync::Arc::clone(&diagnostic_state);
                 // A connection thread reads, parses and writes; it never touches
                 // the engine, so a panic in it is contained by the thread itself
                 // and the queued job (if any) is still completed and released by
-                // the worker. Contained does not mean free: the slot count must
-                // come back DOWN on a panic too. A trailing fetch_sub never ran
-                // when `serve` unwound, so 64 panics over the daemon's lifetime
-                // pinned `live_threads` at the ceiling and every later accept,
-                // root's included, answered "daemon busy" until a restart that
-                // nothing triggers (the watchdog measures the camera worker,
-                // which stays healthy). The guard decrements on unwind and on
-                // return alike.
-                struct SlotGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-                impl Drop for SlotGuard {
-                    fn drop(&mut self) {
-                        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    }
-                }
-                let slot = SlotGuard(live);
+                // the worker. Its slot comes back on unwind too (`Slot`'s
+                // `Drop`).
                 if let Err(e) = std::thread::Builder::new()
                     .name("irlume-conn".into())
                     .spawn(move || {
                         let _slot = slot;
-                        if let Err(e) = serve(stream, &arbiter, &engine_ready, &diagnostic_state) {
+                        if let Err(e) = serve_until(
+                            stream,
+                            &arbiter,
+                            &engine_ready,
+                            &diagnostic_state,
+                            request_deadline,
+                        ) {
                             jout_warn!("irlumed: connection error: {e}");
                         }
                     })
@@ -1886,6 +1863,20 @@ fn uid_of(user: &str) -> Option<u32> {
 /// a few KB of base64; 64 KiB is generous and bounds a slow-loris / memory DoS
 /// from a peer that never sends a newline.
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+
+/// How long a peer has to deliver its whole request line, measured once from
+/// accept. Every client serializes the request first and writes the line in
+/// one `write_all` right after `connect`, and a line is a few hundred bytes
+/// (at most [`MAX_REQUEST_BYTES`]), so it has normally arrived before the
+/// connection thread starts reading; five seconds matches the clients' own
+/// connect timeout. The per-read socket timeout alone restarts on every
+/// byte, so a line that arrives a byte at a time would hold its connection
+/// slot for as long as the bytes keep coming.
+const REQUEST_LINE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The socket timeout for each read and write of a connection outside the
+/// request line: replies, and the stream of an enrollment or framing session.
+const CONNECTION_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// One parsed request waiting for the camera worker, and where to send the
 /// answer. The reply travels back over a channel rather than being written by
@@ -3561,23 +3552,76 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
     }
 }
 
-/// Read and parse one connection, hand the request to the arbiter, write back
-/// what the worker answers.
-///
-/// Everything here runs on the connection's own thread. The only work that
-/// reaches the camera worker is a parsed, authorized-shaped request, which is
-/// what lets an authentication overtake a queue of preview work: before this,
-/// a request nobody had read yet was invisible to the daemon.
+/// Give an accepted connection a slot, or answer it "daemon busy" and close
+/// it. `peer_uid` is `None` when its credentials could not be read. A refusal
+/// is charged to the peer's uid ([`record_refusal`]), so a peer that keeps
+/// reconnecting over its cap is held in the penalty box at accept, as one
+/// spinning on other refusals is, instead of being answered at once each time.
+fn admit(
+    slots: &std::sync::Arc<connection_slots::ConnectionSlots>,
+    stream: UnixStream,
+    peer_uid: Option<u32>,
+) -> Option<(UnixStream, connection_slots::Slot)> {
+    match slots.take(peer_uid) {
+        Ok(slot) => Some((stream, slot)),
+        Err(refusal) => {
+            if let Some(uid) = peer_uid {
+                record_refusal(uid);
+            }
+            let _ = respond(stream, &Response::Error(refusal.message().into()));
+            None
+        }
+    }
+}
+
+/// [`serve_until`] with the request line due [`REQUEST_LINE_DEADLINE`] from
+/// now.
+#[cfg(test)]
 fn serve(
     stream: UnixStream,
     arbiter: &arbiter::Arbiter<Queued>,
     engine_ready: &std::sync::atomic::AtomicBool,
     diagnostic_state: &diagnostics::DiagnosticState,
 ) -> std::io::Result<()> {
-    let peer = peer_cred(&stream)?;
-    serve_peer(stream, arbiter, engine_ready, diagnostic_state, peer)
+    let request_deadline = std::time::Instant::now() + REQUEST_LINE_DEADLINE;
+    serve_until(
+        stream,
+        arbiter,
+        engine_ready,
+        diagnostic_state,
+        request_deadline,
+    )
 }
 
+/// Read and parse one connection, hand the request to the arbiter, write back
+/// what the worker answers. The request line must arrive by
+/// `request_deadline`, which the accept loop sets at accept.
+///
+/// Everything here runs on the connection's own thread. The only work that
+/// reaches the camera worker is a parsed, authorized-shaped request, which is
+/// what lets an authentication overtake a queue of preview work: before this,
+/// a request nobody had read yet was invisible to the daemon.
+fn serve_until(
+    stream: UnixStream,
+    arbiter: &arbiter::Arbiter<Queued>,
+    engine_ready: &std::sync::atomic::AtomicBool,
+    diagnostic_state: &diagnostics::DiagnosticState,
+    request_deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    let peer = peer_cred(&stream)?;
+    serve_peer_until(
+        stream,
+        arbiter,
+        engine_ready,
+        diagnostic_state,
+        peer,
+        request_deadline,
+    )
+}
+
+/// [`serve_peer_until`] with the request line due [`REQUEST_LINE_DEADLINE`]
+/// from now.
+#[cfg(test)]
 fn serve_peer(
     stream: UnixStream,
     arbiter: &arbiter::Arbiter<Queued>,
@@ -3585,12 +3629,35 @@ fn serve_peer(
     diagnostic_state: &diagnostics::DiagnosticState,
     peer: Peer,
 ) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(15)))?;
+    let request_deadline = std::time::Instant::now() + REQUEST_LINE_DEADLINE;
+    serve_peer_until(
+        stream,
+        arbiter,
+        engine_ready,
+        diagnostic_state,
+        peer,
+        request_deadline,
+    )
+}
+
+/// [`serve_until`] for a peer whose credentials are already read.
+fn serve_peer_until(
+    stream: UnixStream,
+    arbiter: &arbiter::Arbiter<Queued>,
+    engine_ready: &std::sync::atomic::AtomicBool,
+    diagnostic_state: &diagnostics::DiagnosticState,
+    peer: Peer,
+    request_deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    stream.set_write_timeout(Some(CONNECTION_IO_TIMEOUT))?;
     // Ingress boundary origin: the connection thread's work from here to the
     // queued scope (read wait, parse, posture, authorization).
     let ingress_started = std::time::Instant::now();
-    match read_request(&stream)? {
+    let read = read_request(&stream, request_deadline);
+    // `read_request` shortened the read timeout to what was left of the
+    // deadline; everything after the request line gets the usual one.
+    stream.set_read_timeout(Some(CONNECTION_IO_TIMEOUT))?;
+    match read? {
         ReadOutcome::Closed => Ok(()),
         ReadOutcome::Bad => respond(stream, &Response::Error("bad request".into())),
         ReadOutcome::Req(req) => {
@@ -3903,11 +3970,45 @@ enum ReadOutcome {
     Req(Request),
 }
 
-/// Read one request line (bounded by [`MAX_REQUEST_BYTES`]) and parse it.
-/// Called by [`serve`] on the connection's own thread (test seam: exercised
-/// over a socketpair without an [`irlume_auth::Engine`]).
-fn read_request(stream: &UnixStream) -> std::io::Result<ReadOutcome> {
-    let mut reader = BufReader::new(stream.try_clone()?).take(MAX_REQUEST_BYTES);
+/// Reads from a connection until one fixed instant, however many reads that
+/// takes. `SO_RCVTIMEO` bounds each read on its own and restarts on every
+/// byte, so before each read it is shortened to the time left, and a read
+/// that would start after the deadline fails instead.
+struct DeadlineRead<'a> {
+    stream: &'a UnixStream,
+    deadline: std::time::Instant,
+}
+
+impl Read for DeadlineRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let late = || {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request line not received in time",
+            )
+        };
+        let remaining = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(late());
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        match (&*self.stream).read(buf) {
+            // SO_RCVTIMEO expiring reads as EAGAIN.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(late()),
+            result => result,
+        }
+    }
+}
+
+/// Read one request line (bounded by [`MAX_REQUEST_BYTES`] and due by
+/// `deadline`) and parse it. Leaves the stream's read timeout at whatever was
+/// left of the deadline. Called by [`serve_peer_until`] on the connection's
+/// own thread (test seam: exercised over a socketpair without an
+/// [`irlume_auth::Engine`]).
+fn read_request(stream: &UnixStream, deadline: std::time::Instant) -> std::io::Result<ReadOutcome> {
+    let mut reader = BufReader::new(DeadlineRead { stream, deadline }).take(MAX_REQUEST_BYTES);
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
         return Ok(ReadOutcome::Closed);
@@ -10459,7 +10560,7 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 14] = [
+        let sources: [(&str, &str); 15] = [
             ("main.rs", include_str!("main.rs")),
             ("attempt_record.rs", include_str!("attempt_record.rs")),
             ("shared_unlock.rs", include_str!("shared_unlock.rs")),
@@ -10494,6 +10595,7 @@ mod tests {
                 ),
             ),
             ("arbiter.rs", include_str!("arbiter.rs")),
+            ("connection_slots.rs", include_str!("connection_slots.rs")),
             ("position_session.rs", include_str!("position_session.rs")),
             (
                 "enrollment_session.rs",
@@ -13963,23 +14065,35 @@ mod tests {
         }
     }
 
+    /// A request line deadline far enough away that only a test about the
+    /// deadline itself reaches it.
+    fn relaxed_deadline() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(10)
+    }
+
     #[test]
     fn read_request_parses_one_line_and_rejects_garbage() {
         // A valid newline-terminated request.
         let (ours, theirs) = UnixStream::pair().unwrap();
         (&theirs).write_all(b"\"Ping\"\n").unwrap();
-        match read_request(&ours).unwrap() {
+        match read_request(&ours, relaxed_deadline()).unwrap() {
             ReadOutcome::Req(Request::Ping) => {}
             _ => panic!("a Ping line must parse to Request::Ping"),
         }
         // Unparsable bytes -> Bad (generic error, never an echo).
         let (ours, theirs) = UnixStream::pair().unwrap();
         (&theirs).write_all(b"{not json}\n").unwrap();
-        assert!(matches!(read_request(&ours).unwrap(), ReadOutcome::Bad));
+        assert!(matches!(
+            read_request(&ours, relaxed_deadline()).unwrap(),
+            ReadOutcome::Bad
+        ));
         // Peer closing without a byte -> Closed.
         let (ours, theirs) = UnixStream::pair().unwrap();
         drop(theirs);
-        assert!(matches!(read_request(&ours).unwrap(), ReadOutcome::Closed));
+        assert!(matches!(
+            read_request(&ours, relaxed_deadline()).unwrap(),
+            ReadOutcome::Closed
+        ));
     }
 
     #[test]
@@ -13994,27 +14108,186 @@ mod tests {
         });
         // The reader must stop at the 64 KiB cap and answer Bad; it must not
         // buffer the whole flood or hang waiting for the newline.
-        assert!(matches!(read_request(&ours).unwrap(), ReadOutcome::Bad));
+        assert!(matches!(
+            read_request(&ours, relaxed_deadline()).unwrap(),
+            ReadOutcome::Bad
+        ));
         writer.join().unwrap();
     }
 
     #[test]
     fn read_request_honours_the_read_deadline_against_a_silent_peer() {
         let (ours, theirs) = UnixStream::pair().unwrap();
-        // Same mechanism handle() arms (shorter here to keep the test quick).
-        ours.set_read_timeout(Some(std::time::Duration::from_millis(300)))
-            .unwrap();
         let t = std::time::Instant::now();
-        let err = read_request(&ours).unwrap_err();
-        assert!(
-            matches!(
-                err.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ),
+        let err = read_request(&ours, t + std::time::Duration::from_millis(300)).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
             "a silent peer must trip the deadline, got {err:?}"
         );
         assert!(t.elapsed() >= std::time::Duration::from_millis(250));
         drop(theirs);
+    }
+
+    /// Write one byte of a request line every `gap`, never the newline,
+    /// until the other end closes or `give_up` passes.
+    fn trickle(
+        theirs: UnixStream,
+        gap: std::time::Duration,
+        give_up: std::time::Duration,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < give_up {
+                if (&theirs).write_all(b" ").is_err() {
+                    return;
+                }
+                std::thread::sleep(gap);
+            }
+        })
+    }
+
+    /// The deadline covers the whole line, not each read: a peer that sends
+    /// a byte well inside every per-read timeout is still cut off when the
+    /// deadline passes. Without that, one byte every few seconds kept a
+    /// connection slot for as long as the 64 KiB line took.
+    #[test]
+    fn read_request_closes_a_slow_sender_at_its_deadline() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let writer = trickle(
+            theirs,
+            std::time::Duration::from_millis(40),
+            std::time::Duration::from_secs(4),
+        );
+        let started = std::time::Instant::now();
+        let outcome = read_request(&ours, started + std::time::Duration::from_millis(400));
+        let elapsed = started.elapsed();
+        drop(ours);
+        writer.join().unwrap();
+        let err = outcome.expect_err("a line that never completes must not parse");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err:?}");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(350)
+                && elapsed < std::time::Duration::from_secs(3),
+            "closed after {elapsed:?}, not at the 400 ms deadline"
+        );
+    }
+
+    /// The same through `serve`: the connection closes at the deadline with
+    /// no reply, and its thread ends, which is what gives the slot back.
+    #[test]
+    fn serve_closes_a_trickling_connection_at_its_request_deadline() {
+        let _passwd = passwd_lock();
+        let arbiter = arbiter::Arbiter::<Queued>::new();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let state = diagnostics::DiagnosticState::default();
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        ours.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let writer = trickle(
+            ours.try_clone().unwrap(),
+            std::time::Duration::from_millis(40),
+            std::time::Duration::from_secs(4),
+        );
+        let started = std::time::Instant::now();
+        let served = serve_peer_until(
+            theirs,
+            &arbiter,
+            &ready,
+            &state,
+            Peer {
+                uid: 4_100_003,
+                gid: 4_100_003,
+                pid: i32::MAX,
+            },
+            started + std::time::Duration::from_millis(400),
+        );
+        let elapsed = started.elapsed();
+        let err = served.expect_err("an incomplete request line is a connection error");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "served for {elapsed:?} past a 400 ms deadline"
+        );
+        let mut reply = Vec::new();
+        (&ours).read_to_end(&mut reply).unwrap();
+        assert!(reply.is_empty(), "no reply is owed to an incomplete line");
+        drop(ours);
+        writer.join().unwrap();
+    }
+
+    /// One account at its connection cap is answered "daemon busy" at
+    /// accept, while other accounts and root are still admitted, and a slot
+    /// it gives back is its own to take again.
+    #[test]
+    fn admit_refuses_an_account_over_its_cap_and_serves_other_accounts_and_root() {
+        const ALICE: u32 = 4_100_004;
+        const BOB: u32 = 4_100_005;
+        let slots = std::sync::Arc::new(connection_slots::ConnectionSlots::with_limits(8, 2, 2));
+        let connect = |uid: Option<u32>| {
+            let (client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            (client, admit(&slots, server, uid))
+        };
+        let refusal = |client: UnixStream| {
+            let mut line = String::new();
+            BufReader::new(client).read_line(&mut line).unwrap();
+            match serde_json::from_str::<Response>(line.trim()).unwrap() {
+                Response::Error(message) => message,
+                other => panic!("a refused connection must be told why, got {other:?}"),
+            }
+        };
+
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let (client, admitted) = connect(Some(ALICE));
+            held.push((client, admitted.expect("under the cap")));
+        }
+        let (client, admitted) = connect(Some(ALICE));
+        assert!(admitted.is_none(), "a third connection is over the cap");
+        assert_eq!(
+            refusal(client),
+            "daemon busy: too many open connections from this user"
+        );
+
+        let (_bob, admitted) = connect(Some(BOB));
+        assert!(admitted.is_some(), "another account is not charged for it");
+        let (_root, admitted) = connect(Some(0));
+        assert!(admitted.is_some(), "root is not charged for it");
+
+        held.pop();
+        let (_again, admitted) = connect(Some(ALICE));
+        assert!(admitted.is_some(), "a slot given back can be taken again");
+    }
+
+    /// An account that keeps reconnecting over its cap spends its refusal
+    /// budget, so the accept loop holds its next connections in the penalty
+    /// box instead of answering each at once. Root is never charged.
+    #[test]
+    fn refusals_at_the_account_cap_are_paced_like_other_refusals() {
+        let _g = env_lock();
+        std::env::remove_var("IRLUME_REFUSAL_RATE");
+        const CAROL: u32 = 4_100_006;
+        let slots = std::sync::Arc::new(connection_slots::ConnectionSlots::with_limits(8, 2, 1));
+        let connect = |uid: u32| {
+            let (_client, server) = UnixStream::pair().unwrap();
+            admit(&slots, server, Some(uid))
+        };
+        let _held = connect(CAROL).expect("under the cap");
+        assert!(!refusal_throttled(CAROL));
+        // The bucket holds one second's worth (100 by default); each refusal
+        // takes one.
+        for _ in 0..150 {
+            assert!(connect(CAROL).is_none(), "over the cap");
+        }
+        assert!(
+            refusal_throttled(CAROL),
+            "cap refusals must reach the pacing the accept loop checks"
+        );
+        let _root = connect(0).expect("root has its own slots");
+        assert!(!refusal_throttled(0));
     }
 
     #[test]

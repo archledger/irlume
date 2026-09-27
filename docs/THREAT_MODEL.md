@@ -459,6 +459,23 @@ installs and loads by hand.
   genuine success does not establish safety against that case. Root deletion,
   disk rollback and the ambiguity between socket delivery and durable reset are
   outside an exactly-once guarantee. Ordinary password login remains available.
+- **Socket connection limits.** The daemon socket is mode 0666 and every
+  request is authorized by the peer's `SO_PEERCRED`, so any local account can
+  open connections. irlumed serves at most 64 at once. 16 of those slots are
+  reserved for root, where the greeters, `sudo` and the polkit helper run
+  PAM, so those stay answerable whatever other accounts hold. The other 48
+  are shared by every non-root uid, and one uid may hold at most 12 of them;
+  one more is answered "daemon busy". A connection has 5 seconds from accept
+  to deliver its whole request line, however many reads that takes, and 15
+  seconds for each later read or write. The limit that remains: the cap
+  counts uids as the kernel reports them, so several accounts together, or
+  one account that runs processes under several uids (for example through
+  subordinate uid ranges in `/etc/subuid` and a user namespace), can hold all
+  48 shared slots. While they do, other non-root clients get "daemon busy":
+  the CLI, the TUI, the KDE settings module, and lock screens that run PAM as
+  the user, such as the KDE lock screen, whose face unlock then goes on to
+  the password. No request is granted or authorized differently, and root's
+  reserved slots stay out of reach of every non-root uid.
 
 ## Camera use by local accounts
 

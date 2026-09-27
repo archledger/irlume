@@ -322,12 +322,15 @@ pub struct VideoControlFunction {
 /// which is not a VideoStreaming interface of the same configuration.
 ///
 /// Like [`active_descriptor_view`], it does not read `wTotalLength`. The
-/// ThinkPad T480's colour camera (USB 5986:2113) returns 996 of the 1026
-/// bytes its configuration header claims, and the kernel keeps what arrived,
-/// so its `descriptors` file is a clean chain shorter than its header says.
-/// The device writes both the header and the chain, so a length check would
-/// prove nothing a device could not also fake, and it would refuse a real IR
-/// camera whose firmware miscounts the same way. A chain is judged on the
+/// #887 reporter's `descriptors` file for a ThinkPad T480 colour camera
+/// (USB 5986:2113) carries 996 of the 1026 bytes its configuration header
+/// claims, as a clean chain shorter than its header says. A published
+/// capture from a unit with the same firmware version (linuxhw LsUSB
+/// `31A261423C`, bcdDevice 54.22) carries all 1026, and whether that unit's
+/// firmware or the capture path dropped the rest is not known. The device
+/// writes both the header and the chain, so a length check would prove
+/// nothing a device could not also fake, and it would refuse a real IR
+/// camera whose file comes up short the same way. A chain is judged on the
 /// descriptors it holds; one cut inside a descriptor is still malformed.
 ///
 /// `extension_units_for_interface` is left as it is on purpose: it decides
@@ -1825,19 +1828,25 @@ mod tests {
     /// sysfs `descriptors` file, one complete configuration.
     const T480_IR: &[u8] = include_bytes!("../tests/fixtures/bison-5986-1141.descriptors");
 
-    /// The ThinkPad T480 colour camera (USB 5986:2113), from the same
-    /// machine. Its configuration header claims a `wTotalLength` of 1026,
-    /// and the device returns 996 bytes: the MJPEG format counts nine frame
-    /// descriptors and carries eight (960x540 is missing). The kernel keeps
-    /// the bytes that arrived, header included, so the file is a clean
-    /// descriptor chain shorter than the `wTotalLength` it carries.
+    /// The ThinkPad T480 colour camera (USB 5986:2113): the #887 reporter's
+    /// file from the same machine. Its configuration header claims a
+    /// `wTotalLength` of 1026, and the file carries 996 bytes: the MJPEG
+    /// format counts nine frame descriptors and the file holds eight
+    /// (960x540 is missing). The sixth YUYV frame (640x360, file offset
+    /// 669) also carries `bFrameIndex` 5 instead of 6, so index 5 appears
+    /// twice. linuxhw LsUSB `31A261423C`, from a unit with the same
+    /// bcdDevice 54.22 and `wTotalLength`, lists all nine MJPEG frames and
+    /// numbers the YUYV frames 1 to 9, so both differences belong to this
+    /// file; whether its unit's firmware or the capture path produced them
+    /// is not known. The file is a clean descriptor chain shorter than the
+    /// `wTotalLength` it carries.
     const T480_RGB: &[u8] = include_bytes!("../tests/fixtures/bison-5986-2113.descriptors");
 
     /// Both T480 files walk by `bLength` to their last byte with no slop,
     /// and each single configuration is its own active view. The colour
-    /// camera's configuration is 30 bytes shorter than its header says,
-    /// and that is a fact about the device, pinned here so a re-capture
-    /// that differs is noticed.
+    /// camera file's configuration is 30 bytes shorter than its header
+    /// says, a fact about this file (see [`T480_RGB`]), pinned here so a
+    /// replacement file that differs is noticed.
     #[test]
     fn t480_descriptor_files_walk_cleanly_and_are_their_own_active_view() {
         for (label, bytes, total) in [("5986:1141", T480_IR, 412), ("5986:2113", T480_RGB, 1026)] {
@@ -1859,9 +1868,9 @@ mod tests {
         assert_eq!(T480_RGB.len(), 18 + 996);
     }
 
-    /// The builders the synthetic counter-cases use lay each descriptor out
-    /// exactly as the real 5986:1141 file does, so a counter-case differs
-    /// from a real attested function only in the field it names.
+    /// Each builder the synthetic counter-cases use lays its descriptor out
+    /// exactly as the real 5986:1141 file does, and each counter-case
+    /// differs from [`attested_shape`] only in the field it names.
     #[test]
     fn the_counter_case_builders_match_the_real_t480_bytes() {
         assert!(T480_IR.starts_with(&t480::device(0x1141, 0x3759, [3, 1, 2])));
@@ -1952,14 +1961,14 @@ mod tests {
     /// The T480's colour camera has no Microsoft unit, and its colour
     /// controls would refuse it on their own.
     ///
-    /// Its configuration is shorter than its own `wTotalLength` (see
-    /// [`T480_RGB`]), and the walk judges it on the descriptors it holds:
-    /// no walker in this module reads `wTotalLength`, so a chain that ends
-    /// cleanly at a descriptor boundary is not malformed, while a
-    /// descriptor cut in the middle still is. The same holds for an IR
-    /// function, which stays attested with its header overstating its
-    /// length by the same 30 bytes, so firmware that miscounts does not
-    /// cost a real IR camera its role.
+    /// The reporter's file holds a configuration shorter than its own
+    /// `wTotalLength` (see [`T480_RGB`]), and the walk judges it on the
+    /// descriptors it holds: no walker in this module reads `wTotalLength`,
+    /// so a chain that ends cleanly at a descriptor boundary is not
+    /// malformed, while a descriptor cut in the middle still is. The same
+    /// holds for an IR function, which stays attested with its header
+    /// overstating its length by the same 30 bytes, so a file that comes up
+    /// short does not cost a real IR camera its role.
     #[test]
     fn t480_2113_is_not() {
         assert_eq!(
@@ -2003,9 +2012,9 @@ mod tests {
     /// A one-configuration device whose VideoControl interface 0 lists
     /// `streams` in its header, followed by a VideoStreaming interface for
     /// each of `videostreaming`. Built from pieces laid out as the real
-    /// 5986:1141 file lays them out, with the attested shape as the default,
-    /// so each counter-case differs from an attested function only in the
-    /// field it names.
+    /// 5986:1141 file lays them out, with [`attested_shape`] as the default,
+    /// so each counter-case differs from that synthetic shape, not from the
+    /// real file, only in the field it names.
     fn function(
         streams: &[u8],
         videostreaming: &[u8],

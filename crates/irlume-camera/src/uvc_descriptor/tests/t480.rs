@@ -11,8 +11,9 @@
 //! `tests/fixtures/asus-3277-0059.descriptors`.
 //!
 //! These builders serve only the counter-cases no real camera supplies: a
-//! function that differs from the attested 5986:1141 shape in the one field
-//! a test names (two streams, a colour bit, a Microsoft unit without
+//! function that differs from the synthetic attested shape
+//! (`attested_shape` in the parent tests, not the real file) in the one
+//! field a test names (two streams, a colour bit, a Microsoft unit without
 //! selector 0x06, a truncated header), a second VideoControl function on
 //! the same device, a vendor-class grabber and an extra configuration. They
 //! began as a transcription of a published `lsusb -v` report (linuxhw LsUSB

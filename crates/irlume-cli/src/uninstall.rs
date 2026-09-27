@@ -1510,17 +1510,23 @@ fn sealed_token_holders() -> Result<TokenSweep, String> {
 pub(crate) fn root_sealed_token_holders() -> Result<Vec<String>, String> {
     let default = irlume_common::state_dir();
     let mut homes = Vec::new();
+    let mut dirs = Vec::new();
     for home in home_trees(&sweep_accounts(), &default) {
-        if let HomeTree::Verified(tree) = home {
-            if tree.keeps_store_of(0)? {
-                homes.push(HomeTree::Verified(tree));
+        match home {
+            HomeTree::Verified(tree) => {
+                if tree.keeps_store_of(0)? {
+                    homes.push(HomeTree::Verified(tree));
+                }
             }
+            // A tree uninstall does not remove can still hold a keyring
+            // store a root irlumed wrote, and a login stack may deliver its
+            // token: the guards keep counting it.
+            HomeTree::Skipped { path, .. } => dirs.extend(skipped_tree_keyring(&path, 0)),
         }
     }
     // What irlumed's own unit names is trusted by where it comes from (a unit
     // file only root writes), links followed as irlumed follows them.
     let roots = unit_state_roots(&default)?;
-    let mut dirs = Vec::new();
     for dir in unit_keyring_dirs()? {
         match std::fs::metadata(&dir) {
             Ok(meta) if meta.is_dir() => dirs.push(dir),
@@ -1537,6 +1543,17 @@ pub(crate) fn root_sealed_token_holders() -> Result<Vec<String>, String> {
         0,
     )?
     .holders)
+}
+
+/// The keyring store in a per-account tree uninstall skips, when it is a real
+/// directory (not a link at its own name) that `root_uid` owns: the login
+/// guards count its tokens although the tree is not removed. Its envelopes are
+/// read as every envelope is, bounded and without following a link.
+fn skipped_tree_keyring(tree: &Path, root_uid: u32) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    let keyring = tree.join("keyring");
+    let meta = std::fs::symlink_metadata(&keyring).ok()?;
+    (meta.is_dir() && meta.uid() == root_uid).then_some(keyring)
 }
 
 /// [`sealed_token_holders`] with the default-root enumeration, the
@@ -2166,6 +2183,33 @@ mod tests {
             std::fs::set_permissions(&tree_path, std::fs::Permissions::from_mode(0o700)).unwrap();
             assert!(answer.is_err_and(|e| e.contains("irlume/keyring")));
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A tree uninstall skips (for example one another account owns) can
+    /// still hold a real keyring store root owns; the login guards count it.
+    /// A link at the store's own name, or a store root does not own, is not.
+    #[test]
+    fn a_skipped_trees_root_owned_keyring_still_counts_for_the_login_guards() {
+        use std::os::unix::fs::MetadataExt as _;
+        let base =
+            std::env::temp_dir().join(format!("irlume-skipped-keyring-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let tree = base.join("irlume");
+        std::fs::create_dir_all(&tree).unwrap();
+        assert_eq!(skipped_tree_keyring(&tree, 0), None, "no keyring directory");
+        std::fs::create_dir(tree.join("keyring")).unwrap();
+        let owner = std::fs::metadata(tree.join("keyring")).unwrap().uid();
+        // This process stands in for root: the store is "root's" when the
+        // injected root uid is its owner.
+        assert_eq!(
+            skipped_tree_keyring(&tree, owner),
+            Some(tree.join("keyring"))
+        );
+        assert_eq!(skipped_tree_keyring(&tree, owner + 1), None, "not root's");
+        std::fs::remove_dir(tree.join("keyring")).unwrap();
+        std::os::unix::fs::symlink(&base, tree.join("keyring")).unwrap();
+        assert_eq!(skipped_tree_keyring(&tree, owner), None, "a link");
         let _ = std::fs::remove_dir_all(&base);
     }
 

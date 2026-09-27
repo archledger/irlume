@@ -252,6 +252,15 @@ impl SealedEnvelope {
             fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
         }
         let s = serde_json::to_string_pretty(self).map_err(|e| Error::Protocol(e.to_string()))?;
+        // Every reader refuses an envelope above MAX_ENVELOPE_BYTES, so one
+        // that large is never written: the live seal stays as it was.
+        if s.len() as u64 > MAX_ENVELOPE_BYTES {
+            return Err(Error::Protocol(format!(
+                "sealed envelope would be {} bytes, more than the {MAX_ENVELOPE_BYTES} a reader \
+                 accepts; nothing was written",
+                s.len()
+            )));
+        }
         // Atomic: a failed rewrite (ENOSPC, power loss, kill) must never corrupt
         // the live seal. Every seal writer (keyring arm/reseal, template-key
         // reseal) goes through here, so this one change protects them all; the
@@ -320,6 +329,43 @@ mod b64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An envelope larger than every reader accepts is never written, and
+    /// the file already there is kept.
+    #[test]
+    fn an_envelope_larger_than_a_reader_accepts_is_not_written() {
+        let dir = std::env::temp_dir().join(format!("irlume-envelope-cap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("alice.json");
+        let envelope = |pcrs: Vec<u32>, pcr_values: Vec<PcrValue>| SealedEnvelope {
+            secret: SecretKind::default(),
+            version: CURRENT_VERSION,
+            policy: PolicyKind::PcrLiteral,
+            pcrs,
+            public: Vec::new(),
+            private: Vec::new(),
+            pcr_values,
+            password_wrap: None,
+        };
+        envelope(vec![7], Vec::new()).save(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+        let values = (0..2_000)
+            .map(|_| PcrValue {
+                pcr: 7,
+                value: vec![0; 32],
+            })
+            .collect();
+        let large = envelope(vec![7; 2_000], values);
+        let err = large.save(&path).unwrap_err();
+        assert!(err.to_string().contains("nothing was written"), "{err}");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "the envelope there is kept"
+        );
+        assert!(SealedEnvelope::load(&path).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// A literal or pcrlock envelope over no firmware-measured PCR (an
     /// `IRLUME_PCRS` such as `11`, a pcrlock policy over OS PCRs only) ranks

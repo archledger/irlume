@@ -1690,8 +1690,9 @@ pub(crate) fn root_sealed_token_holders() -> Result<Vec<String>, String> {
             }
             // A tree uninstall does not remove can still hold a keyring
             // store a root irlumed wrote, and a login stack may deliver its
-            // token: the guards keep counting it.
-            HomeTree::Skipped { path, .. } => dirs.extend(skipped_tree_keyring(&path, 0)?),
+            // token: the guards keep counting it, through the directory the
+            // check held (sealed_token_holders_with).
+            skipped @ HomeTree::Skipped { .. } => homes.push(skipped),
         }
     }
     // What irlumed's own unit names is trusted by where it comes from (a unit
@@ -1715,33 +1716,76 @@ pub(crate) fn root_sealed_token_holders() -> Result<Vec<String>, String> {
     .holders)
 }
 
+/// A keyring store in a tree uninstall skips, held open: the directory the
+/// ownership check was made on, and the path it is named by in messages.
+struct HeldStore {
+    shown: PathBuf,
+    dir: std::fs::File,
+}
+
+impl HeldStore {
+    /// The sealed envelopes in the held directory, read through its
+    /// descriptor (so a directory put at its path since the check is never
+    /// read), bounded and without following a link at an envelope's name.
+    fn sealed_kinds(&self) -> Result<Vec<(String, irlume_core::envelope::SecretKind)>, String> {
+        let shown = self.shown.display().to_string();
+        let pinned = fd_path(&self.dir).map_err(|e| format!("{shown}: {e}"))?;
+        irlume_core::keyring::list_sealed_kinds_at(&pinned).map_err(|e| {
+            format!(
+                "{shown}: {}",
+                e.to_string().replace(&pinned.display().to_string(), &shown)
+            )
+        })
+    }
+}
+
 /// The keyring store in a per-account tree uninstall skips, when it is a
 /// directory that `root_uid` owns: the uninstall and login guards count its
 /// tokens although the tree is not removed. A link at the store's name is
 /// followed only to such a directory (a root irlumed's store linked there),
 /// and the store is then named by where the link leads, as
 /// [`VerifiedTree::linked_root_store`] does for a tree that is removed; a
-/// link to anything else, to nothing or into a loop is no store. Its
-/// envelopes are read as every envelope is, bounded and without following a
-/// link. `Ok(None)` when there is no such store; an error when whether there
-/// is one cannot be established, so the guards stay fail-closed.
-fn skipped_tree_keyring(tree: &Path, root_uid: u32) -> Result<Option<PathBuf>, String> {
+/// link to anything else, to nothing or into a loop is no store, and so is a
+/// path that cannot be followed because of a loop above it. The directory is
+/// opened once and its owner is read from the open directory, which is what
+/// the guards then read ([`HeldStore::sealed_kinds`]). `Ok(None)` when there
+/// is no such store; an error when whether there is one cannot be
+/// established, so the guards stay fail-closed.
+fn skipped_tree_keyring(tree: &Path, root_uid: u32) -> Result<Option<HeldStore>, String> {
     use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     let keyring = tree.join("keyring");
     let fail = |e: std::io::Error| format!("{}: {e}", keyring.display());
-    match std::fs::symlink_metadata(&keyring) {
-        Ok(meta) if meta.file_type().is_symlink() => match std::fs::canonicalize(&keyring) {
-            Ok(target) => match std::fs::metadata(&target) {
-                Ok(meta) => Ok((meta.is_dir() && meta.uid() == root_uid).then_some(target)),
-                Err(e) => Err(fail(e)),
-            },
-            Err(e) if is_absent(&e) || e.raw_os_error() == Some(libc::ELOOP) => Ok(None),
-            Err(e) => Err(fail(e)),
-        },
-        Ok(meta) => Ok((meta.is_dir() && meta.uid() == root_uid).then_some(keyring)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(fail(e)),
-    }
+    let nothing = |e: &std::io::Error| is_absent(e) || e.raw_os_error() == Some(libc::ELOOP);
+    let meta = match std::fs::symlink_metadata(&keyring) {
+        Ok(meta) => meta,
+        Err(e) if nothing(&e) => return Ok(None),
+        Err(e) => return Err(fail(e)),
+    };
+    let (shown, opened) = if meta.file_type().is_symlink() {
+        let target = match std::fs::canonicalize(&keyring) {
+            Ok(target) => target,
+            Err(e) if nothing(&e) => return Ok(None),
+            Err(e) => return Err(fail(e)),
+        };
+        let opened = open_dir(&target);
+        (target, opened)
+    } else if meta.is_dir() {
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&keyring);
+        (keyring.clone(), opened)
+    } else {
+        return Ok(None);
+    };
+    let dir = match opened {
+        Ok(dir) => dir,
+        Err(e) if nothing(&e) => return Ok(None),
+        Err(e) => return Err(fail(e)),
+    };
+    let owner = dir.metadata().map_err(fail)?.uid();
+    Ok((owner == root_uid).then_some(HeldStore { shown, dir }))
 }
 
 /// [`sealed_token_holders`] with the default-root enumeration, the
@@ -1804,11 +1848,8 @@ fn sweep_sealed_token_holders(
                 // The tree is not removed, but a keyring store in it that
                 // root owns may hold a token a login stack delivers: it
                 // counts, fail-closed, as a root store does.
-                if let Some(dir) = skipped_tree_keyring(path, root_uid)? {
-                    sweep.collect(
-                        irlume_core::keyring::list_sealed_kinds_at(&dir)
-                            .map_err(|e| format!("{}: {e}", dir.display()))?,
-                    );
+                if let Some(store) = skipped_tree_keyring(path, root_uid)? {
+                    sweep.collect(store.sealed_kinds()?);
                 }
             }
         }
@@ -2432,13 +2473,15 @@ mod tests {
     #[test]
     fn a_skipped_trees_root_owned_keyring_still_counts_for_the_login_guards() {
         use std::os::unix::fs::MetadataExt as _;
+        // What the guards are handed: the store's path in messages.
+        let shown = |answer: Result<Option<HeldStore>, String>| answer.map(|o| o.map(|h| h.shown));
         let base =
             std::env::temp_dir().join(format!("irlume-skipped-keyring-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let tree = base.join("irlume");
         std::fs::create_dir_all(&tree).unwrap();
         assert_eq!(
-            skipped_tree_keyring(&tree, 0),
+            shown(skipped_tree_keyring(&tree, 0)),
             Ok(None),
             "no keyring directory"
         );
@@ -2447,11 +2490,11 @@ mod tests {
         // This process stands in for root: the store is "root's" when the
         // injected root uid is its owner.
         assert_eq!(
-            skipped_tree_keyring(&tree, owner),
+            shown(skipped_tree_keyring(&tree, owner)),
             Ok(Some(tree.join("keyring")))
         );
         assert_eq!(
-            skipped_tree_keyring(&tree, owner + 1),
+            shown(skipped_tree_keyring(&tree, owner + 1)),
             Ok(None),
             "not root's"
         );
@@ -2462,7 +2505,7 @@ mod tests {
         std::fs::create_dir(&store).unwrap();
         std::os::unix::fs::symlink(&store, tree.join("keyring")).unwrap();
         assert_eq!(
-            skipped_tree_keyring(&tree, owner),
+            shown(skipped_tree_keyring(&tree, owner)),
             Ok(Some(std::fs::canonicalize(&store).unwrap())),
             "a link to root's store"
         );
@@ -2481,14 +2524,18 @@ mod tests {
         );
         std::fs::remove_file(store.join("carol.json")).unwrap();
         assert_eq!(
-            skipped_tree_keyring(&tree, owner + 1),
+            shown(skipped_tree_keyring(&tree, owner + 1)),
             Ok(None),
             "a link to a store root does not own"
         );
         for target in [base.join("nowhere"), tree.join("keyring")] {
             std::fs::remove_file(tree.join("keyring")).unwrap();
             std::os::unix::fs::symlink(&target, tree.join("keyring")).unwrap();
-            assert_eq!(skipped_tree_keyring(&tree, owner), Ok(None), "{target:?}");
+            assert_eq!(
+                shown(skipped_tree_keyring(&tree, owner)),
+                Ok(None),
+                "{target:?}"
+            );
         }
         // Inside a tree this process cannot search, whether a store is there
         // cannot be established: an error, so the guards refuse.
@@ -2496,10 +2543,42 @@ mod tests {
             std::fs::remove_file(tree.join("keyring")).unwrap();
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o000)).unwrap();
-            let answer = skipped_tree_keyring(&tree, owner);
+            let answer = shown(skipped_tree_keyring(&tree, owner));
             std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o700)).unwrap();
             assert!(answer.is_err(), "{answer:?}");
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The guards read a skipped tree's store through the directory the
+    /// check held: one renamed away and replaced by an empty directory after
+    /// the check still counts its token. A loop above the store, which no
+    /// store can be inside, is no store rather than an error.
+    #[test]
+    fn a_skipped_store_is_read_through_the_held_directory_and_a_loop_above_it_is_none() {
+        use std::os::unix::fs::MetadataExt as _;
+        let base = std::env::temp_dir().join(format!("irlume-skipped-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let tree = base.join("irlume");
+        std::fs::create_dir_all(tree.join("keyring")).unwrap();
+        std::fs::write(tree.join("keyring/carol.json"), TOKEN_ENVELOPE).unwrap();
+        let owner = std::fs::metadata(tree.join("keyring")).unwrap().uid();
+        let held = skipped_tree_keyring(&tree, owner)
+            .unwrap()
+            .expect("root's store");
+        std::fs::rename(tree.join("keyring"), base.join("moved")).unwrap();
+        std::fs::create_dir(tree.join("keyring")).unwrap();
+        let kinds = held.sealed_kinds().unwrap();
+        assert_eq!(kinds.len(), 1, "{kinds:?}");
+        assert_eq!(kinds[0].0, "carol");
+        // A self-referential link above the store: the path cannot be
+        // followed, and nothing is there.
+        let looped = base.join("loop");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        assert!(matches!(
+            skipped_tree_keyring(&looped.join("share/irlume"), owner),
+            Ok(None)
+        ));
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -327,16 +327,21 @@ with a fabricated print.
 
 ## Confinement
 
-irlumed runs as root with systemd sandboxing (`packaging/systemd/irlumed.service`:
-a reduced capability set, `ProtectSystem=full` and more; not
-`ProtectHome` or `PrivateDevices`, since it opens cameras and the TPM). What a
-mandatory access control policy adds depends on the distribution:
+The packaged unit (`packaging/systemd/irlumed.service`, which the Debian,
+Ubuntu, Fedora and Arch packages install) and the NixOS module run irlumed as
+root with systemd sandboxing: a reduced capability set, `ProtectSystem=full`
+and more; not `ProtectHome` or `PrivateDevices`, since it opens cameras and the
+TPM. What a mandatory access control policy adds depends on the distribution:
 
 - **AppArmor** (Debian, Ubuntu, and other systems that load
-  `packaging/apparmor/usr.bin.irlumed`): the profile enforces and confines the
-  daemon to the paths it lists. It also allows each account's
-  `~/.local/share/irlume` and models in `~/irlume/models`, which only a source
-  install uses; `usr.local.bin.irlumed` is the profile for that install.
+  `packaging/apparmor/usr.bin.irlumed`): loaded in enforce mode, as it ships,
+  the profile confines the daemon to the paths it lists. In complain mode,
+  which its header suggests for a soak on new hardware, access the profile
+  does not list is logged, not refused (only its explicit `deny` rules still
+  hold), and a profile that did not load leaves the daemon unconfined; the
+  AppArmor row of `irlume tui` shows the running daemon's mode. The
+  profile also allows each account's `~/.local/share/irlume` and models in
+  `~/irlume/models`, which only a source install uses.
 - **SELinux** (Fedora, the `irlume-selinux` subpackage): irlumed runs as
   `unconfined_service_t`, with no domain of its own, so SELinux does not
   confine it. The module only lets the confined greeter (`xdm_t`) and polkit
@@ -345,8 +350,15 @@ mandatory access control policy adds depends on the distribution:
   listening process's domain, so it covers any socket a process in
   `unconfined_service_t` listens on. Narrowing that needs a domain for
   irlumed.
-- **Neither** (Arch by default): the systemd sandbox and `SO_PEERCRED`
+- **Neither** (Arch by default, NixOS): the systemd sandbox and `SO_PEERCRED`
   authorization of every request are what applies.
+
+The developer source install, `scripts/install-host.sh`, writes a unit of its
+own without these sandboxing directives and loads no AppArmor profile, so there
+irlumed runs as root without either, and `SO_PEERCRED` authorization of every
+request is what applies. `packaging/apparmor/usr.local.bin.irlumed` is a
+profile for that install's `/usr/local/bin/irlumed`, which an administrator
+installs and loads by hand.
 
 ## Side channels
 

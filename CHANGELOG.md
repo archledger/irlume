@@ -855,11 +855,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 - THREAT_MODEL.md has a "Confinement" section that says what each
   mandatory access control policy does for irlumed: the AppArmor profile
-  confines it, while on Fedora it runs as `unconfined_service_t` and the
-  SELinux module only lets the greeter and polkit helper domains reach
-  its socket, through a `connectto` grant that names the daemon's domain.
-  The unit, profile and module comments no longer describe the SELinux
-  module as confining the daemon.
+  confines it in enforce mode, while on Fedora it runs as
+  `unconfined_service_t` and the SELinux module only lets the greeter and
+  polkit helper domains reach its socket, through a `connectto` grant
+  that names the daemon's domain. It also says that the source install
+  (`scripts/install-host.sh`) has neither the packaged unit's sandboxing
+  nor a loaded profile. The unit, profile and module comments no longer
+  describe the SELinux module as confining the daemon (#893).
 
 - `irlume keyring arm` and a new doctor check, `sealed-storage`, say what
   protects the sealed secrets at rest. A TPM seal binds the boot chain it

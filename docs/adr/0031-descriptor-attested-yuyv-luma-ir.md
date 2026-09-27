@@ -130,6 +130,7 @@ the Encoding Unit carries both control arrays described in
 [Microsoft's USBView layout](https://github.com/microsoft/Windows-driver-samples/blob/main/usb/usbview/h264.h).
 The Encoding Unit is accepted only in UVC 1.5. Interface endpoints cannot
 name endpoint zero or set reserved address bits.
+An endpoint on the target VideoControl interface is interrupt IN.
 
 The remaining source-reference graph checks and the VideoControl header's
 own total-length check are tracked in #913, required before implementing

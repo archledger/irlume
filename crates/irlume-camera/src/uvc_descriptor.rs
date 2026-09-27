@@ -521,6 +521,9 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                 {
                     return None;
                 }
+                if in_target_vc && (d[2] & 0x80 == 0 || d[3] & 0x03 != 0x03) {
+                    return None;
+                }
                 if in_target_vc {
                     vc_block_closed = true;
                 }
@@ -2455,6 +2458,15 @@ mod tests {
         for address in [0, 0x80, 0x91] {
             let mut bytes = whole.clone();
             bytes[endpoint_at + 2] = address;
+            assert_eq!(
+                ir_function_evidence(&bytes, 0),
+                Err(IrFunctionRefusal::Malformed)
+            );
+        }
+        for (address, attributes) in [(0x01, 3), (0x83, 2), (0x83, 1), (0x83, 0)] {
+            let mut bytes = whole.clone();
+            bytes[endpoint_at + 2] = address;
+            bytes[endpoint_at + 3] = attributes;
             assert_eq!(
                 ir_function_evidence(&bytes, 0),
                 Err(IrFunctionRefusal::Malformed)

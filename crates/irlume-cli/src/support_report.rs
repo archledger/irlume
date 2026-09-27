@@ -871,14 +871,27 @@ fn withholds_other_accounts(snapshot: &SupportSnapshot) -> bool {
 /// recent events include authentications, whose they are, since their
 /// times and outcomes (granted, denied, failed) are account history.
 fn authentication_checklist_line(report: &SupportReport) -> &'static str {
-    let Some(snapshot) = report.daemon.as_ref().filter(|snapshot| {
+    let Some(snapshot) = report.daemon.as_ref() else {
+        return "  [x] no authentication times or outcomes";
+    };
+    let has = |class: OperationClass| {
         snapshot
             .events()
             .iter()
-            .any(|event| event.operation == OperationClass::Authentication)
-    }) else {
-        return "  [x] no authentication times or outcomes";
+            .any(|event| event.operation == class)
     };
+    if !has(OperationClass::Authentication) {
+        // An irlumed from before this release labels keyring arms and token
+        // releases, which are credential operations, as status events, and
+        // does not withhold other accounts'. Without the withholding mark
+        // the report cannot tell such a daemon from root's view of this
+        // one, so status events are not taken as proof there are none.
+        if has(OperationClass::Status) && !withholds_other_accounts(snapshot) {
+            return "  [!] recent status events, which an older irlumed also uses for keyring \
+                    arms and token releases: when each happened and its outcome";
+        }
+        return "  [x] no authentication times or outcomes";
+    }
     if withholds_other_accounts(snapshot) {
         "  [!] this account's recent authentications: when each happened and its outcome"
     } else {
@@ -1177,6 +1190,29 @@ mod tests {
         assert!(text.contains("events of other accounts: withheld"));
 
         let (_, checklist) = render(&fixture_report());
+        assert!(checklist.contains("  [x] no authentication times or outcomes\n"));
+
+        // Status events with no withholding mark may be an older daemon's
+        // credential operations, so they are not taken as proof there are
+        // none; with the mark they are status events only.
+        let (_, checklist) = render(&fixture_report_with_events(
+            EffectivePrivilege::User,
+            &[OperationClass::Status],
+            Vec::new(),
+        ));
+        assert!(
+            checklist.contains("  [!] recent status events, which an older irlumed also uses"),
+            "{checklist}"
+        );
+        assert!(!checklist.contains("[x] no authentication times or outcomes"));
+        let (_, checklist) = render(&fixture_report_with_events(
+            EffectivePrivilege::User,
+            &[OperationClass::Status],
+            vec![SupportUnavailable {
+                section: SupportSection::RecentEvents,
+                reason: UnavailableReason::NotAuthorized,
+            }],
+        ));
         assert!(checklist.contains("  [x] no authentication times or outcomes\n"));
     }
 

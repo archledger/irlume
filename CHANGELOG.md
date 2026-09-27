@@ -843,6 +843,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- The session lock of `irlume auth test --events=jsonl` uses only the
+  caller's own runtime directory: `$XDG_RUNTIME_DIR` when it is a
+  directory, not a symlink, owned by the caller and not writable by group
+  or others. Root without one, as under `sudo` or in the TUI's auth test
+  under `sudo irlume tui`, uses the root-owned 0700 `/run/irlume`; other
+  accounts get `operation-failed` instead of a directory under `/tmp`.
+  The lock is opened without following a symlink and must be a regular
+  file the caller owns.
+
 - `login enable --with-sudo` and `--with-polkit` put irlume's line just
   above the password step (the password include or substack, or the
   `pam_unix.so` line) instead of above the first auth line, so a gate an

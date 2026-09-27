@@ -2066,10 +2066,11 @@ fn valid_transaction_args(args: &[String], sub: &str, allow_apply: bool) -> Opti
 /// An exclusive per-user session, held for as long as the guard lives.
 ///
 /// The contract promises one session per user. That is enforced with an
-/// advisory lock on a file in the caller's own runtime directory rather than a
-/// recorded process id: a lock is released by the kernel when the holder exits
-/// for any reason, including a crash or a kill, so a panel that dies mid-capture
-/// cannot leave a user unable to start another session.
+/// advisory lock on a file in a directory only the caller can write (see
+/// [`session_dir`]) rather than a recorded process id: a lock is released by
+/// the kernel when the holder exits for any reason, including a crash or a
+/// kill, so a panel that dies mid-capture cannot leave a user unable to start
+/// another session.
 struct SessionGuard {
     id: String,
     // Held for its Drop, which closes the descriptor and releases the lock.
@@ -2085,46 +2086,174 @@ struct SessionGuard {
 enum SessionRefusal {
     /// Another session for this user holds the lock.
     Busy,
-    /// The lock itself could not be created or opened.
+    /// No directory qualifies for the lock, or the lock could not be created,
+    /// opened or verified.
     Unavailable,
 }
 
+/// The session lock's file name inside the directory [`session_dir`] opens.
+const SESSION_LOCK_NAME: &str = "machine-session.lock";
+
+/// Where root keeps its session lock when it has no runtime directory of its
+/// own, as under sudo, pkexec, a system unit or a cron job: a root-owned 0700
+/// directory on the `/run` tmpfs, created on first use.
+pub(crate) const ROOT_SESSION_DIR: &str = "/run/irlume";
+
 impl SessionGuard {
     fn acquire() -> std::result::Result<Self, SessionRefusal> {
-        use std::os::unix::io::AsRawFd;
-        let dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(std::path::PathBuf::from)
-            // Falling back to a uid-qualified path keeps the lock per-user on a
-            // system without a runtime directory, rather than making it global.
-            .unwrap_or_else(|| {
-                // SAFETY: getuid cannot fail and touches no memory.
-                std::path::PathBuf::from(format!("/tmp/irlume-{}", unsafe { libc::getuid() }))
-            });
-        let _ = std::fs::create_dir_all(&dir);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join("machine-session.lock"))
-            .map_err(|_| SessionRefusal::Unavailable)?;
-        // SAFETY: fd is owned by `file` and outlives the call.
-        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if locked != 0 {
-            // EWOULDBLOCK is the lock being held, which is the ordinary case
-            // and the only retryable one. Anything else is the lock mechanism
-            // failing, and telling a consumer to retry that would spin.
-            let errno = std::io::Error::last_os_error().raw_os_error();
-            return Err(if errno == Some(libc::EWOULDBLOCK) {
-                SessionRefusal::Busy
-            } else {
-                SessionRefusal::Unavailable
-            });
-        }
+        // The effective uid owns what this process creates, so it is the one
+        // the directory and the lock are checked against.
+        // SAFETY: geteuid cannot fail and touches no memory.
+        let uid = unsafe { libc::geteuid() };
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+        Self::acquire_in(runtime_dir.as_deref(), uid, root_session_dir(uid))
+    }
+
+    /// [`Self::acquire`] with the runtime directory, the caller's uid and the
+    /// fallback directory passed in, so tests can use a sandbox for each.
+    fn acquire_in(
+        runtime_dir: Option<&std::path::Path>,
+        uid: u32,
+        fallback: Option<&std::path::Path>,
+    ) -> std::result::Result<Self, SessionRefusal> {
+        let dir = session_dir(runtime_dir, uid, fallback).ok_or(SessionRefusal::Unavailable)?;
+        let file = open_session_lock(&dir, uid)?;
         Ok(Self {
             id: random_id(),
             _file: file,
         })
     }
+}
+
+/// The fallback directory for `uid` when its runtime directory cannot be used:
+/// [`ROOT_SESSION_DIR`] for root and none for anyone else. A shared location
+/// such as `/tmp` is never used, because any account can create entries there
+/// before the caller does.
+fn root_session_dir(uid: u32) -> Option<&'static std::path::Path> {
+    (uid == 0).then(|| std::path::Path::new(ROOT_SESSION_DIR))
+}
+
+/// Opens the directory that holds the session lock, or `None` when there is
+/// no usable one.
+///
+/// The runtime directory is used when it is an absolute path to a directory
+/// (not a symlink) owned by `uid` that no other account can write, as systemd
+/// creates `/run/user/<uid>`. Otherwise `fallback` is created at 0700 if it is
+/// missing and held to the same rule.
+fn session_dir(
+    runtime_dir: Option<&std::path::Path>,
+    uid: u32,
+    fallback: Option<&std::path::Path>,
+) -> Option<std::fs::File> {
+    use std::os::unix::fs::DirBuilderExt;
+    // The XDG base directory rules make a relative (or empty) value invalid.
+    let runtime = runtime_dir
+        .filter(|dir| dir.is_absolute())
+        .and_then(|dir| owned_dir(dir, uid));
+    if runtime.is_some() {
+        return runtime;
+    }
+    let fallback = fallback?;
+    match std::fs::DirBuilder::new().mode(0o700).create(fallback) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+    owned_dir(fallback, uid)
+}
+
+/// `path` opened as a directory, provided the final component is not a
+/// symlink, it is owned by `uid` and it grants no write permission to group or
+/// others.
+fn owned_dir(path: &std::path::Path, uid: u32) -> Option<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let meta = dir.metadata().ok()?;
+    (meta.is_dir() && meta.uid() == uid && meta.mode() & 0o022 == 0).then_some(dir)
+}
+
+/// Opens the session lock inside `dir`, creating it at 0600 if it is missing,
+/// and keeps it only when it is a regular file owned by `uid`.
+///
+/// The name is resolved through the open directory descriptor, so the lock
+/// lands in the directory [`owned_dir`] checked even if the path that named it
+/// has changed since. `O_NOFOLLOW` refuses a symlink at the lock's name, and
+/// `O_NONBLOCK` keeps a FIFO there from stalling the open.
+fn open_session_lock(
+    dir: &std::fs::File,
+    uid: u32,
+) -> std::result::Result<std::fs::File, SessionRefusal> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::io::AsRawFd;
+    let path = format!("/proc/self/fd/{}/{SESSION_LOCK_NAME}", dir.as_raw_fd());
+    let open = |create_new: bool| {
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        if create_new {
+            options.create_new(true);
+        } else {
+            options.create(true).truncate(false);
+        }
+        options.open(&path)
+    };
+    let owned = |file: &std::fs::File| {
+        file.metadata()
+            .ok()
+            .filter(|meta| meta.is_file() && meta.uid() == uid)
+            .ok_or(SessionRefusal::Unavailable)
+    };
+    let file = open(false).map_err(|_| SessionRefusal::Unavailable)?;
+    let meta = owned(&file)?;
+    lock_exclusive(&file)?;
+    if meta.mode() & 0o077 == 0 {
+        return Ok(file);
+    }
+    // Earlier builds created the lock under the umask. A group or other
+    // reader may already hold a descriptor to it, which a mode change does
+    // not revoke, so the lock is replaced while this process holds it: a run
+    // still using it (an earlier build's, say) makes this one busy above, and
+    // the new owner-only file is locked before the old lock is let go. The
+    // checked directory is one no other account can create a file in.
+    std::fs::remove_file(&path).map_err(|_| SessionRefusal::Unavailable)?;
+    let replaced = match open(true) {
+        Ok(replaced) => replaced,
+        // Another run of this account created it after the unlink.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(SessionRefusal::Busy)
+        }
+        Err(_) => return Err(SessionRefusal::Unavailable),
+    };
+    let meta = owned(&replaced)?;
+    if meta.mode() & 0o077 != 0 {
+        return Err(SessionRefusal::Unavailable);
+    }
+    lock_exclusive(&replaced)?;
+    drop(file);
+    Ok(replaced)
+}
+
+/// Take the session lock on `file` without waiting. Held elsewhere is the
+/// ordinary, retryable case; any other failure is the lock mechanism
+/// failing, and telling a consumer to retry that would spin.
+fn lock_exclusive(file: &std::fs::File) -> std::result::Result<(), SessionRefusal> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: fd is owned by `file` and outlives the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(());
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    Err(if errno == Some(libc::EWOULDBLOCK) {
+        SessionRefusal::Busy
+    } else {
+        SessionRefusal::Unavailable
+    })
 }
 
 pub(crate) const CAMERA_BUSY_MESSAGE: &str =
@@ -3600,5 +3729,284 @@ mod tests {
         assert!(!valid_profiles_list_args(&args(&[
             "profiles", "list", "--json", "--user"
         ])));
+    }
+
+    /// A scratch directory shaped like a systemd runtime directory: owned by
+    /// the test's effective uid, mode 0700 whatever the umask.
+    fn runtime_sandbox(label: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-session-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("sandbox");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        dir
+    }
+
+    fn own_uid() -> u32 {
+        // SAFETY: geteuid cannot fail and touches no memory.
+        unsafe { libc::geteuid() }
+    }
+
+    fn outcome(result: std::result::Result<SessionGuard, SessionRefusal>) -> &'static str {
+        match result {
+            Ok(_) => "acquired",
+            Err(SessionRefusal::Busy) => "busy",
+            Err(SessionRefusal::Unavailable) => "unavailable",
+        }
+    }
+
+    fn acquired(result: std::result::Result<SessionGuard, SessionRefusal>) -> SessionGuard {
+        match result {
+            Ok(guard) => guard,
+            Err(SessionRefusal::Busy) => panic!("session refused as busy"),
+            Err(SessionRefusal::Unavailable) => panic!("session refused as unavailable"),
+        }
+    }
+
+    /// The ordinary case: the lock is a 0600 file of the caller's in its
+    /// runtime directory, a second session is busy while the first lives, and
+    /// dropping the first releases the lock.
+    #[test]
+    fn session_lock_is_taken_in_a_private_runtime_directory_and_released_on_drop() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = runtime_sandbox("normal");
+        let uid = own_uid();
+        let first = acquired(SessionGuard::acquire_in(Some(&dir), uid, None));
+        let meta = std::fs::symlink_metadata(dir.join(SESSION_LOCK_NAME)).expect("lock");
+        assert!(meta.is_file());
+        assert_eq!(meta.uid(), uid);
+        assert_eq!(meta.mode() & 0o7777, 0o600);
+        assert_eq!(
+            outcome(SessionGuard::acquire_in(Some(&dir), uid, None)),
+            "busy"
+        );
+        drop(first);
+        drop(acquired(SessionGuard::acquire_in(Some(&dir), uid, None)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lock an earlier build created under the umask is narrowed to 0600.
+    #[test]
+    fn session_lock_readable_by_others_is_narrowed_to_its_owner() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = runtime_sandbox("narrow");
+        let lock = dir.join(SESSION_LOCK_NAME);
+        std::fs::write(&lock, b"").expect("lock");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        // A descriptor opened while the lock was readable keeps pointing at
+        // that file; the session takes a new one instead.
+        let earlier = std::fs::File::open(&lock).expect("open the old lock");
+        let old_inode = earlier.metadata().expect("old lock").ino();
+        let session = acquired(SessionGuard::acquire_in(Some(&dir), own_uid(), None));
+        let now = std::fs::metadata(&lock).expect("lock");
+        assert_eq!(now.mode() & 0o7777, 0o600);
+        assert_ne!(now.ino(), old_inode, "the readable lock was replaced");
+        drop(earlier);
+        drop(session);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A readable lock an earlier build left, still held by a run using it,
+    /// makes this run busy; it is not replaced, so two runs never hold two
+    /// different locks at once.
+    #[test]
+    fn a_held_readable_lock_is_busy_and_not_replaced() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::io::AsRawFd;
+        let dir = runtime_sandbox("held-legacy");
+        let lock = dir.join(SESSION_LOCK_NAME);
+        std::fs::write(&lock, b"").expect("lock");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let holder = std::fs::File::open(&lock).expect("open the old lock");
+        // SAFETY: fd is owned by `holder` and outlives the call.
+        let held = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(held, 0);
+        let old_inode = holder.metadata().expect("old lock").ino();
+        assert_eq!(
+            outcome(SessionGuard::acquire_in(Some(&dir), own_uid(), None)),
+            "busy"
+        );
+        assert_eq!(
+            std::fs::metadata(&lock).expect("lock").ino(),
+            old_inode,
+            "a held lock is not replaced"
+        );
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlink at the lock's name is refused, and the path it names is not
+    /// created.
+    #[test]
+    fn session_lock_refuses_a_symlink_at_the_lock_path_and_does_not_create_its_target() {
+        let dir = runtime_sandbox("symlink");
+        let elsewhere = runtime_sandbox("symlink-target");
+        let target = elsewhere.join("named-by-the-link");
+        let lock = dir.join(SESSION_LOCK_NAME);
+        std::os::unix::fs::symlink(&target, &lock).expect("symlink");
+        assert_eq!(
+            outcome(SessionGuard::acquire_in(Some(&dir), own_uid(), None)),
+            "unavailable"
+        );
+        assert!(std::fs::symlink_metadata(&target).is_err());
+        assert!(std::fs::symlink_metadata(&lock)
+            .expect("link")
+            .file_type()
+            .is_symlink());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// A runtime directory owned by another account is not used and nothing
+    /// is created in it. The other owner is simulated by checking the sandbox
+    /// against a uid other than the one that made it.
+    #[test]
+    fn session_lock_refuses_a_runtime_directory_owned_by_another_account() {
+        let dir = runtime_sandbox("foreign");
+        let other = own_uid().wrapping_add(1);
+        assert_eq!(
+            outcome(SessionGuard::acquire_in(Some(&dir), other, None)),
+            "unavailable"
+        );
+        assert!(std::fs::symlink_metadata(dir.join(SESSION_LOCK_NAME)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A runtime directory that group or others can write, or a symlink to a
+    /// directory, is not used and nothing is created in it.
+    #[test]
+    fn session_lock_refuses_a_shared_or_symlinked_runtime_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = own_uid();
+        let shared = runtime_sandbox("shared");
+        for mode in [0o1777, 0o720, 0o702] {
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+            assert_eq!(
+                outcome(SessionGuard::acquire_in(Some(&shared), uid, None)),
+                "unavailable",
+                "mode {mode:o}"
+            );
+            assert!(std::fs::symlink_metadata(shared.join(SESSION_LOCK_NAME)).is_err());
+        }
+        let real = runtime_sandbox("linked");
+        let link = shared.join("runtime");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert_eq!(
+            outcome(SessionGuard::acquire_in(Some(&link), uid, None)),
+            "unavailable"
+        );
+        assert!(std::fs::symlink_metadata(real.join(SESSION_LOCK_NAME)).is_err());
+        let _ = std::fs::remove_dir_all(&shared);
+        let _ = std::fs::remove_dir_all(&real);
+    }
+
+    /// A lock file that is not the caller's is refused by the owner check on
+    /// the opened descriptor. The other owner is simulated as above.
+    #[test]
+    fn session_lock_owned_by_another_account_is_refused() {
+        let dir = runtime_sandbox("foreign-lock");
+        std::fs::write(dir.join(SESSION_LOCK_NAME), b"").expect("lock");
+        let handle = owned_dir(&dir, own_uid()).expect("the sandbox qualifies");
+        assert!(open_session_lock(&handle, own_uid().wrapping_add(1)).is_err());
+        assert!(open_session_lock(&handle, own_uid()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without a usable runtime directory an account other than root has no
+    /// fallback, so `auth test` answers `operation-failed`. An empty or
+    /// relative `XDG_RUNTIME_DIR` counts as unset. Only root falls back, to its
+    /// own directory under /run.
+    #[test]
+    fn session_lock_without_a_runtime_directory_is_unavailable_to_other_accounts() {
+        let uid = 1000;
+        assert_eq!(root_session_dir(uid), None);
+        assert_eq!(
+            outcome(SessionGuard::acquire_in(None, uid, root_session_dir(uid))),
+            "unavailable"
+        );
+        for value in ["", "run/user/1000"] {
+            let dir = std::path::Path::new(value);
+            assert_eq!(
+                outcome(SessionGuard::acquire_in(
+                    Some(dir),
+                    uid,
+                    root_session_dir(uid)
+                )),
+                "unavailable",
+                "XDG_RUNTIME_DIR={value:?}"
+            );
+        }
+        assert_eq!(
+            root_session_dir(0),
+            Some(std::path::Path::new("/run/irlume"))
+        );
+    }
+
+    /// The fallback (root's /run/irlume, here a sandbox) is created at 0700
+    /// on first use, and is used both without a runtime directory and when
+    /// the runtime directory is not the caller's own, as under `sudo -E`. A
+    /// symlink in its place is refused.
+    #[test]
+    fn session_lock_fallback_is_a_private_directory_created_on_first_use() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let uid = own_uid();
+        let parent = runtime_sandbox("fallback");
+        let fallback = parent.join("irlume");
+        let session = acquired(SessionGuard::acquire_in(None, uid, Some(&fallback)));
+        let meta = std::fs::symlink_metadata(&fallback).expect("fallback");
+        assert!(meta.is_dir());
+        assert_eq!(meta.uid(), uid);
+        assert_eq!(meta.mode() & 0o7777, 0o700);
+        assert!(fallback.join(SESSION_LOCK_NAME).is_file());
+        drop(session);
+
+        let shared = runtime_sandbox("fallback-shared");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).expect("chmod");
+        let session = acquired(SessionGuard::acquire_in(
+            Some(&shared),
+            uid,
+            Some(&fallback),
+        ));
+        assert!(std::fs::symlink_metadata(shared.join(SESSION_LOCK_NAME)).is_err());
+        drop(session);
+
+        let private = runtime_sandbox("fallback-target");
+        let linked = parent.join("linked");
+        std::os::unix::fs::symlink(&private, &linked).expect("symlink");
+        assert_eq!(
+            outcome(SessionGuard::acquire_in(None, uid, Some(&linked))),
+            "unavailable"
+        );
+        assert!(std::fs::symlink_metadata(private.join(SESSION_LOCK_NAME)).is_err());
+        let _ = std::fs::remove_dir_all(&parent);
+        let _ = std::fs::remove_dir_all(&shared);
+        let _ = std::fs::remove_dir_all(&private);
+    }
+
+    /// `acquire` takes the runtime directory from `XDG_RUNTIME_DIR`.
+    #[test]
+    fn session_lock_reads_the_runtime_directory_from_the_environment() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = runtime_sandbox("env");
+        let saved = std::env::var_os("XDG_RUNTIME_DIR");
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        let result = SessionGuard::acquire();
+        match saved {
+            Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+        let session = acquired(result);
+        assert!(dir.join(SESSION_LOCK_NAME).is_file());
+        drop(session);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1627,6 +1627,9 @@ mod pipeline {
     pub(crate) fn lease_error_failure(error: lease::CameraLeaseError) -> IrFailure {
         match error {
             lease::CameraLeaseError::DeadlineExpired { .. } => IrFailure::CameraLeaseTimeout,
+            // RGB and IR on two USB devices is a configuration the lease
+            // refuses, not contention: waiting would never grant it (#887).
+            lease::CameraLeaseError::SplitPhysicalCamera { .. } => IrFailure::CameraLeaseRefused,
             _ => IrFailure::CameraLeaseRefused,
         }
     }

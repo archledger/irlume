@@ -22,6 +22,11 @@
 //!
 //! This module reads it, so the emitter path can address a documented control on
 //! a unit that says it implements it, instead of guessing.
+//!
+//! The same descriptor also states whether a video function produces infrared
+//! data: Microsoft's face-authentication control applies only to such cameras.
+//! Discovery reads that statement for nodes that offer only YUYV (ADR-0031 §1),
+//! from sysfs alone, and capture re-derives it from the open file descriptor.
 
 use std::path::{Path, PathBuf};
 
@@ -49,9 +54,24 @@ const DESC_DEVICE: u8 = 0x01;
 const DESC_CONFIGURATION: u8 = 0x02;
 const DESC_INTERFACE: u8 = 0x04;
 const DESC_CS_INTERFACE: u8 = 0x24;
+const SUBTYPE_VC_HEADER: u8 = 0x01;
+const SUBTYPE_PROCESSING_UNIT: u8 = 0x05;
 const SUBTYPE_EXTENSION_UNIT: u8 = 0x06;
 const CLASS_VIDEO: u8 = 0x0E;
 const SUBCLASS_VIDEOCONTROL: u8 = 0x01;
+const SUBCLASS_VIDEOSTREAMING: u8 = 0x02;
+
+/// Processing Unit `bmControls` bits that only a colour sensor has a use for
+/// (UVC 1.5 section 3.7.2.5): hue (D2), saturation (D3), white balance
+/// temperature (D6), white balance component (D7), hue auto (D11), white
+/// balance temperature auto (D12) and white balance component auto (D13).
+///
+/// Brightness, contrast, gain, gamma, sharpness, backlight compensation and
+/// power-line frequency are deliberately absent: a monochrome IR sensor can
+/// reasonably offer each of them, so they say nothing about colour. The
+/// ThinkPad T480 IR function advertises no Processing Unit control at all,
+/// and its colour sibling advertises 0x157f, of which 0x104c is in this mask.
+pub(crate) const PU_COLOUR_CONTROLS: u32 = 0x0000_38CC;
 /// One `VC_EXTENSION_UNIT` descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionUnit {
@@ -266,6 +286,272 @@ fn parse_extension_unit(d: &[u8]) -> Option<ExtensionUnit> {
         bm_controls: bm_controls.to_vec(),
         num_controls: *d.get(20)?,
     })
+}
+
+/// What one VideoControl function declares about itself, from its
+/// class-specific descriptors: the streaming interfaces its header lists,
+/// each Processing Unit's controls and its extension units.
+///
+/// Exposed only for the untrusted-input fuzz harness, which pins that
+/// [`Self::extension_units`] always equals what
+/// [`extension_units_for_interface`] returns for the same input.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoControlFunction {
+    /// `baInterfaceNr[]` from the function's one `VC_HEADER`, in the order
+    /// the header lists them.
+    pub streaming_interfaces: Vec<u8>,
+    /// Each `VC_PROCESSING_UNIT`'s `bmControls`, its first four bytes read
+    /// little-endian.
+    pub processing_controls: Vec<u32>,
+    /// Every `VC_EXTENSION_UNIT`, parsed exactly as the emitter path parses
+    /// it.
+    pub extension_units: Vec<ExtensionUnit>,
+}
+
+/// The VideoControl function at `interface_number`, read strictly, or `None`.
+///
+/// This decides a role (ADR-0031 §1) rather than authorizing a write, but it
+/// is held to the same framing rules as [`extension_units_for_interface`]:
+/// the walk steps by `bLength` through exactly one configuration, never
+/// scans for byte pairs, and any truncated, zero-length or overrunning
+/// descriptor refuses the whole answer rather than keeping a prefix. On top
+/// of those it refuses a function that has no `VC_HEADER` or more than one,
+/// a header too short for the interfaces it counts, a Processing Unit too
+/// short for the bitmap it declares, and a header that lists an interface
+/// which is not a VideoStreaming interface of the same configuration.
+///
+/// `extension_units_for_interface` is left as it is on purpose: it decides
+/// which bytes irlume may write to a camera (#159), and a parser shared with
+/// a new consumer is a parser whose next change can move that decision.
+/// This walker reuses only its unit parsing, and a test and the fuzz target
+/// pin that both return the same units.
+#[doc(hidden)]
+pub fn video_control_function(desc: &[u8], interface_number: u8) -> Option<VideoControlFunction> {
+    let mut in_target_vc = false;
+    let mut found_target_vc = false;
+    let mut configurations = 0;
+    let mut headers = 0usize;
+    let mut streaming_interfaces = Vec::new();
+    let mut processing_controls = Vec::new();
+    let mut extension_units = Vec::new();
+    let mut videostreaming = [false; 256];
+    let mut i = 0usize;
+
+    while i < desc.len() {
+        let header = desc.get(i..i.checked_add(2)?)?;
+        let len = usize::from(header[0]);
+        let end = i.checked_add(len)?;
+        if len < 2 || end > desc.len() {
+            return None;
+        }
+        let d = &desc[i..end];
+
+        match d[1] {
+            DESC_CONFIGURATION => {
+                configurations += 1;
+                if configurations != 1 || len < 9 || d[5] == 0 {
+                    return None;
+                }
+                in_target_vc = false;
+            }
+            DESC_INTERFACE => {
+                if len < 9 {
+                    return None;
+                }
+                let video = configurations == 1 && d[5] == CLASS_VIDEO;
+                if video && d[6] == SUBCLASS_VIDEOSTREAMING {
+                    videostreaming[usize::from(d[2])] = true;
+                }
+                in_target_vc = video && d[2] == interface_number && d[6] == SUBCLASS_VIDEOCONTROL;
+                found_target_vc |= in_target_vc;
+            }
+            DESC_CS_INTERFACE if in_target_vc => {
+                if len < 3 {
+                    return None;
+                }
+                match d[2] {
+                    SUBTYPE_VC_HEADER => {
+                        headers += 1;
+                        let count = usize::from(*d.get(11)?);
+                        streaming_interfaces = d.get(12..12 + count)?.to_vec();
+                    }
+                    SUBTYPE_PROCESSING_UNIT => {
+                        processing_controls.push(processing_unit_controls(d)?);
+                    }
+                    SUBTYPE_EXTENSION_UNIT => extension_units.push(parse_extension_unit(d)?),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        i = end;
+    }
+
+    if !found_target_vc || headers != 1 {
+        return None;
+    }
+    if streaming_interfaces
+        .iter()
+        .any(|number| !videostreaming[usize::from(*number)])
+    {
+        return None;
+    }
+    Some(VideoControlFunction {
+        streaming_interfaces,
+        processing_controls,
+        extension_units,
+    })
+}
+
+/// `bmControls` of one `VC_PROCESSING_UNIT` (UVC 1.5 section 3.7.2.5):
+///
+/// ```text
+/// 0 bLength  3 bUnitID  4 bSourceID  5 wMaxMultiplier  7 bControlSize = n
+///                                                      8 bmControls[n]
+/// ```
+///
+/// UVC 1.0 devices end the descriptor after `iProcessing`, later versions
+/// add `bmVideoStandards`; neither is read, so the only length that matters
+/// is the bitmap's own. The bitmap is little-endian and UVC defines no
+/// control above D18, so only its first four bytes are kept. A descriptor
+/// too short for the bitmap it declares yields `None`.
+fn processing_unit_controls(d: &[u8]) -> Option<u32> {
+    let size = usize::from(*d.get(7)?);
+    let bitmap = d.get(8..8 + size)?;
+    Some(
+        bitmap
+            .iter()
+            .take(4)
+            .enumerate()
+            .fold(0u32, |bits, (at, byte)| bits | u32::from(*byte) << (8 * at)),
+    )
+}
+
+/// Why a VideoControl function does not attest that its stream is infrared
+/// (ADR-0031 §1). Each variant names the clause that failed, because the
+/// census and doctor print it as the evidence for keeping a node RGB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IrFunctionRefusal {
+    /// No descriptor could be read for the node: it has no USB parent (a
+    /// loopback or platform node), sysfs is absent or restricted, or the
+    /// active configuration changed during the read.
+    Unreadable,
+    /// The descriptor chain is truncated or inconsistent, the function has
+    /// no single `VC_HEADER`, or its header lists an interface that is not
+    /// VideoStreaming.
+    Malformed,
+    /// The function lists this many streaming interfaces instead of one, so
+    /// its claims cannot be attributed to one node (clause b).
+    StreamingInterfaces(usize),
+    /// The function has no Microsoft camera-control unit (clause c).
+    NoMicrosoftXu,
+    /// The function has more than one Microsoft camera-control unit, which
+    /// makes the unit ambiguous, as it is for the emitter path (clause c).
+    AmbiguousMicrosoftXu,
+    /// The Microsoft unit does not advertise selector 0x06 within
+    /// `bNumControls` (clause c).
+    NoFaceAuthentication,
+    /// A Processing Unit advertises these colour controls (clause d).
+    ColourProcessing(u32),
+}
+
+impl std::fmt::Display for IrFunctionRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable => formatter.write_str("no readable USB descriptor"),
+            Self::Malformed => formatter.write_str("the USB descriptor is malformed"),
+            Self::StreamingInterfaces(count) => {
+                write!(
+                    formatter,
+                    "its video function lists {count} streams, not one"
+                )
+            }
+            Self::NoMicrosoftXu => formatter.write_str("no Microsoft camera-control unit"),
+            Self::AmbiguousMicrosoftXu => {
+                formatter.write_str("more than one Microsoft camera-control unit")
+            }
+            Self::NoFaceAuthentication => formatter
+                .write_str("its Microsoft camera-control unit has no face-authentication control"),
+            Self::ColourProcessing(bits) => write!(
+                formatter,
+                "colour controls advertised (Processing Unit bits 0x{bits:04x})"
+            ),
+        }
+    }
+}
+
+/// What an attested VideoControl function stated (ADR-0031 §1): the
+/// Microsoft unit carrying the face-authentication control and the one
+/// streaming interface the claim belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IrFunctionEvidence {
+    pub(crate) msxu_unit: u8,
+    pub(crate) streaming_interface: u8,
+}
+
+/// Whether the VideoControl function at `vc_interface` of the active
+/// descriptor view `view` attests an infrared stream (ADR-0031 §1, clauses
+/// b to d; clause a, the node's formats, is the caller's).
+///
+/// Microsoft's UVC 1.5 extensions (section 2.2.2.6) define the
+/// face-authentication control as applicable only to cameras that produce
+/// infrared data. Its presence alone is not enough: the claim describes a
+/// function, so it is attributed to a node only when the function has one
+/// streaming interface; a colour function that carries the unit anyway is
+/// caught by its colour controls; and a unit whose bitmap contradicts its
+/// own `bNumControls` advertises nothing, as for the emitter path. Pure over
+/// the bytes, so every clause is testable without a camera.
+pub(crate) fn ir_function_evidence(
+    view: &[u8],
+    vc_interface: u8,
+) -> Result<IrFunctionEvidence, IrFunctionRefusal> {
+    let function =
+        video_control_function(view, vc_interface).ok_or(IrFunctionRefusal::Malformed)?;
+    let streaming_interface = match function.streaming_interfaces.as_slice() {
+        [only] => *only,
+        other => return Err(IrFunctionRefusal::StreamingInterfaces(other.len())),
+    };
+    let mut microsoft = function
+        .extension_units
+        .iter()
+        .filter(|unit| unit.is_microsoft_xu());
+    let unit = match (microsoft.next(), microsoft.next()) {
+        (Some(only), None) => only,
+        (None, _) => return Err(IrFunctionRefusal::NoMicrosoftXu),
+        (Some(_), Some(_)) => return Err(IrFunctionRefusal::AmbiguousMicrosoftXu),
+    };
+    if !unit.advertises(MSXU_FACE_AUTHENTICATION) {
+        return Err(IrFunctionRefusal::NoFaceAuthentication);
+    }
+    let colour = function
+        .processing_controls
+        .iter()
+        .fold(0, |bits, controls| bits | controls)
+        & PU_COLOUR_CONTROLS;
+    if colour != 0 {
+        return Err(IrFunctionRefusal::ColourProcessing(colour));
+    }
+    Ok(IrFunctionEvidence {
+        msxu_unit: unit.unit_id,
+        streaming_interface,
+    })
+}
+
+/// [`ir_function_evidence`] for the function behind `video_device`, from
+/// sysfs alone.
+///
+/// This is the only attestation discovery, the census and the doctor use:
+/// it reads the USB device's `descriptors` file and opens nothing under
+/// `/dev`, so classifying a node never streams a frame or touches the
+/// camera's controls (ADR-0029 §1, §9). Any failure to read is a refusal,
+/// which keeps the node RGB.
+pub(crate) fn ir_function_evidence_for_node(
+    video_device: &str,
+) -> Result<IrFunctionEvidence, IrFunctionRefusal> {
+    let (view, vc_interface) =
+        usb_context(video_device).map_err(|_| IrFunctionRefusal::Unreadable)?;
+    ir_function_evidence(&view, vc_interface)
 }
 
 /// The USB `idVendor:idProduct` behind `video_device`.
@@ -691,6 +977,20 @@ impl CameraIdentity {
         }
     }
 
+    /// [`ir_function_evidence`] for this identity's function, bound to the
+    /// file descriptor the identity was read from.
+    ///
+    /// Capture uses this rather than the role discovery cached: an
+    /// `IRLUME_IR_DEVICE` override, a saved pin or the fallback path can
+    /// open a node discovery never classified, and a path can be re-pointed
+    /// by a replug between discovery and the open. The fd names the device
+    /// that will stream.
+    pub(crate) fn ir_function_evidence(&self) -> Result<IrFunctionEvidence, IrFunctionRefusal> {
+        let view = active_descriptor_view(&self.descriptors, self.active_configuration)
+            .ok_or(IrFunctionRefusal::Malformed)?;
+        ir_function_evidence(&view, self.interface_number)
+    }
+
     pub fn usb_id(&self) -> String {
         format!("{:04x}:{:04x}", self.vid, self.pid)
     }
@@ -786,6 +1086,7 @@ fn bad(msg: String) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
+    mod t480;
 
     #[test]
     fn budget_hint_metadata_rejects_non_usb_paths_without_opening_them() {
@@ -1437,5 +1738,434 @@ mod tests {
             i += len;
         }
         assert_eq!(i, ASUS.len());
+    }
+    /// The transcription reproduces every byte `lsusb` accounted for: each
+    /// configuration is exactly as long as its printed `wTotalLength`, the
+    /// walk consumes it with no slop, and the single configuration is its
+    /// own active view.
+    #[test]
+    fn transcribed_t480_configurations_match_their_printed_total_lengths() {
+        for (label, bytes, total) in [
+            ("5986:1141", t480::ir_1141(), t480::IR_1141_TOTAL),
+            ("5986:2113", t480::rgb_2113(), t480::RGB_2113_TOTAL),
+        ] {
+            assert_eq!(bytes.len(), 18 + usize::from(total), "{label}");
+            let mut at = 0usize;
+            while at < bytes.len() {
+                let len = usize::from(bytes[at]);
+                assert!(len >= 2 && at + len <= bytes.len(), "{label} at {at}");
+                at += len;
+            }
+            assert_eq!(at, bytes.len(), "{label}");
+            assert_eq!(active_descriptor_view(&bytes, 1), Some(bytes), "{label}");
+        }
+    }
+
+    /// ADR-0031 §1 against a camera's real bytes: the ASUS module's IR
+    /// function (VideoControl interface 2) streams GREY, so its role never
+    /// depended on this rule, but its descriptor is the shape the rule
+    /// attests, and its RGB function (interface 0) is not.
+    #[test]
+    fn asus_ir_function_is_attested_and_its_rgb_function_is_not() {
+        assert_eq!(
+            ir_function_evidence(ASUS, 2),
+            Ok(IrFunctionEvidence {
+                msxu_unit: 14,
+                streaming_interface: 3,
+            })
+        );
+        assert_eq!(
+            ir_function_evidence(ASUS, 0),
+            Err(IrFunctionRefusal::NoMicrosoftXu)
+        );
+        assert_eq!(
+            video_control_function(ASUS, 0).unwrap().processing_controls,
+            [0x177F],
+            "the RGB function advertises hue, saturation and white balance"
+        );
+        for not_videocontrol in [1, 3, 4, 5, 9] {
+            assert_eq!(
+                ir_function_evidence(ASUS, not_videocontrol),
+                Err(IrFunctionRefusal::Malformed),
+                "interface {not_videocontrol}"
+            );
+        }
+    }
+
+    /// #887: the ThinkPad T480 IR camera offers only YUYV, and its
+    /// descriptor names it an IR function: one stream, the Microsoft unit 8
+    /// with face authentication (`22 00`, two controls), no colour controls.
+    #[test]
+    fn t480_bison_1141_is_attested() {
+        assert_eq!(
+            ir_function_evidence(&t480::ir_1141(), 0),
+            Ok(IrFunctionEvidence {
+                msxu_unit: 8,
+                streaming_interface: 1,
+            })
+        );
+    }
+
+    /// The T480's colour camera has no Microsoft unit, and its colour
+    /// controls would refuse it on their own.
+    #[test]
+    fn t480_2113_is_not() {
+        let rgb = t480::rgb_2113();
+        assert_eq!(
+            ir_function_evidence(&rgb, 0),
+            Err(IrFunctionRefusal::NoMicrosoftXu)
+        );
+        let function = video_control_function(&rgb, 0).expect("a well-formed UVC 1.00 function");
+        assert_eq!(function.streaming_interfaces, [1]);
+        assert_eq!(function.processing_controls, [0x157F]);
+        assert_eq!(0x157F & PU_COLOUR_CONTROLS, 0x104C);
+    }
+
+    const MSXU: &str = "0f3f95dc-2632-4c4e-92c9-a04782f43bc8";
+
+    /// One extension unit for [`function`]: (unit, printed GUID,
+    /// `bNumControls`, `bmControls`).
+    type Unit<'a> = (u8, &'a str, u8, &'a [u8]);
+
+    /// A one-configuration device whose VideoControl interface 0 lists
+    /// `streams` in its header, followed by a VideoStreaming interface for
+    /// each of `videostreaming`. Built from the T480 transcription's pieces
+    /// with the attested shape as the default, so each counter-case differs
+    /// from an attested function only in the field it names.
+    fn function(
+        streams: &[u8],
+        videostreaming: &[u8],
+        processing: &[u32],
+        units: &[Unit<'_>],
+    ) -> Vec<u8> {
+        let mut bytes = t480::device(0x1141, 0x3759, [3, 1, 2]);
+        bytes.extend(t480::configuration(0, 2, 0));
+        bytes.extend(t480::interface(0, 0, 1, SUBCLASS_VIDEOCONTROL, 1, 0));
+        bytes.extend(t480::vc_header(0x0150, 0, 15_000_000, streams));
+        for controls in processing {
+            bytes.extend(t480::processing_unit(2, 1, 0, 3, *controls, &[0, 0]));
+        }
+        for (unit, guid, count, bitmap) in units {
+            bytes.extend(t480::extension_unit(*unit, guid, *count, 2, bitmap, 0));
+        }
+        bytes.extend(t480::interrupt_endpoint(0x83, 6));
+        for number in videostreaming {
+            bytes.extend(t480::interface(
+                *number,
+                0,
+                0,
+                SUBCLASS_VIDEOSTREAMING,
+                1,
+                0,
+            ));
+            bytes.extend(t480::vs_input_header(0, 3, &[0]));
+        }
+        bytes
+    }
+
+    fn attested_shape() -> Vec<u8> {
+        function(&[1], &[1], &[0], &[(8, MSXU, 2, &[0x22, 0x00])])
+    }
+
+    #[test]
+    fn the_synthetic_attested_shape_is_attested() {
+        assert_eq!(
+            ir_function_evidence(&attested_shape(), 0),
+            Ok(IrFunctionEvidence {
+                msxu_unit: 8,
+                streaming_interface: 1,
+            })
+        );
+        // No Processing Unit at all is no colour control at all.
+        let bare = function(&[1], &[1], &[], &[(8, MSXU, 2, &[0x22, 0x00])]);
+        assert!(ir_function_evidence(&bare, 0).is_ok());
+    }
+
+    /// Clause b: a function with two streams cannot say which node its
+    /// face-authentication claim is about (#428, #704).
+    #[test]
+    fn two_streams_are_not_attributable_to_one_node() {
+        let two = function(&[1, 2], &[1, 2], &[0], &[(8, MSXU, 2, &[0x22, 0x00])]);
+        assert_eq!(
+            ir_function_evidence(&two, 0),
+            Err(IrFunctionRefusal::StreamingInterfaces(2))
+        );
+        let none = function(&[], &[1], &[0], &[(8, MSXU, 2, &[0x22, 0x00])]);
+        assert_eq!(
+            ir_function_evidence(&none, 0),
+            Err(IrFunctionRefusal::StreamingInterfaces(0))
+        );
+    }
+
+    /// Clause d: each colour control alone refuses, and the controls a
+    /// monochrome sensor may carry do not.
+    #[test]
+    fn each_colour_control_alone_refuses_and_the_others_do_not() {
+        for bit in (0..19).map(|d| 1u32 << d) {
+            let shape = function(&[1], &[1], &[bit], &[(8, MSXU, 2, &[0x22, 0x00])]);
+            let got = ir_function_evidence(&shape, 0);
+            if bit & PU_COLOUR_CONTROLS != 0 {
+                assert_eq!(
+                    got,
+                    Err(IrFunctionRefusal::ColourProcessing(bit)),
+                    "{bit:#x}"
+                );
+            } else {
+                assert!(got.is_ok(), "{bit:#x}: {got:?}");
+            }
+        }
+        // Brightness, contrast, gain, backlight and power-line frequency.
+        let monochrome = function(&[1], &[1], &[0x0703], &[(8, MSXU, 2, &[0x22, 0x00])]);
+        assert!(ir_function_evidence(&monochrome, 0).is_ok());
+        // A colour bit on a second Processing Unit counts as much as on the first.
+        let second = function(&[1], &[1], &[0, 0x08], &[(8, MSXU, 2, &[0x22, 0x00])]);
+        assert_eq!(
+            ir_function_evidence(&second, 0),
+            Err(IrFunctionRefusal::ColourProcessing(0x08))
+        );
+    }
+
+    /// Clause c: the Microsoft unit must carry selector 0x06, advertised
+    /// within its own `bNumControls`, and must be the only one.
+    #[test]
+    fn the_microsoft_unit_must_advertise_face_authentication_honestly() {
+        // A ThinkPad P16s Gen 2 colour function: selectors 2, 3 and 9.
+        let p16s = function(&[1], &[1], &[0], &[(8, MSXU, 3, &[0x06, 0x01])]);
+        assert_eq!(
+            ir_function_evidence(&p16s, 0),
+            Err(IrFunctionRefusal::NoFaceAuthentication)
+        );
+        let overclaimed = function(&[1], &[1], &[0], &[(8, MSXU, 1, &[0x22, 0x00])]);
+        assert_eq!(
+            ir_function_evidence(&overclaimed, 0),
+            Err(IrFunctionRefusal::NoFaceAuthentication)
+        );
+        let two = function(
+            &[1],
+            &[1],
+            &[0],
+            &[(8, MSXU, 2, &[0x22, 0x00]), (9, MSXU, 2, &[0x22, 0x00])],
+        );
+        assert_eq!(
+            ir_function_evidence(&two, 0),
+            Err(IrFunctionRefusal::AmbiguousMicrosoftXu)
+        );
+        let vendor_only = function(
+            &[1],
+            &[1],
+            &[0],
+            &[(4, "1229a78c-47b4-4094-b0ce-db07386fb938", 2, &[0x22, 0x00])],
+        );
+        assert_eq!(
+            ir_function_evidence(&vendor_only, 0),
+            Err(IrFunctionRefusal::NoMicrosoftXu)
+        );
+    }
+
+    /// Truncation anywhere refuses the whole answer, as it does for the
+    /// emitter parser: no prefix may attest.
+    #[test]
+    fn a_truncated_header_unit_or_tail_is_malformed() {
+        let whole = attested_shape();
+        let header_at = 18 + 9 + 9;
+        assert_eq!(whole[header_at + 2], SUBTYPE_VC_HEADER);
+
+        // The header counts one interface but ends before listing it.
+        let mut short_header = whole.clone();
+        short_header[header_at] = 12;
+        short_header.remove(header_at + 12);
+        assert_eq!(
+            ir_function_evidence(&short_header, 0),
+            Err(IrFunctionRefusal::Malformed)
+        );
+
+        // The Processing Unit declares three bitmap bytes and carries two.
+        let pu_at = header_at + 13;
+        assert_eq!(whole[pu_at + 2], SUBTYPE_PROCESSING_UNIT);
+        let mut short_pu = whole.clone();
+        short_pu[pu_at] = 10;
+        short_pu.drain(pu_at + 10..pu_at + 13);
+        assert_eq!(
+            ir_function_evidence(&short_pu, 0),
+            Err(IrFunctionRefusal::Malformed)
+        );
+
+        // A tail that stops mid-descriptor, or leaves one stray byte.
+        let mut short_tail = t480::ir_1141();
+        short_tail.pop();
+        assert_eq!(
+            ir_function_evidence(&short_tail, 0),
+            Err(IrFunctionRefusal::Malformed)
+        );
+        let mut stray = t480::ir_1141();
+        stray.push(0);
+        assert_eq!(
+            ir_function_evidence(&stray, 0),
+            Err(IrFunctionRefusal::Malformed)
+        );
+
+        // Two headers make the function's stream list ambiguous.
+        let mut two_headers = whole.clone();
+        let header = whole[header_at..header_at + 13].to_vec();
+        two_headers.splice(header_at..header_at, header);
+        assert_eq!(
+            ir_function_evidence(&two_headers, 0),
+            Err(IrFunctionRefusal::Malformed)
+        );
+    }
+
+    /// The header must list a VideoStreaming interface of the same
+    /// configuration: listing the control interface itself, or one that
+    /// does not exist, is a malformed function, not a stream.
+    #[test]
+    fn a_listed_interface_that_is_not_videostreaming_is_malformed() {
+        for listed in [0u8, 3] {
+            let shape = function(&[listed], &[1], &[0], &[(8, MSXU, 2, &[0x22, 0x00])]);
+            assert_eq!(
+                ir_function_evidence(&shape, 0),
+                Err(IrFunctionRefusal::Malformed),
+                "interface {listed}"
+            );
+        }
+    }
+
+    /// A face-authentication unit belongs to its own function: a second
+    /// VideoControl function on the device cannot lend it to the first.
+    #[test]
+    fn a_face_authentication_unit_on_another_interface_attests_nothing_here() {
+        let mut bytes = function(&[1], &[1], &[0], &[]);
+        bytes.extend(t480::interface(2, 0, 1, SUBCLASS_VIDEOCONTROL, 1, 0));
+        bytes.extend(t480::vc_header(0x0150, 0, 15_000_000, &[3]));
+        bytes.extend(t480::extension_unit(14, MSXU, 2, 2, &[0x22, 0x00], 0));
+        bytes.extend(t480::interface(3, 0, 0, SUBCLASS_VIDEOSTREAMING, 1, 0));
+        assert_eq!(
+            ir_function_evidence(&bytes, 0),
+            Err(IrFunctionRefusal::NoMicrosoftXu)
+        );
+        assert_eq!(
+            ir_function_evidence(&bytes, 2),
+            Ok(IrFunctionEvidence {
+                msxu_unit: 14,
+                streaming_interface: 3,
+            })
+        );
+    }
+
+    /// The fd-bound attestation reads the descriptor of the identity it was
+    /// resolved from, scoped to the active configuration and the bound
+    /// interface.
+    #[test]
+    fn the_camera_identity_attests_from_its_own_descriptor() {
+        let fixture = UsbFixture::new("t480-ir", 1, 0, &t480::ir_1141());
+        assert_eq!(
+            fixture.identity().unwrap().ir_function_evidence(),
+            Ok(IrFunctionEvidence {
+                msxu_unit: 8,
+                streaming_interface: 1,
+            })
+        );
+        let streaming = UsbFixture::new("t480-vs", 1, 1, &t480::ir_1141());
+        assert_eq!(
+            streaming.identity().unwrap().ir_function_evidence(),
+            Err(IrFunctionRefusal::Malformed),
+            "a streaming interface is not a VideoControl function"
+        );
+        let rgb = UsbFixture::new("t480-rgb", 1, 0, &t480::rgb_2113());
+        assert_eq!(
+            rgb.identity().unwrap().ir_function_evidence(),
+            Err(IrFunctionRefusal::NoMicrosoftXu)
+        );
+    }
+
+    /// A node with no USB parent (a loopback feeder, `/dev/null`, a path
+    /// that does not exist) has no descriptor, and no descriptor is no
+    /// attestation.
+    #[test]
+    fn node_evidence_fails_closed_without_a_usb_parent() {
+        for node in ["/dev/null", "/dev/irlume-no-such-node"] {
+            assert_eq!(
+                ir_function_evidence_for_node(node),
+                Err(IrFunctionRefusal::Unreadable),
+                "{node}"
+            );
+        }
+    }
+
+    /// The census prints these as "not IR by USB descriptor: ...".
+    #[test]
+    fn refusals_name_the_clause_that_failed() {
+        for (refusal, text) in [
+            (IrFunctionRefusal::Unreadable, "no readable USB descriptor"),
+            (
+                IrFunctionRefusal::Malformed,
+                "the USB descriptor is malformed",
+            ),
+            (
+                IrFunctionRefusal::StreamingInterfaces(2),
+                "its video function lists 2 streams, not one",
+            ),
+            (
+                IrFunctionRefusal::NoMicrosoftXu,
+                "no Microsoft camera-control unit",
+            ),
+            (
+                IrFunctionRefusal::AmbiguousMicrosoftXu,
+                "more than one Microsoft camera-control unit",
+            ),
+            (
+                IrFunctionRefusal::NoFaceAuthentication,
+                "its Microsoft camera-control unit has no face-authentication control",
+            ),
+            (
+                IrFunctionRefusal::ColourProcessing(0x104C),
+                "colour controls advertised (Processing Unit bits 0x104c)",
+            ),
+        ] {
+            assert_eq!(refusal.to_string(), text);
+        }
+    }
+
+    /// The role walker and the emitter's parser read extension units the
+    /// same way, on real and transcribed bytes and on every interface. The
+    /// fuzz target asserts the same on arbitrary input.
+    #[test]
+    fn video_control_function_xus_match_the_emitter_parser() {
+        let mut short = t480::ir_1141();
+        short.pop();
+        for (label, bytes) in [
+            ("ASUS", ASUS.to_vec()),
+            ("5986:1141", t480::ir_1141()),
+            ("5986:2113", t480::rgb_2113()),
+            ("truncated", short),
+        ] {
+            for interface in 0..=5u8 {
+                let emitter = extension_units_for_interface(&bytes, interface);
+                match video_control_function(&bytes, interface) {
+                    Some(function) => {
+                        assert_eq!(function.extension_units, emitter, "{label} {interface}");
+                    }
+                    // On these inputs the walker refuses only what the
+                    // emitter parser also finds nothing in: interfaces that
+                    // are not VideoControl, and the truncated chain.
+                    None => assert!(
+                        emitter.is_empty(),
+                        "{label} {interface}: the walker refused a function the emitter parsed"
+                    ),
+                }
+            }
+        }
+        assert_eq!(
+            video_control_function(ASUS, 2).unwrap().extension_units,
+            extension_units_for_interface(ASUS, 2),
+        );
+        assert_eq!(
+            video_control_function(&t480::ir_1141(), 0)
+                .unwrap()
+                .extension_units
+                .iter()
+                .map(|unit| unit.unit_id)
+                .collect::<Vec<_>>(),
+            [4, 6, 8]
+        );
     }
 }

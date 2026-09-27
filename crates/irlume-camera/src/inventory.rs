@@ -225,6 +225,14 @@ pub(crate) enum CameraInventoryError {
     DuplicateObservation(String),
     ForeignInstance,
     UnknownCamera,
+    /// No one camera holds every requested endpoint, but each endpoint
+    /// belongs to one live camera and together they span `cameras` of them:
+    /// the RGB and IR nodes are on different USB devices (#887). Kept apart
+    /// from `UnknownCamera` so the refusal names that cause, with a count
+    /// and no paths (ADR-0030 §4).
+    SpansPhysicalCameras {
+        cameras: usize,
+    },
     Removed,
     StaleGeneration,
     ContinuityLost,
@@ -777,7 +785,9 @@ impl CameraInventory {
                     .any(|known| known == path)
             })
         });
-        let entry = matches.next().ok_or(CameraInventoryError::UnknownCamera)?;
+        let Some(entry) = matches.next() else {
+            return Err(self.uncovered_endpoints_error(&requested));
+        };
         if matches.next().is_some() {
             return Err(CameraInventoryError::DescriptorMismatch);
         }
@@ -792,6 +802,42 @@ impl CameraInventory {
             lifecycle_evidence: entry.observation.lifecycle_evidence.clone(),
             endpoint_paths: entry.observation.endpoint_paths.clone(),
         })
+    }
+
+    /// Why no single live camera holds every requested endpoint.
+    ///
+    /// Pairing, the lease and capture qualification all treat one USB device
+    /// as one camera (ADR-0029 §1, ADR-0031 §3). When every endpoint belongs
+    /// to exactly one live camera and they span several, the request names
+    /// nodes that exist but cannot be leased together, which is a different
+    /// answer from an endpoint nobody knows: the ThinkPad T480's RGB and IR
+    /// cameras are two USB devices, and "not in the supervisor inventory"
+    /// sent its reporter looking for a missing camera. Anything else stays
+    /// `UnknownCamera`.
+    fn uncovered_endpoints_error(&self, requested: &BTreeSet<&str>) -> CameraInventoryError {
+        let mut cameras = BTreeSet::new();
+        for path in requested {
+            let mut holders = self.active.values().filter(|entry| {
+                entry
+                    .observation
+                    .endpoint_paths
+                    .iter()
+                    .any(|known| known == path)
+            });
+            match (holders.next(), holders.next()) {
+                (Some(entry), None) => {
+                    cameras.insert(entry.descriptor.camera_instance_id().clone());
+                }
+                _ => return CameraInventoryError::UnknownCamera,
+            }
+        }
+        if cameras.len() > 1 {
+            CameraInventoryError::SpansPhysicalCameras {
+                cameras: cameras.len(),
+            }
+        } else {
+            CameraInventoryError::UnknownCamera
+        }
     }
 
     pub(crate) fn validate_reference(
@@ -1182,6 +1228,46 @@ mod tests {
             inventory.validate_reference(&reference),
             Err(CameraInventoryError::ContinuityLost)
         );
+    }
+
+    /// #887: the ThinkPad T480's RGB camera and IR camera are two USB
+    /// devices, so no one inventory entry holds both nodes. Each node is a
+    /// live camera, which is a different answer from an endpoint nobody
+    /// knows, and the refusal says so with a count.
+    #[test]
+    fn endpoints_on_two_cameras_are_refused_as_split_not_unknown() {
+        let mut inventory =
+            CameraInventory::with_instance_ids_for_test(vec![instance('1'), instance('2')]);
+        inventory
+            .reconcile(vec![
+                observation_with_endpoints(
+                    "/devices/pci/usb1/1-5",
+                    &["/dev/video0", "/dev/video1"],
+                ),
+                observation_with_endpoints(
+                    "/devices/pci/usb1/1-8",
+                    &["/dev/video2", "/dev/video3"],
+                ),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            inventory.reference_for_endpoints(&["/dev/video2", "/dev/video0"]),
+            Err(CameraInventoryError::SpansPhysicalCameras { cameras: 2 })
+        );
+        // Each camera on its own still leases.
+        assert!(inventory
+            .reference_for_endpoints(&["/dev/video0", "/dev/video1"])
+            .is_ok());
+        assert!(inventory.reference_for_endpoints(&["/dev/video2"]).is_ok());
+        // A node no camera holds is still unknown, alone or beside a known one.
+        for request in [&["/dev/video9"][..], &["/dev/video2", "/dev/video9"][..]] {
+            assert_eq!(
+                inventory.reference_for_endpoints(request),
+                Err(CameraInventoryError::UnknownCamera),
+                "{request:?}"
+            );
+        }
     }
 
     fn generation(event: &CameraInventoryEvent) -> u64 {

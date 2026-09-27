@@ -49,6 +49,13 @@ pub enum CameraLeaseError {
     TokenExhausted,
     Stale,
     UnknownEndpoint,
+    /// Every requested endpoint is a live camera node, but they belong to
+    /// `cameras` different USB devices, and a lease covers RGB and IR only
+    /// within one physical camera (ADR-0031 §3). Carries a count, never the
+    /// nodes or their identities (ADR-0030 §4).
+    SplitPhysicalCamera {
+        cameras: usize,
+    },
     Poisoned,
     InvalidTransition {
         from: CameraSessionState,
@@ -75,6 +82,11 @@ impl std::fmt::Display for CameraLeaseError {
             Self::UnknownEndpoint => {
                 formatter.write_str("camera endpoint is not in the supervisor inventory")
             }
+            Self::SplitPhysicalCamera { cameras } => write!(
+                formatter,
+                "the RGB and IR nodes are on {cameras} different USB devices; irlume pairs \
+                 them only within one physical camera"
+            ),
             Self::Poisoned => formatter.write_str("camera lease authority is unavailable"),
             Self::InvalidTransition { from, to } => {
                 write!(
@@ -156,8 +168,10 @@ impl Drop for ActiveOperationGuard {
 /// # Errors
 ///
 /// Returns [`CameraLeaseError::Stale`] when the endpoint set is not one current
-/// physical-camera observation, [`CameraLeaseError::DeadlineExpired`] on
-/// contention, or [`CameraLeaseError::Poisoned`] if supervisor state is unsafe.
+/// physical-camera observation, [`CameraLeaseError::SplitPhysicalCamera`] when
+/// every endpoint is a live camera node but they span several USB devices,
+/// [`CameraLeaseError::DeadlineExpired`] on contention, or
+/// [`CameraLeaseError::Poisoned`] if supervisor state is unsafe.
 pub fn acquire_camera_operation(
     endpoint_paths: &[&str],
     operation: CameraOperationKind,
@@ -174,6 +188,10 @@ pub fn acquire_camera_operation(
                 })?,
         )
     });
+    // Only an endpoint the inventory does not know may be a node that is not
+    // a pinned camera at all, so only that refusal is re-examined here. A
+    // split pair's nodes are each a live inventory camera; re-checking them
+    // would replace the cause the user needs with a per-node verdict.
     if matches!(result, Err(CameraLeaseError::UnknownEndpoint)) {
         for endpoint in endpoint_paths {
             crate::verify_pinned(endpoint)

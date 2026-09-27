@@ -44,8 +44,11 @@ pub use irlume_camera::{
 /// the stable per-device identity the daemon records alongside a persisted pair
 /// so select_pair can survive a udev renumber. Re-exported so the daemon can pick
 /// devices without depending on the camera crate directly. See
-/// [`irlume_camera::select_pair`].
-pub use irlume_camera::{capabilities, device_identity, select_pair, select_rgb};
+/// [`irlume_camera::select_pair`]. `nodes_share_usb_device` lets `set-cameras`
+/// warn about a pin whose RGB and IR nodes are on two USB devices (#887).
+pub use irlume_camera::{
+    capabilities, device_identity, nodes_share_usb_device, select_pair, select_rgb,
+};
 /// Resolve explicitly configured devices without camera discovery or image opens.
 pub use irlume_camera::{configured_ir_target, configured_pair_no_probe};
 /// IR-emitter auto-setup (integrated linux-enable-ir-emitter), re-exported for

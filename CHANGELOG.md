@@ -311,6 +311,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- If RGB-only enrollment was made while irlume used a YUYV-only IR camera
+  as its colour camera, as it could on a ThinkPad T480, enroll again: such
+  a camera is now classified IR, so RGB-only operation selects the colour
+  camera instead (ADR-0031 §1, #887).
+
 - Face at `sudo`, `su`, `doas` and polkit prompts gets 10 seconds instead of
   5, and those prompts use the bounded PAD collections the greeter and lock
   screen use by default (`privileged_grouped_pad_evidence`, now on; `0` turns
@@ -337,6 +342,30 @@ All notable changes to irlume are documented here. This project adheres to
   probe, which now treats inaccessible directories as unknown. The
   guidance names each unresolved directory with its reason, giving a
   reason several directories share, such as a daemon error, once (#900).
+
+- `irlume camera census` and `irlume doctor` classify a camera node that
+  offers only YUYV as an IR sensor when its USB descriptor declares one:
+  its video function has a single stream, the Microsoft
+  face-authentication control and no colour controls (ADR-0031 §1). The
+  ThinkPad T480 IR camera (USB 5986:1141) was listed as a colour camera,
+  and RGB-only operation could select it instead of the RGB camera.
+  YUYV-only colour webcams stay RGB, and every YUYV-only node's row now
+  prints what its descriptor said. Face authentication with such a camera
+  still refuses: its YUYV frames have no measured exposure ceiling yet, and
+  the T480's RGB and IR cameras are two USB devices, which irlume does not
+  pair (#887).
+
+- IR capture from such a node requests the smallest advertised frame size
+  of at least 340x340 instead of the size nearest 640x400, which on the
+  T480 negotiated a 640x480 mode with near-black frames. `irlume doctor`'s
+  stream check applies the same request, and the capture qualification
+  records the size actually requested. GREY and Y16 IR cameras are
+  unchanged (ADR-0031 §5, #887).
+
+- Enrollment and authentication report that the RGB and IR nodes are on
+  different USB devices, with the device count, instead of `camera endpoint
+  is not in the supervisor inventory`, and `irlume set-cameras` warns when
+  it saves such a pair (ADR-0031 §3, #887).
 
 - Package upgrades leave the reconcile units (`irlume-reconcile.path`,
   `.timer`, `.service`) disabled or masked when an administrator turned

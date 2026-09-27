@@ -184,6 +184,9 @@ impl CameraSupervisor {
             .reference_for_endpoints(endpoint_paths)
             .map_err(|error| match error {
                 CameraInventoryError::UnknownCamera => CameraLeaseError::UnknownEndpoint,
+                CameraInventoryError::SpansPhysicalCameras { cameras } => {
+                    CameraLeaseError::SplitPhysicalCamera { cameras }
+                }
                 _ => CameraLeaseError::Stale,
             })?;
         let lease = CameraLease::acquire(
@@ -903,6 +906,62 @@ pub(crate) mod tests {
         assert_eq!(pairs[1].ir, "/dev/usb-ir");
         assert_eq!(pairs[1].id, None);
         assert!(!pairs[1].fixed);
+    }
+
+    /// A lease over RGB and IR nodes on two USB devices (the ThinkPad T480,
+    /// #887) refuses with the split-device error, counts only, and skips the
+    /// per-node pin check: those nodes are live inventory cameras, and a
+    /// per-node verdict would replace the cause.
+    #[test]
+    fn a_pair_across_two_usb_devices_is_refused_as_split() {
+        let supervisor = Arc::new(CameraSupervisor::new(RecordingBackend::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let camera = |path: &str, endpoints: &[&str]| {
+            CameraObservation::with_lifecycle_evidence_and_endpoints(
+                crate::contracts::BackendKind::UvcV4l2,
+                crate::contracts::PhysicalCameraId::new(path, None).unwrap(),
+                crate::contracts::CameraCapabilities::default(),
+                vec![format!("evidence:{path}")],
+                endpoints
+                    .iter()
+                    .map(|endpoint| (*endpoint).to_owned())
+                    .collect(),
+            )
+        };
+        supervisor
+            .reconcile_inventory(vec![
+                camera(
+                    "/devices/test/1-5",
+                    &["/dev/split-ir", "/dev/split-ir-meta"],
+                ),
+                camera("/devices/test/1-8", &["/dev/split-rgb"]),
+            ])
+            .unwrap();
+        let _guard = install_test_supervisor(supervisor);
+
+        let error = crate::lease::acquire_camera_operation(
+            &["/dev/split-rgb", "/dev/split-ir"],
+            CameraOperationKind::Enrollment,
+            std::time::Duration::from_millis(50),
+        )
+        .map(|_| ())
+        .expect_err("two USB devices are not one camera");
+        assert_eq!(error, CameraLeaseError::SplitPhysicalCamera { cameras: 2 });
+        assert_eq!(
+            error.to_string(),
+            "the RGB and IR nodes are on 2 different USB devices; irlume pairs them only \
+             within one physical camera"
+        );
+        assert!(!error.to_string().contains("/dev/"), "counts, never nodes");
+
+        // One camera's own nodes still lease together.
+        assert!(crate::lease::acquire_camera_operation(
+            &["/dev/split-ir", "/dev/split-ir-meta"],
+            CameraOperationKind::Authentication,
+            std::time::Duration::from_millis(50),
+        )
+        .is_ok());
     }
 
     #[test]

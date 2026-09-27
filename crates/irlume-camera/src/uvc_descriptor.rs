@@ -399,7 +399,8 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                     return None;
                 }
                 let video = configurations == 1 && d[5] == CLASS_VIDEO;
-                if video && d[6] == SUBCLASS_VIDEOSTREAMING {
+                if video && d[6] == SUBCLASS_VIDEOSTREAMING && d[3] == 0 && d[2] != interface_number
+                {
                     videostreaming[usize::from(d[2])] = true;
                 }
                 in_target_vc = video && d[2] == interface_number && d[6] == SUBCLASS_VIDEOCONTROL;
@@ -2240,6 +2241,26 @@ mod tests {
             ir_function_evidence(&bytes, 0),
             Err(IrFunctionRefusal::Malformed)
         );
+    }
+
+    #[test]
+    fn the_stream_must_be_a_distinct_interfaces_default_alternate() {
+        let whole = attested_shape();
+        let header_at = 18 + 9 + 9;
+        let stream_at = whole
+            .windows(9)
+            .rposition(|d| d[0] == 9 && d[1] == DESC_INTERFACE && d[6] == SUBCLASS_VIDEOSTREAMING)
+            .unwrap();
+        for (number, alternate) in [(0, 0), (0, 1), (1, 1)] {
+            let mut desc = whole.clone();
+            desc[header_at + 12] = number;
+            desc[stream_at + 2] = number;
+            desc[stream_at + 3] = alternate;
+            assert_eq!(
+                ir_function_evidence(&desc, 0),
+                Err(IrFunctionRefusal::Malformed)
+            );
+        }
     }
 
     #[test]

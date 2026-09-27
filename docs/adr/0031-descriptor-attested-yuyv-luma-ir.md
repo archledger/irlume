@@ -91,8 +91,8 @@ all four of these hold:
 - **(b) One stream.** The VideoControl function uvcvideo binds the node to
   (its interface in the active configuration) has exactly one
   `VC_HEADER`, that header's `bInCollection` is 1, and the listed interface
-  is a VideoStreaming interface (class 0x0E, subclass 0x02) of the same
-  configuration.
+  is a distinct VideoStreaming interface (class 0x0E, subclass 0x02) with
+  a default alternate in the same configuration.
 - **(c) Face authentication.** The function has exactly one
   `MS_CAMERA_CONTROL_XU`, and that unit advertises selector 0x06 within
   `bNumControls`. A bitmap that sets more bits than `bNumControls` claims

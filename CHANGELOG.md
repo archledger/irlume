@@ -909,6 +909,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- An enrollment write that would reuse a template key recording no uid,
+  under an enrollment that records none, is refused with nothing written
+  or removed when the key's recovery envelope exists but cannot be read
+  or parsed, since only that envelope's uid shows whose key it is; the
+  message names `irlume recovery forget`. With no envelope the key is
+  reused as before. Writes to the added-camera store (adding or removing
+  a camera) check the template key as an enrollment write does: a key
+  that opens an enrollment recorded for another uid, or whose recovery
+  envelope records another uid while neither the key nor its enrollment
+  records one, refuses the write with nothing written, and
+  `irlume enroll` gives the account a key of its own (SECURITY_AT_REST.md
+  "Records belong to an account uid", #904).
+
 - The daemon's recent-event history (`SupportSnapshot`, which
   `irlume support-report` reads) and its live status (`LiveStatus`) show
   an account other than root only its own operations and daemon-wide

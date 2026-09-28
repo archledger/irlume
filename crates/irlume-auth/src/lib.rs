@@ -2522,6 +2522,19 @@ fn apply_runtime_capture_health(
 static RUNTIME_CAPTURE_HEALTH: std::sync::OnceLock<std::sync::Mutex<RuntimeCaptureHealth>> =
     std::sync::OnceLock::new();
 
+/// Trips and resets of process-local capture health that changed it.
+static RUNTIME_CAPTURE_HEALTH_CHANGES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many times process-local capture health has changed since this
+/// process started: a first trip for a camera context, or a reset that
+/// cleared one. The capture schedule every account reads may have changed
+/// when this moves, so irlumed tells its readers to refresh.
+#[must_use]
+pub fn runtime_capture_health_changes() -> u64 {
+    RUNTIME_CAPTURE_HEALTH_CHANGES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn with_runtime_capture_health<T>(use_health: impl FnOnce(&RuntimeCaptureHealth) -> T) -> T {
     let health = RUNTIME_CAPTURE_HEALTH
         .get_or_init(|| std::sync::Mutex::new(RuntimeCaptureHealth::default()))
@@ -2539,6 +2552,7 @@ fn trip_runtime_capture_health(context_key: &str, reason: RuntimeDegradation) {
         health.trip(context_key, reason)
     };
     if first {
+        RUNTIME_CAPTURE_HEALTH_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
             "irlumed: concurrent capture degraded for this exact camera context; using \
              one-at-a-time RGB then IR capture until this daemon restarts or the context changes"
@@ -2553,7 +2567,9 @@ pub fn reset_runtime_capture_health(context_key: &str) {
         .get_or_init(|| std::sync::Mutex::new(RuntimeCaptureHealth::default()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    health.reset(context_key);
+    if health.reset(context_key) {
+        RUNTIME_CAPTURE_HEALTH_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Whether a SUCCESSFUL concurrent capture's provenance evidence carries
@@ -3173,6 +3189,22 @@ mod capture_mode_switch_tests {
         )
         .is_some());
         reset_runtime_capture_health("cancelled-setup-regression");
+    }
+
+    /// A first trip for a context, and a reset that clears it, change
+    /// process-local capture health, and the count irlumed reads to tell
+    /// its readers so moves with each. (Other tests trip and reset their own
+    /// contexts meanwhile, so only the least it moved by is checked.)
+    #[test]
+    fn a_trip_and_a_clearing_reset_each_count_as_a_capture_health_change() {
+        let key = "counted-capture-health-context";
+        reset_runtime_capture_health(key);
+        let before = runtime_capture_health_changes();
+        trip_runtime_capture_health(key, RuntimeDegradation::PairArmFailure);
+        let tripped = runtime_capture_health_changes();
+        assert!(tripped > before, "{before} then {tripped}");
+        reset_runtime_capture_health(key);
+        assert!(runtime_capture_health_changes() > tripped);
     }
 
     #[test]

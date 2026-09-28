@@ -26,7 +26,17 @@ struct Shared {
 }
 struct Inner {
     stage: LiveStage,
+    /// Every completed state change: root's revision.
     revision: u64,
+    /// Completed changes every reader can observe: camera setup and
+    /// qualification, which change what every account reads, and other
+    /// daemon-wide work ([`change_readers`]).
+    shared_revision: u64,
+    /// Completed changes to each account's own state, for at most
+    /// [`MAX_REVISION_ACCOUNTS`] accounts. A reader other than root reads
+    /// `shared_revision` plus its own account's count, so its revision does
+    /// not move for another account's work ([`Inner::revision_for`]).
+    account_revisions: BTreeMap<u32, AccountRevision>,
     /// Waiting counts by kind and by whose operation it is, so a reader's
     /// view can relabel another account's without miscounting.
     waiting: BTreeMap<(LiveOperationKind, Owner), u64>,
@@ -40,6 +50,102 @@ struct Worker {
     owner: Owner,
     started_ms: u64,
     cancelled: bool,
+}
+/// Accounts whose state changes keep a count of their own. Each count is
+/// two words; past the bound, the account whose latest change is oldest
+/// gives up its count to the shared one (see [`Inner::note_change`]).
+const MAX_REVISION_ACCOUNTS: usize = 1024;
+#[derive(Clone, Copy)]
+struct AccountRevision {
+    changes: u64,
+    /// `Inner::revision` after this account's latest change.
+    latest: u64,
+}
+/// Whose revision a completed change moves besides root's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChangeReaders {
+    Every,
+    Account(u32),
+    RootOnly,
+}
+/// Camera setup and qualification change what every account reads (the
+/// cameras, the capture schedule), whoever asked for them, so they move
+/// every reader's revision; so does daemon-wide work, and root's work for
+/// a name that did not resolve, which is no account's history and may
+/// still have changed an account's records. Other changes are the
+/// account's own: its enrollment, profiles, keyring and recovery. Root's
+/// own account's are root's alone, since root reads every change.
+fn change_readers(kind: LiveOperationKind, owner: Owner) -> ChangeReaders {
+    match (kind, owner) {
+        (LiveOperationKind::CameraSetup | LiveOperationKind::CaptureQualification, _)
+        | (_, Owner::Daemon | Owner::Unresolved) => ChangeReaders::Every,
+        (_, Owner::Account(0)) => ChangeReaders::RootOnly,
+        (_, Owner::Account(uid)) => ChangeReaders::Account(uid),
+    }
+}
+impl Inner {
+    /// Count one completed state change of `kind` for `owner`.
+    fn note_change(&mut self, kind: LiveOperationKind, owner: Owner) {
+        let Some(revision) = self.revision.checked_add(1) else {
+            self.available = false;
+            return;
+        };
+        self.revision = revision;
+        // Every count below adds up to at most `revision`, so none overflows.
+        match change_readers(kind, owner) {
+            ChangeReaders::Every => self.shared_revision += 1,
+            ChangeReaders::Account(uid) => {
+                if !self.account_revisions.contains_key(&uid)
+                    && self.account_revisions.len() == MAX_REVISION_ACCOUNTS
+                {
+                    // Moving the evicted count into the shared one keeps that
+                    // account's revision where it was and every other
+                    // reader's from going back: each only grows.
+                    if let Some((&evicted, _)) = self
+                        .account_revisions
+                        .iter()
+                        .min_by_key(|(_, account)| account.latest)
+                    {
+                        if let Some(account) = self.account_revisions.remove(&evicted) {
+                            self.shared_revision += account.changes;
+                        }
+                    }
+                }
+                let account = self
+                    .account_revisions
+                    .entry(uid)
+                    .or_insert(AccountRevision {
+                        changes: 0,
+                        latest: 0,
+                    });
+                account.changes += 1;
+                account.latest = revision;
+            }
+            ChangeReaders::RootOnly => {}
+        }
+    }
+    /// The revision the peer with uid `peer_uid` reads: root's counts every
+    /// change; another reader's counts the changes it can observe.
+    fn revision_for(&self, peer_uid: u32) -> u64 {
+        if peer_uid == 0 {
+            return self.revision;
+        }
+        let own = self
+            .account_revisions
+            .get(&peer_uid)
+            .map_or(0, |account| account.changes);
+        self.shared_revision + own
+    }
+    /// Whether the view of the peer with uid `peer_uid` shows work it may
+    /// not see, as `Unknown`, running or waiting.
+    fn shows_unknown_work(&self, peer_uid: u32) -> bool {
+        let hidden = |owner: Owner| !owner.visible_to(peer_uid);
+        self.worker
+            .as_ref()
+            .is_some_and(|worker| hidden(worker.owner))
+            || self.background.iter().any(|task| hidden(task.owner))
+            || self.waiting.keys().any(|&(_, owner)| hidden(owner))
+    }
 }
 const CREATED: u8 = 0;
 const WAITING: u8 = 1;
@@ -83,6 +189,8 @@ impl LiveState {
             inner: Mutex::new(Inner {
                 stage: LiveStage::Starting,
                 revision: 0,
+                shared_revision: 0,
+                account_revisions: BTreeMap::new(),
                 waiting: BTreeMap::new(),
                 worker: None,
                 background: Vec::new(),
@@ -162,7 +270,8 @@ impl LiveState {
     /// the same as that account's enrollment, profile or wallet work
     /// (ADR-0030 §5). Its stop request follows the kind the reader reads
     /// ([`stop_requested`]). Daemon-wide work keeps its kind
-    /// ([`Owner::visible_to`]).
+    /// ([`Owner::visible_to`]). Its `state_revision` moves only for changes
+    /// the reader can observe ([`change_readers`]).
     pub(crate) fn snapshot_for(
         &self,
         cameras: CameraInventorySnapshot,
@@ -179,7 +288,7 @@ impl LiveState {
                 .0
                 .cancel
                 .get()
-                .is_some_and(|token| stop_requested(token, kind));
+                .is_some_and(|token| stop_requested(token, kind, worker.owner, peer_uid));
             LiveWorkerOperation {
                 operation_id: worker.id,
                 kind,
@@ -198,7 +307,7 @@ impl LiveState {
             live_schema: LIVE_SCHEMA_VERSION,
             daemon_instance: self.0.instance,
             daemon_uptime_ms: now_ms,
-            state_revision: inner.revision,
+            state_revision: inner.revision_for(peer_uid),
             stage: inner.stage,
             worker,
             background: inner
@@ -219,6 +328,22 @@ impl LiveState {
             tracking_available: inner.available,
         }
     }
+    /// A change every reader can observe that an operation made beside its
+    /// own records: the capture schedule every account reads changed while
+    /// it ran (a stored qualification, a runtime trip). Moves every reader's
+    /// revision, as daemon-wide work does.
+    pub(crate) fn note_shared_change(&self) {
+        self.lock()
+            .note_change(LiveOperationKind::CaptureQualification, Owner::Daemon);
+    }
+    /// Whether the peer with uid `peer_uid` reads work in live status as
+    /// `Unknown`: another account's, or one that did not resolve, running or
+    /// waiting. The daemon refuses such a peer's camera work then, as it does
+    /// while an authentication is pending, so the refusal tells it nothing
+    /// its live status does not ([`crate::arbiter::Refusal::Busy`]).
+    pub(crate) fn shows_unknown_work(&self, peer_uid: u32) -> bool {
+        self.lock().shows_unknown_work(peer_uid)
+    }
 }
 /// The kind the peer with uid `peer_uid` reads for an operation: its own
 /// unless the reader may not see that operation ([`Owner::visible_to`]),
@@ -230,19 +355,29 @@ fn visible_kind(kind: LiveOperationKind, owner: Owner, peer_uid: u32) -> LiveOpe
         LiveOperationKind::Unknown
     }
 }
-/// Whether the shared token asks the running worker, of `kind` as its reader
-/// reads it, to stop. Authentications and credential releases stop only
-/// when their client leaves; other work also yields to a queued
-/// authentication. An operation the reader may not see reads as `Unknown`
-/// and shows only the request every kind honours, its client leaving:
-/// showing the yield would tell an authentication, which never yields,
-/// from any other kind.
-fn stop_requested(token: &CancelToken, kind: LiveOperationKind) -> bool {
+/// Whether the shared token asks the running worker, of `kind` as the
+/// peer with uid `peer_uid` reads it and owned by `owner`, to stop.
+/// Authentications and credential releases stop only when their client
+/// leaves; other work also yields to a queued authentication. An operation
+/// the reader may not see reads as `Unknown` and shows only the request
+/// every kind honours, its client leaving: showing the yield would tell an
+/// authentication, which never yields, from any other kind. A reader other
+/// than root sees the yield only on its own work, whose client is told it
+/// yielded anyway: on daemon-wide work it would say that the unknown work
+/// waiting is an authentication.
+fn stop_requested(
+    token: &CancelToken,
+    kind: LiveOperationKind,
+    owner: Owner,
+    peer_uid: u32,
+) -> bool {
+    let yield_shown = peer_uid == 0 || owner == Owner::Account(peer_uid);
     match kind {
         LiveOperationKind::Authentication
         | LiveOperationKind::WalletAuthentication
         | LiveOperationKind::Unknown => token.cancel_requested(),
-        _ => token.stop_requested(),
+        _ if yield_shown => token.stop_requested(),
+        _ => token.cancel_requested(),
     }
 }
 impl LiveGuard {
@@ -321,15 +456,6 @@ impl LiveGuard {
             }
         }
     }
-    pub(crate) fn finish_waiting(&self) {
-        let mut inner = self.0.state.lock();
-        match self.0.phase.load(Ordering::Relaxed) {
-            WAITING => remove_waiter(&mut inner, self.0.kind, self.0.owner),
-            CREATED => {}
-            _ => return,
-        }
-        self.0.phase.store(FINISHED, Ordering::Relaxed);
-    }
     pub(crate) fn finish(&self) {
         self.0.finish();
     }
@@ -378,11 +504,7 @@ impl Registration {
                 // Completion invalidates even after an error or unwind: writes
                 // may have happened before the final response became unknown.
                 if self.changes_state {
-                    if let Some(next) = inner.revision.checked_add(1) {
-                        inner.revision = next;
-                    } else {
-                        inner.available = false;
-                    }
+                    inner.note_change(self.kind, self.owner);
                 }
             }
             _ => {}
@@ -609,22 +731,6 @@ mod tests {
         assert_eq!(snapshot(&state).state_revision, 1);
     }
     #[test]
-    fn live_tracker_waiting_cancellation_cannot_finish_a_running_worker() {
-        let (state, _) = setup();
-        let queued = guard(&state, 2, true);
-        queued.waiting();
-        queued.finish_waiting();
-        queued.running();
-        assert!(snapshot(&state).worker.is_none());
-        let running = guard(&state, 3, true);
-        running.running();
-        running.finish_waiting();
-        assert!(snapshot(&state).worker.is_some());
-        assert_eq!(snapshot(&state).state_revision, 0);
-        running.finish();
-        assert_eq!(snapshot(&state).state_revision, 1);
-    }
-    #[test]
     fn live_tracker_worker_unwind_stops_stage_and_cannot_be_republished_ready() {
         let (state, _) = setup();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -762,11 +868,11 @@ mod tests {
             .is_empty());
     }
     /// A reader other than root reads the same stop request for another
-    /// account's running operation, or an unresolved one's, whatever its
-    /// kind: a queued authentication's yield, which only some kinds honour,
-    /// does not show, and a departed client's cancel, which every kind
-    /// honours, does. Root and the account itself read the kind's own
-    /// request, and daemon-wide work keeps it for every reader.
+    /// account's running operation, an unresolved one's or daemon-wide
+    /// work, whatever its kind: a queued authentication's yield, which only
+    /// some kinds honour, does not show, and a departed client's cancel,
+    /// which every kind honours, does. Root reads the kind's own request,
+    /// and so does the account for its own work.
     #[test]
     fn live_status_shows_one_stop_request_for_hidden_operations_of_every_kind() {
         use LiveOperationKind as K;
@@ -809,24 +915,14 @@ mod tests {
                 }
                 token.request_stop();
                 assert_eq!(flag(0), yields, "{owner:?} {kind:?}: root reads the kind's");
-                let owners_view = if owner == Owner::Unresolved {
-                    false
-                } else {
-                    yields
-                };
+                let owners_view = owner == Owner::Account(1_000) && yields;
                 assert_eq!(
                     flag(1_000),
                     owners_view,
-                    "{owner:?} {kind:?}: uid 1000 reads the kind's for its own work"
+                    "{owner:?} {kind:?}: uid 1000 reads the kind's for its own work only"
                 );
-                let others_view = if owner == Owner::Daemon {
-                    yields
-                } else {
-                    false
-                };
-                assert_eq!(
-                    flag(2_000),
-                    others_view,
+                assert!(
+                    !flag(2_000),
                     "{owner:?} {kind:?}: another account reads no yield"
                 );
                 token.request_cancel();
@@ -950,5 +1046,154 @@ mod tests {
         );
         owner.finish();
         assert!(snapshot(&state).background.is_empty());
+    }
+    /// A reader other than root reads a revision that moves for its own
+    /// changes and for those every reader can observe, never for another
+    /// account's or an unresolved one's; root's moves for every change.
+    #[test]
+    fn a_readers_state_revision_moves_only_for_changes_it_can_see() {
+        use LiveOperationKind as K;
+        let (state, _) = setup();
+        let mut next_id = 1u8;
+        let mut change = |kind, owner| {
+            next_id += 1;
+            let operation =
+                state.register(OperationId::from_bytes([next_id; 16]), kind, true, owner);
+            operation.running();
+            operation.finish();
+        };
+        let revisions = || {
+            [0, 1_000, 2_000, 3_000].map(|uid| {
+                state
+                    .snapshot_for(CameraInventorySnapshot::default(), uid)
+                    .state_revision
+            })
+        };
+        assert_eq!(revisions(), [0, 0, 0, 0]);
+        // The account's own work, whether it or root asked for it.
+        change(K::Enrollment, Owner::Account(1_000));
+        change(K::WalletUpdate, Owner::Account(1_000));
+        assert_eq!(revisions(), [2, 2, 0, 0]);
+        change(K::ProfileUpdate, Owner::Account(2_000));
+        change(K::RecoveryUpdate, Owner::Account(2_000));
+        assert_eq!(revisions(), [4, 2, 2, 0]);
+        // Root's own account's work is root's alone.
+        change(K::WalletUpdate, Owner::Account(0));
+        assert_eq!(revisions(), [5, 2, 2, 0]);
+        assert!(!state.lock().account_revisions.contains_key(&0));
+        // Daemon-wide work, root's work for a name that did not resolve, and
+        // camera setup and qualification whoever asked for them, move every
+        // reader's.
+        change(K::WalletUpdate, Owner::Unresolved);
+        change(K::CameraSetup, Owner::Daemon);
+        change(K::CameraSetup, Owner::Account(2_000));
+        change(K::CaptureQualification, Owner::Account(3_000));
+        assert_eq!(revisions(), [9, 6, 6, 4]);
+        let background = state.register_background(OperationId::from_bytes([200; 16]));
+        background.running();
+        background.finish();
+        assert_eq!(revisions(), [10, 7, 7, 5]);
+        // Work that changes nothing moves no one's revision.
+        let read = state.register(
+            OperationId::from_bytes([201; 16]),
+            K::ProfileRead,
+            false,
+            Owner::Account(1_000),
+        );
+        read.running();
+        read.finish();
+        assert_eq!(revisions(), [10, 7, 7, 5]);
+        // An operation of any account that changed the capture schedule
+        // every account reads.
+        state.note_shared_change();
+        assert_eq!(revisions(), [11, 8, 8, 6]);
+    }
+    /// Past the bound of accounts with a count of their own, the account
+    /// whose latest change is oldest gives its count to the shared one: its
+    /// revision stays where it was and no reader's goes back.
+    #[test]
+    fn a_readers_state_revision_never_goes_back_when_its_count_is_evicted() {
+        let (state, _) = setup();
+        let change = |id: u64, uid: u32| {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&id.to_le_bytes());
+            let operation = state.register(
+                OperationId::from_bytes(bytes),
+                LiveOperationKind::ProfileUpdate,
+                true,
+                Owner::Account(uid),
+            );
+            operation.running();
+            operation.finish();
+        };
+        let revision = |uid: u32| {
+            state
+                .snapshot_for(CameraInventorySnapshot::default(), uid)
+                .state_revision
+        };
+        let first = 10_000u32;
+        change(1, first);
+        change(2, first);
+        let mut id = 3u64;
+        for uid in first + 1..first + MAX_REVISION_ACCOUNTS as u32 {
+            change(id, uid);
+            id += 1;
+        }
+        assert_eq!(state.lock().account_revisions.len(), MAX_REVISION_ACCOUNTS);
+        assert_eq!(revision(first), 2);
+        assert_eq!(revision(first + 1), 1);
+        assert_eq!(revision(5), 0, "an account with no changes");
+        // One more account: `first` changed longest ago and is evicted.
+        let newcomer = first + MAX_REVISION_ACCOUNTS as u32;
+        change(id, newcomer);
+        assert_eq!(state.lock().account_revisions.len(), MAX_REVISION_ACCOUNTS);
+        assert!(!state.lock().account_revisions.contains_key(&first));
+        assert_eq!(revision(first), 2, "the evicted account's stays put");
+        assert_eq!(revision(first + 1), 3, "another account's only grows");
+        assert_eq!(revision(newcomer), 3);
+        assert_eq!(revision(5), 2);
+        assert_eq!(revision(0), MAX_REVISION_ACCOUNTS as u64 + 2);
+        // The evicted account's next change counts on from there; coming
+        // back, it evicts `first + 1`, whose one change also becomes shared.
+        change(id + 1, first);
+        assert_eq!(revision(first), 4);
+        assert_eq!(revision(first + 1), 3);
+    }
+    /// A reader other than root is shown another account's work, or an
+    /// unresolved one's, as unknown, running or waiting; that is when the
+    /// daemon refuses its camera work. Its own and daemon-wide work are not.
+    #[test]
+    fn unknown_work_is_what_the_reader_cannot_see_running_or_waiting() {
+        use LiveOperationKind as K;
+        let (state, _) = setup();
+        let readers = || [0, 1_000, 2_000].map(|uid| state.shows_unknown_work(uid));
+        assert_eq!(readers(), [false, false, false]);
+        let register = |id: u8, owner| {
+            state.register(
+                OperationId::from_bytes([id; 16]),
+                K::ProfileRead,
+                false,
+                owner,
+            )
+        };
+        let daemon = register(2, Owner::Daemon);
+        daemon.running();
+        let background = state.register_background(OperationId::from_bytes([3; 16]));
+        background.running();
+        assert_eq!(readers(), [false, false, false], "daemon-wide work");
+        let own = register(4, Owner::Account(1_000));
+        own.waiting();
+        assert_eq!(readers(), [false, false, true]);
+        own.finish();
+        let unresolved = register(5, Owner::Unresolved);
+        unresolved.waiting();
+        assert_eq!(readers(), [false, true, true]);
+        unresolved.finish();
+        daemon.finish();
+        let running = register(6, Owner::Account(2_000));
+        running.running();
+        assert_eq!(readers(), [false, true, false]);
+        running.finish();
+        assert_eq!(readers(), [false, false, false]);
     }
 }

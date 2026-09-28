@@ -2594,7 +2594,7 @@ impl App {
     /// `ListCameras` is camera-class on the daemon side, so the arbiter
     /// serializes it against captures exactly like an enrollment: the
     /// enumeration still opens nodes, but only ever on the one thread that
-    /// owns them (#187). A refusal (an authentication holds the camera) or
+    /// owns them (#187). A refusal (the camera is busy with other work) or
     /// any transport error makes role inspection unavailable. Passive inventory
     /// remains the authority for attachment, independently of classification.
     fn refresh_camera_listing(&mut self) {
@@ -15011,7 +15011,7 @@ mod tests {
         // Any other refusal ran no test and is the daemon's own words.
         for refusal in [
             "camera busy: this account already has a camera operation in flight",
-            "camera busy: an authentication has priority; retry in a moment",
+            "camera busy: other work is in progress; retry in a moment",
             "not authorized to test recognition for 'alice'",
         ] {
             assert_eq!(

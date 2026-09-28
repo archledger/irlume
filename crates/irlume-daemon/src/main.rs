@@ -1101,11 +1101,14 @@ fn main() {
                                         diagnostics::CaptureEvidence::NONE,
                                     );
                                 }
+                                // The arbiter lets the job go before live status
+                                // does, so no refusal it gives for the job comes
+                                // while live status no longer shows it.
+                                arbiter.finish(job.class, job.uid);
                                 link.finish_activity();
                                 scope.finish(
                                     irlume_common::diagnostics::CategoricalOutcome::Cancelled,
                                 );
-                                arbiter.finish(job.class, job.uid);
                                 irlume_common::dlog!(
                                     "queued request dropped: its client disconnected first"
                                 );
@@ -1126,9 +1129,17 @@ fn main() {
                                 attempt.camera = irlume_auth::camera_location(engine.rgb_device());
                             }
                             delivery.attempt = attempt.map(|attempt| (attempt, scope.clone()));
+                            let capture_mode_before = capture_mode_changes();
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 dispatch_scoped_session_delivering(req, &peer, &mut engine, &scope, authorization, session.as_ref(), position.as_ref(), &mut delivery)
                             }));
+                            // Any request can change the capture schedule every
+                            // account reads (an enrollment's automatic probe, a
+                            // runtime trip), whoever it belongs to: every reader's
+                            // state revision moves then (ADR-0030 §5).
+                            if capture_mode_changes() != capture_mode_before {
+                                diagnostic_state.live().note_shared_change();
+                            }
                             // Release the slot before anything else can fail, so a
                             // panicking request cannot lock its uid out of the camera
                             // until the daemon restarts. The link is released in the
@@ -2203,13 +2214,12 @@ impl ClientLink {
                 activity.cancel();
             }
             stop.request_cancel();
-        } else {
-            // A cancelled queued request is no longer waiting for worker work.
-            // RUNNING completion is left to the worker, even after disconnect.
-            if let Some(activity) = &self.activity {
-                activity.finish_waiting();
-            }
         }
+        // A queued request stays in the arbiter's queue until the worker
+        // reaches it and drops it (`claim` fails), so it stays shown as
+        // waiting until then: the arbiter refuses nothing for a job live
+        // status does not show. RUNNING completion is left to the worker,
+        // even after disconnect.
         running
     }
 }
@@ -3857,7 +3867,38 @@ fn serve_peer_until(
                 scope: scope.clone(),
                 enqueued_at: std::time::Instant::now(),
             };
-            if let Err(refusal) = arbiter.submit(class, peer.uid, queued) {
+            // One admission at a time: the check below, the queueing and the
+            // waiting mark happen together, so live status shows a job
+            // exactly while the arbiter holds it (until the worker takes or
+            // drops it), and a request is never refused over another
+            // request that was never admitted.
+            //
+            // An account other than root is also refused camera work while
+            // its live status shows another account's work, running or
+            // waiting, as unknown. It gets the refusal a pending
+            // authentication gets, so being refused tells it nothing its
+            // live status does not: not that the work is an authentication
+            // (ADR-0030 §5).
+            let admitted = {
+                let _admission = ADMISSION
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let admitted = if class == arbiter::Class::Camera
+                    && peer.uid != 0
+                    && diagnostic_state.live().shows_unknown_work(peer.uid)
+                {
+                    Err(arbiter::Refusal::Busy)
+                } else {
+                    arbiter.submit(class, peer.uid, queued)
+                };
+                if admitted.is_ok() {
+                    if let Some(activity) = &activity {
+                        activity.waiting();
+                    }
+                }
+                admitted
+            };
+            if let Err(refusal) = admitted {
                 // Refused, not queued: answer now so the client can retry rather
                 // than hold a slot the login path may want. Charged to the peer,
                 // so a client that spins on refusals throttles itself at accept
@@ -3873,9 +3914,6 @@ fn serve_peer_until(
                     );
                 }
                 return respond(stream, &Response::Error(refusal.message().into()));
-            }
-            if let Some(activity) = &activity {
-                activity.waiting();
             }
             // Wait for the worker, checking between slices whether the client is
             // still there. A polkit dialog the user dismissed (or that closed on a
@@ -5976,6 +6014,35 @@ fn write_measurement_record_artifact(
 
 /// captures, without which a long but healthy run reads as a wedged driver
 /// and systemd kills a working daemon (#141).
+/// Serializes admission to the arbiter with the waiting mark in live status
+/// ([`serve_peer_until`]).
+static ADMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Capture qualification records irlumed has stored since it started.
+static CAPTURE_QUALIFICATION_SAVES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A count that moves whenever the capture schedule every account reads may
+/// have changed: a stored capture qualification record, or a change of
+/// irlume-auth's process-local capture health.
+fn capture_mode_changes() -> u64 {
+    CAPTURE_QUALIFICATION_SAVES
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .wrapping_add(irlume_auth::runtime_capture_health_changes())
+}
+
+/// Count a qualification write every account now reads: a saved record, or
+/// one published whose directory could not be synced, which may not
+/// survive a power loss but is what every reader sees until then.
+fn count_qualification_write<T>(saved: &Result<T, irlume_auth::QualificationStoreError>) {
+    if matches!(
+        saved,
+        Ok(_) | Err(irlume_auth::QualificationStoreError::VisibleNotDurable(_))
+    ) {
+        CAPTURE_QUALIFICATION_SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn run_capture_mode_probe(
     rgb_dev: &str,
     ir_dev: &str,
@@ -6041,7 +6108,9 @@ fn run_capture_mode_probe(
             .as_ref()
             .map(irlume_auth::CaptureQualificationRecord::revision)
     };
-    let stored = match store.save_attempt(attempt, expected_revision) {
+    let saved = store.save_attempt(attempt, expected_revision);
+    count_qualification_write(&saved);
+    let stored = match saved {
         Ok(record) => record,
         Err(irlume_auth::QualificationStoreError::StaleRevision { .. })
             if policy == ProbeStore::AutomaticIfAbsent =>
@@ -15362,12 +15431,147 @@ mod tests {
             BufReader::new(ours).read_line(&mut line).unwrap();
             serde_json::from_str::<Response>(line.trim()).unwrap()
         });
+        // One refusal for every reason the camera is busy: it does not say
+        // an authentication is why (ADR-0030 §5).
         match resp {
-            Response::Error(msg) => assert!(
-                msg.contains("authentication has priority"),
-                "the client must be told why: {msg}"
-            ),
+            Response::Error(msg) => assert_eq!(msg, arbiter::Refusal::Busy.message()),
             other => panic!("a queued authentication must refuse preview work, got {other:?}"),
+        }
+    }
+
+    /// An account other than root is refused camera work, in the words a
+    /// pending authentication gets, while its live status shows another
+    /// account's work, or an unresolved one's, as unknown; so being refused
+    /// tells it nothing its live status does not. Its own work, daemon-wide
+    /// work and root are not refused for that.
+    #[test]
+    fn camera_work_gets_one_refusal_while_the_readers_view_shows_unknown_work() {
+        use irlume_common::live::LiveOperationKind as K;
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let _passwd = passwd_lock();
+        // Closed: a request past the check gets the arbiter's own refusal,
+        // so no test case waits on a worker that is not there.
+        let arbiter = arbiter::Arbiter::<Queued>::new();
+        arbiter.close();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let state = diagnostics::DiagnosticState::default();
+        let (reader, other) = (61_001, 61_002);
+        let ask = |uid: u32| {
+            with_serve_as_peer_and_diagnostics(&arbiter, &ready, &state, peer(uid), |client| {
+                (&*client).write_all(b"\"ListCameras\"\n").unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                match serde_json::from_str::<Response>(line.trim()).unwrap() {
+                    Response::Error(message) => message,
+                    other => panic!("{uid}: expected a refusal, got {other:?}"),
+                }
+            })
+        };
+        let busy = arbiter::Refusal::Busy.message();
+        let queued = arbiter::Refusal::ShuttingDown.message();
+        let pending = |id: u8, owner| {
+            let operation = state.live().register(
+                irlume_common::diagnostics::OperationId::from_bytes([id; 16]),
+                K::ProfileRead,
+                false,
+                owner,
+            );
+            operation.waiting();
+            operation
+        };
+        assert_eq!(ask(reader), queued, "nothing pending");
+        for (id, owner, reader_refused) in [
+            (1, diagnostics::Owner::Account(reader), false),
+            (2, diagnostics::Owner::Daemon, false),
+            (3, diagnostics::Owner::Account(other), true),
+            (4, diagnostics::Owner::Unresolved, true),
+        ] {
+            let operation = pending(id, owner);
+            let expected = if reader_refused { busy } else { queued };
+            assert_eq!(ask(reader), expected, "{owner:?} waiting");
+            assert_eq!(ask(0), queued, "root sees {owner:?}");
+            operation.running();
+            assert_eq!(ask(reader), expected, "{owner:?} running");
+            operation.finish();
+        }
+        assert_eq!(ask(reader), queued, "nothing pending again");
+
+        // Only camera work is refused this way: another account's pending
+        // work does not refuse an account's authentication (a lock screen
+        // that runs PAM as the user) or its other requests.
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if me != 0 {
+            let name = users::name_for_uid(me).expect("the running account");
+            let _other = pending(5, diagnostics::Owner::Account(other));
+            for request in [
+                Request::KeyringInfo { user: name.clone() },
+                Request::Authenticate {
+                    structured_errors: false,
+                    user: name.clone(),
+                    service: Some("kde".into()),
+                    intent_confirmation: None,
+                },
+            ] {
+                let mut wire = serde_json::to_string(&request).unwrap();
+                wire.push('\n');
+                let reply = with_serve_as_peer_and_diagnostics(
+                    &arbiter,
+                    &ready,
+                    &state,
+                    peer(me),
+                    |client| {
+                        (&*client).write_all(wire.as_bytes()).unwrap();
+                        let mut line = String::new();
+                        BufReader::new(client).read_line(&mut line).unwrap();
+                        line
+                    },
+                );
+                assert!(!reply.contains(busy), "{request:?}: {reply}");
+            }
+        }
+
+        // A refusal before the arbiter queues nothing.
+        let open = arbiter::Arbiter::<Queued>::new();
+        let _other = pending(6, diagnostics::Owner::Account(other));
+        let refused =
+            with_serve_as_peer_and_diagnostics(&open, &ready, &state, peer(reader), |client| {
+                (&*client).write_all(b"\"ListCameras\"\n").unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                line
+            });
+        assert!(refused.contains(busy), "{refused}");
+        open.close();
+        assert!(open.take().is_none(), "nothing was queued");
+    }
+
+    /// A qualification record counts as a capture-schedule change once every
+    /// account reads it: saved, or published without its directory sync.
+    /// A write that published nothing does not count.
+    #[test]
+    fn a_published_qualification_counts_as_a_capture_schedule_change() {
+        use irlume_auth::QualificationStoreError as E;
+        let count = || CAPTURE_QUALIFICATION_SAVES.load(std::sync::atomic::Ordering::Relaxed);
+        for (saved, counts) in [
+            (Ok(()), true),
+            (
+                Err(E::VisibleNotDurable("synthetic sync failure".into())),
+                true,
+            ),
+            (Err(E::Io("synthetic write failure".into())), false),
+            (
+                Err(E::StaleRevision {
+                    expected: None,
+                    actual: Some(1),
+                }),
+                false,
+            ),
+            (Err(E::RevisionExhausted), false),
+        ] {
+            let before = count();
+            count_qualification_write(&saved);
+            assert_eq!(count() - before, u64::from(counts), "{saved:?}");
         }
     }
 

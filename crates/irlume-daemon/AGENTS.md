@@ -73,7 +73,8 @@ not published, or is stale), the request queues to the worker, which does the
 real load (a TPM unseal, maybe a template-key reseal) and publishes the
 summary. Keep that fallthrough: answering the miss with an error made every
 listing fail, since nothing ever reached the worker to publish. Camera work is
-`Camera`, refused while an authentication is pending.
+`Camera`, refused while an authentication is pending and, for a peer other
+than root, while its live status shows another account's work as unknown.
 
 ## Recipe: add a daemon request
 

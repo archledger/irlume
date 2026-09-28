@@ -29,6 +29,7 @@ pub mod pad;
 pub mod pcrsig;
 pub mod policy;
 pub mod recovery;
+pub(crate) mod replacement;
 pub mod storage;
 pub mod template_key;
 pub mod tpm;

@@ -946,6 +946,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- An enrollment write that replaces another uid's enrollment records
+  durably what it replaces before it seals the new template key, in
+  `/var/lib/irlume/template-keys/<user>.replacing`. If irlumed stops before
+  the new enrollment is published, the next write or load of the account's
+  enrollment or key puts the replaced key back; if it stops after, or the
+  new enrollment may not survive a power loss, that operation finishes the
+  replacement. A removal of the replaced recovery envelope, added-camera
+  store or its commit journal that failed is tried again there instead of
+  being left for removal by hand, and removes only files still as they
+  were (SECURITY_AT_REST.md "Records belong to an account uid", #904).
+
 - Camera work from an account other than root is refused while its live
   status shows another account's work, or that of an account that did
   not resolve, running or waiting, and that refusal and the one given

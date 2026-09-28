@@ -2697,7 +2697,7 @@ fn an_override_with_a_line_irlume_does_not_read_as_pam_does_is_kept() {
         let edited = with_line(&read_file(svc.etc), line);
         std::fs::write(svc.etc, &edited).unwrap();
         let number = edited.lines().position(|l| l == line).unwrap() + 1;
-        let named = format!("irlume does not read line {number} (`");
+        let named = format!("irlume does not read line {number} as PAM does (");
         for wire in [
             &face_and_keyring as &dyn Fn(&str) -> (String, bool),
             &keyring_only,
@@ -2770,7 +2770,7 @@ fn an_unread_override_whose_jump_counts_irlume_lines_is_kept_on_disable() {
     let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
     wire_service(&svc, true, true, &face_and_keyring).unwrap();
     let jump = "auth       [success=1 default=ignore]   pam_fprintd.so   # local";
-    let typo = "auht       optional     pam_foo.so";
+    let typo = "auht       optional     pam_foo.so secret=kept-out-of-logs";
     let edited = with_line(&with_line(&read_file(svc.etc), jump), typo);
     std::fs::write(svc.etc, &edited).unwrap();
     let number = edited.lines().position(|l| l == typo).unwrap() + 1;
@@ -2778,8 +2778,9 @@ fn an_unread_override_whose_jump_counts_irlume_lines_is_kept_on_disable() {
         let off = wire_service(&svc, false, apply, &face_and_keyring).unwrap();
         assert_eq!(change_id(&off), "keep-edited-override", "{off}");
         assert!(off.unmet, "{off}");
-        let named = format!("irlume does not read line {number} (`{typo}`)");
+        let named = format!("irlume does not read line {number} as PAM does (");
         assert!(off.message.contains(&named), "{off}");
+        assert!(!off.message.contains("kept-out-of-logs"), "{off}");
     }
     assert_eq!(read_file(svc.etc), edited);
 }
@@ -2801,7 +2802,7 @@ fn no_override_is_made_from_a_vendor_copy_irlume_does_not_read_as_pam_does() {
         assert!(on.unmet, "{on}");
         assert!(
             on.message.contains(&format!(
-                ": not created: irlume does not read line {number} of {vendor_path} (`"
+                ": not created: irlume does not read line {number} of {vendor_path} as PAM does ("
             )),
             "{on}"
         );
@@ -2837,7 +2838,7 @@ fn no_override_is_made_from_a_vendor_copy_irlume_does_not_read_as_pam_does() {
     assert!(on.unmet, "{on}");
     assert!(
         on.message.contains(&format!(
-            ": not created: irlume does not read line 1 of {vendor_path} (`"
+            ": not created: irlume does not read line 1 of {vendor_path} as PAM does ("
         )) && on.message.contains("a CRLF line ending"),
         "{on}"
     );
@@ -2852,7 +2853,8 @@ fn no_override_is_made_from_a_vendor_copy_irlume_does_not_read_as_pam_does() {
 /// vendor copy.
 #[test]
 fn reconcile_keeps_an_override_with_a_line_irlume_does_not_read_as_pam_does() {
-    let typo = "auht       optional     pam_foo.so";
+    // Its argument stands for one that holds a secret: no message quotes it.
+    let typo = "auht       optional     pam_foo.so secret=kept-out-of-logs";
     let (wired, ok) = face_and_keyring(&unwire_lines(UPSTREAM_FEDORA).0);
     assert!(ok);
     let unread_vendor = with_line(UPSTREAM_FEDORA, typo);
@@ -2886,6 +2888,7 @@ fn reconcile_keeps_an_override_with_a_line_irlume_does_not_read_as_pam_does() {
             logged.contains(": left as it is: irlume does not read line "),
             "{label}: {logged}"
         );
+        assert!(!logged.contains("kept-out-of-logs"), "{label}: {logged}");
         assert!(
             logged.ends_with("and reconcile changes no file it cannot read as PAM does"),
             "{label}: {logged}"
@@ -2931,18 +2934,18 @@ fn reconcile_keeps_an_override_with_a_line_irlume_does_not_read_as_pam_does() {
 // ---- the stack a first auth include names ----------------------------------------
 
 /// A login screen whose first auth line includes a stack irlume does not
-/// know is wired only when that stack runs the password step, read where
-/// libpam finds it for the file: under the root the file sits in, in
+/// know is wired only when that stack starts with the password step, read
+/// where libpam finds it for the file: under the root the file sits in, in
 /// `etc/pam.d` and then `usr/lib/pam.d`. That holds for a stack irlume edits
 /// in place, for an override made from a vendor file, and for reconcile's
-/// rebuild of one; without the stack, or with a gate in it that the include
-/// layout's face line would skip, each is left as it is.
+/// rebuild of one; without the stack, or with another line first, which the
+/// face jump would skip in the step's place, each is left as it is.
 #[test]
 fn the_stack_a_first_auth_include_names_is_read_where_libpam_finds_it() {
     let vendor = "#%PAM-1.0\nauth       include      site-auth\n-auth      optional     \
                   pam_gnome_keyring.so\naccount    include      site-auth\n\
                   session    include      site-auth\n";
-    let decides = "auth       required     pam_env.so\nauth       required     pam_unix.so\n";
+    let decides = "auth       required     pam_unix.so\nauth       required     pam_nologin.so\n";
     // In place: the stack in /etc/pam.d, then only in /usr/lib/pam.d.
     for dir_of_stack in ["etc/pam.d", "usr/lib/pam.d"] {
         let dir = TestDir::new("include-in-place");
@@ -2950,7 +2953,7 @@ fn the_stack_a_first_auth_include_names_is_read_where_libpam_finds_it() {
         std::fs::create_dir_all(etc.parent().unwrap()).unwrap();
         std::fs::write(&etc, vendor).unwrap();
         let svc = Svc {
-            etc: Box::leak(etc.to_string_lossy().into_owned().into_boxed_str()),
+            etc: leak_path(&etc),
             vendor: None,
         };
         let on = wire_service(&svc, true, false, &face_and_keyring).unwrap();
@@ -2968,7 +2971,7 @@ fn the_stack_a_first_auth_include_names_is_read_where_libpam_finds_it() {
         std::fs::remove_file(format!("{}{BACKUP}", svc.etc)).unwrap();
         for stack in [
             "auth sufficient pam_unix.so\n",
-            // A gate a face match through the include layout would skip.
+            // A gate the face jump would skip in the password step's place.
             "auth requisite pam_nologin.so\nauth required pam_unix.so\n",
         ] {
             std::fs::write(stacks.join("site-auth"), stack).unwrap();

@@ -1373,14 +1373,14 @@ fn unreadable(i: &Input<'_>, line: &UnreadLine<'_>) -> Decision {
 }
 
 /// A line irlume does not read as PAM does, for a message: `irlume does not
-/// read line 7 (`...`) as PAM does (why)`, with `of <file>` after the number
-/// when `file` is given.
+/// read line 7 as PAM does (why)`, with `of <file>` after the number when
+/// `file` is given. The line itself is never quoted: a module's arguments
+/// can hold a secret, and reconcile's messages go to the system journal.
 pub(super) fn unread_sentence(line: &UnreadLine<'_>, file: Option<&str>) -> String {
     let of = file.map_or_else(String::new, |file| format!(" of {file}"));
     format!(
-        "irlume does not read line {}{of} (`{}`) as PAM does ({})",
+        "irlume does not read line {}{of} as PAM does ({})",
         line.number,
-        line.shown(),
         line.why.describe()
     )
 }
@@ -2609,7 +2609,7 @@ session     include       password-auth
             let d = run(&text, Some(VENDOR), true, &greeter);
             assert!(
                 d.message.contains(&format!(
-                    "irlume does not read line {} (`{typo}`)",
+                    "irlume does not read line {} as PAM does (",
                     number(&text)
                 )),
                 "{}",
@@ -3860,7 +3860,8 @@ session     include       password-auth
             assert_eq!(d.change, PlannedChange::KeepEditedOverride, "{}", d.message);
             assert!(d.unmet, "{}", d.message);
             assert!(
-                d.message.contains("irlume does not read line 3 (")
+                d.message
+                    .contains("irlume does not read line 3 as PAM does (")
                     && d.message.contains("a CRLF line ending"),
                 "{}",
                 d.message

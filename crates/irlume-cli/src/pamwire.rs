@@ -5676,8 +5676,8 @@ mod tests {
         let number = text.lines().position(|l| l == UNREAD_RULE).unwrap() + 1;
         assert!(
             outcome.message.contains(&format!(
-                ": kept as it is: irlume does not read line {number} (`{UNREAD_RULE}`) as PAM \
-                 does (PAM does not know its type and runs it as an auth line that always \
+                ": kept as it is: irlume does not read line {number} as PAM does (PAM does \
+                 not know its type and runs it as an auth line that always \
                  fails), and it changes no file it cannot read as PAM does; "
             )),
             "{outcome}"
@@ -5723,7 +5723,7 @@ mod tests {
         // Disable without a backup, and with one that differs: irlume's
         // lines come out, every other byte stays.
         let number = wired.lines().position(|l| l == UNREAD_RULE).unwrap() + 1;
-        let named = format!("irlume does not read line {number} (`{UNREAD_RULE}`) as PAM does");
+        let named = format!("irlume does not read line {number} as PAM does");
         for backup in [None, Some(DEBIAN_SUDO)] {
             std::fs::write(&etc, &wired).unwrap();
             if let Some(backup) = backup {
@@ -6549,6 +6549,10 @@ auth       optional      pam_gnome_keyring.so\n";
                 "auth required pam_permit.so",
             ],
             &["auth [success=ok user_unknown=ignore default=bad] pam_unix.so"],
+            // A password step whose success counts nothing: the stack
+            // grants no one, and a face match must not grant either.
+            &["auth [success=ignore default=die] pam_unix.so"],
+            &["auth [success=reset default=bad] pam_unix.so"],
             &["auth"],
             // A first line that checks no password.
             &["auth required pam_env.so"],
@@ -6583,6 +6587,7 @@ auth       optional      pam_gnome_keyring.so\n";
                 "auth required pam_deny.so",
             ],
             &["auth required pam_sss.so forward_pass"],
+            &["auth [success=done default=die] pam_unix.so"],
             &["auth required /usr/lib64/security/pam_unix2.so"],
         ] {
             assert_eq!(find_auth_anchor(lines), Some(0), "{lines:?}");
@@ -6694,10 +6699,13 @@ auth       optional      pam_gnome_keyring.so\n";
     /// password step: ly and cinnamon-screensaver on Arch (`auth include
     /// login`, which includes `system-local-login` below `pam_nologin.so`),
     /// LightDM on Alpine (`auth include base-auth`, `pam_unix.so` first) and
-    /// on openSUSE (`auth include xdm`). Only openSUSE's, whose stacks hold
-    /// no gate, is wired next to the include, once the stacks it names can
-    /// be read; an include of a stack that includes itself, one too deep, or
-    /// one followed by a gate in the file itself is not.
+    /// on openSUSE (`auth include xdm`, its password substack first). libpam
+    /// puts the included lines in the include's place and the face jump
+    /// skips the first of them, so a stack whose first line is the password
+    /// step is wired with the jump, once the stacks it names can be read,
+    /// and every other line of it still runs on a face match, gates
+    /// included. One whose first line is anything else is not, nor an
+    /// include of a stack that includes itself or one too deep.
     #[test]
     fn a_first_auth_include_of_a_stack_that_decides_is_the_anchor() {
         let stacks = stacks_of(&[
@@ -6717,6 +6725,26 @@ auth       optional      pam_gnome_keyring.so\n";
                 "auth [success=die default=ignore] pam_succeed_if.so user ingroup x\n\
                  auth required pam_unix.so\n",
             ),
+            (
+                "gated-after",
+                "auth required pam_unix.so\n\
+                 auth [success=die default=ignore] pam_succeed_if.so user ingroup x\n",
+            ),
+            ("shared", "auth include system-auth\n"),
+            (
+                "system-auth",
+                "auth required pam_faillock.so preauth\nauth required pam_unix.so\n",
+            ),
+            (
+                "twice",
+                "auth required pam_unix.so\nauth required pam_sss.so\n",
+            ),
+            (
+                "jumpy",
+                "auth required pam_unix.so\n\
+                 auth [success=1 default=ignore] pam_succeed_if.so user ingroup x\n",
+            ),
+            ("ignored", "auth [success=ignore default=die] pam_unix.so\n"),
             ("common-account", "auth requisite pam_nologin.so\n"),
         ]);
         let ly = "#%PAM-1.0\n\nauth       include      login\n\
@@ -6736,11 +6764,9 @@ auth       optional      pam_gnome_keyring.so\n";
                       -session   optional     pam_gnome_keyring.so auto_start\n";
         let cinnamon = "#%PAM-1.0\nauth include login\n";
         let suse = fixture("opensuse", "lightdm");
-        // The include layout's face line skips the whole included stack on a
-        // face match, so a stack with a gate in it is no anchor: Arch's
-        // `login` checks pam_nologin before the password, Alpine's
-        // `base-auth` after it.
-        for text in [ly, alpine, cinnamon] {
+        // Arch's `login` checks pam_nologin before the password: the jump
+        // would skip that line and leave the password asked.
+        for text in [ly, cinnamon] {
             let lines: Vec<&str> = text.lines().collect();
             let (anchor, face) = with_stack_reader(stacks.clone(), || {
                 (
@@ -6753,8 +6779,18 @@ auth       optional      pam_gnome_keyring.so\n";
         }
         for (text, include) in [
             (suse.as_str(), "auth\t include\txdm"),
+            (alpine, "auth       include      base-auth"),
             ("auth include d\n", "auth include d"),
             ("auth include a\n", "auth include a"),
+            ("auth include gated-after\n", "auth include gated-after"),
+            (
+                "auth include d\n@include common-account\n",
+                "auth include d",
+            ),
+            (
+                "auth include d\nauth requisite pam_nologin.so\n",
+                "auth include d",
+            ),
         ] {
             let lines: Vec<&str> = text.lines().collect();
             let at = lines.iter().position(|l| *l == include).unwrap();
@@ -6768,46 +6804,39 @@ auth       optional      pam_gnome_keyring.so\n";
             });
             assert_eq!(anchor, Some(at), "{text}");
             assert!(face.1 && keyring.1 && lock.1, "{text}");
-            // libpam puts the included stack's lines in the include's place,
-            // so a jump over it would skip only its first line: the anchor
-            // gets the include layout, the face line `sufficient` above it
-            // and the keyring and reseal lines below it, with no jump and no
-            // landing.
+            // The face jump skips the first line the include puts in its
+            // place, the password step, onto the landing after the include.
             let wired = face.0.lines().collect::<Vec<_>>();
-            assert_eq!(
-                wired[at],
-                include_greeter_line("ondemand", true),
-                "{}",
-                face.0
-            );
+            assert_eq!(wired[at], GREETER_UNSEAL_COSMIC_JUMP, "{}", face.0);
             assert_eq!(wired[at + 1], include, "{}", face.0);
-            assert_eq!(wired[at + 2], KEYRING_UNSEAL, "{}", face.0);
-            assert_eq!(wired[at + 3], RESEAL_AUTH, "{}", face.0);
-            assert!(!face.0.contains("success=1"), "{}", face.0);
-            assert!(!face.0.contains(PERMIT_LANDING), "{}", face.0);
+            assert_eq!(wired[at + 2], PERMIT_LANDING, "{}", face.0);
+            assert_eq!(wired[at + 3], KEYRING_UNSEAL, "{}", face.0);
+            assert_eq!(wired[at + 4], RESEAL_AUTH, "{}", face.0);
+            assert!(!face.0.contains("sufficient   pam_irlume"), "{}", face.0);
             let locked = lock.0.lines().collect::<Vec<_>>();
-            assert_eq!(
-                locked[at],
-                include_greeter_line("ondemand", false),
+            assert!(
+                locked[at].contains("[success=1 default=ignore]"),
                 "{}",
                 lock.0
             );
             assert_eq!(locked[at + 1], include, "{}", lock.0);
-            assert!(!lock.0.contains("success=1"), "{}", lock.0);
+            assert_eq!(locked[at + 2], PERMIT_LANDING, "{}", lock.0);
             // Without the stack it names, the same file is no anchor.
             assert_eq!(find_auth_anchor(&lines), None, "{text}");
             assert!(!wire_greeter_impl(text, true, true, true).1, "{text}");
         }
-        // A gate is any line that can fail the stack, a bracketed one that
-        // dies on success included.
+        // The first line the include puts in its place must be the step: a
+        // gate above it (in a stack it includes too), a stack that includes
+        // itself or one too deep, a password check or a jump after the step,
+        // or a step that counts no success is no anchor.
         for text in [
             "auth include loop\n",
             "auth include e\n",
-            "auth include d\nauth requisite pam_nologin.so\n",
-            "auth include d\nauth [success=die default=ignore] pam_succeed_if.so user ingroup x\n",
-            "auth include d\nauth [ignore=bad default=ignore] pam_succeed_if.so user ingroup x\n",
             "auth include gated\n",
-            "auth include d\n@include common-account\n",
+            "auth include shared\n",
+            "auth include twice\n",
+            "auth include jumpy\n",
+            "auth include ignored\n",
         ] {
             let lines: Vec<&str> = text.lines().collect();
             let anchor = with_stack_reader(stacks.clone(), || find_auth_anchor(&lines));
@@ -8097,10 +8126,6 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
         let continued = stack("auth optional pam_foo.so \\\n  \u{b}arg");
         assert!(has_line_continuation(&continued));
         assert_eq!(unreadable_line(&continued), None);
-        // Shown with every character that would not print as itself escaped.
-        let text = stack("\u{b}auth\toptional\u{a0}pam_foo.so");
-        let found = unreadable_line(&text).unwrap();
-        assert_eq!(found.shown(), "\\u{b}auth\\u{9}optional\\u{a0}pam_foo.so");
     }
 
     /// Only spaces and tabs lead a line away from its type, as in libpam's
@@ -9543,11 +9568,9 @@ auth required pam_fprintd.so\n\
                     || wired.contains("sufficient pam_irlume.so unseal");
                 let got_jump = wired.contains("success=1 default=ignore");
                 // openSUSE's lightdm includes xdm as its first auth line:
-                // libpam inlines xdm's lines there, so an include takes the
-                // sufficient line, as a jump over it would skip only xdm's
-                // first line.
-                let include_first = (distro, service) == ("opensuse", "lightdm");
-                if expect_sufficient.contains(&distro) || include_first {
+                // libpam inlines xdm's lines there, and the jump skips the
+                // first of them, xdm's password substack.
+                if expect_sufficient.contains(&distro) {
                     assert!(
                         got_sufficient && !got_jump,
                         "{distro}/{service}: the include dialect takes the sufficient line"

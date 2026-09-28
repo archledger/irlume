@@ -85,40 +85,39 @@ knows (no `substack`, no `include` of `system-auth`, `system-login`,
 `system-local-login` or `common-auth`, and no Debian `@include` of a file
 whose name starts with `common-auth` or `login`) is wired next to its first
 auth line only when that line is the password step, or an `include` of a
-stack that runs one. The password step is a `pam_unix.so`, `pam_unix2.so`
-or `pam_sss.so` rule (without pam_sss's `ignore_unknown_user` or
-`ignore_authinfo_unavail`) whose failure fails the stack: `required`,
-`requisite`, or a bracketed control with `bad` or `die` for every failure
-and no jump. irlume reads the included stack where PAM finds it
-(`/etc/pam.d`, then `/usr/lib/pam.d`), and the stacks it includes in turn,
-four deep at most; a line of it that names the shared password stack irlume
-knows counts as the step and is not read further, as where irlume wires
-next to such a line directly. A numeric jump or a `reset` anywhere in an
-included stack, or a stack irlume cannot read or does not read as PAM does,
-leaves the file unwired. Below the first auth line every auth line must be
-one of the modules that check no password (`pam_env.so`, `pam_nologin.so`,
-`pam_faillock.so`, `pam_succeed_if.so`, `pam_permit.so`, `pam_deny.so` and
-the like, or a keyring module), with no `include` or `substack`, and a
-Debian `@include` only of `common-account`, `common-password`,
-`common-session` or `common-session-noninteractive`. PAM reads such a file
-into the auth stack too, so irlume reads it where PAM finds it and holds
-its auth lines to the same rule. Otherwise
+stack whose first line is the password step. The password step is a
+`pam_unix.so`, `pam_unix2.so` or `pam_sss.so` rule (without pam_sss's
+`ignore_unknown_user` or `ignore_authinfo_unavail`) that counts a correct
+password (`ok` or `done` for `success`) and whose failure fails the stack:
+`required`, `requisite`, or a bracketed control with `bad` or `die` for
+every failure and no jump. Below the first auth line every auth line must
+be one of the modules that check no password (`pam_env.so`,
+`pam_nologin.so`, `pam_faillock.so`, `pam_succeed_if.so`, `pam_permit.so`,
+`pam_deny.so` and the like, or a keyring module), with no `include` or
+`substack`, and a Debian `@include` only of `common-account`,
+`common-password`, `common-session` or `common-session-noninteractive`.
+PAM reads such a file into the auth stack too, so irlume reads it where
+PAM finds it and holds its auth lines to the same rule. Otherwise
 `irlume login enable` reports `no anchor to wire` for it and leaves it as
 it is: irlume's lines are designed to follow the password step and a line
-whose failure fails the stack. An `include` taken as that line gets the
-include layout (the face line `sufficient` above it, the keyring and reseal
-lines below it), as `@include common-auth` does: PAM puts the included
-stack's lines in the include's place, so a jump over it would skip only the
-first of them. On a face match that face line skips the included stack and
-every auth line after it, so neither may hold a gate: a line that can fail
-the stack (`bad` or `die` for any return value), such as
-`auth requisite pam_nologin.so`, other than `pam_env.so`,
-`pam_faildelay.so`, `pam_warn.so` or a keyring module. ly and
-cinnamon-screensaver on Arch, whose `login` checks `pam_nologin.so`, and
-LightDM on Alpine, whose `base-auth` does, are left unwired for that
-reason; LightDM on openSUSE is wired when `xdm` and the `postlogin-auth` it
-includes hold no gate. Such a stack that an earlier release wired keeps
-irlume's lines until `irlume login disable` takes them out.
+whose failure fails the stack.
+
+PAM puts the lines of an included stack in the include's place, and
+irlume's face line jumps over the first of them onto its landing after the
+include, so a face match stands in for that one line and every other line
+of the stack still runs, gates such as `pam_nologin.so` included. irlume
+reads the included stack where PAM finds it (`/etc/pam.d`, then
+`/usr/lib/pam.d`), with the stacks it includes in turn, four deep at most,
+and takes the include only when the first of those lines is the password
+step (or the shared password `substack` irlume knows), the others follow
+the rule for lines below the first auth line, and none jumps or `reset`s;
+a stack irlume cannot read or does not read as PAM does leaves the file
+unwired. LightDM on openSUSE (`auth include xdm`, whose first line is the
+password substack) and on Alpine (`auth include base-auth`, `pam_unix.so`
+first) are wired that way. ly and cinnamon-screensaver on Arch, whose
+`login` checks `pam_nologin.so` first, are left unwired; such a stack that
+an earlier release wired keeps irlume's lines until `irlume login disable`
+takes them out.
 
 An override written by a release before this tracking gets the line at the
 first reconcile when it still matches its vendor copy. One that no longer

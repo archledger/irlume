@@ -130,13 +130,7 @@ pub(super) fn wire_greeter_impl(
     // its own keyring modules after; inserting the face line before that include
     // works identically (face IGNORE on cold login → the include's pam_unix +
     // greetd's pam_gnome_keyring run with the unsealed AUTHTOK → keyring unlocks).
-    // A first auth `include` the anchor guess takes gets the same layout: a
-    // jump over it would skip only the first line of the stack it inlines.
-    let inc_at = lines
-        .iter()
-        .position(|l| is_include_auth_layout(l))
-        .or_else(|| find_auth_anchor(&lines).filter(|&at| is_auth_include(lines[at])));
-    if let Some(inc_at) = inc_at {
+    if let Some(inc_at) = lines.iter().position(|l| is_include_auth_layout(l)) {
         let mut out = Vec::with_capacity(lines.len() + 4);
         for (i, l) in lines.iter().enumerate() {
             if i == inc_at {
@@ -220,13 +214,7 @@ pub(super) fn wire_lock(content: &str) -> (String, bool) {
     // system-local-login`) → face-first `sufficient` before it. A warm lock so
     // no keyring-continue arg; on face success the module returns SUCCESS and
     // `sufficient` grants the unlock.
-    // A first auth `include` the anchor guess takes gets the same layout: a
-    // jump over it would skip only the first line of the stack it inlines.
-    let inc_at = lines
-        .iter()
-        .position(|l| is_include_auth_layout(l))
-        .or_else(|| find_auth_anchor(&lines).filter(|&at| is_auth_include(lines[at])));
-    if let Some(inc_at) = inc_at {
+    if let Some(inc_at) = lines.iter().position(|l| is_include_auth_layout(l)) {
         let mut out = Vec::with_capacity(lines.len() + 1);
         for (i, l) in lines.iter().enumerate() {
             if i == inc_at {

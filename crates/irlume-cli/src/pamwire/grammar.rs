@@ -534,24 +534,6 @@ pub(crate) struct UnreadLine<'a> {
     pub(crate) why: Unread,
 }
 
-impl UnreadLine<'_> {
-    /// The line for a message: every character but a space and printable
-    /// ASCII written as its code (`\u{b}`), so the line shows what PAM
-    /// reads and prints nothing a terminal would act on.
-    pub(crate) fn shown(&self) -> String {
-        self.text
-            .chars()
-            .map(|c| {
-                if c == ' ' || c.is_ascii_graphic() {
-                    c.to_string()
-                } else {
-                    format!("\\u{{{:x}}}", u32::from(c))
-                }
-            })
-            .collect()
-    }
-}
-
 /// Whether libpam can take a module name from a module path
 /// (`extract_modulename` in `pam_handlers.c`): what is left after the last
 /// `/` and before the last `.` must be neither empty nor `?`.
@@ -785,14 +767,6 @@ pub(super) fn is_auth_substack_anchor(line: &str) -> bool {
     typed_head(line, "auth").is_some_and(|h| h.control.eq_ignore_ascii_case("substack"))
 }
 
-/// An `auth` line that inlines the stack it names (`include`). libpam puts
-/// that stack's lines in its place, and a jump counts each of them, so no
-/// jump over it skips the whole stack: irlume wires such an anchor as it
-/// wires an include layout ([`is_include_auth_layout`]), never with a jump.
-pub(super) fn is_auth_include(line: &str) -> bool {
-    typed_head(line, "auth").is_some_and(|h| h.control.eq_ignore_ascii_case("include"))
-}
-
 /// Whether `line` is a password step the verify stanza goes above: an inline
 /// include of the auth stack, a shared password substack, any auth substack,
 /// or the `pam_unix.so` auth line.
@@ -858,8 +832,8 @@ const NO_PASSWORD_AUTH_MODULES: [&str; 17] = [
 /// success or a failure: the password step irlume's lines follow.
 const PASSWORD_MODULES: [&str; 3] = ["pam_sss.so", "pam_unix.so", "pam_unix2.so"];
 
-/// How many stacks deep [`stack_decides`] follows an `include`, `substack`
-/// or `@include`. Deeper is read as a stack it cannot tell about.
+/// How many stacks deep irlume follows an `include` or `@include` it reads
+/// ([`included_lines`]). Deeper is read as a stack it cannot tell about.
 const INCLUDE_DEPTH: usize = 4;
 
 /// Whether the first auth line, at `at`, is safe to wire next to when no
@@ -869,52 +843,39 @@ const INCLUDE_DEPTH: usize = 4;
 /// line whose failure fails the stack, so that line must be:
 ///
 /// - a password step ([`is_password_step_that_fails_the_stack`]); or
-/// - an `include` of a stack that runs one ([`stack_decides`]), read from
-///   where libpam finds it ([`with_stack_reader`]). One that cannot be read
-///   is no anchor. It gets the include layout instead, and no auth line
-///   below it may be a gate ([`is_gate`]).
+/// - an `include` of a stack whose first line is one
+///   ([`included_stack_starts_with_the_step`]), read from where libpam finds
+///   it ([`with_stack_reader`]). One that cannot be read is no anchor.
 ///
-/// No auth line below it may check a password either: every one must be one
-/// of [`NO_PASSWORD_AUTH_MODULES`] or a keyring module, and no `include`,
-/// `substack` or `@include` may follow but an `@include` of one of
-/// [`NON_AUTH_INCLUDES`] whose file, read where libpam finds it, holds no
-/// auth line that checks a password or gates, since libpam reads it into
-/// the auth chain too.
+/// No auth line below it may check a password either
+/// ([`quiet_below_anchor`]).
 fn first_auth_line_is_safe(lines: &[&str], at: usize) -> bool {
-    let Some(anchor) = head(lines[at]) else {
-        return false;
-    };
-    // An include gets the include layout, whose `sufficient` face line
-    // skips the whole included stack and every line after it on a face
-    // match: neither may hold a gate then ([`is_gate`]).
-    let include = names_stack(&anchor);
-    let decides = if include {
-        third_field(&anchor).is_some_and(|stack| stack_decides(stack, 1) == Some(true))
-    } else {
-        is_password_step_that_fails_the_stack(&anchor)
-    };
-    decides
-        && lines[at + 1..]
-            .iter()
-            .all(|l| quiet_below_anchor(l, include, 1))
+    let decides = head(lines[at]).is_some_and(|h| {
+        if names_stack(&h) {
+            h.control.eq_ignore_ascii_case("include")
+                && third_field(&h).is_some_and(included_stack_starts_with_the_step)
+        } else {
+            is_password_step_that_fails_the_stack(&h)
+        }
+    });
+    decides && lines[at + 1..].iter().all(|l| quiet_below_anchor(l, 1))
 }
 
 /// Whether `l`, a line below the first auth line [`first_auth_line_is_safe`]
-/// takes, checks no password, and is no gate ([`is_gate`]) when that line is
-/// an `include`. A Debian `@include` is expanded in the auth stack too, so
-/// the file it names, one of [`NON_AUTH_INCLUDES`], is read where libpam
-/// finds it, [`INCLUDE_DEPTH`] files deep at most, and each of its lines
-/// must be one too.
-fn quiet_below_anchor(l: &str, include: bool, depth: usize) -> bool {
+/// takes, checks no password: an auth line must be one of
+/// [`NO_PASSWORD_AUTH_MODULES`] or a keyring module, with no `include` or
+/// `substack`, since the stack it names can check one. A Debian `@include`
+/// is expanded in the auth stack too, so the file it names, one of
+/// [`NON_AUTH_INCLUDES`], is read where libpam finds it, [`INCLUDE_DEPTH`]
+/// files deep at most, and each of its lines must be one too.
+fn quiet_below_anchor(l: &str, depth: usize) -> bool {
     if let Some(file) = at_include_target(l) {
         return depth <= INCLUDE_DEPTH
             && NON_AUTH_INCLUDES.contains(&file)
             && read_stack(file).is_some_and(|text| {
                 !has_line_continuation(&text)
                     && unreadable_line(&text).is_none()
-                    && text
-                        .lines()
-                        .all(|m| quiet_below_anchor(m, include, depth + 1))
+                    && text.lines().all(|m| quiet_below_anchor(m, depth + 1))
             });
     }
     let Some(h) = head(l) else {
@@ -928,35 +889,17 @@ fn quiet_below_anchor(l: &str, include: bool, depth: usize) -> bool {
     }
     // A line with no module loads none: libpam installs one that always
     // fails in its place.
-    let quiet = third_field(&h).is_none_or(|path| {
+    third_field(&h).is_none_or(|path| {
         let file = module_file_name(path);
         NO_PASSWORD_AUTH_MODULES.contains(&file) || KEYRING_CONSUMERS.contains(&file)
-    });
-    quiet && !(include && is_gate(&h))
-}
-
-/// Auth modules whose lines set up the environment, a delay or a log line
-/// and decide nothing on their own, so a face match may skip them.
-const HARMLESS_AUTH_MODULES: [&str; 3] = ["pam_env.so", "pam_faildelay.so", "pam_warn.so"];
-
-/// Whether `h`, an auth rule, is a gate: a line that can fail the stack
-/// (`bad` or `die` for any return value, or no control libpam reads), other
-/// than one of [`HARMLESS_AUTH_MODULES`] or a keyring module. A `sufficient`
-/// or `optional` line is none.
-fn is_gate(h: &Head<'_>) -> bool {
-    let harmless = fields_after_control(h).first().is_some_and(|m| {
-        let file = module_file_name(m);
-        HARMLESS_AUTH_MODULES.contains(&file) || KEYRING_CONSUMERS.contains(&file)
-    });
-    !harmless
-        && control_actions(h.control)
-            .is_none_or(|table| table.iter().any(|a| matches!(a, Action::Bad | Action::Die)))
+    })
 }
 
 /// Whether `h` is a password step whose failure fails the stack: a rule of
-/// one of [`PASSWORD_MODULES`] whose control gives `bad` or `die` for every
-/// return value but `success`, `new_authtok_reqd` and `ignore`, with no
-/// numeric jump. An `ignore_` argument (pam_sss's `ignore_unknown_user` and
+/// one of [`PASSWORD_MODULES`] whose control gives `ok` or `done` for
+/// `success`, so a correct password counts, and `bad` or `die` for every
+/// other return value but `new_authtok_reqd` and `ignore`, with no numeric
+/// jump. An `ignore_` argument (pam_sss's `ignore_unknown_user` and
 /// `ignore_authinfo_unavail`) makes the module answer `ignore` in place of a
 /// failure, so a line with one is not such a step.
 fn is_password_step_that_fails_the_stack(h: &Head<'_>) -> bool {
@@ -970,83 +913,62 @@ fn is_password_step_that_fails_the_stack(h: &Head<'_>) -> bool {
             table
                 .iter()
                 .zip(RETURN_VALUES)
-                .all(|(action, value)| match action {
-                    Action::Bad | Action::Die => true,
-                    Action::Jump(_) => false,
-                    _ => matches!(value, "success" | "new_authtok_reqd" | "ignore"),
+                .all(|(action, value)| match (action, value) {
+                    (Action::Jump(_), _) => false,
+                    (action, "success") => matches!(action, Action::Ok | Action::Done),
+                    (Action::Bad | Action::Die, _) => true,
+                    (_, value) => matches!(value, "new_authtok_reqd" | "ignore"),
                 })
         })
 }
 
-/// Whether the stack `name` names runs a password step whose failure fails
-/// the stack, and nothing else a face match could not skip: `Some(true)`
-/// when it does, `Some(false)` when it runs no such step, `None` when irlume
-/// cannot tell or it holds a gate ([`is_gate`]).
-///
-/// A line that names the shared password stack irlume knows (the `include`
-/// and `@include` layouts, a password `substack`) counts as that step and is
-/// not read further, as wherever irlume wires: irlume's face line sits
-/// directly above such a line in every layout it ships, the gates in that
-/// stack included. Any other `include`, `substack` or `@include` is read in
-/// turn, [`INCLUDE_DEPTH`] stacks deep at most. Every line is read, the
-/// step's and those after it too, since the include layout's face line skips
-/// the whole stack on a face match: a gate anywhere, a numeric jump or a
-/// `reset`, a stack that cannot be read, a continued line or a line irlume
-/// does not read as PAM does ([`unreadable_line`]) makes it one irlume
-/// cannot use.
-fn stack_decides(name: &str, depth: usize) -> Option<bool> {
-    if depth > INCLUDE_DEPTH {
-        return None;
-    }
-    let text = read_stack(name)?;
-    if has_line_continuation(&text) || unreadable_line(&text).is_some() {
-        return None;
-    }
-    let mut step = false;
-    for line in text.lines() {
-        if let Some(file) = at_include_target(line) {
-            step |= is_include_auth_layout(line) || stack_decides(file, depth + 1)?;
-            continue;
-        }
-        let Some(h) = typed_head(line, "auth") else {
-            continue;
-        };
-        if names_stack(&h) {
-            step |= is_include_auth_layout(line)
-                || is_passwd_substack(line, "auth")
-                || stack_decides(third_field(&h)?, depth + 1)?;
-            continue;
-        }
-        let moves = control_actions(h.control).is_some_and(|table| {
-            table
-                .iter()
-                .any(|a| matches!(a, Action::Jump(_) | Action::Reset))
-        });
-        if moves {
-            return None;
-        }
-        if is_password_step_that_fails_the_stack(&h) {
-            step = true;
-        } else if is_gate(&h) {
-            return None;
-        }
-    }
-    Some(step)
+/// Whether the stack an `include` taken as the first auth line names starts
+/// with the password step. libpam puts the stack's lines in the include's
+/// place, and irlume's face line jumps over the first of them onto its
+/// landing after the include, so a face match stands in for that line
+/// alone and every other line of the stack still runs, gates included.
+/// That first line must be a password step
+/// ([`is_password_step_that_fails_the_stack`]) or the shared password
+/// `substack` irlume knows, one line whatever it holds; the others are held
+/// to the rule for the lines below the first auth line
+/// ([`quiet_below_anchor`]), and none may jump or `reset`. The stack is read
+/// as [`included_lines`] reads it; one irlume cannot read is no anchor.
+fn included_stack_starts_with_the_step(name: &str) -> bool {
+    let Some(lines) = included_lines(name, "auth", 1) else {
+        return false;
+    };
+    let Some((first, rest)) = lines.split_first() else {
+        return false;
+    };
+    let moves = |l: &String| {
+        head(l).is_some_and(|h| {
+            control_actions(h.control).is_some_and(|table| {
+                table
+                    .iter()
+                    .any(|a| matches!(a, Action::Jump(_) | Action::Reset))
+            })
+        })
+    };
+    let step = is_passwd_substack(first, "auth")
+        || head(first)
+            .is_some_and(|h| !names_stack(&h) && is_password_step_that_fails_the_stack(&h));
+    step && !lines.iter().any(moves) && rest.iter().all(|l| quiet_below_anchor(l, 1))
 }
 
 /// Whether a numeric jump among the `phase` lines that an `include` of the
 /// stack `name` puts in its place could land past them, onto the lines after
 /// the include: libpam counts the included lines, not the include, so such
 /// a jump counts the lines after it. Also `true` when irlume cannot tell: a
-/// stack that cannot be read ([`with_stack_reader`]), one more than
-/// [`INCLUDE_DEPTH`] deep, a continued line or a line irlume does not read
-/// as PAM does ([`unreadable_line`]).
+/// stack [`included_lines`] cannot read.
 fn included_jump_leaves(name: &str, phase: &str) -> bool {
-    included_reaches(name, phase, 1).is_none_or(|reaches| {
-        reaches
-            .iter()
-            .enumerate()
-            .any(|(at, reach)| at + reach >= reaches.len())
+    included_lines(name, phase, 1).is_none_or(|lines| {
+        lines.iter().enumerate().any(|(at, line)| {
+            head(line).is_some_and(|h| {
+                numeric_actions(&h)
+                    .into_iter()
+                    .any(|(_, reach)| at + reach >= lines.len())
+            })
+        })
     })
 }
 
@@ -1078,12 +1000,14 @@ pub(super) fn include_could_jump_past(line: &str, later: impl Fn(&str) -> bool) 
     )
 }
 
-/// How many lines the numeric jump of each `phase` line the stack `name`
-/// puts in an include's place skips at most, in order, the lines of the
-/// stacks it includes in turn among them; a `substack` is one line, whose
-/// jumps stay inside it. `None` when irlume cannot tell
-/// ([`included_jump_leaves`]).
-fn included_reaches(name: &str, phase: &str, depth: usize) -> Option<Vec<usize>> {
+/// The `phase` lines libpam puts in the place of an `include` of the stack
+/// `name`, in order: the lines of the stacks an `include` or a Debian
+/// `@include` in it names in turn, [`INCLUDE_DEPTH`] stacks deep at most,
+/// and a `substack` as the one line it is. `None` when irlume cannot tell: a
+/// stack that cannot be read ([`with_stack_reader`]), one too deep, a
+/// continued line or a line irlume does not read as PAM does
+/// ([`unreadable_line`]).
+fn included_lines(name: &str, phase: &str, depth: usize) -> Option<Vec<String>> {
     if depth > INCLUDE_DEPTH {
         return None;
     }
@@ -1091,23 +1015,22 @@ fn included_reaches(name: &str, phase: &str, depth: usize) -> Option<Vec<usize>>
     if has_line_continuation(&text) || unreadable_line(&text).is_some() {
         return None;
     }
-    let mut reaches = Vec::new();
+    let mut lines = Vec::new();
     for line in text.lines() {
         if let Some(file) = at_include_target(line) {
-            reaches.extend(included_reaches(file, phase, depth + 1)?);
+            lines.extend(included_lines(file, phase, depth + 1)?);
             continue;
         }
         let Some(h) = typed_head(line, phase) else {
             continue;
         };
         if h.control.eq_ignore_ascii_case("include") {
-            reaches.extend(included_reaches(third_field(&h)?, phase, depth + 1)?);
+            lines.extend(included_lines(third_field(&h)?, phase, depth + 1)?);
             continue;
         }
-        let jump = numeric_actions(&h).into_iter().map(|(_, n)| n).max();
-        reaches.push(jump.unwrap_or(0));
+        lines.push(line.to_string());
     }
-    Some(reaches)
+    Some(lines)
 }
 
 /// Reads a stack an `include`, `substack` or `@include` names: its text, or

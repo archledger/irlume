@@ -23,13 +23,14 @@
 //! unwiring anything on a capability reading.
 
 use super::grammar::{
-    self, content_has_module, directive, has_line_continuation, head, irlume_rule,
-    is_auth_substack_anchor, is_include_auth_layout, is_passwd_substack,
+    self, content_has_module, directive, has_line_continuation, has_read_carriage_return, head,
+    irlume_rule, is_at_include, is_auth_substack_anchor, is_include_auth_layout,
+    is_passwd_substack, unreadable_line, UnreadLine,
 };
 use super::stanzas::{inert_line, BACKUP, CREATED_PREFIX, INERT_TAG, KEYRING_TAG};
 use super::transform::{
-    is_irlume_line, unwire_lines, wire_greeter_impl, wire_lock, wire_polkit_service,
-    wire_verify_service,
+    is_irlume_line, jump_could_count_irlume_lines, unwire_lines, wire_greeter_impl, wire_lock,
+    wire_polkit_service, wire_verify_service, without_irlume_lines,
 };
 use super::PlannedChange;
 
@@ -95,21 +96,24 @@ pub(super) struct Parsed<'a> {
     /// The two header lines, without carriage returns, like the body.
     first: &'a str,
     track_line: Option<&'a str>,
+    /// The whole file as read, carriage returns included.
+    text: &'a str,
     /// `(vendor, body)` digests from a readable tracking line.
     digests: Option<(String, String)>,
     /// Every line except the two header lines, newline-terminated, without
     /// carriage returns.
     body: String,
-    /// The file has a carriage return. Linux-PAM reads it as part of the
-    /// line, so a file saved with CRLF endings names modules and stacks that
-    /// do not exist and refuses every login. The digests leave it out, so
-    /// such a file still reads as unedited; every write irlume makes to it
+    /// The file has a carriage return. Linux-PAM reads one in a line as
+    /// part of that line, so irlume changes nothing in a file with one
+    /// outside a comment ([`Parsed::unreadable`]). The digests leave them
+    /// out, so such a file still reads as unedited; every write irlume makes
     /// has LF endings.
     crlf: bool,
 }
 
-/// Said when a write replaces CRLF line endings.
-const CRLF_FIXED: &str = "its CRLF line endings, which PAM does not read, are now LF";
+/// Said when a write drops carriage returns, which can then only be in
+/// comments: irlume changes nothing in a file with one PAM reads.
+const CRLF_FIXED: &str = "the carriage returns in its comments are gone";
 
 /// Split an override. `None` when the text is not one (no first header line).
 ///
@@ -149,10 +153,21 @@ pub(super) fn parse(content: &str) -> Option<Parsed<'_>> {
     Some(Parsed {
         first,
         track_line,
+        text: content,
         digests: track_line.and_then(parse_v1),
         body,
         crlf: content.contains('\r'),
     })
+}
+
+impl Parsed<'_> {
+    /// The first line of the file irlume does not read as PAM does (see
+    /// [`unreadable_line`]): read from the file as it is, so a carriage
+    /// return the body leaves out counts, and numbered as a line of it. The
+    /// header lines are comments, which PAM does not read.
+    fn unreadable(&self) -> Option<UnreadLine<'_>> {
+        unreadable_line(self.text)
+    }
 }
 
 /// The text without irlume's lines, line endings normalized.
@@ -286,8 +301,10 @@ fn irlume_lines(text: &str) -> Vec<String> {
 const PHASES: [&str; 4] = ["auth", "account", "password", "session"];
 
 /// The phase of a PAM line, without the `-` that tolerates a missing module,
-/// read as libpam reads the type (a bracketed `[auth]` included). `None` for
-/// a comment, an `@include` or anything else.
+/// read as libpam reads the type (a bracketed `[auth]` included): the chain
+/// libpam puts the line in, `auth` for a type it does not know (see
+/// [`grammar::Head::phase`]). `None` for a comment, a blank line or an
+/// `@include`.
 fn phase(line: &str) -> Option<&'static str> {
     head(line).map(|h| h.phase)
 }
@@ -602,13 +619,12 @@ fn line_key(line: &str) -> String {
 /// counts as one; an `include` expands to lines this file does not show).
 fn chain<'a>(text: &'a str, phase_name: &str) -> Vec<&'a str> {
     text.lines()
-        .filter(|l| directive(l).starts_with("@include") || phase(l) == Some(phase_name))
+        .filter(|l| is_at_include(l) || phase(l) == Some(phase_name))
         .collect()
 }
 
 fn is_include(line: &str) -> bool {
-    directive(line).starts_with("@include")
-        || head(line).is_some_and(|h| h.control.eq_ignore_ascii_case("include"))
+    is_at_include(line) || head(line).is_some_and(|h| h.control.eq_ignore_ascii_case("include"))
 }
 
 /// The numeric actions of a line's control, as `(value, count)` (see
@@ -1344,6 +1360,55 @@ pub(super) fn continued_message(etc: &str, enable: bool, vendor_path: Option<&st
     )
 }
 
+/// A file with a line irlume does not read as PAM does ([`unreadable_line`]),
+/// left as it is: irlume cannot tell what a change to it would do.
+fn unreadable(i: &Input<'_>, line: &UnreadLine<'_>) -> Decision {
+    Decision {
+        unmet: true,
+        ..keep(
+            PlannedChange::KeepEditedOverride,
+            unreadable_message(i.etc, i.enable, i.vendor.map(|_| i.vendor_path), line),
+        )
+    }
+}
+
+/// A line irlume does not read as PAM does, for a message: `irlume does not
+/// read line 7 (`...`) as PAM does (why)`, with `of <file>` after the number
+/// when `file` is given.
+pub(super) fn unread_sentence(line: &UnreadLine<'_>, file: Option<&str>) -> String {
+    let of = file.map_or_else(String::new, |file| format!(" of {file}"));
+    format!(
+        "irlume does not read line {}{of} (`{}`) as PAM does ({})",
+        line.number,
+        line.shown(),
+        line.why.describe()
+    )
+}
+
+/// The line that reports a file kept as it is because PAM reads one of its
+/// lines differently from irlume ([`unreadable_line`]), for an override and
+/// for a stack irlume edits in place alike. `vendor_path` names the vendor
+/// copy a disable can fall back to by deleting the file, when there is one.
+pub(super) fn unreadable_message(
+    etc: &str,
+    enable: bool,
+    vendor_path: Option<&str>,
+    line: &UnreadLine<'_>,
+) -> String {
+    let way = match (enable, vendor_path) {
+        (true, _) => "correct that line and run this again".to_string(),
+        (false, Some(vendor_path)) => format!(
+            "correct that line or take irlume's lines out by hand, or delete it to use \
+             {vendor_path}"
+        ),
+        (false, None) => "correct that line or take irlume's lines out by hand".to_string(),
+    };
+    format!(
+        "⚠ {etc}: kept as it is: {}, and it changes no file it cannot read as PAM does; {way}",
+        unread_sentence(line, None)
+    )
+}
+
 /// How to take the vendor file after all when irlume's lines would move one
 /// of its numeric jumps.
 fn take_anyway(etc: &str, vendor_path: &str, scope_flag: &str) -> String {
@@ -1378,6 +1443,19 @@ pub(super) fn decide(i: &Input<'_>) -> Result<Decision, String> {
                 format!("· {etc}: not installed (skipped)"),
             ),
             (true, Some(v)) => {
+                if let Some(line) = unreadable_line(v) {
+                    return Ok(Decision {
+                        unmet: true,
+                        ..keep(
+                            PlannedChange::KeepEditedOverride,
+                            format!(
+                                "⚠ {etc}: not created: {}, and it makes no file from one it \
+                                 cannot read as PAM does",
+                                unread_sentence(&line, Some(i.vendor_path))
+                            ),
+                        )
+                    });
+                }
                 let (wired, ok) = (i.wire)(&base(v));
                 if !ok {
                     no_anchor(etc)
@@ -1406,6 +1484,11 @@ pub(super) fn decide(i: &Input<'_>) -> Result<Decision, String> {
     let class = classify(&p, i.vendor);
     if !i.enable {
         return Ok(remove_or_strip(i, &p, class));
+    }
+    // Every enable reads the file's own lines, if only to check where their
+    // jumps land, even one that rebuilds it from the vendor file.
+    if let Some(line) = p.unreadable() {
+        return Ok(unreadable(i, &line));
     }
     if i.force && matches!(class, E1 | E2 | L2) {
         return forced(i, current, &p);
@@ -1439,7 +1522,7 @@ fn remove_or_strip(i: &Input<'_>, p: &Parsed<'_>, class: Class) -> Decision {
     if !had {
         return keep(PlannedChange::NotWired, format!("· {etc}: not wired"));
     }
-    if has_line_continuation(&p.body) {
+    if has_line_continuation(p.text) {
         return continued(i);
     }
     let kept_why = match (i.vendor, lacks(&p.body, i.vendor)) {
@@ -1455,6 +1538,23 @@ fn remove_or_strip(i: &Input<'_>, p: &Parsed<'_>, class: Class) -> Decision {
             format!("it has lines irlume did not write; delete it to use {vendor_path}")
         }
     };
+    // With a line irlume does not read as PAM does, irlume's lines come out
+    // with every other byte kept, which moves no other line's landing while
+    // no numeric jump counts them; the file is kept as it is otherwise.
+    if let Some(line) = p.unreadable() {
+        if jump_could_count_irlume_lines(p.text) {
+            return unreadable(i, &line);
+        }
+        return replace(
+            PlannedChange::StripInPlace,
+            without_irlume_lines(p.text),
+            format!(
+                "✓ {etc}: removed irlume's lines and kept every other byte as it is, since {}; \
+                 {kept_why}",
+                unread_sentence(&line, None)
+            ),
+        );
+    }
     let shifts = strip_shifts(&p.body, &stripped, i.vendor);
     // Why removing irlume's lines would change the file's behaviour or lose
     // their places, and when a later disable can remove them after all.
@@ -1519,6 +1619,19 @@ fn forced(i: &Input<'_>, current: &str, p: &Parsed<'_>) -> Result<Decision, Stri
     let v = i
         .vendor
         .ok_or_else(|| format!("{etc}: {vendor_path} is gone"))?;
+    if let Some(line) = unreadable_line(v) {
+        return Ok(Decision {
+            unmet: true,
+            ..keep(
+                PlannedChange::KeepEditedOverride,
+                format!(
+                    "⚠ {etc}: not rebuilt from {vendor_path}: {}, and it makes no file from one \
+                     it cannot read as PAM does",
+                    unread_sentence(&line, Some(vendor_path))
+                ),
+            )
+        });
+    }
     let (wired, ok) = (i.wire)(&base(v));
     if !ok {
         return Ok(no_anchor(etc));
@@ -1575,7 +1688,9 @@ fn rebuild(i: &Input<'_>, current: &str, p: &Parsed<'_>, class: Class) -> Decisi
         return vendor_gone(i, p, class);
     };
     let (wired, ok) = (i.wire)(&base(v));
-    let (why, way_out) = if !ok {
+    let (why, way_out) = if let Some(line) = unreadable_line(v) {
+        (unread_sentence(&line, None), String::new())
+    } else if !ok {
         (
             "irlume finds no line to wire in it".to_string(),
             String::new(),
@@ -1677,11 +1792,15 @@ struct InPlace {
 /// irlume's lines past an administrator's line.
 fn in_place(i: &Input<'_>, p: &Parsed<'_>, m: InPlace) -> Decision {
     let etc = i.etc;
-    // Checked on the whole body: the recipe refuses a continued line in the
+    // Checked on the whole file: the recipe refuses a continued line in the
     // lines irlume did not write, but a `\` added to one of irlume's own
-    // lines is gone once they are taken out.
-    if has_line_continuation(&p.body) {
+    // lines is gone once they are taken out. Read with its carriage returns,
+    // since a `\` before one does not continue the line.
+    if has_line_continuation(p.text) {
         return continued(i);
+    }
+    if let Some(line) = p.unreadable() {
+        return unreadable(i, &line);
     }
     let bare = base(&p.body);
     let (wired, ok) = (i.wire)(&bare);
@@ -1698,8 +1817,9 @@ fn in_place(i: &Input<'_>, p: &Parsed<'_>, m: InPlace) -> Decision {
     } = m;
     if irlume_lines(&p.body) == irlume_lines(&wired) {
         if p.crlf {
-            // The lines are right but PAM reads none of them. Every line is
-            // kept; only the line endings change.
+            // The lines are right, and the carriage returns are all in
+            // comments ([`Parsed::unreadable`] refused any other). Every
+            // line is kept; only the carriage returns go.
             return Decision {
                 detail,
                 ..replace(
@@ -2020,6 +2140,9 @@ pub(super) enum Hold {
     /// irlume's lines would make a numeric jump in the new vendor copy land
     /// somewhere else.
     Jump,
+    /// The file or its vendor copy has a line irlume does not read as PAM
+    /// does ([`unreadable_line`]).
+    Unreadable,
 }
 
 /// What reconcile's maintenance step does to one override.
@@ -2046,12 +2169,16 @@ pub(super) fn maintenance(
         return Maintenance::Nothing;
     };
     match classify(&p, Some(v)) {
+        Class::L1 if p.unreadable().is_some() => Maintenance::Blocked(Hold::Unreadable),
         Class::L1 => Maintenance::Record(format!(
             "{}\n{}\n{}",
             p.first,
             tracking_line(&sha256(v), &body_digest(&p.body)),
             p.body
         )),
+        Class::U2 if p.unreadable().is_some() || unreadable_line(v).is_some() => {
+            Maintenance::Blocked(Hold::Unreadable)
+        }
         Class::U2 => {
             let Some(settings) = infer(recipe, &p.body) else {
                 return Maintenance::Blocked(Hold::UnknownSettings);
@@ -2070,6 +2197,23 @@ pub(super) fn maintenance(
         }
         _ => Maintenance::Nothing,
     }
+}
+
+/// Why reconcile left an override as it is for [`Hold::Unreadable`], for its
+/// log: the line of the file, or of its vendor copy, irlume does not read as
+/// PAM does.
+pub(super) fn maintenance_unread(
+    current: &str,
+    vendor_path: &str,
+    vendor: Option<&str>,
+) -> Option<String> {
+    let p = parse(current)?;
+    if let Some(line) = p.unreadable() {
+        return Some(unread_sentence(&line, None));
+    }
+    vendor
+        .and_then(unreadable_line)
+        .map(|line| unread_sentence(&line, Some(vendor_path)))
 }
 
 // ---- doctor and status -----------------------------------------------------------
@@ -2106,6 +2250,8 @@ pub(super) fn assess(
     let enable_apply = format!("`sudo irlume login enable{scope_flag} --apply`");
     let (mut level, mut note) = match class {
         Class::U1 => (Level::Pass, None),
+        // Reconcile does not record it: see below.
+        Class::L1 if p.unreadable().is_some() => (Level::Pass, None),
         Class::L1 => (
             Level::Info,
             Some("matches its vendor copy; the next reconcile records that in its header".into()),
@@ -2133,6 +2279,17 @@ pub(super) fn assess(
                          does not rebuild it; to take the new vendor copy anyway, delete the \
                          file and run {enable_apply}, then check that jump"
                     ),
+                    Hold::Unreadable => match vendor.and_then(unreadable_line) {
+                        Some(line) if p.unreadable().is_none() => format!(
+                            "its vendor copy changed, and irlume does not read line {} of the \
+                             new one as PAM does ({}), so reconcile does not rebuild it",
+                            line.number,
+                            line.why.describe()
+                        ),
+                        _ => {
+                            "its vendor copy changed, and reconcile does not rebuild it".to_string()
+                        }
+                    },
                 }),
             ),
             _ => (Level::Pass, None),
@@ -2223,20 +2380,33 @@ pub(super) fn assess(
             note = Some(format!("{absent}; delete it to use its vendor copy"));
         }
     }
-    if p.crlf {
-        let fix = if content_has_module(&p.body) {
-            format!("{enable_apply} rewrites them as LF and keeps every line")
-        } else {
-            "save it with LF line endings".to_string()
-        };
-        let crlf = format!(
-            "it has CRLF line endings, which PAM does not read, so every login through it fails; \
-             {fix}"
-        );
+    // Named without quoting the line: a module can be named by its path. A
+    // carriage return PAM reads is such a line, named for what it is (the
+    // end of a CRLF line, or a carriage return inside one); one only in
+    // comments changes nothing PAM reads, and the next write drops it.
+    let unread = if let Some(line) = p.unreadable() {
+        Some(format!(
+            "irlume does not read line {} of it as PAM does ({}), so it adds nothing to it \
+             until that line is corrected",
+            line.number,
+            line.why.describe()
+        ))
+    } else if has_read_carriage_return(p.text) {
+        // A continued file, which `unreadable_line` leaves to
+        // `has_line_continuation`.
+        Some(
+            "a line of it holds a carriage return outside a comment, which PAM reads as part \
+             of that line, so irlume adds nothing to it until it is taken out"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    if let Some(unread) = unread {
         level = Level::Warn;
         note = Some(match note {
-            Some(rest) => format!("{crlf}; {rest}"),
-            None => crlf,
+            Some(rest) => format!("{unread}; {rest}"),
+            None => unread,
         });
     }
     (level, note)
@@ -2353,6 +2523,100 @@ session     include       password-auth
             .filter(|l| !is_irlume_line_by_substring(l))
             .collect();
         sha256(&format!("{}\n", kept.join("\n")))
+    }
+
+    /// The chains jumps are counted in are libpam's: a line with a type but
+    /// no control is in its type's chain (every value `bad`), a type libpam
+    /// does not know puts the line in the auth chain, and a Debian
+    /// `@include` counts in every chain, whatever case it is written in.
+    #[test]
+    fn jumps_count_every_line_libpam_puts_in_the_chain() {
+        let gate = "auth [success=1 default=ignore] pam_succeed_if.so user ingroup wheel";
+        let sub = "auth substack password-auth";
+        for between in [
+            "auth",
+            "-AUTH",
+            "auth optional",
+            "[auth] [] pam_foo.so",
+            "auht optional pam_foo.so",
+            "\u{b}auth optional pam_foo.so",
+        ] {
+            let text = format!("{gate}\n{between}\n{sub}\n");
+            let found = jumps(&text);
+            assert_eq!(found.len(), 1, "{between:?}");
+            assert_eq!(found[0].landing, line(sub), "{between:?}");
+            assert_eq!(found[0].skipped, vec![norm(between)], "{between:?}");
+        }
+        // Not in the auth chain: another type's line, a comment, a blank.
+        for between in ["session optional pam_foo.so", "# auth optional x", "   "] {
+            let text = format!("{gate}\n{between}\n{sub}\nauth optional pam_bar.so\n");
+            assert_eq!(
+                jumps(&text)[0].landing,
+                line("auth optional pam_bar.so"),
+                "{between:?}"
+            );
+        }
+        // An @include, in any case, is an include in every chain.
+        for include in [
+            "@include common-auth",
+            "@INCLUDE common-auth",
+            "-@include x",
+        ] {
+            let text = format!("{gate}\n{include}\n{sub}\n");
+            assert!(
+                matches!(jumps(&text)[0].landing, Landing::Across { .. }),
+                "{include}"
+            );
+            let session = format!(
+                "session [success=1 default=ignore] pam_x.so\n{include}\nsession optional pam_y.so\n"
+            );
+            assert!(
+                matches!(jumps(&session)[0].landing, Landing::Across { .. }),
+                "{include}"
+            );
+        }
+        // Glued to its file, it is a type libpam does not know: an auth line.
+        let glued = format!("{gate}\n@includecommon-auth\n{sub}\n");
+        assert_eq!(jumps(&glued)[0].landing, line(sub));
+    }
+
+    /// A line of an override's body is named by its line in the whole file:
+    /// the first header line and the tracking line, wherever it sits in the
+    /// comment block above the first directive, are counted.
+    #[test]
+    fn an_unread_line_of_an_override_is_numbered_as_in_the_file() {
+        let typo = "auht optional pam_foo.so";
+        let tracked = generation(VENDOR);
+        let edited = with_admin_line(&tracked).replacen(ADMIN, typo, 1);
+        let number = |text: &str| text.lines().position(|l| l == typo).unwrap() + 1;
+        let moved_track = {
+            let mut lines: Vec<&str> = edited.lines().collect();
+            let track = lines.remove(1);
+            lines.insert(1, "# a note");
+            lines.insert(2, "# another");
+            lines.insert(3, track);
+            format!("{}\n", lines.join("\n"))
+        };
+        let untracked = {
+            let mut lines: Vec<&str> = edited.lines().collect();
+            lines.remove(1);
+            format!("{}\n", lines.join("\n"))
+        };
+        for text in [edited.clone(), moved_track, untracked] {
+            let p = parse(&text).expect("an override");
+            let found = p.unreadable().expect("the line");
+            assert_eq!(found.number, number(&text), "{text}");
+            let d = run(&text, Some(VENDOR), true, &greeter);
+            assert!(
+                d.message.contains(&format!(
+                    "irlume does not read line {} (`{typo}`)",
+                    number(&text)
+                )),
+                "{}",
+                d.message
+            );
+            assert_eq!(d.write, Write::Nothing);
+        }
     }
 
     /// Every override irlume writes is its vendor copy plus irlume's own
@@ -3578,10 +3842,13 @@ session     include       password-auth
         assert!(off.contains(INERT_TAG), "{off}");
     }
 
-    /// PAM does not read a line that ends in a carriage return, so an
-    /// override saved with CRLF endings refuses every login. irlume does not
-    /// report it as correctly wired, rewrites it with LF endings, and keeps
-    /// every line.
+    /// libpam reads the carriage return of a CRLF ending as part of the
+    /// line, so irlume does not read an override saved with CRLF endings as
+    /// PAM does, and writing it with LF endings would change which lines PAM
+    /// runs. An enable keeps it as it is, names the line and fails, and
+    /// doctor warns about it once, naming the first such line. A disable
+    /// still deletes one nobody edited, which restores its vendor copy; an
+    /// edited one whose numeric jump counts irlume's lines is kept.
     #[test]
     fn an_override_with_crlf_endings_is_not_correctly_wired() {
         let vp = "/usr/lib/pam.d/plasmalogin";
@@ -3589,11 +3856,74 @@ session     include       password-auth
         for text in [tracked.clone(), with_admin_line(&tracked)] {
             let crlf = text.replace('\n', "\r\n");
             let d = run(&crlf, Some(VENDOR), true, &greeter);
-            assert_eq!(written(&d).as_deref(), Some(text.as_str()), "{}", d.message);
+            assert_eq!(d.write, Write::Nothing, "{}", d.message);
+            assert_eq!(d.change, PlannedChange::KeepEditedOverride, "{}", d.message);
+            assert!(d.unmet, "{}", d.message);
+            assert!(
+                d.message.contains("irlume does not read line 3 (")
+                    && d.message.contains("a CRLF line ending"),
+                "{}",
+                d.message
+            );
             let (level, note) = assess(Recipe::Greeter, &crlf, vp, Some(VENDOR), &[], None, "");
             assert_eq!(level, Level::Warn, "{note:?}");
-            assert!(note.unwrap().contains("CRLF"));
+            let note = note.unwrap();
+            assert!(
+                note.starts_with(
+                    "irlume does not read line 3 of it as PAM does (it ends in a \
+                                  carriage return (a CRLF line ending)"
+                ) && note.contains("save the file with LF line endings"),
+                "{note}"
+            );
+            assert_eq!(
+                note.matches("carriage return").count(),
+                1,
+                "one note: {note}"
+            );
+            let off = run(&crlf, Some(VENDOR), false, &greeter);
+            if text == tracked {
+                assert_eq!(off.write, Write::Remove, "{}", off.message);
+            } else {
+                assert_eq!(off.write, Write::Nothing, "{}", off.message);
+                assert!(off.unmet, "{}", off.message);
+            }
         }
+    }
+
+    /// Doctor names a carriage return PAM reads once, for what it is: one
+    /// inside a line is not CRLF line endings. In a continued file, which
+    /// names no line, it is still reported.
+    #[test]
+    fn a_carriage_return_inside_a_line_is_named_as_one() {
+        let vp = "/usr/lib/pam.d/plasmalogin";
+        let tracked = generation(VENDOR);
+        let postlogin = "auth        include       postlogin";
+        let mid = tracked.replacen(postlogin, "auth        include\rpostlogin", 1);
+        assert_ne!(mid, tracked);
+        let (level, note) = assess(Recipe::Greeter, &mid, vp, Some(VENDOR), &[], None, "");
+        assert_eq!(level, Level::Warn, "{note:?}");
+        let note = note.unwrap();
+        assert!(
+            note.contains(
+                "(it holds a carriage return, which PAM does not take for a blank between fields)"
+            ),
+            "{note}"
+        );
+        assert!(!note.contains("CRLF"), "{note}");
+        assert_eq!(note.matches("carriage return").count(), 1, "{note}");
+        let continued = tracked.replacen(
+            postlogin,
+            &format!("auth        optional      pam_foo.so \\\n{postlogin}\r"),
+            1,
+        );
+        assert_ne!(continued, tracked);
+        let (level, note) = assess(Recipe::Greeter, &continued, vp, Some(VENDOR), &[], None, "");
+        assert_eq!(level, Level::Warn, "{note:?}");
+        let note = note.unwrap();
+        assert!(
+            note.starts_with("a line of it holds a carriage return outside a comment"),
+            "{note}"
+        );
     }
 
     /// A kept file whose irlume lines were taken out by hand says it is not
@@ -3657,7 +3987,8 @@ session     include       password-auth
         assert!(d.header_only, "{}", d.message);
         for (text, vendor) in [
             (generation(VENDOR), vendor_v2()),
-            (legacy(VENDOR).replace('\n', "\r\n"), VENDOR.to_string()),
+            // A carriage return in the header: a write drops it.
+            (legacy(VENDOR).replacen('\n', "\r\n", 1), VENDOR.to_string()),
         ] {
             let d = run(&text, Some(&vendor), true, &greeter);
             assert_ne!(d.write, Write::Nothing, "{}", d.message);
@@ -3741,23 +4072,37 @@ session     include       password-auth
         }
     }
 
-    /// A file whose line endings were converted to CRLF twice ends each line
-    /// in `\r\r\n`. The header lines lose every carriage return too, so the
-    /// rewrite has none left, and the next run finds nothing to do.
+    /// Carriage returns only in comments change nothing PAM reads: a
+    /// rewrite drops them, the header lines' included, and the next run
+    /// finds nothing to do. Doubled ones (`\r\r\n`) in the lines PAM reads
+    /// keep the file as CRLF endings do.
     #[test]
-    fn a_doubled_carriage_return_is_gone_after_one_rewrite() {
+    fn carriage_returns_in_comments_are_gone_after_one_rewrite() {
         let vp = "/usr/lib/pam.d/plasmalogin";
         let tracked = generation(VENDOR);
         for text in [tracked.clone(), with_admin_line(&tracked)] {
-            let doubled = text.replace('\n', "\r\r\n");
-            let d = run(&doubled, Some(VENDOR), true, &greeter);
+            let in_comments = text.replacen('\n', "\r\r\n", 2);
+            let (_, note) = assess(
+                Recipe::Greeter,
+                &in_comments,
+                vp,
+                Some(VENDOR),
+                &[],
+                None,
+                "",
+            );
+            assert!(!note.is_some_and(|n| n.contains("CRLF")));
+            let d = run(&in_comments, Some(VENDOR), true, &greeter);
             let after = written(&d).unwrap_or_else(|| panic!("a write: {}", d.message));
+            assert!(d.message.contains(CRLF_FIXED), "{}", d.message);
             assert!(!after.contains('\r'), "{after:?}");
             assert_eq!(after, text);
             let again = run(&after, Some(VENDOR), true, &greeter);
             assert_eq!(again.write, Write::Nothing, "{}", again.message);
-            let (_, note) = assess(Recipe::Greeter, &after, vp, Some(VENDOR), &[], None, "");
-            assert!(!note.is_some_and(|n| n.contains("CRLF")));
+            let doubled = text.replace('\n', "\r\r\n");
+            let d = run(&doubled, Some(VENDOR), true, &greeter);
+            assert_eq!(d.write, Write::Nothing, "{}", d.message);
+            assert!(d.message.contains("a CRLF line ending"), "{}", d.message);
         }
     }
 

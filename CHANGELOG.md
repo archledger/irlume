@@ -349,6 +349,45 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- irlume now wires a login or lock screen stack that names no shared
+  password stack it knows next to the stack's first auth line only when
+  that line is the password step, a `pam_unix.so`, `pam_unix2.so` or
+  `pam_sss.so` rule whose failure fails the stack, or an `include` of a
+  stack that runs such a step, which irlume reads where PAM finds it, and
+  when no auth line below it can check a password. irlume's lines are
+  designed to follow the password step and a line whose failure fails the
+  stack. Any other such stack is left as it is and reported as having no
+  anchor to wire (#858).
+
+- irlume now reads the lines of a PAM stack as libpam does and refuses to
+  change a stack with a line it cannot read that way. A control is parsed
+  as libpam parses it, blanks around `=` included, so
+  `[success = 1 default=ignore]` is the same jump as
+  `[success=1 default=ignore]`, and a control libpam rejects has no jump;
+  a line with a type but no control counts in its stack; Debian's
+  `@include`, the type and the `include` or `substack` keyword are read
+  case-insensitively and as whole fields (the file a Debian `@include`
+  names still counts as the password stack by how its name starts, as
+  `common-auth-local` does); and a line continues on the next one only
+  when it ends in `\`, spaces and tabs aside, outside a comment. So the
+  check that keeps a numeric jump landing where it did sees every jump PAM
+  sees (#858). A line whose type PAM does not know (a typo, or a line led
+  by a no-break space, vertical tab or form feed), which PAM counts in the
+  auth stack as a line that always fails, a blank other than a space or a
+  tab between fields, a carriage return outside a comment (CRLF line
+  endings, which PAM reads as part of each line), a NUL byte, an
+  `@include` without a file, a `substack` without a stack or a module path
+  PAM takes no module name from keeps the file as it is: `irlume login
+  enable` names the line and exits 1, an override is not made from a
+  vendor file with such a line, reconcile leaves the file and logs why,
+  `irlume doctor`'s `login-overrides` check gives its line number, and the
+  machine API reports the surface as `keep-edited-override` with `kept`.
+  `irlume login disable` takes irlume's lines out of such a file and keeps
+  every other byte, unless a numeric jump in it could count irlume's
+  lines, when it keeps the file, names the line and exits 1. A file with
+  CRLF line endings is no longer rewritten with LF endings, which would
+  change which lines PAM runs.
+
 - Under irlumed's AppArmor profile in enforce mode, as Debian and Ubuntu
   load it, `irlume doctor`'s `sealed-storage` check and the guidance after
   a seal establish the storage under `/usr`, `/etc` and a btrfs mount

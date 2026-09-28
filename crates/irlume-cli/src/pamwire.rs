@@ -28,7 +28,10 @@ use std::process::{Command, ExitCode};
 // Horizontal split by responsibility, innermost first: the bytes we write
 // (`stanzas`), reading a stack (`grammar`), rewriting one (`transform`). All
 // three are pure (no filesystem, no policy), which is what keeps this module's
-// file handling and the wiring decisions testable apart from each other.
+// file handling and the wiring decisions testable apart from each other. The
+// one stack they read beyond the file they are given, the one a first auth
+// `include` names, comes through the reader this module sets
+// (`with_stack_reader`, `stack_reader`).
 //
 // Deliberately NOT split by modality: face and fingerprint lines share the same
 // greeter files (a GDM box gets the face `unseal` line and the fingerprint
@@ -599,23 +602,33 @@ fn maintain_override(svc: &Svc, recipe: overrides::Recipe) -> Result<Option<Stri
     let decided = vendor
         .as_deref()
         .map(|v| crate::logintx::sha256_hex(v.as_bytes()));
-    let (content, done) =
-        match overrides::maintenance(recipe, &current, vendor_path, vendor.as_deref()) {
-            overrides::Maintenance::Record(content) => (
-                content,
-                format!("recorded {vendor_path} in the override header; no PAM line changed"),
-            ),
-            overrides::Maintenance::Refresh(content) => (
-                content,
-                format!(
+    let maintenance = with_stack_reader(stack_reader(svc.etc), || {
+        overrides::maintenance(recipe, &current, vendor_path, vendor.as_deref())
+    });
+    let (content, done) = match maintenance {
+        overrides::Maintenance::Record(content) => (
+            content,
+            format!("recorded {vendor_path} in the override header; no PAM line changed"),
+        ),
+        overrides::Maintenance::Refresh(content) => (
+            content,
+            format!(
                 "rebuilt from {vendor_path}, which changed since irlume created this override; \
                  irlume's lines keep their settings"
             ),
-            ),
-            overrides::Maintenance::Nothing | overrides::Maintenance::Blocked(_) => {
-                return Ok(None)
-            }
-        };
+        ),
+        overrides::Maintenance::Blocked(overrides::Hold::Unreadable) => {
+            let why = overrides::maintenance_unread(&current, vendor_path, vendor.as_deref());
+            return Ok(why.map(|why| {
+                format!(
+                    "[login] ⚠ {}: left as it is: {why}, and reconcile changes no file it \
+                     cannot read as PAM does",
+                    svc.etc
+                )
+            }));
+        }
+        overrides::Maintenance::Nothing | overrides::Maintenance::Blocked(_) => return Ok(None),
+    };
     // Made from the vendor copy read above, so kept only while that copy is
     // still the same once the file is in place, as in `wire_override`. A
     // package that changed it meanwhile starts another reconcile, which
@@ -703,7 +716,9 @@ fn refresh_due_for(svc: &Svc, recipe: overrides::Recipe) -> bool {
         return false;
     };
     matches!(
-        overrides::maintenance(recipe, &current, vendor_path, vendor.as_deref()),
+        with_stack_reader(stack_reader(svc.etc), || {
+            overrides::maintenance(recipe, &current, vendor_path, vendor.as_deref())
+        }),
         overrides::Maintenance::Refresh(_)
     )
 }
@@ -774,15 +789,18 @@ pub(crate) fn override_reports() -> Vec<OverrideReport> {
                 read_optional(&etc.with_file_name(&backup_name)),
                 Ok(Some(backup)) if backup != current
             );
-            match overrides::assess(
-                recipe,
-                &current,
-                vendor_path,
-                vendor.as_deref(),
-                &siblings,
-                stale_backup.then_some(backup_name.as_str()),
-                scope_flag(svc.etc),
-            ) {
+            let assessed = with_stack_reader(stack_reader(svc.etc), || {
+                overrides::assess(
+                    recipe,
+                    &current,
+                    vendor_path,
+                    vendor.as_deref(),
+                    &siblings,
+                    stale_backup.then_some(backup_name.as_str()),
+                    scope_flag(svc.etc),
+                )
+            });
+            match assessed {
                 (overrides::Level::Pass, _) | (_, None) => None,
                 (level, Some(note)) => report(level, note),
             }
@@ -3008,6 +3026,10 @@ fn wire_service_with(
     opts: &WireOpts,
     wire: &dyn Fn(&str) -> (String, bool),
 ) -> Result<WireOutcome, WriteError> {
+    // The stack a first auth `include` names is read where libpam finds it
+    // for this file.
+    let reader = stack_reader(s.etc);
+    let wire = &|c: &str| with_stack_reader(reader.clone(), || wire(c));
     let apply = opts.apply;
     let out = |change: PlannedChange, message: String| {
         Ok(WireOutcome {
@@ -3041,6 +3063,11 @@ fn wire_service_with(
             // override.
             if continued_with_irlume_lines(&current) {
                 return Ok(kept_continued(s.etc, true));
+            }
+            // A line irlume does not read as PAM does leaves it unable to
+            // tell where a jump lands or which chain a line is in.
+            if let Some(line) = unreadable_line(&current) {
+                return Ok(kept_unreadable(s.etc, true, &line));
             }
             // Rebuild from the CURRENT file with irlume's own lines stripped,
             // not from the backup.
@@ -3146,7 +3173,16 @@ fn wire_service_with(
                 let current = read(s.etc)?;
                 let (stripped, _) = unwire_lines(&current);
                 let bak_content = read(&bak.to_string_lossy())?;
-                if stripped == bak_content {
+                // `unwire_lines` ends every line in LF. A carriage return is
+                // part of a line to PAM, so with one in the file only the
+                // same bytes count: putting back an LF backup of a file since
+                // saved with CRLF endings would change which lines PAM runs.
+                let same = if current.contains('\r') {
+                    without_irlume_lines(&current) == bak_content
+                } else {
+                    stripped == bak_content
+                };
+                if same {
                     if apply {
                         // The same refusal every other write path in this module
                         // applies. A rename over a SYMLINK replaces the link with
@@ -3168,6 +3204,17 @@ fn wire_service_with(
                     // puts back the whole file irlume first read, as deleting
                     // an override nobody edited does.
                     Ok(kept_continued(s.etc, false))
+                } else if let Some(line) = unreadable_line(&current) {
+                    // Likewise a line PAM reads differently from irlume.
+                    if current.lines().any(is_irlume_line) {
+                        let note = format!(
+                            " (file changed since wiring; backup kept at {}{})",
+                            s.etc, BACKUP
+                        );
+                        disable_unread(s.etc, &current, &line, apply, &note)
+                    } else {
+                        out(PlannedChange::NotWired, format!("· {}: not wired", s.etc))
+                    }
                 } else {
                     let (body, change, message) = strip_in_place(s.etc, &current);
                     if let (true, Some(body)) = (apply, &body) {
@@ -3189,6 +3236,9 @@ fn wire_service_with(
                 // take out once no jump counts them, unless a line ends in `\`.
                 if continued_with_irlume_lines(&current) {
                     return Ok(kept_continued(s.etc, false));
+                }
+                if let Some(line) = unreadable_line(&current) {
+                    return disable_unread(s.etc, &current, &line, apply, "");
                 }
                 let (body, change, message) = strip_in_place(s.etc, &current);
                 if let (true, Some(body)) = (apply, &body) {
@@ -3215,6 +3265,83 @@ fn kept_continued(etc: &str, enable: bool) -> WireOutcome {
         detail: None,
         unmet: true,
     }
+}
+
+/// A stack irlume edits in place, kept as it is because PAM reads one of its
+/// lines differently from irlume ([`unreadable_line`]): the outcome and line
+/// an override in the same state gets, so `login enable` and `login disable`
+/// exit 1 and a machine apply fails the surface.
+fn kept_unreadable(etc: &str, enable: bool, line: &UnreadLine<'_>) -> WireOutcome {
+    WireOutcome {
+        change: PlannedChange::KeepEditedOverride,
+        message: overrides::unreadable_message(etc, enable, None, line),
+        detail: None,
+        unmet: true,
+    }
+}
+
+/// A disable of a stack irlume edits in place that holds irlume's lines and
+/// a line irlume does not read as PAM does ([`unreadable_line`]). When no
+/// numeric jump could count irlume's lines
+/// ([`jump_could_count_irlume_lines`]), they come out and every other byte
+/// stays as it is ([`without_irlume_lines`]), so PAM reads each other line
+/// as before. Otherwise the file is kept as it is ([`kept_unreadable`]).
+/// `note` ends the line that reports a write.
+fn disable_unread(
+    etc: &str,
+    current: &str,
+    line: &UnreadLine<'_>,
+    apply: bool,
+    note: &str,
+) -> Result<WireOutcome, WriteError> {
+    if jump_could_count_irlume_lines(current) {
+        return Ok(kept_unreadable(etc, false, line));
+    }
+    if apply {
+        write_atomic(Path::new(etc), &without_irlume_lines(current))?;
+    }
+    Ok(WireOutcome {
+        change: PlannedChange::StripInPlace,
+        message: format!(
+            "✓ {etc}: removed irlume's lines and kept every other byte as it is, since {}{note}",
+            overrides::unread_sentence(line, None)
+        ),
+        detail: None,
+        unmet: false,
+    })
+}
+
+/// Reads the stacks an include in the file at `path` names where libpam
+/// finds them for that file: under the root the file sits in, in `etc/pam.d`
+/// and then `usr/lib/pam.d`, the directories irlume reads a service from;
+/// for a file anywhere else, in the directory it is in. A name with a `/`
+/// in it, and a stack that is there but cannot be read, read as none.
+fn stack_reader(path: &str) -> StackReader {
+    let dir = Path::new(path).parent().unwrap_or_else(|| Path::new("/"));
+    let root = if dir.ends_with("etc/pam.d") {
+        dir.ancestors().nth(2)
+    } else if dir.ends_with("usr/lib/pam.d") {
+        dir.ancestors().nth(3)
+    } else {
+        None
+    };
+    let dirs = match root {
+        Some(root) => vec![root.join("etc/pam.d"), root.join("usr/lib/pam.d")],
+        None => vec![dir.to_path_buf()],
+    };
+    std::rc::Rc::new(move |name: &str| {
+        if name.is_empty() || name.contains('/') {
+            return None;
+        }
+        for dir in &dirs {
+            match std::fs::read_to_string(dir.join(name)) {
+                Ok(text) => return Some(text),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+        }
+        None
+    })
 }
 
 // ---- pure PAM-text mechanics (unit-tested) -----------------------------------
@@ -3311,8 +3438,9 @@ fn keep_places(etc: &str, current: &str, wired: &str) -> Option<KeptPlaces> {
         .lines()
         .any(|l| is_irlume_line(l) && l.contains(INERT_TAG));
     match overrides::refill(current, wired) {
-        // Byte for byte, so a file with CRLF line endings, which PAM does not
-        // read, is still rewritten.
+        // Byte for byte, so a file whose comments end in a carriage return
+        // is still rewritten. One with a carriage return PAM reads never
+        // gets here: `unreadable_line` refuses it first.
         Some(filled) if filled == current => Some(KeptPlaces::Unchanged),
         Some(filled) if holds_places => Some(KeptPlaces::Filled(filled)),
         None if holds_places => {
@@ -3523,7 +3651,9 @@ mod tests {
 
     #[test]
     fn stripping_a_wired_stack_keeps_what_the_distro_added_later() {
-        let stock = "auth       required     pam_env.so\n                     auth       sufficient   pam_unix.so try_first_pass nullok\n";
+        // A password substack below the gate, where the keyring line goes
+        // after the password step.
+        let stock = "auth       required     pam_env.so\n                     auth       substack     password-auth\n";
         let (wired, changed) = wire_greeter_impl(stock, true, true, false);
         assert!(changed, "the fixture must actually wire");
 
@@ -3544,7 +3674,7 @@ mod tests {
             !base.contains("pam_irlume.so"),
             "and must remove every line irlume did add: {base}"
         );
-        assert!(base.contains("pam_unix.so"), "{base}");
+        assert!(base.contains("substack     password-auth"), "{base}");
     }
 
     /// `flock` is per open file description, so a second `lock_pam()` from the
@@ -4695,8 +4825,9 @@ mod tests {
                 Some(KeptPlaces::Filled(counted.clone()))
             );
             // Already the recipe's line in the place the jump counts. With
-            // CRLF endings, which PAM does not read, it is the recipe's to
-            // rewrite, as before.
+            // CRLF endings the bytes differ, so it is not `Unchanged`;
+            // `wire_service` keeps such a file before this, since PAM reads
+            // each carriage return as part of its line.
             assert_eq!(decide(&counted, wire), Some(KeptPlaces::Unchanged));
             assert_eq!(decide(&counted.replace('\n', "\r\n"), wire), None);
             // Inactive lines no jump counts: wired as the recipe has it.
@@ -5513,6 +5644,247 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&etc).unwrap(), current);
     }
 
+    /// A rule whose type PAM does not know: PAM runs it as an auth line that
+    /// always fails, in the auth chain of the file it reads for a service.
+    const UNREAD_RULE: &str = "auht       required   pam_faillock.so preauth";
+
+    /// `text` with `UNREAD_RULE` directly above `@include common-auth`.
+    fn unread_above_include(text: &str) -> String {
+        let out = text.replacen(
+            "@include common-auth",
+            &format!("{UNREAD_RULE}\n@include common-auth"),
+            1,
+        );
+        assert_ne!(out, text, "{text}");
+        out
+    }
+
+    /// The outcome for a stack irlume edits in place and keeps as it is
+    /// because PAM reads a line of it differently from irlume: the kept,
+    /// unmet outcome an override in that state gets, with the line named.
+    fn assert_kept_unread(outcome: &WireOutcome, text: &str, enable: bool) {
+        assert_eq!(
+            outcome.change,
+            PlannedChange::KeepEditedOverride,
+            "{outcome}"
+        );
+        assert!(outcome.unmet, "{outcome}");
+        let number = text.lines().position(|l| l == UNREAD_RULE).unwrap() + 1;
+        assert!(
+            outcome.message.contains(&format!(
+                ": kept as it is: irlume does not read line {number} (`{UNREAD_RULE}`) as PAM \
+                 does (PAM does not know its type and runs it as an auth line that always \
+                 fails), and it changes no file it cannot read as PAM does; "
+            )),
+            "{outcome}"
+        );
+        let way = if enable {
+            "correct that line and run this again"
+        } else {
+            "correct that line or take irlume's lines out by hand"
+        };
+        assert!(outcome.message.ends_with(way), "{outcome}");
+    }
+
+    /// `login enable` keeps a stack irlume edits in place as it is, byte for
+    /// byte, when PAM reads one of its lines differently from irlume, whether
+    /// irlume's lines are in it or not, and names the line. `login disable`
+    /// takes irlume's lines out and keeps every other byte, unless a numeric
+    /// jump could count irlume's lines: then it keeps the file too. A
+    /// disable still puts back a backup that is the file without irlume's
+    /// lines, as for a continued line: that is the file irlume first read. A
+    /// stack with none of irlume's lines has nothing to take out.
+    #[test]
+    fn an_in_place_stack_with_a_line_irlume_does_not_read_as_pam_does_is_kept() {
+        let dir = TestDir::new("unread-in-place");
+        let etc = dir.0.join("sudo");
+        let bak = dir.0.join(format!("sudo{BACKUP}"));
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let bare = unread_above_include(DEBIAN_SUDO);
+        let (wired, changed) = wire_verify_service(DEBIAN_SUDO);
+        assert!(changed);
+        let wired = unread_above_include(&wired);
+        for current in [&bare, &wired] {
+            std::fs::write(&etc, current).unwrap();
+            for apply in [false, true] {
+                let on = wire_service(&svc, true, apply, &wire_verify_service).unwrap();
+                assert_kept_unread(&on, current, true);
+            }
+            assert_eq!(&std::fs::read_to_string(&etc).unwrap(), current);
+            assert!(!bak.exists());
+        }
+        // Disable without a backup, and with one that differs: irlume's
+        // lines come out, every other byte stays.
+        let number = wired.lines().position(|l| l == UNREAD_RULE).unwrap() + 1;
+        let named = format!("irlume does not read line {number} (`{UNREAD_RULE}`) as PAM does");
+        for backup in [None, Some(DEBIAN_SUDO)] {
+            std::fs::write(&etc, &wired).unwrap();
+            if let Some(backup) = backup {
+                std::fs::write(&bak, backup).unwrap();
+            }
+            for apply in [false, true] {
+                let off = wire_service(&svc, false, apply, &wire_verify_service).unwrap();
+                assert_eq!(off.change, PlannedChange::StripInPlace, "{off}");
+                assert!(!off.unmet, "{off}");
+                assert!(off.message.contains(&named), "{off}");
+                assert_eq!(
+                    off.message.contains("backup kept"),
+                    backup.is_some(),
+                    "{off}"
+                );
+                let expect = if apply { &bare } else { &wired };
+                assert_eq!(&std::fs::read_to_string(&etc).unwrap(), expect);
+            }
+            assert_eq!(bak.exists(), backup.is_some());
+        }
+        // A numeric jump above irlume's lines could count them: kept.
+        let jumped = format!("auth [success=1 default=ignore] pam_foo.so\n{wired}");
+        std::fs::write(&etc, &jumped).unwrap();
+        for apply in [false, true] {
+            let off = wire_service(&svc, false, apply, &wire_verify_service).unwrap();
+            assert_kept_unread(&off, &jumped, false);
+        }
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), jumped);
+        // Nothing of irlume's to take out: not wired, nothing written.
+        std::fs::write(&etc, &bare).unwrap();
+        let off = wire_service(&svc, false, true, &wire_verify_service).unwrap();
+        assert_eq!(off.change, PlannedChange::NotWired, "{off}");
+        assert!(!off.unmet, "{off}");
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), bare);
+        // The backup is the file without irlume's lines: it goes back.
+        std::fs::write(&etc, &wired).unwrap();
+        std::fs::write(&bak, &bare).unwrap();
+        let off = wire_service(&svc, false, true, &wire_verify_service).unwrap();
+        assert_eq!(off.change, PlannedChange::RestoreBackup, "{off}");
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), bare);
+        assert!(!bak.exists());
+    }
+
+    /// libpam reads the carriage return of a CRLF ending as part of the
+    /// line: `pam_warn.so\r` names a module it cannot load, and a Debian
+    /// `@include common-auth\r` a file it does not find. Writing such a stack
+    /// with LF endings would change which lines PAM runs, so an enable keeps
+    /// it as it is and names the line, and a disable takes irlume's lines out
+    /// and keeps every other byte, carriage returns included. A backup goes
+    /// back only when it is the file without irlume's lines byte for byte.
+    #[test]
+    fn an_in_place_stack_with_crlf_endings_is_kept() {
+        let dir = TestDir::new("crlf-in-place");
+        let etc = dir.0.join("sudo");
+        let bak = dir.0.join(format!("sudo{BACKUP}"));
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let lf = format!("{DEBIAN_SUDO}auth optional pam_warn.so\n");
+        let (wired_lf, changed) = wire_verify_service(&lf);
+        assert!(changed);
+        let bare = lf.replace('\n', "\r\n");
+        let wired = wired_lf.replace('\n', "\r\n");
+        let kept = |outcome: &WireOutcome| {
+            assert_eq!(
+                outcome.change,
+                PlannedChange::KeepEditedOverride,
+                "{outcome}"
+            );
+            assert!(outcome.unmet, "{outcome}");
+            assert!(outcome.message.contains("a CRLF line ending"), "{outcome}");
+        };
+        for current in [&bare, &wired] {
+            std::fs::write(&etc, current).unwrap();
+            for apply in [false, true] {
+                kept(&wire_service(&svc, true, apply, &wire_verify_service).unwrap());
+            }
+            assert_eq!(&std::fs::read_to_string(&etc).unwrap(), current);
+            assert!(!bak.exists());
+        }
+        // An LF backup of the file without irlume's lines stays where it is,
+        // and irlume's lines come out with every other byte kept.
+        std::fs::write(&etc, &wired).unwrap();
+        std::fs::write(&bak, &lf).unwrap();
+        for apply in [false, true] {
+            let off = wire_service(&svc, false, apply, &wire_verify_service).unwrap();
+            assert_eq!(off.change, PlannedChange::StripInPlace, "{off}");
+            assert!(off.message.contains("a CRLF line ending"), "{off}");
+            let expect = if apply { &bare } else { &wired };
+            assert_eq!(&std::fs::read_to_string(&etc).unwrap(), expect);
+        }
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), lf);
+        // The same file with CRLF endings goes back.
+        std::fs::write(&etc, &wired).unwrap();
+        std::fs::write(&bak, &bare).unwrap();
+        let off = wire_service(&svc, false, true, &wire_verify_service).unwrap();
+        assert_eq!(off.change, PlannedChange::RestoreBackup, "{off}");
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), bare);
+        assert!(!bak.exists());
+    }
+
+    /// A machine-API enable of such a stack fails its surface as kept, with
+    /// nothing written, as for a continued line.
+    #[test]
+    fn a_stack_irlume_does_not_read_as_pam_does_fails_its_surface_in_a_machine_apply() {
+        let dir = TestDir::new("unread-apply");
+        let current = unread_above_include(DEBIAN_SUDO);
+        let etc = dir.0.join("sudo");
+        std::fs::write(&etc, &current).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let planned = [plan_surface(
+            &svc,
+            ROLE_SUDO,
+            &wire_verify_service,
+            true,
+            false,
+        )];
+        assert_eq!(planned[0].change, PlannedChange::KeepEditedOverride);
+        assert!(planned[0].kept);
+        let applied = apply_surface(&svc, ROLE_SUDO, &wire_verify_service, true, false, &planned);
+        let error = applied.error.clone().expect("the surface fails");
+        assert!(error.contains("irlume does not read line"), "{error}");
+        assert!(applied.kept);
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), current);
+    }
+
+    /// No recipe wires a stack with a line irlume does not read as PAM does,
+    /// and the keyring hand-off report stays silent on one, as for a
+    /// continued line: every conclusion would rest on lines PAM does not
+    /// read as irlume does.
+    #[test]
+    fn no_recipe_wires_a_stack_irlume_does_not_read_as_pam_does() {
+        let with = |stack: &str| format!("{stack}{UNREAD_RULE}\n");
+        let greeter = with(UPSTREAM_FEDORA);
+        let sudo = with(DEBIAN_SUDO);
+        let fingerprint = with(UPSTREAM_GDM_FINGERPRINT);
+        for (label, (out, changed), before) in [
+            ("verify", wire_verify_service(&sudo), &sudo),
+            ("polkit", wire_polkit_service(&sudo), &sudo),
+            ("omarchy lock", wire_omarchy_lock(&sudo), &sudo),
+            ("lock", wire_lock(&greeter), &greeter),
+            (
+                "greeter",
+                wire_greeter_impl(&greeter, true, true, true),
+                &greeter,
+            ),
+            (
+                "fingerprint",
+                wire_fp_keyring(&fingerprint, "gdm-fingerprint"),
+                &fingerprint,
+            ),
+        ] {
+            assert!(!changed, "{label}");
+            assert_eq!(&out, before, "{label}");
+        }
+        let (wired, ok) = wire_greeter_impl(UPSTREAM_FEDORA, true, true, true);
+        assert!(ok);
+        assert!(keyring_handoff(&wired, "plasmalogin").is_some());
+        assert!(keyring_handoff(&with(&wired), "plasmalogin").is_none());
+    }
+
     // ---- keyring hand-off (KWallet / gnome-keyring) --------------------------
     // A greeter can be wired perfectly and still leave the wallet locked, which
     // reaches the user as "KWallet asks for its password even though face login
@@ -5997,7 +6369,10 @@ auth       optional      pam_gnome_keyring.so\n";
             Some(1),
             "substack beats a guess"
         );
-        let neither = ["auth required pam_env.so", "auth required pam_unix.so"];
+        let neither = [
+            "auth required pam_unix.so",
+            "-auth optional pam_gnome_keyring.so",
+        ];
         assert_eq!(
             find_auth_anchor(&neither),
             Some(0),
@@ -6005,6 +6380,311 @@ auth       optional      pam_gnome_keyring.so\n";
         );
         let none: [&str; 0] = [];
         assert_eq!(find_auth_anchor(&none), None);
+    }
+
+    /// A Debian greeter whose password include is a site's own copy
+    /// (`@include common-auth-local`) keeps the include layout, as it always
+    /// has: the face line right above the include, below `pam_nologin`, and
+    /// the keyring and `reseal` lines below it, after the password step, as
+    /// they are designed to be. The include is known by how its name starts,
+    /// not by the exact name.
+    #[test]
+    fn a_suffixed_debian_password_include_keeps_the_include_layout() {
+        for include in [
+            "@include common-auth-local",
+            "@include common-authx",
+            "@include login-local",
+        ] {
+            let stock = format!(
+                "#%PAM-1.0\n\
+                 auth    requisite       pam_nologin.so\n\
+                 auth    required        pam_succeed_if.so user != root quiet_success\n\
+                 {include}\n\
+                 -auth   optional        pam_gnome_keyring.so\n\
+                 @include common-account\n\
+                 session optional        pam_keyinit.so force revoke\n\
+                 @include common-session-local\n\
+                 -session optional       pam_gnome_keyring.so auto_start\n"
+            );
+            for (face, keyring) in [(true, true), (false, true), (true, false)] {
+                let (wired, changed) = wire_greeter_impl(&stock, face, keyring, true);
+                assert!(changed, "{include}");
+                let lines: Vec<&str> = wired.lines().collect();
+                let at = |pred: &dyn Fn(&str) -> bool| lines.iter().position(|l| pred(l));
+                let nologin = at(&|l| l.contains("pam_nologin.so")).unwrap();
+                let inc = at(&|l| l == include).unwrap();
+                assert!(!wired.contains("pam_permit.so"), "{wired}");
+                assert!(!wired.contains("success=1"), "{wired}");
+                if face {
+                    let face_at = at(&|l| irlume_rule_has_arg(l, "unseal")).unwrap();
+                    assert_eq!(face_at + 1, inc, "{wired}");
+                    assert!(nologin < face_at, "{wired}");
+                    assert!(lines[face_at].contains("sufficient"), "{wired}");
+                }
+                let keyring_at = at(&|l| irlume_rule_has_arg(l, "keyring"));
+                assert_eq!(keyring_at.is_some(), keyring, "{wired}");
+                assert!(keyring_at.is_none_or(|k| k > inc), "{wired}");
+                let reseal = at(&|l| l == RESEAL_AUTH).unwrap();
+                assert!(reseal > inc, "{wired}");
+                // The session `reseal` follows the session include.
+                let session_inc = at(&|l| l == "@include common-session-local").unwrap();
+                assert_eq!(lines[session_inc + 1], RESEAL_SESSION, "{wired}");
+            }
+        }
+    }
+
+    /// A reader of the stacks `stacks` names, for a test: no file is read.
+    fn stacks_of(stacks: &[(&str, &str)]) -> StackReader {
+        let stacks: Vec<(String, String)> = stacks
+            .iter()
+            .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
+            .collect();
+        std::rc::Rc::new(move |name: &str| {
+            stacks
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, text)| text.clone())
+        })
+    }
+
+    /// Stacks a first auth `include` names on real systems, as their
+    /// packages installed them on 2026-09-28: openSUSE Tumbleweed's
+    /// `/usr/lib/pam.d/xdm` (package xdm, which its lightdm includes), Arch's
+    /// `/etc/pam.d/login` (util-linux, which ly and cinnamon-screensaver
+    /// include) and `system-local-login` (pambase), and Alpine's
+    /// `/usr/lib/pam.d/base-auth` (linux-pam, which its lightdm includes).
+    const OPENSUSE_XDM: &str = "#%PAM-1.0\nauth     substack       common-auth\n\
+         auth     include        postlogin-auth\naccount  substack       common-account\n\
+         account  include        postlogin-account\npassword substack       common-password\n\
+         password include        postlogin-password\nsession  required       pam_loginuid.so\n\
+         session  substack       common-session\nsession  include        postlogin-session\n\
+         session  optional       pam_keyinit.so revoke force\n";
+    const ARCH_LOGIN: &str = "#%PAM-1.0\n\nauth       requisite    pam_nologin.so\n\
+         auth       include      system-local-login\naccount    include      system-local-login\n\
+         session    include      system-local-login\npassword   include      system-local-login\n";
+    const ARCH_SYSTEM_LOCAL_LOGIN: &str = "#%PAM-1.0\n\nauth      include   system-login\n\
+         account   include   system-login\npassword  include   system-login\n\
+         session   include   system-login\n";
+    const ALPINE_BASE_AUTH: &str = "# basic PAM configuration for Alpine.\n\n\
+         auth required pam_unix.so nullok\nauth required pam_nologin.so\n\
+         auth required pam_env.so\n\n-auth optional pam_gnome_keyring.so\n\
+         -auth optional pam_kwallet5.so\n";
+
+    /// The stacks the reviewer's layouts include: a password line whose
+    /// failure the stack ignores, and a fingerprint line alone.
+    const MY_SUFF: &str = "auth sufficient pam_unix.so\n";
+    const MY_FP: &str = "auth sufficient pam_fprintd.so\n";
+
+    /// irlume's permit landing, keyring and `reseal` lines are designed to
+    /// follow the password step and a line whose failure fails the stack, so
+    /// the first-auth-line guess, which puts them right below that line, is
+    /// taken only where that line is such a step (a password module with a
+    /// control that fails the stack) or an `include` of a stack that runs one,
+    /// and where no auth line below it can check a password.
+    #[test]
+    fn the_first_auth_line_guess_is_refused_above_a_password_step() {
+        for lines in [
+            &["auth required pam_env.so", "auth required pam_unix.so"][..],
+            &[
+                "auth [success=done ignore=ignore default=bad] pam_selinux_permit.so",
+                "auth include my-auth",
+            ],
+            &[
+                "auth [success=done ignore=ignore default=bad] pam_selinux_permit.so",
+                "auth sufficient pam_unix.so nullok",
+                "auth required pam_deny.so",
+            ],
+            &[
+                "auth requisite pam_nologin.so",
+                "@include my-auth",
+                "@include common-account",
+            ],
+            &["auth requisite pam_nologin.so", "auth required pam_sss.so"],
+            &["auth sufficient pam_unix.so nullok"],
+            &["auth optional pam_unix.so"],
+            &["auth [success=ok default=ignore] pam_unix.so"],
+            &[
+                "auth [success=1 default=bad] pam_unix.so",
+                "auth required pam_permit.so",
+            ],
+            &["auth [success=ok user_unknown=ignore default=bad] pam_unix.so"],
+            &["auth"],
+            // A first line that checks no password.
+            &["auth required pam_env.so"],
+            &[
+                "auth requisite pam_nologin.so",
+                "auth optional pam_gnome_keyring.so",
+            ],
+            &["auth required pam_faildelay.so delay=2000000"],
+            &["auth required pam_sss.so ignore_unknown_user"],
+            // An include of a stack irlume cannot read.
+            &["auth include xdm", "account include xdm"],
+        ] {
+            assert_eq!(find_auth_anchor(lines), None, "{lines:?}");
+            let text = format!("{}\n", lines.join("\n"));
+            for (face, keyring) in [(true, true), (false, true), (true, false)] {
+                assert_eq!(
+                    wire_greeter_impl(&text, face, keyring, true),
+                    (text.clone(), false),
+                    "{lines:?}"
+                );
+            }
+            assert_eq!(wire_lock(&text), (text.clone(), false), "{lines:?}");
+        }
+        for lines in [
+            &["auth required pam_unix.so"][..],
+            &[
+                "auth requisite pam_unix.so",
+                "auth optional pam_gnome_keyring.so",
+            ],
+            &[
+                "auth [success=ok new_authtok_reqd=ok ignore=ignore default=bad] pam_unix.so",
+                "auth required pam_deny.so",
+            ],
+            &[
+                "auth required pam_unix.so",
+                "@include common-account",
+                "@include common-session",
+                "account required pam_unix.so",
+                "session optional pam_foo.so",
+            ],
+            &["auth required pam_sss.so forward_pass"],
+            &["auth required /usr/lib64/security/pam_unix2.so"],
+        ] {
+            assert_eq!(find_auth_anchor(lines), Some(0), "{lines:?}");
+        }
+        // openSUSE's `auth include xdm`: its stack runs the password
+        // substack, read where libpam finds it.
+        let xdm = ["auth include xdm", "account include xdm"];
+        let found = with_stack_reader(stacks_of(&[("xdm", OPENSUSE_XDM)]), || {
+            find_auth_anchor(&xdm)
+        });
+        assert_eq!(found, Some(0));
+    }
+
+    /// The reviewer's layouts (i01, i02, i04, i05, i06, i07, i10, i11, u01):
+    /// a first auth line that checks no password, or an include of a stack
+    /// whose password line fails nothing or that runs a fingerprint line
+    /// alone. No recipe wires them, with every stack they name readable or
+    /// none.
+    #[test]
+    fn a_first_auth_line_that_decides_nothing_is_no_anchor() {
+        let layouts = [
+            "auth include my-suff\naccount include system-auth\nsession include system-auth\n",
+            "auth include my-suff\n-auth optional pam_gnome_keyring.so\n\
+             -auth optional pam_kwallet5.so\naccount include system-auth\n\
+             session include system-auth\n",
+            "auth include my-fp\naccount include system-auth\nsession include system-auth\n",
+            "@include my-suff\nauth requisite pam_nologin.so\n@include common-account\n\
+             @include common-session\n",
+            "@include my-suff\nauth required pam_env.so\n@include common-account\n\
+             @include common-session\n",
+            "@include my-fp\nauth required pam_env.so\n-auth optional pam_gnome_keyring.so\n\
+             @include common-account\n@include common-session\n",
+            "auth requisite pam_nologin.so\naccount include system-auth\n\
+             session include system-auth\n",
+            "auth required pam_env.so\nauth required pam_faildelay.so delay=2000000\n\
+             account include system-auth\nsession include system-auth\n",
+            "AUTH requisite pam_nologin.so\nauth required pam_env.so\n\
+             -auth optional pam_gnome_keyring.so\naccount include system-auth\n\
+             session include system-auth\n",
+        ];
+        let readable = stacks_of(&[("my-suff", MY_SUFF), ("my-fp", MY_FP)]);
+        for text in layouts {
+            for reader in [None, Some(readable.clone())] {
+                let wire = |text: &str| {
+                    let (face, keyring, face_only, lock) = (
+                        wire_greeter_impl(text, true, true, true),
+                        wire_greeter_impl(text, false, true, false),
+                        wire_greeter_impl(text, true, false, true),
+                        wire_lock(text),
+                    );
+                    [face, keyring, face_only, lock]
+                };
+                let outs = match reader {
+                    Some(reader) => with_stack_reader(reader, || wire(text)),
+                    None => wire(text),
+                };
+                for out in outs {
+                    assert_eq!(out, (text.to_string(), false), "{text}");
+                }
+            }
+        }
+    }
+
+    /// Real layouts whose first auth line includes a stack that runs the
+    /// password step: ly and cinnamon-screensaver on Arch (`auth include
+    /// login`, which includes `system-local-login` below `pam_nologin.so`),
+    /// LightDM on Alpine (`auth include base-auth`, `pam_unix.so` first) and
+    /// on openSUSE (`auth include xdm`). Each is wired next to the include,
+    /// as before, once the stack it names can be read; an include of a stack
+    /// that includes itself, or one too deep, is not.
+    #[test]
+    fn a_first_auth_include_of_a_stack_that_decides_is_the_anchor() {
+        let stacks = stacks_of(&[
+            ("login", ARCH_LOGIN),
+            ("system-local-login", ARCH_SYSTEM_LOCAL_LOGIN),
+            ("base-auth", ALPINE_BASE_AUTH),
+            ("xdm", OPENSUSE_XDM),
+            ("loop", "auth include loop\n"),
+            ("a", "auth include b\n"),
+            ("b", "auth include c\n"),
+            ("c", "auth include d\n"),
+            ("d", "auth required pam_unix.so\n"),
+            ("e", "auth include a\n"),
+        ]);
+        let ly = "#%PAM-1.0\n\nauth       include      login\n\
+                  -auth      optional     pam_gnome_keyring.so\n\
+                  -auth      optional     pam_kwallet5.so\n\naccount    include      login\n\n\
+                  password   include      login\n\
+                  -password  optional     pam_gnome_keyring.so use_authtok\n\n\
+                  -session   optional     pam_systemd.so       class=greeter\n\
+                  -session   optional     pam_elogind.so\nsession    include      login\n\
+                  -session   optional     pam_gnome_keyring.so auto_start\n\
+                  -session   optional     pam_kwallet5.so      auto_start\n";
+        let alpine = "auth       include      base-auth\n\
+                      -auth      optional     pam_gnome_keyring.so\n\
+                      account    include      base-account\n\
+                      password   include      base-password\n\
+                      session    include      base-session\n\
+                      -session   optional     pam_gnome_keyring.so auto_start\n";
+        let cinnamon = "#%PAM-1.0\nauth include login\n";
+        let suse = fixture("opensuse", "lightdm");
+        for (text, include) in [
+            (ly, "auth       include      login"),
+            (alpine, "auth       include      base-auth"),
+            (cinnamon, "auth include login"),
+            (suse.as_str(), "auth\t include\txdm"),
+            ("auth include d\n", "auth include d"),
+            ("auth include a\n", "auth include a"),
+        ] {
+            let lines: Vec<&str> = text.lines().collect();
+            let at = lines.iter().position(|l| *l == include).unwrap();
+            let (anchor, face, keyring, lock) = with_stack_reader(stacks.clone(), || {
+                (
+                    find_auth_anchor(&lines),
+                    wire_greeter_impl(text, true, true, true),
+                    wire_greeter_impl(text, false, true, false),
+                    wire_lock(text),
+                )
+            });
+            assert_eq!(anchor, Some(at), "{text}");
+            let wired = face.0.lines().collect::<Vec<_>>();
+            assert!(face.1 && keyring.1 && lock.1, "{text}");
+            assert_eq!(wired[at], GREETER_UNSEAL_COSMIC_JUMP, "{}", face.0);
+            assert_eq!(wired[at + 1], include, "{}", face.0);
+            assert_eq!(wired[at + 2], PERMIT_LANDING, "{}", face.0);
+            assert_eq!(wired[at + 3], KEYRING_UNSEAL, "{}", face.0);
+            assert_eq!(wired[at + 4], RESEAL_AUTH, "{}", face.0);
+            // Without the stack it names, the same file is no anchor.
+            assert_eq!(find_auth_anchor(&lines), None, "{text}");
+            assert!(!wire_greeter_impl(text, true, true, true).1, "{text}");
+        }
+        for text in ["auth include loop\n", "auth include e\n"] {
+            let lines: Vec<&str> = text.lines().collect();
+            let anchor = with_stack_reader(stacks.clone(), || find_auth_anchor(&lines));
+            assert_eq!(anchor, None, "{text}");
+        }
     }
 
     #[test]
@@ -6601,6 +7281,85 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
         assert!(!has_line_continuation(
             "auth optional pam_unix.so arg\\more\n"
         ));
+        // libpam skips only spaces, tabs and the newline back from the end
+        // of a line, and looks for a `#` only up to a NUL byte: a backslash
+        // before a carriage return or another blank does not continue, and
+        // one before a comment is no line end either.
+        let crlf = "auth optional pam_exec.so run.sh A \\\r\nauth optional pam_foo.so\r\n";
+        assert!(!has_line_continuation(crlf));
+        let named = unreadable_line(crlf).unwrap();
+        assert_eq!((named.number, named.why), (1, Unread::CrlfEnding));
+        assert!(named.why.describe().contains("a carriage return"));
+        let nbsp = "auth optional pam_exec.so run.sh A \\\u{a0}\n";
+        assert!(!has_line_continuation(nbsp));
+        assert_eq!(
+            unreadable_line(nbsp).map(|l| l.why),
+            Some(Unread::Blank('\u{a0}'))
+        );
+        assert!(!has_line_continuation(
+            "auth optional pam_exec.so run.sh A \\ # note\n"
+        ));
+        assert!(has_line_continuation(
+            "auth optional pam_exec.so run.sh A\0 # note \\\n"
+        ));
+    }
+
+    /// A login screen whose face lines are kept out (`remote_seats`) is
+    /// unwired whole where its reseal-only recipe cannot land, so no face
+    /// line stays behind. One with a line irlume does not read as PAM does
+    /// is such a file: the unwire takes irlume's lines out, face lines
+    /// included, and keeps every other byte, carriage returns too. With a
+    /// numeric jump above irlume's lines, it keeps the file and names the
+    /// line.
+    #[test]
+    fn a_remote_seat_greeter_with_an_unread_line_loses_irlume_lines_on_the_unwire() {
+        let wired = "auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so\n\
+                     auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+                     auth        substack      password-auth\n\
+                     auth       optional                     pam_permit.so   # irlume-landing\n\
+                     auth       optional                     pam_irlume.so keyring\n\
+                     auth       optional                     pam_irlume.so reseal\n\
+                     -auth        optional      pam_gnome_keyring.so\n\
+                     account     include       password-auth\n\
+                     session     include       password-auth\n\
+                     session    optional                     pam_irlume.so reseal\n";
+        let typo = wired.replacen(
+            "pam_selinux_permit.so\n",
+            "pam_selinux_permit.so\nauht optional pam_foo.so\n",
+            1,
+        );
+        let crlf = wired.replace('\n', "\r\n");
+        let reseal_only = |c: &str| wire_greeter_impl(c, false, false, true);
+        for text in [&typo, &crlf] {
+            let dir = TestDir::new("remote-unread");
+            let etc = dir.0.join("lightdm");
+            std::fs::write(&etc, text).unwrap();
+            let svc = Svc {
+                etc: leak(&etc),
+                vendor: None,
+            };
+            assert!(carries_face_lines(svc.etc));
+            assert!(!greeter_want(&svc, true, true, &reseal_only), "{text}");
+            let off = wire_service(&svc, false, true, &reseal_only).unwrap();
+            assert_eq!(off.change, PlannedChange::StripInPlace, "{off}");
+            assert!(!off.unmet, "{off}");
+            let after = std::fs::read_to_string(&etc).unwrap();
+            assert_eq!(after, without_irlume_lines(text));
+            assert!(!carries_face_lines(svc.etc), "{after}");
+            assert!(!after.lines().any(is_irlume_line), "{after}");
+            assert_eq!(after.lines().count() + 5, text.lines().count(), "{after}");
+            assert_eq!(
+                after.split('\n').all(|l| l.is_empty() || l.ends_with('\r')),
+                text == &crlf
+            );
+            // A jump above irlume's lines could count them: kept.
+            let jumped = format!("auth [success=2 default=ignore] pam_foo.so\n{text}");
+            std::fs::write(&etc, &jumped).unwrap();
+            let off = wire_service(&svc, false, true, &reseal_only).unwrap();
+            assert_eq!(off.change, PlannedChange::KeepEditedOverride, "{off}");
+            assert!(off.unmet, "{off}");
+            assert_eq!(std::fs::read_to_string(&etc).unwrap(), jumped);
+        }
     }
 
     #[test]
@@ -6649,6 +7408,382 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
         ] {
             assert!(!has_line_continuation(body), "{name}");
         }
+    }
+
+    /// Every upstream stack irlume pins is one irlume reads line by line as
+    /// libpam does, so the refusal of [`unreadable_line`] changes nothing on
+    /// them; every vendor fixture too.
+    #[test]
+    fn no_upstream_stack_has_a_line_irlume_does_not_read_as_pam_does() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pam");
+        let mut stacks: Vec<(String, String)> = [
+            ("plasmalogin fedora", UPSTREAM_FEDORA),
+            ("plasmalogin arch", UPSTREAM_ARCH),
+            ("plasmalogin debian", UPSTREAM_DEBIAN),
+            ("plasmalogin suse", UPSTREAM_SUSE),
+            ("gdm redhat", UPSTREAM_GDM_REDHAT),
+            ("gdm arch", UPSTREAM_GDM_ARCH),
+            ("gdm renamed", UPSTREAM_GDM_RENAMED_SUBSTACK),
+            ("gdm fingerprint", UPSTREAM_GDM_FINGERPRINT),
+        ]
+        .iter()
+        .map(|(name, body)| ((*name).to_string(), (*body).to_string()))
+        .collect();
+        for distro in std::fs::read_dir(&root).unwrap() {
+            for file in std::fs::read_dir(distro.unwrap().path()).unwrap() {
+                let path = file.unwrap().path();
+                let body = std::fs::read_to_string(&path).unwrap();
+                // Two captures (debian/login, fedora/postlogin) end in the
+                // capture tool's own listing, from a `=====` line on, which
+                // is not PAM text: only what comes before it is checked.
+                let pam = body.split("\n=====").next().unwrap_or_default();
+                stacks.push((path.display().to_string(), format!("{pam}\n")));
+            }
+        }
+        assert!(stacks.len() > 8, "the fixtures are found");
+        for (name, body) in &stacks {
+            assert_eq!(unreadable_line(body), None, "{name}");
+            for (label, (out, changed)) in [
+                ("verify", wire_verify_service(body)),
+                ("greeter", wire_greeter_impl(body, true, true, true)),
+            ] {
+                if changed {
+                    assert_eq!(unreadable_line(&out), None, "{name} {label}\n{out}");
+                }
+            }
+        }
+    }
+
+    /// The jumps of a control are the ones libpam's `_pam_parse_control`
+    /// reads (linux-pam `libpam/pam_misc.c`): blanks before and after each
+    /// `=`, no blank needed after an action or a jump, a later pair for the
+    /// same value replacing an earlier one and `default` setting only the
+    /// values no pair before it set. A control libpam rejects has no jump at
+    /// all, every value being `bad`.
+    #[test]
+    fn a_control_is_parsed_as_libpam_parses_it() {
+        let jumps = |control: &str| -> Vec<(String, usize)> {
+            let line = format!("auth {control} pam_fprintd.so");
+            let h = head(&line).expect("a head");
+            numeric_actions(&h)
+        };
+        let one = |value: &str, n: usize| vec![(value.to_string(), n)];
+        for (control, want) in [
+            ("[success=1 default=ignore]", one("success", 1)),
+            ("[success = 1 default=ignore]", one("success", 1)),
+            ("[success =1 default = ignore]", one("success", 1)),
+            ("[success=\t1 default=ignore]", one("success", 1)),
+            ("[  success=1  ]", one("success", 1)),
+            ("[success=1\u{b}default=ignore]", one("success", 1)),
+            ("[success=1default=ignore]", one("success", 1)),
+            ("[success=okdefault=2]", one("default", 2)),
+            ("success=2", one("success", 2)),
+            ("[default=1 success=ok]", one("default", 1)),
+            ("[default=ignore success=1]", one("success", 1)),
+            ("[success=01 default=ignore]", one("success", 1)),
+            ("[default=1 default=2]", one("default", 1)),
+            ("[success=2147483647]", one("success", 2_147_483_647)),
+            (
+                "[success=1 new_authtok_reqd=2 default=ignore]",
+                vec![
+                    ("success".to_string(), 1),
+                    ("new_authtok_reqd".to_string(), 2),
+                ],
+            ),
+            (
+                "[authtok_expired=3 auth_err=4]",
+                vec![
+                    ("authtok_expired".to_string(), 3),
+                    ("auth_err".to_string(), 4),
+                ],
+            ),
+            // A later pair for the same value wins.
+            ("[success=1 success=ok default=ignore]", vec![]),
+            ("[success=ok success=3]", one("success", 3)),
+            // Rejected by libpam: every value `bad`, no jump.
+            ("[Success=1 default=ignore]", vec![]),
+            ("[success=+1 default=ignore]", vec![]),
+            ("[success=0 default=1]", vec![]),
+            ("[success=2147483648 default=1]", vec![]),
+            ("[success=1 default=ignore bogus=1]", vec![]),
+            ("[success=1 default]", vec![]),
+            ("[success=1 default=]", vec![]),
+            ("[success 1]", vec![]),
+            ("[success=1x default=2]", vec![]),
+            ("[success=1\\] default=2]", vec![]),
+            ("[success=1\u{a0}default=2]", vec![]),
+            ("[success=1 pam_irlume.so default=2]", vec![]),
+            // Keywords, read case-insensitively after the brackets come off.
+            ("required", vec![]),
+            ("[SUFFICIENT]", vec![]),
+            ("Include", vec![]),
+            ("[]", vec![]),
+        ] {
+            assert_eq!(jumps(control), want, "{control:?}");
+        }
+        // A line with no control is in its chain with every value `bad`.
+        let lone = head("auth").expect("a head");
+        assert_eq!((lone.phase, lone.control), ("auth", ""));
+        assert!(numeric_actions(&lone).is_empty());
+    }
+
+    /// A line libpam installs in a chain counts there, whatever irlume's
+    /// other tests make of it: a type libpam does not know puts the line in
+    /// the auth chain, and a line with a type but no control is in its
+    /// type's chain. Neither loads a module.
+    #[test]
+    fn every_line_libpam_installs_has_a_head() {
+        for (line, phase) in [
+            ("auht optional pam_foo.so", "auth"),
+            ("sessoin [success=1 default=ignore] pam_foo.so", "auth"),
+            ("\u{b}auth optional pam_foo.so", "auth"),
+            ("\u{feff}auth optional pam_foo.so", "auth"),
+            ("-[auth] optional pam_foo.so", "auth"),
+            ("[] optional pam_foo.so", "auth"),
+            ("-", "auth"),
+            ("auth", "auth"),
+            ("  -session", "session"),
+            ("ACCOUNT [ ]", "account"),
+            ("[-password] required pam_foo.so", "password"),
+        ] {
+            let h = head(line).unwrap_or_else(|| panic!("{line:?}"));
+            assert_eq!(h.phase, phase, "{line:?}");
+        }
+        for line in [
+            "auht optional pam_foo.so",
+            "\u{b}auth optional pam_foo.so",
+            "-[auth] optional pam_foo.so",
+            "auth",
+            "auth [success=1 default=ignore]",
+        ] {
+            assert!(rule(line).is_none(), "{line:?}");
+        }
+        assert!(rule("[-auth] optional pam_foo.so").is_some());
+        for line in [
+            "",
+            "   ",
+            "# auth optional x",
+            "@include common-auth",
+            "@INCLUDE x",
+        ] {
+            assert!(head(line).is_none(), "{line:?}");
+        }
+    }
+
+    /// Debian's `@include` is a type field (its patch `031_pam_include`
+    /// compares the type with `strcasecmp` after taking off the `-`), so it
+    /// is read case-insensitively and must stand alone as a field; the file
+    /// it names is the whole next field.
+    #[test]
+    fn a_debian_include_is_read_from_the_type_field() {
+        for line in [
+            "@include common-auth",
+            "@INCLUDE common-auth",
+            "-@include common-auth",
+            "[@include] common-auth",
+            " \t@include\tcommon-auth",
+            "@include   common-auth   # note",
+        ] {
+            assert!(is_at_include(line), "{line:?}");
+            assert!(is_include_auth_layout(line), "{line:?}");
+        }
+        // The file an `@include` names counts by its start, as it always
+        // has: a site's own copy of the password stack is the password step
+        // too, so irlume's keyring line never goes above it.
+        for line in [
+            "@include common-auth-local",
+            "@include common-authx",
+            "@include login-local",
+            "@include logind",
+        ] {
+            assert!(is_include_auth_layout(line), "{line:?}");
+            assert!(is_password_step(line), "{line:?}");
+        }
+        for line in [
+            "@includecommon-auth",
+            "# @include common-auth",
+            "auth include common-auth-extra",
+            "@include my-auth",
+            "@include common-account",
+        ] {
+            assert!(!is_include_auth_layout(line), "{line:?}");
+        }
+        assert!(is_session_include("@include common-session"));
+        assert!(is_session_include(
+            "@include   common-session-noninteractive"
+        ));
+        assert!(!is_session_include("@include common-account"));
+        assert!(!is_at_include("@includecommon-auth"));
+        assert_eq!(at_include_target("@include   login"), Some("login"));
+        assert_eq!(at_include_target("@include"), None);
+    }
+
+    /// The anchors irlume wires next to are read with libpam's field syntax:
+    /// the type and the `include`/`substack` keyword case-insensitively and
+    /// without brackets, and the stack as the third field, not any word of
+    /// the line.
+    #[test]
+    fn anchor_lines_are_read_as_libpam_reads_them() {
+        for line in [
+            "auth substack password-auth",
+            "AUTH SUBSTACK password-auth",
+            "-auth [substack] password-auth",
+            "[auth] include system-auth",
+        ] {
+            assert!(is_passwd_substack(line, "auth"), "{line}");
+            assert!(is_password_step(line), "{line}");
+        }
+        for line in [
+            "auth required pam_exec.so substack password-auth",
+            "auth [success=1 default=ignore] pam_x.so include system-auth",
+            "session substack password-auth",
+            "auth substack password-auth-extra",
+        ] {
+            assert!(!is_passwd_substack(line, "auth"), "{line}");
+        }
+        assert!(is_passwd_substack(
+            "Session Include password-auth",
+            "session"
+        ));
+        assert!(is_auth_substack_anchor(
+            "auth [SUBSTACK] gdm-password-auth-substack"
+        ));
+        assert!(!is_auth_substack_anchor(
+            "auth required pam_exec.so substack"
+        ));
+        assert!(is_auth_directive("[auth] required pam_unix.so"));
+        assert!(is_auth_directive("-AUTH optional pam_foo.so"));
+        assert!(is_auth_directive("auth"));
+        assert!(!is_auth_directive("auht required pam_unix.so"));
+        assert!(!is_auth_directive("\u{a0}auth required pam_unix.so"));
+        assert!(!is_auth_directive("@include common-auth"));
+        assert!(is_include_auth_layout("auth INCLUDE system-auth"));
+        assert!(is_include_auth_layout("-auth include system-login"));
+        assert!(!is_include_auth_layout("auth include system-auth-extra"));
+        assert!(is_fingerprint_auth("AUTH [substack] fingerprint-auth"));
+        assert!(is_fingerprint_auth(
+            "auth sufficient /usr/lib64/security/pam_fprintd.so"
+        ));
+        assert!(!is_fingerprint_auth(
+            "auth optional pam_exec.so include /usr/bin/fingerprint-check"
+        ));
+        assert!(!is_fingerprint_auth("session optional pam_fprintd.so"));
+        assert!(is_session_directive("-SESSION optional pam_kwallet5.so"));
+        assert!(!is_session_directive("auth optional pam_kwallet5.so"));
+    }
+
+    /// The lines irlume does not read as libpam does, each named with its
+    /// line number and why; everything else is read as libpam reads it.
+    #[test]
+    fn a_line_irlume_does_not_read_as_pam_does_is_named() {
+        let stack = |line: &str| {
+            format!("#%PAM-1.0\nauth [success=1 default=ignore] pam_x.so\n{line}\nauth substack password-auth\n")
+        };
+        for (line, why) in [
+            (
+                "auht optional pam_foo.so",
+                Unread::UnknownType { names_stack: false },
+            ),
+            (
+                "auht include password-auth",
+                Unread::UnknownType { names_stack: true },
+            ),
+            (
+                "auht substack password-auth",
+                Unread::UnknownType { names_stack: true },
+            ),
+            ("\u{a0}auth optional pam_foo.so", Unread::Blank('\u{a0}')),
+            ("\u{b}session optional pam_foo.so", Unread::Blank('\u{b}')),
+            ("\u{c}auth optional pam_foo.so", Unread::Blank('\u{c}')),
+            ("auth\u{b}optional pam_foo.so", Unread::Blank('\u{b}')),
+            ("auth optional\rpam_foo.so", Unread::Blank('\r')),
+            (
+                "auth [success=1\u{2003}default=2] pam_foo.so",
+                Unread::Blank('\u{2003}'),
+            ),
+            (
+                "\u{feff}auth optional pam_foo.so",
+                Unread::UnknownType { names_stack: false },
+            ),
+            (
+                "-[auth] optional pam_foo.so",
+                Unread::UnknownType { names_stack: false },
+            ),
+            (
+                "sufficient pam_irlume.so",
+                Unread::UnknownType { names_stack: false },
+            ),
+            ("auth optional pam_foo.so\0 # x", Unread::Nul),
+            ("# a comment \0", Unread::Nul),
+            ("@include", Unread::IncludeWithoutFile),
+            ("auth substack", Unread::SubstackWithoutStack),
+            ("auth optional .so", Unread::NoModuleName),
+            ("auth optional /usr/lib64/security/", Unread::NoModuleName),
+            ("auth optional ?.so", Unread::NoModuleName),
+            ("auth substack .d", Unread::NoModuleName),
+        ] {
+            let text = stack(line);
+            let found = unreadable_line(&text).unwrap_or_else(|| panic!("{line:?}"));
+            assert_eq!(
+                (found.number, found.text, found.why),
+                (3, line, why),
+                "{line:?}"
+            );
+        }
+        for line in [
+            "auth optional pam_foo.so",
+            "AUTH [SUFFICIENT] [pam_foo.so]",
+            "[-auth] optional pam_foo.so",
+            "auth",
+            "auth optional",
+            "auth [success = 1 default=ignore] pam_foo.so",
+            "auth include",
+            "auth include no-such-stack",
+            "@include common-auth",
+            "auth optional pam_foo.so # a comment with \u{a0} in it",
+            "auth optional pam_foo.so arg\u{1b}",
+            "  \t  ",
+            "",
+        ] {
+            assert_eq!(unreadable_line(&stack(line)), None, "{line:?}");
+        }
+        // libpam reads the carriage return of a CRLF ending as part of the
+        // line's last field, and a blank CRLF line as a line whose type is
+        // a carriage return: the first line PAM reads is named. One in a
+        // comment is not read.
+        for ending in ["\r\n", "\r\r\n"] {
+            let crlf = stack("auth optional pam_foo.so").replace('\n', ending);
+            let found = unreadable_line(&crlf).unwrap();
+            assert_eq!((found.number, found.why), (2, Unread::CrlfEnding));
+            assert!(found.text.ends_with('\r'), "{:?}", found.text);
+        }
+        let blank = "#%PAM-1.0\n\r\nauth required pam_unix.so\n";
+        assert_eq!(
+            unreadable_line(blank).map(|l| (l.number, l.why)),
+            Some((2, Unread::CrlfEnding))
+        );
+        let in_comments = "#%PAM-1.0\r\n# note\r\nauth required pam_unix.so # x\r\n";
+        assert_eq!(unreadable_line(in_comments), None);
+        assert!(!has_read_carriage_return(in_comments));
+        assert!(has_read_carriage_return(blank));
+        // A continued file is `has_line_continuation`'s to report.
+        let continued = stack("auth optional pam_foo.so \\\n  \u{b}arg");
+        assert!(has_line_continuation(&continued));
+        assert_eq!(unreadable_line(&continued), None);
+        // Shown with every character that would not print as itself escaped.
+        let text = stack("\u{b}auth\toptional\u{a0}pam_foo.so");
+        let found = unreadable_line(&text).unwrap();
+        assert_eq!(found.shown(), "\\u{b}auth\\u{9}optional\\u{a0}pam_foo.so");
+    }
+
+    /// Only spaces and tabs lead a line away from its type, as in libpam's
+    /// `_pam_str_trim`; any other blank stays, and libpam reads it as part
+    /// of the type.
+    #[test]
+    fn directive_skips_only_spaces_and_tabs() {
+        assert_eq!(directive(" \t auth required x # c"), "auth required x ");
+        assert_eq!(directive("\u{b}auth required x"), "\u{b}auth required x");
+        assert_eq!(directive("\u{a0}# c"), "\u{a0}");
     }
 
     #[test]
@@ -8045,7 +9180,12 @@ auth required pam_fprintd.so\n\
         for (distro, services) in dialects {
             for &service in services {
                 let stock = fixture(distro, service);
-                let (wired, changed) = wire_greeter_impl(&stock, true, true, false);
+                // openSUSE's lightdm includes xdm, which its own package
+                // ships (see `OPENSUSE_XDM`).
+                let (wired, changed) =
+                    with_stack_reader(stacks_of(&[("xdm", OPENSUSE_XDM)]), || {
+                        wire_greeter_impl(&stock, true, true, false)
+                    });
                 assert!(
                     changed,
                     "{distro}/{service}: the recipe refused to wire the real shipped file"

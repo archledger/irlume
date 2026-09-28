@@ -61,11 +61,48 @@ where a numeric jump in your lines lands (an `[success=2 default=ignore]` that
 counts irlume's lines), is not made: the file is kept as it is, `irlume login
 enable` says why and exits 1, and irlume's earlier lines stay in effect until
 you adjust your line or rebuild the file. A file with a line that ends in `\`
-is not changed at all (see `disable` below). When irlume's lines are not in
-such a file at all (after a disable, or taken out by hand), `irlume login
-enable` puts them next to the file's password line (the `include` or
-`substack` of the shared password stack) and below every line above it; when
-it cannot tell which line that is, it leaves the file unwired and says so.
+is not changed at all (see `disable` below), and neither is one with a line
+PAM reads differently from how irlume would: a type PAM does not know (a typo
+such as `auht`, or a line led by a no-break space, vertical tab or form feed,
+which PAM reads as part of the type; PAM counts such a line in the auth stack
+as one that always fails), a blank other than a space or a tab between
+fields, a carriage return outside a comment (a file saved with CRLF line
+endings: PAM reads it as part of the line), a NUL byte, an `@include`
+without a file, a `substack` without a stack, or a module path PAM takes no
+module name from. `irlume login enable` names the line and exits 1, and no
+override is made from a vendor file with such a line; correct it (save the
+file with LF line endings) and run the command again. Every other line is
+read as PAM reads it: `[success = 1 default=ignore]`, blanks around `=`
+included, is the same jump as `[success=1 default=ignore]`. When irlume's
+lines are not in such a file at all (after a disable, or taken out by hand),
+`irlume login enable` puts them next to the file's password line (the
+`include` or `substack` of the shared password stack) and below every line
+above it; when it cannot tell which line that is, it leaves the file unwired
+and says so.
+
+A login or lock screen stack that names no shared password stack irlume
+knows (no `substack`, no `include` of `system-auth`, `system-login`,
+`system-local-login` or `common-auth`, and no Debian `@include` of a file
+whose name starts with `common-auth` or `login`) is wired next to its first
+auth line only when that line is the password step, or an `include` of a
+stack that runs one. The password step is a `pam_unix.so`, `pam_unix2.so`
+or `pam_sss.so` rule (without pam_sss's `ignore_unknown_user` or
+`ignore_authinfo_unavail`) whose failure fails the stack: `required`,
+`requisite`, or a bracketed control with `bad` or `die` for every failure
+and no jump. irlume reads the included stack where PAM finds it
+(`/etc/pam.d`, then `/usr/lib/pam.d`), and the stacks it includes in turn,
+four deep at most; a line of it that names the shared password stack irlume
+knows counts as the step. A numeric jump or a `reset` before the step, or a
+stack irlume cannot read or does not read as PAM does, leaves the file
+unwired. Below the first auth line every auth line must be one of the
+modules that check no password (`pam_env.so`, `pam_nologin.so`,
+`pam_faillock.so`, `pam_succeed_if.so`, `pam_permit.so`, `pam_deny.so` and
+the like, or a keyring module), with no `include`, `substack` or other
+`@include` than `common-account`, `common-password`, `common-session` and
+`common-session-noninteractive`. Otherwise `irlume login enable` reports
+`no anchor to wire` for it and leaves it as it is: irlume's lines are
+designed to follow the password step and a line whose failure fails the
+stack.
 
 An override written by a release before this tracking gets the line at the
 first reconcile when it still matches its vendor copy. One that no longer
@@ -83,10 +120,13 @@ from the vendor's without the vendor file, so it moves none of its lines past
 any line; `irlume login enable` says so, and putting the vendor file back
 (reinstalling its package) lets it tell them apart again.
 
-PAM reads a carriage return as part of the line, so an override saved with
-CRLF line endings refuses every login through its service. `irlume doctor`
-reports it, and `sudo irlume login enable --apply` rewrites it with LF
-endings, keeping every line.
+PAM reads a carriage return as part of the line, so in a file saved with
+CRLF line endings a module or stack named last on a line is one PAM does not
+find, and a blank line is one that always fails. irlume adds nothing to such
+a file: `irlume doctor` reports an override with them, and `irlume login
+enable` names the first such line. Save the file with LF line endings and run
+it again. Carriage returns only in comments change nothing PAM reads, and
+irlume's next write drops them.
 
 ## Stop face everywhere
 
@@ -146,9 +186,15 @@ The disable also:
   with the next line into one rule, is left as it is, irlume's lines
   included: taking out one physical line of it can make the rule before it
   take in the next one, the password line included. `disable` says so and
-  exits 1; join those lines or take irlume's lines out by hand. An
-  override whose vendor copy is gone is kept the same way, since PAM has
-  nothing else for that service,
+  exits 1; join those lines or take irlume's lines out by hand. From a
+  file with a line irlume does not read as PAM does (see `enable` above),
+  `disable` takes irlume's lines out and keeps every other byte, carriage
+  returns included, when no numeric jump in the file could count irlume's
+  lines; otherwise it leaves the file as it is, names that line and exits
+  1. An override nobody edited is still deleted, and a backup that is the
+  file without irlume's lines still restored. An override whose vendor copy
+  is gone is kept the same way, since PAM has nothing else for that
+  service,
 - removes the SELinux module on Fedora (`semodule -r irlume`, checked: a
   failure is reported, not papered over),
 - clears the self-heal marker, so the reconcile unit stops re-wiring after

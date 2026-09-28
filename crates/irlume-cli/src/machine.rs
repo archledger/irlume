@@ -3827,12 +3827,41 @@ mod tests {
         }
     }
 
+    /// Run an immediate lock-release check in its own process. A parallel
+    /// test's fork inherits every open descriptor until exec, even CLOEXEC
+    /// ones, and can keep a dropped session locked. The env lock does not
+    /// exclude those forks. Only this exact test runs in the child, before
+    /// it opens any session descriptor.
+    fn in_isolated_session_process() -> bool {
+        const CHILD: &str = "IRLUME_TEST_SESSION_LOCK_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("a named test thread");
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .output()
+            .expect("run the isolated session test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "{name}: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
     /// The ordinary case: the lock is a 0600 file of the caller's in its
     /// runtime directory, a second session is busy while the first lives, and
     /// dropping the first releases the lock.
     #[test]
     fn session_lock_is_taken_in_a_private_runtime_directory_and_released_on_drop() {
         use std::os::unix::fs::MetadataExt;
+        if !in_isolated_session_process() {
+            return;
+        }
         let dir = runtime_sandbox("normal");
         let uid = own_uid();
         let first = acquired(SessionGuard::acquire_in(Some(&dir), uid, None));
@@ -3846,6 +3875,36 @@ mod tests {
         );
         drop(first);
         drop(acquired(SessionGuard::acquire_in(Some(&dir), uid, None)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A child retains forked descriptors only until exec: an executed
+    /// program still running must not keep the dropped session locked.
+    #[test]
+    fn session_lock_is_not_inherited_by_an_executed_child() {
+        use std::process::{Command, Stdio};
+        if !in_isolated_session_process() {
+            return;
+        }
+        let dir = runtime_sandbox("exec");
+        let uid = own_uid();
+        let session = acquired(SessionGuard::acquire_in(Some(&dir), uid, None));
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("exec cat");
+        // spawn returns after exec. Keep cat waiting for input while checking
+        // release, then close its input and reap it before any assertion.
+        let input = child.stdin.take().expect("cat's input");
+        drop(session);
+        let result = SessionGuard::acquire_in(Some(&dir), uid, None);
+        let running = child.try_wait();
+        drop(input);
+        let status = child.wait().expect("reap cat");
+        assert!(running.expect("check cat").is_none(), "cat exited early");
+        assert!(status.success(), "cat: {status}");
+        drop(acquired(result));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4014,6 +4073,9 @@ mod tests {
     #[test]
     fn session_lock_fallback_is_a_private_directory_created_on_first_use() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if !in_isolated_session_process() {
+            return;
+        }
         let uid = own_uid();
         let parent = runtime_sandbox("fallback");
         let fallback = parent.join("irlume");

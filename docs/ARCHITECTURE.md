@@ -95,9 +95,10 @@ of its own operations and of daemon-wide work (ADR-0030 §5, amended
 2026-09-27). The ring keeps each account's events, daemon-wide events and
 unresolved ones apart, the latest 256 of each for 30 minutes and for at most
 32 accounts at once, so other accounts' activity does not push a reader's
-events out. Root's request for an account resolves the name once, when the
-request arrives: the worker acts for that uid, the one its events and live
-entry are shown to. A
+events out. Root's request for an account resolves the name once, through
+NSS, when the request arrives: the worker acts for that uid, the one its
+events, live entry and attempt record entry are shown to. While it holds that
+uid, a request for the same name that would act for another uid is refused. A
 state revision advances after potentially mutating work; it tells clients to
 invalidate their observations, not that a write succeeded. This is a logical
 mutation hint, not a disk-write audit: best-effort storage upgrades during a

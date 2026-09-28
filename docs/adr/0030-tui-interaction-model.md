@@ -620,9 +620,15 @@ own background qualification, which are daemon-wide.
   arrived, the uid recorded with it: the worker does not resolve the name
   again when it starts the request, so the account shown the operation is
   the account it acts for even when the name resolves to another uid by
-  then. For a name that did not resolve, `Authenticate` and
-  `UnsealPassword` are refused without a second lookup; other requests make
-  the lookups their records make, and their events stay root's alone.
+  then. That lookup asks NSS; it does not take a uid another request holds
+  for the name while irlumed serves it. While one request holds a uid for a
+  name, another request for the name that would act for a different uid is
+  refused until the first ends, so neither request's records are checked
+  against the other's uid. A request's attempt is filed for the uid it
+  acted for, and only while that uid still has the name. For a name that
+  did not resolve, `Authenticate` and `UnsealPassword` are refused without
+  a second lookup and file no attempt; other requests make the lookups
+  their records make, and their events stay root's alone.
 - `LiveStatus` answered to any other account reports every operation of
   another account, or of an unresolved one, running or waiting, as
   `unknown` whatever its kind, with its operation ID and elapsed time

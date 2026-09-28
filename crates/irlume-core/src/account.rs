@@ -31,11 +31,17 @@
 //! account replaces it, and an administrator can move it away.
 //!
 //! Resolving a name goes through NSS. When irlumed already knows the uid for
-//! a request, it registers it with [`remember`] so the record checks and
-//! writes of that request use it instead of asking NSS again: a non-root
-//! caller passes the daemon's gate only as the account itself, so its own uid
-//! is the account's, and an authentication request resolves the account for
-//! its retry record.
+//! a request, it holds it with [`hold`] so the record checks and writes of
+//! that request use it instead of asking NSS again: a non-root caller passes
+//! the daemon's gate only as the account itself, so its own uid is the
+//! account's, and root's request resolves the account once, with
+//! [`resolve_fresh`], when irlumed registers it.
+//!
+//! A held uid answers every lookup of the name while it is held, so two
+//! requests that would hold different uids for one name at once cannot both
+//! run: the first keeps its uid until it ends, and the later [`hold`] is
+//! refused. Neither request's records are then checked against the other's
+//! uid.
 
 use irlume_common::{Error, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,11 +58,22 @@ pub enum Resolution {
     Unknown,
 }
 
-/// The current uid of `user`: a uid registered with [`remember`] for this
-/// name if one is held, else an NSS lookup.
+/// The current uid of `user`: the uid a request holds for this name
+/// ([`hold`]) if one is held, else [`resolve_fresh`].
 #[must_use]
 pub fn resolve(user: &str) -> Resolution {
-    remembered(user).unwrap_or_else(|| lookup(user))
+    held(user).unwrap_or_else(|| resolve_fresh(user))
+}
+
+/// What the account database says about `user` now: an NSS lookup (or a
+/// test's stand-in for it, [`remember`]) that ignores any uid a request
+/// holds for the name ([`hold`]), with the same answers as [`resolve`] (a
+/// name no account has, and a failed lookup, are told apart). For a lookup
+/// that must not take another request's answer, such as irlumed's when it
+/// registers root's request for an account.
+#[must_use]
+pub fn resolve_fresh(user: &str) -> Resolution {
+    stood_in(user).unwrap_or_else(|| lookup(user))
 }
 
 fn lookup(user: &str) -> Resolution {
@@ -97,8 +114,18 @@ fn lookup(user: &str) -> Resolution {
     }
 }
 
+/// How a registered answer for a name was made.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A request holds this uid ([`hold`]).
+    Held,
+    /// A stand-in for the account database ([`remember`]).
+    StoodIn,
+}
+
 struct Remembered {
     id: u64,
+    kind: Kind,
     user: String,
     resolution: Resolution,
 }
@@ -112,28 +139,78 @@ fn remembered_list() -> std::sync::MutexGuard<'static, Vec<Remembered>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn remembered(user: &str) -> Option<Resolution> {
+/// The latest answer of `kind` registered for `user`.
+fn latest(kind: Kind, user: &str) -> Option<Resolution> {
     remembered_list()
         .iter()
         .rev()
-        .find(|entry| entry.user == user)
+        .find(|entry| entry.kind == kind && entry.user == user)
         .map(|entry| entry.resolution)
 }
 
-/// A uid a caller resolved for one account, reused by [`resolve`] (and so by
-/// every record check) until this guard drops.
+/// The uid a request holds for `user`. Every hold of a name holds the same
+/// uid ([`hold`]), so any of them is the answer.
+fn held(user: &str) -> Option<Resolution> {
+    latest(Kind::Held, user)
+}
+
+fn stood_in(user: &str) -> Option<Resolution> {
+    latest(Kind::StoodIn, user)
+}
+
+/// A registered answer for one account name, forgotten when this guard
+/// drops: a uid a request holds ([`hold`]), or a stand-in for the account
+/// database ([`remember`]).
 #[must_use = "the uid is forgotten when the guard drops"]
 pub struct RememberedUid {
     id: u64,
 }
 
-/// Register `uid` as `user`'s current uid until the returned guard drops.
+/// Hold `uid` as `user`'s current uid for one request until the returned
+/// guard drops: [`resolve`], and so every record check and write, answers it
+/// for this name, on every thread.
 ///
 /// For a caller that already knows the account's uid for a request (irlumed:
-/// the uid its gate established for a non-root caller, or the one it resolved
-/// for the retry record), so the record checks and writes of that request use
-/// it and do not ask NSS again. Loader threads the request starts see it too.
-/// The latest registration for a name wins.
+/// the uid its gate established for a non-root caller, or the uid root's
+/// request resolved to when irlumed registered it), so the record checks
+/// and writes of that request use it and do not ask NSS again. Loader
+/// threads the request starts see it too. A request may hold the same uid
+/// more than once.
+///
+/// # Errors
+/// [`Error::Policy`] when a request holds another uid for `user` now, as
+/// when NSS maps the name to another uid while a request for it is being
+/// served: nothing is held, and the caller refuses its request. The uid
+/// held first keeps answering until its request ends, so neither request's
+/// records are checked against the other's uid.
+pub fn hold(user: &str, uid: u32) -> Result<RememberedUid> {
+    let mut list = remembered_list();
+    let other = list.iter().any(|entry| {
+        entry.kind == Kind::Held && entry.user == user && entry.resolution != Resolution::Uid(uid)
+    });
+    if other {
+        return Err(Error::Policy(format!(
+            "a request irlumed is serving holds another uid for '{user}', so this request is \
+             refused; try again when that request ends"
+        )));
+    }
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    list.push(Remembered {
+        id,
+        kind: Kind::Held,
+        user: user.to_owned(),
+        resolution: Resolution::Uid(uid),
+    });
+    Ok(RememberedUid { id })
+}
+
+/// Stand in `uid` for what the account database says about `user` until
+/// the returned guard drops: [`resolve_fresh`] answers it, and so does
+/// [`resolve`] while no request holds a uid for the name ([`hold`]).
+///
+/// For tests that change what a name resolves to; irlumed never calls it,
+/// and holds a request's uid with [`hold`]. The latest stand-in for a name
+/// wins.
 pub fn remember(user: &str, uid: u32) -> RememberedUid {
     remember_resolution(user, Resolution::Uid(uid))
 }
@@ -144,6 +221,7 @@ pub(crate) fn remember_resolution(user: &str, resolution: Resolution) -> Remembe
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     remembered_list().push(Remembered {
         id,
+        kind: Kind::StoodIn,
         user: user.to_owned(),
         resolution,
     });
@@ -492,9 +570,52 @@ mod tests {
                 assert_eq!(resolve(user), Resolution::Uid(4200), "the latest wins");
             }
             assert_eq!(resolve(user), Resolution::Uid(4100));
+            assert_eq!(resolve_fresh(user), Resolution::Uid(4100));
             assert_eq!(resolve("irlume-test-other-name"), Resolution::NoAccount);
         }
         assert_eq!(resolve(user), Resolution::NoAccount);
+    }
+
+    /// A uid a request holds answers every lookup of the name except a
+    /// fresh one, which asks the account database. The same uid may be held
+    /// again; a hold of another uid while one is held is refused, and the
+    /// first keeps answering until it drops.
+    #[test]
+    fn a_held_uid_answers_until_it_drops_and_another_uid_is_not_held_meanwhile() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let user = "irlume-test-held-account";
+        // What the account database says about the name now.
+        let _nss = remember(user, 4800);
+        let first = hold(user, 4801).expect("nothing is held for the name");
+        assert_eq!(resolve(user), Resolution::Uid(4801));
+        assert_eq!(
+            resolve_fresh(user),
+            Resolution::Uid(4800),
+            "a fresh lookup ignores the held uid"
+        );
+        let again = hold(user, 4801).expect("the same uid is held again");
+        let error = hold(user, 4800).map(|_| ()).unwrap_err().to_string();
+        assert!(
+            error.contains("another uid") && error.contains(user) && error.contains("try again"),
+            "{error}"
+        );
+        assert!(!error.contains('\u{2014}'));
+        assert_eq!(
+            resolve(user),
+            Resolution::Uid(4801),
+            "the uid held first keeps answering"
+        );
+        drop(again);
+        assert_eq!(resolve(user), Resolution::Uid(4801));
+        let other = hold("irlume-test-held-other-account", 4800).expect("another name");
+        drop(other);
+        drop(first);
+        assert_eq!(resolve(user), Resolution::Uid(4800));
+        let later = hold(user, 4800).expect("nothing is held any more");
+        assert_eq!(resolve(user), Resolution::Uid(4800));
+        drop(later);
     }
 
     #[test]

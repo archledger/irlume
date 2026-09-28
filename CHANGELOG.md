@@ -916,8 +916,12 @@ All notable changes to irlume are documented here. This project adheres to
   events out of what it reads. A request root makes for an account acts
   for the uid the name resolved to when the request arrived, the uid its
   events and live status are shown to, instead of resolving the name
-  again when the worker starts it (ADR-0030 §5, amended 2026-09-27,
-  #907).
+  again when the worker starts it. That lookup asks NSS and does not
+  take a uid another request holds for the name. While one request holds
+  a uid for a name, another request for that name that would act for a
+  different uid is refused until the first ends. An attempt is filed for
+  the uid its request acted for, and only while that uid still has the
+  name (ADR-0030 §5, amended 2026-09-27, #907).
 
 - An enrollment write that would reuse a template key recording no uid,
   under an enrollment that records none, is refused with nothing written

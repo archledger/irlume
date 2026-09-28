@@ -568,10 +568,18 @@ fn account_uid(user: &str) -> io::Result<u32> {
     Ok(uid)
 }
 
-/// File an attempt for `user`. Failures are reported to the journal by the
-/// caller and never change the reply: the record is history, not policy.
-pub(crate) fn record(user: &str, filed: Filed) -> io::Result<()> {
-    let uid = account_uid(user)?;
+/// File an attempt for `user` in the record of `uid`, the account the
+/// request acted for: the uid its name resolved to when irlumed registered
+/// the request, not a lookup made now, which may answer another account
+/// once the name is mapped to another uid. Filed only while `uid` still
+/// carries the name: a uid whose current name differs is another account
+/// now, whose record the attempt is not part of. Failures are reported to
+/// the journal by the caller and never change the reply: the record is
+/// history, not policy.
+pub(crate) fn record(uid: u32, user: &str, filed: Filed) -> io::Result<()> {
+    if crate::users::name_for_uid(uid).as_deref() != Some(user) {
+        return Err(invalid());
+    }
     let store = store()?;
     let _lock = store.lock()?;
     let mut stored = store.read(uid, user)?;
@@ -634,11 +642,12 @@ pub(crate) fn name_bucket(
 /// An entry prepared for a reply and committed once the reply is
 /// delivered (ADR-0030 §5), so the record says what the client got.
 #[derive(Debug)]
-pub(crate) struct Pending(Option<(String, Filed)>);
+pub(crate) struct Pending(Option<(u32, String, Filed)>);
 
 impl Pending {
-    pub(crate) fn new(user: String, filed: Filed) -> Self {
-        Self(Some((user, filed)))
+    /// An entry for `user`, filed in the record of `uid` ([`record`]).
+    pub(crate) fn new(uid: u32, user: String, filed: Filed) -> Self {
+        Self(Some((uid, user, filed)))
     }
 
     /// A reply that files nothing.
@@ -649,7 +658,7 @@ impl Pending {
     /// The reply never reached the client: a grant it carried was not one.
     /// A decision against the face stands as decided.
     pub(crate) fn undelivered(mut self, cause: OutcomeCause) -> Self {
-        if let Some((_, filed)) = &mut self.0 {
+        if let Some((_, _, filed)) = &mut self.0 {
             if filed.result == AttemptResult::Granted {
                 filed.result = AttemptResult::Failed;
                 filed.cause = Some(cause);
@@ -659,8 +668,8 @@ impl Pending {
     }
 
     pub(crate) fn commit(self) {
-        if let Some((user, filed)) = self.0 {
-            record_in_background(user, filed);
+        if let Some((uid, user, filed)) = self.0 {
+            record_in_background(uid, user, filed);
         }
     }
 }
@@ -681,12 +690,22 @@ const WRITER_QUEUE: usize = 64;
 /// those reads fall under the filing test's own guard, like the rest of
 /// the request it came from. The writer's own tests call [`enqueue`] while
 /// holding the env write guard until their records are on disk.
-pub(crate) fn record_in_background(user: String, filed: Filed) {
+pub(crate) fn record_in_background(uid: u32, user: String, filed: Filed) {
     if cfg!(test) {
-        file(&user, filed);
+        file(uid, &user, filed);
         return;
     }
-    enqueue(user, filed);
+    enqueue(uid, user, filed);
+}
+
+/// File an attempt its request ended with as it arrived (while irlumed is
+/// still starting), for the uid `user` resolves to now: no queue lies
+/// between the request and this lookup, so it is the request's own.
+pub(crate) fn record_on_arrival(user: String, filed: Filed) {
+    match crate::users::uid_for_name(&user) {
+        Some(uid) => record_in_background(uid, user, filed),
+        None => not_written(&user, &invalid()),
+    }
 }
 
 /// Records the writer dropped because its queue was full.
@@ -694,8 +713,8 @@ static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 /// Queue a record for the background writer, or drop it when the queue is
 /// full.
-fn enqueue(user: String, filed: Filed) {
-    if writer().try_send(Job::File(user, filed)).is_err() {
+fn enqueue(uid: u32, user: String, filed: Filed) {
+    if writer().try_send(Job::File(uid, user, filed)).is_err() {
         // Journal the first drop and then every hundredth, not each one.
         let dropped = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if dropped == 1 || dropped % 100 == 0 {
@@ -707,18 +726,22 @@ fn enqueue(user: String, filed: Filed) {
 }
 
 /// File one record, reporting a failure to the journal.
-fn file(user: &str, filed: Filed) {
-    if let Err(error) = record(user, filed) {
-        irlume_common::jout_warn!(
-            "irlumed: attempt record for '{}' not written: {error}",
-            crate::journal_safe(user)
-        );
+fn file(uid: u32, user: &str, filed: Filed) {
+    if let Err(error) = record(uid, user, filed) {
+        not_written(user, &error);
     }
+}
+
+fn not_written(user: &str, error: &io::Error) {
+    irlume_common::jout_warn!(
+        "irlumed: attempt record for '{}' not written: {error}",
+        crate::journal_safe(user)
+    );
 }
 
 /// The writer's work, in queue order.
 enum Job {
-    File(String, Filed),
+    File(u32, String, Filed),
     /// A reader's fence: acknowledged once everything queued before it
     /// is on disk.
     Barrier(std::sync::mpsc::SyncSender<()>),
@@ -734,7 +757,7 @@ fn writer() -> &'static std::sync::mpsc::SyncSender<Job> {
             .spawn(move || {
                 for job in rx {
                     match job {
-                        Job::File(user, filed) => file(&user, filed),
+                        Job::File(uid, user, filed) => file(uid, &user, filed),
                         // The reader may have given up: nobody to tell.
                         Job::Barrier(ack) => {
                             let _ = ack.try_send(());
@@ -1336,6 +1359,7 @@ mod tests {
             "nothing recorded yet: an empty record, not an error"
         );
         record(
+            uid,
             &me,
             Filed {
                 at: unix_now(),
@@ -1373,6 +1397,7 @@ mod tests {
         assert!(raw.contains("unit_key_hex"));
         // A second write keeps the same key, so the discriminator is stable.
         record(
+            uid,
             &me,
             Filed {
                 at: unix_now(),
@@ -1417,6 +1442,7 @@ mod tests {
         store().unwrap().write(uid, &foreign).unwrap();
         assert_eq!(load(&me), Some(AttemptRecord::default()));
         record(
+            uid,
             &me,
             Filed {
                 at: unix_now(),
@@ -1440,6 +1466,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An attempt is filed for the uid its request acted for only while
+    /// that uid carries the name the request named: for a uid that carries
+    /// another name now, nothing is written, and the record of the account
+    /// that has the uid is left as it was.
+    #[test]
+    fn an_attempt_is_not_filed_for_a_uid_that_carries_another_name() {
+        let _g = crate::tests::env_lock();
+        let (dir, uid, me) = own_state_dir("renamed");
+        record(uid, &me, refusal(AttemptKind::Authenticate)).expect("the account's own");
+        let other = "irlume-test-no-such-account";
+        assert_ne!(other, me);
+        assert!(record(uid, other, refusal(AttemptKind::Identify)).is_err());
+        let stored = store().unwrap().read_any(uid).unwrap();
+        assert_eq!(stored.account, me);
+        assert!(stored.record.latest_authenticate.is_some());
+        assert!(stored.record.latest_identify.is_none());
+        assert_eq!(stored.next_seq, 2);
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A test build files on the caller's thread, under the env guard its
     /// test holds. The background writer outlived the test that queued a
     /// record and read the environment while a later test rewrote it (an
@@ -1448,7 +1495,7 @@ mod tests {
     fn a_test_build_files_on_the_callers_thread() {
         let _g = crate::tests::env_lock();
         let (dir, uid, me) = own_state_dir("inline");
-        record_in_background(me.clone(), refusal(AttemptKind::Authenticate));
+        record_in_background(uid, me.clone(), refusal(AttemptKind::Authenticate));
         // Read without the writer fence: nothing was left to the writer.
         let stored = store().unwrap().read_any(uid).unwrap();
         assert_eq!(stored.account, me);
@@ -1467,9 +1514,10 @@ mod tests {
     fn the_writer_files_queued_records_in_order_before_a_read() {
         let _g = crate::tests::env_lock();
         let (dir, uid, me) = own_state_dir("writer");
-        enqueue(me.clone(), refusal(AttemptKind::Authenticate));
-        enqueue(me.clone(), refusal(AttemptKind::Identify));
+        enqueue(uid, me.clone(), refusal(AttemptKind::Authenticate));
+        enqueue(uid, me.clone(), refusal(AttemptKind::Identify));
         enqueue(
+            uid,
             me.clone(),
             Filed {
                 result: AttemptResult::Granted,
@@ -1502,7 +1550,7 @@ mod tests {
         let held = store().unwrap().lock().unwrap();
         let started = std::time::Instant::now();
         for _ in 0..queued {
-            enqueue(me.clone(), refusal(AttemptKind::Authenticate));
+            enqueue(uid, me.clone(), refusal(AttemptKind::Authenticate));
         }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),
@@ -1577,20 +1625,21 @@ mod tests {
             capture_ms: Some(400),
             camera: None,
         };
-        let grant = Pending::new("me".into(), filed(AttemptResult::Granted, None))
+        let grant = Pending::new(0, "me".into(), filed(AttemptResult::Granted, None))
             .undelivered(OutcomeCause::TimedOut);
-        let (_, entry) = grant.0.expect("the entry is kept");
+        let (_, _, entry) = grant.0.expect("the entry is kept");
         assert_eq!(entry.result, AttemptResult::Failed);
         assert_eq!(entry.cause, Some(OutcomeCause::TimedOut));
         // The capture evidence still describes what happened before delivery.
         assert_eq!(entry.capture_ms, Some(400));
 
         let refusal = Pending::new(
+            0,
             "me".into(),
             filed(AttemptResult::Refused, Some(OutcomeCause::BelowThreshold)),
         )
         .undelivered(OutcomeCause::Cancelled);
-        let (_, entry) = refusal.0.expect("the entry is kept");
+        let (_, _, entry) = refusal.0.expect("the entry is kept");
         assert_eq!(entry.result, AttemptResult::Refused);
         assert_eq!(entry.cause, Some(OutcomeCause::BelowThreshold));
 

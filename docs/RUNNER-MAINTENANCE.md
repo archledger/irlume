@@ -18,7 +18,7 @@ recorded in `/usr/local/lib/irlume-ci/capture.json`, which binds three facts:
   "schema": 1,
   "source_tree": "<40-hex git tree of the exact sources>",
   "sha256": "<digest of /usr/local/lib/irlume-ci/burst_dump>",
-  "device": "/dev/video2"
+  "device": "<approved IR node, for example /dev/video2>"
 }
 ```
 
@@ -56,10 +56,11 @@ sudo mv -f /usr/local/lib/irlume-ci/burst_dump.new /usr/local/lib/irlume-ci/burs
 sudo chmod 0644 /usr/local/lib/irlume-ci/capture.json  # root:root, no group/world write
 ```
 
-5. Verify with one real invocation (opens the IR camera once, bounded):
+5. Verify with one real invocation (opens the IR camera once, bounded),
+   passing the manifest's `device` as `<device>`:
 
 ```sh
-sudo /usr/local/libexec/irlume-ci-capture <tree> /dev/video2 | tar -t
+sudo /usr/local/libexec/irlume-ci-capture <tree> <device> | tar -t
 ```
 
 Six `frame*.pgm` files plus `means.txt`, and one emitter proof line on

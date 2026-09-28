@@ -1349,6 +1349,10 @@
         "kept": {
           "type": "boolean",
           "description": "True when the apply will keep this surface as it is although irlume's lines there are not the ones this run wants, or because the file (or the vendor file an override would be made from) has a line irlume does not read as PAM does and irlume's lines would be added, changed or, where a numeric jump could count them, removed, which fails the apply (login.apply's kept). False for every other surface, including a keep-edited-override whose irlume lines are already right. Added in 0.15.0; absent from older builds."
+        },
+        "jumps_adjustable": {
+          "type": "boolean",
+          "description": "True on a surface the human --adjust-jumps flag would handle differently because of a numeric jump in an administrator's line. On a kept surface of an enable plan, the only obstacle is such a jump, which irlume's new lines would land inside: login enable --adjust-jumps would make the update. On a strip-in-place or not-wired surface with kept false, which the run takes irlume's lines out of (every surface of a disable plan, and a surface of an enable plan whose configuration no longer wants irlume's lines there), irlume's lines stay as inactive lines because such a jump counts them or lands on one of them: the same command with --adjust-jumps would remove them, lowering a jump that counts them, or moving a landing off a line of irlume's it takes out to the first line after them. The flag applies to irlume's /etc copies of vendor files (overrides) only: a stack irlume edits in place keeps inactive lines and is never marked. False everywhere else. login.apply never changes such a line. Added in 0.15.0; absent from older builds."
         }
       }
     },

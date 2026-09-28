@@ -1103,6 +1103,24 @@ mod tests {
         true
     }
 
+    /// The processes `/proc/locks` lists as holding a lock on `file`, read
+    /// again for up to 5 s until a reading lists `want`; the last reading
+    /// otherwise. The kernel produces the listing a page or less per read,
+    /// each from the locks there are then, so a lock another process takes
+    /// or lets go between two reads moves the lines after it, and one
+    /// reading can leave out a holder that is there. A holder never listed
+    /// still fails.
+    fn listed_holders(file: &File, want: &[u32]) -> Option<Vec<u32>> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let listed = lock_holders(file);
+            if listed.as_deref() == Some(want) || Instant::now() >= deadline {
+                return listed;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// A `flock` process holding `path` until dropped. `-o` keeps the lock out
     /// of the `cat` it runs, so the lock is `flock`'s own and goes when `cat`
     /// ends at the end of its input.
@@ -1215,7 +1233,24 @@ mod tests {
                     Ok(())
                 });
             }
-            let mut child = command.spawn().expect("take a write lease");
+            // No write lease is given while another descriptor has the file
+            // open, and a child another test thread is starting holds a copy
+            // of each descriptor of this process until it runs its program,
+            // such as the one the file was just written through. The lease is
+            // asked for again until that copy is gone, for up to 5 s.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut child = loop {
+                match command.spawn() {
+                    Ok(child) => break child,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("take a write lease: {error:?}"),
+                }
+            };
             let input = child.stdin.take();
             Self { child, input }
         }
@@ -1334,9 +1369,10 @@ mod tests {
         let path = scratch.file("pam.lock", 0o600);
         let file = File::open(&path).unwrap();
         let holder = Holder::new(&path);
-        assert_eq!(lock_holders(&file), Some(vec![holder.pid()]));
+        let listed = listed_holders(&file, &[holder.pid()]);
+        assert_eq!(listed, Some(vec![holder.pid()]));
         assert_eq!(
-            lock_holders(&file).and_then(|pids| processes(&pids)),
+            listed.and_then(|pids| processes(&pids)),
             Some(format!("process {}", holder.pid()))
         );
         drop(holder);
@@ -1469,7 +1505,7 @@ mod tests {
         };
         let probe = File::open(&legacy).unwrap();
         assert_eq!(
-            lock_holders(&probe),
+            listed_holders(&probe, &[holder.pid()]),
             Some(vec![holder.pid()]),
             "the holder is not listed, so its side of the limit cannot be forced"
         );
@@ -1980,7 +2016,7 @@ mod tests {
             earlier_ino,
             "the earlier release's file was not put back at the name"
         );
-        assert!(!held(&moved), "the moved file stayed locked");
+        assert!(released(&moved), "the moved file stayed locked");
         let refused = take_foreign(&replaced, wait)
             .expect_err("a second operation went on beside the earlier release");
         assert!(
@@ -2061,7 +2097,10 @@ mod tests {
                 Vec::<PathBuf>::new(),
                 "moved off: {moved_off}"
             );
-            assert!(!held(&foreign), "moved off: {moved_off}: a lock was kept");
+            assert!(
+                released(&foreign),
+                "moved off: {moved_off}: a lock was kept"
+            );
             for name in entries(&scratch.0) {
                 std::fs::remove_file(scratch.path(&name)).unwrap();
             }
@@ -2117,7 +2156,7 @@ mod tests {
                 "another account's file lost the name"
             );
             assert_eq!(mode(&foreign), 0o644, "another account's file was changed");
-            assert!(!held(&foreign), "errno {errno}: a lock was kept");
+            assert!(released(&foreign), "errno {errno}: a lock was kept");
         }
     }
 

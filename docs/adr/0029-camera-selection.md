@@ -53,6 +53,15 @@ a name may be shown, never matched on.
 
 ## Decision
 
+Amended by [ADR-0032](0032-cross-device-pairing-by-administrator-pin.md)
+(2026-09-28): `SplitPair` is a separate, explicitly authorized cross-device
+candidate class, usable for enrollment/authentication only after that ADR's
+activation gate is satisfied. `ConnectedPair` retains the one-physical-camera
+invariant. Existing account-scoped ranking and the implemented `NotApplicable`
+behavior for incomplete legacy bindings are preserved; that fallback does not
+authorize a split pair. ADR-0032 also extends section 6's coherent-publication
+requirement to updates that both authorize and select a split pair.
+
 1. **Selection is per request, from the requesting account's enrollment,
    before any device is opened.** The order of an authentication request
    in `automatic` mode is: enumerate the connected candidates **camera-
@@ -71,10 +80,13 @@ a name may be shown, never matched on.
    Candidates are ranked among the account's enrolled pairs only:
    1. the primary binding when **both** its sides are bound and both match
       a connected pair (`vid:pid[:serial]` on each side). A legacy binding
-      with one side unbound is not a complete pair (ADR-0024 §2): automatic
-      mode refuses it with a status that names the cause ("primary camera
-      binding incomplete; pin the camera or re-enroll"); pinned mode keeps
-      today's behaviour for such records;
+      with one side unbound is not a complete pair (ADR-0024 §2). As clarified
+      by ADR-0032 (2026-09-28), when the primary binding is missing or
+      incomplete and no eligible complete secondary pair is chosen, selection
+      returns `NotApplicable` and retains the standing ordinary pair under
+      the existing authentication checks. This preserves the implemented
+      legacy behavior; it never authorizes a split pair. Pinned mode keeps
+      today's behavior for such records;
    2. otherwise the account's active secondary groups whose pair matches a
       connected pair by strict both-side equality (ADR-0028 §1), in the
       canonical order of ADR-0024 §5 — sorted by the pair identity
@@ -92,11 +104,12 @@ a name may be shown, never matched on.
       the group. This is the pre-capture choice ADR-0024 §5 describes,
       distinct from the forbidden movement after a biometric or PAD
       refusal;
-   5. nothing eligible connected → the request refuses to the password with
+   5. with a complete primary binding, nothing eligible connected → the
+      request refuses to the password with
       the existing vocabulary and the camera-free status names the cause
-      (`no enrolled camera is connected`, `primary camera binding
-      incomplete`, `ambiguous secondary groups`). An unenrolled pair is
-      never opened for authentication.
+      (`no enrolled camera is connected`, `ambiguous secondary groups`).
+      The incomplete-primary `NotApplicable` case follows item 1 above;
+      automatic selection otherwise never chooses an unenrolled pair.
    The chosen pair is pinned for the attempt through the lease and the
    decision (ADR-0024 §5); hotplug during an attempt changes nothing. The
    engine's standing pair follows the last selection. **Background capture
@@ -245,16 +258,20 @@ a name may be shown, never matched on.
 ## Acceptance tests
 
 - Selection order (pure): complete primary connected and eligible →
-  primary; one-sided legacy binding → refusal naming it; primary absent or
+  primary; missing or incomplete primary with no eligible complete secondary
+  chosen → `NotApplicable`, retaining the standing ordinary pair under
+  existing authentication checks, never a split pair; primary absent or
   ineligible for the mode, one eligible group connected → that group; two
   eligible groups connected → the lower pair identity, unchanged after the
   store is rewritten in another order; two groups with the same pair →
   ambiguous, skipped and reported; group in an inactive store → skipped;
-  nothing eligible connected → refusal naming the cause; an unenrolled
-  pair present alone → never chosen.
+  complete primary with nothing eligible connected → refusal naming the
+  cause; automatic selection never chooses an unenrolled pair.
 - Ordering: with automatic mode the camera lease and the open happen after
   selection; a test with a spy backend asserts no node is opened before the
-  selection ran, and none at all when nothing is selected.
+  selection ran, and none at all when selection returns `Refused`.
+  `NotApplicable` preserves the standing ordinary-pair path under its existing
+  authentication checks.
 - Enrollment candidate: a fresh install with no `cameras.conf` enrolls on
   the ranked candidate and prints it; the enrolled pair becomes the
   primary binding.

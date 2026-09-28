@@ -31,4 +31,5 @@ do, so sketch one in the PR early ([CONTRIBUTING.md](../../CONTRIBUTING.md)
 5. Plain punctuation, no em dashes (CONTRIBUTING.md "Writing style").
 
 Before camera or TUI work, read ADR-0007, 0023, 0024, 0027, 0028, 0029 and
-0030; before camera work, also ADR-0020 and 0021.
+0030; before camera work, also ADR-0020, 0021 and 0032 (split-pair
+authorization, admission posture and activation gates).

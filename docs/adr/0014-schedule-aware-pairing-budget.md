@@ -89,6 +89,13 @@ the hosts that carry dual cameras.
 
 ### Decision
 
+Amended by [ADR-0032](0032-cross-device-pairing-by-administrator-pin.md)
+(2026-09-28) for its proposed split-pair class: every paired split assessment
+carries sequential admission posture, even at skew at or below 3 s. Only
+IR-identity-verified arms may grant on that evidence. The skew-based rule
+below remains unchanged for ordinary pairs; split support stays disabled
+until ADR-0032's activation gate is satisfied.
+
 Pairs admitted only under the sequential budget (skew above
 `MAX_CROSS_SPECTRUM_SKEW`, i.e. captured as separated one-shot bursts)
 carry that fact on the `Assessment` (`sequential_pair`). The lit path then

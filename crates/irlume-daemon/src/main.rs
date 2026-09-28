@@ -3517,6 +3517,7 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
         } => {
             attempt_record::record_on_arrival(
                 user.clone(),
+                peer.uid,
                 attempt_record::Filed {
                     at: attempt_record::unix_now(),
                     kind: irlume_common::AttemptKind::Authenticate,
@@ -3544,6 +3545,7 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
         Request::UnsealPassword { user, service } => {
             attempt_record::record_on_arrival(
                 user.clone(),
+                peer.uid,
                 attempt_record::Filed {
                     at: attempt_record::unix_now(),
                     kind: irlume_common::AttemptKind::Authenticate,
@@ -3564,6 +3566,7 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             if let Some(name) = identify_account(&req, peer) {
                 attempt_record::record_on_arrival(
                     name.clone(),
+                    peer.uid,
                     attempt_record::Filed {
                         at: attempt_record::unix_now(),
                         kind: irlume_common::AttemptKind::Identify,
@@ -5419,15 +5422,58 @@ fn worker_account_uid(
     irlume_core::account::hold(user, uid).map(Some)
 }
 
+/// A refusal for a request whose name-based checks (the account's shadow
+/// entry, its home directory) would read another account's: `user` no
+/// longer resolves through NSS to the uid held for the request
+/// ([`worker_account_uid`]), whose records it writes. `None` when it does,
+/// or when no uid is held.
+fn refuse_moved_account(kind: &str, user: &str) -> Option<Response> {
+    let held = irlume_core::account::resolve(user);
+    if held == irlume_core::account::resolve_fresh(user) {
+        return None;
+    }
+    jout_notice!(
+        "irlumed: {kind}: '{user}' now resolves to another account than the one this request \
+         acts for; nothing was changed"
+    );
+    Some(Response::Error(format!(
+        "'{user}' now resolves to another account than the one this request was made for, so \
+         its password was not checked and nothing was changed; try again"
+    )))
+}
+
 /// The reply to a request [`worker_account_uid`] refused: in the shape its
 /// client decodes, a policy refusal before any camera.
 fn held_account_refusal(req: &Request, error: &irlume_common::Error) -> Response {
-    let reason = error.to_string();
-    jout_notice!("irlumed: {}", journal_safe(&reason));
     if matches!(req, Request::Authenticate { .. }) {
+        let reason = error.to_string();
+        jout_notice!("irlumed: {}", journal_safe(&reason));
         return early_refusal(EarlyRefusal::Policy, reason);
     }
     note_pre_camera(irlume_common::OutcomeCause::Policy);
+    held_account_reply(req, error)
+}
+
+/// The reply to a request refused because another request holds another
+/// uid for the name it names, in the shape its client asked for: a
+/// `ListProfiles` that opted into structured errors gets an
+/// `OperationError`, which it may retry once the other request ends.
+fn held_account_reply(req: &Request, error: &irlume_common::Error) -> Response {
+    let reason = error.to_string();
+    jout_notice!("irlumed: {}", journal_safe(&reason));
+    if matches!(
+        req,
+        Request::ListProfiles {
+            structured_errors: true,
+            ..
+        }
+    ) {
+        return Response::OperationError {
+            code: irlume_common::OperationErrorCode::OperationFailed,
+            retryable: true,
+            cause: None,
+        };
+    }
     Response::Error(reason)
 }
 
@@ -5530,7 +5576,7 @@ fn dispatch_status_with_diagnostics(
     }
     let _gate_uid = match gate_account_uid(req, peer) {
         Ok(held) => held,
-        Err(error) => return Some(Response::Error(error.to_string())),
+        Err(error) => return Some(held_account_reply(req, &error)),
     };
     // Both views depend on the reader: root sees every operation, any other
     // account only its own and daemon-wide ones (`diagnostics::Owner`).
@@ -7888,6 +7934,11 @@ fn dispatch_scoped_session_inner(
             if password.expose().contains(&0) {
                 return refuse_nul_password("SealPassword", &user);
             }
+            // The password and the home directory are looked up by name, and
+            // the envelope is written for the uid held for the request.
+            if let Some(refusal) = refuse_moved_account("SealPassword", &user) {
+                return refusal;
+            }
             let verified = password_matches_login(&user, password.expose());
             if verified == Some(false) {
                 jout_notice!(
@@ -7929,6 +7980,11 @@ fn dispatch_scoped_session_inner(
             // did not force one, so a KDE-only machine gets the wallet key
             // without the client needing to know to ask.
             let home = crate::users::home_for_name(&user);
+            // Again after the lookups by name, so a remap while they ran is
+            // caught too.
+            if let Some(refusal) = refuse_moved_account("SealPassword", &user) {
+                return refusal;
+            }
             let forced_kind = kind;
             let core_kind = match forced_kind {
                 Some(k) => crate::users::wire_to_core_kind(k),
@@ -8235,6 +8291,11 @@ fn dispatch_scoped_session_inner(
             if password.expose().contains(&0) {
                 return refuse_nul_password("ResealPassword", &user);
             }
+            // The password is checked by name, and the envelope is resealed
+            // for the uid held for the request.
+            if let Some(refusal) = refuse_moved_account("ResealPassword", &user) {
+                return refusal;
+            }
             // Only an armed account has a seal to keep, and the check costs a
             // crypt() on every session open, so an unarmed one skips it:
             // `reseal_password` answers `NotArmed` for it.
@@ -8249,6 +8310,9 @@ fn dispatch_scoped_session_inner(
                     "that is not '{user}'s current login password; the sealed secret was left \
                      as it was"
                 ));
+            }
+            if let Some(refusal) = refuse_moved_account("ResealPassword", &user) {
+                return refusal;
             }
             match irlume_core::keyring::reseal_password(
                 &user,
@@ -18283,6 +18347,89 @@ mod tests {
         }
         assert!(refused.iter().all(held_elsewhere), "{refused:?}");
         assert!(!served.iter().any(held_elsewhere), "{served:?}");
+    }
+
+    /// A listing refused because another request holds another uid for the
+    /// name answers in the shape its client asked for, on the status path
+    /// and on the worker alike.
+    #[test]
+    fn a_listing_refused_over_a_held_uid_answers_in_the_shape_asked_for() {
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("listing-held-uid");
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        let name = users::name_for_uid(me).expect("the running account");
+        let _other = irlume_core::account::hold(&name, me.wrapping_add(1)).unwrap();
+        let list = |structured_errors| Request::ListProfiles {
+            user: name.clone(),
+            structured_errors,
+            handles: false,
+        };
+        let structured = |response: &Response| {
+            matches!(
+                response,
+                Response::OperationError {
+                    code: irlume_common::OperationErrorCode::OperationFailed,
+                    retryable: true,
+                    ..
+                }
+            )
+        };
+        let prose = |response: &Response| matches!(response, Response::Error(message) if message.contains("holds another uid"));
+        let status = dispatch_status(&list(true), &peer(me)).expect("answered");
+        assert!(structured(&status), "{status:?}");
+        let status = dispatch_status(&list(false), &peer(me)).expect("answered");
+        assert!(prose(&status), "{status:?}");
+        let worker = dispatch(list(true), &peer(me), &mut e);
+        assert!(structured(&worker), "{worker:?}");
+        let worker = dispatch(list(false), &peer(me), &mut e);
+        assert!(prose(&worker), "{worker:?}");
+    }
+
+    /// A password seal or reseal checks the password, and a seal the home
+    /// directory, by name: registered for a uid the name no longer resolves
+    /// to, both are refused with nothing checked or written. Registered for
+    /// the uid the name resolves to, they go on.
+    #[test]
+    fn a_password_seal_is_refused_while_the_name_resolves_to_another_uid() {
+        use diagnostics::Owner;
+        use irlume_common::diagnostics::OperationClass;
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("seal-moved-account");
+        let user = "nobody";
+        let now = uid_of(user).expect("NSS account nobody");
+        let password = || irlume_common::SecretBytes::new(b"a password".to_vec());
+        let requests = || {
+            [
+                Request::SealPassword {
+                    kind: None,
+                    user: user.into(),
+                    password: password(),
+                    wallet_salt: None,
+                    wallet_salt_checked: true,
+                },
+                Request::ResealPassword {
+                    user: user.into(),
+                    password: password(),
+                    wallet_salt: None,
+                    wallet_salt_checked: true,
+                },
+            ]
+        };
+        let moved = |response: &Response| matches!(response, Response::Error(message) if message.contains("now resolves to another account"));
+        let state = diagnostics::DiagnosticState::default();
+        for (registered, refused) in [(now.wrapping_add(1), true), (now, false)] {
+            for request in requests() {
+                let scope = state.begin_for(OperationClass::Status, Owner::Account(registered));
+                let response = dispatch_scoped(request, &peer(0), &mut e, &scope, None);
+                assert_eq!(moved(&response), refused, "{registered}: {response:?}");
+            }
+            if refused {
+                assert!(!irlume_core::keyring::has_sealed_password(user));
+            }
+        }
     }
 
     #[test]

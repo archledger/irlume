@@ -699,10 +699,18 @@ pub(crate) fn record_in_background(uid: u32, user: String, filed: Filed) {
 }
 
 /// File an attempt its request ended with as it arrived (while irlumed is
-/// still starting), for the uid `user` resolves to now: no queue lies
-/// between the request and this lookup, so it is the request's own.
-pub(crate) fn record_on_arrival(user: String, filed: Filed) {
-    match crate::users::uid_for_name(&user) {
+/// still starting). A peer other than root (`peer_uid`) is admitted only as
+/// the account it names, so the record is its own uid's, not the uid a
+/// second lookup of the name might answer. Root's request is filed for the
+/// uid `user` resolves to now: no queue lies between the request and this
+/// lookup, so it is the request's own.
+pub(crate) fn record_on_arrival(user: String, peer_uid: u32, filed: Filed) {
+    let uid = if peer_uid == 0 {
+        crate::users::uid_for_name(&user)
+    } else {
+        Some(peer_uid)
+    };
+    match uid {
         Some(uid) => record_in_background(uid, user, filed),
         None => not_written(&user, &invalid()),
     }
@@ -1500,6 +1508,38 @@ mod tests {
         let stored = store().unwrap().read_any(uid).unwrap();
         assert_eq!(stored.account, me);
         assert!(stored.record.latest_authenticate.is_some());
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A startup refusal of a peer other than root is filed for the uid the
+    /// gate admitted it as, the peer's own, never for the uid a second
+    /// lookup of the name answers (and, like every record, only while that
+    /// uid still has the name); root's is filed for the uid the name
+    /// resolves to.
+    #[test]
+    fn a_startup_refusal_files_a_non_root_peer_under_its_own_uid() {
+        let _g = crate::tests::env_lock();
+        let (dir, uid, me) = own_state_dir("arrival-peer");
+        let latest = |uid| {
+            store()
+                .unwrap()
+                .read_any(uid)
+                .ok()
+                .map(|stored| stored.record)
+                .unwrap_or_default()
+        };
+        // Admitted as another uid than the name has now.
+        record_on_arrival(
+            me.clone(),
+            uid.wrapping_add(1),
+            refusal(AttemptKind::Authenticate),
+        );
+        assert!(latest(uid).latest_authenticate.is_none(), "not the name's");
+        record_on_arrival(me.clone(), uid, refusal(AttemptKind::Authenticate));
+        assert!(latest(uid).latest_authenticate.is_some(), "the peer's own");
+        record_on_arrival(me.clone(), 0, refusal(AttemptKind::Identify));
+        assert!(latest(uid).latest_identify.is_some(), "root's: the name's");
         std::env::remove_var("IRLUME_STATE_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }

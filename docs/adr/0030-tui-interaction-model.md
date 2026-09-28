@@ -625,7 +625,10 @@ own background qualification, which are daemon-wide.
   name, another request for the name that would act for a different uid is
   refused until the first ends, so neither request's records are checked
   against the other's uid. A request's attempt is filed for the uid it
-  acted for, and only while that uid still has the name. For a name that
+  acted for, and only while that uid still has the name. A keyring arm or
+  reseal checks the password, and an arm the home directory, by name, so it
+  is refused while the name resolves to another uid than the one the
+  request acts for, checked before and after those lookups. For a name that
   did not resolve, `Authenticate` and `UnsealPassword` are refused without
   a second lookup and file no attempt; other requests make the lookups
   their records make, and their events stay root's alone.

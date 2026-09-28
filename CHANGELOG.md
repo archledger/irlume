@@ -921,7 +921,10 @@ All notable changes to irlume are documented here. This project adheres to
   a uid for a name, another request for that name that would act for a
   different uid is refused until the first ends. An attempt is filed for
   the uid its request acted for, and only while that uid still has the
-  name (ADR-0030 §5, amended 2026-09-27, #907).
+  name. A keyring arm or reseal, which checks the password (and an arm
+  the home directory) by name, is refused while the name resolves to
+  another uid than the one the request acts for (ADR-0030 §5, amended
+  2026-09-27, #907).
 
 - An enrollment write that would reuse a template key recording no uid,
   under an enrollment that records none, is refused with nothing written

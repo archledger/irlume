@@ -21,7 +21,7 @@ code, and say so in the PR. `ADR-NNNN` means `docs/adr/NNNN-*.md`. Nested
 | Path | What it is | Start at |
 |---|---|---|
 | `crates/irlume-common` | Wire types (`Request`, `Response`), socket client, config. Depends on no other irlume crate. | [its AGENTS.md](crates/irlume-common/AGENTS.md), [docs/SETUP.md](docs/SETUP.md) |
-| `crates/irlume-camera` | V4L2/UVC capture, IR emitter, device pinning, inventory. | `crates/irlume-camera/src/lib.rs`; ADR-0007, 0023, 0024, 0027, 0028, 0029 |
+| `crates/irlume-camera` | V4L2/UVC capture, IR emitter, device pinning, inventory. | `crates/irlume-camera/src/lib.rs`; ADR-0007, 0023, 0024, 0027, 0028, 0029, 0032 (split-pair authorization, admission posture and activation gates) |
 | `crates/irlume-vision`, `-liveness` | Detection, alignment, embedding; liveness cues and PAD. | ADR-0013, ADR-0019, [docs/PAD_SELFTEST.md](docs/PAD_SELFTEST.md) |
 | `crates/irlume-core` | Encrypted templates, TPM sealing, keyring and recovery envelopes. | ADR-0025, [docs/SECURITY_AT_REST.md](docs/SECURITY_AT_REST.md) |
 | `crates/irlume-auth` | The `Engine`: the only place a face grant is decided (pam_fprintd verifies fingerprints). | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) "Authentication flow" |

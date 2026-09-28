@@ -577,6 +577,8 @@ APPARMOR_RUNTIME_RULES=(
   "/sys/fs/btrfs/ r,"
   "/sys/fs/btrfs/*/devices/ r,"
   "/sys/fs/btrfs/*/devices/* r,"
+  # ONNX Runtime falls back to PCI enumeration during hardware discovery.
+  "/sys/bus/pci/devices/ r,"
 )
 for profile in "${APPARMOR_PROFILES[@]}"; do
   for rule in "${APPARMOR_RUNTIME_RULES[@]}"; do

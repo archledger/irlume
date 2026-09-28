@@ -138,6 +138,13 @@ missing or older runner-user installation cannot change the tool used. The
 runner cleans the temporary directory after the job; setup requires no sudo and
 does not replace tools in the runner's Cargo home.
 
+The next step runs `cargo llvm-cov clean --workspace`. The lanes pass
+`--no-report`, which keeps earlier build artifacts, and the report reads every
+instrumented binary under the runner's persistent target directory, so a binary
+built from an earlier night's tree would count each file changed since then
+twice (#906). The clean removes the workspace crates' instrumented builds and
+profiles; dependency builds stay.
+
 Both eligible runners use distribution Rust. Setup locates system `llvm-cov`
 and `llvm-profdata`, checks that their LLVM major versions match `rustc -vV`,
 and exports `LLVM_COV` and `LLVM_PROFDATA`. Missing tools, an incompatible LLVM,

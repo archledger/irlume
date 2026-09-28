@@ -334,6 +334,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- At the end of its 60-second wait for the lock of earlier releases
+  (`/run/lock/irlume-pam.lock`), a PAM operation reads `/proc/locks`
+  until two consecutive readings list the same processes holding and
+  waiting for that lock, at most 10 times, and otherwise judges every
+  process any reading listed. The kernel produces that file a page or
+  less per read, so one reading can leave out a line when other locks
+  change meanwhile. A FIFO another account owns at that name is now
+  opened without waiting for a writer, never read, and waited for within
+  the same 60 seconds and with the same check at the end as a regular
+  file, before it is replaced; a socket or device node there is still
+  replaced at once (#903).
+
 - `irlume login plan --json` marks each surface the apply will keep as it
   is and fail on (`kept`, as in `login apply`), and its `plan_id` covers
   it. A PAM file kept as it is was reported as `keep-edited-override`

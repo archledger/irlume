@@ -132,18 +132,19 @@ The Encoding Unit is accepted only in UVC 1.5. Interface endpoints cannot
 name endpoint zero or set reserved address bits.
 An endpoint on the target VideoControl interface is interrupt IN.
 
-The remaining source-reference graph checks and the VideoControl header's
-own total-length check are tracked in #913, required before implementing
-the exposure ceiling in §4. This is not a complete USB/UVC validator, and
+The VideoControl header's own total and the source references of every
+terminal and unit are checked too (Amendment 2026-09-27 below, #913). This
+is not a complete USB/UVC validator, and
 even a fully consistent descriptor is a device-supplied modality claim.
 YUYV credential release remains refused while §4 is pending.
 
 The configuration header's `wTotalLength` is not used: the reporter's 5986:2113 `descriptors`
 file carries 996 of the 1026 bytes its configuration header claims (linuxhw
-31A261423C, from a unit with the same bcdDevice 54.22, carries all 1026, and
-whether the reporter's unit or the capture path dropped the rest is not
-known), and a device writes both numbers, so the walk judges the
-descriptors the file holds.
+31A261423C, from a unit with the same bcdDevice 54.22, carries all 1026:
+one MJPEG frame descriptor its VideoStreaming header counts is missing from
+the reporter's file, and whether the reporter's unit or the capture path
+dropped it is not known), and a device writes both numbers, so the walk
+judges the descriptors the file holds.
 Every failure, an unreadable or absent descriptor included, keeps the node
 `Role::Rgb`. The extension-unit parser that authorizes emitter writes
 (#159) is not changed; the new walker shares its unit parsing, and a test
@@ -308,8 +309,8 @@ than the 640x400 constant.
 
 | Boundary | Required result |
 |---|---|
-| Descriptor rule | The ASUS 3277:0059 IR function (interface 2) is attested and its RGB function (interface 0) is not; the T480 5986:1141 function is attested and 5986:2113 is not, from the reporter's descriptor files, with the 5986:2113 file's configuration 30 bytes shorter than its `wTotalLength` refused only for its missing Microsoft unit; two streams, each colour bit alone, a Microsoft unit without selector 0x06 or with more bits than `bNumControls`, two Microsoft units, a truncated header, Processing Unit, extension unit (including one that stops before its string index) or tail, a listed interface that is not VideoStreaming, a face-authentication unit on another interface, a node interface that is not a VideoControl interface, a descriptor file without one complete active configuration, and a node without a USB parent are each refused with the named reason |
-| Parser agreement | The new walker and the emitter's extension-unit parser return the same units for every interface of the ASUS and both T480 fixtures, and the fuzz target asserts it on arbitrary input |
+| Descriptor rule | The ASUS 3277:0059 IR function (interface 2) is attested and its RGB function (interface 0) is not; the T480 5986:1141 function is attested and 5986:2113 is not, from the reporter's descriptor files, with the 5986:2113 file's configuration 30 bytes shorter than its `wTotalLength` refused only for its missing Microsoft unit; two streams, each colour bit alone, a Microsoft unit without selector 0x06 or with more bits than `bNumControls`, two Microsoft units, a truncated header, Processing Unit, extension unit (including one that stops before its string index) or tail, a listed interface that is not VideoStreaming, a `VC_HEADER` total other than its control block, a source that is zero, missing, the entity itself, an Output Terminal or on a cycle, a Selector or Extension Unit without an input, a face-authentication unit on another interface, a node interface that is not a VideoControl interface, a descriptor file without one complete active configuration, and a node without a USB parent are each refused with the named reason; the Logitech BRIO and NexiGo N930W graphs (fan-out, two Output Terminals, units nothing reads, sources listed after the entity that reads them) keep their answers |
+| Parser agreement | The new walker and the emitter's extension-unit parser return the same units for every interface of the ASUS and both T480 fixtures, and for the BRIO and NexiGo functions, and the fuzz target asserts it on arbitrary input |
 | Classification | `[YUYV]` with the attestation is `Role::Ir` and without it `Role::Rgb`; MJPG+YUYV, YUYV+RGB3, NV12, NV12+YUYV and YUYV+GREY stay what their formats say whatever the attestation; the descriptor is not consulted for GREY, Y16, metadata or empty format lists |
 | Frame size | GREY and Y16 ignore the size list and request 640x400; unattested YUYV requests 640x400; attested YUYV requests 340x340 from `{640x480, 340x340}` in either order, 400x400 from `{400x480, 400x400}`, 640x400 from an empty or too-small list, and the first of two equal areas; a replica of uvcvideo's nearest-size rule shows 640x400 landing on 640x480; the candidate walk hands the format ioctl the size it chose |
 | Qualification | The IR stream contract records the requested size it is given, not 640x400, and the open IR camera builds it from the request it made |
@@ -322,4 +323,51 @@ The T480 tests read the `descriptors` files @maurerr supplied on #887
 (`crates/irlume-camera/tests/fixtures/bison-5986-1141.descriptors` and
 `bison-5986-2113.descriptors`, #575), which are also fuzz seeds; builders
 laid out like the 5986:1141 bytes remain only for the synthetic
-counter-cases.
+counter-cases. The source-graph tests also read a Logitech BRIO and a
+NexiGo N930W from a maintainer machine
+(`logitech-046d-085e.descriptors`, `nexigo-3443-c803.descriptors`).
+
+## Amendment 2026-09-27: VideoControl header total and source graph
+
+#913, required before §4. Two checks join §1's structural list. A failure
+of either refuses the function as malformed and keeps the node `Role::Rgb`.
+
+- **The VideoControl header's own total.** `VC_HEADER`'s `wTotalLength`
+  must equal the length of the header and the terminals and units after
+  it, which §1 already requires to form one block before the endpoints
+  (UVC 1.1 and 1.5 Table 3-3: "the combined length of this descriptor
+  header and all Unit and Terminal descriptors"). The interrupt endpoint,
+  a SuperSpeed companion and the class-specific endpoint descriptor are
+  not counted. Linux uvcvideo does not read this field. The
+  configuration's `wTotalLength` stays unread, for the reason §1 gives.
+- **Sources.** Every source a terminal or unit names (the Output
+  Terminal's `bSourceID`, a Selector or Extension Unit's
+  `baSourceID[bNrInPins]`, a Processing or Encoding Unit's `bSourceID`)
+  must be another entity of the same function, nonzero and not an Output
+  Terminal, and the references form no cycle. Every Selector and
+  Extension Unit has at least one input. UVC 1.5 §2.3 gives every unit
+  one or more input pins and an Output Terminal none to read from, and
+  disallows loops; §3.7.2 reserves ID 0. With these, the inputs of every
+  entity lead back to an Input Terminal, so a Microsoft unit disconnected
+  from its function does not attest it. `bAssocTerminal` is an
+  association, not a source, and is not checked.
+- **What stays allowed.** References are resolved once the whole block
+  has been read, since §3.7.2 leaves the order free and real functions
+  refer ahead: the T480 IR camera and the ASUS IR function list their
+  Output Terminal before the units it reads, and a NexiGo N930W lists its
+  Output Terminal first and its Input Terminal fourth. Fan-out, more than
+  one Output Terminal and units whose output nothing reads are allowed: a
+  Logitech BRIO feeds two Output Terminals and eight extension units, its
+  Microsoft unit among them, from one Processing Unit. The Microsoft unit
+  is therefore not required to lie between an Input and an Output
+  Terminal.
+
+Checked against the fixtures, the BRIO and the NexiGo, and 196,736
+VideoControl functions (6,139 device, firmware and interface combinations)
+in the linuxhw LsUSB corpus. No function with a Microsoft unit or an IR
+name there fails either check. Colour cameras do: 6 combinations with a
+different header total, 17 with a zero or missing source and 140 with an
+Output Terminal as a source. They stay `Role::Rgb`, and one that offers
+only YUYV now names a malformed descriptor instead of its earlier refusal.
+The streaming interface's `bTerminalLink` naming an Output Terminal of the
+function is not checked; the fixtures, the BRIO and the NexiGo satisfy it.

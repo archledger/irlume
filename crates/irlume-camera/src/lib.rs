@@ -17251,6 +17251,7 @@ mod tests {
             "\npub(crate) fn ir_function_evidence(",
             "\npub fn video_control_function(",
             "\nfn video_control_walk(",
+            "\nfn source_graph_is_sound(",
             "\nfn processing_unit_controls(",
         ] {
             for line in source_code_lines(source_body(uvc, signature)) {

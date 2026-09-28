@@ -319,19 +319,30 @@ pub struct VideoControlFunction {
 /// of those it refuses a function that has no `VC_HEADER` or more than one,
 /// a header too short for the interfaces it counts, a Processing Unit too
 /// short for the bitmap it declares, and a header that lists an interface
-/// which is not a VideoStreaming interface of the same configuration.
+/// which is not a VideoStreaming interface of the same configuration. It
+/// also refuses a `VC_HEADER` whose own `wTotalLength` differs from the
+/// header and the terminals and units that follow it (UVC 1.5 Table 3-3;
+/// the interrupt endpoint and its class-specific descriptor are not
+/// counted), and a terminal or unit whose sources are not sound (see
+/// [`source_graph_is_sound`]).
 ///
-/// Like [`active_descriptor_view`], it does not read `wTotalLength`. The
-/// #887 reporter's `descriptors` file for a ThinkPad T480 colour camera
-/// (USB 5986:2113) carries 996 of the 1026 bytes its configuration header
-/// claims, as a clean chain shorter than its header says. A published
-/// capture from a unit with the same firmware version (linuxhw LsUSB
-/// `31A261423C`, bcdDevice 54.22) carries all 1026, and whether that unit's
-/// firmware or the capture path dropped the rest is not known. The device
-/// writes both the header and the chain, so a length check would prove
-/// nothing a device could not also fake, and it would refuse a real IR
-/// camera whose file comes up short the same way. A chain is judged on the
-/// descriptors it holds; one cut inside a descriptor is still malformed.
+/// Like [`active_descriptor_view`], it does not read the configuration's
+/// `wTotalLength`. The #887 reporter's `descriptors` file for a ThinkPad
+/// T480 colour camera (USB 5986:2113) carries 996 of the 1026 bytes its
+/// configuration header claims, as a clean chain shorter than its header
+/// says: one MJPEG frame descriptor its VideoStreaming header counts is
+/// missing. A published capture from a unit with the same firmware version
+/// (linuxhw LsUSB `31A261423C`, bcdDevice 54.22) carries all 1026, and
+/// whether the reporter's unit or the capture path dropped the frame is
+/// not known. The device writes both the header and the chain, so a length
+/// check would prove nothing a device could not also fake, and it would
+/// refuse a real IR camera whose file comes up short the same way. A chain
+/// is judged on the descriptors it holds; one cut inside a descriptor is
+/// still malformed. The `VC_HEADER`'s total is another matter: it covers
+/// only the control block, which the walk reads whole, so a total that
+/// disagrees with that block is an inconsistency inside the descriptors
+/// read (#913). Every real control block checked agrees with its total:
+/// the T480 pair, the ASUS module, a Logitech BRIO and a NexiGo N930W.
 ///
 /// `extension_units_for_interface` is left as it is on purpose: it decides
 /// which bytes irlume may write to a camera (#159), and a parser shared with
@@ -371,7 +382,10 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
     let mut configurations = 0;
     let mut declared_interfaces = 0usize;
     let mut vc_block_closed = false;
-    let mut entity_ids = std::collections::BTreeSet::new();
+    // Entity ID to (subtype, source IDs), for the source graph (#913).
+    let mut entities = std::collections::BTreeMap::new();
+    let mut header_total = None;
+    let mut block_length = 0usize;
     let mut endpoint_count = None;
     let mut endpoint_addresses = std::collections::BTreeSet::new();
     let mut headers = 0usize;
@@ -435,12 +449,14 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                 if d[2] != SUBTYPE_VC_HEADER && headers != 1 {
                     return None;
                 }
+                block_length += len;
                 // UVC terminals and units share one entity-ID namespace.
                 if matches!(d[2], 2..=7) {
                     let id = *d.get(3)?;
-                    if id == 0 || !entity_ids.insert(id) {
+                    if id == 0 || entities.contains_key(&id) {
                         return None;
                     }
+                    entities.insert(id, (d[2], Vec::new()));
                 }
                 match d[2] {
                     SUBTYPE_VC_HEADER => {
@@ -450,6 +466,8 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                             return None;
                         }
                         uvc_version = Some(version);
+                        header_total =
+                            Some(usize::from(u16::from_le_bytes([*d.get(5)?, *d.get(6)?])));
                         let count = usize::from(*d.get(11)?);
                         streaming_interfaces = d.get(12..12 + count)?.to_vec();
                     }
@@ -463,6 +481,7 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                             return None;
                         }
                         processing_controls.push(processing_unit_controls(d)?);
+                        entities.get_mut(&d[3])?.1.push(d[4]);
                     }
                     2 => {
                         // USB input terminals are eight bytes; camera and
@@ -484,11 +503,17 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                         if len < 9 {
                             return None;
                         }
+                        entities.get_mut(&d[3])?.1.push(d[7]);
                     }
                     4 => {
-                        if len < 6 + usize::from(*d.get(4)?) {
+                        let pins = usize::from(*d.get(4)?);
+                        if len < 6 + pins {
                             return None;
                         }
+                        entities
+                            .get_mut(&d[3])?
+                            .1
+                            .extend_from_slice(&d[5..5 + pins]);
                     }
                     7 => {
                         // Both bmControls and bmControlsRuntime have the
@@ -496,6 +521,7 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                         if uvc_version? != 0x0150 || len < 7 + 2 * usize::from(*d.get(6)?) {
                             return None;
                         }
+                        entities.get_mut(&d[3])?.1.push(d[4]);
                     }
                     SUBTYPE_EXTENSION_UNIT => {
                         // bLength is 24 + bNrInPins + bControlSize, closed
@@ -508,6 +534,10 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
                             return None;
                         }
                         extension_units.push(parse_extension_unit(d)?);
+                        entities
+                            .get_mut(&d[3])?
+                            .1
+                            .extend_from_slice(&d[22..22 + pins]);
                     }
                     _ => return None,
                 }
@@ -551,6 +581,12 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
     if headers != 1 {
         return None;
     }
+    if header_total != Some(block_length) {
+        return None;
+    }
+    if !source_graph_is_sound(&entities) {
+        return None;
+    }
     if streaming_interfaces
         .iter()
         .any(|number| !videostreaming[usize::from(*number)])
@@ -562,6 +598,53 @@ fn video_control_walk(desc: &[u8], interface_number: u8) -> Option<VideoControlW
         processing_controls,
         extension_units,
     }))
+}
+
+/// Every source a terminal or unit names is another entity of the same
+/// function that has an output: nonzero, not itself, not an Output
+/// Terminal, and the references form no cycle (#913). Every unit has at
+/// least one input (UVC 1.5 section 2.3); only an Input Terminal has none.
+/// Together these make every entity's inputs lead back to an Input
+/// Terminal, so no unit is disconnected from the function it claims to
+/// belong to.
+///
+/// The references are resolved once the whole block has been read, not in
+/// descriptor order: the specification leaves the order free, and the T480
+/// IR camera and the ASUS module list their Output Terminal before the
+/// units it reads. Fan-out, more than one Output Terminal and a unit whose
+/// output nothing reads are allowed, as on the Logitech BRIO.
+fn source_graph_is_sound(entities: &std::collections::BTreeMap<u8, (u8, Vec<u8>)>) -> bool {
+    for (id, (subtype, sources)) in entities {
+        if *subtype != 2 && sources.is_empty() {
+            return false;
+        }
+        for source in sources {
+            if *source == 0 || source == id {
+                return false;
+            }
+            match entities.get(source) {
+                Some((3, _)) | None => return false,
+                Some(_) => {}
+            }
+        }
+    }
+    // Remove entities whose sources are all removed; what remains after
+    // no removal is possible lies on or behind a cycle.
+    let mut placed = std::collections::BTreeSet::new();
+    loop {
+        let before = placed.len();
+        for (id, (_, sources)) in entities {
+            if !placed.contains(id) && sources.iter().all(|source| placed.contains(source)) {
+                placed.insert(*id);
+            }
+        }
+        if placed.len() == entities.len() {
+            return true;
+        }
+        if placed.len() == before {
+            return false;
+        }
+    }
 }
 
 /// `bmControls` of one `VC_PROCESSING_UNIT` (UVC 1.5 section 3.7.2.5):
@@ -599,8 +682,10 @@ pub(crate) enum IrFunctionRefusal {
     Unreadable,
     /// The descriptor file holds no complete active configuration, the
     /// descriptor chain is truncated or inconsistent, the function has no
-    /// single `VC_HEADER`, or its header lists an interface that is not
-    /// VideoStreaming.
+    /// single `VC_HEADER`, its header lists an interface that is not
+    /// VideoStreaming or states a length its control block does not have, a
+    /// terminal or unit names a source that is zero, missing, itself, an
+    /// Output Terminal or part of a loop, or a unit has no input.
     Malformed,
     /// The descriptor is well formed, but the node's USB interface is not a
     /// UVC VideoControl interface of the active configuration, as for a
@@ -1989,7 +2074,8 @@ mod tests {
 
     /// Each builder the synthetic counter-cases use lays its descriptor out
     /// exactly as the real 5986:1141 file does, and each counter-case
-    /// differs from [`attested_shape`] only in the field it names.
+    /// differs from [`attested_shape`] only in the field it names, with the
+    /// `VC_HEADER` total kept equal to its control block.
     #[test]
     fn the_counter_case_builders_match_the_real_t480_bytes() {
         assert!(T480_IR.starts_with(&t480::device(0x1141, 0x3759, [3, 1, 2])));
@@ -1997,7 +2083,9 @@ mod tests {
             t480::configuration(0x019C, 2, 4),
             t480::interface(0, 0, 1, SUBCLASS_VIDEOCONTROL, 1, 5),
             t480::vc_header(0x0150, 0x0088, 15_000_000, &[1]),
+            t480::camera_terminal(1, [0, 0, 0x20]),
             t480::processing_unit(2, 1, 0, 3, 0, &[0, 0]),
+            t480::output_terminal(3, 8),
             t480::extension_unit(8, MSXU, 2, 6, &[0x22, 0x00], 7),
             t480::interrupt_endpoint(0x83, 6),
             t480::interface(1, 0, 0, SUBCLASS_VIDEOSTREAMING, 1, 0),
@@ -2082,8 +2170,10 @@ mod tests {
     ///
     /// The reporter's file holds a configuration shorter than its own
     /// `wTotalLength` (see [`T480_RGB`]), and the walk judges it on the
-    /// descriptors it holds: no walker in this module reads `wTotalLength`,
-    /// so a chain that ends cleanly at a descriptor boundary is not
+    /// descriptors it holds: no walker in this module reads the
+    /// configuration's `wTotalLength` (the `VC_HEADER`'s own total, which
+    /// its file has right, is checked), so a chain that ends cleanly at a
+    /// descriptor boundary is not
     /// malformed, while a descriptor cut in the middle still is. The same
     /// holds for an IR function, which stays attested with its header
     /// overstating its length by the same 30 bytes, so a file that comes up
@@ -2133,7 +2223,9 @@ mod tests {
     /// each of `videostreaming`. Built from pieces laid out as the real
     /// 5986:1141 file lays them out, with [`attested_shape`] as the default,
     /// so each counter-case differs from that synthetic shape, not from the
-    /// real file, only in the field it names.
+    /// real file, only in the field it names. The control block is a
+    /// complete source graph ([`control_block`]) and the header's total is
+    /// its length, so a counter-case is refused only by its own clause.
     fn function(
         streams: &[u8],
         videostreaming: &[u8],
@@ -2149,20 +2241,14 @@ mod tests {
             .len();
         bytes.extend(t480::configuration(0, interface_count as u8, 0));
         bytes.extend(t480::interface(0, 0, 1, SUBCLASS_VIDEOCONTROL, 1, 0));
-        bytes.extend(t480::vc_header(0x0150, 0, 15_000_000, streams));
-        for (index, controls) in processing.iter().enumerate() {
-            bytes.extend(t480::processing_unit(
-                2 + index as u8,
-                1,
-                0,
-                3,
-                *controls,
-                &[0, 0],
-            ));
-        }
-        for (unit, guid, count, bitmap) in units {
-            bytes.extend(t480::extension_unit(*unit, guid, *count, 2, bitmap, 0));
-        }
+        let (block, output) = control_block(processing, units);
+        bytes.extend(t480::vc_header(
+            0x0150,
+            (12 + streams.len() + block.len()) as u16,
+            15_000_000,
+            streams,
+        ));
+        bytes.extend(block);
         bytes.extend(t480::interrupt_endpoint(0x83, 6));
         for number in videostreaming {
             bytes.extend(t480::interface(
@@ -2173,9 +2259,63 @@ mod tests {
                 1,
                 0,
             ));
-            bytes.extend(t480::vs_input_header(0, 3, &[0]));
+            bytes.extend(t480::vs_input_header(0, output, &[0]));
         }
         bytes
+    }
+
+    /// The terminals and units after a synthetic `VC_HEADER`, as one
+    /// complete source graph: Processing Units 2 onward fed by the camera
+    /// Input Terminal 1, a USB streaming Output Terminal fed by the last of
+    /// them (or by the camera), and each extension unit fed by the camera
+    /// with nothing reading it, as the Logitech BRIO's units are. Returns
+    /// the bytes and the Output Terminal's ID. The Processing Units come
+    /// first so their offset after the header stays fixed.
+    fn control_block(processing: &[u32], units: &[Unit<'_>]) -> (Vec<u8>, u8) {
+        let mut block = Vec::new();
+        for (index, controls) in processing.iter().enumerate() {
+            block.extend(t480::processing_unit(
+                2 + index as u8,
+                1,
+                0,
+                3,
+                *controls,
+                &[0, 0],
+            ));
+        }
+        let output = 2 + processing.len() as u8;
+        block.extend(t480::camera_terminal(1, [0, 0, 0x20]));
+        block.extend(t480::output_terminal(output, output - 1));
+        for (unit, guid, count, bitmap) in units {
+            block.extend(t480::extension_unit(*unit, guid, *count, 1, bitmap, 0));
+        }
+        (block, output)
+    }
+
+    /// Rewrites the synthetic function's `VC_HEADER` `wTotalLength` to the
+    /// class-specific descriptors that follow it, for a counter-case that
+    /// adds or removes bytes there, so only the clause it names refuses it.
+    fn refresh_vc_total(bytes: &mut [u8]) {
+        let header_at = 18 + 9 + 9;
+        assert_eq!(bytes[header_at + 2], SUBTYPE_VC_HEADER);
+        let mut at = header_at;
+        while at + 1 < bytes.len() && bytes[at + 1] == DESC_CS_INTERFACE && bytes[at] >= 2 {
+            at += usize::from(bytes[at]);
+        }
+        let total = (at - header_at) as u16;
+        bytes[header_at + 5..header_at + 7].copy_from_slice(&total.to_le_bytes());
+    }
+
+    /// The offset of entity `id` in the synthetic function's control block.
+    fn entity_at(bytes: &[u8], id: u8) -> usize {
+        let mut at = 18 + 9 + 9;
+        while bytes[at + 1] == DESC_CS_INTERFACE {
+            if matches!(bytes[at + 2], 2..=7) && bytes[at + 3] == id {
+                return at;
+            }
+            at += usize::from(bytes[at]);
+        }
+        panic!("no entity {id}");
     }
 
     fn attested_shape() -> Vec<u8> {
@@ -2299,6 +2439,7 @@ mod tests {
             let length = usize::from(whole[pu_at]);
             whole[pu_at] -= 1;
             whole.remove(pu_at + length - 1);
+            refresh_vc_total(&mut whole);
             if version == 0x0100 {
                 assert!(ir_function_evidence(&whole, 0).is_ok());
             } else {
@@ -2335,9 +2476,11 @@ mod tests {
     fn an_extension_unit_before_the_control_header_is_malformed() {
         let mut bytes = function(&[1], &[1], &[], &[(8, MSXU, 2, &[0x22, 0x00])]);
         let header_at = 18 + 9 + 9;
-        let header: Vec<_> = bytes.drain(header_at..header_at + 13).collect();
-        let unit_end = header_at + usize::from(bytes[header_at]);
-        bytes.splice(unit_end..unit_end, header);
+        let unit_at = entity_at(&bytes, 8);
+        let unit: Vec<_> = bytes
+            .drain(unit_at..unit_at + usize::from(bytes[unit_at]))
+            .collect();
+        bytes.splice(header_at..header_at, unit);
         assert_eq!(
             ir_function_evidence(&bytes, 0),
             Err(IrFunctionRefusal::Malformed)
@@ -2426,6 +2569,7 @@ mod tests {
         let mut bytes = whole;
         // A complete USB input terminal with the XU's ID.
         bytes.splice(xu_at..xu_at, [8, DESC_CS_INTERFACE, 2, 8, 0, 2, 0, 0]);
+        refresh_vc_total(&mut bytes);
         assert_eq!(
             ir_function_evidence(&bytes, 0),
             Err(IrFunctionRefusal::Malformed)
@@ -2533,12 +2677,14 @@ mod tests {
         for entity in entities {
             let mut valid = whole.clone();
             valid.splice(at..at, entity.clone());
+            refresh_vc_total(&mut valid);
             assert!(ir_function_evidence(&valid, 0).is_ok(), "{entity:?}");
             for length in 3..entity.len() {
                 let mut short = entity[..length].to_vec();
                 short[0] = length as u8;
                 let mut bytes = whole.clone();
                 bytes.splice(at..at, short);
+                refresh_vc_total(&mut bytes);
                 assert_eq!(
                     ir_function_evidence(&bytes, 0),
                     Err(IrFunctionRefusal::Malformed),
@@ -2559,6 +2705,7 @@ mod tests {
                 header_at + 13..header_at + 13,
                 [13, DESC_CS_INTERFACE, 7, 4, 2, 0, 3, 0, 0, 0, 0, 0, 0],
             );
+            refresh_vc_total(&mut bytes);
             assert_eq!(
                 ir_function_evidence(&bytes, 0),
                 Err(IrFunctionRefusal::Malformed)
@@ -2577,6 +2724,7 @@ mod tests {
             header_at + 13..header_at + 13,
             [4, DESC_CS_INTERFACE, 0xff, 4],
         );
+        refresh_vc_total(&mut bytes);
         assert_eq!(
             ir_function_evidence(&bytes, 0),
             Err(IrFunctionRefusal::Malformed)
@@ -2593,6 +2741,7 @@ mod tests {
         let mut short_header = whole.clone();
         short_header[header_at] = 12;
         short_header.remove(header_at + 12);
+        refresh_vc_total(&mut short_header);
         assert_eq!(
             ir_function_evidence(&short_header, 0),
             Err(IrFunctionRefusal::Malformed)
@@ -2604,6 +2753,7 @@ mod tests {
         let mut short_pu = whole.clone();
         short_pu[pu_at] = 10;
         short_pu.drain(pu_at + 10..pu_at + 13);
+        refresh_vc_total(&mut short_pu);
         assert_eq!(
             ir_function_evidence(&short_pu, 0),
             Err(IrFunctionRefusal::Malformed)
@@ -2616,6 +2766,7 @@ mod tests {
         let mut no_i_processing = whole.clone();
         no_i_processing[pu_at] = (8 + control_size) as u8;
         no_i_processing.drain(pu_at + 8 + control_size..pu_at + pu_len);
+        refresh_vc_total(&mut no_i_processing);
         assert_eq!(
             ir_function_evidence(&no_i_processing, 0),
             Err(IrFunctionRefusal::Malformed)
@@ -2633,6 +2784,7 @@ mod tests {
         let mut no_i_extension = whole.clone();
         no_i_extension[xu_at] = (xu_len - 1) as u8;
         no_i_extension.remove(xu_at + xu_len - 1);
+        refresh_vc_total(&mut no_i_extension);
         assert_eq!(
             ir_function_evidence(&no_i_extension, 0),
             Err(IrFunctionRefusal::Malformed)
@@ -2656,10 +2808,243 @@ mod tests {
         let mut two_headers = whole.clone();
         let header = whole[header_at..header_at + 13].to_vec();
         two_headers.splice(header_at..header_at, header);
+        refresh_vc_total(&mut two_headers);
         assert_eq!(
             ir_function_evidence(&two_headers, 0),
             Err(IrFunctionRefusal::Malformed)
         );
+    }
+
+    /// #913: the `VC_HEADER`'s own `wTotalLength` counts the header and
+    /// every terminal and unit after it, and nothing else: not the
+    /// class-specific interrupt endpoint that follows, and never the
+    /// configuration's `wTotalLength`, which the T480 colour file overstates.
+    #[test]
+    fn the_control_header_total_length_counts_its_own_block() {
+        let whole = attested_shape();
+        let header_at = 18 + 9 + 9;
+        let total = u16::from_le_bytes([whole[header_at + 5], whole[header_at + 6]]);
+        assert_eq!(total, 13 + 13 + 18 + 9 + 27);
+        for wrong in [0, total - 1, total + 1, total - 13, total + 5, u16::MAX] {
+            let mut bytes = whole.clone();
+            bytes[header_at + 5..header_at + 7].copy_from_slice(&wrong.to_le_bytes());
+            assert_eq!(
+                ir_function_evidence(&bytes, 0),
+                Err(IrFunctionRefusal::Malformed),
+                "{wrong}"
+            );
+        }
+        // The real functions: T480 IR at 44 (136), T480 colour at 44 (109),
+        // ASUS at 44 (110) and 905 (127).
+        for (label, bytes, header_at, interface, total) in [
+            ("5986:1141", T480_IR, 44, 0, 136u16),
+            ("5986:2113", T480_RGB, 44, 0, 109),
+            ("3277:0059 RGB", ASUS, 44, 0, 110),
+            ("3277:0059 IR", ASUS, 905, 2, 127),
+        ] {
+            assert_eq!(bytes[header_at + 2], SUBTYPE_VC_HEADER, "{label}");
+            assert_eq!(
+                u16::from_le_bytes([bytes[header_at + 5], bytes[header_at + 6]]),
+                total,
+                "{label}"
+            );
+            assert!(
+                video_control_function(bytes, interface).is_some(),
+                "{label}"
+            );
+            for wrong in [total - 1, total + 1] {
+                let mut changed = bytes.to_vec();
+                changed[header_at + 5..header_at + 7].copy_from_slice(&wrong.to_le_bytes());
+                assert!(
+                    video_control_function(&changed, interface).is_none(),
+                    "{label} {wrong}"
+                );
+            }
+        }
+    }
+
+    /// #913: every source a terminal or unit names is another entity of
+    /// the same function with an output. Zero, a missing ID, the entity
+    /// itself, an Output Terminal and a cycle refuse; a forward reference,
+    /// fan-out and a unit whose output nothing reads, all on real cameras,
+    /// do not.
+    #[test]
+    fn every_source_names_another_entity_of_the_function() {
+        // PU 2 <- IT 1, OT 3 <- PU 2, XU 8 <- IT 1.
+        let whole = attested_shape();
+        let set = |pairs: &[(u8, usize, u8)]| {
+            let mut bytes = whole.clone();
+            for (id, field, source) in pairs {
+                let at = entity_at(&bytes, *id);
+                bytes[at + field] = *source;
+            }
+            ir_function_evidence(&bytes, 0)
+        };
+        const PU: usize = 4;
+        const OT: usize = 7;
+        const XU: usize = 22;
+        for (label, pairs) in [
+            ("zero", &[(3, OT, 0)][..]),
+            ("missing", &[(3, OT, 0x42)]),
+            ("self", &[(8, XU, 8)]),
+            ("output terminal", &[(8, XU, 3)]),
+            ("cycle", &[(2, PU, 8), (8, XU, 2)]),
+        ] {
+            assert_eq!(set(pairs), Err(IrFunctionRefusal::Malformed), "{label}");
+        }
+        // T480 5986:1141 and ASUS read their Output Terminal's source
+        // further down the block.
+        assert!(set(&[(3, OT, 8)]).is_ok(), "forward reference");
+
+        // A selector unit with a valid pin does not hide a cycle behind
+        // its other pin, and a zero pin refuses.
+        for (label, pins, result_ok) in [
+            ("valid pins", [1u8, 2], true),
+            ("zero pin", [1, 0], false),
+            ("cycle behind a valid pin", [1, 8], false),
+        ] {
+            let mut bytes = whole.clone();
+            let xu_at = entity_at(&bytes, 8);
+            bytes[xu_at + XU] = 5;
+            let at = entity_at(&bytes, 2);
+            bytes.splice(at..at, [8, DESC_CS_INTERFACE, 4, 5, 2, pins[0], pins[1], 0]);
+            refresh_vc_total(&mut bytes);
+            assert_eq!(
+                ir_function_evidence(&bytes, 0).is_ok(),
+                result_ok,
+                "{label}"
+            );
+        }
+
+        // A unit with no input is disconnected from the function (UVC 1.5
+        // section 2.3: one or more input pins): the Microsoft unit with
+        // `bNrInPins` 0, and a Selector Unit with none.
+        let mut bytes = whole.clone();
+        let xu_at = entity_at(&bytes, 8);
+        assert_eq!(bytes[xu_at + 21], 1);
+        bytes[xu_at + 21] = 0;
+        bytes.remove(xu_at + XU);
+        bytes[xu_at] -= 1;
+        refresh_vc_total(&mut bytes);
+        assert_eq!(
+            ir_function_evidence(&bytes, 0),
+            Err(IrFunctionRefusal::Malformed),
+            "a Microsoft unit with no input"
+        );
+        let mut bytes = whole.clone();
+        let at = entity_at(&bytes, 2);
+        bytes.splice(at..at, [6, DESC_CS_INTERFACE, 4, 5, 0, 0]);
+        refresh_vc_total(&mut bytes);
+        assert_eq!(
+            ir_function_evidence(&bytes, 0),
+            Err(IrFunctionRefusal::Malformed),
+            "a selector unit with no input"
+        );
+    }
+
+    /// #913: a unit cannot take its input from another VideoControl
+    /// function's entity; each function is its own ID namespace.
+    #[test]
+    fn a_source_in_another_function_is_missing_here() {
+        // Interface 0: IT 1, PU 2, PU 3, OT 4. Interface 2: IT 1, OT 2, XU 14.
+        let mut bytes = function(&[1], &[1], &[0, 0], &[]);
+        bytes[18 + 4] = 4;
+        bytes.extend(t480::interface(2, 0, 1, SUBCLASS_VIDEOCONTROL, 1, 0));
+        let (mut block, _) = control_block(&[], &[(14, MSXU, 2, &[0x22, 0x00])]);
+        let xu_at = block.len() - 27;
+        block[xu_at + 22] = 3; // PU 3 exists only in interface 0
+        bytes.extend(t480::vc_header(
+            0x0150,
+            (13 + block.len()) as u16,
+            15_000_000,
+            &[3],
+        ));
+        bytes.extend(block);
+        bytes.extend(t480::interrupt_endpoint(0x84, 6));
+        bytes.extend(t480::interface(3, 0, 0, SUBCLASS_VIDEOSTREAMING, 1, 0));
+        assert_eq!(
+            video_control_function(&bytes, 0)
+                .expect("interface 0 is well formed")
+                .processing_controls
+                .len(),
+            2,
+            "PU 3 exists in interface 0"
+        );
+        assert_eq!(
+            ir_function_evidence(&bytes, 0),
+            Err(IrFunctionRefusal::NoMicrosoftXu)
+        );
+        assert_eq!(
+            ir_function_evidence(&bytes, 2),
+            Err(IrFunctionRefusal::Malformed)
+        );
+    }
+
+    /// A Logitech BRIO (USB 046d:085e, bcdDevice 3.17), read from sysfs on
+    /// a maintainer machine: one function, two streams, two USB streaming
+    /// Output Terminals fed by Processing Unit 3, and eight extension units,
+    /// the Microsoft one among them, fed by it with nothing reading them.
+    const BRIO: &[u8] = include_bytes!("../tests/fixtures/logitech-046d-085e.descriptors");
+
+    /// A NexiGo N930W (USB 3443:c803, bcdDevice 0.07) from the same
+    /// machine: two functions with the same entity IDs, each listing its
+    /// Output Terminal first and its Input Terminal fourth, so an Output
+    /// Terminal and an extension unit read entities listed after them.
+    const NEXIGO: &[u8] = include_bytes!("../tests/fixtures/nexigo-3443-c803.descriptors");
+
+    /// #913 on real graphs: every real control block has a sound source
+    /// graph and a header total equal to its block, including the shapes
+    /// the checks must allow (fan-out, two Output Terminals, units nothing
+    /// reads, entities read before they are listed). Each function keeps
+    /// the outcome its clauses b to d give it.
+    #[test]
+    fn real_control_blocks_pass_the_length_and_source_checks() {
+        for (label, bytes) in [("BRIO", BRIO), ("NexiGo", NEXIGO)] {
+            assert_eq!(
+                active_descriptor_view(bytes, 1).as_deref(),
+                Some(bytes),
+                "{label}"
+            );
+        }
+        let brio = video_control_function(BRIO, 0).expect("a well-formed BRIO function");
+        assert_eq!(brio.streaming_interfaces, [1, 2]);
+        assert_eq!(brio.extension_units.len(), 8);
+        assert_eq!(
+            ir_function_evidence(BRIO, 0),
+            Err(IrFunctionRefusal::StreamingInterfaces(2))
+        );
+        assert_eq!(
+            ir_function_evidence(NEXIGO, 0),
+            Err(IrFunctionRefusal::NoFaceAuthentication)
+        );
+        assert_eq!(
+            ir_function_evidence(NEXIGO, 2),
+            Ok(IrFunctionEvidence {
+                msxu_unit: 4,
+                streaming_interface: 3,
+            })
+        );
+        for (label, bytes, interface) in [
+            ("5986:1141", T480_IR, 0),
+            ("5986:2113", T480_RGB, 0),
+            ("3277:0059 RGB", ASUS, 0),
+            ("3277:0059 IR", ASUS, 2),
+            ("BRIO", BRIO, 0),
+            ("NexiGo RGB", NEXIGO, 0),
+            ("NexiGo IR", NEXIGO, 2),
+        ] {
+            assert!(
+                video_control_function(bytes, interface).is_some(),
+                "{label}"
+            );
+            assert_eq!(
+                video_control_function(bytes, interface)
+                    .unwrap()
+                    .extension_units,
+                extension_units_for_interface(bytes, interface),
+                "{label}"
+            );
+        }
     }
 
     /// The header must list a VideoStreaming interface of the same
@@ -2684,8 +3069,14 @@ mod tests {
         let mut bytes = function(&[1], &[1], &[0], &[]);
         bytes[18 + 4] = 4;
         bytes.extend(t480::interface(2, 0, 1, SUBCLASS_VIDEOCONTROL, 1, 0));
-        bytes.extend(t480::vc_header(0x0150, 0, 15_000_000, &[3]));
-        bytes.extend(t480::extension_unit(14, MSXU, 2, 2, &[0x22, 0x00], 0));
+        let (block, _) = control_block(&[], &[(14, MSXU, 2, &[0x22, 0x00])]);
+        bytes.extend(t480::vc_header(
+            0x0150,
+            (13 + block.len()) as u16,
+            15_000_000,
+            &[3],
+        ));
+        bytes.extend(block);
         bytes.extend(t480::interrupt_endpoint(0x84, 6));
         bytes.extend(t480::interface(3, 0, 0, SUBCLASS_VIDEOSTREAMING, 1, 0));
         assert_eq!(

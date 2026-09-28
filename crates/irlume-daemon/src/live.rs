@@ -70,14 +70,17 @@ enum ChangeReaders {
 }
 /// Camera setup and qualification change what every account reads (the
 /// cameras, the capture schedule), whoever asked for them, so they move
-/// every reader's revision; so does daemon-wide work. Other changes are
-/// the account's own: its enrollment, profiles, keyring and recovery.
+/// every reader's revision; so does daemon-wide work, and root's work for
+/// a name that did not resolve, which is no account's history and may
+/// still have changed an account's records. Other changes are the
+/// account's own: its enrollment, profiles, keyring and recovery. Root's
+/// own account's are root's alone, since root reads every change.
 fn change_readers(kind: LiveOperationKind, owner: Owner) -> ChangeReaders {
     match (kind, owner) {
         (LiveOperationKind::CameraSetup | LiveOperationKind::CaptureQualification, _)
-        | (_, Owner::Daemon) => ChangeReaders::Every,
+        | (_, Owner::Daemon | Owner::Unresolved) => ChangeReaders::Every,
+        (_, Owner::Account(0)) => ChangeReaders::RootOnly,
         (_, Owner::Account(uid)) => ChangeReaders::Account(uid),
-        (_, Owner::Unresolved) => ChangeReaders::RootOnly,
     }
 }
 impl Inner {
@@ -285,7 +288,7 @@ impl LiveState {
                 .0
                 .cancel
                 .get()
-                .is_some_and(|token| stop_requested(token, kind));
+                .is_some_and(|token| stop_requested(token, kind, worker.owner, peer_uid));
             LiveWorkerOperation {
                 operation_id: worker.id,
                 kind,
@@ -344,19 +347,29 @@ fn visible_kind(kind: LiveOperationKind, owner: Owner, peer_uid: u32) -> LiveOpe
         LiveOperationKind::Unknown
     }
 }
-/// Whether the shared token asks the running worker, of `kind` as its reader
-/// reads it, to stop. Authentications and credential releases stop only
-/// when their client leaves; other work also yields to a queued
-/// authentication. An operation the reader may not see reads as `Unknown`
-/// and shows only the request every kind honours, its client leaving:
-/// showing the yield would tell an authentication, which never yields,
-/// from any other kind.
-fn stop_requested(token: &CancelToken, kind: LiveOperationKind) -> bool {
+/// Whether the shared token asks the running worker, of `kind` as the
+/// peer with uid `peer_uid` reads it and owned by `owner`, to stop.
+/// Authentications and credential releases stop only when their client
+/// leaves; other work also yields to a queued authentication. An operation
+/// the reader may not see reads as `Unknown` and shows only the request
+/// every kind honours, its client leaving: showing the yield would tell an
+/// authentication, which never yields, from any other kind. A reader other
+/// than root sees the yield only on its own work, whose client is told it
+/// yielded anyway: on daemon-wide work it would say that the unknown work
+/// waiting is an authentication.
+fn stop_requested(
+    token: &CancelToken,
+    kind: LiveOperationKind,
+    owner: Owner,
+    peer_uid: u32,
+) -> bool {
+    let yield_shown = peer_uid == 0 || owner == Owner::Account(peer_uid);
     match kind {
         LiveOperationKind::Authentication
         | LiveOperationKind::WalletAuthentication
         | LiveOperationKind::Unknown => token.cancel_requested(),
-        _ => token.stop_requested(),
+        _ if yield_shown => token.stop_requested(),
+        _ => token.cancel_requested(),
     }
 }
 impl LiveGuard {
@@ -872,11 +885,11 @@ mod tests {
             .is_empty());
     }
     /// A reader other than root reads the same stop request for another
-    /// account's running operation, or an unresolved one's, whatever its
-    /// kind: a queued authentication's yield, which only some kinds honour,
-    /// does not show, and a departed client's cancel, which every kind
-    /// honours, does. Root and the account itself read the kind's own
-    /// request, and daemon-wide work keeps it for every reader.
+    /// account's running operation, an unresolved one's or daemon-wide
+    /// work, whatever its kind: a queued authentication's yield, which only
+    /// some kinds honour, does not show, and a departed client's cancel,
+    /// which every kind honours, does. Root reads the kind's own request,
+    /// and so does the account for its own work.
     #[test]
     fn live_status_shows_one_stop_request_for_hidden_operations_of_every_kind() {
         use LiveOperationKind as K;
@@ -919,24 +932,14 @@ mod tests {
                 }
                 token.request_stop();
                 assert_eq!(flag(0), yields, "{owner:?} {kind:?}: root reads the kind's");
-                let owners_view = if owner == Owner::Unresolved {
-                    false
-                } else {
-                    yields
-                };
+                let owners_view = owner == Owner::Account(1_000) && yields;
                 assert_eq!(
                     flag(1_000),
                     owners_view,
-                    "{owner:?} {kind:?}: uid 1000 reads the kind's for its own work"
+                    "{owner:?} {kind:?}: uid 1000 reads the kind's for its own work only"
                 );
-                let others_view = if owner == Owner::Daemon {
-                    yields
-                } else {
-                    false
-                };
-                assert_eq!(
-                    flag(2_000),
-                    others_view,
+                assert!(
+                    !flag(2_000),
                     "{owner:?} {kind:?}: another account reads no yield"
                 );
                 token.request_cancel();
@@ -1091,19 +1094,22 @@ mod tests {
         change(K::ProfileUpdate, Owner::Account(2_000));
         change(K::RecoveryUpdate, Owner::Account(2_000));
         assert_eq!(revisions(), [4, 2, 2, 0]);
-        // Work for a name that did not resolve is root's alone.
-        change(K::WalletUpdate, Owner::Unresolved);
+        // Root's own account's work is root's alone.
+        change(K::WalletUpdate, Owner::Account(0));
         assert_eq!(revisions(), [5, 2, 2, 0]);
-        // Daemon-wide work, and camera setup and qualification whoever asked
-        // for them, change what every account reads.
+        assert!(!state.lock().account_revisions.contains_key(&0));
+        // Daemon-wide work, root's work for a name that did not resolve, and
+        // camera setup and qualification whoever asked for them, move every
+        // reader's.
+        change(K::WalletUpdate, Owner::Unresolved);
         change(K::CameraSetup, Owner::Daemon);
         change(K::CameraSetup, Owner::Account(2_000));
         change(K::CaptureQualification, Owner::Account(3_000));
-        assert_eq!(revisions(), [8, 5, 5, 3]);
+        assert_eq!(revisions(), [9, 6, 6, 4]);
         let background = state.register_background(OperationId::from_bytes([200; 16]));
         background.running();
         background.finish();
-        assert_eq!(revisions(), [9, 6, 6, 4]);
+        assert_eq!(revisions(), [10, 7, 7, 5]);
         // Work that changes nothing moves no one's revision.
         let read = state.register(
             OperationId::from_bytes([201; 16]),
@@ -1113,7 +1119,7 @@ mod tests {
         );
         read.running();
         read.finish();
-        assert_eq!(revisions(), [9, 6, 6, 4]);
+        assert_eq!(revisions(), [10, 7, 7, 5]);
     }
     /// Past the bound of accounts with a count of their own, the account
     /// whose latest change is oldest gives its count to the shared one: its

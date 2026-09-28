@@ -954,7 +954,9 @@ All notable changes to irlume are documented here. This project adheres to
   live status that a reader other than root reads advances for its own
   account's changes, camera setup and qualification and other daemon-wide
   work, and no longer for another account's; root's still counts every
-  change (ADR-0030 §5, amended 2026-09-27, #907).
+  change. Such a reader sees a running operation's yield to a queued
+  authentication only on its own work (ADR-0030 §5, amended 2026-09-27,
+  #907).
 
 - The daemon's recent-event history keeps each account's events,
   daemon-wide events and those of an account that did not resolve apart,

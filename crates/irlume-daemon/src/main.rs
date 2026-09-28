@@ -1101,11 +1101,14 @@ fn main() {
                                         diagnostics::CaptureEvidence::NONE,
                                     );
                                 }
+                                // The arbiter lets the job go before live status
+                                // does, so no refusal it gives for the job comes
+                                // while live status no longer shows it.
+                                arbiter.finish(job.class, job.uid);
                                 link.finish_activity();
                                 scope.finish(
                                     irlume_common::diagnostics::CategoricalOutcome::Cancelled,
                                 );
-                                arbiter.finish(job.class, job.uid);
                                 irlume_common::dlog!(
                                     "queued request dropped: its client disconnected first"
                                 );
@@ -2203,13 +2206,12 @@ impl ClientLink {
                 activity.cancel();
             }
             stop.request_cancel();
-        } else {
-            // A cancelled queued request is no longer waiting for worker work.
-            // RUNNING completion is left to the worker, even after disconnect.
-            if let Some(activity) = &self.activity {
-                activity.finish_waiting();
-            }
         }
+        // A queued request stays in the arbiter's queue until the worker
+        // reaches it and drops it (`claim` fails), so it stays shown as
+        // waiting until then: the arbiter refuses nothing for a job live
+        // status does not show. RUNNING completion is left to the worker,
+        // even after disconnect.
         running
     }
 }
@@ -3857,6 +3859,12 @@ fn serve_peer_until(
                 scope: scope.clone(),
                 enqueued_at: std::time::Instant::now(),
             };
+            // Shown as waiting before the arbiter queues it, and until the
+            // worker takes or drops it, so live status shows every job the
+            // arbiter holds.
+            if let Some(activity) = &activity {
+                activity.waiting();
+            }
             // An account other than root is also refused camera work while
             // its live status shows another account's work, running or
             // waiting, as unknown. It gets the refusal a pending
@@ -3872,6 +3880,9 @@ fn serve_peer_until(
                 arbiter.submit(class, peer.uid, queued)
             };
             if let Err(refusal) = admitted {
+                if let Some(activity) = &activity {
+                    activity.finish_waiting();
+                }
                 // Refused, not queued: answer now so the client can retry rather
                 // than hold a slot the login path may want. Charged to the peer,
                 // so a client that spins on refusals throttles itself at accept
@@ -3887,9 +3898,6 @@ fn serve_peer_until(
                     );
                 }
                 return respond(stream, &Response::Error(refusal.message().into()));
-            }
-            if let Some(activity) = &activity {
-                activity.waiting();
             }
             // Wait for the worker, checking between slices whether the client is
             // still there. A polkit dialog the user dismissed (or that closed on a
@@ -15440,6 +15448,55 @@ mod tests {
             operation.finish();
         }
         assert_eq!(ask(reader), queued, "nothing pending again");
+
+        // Only camera work is refused this way: another account's pending
+        // work does not refuse an account's authentication (a lock screen
+        // that runs PAM as the user) or its other requests.
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if me != 0 {
+            let name = users::name_for_uid(me).expect("the running account");
+            let _other = pending(5, diagnostics::Owner::Account(other));
+            for request in [
+                Request::KeyringInfo { user: name.clone() },
+                Request::Authenticate {
+                    structured_errors: false,
+                    user: name.clone(),
+                    service: Some("kde".into()),
+                    intent_confirmation: None,
+                },
+            ] {
+                let mut wire = serde_json::to_string(&request).unwrap();
+                wire.push('\n');
+                let reply = with_serve_as_peer_and_diagnostics(
+                    &arbiter,
+                    &ready,
+                    &state,
+                    peer(me),
+                    |client| {
+                        (&*client).write_all(wire.as_bytes()).unwrap();
+                        let mut line = String::new();
+                        BufReader::new(client).read_line(&mut line).unwrap();
+                        line
+                    },
+                );
+                assert!(!reply.contains(busy), "{request:?}: {reply}");
+            }
+        }
+
+        // A refusal before the arbiter queues nothing.
+        let open = arbiter::Arbiter::<Queued>::new();
+        let _other = pending(6, diagnostics::Owner::Account(other));
+        let refused =
+            with_serve_as_peer_and_diagnostics(&open, &ready, &state, peer(reader), |client| {
+                (&*client).write_all(b"\"ListCameras\"\n").unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                line
+            });
+        assert!(refused.contains(busy), "{refused}");
+        open.close();
+        assert!(open.take().is_none(), "nothing was queued");
     }
 
     /// A request line deadline far enough away that only a test about the

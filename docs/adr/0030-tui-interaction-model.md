@@ -662,18 +662,28 @@ own background qualification, which are daemon-wide.
   both refusals read the same: "camera busy: other work is in progress;
   retry in a moment". The refusal used to name an authentication, and
   camera work was otherwise queued, so the refusal itself said one was
-  pending; now it says no more than the peer's live status. Root's camera
-  work is refused only while an authentication is pending, as before.
+  pending; now it says no more than the peer's live status, which shows a
+  job from before the arbiter queues it until the worker takes or drops
+  it. Root's camera work is refused only while an authentication is
+  pending, as before. The cost is availability between accounts: while one
+  account's work is pending, another account's camera work is refused
+  where it used to wait behind it, and its client retries. Authentications,
+  credential releases and other work that opens no camera are never
+  refused this way, and neither is root.
+- A reader other than root sees the yield to a queued authentication only
+  on its own work, whose client is told it yielded anyway; on daemon-wide
+  work it would say that the unknown work waiting is an authentication.
 - `state_revision`, which tells clients to drop their observations after
-  state-changing work, advanced for every account's work, including the
-  `ResealPassword` of a login that reseals, although a reader observes
-  none of another account's state. Root's revision still counts every such
-  completion. Another reader's counts only the changes it can observe: its
-  own account's, whoever asked for them, camera setup and qualification,
-  which change what every account reads, and other daemon-wide work. It
-  only grows: counts are kept for at most 1024 accounts, and the account
-  whose latest change is oldest gives its count to the shared one when a
-  new account needs a place.
+  state-changing work, advanced for every account's work, although a
+  reader observes none of another account's state. Root's revision still
+  counts every such completion. Another reader's counts only the changes
+  it can observe: its own account's, whoever asked for them, camera setup
+  and qualification, which change what every account reads, and
+  daemon-wide work, including root's work for a name that did not
+  resolve. It only grows: counts are kept for at most 1024 accounts, and
+  the account whose latest change is oldest gives its count to the shared
+  one when a new account needs a place, which moves every other reader's
+  revision once.
 - The wire does not change: `unknown` and `not_authorized` are values
   released clients already decode, the refusal is an `Error` string as
   before, and `state_revision` keeps its type.

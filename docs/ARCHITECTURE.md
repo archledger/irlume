@@ -57,11 +57,11 @@ flowchart LR
   [#169](https://github.com/archledger/irlume/issues/169) tracks each
   difference. Connections are
   handled concurrently, but exactly ONE worker owns and advances the biometric
-  engine and camera state; the arbiter refuses non-auth camera work while an
-  authentication is pending (and, for an account other than root, while
-  another account's work is, in the same words), and long operations yield
-  only at complete capture boundaries. The security invariant is the
-  serialized owner, not the thread count.
+  engine and camera state; non-auth camera work is refused while an
+  authentication is pending and, for an account other than root, while its
+  live status shows another account's or unresolved work, in the same
+  words. Long operations yield only at complete capture boundaries. The
+  security invariant is the serialized owner, not the thread count.
 - **Trust boundary:** `irlumed` reads `SO_PEERCRED` on every connection. Only
   root or the target user may enroll/delete that user's profiles, and the sealed
   login password is released only to a root peer. (We use a raw Unix socket +

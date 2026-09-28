@@ -913,14 +913,22 @@ All notable changes to irlume are documented here. This project adheres to
   under an enrollment that records none, is refused with nothing written
   or removed when the key's recovery envelope exists but cannot be read
   or parsed, since only that envelope's uid shows whose key it is; the
-  message names `irlume recovery forget`. With no envelope the key is
-  reused as before. Writes to the added-camera store (adding or removing
-  a camera) check the template key as an enrollment write does: a key
-  that opens an enrollment recorded for another uid, or whose recovery
-  envelope records another uid while neither the key nor its enrollment
-  records one, refuses the write with nothing written, and
-  `irlume enroll` gives the account a key of its own (SECURITY_AT_REST.md
-  "Records belong to an account uid", #904).
+  message names `irlume recovery forget` when the envelope is a file, or
+  a symbolic link whose target exists, which that command removes, and
+  otherwise (a directory, for instance) says to move the path away. With
+  no envelope the key is reused as before. Writes to the added-camera
+  store (adding or removing a camera) check the template key as an
+  enrollment write does: a key that opens an enrollment recorded for
+  another uid, or whose recovery envelope records another uid while
+  neither the key nor its enrollment records one, refuses the write with
+  nothing written, and `irlume enroll` gives the account a key of its
+  own. An enrollment write, an added-camera store write and
+  `irlume recovery setup` now check the key on a load that writes
+  nothing, and move it to a stronger TPM policy only once they keep it as
+  the account's, so a refused write leaves the template key file as it
+  was, and a key replaced as another account's is put back unchanged when
+  the write fails (SECURITY_AT_REST.md "Records belong to an account
+  uid", #904).
 
 - The daemon's recent-event history (`SupportSnapshot`, which
   `irlume support-report` reads) and its live status (`LiveStatus`) show

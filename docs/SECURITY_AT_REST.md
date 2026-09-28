@@ -245,7 +245,15 @@ each record it does not use, with the uids and the next step.
   envelope is removed once the new enrollment is saved. When that field is
   needed and the recovery envelope exists but cannot be read or parsed, the
   write is refused with nothing written or removed; remove the envelope
-  with `irlume recovery forget`, or move it away, and write again.
+  with `irlume recovery forget`, or move it away, and write again. That
+  command removes a file, or a symbolic link whose target exists (the link,
+  not the target); for anything else there, such as a directory, the
+  refusal says to move the path away instead. An enrollment write, an
+  added-camera store write and `irlume recovery setup` check the key on a
+  load that writes nothing, and move it to a stronger policy only once
+  they keep it as the account's: a write refused over the key leaves the
+  key file as it was, and a key an enrollment write replaces is set aside
+  unmoved, so a failed write puts it back as it was.
 - `irlume recovery setup` does not wrap a template key for the account when
   the enrollment under it records another uid, whatever the key records.
   For a key that records no uid, over an enrollment that records none (or

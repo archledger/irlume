@@ -7,6 +7,49 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `irlume login enable --adjust-jumps` adds irlume's lines to an `/etc`
+  copy of a vendor PAM file whose only obstacle is a numeric jump in a
+  line you added, such as `[success=1 default=ignore] pam_fprintd.so`
+  right above the password substack of a Fedora plasmalogin, by changing
+  the jump's value. Each adjusted jump skips the same lines of yours as
+  before, and irlume's lines among them, and lands on the same line, with
+  one exception: the success of a `pam_fprintd.so` line lands on irlume's
+  `pam_permit.so` landing when irlume puts that line right after what the
+  jump skips. Here `success=1` becomes `success=2`: the verified
+  fingerprint's success is recorded, and irlume's keyring and reseal lines
+  run after it as before. Any other action, a failure or the success of a
+  `pam_succeed_if.so` group check among them, skips irlume's lines up to
+  the line it landed on. Only the jump's digits change, so a control
+  written `[success = 1 default=ignore]` keeps its blanks.
+  `login disable --adjust-jumps` takes irlume's lines out rather than
+  leave inactive lines in their places: it lowers a jump that counts them,
+  or moves a landing off a line of irlume's it takes out to the first line
+  after them. `login enable --adjust-jumps` does the same on a login or lock
+  screen the configuration no longer wants wired. Without the flag an
+  enable keeps the file and fails as before, and a disable keeps inactive
+  lines; the preview and the refusal name each line the flag would change
+  by its number, with its jump values before and after, and where its
+  jumps would land, never quoting a line. A jump of the vendor copy that
+  irlume's lines had moved when the copy was made is left as the vendor
+  wrote it, since taking irlume's lines out gives it back its vendor
+  landing, and the output names the line it lands on now. The flag applies to irlume's `/etc` copies of vendor PAM files
+  only: a stack irlume edits in place, such as `sudo` on Debian, keeps
+  inactive lines on a disable, as without it. Where it cannot show that the
+  jumps keep their landings, the flag changes no jump and the run goes as
+  without it: a jump across an `include` or past the end of the stack, a
+  disable that would land a jump on the end of the stack, an `include`
+  above irlume's lines whose stack has a numeric jump that could land past
+  its end, a control not in brackets, or a `substack` whose file
+  irlume cannot read where PAM finds it, or cannot read as PAM does, since
+  PAM counts a substack it cannot load as two modules. A file with a line
+  continued with `\` or a line irlume does not read as PAM does is handled
+  as without the flag. Over the inactive lines a disable without the flag
+  left, an enable that would move such a jump says to run
+  `login disable --adjust-jumps`, then `login enable --adjust-jumps`, or
+  why that disable would keep them too. The `login plan --json` changes
+  carry `jumps_adjustable` for a surface the flag would handle
+  differently; the machine API never changes such a line (#875).
+
 - Diagnostic trace schema 5 times the grouped sequential route's capture
   batch phase by phase: `sequential_rgb_start`, one
   `sequential_rgb_sample` per sample, `sequential_rgb_release`, then the
@@ -325,6 +368,14 @@ All notable changes to irlume are documented here. This project adheres to
   requests schema 4 and an older daemon refuses it as before.
 
 ### Changed
+
+- Messages about a numeric jump that irlume's lines would move, and about
+  a line of yours that irlume's lines would move past, name each line by
+  its number in the file, or in the vendor copy an override is made or
+  rebuilt from, and irlume's own lines by what they are, never by their
+  text: a module's arguments can hold a secret, and reconcile's messages
+  reach the system journal. That covers the refusals and warnings of
+  `irlume login enable` and `disable` and reconcile's log (#933).
 
 - If RGB-only enrollment was made while irlume used a YUYV-only IR camera
   as its colour camera, as it could on a ThinkPad T480, enroll again: such

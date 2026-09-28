@@ -663,11 +663,11 @@ would change, without changing anything.
   "plan_id": "c574f96dba23c06bbb2e2f395a74f074",
   "action": "disable",
   "changes": [
-    { "surface": "gdm-password", "role": "login-screen", "change": "not-installed", "writes": false, "kept": false },
-    { "surface": "plasmalogin", "role": "login-screen", "change": "restore-backup", "writes": true, "kept": false },
-    { "surface": "kde", "role": "lock-screen", "change": "restore-backup", "writes": true, "kept": false },
-    { "surface": "sudo", "role": "sudo", "change": "restore-backup", "writes": true, "kept": false },
-    { "surface": "polkit-1", "role": "polkit", "change": "remove-override", "writes": true, "kept": false }
+    { "surface": "gdm-password", "role": "login-screen", "change": "not-installed", "writes": false, "kept": false, "jumps_adjustable": false },
+    { "surface": "plasmalogin", "role": "login-screen", "change": "restore-backup", "writes": true, "kept": false, "jumps_adjustable": false },
+    { "surface": "kde", "role": "lock-screen", "change": "restore-backup", "writes": true, "kept": false, "jumps_adjustable": false },
+    { "surface": "sudo", "role": "sudo", "change": "restore-backup", "writes": true, "kept": false, "jumps_adjustable": false },
+    { "surface": "polkit-1", "role": "polkit", "change": "remove-override", "writes": true, "kept": false, "jumps_adjustable": false }
   ],
   "writes": 4,
   "requires_root": true
@@ -699,6 +699,25 @@ which fails the apply (`kept` in `login apply` below); it is false for every
 other surface, including a `keep-edited-override` whose irlume lines are
 already right. The same file can be either, depending on the lines the
 configuration wants. `kept` was added in 0.15.0 and is absent from older
+builds. `jumps_adjustable` is true on a surface the human `--adjust-jumps` flag
+would handle differently because of a numeric jump in an administrator's line
+(see [DISABLE.md](DISABLE.md)). On a `kept` surface of an enable plan, the
+only obstacle is such a jump, which irlume's new lines would land
+inside: `login enable --adjust-jumps` would make the update. On a surface the
+run takes irlume's lines out of, `strip-in-place` or `not-wired` with `kept`
+false, irlume's lines stay as inactive lines because such a jump counts them
+or lands on one of them: the same command with `--adjust-jumps` would remove
+them, lowering a jump that counts them, or moving a landing off a line of
+irlume's it takes out to the first line after them. That is every surface of a
+disable plan, and a surface of an enable plan whose configuration no longer
+wants irlume's lines there, such as a login screen once face login is off, so
+an enable plan can mark a surface `jumps_adjustable` with `kept` false. It is
+false everywhere else, including a surface the flag cannot help and every
+stack irlume edits in place: the flag applies to irlume's `/etc` copies of
+vendor files only, and a stack edited in place keeps inactive lines. The API
+itself never changes such a line: `login apply` keeps a `kept` surface and
+fails on it, and leaves inactive lines where it takes irlume's lines out,
+either way. `jumps_adjustable` was added in 0.15.0 and is absent from older
 builds.
 
 The override changes concern a service a distribution ships only under
@@ -754,11 +773,14 @@ in those lines counts irlume's lines, `strip-in-place` replaces them with
 inactive `pam_permit.so` lines in the same places rather than removing them,
 so the jump lands where it did; it does the same when irlume could not tell
 where to put its lines back without them. The API never rebuilds an edited
-copy: that takes the human `login enable --force`.
+copy, and never changes the value or the landing of a numeric jump in one:
+those take the human `login enable --force` and `login enable --adjust-jumps`
+(or `login disable --adjust-jumps`).
 
 `plan_id` is a digest of the action and the exact per-surface outcomes it was
-computed against, `kept` included. Two plans over an unchanged machine share an id; any change to
-what would happen produces a different one. For a surface with a vendor path it
+computed against, `kept` and `jumps_adjustable` included. Two plans over an
+unchanged machine share an id; any change to what would happen produces a
+different one. For a surface with a vendor path it
 covers the vendor file too, whether or not an override exists yet, so a vendor
 update between `plan` and `apply` makes the plan stale. It exists so that a
 later apply can refuse a plan that no longer matches the machine rather than

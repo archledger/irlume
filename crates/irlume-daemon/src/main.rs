@@ -18091,6 +18091,60 @@ mod tests {
         assert_eq!(saved["uid"], owner.uid, "{saved}");
     }
 
+    /// Root's request acts for the uid its account resolved to when it was
+    /// registered, through the dispatch and across the load and the save:
+    /// with the name resolving to another uid by the time the worker runs
+    /// it, a rename registered for the enrollment's uid rewrites that
+    /// enrollment and keeps its uid, while one registered for the name's
+    /// current uid finds no enrollment of that uid's (#904).
+    #[test]
+    fn a_root_rewrite_acts_for_its_registered_uid_through_the_save() {
+        // Ends in storage::save, which seals a template key on a TPM host;
+        // same convention as the other mutation tests.
+        if irlume_core::template_key::tpm_available() {
+            jout_debug!("skipping: TPM present; storage::save would touch real hardware");
+            return;
+        }
+        use diagnostics::Owner;
+        let _g = enrollment_summary_test_lock();
+        let mut e = engine();
+        let sb = sandbox("root-pin-write");
+        let user = "nobody";
+        let now = uid_of(user).expect("NSS account nobody");
+        let then = now.wrapping_add(1);
+        let mut planted = enrollment_with(user, &["Face Scan 1"]);
+        planted.uid = Some(then);
+        write_enrollment(&sb.dir, &planted);
+        let rename = |new_name: &str| Request::RenameProfile {
+            user: user.into(),
+            profile: "Face Profile 1".into(),
+            new_name: new_name.into(),
+        };
+        let state = diagnostics::DiagnosticState::default();
+        let run = |e: &mut irlume_auth::Engine, registered: u32, new_name: &str| {
+            let request = rename(new_name);
+            let scope = state.begin_for(
+                diagnostic_operation_class(&request),
+                Owner::Account(registered),
+            );
+            dispatch_scoped(request, &peer(0), e, &scope, None)
+        };
+        let saved = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(sb.dir.join(format!("{user}.json"))).unwrap())
+                .unwrap()
+        };
+
+        let current = run(&mut e, now, "Current");
+        assert!(matches!(current, Response::Error(_)), "{current:?}");
+        assert_eq!(saved()["profiles"][0]["name"], "Face Profile 1");
+
+        let registered = run(&mut e, then, "Registered");
+        assert!(!matches!(registered, Response::Error(_)), "{registered:?}");
+        let saved = saved();
+        assert_eq!(saved["profiles"][0]["name"], "Registered");
+        assert_eq!(saved["uid"], then, "{saved}");
+    }
+
     /// A cached listing answers only while the name resolves as it did for
     /// the load that built it. Once the name resolves to another uid, with
     /// the enrollment file unchanged, the listing goes to the worker, whose

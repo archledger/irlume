@@ -345,6 +345,18 @@ jobs:
       - name: Set up pinned coverage tools (system Rust)
         run: bash scripts/ci/setup-coverage-tools.sh
 
+      # `--no-report` runs keep earlier build artifacts, and the report reads
+      # every instrumented binary under the runner's persistent target
+      # directory. A binary left from an earlier night's tree counts each file
+      # changed since then twice: on 2026-09-28 the 57 files changed since
+      # 2026-09-26 counted 1.96 times their lines, the 83 unchanged files
+      # matched, and the total fell from 85.26% to 54.73% (#906). Remove the
+      # workspace's instrumented builds and profiles first; dependencies stay
+      # built.
+      - name: Remove earlier coverage builds and profiles
+        run: |
+          "$IRLUME_COVERAGE_BIN" llvm-cov clean --workspace
+
       - name: Fetch model weights (models-v1 release, sha256-verified)
         run: bash scripts/fetch-models.sh
 

@@ -98,8 +98,19 @@ p=Path(a[a.index('--root')+1])/'bin';p.mkdir()
         self.assertLess(coverage.index('bash scripts/ci/setup-coverage-tools.sh'),
                         coverage.index('ffmpeg -loglevel'))
         self.assertNotIn('-- cargo llvm-cov', coverage)
-        self.assertEqual(coverage.count('"$IRLUME_COVERAGE_BIN" llvm-cov'), 9)
+        self.assertEqual(coverage.count('"$IRLUME_COVERAGE_BIN" llvm-cov'), 10)
         self.assertIn('--fail-under-lines 75', coverage)
+
+    def test_workflow_cleans_earlier_builds_before_the_first_measurement(self):
+        # `--no-report` keeps old artifacts and the report reads every
+        # instrumented binary in the persistent target directory (#906).
+        workflow = (ROOT / '.github/workflows/hardware-suite.yml').read_text()
+        coverage = workflow.split('\n  coverage:', 1)[1]
+        clean = coverage.index('\n          "$IRLUME_COVERAGE_BIN" llvm-cov clean --workspace\n')
+        self.assertEqual(coverage.count('llvm-cov clean'), 1)
+        self.assertLess(coverage.index('bash scripts/ci/setup-coverage-tools.sh'), clean)
+        self.assertLess(clean, coverage.index('"$IRLUME_COVERAGE_BIN" llvm-cov --no-report'))
+        self.assertLess(clean, coverage.index('"$IRLUME_COVERAGE_BIN" llvm-cov report'))
 
 
 if __name__ == '__main__':

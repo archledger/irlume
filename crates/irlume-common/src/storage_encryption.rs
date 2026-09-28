@@ -14,9 +14,11 @@
 //! 2. Otherwise, as for btrfs, whose `st_dev` is an anonymous number, the
 //!    mount that holds the path in `/proc/self/mountinfo` (the longest mount
 //!    point containing it; the later entry on a tie, since it is mounted
-//!    over the earlier) names its source device. A btrfs filesystem can span
-//!    several devices, so every device `/sys/fs/btrfs/<fsid>/devices` lists
-//!    for it counts.
+//!    over the earlier) names its source device. That source is matched in
+//!    sysfs without a stat of its `/dev` node: `/dev/mapper/<name>` by the
+//!    device-mapper `dm/name`, another `/dev` path by the entry directly in
+//!    `/dev` its links lead to. A btrfs filesystem can span several devices,
+//!    so every device `/sys/fs/btrfs/<fsid>/devices` lists for it counts.
 //! 3. The device stack below, in `/sys/class/block/<name>`: a device-mapper
 //!    node whose `dm/uuid` names a cryptsetup encryption type
 //!    (`CRYPT-LUKS2-...`, `CRYPT-PLAIN-...`) is dm-crypt; any other stacked
@@ -35,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 /// Whether the block storage under a path is encrypted.
@@ -446,19 +448,52 @@ fn mount_holding<'a>(mounts: &'a [Mount], path: &Path) -> Option<&'a Mount> {
     best.map(|(mount, _)| mount)
 }
 
-/// The sysfs name of the block device a mount source names: a `/dev` node,
-/// followed through its symlinks (`/dev/mapper/luks-...` points at
-/// `../dm-0`). A block device node is looked up by its device number, which
-/// also covers a node whose name differs from its sysfs name.
+/// The sysfs name of the block device a mount source names, found without
+/// a stat of any `/dev` node: irlumed's AppArmor profiles grant no block
+/// node. A `/dev/mapper/<name>` source is the device-mapper device whose
+/// `dm/name` reads `<name>`. Another `/dev` path is followed through its
+/// symlinks (`/dev/disk/by-uuid/...` points at `../../nvme0n1p3`), which
+/// reads the links and never stats their target, and names the device when
+/// it resolves to an entry directly in `/dev` that `class/block` lists.
+/// Anything else, a node in a subdirectory included, is not known.
 fn source_device(roots: &Roots, source: &str) -> Option<String> {
     let rel = source.strip_prefix("/dev/")?;
-    let node = fs::canonicalize(roots.dev.join(rel)).ok()?;
-    let meta = fs::metadata(&node).ok()?;
-    if meta.file_type().is_block_device() {
-        let rdev = meta.rdev();
-        return name_of_dev(&roots.sys, libc::major(rdev), libc::minor(rdev));
+    if let Some(mapper) = rel.strip_prefix("mapper/") {
+        return dm_device_named(&roots.sys, mapper);
     }
-    plain_name(node.file_name()?)
+    let node = fs::canonicalize(roots.dev.join(rel)).ok()?;
+    if node.parent()? != fs::canonicalize(&roots.dev).ok()? {
+        return None;
+    }
+    let name = plain_name(node.file_name()?)?;
+    // Canonicalizing reads the class/block link only; it fails when the
+    // entry is missing.
+    fs::canonicalize(roots.sys.join("class/block").join(&name)).ok()?;
+    Some(name)
+}
+
+/// The sysfs name of the device-mapper device called `mapper`: the one
+/// `class/block` entry whose `dm/name` reads `mapper`. `None` when no entry
+/// or more than one does, or when the listing or an entry's `dm/name`
+/// cannot be read.
+fn dm_device_named(sys: &Path, mapper: &str) -> Option<String> {
+    let mapper = plain_name(OsStr::new(mapper))?;
+    let mut found = None;
+    for entry in fs::read_dir(sys.join("class/block")).ok()? {
+        let entry = entry.ok()?;
+        let name = plain_name(&entry.file_name())?;
+        match fs::read_to_string(entry.path().join("dm/name")) {
+            Ok(text) if text.strip_suffix('\n').unwrap_or(&text) == mapper => {
+                if found.replace(name).is_some() {
+                    return None;
+                }
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    found
 }
 
 /// Every device of the btrfs filesystem that `name` belongs to, or `None`
@@ -690,6 +725,7 @@ mod tests {
             fs::create_dir_all(dir.join("dm")).unwrap();
             fs::create_dir_all(dir.join("slaves")).unwrap();
             fs::write(dir.join("dm/uuid"), format!("{uuid}\n")).unwrap();
+            fs::write(dir.join("dm/name"), format!("{mapper}\n")).unwrap();
             for slave in slaves {
                 fs::write(dir.join("slaves").join(slave), b"").unwrap();
             }
@@ -823,6 +859,125 @@ mod tests {
         fx.disk("sda", "8:0");
         fx.dm("dm-0", "253:0", "luks-a", LUKS_UUID, &["sda"]);
         fx.mountinfo("43 1 0:35 / / rw shared:1 - btrfs /dev/mapper/luks-a rw\n");
+        assert_eq!(probe(&fx, 0, 37), Unknown);
+    }
+
+    #[test]
+    fn a_mapper_source_is_found_by_its_dm_name_without_a_dev_node() {
+        let fx = Fixture::new("mapper-name");
+        fx.disk("nvme0n1", "259:0");
+        fx.partition("nvme0n1", "nvme0n1p3", "259:3");
+        fx.dm("dm-0", "253:0", "luks-0b1c", LUKS_UUID, &["nvme0n1p3"]);
+        fx.dm("dm-1", "253:1", "vg-root", "LVM-abcdefAbcdef", &["dm-0"]);
+        fx.btrfs("6fdb3276-6661-41e1-9520-9bdbde1102ae", &["dm-0"]);
+        // irlumed's AppArmor profiles grant no /dev block node, so the
+        // lookup must succeed from sysfs alone.
+        fs::remove_dir_all(fx.root.join("dev")).unwrap();
+        let roots = fx.roots();
+        assert_eq!(
+            source_device(&roots, "/dev/mapper/luks-0b1c").as_deref(),
+            Some("dm-0")
+        );
+        assert_eq!(
+            source_device(&roots, "/dev/mapper/vg-root").as_deref(),
+            Some("dm-1")
+        );
+        fx.mountinfo("43 1 0:35 /root / rw shared:1 - btrfs /dev/mapper/luks-0b1c rw\n");
+        assert_eq!(probe(&fx, 0, 37), Encrypted);
+        // A name that matches no device-mapper device, or is not one plain
+        // name, resolves to nothing, and the storage stays unknown.
+        for source in [
+            "/dev/mapper/luks-0b1",
+            "/dev/mapper/luks-0b1c-x",
+            "/dev/mapper/dm-0",
+            "/dev/mapper/control",
+            "/dev/mapper/",
+            "/dev/mapper/../nvme0n1p3",
+            "/dev/mapper/a/luks-0b1c",
+        ] {
+            assert_eq!(source_device(&roots, source), None, "{source}");
+        }
+        fx.mountinfo("43 1 0:35 /root / rw shared:1 - btrfs /dev/mapper/luks-gone rw\n");
+        assert_eq!(probe(&fx, 0, 37), Unknown);
+        // Two devices with one name, which the kernel does not allow, and a
+        // dm/name that cannot be read (a directory in its place) decide
+        // nothing either.
+        let other = fx.root.join("sys/devices/virtual/block/dm-1/dm/name");
+        fs::write(&other, b"luks-0b1c\n").unwrap();
+        assert_eq!(source_device(&roots, "/dev/mapper/luks-0b1c"), None);
+        fs::remove_file(&other).unwrap();
+        fs::create_dir(&other).unwrap();
+        assert_eq!(source_device(&roots, "/dev/mapper/luks-0b1c"), None);
+    }
+
+    #[test]
+    fn a_btrfs_filesystem_on_several_mapper_devices_resolves_without_a_dev_node() {
+        let fx = Fixture::new("btrfs-mapper-multi");
+        fx.disk("sda", "8:0");
+        fx.disk("sdb", "8:16");
+        fx.disk("sdc", "8:32");
+        fx.dm("dm-0", "253:0", "luks-a", LUKS_UUID, &["sda"]);
+        fx.dm("dm-1", "253:1", "luks-b", LUKS_UUID, &["sdb"]);
+        fx.btrfs("0f0f", &["dm-0", "dm-1"]);
+        fs::remove_dir_all(fx.root.join("dev")).unwrap();
+        // btrfs names one member as the source; every member counts.
+        fx.mountinfo("43 1 0:35 / / rw shared:1 - btrfs /dev/mapper/luks-b rw\n");
+        assert_eq!(probe(&fx, 0, 37), Encrypted);
+        // One plain member leaves part of the filesystem unencrypted.
+        fx.btrfs("0f0f", &["sdc"]);
+        assert_eq!(probe(&fx, 0, 37), NotEncrypted);
+    }
+
+    #[test]
+    fn a_dev_path_names_the_block_device_its_links_lead_to() {
+        let fx = Fixture::new("dev-path");
+        fx.disk("nvme0n1", "259:0");
+        fx.partition("nvme0n1", "nvme0n1p3", "259:3");
+        fx.dm("dm-0", "253:0", "luks-0b1c", LUKS_UUID, &["nvme0n1p3"]);
+        let dev = fx.root.join("dev");
+        fs::create_dir_all(dev.join("disk/by-uuid")).unwrap();
+        symlink("../../nvme0n1p3", dev.join("disk/by-uuid/6fdb3276")).unwrap();
+        fs::create_dir_all(dev.join("vg")).unwrap();
+        symlink("../dm-0", dev.join("vg/root")).unwrap();
+        let roots = fx.roots();
+        for (source, name) in [
+            ("/dev/nvme0n1p3", "nvme0n1p3"),
+            ("/dev/disk/by-uuid/6fdb3276", "nvme0n1p3"),
+            ("/dev/dm-0", "dm-0"),
+            ("/dev/vg/root", "dm-0"),
+        ] {
+            assert_eq!(
+                source_device(&roots, source).as_deref(),
+                Some(name),
+                "{source}"
+            );
+        }
+        // A plain partition, named through a link.
+        fx.btrfs("6fdb3276-6661-41e1-9520-9bdbde1102ae", &["nvme0n1p3"]);
+        fx.mountinfo("43 1 0:35 / / rw shared:1 - btrfs /dev/disk/by-uuid/6fdb3276 rw\n");
+        assert_eq!(probe(&fx, 0, 37), NotEncrypted);
+        // An entry sysfs does not list, one in a subdirectory, one outside
+        // /dev, a missing one and a source outside /dev resolve to nothing.
+        fs::write(dev.join("sdz"), b"").unwrap();
+        fs::create_dir_all(dev.join("cciss")).unwrap();
+        fs::write(dev.join("cciss/nvme0n1p3"), b"").unwrap();
+        fs::create_dir_all(fx.root.join("outside")).unwrap();
+        fs::write(fx.root.join("outside/nvme0n1p3"), b"").unwrap();
+        symlink("../outside/nvme0n1p3", dev.join("escape")).unwrap();
+        for source in [
+            "/dev/sdz",
+            "/dev/cciss/nvme0n1p3",
+            "/dev/escape",
+            "/dev/../outside/nvme0n1p3",
+            "/dev/missing",
+            "/dev/",
+            "dev/nvme0n1p3",
+            "rpool/irlume",
+            "tmpfs",
+        ] {
+            assert_eq!(source_device(&roots, source), None, "{source}");
+        }
+        fx.mountinfo("43 1 0:35 / / rw shared:1 - btrfs /dev/cciss/nvme0n1p3 rw\n");
         assert_eq!(probe(&fx, 0, 37), Unknown);
     }
 

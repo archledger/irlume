@@ -349,6 +349,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Under irlumed's AppArmor profile in enforce mode, as Debian and Ubuntu
+  load it, `irlume doctor`'s `sealed-storage` check and the guidance after
+  a seal establish the storage under `/usr`, `/etc` and a btrfs mount
+  instead of reporting it unknown, which gave encrypted installs a storage
+  warning. Both packaged profiles let irlumed read the `/usr` and `/etc`
+  directories, nothing beneath them, and the probe finds a mount's source
+  device in sysfs without a stat of its `/dev` node, which the profiles do
+  not grant: a `/dev/mapper/<name>` source by its device-mapper name,
+  another `/dev` path by the device its links lead to (#900).
+
 - At the end of its 60-second wait for the lock of earlier releases
   (`/run/lock/irlume-pam.lock`), a PAM operation reads `/proc/locks`
   until two consecutive readings list the same processes holding and

@@ -211,7 +211,11 @@ field. Sanitization is therefore enforced by types and serialization tests,
 not by regex replacement after arbitrary strings have been collected.
 
 The daemon retains at most 256 share-safe events or 30 minutes, whichever is
-smaller. The ring is process-local and intentionally disappears on restart. A
+smaller. (Amended 2026-09-27 by ADR-0030's amendment of that date: the bound
+applies to each account's events, to daemon-wide events and to unresolved ones
+separately, for at most 32 accounts at once, so one account's activity does not
+push another reader's events out.) The ring is process-local and intentionally
+disappears on restart. A
 support report states that boundary. Persistent diagnostic history remains the
 system journal under the machine's existing access controls.
 

@@ -205,15 +205,18 @@ NSS (so LDAP, SSSD and systemd-homed accounts resolve too). A request from
 the account itself (not root) passes irlumed's authorization check only when
 the name resolves to the caller's uid, so every record that request loads or
 writes is checked against, and records, the caller's uid. A root request that
-names an account resolves the name once, when irlumed starts serving it, and
-its records are checked against, and record, that uid until it ends: an
+names an account resolves the name once, through NSS, when irlumed registers
+the request (a uid another request holds for the name is not taken), and its
+records are checked against, and record, that uid until it ends: an
 enrollment captured, or a keyring password checked, while the name resolved
 to one account is saved or sealed for that account's uid even when the name
-resolves to another uid by the time of the write. A name no account has, or
-whose lookup fails, is looked up again by each record check. On an
-authentication request irlumed reuses the lookup it already makes for the
-retry record, so the check adds no second lookup there. A cached profile
-listing is served only while the name resolves to the uid its load used.
+resolves to another uid by the time of the write. While a request holds a
+uid for a name, a request for the same name that would hold another uid is
+refused before it checks or writes a record, until the first ends. A name no
+account has, or whose lookup fails, is looked up again by each record check.
+An authentication's retry record is kept for the uid the request holds, so
+the check adds no second lookup there. A cached profile listing is served
+only while the name resolves to the uid its load used.
 
 | Record | Recorded uid differs from the current one | Current uid cannot be resolved |
 |---|---|---|
@@ -306,7 +309,9 @@ each record it does not use, with the uids and the next step.
   hand) is not tied to a uid: a listing for the name shows its groups as
   stale until they are removed.
 - Retry records (`retry/<uid>.json`) and the attempt record are kept by uid
-  already.
+  already. An attempt is filed for the uid its request acted for, and only
+  while that uid still has the name the request named; otherwise it is not
+  filed.
 - The field is additive: an older irlumed ignores it and keeps using records
   by name.
 

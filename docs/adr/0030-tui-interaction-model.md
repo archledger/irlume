@@ -610,6 +610,28 @@ own background qualification, which are daemon-wide.
   daemon-wide ones, numbered from 1, and always lists `recent_events` as
   `not_authorized` in `unavailable`, so the reader knows the list may be
   partial and the marker itself tells nothing.
+- The ring keeps each account's events, daemon-wide events and unresolved
+  ones apart, the latest 256 of each for 30 minutes, for at most 32 accounts
+  at once; a 33rd account displaces the account whose latest event is
+  oldest. A snapshot lists the latest 256 events its reader may read, so
+  another account's activity does not push them out while no more than 32
+  accounts have events.
+- Root's request acts for the uid its account resolved to when the request
+  arrived, the uid recorded with it: the worker does not resolve the name
+  again when it starts the request, so the account shown the operation is
+  the account it acts for even when the name resolves to another uid by
+  then. That lookup asks NSS; it does not take a uid another request holds
+  for the name while irlumed serves it. While one request holds a uid for a
+  name, another request for the name that would act for a different uid is
+  refused until the first ends, so neither request's records are checked
+  against the other's uid. A request's attempt is filed for the uid it
+  acted for, and only while that uid still has the name. A keyring arm or
+  reseal checks the password, and an arm the home directory, by name, so it
+  is refused while the name resolves to another uid than the one the
+  request acts for, checked before and after those lookups. For a name that
+  did not resolve, `Authenticate` and `UnsealPassword` are refused without
+  a second lookup and file no attempt; other requests make the lookups
+  their records make, and their events stay root's alone.
 - `LiveStatus` answered to any other account reports every operation of
   another account, or of an unresolved one, running or waiting, as
   `unknown` whatever its kind, with its operation ID and elapsed time

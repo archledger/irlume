@@ -909,6 +909,23 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- The daemon's recent-event history keeps each account's events,
+  daemon-wide events and those of an account that did not resolve apart,
+  the latest 256 of each for 30 minutes and for up to 32 accounts at
+  once, so other accounts' activity no longer pushes an account's own
+  events out of what it reads. A request root makes for an account acts
+  for the uid the name resolved to when the request arrived, the uid its
+  events and live status are shown to, instead of resolving the name
+  again when the worker starts it. That lookup asks NSS and does not
+  take a uid another request holds for the name. While one request holds
+  a uid for a name, another request for that name that would act for a
+  different uid is refused until the first ends. An attempt is filed for
+  the uid its request acted for, and only while that uid still has the
+  name. A keyring arm or reseal, which checks the password (and an arm
+  the home directory) by name, is refused while the name resolves to
+  another uid than the one the request acts for (ADR-0030 §5, amended
+  2026-09-27, #907).
+
 - An enrollment write that would reuse a template key recording no uid,
   under an enrollment that records none, is refused with nothing written
   or removed when the key's recovery envelope exists but cannot be read

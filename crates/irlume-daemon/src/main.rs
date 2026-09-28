@@ -2619,11 +2619,11 @@ mod worker_engine {
             let inline = ["early_refusal(", "EarlyRefusal::"].concat();
             let sites = flat.matches(&wrapped).count() + flat.matches(&inline).count();
             assert_eq!(
-                sites, 9,
-                "the nine pre-camera refusal sites (daemon starting, root \
+                sites, 10,
+                "the ten pre-camera refusal sites (daemon starting, root \
                  gate, camera seat, method, configuration, cosmic binding, \
-                 convenience tier, biopolicy, retry throttle) each name their \
-                 cause"
+                 convenience tier, biopolicy, retry throttle, an account \
+                 another request holds) each name their cause"
             );
         }
 
@@ -3309,12 +3309,20 @@ static SOCKET_ACTIVATED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// credentials. That is what lets the daemon answer it while the engine is still
 /// loading (#244). Every authorization check below is a property of the REQUEST,
 /// never of startup state, so answering early cannot weaken any of them.
+///
+/// `resolve_account` looks up the account the request is for: on the
+/// worker `irlume_core::account::resolve`, which answers the uid the worker
+/// holds for the request ([`worker_account_uid`]); before the engine exists
+/// `irlume_core::account::resolve_fresh`, since nothing holds a uid for the
+/// request there and the answer must be NSS's, not a uid another request
+/// holds for the name.
 fn unseal_keyring(
     user: &str,
     service: Option<&str>,
     have_password: bool,
     auth_phase: bool,
     peer: &Peer,
+    resolve_account: fn(&str) -> irlume_core::account::Resolution,
 ) -> Response {
     let user = user.to_string();
     let service = service.map(str::to_string);
@@ -3377,14 +3385,26 @@ fn unseal_keyring(
     // tell (logind's session state or the account cannot be read): the
     // typed password still opens a password- or wallet-key-keyed keyring,
     // and a GNOME keyring token still reaches the session phase.
-    // An auth-phase request resolves the account here; the release below
-    // checks the envelope's uid against the same answer.
-    let resolved = if auth_phase {
-        crate::users::uid_for_name(&user)
-    } else {
-        None
+    // Every request resolves the account here and holds the answer; the
+    // release below checks the envelope's uid against it, and an auth-phase
+    // request also asks logind about it. On the worker the answer is the uid
+    // the request was registered for, which the worker holds
+    // ([`worker_account_uid`]). Before the engine exists it is NSS's, and
+    // holding it is refused while another request holds another uid for the
+    // name, so the request never acts for that request's uid.
+    let resolved = match resolve_account(&user) {
+        irlume_core::account::Resolution::Uid(uid) => Some(uid),
+        irlume_core::account::Resolution::NoAccount | irlume_core::account::Resolution::Unknown => {
+            None
+        }
     };
-    let _account_uid = resolved.map(|uid| irlume_core::account::remember(&user, uid));
+    let _account_uid = match resolved
+        .map(|uid| irlume_core::account::hold(&user, uid))
+        .transpose()
+    {
+        Ok(held) => held,
+        Err(error) => return Response::Error(error.to_string()),
+    };
     if auth_phase {
         let live = resolved.and_then(attempt_record::local_graphical_session);
         if live != Some(false) {
@@ -3463,7 +3483,14 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             service,
             have_password,
             auth_phase,
-        } => unseal_keyring(&user, service.as_deref(), have_password, auth_phase, peer),
+        } => unseal_keyring(
+            &user,
+            service.as_deref(),
+            have_password,
+            auth_phase,
+            peer,
+            irlume_core::account::resolve_fresh,
+        ),
         Request::Ping => Response::Ok("starting".into()),
         Request::PreferencesStatus => {
             Response::PreferencesStatus(irlume_common::PreferencesState::observe())
@@ -3488,8 +3515,9 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             structured_errors,
             ..
         } => {
-            attempt_record::record_in_background(
+            attempt_record::record_on_arrival(
                 user.clone(),
+                peer.uid,
                 attempt_record::Filed {
                     at: attempt_record::unix_now(),
                     kind: irlume_common::AttemptKind::Authenticate,
@@ -3515,8 +3543,9 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             }
         }
         Request::UnsealPassword { user, service } => {
-            attempt_record::record_in_background(
+            attempt_record::record_on_arrival(
                 user.clone(),
+                peer.uid,
                 attempt_record::Filed {
                     at: attempt_record::unix_now(),
                     kind: irlume_common::AttemptKind::Authenticate,
@@ -3535,8 +3564,9 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
         // Past pregate, so an `IdentifyFor` peer may act for the account.
         Request::Identify | Request::IdentifyFor { .. } => {
             if let Some(name) = identify_account(&req, peer) {
-                attempt_record::record_in_background(
+                attempt_record::record_on_arrival(
                     name.clone(),
+                    peer.uid,
                     attempt_record::Filed {
                         at: attempt_record::unix_now(),
                         kind: irlume_common::AttemptKind::Identify,
@@ -3734,7 +3764,9 @@ fn serve_peer_until(
                 );
                 scope.finish(categorical_outcome(&resp));
                 if peer_may_file_for(&req, &peer) {
-                    if let Some(attempt) = AttemptContext::for_request(&req, &peer, || None) {
+                    if let Some(attempt) =
+                        AttemptContext::for_request(&req, &peer, scope.owner(), || None)
+                    {
                         // Whatever the reply shape, an authority or
                         // confirmation refusal is a policy decision before
                         // any camera.
@@ -3812,9 +3844,9 @@ fn serve_peer_until(
             // Built before the request moves into the job: a refusal at the
             // door is a completed attempt that reached no camera (ADR-0030
             // §5), and only the refusal branch uses it.
-            let refused_attempt = AttemptContext::for_request(&req, &peer, || None);
+            let refused_attempt = AttemptContext::for_request(&req, &peer, scope.owner(), || None);
             let queued = Queued {
-                attempt: AttemptContext::for_request(&req, &peer, || None),
+                attempt: AttemptContext::for_request(&req, &peer, scope.owner(), || None),
                 authorization,
                 session,
                 position,
@@ -4983,24 +5015,27 @@ fn summarize_enrollment(
 }
 
 /// How `user` resolves for a worker-side load of its enrollment, held until
-/// the returned guard drops: a non-root caller's uid is already held from the
-/// gate, and root's request resolves the name here, so the load checks the
-/// records against that answer. A summary built from the load records it as
-/// its owner, so the status path serves it ([`EnrollmentSummary::serves`]).
+/// the returned guard drops: the uid the worker holds for the request
+/// ([`worker_account_uid`]), else the name resolves here, so the load checks
+/// the records against that answer. A summary built from the load records
+/// it as its owner, so the status path serves it
+/// ([`EnrollmentSummary::serves`]).
+///
+/// # Errors
+/// Another request irlumed is serving came to hold another uid for the name
+/// after it resolved here: nothing is loaded.
 fn summary_owner(
     user: &str,
-) -> (
+) -> irlume_common::Result<(
     irlume_core::account::Resolution,
     Option<irlume_core::account::RememberedUid>,
-) {
+)> {
     let owner = irlume_core::account::resolve(user);
     let held = match owner {
-        irlume_core::account::Resolution::Uid(uid) => {
-            Some(irlume_core::account::remember(user, uid))
-        }
+        irlume_core::account::Resolution::Uid(uid) => Some(irlume_core::account::hold(user, uid)?),
         _ => None,
     };
-    (owner, held)
+    Ok((owner, held))
 }
 
 fn publish_enrollment_summary(user: &str, summary: EnrollmentSummary) {
@@ -5326,54 +5361,135 @@ fn note_camera_seat_refusal(uid: u32, unknown: bool) {
 }
 
 /// The uid [`pregate`] established for the account a request names, held
-/// for the request (`irlume_core::account::remember`): a non-root peer passes
+/// for the request (`irlume_core::account::hold`): a non-root peer passes
 /// a [`Privilege::RootOrTarget`] gate only as that account, so the account's
 /// uid is the peer's. The records the request checks and writes are then
 /// bound to the account that was authorized, whatever a later lookup of the
-/// name answers. `None` for root, for which the gate resolves no account
-/// (the worker resolves it once: [`worker_account_uid`]).
+/// name answers. `Ok(None)` for root, for which the gate resolves no account
+/// (the request's registration resolves it once, and the worker holds that
+/// answer: [`worker_account_uid`]).
 ///
 /// Only for a request the gate admitted: a refused peer's uid says nothing
 /// about the account it named.
-fn gate_account_uid(req: &Request, peer: &Peer) -> Option<irlume_core::account::RememberedUid> {
+///
+/// # Errors
+/// Another request irlumed is serving holds another uid for the name: the
+/// request is refused with this error rather than check that request's
+/// records against the peer's uid, or its own against the other uid.
+fn gate_account_uid(
+    req: &Request,
+    peer: &Peer,
+) -> irlume_common::Result<Option<irlume_core::account::RememberedUid>> {
     let posture = posture(req);
     match (posture.privilege, posture.user) {
         (Privilege::RootOrTarget { .. }, Some(user)) if peer.uid != 0 => {
-            Some(irlume_core::account::remember(user, peer.uid))
+            irlume_core::account::hold(user, peer.uid).map(Some)
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
 /// The uid held for a request the worker serves: [`gate_account_uid`], and
 /// for root, for which the gate resolves no account, the uid that the
-/// account the request names ([`Privilege::RootOrTarget`]) resolves to when
-/// the worker starts it. A request can run for a long time before it writes
-/// (an enrollment captures first and saves at the end; `SealPassword`
-/// verifies the password and then seals it), so its records are bound to the
-/// account the name resolved to when it started, whatever a later lookup
-/// answers. A name that resolves to no account, or whose lookup fails, holds
-/// nothing: the request's records then go by the lookups they make. Nor does
-/// root's `Authenticate` here: its arm resolves the account for the retry
-/// record before it loads a record, and holds that uid, so authentication
-/// makes no second lookup.
-fn worker_account_uid(req: &Request, peer: &Peer) -> Option<irlume_core::account::RememberedUid> {
+/// account the request names resolved to when the request was registered,
+/// the one its diagnostic owner records ([`diagnostic_owner`],
+/// [`request_account_uid`]). The worker does not look the name up again, so
+/// the request acts for the account its live entry and events are shown
+/// to, however long it waited in the queue. A request can also run for a
+/// long time before it writes (an enrollment captures first and saves at
+/// the end; `SealPassword` verifies the password and then seals it), and its
+/// records stay bound to that uid whatever a later lookup answers. A name
+/// that did not resolve holds nothing: the request's records then go by the
+/// lookups they make, and its events and live entry stay root's alone.
+///
+/// # Errors
+/// Another request irlumed is serving holds another uid for the name, as
+/// when NSS mapped the name to another uid between the two registrations:
+/// the uid held first keeps answering until its request ends, and this
+/// request is refused with the error before it checks or writes a record,
+/// so neither request's records open for the other's uid.
+fn worker_account_uid(
+    req: &Request,
+    peer: &Peer,
+    owner: diagnostics::Owner,
+) -> irlume_common::Result<Option<irlume_core::account::RememberedUid>> {
     if peer.uid != 0 {
         return gate_account_uid(req, peer);
     }
-    if matches!(req, Request::Authenticate { .. }) {
+    let (Some(user), Some(uid)) = (posture(req).user, request_account_uid(peer, owner)) else {
+        return Ok(None);
+    };
+    irlume_core::account::hold(user, uid).map(Some)
+}
+
+/// A refusal for a request whose name-based checks (the account's shadow
+/// entry, its home directory) would read another account's: `user` no
+/// longer resolves through NSS to the uid held for the request
+/// ([`worker_account_uid`]), whose records it writes. `None` when it does,
+/// or when no uid is held.
+fn refuse_moved_account(kind: &str, user: &str) -> Option<Response> {
+    let held = irlume_core::account::resolve(user);
+    if held == irlume_core::account::resolve_fresh(user) {
         return None;
     }
-    let posture = posture(req);
-    match (posture.privilege, posture.user) {
-        (Privilege::RootOrTarget { .. }, Some(user)) => match irlume_core::account::resolve(user) {
-            irlume_core::account::Resolution::Uid(uid) => {
-                Some(irlume_core::account::remember(user, uid))
-            }
-            irlume_core::account::Resolution::NoAccount
-            | irlume_core::account::Resolution::Unknown => None,
-        },
-        _ => None,
+    jout_notice!(
+        "irlumed: {kind}: '{user}' now resolves to another account than the one this request \
+         acts for; nothing was changed"
+    );
+    Some(Response::Error(format!(
+        "'{user}' now resolves to another account than the one this request was made for, so \
+         its password was not checked and nothing was changed; try again"
+    )))
+}
+
+/// The reply to a request [`worker_account_uid`] refused: in the shape its
+/// client decodes, a policy refusal before any camera.
+fn held_account_refusal(req: &Request, error: &irlume_common::Error) -> Response {
+    if matches!(req, Request::Authenticate { .. }) {
+        let reason = error.to_string();
+        jout_notice!("irlumed: {}", journal_safe(&reason));
+        return early_refusal(EarlyRefusal::Policy, reason);
+    }
+    note_pre_camera(irlume_common::OutcomeCause::Policy);
+    held_account_reply(req, error)
+}
+
+/// The reply to a request refused because another request holds another
+/// uid for the name it names, in the shape its client asked for: a
+/// `ListProfiles` that opted into structured errors gets an
+/// `OperationError`, which it may retry once the other request ends.
+fn held_account_reply(req: &Request, error: &irlume_common::Error) -> Response {
+    let reason = error.to_string();
+    jout_notice!("irlumed: {}", journal_safe(&reason));
+    if matches!(
+        req,
+        Request::ListProfiles {
+            structured_errors: true,
+            ..
+        }
+    ) {
+        return Response::OperationError {
+            code: irlume_common::OperationErrorCode::OperationFailed,
+            retryable: true,
+            cause: None,
+        };
+    }
+    Response::Error(reason)
+}
+
+/// The uid a request that names an account acts for, from the one lookup
+/// made when it was registered: a peer other than root passes the gate only
+/// as the account it names, so the peer's own uid; for root, the uid its
+/// diagnostic owner records ([`diagnostic_owner`]). `None` when root's name
+/// did not resolve then, or `owner` names no account; nothing looks the name
+/// up again.
+fn request_account_uid(peer: &Peer, owner: diagnostics::Owner) -> Option<u32> {
+    if peer.uid != 0 {
+        return Some(peer.uid);
+    }
+    match owner {
+        diagnostics::Owner::Account(uid) => Some(uid),
+        diagnostics::Owner::Daemon | diagnostics::Owner::Unresolved => None,
     }
 }
 
@@ -5458,7 +5574,10 @@ fn dispatch_status_with_diagnostics(
     if let Some(resp) = pregate(req, peer) {
         return Some(resp);
     }
-    let _gate_uid = gate_account_uid(req, peer);
+    let _gate_uid = match gate_account_uid(req, peer) {
+        Ok(held) => held,
+        Err(error) => return Some(held_account_reply(req, &error)),
+    };
     // Both views depend on the reader: root sees every operation, any other
     // account only its own and daemon-wide ones (`diagnostics::Owner`).
     if matches!(req, Request::LiveStatus) {
@@ -5597,7 +5716,16 @@ fn dispatch_status_with_diagnostics(
             // publishes. Serving the real load here would put a TPM command
             // and a potential template-key WRITE on a connection thread.
             let mut sum = cached_enrollment_summary(user)?;
-            if !sum.serves(irlume_core::account::resolve(user)) {
+            // A peer other than root holds its own uid for the name
+            // ([`gate_account_uid`]). Root holds none here: its answer is
+            // NSS's, not a uid another request holds while irlumed serves
+            // it, as for the request's registration ([`diagnostic_owner`]).
+            let resolution = if peer.uid == 0 {
+                irlume_core::account::resolve_fresh(user)
+            } else {
+                irlume_core::account::resolve(user)
+            };
+            if !sum.serves(resolution) {
                 return None;
             }
             let primary = primary_digest_now(user);
@@ -6358,17 +6486,30 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
 /// which leaves the operation to root alone; root's requests that name no
 /// account (camera setup and qualification, diagnostics, a support probe, a
 /// recognition test) are daemon-wide.
+///
+/// This is the one lookup of root's account, made when the request is
+/// registered, and the worker acts for the same uid ([`request_account_uid`],
+/// [`worker_account_uid`]) rather than resolving the name again when it
+/// starts. It asks NSS afresh (`irlume_core::account::resolve_fresh`), not
+/// the uid another request holds for the name while irlumed serves it: a
+/// request that arrives after NSS mapped the name to another uid is
+/// registered for that uid, and does not run while the earlier request
+/// still holds the old one ([`irlume_core::account::hold`]).
 fn diagnostic_owner(req: &Request, peer: &Peer) -> diagnostics::Owner {
     use diagnostics::Owner;
+    use irlume_core::account::Resolution;
     if peer.uid != 0 {
         return Owner::Account(peer.uid);
     }
-    match posture(req).user {
-        None => Owner::Daemon,
-        Some(user) => Some(user)
-            .filter(|user| valid_username(user))
-            .and_then(uid_of)
-            .map_or(Owner::Unresolved, Owner::Account),
+    let Some(user) = posture(req).user else {
+        return Owner::Daemon;
+    };
+    if !valid_username(user) {
+        return Owner::Unresolved;
+    }
+    match irlume_core::account::resolve_fresh(user) {
+        Resolution::Uid(uid) => Owner::Account(uid),
+        Resolution::NoAccount | Resolution::Unknown => Owner::Unresolved,
     }
 }
 
@@ -6588,6 +6729,10 @@ fn set_cameras_if_current(
 /// What the attempt record needs from a request before it is served
 /// (ADR-0030 §5); filed from the reply that was actually sent.
 struct AttemptContext {
+    /// The uid the request acts for, resolved when it was registered
+    /// ([`request_account_uid`]): the attempt is filed in that uid's record,
+    /// however the name resolves by the time the reply is filed.
+    uid: u32,
     user: String,
     kind: irlume_common::AttemptKind,
     surface: irlume_common::AttemptSurface,
@@ -6698,13 +6843,21 @@ fn attempt_surface(
 
 impl AttemptContext {
     /// `camera` resolves the configured camera's location now (sysfs, no
-    /// opens); a path that never reaches a camera passes `|| None`.
+    /// opens); a path that never reaches a camera passes `|| None`. `owner`
+    /// is the request's diagnostic owner, which records the uid it acts for
+    /// ([`request_account_uid`]). A request that acts for no uid (root's
+    /// request for a name that did not resolve when it was registered)
+    /// files nothing: a lookup when the reply is filed could only find an
+    /// account the name was given since, and the attempt is not that
+    /// account's history.
     fn for_request(
         req: &Request,
         peer: &Peer,
+        owner: diagnostics::Owner,
         camera: impl FnOnce() -> Option<irlume_auth::CameraLocation>,
     ) -> Option<Self> {
         reset_reply_facts();
+        let uid = request_account_uid(peer, owner)?;
         let (user, kind, surface) = match req {
             // The verify path and the cold-login credential-release path
             // are both face authentications.
@@ -6733,6 +6886,7 @@ impl AttemptContext {
             _ => return None,
         };
         Some(Self {
+            uid,
             user,
             kind,
             surface,
@@ -6861,14 +7015,19 @@ impl AttemptContext {
             },
             camera,
         };
-        attempt_record::Pending::new(self.user, filed)
+        attempt_record::Pending::new(self.uid, self.user, filed)
     }
 }
 
 #[cfg(test)]
 fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
     let state = diagnostics::DiagnosticState::default();
-    let scope = state.begin(diagnostic_operation_class(&req));
+    // Registered as `serve` registers it, so the worker acts for the
+    // account its owner records.
+    let scope = state.begin_for(
+        diagnostic_operation_class(&req),
+        diagnostic_owner(&req, peer),
+    );
     let response = dispatch_scoped(req, peer, engine, &scope, None);
     scope.finish(categorical_outcome(&response));
     response
@@ -6935,7 +7094,7 @@ fn dispatch_scoped_session_delivering(
     // from the submission snapshot; a test dispatch arms it here.
     reset_reply_facts();
     if delivery.attempt.is_none() {
-        delivery.attempt = AttemptContext::for_request(&req, peer, || {
+        delivery.attempt = AttemptContext::for_request(&req, peer, scope.owner(), || {
             irlume_auth::camera_location(engine.rgb_device())
         })
         .map(|attempt| (attempt, scope.clone()));
@@ -7118,8 +7277,15 @@ fn dispatch_scoped_session_inner(
     // Status requests are normally answered on the connection thread and
     // never reach here; delegating keeps this dispatch total (and identical
     // in behavior) if one is ever submitted anyway. The pregate rides inside.
-    if let Some(resp) = dispatch_status(&req, peer) {
-        return resp;
+    // A `ListProfiles` here is one the connection thread could not answer
+    // from the cached summary, and the worker loads it for the uid the
+    // request was registered for ([`worker_account_uid`]): a summary cached
+    // since then can belong to the uid the name resolves to now, which is
+    // another account when the name moved while the request waited.
+    if !matches!(req, Request::ListProfiles { .. }) {
+        if let Some(resp) = dispatch_status(&req, peer) {
+            return resp;
+        }
     }
     // Every arm below runs with the posture table already enforced: the
     // username screened for traversal, and the declared privilege satisfied
@@ -7127,7 +7293,10 @@ fn dispatch_scoped_session_inner(
     if let Some(resp) = pregate(&req, peer) {
         return resp;
     }
-    let _account_uid = worker_account_uid(&req, peer);
+    let _account_uid = match worker_account_uid(&req, peer, scope.owner()) {
+        Ok(held) => held,
+        Err(error) => return held_account_refusal(&req, &error),
+    };
     if operation_authorization::required(&req, peer) {
         let result = authorization
             .ok_or_else(|| operation_authorization::REFUSED.to_owned())
@@ -7274,7 +7443,15 @@ fn dispatch_scoped_session_inner(
                     Response::Error(prose)
                 }
             };
-            let (owner, _owner_uid) = summary_owner(&user);
+            let (owner, _owner_uid) = match summary_owner(&user) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    return fail(
+                        irlume_common::OperationErrorCode::OperationFailed,
+                        error.to_string(),
+                    )
+                }
+            };
             let digest_before = primary_digest_now(&user);
             match irlume_core::storage::load(&user) {
                 Ok(enr) => {
@@ -7430,13 +7607,15 @@ fn dispatch_scoped_session_inner(
                 irlume_auth::AuthenticationPurpose::for_service(service.as_deref()),
                 sensor_policy,
             );
-            let retry_attempt = match retry_throttle::FaceAttempt::for_user(&user) {
+            // The uid the request was registered for, not a second lookup.
+            // The worker holds it ([`worker_account_uid`]), so the
+            // enrollment and key loads of this request check the uid each
+            // record was written for against it.
+            let account_uid = request_account_uid(peer, scope.owner());
+            let retry_attempt = match retry_throttle::FaceAttempt::for_account(account_uid) {
                 Ok(attempt) => attempt,
                 Err(reason) => return retry_verify_refusal(reason),
             };
-            // The enrollment and key loads of this request check the uid
-            // each record was written for against this resolution.
-            let _account_uid = irlume_core::account::remember(&user, retry_attempt.uid());
             let convenience = tier == irlume_core::biopolicy::Tier::Convenience;
             let t = std::time::Instant::now();
             // The reply is built by ONE function whether the engine hands the
@@ -7755,6 +7934,11 @@ fn dispatch_scoped_session_inner(
             if password.expose().contains(&0) {
                 return refuse_nul_password("SealPassword", &user);
             }
+            // The password and the home directory are looked up by name, and
+            // the envelope is written for the uid held for the request.
+            if let Some(refusal) = refuse_moved_account("SealPassword", &user) {
+                return refusal;
+            }
             let verified = password_matches_login(&user, password.expose());
             if verified == Some(false) {
                 jout_notice!(
@@ -7796,6 +7980,11 @@ fn dispatch_scoped_session_inner(
             // did not force one, so a KDE-only machine gets the wallet key
             // without the client needing to know to ask.
             let home = crate::users::home_for_name(&user);
+            // Again after the lookups by name, so a remap while they ran is
+            // caught too.
+            if let Some(refusal) = refuse_moved_account("SealPassword", &user) {
+                return refusal;
+            }
             let forced_kind = kind;
             let core_kind = match forced_kind {
                 Some(k) => crate::users::wire_to_core_kind(k),
@@ -8016,6 +8205,7 @@ fn dispatch_scoped_session_inner(
             }
             do_unseal_password_scoped(
                 &user,
+                request_account_uid(peer, scope.owner()),
                 service.as_deref(),
                 engine,
                 scope,
@@ -8036,7 +8226,14 @@ fn dispatch_scoped_session_inner(
                 scope,
                 irlume_common::diagnostics::TraceStage::CredentialUnseal,
             );
-            unseal_keyring(&user, service.as_deref(), have_password, auth_phase, peer)
+            unseal_keyring(
+                &user,
+                service.as_deref(),
+                have_password,
+                auth_phase,
+                peer,
+                irlume_core::account::resolve,
+            )
         }
         Request::ForgetPassword { user } => match irlume_core::keyring::forget_password(&user) {
             Ok(()) => Response::PasswordForgotten,
@@ -8094,6 +8291,11 @@ fn dispatch_scoped_session_inner(
             if password.expose().contains(&0) {
                 return refuse_nul_password("ResealPassword", &user);
             }
+            // The password is checked by name, and the envelope is resealed
+            // for the uid held for the request.
+            if let Some(refusal) = refuse_moved_account("ResealPassword", &user) {
+                return refusal;
+            }
             // Only an armed account has a seal to keep, and the check costs a
             // crypt() on every session open, so an unarmed one skips it:
             // `reseal_password` answers `NotArmed` for it.
@@ -8108,6 +8310,9 @@ fn dispatch_scoped_session_inner(
                     "that is not '{user}'s current login password; the sealed secret was left \
                      as it was"
                 ));
+            }
+            if let Some(refusal) = refuse_moved_account("ResealPassword", &user) {
+                return refusal;
             }
             match irlume_core::keyring::reseal_password(
                 &user,
@@ -8794,7 +8999,10 @@ fn remove_camera_group(
 }
 
 fn set_require_eyes_open_off(user: &str, engine: &irlume_auth::Engine) -> Response {
-    let (owner, _owner_uid) = summary_owner(user);
+    let (owner, _owner_uid) = match summary_owner(user) {
+        Ok(owner) => owner,
+        Err(error) => return Response::Error(error.to_string()),
+    };
     let mut enrollment = match irlume_core::storage::load(user) {
         Ok(Some(enrollment)) => enrollment,
         Ok(None) => return Response::Error(format!("'{user}' is not enrolled")),
@@ -8937,13 +9145,33 @@ fn do_unseal_password(
     engine: &mut irlume_auth::Engine,
 ) -> Response {
     let state = diagnostics::DiagnosticState::default();
-    let scope = state.begin(irlume_common::diagnostics::OperationClass::Authentication);
+    // Registered as root's request is: its owner is the account resolved
+    // now, and the release acts for that uid, which the worker holds.
+    let root = Peer {
+        uid: 0,
+        gid: 0,
+        pid: 0,
+    };
+    let request = Request::UnsealPassword {
+        user: user.into(),
+        service: service.map(Into::into),
+    };
+    let owner = diagnostic_owner(&request, &root);
+    let scope = state.begin_for(
+        irlume_common::diagnostics::OperationClass::Authentication,
+        owner,
+    );
+    let _account_uid = match worker_account_uid(&request, &root, owner) {
+        Ok(held) => held,
+        Err(error) => return held_account_refusal(&request, &error),
+    };
     let policy = match irlume_common::config::observe_face_sensor_policy().resolve() {
         Ok(policy) => policy,
         Err(error) => return Response::Error(error.to_string()),
     };
     do_unseal_password_scoped(
         user,
+        request_account_uid(&root, owner),
         service,
         engine,
         &scope,
@@ -8956,6 +9184,7 @@ fn do_unseal_password(
 #[allow(clippy::too_many_arguments)]
 fn do_unseal_password_scoped(
     user: &str,
+    account_uid: Option<u32>,
     service: Option<&str>,
     engine: &mut irlume_auth::Engine,
     diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
@@ -8972,13 +9201,14 @@ fn do_unseal_password_scoped(
         };
     }
     let window = irlume_auth::AuthenticationWindow::for_service(service);
-    let retry_attempt = match retry_throttle::FaceAttempt::for_user(user) {
+    // `account_uid` is the uid the request was registered for, which the
+    // worker holds ([`worker_account_uid`]): the enrollment, key and
+    // sealed-secret loads of this request check the uid each record was
+    // written for against it.
+    let retry_attempt = match retry_throttle::FaceAttempt::for_account(account_uid) {
         Ok(attempt) => attempt,
         Err(reason) => return retry_unseal_refusal(reason),
     };
-    // The enrollment, key and sealed-secret loads of this request check the
-    // uid each record was written for against this resolution.
-    let _account_uid = irlume_core::account::remember(user, retry_attempt.uid());
     // ADR-0027, same shape as the Authenticate arm: one reply builder, run by
     // the engine's decision hook before the concurrent pair is released, or
     // by the ordinary return path. The credential itself is prepared inside
@@ -10918,7 +11148,7 @@ mod tests {
             "pregate(",
             "authorized_for(",
             "uid_of(",
-            "FaceAttempt::for_user(",
+            "FaceAttempt::for_account(",
             "Recovery::for_user(",
             "dispatch_using(",
             "retry_throttle::record(",
@@ -10941,7 +11171,8 @@ mod tests {
             "account::resolve(",
             "summary_owner(",
             "dispatch_status(",
-            // Resolves the account a root peer's request names.
+            // Holds a uid for the name a request names, which every lookup
+            // of that name answers while it is held.
             "worker_account_uid(",
         ];
         /// Drops char literals, string literals and line comments so a brace
@@ -16565,7 +16796,6 @@ mod tests {
             let subscription = state
                 .subscribe_trace(0, 60_000, Some(CURRENT_TRACE_SCHEMA_VERSION))
                 .unwrap();
-            let scope = state.begin(irlume_common::diagnostics::OperationClass::Authentication);
             // A real local account, so the retry-throttle state is
             // readable; it is not enrolled in the sandbox, so the engine
             // call itself denies and still exercises the boundary.
@@ -16573,24 +16803,24 @@ mod tests {
             // is specified as always succeeding.
             let local_user =
                 users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into());
-            let reply = dispatch_scoped_session(
-                Request::Authenticate {
-                    structured_errors: false,
-                    user: local_user,
-                    // A screen-unlock service so the convenience-tier engine
-                    // still reaches the engine call. This service class takes
-                    // no intent attestation; sending one would be refused by
-                    // the confirmation gate.
-                    service: Some("kde-fingerprint".into()),
-                    intent_confirmation: None,
-                },
-                &peer(0),
-                &mut e,
-                &scope,
-                None,
-                None,
-                None,
+            let request = Request::Authenticate {
+                structured_errors: false,
+                user: local_user,
+                // A screen-unlock service so the convenience-tier engine
+                // still reaches the engine call. This service class takes
+                // no intent attestation; sending one would be refused by
+                // the confirmation gate.
+                service: Some("kde-fingerprint".into()),
+                intent_confirmation: None,
+            };
+            // Registered as `serve` registers it: the worker acts for the
+            // account its owner records.
+            let scope = state.begin_for(
+                irlume_common::diagnostics::OperationClass::Authentication,
+                diagnostic_owner(&request, &peer(0)),
             );
+            let reply =
+                dispatch_scoped_session(request, &peer(0), &mut e, &scope, None, None, None);
             assert!(
                 matches!(reply.response, Response::AuthResult { granted: false, .. }),
                 "{:?}",
@@ -17375,19 +17605,20 @@ mod tests {
         );
     }
 
-    /// Root's request resolves the account it names once, when the worker
-    /// starts it, and holds that uid for the whole request: a write made
-    /// after the name resolves to another uid (here the save at the end of a
-    /// reset enrollment's capture) records the uid the request started with,
-    /// since every record check resolves through the held uid. The lookup at
-    /// the start is stood in for by a registered answer, released before the
-    /// write so the name then resolves through NSS to another uid. A name no
-    /// account has holds nothing, and neither does a request that names no
-    /// account, nor an authentication request, whose arm holds the uid it
-    /// resolves for the retry record. A non-root peer's request holds the
-    /// peer's uid.
+    /// Root's request resolves the account it names once, when it is
+    /// registered (its diagnostic owner), and the worker holds that uid for
+    /// the whole request: a write made after the name resolves to another
+    /// uid (here the save at the end of a reset enrollment's capture)
+    /// records the uid the request was registered for, since every record
+    /// check resolves through the held uid. The lookup at registration is
+    /// stood in for by a registered answer, released before the worker
+    /// starts so the name then resolves through NSS to another uid. A name
+    /// no account has holds nothing, and neither does a request that names
+    /// no account. An authentication holds its uid too, and its retry
+    /// record is that uid's. A non-root peer's request holds the peer's uid.
     #[test]
-    fn a_root_request_holds_the_uid_its_account_resolved_to_when_it_started() {
+    fn a_root_request_holds_the_uid_its_account_resolved_to_when_it_was_registered() {
+        use diagnostics::Owner;
         use irlume_core::account::Resolution;
         let _g = enrollment_summary_test_lock();
         let sb = sandbox("root-request-uid");
@@ -17401,13 +17632,16 @@ mod tests {
             reset: true,
         };
         let start = irlume_core::account::remember(user, then);
-        let held = worker_account_uid(&enroll(user), &peer(0));
+        let owner = diagnostic_owner(&enroll(user), &peer(0));
         drop(start);
+        assert_eq!(owner, Owner::Account(then), "registered for that uid");
+        assert_eq!(irlume_core::account::resolve(user), Resolution::Uid(now));
+        let held = worker_account_uid(&enroll(user), &peer(0), owner).expect("nothing held");
         assert!(held.is_some(), "root's request holds a uid");
         assert_eq!(
             irlume_core::account::resolve(user),
             Resolution::Uid(then),
-            "the request's lookups answer the uid it started with"
+            "the request's lookups answer the uid it was registered for"
         );
         // The write at the end of the capture, on a host without a TPM.
         if !irlume_core::template_key::tpm_available() {
@@ -17427,22 +17661,400 @@ mod tests {
             irlume_core::account::resolve(missing),
             Resolution::NoAccount
         );
-        assert!(worker_account_uid(&enroll(missing), &peer(0)).is_none());
-        assert!(worker_account_uid(&Request::Ping, &peer(0)).is_none());
+        let unresolved = diagnostic_owner(&enroll(missing), &peer(0));
+        assert_eq!(unresolved, Owner::Unresolved);
+        assert!(worker_account_uid(&enroll(missing), &peer(0), unresolved)
+            .expect("nothing held")
+            .is_none());
+        assert_eq!(request_account_uid(&peer(0), unresolved), None);
+        assert!(worker_account_uid(&Request::Ping, &peer(0), Owner::Daemon)
+            .expect("nothing held")
+            .is_none());
         let authenticate = Request::Authenticate {
             structured_errors: false,
             user: user.into(),
             service: None,
             intent_confirmation: None,
         };
-        assert!(
-            worker_account_uid(&authenticate, &peer(0)).is_none(),
-            "its arm resolves the account for the retry record"
+        let held = worker_account_uid(&authenticate, &peer(0), Owner::Account(then))
+            .expect("nothing held");
+        assert!(held.is_some(), "an authentication holds its uid too");
+        assert_eq!(irlume_core::account::resolve(user), Resolution::Uid(then));
+        assert_eq!(
+            request_account_uid(&peer(0), Owner::Account(then)),
+            Some(then),
+            "and its retry record is that uid's"
         );
+        drop(held);
 
-        let own = worker_account_uid(&enroll(user), &peer(then));
+        let own = worker_account_uid(&enroll(user), &peer(then), Owner::Account(then))
+            .expect("nothing held");
         assert!(own.is_some());
         assert_eq!(irlume_core::account::resolve(user), Resolution::Uid(then));
+        assert_eq!(
+            request_account_uid(&peer(then), Owner::Account(then)),
+            Some(then)
+        );
+    }
+
+    /// A queued root request acts for the uid its account resolved to when
+    /// it was registered, the uid its live entry and events are shown to,
+    /// even when the name resolves to another uid by the time the worker
+    /// starts it: the listing reads the enrollment recorded for the
+    /// registered uid, and the request's events reach that account and not
+    /// the one the name resolves to now.
+    #[test]
+    fn a_queued_root_request_acts_for_the_uid_it_was_registered_for() {
+        use irlume_common::diagnostics::OperationClass;
+        use irlume_core::account::Resolution;
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let _g = enrollment_summary_test_lock();
+        let sb = sandbox("registered-uid");
+        let user = "nobody";
+        let now = uid_of(user).expect("NSS account nobody");
+        let then = now.wrapping_add(1);
+        let mut enrollment = enrollment_with(user, &["Face Scan 1"]);
+        enrollment.uid = Some(then);
+        write_enrollment(&sb.dir, &enrollment);
+        let state = diagnostics::DiagnosticState::default();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        // The lookup made when the request is registered, stood in for by a
+        // registered answer.
+        let registered = irlume_core::account::remember(user, then);
+        let worker = {
+            let arbiter = std::sync::Arc::clone(&arbiter);
+            std::thread::spawn(move || {
+                let job = arbiter.take().expect("root's listing queued");
+                // The name resolves to another uid before the worker starts,
+                // and a summary for that uid, listing no profile, is cached
+                // meanwhile: the worker must not answer from it.
+                drop(registered);
+                publish_enrollment_summary(
+                    user,
+                    EnrollmentSummary {
+                        owner: Resolution::Uid(now),
+                        profiles: Vec::new(),
+                        ir_ratio_calibrated: false,
+                        camera_groups: Vec::new(),
+                        camera_store_error: None,
+                        primary_camera: None,
+                        primary_digest: primary_digest_now(user),
+                        camera_store: CameraStoreSnapshot::default(),
+                    },
+                );
+                assert!(
+                    matches!(
+                        dispatch_status(&list_profiles_of(user), &peer(0)),
+                        Some(Response::Enrollment { .. })
+                    ),
+                    "the connection thread would answer from that summary now"
+                );
+                let Queued {
+                    authorization,
+                    req,
+                    peer,
+                    reply,
+                    link,
+                    scope,
+                    ..
+                } = job.payload;
+                assert!(link.claim());
+                let mut engine = engine();
+                let response = dispatch_scoped(req, &peer, &mut engine, &scope, authorization);
+                scope.finish(categorical_outcome(&response));
+                link.released();
+                link.finish_activity();
+                arbiter.finish(job.class, job.uid);
+                reply.send(response.into()).unwrap();
+                scope.owner()
+            })
+        };
+        let mut wire = serde_json::to_string(&list_profiles_of(user)).unwrap();
+        wire.push('\n');
+        let response =
+            with_serve_as_peer_and_diagnostics(&arbiter, &ready, &state, peer(0), |client| {
+                (&*client).write_all(wire.as_bytes()).unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                serde_json::from_str::<Response>(line.trim()).unwrap()
+            });
+        arbiter.close();
+        let owner = worker.join().unwrap();
+        assert_eq!(owner, diagnostics::Owner::Account(then));
+        assert_eq!(irlume_core::account::resolve(user), Resolution::Uid(now));
+        assert_eq!(
+            listed_profiles(response),
+            1,
+            "the enrollment recorded for the uid the request was registered for"
+        );
+        let listings = |uid: u32| {
+            state
+                .snapshot_for(std::time::Duration::from_secs(60), uid)
+                .events()
+                .iter()
+                .filter(|event| event.operation == OperationClass::Status)
+                .count()
+        };
+        assert_eq!(listings(then), 1);
+        assert_eq!(listings(now), 0);
+    }
+
+    /// Root's authentication charges the retry record of the uid it was
+    /// registered for, the uid its events are shown to, and not that of the
+    /// uid the name resolves to when the worker starts it. One whose name
+    /// did not resolve then is refused before a capture, with no lookup
+    /// and no charge.
+    #[test]
+    fn a_root_authentication_charges_the_account_it_was_registered_for() {
+        use diagnostics::Owner;
+        use irlume_common::diagnostics::OperationClass;
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("registered-authentication");
+        let user = "nobody";
+        let now = uid_of(user).expect("NSS account nobody");
+        // Registered while the name resolved to the running account's uid,
+        // which has a name for the retry record; it resolves to `now` when
+        // the worker starts the request.
+        // SAFETY: geteuid takes no arguments, reads only this process's own
+        // effective uid, and always succeeds.
+        let then = unsafe { libc::geteuid() };
+        assert_ne!(then, now, "the test does not run as nobody");
+        let authenticate = || Request::Authenticate {
+            structured_errors: false,
+            user: user.into(),
+            // A screen-unlock service: it takes no intent attestation and
+            // reaches the engine, which denies an account not enrolled.
+            service: Some("kde-fingerprint".into()),
+            intent_confirmation: None,
+        };
+        let retry = sb.dir.join("retry");
+        let state = diagnostics::DiagnosticState::default();
+        let scope = state.begin_for(OperationClass::Authentication, Owner::Account(then));
+        let response = dispatch_scoped(authenticate(), &peer(0), &mut e, &scope, None);
+        assert!(
+            matches!(response, Response::AuthResult { granted: false, .. }),
+            "{response:?}"
+        );
+        assert!(retry.join(format!("{then}.json")).exists(), "{response:?}");
+        assert!(!retry.join(format!("{now}.json")).exists());
+
+        std::fs::remove_dir_all(&retry).unwrap();
+        let scope = state.begin_for(OperationClass::Authentication, Owner::Unresolved);
+        let response = dispatch_scoped(authenticate(), &peer(0), &mut e, &scope, None);
+        assert!(
+            matches!(
+                response,
+                Response::AuthResult {
+                    granted: false,
+                    refused_by_policy: true,
+                    ref reason,
+                    ..
+                } if reason == retry_throttle::UNAVAILABLE
+            ),
+            "{response:?}"
+        );
+        assert!(!retry.join(format!("{now}.json")).exists());
+        assert!(!retry.join(format!("{then}.json")).exists());
+    }
+
+    /// Two requests for one name whose NSS answer changes between their
+    /// registrations. The first was registered while the name resolved to
+    /// `then` (stood in), and its worker holds that uid. The second root
+    /// request is registered from a fresh NSS lookup, which answers `now`,
+    /// not the uid the first holds. While the first holds `then`, root's
+    /// listing and authentication for the name, and the account's own
+    /// listing, are refused before any record is checked or retry attempt
+    /// charged, and the first request's lookups keep answering `then`. Once
+    /// the first ends, root's listing runs for `now`, and the enrollment
+    /// recorded for `then` reads as another uid's. Root's listing is not
+    /// answered meanwhile from the summary published for `then` either.
+    #[test]
+    fn a_root_request_registered_while_another_holds_the_name_resolves_it_afresh() {
+        use diagnostics::Owner;
+        use irlume_common::diagnostics::OperationClass;
+        use irlume_core::account::Resolution;
+        let _g = enrollment_summary_test_lock();
+        let mut e = engine();
+        let sb = sandbox("fresh-registration");
+        let user = "nobody";
+        let now = uid_of(user).expect("NSS account nobody");
+        let then = now.wrapping_add(1);
+        let mut enrollment = enrollment_with(user, &["Face Scan 1"]);
+        enrollment.uid = Some(then);
+        write_enrollment(&sb.dir, &enrollment);
+        let state = diagnostics::DiagnosticState::default();
+        let first = {
+            let _nss = irlume_core::account::remember(user, then);
+            assert_eq!(
+                listed_profiles(dispatch(list_profiles_of(user), &peer(0), &mut e)),
+                1,
+                "the listing published for the account the name belonged to"
+            );
+            let owner = diagnostic_owner(&list_profiles_of(user), &peer(0));
+            assert_eq!(owner, Owner::Account(then));
+            worker_account_uid(&list_profiles_of(user), &peer(0), owner)
+                .expect("nothing held")
+                .expect("the first request holds its uid")
+        };
+        assert_eq!(irlume_core::account::resolve(user), Resolution::Uid(then));
+        let second = diagnostic_owner(&list_profiles_of(user), &peer(0));
+        assert_eq!(
+            second,
+            Owner::Account(now),
+            "registered from NSS, not from the uid the first request holds"
+        );
+        let listing = |e: &mut irlume_auth::Engine| {
+            let scope = state.begin_for(OperationClass::Status, second);
+            dispatch_scoped(list_profiles_of(user), &peer(0), e, &scope, None)
+        };
+        let refused = |response: &Response| match response {
+            Response::Error(message) => message.contains("holds another uid"),
+            Response::AuthResult {
+                granted: false,
+                refused_by_policy: true,
+                cause: Some(irlume_common::OutcomeCause::Policy),
+                reason,
+                ..
+            } => reason.contains("holds another uid"),
+            _ => false,
+        };
+        let response = listing(&mut e);
+        assert!(refused(&response), "{response:?}");
+        let authenticate = Request::Authenticate {
+            structured_errors: false,
+            user: user.into(),
+            service: Some("kde-fingerprint".into()),
+            intent_confirmation: None,
+        };
+        let scope = state.begin_for(OperationClass::Authentication, second);
+        let response = dispatch_scoped(authenticate, &peer(0), &mut e, &scope, None);
+        assert!(refused(&response), "{response:?}");
+        let retry = sb.dir.join("retry");
+        assert!(!retry.join(format!("{now}.json")).exists(), "no charge");
+        assert!(!retry.join(format!("{then}.json")).exists(), "no charge");
+        let response = dispatch(list_profiles_of(user), &peer(now), &mut e);
+        assert!(refused(&response), "{response:?}");
+        assert!(
+            dispatch_status(&list_profiles_of(user), &peer(0)).is_none(),
+            "root's cached listing is not served for the uid the first request holds"
+        );
+        assert_eq!(
+            irlume_core::account::resolve(user),
+            Resolution::Uid(then),
+            "the first request's lookups still answer its uid"
+        );
+
+        drop(first);
+        assert_eq!(irlume_core::account::resolve(user), Resolution::Uid(now));
+        assert_eq!(
+            listed_profiles(listing(&mut e)),
+            0,
+            "the enrollment recorded for the uid the name no longer resolves to"
+        );
+    }
+
+    /// irlumed holds a request's uid with `irlume_core::account::hold`,
+    /// which a fresh lookup ignores and which refuses another uid for a name
+    /// while one is held. It never calls `remember`, the stand-in for NSS the
+    /// tests use: a fresh lookup answers a stand-in, so a registration would
+    /// again take another request's uid.
+    #[test]
+    fn irlumed_holds_request_uids_and_never_stands_in_for_nss() {
+        let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        let mut scanned = 0usize;
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if !name.ends_with(".rs") || name.ends_with("tests.rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                let production = text
+                    .split("\nmod tests {")
+                    .next()
+                    .and_then(|head| head.split("#[cfg(test)]\nmod tests").next())
+                    .unwrap_or_default();
+                assert!(
+                    !production.contains("account::remember"),
+                    "{} stands in for NSS outside its tests",
+                    path.display()
+                );
+                scanned += 1;
+            }
+        }
+        assert!(scanned >= 10, "scanned {scanned} files");
+    }
+
+    /// Root's authentication files its attempt in the record of the uid it
+    /// was registered for, and only while that uid carries the name the
+    /// request named. Registered for the running account's uid under the
+    /// name `nobody`, which resolves to nobody's uid when the reply is
+    /// filed, it files nothing: not in nobody's record, where a lookup of the
+    /// name at filing would put it, and not in the registered uid's, which
+    /// carries another name. Registered for no account, it files nothing
+    /// either. Registered for the running account under its own name, it
+    /// files in that uid's record.
+    #[test]
+    fn a_root_authentication_files_its_attempt_for_the_uid_it_was_registered_for() {
+        use diagnostics::Owner;
+        use irlume_common::diagnostics::OperationClass;
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("registered-attempt");
+        let user = "nobody";
+        let now = uid_of(user).expect("NSS account nobody");
+        // SAFETY: geteuid takes no arguments, reads only this process's own
+        // effective uid, and always succeeds.
+        let then = unsafe { libc::geteuid() };
+        assert_ne!(then, now, "the test does not run as nobody");
+        let me = users::name_for_uid(then).expect("own name");
+        let authenticate = |user: &str| Request::Authenticate {
+            structured_errors: false,
+            user: user.into(),
+            // A screen-unlock service: it takes no intent attestation and
+            // reaches the engine, which denies an account not enrolled.
+            service: Some("kde-fingerprint".into()),
+            intent_confirmation: None,
+        };
+        let filed = |uid: u32| sb.dir.join("attempts").join(format!("{uid}.json")).exists();
+        let state = diagnostics::DiagnosticState::default();
+
+        let scope = state.begin_for(OperationClass::Authentication, Owner::Account(then));
+        let response = dispatch_scoped(authenticate(user), &peer(0), &mut e, &scope, None);
+        assert!(
+            matches!(response, Response::AuthResult { granted: false, .. }),
+            "{response:?}"
+        );
+        assert!(!filed(now), "not the record the name resolves to now");
+        assert!(!filed(then), "the registered uid carries another name");
+
+        let scope = state.begin_for(OperationClass::Authentication, Owner::Unresolved);
+        let response = dispatch_scoped(authenticate(user), &peer(0), &mut e, &scope, None);
+        assert!(
+            matches!(response, Response::AuthResult { granted: false, .. }),
+            "{response:?}"
+        );
+        assert!(!filed(now) && !filed(then), "no account, nothing filed");
+
+        let scope = state.begin_for(OperationClass::Authentication, Owner::Account(then));
+        let response = dispatch_scoped(authenticate(&me), &peer(0), &mut e, &scope, None);
+        assert!(
+            matches!(response, Response::AuthResult { granted: false, .. }),
+            "{response:?}"
+        );
+        assert!(filed(then), "the registered uid's record");
+        assert!(!filed(now));
+        assert!(attempt_record::load(&me)
+            .expect("the sandbox attempt store is readable")
+            .latest_authenticate
+            .is_some());
     }
 
     /// The same for a write: the account's own rename records the peer's uid
@@ -17668,7 +18280,14 @@ mod tests {
         envelope
             .save(&irlume_core::keyring::envelope_path(&user))
             .unwrap();
-        let response = unseal_keyring(&user, Some("kde"), false, false, &peer(0));
+        let response = unseal_keyring(
+            &user,
+            Some("kde"),
+            false,
+            false,
+            &peer(0),
+            irlume_core::account::resolve,
+        );
         match previous_tcti {
             Some(value) => std::env::set_var("IRLUME_TCTI", value),
             None => std::env::remove_var("IRLUME_TCTI"),
@@ -17681,6 +18300,135 @@ mod tests {
                 );
             }
             other => panic!("another uid's secret must not be released, got {other:?}"),
+        }
+    }
+
+    /// Before the engine exists, a keyring release, in the auth phase or the
+    /// session phase, asks NSS for its account, not the uid another request
+    /// holds for the name: while that request holds another uid, the
+    /// release is refused instead of acting for that request's uid. A
+    /// request holding the same uid does not stop it.
+    #[test]
+    fn a_keyring_release_before_the_engine_does_not_take_another_requests_uid() {
+        let _g = env_lock();
+        let _sb = sandbox("startup-keyring-held-uid");
+        let user = "nobody";
+        let now = uid_of(user).expect("NSS account nobody");
+        let then = now.wrapping_add(1);
+        plant_fake_envelope(user);
+        // Never the host TPM, even if a check were missing.
+        let previous_tcti = std::env::var_os("IRLUME_TCTI");
+        std::env::set_var("IRLUME_TCTI", "device:/nonexistent/irlume-test-tpm");
+        let release = |auth_phase| {
+            dispatch_before_engine(
+                Request::UnsealKeyring {
+                    user: user.into(),
+                    service: Some("plasmalogin".into()),
+                    have_password: false,
+                    auth_phase,
+                },
+                &peer(0),
+            )
+        };
+        let held_elsewhere = |response: &Response| matches!(response, Response::Error(message) if message.contains("holds another uid"));
+        // Another request holds the uid the name had before NSS mapped it
+        // to `now`.
+        // The auth-phase release and the session-phase (or older module's)
+        // one alike.
+        let other = irlume_core::account::hold(user, then).unwrap();
+        let refused = [release(true), release(false)];
+        drop(other);
+        let same = irlume_core::account::hold(user, now).unwrap();
+        let served = [release(true), release(false)];
+        drop(same);
+        match previous_tcti {
+            Some(value) => std::env::set_var("IRLUME_TCTI", value),
+            None => std::env::remove_var("IRLUME_TCTI"),
+        }
+        assert!(refused.iter().all(held_elsewhere), "{refused:?}");
+        assert!(!served.iter().any(held_elsewhere), "{served:?}");
+    }
+
+    /// A listing refused because another request holds another uid for the
+    /// name answers in the shape its client asked for, on the status path
+    /// and on the worker alike.
+    #[test]
+    fn a_listing_refused_over_a_held_uid_answers_in_the_shape_asked_for() {
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("listing-held-uid");
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        let name = users::name_for_uid(me).expect("the running account");
+        let _other = irlume_core::account::hold(&name, me.wrapping_add(1)).unwrap();
+        let list = |structured_errors| Request::ListProfiles {
+            user: name.clone(),
+            structured_errors,
+            handles: false,
+        };
+        let structured = |response: &Response| {
+            matches!(
+                response,
+                Response::OperationError {
+                    code: irlume_common::OperationErrorCode::OperationFailed,
+                    retryable: true,
+                    ..
+                }
+            )
+        };
+        let prose = |response: &Response| matches!(response, Response::Error(message) if message.contains("holds another uid"));
+        let status = dispatch_status(&list(true), &peer(me)).expect("answered");
+        assert!(structured(&status), "{status:?}");
+        let status = dispatch_status(&list(false), &peer(me)).expect("answered");
+        assert!(prose(&status), "{status:?}");
+        let worker = dispatch(list(true), &peer(me), &mut e);
+        assert!(structured(&worker), "{worker:?}");
+        let worker = dispatch(list(false), &peer(me), &mut e);
+        assert!(prose(&worker), "{worker:?}");
+    }
+
+    /// A password seal or reseal checks the password, and a seal the home
+    /// directory, by name: registered for a uid the name no longer resolves
+    /// to, both are refused with nothing checked or written. Registered for
+    /// the uid the name resolves to, they go on.
+    #[test]
+    fn a_password_seal_is_refused_while_the_name_resolves_to_another_uid() {
+        use diagnostics::Owner;
+        use irlume_common::diagnostics::OperationClass;
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("seal-moved-account");
+        let user = "nobody";
+        let now = uid_of(user).expect("NSS account nobody");
+        let password = || irlume_common::SecretBytes::new(b"a password".to_vec());
+        let requests = || {
+            [
+                Request::SealPassword {
+                    kind: None,
+                    user: user.into(),
+                    password: password(),
+                    wallet_salt: None,
+                    wallet_salt_checked: true,
+                },
+                Request::ResealPassword {
+                    user: user.into(),
+                    password: password(),
+                    wallet_salt: None,
+                    wallet_salt_checked: true,
+                },
+            ]
+        };
+        let moved = |response: &Response| matches!(response, Response::Error(message) if message.contains("now resolves to another account"));
+        let state = diagnostics::DiagnosticState::default();
+        for (registered, refused) in [(now.wrapping_add(1), true), (now, false)] {
+            for request in requests() {
+                let scope = state.begin_for(OperationClass::Status, Owner::Account(registered));
+                let response = dispatch_scoped(request, &peer(0), &mut e, &scope, None);
+                assert_eq!(moved(&response), refused, "{registered}: {response:?}");
+            }
+            if refused {
+                assert!(!irlume_core::keyring::has_sealed_password(user));
+            }
         }
     }
 
@@ -19420,10 +20168,38 @@ mod tests {
             std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
             outcomes.push((
                 kind,
-                unseal_keyring("carol", Some("plasmalogin"), true, false, &peer(0)),
-                unseal_keyring("carol", Some("plasmalogin"), false, false, &peer(0)),
-                unseal_keyring("carol", Some("sudo"), true, false, &peer(0)),
-                unseal_keyring("carol", Some("plasmalogin"), true, false, &peer(NOBODY)),
+                unseal_keyring(
+                    "carol",
+                    Some("plasmalogin"),
+                    true,
+                    false,
+                    &peer(0),
+                    irlume_core::account::resolve,
+                ),
+                unseal_keyring(
+                    "carol",
+                    Some("plasmalogin"),
+                    false,
+                    false,
+                    &peer(0),
+                    irlume_core::account::resolve,
+                ),
+                unseal_keyring(
+                    "carol",
+                    Some("sudo"),
+                    true,
+                    false,
+                    &peer(0),
+                    irlume_core::account::resolve,
+                ),
+                unseal_keyring(
+                    "carol",
+                    Some("plasmalogin"),
+                    true,
+                    false,
+                    &peer(NOBODY),
+                    irlume_core::account::resolve,
+                ),
             ));
         }
         match previous {
@@ -19485,21 +20261,69 @@ mod tests {
             std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
             let _ = std::fs::remove_file(sessions.join("2"));
             std::fs::write(sessions.join("c1"), session("1", "tty")).unwrap();
-            let cold = unseal_keyring(&user, Some("plasmalogin"), false, true, &peer(0));
+            let cold = unseal_keyring(
+                &user,
+                Some("plasmalogin"),
+                false,
+                true,
+                &peer(0),
+                irlume_core::account::resolve,
+            );
             std::fs::write(sessions.join("2"), session("0", "wayland")).unwrap();
-            let lock = unseal_keyring(&user, Some("kde"), false, true, &peer(0));
-            let login = unseal_keyring(&user, Some("plasmalogin"), false, true, &peer(0));
-            let session = unseal_keyring(&user, Some("plasmalogin"), true, false, &peer(0));
-            let older = unseal_keyring(&user, Some("kde"), false, false, &peer(0));
+            let lock = unseal_keyring(
+                &user,
+                Some("kde"),
+                false,
+                true,
+                &peer(0),
+                irlume_core::account::resolve,
+            );
+            let login = unseal_keyring(
+                &user,
+                Some("plasmalogin"),
+                false,
+                true,
+                &peer(0),
+                irlume_core::account::resolve,
+            );
+            let session = unseal_keyring(
+                &user,
+                Some("plasmalogin"),
+                true,
+                false,
+                &peer(0),
+                irlume_core::account::resolve,
+            );
+            let older = unseal_keyring(
+                &user,
+                Some("kde"),
+                false,
+                false,
+                &peer(0),
+                irlume_core::account::resolve,
+            );
             let set_root = |root: std::path::PathBuf| {
                 *attempt_record::SESSIONS_ROOT
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = Some(root);
             };
             set_root(sessions.join("unreadable"));
-            let unknown = unseal_keyring(&user, Some("plasmalogin"), false, true, &peer(0));
-            let unknown_session =
-                unseal_keyring(&user, Some("plasmalogin"), false, false, &peer(0));
+            let unknown = unseal_keyring(
+                &user,
+                Some("plasmalogin"),
+                false,
+                true,
+                &peer(0),
+                irlume_core::account::resolve,
+            );
+            let unknown_session = unseal_keyring(
+                &user,
+                Some("plasmalogin"),
+                false,
+                false,
+                &peer(0),
+                irlume_core::account::resolve,
+            );
             set_root(sessions.clone());
             outcomes.push((
                 kind,

@@ -2059,6 +2059,28 @@ fn a_file_exchanged_out_survives_a_stop_and_the_next_sweep() {
     }
 }
 
+/// The move to the exchange name is synced before the exchange; when that
+/// sync fails, the write is refused before the live file is touched and
+/// leaves nothing behind.
+#[test]
+fn a_failed_sync_before_the_exchange_refuses_the_write_untouched() {
+    let dir = TestDir::new("ovr-write-sync-before-exchange");
+    let path = dir.0.join("sudo");
+    std::fs::write(&path, "decided on this\n").unwrap();
+    arm(&FAIL_SYNC_BEFORE_EXCHANGE, &path);
+    let err = write_atomic_checked(&path, "IRLUME'S FILE\n", Some("decided on this\n"))
+        .expect_err("the write is refused");
+    disarm(&FAIL_SYNC_BEFORE_EXCHANGE, &path);
+    assert!(!err.landed, "{err}");
+    assert!(err.message.contains("fsync"), "{err}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "decided on this\n");
+    assert_eq!(
+        entries(&dir.0),
+        ["sudo"],
+        "no scratch or exchange file is left"
+    );
+}
+
 /// A file that appears where irlume is creating one, after irlume saw none,
 /// is never replaced.
 #[test]

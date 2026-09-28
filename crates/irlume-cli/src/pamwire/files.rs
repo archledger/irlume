@@ -503,6 +503,26 @@ fn armed(hook: &TestHook, path: &Path) -> bool {
 #[cfg(test)]
 pub(super) static FAIL_SYNC_AFTER_CHANGE: TestHook = TestHook::new(Vec::new());
 
+/// Test-only: fail the directory sync that makes the move of irlume's file
+/// to its exchange name durable, before the exchange.
+#[cfg(test)]
+pub(super) static FAIL_SYNC_BEFORE_EXCHANGE: TestHook = TestHook::new(Vec::new());
+
+/// Make the move of irlume's file to its exchange name durable before the
+/// exchange (see [`install`]). Without it, a power loss after the exchange
+/// could bring the directory back with the exchange but not the move, and
+/// the file taken out of the live path would then be under the scratch name
+/// the next run's sweep deletes. Nothing has reached the live path yet, so
+/// a failure is one before the change.
+fn sync_before_exchange(path: &Path) -> Result<(), WriteError> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    #[cfg(test)]
+    if fires(&FAIL_SYNC_BEFORE_EXCHANGE, path) {
+        return Err(format!("fsync {}: failed for the test", dir.display()).into());
+    }
+    fsync_dir(dir).map_err(WriteError::from)
+}
+
 /// Make the change to `path` durable. A failure here comes after the change,
 /// so it is reported as one that landed.
 fn sync_after_change(path: &Path) -> Result<(), WriteError> {
@@ -1278,7 +1298,9 @@ fn changed_while_writing(path: &Path) -> String {
 /// sweep of abandoned scratch files never takes a private name, so another
 /// writer's file that replaced the checked one is kept, not deleted. A kill
 /// between the move and the exchange leaves irlume's own unfinished file
-/// under that name instead, a leftover rather than a loss.
+/// under that name instead, a leftover rather than a loss. The move is
+/// synced before the exchange ([`sync_before_exchange`]), so a power loss
+/// cannot keep the exchange and drop the move.
 ///
 /// On a filesystem without `RENAME_EXCHANGE` a replacement falls back to a
 /// plain rename right after the check, as irlume wrote before; the window
@@ -1326,6 +1348,7 @@ fn install(
     };
     *tmp = move_aside_as(tmp, path, "exchange")
         .map_err(|e| format!("rename {} before the exchange: {e}", tmp.display()))?;
+    sync_before_exchange(path)?;
     let tmp: &Path = tmp;
     match renameat2_exchange(tmp, path) {
         Ok(()) => {}

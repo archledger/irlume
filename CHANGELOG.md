@@ -7,6 +7,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Diagnostic trace schema 5 times the grouped sequential route's capture
+  batch phase by phase: `sequential_rgb_start`, one
+  `sequential_rgb_sample` per sample, `sequential_rgb_release`, then the
+  same three for IR, so a traced run divides the batch that took about
+  5.2 s of an 8.1 s BRIO grant into session start, samples and release for
+  each camera (#856). The first RGB sample includes the warm-up and
+  delivered-rate fill; the IR start includes emitter enable, warm-up and
+  rate fill; the IR release includes the emitter restore. A new
+  `grouped_evaluation` stage times each grouped route's evaluation of its
+  collected samples, which lies inside `finalization`. Schema 4 and older
+  subscribers omit all seven records; the recorder now requests schema 5,
+  which a daemon started before the upgrade refuses as an unsupported
+  schema until it restarts. Capture, decisions and the concurrent routes'
+  records are unchanged.
+
 - Keyring arms seal the login password where oo7 keeps the login
   keyring, as on Fedora 45 GNOME, whose login screen hands the password
   to `oo7-daemon` through `pam_oo7`: oo7 opens the keyring with that

@@ -18,6 +18,50 @@ pub struct SequentialBatchRequest {
     pub deadline: Instant,
 }
 
+/// One timed phase of a sequential batch, reported when it ends, whether or
+/// not it succeeded. Durations only: no frame, statistic or error text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SequentialBatchPhase {
+    /// RGB session start on the open camera: stream setup, buffers and the
+    /// backlight write.
+    RgbStart,
+    /// One denoised RGB sample. The first of a session also starts the
+    /// stream, waits out the auto-exposure warm-up and fills the
+    /// delivered-rate window.
+    RgbSample,
+    /// RGB session release: stream stop, buffer release and backlight
+    /// restore. Ends before the IR session starts.
+    RgbRelease,
+    /// IR session start: buffers, metadata queue, emitter enable, stream
+    /// start and warm-up, delivered-rate fill.
+    IrStart,
+    /// One IR burst and its gate frame.
+    IrSample,
+    /// IR session release: stream stop, metadata close, buffer release and
+    /// emitter restore.
+    IrRelease,
+}
+
+/// The phase labels of one role's session in a batch.
+#[derive(Clone, Copy)]
+struct PhaseLabels {
+    start: SequentialBatchPhase,
+    sample: SequentialBatchPhase,
+    release: SequentialBatchPhase,
+}
+
+const RGB_PHASES: PhaseLabels = PhaseLabels {
+    start: SequentialBatchPhase::RgbStart,
+    sample: SequentialBatchPhase::RgbSample,
+    release: SequentialBatchPhase::RgbRelease,
+};
+
+const IR_PHASES: PhaseLabels = PhaseLabels {
+    start: SequentialBatchPhase::IrStart,
+    sample: SequentialBatchPhase::IrSample,
+    release: SequentialBatchPhase::IrRelease,
+};
+
 /// Collect bounded fresh sequential evidence using already negotiated cameras.
 ///
 /// The caller owns the camera operation and qualification/security policy.
@@ -57,6 +101,23 @@ pub fn capture_sequential_batch_with_control(
     request: SequentialBatchRequest,
     control: &CaptureControl,
 ) -> Result<Vec<(Frame, Frame, IrCaptureStats)>> {
+    capture_sequential_batch_observed(rgb, ir, contract, request, control, &|_, _| {})
+}
+
+/// [`capture_sequential_batch_with_control`], reporting each phase's elapsed
+/// time to `observe` on the calling thread as the phase ends. Observation
+/// changes no capture, ordering or cleanup; `observe` must not block.
+///
+/// # Errors
+/// The errors of [`capture_sequential_batch_with_control`].
+pub fn capture_sequential_batch_observed(
+    rgb: &RgbCamera,
+    ir: &IrCamera,
+    contract: &RuntimePairContract,
+    request: SequentialBatchRequest,
+    control: &CaptureControl,
+    observe: &dyn Fn(SequentialBatchPhase, Duration),
+) -> Result<Vec<(Frame, Frame, IrCaptureStats)>> {
     capture_batch_controlled_with(
         request,
         contract,
@@ -76,6 +137,7 @@ pub fn capture_sequential_batch_with_control(
                 .and_then(|()| ir.lease.require_endpoint(&ir.device))
                 .map_err(|error| Error::Hardware(error.to_string()))
         },
+        observe,
     )
 }
 
@@ -202,6 +264,7 @@ pub(super) fn capture_batch_with<R, I>(
     ),
     now: impl Fn() -> Instant,
     live: impl FnOnce() -> Result<()>,
+    observe: &dyn Fn(SequentialBatchPhase, Duration),
 ) -> Result<Vec<(Frame, Frame, IrCaptureStats)>> {
     capture_batch_controlled_with(
         request,
@@ -211,9 +274,14 @@ pub(super) fn capture_batch_with<R, I>(
         now,
         &CaptureControl::with_progress(super::no_progress()),
         live,
+        observe,
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the camera boundaries stay injectable for the scripted batch tests"
+)]
 pub(super) fn capture_batch_controlled_with<R, I>(
     request: SequentialBatchRequest,
     contract: &RuntimePairContract,
@@ -228,6 +296,7 @@ pub(super) fn capture_batch_controlled_with<R, I>(
     now: impl Fn() -> Instant,
     control: &CaptureControl,
     live: impl FnOnce() -> Result<()>,
+    observe: &dyn Fn(SequentialBatchPhase, Duration),
 ) -> Result<Vec<(Frame, Frame, IrCaptureStats)>> {
     if !(1..=5).contains(&request.pairs) {
         return Err(Error::Hardware(
@@ -245,8 +314,8 @@ pub(super) fn capture_batch_controlled_with<R, I>(
     // Each phase owns its stream, including all error/unwind paths. The first
     // owner is dropped before the second opener can run; neither survives into
     // validation or downstream inference.
-    let rgb = collect_phase(request.pairs, rgb, &checkpoint)?;
-    let ir = collect_phase(request.pairs, ir, &checkpoint)?;
+    let rgb = collect_phase(request.pairs, rgb, &checkpoint, RGB_PHASES, observe)?;
+    let ir = collect_phase(request.pairs, ir, &checkpoint, IR_PHASES, observe)?;
     checkpoint()?;
     if rgb
         .last()
@@ -291,20 +360,45 @@ pub(super) fn capture_batch_controlled_with<R, I>(
 
 fn collect_phase<S, T>(
     count: usize,
-    (open, mut capture): (impl FnOnce() -> Result<S>, impl FnMut(&mut S) -> Result<T>),
+    (open, capture): (impl FnOnce() -> Result<S>, impl FnMut(&mut S) -> Result<T>),
     checkpoint: &impl Fn() -> Result<()>,
+    phases: PhaseLabels,
+    observe: &dyn Fn(SequentialBatchPhase, Duration),
 ) -> Result<Vec<T>> {
     checkpoint()?;
-    let mut session = open()?;
+    let started = Instant::now();
+    let session = open();
+    observe(phases.start, started.elapsed());
+    let mut session = session?;
+    let samples = collect_samples(count, &mut session, capture, checkpoint, phases, observe);
+    // The owner is dropped here on success and on every error, as before;
+    // only an unwinding capture skips this report.
+    let released = Instant::now();
+    drop(session);
+    observe(phases.release, released.elapsed());
+    let samples = samples?;
+    checkpoint()?;
+    Ok(samples)
+}
+
+fn collect_samples<S, T>(
+    count: usize,
+    session: &mut S,
+    mut capture: impl FnMut(&mut S) -> Result<T>,
+    checkpoint: &impl Fn() -> Result<()>,
+    phases: PhaseLabels,
+    observe: &dyn Fn(SequentialBatchPhase, Duration),
+) -> Result<Vec<T>> {
     checkpoint()?;
     let mut samples = Vec::with_capacity(count);
     for _ in 0..count {
         checkpoint()?;
-        samples.push(capture(&mut session)?);
+        let started = Instant::now();
+        let sample = capture(session);
+        observe(phases.sample, started.elapsed());
+        samples.push(sample?);
         checkpoint()?;
     }
-    checkpoint()?;
-    drop(session);
     checkpoint()?;
     Ok(samples)
 }

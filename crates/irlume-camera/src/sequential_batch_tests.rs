@@ -85,7 +85,29 @@ impl BatchFixture {
     }
 
     fn run(&mut self, fault: &str) -> irlume_common::Result<Vec<(Frame, Frame, IrCaptureStats)>> {
+        self.run_with(fault, false)
+    }
+
+    /// [`Self::run`], logging each reported phase by name beside the owner
+    /// events, so the log shows exactly which calls a phase covers.
+    fn run_observed(
+        &mut self,
+        fault: &str,
+    ) -> irlume_common::Result<Vec<(Frame, Frame, IrCaptureStats)>> {
+        self.run_with(fault, true)
+    }
+
+    fn run_with(
+        &mut self,
+        fault: &str,
+        observed: bool,
+    ) -> irlume_common::Result<Vec<(Frame, Frame, IrCaptureStats)>> {
         let events = &self.events;
+        let observe = |phase: SequentialBatchPhase, _elapsed: Duration| {
+            if observed {
+                events.borrow_mut().push(format!("{phase:?}"));
+            }
+        };
         let now = &self.now;
         let deadline = self.request.deadline;
         let open = |role| {
@@ -161,6 +183,7 @@ impl BatchFixture {
                     Ok(())
                 }
             },
+            &observe,
         )
     }
 }
@@ -183,6 +206,84 @@ fn batch_preserves_order_stats_and_releases_both_sessions_before_return() {
         let ir_open = events.iter().position(|e| e == "ir open").unwrap();
         assert!(rgb_close < ir_open);
         assert_eq!(&events[events.len() - 2..], ["ir close", "lease check"]);
+    }
+}
+
+/// Each phase covers exactly its own calls: the start ends when the opener
+/// returns, a sample when its capture returns, and the release after the
+/// owner is dropped and before the next session opens.
+#[test]
+fn batch_reports_every_phase_around_exactly_its_own_calls() {
+    let mut fixture = BatchFixture::new(5);
+    fixture.run_observed("").expect("valid batch");
+    let mut expected = vec!["rgb open".to_owned(), "RgbStart".into()];
+    for _ in 0..5 {
+        expected.extend(["rgb capture".into(), "RgbSample".into()]);
+    }
+    expected.extend(["rgb close".into(), "RgbRelease".into()]);
+    expected.extend(["ir open".into(), "IrStart".into()]);
+    for _ in 0..5 {
+        expected.extend(["ir capture".into(), "IrSample".into()]);
+    }
+    expected.extend(["ir close".into(), "IrRelease".into(), "lease check".into()]);
+    assert_eq!(*fixture.events.borrow(), expected);
+}
+
+/// A failed phase still reports its time; every opened session reports its
+/// release, and nothing is reported for a phase that never began. Only an
+/// unwinding capture skips the release report; its owner still closes.
+#[test]
+fn batch_reports_failed_phases_and_the_release_of_every_opened_session() {
+    let reported = |fixture: &BatchFixture| -> Vec<String> {
+        fixture
+            .events
+            .borrow()
+            .iter()
+            .filter(|event| !event.contains(' '))
+            .cloned()
+            .collect()
+    };
+    let rgb = |samples: usize| {
+        let mut phases = vec!["RgbStart".to_owned()];
+        phases.extend(std::iter::repeat_n("RgbSample".to_owned(), samples));
+        phases.push("RgbRelease".into());
+        phases
+    };
+    let ir_after_rgb = |samples: usize| {
+        let mut phases = rgb(5);
+        phases.push("IrStart".into());
+        phases.extend(std::iter::repeat_n("IrSample".to_owned(), samples));
+        phases.push("IrRelease".into());
+        phases
+    };
+    for (fault, expected) in [
+        ("rgb open error", vec!["RgbStart".to_owned()]),
+        ("rgb open deadline", rgb(0)),
+        ("rgb capture error", rgb(3)),
+        ("rgb capture deadline", rgb(1)),
+        ("rgb close deadline", rgb(5)),
+        ("ir open error", {
+            let mut phases = rgb(5);
+            phases.push("IrStart".into());
+            phases
+        }),
+        ("ir capture error", ir_after_rgb(3)),
+        ("ir close deadline", ir_after_rgb(5)),
+        ("lease stale", ir_after_rgb(5)),
+    ] {
+        let mut fixture = BatchFixture::new(5);
+        assert!(fixture.run_observed(fault).is_err(), "{fault}");
+        assert_eq!(reported(&fixture), expected, "{fault}");
+    }
+    for (role, release) in [("rgb", "RgbRelease"), ("ir", "IrRelease")] {
+        let mut fixture = BatchFixture::new(5);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fixture.run_observed(&format!("{role} panic"))
+        }));
+        assert!(result.is_err());
+        let events = fixture.events.borrow();
+        assert_eq!(events.last().unwrap(), &format!("{role} close"));
+        assert!(!events.iter().any(|event| event == release), "{events:?}");
     }
 }
 
@@ -413,6 +514,7 @@ fn capture_cancellation_releases_rgb_and_never_opens_ir_batch() {
         || now.get(),
         &control,
         || panic!("cancelled partial batch must not be validated"),
+        &|_, _| {},
     );
     assert!(matches!(result, Err(Error::Preempted(_))));
     assert_eq!(*events.borrow(), ["rgb open", "rgb close"]);

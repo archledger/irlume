@@ -82,8 +82,8 @@ contain exact liveness and match measurements, but never frames, crops,
 landmarks, embeddings, credentials, account/profile names, or raw emitter
 payloads.
 
-The recorder requests trace schema 4. A current daemon honors explicit schema
-1 through 4; a request without `trace_schema` retains schema 1 for older
+The recorder requests trace schema 5. A current daemon honors explicit schema
+1 through 5; a request without `trace_schema` retains schema 1 for older
 recorders. An older daemon ignores the optional request field and continues
 producing schema 1, which the current reader also accepts. Each stream uses one
 schema throughout; unsupported versions, version changes within a stream and
@@ -106,6 +106,33 @@ session reports none. Neither is a first-frame or desktop-unlock latency, and
 stages nest (`camera_open` lies inside `capture_setup`), so they are not
 summed. Schema 3 and older subscribers omit both records before queue,
 sequence and drop accounting.
+
+Schema 5 divides the capture batch of the grouped sequential route: the route
+a pair that `irlume camera-tune` measured as sequential takes at login and
+lock screens when both PAD models are loaded. The batch opens one RGB session
+for all five samples and releases it before one IR session takes all five.
+`sequential_rgb_start` is the RGB session start on the open camera (stream
+setup, buffers, backlight write). Each `sequential_rgb_sample` is one denoised
+RGB sample; the first of a session also starts the stream, waits out the
+auto-exposure warm-up and fills the delivered-rate window, so its excess over
+the later samples is that warm-up and fill. `sequential_rgb_release` is the
+stream stop, buffer release and backlight restore. `sequential_ir_start`
+covers buffers, the metadata queue, emitter enable, stream start and warm-up,
+and the delivered-rate fill; the `[capture-stage] ir-arm` debug line splits it
+further. Each `sequential_ir_sample` is one IR burst and its gate frame, and
+`sequential_ir_release` is the stream stop, metadata close, buffer release and
+emitter restore. Each phase is reported when it ends, whether or not it
+succeeded, and every started session reports its release unless a capture
+panicked. `grouped_evaluation` is the evaluation of the collected samples
+(detection, liveness and PAD for each, identity for the final admissible one),
+reported once per group whatever its result, on the pair and the RGB-only
+grouped routes. The batch releases its sessions before it returns, so on a
+grouped route `finalization` contains the last group's `grouped_evaluation`,
+and the rest of it is the final matching, camera handle close and lease
+release. The eager sequential route still reports one `rgb_capture` and one
+`ir_capture` per pair, and the concurrent routes report none of these stages.
+Schema 4 and older subscribers omit all seven records before queue, sequence
+and drop accounting.
 
 For a public issue, start with `irlume support-report`. Its default action is
 read-only and camera-free, and its `.txt` output is structurally share-safe and

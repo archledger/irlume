@@ -3310,12 +3310,12 @@ static SOCKET_ACTIVATED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// loading (#244). Every authorization check below is a property of the REQUEST,
 /// never of startup state, so answering early cannot weaken any of them.
 ///
-/// `resolve_account` looks up the account an auth-phase request is for: on
-/// the worker `irlume_core::account::resolve`, which answers the uid the
-/// worker holds for the request ([`worker_account_uid`]); before the engine
-/// exists `irlume_core::account::resolve_fresh`, since nothing holds a uid
-/// for the request there and the answer must be NSS's, not a uid another
-/// request holds for the name.
+/// `resolve_account` looks up the account the request is for: on the
+/// worker `irlume_core::account::resolve`, which answers the uid the worker
+/// holds for the request ([`worker_account_uid`]); before the engine exists
+/// `irlume_core::account::resolve_fresh`, since nothing holds a uid for the
+/// request there and the answer must be NSS's, not a uid another request
+/// holds for the name.
 fn unseal_keyring(
     user: &str,
     service: Option<&str>,
@@ -3385,20 +3385,18 @@ fn unseal_keyring(
     // tell (logind's session state or the account cannot be read): the
     // typed password still opens a password- or wallet-key-keyed keyring,
     // and a GNOME keyring token still reaches the session phase.
-    // An auth-phase request resolves the account here; the release below
-    // checks the envelope's uid against the same answer. On the worker the
-    // answer is the uid the request was registered for, which the worker
-    // holds ([`worker_account_uid`]). Before the engine exists it is NSS's,
-    // and holding it is refused while another request holds another uid
-    // for the name, so the request never acts for that request's uid.
-    let resolved = if auth_phase {
-        match resolve_account(&user) {
-            irlume_core::account::Resolution::Uid(uid) => Some(uid),
-            irlume_core::account::Resolution::NoAccount
-            | irlume_core::account::Resolution::Unknown => None,
+    // Every request resolves the account here and holds the answer; the
+    // release below checks the envelope's uid against it, and an auth-phase
+    // request also asks logind about it. On the worker the answer is the uid
+    // the request was registered for, which the worker holds
+    // ([`worker_account_uid`]). Before the engine exists it is NSS's, and
+    // holding it is refused while another request holds another uid for the
+    // name, so the request never acts for that request's uid.
+    let resolved = match resolve_account(&user) {
+        irlume_core::account::Resolution::Uid(uid) => Some(uid),
+        irlume_core::account::Resolution::NoAccount | irlume_core::account::Resolution::Unknown => {
+            None
         }
-    } else {
-        None
     };
     let _account_uid = match resolved
         .map(|uid| irlume_core::account::hold(&user, uid))
@@ -18241,11 +18239,11 @@ mod tests {
         }
     }
 
-    /// Before the engine exists, an auth-phase keyring release asks NSS for
-    /// its account, not the uid another request holds for the name: while
-    /// that request holds another uid, the release is refused instead of
-    /// acting for that request's uid. A request holding the same uid does
-    /// not stop it.
+    /// Before the engine exists, a keyring release, in the auth phase or the
+    /// session phase, asks NSS for its account, not the uid another request
+    /// holds for the name: while that request holds another uid, the
+    /// release is refused instead of acting for that request's uid. A
+    /// request holding the same uid does not stop it.
     #[test]
     fn a_keyring_release_before_the_engine_does_not_take_another_requests_uid() {
         let _g = env_lock();
@@ -18257,13 +18255,13 @@ mod tests {
         // Never the host TPM, even if a check were missing.
         let previous_tcti = std::env::var_os("IRLUME_TCTI");
         std::env::set_var("IRLUME_TCTI", "device:/nonexistent/irlume-test-tpm");
-        let release = || {
+        let release = |auth_phase| {
             dispatch_before_engine(
                 Request::UnsealKeyring {
                     user: user.into(),
                     service: Some("plasmalogin".into()),
                     have_password: false,
-                    auth_phase: true,
+                    auth_phase,
                 },
                 &peer(0),
             )
@@ -18271,18 +18269,20 @@ mod tests {
         let held_elsewhere = |response: &Response| matches!(response, Response::Error(message) if message.contains("holds another uid"));
         // Another request holds the uid the name had before NSS mapped it
         // to `now`.
+        // The auth-phase release and the session-phase (or older module's)
+        // one alike.
         let other = irlume_core::account::hold(user, then).unwrap();
-        let refused = release();
+        let refused = [release(true), release(false)];
         drop(other);
         let same = irlume_core::account::hold(user, now).unwrap();
-        let served = release();
+        let served = [release(true), release(false)];
         drop(same);
         match previous_tcti {
             Some(value) => std::env::set_var("IRLUME_TCTI", value),
             None => std::env::remove_var("IRLUME_TCTI"),
         }
-        assert!(held_elsewhere(&refused), "{refused:?}");
-        assert!(!held_elsewhere(&served), "{served:?}");
+        assert!(refused.iter().all(held_elsewhere), "{refused:?}");
+        assert!(!served.iter().any(held_elsewhere), "{served:?}");
     }
 
     #[test]

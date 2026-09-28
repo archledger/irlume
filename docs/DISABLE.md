@@ -102,7 +102,10 @@ the like, or a keyring module), with no `include`, `substack` or other
 `common-session-noninteractive`. Otherwise `irlume login enable` reports
 `no anchor to wire` for it and leaves it as it is: irlume's lines are
 designed to follow the password step and a line whose failure fails the
-stack.
+stack. An `include` taken as that line gets the include layout (the face
+line `sufficient` above it, the keyring and reseal lines below it), as
+`@include common-auth` does: PAM puts the included stack's lines in the
+include's place, so a jump over it would skip only the first of them.
 
 An override written by a release before this tracking gets the line at the
 first reconcile when it still matches its vendor copy. One that no longer

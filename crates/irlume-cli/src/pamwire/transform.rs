@@ -130,7 +130,13 @@ pub(super) fn wire_greeter_impl(
     // its own keyring modules after; inserting the face line before that include
     // works identically (face IGNORE on cold login → the include's pam_unix +
     // greetd's pam_gnome_keyring run with the unsealed AUTHTOK → keyring unlocks).
-    if let Some(inc_at) = lines.iter().position(|l| is_include_auth_layout(l)) {
+    // A first auth `include` the anchor guess takes gets the same layout: a
+    // jump over it would skip only the first line of the stack it inlines.
+    let inc_at = lines
+        .iter()
+        .position(|l| is_include_auth_layout(l))
+        .or_else(|| find_auth_anchor(&lines).filter(|&at| is_auth_include(lines[at])));
+    if let Some(inc_at) = inc_at {
         let mut out = Vec::with_capacity(lines.len() + 4);
         for (i, l) in lines.iter().enumerate() {
             if i == inc_at {
@@ -214,7 +220,13 @@ pub(super) fn wire_lock(content: &str) -> (String, bool) {
     // system-local-login`) → face-first `sufficient` before it. A warm lock so
     // no keyring-continue arg; on face success the module returns SUCCESS and
     // `sufficient` grants the unlock.
-    if let Some(inc_at) = lines.iter().position(|l| is_include_auth_layout(l)) {
+    // A first auth `include` the anchor guess takes gets the same layout: a
+    // jump over it would skip only the first line of the stack it inlines.
+    let inc_at = lines
+        .iter()
+        .position(|l| is_include_auth_layout(l))
+        .or_else(|| find_auth_anchor(&lines).filter(|&at| is_auth_include(lines[at])));
+    if let Some(inc_at) = inc_at {
         let mut out = Vec::with_capacity(lines.len() + 1);
         for (i, l) in lines.iter().enumerate() {
             if i == inc_at {
@@ -478,7 +490,7 @@ pub(super) fn without_irlume_lines(content: &str) -> String {
         .split_inclusive('\n')
         .filter(|l| {
             let line = l.strip_suffix('\n').unwrap_or(l);
-            !is_irlume_line(line.strip_suffix('\r').unwrap_or(line))
+            !is_irlume_line(line.trim_end_matches('\r'))
         })
         .collect()
 }
@@ -489,7 +501,7 @@ pub(super) fn without_irlume_lines(content: &str) -> String {
 /// irlume's lines out moves no other line's landing, whatever else in the
 /// file irlume does not read as PAM does.
 pub(super) fn jump_could_count_irlume_lines(content: &str) -> bool {
-    let irlume = |l: &str| is_irlume_line(l.strip_suffix('\r').unwrap_or(l));
+    let irlume = |l: &str| is_irlume_line(l.trim_end_matches('\r'));
     let lines: Vec<&str> = content.split('\n').collect();
     let Some(last) = lines.iter().rposition(|l| irlume(l)) else {
         return false;

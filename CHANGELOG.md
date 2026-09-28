@@ -356,8 +356,11 @@ All notable changes to irlume are documented here. This project adheres to
   stack that runs such a step, which irlume reads where PAM finds it, and
   when no auth line below it can check a password. irlume's lines are
   designed to follow the password step and a line whose failure fails the
-  stack. Any other such stack is left as it is and reported as having no
-  anchor to wire (#858).
+  stack. An `include` there gets irlume's include layout, the face line
+  `sufficient` above it and the keyring and reseal lines below it, since
+  PAM puts the included lines in its place and a jump over it would skip
+  only the first of them. Any other such stack is left as it is and
+  reported as having no anchor to wire (#858).
 
 - irlume now reads the lines of a PAM stack as libpam does and refuses to
   change a stack with a line it cannot read that way. A control is parsed

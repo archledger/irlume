@@ -6669,13 +6669,33 @@ auth       optional      pam_gnome_keyring.so\n";
                 )
             });
             assert_eq!(anchor, Some(at), "{text}");
-            let wired = face.0.lines().collect::<Vec<_>>();
             assert!(face.1 && keyring.1 && lock.1, "{text}");
-            assert_eq!(wired[at], GREETER_UNSEAL_COSMIC_JUMP, "{}", face.0);
+            // libpam puts the included stack's lines in the include's place,
+            // so a jump over it would skip only its first line: the anchor
+            // gets the include layout, the face line `sufficient` above it
+            // and the keyring and reseal lines below it, with no jump and no
+            // landing.
+            let wired = face.0.lines().collect::<Vec<_>>();
+            assert_eq!(
+                wired[at],
+                include_greeter_line("ondemand", true),
+                "{}",
+                face.0
+            );
             assert_eq!(wired[at + 1], include, "{}", face.0);
-            assert_eq!(wired[at + 2], PERMIT_LANDING, "{}", face.0);
-            assert_eq!(wired[at + 3], KEYRING_UNSEAL, "{}", face.0);
-            assert_eq!(wired[at + 4], RESEAL_AUTH, "{}", face.0);
+            assert_eq!(wired[at + 2], KEYRING_UNSEAL, "{}", face.0);
+            assert_eq!(wired[at + 3], RESEAL_AUTH, "{}", face.0);
+            assert!(!face.0.contains("success=1"), "{}", face.0);
+            assert!(!face.0.contains(PERMIT_LANDING), "{}", face.0);
+            let locked = lock.0.lines().collect::<Vec<_>>();
+            assert_eq!(
+                locked[at],
+                include_greeter_line("ondemand", false),
+                "{}",
+                lock.0
+            );
+            assert_eq!(locked[at + 1], include, "{}", lock.0);
+            assert!(!lock.0.contains("success=1"), "{}", lock.0);
             // Without the stack it names, the same file is no anchor.
             assert_eq!(find_auth_anchor(&lines), None, "{text}");
             assert!(!wire_greeter_impl(text, true, true, true).1, "{text}");
@@ -7329,8 +7349,11 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
             1,
         );
         let crlf = wired.replace('\n', "\r\n");
+        // Every carriage return at a line's end is taken off before irlume
+        // tells its own lines, so doubled ones are stripped too.
+        let crcrlf = wired.replace('\n', "\r\r\n");
         let reseal_only = |c: &str| wire_greeter_impl(c, false, false, true);
-        for text in [&typo, &crlf] {
+        for text in [&typo, &crlf, &crcrlf] {
             let dir = TestDir::new("remote-unread");
             let etc = dir.0.join("lightdm");
             std::fs::write(&etc, text).unwrap();
@@ -7350,7 +7373,7 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
             assert_eq!(after.lines().count() + 5, text.lines().count(), "{after}");
             assert_eq!(
                 after.split('\n').all(|l| l.is_empty() || l.ends_with('\r')),
-                text == &crlf
+                text != &typo
             );
             // A jump above irlume's lines could count them: kept.
             let jumped = format!("auth [success=2 default=ignore] pam_foo.so\n{text}");
@@ -7360,6 +7383,22 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
             assert!(off.unmet, "{off}");
             assert_eq!(std::fs::read_to_string(&etc).unwrap(), jumped);
         }
+    }
+
+    /// Every carriage return at a line's end is taken off before irlume
+    /// tells its own lines, so a verify line that ends in the module name
+    /// with doubled carriage returns is still irlume's: it is stripped, and
+    /// a jump above it counts it.
+    #[test]
+    fn a_line_of_irlume_s_with_doubled_carriage_returns_is_told() {
+        let text = format!("{VERIFY_STANZA}\r\r\nauth       include      system-auth\r\r\n");
+        assert_eq!(
+            without_irlume_lines(&text),
+            "auth       include      system-auth\r\r\n"
+        );
+        assert!(!jump_could_count_irlume_lines(&text));
+        let jumped = format!("auth [success=1 default=ignore] pam_foo.so\r\r\n{text}");
+        assert!(jump_could_count_irlume_lines(&jumped));
     }
 
     #[test]
@@ -9212,7 +9251,12 @@ auth required pam_fprintd.so\n\
                 let got_sufficient = wired.contains("sufficient   pam_irlume.so unseal")
                     || wired.contains("sufficient pam_irlume.so unseal");
                 let got_jump = wired.contains("success=1 default=ignore");
-                if expect_sufficient.contains(&distro) {
+                // openSUSE's lightdm includes xdm as its first auth line:
+                // libpam inlines xdm's lines there, so an include takes the
+                // sufficient line, as a jump over it would skip only xdm's
+                // first line.
+                let include_first = (distro, service) == ("opensuse", "lightdm");
+                if expect_sufficient.contains(&distro) || include_first {
                     assert!(
                         got_sufficient && !got_jump,
                         "{distro}/{service}: the include dialect takes the sufficient line"

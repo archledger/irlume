@@ -785,6 +785,14 @@ pub(super) fn is_auth_substack_anchor(line: &str) -> bool {
     typed_head(line, "auth").is_some_and(|h| h.control.eq_ignore_ascii_case("substack"))
 }
 
+/// An `auth` line that inlines the stack it names (`include`). libpam puts
+/// that stack's lines in its place, and a jump counts each of them, so no
+/// jump over it skips the whole stack: irlume wires such an anchor as it
+/// wires an include layout ([`is_include_auth_layout`]), never with a jump.
+pub(super) fn is_auth_include(line: &str) -> bool {
+    typed_head(line, "auth").is_some_and(|h| h.control.eq_ignore_ascii_case("include"))
+}
+
 /// Whether `line` is a password step the verify stanza goes above: an inline
 /// include of the auth stack, a shared password substack, any auth substack,
 /// or the `pam_unix.so` auth line.

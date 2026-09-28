@@ -23,9 +23,9 @@
 //! unwiring anything on a capability reading.
 
 use super::grammar::{
-    self, content_has_module, directive, has_line_continuation, has_read_carriage_return, head,
-    irlume_rule, is_at_include, is_auth_substack_anchor, is_include_auth_layout,
-    is_passwd_substack, unreadable_line, UnreadLine,
+    self, carriage_return_line, content_has_module, directive, has_line_continuation,
+    has_read_carriage_return, head, irlume_rule, is_at_include, is_auth_substack_anchor,
+    is_include_auth_layout, is_passwd_substack, unreadable_line, UnreadLine,
 };
 use super::stanzas::{inert_line, BACKUP, CREATED_PREFIX, INERT_TAG, KEYRING_TAG};
 use super::transform::{
@@ -2168,15 +2168,19 @@ pub(super) fn maintenance(
     let (Some(p), Some(v)) = (parse(current), vendor) else {
         return Maintenance::Nothing;
     };
+    // A carriage return PAM reads counts in a continued file too, which
+    // `unreadable_line` leaves to `has_line_continuation`: the parsed body
+    // has none, so a write from it would change what PAM reads.
+    let unread = p.unreadable().is_some() || has_read_carriage_return(p.text);
     match classify(&p, Some(v)) {
-        Class::L1 if p.unreadable().is_some() => Maintenance::Blocked(Hold::Unreadable),
+        Class::L1 if unread => Maintenance::Blocked(Hold::Unreadable),
         Class::L1 => Maintenance::Record(format!(
             "{}\n{}\n{}",
             p.first,
             tracking_line(&sha256(v), &body_digest(&p.body)),
             p.body
         )),
-        Class::U2 if p.unreadable().is_some() || unreadable_line(v).is_some() => {
+        Class::U2 if unread || unreadable_line(v).is_some() => {
             Maintenance::Blocked(Hold::Unreadable)
         }
         Class::U2 => {
@@ -2208,7 +2212,7 @@ pub(super) fn maintenance_unread(
     vendor: Option<&str>,
 ) -> Option<String> {
     let p = parse(current)?;
-    if let Some(line) = p.unreadable() {
+    if let Some(line) = p.unreadable().or_else(|| carriage_return_line(p.text)) {
         return Some(unread_sentence(&line, None));
     }
     vendor
@@ -3132,6 +3136,36 @@ session     include       password-auth
         );
         let (sudo, _) = wire_verify_service("auth include system-auth\n");
         assert!(infer(Recipe::Verify, &sudo).is_some());
+    }
+
+    /// A legacy override with a continued line and CRLF endings on its other
+    /// lines: PAM reads
+    /// each carriage return as part of its line, and a record written from
+    /// the parsed body would drop them. Reconcile holds it and names the
+    /// line, as for a file without a continued line; the same file with LF
+    /// endings is recorded.
+    #[test]
+    fn maintenance_holds_a_continued_legacy_file_with_carriage_returns() {
+        let vp = "/usr/lib/pam.d/plasmalogin";
+        let vendor = format!("{VENDOR}auth optional pam_env.so \\\n    readenv=1\n");
+        let lf = legacy(&vendor);
+        assert!(has_line_continuation(&lf));
+        assert!(matches!(
+            maintenance(Recipe::Greeter, &lf, vp, Some(&vendor)),
+            Maintenance::Record(_)
+        ));
+        // The continued line keeps its LF ending: a `\` before a carriage
+        // return continues no line for PAM.
+        let crlf = lf.replace('\n', "\r\n").replace("\\\r\n", "\\\n");
+        assert!(has_line_continuation(&crlf));
+        assert_eq!(unreadable_line(&crlf), None);
+        assert_eq!(
+            maintenance(Recipe::Greeter, &crlf, vp, Some(&vendor)),
+            Maintenance::Blocked(Hold::Unreadable)
+        );
+        let why = maintenance_unread(&crlf, vp, Some(&vendor)).expect("reconcile says why");
+        assert!(why.starts_with("irlume does not read line "), "{why}");
+        assert!(why.contains("a CRLF line ending"), "{why}");
     }
 
     #[test]

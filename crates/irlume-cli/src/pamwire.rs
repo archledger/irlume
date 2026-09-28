@@ -7604,11 +7604,20 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
 
     /// libpam reads a line up to its first NUL byte, so a line of irlume's
     /// with a NUL right after the module name is still irlume's: a disable
-    /// finds it and takes it out, every other byte kept.
+    /// finds it and takes it out, every other byte kept. A foreign line
+    /// with irlume's tag after a NUL is not irlume's.
     #[test]
     fn a_line_of_irlume_s_followed_by_a_nul_is_told() {
         let line = format!("{VERIFY_STANZA}\0garbage");
         assert!(is_irlume_line(&line));
+        // A tag after the NUL marks no line of irlume's: PAM reads only the
+        // foreign line before it.
+        for foreign in [
+            "auth optional pam_permit.so\0 # irlume-landing",
+            "auth optional pam_gnome_keyring.so\0 # irlume-keyring",
+        ] {
+            assert!(!is_irlume_line(foreign), "{foreign:?}");
+        }
         let text = format!("{line}\nauth       include      system-auth\n");
         assert!(holds_irlume_line(&text));
         assert_eq!(

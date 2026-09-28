@@ -624,7 +624,29 @@ pub(crate) fn unreadable_line(content: &str) -> Option<UnreadLine<'_>> {
 /// reads (before any `#`), as each line of a file saved with CRLF line
 /// endings does: PAM reads it as part of that line ([`unreadable_line`]).
 pub(crate) fn has_read_carriage_return(content: &str) -> bool {
-    content.split('\n').any(|l| directive(l).contains('\r'))
+    carriage_return_line(content).is_some()
+}
+
+/// The first line of `content` with a carriage return in what libpam reads,
+/// named as [`unreadable_line`] names one, whether or not the file has a
+/// continued line (for which [`unreadable_line`] names none).
+pub(crate) fn carriage_return_line(content: &str) -> Option<UnreadLine<'_>> {
+    content.split('\n').enumerate().find_map(|(i, text)| {
+        let read = directive(text);
+        let before = read.trim_end_matches('\r');
+        let why = if before.contains('\r') {
+            Unread::Blank('\r')
+        } else if before.len() < read.len() {
+            Unread::CrlfEnding
+        } else {
+            return None;
+        };
+        Some(UnreadLine {
+            number: i + 1,
+            text,
+            why,
+        })
+    })
 }
 
 /// The file name of a module path: everything after its last `/`, so both

@@ -739,16 +739,32 @@ pub(super) fn is_auth_directive(line: &str) -> bool {
     typed_head(line, "auth").is_some()
 }
 
-/// Whether `content` holds an auth line libpam installs as one that always
-/// fails: one with a type but no control, or with no module path or stack
-/// name. libpam fails the stack there unless a line before it ends the
-/// stack, so a `sufficient` face line irlume put above it would let a face
-/// match through where the stack lets no one through; irlume wires nothing
-/// into such a file.
+/// Whether `content` holds an auth line libpam installs or runs as one that
+/// always fails: one with a type but no control, with no module path or
+/// stack name, or with a control libpam rejects, which makes every return
+/// value `bad`. libpam fails the stack there unless a line before it ends
+/// the stack, so a `sufficient` face line irlume put above it would let a
+/// face match through where the stack lets no one through; irlume wires
+/// nothing into such a file. A valid control that is `bad` or `die` for
+/// every value, such as `[default=die]` on faillock's `authfail` line, is
+/// not one: it is the branch a failed password takes, and a correct one
+/// jumps past it.
 pub(super) fn has_failing_auth_line(content: &str) -> bool {
     content.lines().any(|l| {
-        typed_head(l, "auth").is_some_and(|h| h.control.is_empty() || third_field(&h).is_none())
+        typed_head(l, "auth").is_some_and(|h| {
+            h.control.is_empty() || third_field(&h).is_none() || control_is_rejected(h.control)
+        })
     })
+}
+
+/// Whether libpam rejects `control` ("pam_parse: expecting ..."): not one
+/// of its keywords, `include` or `substack`, and not `value=action` pairs it
+/// reads ([`control_pairs`]).
+fn control_is_rejected(control: &str) -> bool {
+    !CONTROL_KEYWORDS
+        .iter()
+        .any(|k| control.eq_ignore_ascii_case(k))
+        && control_pairs(control).is_none()
 }
 
 /// Whether this line's type, read as libpam reads it, is `session`.

@@ -3758,7 +3758,7 @@ mod tests {
     use super::report::label_of;
 
     // Fedora gdm-password layout (real /etc file, the GDM greeter).
-    const GDM: &str = "#%PAM-1.0\nauth     [success=done ...] pam_selinux_permit.so\nauth     substack      password-auth\nauth     optional      pam_gnome_keyring.so\naccount  include       password-auth\nsession  include       password-auth\nsession  optional      pam_gnome_keyring.so auto_start\n";
+    const GDM: &str = "#%PAM-1.0\nauth     [success=done ignore=ignore default=bad] pam_selinux_permit.so\nauth     substack      password-auth\nauth     optional      pam_gnome_keyring.so\naccount  include       password-auth\nsession  include       password-auth\nsession  optional      pam_gnome_keyring.so auto_start\n";
 
     fn scratch_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("irlume-pamfile-{tag}-{}", std::process::id()));
@@ -5890,10 +5890,13 @@ mod tests {
     }
 
     /// libpam installs an auth line with no control, or with no module, as
-    /// one that always fails: a stack that reaches it lets no one through
-    /// unless a line before it ends the stack. No recipe wires such a file,
-    /// wherever the line is, since a `sufficient` face line above it would
-    /// let a face match through; a sudo stack of that line alone included.
+    /// one that always fails, and runs one whose control it rejects as a line
+    /// that is `bad` whatever its module returns: a stack that reaches it
+    /// lets no one through unless a line before it ends the stack. No recipe
+    /// wires such a file, wherever the line is, since a `sufficient` face
+    /// line above it would let a face match through; a sudo stack of that
+    /// line alone included. faillock's `[default=die]` branch, which a
+    /// correct password jumps past, is no such line.
     #[test]
     fn no_recipe_wires_a_stack_with_an_auth_line_that_always_fails() {
         for failing in [
@@ -5901,6 +5904,9 @@ mod tests {
             "-auth",
             "auth       required",
             "auth       [default=ignore]",
+            "auth       [success=bogus]   pam_unix.so",
+            "AUTH       [success=bogus]   pam_unix.so",
+            "auth       bogus             pam_unix.so",
         ] {
             let only = format!("#%PAM-1.0\n{failing}\n");
             let sudo_below = format!("{DEBIAN_SUDO}{failing}\n");
@@ -5931,6 +5937,10 @@ mod tests {
         // The same lines of another type leave the auth stack as it was.
         let session = format!("{DEBIAN_SUDO}session\n");
         assert!(wire_verify_service(&session).1);
+        assert!(!has_failing_auth_line(
+            "auth [success=1 default=bad] pam_unix.so\n\
+             auth [default=die] pam_faillock.so authfail\n"
+        ));
     }
 
     // ---- keyring hand-off (KWallet / gnome-keyring) --------------------------

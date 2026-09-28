@@ -334,6 +334,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume login plan --json` marks each surface the apply will keep as it
+  is and fail on (`kept`, as in `login apply`), and its `plan_id` covers
+  it. A PAM file kept as it is was reported as `keep-edited-override`
+  whether irlume's lines in it were right or could not be updated, so a
+  plan did not show that the apply would fail (#859).
+
+- A PAM file that another writer put in place just before irlume replaced
+  it is no longer lost when irlume is killed during that replacement: the
+  file taken out of the path now waits under a name the next run's cleanup
+  of irlume's leftover files does not remove (#859).
+
 - `irlume doctor`'s `sealed-storage` check and the guidance after a seal
   ask irlumed to probe its own keyring and template-key directories and
   the installed system. The daemon's directory settings take precedence

@@ -909,6 +909,7 @@ pub fn login_plan(args: &[String]) -> ExitCode {
                 "role": surface.role,
                 "change": surface.change.id(),
                 "writes": surface.change.writes(),
+                "kept": surface.kept,
             })
         })
         .collect();
@@ -960,6 +961,13 @@ fn plan_id(action: &str, planned: &[crate::pamwire::PlannedSurface]) -> String {
             (true, false) => " on",
             (true, true) => " on-without-face",
         });
+        // Whether the apply fails on the surface: an edited file kept as it
+        // is shares the change name and the state whether its irlume lines
+        // are right or cannot be updated, which the lines the configuration
+        // wants decide.
+        if surface.kept {
+            material.push_str(" kept");
+        }
     }
     use sha2::{Digest as _, Sha256};
     let digest = Sha256::digest(material.as_bytes());
@@ -3525,6 +3533,7 @@ mod tests {
                 state: state.to_string(),
                 want: true,
                 face_blocked: false,
+                kept: false,
             }]
         };
         let before = plan_id("enable", &with_state("aaaa"));
@@ -3553,6 +3562,7 @@ mod tests {
                 state: "same-state".into(),
                 want: true,
                 face_blocked: false,
+                kept: false,
             }]
         };
         let base = plan_id("enable", &surfaces(PlannedChange::Wire));
@@ -3568,6 +3578,21 @@ mod tests {
             plan_id("enable", &surfaces(PlannedChange::AlreadyCorrect))
         );
         assert_eq!(base.len(), 32);
+        // An edited file kept as it is: whether the apply fails on it is
+        // part of the plan, with the change name and the state unchanged.
+        let kept = |kept| {
+            let mut planned = surfaces(PlannedChange::KeepEditedOverride);
+            planned[0].kept = kept;
+            planned
+        };
+        assert_ne!(
+            plan_id("enable", &kept(true)),
+            plan_id("enable", &kept(false))
+        );
+        assert_eq!(
+            plan_id("enable", &kept(true)),
+            plan_id("enable", &kept(true))
+        );
     }
 
     #[test]

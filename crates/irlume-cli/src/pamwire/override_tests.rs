@@ -903,6 +903,17 @@ fn a_refused_update_is_an_unmet_request_for_a_person_only() {
     assert_eq!(change_id(&same), "keep-edited-override", "{same}");
     assert!(!same.unmet);
     assert!(!kept_unmet(ScopeOrigin::Command, &same));
+    // The plan tells the two apart over the same file: the apply fails on
+    // the first and not on the second.
+    let refused = plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false);
+    let right = plan_surface(&svc, ROLE_LOGIN, &keyring_only, true, false);
+    for planned in [&refused, &right] {
+        assert_eq!(planned.change, PlannedChange::KeepEditedOverride);
+    }
+    assert_eq!(refused.state, right.state);
+    assert!(refused.kept);
+    assert!(!right.kept);
+    assert_eq!(read_file(svc.etc), before, "planning wrote nothing");
 }
 
 /// A person at the terminal sees how a kept override differs and how to
@@ -1158,6 +1169,7 @@ fn apply_refuses_a_surface_whose_vendor_copy_changed_after_the_plan() {
         state: surface_state_for(&svc),
         want: true,
         face_blocked: false,
+        kept: false,
     };
     std::fs::write(svc.vendor.unwrap(), fedora_with_oo7()).unwrap();
     let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false, &[planned]);
@@ -1184,6 +1196,7 @@ fn apply_refuses_a_surface_whose_want_changed_after_the_plan() {
         state: surface_state_for(&svc),
         want: false,
         face_blocked: false,
+        kept: false,
     };
     let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false, &[planned]);
     let error = applied.error.expect("the surface is refused");
@@ -1200,6 +1213,7 @@ fn apply_refuses_a_surface_whose_want_changed_after_the_plan() {
         state: surface_state_for(&svc),
         want: true,
         face_blocked: true,
+        kept: false,
     };
     let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false, &[planned]);
     assert!(applied.error.is_some(), "the surface is refused");
@@ -1980,7 +1994,7 @@ fn a_checked_write_keeps_a_file_that_replaced_the_checked_one() {
 /// A second writer that replaces the path after the write swapped its file
 /// in, and before it swaps the first writer's back, keeps its file in place;
 /// the first writer's file is kept under a private name the scratch sweep
-/// never takes, not left under the scratch name.
+/// never takes.
 #[test]
 fn a_checked_write_keeps_a_second_file_that_replaced_it_meanwhile() {
     let dir = TestDir::new("ovr-write-two-interlopers");
@@ -2003,6 +2017,46 @@ fn a_checked_write_keeps_a_second_file_that_replaced_it_meanwhile() {
         std::fs::read_to_string(dir.0.join(kept)).unwrap(),
         "SOMEONE ELSE'S FILE\n"
     );
+}
+
+/// A run killed after exchanging its file into the path and before it looks
+/// at the file that came out leaves that file under a name the next run's
+/// scratch sweep does not take: here another writer's, which replaced the
+/// checked file just before the exchange, and there the checked file itself.
+#[test]
+fn a_file_exchanged_out_survives_a_stop_and_the_next_sweep() {
+    for (label, interloper, came_out) in [
+        ("other", true, "SOMEONE ELSE'S FILE\n"),
+        ("checked", false, "decided on this\n"),
+    ] {
+        let dir = TestDir::new(&format!("ovr-write-stop-after-exchange-{label}"));
+        let path = dir.0.join("sudo");
+        std::fs::write(&path, "decided on this\n").unwrap();
+        if interloper {
+            arm(&INTERLOPE_BEFORE_INSTALL, &path);
+        }
+        arm(&STOP_AFTER_EXCHANGE, &path);
+        let stopped = write_atomic_checked(&path, "IRLUME'S FILE\n", Some("decided on this\n"));
+        disarm(&INTERLOPE_BEFORE_INSTALL, &path);
+        disarm(&STOP_AFTER_EXCHANGE, &path);
+        assert!(stopped.is_err(), "{label}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "IRLUME'S FILE\n",
+            "{label}"
+        );
+        sweep_abandoned_scratch_in(&dir.0);
+        let names = entries(&dir.0);
+        assert_eq!(names.len(), 2, "{label}: {names:?}");
+        let aside = names.iter().find(|n| *n != "sudo").unwrap();
+        assert!(aside.contains(".irlume-exchange."), "{label}: {aside}");
+        assert!(!is_abandoned_scratch(aside), "{label}: {aside}");
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join(aside)).unwrap(),
+            came_out,
+            "{label}"
+        );
+    }
 }
 
 /// A file that appears where irlume is creating one, after irlume saw none,
@@ -2173,6 +2227,9 @@ fn the_scratch_sweep_takes_only_names_irlume_makes() {
         ".sudo.irlume-old.1234.0.tmp",
         ".sudo.irlume-removing.1234.0",
         ".sudo.irlume-removing.1234.0.tmp",
+        ".sudo.irlume-exchange.1234.0",
+        ".sudo.irlume-exchange.1234.0.tmp",
+        ".sudo.irlume-kept.1234.0",
         ".sudo.irlume-new.1234.0.tmp.swp",
         "..irlume-new.1234.0.tmp",
         ".irlume-new.1234.0.tmp",
@@ -2384,10 +2441,12 @@ fn a_kept_override_fails_its_surface_in_a_machine_apply() {
         false,
     )];
     assert_eq!(planned[0].change, PlannedChange::KeepEditedOverride);
+    assert!(planned[0].kept, "the plan says the apply fails here");
     let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, false, false, &planned);
     let error = applied.error.clone().expect("the surface fails");
     assert!(error.contains("kept as it is"), "{error}");
     assert!(applied.kept);
+    assert_eq!(planned[0].kept, applied.kept);
     assert_eq!(read_file(svc.etc), continued, "nothing written");
     assert!(content_has_module(&read_file(svc.etc)));
     assert!(crate::machine::marker_follows(std::slice::from_ref(

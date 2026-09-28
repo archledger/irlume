@@ -1330,7 +1330,7 @@
         },
         "kept": {
           "type": "boolean",
-          "description": "True for a surface irlume left as it was rather than update it (the plan's keep-edited-override); it fails the apply without anything written there. Added in 0.15.0; absent from older builds."
+          "description": "True for a surface irlume left as it was rather than update it (the plan's kept); it fails the apply without anything written there. Added in 0.15.0; absent from older builds."
         }
       }
     }

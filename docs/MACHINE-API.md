@@ -663,11 +663,11 @@ would change, without changing anything.
   "plan_id": "c574f96dba23c06bbb2e2f395a74f074",
   "action": "disable",
   "changes": [
-    { "surface": "gdm-password", "role": "login-screen", "change": "not-installed", "writes": false },
-    { "surface": "plasmalogin", "role": "login-screen", "change": "restore-backup", "writes": true },
-    { "surface": "kde", "role": "lock-screen", "change": "restore-backup", "writes": true },
-    { "surface": "sudo", "role": "sudo", "change": "restore-backup", "writes": true },
-    { "surface": "polkit-1", "role": "polkit", "change": "remove-override", "writes": true }
+    { "surface": "gdm-password", "role": "login-screen", "change": "not-installed", "writes": false, "kept": false },
+    { "surface": "plasmalogin", "role": "login-screen", "change": "restore-backup", "writes": true, "kept": false },
+    { "surface": "kde", "role": "lock-screen", "change": "restore-backup", "writes": true, "kept": false },
+    { "surface": "sudo", "role": "sudo", "change": "restore-backup", "writes": true, "kept": false },
+    { "surface": "polkit-1", "role": "polkit", "change": "remove-override", "writes": true, "kept": false }
   ],
   "writes": 4,
   "requires_root": true
@@ -693,7 +693,13 @@ by path, in keeping with the no-paths rule.
 `not-wired`. `writes` on a change says whether applying it would touch disk,
 and the top-level `writes` counts them, so "nothing to do" is a fact the engine
 states rather than one a consumer infers from outcome names it may not
-recognise.
+recognise. `kept` on a change is true when the apply will keep that surface
+as it is although irlume's lines there are not the ones this run wants,
+which fails the apply (`kept` in `login apply` below); it is false for every
+other surface, including a `keep-edited-override` whose irlume lines are
+already right. The same file can be either, depending on the lines the
+configuration wants. `kept` was added in 0.15.0 and is absent from older
+builds.
 
 The override changes concern a service a distribution ships only under
 `/usr/lib/pam.d`, for which irlume keeps its own copy in `/etc/pam.d`.
@@ -711,7 +717,8 @@ move one of irlume's lines past an administrator's line. A stack irlume edits
 in place reports it too when a disable left inactive lines in the places of
 irlume's lines because a numeric jump counts them, and irlume's lines no
 longer fit those places; while they fit, `wire` puts irlume's lines back in
-them, so the jump lands where it did. `login apply` counts
+them, so the jump lands where it did. When irlume's lines in the kept file
+are not the ones this run wants (the plan's `kept`), `login apply` counts
 such a surface as failed (`applied: false`, and the apply fails), since
 irlume's lines are not the ones it was asked for; as on the command line, the
 self-heal marker still follows the other surfaces. A copy nobody edited is not
@@ -733,7 +740,7 @@ where to put its lines back without them. The API never rebuilds an edited
 copy: that takes the human `login enable --force`.
 
 `plan_id` is a digest of the action and the exact per-surface outcomes it was
-computed against. Two plans over an unchanged machine share an id; any change to
+computed against, `kept` included. Two plans over an unchanged machine share an id; any change to
 what would happen produces a different one. For a surface with a vendor path it
 covers the vendor file too, whether or not an override exists yet, so a vendor
 update between `plan` and `apply` makes the plan stale. It exists so that a
@@ -776,7 +783,7 @@ every surface as the success document does (`surface`, `role`, `change`,
 `applied`), so a caller can name the surface that failed. Each change in either
 document also carries `kept`: true for a surface irlume left as it was rather
 than update it (its lines would have moved an administrator's jump or line, or
-the file has a continued line; the plan shows it as `keep-edited-override`),
+the file has a continued line; the plan marks it `kept`),
 which fails the apply without anything written there.
 
 **verify** answers whether the machine is still as that transaction left it,

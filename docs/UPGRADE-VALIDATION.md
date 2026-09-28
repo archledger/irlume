@@ -105,6 +105,15 @@ python3 /var/tmp/irlume-upgrade-input/test-package-upgrade.py \
   --output /var/tmp/irlume-upgrade-output/debian.json
 ```
 
+The default `universal` Debian lane accepts the upstream version with an
+optional numeric package revision and requires the universal package's 0755
+PAM module. For the PPA's Ubuntu 26.04 (Resolute) packages, add `--deb-lane=ppa`
+and use a separate fresh guest and output path. That lane requires the exact
+upstream version with a `-0ppaN~resoluteN` revision (positive revision numbers)
+and the PPA recipe's 0644 PAM module. It is refused for RPM or Arch inputs.
+The selected lane is recorded in the receipt; it does not relax the signature,
+guest-admission, state-preservation or authentication checks.
+
 Arch:
 
 ```sh

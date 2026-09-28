@@ -22,6 +22,76 @@ SPEC.loader.exec_module(upgrade)
 
 
 class HarnessTests(unittest.TestCase):
+    def test_ppa_versions_require_the_explicit_lane_and_exact_upstream(self):
+        version = "0.15.0-0ppa1~resolute1"
+        with patch.object(upgrade, "read_command", side_effect=["irlume", version]):
+            with self.assertRaisesRegex(upgrade.Failure, "package-metadata"):
+                upgrade.package_metadata(Path("/candidate.deb"), "deb", "0.15.0")
+        with patch.object(upgrade, "read_command", side_effect=["irlume", version]):
+            self.assertEqual(upgrade.package_metadata(
+                Path("/candidate.deb"), "deb", "0.15.0", deb_lane="ppa"), version)
+        for bad in ("0.14.0-0ppa1~resolute1", "0.15.0-1", "0.15.0-0ppa1~noble1",
+                    "1:0.15.0-0ppa1~resolute1", "0.15.0-0ppa1~resolute1\nextra"):
+            with self.subTest(version=bad), \
+                    patch.object(upgrade, "read_command", side_effect=["irlume", bad]):
+                with self.assertRaisesRegex(upgrade.Failure, "package-metadata"):
+                    upgrade.package_metadata(Path("/candidate.deb"), "deb", "0.15.0", deb_lane="ppa")
+
+    def test_each_debian_lane_requires_its_shipped_pam_module_mode(self):
+        common = {
+            "/usr/libexec/irlume-password-verify": 0o755,
+            "/usr/libexec/irlume/irlume-kwallet-init": 0o755,
+            "/usr/libexec/irlume/irlume-gkr-unlock": 0o755,
+            "/etc/pam.d/irlume-retry-reset": 0o644,
+            "/usr/share/polkit-1/actions/org.irlume.enroll.policy": 0o644,
+            "/usr/share/polkit-1/actions/org.irlume.recovery-manage.policy": 0o644,
+        }
+        module = "/usr/lib/x86_64-linux-gnu/security/pam_irlume.so"
+        for lane, wanted, wrong in (("universal", 0o755, 0o644), ("ppa", 0o644, 0o755)):
+            with self.subTest(lane=lane):
+                payload = {path: {"type": "file", "mode": mode, "uid": 0, "gid": 0}
+                           for path, mode in (common | {module: wanted}).items()}
+                upgrade.check_candidate_payload(payload, "deb", deb_lane=lane)
+                payload[module]["mode"] = wrong
+                with self.assertRaisesRegex(upgrade.Failure, "candidate-required-payload"):
+                    upgrade.check_candidate_payload(payload, "deb", deb_lane=lane)
+
+    def test_debian_lane_is_refused_for_other_formats_before_metadata_or_output(self):
+        for suffix in ("rpm", "pkg.tar.zst"):
+            with self.subTest(format=suffix), tempfile.TemporaryDirectory() as temp, \
+                    patch.object(upgrade, "admit_guest", return_value="kvm"), \
+                    patch.object(upgrade, "package_path", side_effect=[
+                        Path(f"/old.{suffix}"), Path(f"/candidate.{suffix}")]), \
+                    patch.object(upgrade, "package_metadata") as metadata, \
+                    patch.object(upgrade.sys, "stderr", io.StringIO()) as stderr:
+                output = Path(temp) / "result.json"
+                self.assertEqual(upgrade.main([
+                    "--old", f"/old.{suffix}", "--candidate", f"/candidate.{suffix}",
+                    "--deb-lane", "ppa", "--output", str(output)]), 2)
+                self.assertIn("deb-lane-requires-deb", stderr.getvalue())
+                metadata.assert_not_called()
+                self.assertEqual(list(Path(temp).iterdir()), [])
+
+    def test_ppa_cli_propagates_the_lane_and_records_it_in_the_receipt(self):
+        # Stub guest mutations; exercise real argument, metadata and receipt logic.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old, candidate, output = root / "old.deb", root / "candidate.deb", root / "result.json"
+            old.write_bytes(b"old synthetic package")
+            candidate.write_bytes(b"candidate synthetic package")
+            with patch.object(upgrade, "INPUT_ROOT", root), \
+                    patch.object(upgrade, "admit_guest", return_value="kvm"), \
+                    patch.object(upgrade, "read_command", side_effect=[
+                        "irlume", "0.14.0-0ppa1~resolute1", "irlume", "0.15.0-0ppa1~resolute1"]), \
+                    patch.object(upgrade, "Runner"), \
+                    patch.object(upgrade, "execute") as execute, \
+                    patch.object(upgrade.sys, "stdout", io.StringIO()):
+                self.assertEqual(upgrade.main([
+                    "--old", str(old), "--candidate", str(candidate),
+                    "--deb-lane", "ppa", "--output", str(output)]), 0)
+                self.assertEqual(execute.call_args.kwargs["deb_lane"], "ppa")
+            self.assertEqual(json.loads(output.read_text())["deb_lane"], "ppa")
+
     def test_release_policy_packages_match_the_014_to_015_main_packages(self):
         metadata = ["irlume-selinux\t(none)\t0.14.0\t1.fc44\tnoarch",
                     "irlume-selinux\t(none)\t0.15.0\t1.fc44\tnoarch"]

@@ -282,7 +282,12 @@ pub(super) mod shared_greeter {
                         );
                         requests += 1;
                         let state = diagnostics::DiagnosticState::default();
-                        let scope = state.begin(diagnostic_operation_class(&req));
+                        // Registered as `serve` registers it: the worker
+                        // acts for the account its owner records.
+                        let scope = state.begin_for(
+                            diagnostic_operation_class(&req),
+                            diagnostic_owner(&req, &peer),
+                        );
                         let reply =
                             dispatch_scoped_session(req, &peer, engine, &scope, None, None, None);
                         prepared_grant |= is_face_grant(&reply.response);

@@ -11,7 +11,7 @@ use irlume_common::diagnostics::{
     MAX_SHARE_SAFE_EVENTS, MAX_TRACE_LINE_BYTES, V2_TRACE_SCHEMA_VERSION, V3_TRACE_SCHEMA_VERSION,
 };
 use sha2::{Digest as _, Sha256};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
@@ -80,9 +80,23 @@ pub(crate) enum TraceSubscribeError {
     UnsupportedSchema,
 }
 
+/// How many accounts keep a ring of recent events at once. Each ring holds
+/// up to [`MAX_SHARE_SAFE_EVENTS`] events, the most one snapshot lists, so
+/// the daemon-wide ring, the unresolved ring and these hold at most 34 x 256
+/// events. One to a few accounts authenticate on a machine within the
+/// 30 minutes a ring keeps; 32 leaves room for a shared host. A 33rd
+/// account displaces the ring of the account whose latest event is oldest.
+const MAX_ACCOUNT_RINGS: usize = 32;
+
 #[derive(Default)]
 struct Inner {
-    events: VecDeque<TimedShareSafeEvent>,
+    /// Recent events kept apart by whose operation they belong to
+    /// ([`Owner`]), each ring in the order recorded. A reader's snapshot
+    /// merges the rings it may read, so events it may not read never take
+    /// the place of events it may: each ring drops only its own oldest
+    /// events, and at most [`MAX_ACCOUNT_RINGS`] accounts keep a ring.
+    rings: BTreeMap<Owner, VecDeque<TimedShareSafeEvent>>,
+    /// Numbers every event in the order recorded, across all rings.
     next_sequence: u64,
     capture: Option<CaptureStatus>,
     cameras: Vec<SanitizedCameraContext>,
@@ -93,9 +107,6 @@ struct TimedShareSafeEvent {
     sequence: u64,
     operation_id: OperationId,
     operation: OperationClass,
-    /// Whose operation it was ([`OperationScope::owner`]). Kept in memory
-    /// to choose who may read the event; never on the wire.
-    owner: Owner,
     kind: ShareSafeEventKind,
 }
 
@@ -203,15 +214,18 @@ impl DiagnosticState {
         self.snapshot_for(since, 0)
     }
 
-    /// The events the peer with uid `peer_uid` may read. Root reads them
+    /// The events the peer with uid `peer_uid` may read, the latest
+    /// [`MAX_SHARE_SAFE_EVENTS`] in the order recorded. Root reads them
     /// all. Another account reads those of its own operations and of
     /// daemon-wide ones ([`Owner::visible_to`]), never another account's or
     /// an unresolved one's, whatever their class, and its snapshot always
     /// lists recent events as `NotAuthorized` in `unavailable`, whether or
     /// not an event was left out, so the reader knows the list is partial
-    /// and learns nothing from the marker itself. Its events are numbered
-    /// from 1 in order: the ring's own sequence counts every event, so its
-    /// gaps would count the ones left out.
+    /// and learns nothing from the marker itself. Those rings are kept
+    /// apart from the others ([`Inner::rings`]), so what it reads does not
+    /// depend on other accounts' activity. Its events are numbered from 1
+    /// in order: the daemon's own sequence counts every event, so its gaps
+    /// would count the ones left out.
     pub(crate) fn snapshot_for(&self, since: Duration, peer_uid: u32) -> SupportSnapshot {
         let now_ms = self.shared.clock.now_ms();
         let since_ms = u64::try_from(since.as_millis())
@@ -222,11 +236,12 @@ impl DiagnosticState {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        prune_expired(&mut inner.events, now_ms);
+        prune_expired(&mut inner.rings, now_ms);
         let mut events: Vec<ShareSafeEvent> = inner
-            .events
+            .rings
             .iter()
-            .filter(|event| event.owner.visible_to(peer_uid))
+            .filter(|(owner, _)| owner.visible_to(peer_uid))
+            .flat_map(|(_, ring)| ring)
             .filter_map(|event| {
                 let age_ms = now_ms.saturating_sub(event.recorded_ms);
                 (age_ms <= since_ms).then(|| ShareSafeEvent {
@@ -241,6 +256,12 @@ impl DiagnosticState {
         let capture = inner.capture.clone();
         let cameras = inner.cameras.clone();
         drop(inner);
+        events.sort_unstable_by_key(|event| event.sequence);
+        // The latest the snapshot can list, before any renumbering, so a
+        // reader other than root still reads its list numbered from 1.
+        if events.len() > MAX_SHARE_SAFE_EVENTS {
+            events.drain(..events.len() - MAX_SHARE_SAFE_EVENTS);
+        }
         if peer_uid != 0 {
             for (sequence, event) in (1_u64..).zip(&mut events) {
                 event.sequence = sequence;
@@ -617,20 +638,45 @@ fn record_locked(
     owner: Owner,
     kind: ShareSafeEventKind,
 ) {
-    prune_expired(&mut inner.events, now_ms);
-    while inner.events.len() >= MAX_SHARE_SAFE_EVENTS {
-        inner.events.pop_front();
+    prune_expired(&mut inner.rings, now_ms);
+    if matches!(owner, Owner::Account(_)) && !inner.rings.contains_key(&owner) {
+        make_room_for_an_account(&mut inner.rings);
     }
     let sequence = inner.next_sequence;
     inner.next_sequence = inner.next_sequence.saturating_add(1);
-    inner.events.push_back(TimedShareSafeEvent {
+    let ring = inner.rings.entry(owner).or_default();
+    while ring.len() >= MAX_SHARE_SAFE_EVENTS {
+        ring.pop_front();
+    }
+    ring.push_back(TimedShareSafeEvent {
         recorded_ms: now_ms,
         sequence,
         operation_id,
         operation,
-        owner,
         kind,
     });
+}
+
+/// Before an account without a ring gets one: when [`MAX_ACCOUNT_RINGS`]
+/// accounts already keep one, drop the ring of the account whose latest
+/// event is oldest. The daemon-wide and unresolved rings are never dropped
+/// for an account.
+fn make_room_for_an_account(rings: &mut BTreeMap<Owner, VecDeque<TimedShareSafeEvent>>) {
+    let accounts = rings
+        .keys()
+        .filter(|owner| matches!(owner, Owner::Account(_)))
+        .count();
+    if accounts < MAX_ACCOUNT_RINGS {
+        return;
+    }
+    let least_recent = rings
+        .iter()
+        .filter(|(owner, _)| matches!(owner, Owner::Account(_)))
+        .min_by_key(|(_, ring)| ring.back().map_or(0, |event| event.sequence))
+        .map(|(owner, _)| *owner);
+    if let Some(owner) = least_recent {
+        rings.remove(&owner);
+    }
 }
 
 #[derive(Clone)]
@@ -809,14 +855,18 @@ impl DiagnosticSink for OperationScope {
     }
 }
 
-fn prune_expired(events: &mut VecDeque<TimedShareSafeEvent>, now_ms: u64) {
+/// Drop every event older than [`MAX_HISTORY_MS`], and a ring left empty.
+fn prune_expired(rings: &mut BTreeMap<Owner, VecDeque<TimedShareSafeEvent>>, now_ms: u64) {
     let cutoff = now_ms.saturating_sub(MAX_HISTORY_MS);
-    while events
-        .front()
-        .is_some_and(|event| event.recorded_ms < cutoff)
-    {
-        events.pop_front();
-    }
+    rings.retain(|_, events| {
+        while events
+            .front()
+            .is_some_and(|event| event.recorded_ms < cutoff)
+        {
+            events.pop_front();
+        }
+        !events.is_empty()
+    });
 }
 
 #[cfg(test)]
@@ -1084,6 +1134,158 @@ mod tests {
         assert_eq!(view(&busy, 3_000), view(&quiet, 3_000));
         assert_eq!(numbers(&busy, 0), [1, 2, 3, 4, 5, 6]);
         assert_eq!(numbers(&quiet, 0), [1, 2, 3]);
+    }
+
+    /// Events a reader may not read never take the place of events it may:
+    /// hundreds of other accounts' and unresolved events recorded between
+    /// a reader's own leave its view as it is on a daemon where nothing
+    /// else happened. Root still reads the latest 256 events of every
+    /// account, numbered by the daemon's sequence without a gap.
+    #[test]
+    fn other_accounts_events_do_not_displace_a_readers_own() {
+        let since = Duration::from_secs(1_800);
+        let record = |state: &DiagnosticState, others: bool| {
+            for _ in 0..20 {
+                state
+                    .begin(OperationClass::CameraDiagnostics)
+                    .finish(CategoricalOutcome::Completed);
+                let mine = state.begin_for(OperationClass::Authentication, Owner::Account(2_000));
+                mine.emit(selected());
+                mine.finish(CategoricalOutcome::Granted);
+                if others {
+                    for _ in 0..15 {
+                        let theirs =
+                            state.begin_for(OperationClass::Authentication, Owner::Account(1_000));
+                        theirs.emit(selected());
+                        theirs.finish(CategoricalOutcome::Denied);
+                    }
+                    for _ in 0..5 {
+                        state
+                            .begin_for(OperationClass::Enrollment, Owner::Unresolved)
+                            .finish(CategoricalOutcome::Failed);
+                    }
+                }
+            }
+        };
+        let busy = DiagnosticState::default();
+        record(&busy, true);
+        let quiet = DiagnosticState::default();
+        record(&quiet, false);
+        let view = |state: &DiagnosticState, uid: u32| {
+            state
+                .snapshot_for(since, uid)
+                .events()
+                .iter()
+                .map(|event| (event.sequence, event.operation, event.kind.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        // 20 daemon-wide events and 40 of its own, all of them.
+        assert_eq!(view(&quiet, 2_000).len(), 60);
+        assert_eq!(view(&busy, 2_000), view(&quiet, 2_000));
+        assert_eq!(view(&busy, 3_000).len(), 20);
+        assert_eq!(view(&busy, 3_000), view(&quiet, 3_000));
+        // 20 rounds of 38 events: root reads the last 256 of the 760.
+        let root: Vec<u64> = view(&busy, 0)
+            .into_iter()
+            .map(|(sequence, ..)| sequence)
+            .collect();
+        assert_eq!(root, (505..=760).collect::<Vec<_>>());
+    }
+
+    /// A reader's view lists the latest 256 events it may read, numbered
+    /// from 1, even when its own and the daemon-wide rings hold more.
+    #[test]
+    fn a_readers_view_lists_its_latest_events_numbered_from_1() {
+        let state = DiagnosticState::default();
+        for _ in 0..200 {
+            state
+                .begin(OperationClass::CameraDiagnostics)
+                .finish(CategoricalOutcome::Completed);
+            state
+                .begin_for(OperationClass::Authentication, Owner::Account(2_000))
+                .finish(CategoricalOutcome::Granted);
+        }
+        let own = state.snapshot_for(Duration::from_secs(1_800), 2_000);
+        let numbers: Vec<u64> = own.events().iter().map(|event| event.sequence).collect();
+        assert_eq!(numbers, (1..=256).collect::<Vec<_>>());
+        assert_eq!(
+            own.events().last().map(|event| event.operation),
+            Some(OperationClass::Authentication),
+            "the latest event is the account's last"
+        );
+        let root: Vec<u64> = state
+            .snapshot(Duration::from_secs(1_800))
+            .events()
+            .iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(root, (145..=400).collect::<Vec<_>>());
+    }
+
+    /// At most 32 accounts keep a ring. Another account displaces the ring
+    /// of the account whose latest event is oldest, never the daemon-wide
+    /// or unresolved ring, so what the daemon keeps stays bounded however
+    /// many uids record events.
+    #[test]
+    fn only_a_33rd_account_displaces_an_account_ring() {
+        let since = Duration::from_secs(1_800);
+        let state = DiagnosticState::default();
+        let record = |owner: Owner| {
+            state
+                .begin_for(OperationClass::Authentication, owner)
+                .finish(CategoricalOutcome::Denied);
+        };
+        let events_of = |uid: u32| state.snapshot_for(since, uid).events().len();
+        state
+            .begin(OperationClass::CameraDiagnostics)
+            .finish(CategoricalOutcome::Completed);
+        record(Owner::Unresolved);
+        let accounts = u32::try_from(MAX_ACCOUNT_RINGS).unwrap();
+        for uid in 1..=accounts {
+            record(Owner::Account(uid));
+        }
+        // Account 1 records again, so account 2 is now the least recent.
+        record(Owner::Account(1));
+        for uid in 1..=accounts {
+            assert_eq!(events_of(uid), 1 + usize::from(uid == 1) + 1, "{uid}");
+        }
+
+        record(Owner::Account(accounts + 1));
+        assert_eq!(events_of(2), 1, "account 2's ring made way");
+        assert_eq!(events_of(1), 3);
+        assert_eq!(events_of(3), 2);
+        assert_eq!(events_of(accounts + 1), 2);
+        let root = state.snapshot(since);
+        assert_eq!(
+            root.events()
+                .iter()
+                .filter(|event| event.operation == OperationClass::CameraDiagnostics)
+                .count(),
+            1,
+            "the daemon-wide ring stays"
+        );
+        // The daemon-wide and unresolved events, account 1's two, one each
+        // of the 30 other accounts left, and account 33's.
+        assert_eq!(root.events().len(), 1 + 1 + 2 + 30 + 1);
+
+        for uid in 1_000..2_000 {
+            for _ in 0..3 {
+                record(Owner::Account(uid));
+            }
+        }
+        let inner = state.shared.inner.lock().unwrap();
+        let accounts_kept = inner
+            .rings
+            .keys()
+            .filter(|owner| matches!(owner, Owner::Account(_)))
+            .count();
+        assert_eq!(accounts_kept, MAX_ACCOUNT_RINGS);
+        assert_eq!(inner.rings.len(), MAX_ACCOUNT_RINGS + 2);
+        assert!(inner
+            .rings
+            .values()
+            .all(|ring| ring.len() <= MAX_SHARE_SAFE_EVENTS));
     }
 
     #[test]

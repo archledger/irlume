@@ -532,8 +532,12 @@ pub(crate) struct FaceAttempt {
 }
 
 impl FaceAttempt {
-    pub(crate) fn for_user(user: &str) -> Result<Self, &'static str> {
-        let result = account(user).and_then(|a| {
+    /// Reserve an attempt on the retry record of the account with `uid`,
+    /// the account the request acts for, resolved once when the daemon
+    /// registered it; no second lookup of the name is made here. `None`, a
+    /// name that did not resolve, is refused as unavailable.
+    pub(crate) fn for_account(uid: Option<u32>) -> Result<Self, &'static str> {
+        let result = uid.ok_or_else(invalid).and_then(account_of).and_then(|a| {
             Self::begin(
                 production_store()?,
                 a,
@@ -652,6 +656,10 @@ type Writer = fn(&Path, &[u8], u32) -> io::Result<AtomicWrite>;
 
 fn account(user: &str) -> io::Result<Account> {
     let uid = crate::users::uid_for_name(user).ok_or_else(invalid)?;
+    account_of(uid)
+}
+
+fn account_of(uid: u32) -> io::Result<Account> {
     let name = crate::users::name_for_uid(uid).ok_or_else(invalid)?;
     Ok(Account { uid, name })
 }

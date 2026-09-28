@@ -610,6 +610,19 @@ own background qualification, which are daemon-wide.
   daemon-wide ones, numbered from 1, and always lists `recent_events` as
   `not_authorized` in `unavailable`, so the reader knows the list may be
   partial and the marker itself tells nothing.
+- The ring keeps each account's events, daemon-wide events and unresolved
+  ones apart, the latest 256 of each for 30 minutes, for at most 32 accounts
+  at once; a 33rd account displaces the account whose latest event is
+  oldest. A snapshot lists the latest 256 events its reader may read, so
+  another account's activity does not push them out while no more than 32
+  accounts have events.
+- Root's request acts for the uid its account resolved to when the request
+  arrived, the uid recorded with it: the worker does not resolve the name
+  again when it starts the request, so the account shown the operation is
+  the account it acts for even when the name resolves to another uid by
+  then. For a name that did not resolve, `Authenticate` and
+  `UnsealPassword` are refused without a second lookup; other requests make
+  the lookups their records make, and their events stay root's alone.
 - `LiveStatus` answered to any other account reports every operation of
   another account, or of an unresolved one, running or waiting, as
   `unknown` whatever its kind, with its operation ID and elapsed time

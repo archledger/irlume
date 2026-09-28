@@ -1,12 +1,12 @@
-# Custom labels of the self-hosted runner fleet (minihost and archhost), so actionlint can
+# Custom labels of the self-hosted runner fleet (minihost), so actionlint can
 # validate runs-on lines instead of flagging them as unknown.
 self-hosted-runner:
   labels:
     - arch
     - ir-camera
     - tpm
-    # Shared by BOTH machines, so a light job can land on either instead of
-    # making one of them a single point of failure for a required check.
+    # Carried by every runner that takes hardware-checks.yml (minihost alone
+    # since 2026-09-28); a second runner with it would share that lane.
     - ci
     # minihost (Intel N100, CachyOS) capability labels.
     - cachyos

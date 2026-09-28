@@ -74,11 +74,11 @@ Manifest (replace placeholders with verified values):
 {"schema": 1, "source_tree": "<40-character Git tree ID>", "sha256": "<64-character ELF SHA256>", "device": "/dev/video2"}
 ```
 
-For the verified Archhost runner account `ghrunner`, the only required sudoers
+For the runner account (`<runner-user>` below), the only required sudoers
 command rule is:
 
 ```sudoers
-ghrunner ALL=(root) NOPASSWD: /usr/local/libexec/irlume-ci-capture
+<runner-user> ALL=(root) NOPASSWD: /usr/local/libexec/irlume-ci-capture
 ```
 
 The helper itself validates its two arguments. Do not grant `env`, a shell,
@@ -145,8 +145,10 @@ built from an earlier night's tree would count each file changed since then
 twice (#906). The clean removes the workspace crates' instrumented builds and
 profiles; dependency builds stay.
 
-Both eligible runners use distribution Rust. Setup locates system `llvm-cov`
-and `llvm-profdata`, checks that their LLVM major versions match `rustc -vV`,
+The eligible runner uses distribution Rust: its runner `.env` and `.path` list
+`/usr/bin` before `~/.cargo/bin`, so a rustup default toolchain cannot shadow
+it. Setup locates system `llvm-cov` and `llvm-profdata`, checks that their
+LLVM major versions match `rustc -vV`,
 and exports `LLVM_COV` and `LLVM_PROFDATA`. Missing tools, an incompatible LLVM,
 a failed install, or an unexpected coverage-tool version fails setup before
 any test capture. The version check is a prerequisite check; actual profile
@@ -157,7 +159,7 @@ See the [pinned tool's upstream environment contract](https://github.com/taiki-e
 provisioned runners, incompatible/missing LLVM, failed installation and wrong
 tool versions using executable fixtures. It neither installs real tools nor
 opens hardware. For a version update, also run a real tiny instrumented Rust
-test and `report --summary-only --fail-under-lines 75` as each runner account
+test and `report --summary-only --fail-under-lines 75` as the runner account
 with the exact new setup, before qualifying the full nightly again. Keep the
 shared capability selectors, named-test guards and coverage threshold intact.
 

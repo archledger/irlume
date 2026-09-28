@@ -1,6 +1,6 @@
 # CI health alert
 #
-# The nightly hardware suite lives on personal machines and fails silently:
+# The nightly hardware suite lives on a personal machine and fails silently:
 # from 2026-09-10 to 2026-09-14 it was red four nights in a row for runner
 # environment reasons and nothing surfaced it until release day, because the
 # old hourly host monitor was retired with its agent. A genuine regression

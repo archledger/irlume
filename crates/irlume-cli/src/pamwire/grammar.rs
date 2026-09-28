@@ -1084,13 +1084,16 @@ fn included_stack_starts_with_the_step(name: &str) -> bool {
 /// the include: libpam counts the included lines, not the include, so such
 /// a jump counts the lines after it. Also `true` when irlume cannot tell: a
 /// stack [`included_lines`] cannot read.
-fn included_jump_leaves(name: &str, phase: &str) -> bool {
+///
+/// With `to_end`, a jump that lands on the first line after the include
+/// counts too: it lands on whatever line comes next.
+fn included_jump_leaves(name: &str, phase: &str, to_end: bool) -> bool {
     included_lines(name, phase, 1).is_none_or(|lines| {
         lines.iter().enumerate().any(|(at, line)| {
             head(line).is_some_and(|h| {
                 numeric_actions(&h)
                     .into_iter()
-                    .any(|(_, reach)| at + reach >= lines.len())
+                    .any(|(_, reach)| at + reach + usize::from(to_end) >= lines.len())
             })
         })
     })
@@ -1099,16 +1102,20 @@ fn included_jump_leaves(name: &str, phase: &str) -> bool {
 /// For an `include` or a Debian `@include` line, `Some` of whether a numeric
 /// jump among the lines it puts in its place could land past them for a
 /// type `later` says one of irlume's lines comes after it in
-/// ([`included_jump_leaves`]): libpam puts the named stack's lines of the
-/// include's type in its place, and all of a Debian `@include`'s file, in
-/// every type's stack. `Some(true)` for one irlume cannot read, `None` for
-/// any other line.
-pub(super) fn include_could_jump_past(line: &str, later: impl Fn(&str) -> bool) -> Option<bool> {
+/// ([`included_jump_leaves`]; with `to_end`, onto the first line after
+/// them too): libpam puts the named stack's lines of the include's type in
+/// its place, and all of a Debian `@include`'s file, in every type's stack.
+/// `Some(true)` for one irlume cannot read, `None` for any other line.
+pub(super) fn include_could_jump_past(
+    line: &str,
+    later: impl Fn(&str) -> bool,
+    to_end: bool,
+) -> Option<bool> {
     if is_at_include(line) {
         return Some(at_include_target(line).is_none_or(|file| {
             TYPES
                 .into_iter()
-                .any(|phase| later(phase) && included_jump_leaves(file, phase))
+                .any(|phase| later(phase) && included_jump_leaves(file, phase, to_end))
         }));
     }
     let h = head(line)?;
@@ -1120,7 +1127,7 @@ pub(super) fn include_could_jump_past(line: &str, later: impl Fn(&str) -> bool) 
     Some(
         !h.known_type
             || later(h.phase)
-                && third_field(&h).is_none_or(|stack| included_jump_leaves(stack, h.phase)),
+                && third_field(&h).is_none_or(|stack| included_jump_leaves(stack, h.phase, to_end)),
     )
 }
 

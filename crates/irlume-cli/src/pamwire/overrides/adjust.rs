@@ -408,13 +408,27 @@ fn include_jump(b: &[&str], a: &[&str], pairing: &Pairing, source: &Source<'_>) 
                 .any(|k| pairing.to_after[k].is_none() && phase(b[k]) == Some(kind));
             added_after || taken_after
         };
-        (include_could_jump_past(line, later) == Some(true)).then(|| {
+        // A jump that lands right after the included lines lands on the next
+        // line, so where that next auth line is one of irlume's this
+        // adjustment adds, it would land on it instead: irlume's landing or
+        // keyring line would run where the stack went on before.
+        let next_auth_added = |kind: &str| {
+            kind == "auth"
+                && pairing.to_after[at].is_some_and(|from| {
+                    (from + 1..a.len())
+                        .find(|&k| phase(a[k]) == Some("auth"))
+                        .is_some_and(|k| pairing.added[k])
+                })
+        };
+        let could = include_could_jump_past(line, later, false) == Some(true)
+            || include_could_jump_past(line, next_auth_added, true) == Some(true);
+        could.then(|| {
             let name = name_before(b, at, source);
             if include_is_read(line) {
                 format!(
                     "a numeric jump in the stack the include on {name} puts in its place could \
-                     land past that stack's end, onto irlume's lines after it, and irlume \
-                     changes no jump in an included stack"
+                     land past that stack's end, or on the line irlume adds right after it, \
+                     and irlume changes no jump in an included stack"
                 )
             } else {
                 format!(
@@ -1723,6 +1737,44 @@ mod tests {
         assert!(
             why.contains(&format!("the include on line {include_at}")),
             "{why}"
+        );
+    }
+
+    /// A jump in an included stack that lands on the first line after the
+    /// included lines lands on whatever line comes next: where that next auth
+    /// line is one irlume adds (its face line, here, right after an include
+    /// above the password substack), the jump would newly run it, and no
+    /// value in the file changes that. The adjustment is refused for it; a
+    /// stack whose jumps land inside it is no obstacle to this check.
+    #[test]
+    fn a_jump_landing_where_irlume_adds_a_line_after_an_include_is_refused() {
+        let include = "auth        include       extra";
+        let before = above_substack(&above_substack(&keyring(&vendor()), ISSUE_JUMP), include);
+        let after = face(&unwire_lines(&before).0);
+        let lines: Vec<&str> = after.lines().collect();
+        let at = lines.iter().position(|l| *l == include).unwrap();
+        assert!(lines[at + 1].contains("pam_irlume.so unseal"), "{after}");
+        let lands_after = "auth [success=1 default=ignore] pam_x.so\nauth required pam_y.so\n";
+        let inside = "auth [success=1 default=ignore] pam_x.so\nauth required pam_y.so\n\
+                      auth required pam_z.so\n";
+        let named = format!(
+            "a numeric jump in the stack the include on line {} puts in its place could land",
+            number_of(&before, include)
+        );
+        let refused = with_stack_reader(stacks(Some(lands_after)), || {
+            super::raise(&before, &after, &READ)
+        })
+        .expect_err("lands on the face line");
+        assert!(refused.starts_with(&named), "{refused}");
+        let other = with_stack_reader(stacks(Some(inside)), || {
+            super::raise(&before, &after, &READ)
+        });
+        assert!(
+            other
+                .as_ref()
+                .err()
+                .is_none_or(|why| !why.starts_with(&named)),
+            "{other:?}"
         );
     }
 

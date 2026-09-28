@@ -89,10 +89,10 @@ stack once irlume's lines are out (it landed on one of them, with no line of
 its type after them), the flag does not change the jump either: an enable
 keeps the file, and a disable keeps inactive lines. The same holds with an
 `include` above irlume's lines whose stack has a
-numeric jump that could land past its end (PAM puts the included lines in
-the include's place, so such a jump counts the lines after it, and no value
-in your file changes it; irlume reads the stack where PAM finds it, and one
-it cannot read counts), and with a `substack` whose file irlume cannot read
+numeric jump that could land past its end, or on the auth line irlume adds
+right after it (PAM puts the included lines in the include's place, so such
+a jump counts the lines after it, and no value in your file changes it;
+irlume reads the stack where PAM finds it, and one it cannot read counts), and with a `substack` whose file irlume cannot read
 where PAM finds it, or cannot read as PAM does: PAM counts a substack it
 cannot load as two modules, the substack and one that always fails. After a
 `disable` without the flag, which leaves inactive lines in irlume's places,

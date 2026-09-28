@@ -528,7 +528,7 @@ pub(super) fn jump_could_count_irlume_lines(content: &str) -> bool {
         if irlume(l) {
             return false;
         }
-        if let Some(past) = include_could_jump_past(read, |phase| later_irlume(at, phase)) {
+        if let Some(past) = include_could_jump_past(read, |phase| later_irlume(at, phase), false) {
             return past;
         }
         head(read).is_some_and(|h| !numeric_actions(&h).is_empty())

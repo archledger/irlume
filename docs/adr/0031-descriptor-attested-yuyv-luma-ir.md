@@ -138,13 +138,11 @@ is not a complete USB/UVC validator, and
 even a fully consistent descriptor is a device-supplied modality claim.
 YUYV credential release remains refused while §4 is pending.
 
-The configuration header's `wTotalLength` is not used: the reporter's 5986:2113 `descriptors`
-file carries 996 of the 1026 bytes its configuration header claims (linuxhw
-31A261423C, from a unit with the same bcdDevice 54.22, carries all 1026:
-one MJPEG frame descriptor its VideoStreaming header counts is missing from
-the reporter's file, and whether the reporter's unit or the capture path
-dropped it is not known), and a device writes both numbers, so the walk
-judges the descriptors the file holds.
+The configuration header's `wTotalLength` is not used: a device writes both
+that number and the chain, so the walk judges the descriptors the file
+holds. (The reporter's first 5986:2113 file came up 30 bytes short of its
+header, which prompted this; the file sysfs gives on that machine turned out
+to match its header, and the short copy was a clipped paste.)
 Every failure, an unreadable or absent descriptor included, keeps the node
 `Role::Rgb`. The extension-unit parser that authorizes emitter writes
 (#159) is not changed; the new walker shares its unit parsing, and a test
@@ -309,7 +307,7 @@ than the 640x400 constant.
 
 | Boundary | Required result |
 |---|---|
-| Descriptor rule | The ASUS 3277:0059 IR function (interface 2) is attested and its RGB function (interface 0) is not; the T480 5986:1141 function is attested and 5986:2113 is not, from the reporter's descriptor files, with the 5986:2113 file's configuration 30 bytes shorter than its `wTotalLength` refused only for its missing Microsoft unit; two streams, each colour bit alone, a Microsoft unit without selector 0x06 or with more bits than `bNumControls`, two Microsoft units, a truncated header, Processing Unit, extension unit (including one that stops before its string index) or tail, a listed interface that is not VideoStreaming, a `VC_HEADER` total other than its control block, a source that is zero, missing, the entity itself, an Output Terminal or on a cycle, a Selector or Extension Unit without an input, a face-authentication unit on another interface, a node interface that is not a VideoControl interface, a descriptor file without one complete active configuration, and a node without a USB parent are each refused with the named reason; the Logitech BRIO and NexiGo N930W graphs (fan-out, two Output Terminals, units nothing reads, sources listed after the entity that reads them) keep their answers |
+| Descriptor rule | The ASUS 3277:0059 IR function (interface 2) is attested and its RGB function (interface 0) is not; the T480 5986:1141 function is attested and 5986:2113 is not, from the reporter's descriptor files, the 5986:2113 file refused only for its missing Microsoft unit, and an IR function whose header overstates its length by 30 bytes still attested; two streams, each colour bit alone, a Microsoft unit without selector 0x06 or with more bits than `bNumControls`, two Microsoft units, a truncated header, Processing Unit, extension unit (including one that stops before its string index) or tail, a listed interface that is not VideoStreaming, a `VC_HEADER` total other than its control block, a source that is zero, missing, the entity itself, an Output Terminal or on a cycle, a Selector or Extension Unit without an input, a face-authentication unit on another interface, a node interface that is not a VideoControl interface, a descriptor file without one complete active configuration, and a node without a USB parent are each refused with the named reason; the Logitech BRIO and NexiGo N930W graphs (fan-out, two Output Terminals, units nothing reads, sources listed after the entity that reads them) keep their answers |
 | Parser agreement | The new walker and the emitter's extension-unit parser return the same units for every interface of the ASUS and both T480 fixtures, and for the BRIO and NexiGo functions, and the fuzz target asserts it on arbitrary input |
 | Classification | `[YUYV]` with the attestation is `Role::Ir` and without it `Role::Rgb`; MJPG+YUYV, YUYV+RGB3, NV12, NV12+YUYV and YUYV+GREY stay what their formats say whatever the attestation; the descriptor is not consulted for GREY, Y16, metadata or empty format lists |
 | Frame size | GREY and Y16 ignore the size list and request 640x400; unattested YUYV requests 640x400; attested YUYV requests 340x340 from `{640x480, 340x340}` in either order, 400x400 from `{400x480, 400x400}`, 640x400 from an empty or too-small list, and the first of two equal areas; a replica of uvcvideo's nearest-size rule shows 640x400 landing on 640x480; the candidate walk hands the format ioctl the size it chose |

@@ -678,9 +678,10 @@ own background qualification, which are daemon-wide.
   reader observes none of another account's state. Root's revision still
   counts every such completion. Another reader's counts only the changes
   it can observe: its own account's, whoever asked for them, camera setup
-  and qualification, which change what every account reads, and
-  daemon-wide work, including root's work for a name that did not
-  resolve. It only grows: counts are kept for at most 1024 accounts, and
+  and qualification, which change what every account reads, any other
+  operation that changed the capture schedule every account reads (an
+  enrollment's automatic probe, a runtime trip), and daemon-wide work,
+  including root's work for a name that did not resolve. It only grows: counts are kept for at most 1024 accounts, and
   the account whose latest change is oldest gives its count to the shared
   one when a new account needs a place, which moves every other reader's
   revision once.

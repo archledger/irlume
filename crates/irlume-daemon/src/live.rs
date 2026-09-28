@@ -328,6 +328,14 @@ impl LiveState {
             tracking_available: inner.available,
         }
     }
+    /// A change every reader can observe that an operation made beside its
+    /// own records: the capture schedule every account reads changed while
+    /// it ran (a stored qualification, a runtime trip). Moves every reader's
+    /// revision, as daemon-wide work does.
+    pub(crate) fn note_shared_change(&self) {
+        self.lock()
+            .note_change(LiveOperationKind::CaptureQualification, Owner::Daemon);
+    }
     /// Whether the peer with uid `peer_uid` reads work in live status as
     /// `Unknown`: another account's, or one that did not resolve, running or
     /// waiting. The daemon refuses such a peer's camera work then, as it does
@@ -447,15 +455,6 @@ impl LiveGuard {
                 task.cancelled = true;
             }
         }
-    }
-    pub(crate) fn finish_waiting(&self) {
-        let mut inner = self.0.state.lock();
-        match self.0.phase.load(Ordering::Relaxed) {
-            WAITING => remove_waiter(&mut inner, self.0.kind, self.0.owner),
-            CREATED => {}
-            _ => return,
-        }
-        self.0.phase.store(FINISHED, Ordering::Relaxed);
     }
     pub(crate) fn finish(&self) {
         self.0.finish();
@@ -729,22 +728,6 @@ mod tests {
             panic!("synthetic unwind");
         }));
         assert!(snapshot(&state).worker.is_none());
-        assert_eq!(snapshot(&state).state_revision, 1);
-    }
-    #[test]
-    fn live_tracker_waiting_cancellation_cannot_finish_a_running_worker() {
-        let (state, _) = setup();
-        let queued = guard(&state, 2, true);
-        queued.waiting();
-        queued.finish_waiting();
-        queued.running();
-        assert!(snapshot(&state).worker.is_none());
-        let running = guard(&state, 3, true);
-        running.running();
-        running.finish_waiting();
-        assert!(snapshot(&state).worker.is_some());
-        assert_eq!(snapshot(&state).state_revision, 0);
-        running.finish();
         assert_eq!(snapshot(&state).state_revision, 1);
     }
     #[test]
@@ -1120,6 +1103,10 @@ mod tests {
         read.running();
         read.finish();
         assert_eq!(revisions(), [10, 7, 7, 5]);
+        // An operation of any account that changed the capture schedule
+        // every account reads.
+        state.note_shared_change();
+        assert_eq!(revisions(), [11, 8, 8, 6]);
     }
     /// Past the bound of accounts with a count of their own, the account
     /// whose latest change is oldest gives its count to the shared one: its

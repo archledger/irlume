@@ -952,9 +952,10 @@ All notable changes to irlume are documented here. This project adheres to
   while an authentication is pending now read the same: "camera busy:
   other work is in progress; retry in a moment". The state revision in
   live status that a reader other than root reads advances for its own
-  account's changes, camera setup and qualification and other daemon-wide
-  work, and no longer for another account's; root's still counts every
-  change. Such a reader sees a running operation's yield to a queued
+  account's changes, camera setup and qualification, any change to the
+  capture schedule every account reads, and other daemon-wide work, and
+  no longer for another account's; root's still counts every change.
+  Such a reader sees a running operation's yield to a queued
   authentication only on its own work (ADR-0030 §5, amended 2026-09-27,
   #907).
 

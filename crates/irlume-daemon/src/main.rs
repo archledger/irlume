@@ -1129,9 +1129,17 @@ fn main() {
                                 attempt.camera = irlume_auth::camera_location(engine.rgb_device());
                             }
                             delivery.attempt = attempt.map(|attempt| (attempt, scope.clone()));
+                            let capture_mode_before = capture_mode_changes();
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 dispatch_scoped_session_delivering(req, &peer, &mut engine, &scope, authorization, session.as_ref(), position.as_ref(), &mut delivery)
                             }));
+                            // Any request can change the capture schedule every
+                            // account reads (an enrollment's automatic probe, a
+                            // runtime trip), whoever it belongs to: every reader's
+                            // state revision moves then (ADR-0030 §5).
+                            if capture_mode_changes() != capture_mode_before {
+                                diagnostic_state.live().note_shared_change();
+                            }
                             // Release the slot before anything else can fail, so a
                             // panicking request cannot lock its uid out of the camera
                             // until the daemon restarts. The link is released in the
@@ -3859,30 +3867,38 @@ fn serve_peer_until(
                 scope: scope.clone(),
                 enqueued_at: std::time::Instant::now(),
             };
-            // Shown as waiting before the arbiter queues it, and until the
-            // worker takes or drops it, so live status shows every job the
-            // arbiter holds.
-            if let Some(activity) = &activity {
-                activity.waiting();
-            }
+            // One admission at a time: the check below, the queueing and the
+            // waiting mark happen together, so live status shows a job
+            // exactly while the arbiter holds it (until the worker takes or
+            // drops it), and a request is never refused over another
+            // request that was never admitted.
+            //
             // An account other than root is also refused camera work while
             // its live status shows another account's work, running or
             // waiting, as unknown. It gets the refusal a pending
             // authentication gets, so being refused tells it nothing its
             // live status does not: not that the work is an authentication
             // (ADR-0030 §5).
-            let admitted = if class == arbiter::Class::Camera
-                && peer.uid != 0
-                && diagnostic_state.live().shows_unknown_work(peer.uid)
-            {
-                Err(arbiter::Refusal::Busy)
-            } else {
-                arbiter.submit(class, peer.uid, queued)
+            let admitted = {
+                let _admission = ADMISSION
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let admitted = if class == arbiter::Class::Camera
+                    && peer.uid != 0
+                    && diagnostic_state.live().shows_unknown_work(peer.uid)
+                {
+                    Err(arbiter::Refusal::Busy)
+                } else {
+                    arbiter.submit(class, peer.uid, queued)
+                };
+                if admitted.is_ok() {
+                    if let Some(activity) = &activity {
+                        activity.waiting();
+                    }
+                }
+                admitted
             };
             if let Err(refusal) = admitted {
-                if let Some(activity) = &activity {
-                    activity.finish_waiting();
-                }
                 // Refused, not queued: answer now so the client can retry rather
                 // than hold a slot the login path may want. Charged to the peer,
                 // so a client that spins on refusals throttles itself at accept
@@ -5998,6 +6014,23 @@ fn write_measurement_record_artifact(
 
 /// captures, without which a long but healthy run reads as a wedged driver
 /// and systemd kills a working daemon (#141).
+/// Serializes admission to the arbiter with the waiting mark in live status
+/// ([`serve_peer_until`]).
+static ADMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Capture qualification records irlumed has stored since it started.
+static CAPTURE_QUALIFICATION_SAVES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A count that moves whenever the capture schedule every account reads may
+/// have changed: a stored capture qualification record, or a change of
+/// irlume-auth's process-local capture health.
+fn capture_mode_changes() -> u64 {
+    CAPTURE_QUALIFICATION_SAVES
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .wrapping_add(irlume_auth::runtime_capture_health_changes())
+}
+
 fn run_capture_mode_probe(
     rgb_dev: &str,
     ir_dev: &str,
@@ -6064,7 +6097,10 @@ fn run_capture_mode_probe(
             .map(irlume_auth::CaptureQualificationRecord::revision)
     };
     let stored = match store.save_attempt(attempt, expected_revision) {
-        Ok(record) => record,
+        Ok(record) => {
+            CAPTURE_QUALIFICATION_SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            record
+        }
         Err(irlume_auth::QualificationStoreError::StaleRevision { .. })
             if policy == ProbeStore::AutomaticIfAbsent =>
         {

@@ -3309,12 +3309,20 @@ static SOCKET_ACTIVATED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// credentials. That is what lets the daemon answer it while the engine is still
 /// loading (#244). Every authorization check below is a property of the REQUEST,
 /// never of startup state, so answering early cannot weaken any of them.
+///
+/// `resolve_account` looks up the account an auth-phase request is for: on
+/// the worker `irlume_core::account::resolve`, which answers the uid the
+/// worker holds for the request ([`worker_account_uid`]); before the engine
+/// exists `irlume_core::account::resolve_fresh`, since nothing holds a uid
+/// for the request there and the answer must be NSS's, not a uid another
+/// request holds for the name.
 fn unseal_keyring(
     user: &str,
     service: Option<&str>,
     have_password: bool,
     auth_phase: bool,
     peer: &Peer,
+    resolve_account: fn(&str) -> irlume_core::account::Resolution,
 ) -> Response {
     let user = user.to_string();
     let service = service.map(str::to_string);
@@ -3380,9 +3388,11 @@ fn unseal_keyring(
     // An auth-phase request resolves the account here; the release below
     // checks the envelope's uid against the same answer. On the worker the
     // answer is the uid the request was registered for, which the worker
-    // holds ([`worker_account_uid`]).
+    // holds ([`worker_account_uid`]). Before the engine exists it is NSS's,
+    // and holding it is refused while another request holds another uid
+    // for the name, so the request never acts for that request's uid.
     let resolved = if auth_phase {
-        match irlume_core::account::resolve(&user) {
+        match resolve_account(&user) {
             irlume_core::account::Resolution::Uid(uid) => Some(uid),
             irlume_core::account::Resolution::NoAccount
             | irlume_core::account::Resolution::Unknown => None,
@@ -3475,7 +3485,14 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             service,
             have_password,
             auth_phase,
-        } => unseal_keyring(&user, service.as_deref(), have_password, auth_phase, peer),
+        } => unseal_keyring(
+            &user,
+            service.as_deref(),
+            have_password,
+            auth_phase,
+            peer,
+            irlume_core::account::resolve_fresh,
+        ),
         Request::Ping => Response::Ok("starting".into()),
         Request::PreferencesStatus => {
             Response::PreferencesStatus(irlume_common::PreferencesState::observe())
@@ -8155,7 +8172,14 @@ fn dispatch_scoped_session_inner(
                 scope,
                 irlume_common::diagnostics::TraceStage::CredentialUnseal,
             );
-            unseal_keyring(&user, service.as_deref(), have_password, auth_phase, peer)
+            unseal_keyring(
+                &user,
+                service.as_deref(),
+                have_password,
+                auth_phase,
+                peer,
+                irlume_core::account::resolve,
+            )
         }
         Request::ForgetPassword { user } => match irlume_core::keyring::forget_password(&user) {
             Ok(()) => Response::PasswordForgotten,
@@ -18194,7 +18218,14 @@ mod tests {
         envelope
             .save(&irlume_core::keyring::envelope_path(&user))
             .unwrap();
-        let response = unseal_keyring(&user, Some("kde"), false, false, &peer(0));
+        let response = unseal_keyring(
+            &user,
+            Some("kde"),
+            false,
+            false,
+            &peer(0),
+            irlume_core::account::resolve,
+        );
         match previous_tcti {
             Some(value) => std::env::set_var("IRLUME_TCTI", value),
             None => std::env::remove_var("IRLUME_TCTI"),
@@ -18208,6 +18239,50 @@ mod tests {
             }
             other => panic!("another uid's secret must not be released, got {other:?}"),
         }
+    }
+
+    /// Before the engine exists, an auth-phase keyring release asks NSS for
+    /// its account, not the uid another request holds for the name: while
+    /// that request holds another uid, the release is refused instead of
+    /// acting for that request's uid. A request holding the same uid does
+    /// not stop it.
+    #[test]
+    fn a_keyring_release_before_the_engine_does_not_take_another_requests_uid() {
+        let _g = env_lock();
+        let _sb = sandbox("startup-keyring-held-uid");
+        let user = "nobody";
+        let now = uid_of(user).expect("NSS account nobody");
+        let then = now.wrapping_add(1);
+        plant_fake_envelope(user);
+        // Never the host TPM, even if a check were missing.
+        let previous_tcti = std::env::var_os("IRLUME_TCTI");
+        std::env::set_var("IRLUME_TCTI", "device:/nonexistent/irlume-test-tpm");
+        let release = || {
+            dispatch_before_engine(
+                Request::UnsealKeyring {
+                    user: user.into(),
+                    service: Some("plasmalogin".into()),
+                    have_password: false,
+                    auth_phase: true,
+                },
+                &peer(0),
+            )
+        };
+        let held_elsewhere = |response: &Response| matches!(response, Response::Error(message) if message.contains("holds another uid"));
+        // Another request holds the uid the name had before NSS mapped it
+        // to `now`.
+        let other = irlume_core::account::hold(user, then).unwrap();
+        let refused = release();
+        drop(other);
+        let same = irlume_core::account::hold(user, now).unwrap();
+        let served = release();
+        drop(same);
+        match previous_tcti {
+            Some(value) => std::env::set_var("IRLUME_TCTI", value),
+            None => std::env::remove_var("IRLUME_TCTI"),
+        }
+        assert!(held_elsewhere(&refused), "{refused:?}");
+        assert!(!held_elsewhere(&served), "{served:?}");
     }
 
     #[test]
@@ -19946,10 +20021,38 @@ mod tests {
             std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
             outcomes.push((
                 kind,
-                unseal_keyring("carol", Some("plasmalogin"), true, false, &peer(0)),
-                unseal_keyring("carol", Some("plasmalogin"), false, false, &peer(0)),
-                unseal_keyring("carol", Some("sudo"), true, false, &peer(0)),
-                unseal_keyring("carol", Some("plasmalogin"), true, false, &peer(NOBODY)),
+                unseal_keyring(
+                    "carol",
+                    Some("plasmalogin"),
+                    true,
+                    false,
+                    &peer(0),
+                    irlume_core::account::resolve,
+                ),
+                unseal_keyring(
+                    "carol",
+                    Some("plasmalogin"),
+                    false,
+                    false,
+                    &peer(0),
+                    irlume_core::account::resolve,
+                ),
+                unseal_keyring(
+                    "carol",
+                    Some("sudo"),
+                    true,
+                    false,
+                    &peer(0),
+                    irlume_core::account::resolve,
+                ),
+                unseal_keyring(
+                    "carol",
+                    Some("plasmalogin"),
+                    true,
+                    false,
+                    &peer(NOBODY),
+                    irlume_core::account::resolve,
+                ),
             ));
         }
         match previous {
@@ -20011,21 +20114,69 @@ mod tests {
             std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
             let _ = std::fs::remove_file(sessions.join("2"));
             std::fs::write(sessions.join("c1"), session("1", "tty")).unwrap();
-            let cold = unseal_keyring(&user, Some("plasmalogin"), false, true, &peer(0));
+            let cold = unseal_keyring(
+                &user,
+                Some("plasmalogin"),
+                false,
+                true,
+                &peer(0),
+                irlume_core::account::resolve,
+            );
             std::fs::write(sessions.join("2"), session("0", "wayland")).unwrap();
-            let lock = unseal_keyring(&user, Some("kde"), false, true, &peer(0));
-            let login = unseal_keyring(&user, Some("plasmalogin"), false, true, &peer(0));
-            let session = unseal_keyring(&user, Some("plasmalogin"), true, false, &peer(0));
-            let older = unseal_keyring(&user, Some("kde"), false, false, &peer(0));
+            let lock = unseal_keyring(
+                &user,
+                Some("kde"),
+                false,
+                true,
+                &peer(0),
+                irlume_core::account::resolve,
+            );
+            let login = unseal_keyring(
+                &user,
+                Some("plasmalogin"),
+                false,
+                true,
+                &peer(0),
+                irlume_core::account::resolve,
+            );
+            let session = unseal_keyring(
+                &user,
+                Some("plasmalogin"),
+                true,
+                false,
+                &peer(0),
+                irlume_core::account::resolve,
+            );
+            let older = unseal_keyring(
+                &user,
+                Some("kde"),
+                false,
+                false,
+                &peer(0),
+                irlume_core::account::resolve,
+            );
             let set_root = |root: std::path::PathBuf| {
                 *attempt_record::SESSIONS_ROOT
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = Some(root);
             };
             set_root(sessions.join("unreadable"));
-            let unknown = unseal_keyring(&user, Some("plasmalogin"), false, true, &peer(0));
-            let unknown_session =
-                unseal_keyring(&user, Some("plasmalogin"), false, false, &peer(0));
+            let unknown = unseal_keyring(
+                &user,
+                Some("plasmalogin"),
+                false,
+                true,
+                &peer(0),
+                irlume_core::account::resolve,
+            );
+            let unknown_session = unseal_keyring(
+                &user,
+                Some("plasmalogin"),
+                false,
+                false,
+                &peer(0),
+                irlume_core::account::resolve,
+            );
             set_root(sessions.clone());
             outcomes.push((
                 kind,

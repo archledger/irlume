@@ -34,6 +34,8 @@ use super::transform::{
 };
 use super::PlannedChange;
 
+mod adjust;
+
 /// The second header line of an override irlume writes, followed by a version
 /// token (`v1`) and that version's fields.
 pub(super) const OVERRIDE_TRACK_PREFIX: &str = "# irlume: override ";
@@ -96,6 +98,8 @@ pub(super) struct Parsed<'a> {
     /// The two header lines, without carriage returns, like the body.
     first: &'a str,
     track_line: Option<&'a str>,
+    /// Which line of the file the tracking line is, counting from 0.
+    track_at: Option<usize>,
     /// The whole file as read, carriage returns included.
     text: &'a str,
     /// `(vendor, body)` digests from a readable tracking line.
@@ -153,6 +157,7 @@ pub(super) fn parse(content: &str) -> Option<Parsed<'_>> {
     Some(Parsed {
         first,
         track_line,
+        track_at,
         text: content,
         digests: track_line.and_then(parse_v1),
         body,
@@ -167,6 +172,27 @@ impl Parsed<'_> {
     /// header lines are comments, which PAM does not read.
     fn unreadable(&self) -> Option<UnreadLine<'_>> {
         unreadable_line(self.text)
+    }
+
+    /// The number, counting from 1, of the line of the file that the line of
+    /// the body at `at` is: the body leaves out the first header line and
+    /// the tracking line.
+    fn line_number(&self, at: usize) -> usize {
+        let in_file = at + 1;
+        match self.track_at {
+            Some(track) if in_file >= track => in_file + 2,
+            _ => in_file + 1,
+        }
+    }
+
+    /// How a message names the lines of the body: by their numbers in the
+    /// file ([`Parsed::line_number`]).
+    fn names(&self) -> Names<'_> {
+        Names {
+            text: &self.body,
+            number: Box::new(|at| self.line_number(at)),
+            of: String::new(),
+        }
     }
 }
 
@@ -413,12 +439,17 @@ fn own_landings(text: &str) -> Vec<(String, String, Landing)> {
 /// [`fill_slots`] as an alternative to a write [`check_jumps`] refused: the
 /// filled file when it moves no jump of the other lines and irlume's own
 /// jumps land as they do in `wired`.
-fn filled_in_place(body: &str, wired: &str, edited: bool) -> Option<(String, JumpCheck)> {
+fn filled_in_place(
+    body: &str,
+    wired: &str,
+    edited: bool,
+    names: &[Names<'_>],
+) -> Option<(String, JumpCheck)> {
     let filled = fill_slots(body, wired)?;
     if own_landings(&filled) != own_landings(wired) {
         return None;
     }
-    match check_jumps(body, &filled, edited) {
+    match check_jumps(body, &filled, edited, names) {
         JumpCheck::Refuse(_) => None,
         check => Some((filled, check)),
     }
@@ -549,13 +580,9 @@ pub(super) enum Landing {
     /// lines its job (see [`kind`]), so a new version of irlume's line, or an
     /// inactive line holding its place, is the same landing; and which line
     /// of the phase with that key it is, counting from 1, so a jump that
-    /// moves from one copy of a rule to the next copy is seen to move.
-    /// `text` is for messages.
-    Line {
-        key: String,
-        nth: usize,
-        text: String,
-    },
+    /// moves from one copy of a rule to the next copy is seen to move. A
+    /// message names it through [`Names`], never by its text.
+    Line { key: String, nth: usize },
     /// Just past the last module of the phase: the stack ends there.
     End,
     /// Past the end of the stack, which libpam logs as a bad jump and fails.
@@ -571,7 +598,7 @@ pub(super) enum Landing {
 impl PartialEq for Landing {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Landing::Line { key: a, nth: m, .. }, Landing::Line { key: b, nth: n, .. }) => {
+            (Landing::Line { key: a, nth: m }, Landing::Line { key: b, nth: n }) => {
                 a == b && m == n
             }
             (Landing::End, Landing::End) | (Landing::PastEnd, Landing::PastEnd) => true,
@@ -593,10 +620,14 @@ impl PartialEq for Landing {
 impl Eq for Landing {}
 
 impl Landing {
-    fn describe(&self, phase: &str) -> String {
+    /// The landing for a message: one of irlume's lines by what it is, any
+    /// other line by its number ([`Names`]).
+    fn describe(&self, phase: &str, names: &[Names<'_>]) -> String {
         match self {
-            Landing::Line { text, nth: 1, .. } => format!("`{text}`"),
-            Landing::Line { text, nth, .. } => format!("copy {nth} of `{text}`"),
+            Landing::Line { key, nth } => match key.strip_prefix("irlume ") {
+                Some(kind) => format!("irlume's {}", role_of_kind(kind)),
+                None => name_line(names, phase, key, *nth),
+            },
             Landing::End => format!("the end of the {phase} stack"),
             Landing::PastEnd => format!("past the end of the {phase} stack, which fails it"),
             Landing::Across { .. } => {
@@ -604,6 +635,73 @@ impl Landing {
             }
         }
     }
+}
+
+/// What one of irlume's lines of kind `kind` (see [`kind`]) is, for a
+/// message: `pam_permit.so landing`, `auth keyring line`. Only the jobs
+/// irlume writes are named, so nothing else from the line reaches a message.
+pub(super) fn role_of_kind(kind: &str) -> String {
+    let (phase, job) = kind.split_once(' ').unwrap_or(("auth", ""));
+    let phase = PHASES.into_iter().find(|p| *p == phase).unwrap_or("auth");
+    match job {
+        "landing" => "pam_permit.so landing".to_string(),
+        "keyring-tag" => "pam_gnome_keyring.so line".to_string(),
+        "unseal" | "keyring" | "reseal" | "wait" => format!("{phase} {job} line"),
+        _ => format!("{phase} line"),
+    }
+}
+
+/// How a message names the lines of a file irlume read: by their number,
+/// never by their text, since a module's arguments can hold a secret and
+/// reconcile's messages reach the system journal.
+pub(super) struct Names<'a> {
+    /// The file's text as irlume read it (an override's body, say).
+    pub(super) text: &'a str,
+    /// The number, counting from 1, of the line of the file at an index of
+    /// `text`.
+    pub(super) number: Box<dyn Fn(usize) -> usize + 'a>,
+    /// What follows the number: ` of <file>`, or nothing for the file the
+    /// message is about.
+    pub(super) of: String,
+}
+
+impl<'a> Names<'a> {
+    /// Names the lines of `text`, a whole file, by their place in it.
+    pub(super) fn whole(text: &'a str) -> Names<'a> {
+        Names {
+            text,
+            number: Box::new(|at| at + 1),
+            of: String::new(),
+        }
+    }
+
+    /// Names the lines of the file `file` holds, `text`, as ` of <file>`.
+    fn of(text: &'a str, file: &str) -> Names<'a> {
+        Names {
+            of: format!(" of {file}"),
+            ..Names::whole(text)
+        }
+    }
+
+    /// `line N`, for the `nth` line of the `phase` chain of the text whose
+    /// key is `key` ([`line_key`]), when the text has one.
+    fn find(&self, phase: &str, key: &str, nth: usize) -> Option<String> {
+        self.text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| in_chain(l, phase) && line_key(l) == key)
+            .nth(nth.checked_sub(1)?)
+            .map(|(at, _)| format!("line {}{}", (self.number)(at), self.of))
+    }
+}
+
+/// The `nth` line of the `phase` chain whose key is `key`, named by the
+/// first of `names` that has it.
+fn name_line(names: &[Names<'_>], phase: &str, key: &str, nth: usize) -> String {
+    names
+        .iter()
+        .find_map(|n| n.find(phase, key, nth))
+        .unwrap_or_else(|| "a line irlume did not write".to_string())
 }
 
 /// How a landing identifies a line: see [`Landing::Line`].
@@ -615,12 +713,16 @@ fn line_key(line: &str) -> String {
     }
 }
 
+/// Whether libpam puts `line` in the chain of one phase: a line of that
+/// phase, or a Debian `@include`, which brings in every phase of its file.
+fn in_chain(line: &str, phase_name: &str) -> bool {
+    is_at_include(line) || phase(line) == Some(phase_name)
+}
+
 /// The lines libpam puts in one phase's chain, one module each (a `substack`
 /// counts as one; an `include` expands to lines this file does not show).
 fn chain<'a>(text: &'a str, phase_name: &str) -> Vec<&'a str> {
-    text.lines()
-        .filter(|l| is_at_include(l) || phase(l) == Some(phase_name))
-        .collect()
+    text.lines().filter(|l| in_chain(l, phase_name)).collect()
 }
 
 fn is_include(line: &str) -> bool {
@@ -660,11 +762,7 @@ fn landing_of(chain: &[&str], at: usize, n: usize) -> Landing {
     match target {
         Some(to) => {
             let (key, nth) = occurrence(chain, to);
-            Landing::Line {
-                key,
-                nth,
-                text: norm(chain[to]),
-            }
+            Landing::Line { key, nth }
         }
         None => Landing::End,
     }
@@ -735,7 +833,11 @@ fn has_numeric_jump(text: &str) -> bool {
 /// A jump irlume did not write that lands somewhere else after a write.
 pub(super) struct Shift {
     phase: &'static str,
+    /// The jump's line, whitespace normalized, to compare with; a message
+    /// names it through [`Names`] instead.
     line: String,
+    /// Which line of its phase with that text it is, counting from 1.
+    ordinal: usize,
     now: Landing,
 }
 
@@ -759,8 +861,47 @@ pub(super) fn jump_shifts(before: &str, after: &str) -> Vec<Shift> {
             out.push(Shift {
                 phase: j.phase,
                 line: j.line,
+                ordinal: j.ordinal,
                 now: j.landing,
             });
+        }
+    }
+    out
+}
+
+/// The lines of `stripped`, a file without irlume's lines, each of whose
+/// numeric jumps skips the same lines and lands on the same line as in the
+/// vendor copy, as `(phase, line, ordinal)` ([`Jump`]): irlume's lines had
+/// moved them, and taking those lines out gives them back the vendor's own
+/// behaviour, as [`strip_shifts`] reads it.
+pub(super) fn as_the_vendor_has_them(
+    stripped: &str,
+    vendor: Option<&str>,
+) -> Vec<(&'static str, String, usize)> {
+    let Some(v) = vendor else {
+        return Vec::new();
+    };
+    let vendor_jumps = jumps(&base(v));
+    let stripped_jumps = jumps(stripped);
+    let as_vendor = |j: &Jump| {
+        vendor_jumps.iter().any(|o| {
+            o.phase == j.phase
+                && o.line == j.line
+                && o.ordinal == j.ordinal
+                && o.key == j.key
+                && o.landing == j.landing
+                && o.skipped == j.skipped
+        })
+    };
+    let mut out: Vec<(&'static str, String, usize)> = Vec::new();
+    for j in &stripped_jumps {
+        let id = (j.phase, j.line.clone(), j.ordinal);
+        let every = stripped_jumps
+            .iter()
+            .filter(|o| o.phase == j.phase && o.line == j.line && o.ordinal == j.ordinal)
+            .all(as_vendor);
+        if every && !out.contains(&id) {
+            out.push(id);
         }
     }
     out
@@ -799,27 +940,36 @@ fn strip_shifts(body: &str, stripped: &str, vendor: Option<&str>) -> Vec<Shift> 
         .collect()
 }
 
-pub(super) fn shift_reason(shifts: &[Shift]) -> String {
+impl Shift {
+    /// The jump's line for a message ([`Names`]).
+    fn named(&self, names: &[Names<'_>]) -> String {
+        name_line(names, self.phase, &self.line, self.ordinal)
+    }
+}
+
+/// Why a write that moves `shifts` is refused, naming each line by its
+/// number through `names`, never quoting one.
+pub(super) fn shift_reason(shifts: &[Shift], names: &[Names<'_>]) -> String {
     let first = &shifts[0];
     let more = match shifts.len() {
         1 => String::new(),
         n => format!(" (and {} more)", n - 1),
     };
     format!(
-        "the jump in `{}` would then land on {}{more}",
-        first.line,
-        first.now.describe(first.phase)
+        "the jump on {} would then land on {}{more}",
+        first.named(names),
+        first.now.describe(first.phase, names)
     )
 }
 
-fn shift_warnings(shifts: &[Shift], why: &str) -> String {
+fn shift_warnings(shifts: &[Shift], why: &str, names: &[Names<'_>]) -> String {
     shifts
         .iter()
         .map(|s| {
             format!(
-                "\n    ⚠ `{}` now jumps to {}{why}; check that jump",
-                s.line,
-                s.now.describe(s.phase)
+                "\n    ⚠ the jump on {} now lands on {}{why}; check that jump",
+                s.named(names),
+                s.now.describe(s.phase, names)
             )
         })
         .collect()
@@ -862,6 +1012,7 @@ pub(super) fn jumps_moved_by_irlume(before: &str, after: &str) -> Vec<Shift> {
             out.push(Shift {
                 phase: j.phase,
                 line: j.line,
+                ordinal: j.ordinal,
                 now: j.landing,
             });
         }
@@ -870,15 +1021,20 @@ pub(super) fn jumps_moved_by_irlume(before: &str, after: &str) -> Vec<Shift> {
 }
 
 /// `edited`: the file may hold an administrator's lines, and so jumps written
-/// by someone who counted what they saw.
-fn check_jumps(before: &str, after: &str, edited: bool) -> JumpCheck {
+/// by someone who counted what they saw. The messages name lines through
+/// `names`.
+fn check_jumps(before: &str, after: &str, edited: bool, names: &[Names<'_>]) -> JumpCheck {
     let shifts = jumps_moved_by_irlume(before, after);
     if shifts.is_empty() {
         JumpCheck::Clear
     } else if edited || has_irlume_line(before) {
-        JumpCheck::Refuse(shift_reason(&shifts))
+        JumpCheck::Refuse(shift_reason(&shifts, names))
     } else {
-        JumpCheck::Warn(shift_warnings(&shifts, " once irlume's lines are in"))
+        JumpCheck::Warn(shift_warnings(
+            &shifts,
+            " once irlume's lines are in",
+            names,
+        ))
     }
 }
 
@@ -986,13 +1142,22 @@ fn slots(text: &str, own: &[bool]) -> Vec<(String, usize)> {
 /// The first administrator's line `candidate` would move one of irlume's
 /// lines past, compared with `body`; both have the same lines irlume did not
 /// write. A line of a kind `body` has must keep its slot; a line of a new kind
-/// may only go into a slot where irlume already has a line.
-fn crossing(body: &str, candidate: &str, bare: &str, own: &[bool]) -> Option<String> {
-    let admin_lines: Vec<&str> = bare
+/// may only go into a slot where irlume already has a line. `Some` of the
+/// line's index in `body`, or of `None` when it cannot be told.
+fn crossing(body: &str, candidate: &str, bare: &str, own: &[bool]) -> Option<Option<usize>> {
+    // `bare` is `body` without irlume's lines, in order.
+    let theirs: Vec<usize> = body
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !is_irlume_line(l))
+        .map(|(at, _)| at)
+        .collect();
+    let admin_lines: Vec<usize> = bare
         .lines()
         .zip(own)
-        .filter(|(_, admin)| **admin)
-        .map(|(l, _)| l)
+        .enumerate()
+        .filter(|(_, (_, admin))| **admin)
+        .map(|(at, _)| at)
         .collect();
     let before = slots(body, own);
     let held: Vec<usize> = before.iter().map(|(_, s)| *s).collect();
@@ -1027,7 +1192,7 @@ fn crossing(body: &str, candidate: &str, bare: &str, own: &[bool]) -> Option<Str
         return Some(
             admin_lines
                 .get(crossed)
-                .map_or_else(String::new, |l| norm(l)),
+                .and_then(|&at| theirs.get(at).copied()),
         );
     }
     None
@@ -1127,8 +1292,9 @@ fn anchored(
 /// Why irlume's lines cannot be updated in a file it keeps.
 enum Misplaced {
     /// The update would move one of irlume's lines past this line, which an
-    /// administrator may have placed around irlume's on purpose.
-    Crossing(String),
+    /// administrator may have placed around irlume's on purpose: its index in
+    /// the body, when it can be told.
+    Crossing(Option<usize>),
     /// The file has none of irlume's lines and no password stack irlume can
     /// tell is not an administrator's to wire next to (see [`anchored`]).
     NoPasswordAnchor,
@@ -1265,9 +1431,25 @@ pub(super) struct Input<'a> {
     pub(super) enable: bool,
     /// `login enable --force`: rebuild an edited override from the vendor file.
     pub(super) force: bool,
+    /// `login enable --adjust-jumps` or `login disable --adjust-jumps`: when
+    /// irlume's lines would move a numeric jump, change the jump's value so
+    /// it skips the same lines of the file and lands on the same line (a
+    /// fingerprint's success on irlume's permit landing), where that can be
+    /// shown ([`adjust`]).
+    pub(super) adjust_jumps: bool,
+    /// The command the person ran, `enable` or `disable`, for the commands a
+    /// message offers. An `enable` also takes irlume's lines out of a file
+    /// its configuration no longer wants them in, with `enable` false.
+    pub(super) command: &'a str,
     /// ` --with-sudo` or ` --with-polkit` for the hint, or empty.
     pub(super) scope_flag: &'a str,
     pub(super) wire: &'a dyn Fn(&str) -> (String, bool),
+    /// Whether libpam loads the file a `substack` line names as one stack,
+    /// which `--adjust-jumps` needs to count the lines a jump skips as libpam
+    /// does ([`adjust`]). The caller reads it through the same reader it sets
+    /// around the decision for the stacks an include names
+    /// ([`grammar::with_stack_reader`]).
+    pub(super) opens: &'a dyn Fn(&str) -> bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1288,6 +1470,13 @@ pub(super) struct Decision {
     /// irlume's lines in the file are not the ones this run wanted: updating
     /// or adding them was refused, and the file keeps what it has.
     pub(super) unmet: bool,
+    /// `--adjust-jumps` would handle the file differently: an enable refused
+    /// (`unmet`) only because it would move a numeric jump, which the flag
+    /// makes by changing that jump's value, or a run taking irlume's lines
+    /// out that leaves inactive lines where the flag removes them, lowering
+    /// a jump that counts them or moving a landing off one of them. False
+    /// when the run has the flag.
+    pub(super) adjustable: bool,
     /// The write adds the tracking line to a file and changes no PAM line.
     /// A file that may not be written (immutable, or on a read-only mount)
     /// then loses nothing by being left as it is.
@@ -1302,6 +1491,7 @@ fn keep(change: PlannedChange, message: String) -> Decision {
         message,
         detail: None,
         unmet: false,
+        adjustable: false,
         header_only: false,
     }
 }
@@ -1314,8 +1504,107 @@ fn replace(change: PlannedChange, content: String, message: String) -> Decision 
         message,
         detail: None,
         unmet: false,
+        adjustable: false,
         header_only: false,
     }
+}
+
+/// The lines an adjustment changes, each by its number with its jumps before
+/// and after, then where an action of the line now lands when that is
+/// another line, then each action that lands elsewhere with its value kept,
+/// indented for continuation lines of a message. No line is quoted: a
+/// module's arguments can hold a secret, and reconcile's messages reach the
+/// system journal.
+fn changed_lines(adjusted: &adjust::Adjusted) -> String {
+    let mut out = String::new();
+    for c in &adjusted.changed {
+        out.push_str(&format!("\n      {}", c.describe()));
+        for note in &c.notes {
+            out.push_str(&format!("\n        {note}"));
+        }
+    }
+    for note in &adjusted.moved {
+        out.push_str(&format!("\n      {note}"));
+    }
+    out
+}
+
+/// What an adjustment does to the jumps, for the line that introduces
+/// [`changed_lines`]: the lines it changes, and that every jump skips the
+/// same lines of the administrator's as before and lands on the same line,
+/// except where [`changed_lines`] says otherwise.
+fn adjusted_summary(adjusted: &adjust::Adjusted, done: bool) -> String {
+    let lines = match adjusted.changed.len() {
+        0 => "no value",
+        1 => "this line",
+        _ => "these lines",
+    };
+    let noted = !adjusted.moved.is_empty() || adjusted.changed.iter().any(|c| !c.notes.is_empty());
+    format!(
+        "{} {lines}; every numeric jump {}skips the same lines of yours as before and lands on \
+         the same line{}",
+        if done { "changed" } else { "changing" },
+        if done { "" } else { "then " },
+        if noted { ", except as noted" } else { "" }
+    )
+}
+
+/// What a write made with `--adjust-jumps` did to the jumps, for its line.
+fn adjusted_note(adjusted: &adjust::Adjusted) -> String {
+    format!(
+        "\n    --adjust-jumps {}:{}",
+        adjusted_summary(adjusted, true),
+        changed_lines(adjusted)
+    )
+}
+
+/// Why `--adjust-jumps` cannot keep a jump's landing, for the line after a
+/// refusal.
+fn adjust_refusal(cannot: &str) -> String {
+    format!("\n    --adjust-jumps cannot keep that jump's landing: {cannot}")
+}
+
+/// What follows [`adjust::OWN_LINES`] in an enable's refusal: the two
+/// commands that get there when a disable with the flag takes irlume's lines
+/// out of this file (so that an enable with it then only adds them), or why
+/// that disable cannot either. It keeps inactive lines where irlume could
+/// not tell where to put its lines back, and where lowering a jump is
+/// refused.
+fn own_lines_way(
+    i: &Input<'_>,
+    p: &Parsed<'_>,
+    bare: &str,
+    edited: bool,
+    source: &adjust::Source<'_>,
+) -> String {
+    let cannot = if strip_loses_place(&p.body, i.vendor, edited) {
+        Some("irlume could not tell where to put them back".to_string())
+    } else {
+        adjust::lower(&p.body, bare, source).err()
+    };
+    let scope = i.scope_flag;
+    match cannot {
+        None => format!(
+            "; take them out first, then add irlume's lines:\
+             \n      sudo irlume login disable{scope} --apply --adjust-jumps\
+             \n      sudo irlume login enable{scope} --apply --adjust-jumps"
+        ),
+        Some(why) => {
+            format!("; `irlume login disable --adjust-jumps` cannot take them out either: {why}")
+        }
+    }
+}
+
+/// What `--adjust-jumps` would change instead of keeping the file, and the
+/// commands, for the refusal a run without it prints.
+fn adjust_offer(action: &str, scope_flag: &str, adjusted: &adjust::Adjusted, what: &str) -> String {
+    format!(
+        "\n    --adjust-jumps {what}, {}:{}\
+         \n      irlume login {action}{scope_flag} --adjust-jumps   (preview)\
+         \n      sudo irlume login {action}{scope_flag} --apply --adjust-jumps",
+        adjusted_summary(adjusted, false),
+        changed_lines(adjusted)
+    )
 }
 
 fn no_anchor(etc: &str) -> Decision {
@@ -1460,7 +1749,8 @@ pub(super) fn decide(i: &Input<'_>) -> Result<Decision, String> {
                 if !ok {
                     no_anchor(etc)
                 } else {
-                    let warn = match check_jumps(&base(v), &wired, false) {
+                    let names = [Names::of(v, i.vendor_path)];
+                    let warn = match check_jumps(&base(v), &wired, false, &names) {
                         JumpCheck::Warn(w) => w,
                         _ => String::new(),
                     };
@@ -1556,16 +1846,18 @@ fn remove_or_strip(i: &Input<'_>, p: &Parsed<'_>, class: Class) -> Decision {
         );
     }
     let shifts = strip_shifts(&p.body, &stripped, i.vendor);
+    let loses_place = strip_loses_place(&p.body, i.vendor, class.edited());
     // Why removing irlume's lines would change the file's behaviour or lose
     // their places, and when a later disable can remove them after all.
     let held = if !shifts.is_empty() {
-        let why = shift_reason(&shifts).replacen("would then land on", "would land on", 1);
+        let why =
+            shift_reason(&shifts, &[p.names()]).replacen("would then land on", "would land on", 1);
         Some((
             format!("change a jump: without them {why}"),
             format!("without them {why}"),
             "once that jump no longer counts them",
         ))
-    } else if strip_loses_place(&p.body, i.vendor, class.edited()) {
+    } else if loses_place {
         let why = "irlume could not tell where to put them back";
         Some((
             format!("lose their places: {why}"),
@@ -1575,30 +1867,68 @@ fn remove_or_strip(i: &Input<'_>, p: &Parsed<'_>, class: Class) -> Decision {
     } else {
         None
     };
-    let (body, message) = match held {
-        None => (
+    // A jump that counts irlume's lines can instead be lowered by the lines
+    // taken out of it, so it skips the same lines of the file and lands on
+    // the same line, or on the first line after irlume's when it landed on
+    // one of them: with `--adjust-jumps`, or offered without it, naming the
+    // command the person ran (an enable takes irlume's lines out of a file
+    // its configuration no longer wants them in). Not while irlume could
+    // not tell where to put its lines back.
+    let source = adjust::Source {
+        carriage_return: has_read_carriage_return(p.text),
+        opens: i.opens,
+        number: &|at| p.line_number(at),
+        vendor: i.vendor,
+    };
+    let lowered =
+        (!shifts.is_empty() && !loses_place).then(|| adjust::lower(&p.body, &stripped, &source));
+    // The plan marks a surface the flag would handle differently: inactive
+    // lines without it, irlume's lines removed with it.
+    let adjustable = held.is_some() && !i.adjust_jumps && matches!(lowered, Some(Ok(_)));
+    let (body, message) = match (held, &lowered) {
+        (None, _) => (
             stripped,
             format!("✓ {etc}: removed irlume's lines and kept the file; {kept_why}"),
         ),
-        Some((change, without, until)) => {
+        (Some(_), Some(Ok(adjusted))) if i.adjust_jumps => (
+            adjusted.text.clone(),
+            format!(
+                "✓ {etc}: removed irlume's lines and kept the file; {kept_why}{}",
+                adjusted_note(adjusted)
+            ),
+        ),
+        (Some((change, without, until)), _) => {
+            let then = match &lowered {
+                Some(Ok(adjusted)) if !i.adjust_jumps => adjust_offer(
+                    i.command,
+                    i.scope_flag,
+                    adjusted,
+                    "removes irlume's lines instead",
+                ),
+                Some(Err(cannot)) if i.adjust_jumps => adjust_refusal(cannot),
+                _ => String::new(),
+            };
             // Inactive lines in their places keep every jump where it lands
             // now, and keep the places for the next enable.
             let inert = neutralize(&p.body);
             if inert == normalize(&p.body) {
-                return keep(
-                    PlannedChange::NotWired,
-                    format!(
-                        "· {etc}: not wired; inactive lines hold the places of irlume's lines, \
-                         because {without}"
-                    ),
-                );
+                return Decision {
+                    adjustable,
+                    ..keep(
+                        PlannedChange::NotWired,
+                        format!(
+                            "· {etc}: not wired; inactive lines hold the places of irlume's \
+                             lines, because {without}{then}"
+                        ),
+                    )
+                };
             }
             (
                 inert,
                 format!(
                     "✓ {etc}: turned irlume's lines into inactive pam_permit.so lines and kept \
                      the file; {kept_why}\n    removing them instead would {change}; {until}, \
-                     `sudo irlume login disable --apply` removes them"
+                     `sudo irlume login disable --apply` removes them{then}"
                 ),
             )
         }
@@ -1610,6 +1940,7 @@ fn remove_or_strip(i: &Input<'_>, p: &Parsed<'_>, class: Class) -> Decision {
                 diff_block(etc, vendor_path, &p.body, v)
             )
         }),
+        adjustable,
         ..replace(PlannedChange::StripInPlace, keep_header(p, &body), message)
     }
 }
@@ -1646,7 +1977,9 @@ fn forced(i: &Input<'_>, current: &str, p: &Parsed<'_>) -> Result<Decision, Stri
     let detail = Some(diff_block(etc, vendor_path, &p.body, v));
     // `--force` gives up the lines irlume did not write, not the vendor's
     // own jumps: irlume's lines must not move one, as in any other rebuild.
-    let warn = match check_jumps(&p.body, &wired, false) {
+    // Its jumps are the vendor copy's, named by their lines there.
+    let names = [Names::of(v, vendor_path)];
+    let warn = match check_jumps(&p.body, &wired, false, &names) {
         JumpCheck::Refuse(reason) => {
             return Ok(Decision {
                 detail,
@@ -1680,6 +2013,10 @@ fn forced(i: &Input<'_>, current: &str, p: &Parsed<'_>) -> Result<Decision, Stri
 /// [`InPlace::refused`].
 const WHY: &str = "{why}";
 
+/// Stands for `other ` in [`InPlace::rewired`] when `--adjust-jumps` changed
+/// a line irlume did not write, which the message names after it.
+const OTHER: &str = "{other}";
+
 /// U1, U2 and L1: nothing of anybody else's is in the file, so it follows the
 /// vendor file.
 fn rebuild(i: &Input<'_>, current: &str, p: &Parsed<'_>, class: Class) -> Decision {
@@ -1689,7 +2026,7 @@ fn rebuild(i: &Input<'_>, current: &str, p: &Parsed<'_>, class: Class) -> Decisi
     };
     let (wired, ok) = (i.wire)(&base(v));
     let (why, way_out) = if let Some(line) = unreadable_line(v) {
-        (unread_sentence(&line, None), String::new())
+        (unread_sentence(&line, Some(vendor_path)), String::new())
     } else if !ok {
         (
             "irlume finds no line to wire in it".to_string(),
@@ -1703,7 +2040,9 @@ fn rebuild(i: &Input<'_>, current: &str, p: &Parsed<'_>, class: Class) -> Decisi
                 format!("· {etc}: already correctly wired"),
             );
         }
-        let warn = match check_jumps(&p.body, &wired, false) {
+        // Its jumps are the vendor copy's, named by their lines there.
+        let names = [Names::of(v, vendor_path)];
+        let warn = match check_jumps(&p.body, &wired, false, &names) {
             JumpCheck::Refuse(reason) => Err(reason),
             JumpCheck::Warn(w) => Ok(w),
             JumpCheck::Clear => Ok(String::new()),
@@ -1776,7 +2115,7 @@ struct InPlace {
     edited: bool,
     /// irlume's lines are already right: the outcome and its line.
     unchanged: (PlannedChange, String),
-    /// irlume's lines are updated.
+    /// irlume's lines are updated; [`OTHER`] may mark where `other ` goes.
     rewired: String,
     /// Nothing is written; [`WHY`] marks where the reason goes.
     refused: String,
@@ -1836,7 +2175,9 @@ fn in_place(i: &Input<'_>, p: &Parsed<'_>, m: InPlace) -> Decision {
         };
     }
     let wired_now = has_irlume_line(&p.body);
-    let refuse = |why: String| {
+    // `then` follows the line: what `--adjust-jumps` would do instead, or
+    // why it cannot. `adjustable`: it can.
+    let refuse = |why: String, then: String, adjustable: bool| {
         let message = if wired_now {
             refused.replace(WHY, &why)
         } else {
@@ -1855,15 +2196,27 @@ fn in_place(i: &Input<'_>, p: &Parsed<'_>, m: InPlace) -> Decision {
         Decision {
             detail: detail.clone().or_else(|| refused_detail.clone()),
             unmet: true,
-            ..keep(PlannedChange::KeepEditedOverride, message)
+            adjustable,
+            ..keep(
+                PlannedChange::KeepEditedOverride,
+                format!("{message}{then}"),
+            )
         }
     };
     let arranged = match arrange(&p.body, &bare, wired.clone(), i.vendor, edited, i.wire) {
         Ok(text) => text,
         Err(Misplaced::Crossing(line)) => {
-            return refuse(format!(
-                "move one of them past `{line}`, which irlume did not write"
-            ));
+            return refuse(
+                format!(
+                    "move one of them past {}, which irlume did not write",
+                    line.map_or_else(
+                        || "a line".to_string(),
+                        |at| format!("line {}", p.line_number(at))
+                    )
+                ),
+                String::new(),
+                false,
+            );
         }
         Err(Misplaced::NoPasswordAnchor) => {
             let why = match i.vendor {
@@ -1892,11 +2245,53 @@ fn in_place(i: &Input<'_>, p: &Parsed<'_>, m: InPlace) -> Decision {
     // anything: each of irlume's lines updated in its own place, and an
     // inactive line kept where this configuration no longer wants one (face
     // login turned off where a jump counts the face line, or lines a disable
-    // left inactive).
-    let (arranged, check, filled) = match check_jumps(&p.body, &arranged, edited) {
-        JumpCheck::Refuse(reason) => match filled_in_place(&p.body, &wired, edited) {
+    // left inactive). Failing that, `--adjust-jumps` changes the value of
+    // each jump irlume's new lines land inside, so it skips the same lines of
+    // the file and lands on the same line (a fingerprint's success on
+    // irlume's permit landing); without the flag the file is kept and the
+    // refusal says what the flag would change.
+    let mut raised: Option<adjust::Adjusted> = None;
+    let names = [p.names()];
+    let (arranged, check, filled) = match check_jumps(&p.body, &arranged, edited, &names) {
+        JumpCheck::Refuse(reason) => match filled_in_place(&p.body, &wired, edited, &names) {
             Some((text, check)) => (text, check, true),
-            None => return refuse(format!("move a jump: {reason}")),
+            None => {
+                let why = format!("move a jump: {reason}");
+                let source = adjust::Source {
+                    carriage_return: has_read_carriage_return(p.text),
+                    opens: i.opens,
+                    number: &|at| p.line_number(at),
+                    vendor: i.vendor,
+                };
+                match adjust::raise(&p.body, &arranged, &source) {
+                    Ok(adjusted) if i.adjust_jumps => {
+                        // `check_jumps` cannot pass on the adjusted text by
+                        // design (its adjusted lines are jumps it has not
+                        // seen, which land elsewhere without irlume's
+                        // lines); `raise` proved it instead, running the
+                        // same jump check over every other line.
+                        let text = adjusted.text.clone();
+                        raised = Some(adjusted);
+                        (text, JumpCheck::Clear, false)
+                    }
+                    Ok(adjusted) => {
+                        let offer =
+                            adjust_offer(i.command, i.scope_flag, &adjusted, "adds irlume's lines");
+                        return refuse(why, offer, true);
+                    }
+                    // With the flag, why it cannot help. With or without
+                    // it, when irlume's own lines are in the way, what a
+                    // disable with the flag does about them.
+                    Err(cannot) if cannot == adjust::OWN_LINES => {
+                        let way = own_lines_way(i, p, &bare, edited, &source);
+                        return refuse(why, format!("{}{way}", adjust_refusal(&cannot)), false);
+                    }
+                    Err(cannot) if i.adjust_jumps => {
+                        return refuse(why, adjust_refusal(&cannot), false);
+                    }
+                    Err(_) => return refuse(why, String::new(), false),
+                }
+            }
         },
         check => (arranged, check, false),
     };
@@ -1910,7 +2305,8 @@ fn in_place(i: &Input<'_>, p: &Parsed<'_>, m: InPlace) -> Decision {
     let mut message = match check {
         JumpCheck::Warn(warn) => format!("{rewired}{warn}"),
         JumpCheck::Clear | JumpCheck::Refuse(_) => rewired,
-    };
+    }
+    .replace(OTHER, if raised.is_some() { "other " } else { "" });
     if filled && arranged.contains(INERT_TAG) {
         message.push_str(
             "; an inactive line holds the place of each of irlume's lines this configuration \
@@ -1919,6 +2315,9 @@ fn in_place(i: &Input<'_>, p: &Parsed<'_>, m: InPlace) -> Decision {
     }
     if p.crlf {
         message.push_str(&format!("; {CRLF_FIXED}"));
+    }
+    if let Some(adjusted) = &raised {
+        message.push_str(&adjusted_note(adjusted));
     }
     Decision {
         detail,
@@ -1956,7 +2355,7 @@ fn rewire_edited(i: &Input<'_>, p: &Parsed<'_>, class: Class) -> Decision {
         }
         None => (
             "kept, with the lines irlume did not write".to_string(),
-            "kept the lines irlume did not write".to_string(),
+            format!("kept the {OTHER}lines irlume did not write"),
         ),
     };
     let refusal = match class {
@@ -1979,7 +2378,8 @@ fn rewire_edited(i: &Input<'_>, p: &Parsed<'_>, class: Class) -> Decision {
                         format!("· {etc}: already correctly wired"),
                     ),
                     rewired: format!(
-                        "✓ {etc}: updated irlume's lines and kept the lines irlume did not write"
+                        "✓ {etc}: updated irlume's lines and kept the {OTHER}lines irlume did \
+                         not write"
                     ),
                     refused: format!(
                         "⚠ {etc}: kept as it is, because updating irlume's lines would {WHY}; \
@@ -2460,7 +2860,6 @@ session     include       password-auth
         Landing::Line {
             key: line_key(text),
             nth: 1,
-            text: norm(text),
         }
     }
 
@@ -2505,9 +2904,17 @@ session     include       password-auth
             backup: None,
             enable,
             force: false,
+            adjust_jumps: false,
+            command: if enable { "enable" } else { "disable" },
             scope_flag: "",
             wire,
+            opens: &fedora_stacks,
         }
+    }
+
+    /// The stack files these tests' files name: Fedora's password stack.
+    fn fedora_stacks(name: &str) -> bool {
+        name == "password-auth"
     }
 
     /// How irlume told its own lines apart before it read the module-path
@@ -3034,10 +3441,10 @@ session     include       password-auth
         let (moved, _) = keyring_only(&base(&thinkpad));
         let shifts = jump_shifts(&thinkpad, &moved);
         assert_eq!(shifts.len(), 1);
+        let reason = shift_reason(&shifts, &[Names::whole(&thinkpad)]);
         assert!(
-            shift_reason(&shifts).contains("pam_irlume.so reseal"),
-            "{}",
-            shift_reason(&shifts)
+            reason.ends_with("would then land on irlume's auth reseal line"),
+            "{reason}"
         );
         // Stripping moves it onto a wallet line.
         let shifts = jump_shifts(&thinkpad, &base(&thinkpad));
@@ -3466,13 +3873,206 @@ session     include       password-auth
         let stripped = base(&p.body);
         let shifts = jump_shifts(&p.body, &stripped);
         assert_eq!(shifts.len(), 1, "{stripped}");
-        assert!(shift_reason(&shifts).contains("pam_succeed_if.so"));
+        let number = wired.lines().position(|l| l == session_jump).unwrap() + 1;
+        let reason = shift_reason(&shifts, &[p.names()]);
+        assert!(
+            reason.starts_with(&format!("the jump on line {number} would then land on ")),
+            "{reason}"
+        );
+        assert!(!reason.contains("service = x"), "{reason}");
         assert!(jump_shifts(&p.body, &neutralize(&p.body)).is_empty());
         let d = decide(&input(Some(&wired), Some(VENDOR), false, &greeter)).unwrap();
         let Write::Replace(after) = d.write else {
             panic!("a write");
         };
         assert!(after.contains("# irlume-inert reseal"), "{after}");
+    }
+
+    /// Two vendor jumps irlume's face line moved when the override was made,
+    /// and a line an administrator then added right after the password
+    /// substack. The plain disable offers the flag, and `--adjust-jumps`
+    /// leaves the first vendor jump as the vendor wrote it, since it lands
+    /// where the vendor file has it once irlume's lines are out, and lowers
+    /// the second, whose landing the added line changed, from 2 to 1.
+    #[test]
+    fn disable_with_adjust_jumps_lowers_a_vendor_jump_the_other_one_skips() {
+        let v = "auth [success=1 default=ignore] pam_v.so";
+        let w = "auth [success=2 default=ignore] pam_w.so";
+        let substack = "auth substack password-auth";
+        let vendor =
+            format!("{v}\n{w}\n{substack}\nauth required pam_b.so\nauth required pam_c.so\n");
+        let (wired, ok) = greeter(&base(&vendor));
+        assert!(ok);
+        let made = render("/usr/lib/pam.d/plasmalogin", &vendor, &wired);
+        let current = made.replacen(
+            &format!("{substack}\n"),
+            &format!("{substack}\nauth optional pam_z.so\n"),
+            1,
+        );
+        let plain = run(&current, Some(&vendor), false, &greeter);
+        assert!(plain.adjustable, "{}", plain.message);
+        let number = current.lines().position(|l| l == w).unwrap() + 1;
+        assert!(
+            plain
+                .message
+                .contains(&format!("line {number}: `success=2` becomes `success=1`")),
+            "{}",
+            plain.message
+        );
+        let mut with = input(Some(&current), Some(&vendor), false, &greeter);
+        with.adjust_jumps = true;
+        let d = decide(&with).unwrap();
+        let after = written(&d).unwrap_or_else(|| panic!("a write: {}", d.message));
+        let p = parse(&current).unwrap();
+        let lowered = w.replacen("success=2", "success=1", 1);
+        assert_eq!(
+            after,
+            keep_header(&p, &base(&p.body).replacen(w, &lowered, 1)),
+            "{}",
+            d.message
+        );
+        assert!(after.contains(&format!("{v}\n")), "{after}");
+    }
+
+    /// A rebuild from a vendor copy with a line irlume does not read as PAM
+    /// does names that line by its number in the vendor copy, never by its
+    /// text, and leaves the override as it is.
+    #[test]
+    fn a_rebuild_names_the_vendor_copys_unread_line_by_its_number_there() {
+        let typo = "auht       optional     pam_foo.so secret=kept-out-of-logs";
+        let updated = format!("{VENDOR}{typo}\n");
+        let number = updated.lines().position(|l| l == typo).unwrap() + 1;
+        let d = run(&generation(VENDOR), Some(&updated), true, &greeter);
+        assert_eq!(d.write, Write::Nothing, "{}", d.message);
+        assert!(
+            d.message.contains(&format!(
+                "irlume does not read line {number} of /usr/lib/pam.d/plasmalogin as PAM does ("
+            )),
+            "{}",
+            d.message
+        );
+        assert!(!d.message.contains("kept-out-of-logs"), "{}", d.message);
+    }
+
+    /// The refusal of an update that would move one of irlume's lines past
+    /// an administrator's line names that line by its number in the file,
+    /// never by its text: a module's arguments can hold a secret.
+    #[test]
+    fn a_crossing_is_named_by_its_line_number() {
+        let faillock = "auth       required     pam_faillock.so preauth secret=kept-out-of-logs";
+        // irlume's face line above the administrator's line, where the
+        // polkit recipe wants its verify line below it, in no place irlume
+        // holds: the update is refused.
+        let body = format!(
+            "#%PAM-1.0\nauth       sufficient   pam_irlume.so unseal\n{faillock}\n\
+             auth       include      system-auth\naccount    include      system-auth\n"
+        );
+        let current = format!("{}\n{body}", created_line("/usr/lib/pam.d/plasmalogin"));
+        let d = run(&current, Some(POLKIT_VENDOR), true, &wire_polkit_service);
+        assert_eq!(d.write, Write::Nothing, "{}", d.message);
+        let number = current.lines().position(|l| l == faillock).unwrap() + 1;
+        assert!(
+            d.message.contains(&format!(
+                "move one of them past line {number}, which irlume did not write"
+            )),
+            "{}",
+            d.message
+        );
+        assert!(!d.message.contains("kept-out-of-logs"), "{}", d.message);
+    }
+
+    /// `Parsed::line_number` gives the number in the file of each line of the
+    /// body, which leaves out the first header line and the tracking line:
+    /// for a file with the tracking line on line 2, one with comments above
+    /// it, and a legacy one with none.
+    #[test]
+    fn a_body_line_is_numbered_as_in_the_file() {
+        let tracked = with_admin_line(&generation(VENDOR));
+        let moved_track = {
+            let mut lines: Vec<&str> = tracked.lines().collect();
+            let track = lines.remove(1);
+            lines.insert(1, "# a note");
+            lines.insert(2, "# another");
+            lines.insert(3, track);
+            format!("{}\n", lines.join("\n"))
+        };
+        let untracked = {
+            let mut lines: Vec<&str> = tracked.lines().collect();
+            lines.remove(1);
+            format!("{}\n", lines.join("\n"))
+        };
+        for text in [tracked.clone(), moved_track, untracked] {
+            let p = parse(&text).expect("an override");
+            let file: Vec<&str> = text.lines().collect();
+            for (at, line) in p.body.lines().enumerate() {
+                let number = p.line_number(at);
+                assert_eq!(file[number - 1], line, "{at}: {text}");
+                assert!(!is_tracking_line(file[number - 1]), "{text}");
+            }
+            assert_eq!(p.line_number(0), 2 + usize::from(p.track_at == Some(1)));
+        }
+    }
+
+    /// A disable with `--adjust-jumps` leaves a vendor jump that irlume's
+    /// face line had moved as the vendor wrote it: taking irlume's lines out
+    /// gives it back its vendor landing (DISABLE.md). Only the jump the
+    /// administrator added is lowered, and the offer without the flag names
+    /// only that line.
+    #[test]
+    fn disable_with_adjust_jumps_gives_a_vendor_jump_back_its_vendor_landing() {
+        let vendor_jump = "auth [success=2 default=ignore] pam_x.so";
+        let vendor = format!(
+            "{vendor_jump}\nauth required pam_a.so\nauth substack password-auth\n\
+             auth optional pam_b.so\n"
+        );
+        let (wired, ok) = greeter(&base(&vendor));
+        assert!(ok);
+        let made = render("/usr/lib/pam.d/plasmalogin", &vendor, &wired);
+        // The administrator's #875 line over the vendor jump, pam_a, irlume's
+        // face line and the substack, onto irlume's permit landing.
+        let fingerprint = "auth [success=4 default=ignore] pam_fprintd.so";
+        let current = made.replacen(vendor_jump, &format!("{fingerprint}\n{vendor_jump}"), 1);
+        let lowered = fingerprint.replacen("success=4", "success=3", 1);
+        let plain = run(&current, Some(&vendor), false, &greeter);
+        assert!(plain.adjustable, "{}", plain.message);
+        let number = current.lines().position(|l| l == fingerprint).unwrap() + 1;
+        assert!(
+            plain
+                .message
+                .contains(&format!("line {number}: `success=4` becomes `success=3`")),
+            "{}",
+            plain.message
+        );
+        assert_eq!(
+            plain.message.matches(" becomes `").count(),
+            1,
+            "{}",
+            plain.message
+        );
+        // The vendor jump keeps its value and lands elsewhere, as the vendor
+        // copy has it: a note says so, by line numbers.
+        let at = |line: &str| current.lines().position(|l| l == line).unwrap() + 1;
+        let given_back = format!(
+            "`success=2` on line {} lands on line {} rather than line {}, as the vendor copy \
+             has it",
+            at(vendor_jump),
+            at("auth optional pam_b.so"),
+            at("auth substack password-auth")
+        );
+        assert!(plain.message.contains(&given_back), "{}", plain.message);
+        let mut with = input(Some(&current), Some(&vendor), false, &greeter);
+        with.adjust_jumps = true;
+        let d = decide(&with).unwrap();
+        assert!(d.message.contains(&given_back), "{}", d.message);
+        let after = written(&d).unwrap_or_else(|| panic!("a write: {}", d.message));
+        let p = parse(&current).unwrap();
+        assert_eq!(
+            after,
+            keep_header(&p, &base(&p.body).replacen(fingerprint, &lowered, 1)),
+            "{}",
+            d.message
+        );
+        assert!(after.contains(&format!("{vendor_jump}\n")), "{after}");
     }
 
     /// Updating irlume's lines never moves one past an administrator's line.
@@ -3505,9 +4105,10 @@ session     include       password-auth
         let above_bare = base(&above);
         let above_own = own_lines(&above_bare, Some(polkit_vendor), true);
         let (above_wired, _) = wire_polkit_service(&above_bare);
+        let faillock_at = above.lines().position(|l| l == faillock).unwrap();
         assert_eq!(
-            crossing(&above, &above_wired, &above_bare, &above_own).as_deref(),
-            Some(norm(faillock).as_str()),
+            crossing(&above, &above_wired, &above_bare, &above_own),
+            Some(Some(faillock_at)),
             "the recipe would move irlume's line past faillock"
         );
         let arranged = arrange(
@@ -4053,13 +4654,27 @@ session     include       password-auth
         let second = Landing::Line {
             key: line_key(hook),
             nth: 2,
-            text: norm(hook),
         };
+        // The second hook line, by its number in the file.
+        let second_hook = edited
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| *l == hook)
+            .nth(1)
+            .unwrap()
+            .0
+            + 1;
         assert_eq!(gate_lands(&base(&edited)), Some(second));
         for vendor in [Some(VENDOR), None] {
             let d = run(&edited, vendor, false, &greeter);
             assert_eq!(d.change, PlannedChange::StripInPlace, "{}", d.message);
-            assert!(d.message.contains("copy 2 of `"), "{}", d.message);
+            assert!(
+                d.message
+                    .contains(&format!("would land on line {second_hook};")),
+                "{}",
+                d.message
+            );
+            assert!(!d.message.contains("login-hook"), "{}", d.message);
             let after = written(&d).expect("a write");
             assert!(!content_has_module(&after), "{after}");
             assert!(after.contains("# irlume-inert reseal"), "{after}");
@@ -4162,12 +4777,20 @@ session     include       password-auth
         let d = forced(&edited);
         assert_eq!(d.write, Write::Nothing, "{}", d.message);
         assert!(d.unmet && !d.keep_copy, "{}", d.message);
+        // Named by its line in the vendor copy the rebuild would take.
+        let number = v3
+            .lines()
+            .position(|l| l.contains("pam_fprintd.so"))
+            .unwrap()
+            + 1;
         assert!(
-            d.message
-                .contains("the jump in `auth [success=1 default=ignore] pam_fprintd.so`"),
+            d.message.contains(&format!(
+                "the jump on line {number} of /usr/lib/pam.d/plasmalogin would then land on"
+            )),
             "{}",
             d.message
         );
+        assert!(!d.message.contains("pam_fprintd.so"), "{}", d.message);
         assert!(
             d.message.contains("delete /etc/pam.d/plasmalogin and run"),
             "{}",
@@ -4179,7 +4802,14 @@ session     include       password-auth
         let d = forced(&unwired);
         assert!(written(&d).is_some(), "{}", d.message);
         assert!(d.keep_copy);
-        assert!(d.message.contains("now jumps to"), "{}", d.message);
+        assert!(
+            d.message.contains(&format!(
+                "⚠ the jump on line {number} of /usr/lib/pam.d/plasmalogin now lands on line"
+            )),
+            "{}",
+            d.message
+        );
+        assert!(!d.message.contains("pam_fprintd.so"), "{}", d.message);
     }
 
     /// A vendor update that changes where one of its jumps lands blocks a

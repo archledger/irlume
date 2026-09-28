@@ -17,6 +17,7 @@
 //! that way, [`unreadable_line`] names, and no write is made to such a file.
 
 use super::stanzas::{KEYRING_CONSUMERS, MODULE};
+use std::ops::Range;
 
 /// Whether any line of `c` is a rule that loads pam_irlume.so (see
 /// [`irlume_rule`]).
@@ -171,6 +172,13 @@ pub(crate) fn names_stack(h: &Head<'_>) -> bool {
     h.control.eq_ignore_ascii_case("include") || h.control.eq_ignore_ascii_case("substack")
 }
 
+/// The stack an `include` or `substack` line names, its third field as
+/// [`next_field`] reads it, or `None` for any other line and for one that
+/// names no stack.
+pub(crate) fn stack_name<'a>(h: &Head<'a>) -> Option<&'a str> {
+    names_stack(h).then(|| third_field(h)).flatten()
+}
+
 /// The words libpam reads as a whole control (`strcasecmp` in
 /// `_pam_parse_conf_file`); any other control is parsed by
 /// `_pam_parse_control` as `value=action` pairs.
@@ -262,6 +270,17 @@ const ACTION_NAMES: [(&str, Action); 6] = [
 /// control libpam rejects ("pam_parse: expecting ..."), which makes every
 /// value `bad`: no jump at all, whatever pairs it read before the error.
 fn control_pairs(control: &str) -> Option<Vec<(&'static str, Action)>> {
+    Some(
+        control_pairs_at(control)?
+            .into_iter()
+            .map(|(value, action, _)| (value, action))
+            .collect(),
+    )
+}
+
+/// As [`control_pairs`], with where each pair's action is written: the bytes
+/// of `control` that hold the action word or the jump's digits.
+fn control_pairs_at(control: &str) -> Option<Vec<(&'static str, Action, Range<usize>)>> {
     let b = control.as_bytes();
     let skip = |mut i: usize| {
         while i < b.len() && control_blank(b[i]) {
@@ -291,12 +310,13 @@ fn control_pairs(control: &str) -> Option<Vec<(&'static str, Action)>> {
         if i == b.len() {
             return None;
         }
+        let start = i;
         if let Some((name, action)) = ACTION_NAMES
             .into_iter()
             .find(|(name, _)| b[i..].starts_with(name.as_bytes()))
         {
             i += name.len();
-            pairs.push((value, action));
+            pairs.push((value, action, start..i));
             continue;
         }
         if !b[i].is_ascii_digit() {
@@ -313,7 +333,7 @@ fn control_pairs(control: &str) -> Option<Vec<(&'static str, Action)>> {
         if n == 0 {
             return None;
         }
-        pairs.push((value, Action::Jump(usize::try_from(n).ok()?)));
+        pairs.push((value, Action::Jump(usize::try_from(n).ok()?), start..i));
     }
 }
 
@@ -410,6 +430,60 @@ pub(crate) fn numeric_actions(h: &Head<'_>) -> Vec<(String, usize)> {
             _ => None,
         })
         .collect()
+}
+
+/// `line` with some of its numeric jumps given new values and every other
+/// byte kept: each `(value, from, to)` names a jump [`numeric_actions`]
+/// reports for the line as `(value, from)`, and the digits libpam reads for
+/// it become `to`'s. Each pair keeps its spelling, blanks around `=` and a
+/// jump run into the next pair (`success=1default=ignore`) included, so
+/// libpam splits the control into the same pairs and reads each changed
+/// jump as `to`. `None` when the control is not written in brackets closed
+/// on the line before any comment, names a changed value in more than one
+/// pair, or has no such jump in effect, and when a value is changed twice
+/// or `to` is not a jump libpam reads (1 to `INT_MAX`).
+pub(crate) fn with_jump_values(line: &str, edits: &[(&str, usize, usize)]) -> Option<String> {
+    let h = head(line)?;
+    if h.control.is_empty() {
+        return None;
+    }
+    // The control is a slice of the line: `head` reads it from `directive`,
+    // which slices the line.
+    let start = (h.control.as_ptr() as usize).checked_sub(line.as_ptr() as usize)?;
+    let end = start + h.control.len();
+    let bracketed = line.get(..start).is_some_and(|l| l.ends_with('['))
+        && line.get(end..).is_some_and(|l| l.starts_with(']'));
+    if !bracketed || line.get(start..end) != Some(h.control) {
+        return None;
+    }
+    let pairs = control_pairs_at(h.control)?;
+    let plain: Vec<(&'static str, Action)> = pairs.iter().map(|(v, a, _)| (*v, *a)).collect();
+    let by = set_by(&plain);
+    let mut spans: Vec<(Range<usize>, usize)> = Vec::with_capacity(edits.len());
+    for (e, &(value, from, to)) in edits.iter().enumerate() {
+        if edits[..e].iter().any(|o| o.0 == value)
+            || to == 0
+            || u64::try_from(to).ok().is_none_or(|t| t > MAX_JUMP)
+        {
+            return None;
+        }
+        let mut named = pairs
+            .iter()
+            .enumerate()
+            .filter(|(_, (v, _, _))| *v == value);
+        let (at, (_, action, span)) = named.next()?;
+        if named.next().is_some() || *action != Action::Jump(from) || !by.contains(&Some(at)) {
+            return None;
+        }
+        spans.push((start + span.start..start + span.end, to));
+    }
+    // From the last span back, so the earlier ones stay where they are.
+    spans.sort_by_key(|(span, _)| std::cmp::Reverse(span.start));
+    let mut out = line.to_string();
+    for (span, to) in spans {
+        out.replace_range(span, &to.to_string());
+    }
+    Some(out)
 }
 
 /// The fields of a rule line, or `None` for anything that loads no module: a
@@ -1048,6 +1122,22 @@ pub(super) fn include_could_jump_past(line: &str, later: impl Fn(&str) -> bool) 
             || later(h.phase)
                 && third_field(&h).is_none_or(|stack| included_jump_leaves(stack, h.phase)),
     )
+}
+
+/// Whether irlume can read the lines an `include` or a Debian `@include`
+/// line puts in its place, the stacks they include in turn among them, as
+/// [`include_could_jump_past`] reads them ([`included_lines`]): `false` for
+/// one it cannot read, and for any other line.
+pub(super) fn include_is_read(line: &str) -> bool {
+    if is_at_include(line) {
+        return at_include_target(line)
+            .is_some_and(|file| included_lines(file, "auth", 1).is_some());
+    }
+    head(line)
+        .filter(|h| h.known_type && h.control.eq_ignore_ascii_case("include"))
+        .is_some_and(|h| {
+            third_field(&h).is_some_and(|stack| included_lines(stack, h.phase, 1).is_some())
+        })
 }
 
 /// The `phase` lines libpam puts in the place of an `include` of the stack

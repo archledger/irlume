@@ -2045,12 +2045,19 @@ KEYRING / TPM
 
 SYSTEM INTEGRATION
   login <status|enable|disable|reconcile> [--with-sudo] [--with-polkit] [--apply] [--force]
+        [--adjust-jumps]
                         PAM wiring: greeters, lock screen, sudo, and app prompts
                         (--with-polkit lets your face approve Bitwarden/pkexec);
                         reconcile re-applies it after a distro PAM regeneration and
                         applies immediately (no --apply; the self-heal unit runs it);
                         enable --force rebuilds irlume's /etc copies of vendor PAM
-                        files that have lines of yours, keeping each as .pre-irlume
+                        files that have lines of yours, keeping each as .pre-irlume;
+                        --adjust-jumps changes the value of a numeric jump of yours
+                        in such a copy that irlume's lines would move, so it skips
+                        the same lines of yours and lands on the same line (a
+                        fingerprint's success: on irlume's pam_permit.so landing;
+                        where irlume's lines come out and it landed on one: the
+                        first line after them)
   logs [-f] [--since T]           the face-auth journal in one view (daemon, PAM, keyring)
   logs debug <on|off>             per-stage pipeline tracing in the daemon (sudo)
   fingerprint <status|add|verify|reset|enable|disable> [--fingerprint-only]

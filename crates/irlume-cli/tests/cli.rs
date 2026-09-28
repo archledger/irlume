@@ -2577,6 +2577,45 @@ fn login_force_is_refused_outside_enable_and_disable() {
     assert!(!lock.exists(), "a dry run takes no lock");
 }
 
+/// `--adjust-jumps` is a person agreeing to a change of a numeric jump in a
+/// line irlume did not write, so, like `--force`, only `login enable` and
+/// `login disable` take it: the unattended reconcile, a status read and a
+/// bare `login` refuse it with a usage error before anything is read or
+/// locked, rather than run without it.
+#[test]
+fn login_adjust_jumps_is_refused_outside_enable_and_disable() {
+    let sb = Sandbox::new("login-adjust-jumps-scope");
+    let lock = sb.pam_lock();
+    for args in [
+        &["login", "reconcile", "--adjust-jumps"][..],
+        &["login", "status", "--adjust-jumps"],
+        &["login", "--adjust-jumps"],
+    ] {
+        let (code, out, err) = run(sb.cmd(args).env("IRLUME_PAM_LOCK", &lock));
+        assert_eq!(code, 2, "{args:?}\n{out}\n{err}");
+        assert!(
+            err.contains("--adjust-jumps applies to login enable and disable only"),
+            "{err}"
+        );
+        assert!(
+            err.contains("[--adjust-jumps]"),
+            "the usage names it: {err}"
+        );
+        assert!(!lock.exists(), "{args:?} took the PAM lock");
+    }
+    // `disable` takes it, and the run goes on (a dry run here, which reads
+    // PAM files and writes nothing).
+    let (_, out, err) = run(sb
+        .cmd(&["login", "disable", "--adjust-jumps"])
+        .env("IRLUME_PAM_LOCK", &lock));
+    assert!(
+        !err.contains("applies to login enable and disable only"),
+        "{out}\n{err}"
+    );
+    assert!(out.contains("DRY RUN"), "{out}\n{err}");
+    assert!(!lock.exists(), "a dry run takes no lock");
+}
+
 /// Without `IRLUME_PAM_LOCK`, the PAM lock is `pam.lock` in the root-only
 /// `/run/irlume`. `/run/lock/irlume-pam.lock`, the lock earlier releases
 /// created at 0644, is taken too: created at 0600 when it is missing, and one

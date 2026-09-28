@@ -60,8 +60,49 @@ update that would move one of irlume's lines past one of yours, or change
 where a numeric jump in your lines lands (an `[success=2 default=ignore]` that
 counts irlume's lines), is not made: the file is kept as it is, `irlume login
 enable` says why and exits 1, and irlume's earlier lines stay in effect until
-you adjust your line or rebuild the file. A file with a line that ends in `\`
-is not changed at all (see `disable` below), and neither is one with a line
+you adjust your line or rebuild the file. When the only thing in the way is a
+numeric jump in brackets that irlume's new lines would land inside, such as
+`[success=1 default=ignore] pam_fprintd.so` right above the password
+substack, `irlume login enable` also says how `--adjust-jumps` would change
+that line, naming it by its number, and `sudo irlume login enable --apply
+--adjust-jumps` changes it together with irlume's lines. Each adjusted jump
+skips the same lines of yours as before, and irlume's lines among them, and
+lands on the same line as before. One action lands elsewhere, and the output
+says so: the `success` of a `pam_fprintd.so` line lands on irlume's
+`pam_permit.so` landing when irlume puts that line right after the last line
+the jump skips. For the line above, `success=1` becomes `success=2`: it skips
+irlume's face line and the substack, and the landing records the verified
+fingerprint's success, after which irlume's keyring and reseal lines run as
+before. Any other action, such as a failure (`default=1`) or the success of a
+`pam_succeed_if.so` group check, skips irlume's lines up to the line it
+landed on, since the landing would record a success that module did not
+earn. Only the digits of the jump change, so `[success = 1 default=ignore]`
+becomes `[success = 2 default=ignore]`. The output names each line by its
+number and never quotes one, since a module's arguments can hold a secret,
+and so does every message about a numeric jump irlume's lines would move or
+a line of yours they would move past: by its number in the file, or in the
+vendor copy an override is made or rebuilt from, and irlume's own lines by
+what they are.
+With a jump across an `include`, one past the end of the stack, a control
+not in brackets, or, on a disable, a jump that would land on the end of the
+stack once irlume's lines are out (it landed on one of them, with no line of
+its type after them), the flag does not change the jump either: an enable
+keeps the file, and a disable keeps inactive lines. The same holds with an
+`include` above irlume's lines whose stack has a
+numeric jump that could land past its end (PAM puts the included lines in
+the include's place, so such a jump counts the lines after it, and no value
+in your file changes it; irlume reads the stack where PAM finds it, and one
+it cannot read counts), and with a `substack` whose file irlume cannot read
+where PAM finds it, or cannot read as PAM does: PAM counts a substack it
+cannot load as two modules, the substack and one that always fails. After a
+`disable` without the flag, which leaves inactive lines in irlume's places,
+an enable that would move such a jump cannot adjust it either, since those
+lines change as well: it says to run `sudo irlume login disable --apply
+--adjust-jumps`, which takes them out, and then `sudo irlume login enable
+--apply --adjust-jumps`, or why that disable would keep them too.
+
+A file with a line that ends in `\` is not changed at all (see `disable`
+below), with or without `--adjust-jumps`, and neither is one with a line
 PAM reads differently from how irlume would: a type PAM does not know (a typo
 such as `auht`, or a line led by a no-break space, vertical tab or form feed,
 which PAM reads as part of the type; PAM counts such a line in the auth stack
@@ -199,10 +240,29 @@ The disable also:
   example an RGB-only camera no longer does face login), that `enable`
   turns on the lines it still uses in their places and leaves an inactive
   line where one is no longer used, so your jump still lands where it
-  did. A numeric jump from the vendor file that
-  irlume's lines had moved lands where the vendor file has it again once
-  they are removed. A file with a line that ends in `\`, which PAM joins
-  with the next line into one rule, is left as it is, irlume's lines
+  did. In an override where a numeric jump of yours counts irlume's lines
+  or lands on one of them, `disable --adjust-jumps` removes them instead
+  of leaving inactive lines: a jump that counts them is lowered by the
+  lines it took out, so it skips the same lines of yours as before and
+  lands on the same line, and a jump that landed on one of them lands on
+  the first line after them. After an `enable --adjust-jumps` that gives
+  the jump back the value you wrote, unless that value already counted
+  irlume's lines, such as the keyring lines of a machine without face
+  login: then it gets the value that lands on the same line without them.
+  The plain `disable` says how the flag would change the line, naming it
+  by its number, and the flag keeps the inactive lines when irlume cannot
+  show that (see `enable` above). An
+  `enable` takes irlume's lines
+  out the same way from a login screen or lock screen its configuration no
+  longer wants them in (face login turned off, say), and there
+  `enable --adjust-jumps` does what `disable --adjust-jumps` does for that
+  file. A numeric jump from the vendor file that irlume's lines had moved
+  lands where the vendor file has it again once they are removed, and
+  `disable --adjust-jumps` leaves it as the vendor wrote it, also where it
+  skips or lands on a jump of yours the flag lowers, and names the line it
+  lands on now. A file
+  with a line that ends in `\`, which PAM joins with the next line into
+  one rule, is left as it is, irlume's lines
   included: taking out one physical line of it can make the rule before it
   take in the next one, the password line included. `disable` says so and
   exits 1; join those lines or take irlume's lines out by hand. From a

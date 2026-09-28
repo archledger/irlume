@@ -910,6 +910,14 @@ pub fn login_plan(args: &[String]) -> ExitCode {
                 "change": surface.change.id(),
                 "writes": surface.change.writes(),
                 "kept": surface.kept,
+                // A surface the person's `--adjust-jumps` would handle
+                // differently because of an administrator's numeric jump:
+                // a kept enable surface it would update, or a surface the
+                // run takes irlume's lines out of (a disable's, or one an
+                // enable no longer wants wired) where it would remove them
+                // rather than leave inactive ones. The API itself never
+                // changes such a line.
+                "jumps_adjustable": surface.adjustable,
             })
         })
         .collect();
@@ -967,6 +975,13 @@ fn plan_id(action: &str, planned: &[crate::pamwire::PlannedSurface]) -> String {
         // wants decide.
         if surface.kept {
             material.push_str(" kept");
+        }
+        // And whether `--adjust-jumps` would handle it differently: the same
+        // file can be kept either way, depending on the lines the
+        // configuration wants. Only when true, so a plan with no such
+        // surface keeps its id.
+        if surface.adjustable {
+            material.push_str(" adjustable");
         }
     }
     use sha2::{Digest as _, Sha256};
@@ -3534,6 +3549,7 @@ mod tests {
                 want: true,
                 face_blocked: false,
                 kept: false,
+                adjustable: false,
             }]
         };
         let before = plan_id("enable", &with_state("aaaa"));
@@ -3563,6 +3579,7 @@ mod tests {
                 want: true,
                 face_blocked: false,
                 kept: false,
+                adjustable: false,
             }]
         };
         let base = plan_id("enable", &surfaces(PlannedChange::Wire));
@@ -3591,6 +3608,21 @@ mod tests {
         );
         assert_eq!(
             plan_id("enable", &kept(true)),
+            plan_id("enable", &kept(true))
+        );
+        // Whether `--adjust-jumps` would update a kept surface is part of it
+        // too, and a plan without such a surface keeps the id it had.
+        let adjustable = |adjustable| {
+            let mut planned = kept(true);
+            planned[0].adjustable = adjustable;
+            planned
+        };
+        assert_ne!(
+            plan_id("enable", &adjustable(true)),
+            plan_id("enable", &adjustable(false))
+        );
+        assert_eq!(
+            plan_id("enable", &adjustable(false)),
             plan_id("enable", &kept(true))
         );
     }

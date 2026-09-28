@@ -438,6 +438,8 @@ fn force_apply() -> WireOpts {
     WireOpts {
         apply: true,
         force: true,
+        adjust_jumps: false,
+        enabling: false,
         expect_vendor: None,
     }
 }
@@ -587,10 +589,19 @@ fn disable_keeps_a_legacy_override_that_differs_from_its_vendor_copy() {
         lands_after(&before, "pam_fprintd.so", 2),
         "{after}"
     );
+    // The lines are named by their numbers in this legacy override, which
+    // has no tracking line: the jump, and the wallet line it would land on.
+    let number = |line: &str| before.lines().position(|l| l == line).unwrap() + 1;
+    let named = format!(
+        "without them the jump on line {} would land on line {};",
+        number(LOCAL_JUMP),
+        number("-auth        optional      pam_kwallet5.so")
+    );
     assert!(
-        off.message.contains("inactive") && off.message.contains("pam_kwallet5.so"),
+        off.message.contains("inactive") && off.message.contains(&named),
         "the run says why: {off}"
     );
+    assert!(!off.message.contains("timeout=15"), "{off}");
     // A second disable finds nothing live of irlume's and writes nothing.
     let again = wire_service(&svc, false, true, &face_and_keyring).unwrap();
     assert_eq!(change_id(&again), "not-wired", "{again}");
@@ -937,18 +948,35 @@ fn only_a_person_gets_the_detail_block() {
 
 #[test]
 fn the_root_hint_repeats_the_flags_given() {
+    let force = RunFlags {
+        force: true,
+        adjust_jumps: false,
+    };
     assert_eq!(
-        sudo_rerun_hint(true, true, true, true),
+        sudo_rerun_hint(true, true, true, force),
         "sudo irlume login enable --with-sudo --with-polkit --apply --force"
     );
     assert_eq!(
-        sudo_rerun_hint(true, false, false, false),
+        sudo_rerun_hint(true, false, false, RunFlags::default()),
         "sudo irlume login enable --apply"
     );
     // A disable takes --force too: past a GNOME keyring token refusal.
     assert_eq!(
-        sudo_rerun_hint(false, false, true, true),
+        sudo_rerun_hint(false, false, true, force),
         "sudo irlume login disable --with-polkit --apply --force"
+    );
+    // And --adjust-jumps, which both take.
+    let adjust = RunFlags {
+        force: false,
+        adjust_jumps: true,
+    };
+    assert_eq!(
+        sudo_rerun_hint(true, false, false, adjust),
+        "sudo irlume login enable --apply --adjust-jumps"
+    );
+    assert_eq!(
+        sudo_rerun_hint(false, true, false, adjust),
+        "sudo irlume login disable --with-sudo --apply --adjust-jumps"
     );
 }
 
@@ -1173,6 +1201,7 @@ fn apply_refuses_a_surface_whose_vendor_copy_changed_after_the_plan() {
         want: true,
         face_blocked: false,
         kept: false,
+        adjustable: false,
     };
     std::fs::write(svc.vendor.unwrap(), fedora_with_oo7()).unwrap();
     let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false, &[planned]);
@@ -1200,6 +1229,7 @@ fn apply_refuses_a_surface_whose_want_changed_after_the_plan() {
         want: false,
         face_blocked: false,
         kept: false,
+        adjustable: false,
     };
     let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false, &[planned]);
     let error = applied.error.expect("the surface is refused");
@@ -1217,6 +1247,7 @@ fn apply_refuses_a_surface_whose_want_changed_after_the_plan() {
         want: true,
         face_blocked: true,
         kept: false,
+        adjustable: false,
     };
     let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false, &[planned]);
     assert!(applied.error.is_some(), "the surface is refused");
@@ -1696,6 +1727,8 @@ fn the_write_refuses_a_vendor_copy_other_than_the_one_checked() {
     let opts = WireOpts {
         apply: true,
         force: false,
+        adjust_jumps: false,
+        enabling: false,
         expect_vendor: Some(crate::logintx::sha256_hex(UPSTREAM_FEDORA.as_bytes())),
     };
     std::fs::write(svc.vendor.unwrap(), fedora_with_oo7()).unwrap();
@@ -2153,6 +2186,8 @@ fn an_override_whose_vendor_copy_changes_during_the_write_is_not_kept() {
     let opts = WireOpts {
         apply: true,
         force: false,
+        adjust_jumps: false,
+        enabling: false,
         expect_vendor: None,
     };
     let dir = TestDir::new("ovr-write-vendor-race");
@@ -3001,4 +3036,936 @@ fn the_stack_a_first_auth_include_names_is_read_where_libpam_finds_it() {
     let body = read_file(svc.etc);
     assert!(body.contains("pam_kwallet5.so auto_start"), "{body}");
     assert!(body.contains(KEYRING_UNSEAL), "{body}");
+}
+
+// ---- --adjust-jumps (#875) ---------------------------------------------------------
+
+/// The fingerprint line of #875, as an administrator wrote it on a Fedora 44
+/// ThinkPad whose plasmalogin had irlume's keyring lines only (an RGB camera),
+/// right above the password substack.
+const ISSUE_JUMP: &str = "auth [success=1 default=ignore] pam_fprintd.so max-tries=1 timeout=5   \
+                          # fingerprint at the login screen (local)";
+
+/// Fedora's password stack next to `svc`, which its `substack password-auth`
+/// line names: `--adjust-jumps` counts a substack only when PAM loads its
+/// file as one stack (`substack_loads`).
+fn ship_stack(svc: &Svc, name: &str) {
+    let dir = Path::new(svc.etc).parent().unwrap();
+    std::fs::write(dir.join(name), "auth required pam_unix.so\n").unwrap();
+}
+
+/// The #875 file: an override irlume created from the Fedora 44 vendor copy
+/// with its keyring lines, and the administrator's fingerprint line added.
+fn issue_override(svc: &Svc, jump: &str) -> String {
+    ship_stack(svc, "password-auth");
+    wire_service(svc, true, true, &keyring_only).unwrap();
+    let edited = with_line(&read_file(svc.etc), jump);
+    std::fs::write(svc.etc, &edited).unwrap();
+    edited
+}
+
+fn adjusting(apply: bool) -> WireOpts {
+    WireOpts {
+        apply,
+        adjust_jumps: true,
+        ..WireOpts::default()
+    }
+}
+
+/// The part of `message` about `--adjust-jumps`, which names lines by their
+/// numbers and never quotes one: a module's arguments can hold a secret, and
+/// reconcile's messages reach the system journal. So neither the arguments
+/// nor the comment of the #875 line are in it.
+fn adjust_offer_of(message: &str) -> &str {
+    let (_, offer) = message
+        .split_once("\n    --adjust-jumps")
+        .unwrap_or_else(|| panic!("no --adjust-jumps line: {message}"));
+    for quoted in ["max-tries", "timeout=5", "at the login screen"] {
+        assert!(!offer.contains(quoted), "{quoted}: {message}");
+    }
+    offer
+}
+
+/// How the `--adjust-jumps` lines name the change to `line` of `text`: by
+/// its number in the file.
+fn changed_line(text: &str, line: &str, change: &str) -> String {
+    let number = text
+        .lines()
+        .position(|l| l == line)
+        .unwrap_or_else(|| panic!("`{line}` is not in the file"))
+        + 1;
+    format!("line {number}: {change}")
+}
+
+/// Without `--adjust-jumps` the #875 file is kept and the run fails as
+/// before (#860), and both the dry run and the apply name the line the flag
+/// would change and the flag. The plan marks the surface kept and
+/// adjustable. With the flag the preview shows the change, and the apply
+/// makes it: irlume's face lines go in and `success=1` becomes `success=2`,
+/// every other byte of the administrator's line as it was.
+#[test]
+fn the_issue_file_takes_face_login_with_adjust_jumps_only() {
+    let dir = TestDir::new("ovr-adjust-issue");
+    let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+    let before = issue_override(&svc, ISSUE_JUMP);
+    let raised = ISSUE_JUMP.replacen("success=1", "success=2", 1);
+    for apply in [false, true] {
+        let kept = wire_service(&svc, true, apply, &face_and_keyring).unwrap();
+        assert_eq!(change_id(&kept), "keep-edited-override", "{kept}");
+        assert!(kept.unmet && kept.adjustable, "{kept}");
+        assert!(kept_unmet(ScopeOrigin::Command, &kept));
+        let offer = adjust_offer_of(&kept.message);
+        for named in [
+            changed_line(&before, ISSUE_JUMP, "`success=1` becomes `success=2`"),
+            "irlume login enable --adjust-jumps   (preview)".to_string(),
+            "sudo irlume login enable --apply --adjust-jumps".to_string(),
+        ] {
+            assert!(offer.contains(&named), "{named}\n{kept}");
+        }
+        assert_eq!(read_file(svc.etc), before);
+    }
+    let planned = plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false);
+    assert_eq!(planned.change, PlannedChange::KeepEditedOverride);
+    assert!(planned.kept && planned.adjustable);
+    // The same file under the keyring recipe it has is no refusal at all.
+    let right = plan_surface(&svc, ROLE_LOGIN, &keyring_only, true, false);
+    assert!(!right.kept && !right.adjustable);
+
+    let preview = wire_service_with(&svc, true, &adjusting(false), &face_and_keyring).unwrap();
+    assert_eq!(change_id(&preview), "rewire-override", "{preview}");
+    assert!(!preview.unmet && !preview.adjustable, "{preview}");
+    assert!(
+        adjust_offer_of(&preview.message).contains(&changed_line(
+            &before,
+            ISSUE_JUMP,
+            "`success=1` becomes `success=2`"
+        )),
+        "{preview}"
+    );
+    assert_eq!(read_file(svc.etc), before, "a preview writes nothing");
+    let on = wire_service_with(&svc, true, &adjusting(true), &face_and_keyring).unwrap();
+    assert_eq!(on.message, preview.message);
+    let after = read_file(svc.etc);
+    // The header lines are comments the recipe passes over.
+    let (wired, _) = face_and_keyring(&unwire_lines(&before).0);
+    assert_eq!(after, wired.replacen(ISSUE_JUMP, &raised, 1));
+    assert_eq!(
+        lands_after(&after, "pam_fprintd.so", 2),
+        PERMIT_LANDING,
+        "the fingerprint's success lands on irlume's permit line"
+    );
+    // irlume's keyring and reseal lines run after it, as they did.
+    let lines: Vec<&str> = after.lines().collect();
+    let at = lines.iter().position(|l| *l == PERMIT_LANDING).unwrap();
+    assert_eq!(&lines[at + 1..at + 3], &[KEYRING_UNSEAL, RESEAL_AUTH]);
+    // From then on an enable without the flag finds the file right.
+    let again = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert!(!again.unmet, "{again}");
+    assert!(!again.message.contains("--adjust-jumps"), "{again}");
+    assert_eq!(read_file(svc.etc), after);
+}
+
+/// `enable --adjust-jumps` then `disable --adjust-jumps` gives the
+/// administrator's jump back its value, and the file is the one before the
+/// enable without irlume's lines, byte for byte: for the issue's line with
+/// `default=ignore` and `default=die`, and for a failure jump, which lands
+/// on the same line as before rather than on the permit landing. A disable
+/// without the flag keeps inactive lines in irlume's places, as it did, and
+/// names the flag, and the disable plan marks the surface adjustable.
+/// Enabling again from the file without irlume's lines raises the
+/// fingerprint's success the same way; the failure jump, which there lands
+/// on the gnome-keyring line, skips irlume's keyring lines too and still
+/// lands on it.
+#[test]
+fn adjust_jumps_round_trip_returns_the_administrators_jump() {
+    let fail_jump =
+        ISSUE_JUMP.replacen("[success=1 default=ignore]", "[success=done default=1]", 1);
+    for (jump, raised, again, lowered) in [
+        (
+            ISSUE_JUMP.to_string(),
+            ISSUE_JUMP.replacen("success=1", "success=2", 1),
+            None,
+            "`success=2` becomes `success=1`",
+        ),
+        (
+            ISSUE_JUMP.replacen("default=ignore", "default=die", 1),
+            ISSUE_JUMP.replacen("[success=1 default=ignore]", "[success=2 default=die]", 1),
+            None,
+            "`success=2` becomes `success=1`",
+        ),
+        (
+            fail_jump.clone(),
+            fail_jump.replacen("default=1", "default=3", 1),
+            Some(fail_jump.replacen("default=1", "default=5", 1)),
+            "`default=3` becomes `default=1`",
+        ),
+    ] {
+        let dir = TestDir::new("ovr-adjust-round-trip");
+        let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+        let before = issue_override(&svc, &jump);
+        wire_service_with(&svc, true, &adjusting(true), &face_and_keyring).unwrap();
+        let wired = read_file(svc.etc);
+        assert!(wired.contains(&raised), "{wired}");
+
+        let held = wire_service(&svc, false, false, &face_and_keyring).unwrap();
+        assert_eq!(change_id(&held), "strip-in-place", "{held}");
+        assert!(held.message.contains("inactive"), "{held}");
+        assert!(held.adjustable, "{held}");
+        let planned = plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, false, false);
+        assert_eq!(planned.change, PlannedChange::StripInPlace);
+        assert!(!planned.kept && planned.adjustable);
+        assert!(
+            held.message
+                .contains("sudo irlume login disable --apply --adjust-jumps"),
+            "{held}"
+        );
+        assert!(
+            adjust_offer_of(&held.message).contains(&changed_line(&wired, &raised, lowered)),
+            "{held}"
+        );
+
+        let off = wire_service_with(&svc, false, &adjusting(true), &face_and_keyring).unwrap();
+        assert_eq!(change_id(&off), "strip-in-place", "{off}");
+        assert!(!off.adjustable, "{off}");
+        let after = read_file(svc.etc);
+        assert_eq!(after, unwire_lines(&before).0, "{jump}: {off}");
+        assert!(after.contains(&jump), "{after}");
+        assert!(!after.lines().any(is_irlume_line), "{after}");
+        // With irlume's lines gone the disable plan has nothing left to do.
+        let planned = plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, false, false);
+        assert!(!planned.adjustable);
+
+        // Enabling again, now from a file with none of irlume's lines, puts
+        // them next to the password substack and adjusts the jump again.
+        let on = wire_service_with(&svc, true, &adjusting(true), &face_and_keyring).unwrap();
+        assert!(!on.unmet, "{on}");
+        let expected = match &again {
+            Some(line) => wired.replacen(&raised, line, 1),
+            None => wired.clone(),
+        };
+        assert_eq!(read_file(svc.etc), expected, "{jump}: {on}");
+        if again.is_some() {
+            assert_eq!(
+                lands_after(&expected, "pam_fprintd.so", 5),
+                "-auth        optional      pam_gnome_keyring.so"
+            );
+        }
+    }
+}
+
+/// What `--adjust-jumps` cannot show keeps its landing is refused with the
+/// flag too, and the file is kept: a control not in brackets, a jump past
+/// the end of the stack, and a file with a continued line. None of them is
+/// offered, and the plan does not mark them adjustable.
+#[test]
+fn adjust_jumps_keeps_what_it_cannot_prove() {
+    let continued = ISSUE_JUMP.replacen("# fingerprint", "\\\n# fingerprint", 1);
+    for (label, jump) in [
+        (
+            "not in brackets",
+            "auth       success=1   pam_fprintd.so".to_string(),
+        ),
+        (
+            "past the end",
+            "auth       [success=12 default=ignore]   pam_fprintd.so".to_string(),
+        ),
+        ("continued", continued),
+    ] {
+        let dir = TestDir::new("ovr-adjust-refused");
+        let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+        let before = issue_override(&svc, &jump);
+        let plain = wire_service(&svc, true, false, &face_and_keyring).unwrap();
+        assert!(plain.unmet && !plain.adjustable, "{label}: {plain}");
+        assert!(
+            !plain.message.contains("--adjust-jumps"),
+            "{label}: {plain}"
+        );
+        let with = wire_service_with(&svc, true, &adjusting(true), &face_and_keyring).unwrap();
+        assert_eq!(change_id(&with), "keep-edited-override", "{label}: {with}");
+        assert!(with.unmet && !with.adjustable, "{label}: {with}");
+        if label != "continued" {
+            assert!(
+                with.message.contains("--adjust-jumps cannot keep"),
+                "{label}: {with}"
+            );
+        }
+        assert_eq!(read_file(svc.etc), before, "{label}");
+        let planned = plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false);
+        assert!(planned.kept && !planned.adjustable, "{label}");
+    }
+}
+
+/// The machine API never changes an administrator's jump: a surface the
+/// plan marks adjustable is kept by `login apply` and fails it, as any kept
+/// surface does.
+#[test]
+fn a_machine_apply_keeps_an_adjustable_surface() {
+    let dir = TestDir::new("ovr-adjust-machine");
+    let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+    let before = issue_override(&svc, ISSUE_JUMP);
+    let planned = [plan_surface(
+        &svc,
+        ROLE_LOGIN,
+        &face_and_keyring,
+        true,
+        false,
+    )];
+    assert!(planned[0].kept && planned[0].adjustable);
+    let applied = apply_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false, &planned);
+    assert!(applied.kept, "{:?}", applied.error);
+    assert!(applied.error.is_some());
+    assert_eq!(read_file(svc.etc), before, "nothing written");
+}
+
+/// A file with a line irlume does not read as PAM does, here inside the
+/// range of the administrator's jump: a type PAM does not know, a type led
+/// by a no-break space, a carriage return (on a line of its own, after
+/// blanks, or at the end of the jump's line) and a `substack` that names no
+/// stack. Every enable leaves such a file as it is, and so does every
+/// disable while a jump could count irlume's lines, with or without the
+/// flag: each names the line by its number, none offers the flag, and the
+/// plan does not mark the surface adjustable. The same in a file with none
+/// of irlume's lines.
+#[test]
+fn adjust_jumps_changes_nothing_in_a_file_irlume_does_not_read_as_pam_does() {
+    let gate = "auth       [success=1 default=ignore]   pam_succeed_if.so user ingroup fpusers";
+    let fail = "auth       [success=done default=1]   pam_fprintd.so";
+    for tail in [
+        "\nauht       optional     pam_foo.so",
+        "\n\u{a0}session    optional     pam_foo.so",
+        "\n\r",
+        "\n   \r",
+        "\n\t\r",
+        "\r",
+        "\nauth        substack",
+    ] {
+        for (jump, raised) in [
+            (gate, gate.replacen("success=1", "success=3", 1)),
+            (fail, fail.replacen("default=1", "default=3", 1)),
+        ] {
+            kept_by_every_run(&format!("{jump}{tail}"), &format!("{raised}{tail}"));
+        }
+    }
+    // A file with none of irlume's lines, a gate over a carriage return and
+    // the password substack.
+    let dir = TestDir::new("ovr-adjust-cr-bare");
+    let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+    let with = issue_override(&svc, &format!("{gate}\n\r"));
+    let bare: String = with
+        .split_inclusive('\n')
+        .filter(|l| !is_irlume_line(l.trim_end_matches(['\r', '\n'])))
+        .collect();
+    assert!(bare.contains("\n\r\n"), "{bare:?}");
+    std::fs::write(svc.etc, &bare).unwrap();
+    let plain = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert!(plain.unmet && !plain.adjustable, "{plain}");
+    let on = wire_service_with(&svc, true, &adjusting(true), &face_and_keyring).unwrap();
+    assert!(on.unmet && !on.adjustable, "{on}");
+    assert!(on.message.contains("carriage return"), "{on}");
+    assert!(!on.message.contains("--adjust-jumps"), "{on}");
+    assert_eq!(read_file(svc.etc), bare);
+}
+
+/// With `lines` in the #875 file, and with `raised` in the stack a raise
+/// would have written: every enable and every disable, with or without
+/// `--adjust-jumps`, keeps the file as it is and names the line irlume does
+/// not read as PAM does, and none offers the flag.
+fn kept_by_every_run(lines: &str, raised: &str) {
+    // Tests run in parallel in one process: a root of its own for each call.
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let label = format!("{lines:?}");
+    let plain = || WireOpts {
+        apply: true,
+        ..WireOpts::default()
+    };
+    let dir = TestDir::new(&format!("ovr-adjust-unread-{n}"));
+    let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+    let before = issue_override(&svc, lines);
+    for opts in [plain(), adjusting(true)] {
+        let on = wire_service_with(&svc, true, &opts, &face_and_keyring).unwrap();
+        assert_eq!(change_id(&on), "keep-edited-override", "{label}: {on}");
+        assert!(on.unmet && !on.adjustable, "{label}: {on}");
+        assert!(
+            on.message.contains("irlume does not read line "),
+            "{label}: {on}"
+        );
+        assert!(!on.message.contains("--adjust-jumps"), "{label}: {on}");
+        assert_eq!(read_file(svc.etc), before, "{label}");
+    }
+    let planned = plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false);
+    assert!(planned.kept && !planned.adjustable, "{label}");
+
+    let dir = TestDir::new(&format!("ovr-adjust-unread-off-{n}"));
+    let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+    ship_stack(&svc, "password-auth");
+    wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    let wired = with_line(&read_file(svc.etc), raised);
+    std::fs::write(svc.etc, &wired).unwrap();
+    for opts in [plain(), adjusting(true)] {
+        let off = wire_service_with(&svc, false, &opts, &face_and_keyring).unwrap();
+        assert_eq!(change_id(&off), "keep-edited-override", "{label}: {off}");
+        assert!(off.unmet && !off.adjustable, "{label}: {off}");
+        assert!(
+            off.message.contains("irlume does not read line "),
+            "{label}: {off}"
+        );
+        assert!(!off.message.contains("--adjust-jumps"), "{label}: {off}");
+        assert_eq!(read_file(svc.etc), wired, "{label}");
+    }
+    let planned = plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, false, false);
+    assert!(!planned.adjustable, "{label}");
+}
+
+/// Messages about a numeric jump irlume's lines would move name each line
+/// by its number, and irlume's lines by what they are, never by their text:
+/// a module's arguments can hold a secret, and reconcile's messages reach
+/// the system journal (#933). Here the jump's line carries such an argument,
+/// through a materialization's warning, an enable's refusal as a person runs
+/// it and as reconcile logs it, the `--adjust-jumps` offer and preview, and
+/// a disable that keeps inactive lines.
+#[test]
+fn no_jump_message_quotes_a_line() {
+    const SECRET: &str = "kept-out-of-logs";
+    let jump = format!("auth [success=1 default=ignore] pam_fprintd.so token={SECRET}");
+    let substack = "auth        substack      password-auth\n";
+    // A vendor copy with the jump right above its password substack:
+    // making the override moves it, with a warning.
+    let dir = TestDir::new("ovr-no-quote-made");
+    let vendor = UPSTREAM_FEDORA.replacen(substack, &format!("{jump}\n{substack}"), 1);
+    let svc = plasmalogin(&dir.0, &vendor);
+    ship_stack(&svc, "password-auth");
+    let made = wire_service(&svc, true, false, &face_and_keyring).unwrap();
+    let number = vendor.lines().position(|l| l == jump).unwrap() + 1;
+    // Onto the substack below it, past irlume's face line.
+    let vendor_path = svc.vendor.unwrap();
+    assert!(
+        made.message.contains(&format!(
+            "⚠ the jump on line {number} of {vendor_path} now lands on line {} of {vendor_path}",
+            number + 1
+        )),
+        "{made}"
+    );
+    assert!(!made.message.contains(SECRET), "{made}");
+
+    // The #875 file with that jump: the enable is refused.
+    let dir = TestDir::new("ovr-no-quote-enable");
+    let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+    let before = issue_override(&svc, &jump);
+    let at = before.lines().position(|l| l == jump).unwrap() + 1;
+    let person = wire_service(&svc, true, false, &face_and_keyring).unwrap();
+    assert!(
+        person.message.contains(&format!(
+            "the jump on line {at} would then land on line {}",
+            at + 1
+        )),
+        "{person}"
+    );
+    let reconcile = WireOpts {
+        apply: true,
+        enabling: true,
+        ..WireOpts::default()
+    };
+    let reconciled = wire_service_with(&svc, true, &reconcile, &face_and_keyring).unwrap();
+    let logged = outcome_lines(&reconciled, ScopeOrigin::Marker).join("\n");
+    assert!(
+        logged.contains(&format!("the jump on line {at}")),
+        "{logged}"
+    );
+    let preview = wire_service_with(&svc, true, &adjusting(false), &face_and_keyring).unwrap();
+    for message in [&person.message, &logged, &preview.message] {
+        assert!(!message.contains(SECRET), "{message}");
+    }
+    assert_eq!(read_file(svc.etc), before);
+
+    // With irlume's face lines in, a disable without the flag keeps
+    // inactive lines and says why.
+    wire_service_with(&svc, true, &adjusting(true), &face_and_keyring).unwrap();
+    let wired = read_file(svc.etc);
+    let held = wire_service(&svc, false, false, &face_and_keyring).unwrap();
+    assert!(held.message.contains("inactive"), "{held}");
+    let raised = jump.replacen("success=1", "success=2", 1);
+    let at = wired.lines().position(|l| l == raised).unwrap() + 1;
+    assert!(
+        held.message
+            .contains(&format!("without them the jump on line {at} would land on")),
+        "{held}"
+    );
+    let logged = outcome_lines(&held, ScopeOrigin::Marker).join("\n");
+    for message in [&held.message, &logged] {
+        assert!(!message.contains(SECRET), "{message}");
+    }
+}
+
+/// Auth lines PAM installs as modules that always fail: a type with no
+/// control, or with no module. No recipe wires a file with one, so an enable
+/// inside the range of the administrator's jump, with the flag or without
+/// it, reports no anchor to wire, offers no flag, and leaves the file as it
+/// is. A session line with no control is in no auth chain: there the plain
+/// enable offers the flag, `enable --adjust-jumps` raises the jump over
+/// irlume's lines, and `disable --adjust-jumps` gives the file back.
+#[test]
+fn adjust_jumps_and_a_line_with_a_type_and_no_control() {
+    let gate = "auth       [success=1 default=ignore]   pam_succeed_if.so user ingroup fpusers";
+    let fail = "auth       [success=done default=1]   pam_fprintd.so";
+    let plain = || WireOpts {
+        apply: true,
+        ..WireOpts::default()
+    };
+    for odd in FAILING_AUTH_LINES {
+        for jump in [gate, fail] {
+            let label = format!("{jump} / {odd:?}");
+            let dir = TestDir::new("ovr-adjust-failing-line");
+            let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+            let before = issue_override(&svc, &format!("{jump}\n{odd}"));
+            for opts in [plain(), adjusting(true)] {
+                let on = wire_service_with(&svc, true, &opts, &face_and_keyring).unwrap();
+                assert_eq!(change_id(&on), "no-anchor", "{label}: {on}");
+                assert!(!on.adjustable, "{label}: {on}");
+                assert!(!on.message.contains("--adjust-jumps"), "{label}: {on}");
+                assert_eq!(read_file(svc.etc), before, "{label}");
+            }
+        }
+    }
+    for (jump, raised, module) in [
+        (
+            gate,
+            gate.replacen("success=1", "success=3", 1),
+            "pam_succeed_if.so",
+        ),
+        (
+            fail,
+            fail.replacen("default=1", "default=3", 1),
+            "pam_fprintd.so",
+        ),
+    ] {
+        let dir = TestDir::new("ovr-adjust-session-no-control");
+        let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+        let before = issue_override(&svc, &format!("{jump}\nsession"));
+        let plain = wire_service(&svc, true, false, &face_and_keyring).unwrap();
+        assert!(plain.unmet && plain.adjustable, "{jump}: {plain}");
+        let on = wire_service_with(&svc, true, &adjusting(true), &face_and_keyring).unwrap();
+        assert!(!on.unmet, "{jump}: {on}");
+        let after = read_file(svc.etc);
+        assert!(after.contains(&raised), "{after}");
+        assert_eq!(lands_after(&after, module, 3), KEYRING_UNSEAL);
+        wire_service_with(&svc, false, &adjusting(true), &face_and_keyring).unwrap();
+        assert_eq!(read_file(svc.etc), unwire_lines(&before).0, "{jump}");
+    }
+}
+
+/// The auth lines PAM installs as modules that always fail, which no recipe
+/// wires around: a type with no control, or with no module.
+const FAILING_AUTH_LINES: [&str; 4] = [
+    "auth",
+    "-auth",
+    "auth       required",
+    "auth       [default=ignore]",
+];
+
+/// A disable counts an auth line PAM installs as a module that always fails
+/// as PAM does. No enable wires around one, but an administrator can add one
+/// to a file irlume's lines are already in, inside the range of a jump that
+/// counts them: the plain disable keeps inactive lines and offers the flag,
+/// and `disable --adjust-jumps` takes irlume's lines out and lowers the jump
+/// past that line, so it still lands on the password substack.
+#[test]
+fn disable_adjust_jumps_counts_an_auth_line_that_always_fails() {
+    let gate = "auth       [success=1 default=ignore]   pam_succeed_if.so user ingroup fpusers";
+    let fail = "auth       [success=done default=1]   pam_fprintd.so";
+    let substack = "auth        substack      password-auth";
+    for odd in FAILING_AUTH_LINES {
+        for (jump, raised, module) in [
+            (
+                gate,
+                gate.replacen("success=1", "success=2", 1),
+                "pam_succeed_if.so",
+            ),
+            (
+                fail,
+                fail.replacen("default=1", "default=2", 1),
+                "pam_fprintd.so",
+            ),
+        ] {
+            let label = format!("{jump} / {odd:?}");
+            let dir = TestDir::new("ovr-adjust-failing-line-off");
+            let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+            ship_stack(&svc, "password-auth");
+            wire_service(&svc, true, true, &face_and_keyring).unwrap();
+            let wired = with_line(&read_file(svc.etc), &format!("{raised}\n{odd}"));
+            std::fs::write(svc.etc, &wired).unwrap();
+            assert_eq!(lands_after(&wired, module, 2), substack, "{label}");
+            let held = wire_service(&svc, false, false, &face_and_keyring).unwrap();
+            assert_eq!(change_id(&held), "strip-in-place", "{label}: {held}");
+            assert!(held.adjustable, "{label}: {held}");
+            assert!(
+                held.message
+                    .contains("sudo irlume login disable --apply --adjust-jumps"),
+                "{label}: {held}"
+            );
+            assert_eq!(
+                read_file(svc.etc),
+                wired,
+                "{label}: a preview writes nothing"
+            );
+            let off = wire_service_with(&svc, false, &adjusting(true), &face_and_keyring).unwrap();
+            assert_eq!(change_id(&off), "strip-in-place", "{label}: {off}");
+            let after = read_file(svc.etc);
+            assert_eq!(
+                after,
+                unwire_lines(&wired).0.replacen(&raised, jump, 1),
+                "{label}"
+            );
+            assert_eq!(lands_after(&after, module, 1), substack, "{label}");
+        }
+    }
+}
+
+/// An enable takes irlume's lines out of a surface its configuration no
+/// longer wants them in (face login turned off, say) the way a disable does,
+/// and there offers the command the person ran: `login enable
+/// --adjust-jumps`, which acts on that surface, never `login disable`, which
+/// would unwire every other surface too. The plan marks the surface
+/// adjustable and not kept, as an enable plan does for a surface it unwires,
+/// and the enable with the flag removes irlume's lines and lowers the jump.
+#[test]
+fn an_enable_that_unwires_a_surface_offers_the_enable_with_the_flag() {
+    let dir = TestDir::new("ovr-adjust-enable-unwire");
+    let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+    let before = issue_override(&svc, ISSUE_JUMP);
+    wire_service_with(&svc, true, &adjusting(true), &face_and_keyring).unwrap();
+    let wired = read_file(svc.etc);
+    let enabling = |apply: bool, adjust_jumps: bool| WireOpts {
+        apply,
+        adjust_jumps,
+        enabling: true,
+        ..WireOpts::default()
+    };
+    let held = wire_service_with(&svc, false, &enabling(false, false), &face_and_keyring).unwrap();
+    assert_eq!(change_id(&held), "strip-in-place", "{held}");
+    assert!(held.adjustable && !held.unmet, "{held}");
+    for named in [
+        "irlume login enable --adjust-jumps   (preview)",
+        "sudo irlume login enable --apply --adjust-jumps",
+    ] {
+        assert!(held.message.contains(named), "{named}\n{held}");
+    }
+    assert!(!held.message.contains("disable --adjust-jumps"), "{held}");
+    assert!(
+        !held.message.contains("disable --apply --adjust-jumps"),
+        "{held}"
+    );
+    assert_eq!(read_file(svc.etc), wired, "a preview writes nothing");
+    // What an enable plan computes for a surface it no longer wants wired.
+    let planned = plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, false, false);
+    assert_eq!(planned.change, PlannedChange::StripInPlace);
+    assert!(!planned.kept && planned.adjustable);
+    let off = wire_service_with(&svc, false, &enabling(true, true), &face_and_keyring).unwrap();
+    assert_eq!(change_id(&off), "strip-in-place", "{off}");
+    assert!(!off.adjustable, "{off}");
+    assert_eq!(read_file(svc.etc), unwire_lines(&before).0);
+}
+
+/// The applied enable names the administrator's line it changed, and so no
+/// longer says it kept every line irlume did not write: it kept the other
+/// ones.
+#[test]
+fn the_applied_enable_says_it_kept_the_other_lines() {
+    let dir = TestDir::new("ovr-adjust-applied-message");
+    let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+    issue_override(&svc, ISSUE_JUMP);
+    let on = wire_service_with(&svc, true, &adjusting(true), &face_and_keyring).unwrap();
+    assert_eq!(change_id(&on), "rewire-override", "{on}");
+    assert!(
+        on.message
+            .contains("updated irlume's lines and kept the other lines irlume did not write"),
+        "{on}"
+    );
+    assert!(
+        on.message.contains("--adjust-jumps changed this line"),
+        "{on}"
+    );
+    assert!(!on.message.contains("{other}"), "{on}");
+    // Without an adjusted line, every line irlume did not write is kept.
+    let dir = TestDir::new("ovr-adjust-applied-plain");
+    let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+    issue_override(&svc, LOCAL_LINE);
+    let on = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert!(
+        on.message
+            .contains("updated irlume's lines and kept the lines irlume did not write"),
+        "{on}"
+    );
+    assert!(!on.message.contains("{other}"), "{on}");
+}
+
+/// What `refused_both_ways` checks, for one line next to the administrator's
+/// jump that `--adjust-jumps` cannot count as PAM does (a `substack` whose
+/// file PAM cannot load).
+struct Odd<'a> {
+    /// The administrator's jump and the line, as they go into the file.
+    lines: &'a str,
+    /// The jump as a raise would have written it, and the line.
+    raised: &'a str,
+    /// Part of the reason the flag gives.
+    why: &'a str,
+}
+
+/// With `odd.lines` in the #875 file: the plain enable keeps the file and
+/// does not offer the flag, the plan does not mark the surface adjustable,
+/// and the enable with the flag keeps the file and says why. With
+/// `odd.raised` in the stack a raise would have written: the plain disable
+/// does not offer the flag either, and the disable with the flag keeps
+/// inactive lines, as without it, and says why. `setup` prepares each
+/// temporary root.
+fn refused_both_ways(odd: &Odd<'_>, setup: &dyn Fn(&Svc)) {
+    // Tests run in parallel in one process: a root of its own for each call.
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let label = format!("{:?}", odd.lines);
+    let dir = TestDir::new(&format!("ovr-adjust-odd-{n}"));
+    let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+    setup(&svc);
+    let before = issue_override(&svc, odd.lines);
+    let plain = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert!(plain.unmet && !plain.adjustable, "{label}: {plain}");
+    assert!(
+        !plain.message.contains("--apply --adjust-jumps"),
+        "{label}: {plain}"
+    );
+    assert_eq!(read_file(svc.etc), before, "{label}");
+    let planned = plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false);
+    assert!(planned.kept && !planned.adjustable, "{label}");
+    let with = wire_service_with(&svc, true, &adjusting(true), &face_and_keyring).unwrap();
+    assert_eq!(change_id(&with), "keep-edited-override", "{label}: {with}");
+    assert!(with.unmet && !with.adjustable, "{label}: {with}");
+    for named in ["--adjust-jumps cannot keep", odd.why] {
+        assert!(with.message.contains(named), "{label}: {named}\n{with}");
+    }
+    assert_eq!(read_file(svc.etc), before, "{label}");
+
+    let dir = TestDir::new(&format!("ovr-adjust-odd-off-{n}"));
+    let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+    setup(&svc);
+    ship_stack(&svc, "password-auth");
+    wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    let wired = with_line(&read_file(svc.etc), odd.raised);
+    std::fs::write(svc.etc, &wired).unwrap();
+    let plain = wire_service(&svc, false, false, &face_and_keyring).unwrap();
+    assert_eq!(change_id(&plain), "strip-in-place", "{label}: {plain}");
+    assert!(!plain.adjustable, "{label}: {plain}");
+    assert!(
+        !plain.message.contains("--adjust-jumps"),
+        "{label}: {plain}"
+    );
+    let planned = plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, false, false);
+    assert!(!planned.kept && !planned.adjustable, "{label}");
+    let off = wire_service_with(&svc, false, &adjusting(true), &face_and_keyring).unwrap();
+    assert_eq!(change_id(&off), "strip-in-place", "{label}: {off}");
+    for named in ["inactive", "--adjust-jumps cannot keep", odd.why] {
+        assert!(off.message.contains(named), "{label}: {named}\n{off}");
+    }
+    let after = read_file(svc.etc);
+    let raised_jump = odd.raised.lines().next().unwrap().trim_end_matches('\r');
+    assert!(
+        after.contains(raised_jump),
+        "{label}: the jump keeps its value"
+    );
+    assert!(after.contains(INERT_TAG), "{label}: {after}");
+}
+
+/// A `substack` whose file PAM cannot load is two modules to PAM: the
+/// substack, then one that always fails. irlume counts one line. A gate's
+/// success or a failed fingerprint over it and the password substack,
+/// raised by irlume's count, would land a line further in PAM, on irlume's
+/// permit landing. Refused both ways, the file kept on enable, whether the
+/// file is missing or the name is a directory in `/etc/pam.d` over a file in
+/// `/usr/lib/pam.d` (PAM opens the first). A substack whose file PAM loads
+/// is adjusted like any line, in `/etc/pam.d` or `/usr/lib/pam.d`, and the
+/// disable with the flag gives the file back. One that names no stack is a
+/// line irlume does not read as PAM does
+/// (`adjust_jumps_changes_nothing_in_a_file_irlume_does_not_read_as_pam_does`).
+#[test]
+fn adjust_jumps_refuses_a_substack_pam_cannot_open() {
+    let gate = "auth       [success=2 default=ignore]   pam_succeed_if.so user ingroup fpusers";
+    let fail = "auth       [success=done default=2]   pam_fprintd.so";
+    let shadowed = |svc: &Svc| {
+        let etc = Path::new(svc.etc).parent().unwrap();
+        std::fs::create_dir(etc.join("fingerprint-dir")).unwrap();
+        let usr = Path::new(svc.vendor.unwrap()).parent().unwrap();
+        std::fs::write(usr.join("fingerprint-dir"), "auth required pam_unix.so\n").unwrap();
+    };
+    for (jump, raised) in [
+        (gate, gate.replacen("success=2", "success=4", 1)),
+        (fail, fail.replacen("default=2", "default=4", 1)),
+    ] {
+        for (odd, setup) in [
+            (
+                "auth        substack      fingerprint-missing",
+                &(|_: &Svc| {}) as &dyn Fn(&Svc),
+            ),
+            ("auth        substack      fingerprint-dir", &shadowed),
+        ] {
+            refused_both_ways(
+                &Odd {
+                    lines: &format!("{jump}\n{odd}"),
+                    raised: &format!("{raised}\n{odd}"),
+                    why: "two modules",
+                },
+                setup,
+            );
+        }
+        for in_etc in [true, false] {
+            let dir = TestDir::new("ovr-adjust-substack-found");
+            let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+            if in_etc {
+                ship_stack(&svc, "fingerprint-auth");
+            } else {
+                let usr = Path::new(svc.vendor.unwrap()).parent().unwrap();
+                std::fs::write(usr.join("fingerprint-auth"), "auth required pam_unix.so\n")
+                    .unwrap();
+            }
+            let known = "auth        substack      fingerprint-auth";
+            let before = issue_override(&svc, &format!("{jump}\n{known}"));
+            let on = wire_service_with(&svc, true, &adjusting(true), &face_and_keyring).unwrap();
+            assert!(!on.unmet, "{jump}: {on}");
+            let wired = read_file(svc.etc);
+            assert!(wired.contains(&raised), "{wired}");
+            wire_service_with(&svc, false, &adjusting(true), &face_and_keyring).unwrap();
+            assert_eq!(read_file(svc.etc), unwire_lines(&before).0, "{jump}");
+        }
+    }
+}
+
+/// `--adjust-jumps` counts a `substack` as one module only where libpam
+/// loads its file as one stack, which `substack_loads` reads through the
+/// reader the recipe uses for the file ([`stack_reader`]): in `/etc/pam.d`,
+/// then `/usr/lib/pam.d`, the first that exists (a dangling link does not),
+/// here under a temporary root. A directory, a name with a `/` in it, a
+/// missing file and a file with a line irlume does not read as PAM does
+/// (one with a module path libpam takes no name from makes it add a module
+/// that always fails after the substack) read as not loaded, and a service
+/// path that is not under `etc/pam.d` looks next to itself only.
+#[test]
+fn a_substack_file_is_looked_up_as_pam_looks_it_up() {
+    let dir = TestDir::new("stack-opens");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    let etc = Path::new(svc.etc).parent().unwrap();
+    let usr = Path::new(svc.vendor.unwrap()).parent().unwrap();
+    let stack = "auth required pam_unix.so\n";
+    std::fs::write(etc.join("in-etc"), stack).unwrap();
+    std::fs::write(usr.join("in-usr"), stack).unwrap();
+    std::fs::create_dir(etc.join("shadowed")).unwrap();
+    std::fs::write(usr.join("shadowed"), stack).unwrap();
+    std::os::unix::fs::symlink(etc.join("nowhere"), etc.join("dangling")).unwrap();
+    std::fs::write(usr.join("dangling"), stack).unwrap();
+    std::fs::write(
+        etc.join("no-name"),
+        "auth required pam_unix.so\nauth required .so\n",
+    )
+    .unwrap();
+    std::fs::write(etc.join("typo"), "auht required pam_unix.so\n").unwrap();
+    std::fs::write(
+        etc.join("continued"),
+        "auth required pam_unix.so \\\n  nullok\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.0.join("opt/pam")).unwrap();
+    std::fs::write(dir.0.join("opt/pam/stack"), stack).unwrap();
+    let reader = stack_reader(svc.etc);
+    for (name, loads) in [
+        ("in-etc", true),
+        ("in-usr", true),
+        ("dangling", true),
+        ("shadowed", false),
+        ("missing", false),
+        ("no-name", false),
+        ("typo", false),
+        ("continued", false),
+        ("/opt/pam/stack", false),
+        ("/opt/pam/missing", false),
+        ("/opt/pam", false),
+        ("", false),
+    ] {
+        assert_eq!(substack_loads(&reader, name), loads, "{name:?}");
+    }
+    let elsewhere = leak_path(&dir.0.join("srv/plasmalogin"));
+    assert!(!substack_loads(&stack_reader(elsewhere), "in-etc"));
+}
+
+/// After a disable without the flag, which leaves inactive lines in irlume's
+/// places, an enable that would move the #875 jump cannot adjust it: the
+/// inactive lines change as well, and the adjustment counts only lines
+/// irlume adds. Both the plain enable and the enable with the flag keep the
+/// file and name the two commands that get there, and the plan does not
+/// mark the surface adjustable. The disable with the flag takes the
+/// inactive lines out, and the enable with the flag then lands the
+/// fingerprint's success on irlume's permit landing, as from the issue's
+/// file. Where the disable with the flag would keep the inactive lines as
+/// well, here for a jump that crosses an include, the enable says so
+/// instead of naming the commands.
+#[test]
+fn an_enable_over_inactive_lines_names_the_disable_with_the_flag() {
+    let dir = TestDir::new("ovr-adjust-after-plain-disable-include");
+    let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+    let across = "auth       [success=12 default=ignore]   pam_fprintd.so";
+    issue_override(&svc, across);
+    wire_service(&svc, false, true, &face_and_keyring).unwrap();
+    let inert = read_file(svc.etc);
+    assert!(inert.contains(INERT_TAG), "{inert}");
+    let kept = wire_service_with(&svc, true, &adjusting(true), &face_and_keyring).unwrap();
+    assert!(kept.unmet && !kept.adjustable, "{kept}");
+    for named in [
+        "irlume's lines already in the file",
+        "`irlume login disable --adjust-jumps` cannot take them out either",
+        "include",
+    ] {
+        assert!(kept.message.contains(named), "{named}\n{kept}");
+    }
+    assert!(
+        !kept
+            .message
+            .contains("sudo irlume login disable --apply --adjust-jumps"),
+        "{kept}"
+    );
+    let off = wire_service_with(&svc, false, &adjusting(true), &face_and_keyring).unwrap();
+    assert!(off.message.contains("--adjust-jumps cannot keep"), "{off}");
+    assert_eq!(read_file(svc.etc), inert, "the disable keeps them too");
+
+    let dir = TestDir::new("ovr-adjust-after-plain-disable");
+    let svc = plasmalogin(&dir.0, &fedora_with_oo7());
+    let before = issue_override(&svc, ISSUE_JUMP);
+    let held = wire_service(&svc, false, true, &face_and_keyring).unwrap();
+    assert!(held.adjustable, "{held}");
+    let inert = read_file(svc.etc);
+    assert!(inert.contains(INERT_TAG), "{inert}");
+    for adjust_jumps in [false, true] {
+        let opts = WireOpts {
+            apply: true,
+            adjust_jumps,
+            ..WireOpts::default()
+        };
+        let kept = wire_service_with(&svc, true, &opts, &face_and_keyring).unwrap();
+        assert_eq!(change_id(&kept), "keep-edited-override", "{kept}");
+        assert!(kept.unmet && !kept.adjustable, "{kept}");
+        for named in [
+            "irlume's lines already in the file",
+            "sudo irlume login disable --apply --adjust-jumps",
+            "sudo irlume login enable --apply --adjust-jumps",
+        ] {
+            assert!(kept.message.contains(named), "{named}\n{kept}");
+        }
+        assert_eq!(read_file(svc.etc), inert);
+    }
+    let planned = plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false);
+    assert!(planned.kept && !planned.adjustable);
+
+    wire_service_with(&svc, false, &adjusting(true), &face_and_keyring).unwrap();
+    assert_eq!(read_file(svc.etc), unwire_lines(&before).0);
+    let on = wire_service_with(&svc, true, &adjusting(true), &face_and_keyring).unwrap();
+    assert!(!on.unmet, "{on}");
+    let after = read_file(svc.etc);
+    let raised = ISSUE_JUMP.replacen("success=1", "success=2", 1);
+    assert!(after.contains(&raised), "{after}");
+    assert_eq!(lands_after(&after, "pam_fprintd.so", 2), PERMIT_LANDING);
 }

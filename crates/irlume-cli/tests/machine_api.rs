@@ -654,6 +654,21 @@ fn login_plan_answers_for_both_actions() {
             if change["kept"] == serde_json::json!(true) {
                 assert_eq!(change["writes"], serde_json::json!(false), "{change}");
             }
+            // `--adjust-jumps` handles differently only a kept enable
+            // surface, or a surface the run unwires (every surface of a
+            // disable, one an enable no longer wants wired) and leaves with
+            // inactive lines.
+            assert!(change["jumps_adjustable"].is_boolean());
+            if change["jumps_adjustable"] == serde_json::json!(true) {
+                if change["kept"] == serde_json::json!(true) {
+                    assert_eq!(action, "enable", "{change}");
+                } else {
+                    assert!(
+                        change["change"] == "strip-in-place" || change["change"] == "not-wired",
+                        "{change}"
+                    );
+                }
+            }
         }
         // requires_root must agree with the write count rather than being an
         // independent claim a consumer could act on wrongly.

@@ -267,14 +267,15 @@ const POLKIT: Svc = Svc {
 
 // ---- CLI entry ---------------------------------------------------------------
 
-const LOGIN_USAGE: &str =
-    "usage: irlume login <status|enable|disable|reconcile> [--with-sudo] [--with-polkit] [--apply] [--force]";
+const LOGIN_USAGE: &str = "usage: irlume login <status|enable|disable|reconcile> [--with-sudo] \
+     [--with-polkit] [--apply] [--force] [--adjust-jumps]";
 
 pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
     let apply = args.iter().any(|a| a == "--apply");
     let with_sudo = args.iter().any(|a| a == "--with-sudo");
     let with_polkit = args.iter().any(|a| a == "--with-polkit");
     let force = args.iter().any(|a| a == "--force");
+    let adjust_jumps = args.iter().any(|a| a == "--adjust-jumps");
     // `--force` is a person overriding a refusal: an enable rebuilds
     // overrides an administrator edited, and a disable goes ahead although a
     // GNOME keyring token depends on the line it removes. Reconcile runs
@@ -284,6 +285,17 @@ pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
         eprintln!("  (--force applies to login enable and disable only)");
         return ExitCode::from(2);
     }
+    // `--adjust-jumps` is a person agreeing to a change of a line irlume did
+    // not write, for the same two commands.
+    if adjust_jumps && !matches!(action, Some("enable" | "disable")) {
+        eprintln!("{LOGIN_USAGE}");
+        eprintln!("  (--adjust-jumps applies to login enable and disable only)");
+        return ExitCode::from(2);
+    }
+    let flags = RunFlags {
+        force,
+        adjust_jumps,
+    };
     // On NixOS the system configuration generates the stacks, and the flake
     // module writes irlume's rules. Refused ahead of the root check, the PAM
     // lock and the capability reading, so nothing is asked for or touched.
@@ -299,8 +311,8 @@ pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
             eprintln!("{}", crate::nixos::LOGIN_REFUSAL);
             ExitCode::FAILURE
         }
-        Some("enable") => act(true, apply, with_sudo, with_polkit, force),
-        Some("disable") => act(false, apply, with_sudo, with_polkit, force),
+        Some("enable") => act(true, apply, with_sudo, with_polkit, flags),
+        Some("disable") => act(false, apply, with_sudo, with_polkit, flags),
         Some("reconcile") => reconcile(),
         _ => {
             eprintln!("{LOGIN_USAGE}");
@@ -924,7 +936,7 @@ fn reconcile_wiring(
         with_sudo,
         with_polkit,
         ScopeOrigin::Marker,
-        false,
+        RunFlags::default(),
     )
 }
 
@@ -1582,6 +1594,14 @@ pub(crate) struct PlannedSurface {
     /// edited file whose irlume lines are already right, and the same file
     /// can be either, depending on the lines the configuration wants.
     pub(crate) kept: bool,
+    /// Whether the person's `--adjust-jumps` would handle the surface
+    /// differently because of an administrator's numeric jump
+    /// ([`WireOutcome`]'s `adjustable`): an enable kept only because the
+    /// update would move that jump, or a surface the run takes irlume's
+    /// lines out of (every surface of a disable, and one an enable no longer
+    /// wants wired) that keeps inactive lines where the flag removes them.
+    /// The machine apply never changes such a line.
+    pub(crate) adjustable: bool,
 }
 
 /// What `login enable`/`login disable` would change, computed without writing.
@@ -1707,9 +1727,9 @@ fn plan_surface(
     // A service whose decision cannot even be computed (an unreadable file)
     // is reported as not-installed rather than omitted: a surface silently
     // missing from a plan is how a consumer comes to believe it was covered.
-    let (change, kept) = wire_service(svc, want, false, wire)
-        .map(|outcome| (outcome.change, outcome.unmet))
-        .unwrap_or((PlannedChange::NotInstalled, false));
+    let (change, kept, adjustable) = wire_service(svc, want, false, wire)
+        .map(|outcome| (outcome.change, outcome.unmet, outcome.adjustable))
+        .unwrap_or((PlannedChange::NotInstalled, false, false));
     PlannedSurface {
         id: service_name(svc.etc),
         role,
@@ -1720,6 +1740,7 @@ fn plan_surface(
         want,
         face_blocked,
         kept,
+        adjustable,
     }
 }
 
@@ -2051,9 +2072,13 @@ fn apply_surface(
         // nothing to roll back to, so writing would be irreversible.
         return untouched_record(svc, role, message);
     }
+    // Neither `--force` nor `--adjust-jumps`: the machine API never rebuilds
+    // an edited override or changes a line irlume did not write.
     let opts = WireOpts {
         apply: true,
         force: false,
+        adjust_jumps: false,
+        enabling: false,
         expect_vendor: planned_state
             .filter(|_| svc.vendor.is_some())
             .and_then(|state| state.split(' ').nth(2))
@@ -2181,23 +2206,38 @@ fn settle_surface(
     }
 }
 
+/// The flags of `login enable` and `login disable` that let a person past a
+/// refusal. Reconcile passes neither.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RunFlags {
+    /// `--force`.
+    force: bool,
+    /// `--adjust-jumps`.
+    adjust_jumps: bool,
+}
+
 /// The command a person without root is told to run: the same action and
 /// flags, with `--apply`, so following it literally does what they asked.
-fn sudo_rerun_hint(enable: bool, with_sudo: bool, with_polkit: bool, force: bool) -> String {
+fn sudo_rerun_hint(enable: bool, with_sudo: bool, with_polkit: bool, flags: RunFlags) -> String {
     format!(
-        "sudo irlume login {}{}{} --apply{}",
+        "sudo irlume login {}{}{} --apply{}{}",
         if enable { "enable" } else { "disable" },
         if with_sudo { " --with-sudo" } else { "" },
         if with_polkit { " --with-polkit" } else { "" },
-        if force { " --force" } else { "" }
+        if flags.force { " --force" } else { "" },
+        if flags.adjust_jumps {
+            " --adjust-jumps"
+        } else {
+            ""
+        }
     )
 }
 
-fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool, force: bool) -> ExitCode {
+fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool, flags: RunFlags) -> ExitCode {
     if apply && effective_uid() != 0 {
         eprintln!(
             "[login] applying changes needs root; run: {}",
-            sudo_rerun_hint(enable, with_sudo, with_polkit, force)
+            sudo_rerun_hint(enable, with_sudo, with_polkit, flags)
         );
         return ExitCode::FAILURE;
     }
@@ -2221,7 +2261,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool, force: boo
         with_sudo,
         with_polkit,
         ScopeOrigin::Command,
-        force,
+        flags,
     )
 }
 
@@ -2326,11 +2366,19 @@ fn act_holding_lock(
     with_sudo: bool,
     with_polkit: bool,
     origin: ScopeOrigin,
-    force: bool,
+    flags: RunFlags,
 ) -> ExitCode {
+    let RunFlags {
+        force,
+        adjust_jumps,
+    } = flags;
     let opts = WireOpts {
         apply,
         force: force && enable && origin == ScopeOrigin::Command,
+        // A person's run only: reconcile never changes a line irlume did not
+        // write.
+        adjust_jumps: adjust_jumps && origin == ScopeOrigin::Command,
+        enabling: enable,
         expect_vendor: None,
     };
     if !apply {
@@ -2781,6 +2829,12 @@ pub(crate) struct WireOutcome {
     /// them was refused (it would have moved a jump or one of irlume's lines
     /// past an administrator's line), so the file keeps its earlier ones.
     pub(crate) unmet: bool,
+    /// `--adjust-jumps` would handle the file differently because of a
+    /// numeric jump: an enable refused (`unmet`) only because the update
+    /// would move that jump, or a run taking irlume's lines out that leaves
+    /// inactive lines where the flag removes them, lowering a jump that
+    /// counts them or moving a landing off one of them.
+    pub(crate) adjustable: bool,
 }
 
 /// How a `wire_service` call may act.
@@ -2791,6 +2845,14 @@ struct WireOpts {
     /// `login enable --force`: rebuild an override with lines irlume did not
     /// write from the vendor copy, keeping the old file as `.pre-irlume`.
     force: bool,
+    /// `login enable --adjust-jumps` or `login disable --adjust-jumps`: in an
+    /// override, change the value of a numeric jump irlume's lines would
+    /// move, so it lands where it did, rather than keep the file.
+    adjust_jumps: bool,
+    /// The person's run is a `login enable`, which also takes irlume's lines
+    /// out of a surface its configuration no longer wants them in: a message
+    /// then offers `enable`, the command they ran, not `disable`.
+    enabling: bool,
     /// The vendor file's digest the machine plan was computed against. A
     /// different one at the moment of reading refuses the surface, so the
     /// vendor copy a plan showed is the one the write uses.
@@ -2833,6 +2895,21 @@ fn scope_flag(etc: &str) -> &'static str {
     }
 }
 
+/// Whether libpam loads the stack file `name` a `substack` line names as one
+/// stack, as far as irlume can tell: `reader` ([`stack_reader`], the reader
+/// the recipe uses for the file) finds it where libpam finds it and reads it,
+/// and irlume reads every line of it as libpam does ([`unreadable_line`]),
+/// none of them continued. libpam adds a module that always fails after a
+/// substack whose file it cannot open or load, one with a module path it
+/// takes no name from among its lines, so a jump over such a line skips two
+/// modules. Anything else irlume cannot read, a name with a `/` in it among
+/// them, reads as not loaded, which only keeps `--adjust-jumps` from changing
+/// a jump.
+fn substack_loads(reader: &StackReader, name: &str) -> bool {
+    reader(name)
+        .is_some_and(|text| !has_line_continuation(&text) && unreadable_line(&text).is_none())
+}
+
 /// The override strategy: an irlume-created `/etc` copy of a vendor file, or
 /// none yet. Every decision is [`overrides::decide`]'s; this reads its inputs
 /// and carries out what it chose.
@@ -2851,6 +2928,7 @@ fn wire_override(
             message: format!("· {}: not wired", s.etc),
             detail: None,
             unmet: false,
+            adjustable: false,
         });
     }
     // Read once, and compared with the plan's digest when there is one, so the
@@ -2887,9 +2965,10 @@ fn wire_override(
     } else {
         None
     };
-    // The stacks an include names are read where libpam finds them for this
-    // file, as the recipe reads them.
-    let decision = with_stack_reader(stack_reader(s.etc), || {
+    // The stacks an include or a substack names are read where libpam finds
+    // them for this file, as the recipe reads them.
+    let reader = stack_reader(s.etc);
+    let decision = with_stack_reader(reader.clone(), || {
         overrides::decide(&overrides::Input {
             etc: s.etc,
             vendor_path,
@@ -2898,8 +2977,15 @@ fn wire_override(
             backup: backup.as_deref(),
             enable,
             force: opts.force,
+            adjust_jumps: opts.adjust_jumps,
+            command: if enable || opts.enabling {
+                "enable"
+            } else {
+                "disable"
+            },
             scope_flag: scope_flag(s.etc),
             wire,
+            opens: &|name| substack_loads(&reader, name),
         })
     })?;
     if opts.apply {
@@ -2970,6 +3056,7 @@ fn wire_override(
         message: decision.message,
         detail: decision.detail,
         unmet: decision.unmet,
+        adjustable: decision.adjustable,
     })
 }
 
@@ -3004,6 +3091,7 @@ fn header_write_refused(
         ),
         detail: None,
         unmet: false,
+        adjustable: false,
     })
 }
 
@@ -3041,6 +3129,7 @@ fn wire_service_with(
             message,
             detail: None,
             unmet: false,
+            adjustable: false,
         })
     };
     let etc = Path::new(s.etc);
@@ -3146,6 +3235,7 @@ fn wire_service_with(
                         message,
                         detail: None,
                         unmet: true,
+                        adjustable: false,
                     });
                 }
             };
@@ -3267,6 +3357,7 @@ fn kept_continued(etc: &str, enable: bool) -> WireOutcome {
         message: overrides::continued_message(etc, enable, None),
         detail: None,
         unmet: true,
+        adjustable: false,
     }
 }
 
@@ -3280,6 +3371,7 @@ fn kept_unreadable(etc: &str, enable: bool, line: &UnreadLine<'_>) -> WireOutcom
         message: overrides::unreadable_message(etc, enable, None, line),
         detail: None,
         unmet: true,
+        adjustable: false,
     }
 }
 
@@ -3312,6 +3404,7 @@ fn disable_unread(
         ),
         detail: None,
         unmet: false,
+        adjustable: false,
     })
 }
 
@@ -3378,7 +3471,11 @@ fn strip_in_place(etc: &str, current: &str) -> (Option<String>, PlannedChange, S
             format!("✓ {etc}: stripped irlume lines"),
         );
     }
-    let why = overrides::shift_reason(&shifts).replacen("would then land on", "would land on", 1);
+    let why = overrides::shift_reason(&shifts, &[overrides::Names::whole(current)]).replacen(
+        "would then land on",
+        "would land on",
+        1,
+    );
     let inert = overrides::neutralize(current);
     if inert == overrides::normalize(current) {
         return (
@@ -3457,7 +3554,7 @@ fn keep_places(etc: &str, current: &str, wired: &str) -> Option<KeptPlaces> {
                 "⚠ {etc}: {state}: irlume's lines do not fit the places its inactive lines \
                  hold, and wiring them without those places would move a jump: {}; adjust that \
                  line",
-                overrides::shift_reason(&shifts)
+                overrides::shift_reason(&shifts, &[overrides::Names::whole(current)])
             )))
         }
         _ => None,
@@ -4604,7 +4701,13 @@ mod tests {
             message.contains("inactive pam_permit.so lines"),
             "{message}"
         );
-        assert!(message.contains("would land on"), "{message}");
+        // The jump and the line it would land on, by their numbers, not
+        // their text.
+        assert!(
+            message.contains("without them the jump on line 1 would land on line 5"),
+            "{message}"
+        );
+        assert!(!message.contains("ingroup fast"), "{message}");
         // The next disable while the jump still counts them writes nothing;
         // once the jump is gone it takes the inactive lines out.
         let (again, change, message) = strip_in_place("/etc/pam.d/sudo", &body);
@@ -4862,8 +4965,12 @@ mod tests {
                     message.starts_with("⚠ /etc/pam.d/sudo: not wired"),
                     "{message}"
                 );
-                assert!(message.contains("would then land on"), "{message}");
-                assert!(message.contains("pam_succeed_if.so"), "{message}");
+                // The jump's line and its landing by their numbers.
+                assert!(
+                    message.contains("the jump on line 1 would then land on line 5"),
+                    "{message}"
+                );
+                assert!(!message.contains("ingroup fast"), "{message}");
             }
             other => panic!("expected a refusal: {other:?}"),
         }

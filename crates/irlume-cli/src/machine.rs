@@ -3882,6 +3882,7 @@ mod tests {
     /// program still running must not keep the dropped session locked.
     #[test]
     fn session_lock_is_not_inherited_by_an_executed_child() {
+        use std::io::{Read, Write};
         use std::process::{Command, Stdio};
         if !in_isolated_session_process() {
             return;
@@ -3891,17 +3892,27 @@ mod tests {
         let session = acquired(SessionGuard::acquire_in(Some(&dir), uid, None));
         let mut child = Command::new("cat")
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .spawn()
             .expect("exec cat");
-        // spawn returns after exec. Keep cat waiting for input while checking
-        // release, then close its input and reap it before any assertion.
-        let input = child.stdin.take().expect("cat's input");
+        // spawn can return before the child's CLOEXEC cleanup finishes.
+        // Wait for cat to echo before checking release; reap it before asserting.
+        let mut input = child.stdin.take().expect("cat's input");
+        let mut echoed = [0; 5];
+        let ready = input.write_all(b"ready").and_then(|()| {
+            child
+                .stdout
+                .as_mut()
+                .expect("cat's output")
+                .read_exact(&mut echoed)
+        });
         drop(session);
         let result = SessionGuard::acquire_in(Some(&dir), uid, None);
         let running = child.try_wait();
         drop(input);
         let status = child.wait().expect("reap cat");
+        ready.expect("cat must echo after exec");
+        assert_eq!(&echoed, b"ready");
         assert!(running.expect("check cat").is_none(), "cat exited early");
         assert!(status.success(), "cat: {status}");
         drop(acquired(result));

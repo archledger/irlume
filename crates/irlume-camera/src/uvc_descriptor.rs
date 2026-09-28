@@ -327,16 +327,9 @@ pub struct VideoControlFunction {
 /// [`source_graph_is_sound`]).
 ///
 /// Like [`active_descriptor_view`], it does not read the configuration's
-/// `wTotalLength`. The #887 reporter's `descriptors` file for a ThinkPad
-/// T480 colour camera (USB 5986:2113) carries 996 of the 1026 bytes its
-/// configuration header claims, as a clean chain shorter than its header
-/// says: one MJPEG frame descriptor its VideoStreaming header counts is
-/// missing. A published capture from a unit with the same firmware version
-/// (linuxhw LsUSB `31A261423C`, bcdDevice 54.22) carries all 1026, and
-/// whether the reporter's unit or the capture path dropped the frame is
-/// not known. The device writes both the header and the chain, so a length
-/// check would prove nothing a device could not also fake, and it would
-/// refuse a real IR camera whose file comes up short the same way. A chain
+/// `wTotalLength`: the device writes both the header and the chain, so a
+/// length check would prove nothing a device could not also fake, and it
+/// would refuse a real IR camera whose file came up short. A chain
 /// is judged on the descriptors it holds; one cut inside a descriptor is
 /// still malformed. The `VC_HEADER`'s total is another matter: it covers
 /// only the control block, which the walk reads whole, so a total that
@@ -2033,24 +2026,19 @@ mod tests {
     const T480_IR: &[u8] = include_bytes!("../tests/fixtures/bison-5986-1141.descriptors");
 
     /// The ThinkPad T480 colour camera (USB 5986:2113): the #887 reporter's
-    /// file from the same machine. Its configuration header claims a
-    /// `wTotalLength` of 1026, and the file carries 996 bytes: the MJPEG
-    /// format counts nine frame descriptors and the file holds eight
-    /// (960x540 is missing). The sixth YUYV frame (640x360, file offset
-    /// 669) also carries `bFrameIndex` 5 instead of 6, so index 5 appears
-    /// twice. linuxhw LsUSB `31A261423C`, from a unit with the same
-    /// bcdDevice 54.22 and `wTotalLength`, lists all nine MJPEG frames and
-    /// numbers the YUYV frames 1 to 9, so both differences belong to this
-    /// file; whether its unit's firmware or the capture path produced them
-    /// is not known. The file is a clean descriptor chain shorter than the
-    /// `wTotalLength` it carries.
+    /// file from the same machine, the 1044 bytes sysfs gives (sha256
+    /// `7d1873db…`). Its configuration's 1026 bytes agree with the
+    /// `wTotalLength` its header claims: nine MJPEG frames, 960x540
+    /// included, and YUYV frames numbered 1 to 9, as linuxhw LsUSB
+    /// `31A261423C` (bcdDevice 54.22) lists them. An earlier copy of this
+    /// file, from a clipped paste, lacked the 960x540 frame and one frame
+    /// index.
     const T480_RGB: &[u8] = include_bytes!("../tests/fixtures/bison-5986-2113.descriptors");
 
     /// Both T480 files walk by `bLength` to their last byte with no slop,
-    /// and each single configuration is its own active view. The colour
-    /// camera file's configuration is 30 bytes shorter than its header
-    /// says, a fact about this file (see [`T480_RGB`]), pinned here so a
-    /// replacement file that differs is noticed.
+    /// and each single configuration is its own active view and as long as
+    /// its header says. The lengths are pinned so a replacement file that
+    /// differs is noticed.
     #[test]
     fn t480_descriptor_files_walk_cleanly_and_are_their_own_active_view() {
         for (label, bytes, total) in [("5986:1141", T480_IR, 412), ("5986:2113", T480_RGB, 1026)] {
@@ -2069,7 +2057,7 @@ mod tests {
             );
         }
         assert_eq!(T480_IR.len(), 18 + 412);
-        assert_eq!(T480_RGB.len(), 18 + 996);
+        assert_eq!(T480_RGB.len(), 18 + 1026);
     }
 
     /// Each builder the synthetic counter-cases use lays its descriptor out
@@ -2168,16 +2156,13 @@ mod tests {
     /// The T480's colour camera has no Microsoft unit, and its colour
     /// controls would refuse it on their own.
     ///
-    /// The reporter's file holds a configuration shorter than its own
-    /// `wTotalLength` (see [`T480_RGB`]), and the walk judges it on the
-    /// descriptors it holds: no walker in this module reads the
-    /// configuration's `wTotalLength` (the `VC_HEADER`'s own total, which
-    /// its file has right, is checked), so a chain that ends cleanly at a
-    /// descriptor boundary is not
-    /// malformed, while a descriptor cut in the middle still is. The same
-    /// holds for an IR function, which stays attested with its header
-    /// overstating its length by the same 30 bytes, so a file that comes up
-    /// short does not cost a real IR camera its role.
+    /// The walk judges a function on the descriptors it holds: no walker in
+    /// this module reads the configuration's `wTotalLength` (the
+    /// `VC_HEADER`'s own total is checked), so a chain that ends cleanly at
+    /// a descriptor boundary is not malformed, while a descriptor cut in
+    /// the middle still is. An IR function stays attested with its header
+    /// overstating its length by 30 bytes, so a file that comes up short
+    /// does not cost a real IR camera its role.
     #[test]
     fn t480_2113_is_not() {
         assert_eq!(

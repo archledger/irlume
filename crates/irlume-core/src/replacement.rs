@@ -157,7 +157,16 @@ pub(crate) fn begin(user: &str, key: Option<&[u8]>) -> Result<()> {
         ))
     };
     match irlume_common::write_atomic_reporting(&path, &bytes, 0o600) {
-        Ok(irlume_common::AtomicWrite::Durable) => Ok(()),
+        // The template-key directory may have just been created (the state
+        // lock creates it on a host without a TPM): its own entry must last
+        // too, or the record goes with it.
+        Ok(irlume_common::AtomicWrite::Durable) => {
+            let dir = template_key::key_dir();
+            sync_parent(&dir).map_err(|error| {
+                let _ = std::fs::remove_file(&path);
+                refused(error.to_string())
+            })
+        }
         Ok(irlume_common::AtomicWrite::VisibleNotDurable(error)) => {
             // Nothing is replaced yet: a record that stays is settled as a
             // replacement that published nothing.

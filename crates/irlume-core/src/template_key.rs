@@ -1114,9 +1114,21 @@ fn load_recovery(user: &str) -> Result<RecoveryEnvelope> {
 /// [`load_recovery`], with `Ok(None)` when no recovery envelope is stored.
 /// A stored one that cannot be read or parsed is an error.
 fn stored_recovery(user: &str) -> Result<Option<RecoveryEnvelope>> {
-    let data = match std::fs::read(recovery_path(user)) {
+    let path = recovery_path(user);
+    let data = match std::fs::read(&path) {
         Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // A link whose target is missing also reads as not found, but an
+        // entry is there, and it shows no uid: it is not an absent envelope.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Ok(_) => Err(Error::Io(format!(
+                    "{} is a link that does not resolve",
+                    path.display()
+                ))),
+                Err(e) => Err(Error::Io(e.to_string())),
+            };
+        }
         Err(e) => return Err(Error::Io(e.to_string())),
     };
     serde_json::from_slice(&data)
@@ -1698,12 +1710,15 @@ mod tests {
         let link_to_a_directory = || std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
         let a_directory = || std::fs::create_dir(&path).unwrap();
         let a_link_loop = || std::os::unix::fs::symlink(&path, &path).unwrap();
-        let kinds: [(&str, &dyn Fn(), bool); 5] = [
+        let a_dangling_link =
+            || std::os::unix::fs::symlink(elsewhere.join("missing"), &path).unwrap();
+        let kinds: [(&str, &dyn Fn(), bool); 6] = [
             ("a file", &not_json, true),
             ("a link to a file", &link_to_a_file, true),
             ("a link to a directory", &link_to_a_directory, true),
             ("a directory", &a_directory, false),
             ("a link that does not resolve", &a_link_loop, false),
+            ("a link to a missing file", &a_dangling_link, false),
         ];
         let forget_step = format!(
             "remove it with `irlume recovery forget`, or move {} away",

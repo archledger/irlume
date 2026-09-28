@@ -892,7 +892,8 @@ and other permissions are removed from a file root owns. Whatever
 another account owns there is replaced, in one rename (`RENAME_EXCHANGE`), by a
 new 0600 file root owns, which the operation holds and leaves in place, so that
 account cannot move the lock off its name while the operation runs. A regular
-file there is locked, as below, before it is replaced, so an operation that
+file or a FIFO there is locked, as below, before it is replaced (a FIFO is
+opened without waiting for a writer and never read), so an operation that
 fails while waiting for it leaves it at the name; a file that took the name
 meanwhile is waited for too, and goes back to the name if the operation fails
 then. Where the rename cannot be made the operation fails, as

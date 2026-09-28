@@ -49,6 +49,11 @@ const LEGACY_POLL: Duration = Duration::from_millis(100);
 /// file at the name.
 const LEGACY_OPEN_TRIES: usize = 8;
 
+/// How many times the verdict at the end of the wait for [`LEGACY_PAM_LOCK`]
+/// reads `/proc/locks` at most, while no two consecutive readings agree
+/// ([`agreed_lock_users`]).
+const LOCKS_READINGS: usize = 10;
+
 /// Take the exclusive lock every irlume path that changes PAM must hold.
 ///
 /// Nothing serialised these before. `login apply`, `login rollback`, human
@@ -207,11 +212,11 @@ fn open_lock(path: &Path, uid: u32) -> Result<File, String> {
 /// The file is opened, or created when it is missing, by [`open_legacy_lock`]:
 /// one of those releases that has started but not yet reached its lock then
 /// opens the same file and waits for this operation, where it would otherwise
-/// create a file of its own and lock it while this operation runs. A file
-/// another account owns is waited for as below while it keeps the name, and
-/// only then replaced there by one of this operation's own, already locked
-/// ([`replace_legacy_lock`]); any other file the replacement takes off the
-/// name is waited for within the same `wait`.
+/// create a file of its own and lock it while this operation runs. A regular
+/// file or a FIFO another account owns is waited for as below while it keeps
+/// the name, and only then replaced there by one of this operation's own,
+/// already locked ([`replace_legacy_lock`]); any other such file the
+/// replacement takes off the name is waited for within the same `wait`.
 ///
 /// Any account could open the file before, so a process holding it is not
 /// necessarily an irlume: it is waited for at most `wait` and named on stderr.
@@ -273,36 +278,40 @@ enum LegacyLock {
 /// file another process created first, in a directory created at 0755 when
 /// missing, as those releases did. A file that exists is first opened with
 /// `O_PATH` and without following a symlink, which does not wait and does not
-/// open a FIFO or a socket, and only a regular file is then opened for reading,
-/// here or by [`replace_legacy_lock`], through that descriptor, so it is the
-/// file just checked. That open waits
-/// while another process holds a write lease on the file, as the open of those
-/// releases did, where an open that does not wait fails: the kernel asks the
-/// holder to give the lease up and, after `/proc/sys/fs/lease-break-time` (45 s
-/// by default), reduces it to a read lease, which does not delay a reader. No
-/// write lease can be taken on the file while it is open. When the name is
-/// removed between creating and opening it, creating it is tried again. Any
-/// other error opening or creating it stops the operation, as it stopped those
+/// open a FIFO or a socket. Then only a regular file, here or by
+/// [`replace_legacy_lock`], or a FIFO another account owns, there with
+/// [`open_fifo`], is opened for reading, through that descriptor, so it is the
+/// file just checked. The open of a regular file waits while another process
+/// holds a write lease on the file, as the open of those releases did, where
+/// an open that does not wait fails: the kernel asks the holder to give the
+/// lease up and, after `/proc/sys/fs/lease-break-time` (45 s by default),
+/// reduces it to a read lease, which does not delay a reader. No write lease
+/// can be taken on the file while it is open. When the name is removed
+/// between creating and opening it, creating it is tried again. Any other
+/// error opening or creating it stops the operation, as it stopped those
 /// releases.
 ///
 /// A symlink `uid` owns, or a FIFO, a socket or a device, stops the
 /// operation with the command that removes it: an earlier release opened the
 /// name with an ordinary open, so it may have followed the symlink or opened
-/// the FIFO and hold its lock, which this operation cannot take or wait for.
-/// Only root can create one where `/run/lock` is root's alone, and only root
-/// can remove one where every account can write it, since the directory is
-/// sticky, so no account can make an operation stop this way.
+/// the FIFO and hold its lock. Only root can create one where `/run/lock` is
+/// root's alone, and only root can remove one where every account can write
+/// it, since the directory is sticky, so no account can make an operation stop
+/// this way.
 ///
 /// Group and other permissions are removed from a file owned by `uid`, so an
 /// account that has not opened it by then cannot. Whatever another account
 /// owns at the name is returned as the `O_PATH` descriptor, not changed, for
-/// [`replace_legacy_lock`], which waits for a regular file there and then puts
-/// a file of this operation's own at the name, since that account can remove
-/// its own at any time. A symlink is not followed, and `protected_symlinks`,
-/// which systemd turns on, keeps an earlier release running as root from
-/// following it either. A regular file is waited for, since where
-/// `protected_regular` is off an earlier release running as root opens it and
-/// locks it. That account can hold a lease on it and then its lock, and so
+/// [`replace_legacy_lock`], which waits for a regular file or a FIFO there and
+/// then puts a file of this operation's own at the name, since that account
+/// can remove its own at any time. A symlink is not followed, and
+/// `protected_symlinks`, which systemd turns on, keeps an earlier release
+/// running as root from following it either. A regular file is waited for,
+/// since where `protected_regular` is off an earlier release running as root
+/// opens it and locks it, and so is a FIFO, which such a release opens where
+/// `protected_fifos` is off. An earlier release cannot open a socket, and no
+/// account but root can create a device node, so neither is waited for. That
+/// account can hold a lease on a regular file and the lock of either, and so
 /// delay each operation by up to the lease break time and [`LEGACY_WAIT`], as
 /// an account that opened the 0644 file of those releases can delay them; it
 /// cannot stop one, since its process is not an earlier irlume (see
@@ -380,16 +389,52 @@ fn open_for_reading(path: &Path, found: &File) -> Result<File, String> {
         .map_err(|error| format!("open {}: {error}", path.display()))
 }
 
+/// Opens `found`, a FIFO opened with `O_PATH`, for reading, through that
+/// descriptor, so its lock can be taken. `O_NONBLOCK` keeps the open from
+/// waiting for a writer, and nothing is ever read from it.
+fn open_fifo(path: &Path, found: &File) -> Result<File, String> {
+    let at = Path::new("/proc/self/fd").join(found.as_raw_fd().to_string());
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&at)
+        .map_err(|error| format!("open {}: {error}", path.display()))
+}
+
+/// Whether what `meta` describes, at the name of the lock of earlier releases
+/// and owned by another account, is waited for before it is replaced: a
+/// regular file or a FIFO, which an earlier release may have opened and
+/// locked (see [`open_legacy_lock`]).
+fn waited_for(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt as _;
+    meta.is_file() || meta.file_type().is_fifo()
+}
+
+/// Opens `found`, a regular file or a FIFO opened with `O_PATH`, through that
+/// descriptor so its lock can be taken: a FIFO with [`open_fifo`], a regular
+/// file with [`open_for_reading`].
+fn open_to_lock(path: &Path, found: &File) -> Result<File, String> {
+    use std::os::unix::fs::FileTypeExt as _;
+    let meta = found
+        .metadata()
+        .map_err(|error| format!("stat {}: {error}", path.display()))?;
+    if meta.file_type().is_fifo() {
+        open_fifo(path, found)
+    } else {
+        open_for_reading(path, found)
+    }
+}
+
 /// Takes the lock of earlier releases at `path` where another account owns
 /// `found`, what is at the name, opened with `O_PATH`. Returns the files whose
 /// lock this operation then holds.
 ///
-/// A regular file there is waited for first, with `wait_for`, as
+/// A regular file or a FIFO there is waited for first, with `wait_for`, as
 /// [`take_legacy_lock`] says, while it keeps the name: an earlier release that
 /// opens `path` meanwhile opens that file and waits for its holder, and the
 /// name is unchanged when the operation stops there or is killed. Only then
 /// does [`claim_legacy_name`] put a file of this operation's own at the name.
-/// A symlink, a FIFO or anything else there is not waited for.
+/// A symlink, a socket or anything else there is not waited for.
 fn replace_legacy_lock(
     path: &Path,
     found: &File,
@@ -399,8 +444,8 @@ fn replace_legacy_lock(
         .metadata()
         .map_err(|error| format!("stat {}: {error}", path.display()))?;
     let mut held = Vec::new();
-    if meta.is_file() {
-        held.extend(wait_for(open_for_reading(path, found)?)?);
+    if waited_for(&meta) {
+        held.extend(wait_for(open_to_lock(path, found)?)?);
     }
     held.extend(claim_legacy_name(path, &meta, wait_for)?);
     Ok(held)
@@ -428,16 +473,17 @@ fn replace_legacy_lock(
 /// times.
 ///
 /// What comes out keeps the other name until the operation is past it. A
-/// regular file other than `found`, such as one an earlier release created and
-/// locked after `found` was removed, is waited for with `wait_for`, as `found`
-/// was, and removed from the other name only once that succeeds, as anything
-/// else that comes out is at once. When the wait stops the operation, or what
-/// came out cannot be opened, it is exchanged back ([`put_back`]), so the name
-/// leads again to the file an earlier release may hold. A process that opened
-/// the name while this operation's file was there still takes that file when
-/// the operation stops, and an operation killed during the wait leaves its
-/// file at the name and what came out at the other; both need that account to
-/// change the name between `found` being opened and the exchange.
+/// regular file or a FIFO other than `found`, such as a file an earlier
+/// release created and locked after `found` was removed, is waited for with
+/// `wait_for`, as `found` was, and removed from the other name only once that
+/// succeeds, as anything else that comes out is at once. When the wait stops
+/// the operation, or what came out cannot be opened, it is exchanged back
+/// ([`put_back`]), so the name leads again to the file an earlier release may
+/// hold. A process that opened the name while this operation's file was there
+/// still takes that file when the operation stops, and an operation killed
+/// during the wait leaves its file at the name and what came out at the
+/// other; both need that account to change the name between `found` being
+/// opened and the exchange.
 ///
 /// When the file cannot take the name, as on a filesystem without
 /// `RENAME_EXCHANGE`, it is removed and the operation stops, since `found`
@@ -494,7 +540,7 @@ fn claim_legacy_name(
     let waited = match came_out(path, &temp, found) {
         Ok(CameOut::Gone) => return Ok(vec![file]),
         Ok(CameOut::Done) => Ok(None),
-        Ok(CameOut::Other(other)) => open_for_reading(path, &other).and_then(wait_for),
+        Ok(CameOut::Other(other)) => open_to_lock(path, &other).and_then(wait_for),
         Err(why) => Err(why),
     };
     match waited {
@@ -574,9 +620,10 @@ fn remove_claim_file(temp: &Path, file: &File) {
 enum CameOut {
     /// Nothing is there: its owner has moved it since.
     Gone,
-    /// `found` itself, or not a regular file: nothing more to wait for.
+    /// `found` itself, or neither a regular file nor a FIFO: nothing more to
+    /// wait for.
     Done,
-    /// A regular file other than `found`, opened with `O_PATH`.
+    /// A regular file or a FIFO other than `found`, opened with `O_PATH`.
     Other(File),
 }
 
@@ -607,7 +654,7 @@ fn came_out(path: &Path, temp: &Path, found: &std::fs::Metadata) -> Result<CameO
             path.display()
         )
     })?;
-    if meta.is_file() && (meta.dev(), meta.ino()) != (found.dev(), found.ino()) {
+    if waited_for(&meta) && (meta.dev(), meta.ino()) != (found.dev(), found.ino()) {
         Ok(CameOut::Other(out))
     } else {
         Ok(CameOut::Done)
@@ -692,15 +739,20 @@ fn wait_for_legacy_lock(
         };
         let now = Instant::now();
         if now >= deadline {
-            let verdict = earlier_irlumes(lock_users(&file), |pid| has_open_as(pid, uid, &meta));
+            let users = settled_lock_users(&file);
+            let listed = users
+                .as_ref()
+                .and_then(|users| processes(&users.holders))
+                .map(|who| format!(" by {who}"))
+                .unwrap_or_default();
+            let verdict = earlier_irlumes(users, |pid| has_open_as(pid, uid, &meta));
             let detail = match verdict {
                 Ok(own) if own.holders.is_empty() && own.waiters.is_empty() => {
                     eprintln!(
-                        "irlume: {} is still held{}; no process holding or waiting for it runs \
-                         as uid {uid} with it open, so none is an earlier irlume, and this \
+                        "irlume: {} is still held{listed}; no process holding or waiting for it \
+                         runs as uid {uid} with it open, so none is an earlier irlume, and this \
                          operation goes on without it",
-                        path.display(),
-                        by()
+                        path.display()
                     );
                     return Ok(None);
                 }
@@ -740,10 +792,11 @@ fn wait_for_legacy_lock(
 }
 
 /// Which of `users`, the processes `/proc/locks` lists as holding or waiting
-/// for the lock of earlier releases (`None` when they cannot be read), may be
-/// an earlier irlume, as `open_as` ([`has_open_as`]) tells. A waiter counts as
-/// a holder does: it takes the lock once the holder lets go, which may be while
-/// the operation that passed over that holder runs.
+/// for the lock of earlier releases ([`settled_lock_users`]; `None` when they
+/// cannot be read), may be an earlier irlume, as `open_as` ([`has_open_as`])
+/// tells. A waiter counts as a holder does: it takes the lock once the holder
+/// lets go, which may be while the operation that passed over that holder
+/// runs.
 ///
 /// `Err` says why `/proc` cannot rule that out: the holders cannot be read,
 /// none is listed (a holder outside this PID namespace is not), or what one of
@@ -875,14 +928,91 @@ fn lock_holders(file: &File) -> Option<Vec<u32>> {
 /// The processes `/proc/locks` lists as holding a `flock` lock on `file` or
 /// waiting for one, or `None` when that, or the file's mount, cannot be read.
 fn lock_users(file: &File) -> Option<LockUsers> {
-    let (Ok(meta), Some(device), Ok(locks)) = (
-        file.metadata(),
-        superblock_device(file),
-        std::fs::read_to_string("/proc/locks"),
-    ) else {
+    let (Ok(meta), Some(device), Some(locks)) =
+        (file.metadata(), superblock_device(file), read_proc_locks())
+    else {
         return None;
     };
     Some(flock_users(&locks, device, meta.ino()))
+}
+
+/// `/proc/locks`, or `None` when it cannot be read. The kernel produces the
+/// file a page or less per read, each from the locks there are at that
+/// moment, and no more than the read asks for. It is read into a buffer of
+/// 64 KiB, so each read takes a whole page and the file takes as few reads as
+/// it can (see [`settled_lock_users`]).
+fn read_proc_locks() -> Option<String> {
+    use std::io::Read as _;
+    let mut locks = String::with_capacity(64 * 1024);
+    File::open("/proc/locks")
+        .ok()?
+        .read_to_string(&mut locks)
+        .ok()?;
+    Some(locks)
+}
+
+impl LockUsers {
+    /// Whether `other` lists the same holders and waiters, in any order.
+    fn same_as(&self, other: &Self) -> bool {
+        let sorted = |pids: &[u32]| {
+            let mut pids = pids.to_vec();
+            pids.sort_unstable();
+            pids
+        };
+        sorted(&self.holders) == sorted(&other.holders)
+            && sorted(&self.waiters) == sorted(&other.waiters)
+    }
+
+    /// Adds the holders and waiters `other` lists that this does not.
+    fn add(&mut self, other: &Self) {
+        for (pids, more) in [
+            (&mut self.holders, &other.holders),
+            (&mut self.waiters, &other.waiters),
+        ] {
+            for &pid in more {
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+        }
+    }
+}
+
+/// [`lock_users`] for the verdict at the end of the wait for the lock of
+/// earlier releases, from readings of `/proc/locks` that agree. The kernel
+/// produces that file a page or less per read, each from the locks there are
+/// at that moment, so a lock another process takes or lets go between two
+/// reads shifts the lines after it, and one reading can leave out a line or
+/// show one twice ([`agreed_lock_users`]).
+fn settled_lock_users(file: &File) -> Option<LockUsers> {
+    let (Ok(meta), Some(device)) = (file.metadata(), superblock_device(file)) else {
+        return None;
+    };
+    agreed_lock_users(read_proc_locks, device, meta.ino())
+}
+
+/// The processes holding a `flock` lock on inode `ino` of the filesystem
+/// `device`, and those waiting for one, that two consecutive readings of
+/// `/proc/locks` from `read` list alike, reading it at most
+/// [`LOCKS_READINGS`] times. When no two consecutive readings agree, every
+/// process any of them lists counts, so one that a reading left out is still
+/// judged ([`earlier_irlumes`]). `None` when a reading fails.
+fn agreed_lock_users(
+    mut read: impl FnMut() -> Option<String>,
+    device: (u32, u32),
+    ino: u64,
+) -> Option<LockUsers> {
+    let mut every = LockUsers::default();
+    let mut last: Option<LockUsers> = None;
+    for _ in 0..LOCKS_READINGS {
+        let users = flock_users(&read()?, device, ino);
+        if last.as_ref().is_some_and(|last| last.same_as(&users)) {
+            return Some(users);
+        }
+        every.add(&users);
+        last = Some(users);
+    }
+    Some(every)
 }
 
 /// The device number of the filesystem `file` is on, as `/proc/locks` gives it:
@@ -1782,15 +1912,17 @@ mod tests {
         assert!(error.contains("is a FIFO, not the lock file"), "{error}");
     }
 
-    /// A symlink or a FIFO another account owns at the legacy lock's name is
-    /// replaced by a file of the caller's own, created at 0600 and held, since
-    /// that account can remove it at any time; it is not followed, opened or
-    /// waited for. The symlink's target is neither changed, locked nor
-    /// created, and no other name is left behind. A test cannot create a file
-    /// another account owns, so the caller is given another uid, which makes
-    /// the test's own files another account's.
+    /// A symlink, a FIFO or a socket another account owns at the legacy lock's
+    /// name is replaced by a file of the caller's own, created at 0600 and
+    /// held, since that account can remove it at any time. The symlink is not
+    /// followed and the socket is not opened; neither is waited for. The FIFO
+    /// is opened without waiting for a writer, and its lock, which no process
+    /// holds here, is taken at once and held too. The symlink's target is
+    /// neither changed, locked nor created, and no other name is left behind.
+    /// A test cannot create a file another account owns, so the caller is
+    /// given another uid, which makes the test's own files another account's.
     #[test]
-    fn replaces_a_symlink_or_fifo_another_account_owns_at_the_legacy_lock() {
+    fn replaces_a_symlink_fifo_or_socket_another_account_owns_at_the_legacy_lock() {
         let scratch = Scratch::new("legacy-foreign-special");
         let other = uid().wrapping_add(1);
         let long = Duration::from_secs(30);
@@ -1831,13 +1963,28 @@ mod tests {
         });
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(10)),
-            Ok(Ok(1)),
-            "a FIFO at the legacy lock's name must be replaced without blocking"
+            Ok(Ok(2)),
+            "a FIFO at the legacy lock's name must be locked and replaced without blocking"
         );
         assert!(std::fs::symlink_metadata(&fifo).unwrap().is_file());
+        assert_eq!(mode(&fifo), 0o600);
+
+        let socket = scratch.path("socket.lock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind a socket"));
+        let taken = take_legacy_lock(&socket, other, long).expect("take the legacy lock");
+        assert_eq!(taken.len(), 1, "{taken:?}");
+        assert!(std::fs::symlink_metadata(&socket).unwrap().is_file());
+        assert_eq!(mode(&socket), 0o600);
+        drop(taken);
         assert_eq!(
             entries(&scratch.0),
-            ["dangling.lock", "fifo.lock", "link.lock", "target"]
+            [
+                "dangling.lock",
+                "fifo.lock",
+                "link.lock",
+                "socket.lock",
+                "target"
+            ]
         );
     }
 
@@ -2351,5 +2498,342 @@ mod tests {
         }
         drop(holder);
         let _ = waiter.wait();
+    }
+
+    /// A canned `/proc/locks` reading: a POSIX lock on another inode, then a
+    /// `flock` line on inode 777 of device `00:1a` for each of `holders`, and
+    /// a line waiting for that lock for each of `waiters`.
+    fn locks_reading(holders: &[u32], waiters: &[u32]) -> String {
+        let mut locks = String::from("1: POSIX  ADVISORY  WRITE 4000 00:1a:12 0 EOF\n");
+        for (at, pid) in holders.iter().enumerate() {
+            locks.push_str(&format!(
+                "{}: FLOCK  ADVISORY  WRITE {pid} 00:1a:777 0 EOF\n",
+                at + 2
+            ));
+        }
+        for pid in waiters {
+            locks.push_str(&format!(
+                "2: -> FLOCK  ADVISORY  WRITE {pid} 00:1a:777 0 EOF\n"
+            ));
+        }
+        locks
+    }
+
+    /// [`agreed_lock_users`] for inode 777 of device `00:1a` over `readings`,
+    /// taken in turn, and from the first again once all are taken, with how
+    /// many it took. `None` stands for a reading that fails.
+    fn agreed(readings: &[Option<String>]) -> (Option<LockUsers>, usize) {
+        let mut next = readings.iter().cycle();
+        let mut taken = 0;
+        let users = agreed_lock_users(
+            || {
+                taken += 1;
+                next.next().cloned().flatten()
+            },
+            (0, 0x1a),
+            777,
+        );
+        (users, taken)
+    }
+
+    /// The verdict at the limit reads `/proc/locks` until two consecutive
+    /// readings list the same holders and waiters of the file, since one
+    /// reading can leave out a line when other locks change meanwhile. Here
+    /// the first reading leaves out process 4343, which runs as the caller's
+    /// uid with the file open, beside process 4242, which does not: that
+    /// reading alone lets the operation go on, and the two after it, which
+    /// agree, stop it. Two readings listing the same processes in another
+    /// order agree. A reading that fails leaves the holders unread, which
+    /// stops the operation ([`earlier_irlumes`]).
+    #[test]
+    fn decides_at_the_limit_on_the_first_two_proc_locks_readings_that_agree() {
+        let earlier = |pid| Some(pid == 4343);
+        let left_out = locks_reading(&[4242], &[]);
+        let full = locks_reading(&[4242, 4343], &[]);
+        assert_eq!(
+            earlier_irlumes(Some(flock_users(&left_out, (0, 0x1a), 777)), earlier),
+            Ok(LockUsers::default()),
+            "the reading without process 4343 must let the operation go on alone"
+        );
+        let (users, taken) = agreed(&[Some(left_out), Some(full.clone()), Some(full.clone())]);
+        assert_eq!(taken, 3);
+        assert_eq!(
+            users,
+            Some(LockUsers {
+                holders: vec![4242, 4343],
+                waiters: Vec::new(),
+            })
+        );
+        assert_eq!(
+            earlier_irlumes(users, earlier),
+            Ok(LockUsers {
+                holders: vec![4343],
+                waiters: Vec::new(),
+            })
+        );
+
+        let reordered = locks_reading(&[4343, 4242], &[]);
+        let (users, taken) = agreed(&[Some(full.clone()), Some(reordered)]);
+        assert_eq!(taken, 2, "the same processes in another order disagreed");
+        assert_eq!(
+            users,
+            Some(LockUsers {
+                holders: vec![4343, 4242],
+                waiters: Vec::new(),
+            })
+        );
+
+        assert_eq!(agreed(&[Some(full), None]), (None, 2));
+    }
+
+    /// When no two consecutive readings of `/proc/locks` agree, the verdict
+    /// at the limit judges every holder and waiter any of them lists, after
+    /// [`LOCKS_READINGS`] readings. Here readings that list process 4242
+    /// holding the lock and process 4444 waiting for it, neither of which runs
+    /// as the caller's uid with the file open, alternate with readings that
+    /// list process 4343, which does, holding it beside 4242: the first kind
+    /// alone lets the operation go on, and all of them together stop it.
+    #[test]
+    fn decides_at_the_limit_on_every_process_proc_locks_readings_list_when_none_agree() {
+        let earlier = |pid| Some(pid == 4343);
+        let left_out = locks_reading(&[4242], &[4444]);
+        assert_eq!(
+            earlier_irlumes(Some(flock_users(&left_out, (0, 0x1a), 777)), earlier),
+            Ok(LockUsers::default()),
+            "the reading without process 4343 must let the operation go on alone"
+        );
+        let (users, taken) = agreed(&[Some(left_out), Some(locks_reading(&[4242, 4343], &[]))]);
+        assert_eq!(taken, LOCKS_READINGS);
+        assert_eq!(
+            users,
+            Some(LockUsers {
+                holders: vec![4242, 4343],
+                waiters: vec![4444],
+            })
+        );
+        assert_eq!(
+            earlier_irlumes(users, earlier),
+            Ok(LockUsers {
+                holders: vec![4343],
+                waiters: Vec::new(),
+            })
+        );
+    }
+
+    /// A FIFO at `path`, made by `mkfifo`.
+    fn make_fifo(path: &Path) {
+        let made = Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo failed");
+    }
+
+    /// Whether some process holds a lock on the FIFO at `path`, asked of a
+    /// separate process as [`held`] asks. `flock` opens a name for reading
+    /// only, which on a FIFO waits for a writer, so the shell opens it for
+    /// reading and writing, which does not, and `flock` locks that
+    /// descriptor. It exits 75 when the lock is held.
+    fn fifo_held(path: &Path) -> bool {
+        let status = Command::new("sh")
+            .args(["-c", "exec 9<>\"$1\" && exec flock -n -E 75 -x 9", "sh"])
+            .arg(path)
+            .status()
+            .expect("run sh");
+        match status.code() {
+            Some(0) => false,
+            Some(75) => true,
+            _ => panic!("cannot tell whether {} is locked: {status}", path.display()),
+        }
+    }
+
+    /// Whether the lock on the FIFO at `path` is let go within 5 s, as
+    /// [`released`] asks of a file.
+    fn fifo_released(path: &Path) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fifo_held(path) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+
+    /// A `flock` process holding a lock on the FIFO at `path` until dropped,
+    /// as [`Holder`] holds one on a file. The shell first opens the FIFO for
+    /// reading and writing, which does not wait, and keeps it open, so the
+    /// open of `flock` it then becomes, for reading only, finds a writer and
+    /// does not wait either.
+    struct FifoHolder {
+        child: Child,
+        input: Option<ChildStdin>,
+    }
+
+    impl FifoHolder {
+        fn new(path: &Path) -> Self {
+            let mut child = Command::new("sh")
+                .args(["-c", "exec 9<>\"$1\" && exec flock -o -x \"$1\" cat", "sh"])
+                .arg(path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("run sh");
+            let input = child.stdin.take();
+            let holder = Self { child, input };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !fifo_held(path) {
+                assert!(
+                    Instant::now() < deadline,
+                    "flock never took {}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            holder
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+    }
+
+    impl Drop for FifoHolder {
+        fn drop(&mut self) {
+            drop(self.input.take());
+            let _ = self.child.wait();
+        }
+    }
+
+    /// A FIFO another account owns at the legacy lock's name, which an
+    /// earlier release running as root opens and locks where
+    /// `protected_fifos` is off, is opened without waiting for a writer, and
+    /// a process holding its lock is waited for, as for a regular file. Once
+    /// that process lets go, the FIFO is locked and only then replaced at the
+    /// name by a file of the caller's own, created at 0600. Both are held,
+    /// and no other name is left behind; the FIFO is found again by a second
+    /// name, a hard link made first.
+    #[test]
+    fn waits_for_a_held_fifo_another_account_owns_at_the_legacy_lock_then_replaces_it() {
+        let scratch = Scratch::new("legacy-fifo-wait");
+        let fifo = scratch.path("foreign.lock");
+        make_fifo(&fifo);
+        let kept = scratch.path("kept");
+        std::fs::hard_link(&fifo, &kept).unwrap();
+        let before = ino(&fifo);
+        let holder = FifoHolder::new(&fifo);
+        let name = fifo.clone();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            let kept_name = ino(&name) == before;
+            drop(holder);
+            kept_name
+        });
+        let started = Instant::now();
+        let taken = take_legacy_lock(&fifo, uid().wrapping_add(1), Duration::from_secs(30));
+        let waited = started.elapsed();
+        assert!(
+            release.join().unwrap(),
+            "the FIFO lost its name while the operation waited for its lock"
+        );
+        let taken = taken.expect("a held FIFO at the legacy lock's name stopped the operation");
+        assert!(
+            waited >= Duration::from_millis(500) && waited < Duration::from_secs(30),
+            "returned after {waited:?}, while the FIFO's lock was held for 700 ms"
+        );
+        assert_eq!(taken.len(), 2, "{taken:?}");
+        let own = std::fs::symlink_metadata(&fifo).unwrap();
+        assert!(own.is_file(), "the FIFO kept the name");
+        assert_eq!(own.uid(), uid());
+        assert_eq!(mode(&fifo), 0o600);
+        assert!(held(&fifo), "the file at the name is not held");
+        assert!(fifo_held(&kept), "the FIFO is not held");
+        assert_eq!(
+            std::fs::metadata(&kept).unwrap().nlink(),
+            1,
+            "the FIFO kept a name beside the lock"
+        );
+        assert_eq!(entries(&scratch.0), ["foreign.lock", "kept"]);
+        drop(taken);
+        assert!(released(&fifo), "the file at the name was not released");
+        assert!(fifo_released(&kept), "the FIFO was not released");
+    }
+
+    /// What `attempt` returns, tried again, up to 5 times in all, while it
+    /// stops with the refusal that `/proc/locks` lists no holder. Two
+    /// consecutive readings can agree and both leave out a line when other
+    /// locks change meanwhile, so a holder that is there is at times not
+    /// listed at the limit, and the operation then stops, leaving files
+    /// unchanged. A holder that no attempt lists still fails.
+    fn unless_unlisted<T>(mut attempt: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+        let mut left = 5;
+        loop {
+            let result = attempt();
+            left -= 1;
+            match &result {
+                Err(refused) if refused.contains("does not list") && left > 0 => {}
+                _ => return result,
+            }
+        }
+    }
+
+    /// At the limit, a FIFO another account owns at the legacy lock's name
+    /// gets the verdict a regular file gets. While a process running as the
+    /// caller's uid with it open holds its lock, the operation stops with an
+    /// error naming that process, and the FIFO keeps its name. When that
+    /// holder runs as another account than the caller, the operation goes on:
+    /// a file of the caller's own takes the name, held, and the FIFO's lock
+    /// stays its holder's. No other name is left behind, and the operation
+    /// leaves no lock on the FIFO. Each operation is run again while it stops
+    /// because `/proc/locks` does not list the holder ([`unless_unlisted`]).
+    #[test]
+    fn stops_or_goes_on_at_the_limit_over_a_held_legacy_fifo_as_over_a_file() {
+        let scratch = Scratch::new("legacy-fifo-limit");
+        let fifo = scratch.path("foreign.lock");
+        make_fifo(&fifo);
+        let kept = scratch.path("kept");
+        std::fs::hard_link(&fifo, &kept).unwrap();
+        let before = ino(&fifo);
+        let holder = FifoHolder::new(&fifo);
+        let limit = Duration::from_millis(300);
+        let timed = |operation: &dyn Fn() -> Result<Vec<File>, String>| {
+            let started = Instant::now();
+            let result = operation();
+            let waited = started.elapsed();
+            assert!(
+                waited >= limit && waited < Duration::from_secs(10),
+                "waited {waited:?} for a limit of 300 ms"
+            );
+            result
+        };
+
+        let refused = unless_unlisted(|| timed(&|| take_foreign(&fifo, limit)))
+            .expect_err("went on beside a process of the account holding the FIFO's lock");
+        assert!(
+            refused.contains(&format!("process {}", holder.pid())),
+            "{refused}"
+        );
+        assert_eq!(ino(&fifo), before, "the FIFO lost its name");
+        assert_eq!(entries(&scratch.0), ["foreign.lock", "kept"]);
+
+        let taken =
+            unless_unlisted(|| timed(&|| take_legacy_lock(&fifo, uid().wrapping_add(1), limit)))
+                .expect("stopped beside a holder that runs as another account");
+        assert_eq!(taken.len(), 1, "{taken:?}");
+        assert!(
+            std::fs::symlink_metadata(&fifo).unwrap().is_file(),
+            "the FIFO kept the name"
+        );
+        assert_eq!(mode(&fifo), 0o600);
+        assert!(held(&fifo), "the file at the name is not held");
+        assert_eq!(entries(&scratch.0), ["foreign.lock", "kept"]);
+        drop(taken);
+        assert!(fifo_held(&kept), "the FIFO's holder lost its lock");
+        drop(holder);
+        assert!(
+            fifo_released(&kept),
+            "a lock the operation took was left on the FIFO"
+        );
+        assert!(released(&fifo), "the file at the name was not released");
     }
 }

@@ -11,6 +11,9 @@ one-physical-camera invariant. Existing account selection, including the
 implemented incomplete-legacy-binding `NotApplicable` behavior, remains in
 force for ordinary pairs.
 
+Amends ADR-0014's admission posture for split pairs: their paired evidence
+always requires IR-identity-verified grant arms, regardless of measured skew.
+
 Depends on ADR-0007 (identity and capture qualification), ADR-0024 (complete
 role-labelled credential bindings), ADR-0029 (selection), ADR-0030 (display
 and redaction), and ADR-0031 (descriptor-based YUYV IR classification).
@@ -123,11 +126,22 @@ the pair for an account nor silently changes the selected default.
 
 For authentication, the split pair must additionally match the requesting
 account's complete split-aware primary binding or an active secondary group.
-In automatic mode, keep eligible primary first, then eligible secondary
-pairs in canonical role-labelled pair-key order. Step 5 specifies the
-extended key ordering while preserving the relative order of existing
-ordinary-pair keys. Reordering non-overlapping authorization records does
-not change this account-scoped ranking.
+In automatic mode, keep eligible primary first, regardless of pair class.
+Eligible secondary pairs have this total order:
+
+1. Ordinary pairs (class tag 0), ordered by their existing
+   `(rgb identity, ir identity)` comparison.
+2. Split pairs (class tag 1), ordered by `(RGB unit key, IR unit key)`. Compare
+   each unit key's fields in this order: binding identity, controller identity,
+   root-hub protocol domain, relative port chain. Compare canonical raw text
+   fields bytewise and port chains lexicographically by numeric port number;
+   a proper prefix sorts before the longer value.
+
+The comparison uses typed fields, not concatenated display labels or node
+paths. Equal complete pair keys retain the existing ambiguity refusal;
+store position never breaks a tie. This preserves the relative order of
+ordinary secondary pairs. Reordering discovery, stores or non-overlapping
+authorization records does not change this account-scoped ranking.
 
 Pinned mode still selects one pair and does not fall back to another when
 it is unavailable. A selected split pair refers to its complete pair key,
@@ -162,8 +176,25 @@ or reordering machine authorization records does not rewrite enrollments or
 reactivate an inactive secondary store.
 
 The administrator changes the root-owned authorization records through a
-daemon-validated privileged configuration operation. An update that both
-authorizes and selects a split pair publishes one coherent old or new state
+daemon-validated privileged configuration operation. An operation that adds
+or replaces an authorization, or selects a split pair, carries the expected
+supervisor ID and publication revision from the displayed opt-in inventory,
+plus both displayed instance IDs, generations and selected endpoints in role
+order. Preserve this guard through confirmation and privilege approval.
+Endpoint tokens and matching persistent facts alone are insufficient: a
+replug can reuse the same path and token.
+
+At the mutation boundary, the daemon requires a complete current publication
+matching the expected supervisor, revision and both candidate guards, then
+validates identities, locations and roles from that publication. Serialize
+this check with inventory publication and configuration mutation so a change
+cannot land between the check and commit. Any mismatch or unavailable
+inventory refuses without changing authorization or selection and requires
+a fresh listing and confirmation. Removing an authorization need not require
+its cameras to be connected; removal never authorizes a replacement.
+
+An update that both authorizes and selects a split pair publishes one
+coherent old or new state
 under the configuration lock, extending ADR-0029 section 6. A malformed or
 unreadable authorization state, or an unresolved selected-pair reference,
 refuses the split operation; it is not read as a fresh automatic setup.
@@ -182,6 +213,19 @@ the devices; it does not authorize concurrent streaming. A split pair cannot
 inherit a concurrent qualification from an ordinary pair or either side
 alone. Existing sensor-policy, per-operation eligibility, PAD and quality
 requirements remain in force.
+
+Every paired split assessment must carry sequential admission posture
+(`sequential_pair`), including captures at or below
+`MAX_CROSS_SPECTRUM_SKEW`. The current skew-only
+`pair_admitted_sequentially` rule is insufficient for this class: a short
+gap does not make two physical devices a concurrent pair. Propagate the
+split provenance into assessment and grant decisions, including retries;
+never infer this posture from elapsed time alone. As in ADR-0014, both the
+RGB-primary and fusion grant arms are unavailable on this paired evidence.
+Only the IR-identity-verified fallback and calibrated-centroid arms may grant,
+with all their existing thresholds and gates. Pairing budgets and stale-RGB
+discard behavior remain unchanged; an IR-only decision retains its existing
+IR identity requirements.
 
 Both instance keys are acquired together in deterministic order and both
 selected incarnations are revalidated against one live publication before
@@ -208,6 +252,9 @@ contract. A candidate carries `instance_id`, `generation` and
 `endpoint_paths`; its decoder rejects unknown fields. Split-pair role and
 location information is exposed only through a separate opt-in request and
 reply. Existing clients keep receiving their existing reply shapes.
+The opt-in listing includes the publication and per-side guards required by
+section 4; management echoes those displayed guards without refreshing them
+silently after confirmation.
 
 For non-root peers, both sides use the existing daemon-instance endpoint
 tokens. Neither real node path, binding identity nor serial is sent. Display
@@ -295,20 +342,40 @@ These cases gate the implementation phases:
 8. Ordinary pairs retain their device claims. Overlapping split records yield
    only the first resolvable pair; reordering independent records does not
    alter the account's primary-first and canonical-secondary ranking.
+   With an unavailable primary and mixed secondary classes, an eligible
+   ordinary pair precedes every split pair, even one with a smaller identity.
+   A split primary still precedes ordinary secondaries. Split secondaries
+   follow the field comparison in section 3 under input permutations;
+   duplicate complete keys refuse as ambiguous rather than using store order.
 9. A split authorization alone does not satisfy enrollment binding. Legacy
    pins, incomplete bindings and `NotApplicable` fallback do not authorize it.
    Removing authorization does not move credentials or reactivate a store.
+   With a missing or one-sided primary and no chosen complete secondary,
+   `NotApplicable` retains the standing ordinary pair under its existing
+   authentication checks; it neither refuses selection solely for the
+   incomplete binding nor admits a standing split pair.
 10. Pinned selection names one complete pair key. A missing selected record
     refuses; environment overrides cannot bypass authorization; forbidding
     external cameras rejects either external side.
 11. Concurrent readers and crash recovery observe a coherent old or new
     configuration. Malformed state is a refusal, not automatic selection.
     Mixed-version management fails visibly without an old-setter fallback.
+    Replug either side between listing, confirmation and commit, including
+    reuse of the same identity, location, path and endpoint token: the stale
+    instance/generation guard refuses with no configuration change. A changed
+    supervisor or revision, mixed displayed publications and unavailable
+    inventory also refuse. Race publication against the commit to verify the
+    check and mutation boundary. An unchanged guarded publication succeeds.
 12. Both leases and revalidation precede the first open. Either side changing
     before or during capture refuses the attempt without mixing generations,
     pooling pairs or retaining one lease after a two-sided failure.
 13. A valid ordinary concurrent qualification cannot enable concurrent split
     capture. Existing sensor-policy and quality checks still run.
+    At skew below, equal to and above 3 s within the sequential budget,
+    paired split evidence retains sequential admission posture. A high RGB
+    match with IR below identity thresholds cannot grant through RGB-primary
+    or fusion; retry paths retain this restriction. Ordinary-pair behavior
+    and stale-evidence handling remain unchanged.
 14. Frozen old decoders accept existing replies from a daemon with split
     records. New non-root replies, events and errors expose no raw paths,
     binding identities, serials or internal controller paths.
@@ -320,15 +387,17 @@ These cases gate the implementation phases:
 
 ## Phasing
 
-1. Land this proposed ADR alone, with the ADR-0029 amendment pointers.
+1. Land this proposed ADR alone, with ADR-0014 and ADR-0029 amendment pointers.
 2. Add the separate data model, qualified-location facts and pure pin resolver;
    publish no usable split candidates yet. Test identity and ambiguity cases.
 3. Add administrator configuration, selection references and the opt-in wire
-   contract. Define and test serialization, upgrades, coherent publication and
-   redaction. Configured candidates remain unavailable to enrollment/auth.
+   contract. Define and test serialization, upgrades, displayed-inventory
+   guards, coherent publication and redaction. Configured candidates remain
+   unavailable to enrollment/auth.
 4. Add split-aware lease acquisition, revalidation and sequential capture
-   provenance. Keep the explicit enrollment/authentication gate closed and
-   prove that it holds for native GREY as well as YUYV.
+   provenance and unconditional split sequential admission posture. Keep the
+   explicit enrollment/authentication gate closed and prove that it holds
+   for native GREY as well as YUYV.
 5. Add complete split-aware primary/secondary bindings and request-path
    resolution. Validate legacy separation, account selection and all activation
    tests before enabling split enrollment or authentication.

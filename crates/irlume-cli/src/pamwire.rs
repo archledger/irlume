@@ -8081,6 +8081,15 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
             "auth optional pam_exec.so include /usr/bin/fingerprint-check"
         ));
         assert!(!is_fingerprint_auth("session optional pam_fprintd.so"));
+        // The module is the module path, not an argument naming one.
+        for line in [
+            "auth optional pam_exec.so /usr/local/libexec/check-pam_fprintd.so",
+            "[auth] optional pam_exec.so /usr/local/libexec/check-pam_fprintd.so",
+            "auth substack password-auth fingerprint",
+        ] {
+            assert!(!is_fingerprint_auth(line), "{line}");
+        }
+        assert!(is_fingerprint_auth("[auth] sufficient pam_fprintd.so"));
         assert!(is_session_directive("-SESSION optional pam_kwallet5.so"));
         assert!(!is_session_directive("auth optional pam_kwallet5.so"));
     }
@@ -8193,6 +8202,49 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
         assert_eq!(directive(" \t auth required x # c"), "auth required x ");
         assert_eq!(directive("\u{b}auth required x"), "\u{b}auth required x");
         assert_eq!(directive("\u{a0}# c"), "\u{a0}");
+    }
+
+    /// A keyring module is the rule's module path, never an argument: a
+    /// `pam_exec.so` line that names one loads only pam_exec, so it neither
+    /// counts as a consumer nor hides the pair irlume supplies, and a
+    /// fingerprint keyring line goes below the real pam_fprintd line, not a
+    /// line that only names it.
+    #[test]
+    fn a_module_named_in_an_argument_is_not_that_module() {
+        for line in [
+            "auth optional pam_exec.so /usr/local/libexec/pam_gnome_keyring.so",
+            "[auth] optional pam_exec.so /usr/local/libexec/pam_gnome_keyring.so",
+            "[session] optional pam_exec.so /usr/local/libexec/pam_gnome_keyring.so",
+        ] {
+            assert_eq!(consumer_active_for(line, "gdm-fingerprint"), None, "{line}");
+        }
+        let stack = "#%PAM-1.0\n\
+                     [auth] optional pam_exec.so /usr/local/libexec/check-pam_fprintd.so\n\
+                     auth sufficient pam_fprintd.so\n\
+                     [auth] optional pam_exec.so /usr/local/libexec/pam_gnome_keyring.so\n\
+                     [session] optional pam_exec.so /usr/local/libexec/pam_gnome_keyring.so\n";
+        let (wired, changed) = wire_fp_keyring(stack, "gdm-fingerprint");
+        assert!(changed, "{wired}");
+        let lines: Vec<&str> = wired.lines().collect();
+        let fprintd = lines
+            .iter()
+            .position(|l| *l == "auth sufficient pam_fprintd.so")
+            .unwrap();
+        let keyring = lines
+            .iter()
+            .position(|l| irlume_rule_has_arg(l, "keyring"))
+            .unwrap();
+        assert!(keyring > fprintd, "{wired}");
+        assert!(wired.contains(FP_GKR_SESSION), "{wired}");
+        // A session line that loads kwallet and names gnome-keyring in its
+        // arguments is no gnome-keyring session line.
+        let handoff = format!(
+            "{KEYRING_UNSEAL}\nauth optional pam_gnome_keyring.so\n\
+             session optional pam_kwallet5.so note=pam_gnome_keyring.so\n"
+        );
+        let found = keyring_handoff(&handoff, "plasmalogin").unwrap();
+        assert_eq!(found.complete, None);
+        assert_eq!(found.auth_only, vec!["pam_gnome_keyring.so"]);
     }
 
     #[test]

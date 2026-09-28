@@ -70,11 +70,9 @@ pub(super) fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHan
     // order-sensitive.
     let has_session_line = |module: &str| {
         lines.iter().any(|l| {
-            is_session_directive(l)
-                && directive(l).contains(module)
-                // The session half is gated by `only_if=` exactly as the auth
-                // half is: gkr-pam checks it in `pam_sm_open_session` too.
-                && consumer_active_for(l, service).is_some()
+            // The session half is gated by `only_if=` exactly as the auth
+            // half is: gkr-pam checks it in `pam_sm_open_session` too.
+            is_session_directive(l) && consumer_active_for(l, service) == Some(module)
         })
     };
     // Only lines BELOW ours can see the token we set, so the search starts past

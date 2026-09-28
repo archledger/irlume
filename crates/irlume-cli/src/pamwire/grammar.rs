@@ -1086,13 +1086,18 @@ fn read_stack(name: &str) -> Option<String> {
 /// GDM's development branch). With only the literal match this returned no
 /// anchor, `wire_fp_keyring` became a silent no-op, and the fingerprint keyring
 /// unlock never wired on Fedora at all.
+///
+/// The module is matched on the rule's module path and the stack on the
+/// name the line gives it, never on an argument: `pam_exec.so
+/// /usr/local/libexec/check-pam_fprintd.so` checks no fingerprint.
 pub(super) fn is_fingerprint_auth(line: &str) -> bool {
     let Some(h) = typed_head(line, "auth") else {
         return false;
     };
-    let fields = fields_after_control(&h);
-    fields.iter().any(|w| w.contains("pam_fprintd.so"))
-        || (names_stack(&h) && fields.iter().any(|w| w.contains("fingerprint")))
+    if names_stack(&h) {
+        return third_field(&h).is_some_and(|stack| stack.contains("fingerprint"));
+    }
+    rule_names_module(line, "pam_fprintd.so")
 }
 
 /// The keyring module on this line, if it is one AND it will actually do
@@ -1111,11 +1116,18 @@ pub(super) fn is_fingerprint_auth(line: &str) -> bool {
 /// gkr ORs `ARG_IGNORE_SERVICE` in and never clears it. `pam_kwallet5.so` has no
 /// equivalent option (`only_if` appears nowhere in kwallet-pam), so this only
 /// ever narrows the gnome-keyring case.
+///
+/// The module is the rule's module path, never an argument: `pam_exec.so
+/// /path/pam_gnome_keyring.so` loads only pam_exec.
 pub(super) fn consumer_active_for(line: &str, service: &str) -> Option<&'static str> {
-    let t = directive(line);
-    let module = KEYRING_CONSUMERS.iter().copied().find(|m| t.contains(m))?;
-    let gated_out = t
-        .split_whitespace()
+    let r = rule(line)?;
+    let module = KEYRING_CONSUMERS
+        .iter()
+        .copied()
+        .find(|m| module_file_name(r.module) == *m)?;
+    let gated_out = r
+        .args
+        .iter()
         .filter_map(|w| w.strip_prefix("only_if="))
         .any(|list| !list.split(',').any(|item| item == service));
     (!gated_out).then_some(module)

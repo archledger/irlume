@@ -402,7 +402,9 @@ All notable changes to irlume are documented here. This project adheres to
   CRLF line endings is no longer rewritten with LF endings, which would
   change which lines PAM runs. Messages about such a line give its number
   and why, never its text, since a module's arguments can hold a secret
-  and reconcile's messages reach the system journal.
+  and reconcile's messages reach the system journal. The fingerprint line
+  irlume's keyring line follows, and the keyring modules it looks for, are
+  told by a rule's module path, never by an argument that names one.
 
 - Under irlumed's AppArmor profile in enforce mode, as Debian and Ubuntu
   load it, `irlume doctor`'s `sealed-storage` check and the guidance after

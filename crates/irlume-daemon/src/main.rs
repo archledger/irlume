@@ -6031,6 +6031,18 @@ fn capture_mode_changes() -> u64 {
         .wrapping_add(irlume_auth::runtime_capture_health_changes())
 }
 
+/// Count a qualification write every account now reads: a saved record, or
+/// one published whose directory could not be synced, which may not
+/// survive a power loss but is what every reader sees until then.
+fn count_qualification_write<T>(saved: &Result<T, irlume_auth::QualificationStoreError>) {
+    if matches!(
+        saved,
+        Ok(_) | Err(irlume_auth::QualificationStoreError::VisibleNotDurable(_))
+    ) {
+        CAPTURE_QUALIFICATION_SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn run_capture_mode_probe(
     rgb_dev: &str,
     ir_dev: &str,
@@ -6096,11 +6108,10 @@ fn run_capture_mode_probe(
             .as_ref()
             .map(irlume_auth::CaptureQualificationRecord::revision)
     };
-    let stored = match store.save_attempt(attempt, expected_revision) {
-        Ok(record) => {
-            CAPTURE_QUALIFICATION_SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            record
-        }
+    let saved = store.save_attempt(attempt, expected_revision);
+    count_qualification_write(&saved);
+    let stored = match saved {
+        Ok(record) => record,
         Err(irlume_auth::QualificationStoreError::StaleRevision { .. })
             if policy == ProbeStore::AutomaticIfAbsent =>
         {
@@ -15533,6 +15544,35 @@ mod tests {
         assert!(refused.contains(busy), "{refused}");
         open.close();
         assert!(open.take().is_none(), "nothing was queued");
+    }
+
+    /// A qualification record counts as a capture-schedule change once every
+    /// account reads it: saved, or published without its directory sync.
+    /// A write that published nothing does not count.
+    #[test]
+    fn a_published_qualification_counts_as_a_capture_schedule_change() {
+        use irlume_auth::QualificationStoreError as E;
+        let count = || CAPTURE_QUALIFICATION_SAVES.load(std::sync::atomic::Ordering::Relaxed);
+        for (saved, counts) in [
+            (Ok(()), true),
+            (
+                Err(E::VisibleNotDurable("synthetic sync failure".into())),
+                true,
+            ),
+            (Err(E::Io("synthetic write failure".into())), false),
+            (
+                Err(E::StaleRevision {
+                    expected: None,
+                    actual: Some(1),
+                }),
+                false,
+            ),
+            (Err(E::RevisionExhausted), false),
+        ] {
+            let before = count();
+            count_qualification_write(&saved);
+            assert_eq!(count() - before, u64::from(counts), "{saved:?}");
+        }
     }
 
     /// A request line deadline far enough away that only a test about the

@@ -254,8 +254,17 @@ pub(crate) fn restore_surface_with(
 /// outside that pattern is ever considered, because a cleanup that reasons about
 /// what "looks unexpected" is how a harness in this project deleted a real
 /// conffile.
+///
+/// A scratch name only ever holds irlume's own unfinished file. The file a
+/// replacement takes out of the live path comes out under a private name
+/// (see [`install`]), so a run killed after the exchange leaves that file,
+/// which may be another writer's, where the sweep does not take it.
 pub(super) fn sweep_abandoned_scratch() {
-    let dir = std::path::Path::new("/etc/pam.d");
+    sweep_abandoned_scratch_in(Path::new("/etc/pam.d"));
+}
+
+/// [`sweep_abandoned_scratch`] in `dir`.
+pub(super) fn sweep_abandoned_scratch_in(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -467,6 +476,13 @@ fn chmod_for_test(path: &Path) {
 #[cfg(test)]
 pub(super) static CHMOD_BEFORE_INSTALL: TestHook = TestHook::new(Vec::new());
 
+/// Test-only: stop a replacement right after its exchange, before it looks
+/// at the file that came out, as a kill or power loss there would. The
+/// write's own cleanup still runs, which removes only a file that is
+/// irlume's.
+#[cfg(test)]
+pub(super) static STOP_AFTER_EXCHANGE: TestHook = TestHook::new(Vec::new());
+
 /// Test-only: renames to or from these paths behave as on a filesystem
 /// without `RENAME_NOREPLACE` and `RENAME_EXCHANGE` (EINVAL). Stays armed
 /// until disarmed.
@@ -486,6 +502,26 @@ fn armed(hook: &TestHook, path: &Path) -> bool {
 /// reachable.
 #[cfg(test)]
 pub(super) static FAIL_SYNC_AFTER_CHANGE: TestHook = TestHook::new(Vec::new());
+
+/// Test-only: fail the directory sync that makes the move of irlume's file
+/// to its exchange name durable, before the exchange.
+#[cfg(test)]
+pub(super) static FAIL_SYNC_BEFORE_EXCHANGE: TestHook = TestHook::new(Vec::new());
+
+/// Make the move of irlume's file to its exchange name durable before the
+/// exchange (see [`install`]). Without it, a power loss after the exchange
+/// could bring the directory back with the exchange but not the move, and
+/// the file taken out of the live path would then be under the scratch name
+/// the next run's sweep deletes. Nothing has reached the live path yet, so
+/// a failure is one before the change.
+fn sync_before_exchange(path: &Path) -> Result<(), WriteError> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    #[cfg(test)]
+    if fires(&FAIL_SYNC_BEFORE_EXCHANGE, path) {
+        return Err(format!("fsync {}: failed for the test", dir.display()).into());
+    }
+    fsync_dir(dir).map_err(WriteError::from)
+}
 
 /// Make the change to `path` durable. A failure here comes after the change,
 /// so it is reported as one that landed.
@@ -1176,7 +1212,9 @@ fn write_atomic_inner(
         }
         Attrs::Given(given) => (Some(given), None),
     };
-    let tmp = scratch_path(path, "new");
+    // The name irlume's file has: its scratch name, then the private name
+    // [`install`] moves it to before an exchange.
+    let mut tmp = scratch_path(path, "new");
     // The scratch file's identity, so cleanup removes that name only while it
     // still refers to this file and never to one swapped out of the path.
     let mut ours: Option<(u64, u64)> = None;
@@ -1220,7 +1258,7 @@ fn write_atomic_inner(
         interlope_for_test(path);
         #[cfg(test)]
         chmod_for_test(path);
-        install(&tmp, path, before, expected, carried, ours, still)?;
+        install(&mut tmp, path, before, expected, carried, ours, still)?;
         sync_after_change(path)
     })();
     if result.is_err() {
@@ -1253,11 +1291,22 @@ fn changed_while_writing(path: &Path) -> String {
 ///   (same inode, one link, `expected`'s bytes and the `carried` mode and
 ///   owner when given). Any other is exchanged back and the write is refused.
 ///
+/// Before the exchange irlume's file moves from its scratch name to a
+/// private one, `.{name}.irlume-exchange.{pid}.{seq}`, and `tmp` is updated
+/// to it. The file that comes out of the path takes that name, and a run
+/// killed before it looks at that file leaves it there: the next run's
+/// sweep of abandoned scratch files never takes a private name, so another
+/// writer's file that replaced the checked one is kept, not deleted. A kill
+/// between the move and the exchange leaves irlume's own unfinished file
+/// under that name instead, a leftover rather than a loss. The move is
+/// synced before the exchange ([`sync_before_exchange`]), so a power loss
+/// cannot keep the exchange and drop the move.
+///
 /// On a filesystem without `RENAME_EXCHANGE` a replacement falls back to a
 /// plain rename right after the check, as irlume wrote before; the window
 /// between the two remains there.
 fn install(
-    tmp: &Path,
+    tmp: &mut PathBuf,
     path: &Path,
     before: TargetState,
     expected: Option<Expect<'_>>,
@@ -1269,6 +1318,7 @@ fn install(
     let unsupported =
         |e: &std::io::Error| matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS));
     let Some(identity) = before else {
+        let tmp: &Path = tmp;
         match renameat2_noreplace(tmp, path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1296,6 +1346,10 @@ fn install(
             }
         };
     };
+    *tmp = move_aside_as(tmp, path, "exchange")
+        .map_err(|e| format!("rename {} before the exchange: {e}", tmp.display()))?;
+    sync_before_exchange(path)?;
+    let tmp: &Path = tmp;
     match renameat2_exchange(tmp, path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1319,6 +1373,10 @@ fn install(
                 .map_err(|e| format!("rename into {}: {e}", path.display()).into());
         }
         Err(e) => return Err(format!("rename into {}: {e}", path.display()).into()),
+    }
+    #[cfg(test)]
+    if fires(&STOP_AFTER_EXCHANGE, path) {
+        return Err("stopped after the exchange for the test".to_string().into());
     }
     // `tmp` now names what the path held at the instant of the exchange.
     let replaced_the_checked_file = std::fs::symlink_metadata(tmp).is_ok_and(|m| {
@@ -1349,8 +1407,7 @@ fn install(
 /// A second writer can replace irlume's file at `path` before this exchange.
 /// It then puts the older file back and takes out the second writer's, the
 /// newer, which goes back once more; the file that comes out is kept under a
-/// private name, not left under the scratch name, which the sweep of
-/// abandoned scratch files deletes.
+/// private name of its own (see [`kept_aside`]).
 fn swap_back(tmp: &Path, path: &Path, ours: Option<(u64, u64)>) -> Result<(), WriteError> {
     use std::os::unix::fs::MetadataExt as _;
     #[cfg(test)]
@@ -1411,10 +1468,10 @@ fn take_back_created(path: &Path, ours: Option<(u64, u64)>) -> Result<(), WriteE
     }
 }
 
-/// Another writer's file, found under the scratch name `tmp` after a write
-/// was refused, moved to a private name next to `path` that the sweep of
-/// abandoned scratch files never takes. Where it is now: that name, or `tmp`
-/// if it could not be moved.
+/// Another writer's file, found under the exchange name `tmp` after a write
+/// was refused, moved to a private name of its own next to `path`, which the
+/// sweep of abandoned scratch files never takes either. Where it is now:
+/// that name, or `tmp` if it could not be moved.
 fn kept_aside(tmp: &Path, path: &Path) -> PathBuf {
     move_aside_as(tmp, path, "kept").unwrap_or_else(|_| tmp.to_path_buf())
 }

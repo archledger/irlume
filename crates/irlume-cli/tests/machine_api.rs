@@ -649,6 +649,11 @@ fn login_plan_answers_for_both_actions() {
         for change in changes {
             assert!(change["surface"].is_string());
             assert!(change["writes"].is_boolean());
+            // A surface the apply keeps as it is (and fails on) writes nothing.
+            assert!(change["kept"].is_boolean());
+            if change["kept"] == serde_json::json!(true) {
+                assert_eq!(change["writes"], serde_json::json!(false), "{change}");
+            }
         }
         // requires_root must agree with the write count rather than being an
         // independent claim a consumer could act on wrongly.

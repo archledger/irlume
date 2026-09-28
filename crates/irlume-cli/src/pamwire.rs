@@ -1558,6 +1558,12 @@ pub(crate) struct PlannedSurface {
     /// Whether the plan kept the surface's face and fingerprint lines out
     /// (`remote_seats`), which the files it digests do not show either.
     pub(crate) face_blocked: bool,
+    /// Whether the apply keeps the surface as it is although irlume's lines
+    /// there are not the ones this run wants ([`WireOutcome`]'s `unmet`),
+    /// which fails the apply. `keep-edited-override` covers that and an
+    /// edited file whose irlume lines are already right, and the same file
+    /// can be either, depending on the lines the configuration wants.
+    pub(crate) kept: bool,
 }
 
 /// What `login enable`/`login disable` would change, computed without writing.
@@ -1683,9 +1689,9 @@ fn plan_surface(
     // A service whose decision cannot even be computed (an unreadable file)
     // is reported as not-installed rather than omitted: a surface silently
     // missing from a plan is how a consumer comes to believe it was covered.
-    let change = wire_service(svc, want, false, wire)
-        .map(|outcome| outcome.change)
-        .unwrap_or(PlannedChange::NotInstalled);
+    let (change, kept) = wire_service(svc, want, false, wire)
+        .map(|outcome| (outcome.change, outcome.unmet))
+        .unwrap_or((PlannedChange::NotInstalled, false));
     PlannedSurface {
         id: service_name(svc.etc),
         role,
@@ -1695,6 +1701,7 @@ fn plan_surface(
         state: surface_state_for(svc),
         want,
         face_blocked,
+        kept,
     }
 }
 

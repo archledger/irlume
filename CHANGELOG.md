@@ -946,6 +946,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- Camera work from an account other than root is refused while its live
+  status shows another account's work, or that of an account that did
+  not resolve, running or waiting, and that refusal and the one given
+  while an authentication is pending now read the same: "camera busy:
+  other work is in progress; retry in a moment". The state revision in
+  live status that a reader other than root reads advances for its own
+  account's changes, camera setup and qualification and other daemon-wide
+  work, and no longer for another account's; root's still counts every
+  change (ADR-0030 §5, amended 2026-09-27, #907).
+
 - The daemon's recent-event history keeps each account's events,
   daemon-wide events and those of an account that did not resolve apart,
   the latest 256 of each for 30 minutes and for up to 32 accounts at

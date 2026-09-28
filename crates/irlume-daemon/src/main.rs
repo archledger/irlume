@@ -3857,7 +3857,21 @@ fn serve_peer_until(
                 scope: scope.clone(),
                 enqueued_at: std::time::Instant::now(),
             };
-            if let Err(refusal) = arbiter.submit(class, peer.uid, queued) {
+            // An account other than root is also refused camera work while
+            // its live status shows another account's work, running or
+            // waiting, as unknown. It gets the refusal a pending
+            // authentication gets, so being refused tells it nothing its
+            // live status does not: not that the work is an authentication
+            // (ADR-0030 §5).
+            let admitted = if class == arbiter::Class::Camera
+                && peer.uid != 0
+                && diagnostic_state.live().shows_unknown_work(peer.uid)
+            {
+                Err(arbiter::Refusal::Busy)
+            } else {
+                arbiter.submit(class, peer.uid, queued)
+            };
+            if let Err(refusal) = admitted {
                 // Refused, not queued: answer now so the client can retry rather
                 // than hold a slot the login path may want. Charged to the peer,
                 // so a client that spins on refusals throttles itself at accept
@@ -15362,13 +15376,70 @@ mod tests {
             BufReader::new(ours).read_line(&mut line).unwrap();
             serde_json::from_str::<Response>(line.trim()).unwrap()
         });
+        // One refusal for every reason the camera is busy: it does not say
+        // an authentication is why (ADR-0030 §5).
         match resp {
-            Response::Error(msg) => assert!(
-                msg.contains("authentication has priority"),
-                "the client must be told why: {msg}"
-            ),
+            Response::Error(msg) => assert_eq!(msg, arbiter::Refusal::Busy.message()),
             other => panic!("a queued authentication must refuse preview work, got {other:?}"),
         }
+    }
+
+    /// An account other than root is refused camera work, in the words a
+    /// pending authentication gets, while its live status shows another
+    /// account's work, or an unresolved one's, as unknown; so being refused
+    /// tells it nothing its live status does not. Its own work, daemon-wide
+    /// work and root are not refused for that.
+    #[test]
+    fn camera_work_gets_one_refusal_while_the_readers_view_shows_unknown_work() {
+        use irlume_common::live::LiveOperationKind as K;
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let _passwd = passwd_lock();
+        // Closed: a request past the check gets the arbiter's own refusal,
+        // so no test case waits on a worker that is not there.
+        let arbiter = arbiter::Arbiter::<Queued>::new();
+        arbiter.close();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let state = diagnostics::DiagnosticState::default();
+        let (reader, other) = (61_001, 61_002);
+        let ask = |uid: u32| {
+            with_serve_as_peer_and_diagnostics(&arbiter, &ready, &state, peer(uid), |client| {
+                (&*client).write_all(b"\"ListCameras\"\n").unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                match serde_json::from_str::<Response>(line.trim()).unwrap() {
+                    Response::Error(message) => message,
+                    other => panic!("{uid}: expected a refusal, got {other:?}"),
+                }
+            })
+        };
+        let busy = arbiter::Refusal::Busy.message();
+        let queued = arbiter::Refusal::ShuttingDown.message();
+        let pending = |id: u8, owner| {
+            let operation = state.live().register(
+                irlume_common::diagnostics::OperationId::from_bytes([id; 16]),
+                K::ProfileRead,
+                false,
+                owner,
+            );
+            operation.waiting();
+            operation
+        };
+        assert_eq!(ask(reader), queued, "nothing pending");
+        for (id, owner, reader_refused) in [
+            (1, diagnostics::Owner::Account(reader), false),
+            (2, diagnostics::Owner::Daemon, false),
+            (3, diagnostics::Owner::Account(other), true),
+            (4, diagnostics::Owner::Unresolved, true),
+        ] {
+            let operation = pending(id, owner);
+            let expected = if reader_refused { busy } else { queued };
+            assert_eq!(ask(reader), expected, "{owner:?} waiting");
+            assert_eq!(ask(0), queued, "root sees {owner:?}");
+            operation.running();
+            assert_eq!(ask(reader), expected, "{owner:?} running");
+            operation.finish();
+        }
+        assert_eq!(ask(reader), queued, "nothing pending again");
     }
 
     /// A request line deadline far enough away that only a test about the

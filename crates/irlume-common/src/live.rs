@@ -68,6 +68,9 @@ pub struct LiveStatusSnapshot {
     pub daemon_uptime_ms: u64,
     /// Invalidation hint after potentially state-changing work completes,
     /// including failed/unknown outcomes. This is not a successful-write count.
+    /// Root's counts every such completion; another reader's only those it
+    /// can observe: its own account's, camera setup and qualification, and
+    /// daemon-wide work. Each only grows within one `daemon_instance`.
     pub state_revision: u64,
     pub stage: LiveStage,
     pub worker: Option<LiveWorkerOperation>,

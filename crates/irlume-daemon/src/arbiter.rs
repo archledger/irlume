@@ -19,7 +19,10 @@
 //!   authentication is pending, and each unprivileged uid may hold at most one
 //!   camera slot. Refusing beats queueing: a preview client that is told to come
 //!   back has lost a frame, while one that is queued behind an enrollment holds
-//!   a slot the login path may want.
+//!   a slot the login path may want. The refusal does not say an
+//!   authentication is why: the daemon gives an account other than root the
+//!   same one while another account's work is pending, work its live status
+//!   shows only as unknown (ADR-0030 §5), so being refused tells it no more.
 //!
 //! What this deliberately does not do is preempt by force. An operation already
 //! running is ASKED to stop, through [`CancelToken`], and it answers at its own
@@ -190,8 +193,12 @@ pub fn classify(req: &Request) -> Class {
 /// Why a camera request was turned away, in words a client can show.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Refusal {
-    /// An authentication is queued or running. The camera belongs to it.
-    AuthenticationPending,
+    /// An authentication is queued or running, so the camera belongs to it.
+    /// The daemon also gives this refusal to an account other than root
+    /// while another account's work, or work for an account that did not
+    /// resolve, is queued or running: that account's live status shows the
+    /// work as unknown, and one refusal for both says nothing more.
+    Busy,
     /// This uid already has a camera operation queued or running.
     AlreadyHoldsSlot,
     /// The arbiter is closed: the worker has drained and exited, so a queued
@@ -206,9 +213,7 @@ pub enum Refusal {
 impl Refusal {
     pub fn message(self) -> &'static str {
         match self {
-            Refusal::AuthenticationPending => {
-                "camera busy: an authentication has priority; retry in a moment"
-            }
+            Refusal::Busy => "camera busy: other work is in progress; retry in a moment",
             Refusal::AlreadyHoldsSlot => {
                 "camera busy: this account already has a camera operation in flight"
             }
@@ -350,7 +355,7 @@ impl<T> Arbiter<T> {
             }
             Class::Camera => {
                 if inner.auth_pending() {
-                    return Err(Refusal::AuthenticationPending);
+                    return Err(Refusal::Busy);
                 }
                 if uid != 0 && inner.camera_slots.contains(&uid) {
                     return Err(Refusal::AlreadyHoldsSlot);
@@ -459,10 +464,7 @@ mod tests {
     fn camera_work_is_refused_while_an_authentication_waits() {
         let a = arb();
         a.submit(Class::Auth, 0, "login").unwrap();
-        assert_eq!(
-            a.submit(Class::Camera, 1000, "preview"),
-            Err(Refusal::AuthenticationPending)
-        );
+        assert_eq!(a.submit(Class::Camera, 1000, "preview"), Err(Refusal::Busy));
         // Refusing is not the same as blocking the machine: work that does not
         // touch the camera still goes through.
         assert!(a.submit(Class::Plain, 1000, "listing").is_ok());
@@ -474,10 +476,7 @@ mod tests {
         a.submit(Class::Auth, 0, "login").unwrap();
         let job = a.take().unwrap();
         // The queue is empty now, so only `auth_running` can carry the refusal.
-        assert_eq!(
-            a.submit(Class::Camera, 1000, "preview"),
-            Err(Refusal::AuthenticationPending)
-        );
+        assert_eq!(a.submit(Class::Camera, 1000, "preview"), Err(Refusal::Busy));
         a.finish(job.class, job.uid);
         assert!(a.submit(Class::Camera, 1000, "preview").is_ok());
     }

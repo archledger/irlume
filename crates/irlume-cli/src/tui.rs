@@ -15011,7 +15011,7 @@ mod tests {
         // Any other refusal ran no test and is the daemon's own words.
         for refusal in [
             "camera busy: this account already has a camera operation in flight",
-            "camera busy: an authentication has priority; retry in a moment",
+            "camera busy: other work is in progress; retry in a moment",
             "not authorized to test recognition for 'alice'",
         ] {
             assert_eq!(

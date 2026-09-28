@@ -7216,8 +7216,15 @@ fn dispatch_scoped_session_inner(
     // Status requests are normally answered on the connection thread and
     // never reach here; delegating keeps this dispatch total (and identical
     // in behavior) if one is ever submitted anyway. The pregate rides inside.
-    if let Some(resp) = dispatch_status(&req, peer) {
-        return resp;
+    // A `ListProfiles` here is one the connection thread could not answer
+    // from the cached summary, and the worker loads it for the uid the
+    // request was registered for ([`worker_account_uid`]): a summary cached
+    // since then can belong to the uid the name resolves to now, which is
+    // another account when the name moved while the request waited.
+    if !matches!(req, Request::ListProfiles { .. }) {
+        if let Some(resp) = dispatch_status(&req, peer) {
+            return resp;
+        }
     }
     // Every arm below runs with the posture table already enforced: the
     // username screened for traversal, and the declared privilege satisfied
@@ -17633,8 +17640,30 @@ mod tests {
             let arbiter = std::sync::Arc::clone(&arbiter);
             std::thread::spawn(move || {
                 let job = arbiter.take().expect("root's listing queued");
-                // The name resolves to another uid before the worker starts.
+                // The name resolves to another uid before the worker starts,
+                // and a summary for that uid, listing no profile, is cached
+                // meanwhile: the worker must not answer from it.
                 drop(registered);
+                publish_enrollment_summary(
+                    user,
+                    EnrollmentSummary {
+                        owner: Resolution::Uid(now),
+                        profiles: Vec::new(),
+                        ir_ratio_calibrated: false,
+                        camera_groups: Vec::new(),
+                        camera_store_error: None,
+                        primary_camera: None,
+                        primary_digest: primary_digest_now(user),
+                        camera_store: CameraStoreSnapshot::default(),
+                    },
+                );
+                assert!(
+                    matches!(
+                        dispatch_status(&list_profiles_of(user), &peer(0)),
+                        Some(Response::Enrollment { .. })
+                    ),
+                    "the connection thread would answer from that summary now"
+                );
                 let Queued {
                     authorization,
                     req,

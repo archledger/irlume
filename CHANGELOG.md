@@ -400,6 +400,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Both AppArmor profiles allow ONNX Runtime to enumerate PCI devices while
+  the daemon loads models, removing the startup denial for
+  `/sys/bus/pci/devices/` (#925).
+
 - irlume now wires a login or lock screen stack that names no shared
   password stack it knows next to the stack's first auth line only when
   that line is the password step, a `pam_unix.so`, `pam_unix2.so` or

@@ -90,6 +90,10 @@ profile irlumed /usr/local/bin/irlumed {
   /sys/class/video4linux/** r,
   /sys/devices/** r,
 
+  # ONNX Runtime enumerates PCI devices during hardware discovery at startup.
+  # Per-device attributes resolve under /sys/devices, covered above.
+  /sys/bus/pci/devices/ r,
+
   # Storage diagnostics read their mount topology and every btrfs member.
   # Block-stack metadata resolves under /sys/devices; no device is opened,
   # and a mount source's /dev node is found through sysfs, never statted.

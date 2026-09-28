@@ -242,7 +242,18 @@ each record it does not use, with the uids and the next step.
   records another uid: `irlume recovery setup` records the uid it wrapped
   the key for, and the write reads only that field. As for a key sealed for
   another uid, the account gets a new key, and the old key's recovery
-  envelope is removed once the new enrollment is saved.
+  envelope is removed once the new enrollment is saved. When that field is
+  needed and the recovery envelope exists but cannot be read or parsed, the
+  write is refused with nothing written or removed; remove the envelope
+  with `irlume recovery forget`, or move it away, and write again. That
+  command removes a file, or a symbolic link whose target exists (the link,
+  not the target); for anything else there, such as a directory, the
+  refusal says to move the path away instead. An enrollment write, an
+  added-camera store write and `irlume recovery setup` check the key on a
+  load that writes nothing, and move it to a stronger policy only once
+  they keep it as the account's: a write refused over the key leaves the
+  key file as it was, and a key an enrollment write replaces is set aside
+  unmoved, so a failed write puts it back as it was.
 - `irlume recovery setup` does not wrap a template key for the account when
   the enrollment under it records another uid, whatever the key records.
   For a key that records no uid, over an enrollment that records none (or
@@ -280,7 +291,13 @@ each record it does not use, with the uids and the next step.
   enrollment, whose check covers them; on a host without a TPM they are
   plaintext, but still unusable without a primary enrollment for the uid. A
   profile listing leaves the store out when the primary enrollment beside it
-  was recorded for another uid, or its template key was. An enrollment write
+  was recorded for another uid, or its template key was. A write to the
+  store (adding or removing a camera) uses an existing template key only
+  when an enrollment write would reuse it. A key sealed for another uid, or
+  one that an enrollment write would replace as another account's or refuse
+  over an unreadable recovery envelope (above), refuses the store write with
+  nothing written: `irlume enroll` gives the account a key of its own, once
+  an unreadable envelope is removed. An enrollment write
   that replaces that enrollment removes the store, and its commit journal,
   once the new enrollment is saved; a write that fails, or whose publication
   is not confirmed durable, leaves them. Deleting the last profile removes

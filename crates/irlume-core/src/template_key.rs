@@ -175,15 +175,58 @@ pub(crate) fn key_is_for_another_account(user: &str, account: &mut Account<'_>) 
 /// recovery setup wraps the key as it is and records the uid it was set up
 /// for, so for a key an earlier release sealed without a uid the envelope
 /// names the account the key belongs to. Only the envelope's `uid` field is
-/// read; nothing is unwrapped. `false` when the key records a uid or cannot
-/// be read, and when no recovery envelope can be read.
+/// read; nothing is unwrapped. `Ok(false)` when the key records a uid or
+/// cannot be read, and when no recovery envelope is stored.
+///
+/// # Errors
+///
+/// [`Error::Policy`] when the key records no uid and a recovery envelope is
+/// stored but cannot be read or parsed: it may name another account, so
+/// the write that asks is refused rather than reusing the key, or replacing
+/// it, which would remove the envelope and the added-camera store. The
+/// message names `irlume recovery forget` only when that command removes
+/// what is at the recovery path ([`recovery_forget_removes`]), and
+/// otherwise says to move the path away.
 pub(crate) fn unbound_key_has_another_accounts_recovery(
     user: &str,
     account: &mut Account<'_>,
-) -> bool {
-    SealedEnvelope::load(&key_path(user)).is_ok_and(|env| env.uid.is_none())
-        && load_recovery(user)
-            .is_ok_and(|env| matches!(account.owner(env.uid), crate::account::Owner::Other { .. }))
+) -> Result<bool> {
+    if !SealedEnvelope::load(&key_path(user)).is_ok_and(|env| env.uid.is_none()) {
+        return Ok(false);
+    }
+    let envelope = stored_recovery(user).map_err(|e| {
+        let path = recovery_path(user);
+        let next_step = if recovery_forget_removes(&path) {
+            format!(
+                "remove it with `irlume recovery forget`, or move {} away",
+                path.display()
+            )
+        } else {
+            format!(
+                "{} is not a file that `irlume recovery forget` removes, so move it away",
+                path.display()
+            )
+        };
+        Error::Policy(format!(
+            "the recovery envelope stored for '{user}' cannot be read ({e}), so it cannot show \
+             whether the template key it wraps is this account's, and nothing was written; \
+             {next_step}"
+        ))
+    })?;
+    Ok(envelope
+        .is_some_and(|env| matches!(account.owner(env.uid), crate::account::Owner::Other { .. })))
+}
+
+/// Whether the refusal over an unreadable recovery envelope at `path` names
+/// `irlume recovery forget` as the next step: for a regular file, or a
+/// symbolic link whose target exists, which [`forget_recovery_unlocked`]
+/// removes (the link, not its target). It leaves a directory, and a link
+/// whose target does not resolve, in place, so for those, and for any other
+/// kind of file, the refusal says to move the path away instead.
+fn recovery_forget_removes(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.is_file() || (metadata.file_type().is_symlink() && path.exists())
+    })
 }
 
 /// Whether a recovery envelope exists for `user`.
@@ -206,7 +249,8 @@ pub(crate) fn ensure_key_unlocked(user: &str) -> Result<Zeroizing<Vec<u8>>> {
         user,
         &mut Account::new(user),
         None,
-        load_key_as,
+        load_key_unmoved_as,
+        move_kept_key,
         reseal_key_unlocked,
     )
     .map(|key| key.key)
@@ -214,8 +258,10 @@ pub(crate) fn ensure_key_unlocked(user: &str) -> Result<Zeroizing<Vec<u8>>> {
 
 /// Whether an unsealed template key is another account's by the records
 /// coupled to it, given the user, the key and the enrollment write's view of
-/// the account ([`crate::storage`] reads the enrollment under the key).
-pub(crate) type KeyIsAnotherAccounts<'f> = &'f dyn Fn(&str, &[u8], &mut Account<'_>) -> bool;
+/// the account ([`crate::storage`] reads the enrollment under the key). An
+/// error, a coupled record that cannot be read, refuses the write.
+pub(crate) type KeyIsAnotherAccounts<'f> =
+    &'f dyn Fn(&str, &[u8], &mut Account<'_>) -> Result<bool>;
 
 /// The key an enrollment write encrypts under: [`ensure_key_unlocked`],
 /// except that a sealed key recorded for another uid is replaced, and so is
@@ -225,11 +271,14 @@ pub(crate) type KeyIsAnotherAccounts<'f> = &'f dyn Fn(&str, &[u8], &mut Account<
 /// nor that enrollment records a uid and its recovery envelope records
 /// another ([`unbound_key_has_another_accounts_recovery`]). The enrollment
 /// written with it replaces that account's enrollment, so the account gets a
-/// key of its own. Nothing else replaces it. The replacement is final only
+/// key of its own. Nothing else replaces it, and an error from `is_other`
+/// refuses the write with nothing replaced. The replacement is final only
 /// once that enrollment is published: the write settles it with
 /// [`WriteKey::settle`], which removes the replaced key's recovery envelope.
 /// `account` is the enrollment write's view of the account, so the key is
-/// chosen against the uid the enrollment is written for.
+/// chosen against the uid the enrollment is written for. The key is checked
+/// on a load that writes nothing, and only a key the write keeps moves to a
+/// stronger TPM policy ([`move_kept_key`]).
 pub(crate) fn ensure_enrollment_key_unlocked(
     user: &str,
     account: &mut Account<'_>,
@@ -239,9 +288,71 @@ pub(crate) fn ensure_enrollment_key_unlocked(
         user,
         account,
         Some(is_other),
-        load_key_as,
+        load_key_unmoved_as,
+        move_kept_key,
         reseal_key_unlocked,
     )
+}
+
+/// The key an added-camera store write encrypts under
+/// ([`crate::multi_camera::production_key_for`]): [`ensure_key`], except that
+/// an existing key that `is_other` finds is another account's, the check an
+/// enrollment write makes ([`ensure_enrollment_key_unlocked`]), is refused.
+/// The store is encrypted under the key of the enrollment beside it and only
+/// an enrollment write replaces a key, so the store write is refused with
+/// nothing written; `irlume enroll` then gives the account a key of its own
+/// and removes the replaced enrollment's store. A key sealed for another uid
+/// is refused by the unseal, as in [`ensure_key`]. The key is checked on a
+/// load that writes nothing, and moves to a stronger TPM policy
+/// ([`move_kept_key`]) only once the check found it is the account's, so a
+/// refused write leaves the key file as it was.
+///
+/// # Errors
+///
+/// Returns the lock, unseal or seal error, the refusal of a key sealed for
+/// another uid, an error from `is_other`, or [`Error::Policy`] when
+/// `is_other` finds the key is another account's.
+pub(crate) fn ensure_camera_store_key(
+    user: &str,
+    is_other: KeyIsAnotherAccounts<'_>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let _state = UserStateLock::acquire(user)?;
+    camera_store_key_with(
+        user,
+        &mut Account::new(user),
+        is_other,
+        load_key_unmoved_as,
+        move_kept_key,
+        reseal_key_unlocked,
+    )
+}
+
+/// [`ensure_camera_store_key`] once the user state lock is held, with the
+/// unseal (`load`, which must write nothing), the move of a kept key to a
+/// stronger policy (`move_kept`) and the seal (`reseal`) passed in. A key
+/// sealed here, because none was stored, is the account's own and is not
+/// checked.
+pub(crate) fn camera_store_key_with(
+    user: &str,
+    account: &mut Account<'_>,
+    is_other: KeyIsAnotherAccounts<'_>,
+    mut load: impl FnMut(&str, &mut Account<'_>) -> Result<Zeroizing<Vec<u8>>>,
+    move_kept: impl FnOnce(&str, &[u8]),
+    reseal: impl FnOnce(&str, &[u8], Option<u32>) -> Result<()>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    if !has_key(user) {
+        return ensure_key_with(user, account, None, load, |_, _| {}, reseal).map(|key| key.key);
+    }
+    let key = load(user, account)?;
+    if is_other(user, &key, account)? {
+        return Err(Error::Policy(format!(
+            "the template key of '{user}' belongs to another uid (the enrollment it opens, or \
+             its recovery envelope, records one), so no added-camera store is written under it; \
+             run `irlume enroll` to enroll again"
+        )));
+    }
+    move_kept(user, &key);
+    Ok(key)
 }
 
 /// The template key an enrollment write encrypts under.
@@ -325,26 +436,37 @@ impl WriteKey {
     }
 }
 
-/// [`ensure_key_unlocked`] with the unseal (`load`) and the seal (`reseal`)
-/// passed in. Only with `replace_other` (an enrollment write's
-/// [`KeyIsAnotherAccounts`]) is a key replaced: one sealed for another uid,
-/// or one that `replace_other` finds is another account's. It is set aside
-/// first: a failed seal or round trip puts it back, and the enrollment write
-/// settles the rest ([`WriteKey::settle`]).
+/// [`ensure_key_unlocked`] with the unseal (`load`), the move of a kept key
+/// to a stronger policy (`move_kept`) and the seal (`reseal`) passed in.
+/// Only with `replace_other` (an enrollment write's [`KeyIsAnotherAccounts`])
+/// is a key replaced: one sealed for another uid, or one that
+/// `replace_other` finds is another account's. It is set aside first, as
+/// `load` found it (`load` writes nothing): a failed seal or round trip puts
+/// it back, and the enrollment write settles the rest ([`WriteKey::settle`]).
+/// An existing key moves only once it is kept, after that check, so neither
+/// a refused write nor a replacement moves another account's key.
 pub(crate) fn ensure_key_with(
     user: &str,
     account: &mut Account<'_>,
     replace_other: Option<KeyIsAnotherAccounts<'_>>,
     mut load: impl FnMut(&str, &mut Account<'_>) -> Result<Zeroizing<Vec<u8>>>,
+    move_kept: impl FnOnce(&str, &[u8]),
     reseal: impl FnOnce(&str, &[u8], Option<u32>) -> Result<()>,
 ) -> Result<WriteKey> {
     let mut replaced = None;
     if has_key(user) {
         match (load(user, account), replace_other) {
-            (Ok(key), Some(is_other)) if is_other(user, &key, account) => {
+            (Ok(key), Some(is_other)) => {
+                if !is_other(user, &key, account)? {
+                    move_kept(user, &key);
+                    return Ok(WriteKey::kept(key));
+                }
                 replaced = Some(ReplacedKey::set_aside(user)?);
             }
-            (Ok(key), _) => return Ok(WriteKey::kept(key)),
+            (Ok(key), None) => {
+                move_kept(user, &key);
+                return Ok(WriteKey::kept(key));
+            }
             (Err(_), Some(_)) if account.found_other() => {
                 replaced = Some(ReplacedKey::set_aside(user)?);
             }
@@ -529,7 +651,9 @@ pub(crate) enum KeyLoadPolicy {
     Upgrade,
     /// The normal unseal, never followed by a move to a stronger policy: an
     /// authentication request unseals the key at most once (ADR-0025), and
-    /// the move round-trip unseals the new envelope.
+    /// the move round-trip unseals the new envelope. A write that checks
+    /// whose key it is loads it so too, and moves only a key it keeps
+    /// ([`move_kept_key`]).
     Keep,
     ReadOnly,
 }
@@ -558,6 +682,17 @@ pub(crate) fn load_key_for_authentication_as(
     user: &str,
     account: &mut Account<'_>,
 ) -> Result<Zeroizing<Vec<u8>>> {
+    load_key_unmoved_as(user, account)
+}
+
+/// [`load_key_as`] without the move to a stronger policy: the key file is
+/// only read. A write that checks whether the key is the account's loads it
+/// this way and moves only a key it keeps ([`move_kept_key`]), so a write
+/// refused over the key leaves the key file as it was.
+pub(crate) fn load_key_unmoved_as(
+    user: &str,
+    account: &mut Account<'_>,
+) -> Result<Zeroizing<Vec<u8>>> {
     load_key_with(
         user,
         account,
@@ -566,6 +701,29 @@ pub(crate) fn load_key_for_authentication_as(
         tpm::stronger_tier_available_than,
         tpm::seal,
     )
+}
+
+/// Move `user`'s template key, unsealed as `key` by [`load_key_unmoved_as`]
+/// and kept by the write that loaded it, to a strictly stronger TPM policy
+/// when one is available, as a load through [`load_key_as`] does: best
+/// effort, keeping the uid the key records, and never failing the write.
+/// The caller holds the user state lock it loaded the key under, so the
+/// envelope read here is the one `key` was unsealed from.
+pub(crate) fn move_kept_key(user: &str, key: &[u8]) {
+    move_kept_key_with(user, key, tpm::stronger_tier_available_than, tpm::seal);
+}
+
+/// [`move_kept_key`] with the TPM calls passed in.
+pub(crate) fn move_kept_key_with(
+    user: &str,
+    key: &[u8],
+    stronger_tier_available: impl FnOnce(&SealedEnvelope) -> bool,
+    seal: impl FnOnce(&[u8]) -> Result<SealedEnvelope>,
+) {
+    let path = key_path(user);
+    if let Ok(env) = SealedEnvelope::load(&path) {
+        move_best_effort(&path, &env, key, stronger_tier_available, seal);
+    }
 }
 
 /// Move `user`'s template key to a strictly stronger TPM policy when one is
@@ -675,21 +833,39 @@ pub(crate) fn load_key_with(
     // Best-effort tier auto-upgrade (mirrors keyring::reseal_password): if a
     // strictly stronger policy is available than the one this key was sealed
     // under (pcrlock provisioned since, or a signed Tier 1 envelope from an
-    // earlier release), re-seal the key to it with no re-enroll. Not on an
-    // authentication request's load (`Keep`), since the ladder's round trip
-    // unseals again. The check short-circuits to a no-op once the envelope is
-    // already at the best policy. Never fail the load on it: the key unsealed
-    // fine and the weaker envelope stays usable.
+    // earlier release), re-seal the key to it with no re-enroll. Not on a
+    // `Keep` load: an authentication request's, since the ladder's round trip
+    // unseals again, or a write's, which moves the key only once it has found
+    // the key is the account's (`move_kept_key`). The check short-circuits to
+    // a no-op once the envelope is already at the best policy. Never fail the
+    // load on it: the key unsealed fine and the weaker envelope stays usable.
     // The move keeps the uid the key records, or none (see `move_with`).
-    if policy == KeyLoadPolicy::Upgrade && stronger_tier_available(&env) {
-        if let Ok(mut candidate) = seal(&key) {
-            candidate.uid = env.uid;
-            if candidate.strength_rank() > env.strength_rank() && candidate.save(&path).is_ok() {
-                set_0600(&path);
-            }
-        }
+    if policy == KeyLoadPolicy::Upgrade {
+        move_best_effort(&path, &env, &key, stronger_tier_available, seal);
     }
     Ok(key)
+}
+
+/// Re-seal `key`, unsealed from `env` at `path`, under a strictly stronger
+/// policy when one is available, keeping the uid `env` records. Best effort:
+/// a failed seal or save, or a candidate that does not rank higher, leaves
+/// `env` in place.
+fn move_best_effort(
+    path: &Path,
+    env: &SealedEnvelope,
+    key: &[u8],
+    stronger_tier_available: impl FnOnce(&SealedEnvelope) -> bool,
+    seal: impl FnOnce(&[u8]) -> Result<SealedEnvelope>,
+) {
+    if !stronger_tier_available(env) {
+        return;
+    }
+    if let Ok(mut candidate) = seal(key) {
+        candidate.uid = env.uid;
+        if candidate.strength_rank() > env.strength_rank() && candidate.save(path).is_ok() {
+            set_0600(path);
+        }
+    }
 }
 
 /// (Re-)seal `key` for `user` against the current TPM PCR policy and persist it.
@@ -749,23 +925,28 @@ pub(crate) fn forget_key_unlocked(user: &str) -> Result<()> {
 /// ([`crate::recovery::check_new_passphrase`]) is refused before any file is
 /// read or written, so an existing envelope stays as it was.
 ///
-/// The key is not wrapped for this account, and an existing envelope stays,
-/// when the enrollment it opens records another uid, or when the key records
-/// no uid, its enrollment records none, and the envelope it would replace
-/// records another uid ([`crate::account`]).
+/// The key is not wrapped for this account, and an existing envelope and
+/// the key file stay as they were, when the enrollment it opens records
+/// another uid, or when the key records no uid, its enrollment records none,
+/// and the envelope it would replace records another uid
+/// ([`crate::account`]).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn setup_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
     crate::recovery::check_new_passphrase(passphrase)?;
     let _state = UserStateLock::acquire(user)?;
-    setup_recovery_with(user, passphrase, load_key_as)
+    setup_recovery_with(user, passphrase, load_key_unmoved_as, move_kept_key)
 }
 
 /// [`setup_recovery`] once the passphrase passed and the user state lock is
-/// held, with the unseal passed in.
+/// held, with the unseal (`load`, which must write nothing) and the move of
+/// a key the setup keeps to a stronger policy (`move_kept`) passed in. The
+/// key moves only once it is found to be the account's, so a refused setup
+/// leaves the key file as it was.
 pub(crate) fn setup_recovery_with(
     user: &str,
     passphrase: &[u8],
     load: impl FnOnce(&str, &mut Account<'_>) -> Result<Zeroizing<Vec<u8>>>,
+    move_kept: impl FnOnce(&str, &[u8]),
 ) -> Result<()> {
     let mut account = Account::new(user);
     // `load` refuses a key sealed for another uid; one without a uid is
@@ -781,6 +962,7 @@ pub(crate) fn setup_recovery_with(
         other => other,
     })?;
     let uid = account.uid_to_record(Record::Recovery, None)?;
+    move_kept(user, &key);
     let mut env = crate::recovery::wrap(passphrase, &key)?;
     env.uid = uid;
     save_recovery(user, &env)
@@ -927,6 +1109,31 @@ fn save_recovery(user: &str, env: &RecoveryEnvelope) -> Result<()> {
 fn load_recovery(user: &str) -> Result<RecoveryEnvelope> {
     let data = std::fs::read(recovery_path(user)).map_err(|e| Error::Io(e.to_string()))?;
     serde_json::from_slice(&data).map_err(|e| Error::Protocol(e.to_string()))
+}
+
+/// [`load_recovery`], with `Ok(None)` when no recovery envelope is stored.
+/// A stored one that cannot be read or parsed is an error.
+fn stored_recovery(user: &str) -> Result<Option<RecoveryEnvelope>> {
+    let path = recovery_path(user);
+    let data = match std::fs::read(&path) {
+        Ok(data) => data,
+        // A link whose target is missing also reads as not found, but an
+        // entry is there, and it shows no uid: it is not an absent envelope.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Ok(_) => Err(Error::Io(format!(
+                    "{} is a link that does not resolve",
+                    path.display()
+                ))),
+                Err(e) => Err(Error::Io(e.to_string())),
+            };
+        }
+        Err(e) => return Err(Error::Io(e.to_string())),
+    };
+    serde_json::from_slice(&data)
+        .map(Some)
+        .map_err(|e| Error::Protocol(e.to_string()))
 }
 
 #[cfg(unix)]
@@ -1470,6 +1677,99 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The refusal over an unreadable recovery envelope names
+    /// `irlume recovery forget` only for what that command removes: a file,
+    /// or a symbolic link whose target exists (the link goes, the target
+    /// stays). For a directory, or a link that does not resolve, it says to
+    /// move the path away instead, since the command leaves those in place.
+    #[test]
+    fn an_unreadable_recovery_envelope_names_forget_only_where_forget_removes_it() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("recovery-next-step"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        let user = "recovery-next-step";
+        let weak: SealedEnvelope =
+            serde_json::from_str(r#"{"version":1,"pcrs":[7],"public":"","private":""}"#).unwrap();
+        weak.save(&key_path(user)).unwrap();
+        let path = recovery_path(user);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let target = elsewhere.join("not-an-envelope");
+        std::fs::write(&target, b"synthetic, not an envelope").unwrap();
+        let clear = || {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir(&path);
+        };
+        let not_json = || std::fs::write(&path, b"synthetic, not an envelope").unwrap();
+        let link_to_a_file = || std::os::unix::fs::symlink(&target, &path).unwrap();
+        let link_to_a_directory = || std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        let a_directory = || std::fs::create_dir(&path).unwrap();
+        let a_link_loop = || std::os::unix::fs::symlink(&path, &path).unwrap();
+        let a_dangling_link =
+            || std::os::unix::fs::symlink(elsewhere.join("missing"), &path).unwrap();
+        let kinds: [(&str, &dyn Fn(), bool); 6] = [
+            ("a file", &not_json, true),
+            ("a link to a file", &link_to_a_file, true),
+            ("a link to a directory", &link_to_a_directory, true),
+            ("a directory", &a_directory, false),
+            ("a link that does not resolve", &a_link_loop, false),
+            ("a link to a missing file", &a_dangling_link, false),
+        ];
+        let forget_step = format!(
+            "remove it with `irlume recovery forget`, or move {} away",
+            path.display()
+        );
+        let move_step = format!(
+            "{} is not a file that `irlume recovery forget` removes, so move it away",
+            path.display()
+        );
+        for (kind, plant, forget_removes) in kinds {
+            clear();
+            plant();
+            let error = unbound_key_has_another_accounts_recovery(user, &mut Account::new(user))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("cannot be read"), "{kind}: {error}");
+            assert!(
+                !error.contains('\u{2014}') && !error.contains('\u{2013}'),
+                "{kind}: {error}"
+            );
+            let forgotten = forget_recovery(user);
+            if forget_removes {
+                assert!(error.ends_with(&forget_step), "{kind}: {error}");
+                forgotten.unwrap();
+                assert!(
+                    std::fs::symlink_metadata(&path).is_err(),
+                    "{kind}: forget removed it"
+                );
+                assert!(
+                    !unbound_key_has_another_accounts_recovery(user, &mut Account::new(user))
+                        .unwrap(),
+                    "{kind}: and the next write goes ahead"
+                );
+            } else {
+                assert!(error.ends_with(&move_step), "{kind}: {error}");
+                assert!(!error.contains("remove it with"), "{kind}: {error}");
+                assert!(
+                    std::fs::symlink_metadata(&path).is_ok(),
+                    "{kind}: forget leaves it ({forgotten:?})"
+                );
+            }
+            assert!(
+                target.exists() && elsewhere.is_dir(),
+                "{kind}: a link target stays"
+            );
+        }
+        clear();
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A template key on a weaker policy stays there through an
     /// authentication request's load, which unseals it once, and moves when
     /// irlumed starts: once, and not again when nothing stronger is left.
@@ -1524,7 +1824,9 @@ mod tests {
     /// enrollment's key replaces the key once that enrollment is published
     /// (and removes the recovery file, which can only restore the replaced
     /// key). A key an earlier release sealed without a uid unseals, and its
-    /// next re-seal records the uid.
+    /// next re-seal records the uid. An added-camera store write does not
+    /// use such a key while its recovery envelope records another uid or
+    /// cannot be read, and uses it once no envelope is stored.
     #[test]
     #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn tpm_a_template_key_records_its_uid_and_a_new_enrollment_replaces_it() {
@@ -1578,7 +1880,8 @@ mod tests {
         let replace = || {
             let _state = UserStateLock::acquire(user).unwrap();
             // No enrollment here: only the key's own uid decides.
-            ensure_enrollment_key_unlocked(user, &mut Account::new(user), &|_, _, _| false).unwrap()
+            ensure_enrollment_key_unlocked(user, &mut Account::new(user), &|_, _, _| Ok(false))
+                .unwrap()
         };
         let unpublished = replace();
         assert_eq!(recorded(), Some(5102));
@@ -1601,6 +1904,33 @@ mod tests {
         assert_eq!(&*load_key(user).unwrap(), &*second);
         reseal_key(user, &second).unwrap();
         assert_eq!(recorded(), Some(5102));
+
+        // The added-camera store's write key does not reuse such a key when
+        // its recovery envelope records another uid, or cannot be read.
+        let state = crate::test_tmp_dir("state-uid-tpm");
+        let _ = std::fs::remove_dir_all(&state);
+        std::env::set_var("IRLUME_STATE_DIR", &state);
+        *TPM_PRESENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(true);
+        legacy.save(&key_path(user)).unwrap();
+        let mut other = crate::recovery::wrap(b"recovery passphrase", &second).unwrap();
+        other.uid = Some(5101);
+        save_recovery(user, &other).unwrap();
+        let another_accounts = crate::multi_camera::production_key_for(user);
+        std::fs::write(recovery_path(user), b"synthetic, not an envelope").unwrap();
+        let unreadable = crate::multi_camera::production_key_for(user);
+        forget_recovery_unlocked(user).unwrap();
+        let reused = crate::multi_camera::production_key_for(user);
+        *TPM_PRESENT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&state);
+        let error = another_accounts.unwrap_err().to_string();
+        assert!(error.contains("belongs to another uid"), "{error}");
+        let error = unreadable.unwrap_err().to_string();
+        assert!(error.contains("cannot be read"), "{error}");
+        assert_eq!(
+            reused.unwrap().as_deref().map(|k| k.as_slice()),
+            Some(&second[..])
+        );
 
         forget_key(user).unwrap();
         std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");

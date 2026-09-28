@@ -708,15 +708,23 @@ fn save_key(
 /// - when that enrollment records no uid either (or none is stored, or `key`
 ///   does not read it), the recovery envelope does: a setup records the uid
 ///   it wrapped the key for
-///   ([`template_key::unbound_key_has_another_accounts_recovery`]).
+///   ([`template_key::unbound_key_has_another_accounts_recovery`]), and one
+///   that is stored but cannot be read is an error.
 ///
 /// A write for this account then does not reuse the key: it protects that
 /// account's templates, and that account's recovery envelope restores it.
-fn key_is_another_accounts(user: &str, key: &[u8], account: &mut Account<'_>) -> bool {
+/// An enrollment write replaces the key; an added-camera store write is
+/// refused ([`template_key::ensure_camera_store_key`]). An error refuses
+/// either write.
+pub(crate) fn key_is_another_accounts(
+    user: &str,
+    key: &[u8],
+    account: &mut Account<'_>,
+) -> irlume_common::Result<bool> {
     match account.owner(stored_enrollment_uid(user, Some(key))) {
-        Owner::Other { .. } => true,
+        Owner::Other { .. } => Ok(true),
         Owner::Unrecorded => template_key::unbound_key_has_another_accounts_recovery(user, account),
-        Owner::Current | Owner::Unknown { .. } => false,
+        Owner::Current | Owner::Unknown { .. } => Ok(false),
     }
 }
 
@@ -800,16 +808,27 @@ pub fn save(e: &Enrollment) -> irlume_common::Result<()> {
 /// but directory synchronization failed, the error explicitly says so.
 pub fn save_replacement(e: &Enrollment) -> irlume_common::Result<()> {
     save_with_key(e, |user, account| {
-        replacement_key(user, account, template_key::load_key_as, save_key)
+        replacement_key(
+            user,
+            account,
+            template_key::load_key_unmoved_as,
+            template_key::move_kept_key,
+            save_key,
+        )
     })
 }
 
 /// The key a replacement enrollment is written under; `account` is the
-/// save's view of the account.
+/// save's view of the account. The existing key is loaded with
+/// `load_existing`, which writes nothing, and moves to a stronger TPM policy
+/// (`move_kept`) only once the write keeps it: a write refused over the key
+/// leaves the key file as it was, and `first_save` sets aside a key it
+/// replaces as it was.
 fn replacement_key(
     user: &str,
     account: &mut Account<'_>,
     load_existing: impl FnOnce(&str, &mut Account<'_>) -> irlume_common::Result<Zeroizing<Vec<u8>>>,
+    move_kept: impl FnOnce(&str, &[u8]),
     first_save: impl FnOnce(
         &str,
         &mut Account<'_>,
@@ -833,10 +852,12 @@ fn replacement_key(
         // recovery envelope records one while neither it nor its enrollment
         // does (a key an earlier release sealed without a uid), is that
         // account's key: the first-save path replaces it, as it does a key
-        // sealed for another uid.
-        if key_is_another_accounts(user, &key, account) {
+        // sealed for another uid. A recovery envelope that cannot be read
+        // refuses the write.
+        if key_is_another_accounts(user, &key, account)? {
             return first_save(user, account);
         }
+        move_kept(user, &key);
         Ok(Some(template_key::WriteKey::kept(key)))
     } else {
         first_save(user, account)
@@ -2180,6 +2201,32 @@ mod tests {
         )
     }
 
+    /// The move of a kept key to a stronger policy in the tests where none
+    /// is available.
+    fn no_move(_: &str, _: &[u8]) {}
+
+    /// The move of a kept key to a stronger policy
+    /// ([`template_key::move_kept_key`]) in the replacement tests.
+    type FakeMove = dyn Fn(&str, &[u8]);
+
+    /// The move of a kept key when the fake TPM always has a stronger
+    /// policy: it seals the key under pcrlock, as the ladder would.
+    fn fake_move(user: &str, key: &[u8]) {
+        template_key::move_kept_key_with(
+            user,
+            key,
+            |_| true,
+            |key| {
+                let mut env: crate::envelope::SealedEnvelope =
+                    serde_json::from_str(r#"{"version":1,"pcrs":[7],"public":"","private":""}"#)
+                        .unwrap();
+                env.policy = crate::envelope::PolicyKind::PcrlockNv { nv_index: 1 };
+                env.private = key.to_vec();
+                Ok(env)
+            },
+        );
+    }
+
     /// Save `e` with the key choice of `save_replacement` (`replacing`) or of
     /// `save`, sealing a new key with `reseal`.
     fn save_choosing_key(
@@ -2187,19 +2234,30 @@ mod tests {
         replacing: bool,
         reseal: &FakeSeal,
     ) -> irlume_common::Result<()> {
+        save_moving_kept_key(e, replacing, reseal, &no_move)
+    }
+
+    /// [`save_choosing_key`], moving a key the write keeps with `move_kept`.
+    fn save_moving_kept_key(
+        e: &Enrollment,
+        replacing: bool,
+        reseal: &FakeSeal,
+        move_kept: &FakeMove,
+    ) -> irlume_common::Result<()> {
         let enrollment_key = |user: &str, account: &mut Account<'_>| {
             template_key::ensure_key_with(
                 user,
                 account,
                 Some(&key_is_another_accounts),
                 fake_load,
+                move_kept,
                 reseal,
             )
             .map(Some)
         };
         save_with_key(e, |user, account| {
             if replacing {
-                replacement_key(user, account, fake_load, enrollment_key)
+                replacement_key(user, account, fake_load, move_kept, enrollment_key)
             } else {
                 enrollment_key(user, account)
             }
@@ -2241,6 +2299,7 @@ mod tests {
                     account,
                     Some(&key_is_another_accounts),
                     fake_load,
+                    no_move,
                     reseal,
                 )
                 .map(Some)
@@ -2309,6 +2368,11 @@ mod tests {
         let old_key = [5u8; 32];
         let recovery = template_key::recovery_path(user);
         fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+        // A recovery envelope of the key that records no uid, as an earlier
+        // release wrote it.
+        let wrapped =
+            serde_json::to_vec(&crate::recovery::wrap(b"a recovery passphrase", &old_key).unwrap())
+                .unwrap();
         // The enrollment under `old_key` records `uid`; the key records none.
         let plant = |uid: Option<u32>| {
             let mut old = sample();
@@ -2317,7 +2381,7 @@ mod tests {
             let enrollment = serialize_enrollment(&old, Some(&old_key)).unwrap();
             fs::write(profile_path(user), &enrollment).unwrap();
             fake_seal(user, &old_key, None).unwrap();
-            fs::write(&recovery, b"synthetic recovery of the key").unwrap();
+            fs::write(&recovery, &wrapped).unwrap();
             plant_camera_store(user);
             (enrollment, fs::read(template_key::key_path(user)).unwrap())
         };
@@ -2508,6 +2572,508 @@ mod tests {
         leave_uid_sandbox(&dir);
     }
 
+    /// A template key an earlier release sealed without a uid, under an
+    /// enrollment that records none (or none stored), is reused only when
+    /// its recovery envelope shows no other uid. An envelope that is stored
+    /// but cannot be read (not JSON, not an envelope, not a file) cannot
+    /// show that, so neither a replacement enrollment nor a first save is
+    /// written: nothing is sealed, and the key, the enrollment, the envelope
+    /// and the added-camera store stay as they were. The refusal names
+    /// `irlume recovery forget` for a file, which it removes, and otherwise
+    /// says to move the path away. With no envelope stored the key is
+    /// reused, as before. Beside a key or an enrollment that records the
+    /// current uid the envelope is not needed, and the write goes ahead.
+    #[test]
+    fn an_unreadable_recovery_envelope_refuses_a_write_that_would_reuse_an_unbound_key() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("uid-unreadable-recovery");
+        let user = "uid-unreadable-recovery";
+        let old_key = [13u8; 32];
+        let recovery = template_key::recovery_path(user);
+        fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+        let clear_recovery = || {
+            let _ = fs::remove_file(&recovery);
+            let _ = fs::remove_dir(&recovery);
+        };
+        // The key records `key_uid`; with `enrolled`, an enrollment that
+        // records the uid it holds is stored under the key.
+        let plant = |key_uid: Option<u32>, enrolled: Option<Option<u32>>| {
+            clear_recovery();
+            let _ = fs::remove_file(profile_path(user));
+            if let Some(uid) = enrolled {
+                let mut old = sample();
+                old.user = user.into();
+                old.uid = uid;
+                let bytes = serialize_enrollment(&old, Some(&old_key)).unwrap();
+                fs::write(profile_path(user), bytes).unwrap();
+            }
+            fake_seal(user, &old_key, key_uid).unwrap();
+            (
+                fs::read(profile_path(user)).ok(),
+                fs::read(template_key::key_path(user)).unwrap(),
+            )
+        };
+        let not_json = || fs::write(&recovery, b"synthetic, not an envelope").unwrap();
+        let not_an_envelope = || fs::write(&recovery, br#"{"version":1}"#).unwrap();
+        let not_a_file = || fs::create_dir(&recovery).unwrap();
+        // Whether `irlume recovery forget` removes what is at the path, and
+        // so whether the refusal names it.
+        let unreadable: [(&str, &dyn Fn(), bool); 3] = [
+            ("not JSON", &not_json, true),
+            ("not an envelope", &not_an_envelope, true),
+            ("not a file", &not_a_file, false),
+        ];
+        let (store, journal) = plant_camera_store(user);
+        let _now = crate::account::remember(user, 7102);
+        let mut replacement = Enrollment::new(user);
+        replacement.profiles = sample().profiles;
+        let no_seal: &FakeSeal = &|_, _, _| panic!("no key is sealed");
+
+        for (what, replacing) in [("a replacement", true), ("a first save", false)] {
+            let write = || save_choosing_key(&replacement, replacing, no_seal);
+            for enrolled in [Some(None), None] {
+                for (kind, make_unreadable, forget_removes) in unreadable {
+                    let case = format!("{what}, enrolled {enrolled:?}, recovery {kind}");
+                    let (enrollment_before, key_before) = plant(None, enrolled);
+                    make_unreadable();
+                    let error = write().unwrap_err().to_string();
+                    assert!(
+                        error.contains("recovery envelope") && error.contains("cannot be read"),
+                        "{case}: {error}"
+                    );
+                    let next_step = if forget_removes {
+                        format!(
+                            "remove it with `irlume recovery forget`, or move {} away",
+                            recovery.display()
+                        )
+                    } else {
+                        format!(
+                            "{} is not a file that `irlume recovery forget` removes, so move it \
+                             away",
+                            recovery.display()
+                        )
+                    };
+                    assert!(error.ends_with(&next_step), "{case}: {error}");
+                    assert_eq!(
+                        fs::read(template_key::key_path(user)).unwrap(),
+                        key_before,
+                        "{case}: the key is kept"
+                    );
+                    assert_eq!(
+                        fs::read(profile_path(user)).ok(),
+                        enrollment_before,
+                        "{case}: no enrollment is written"
+                    );
+                    assert!(recovery.exists(), "{case}: the envelope stays");
+                    assert!(store.exists() && journal.exists(), "{case}: and the store");
+                }
+
+                let case = format!("{what}, enrolled {enrolled:?}, no recovery envelope");
+                let (_, key_before) = plant(None, enrolled);
+                write().unwrap();
+                assert_eq!(
+                    fs::read(template_key::key_path(user)).unwrap(),
+                    key_before,
+                    "{case}: the key is reused"
+                );
+                let saved =
+                    deserialize_enrollment(&fs::read(profile_path(user)).unwrap(), Some(&old_key))
+                        .unwrap();
+                assert_eq!(saved.uid, Some(7102), "{case}");
+                assert!(store.exists() && journal.exists(), "{case}");
+            }
+
+            for (key_uid, enrollment_uid) in [(Some(7102), None), (None, Some(7102))] {
+                let case = format!("{what}, key {key_uid:?}, enrollment {enrollment_uid:?}");
+                let (_, key_before) = plant(key_uid, Some(enrollment_uid));
+                not_json();
+                write().unwrap();
+                assert_eq!(
+                    fs::read(template_key::key_path(user)).unwrap(),
+                    key_before,
+                    "{case}: the key is reused"
+                );
+                assert_eq!(
+                    fs::read(&recovery).unwrap(),
+                    b"synthetic, not an envelope",
+                    "{case}: the envelope is left alone"
+                );
+            }
+        }
+        clear_recovery();
+        leave_uid_sandbox(&dir);
+    }
+
+    /// An added-camera store write uses the account's template key only
+    /// when an enrollment write would reuse it too. A key that opens an
+    /// enrollment recorded for another uid, or that records no uid under an
+    /// enrollment that records none (or none stored) while its recovery
+    /// envelope records another uid, is refused with nothing sealed: the
+    /// store write does not replace the key, since the enrollment beside the
+    /// store is encrypted under it. So is such a key when its recovery
+    /// envelope cannot be read, and a key sealed for another uid. The key is
+    /// used when those records show the current uid or none, and a new key
+    /// is sealed for the account when none is stored.
+    #[test]
+    fn an_added_camera_store_write_refuses_a_key_an_enrollment_write_would_replace() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("uid-camera-store-key");
+        let user = "uid-camera-store-key";
+        let old_key = [17u8; 32];
+        let wrapped = crate::recovery::wrap(b"a recovery passphrase", &old_key).unwrap();
+        let recovery = template_key::recovery_path(user);
+        fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+        // The key records `key_uid`; with `enrolled`, an enrollment that
+        // records the uid it holds is stored under it; with `recovery_uid`, a
+        // recovery envelope that records the uid it holds is stored.
+        let plant = |key_uid: Option<u32>,
+                     enrolled: Option<Option<u32>>,
+                     recovery_uid: Option<Option<u32>>| {
+            let _ = fs::remove_file(profile_path(user));
+            let _ = fs::remove_file(&recovery);
+            if let Some(uid) = enrolled {
+                let mut old = sample();
+                old.user = user.into();
+                old.uid = uid;
+                let bytes = serialize_enrollment(&old, Some(&old_key)).unwrap();
+                fs::write(profile_path(user), bytes).unwrap();
+            }
+            fake_seal(user, &old_key, key_uid).unwrap();
+            if let Some(uid) = recovery_uid {
+                let mut envelope = wrapped.clone();
+                envelope.uid = uid;
+                fs::write(&recovery, serde_json::to_vec(&envelope).unwrap()).unwrap();
+            }
+            (
+                fs::read(profile_path(user)).ok(),
+                fs::read(template_key::key_path(user)).unwrap(),
+                fs::read(&recovery).ok(),
+            )
+        };
+        let _now = crate::account::remember(user, 7202);
+        let no_seal: &FakeSeal = &|_, _, _| panic!("no key is sealed over an existing one");
+        let store_key = |reseal: &FakeSeal| {
+            template_key::camera_store_key_with(
+                user,
+                &mut Account::new(user),
+                &key_is_another_accounts,
+                fake_load,
+                no_move,
+                reseal,
+            )
+        };
+
+        let refused = [
+            (
+                "its enrollment records another uid",
+                None,
+                Some(Some(7201)),
+                Some(None),
+                "belongs to another uid",
+            ),
+            (
+                "its enrollment records another uid, the key the current one",
+                Some(7202),
+                Some(Some(7201)),
+                None,
+                "belongs to another uid",
+            ),
+            (
+                "its recovery envelope records another uid",
+                None,
+                Some(None),
+                Some(Some(7201)),
+                "belongs to another uid",
+            ),
+            (
+                "no enrollment, its recovery envelope records another uid",
+                None,
+                None,
+                Some(Some(7201)),
+                "belongs to another uid",
+            ),
+            (
+                "the key records another uid",
+                Some(7201),
+                Some(None),
+                None,
+                "uid 7201",
+            ),
+        ];
+        for (case, key_uid, enrolled, recovery_uid, expected) in refused {
+            let before = plant(key_uid, enrolled, recovery_uid);
+            let error = store_key(no_seal).unwrap_err().to_string();
+            assert!(error.contains(expected), "{case}: {error}");
+            assert_eq!(
+                (
+                    fs::read(profile_path(user)).ok(),
+                    fs::read(template_key::key_path(user)).unwrap(),
+                    fs::read(&recovery).ok(),
+                ),
+                before,
+                "{case}: nothing changes"
+            );
+        }
+
+        let (_, key_before, _) = plant(None, Some(None), None);
+        fs::write(&recovery, b"synthetic, not an envelope").unwrap();
+        let error = store_key(no_seal).unwrap_err().to_string();
+        assert!(error.contains("cannot be read"), "{error}");
+        assert_eq!(fs::read(template_key::key_path(user)).unwrap(), key_before);
+
+        let kept = [
+            (
+                "its enrollment records the current uid",
+                None,
+                Some(Some(7202)),
+                Some(Some(7201)),
+            ),
+            (
+                "the key records the current uid",
+                Some(7202),
+                Some(None),
+                Some(Some(7201)),
+            ),
+            (
+                "its recovery envelope records the current uid",
+                None,
+                Some(None),
+                Some(Some(7202)),
+            ),
+            ("nothing records a uid", None, Some(None), Some(None)),
+            ("no recovery envelope", None, None, None),
+        ];
+        for (case, key_uid, enrolled, recovery_uid) in kept {
+            let before = plant(key_uid, enrolled, recovery_uid);
+            let key = store_key(no_seal).unwrap();
+            assert_eq!(&*key, &old_key, "{case}: the key is used");
+            assert_eq!(
+                fs::read(template_key::key_path(user)).unwrap(),
+                before.1,
+                "{case}"
+            );
+        }
+
+        let _ = fs::remove_file(profile_path(user));
+        let _ = fs::remove_file(&recovery);
+        fs::remove_file(template_key::key_path(user)).unwrap();
+        let key = store_key(&fake_seal).unwrap();
+        let sealed = crate::envelope::SealedEnvelope::load(&template_key::key_path(user)).unwrap();
+        assert_eq!(sealed.private, key.to_vec(), "a new key is sealed");
+        assert_eq!(sealed.uid, Some(7202), "for the account");
+        leave_uid_sandbox(&dir);
+    }
+
+    /// A write moves an existing template key to a stronger TPM policy only
+    /// once it keeps the key as the account's: the key is checked on a load
+    /// that writes nothing. So a write refused over the key (an enrollment
+    /// write over an unreadable recovery envelope, an added-camera store
+    /// write or a recovery setup over a key whose records name another uid)
+    /// leaves the key file byte for byte as it was, although a stronger
+    /// policy is available. Nor does a key an enrollment write replaces as
+    /// another account's move: a failed replacement puts it back as it was.
+    /// A key each write keeps moves, and keeps the uid it records.
+    #[test]
+    fn a_write_moves_a_template_key_to_a_stronger_policy_only_once_it_keeps_it() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("uid-kept-key-move");
+        let user = "uid-kept-key-move";
+        let old_key = [19u8; 32];
+        let passphrase: &[u8] = b"a recovery passphrase";
+        let wrapped = crate::recovery::wrap(passphrase, &old_key).unwrap();
+        let recovery = template_key::recovery_path(user);
+        fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+        // What is stored at the recovery path.
+        #[derive(Clone, Copy, Debug)]
+        enum Recovery {
+            Absent,
+            Records(Option<u32>),
+            Unreadable,
+        }
+        // The key records `key_uid`; with `enrolled`, an enrollment that
+        // records the uid it holds is stored under it. Returns the key file.
+        let plant = |key_uid: Option<u32>, enrolled: Option<Option<u32>>, stored: Recovery| {
+            let _ = fs::remove_file(profile_path(user));
+            let _ = fs::remove_file(&recovery);
+            if let Some(uid) = enrolled {
+                let mut old = sample();
+                old.user = user.into();
+                old.uid = uid;
+                let bytes = serialize_enrollment(&old, Some(&old_key)).unwrap();
+                fs::write(profile_path(user), bytes).unwrap();
+            }
+            fake_seal(user, &old_key, key_uid).unwrap();
+            match stored {
+                Recovery::Absent => {}
+                Recovery::Records(uid) => {
+                    let mut envelope = wrapped.clone();
+                    envelope.uid = uid;
+                    fs::write(&recovery, serde_json::to_vec(&envelope).unwrap()).unwrap();
+                }
+                Recovery::Unreadable => {
+                    fs::write(&recovery, b"synthetic, not an envelope").unwrap();
+                }
+            }
+            fs::read(template_key::key_path(user)).unwrap()
+        };
+        let _now = crate::account::remember(user, 7302);
+        let mut replacement = Enrollment::new(user);
+        replacement.profiles = sample().profiles;
+        let no_seal: &FakeSeal = &|_, _, _| panic!("no key is sealed over one the write checks");
+        let enrollment = || save_moving_kept_key(&replacement, false, no_seal, &fake_move);
+        let replacing = || save_moving_kept_key(&replacement, true, no_seal, &fake_move);
+        let camera_store = || {
+            template_key::camera_store_key_with(
+                user,
+                &mut Account::new(user),
+                &key_is_another_accounts,
+                fake_load,
+                fake_move,
+                no_seal,
+            )
+            .map(drop)
+        };
+        let recovery_setup =
+            || template_key::setup_recovery_with(user, passphrase, fake_load, fake_move);
+        type Write<'w> = &'w dyn Fn() -> irlume_common::Result<()>;
+        // The write, the enrollment and recovery envelope beside a key that
+        // records no uid, and the refusal expected.
+        type Refused<'w> = (&'w str, Write<'w>, Option<Option<u32>>, Recovery, &'w str);
+
+        let refused: [Refused<'_>; 9] = [
+            (
+                "an enrollment write",
+                &enrollment,
+                Some(None),
+                Recovery::Unreadable,
+                "cannot be read",
+            ),
+            (
+                "an enrollment write",
+                &enrollment,
+                None,
+                Recovery::Unreadable,
+                "cannot be read",
+            ),
+            (
+                "a replacement enrollment write",
+                &replacing,
+                Some(None),
+                Recovery::Unreadable,
+                "cannot be read",
+            ),
+            (
+                "a replacement enrollment write",
+                &replacing,
+                None,
+                Recovery::Unreadable,
+                "cannot be read",
+            ),
+            (
+                "an added-camera store write",
+                &camera_store,
+                Some(Some(7301)),
+                Recovery::Absent,
+                "belongs to another uid",
+            ),
+            (
+                "an added-camera store write",
+                &camera_store,
+                Some(None),
+                Recovery::Records(Some(7301)),
+                "belongs to another uid",
+            ),
+            (
+                "an added-camera store write",
+                &camera_store,
+                Some(None),
+                Recovery::Unreadable,
+                "cannot be read",
+            ),
+            (
+                "a recovery setup",
+                &recovery_setup,
+                Some(Some(7301)),
+                Recovery::Absent,
+                "face enrollment",
+            ),
+            (
+                "a recovery setup",
+                &recovery_setup,
+                Some(None),
+                Recovery::Records(Some(7301)),
+                "recovery envelope",
+            ),
+        ];
+        for (what, write, enrolled, stored, expected) in refused {
+            let case = format!("{what}, enrolled {enrolled:?}, recovery {stored:?}");
+            let before = plant(None, enrolled, stored);
+            let error = write().unwrap_err().to_string();
+            assert!(error.contains(expected), "{case}: {error}");
+            assert_eq!(
+                fs::read(template_key::key_path(user)).unwrap(),
+                before,
+                "{case}: the key file is as it was"
+            );
+        }
+
+        // An enrollment write replaces a key whose enrollment records another
+        // uid, and a failed seal of the new key puts back the replaced key
+        // exactly as it was: it was not moved before it was set aside.
+        let failing_seal: &FakeSeal =
+            &|_, _, _| Err(irlume_common::Error::Policy("injected seal failure".into()));
+        for replacing in [false, true] {
+            let before = plant(None, Some(Some(7301)), Recovery::Absent);
+            let error = save_moving_kept_key(&replacement, replacing, failing_seal, &fake_move)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("injected seal failure"), "{error}");
+            assert_eq!(
+                fs::read(template_key::key_path(user)).unwrap(),
+                before,
+                "replacing {replacing}: the replaced key is put back as it was"
+            );
+        }
+
+        let kept: [(&str, Write<'_>); 4] = [
+            ("an enrollment write", &enrollment),
+            ("a replacement enrollment write", &replacing),
+            ("an added-camera store write", &camera_store),
+            ("a recovery setup", &recovery_setup),
+        ];
+        for (what, write) in kept {
+            for key_uid in [None, Some(7302)] {
+                let case = format!("{what}, key {key_uid:?}");
+                let before = plant(key_uid, Some(None), Recovery::Absent);
+                write().unwrap();
+                assert_ne!(
+                    fs::read(template_key::key_path(user)).unwrap(),
+                    before,
+                    "{case}: the kept key moved"
+                );
+                let moved =
+                    crate::envelope::SealedEnvelope::load(&template_key::key_path(user)).unwrap();
+                assert!(
+                    matches!(moved.policy, crate::envelope::PolicyKind::PcrlockNv { .. }),
+                    "{case}"
+                );
+                assert_eq!(moved.private, old_key.to_vec(), "{case}: the same key");
+                assert_eq!(moved.uid, key_uid, "{case}: and the uid it records");
+            }
+        }
+        let _ = fs::remove_file(&recovery);
+        leave_uid_sandbox(&dir);
+    }
+
     /// A recovery setup wraps the template key for the account only when the
     /// records coupled to the key do not show it is another account's. An
     /// enrollment under the key recorded for another uid refuses it, whatever
@@ -2569,7 +3135,7 @@ mod tests {
         ] {
             let case = format!("{key_uid:?} {enrollment_uid:?} {recovery_before:?}");
             let before = plant(key_uid, enrollment_uid, recovery_before);
-            let error = template_key::setup_recovery_with(user, passphrase, fake_load)
+            let error = template_key::setup_recovery_with(user, passphrase, fake_load, no_move)
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -2597,7 +3163,7 @@ mod tests {
             (Some(6802), Some(None), Some(6801)),
         ] {
             plant(key_uid, enrollment_uid, recovery_before);
-            template_key::setup_recovery_with(user, passphrase, fake_load).unwrap();
+            template_key::setup_recovery_with(user, passphrase, fake_load, no_move).unwrap();
             assert_eq!(
                 recovery_uid(),
                 Some(6802),
@@ -2781,6 +3347,7 @@ mod tests {
                 user,
                 account,
                 |_, _| panic!("a key sealed for another uid must not be unsealed"),
+                no_move,
                 |_, _| {
                     first_saves += 1;
                     Ok(None)
@@ -2883,6 +3450,7 @@ mod tests {
                     account,
                     Some(&key_is_another_accounts),
                     fake_load,
+                    no_move,
                     fake_seal,
                 )
                 .map(Some)
@@ -2966,7 +3534,9 @@ mod tests {
         let key_before = fs::read(template_key::key_path(user)).unwrap();
         let recovery = template_key::recovery_path(user);
         fs::create_dir_all(recovery.parent().unwrap()).unwrap();
-        fs::write(&recovery, b"synthetic recovery of the key").unwrap();
+        // A recovery envelope of the key that records no uid either.
+        let wrapped = crate::recovery::wrap(b"a recovery passphrase", &key).unwrap();
+        fs::write(&recovery, serde_json::to_vec(&wrapped).unwrap()).unwrap();
         let loaded = loaded_as_the_first_account(&|| {
             load_with(user, template_key::UserStateLock::acquire, fake_load)
                 .unwrap()
@@ -2989,6 +3559,7 @@ mod tests {
                 account,
                 Some(&key_is_another_accounts),
                 fake_load,
+                no_move,
                 |_, _, _| panic!("the key of the loaded account is kept"),
             )
             .map(Some)
@@ -3448,6 +4019,7 @@ mod tests {
                         "injected unseal failure".into(),
                     ))
                 },
+                no_move,
                 |_, _| panic!("an existing key must not be replaced"),
             )
         })
@@ -3460,6 +4032,7 @@ mod tests {
                 user,
                 account,
                 |_, _| Ok(Zeroizing::new(key.clone())),
+                no_move,
                 |_, _| panic!("an existing key must not be replaced"),
             )
         })
@@ -3483,7 +4056,8 @@ mod tests {
         assert!(save_with_key(&old, |user, account| replacement_key(
             user,
             account,
-            template_key::load_key_as,
+            template_key::load_key_unmoved_as,
+            template_key::move_kept_key,
             |_, _| panic!("an encrypted store must not generate a new key"),
         ))
         .is_err());
@@ -3503,6 +4077,7 @@ mod tests {
                     user,
                     account,
                     |_, _| panic!("there is no existing key to unseal"),
+                    no_move,
                     |_, _| Ok(None),
                 )
             })
@@ -3547,6 +4122,7 @@ mod tests {
                     user,
                     account,
                     |_, _| panic!("unknown versions must be rejected before loading a key"),
+                    no_move,
                     |_, _| panic!("unknown versions must be rejected before creating a key"),
                 )
             })

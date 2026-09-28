@@ -659,17 +659,22 @@ pub fn load_secondary_resolved(
 /// `Ok(None)` on a no-TPM host, which writes the documented root-only
 /// plaintext legacy format, exactly how the primary store behaves there. On
 /// a TPM host an unseal failure is an error (fail closed; never a silent
-/// plaintext downgrade). Reads use [`existing_key_for`], which never mints.
+/// plaintext downgrade). An existing key that an enrollment write would
+/// replace as another account's (the enrollment it opens, or its recovery
+/// envelope, records another uid) is refused, and so is one whose recovery
+/// envelope cannot be read. Reads use [`existing_key_for`], which never
+/// mints.
 ///
 /// # Errors
 ///
 /// Returns [`SecondaryStoreError::Invalid`] when the TPM is present but the
-/// account template key cannot be unsealed or sealed.
+/// account template key cannot be unsealed or sealed, or is another
+/// account's.
 pub fn production_key_for(user: &str) -> Result<Option<Zeroizing<Vec<u8>>>, SecondaryStoreError> {
     if !crate::template_key::tpm_available() {
         return Ok(None);
     }
-    crate::template_key::ensure_key(user)
+    crate::template_key::ensure_camera_store_key(user, &crate::storage::key_is_another_accounts)
         .map(Some)
         .map_err(key_unavailable)
 }

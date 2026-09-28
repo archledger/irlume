@@ -367,7 +367,9 @@ All notable changes to irlume are documented here. This project adheres to
   them out. A Debian `@include` of `common-account` and the like below the
   first auth line is read where PAM finds it too, and its auth lines held
   to the same rule. Any other such stack is left as it is and reported as
-  having no anchor to wire (#858).
+  having no anchor to wire (#858). So is any stack with an auth line PAM
+  runs as one that always fails (a type with no control, or no module),
+  since a face line above it could end the stack before that line fails.
 
 - irlume now reads the lines of a PAM stack as libpam does and refuses to
   change a stack with a line it cannot read that way. A control is parsed

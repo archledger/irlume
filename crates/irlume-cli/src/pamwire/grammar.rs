@@ -739,6 +739,18 @@ pub(super) fn is_auth_directive(line: &str) -> bool {
     typed_head(line, "auth").is_some()
 }
 
+/// Whether `content` holds an auth line libpam installs as one that always
+/// fails: one with a type but no control, or with no module path or stack
+/// name. libpam fails the stack there unless a line before it ends the
+/// stack, so a `sufficient` face line irlume put above it would let a face
+/// match through where the stack lets no one through; irlume wires nothing
+/// into such a file.
+pub(super) fn has_failing_auth_line(content: &str) -> bool {
+    content.lines().any(|l| {
+        typed_head(l, "auth").is_some_and(|h| h.control.is_empty() || third_field(&h).is_none())
+    })
+}
+
 /// Whether this line's type, read as libpam reads it, is `session`.
 pub(super) fn is_session_directive(line: &str) -> bool {
     typed_head(line, "session").is_some()

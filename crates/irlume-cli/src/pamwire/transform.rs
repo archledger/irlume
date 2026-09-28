@@ -116,7 +116,10 @@ pub(super) fn wire_greeter_impl(
     keyring: bool,
     ondemand: bool,
 ) -> (String, bool) {
-    if has_line_continuation(content) || unreadable_line(content).is_some() {
+    if has_line_continuation(content)
+        || unreadable_line(content).is_some()
+        || has_failing_auth_line(content)
+    {
         return (content.to_string(), false);
     }
     if content_has_module(content) {
@@ -203,7 +206,10 @@ pub(super) fn wire_greeter_impl(
 /// screen unlock releases no credential). Handles both the Debian `@include`
 /// and the Fedora `substack` layouts.
 pub(super) fn wire_lock(content: &str) -> (String, bool) {
-    if has_line_continuation(content) || unreadable_line(content).is_some() {
+    if has_line_continuation(content)
+        || unreadable_line(content).is_some()
+        || has_failing_auth_line(content)
+    {
         return (content.to_string(), false);
     }
     if content_has_module(content) {
@@ -331,7 +337,10 @@ pub(super) fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
 /// on a failed face would then fail the whole prompt instead of falling back to
 /// the password.
 pub(super) fn wire_verify_service(content: &str) -> (String, bool) {
-    if has_line_continuation(content) || unreadable_line(content).is_some() {
+    if has_line_continuation(content)
+        || unreadable_line(content).is_some()
+        || has_failing_auth_line(content)
+    {
         return (content.to_string(), false);
     }
     if content_has_module(content) {
@@ -394,7 +403,10 @@ fn insert_verify_stanza(content: &str, stanza: &str) -> (String, bool) {
 /// would miss a second stray irlume line and leave a plain-`sufficient` control
 /// under which a shake is silently `default=ignore`d.
 pub(super) fn wire_polkit_service(content: &str) -> (String, bool) {
-    if has_line_continuation(content) || unreadable_line(content).is_some() {
+    if has_line_continuation(content)
+        || unreadable_line(content).is_some()
+        || has_failing_auth_line(content)
+    {
         return (content.to_string(), false);
     }
     if content_has_module(content) {
@@ -411,6 +423,7 @@ pub(super) fn wire_polkit_service(content: &str) -> (String, bool) {
 pub(super) fn wire_omarchy_lock(content: &str) -> (String, bool) {
     if has_line_continuation(content)
         || unreadable_line(content).is_some()
+        || has_failing_auth_line(content)
         || content_has_module(content)
     {
         return (content.to_string(), false);

@@ -78,7 +78,10 @@ lines are not in such a file at all (after a disable, or taken out by hand),
 `irlume login enable` puts them next to the file's password line (the
 `include` or `substack` of the shared password stack) and below every line
 above it; when it cannot tell which line that is, it leaves the file unwired
-and says so.
+and says so. A file with an auth line PAM runs as one that always fails (a
+type with no control, or no module) is left unwired too, reported as having
+no anchor to wire: PAM fails the stack at that line, and a face line above it
+could end the stack before it.
 
 A login or lock screen stack that names no shared password stack irlume
 knows (no `substack`, no `include` of `system-auth`, `system-login`,

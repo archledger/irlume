@@ -5889,6 +5889,50 @@ mod tests {
         assert!(keyring_handoff(&with(&wired), "plasmalogin").is_none());
     }
 
+    /// libpam installs an auth line with no control, or with no module, as
+    /// one that always fails: a stack that reaches it lets no one through
+    /// unless a line before it ends the stack. No recipe wires such a file,
+    /// wherever the line is, since a `sufficient` face line above it would
+    /// let a face match through; a sudo stack of that line alone included.
+    #[test]
+    fn no_recipe_wires_a_stack_with_an_auth_line_that_always_fails() {
+        for failing in [
+            "auth",
+            "-auth",
+            "auth       required",
+            "auth       [default=ignore]",
+        ] {
+            let only = format!("#%PAM-1.0\n{failing}\n");
+            let sudo_below = format!("{DEBIAN_SUDO}{failing}\n");
+            let sudo_above = format!("#%PAM-1.0\n{failing}\n@include common-auth\n");
+            let greeter = format!("{UPSTREAM_FEDORA}{failing}\n");
+            let debian = format!("{}{failing}\n", fixture("debian", "lightdm"));
+            for verify in [&only, &sudo_below, &sudo_above] {
+                for (label, (out, changed)) in [
+                    ("verify", wire_verify_service(verify)),
+                    ("polkit", wire_polkit_service(verify)),
+                    ("omarchy lock", wire_omarchy_lock(verify)),
+                ] {
+                    assert!(!changed, "{label}: {verify}");
+                    assert_eq!(&out, verify, "{label}");
+                }
+            }
+            for stack in [&greeter, &debian, &only] {
+                for (label, (out, changed)) in [
+                    ("lock", wire_lock(stack)),
+                    ("greeter", wire_greeter_impl(stack, true, true, true)),
+                    ("keyring", wire_greeter_impl(stack, false, true, false)),
+                ] {
+                    assert!(!changed, "{label}: {stack}");
+                    assert_eq!(&out, stack, "{label}");
+                }
+            }
+        }
+        // The same lines of another type leave the auth stack as it was.
+        let session = format!("{DEBIAN_SUDO}session\n");
+        assert!(wire_verify_service(&session).1);
+    }
+
     // ---- keyring hand-off (KWallet / gnome-keyring) --------------------------
     // A greeter can be wired perfectly and still leave the wallet locked, which
     // reaches the user as "KWallet asks for its password even though face login
@@ -7572,9 +7616,12 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
     /// libpam puts the lines of the stack an `include` names in its place,
     /// and all of a Debian `@include`'s file in every type's stack, so a
     /// numeric jump among them that lands past them counts the lines after
-    /// the include. Each stack is read where libpam finds it; one that
-    /// cannot be read counts, as does an include of a type PAM does not
-    /// know. A `substack` is one line, whose jumps stay inside it.
+    /// the include. One that lands on the first line after the include skips
+    /// included lines only: with irlume's lines taken out there, the same
+    /// lines of the file run as before they were added. Each stack is read
+    /// where libpam finds it; one that cannot be read counts, as does an
+    /// include of a type PAM does not know. A `substack` is one line, whose
+    /// jumps stay inside it.
     #[test]
     fn a_jump_in_an_included_stack_counts_irlume_s_lines_when_it_lands_past_it() {
         let (common_auth, system_login, system_auth) = (
@@ -7599,6 +7646,14 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
                 "auth required pam_env.so\nauth include leaves\n",
             ),
             ("typo", "auht optional pam_foo.so\n"),
+            (
+                "lands-after",
+                "auth [success=1 default=ignore] pam_unix.so\nauth requisite pam_deny.so\n",
+            ),
+            (
+                "lands-past",
+                "auth [success=2 default=ignore] pam_unix.so\nauth requisite pam_deny.so\n",
+            ),
         ]);
         let auth = format!("{KEYRING_UNSEAL}\n{RESEAL_AUTH}\n");
         let session = format!("{RESEAL_SESSION}\n");
@@ -7617,6 +7672,8 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
             ("session include leaves", &session, false),
             ("auth include leaves-session", &auth, false),
             ("account include leaves", &auth, false),
+            ("auth include lands-after", &auth, false),
+            ("auth include lands-past", &auth, true),
             ("auth include leaves", &auth, true),
             ("@include leaves", &auth, true),
             ("auth include outer-leaves", &auth, true),

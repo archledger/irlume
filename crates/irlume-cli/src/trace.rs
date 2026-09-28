@@ -735,4 +735,81 @@ mod tests {
         assert!(rendered.contains("IdentityInference"));
         assert!(rendered.contains("StreamOwnerRelease"));
     }
+
+    /// `irlume trace explain` reads a schema 5 file with the sequential
+    /// capture phases and the grouped evaluation, and refuses the same
+    /// stages in a file labeled with an older schema.
+    #[test]
+    fn explain_reads_schema_5_sequential_capture_stages_and_refuses_them_below() {
+        use irlume_common::diagnostics::{TraceStage, V4_TRACE_SCHEMA_VERSION};
+        let stages = [
+            TraceStage::SequentialRgbStart,
+            TraceStage::SequentialRgbSample,
+            TraceStage::SequentialRgbRelease,
+            TraceStage::SequentialIrStart,
+            TraceStage::SequentialIrSample,
+            TraceStage::SequentialIrRelease,
+            TraceStage::GroupedEvaluation,
+        ];
+        let limits = TraceLimits::bounded(1_000);
+        let mut records = vec![fixture_record(
+            0,
+            TraceEventKind::TraceStarted {
+                limits,
+                warning: TraceWarning::PrivilegedDiagnosticOracle,
+            },
+            false,
+        )];
+        for (index, stage) in stages.iter().enumerate() {
+            records.push(fixture_record(
+                index as u64 + 1,
+                TraceEventKind::StageTiming {
+                    stage: *stage,
+                    elapsed_us: 1_000 * (index as u64 + 1),
+                },
+                false,
+            ));
+        }
+        records.push(fixture_record(
+            stages.len() as u64 + 1,
+            TraceEventKind::Finished {
+                outcome: CategoricalOutcome::Completed,
+            },
+            true,
+        ));
+        let write = |path: &Path, records: &[TraceRecord]| {
+            let mut bytes = Vec::new();
+            for record in records {
+                serde_json::to_writer(&mut bytes, record).unwrap();
+                bytes.push(b'\n');
+            }
+            std::fs::write(path, bytes).unwrap();
+        };
+        let dir = sandbox("explain-v5");
+        let current = dir.join("current.jsonl");
+        write(&current, &records);
+        let rendered = explain(&current).unwrap();
+        assert!(rendered.starts_with(&format!(
+            "Irlume diagnostic trace schema {CURRENT_TRACE_SCHEMA_VERSION}\n"
+        )));
+        for (index, stage) in stages.iter().enumerate() {
+            assert!(
+                rendered.contains(&format!(
+                    "StageTiming {{ stage: {stage:?}, elapsed_us: {} }}",
+                    1_000 * (index + 1)
+                )),
+                "{rendered}"
+            );
+        }
+
+        for record in &mut records {
+            record.trace_schema = V4_TRACE_SCHEMA_VERSION;
+        }
+        let older = dir.join("older.jsonl");
+        write(&older, &records);
+        assert!(explain(&older)
+            .unwrap_err()
+            .contains("unsupported trace schema"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

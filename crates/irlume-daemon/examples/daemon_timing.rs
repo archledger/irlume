@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const HELP: &str = "Usage: daemon_timing <user> [--service NAME|none] [--trials N] [--cancel-after MS] [--no-trace]
 Sends real Authenticate requests to the running daemon and measures request-to-reply.
 With a trace subscription (root; default on unless --no-trace) it also prints the
-daemon-side stage boundaries (schema 4). Refused and cancelled trials are labeled,
+daemon-side stage boundaries (schema 5). Refused and cancelled trials are labeled,
 never pooled with grants. Stage intervals may overlap or nest and are never summed.
 Unmeasured boundaries (worker reply to socket write, PAM stack, desktop unlock) are
 printed explicitly. Replies have a 30s deadline; cancellation must be 0..=30000ms.
@@ -692,7 +692,7 @@ mod tests {
         assert!(TraceConnection::on_stream(client, 100)
             .err()
             .unwrap()
-            .contains("schema 4"));
+            .contains("schema 5"));
         let (client, _server) = trace_pair(CURRENT_TRACE_SCHEMA_VERSION, 50);
         assert!(TraceConnection::on_stream(client, 100)
             .err()

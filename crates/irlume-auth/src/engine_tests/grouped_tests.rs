@@ -1362,3 +1362,153 @@ fn rgb_only_grouped_route_requires_convenience_shape() {
         "credential release needs a local login or lock service"
     );
 }
+
+#[derive(Default)]
+struct StageSink(std::sync::Mutex<Vec<irlume_common::diagnostics::TraceEventKind>>);
+
+impl irlume_common::diagnostics::DiagnosticSink for StageSink {
+    fn emit_trace(&self, kind: irlume_common::diagnostics::TraceEventKind) {
+        self.0.lock().unwrap().push(kind);
+    }
+}
+
+impl StageSink {
+    fn stages(&self) -> Vec<irlume_common::diagnostics::TraceStage> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                irlume_common::diagnostics::TraceEventKind::StageTiming { stage, .. } => {
+                    Some(*stage)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Each phase of the grouped route's sequential batch becomes its own
+/// schema 5 stage carrying only the elapsed time, which a schema 4
+/// subscriber never receives.
+#[test]
+fn grouped_batch_phases_report_their_own_schema_5_stages() {
+    use irlume_camera::SequentialBatchPhase as Phase;
+    use irlume_common::diagnostics::{
+        TraceEventKind, TraceStage, CURRENT_TRACE_SCHEMA_VERSION, V4_TRACE_SCHEMA_VERSION,
+    };
+    let sink = StageSink::default();
+    let phases = [
+        (Phase::RgbStart, TraceStage::SequentialRgbStart),
+        (Phase::RgbSample, TraceStage::SequentialRgbSample),
+        (Phase::RgbRelease, TraceStage::SequentialRgbRelease),
+        (Phase::IrStart, TraceStage::SequentialIrStart),
+        (Phase::IrSample, TraceStage::SequentialIrSample),
+        (Phase::IrRelease, TraceStage::SequentialIrRelease),
+    ];
+    for (index, (phase, _)) in phases.iter().enumerate() {
+        crate::grouped_auth::emit_batch_phase(
+            &sink,
+            *phase,
+            Duration::from_micros(1_000 + index as u64),
+        );
+    }
+    let events = sink.0.lock().unwrap();
+    assert_eq!(events.len(), phases.len());
+    for (index, (event, (_, stage))) in events.iter().zip(phases).enumerate() {
+        assert_eq!(
+            *event,
+            TraceEventKind::StageTiming {
+                stage,
+                elapsed_us: 1_000 + index as u64,
+            }
+        );
+        assert!(event.supports_schema(CURRENT_TRACE_SCHEMA_VERSION));
+        assert!(!event.supports_schema(V4_TRACE_SCHEMA_VERSION), "{event:?}");
+    }
+}
+
+/// The grouped evaluation is one stage per group, reported after the
+/// per-sample stages it contains, whether the group is ready, refused or
+/// failed.
+#[test]
+fn grouped_evaluation_is_one_stage_after_its_samples_on_every_result() {
+    use crate::grouped_auth::in_grouped_evaluation;
+    use irlume_common::diagnostics::{DiagnosticSink, TraceEventKind, TraceStage};
+    let _guard = env_guard();
+    let mut s = shared();
+    let detection = |sink: &StageSink| {
+        sink.emit_trace(TraceEventKind::StageTiming {
+            stage: TraceStage::Detection,
+            elapsed_us: 1,
+        });
+    };
+    let expected = |samples: usize| {
+        let mut stages = vec![TraceStage::Detection; samples];
+        stages.push(TraceStage::GroupedEvaluation);
+        stages
+    };
+
+    let sink = StageSink::default();
+    let ready = in_grouped_evaluation(&sink, || {
+        s.engine.evaluate_grouped_samples_with(
+            (0..5).collect(),
+            Instant::now() + Duration::from_secs(15),
+            |e, i| {
+                detection(&sink);
+                Ok(sample(e, i, 0.2))
+            },
+            |_, mut evidence| {
+                evidence.assessment.embedding = Some(evidence.identity.1);
+                Ok(evidence.assessment)
+            },
+            Instant::now,
+        )
+    });
+    assert!(matches!(ready, Ok(PreparedGroup::Ready(_))));
+    assert_eq!(sink.stages(), expected(5));
+    s.engine.vit_scores.clear();
+
+    let sink = StageSink::default();
+    let assessed = Cell::new(0);
+    let refused = in_grouped_evaluation(&sink, || {
+        s.engine.evaluate_grouped_samples_with(
+            (0..5).collect(),
+            Instant::now() + Duration::from_secs(15),
+            |e, i| {
+                detection(&sink);
+                assessed.set(assessed.get() + 1);
+                let mut v = sample(e, i, 0.2);
+                if i == 2 {
+                    v.assessment.verdict = Verdict::Uncertain;
+                    v.assessment.reason = "unusable evidence".into();
+                }
+                Ok(v)
+            },
+            |_, _| panic!("a refused group reached identity"),
+            Instant::now,
+        )
+    });
+    assert!(matches!(refused, Ok(PreparedGroup::Refused(_))));
+    assert!(assessed.get() > 2);
+    assert_eq!(sink.stages(), expected(assessed.get()));
+
+    let sink = StageSink::default();
+    let failed = in_grouped_evaluation(&sink, || {
+        s.engine.evaluate_grouped_samples_with(
+            (0..5).collect(),
+            Instant::now() + Duration::from_secs(15),
+            |e, i| {
+                detection(&sink);
+                if i == 1 {
+                    return Err(irlume_common::Error::Hardware("scripted failure".into()));
+                }
+                Ok(sample(e, i, 0.2))
+            },
+            |_, _| panic!("a failed group reached identity"),
+            Instant::now,
+        )
+    });
+    assert!(failed.is_err());
+    assert_eq!(sink.stages(), expected(2));
+}

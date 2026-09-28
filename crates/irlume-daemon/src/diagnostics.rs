@@ -9,6 +9,7 @@ use irlume_common::diagnostics::{
     SupportUnavailable, TraceEventKind, TraceLimits, TraceRecord, TraceWarning, UnavailableReason,
     CURRENT_TRACE_SCHEMA_VERSION, LEGACY_TRACE_SCHEMA_VERSION, MAX_HISTORY_MS,
     MAX_SHARE_SAFE_EVENTS, MAX_TRACE_LINE_BYTES, V2_TRACE_SCHEMA_VERSION, V3_TRACE_SCHEMA_VERSION,
+    V4_TRACE_SCHEMA_VERSION,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, VecDeque};
@@ -329,6 +330,7 @@ impl DiagnosticState {
             LEGACY_TRACE_SCHEMA_VERSION
                 | V2_TRACE_SCHEMA_VERSION
                 | V3_TRACE_SCHEMA_VERSION
+                | V4_TRACE_SCHEMA_VERSION
                 | CURRENT_TRACE_SCHEMA_VERSION
         ) {
             return Err(TraceSubscribeError::UnsupportedSchema);
@@ -1342,7 +1344,7 @@ mod tests {
     #[test]
     fn trace_negotiation_defaults_to_legacy_and_rejects_unknown_versions_without_ownership() {
         let state = DiagnosticState::default();
-        for unsupported in [0, 5, u32::MAX] {
+        for unsupported in [0, 6, u32::MAX] {
             assert!(matches!(
                 state.subscribe_trace(0, 60_000, Some(unsupported)),
                 Err(TraceSubscribeError::UnsupportedSchema)
@@ -1354,6 +1356,7 @@ mod tests {
             (Some(2), 2),
             (Some(3), 3),
             (Some(4), 4),
+            (Some(5), 5),
         ] {
             let subscription = state.subscribe_trace(0, 60_000, requested).unwrap();
             let mut records: Vec<_> = subscription.receiver.try_iter().collect();
@@ -1443,9 +1446,8 @@ mod tests {
         assert!(records.last().unwrap().terminal);
     }
 
-    /// A schema 3 subscriber (the previous current tier) keeps working and
-    /// never receives the schema 4 setup/finalization stages; a schema 4
-    /// subscriber receives them.
+    /// A schema 3 subscriber keeps working and never receives the schema 4
+    /// setup/finalization stages; a schema 4 subscriber receives them.
     #[test]
     fn schema_3_subscriber_omits_setup_and_finalization_stages() {
         use irlume_common::diagnostics::TraceStage;
@@ -1482,8 +1484,8 @@ mod tests {
         drop(operation);
         drop(older);
 
-        let current = state
-            .subscribe_trace_with_capacity(0, 60_000, Some(CURRENT_TRACE_SCHEMA_VERSION), 8)
+        let v4 = state
+            .subscribe_trace_with_capacity(0, 60_000, Some(V4_TRACE_SCHEMA_VERSION), 8)
             .unwrap();
         let operation = state.begin(OperationClass::Authentication);
         for stage in [TraceStage::CaptureSetup, TraceStage::Finalization] {
@@ -1492,7 +1494,7 @@ mod tests {
                 elapsed_us: 7,
             });
         }
-        let records: Vec<_> = current.receiver.try_iter().collect();
+        let records: Vec<_> = v4.receiver.try_iter().collect();
         let stages: Vec<_> = records
             .iter()
             .filter_map(|record| match record.event {
@@ -1502,6 +1504,88 @@ mod tests {
             .collect();
         assert_eq!(stages, [TraceStage::CaptureSetup, TraceStage::Finalization]);
         assert!(records.iter().all(|record| record.trace_schema == 4));
+    }
+
+    /// A schema 4 subscriber (the previous current tier) keeps working and
+    /// never receives the schema 5 sequential capture phases or the grouped
+    /// evaluation, before queue, sequence and drop accounting; a schema 5
+    /// subscriber receives them in emission order.
+    #[test]
+    fn schema_4_subscriber_omits_sequential_capture_stages() {
+        use irlume_common::diagnostics::TraceStage;
+        const SCHEMA_5: [TraceStage; 7] = [
+            TraceStage::SequentialRgbStart,
+            TraceStage::SequentialRgbSample,
+            TraceStage::SequentialRgbRelease,
+            TraceStage::SequentialIrStart,
+            TraceStage::SequentialIrSample,
+            TraceStage::SequentialIrRelease,
+            TraceStage::GroupedEvaluation,
+        ];
+        let stages_of = |records: &[TraceRecord]| -> Vec<TraceStage> {
+            records
+                .iter()
+                .filter_map(|record| match record.event {
+                    TraceEventKind::StageTiming { stage, .. } => Some(stage),
+                    _ => None,
+                })
+                .collect()
+        };
+        let state = DiagnosticState::default();
+        // The initial record and the one real stage fill this queue: the
+        // omitted stages must neither take capacity nor count as drops.
+        let older = state
+            .subscribe_trace_with_capacity(0, 60_000, Some(V4_TRACE_SCHEMA_VERSION), 2)
+            .unwrap();
+        let operation = state.begin(OperationClass::Authentication);
+        operation.emit_trace(TraceEventKind::StageTiming {
+            stage: TraceStage::CaptureSetup,
+            elapsed_us: 7,
+        });
+        for _ in 0..10 {
+            for stage in SCHEMA_5 {
+                operation.emit_trace(TraceEventKind::StageTiming {
+                    stage,
+                    elapsed_us: 7,
+                });
+            }
+        }
+        let mut records: Vec<_> = older.receiver.try_iter().collect();
+        records.extend(older.finish(CategoricalOutcome::Completed));
+        assert!(records.iter().all(|record| record.trace_schema == 4));
+        assert_eq!(
+            stages_of(&records),
+            [TraceStage::CaptureSetup],
+            "{records:?}"
+        );
+        assert!(!records
+            .iter()
+            .any(|record| matches!(record.event, TraceEventKind::EventsDropped { .. })));
+        assert!(records
+            .iter()
+            .enumerate()
+            .all(|(index, record)| record.sequence == index as u64));
+        assert!(records.last().unwrap().terminal);
+        drop(operation);
+        drop(older);
+
+        let current = state
+            .subscribe_trace_with_capacity(0, 60_000, Some(CURRENT_TRACE_SCHEMA_VERSION), 16)
+            .unwrap();
+        let operation = state.begin(OperationClass::Authentication);
+        for stage in SCHEMA_5 {
+            operation.emit_trace(TraceEventKind::StageTiming {
+                stage,
+                elapsed_us: 7,
+            });
+        }
+        let records: Vec<_> = current.receiver.try_iter().collect();
+        assert_eq!(stages_of(&records), SCHEMA_5);
+        assert!(records.iter().all(|record| record.trace_schema == 5));
+        assert!(records
+            .iter()
+            .enumerate()
+            .all(|(index, record)| record.sequence == index as u64));
     }
 
     #[test]

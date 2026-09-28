@@ -98,6 +98,45 @@ pub(super) fn eligible_configuration(
         && window >= GRACE_WINDOW_MS
 }
 
+/// Report one phase of the grouped route's sequential batch as its trace
+/// schema 5 stage: an elapsed time only.
+pub(super) fn emit_batch_phase(
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    phase: irlume_camera::SequentialBatchPhase,
+    elapsed: std::time::Duration,
+) {
+    use irlume_camera::SequentialBatchPhase as Phase;
+    use irlume_common::diagnostics::TraceStage;
+    let stage = match phase {
+        Phase::RgbStart => TraceStage::SequentialRgbStart,
+        Phase::RgbSample => TraceStage::SequentialRgbSample,
+        Phase::RgbRelease => TraceStage::SequentialRgbRelease,
+        Phase::IrStart => TraceStage::SequentialIrStart,
+        Phase::IrSample => TraceStage::SequentialIrSample,
+        Phase::IrRelease => TraceStage::SequentialIrRelease,
+    };
+    diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+        stage,
+        elapsed_us: u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+    });
+}
+
+/// Run a grouped route's evaluation of its collected samples inside the
+/// `GroupedEvaluation` stage, reported once whatever the result. The batch
+/// released its sessions before returning, so this lies inside
+/// `Finalization`; the rest of that interval is the final matching, camera
+/// handle close and lease release.
+pub(super) fn in_grouped_evaluation<T>(
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    evaluate: impl FnOnce() -> T,
+) -> T {
+    let _timing = TraceStageTimer::new(
+        diagnostics,
+        irlume_common::diagnostics::TraceStage::GroupedEvaluation,
+    );
+    evaluate()
+}
+
 fn expired() -> Outcome {
     Outcome::deny(
         OutcomeKind::DeadlineExpired,
@@ -399,7 +438,7 @@ impl Engine {
         let control = self.capture_control();
         self.emit_capture_setup(diagnostics);
         let started = Instant::now();
-        let samples = irlume_camera::capture_sequential_batch_with_control(
+        let samples = irlume_camera::capture_sequential_batch_observed(
             &cameras.0,
             &cameras.1,
             contract,
@@ -409,6 +448,7 @@ impl Engine {
                 deadline,
             },
             &control,
+            &|phase, elapsed| emit_batch_phase(diagnostics, phase, elapsed),
         );
         // A completed batch opened and released both streams; a failed one
         // may have opened none.
@@ -421,31 +461,33 @@ impl Engine {
             samples.len(),
             started.elapsed().as_millis()
         );
-        let prepared = self.evaluate_grouped_samples_with(
-            samples,
-            deadline,
-            |engine, (rgb, ir, stats)| {
-                let detected = engine.detect_rgb_assessment(&rgb, None, diagnostics)?;
-                engine
-                    .assess_captured_pair(
-                        rgb,
-                        ir,
-                        stats,
-                        detected,
-                        PairAssessmentContext {
-                            sequential: true,
-                            pair_sequential_retried: false,
-                            rgb_hard_retried: false,
-                            held_sessions: false,
-                            ir_ms: None,
-                            diagnostics,
-                        },
-                    )
-                    .map_err(CapturePathError::into_inner)
-            },
-            |engine, evidence| engine.materialize_pair_identity(evidence, diagnostics),
-            Instant::now,
-        )?;
+        let prepared = in_grouped_evaluation(diagnostics, || {
+            self.evaluate_grouped_samples_with(
+                samples,
+                deadline,
+                |engine, (rgb, ir, stats)| {
+                    let detected = engine.detect_rgb_assessment(&rgb, None, diagnostics)?;
+                    engine
+                        .assess_captured_pair(
+                            rgb,
+                            ir,
+                            stats,
+                            detected,
+                            PairAssessmentContext {
+                                sequential: true,
+                                pair_sequential_retried: false,
+                                rgb_hard_retried: false,
+                                held_sessions: false,
+                                ir_ms: None,
+                                diagnostics,
+                            },
+                        )
+                        .map_err(CapturePathError::into_inner)
+                },
+                |engine, evidence| engine.materialize_pair_identity(evidence, diagnostics),
+                Instant::now,
+            )
+        })?;
         match prepared {
             PreparedGroup::Refused(outcome) => Ok(outcome),
             PreparedGroup::Ready(a) => {
@@ -503,13 +545,15 @@ impl Engine {
             frames.len(),
             started.elapsed().as_millis()
         );
-        let prepared = self.evaluate_grouped_rgb_samples_with(
-            frames,
-            deadline,
-            |engine, frame| engine.assess_rgb_only_frame_deferred(frame, diagnostics),
-            |engine, evidence| engine.materialize_pair_identity(evidence, diagnostics),
-            Instant::now,
-        )?;
+        let prepared = in_grouped_evaluation(diagnostics, || {
+            self.evaluate_grouped_rgb_samples_with(
+                frames,
+                deadline,
+                |engine, frame| engine.assess_rgb_only_frame_deferred(frame, diagnostics),
+                |engine, evidence| engine.materialize_pair_identity(evidence, diagnostics),
+                Instant::now,
+            )
+        })?;
         match prepared {
             PreparedGroup::Refused(outcome) => Ok(outcome),
             PreparedGroup::Ready(a) => {

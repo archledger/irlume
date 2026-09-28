@@ -24,8 +24,12 @@ pub const V2_TRACE_SCHEMA_VERSION: u32 = 2;
 /// finalization stages of the current tier. Kept addressable so an older
 /// client that negotiated it keeps working.
 pub const V3_TRACE_SCHEMA_VERSION: u32 = 3;
+/// The tier that added the capture-setup and finalization stages but not
+/// the sequential capture phases and grouped evaluation of the current tier.
+/// Kept addressable so an older client that negotiated it keeps working.
+pub const V4_TRACE_SCHEMA_VERSION: u32 = 4;
 /// Latest trace vocabulary, requested explicitly by current clients.
-pub const CURRENT_TRACE_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_TRACE_SCHEMA_VERSION: u32 = 5;
 /// Current schema for callers constructing new records, not a subscription default.
 pub const TRACE_SCHEMA_VERSION: u32 = CURRENT_TRACE_SCHEMA_VERSION;
 pub const DEFAULT_TRACE_DURATION_MS: u64 = 60_000;
@@ -711,6 +715,23 @@ diagnostic_enum!(TraceWarning {
 // engine return: final matching, camera handle close, lease release; reported
 // only when a route armed and released an owner, or completed a capture that
 // opened and released its own sessions; absent otherwise).
+//
+// Schema 5 adds the phases of the grouped route's sequential batch, each
+// reported when it ends, whether or not it succeeded: `SequentialRgbStart`
+// (RGB session start on the open camera: stream setup, buffers, backlight
+// write), `SequentialRgbSample` (one denoised RGB sample; the first of a
+// session also starts the stream, waits out the auto-exposure warm-up and
+// fills the delivered-rate window), `SequentialRgbRelease` (stream stop,
+// buffer release, backlight restore; before IR starts), `SequentialIrStart`
+// (buffers, metadata queue, emitter enable, stream start and warm-up,
+// delivered-rate fill), `SequentialIrSample` (one IR burst and its gate
+// frame) and `SequentialIrRelease` (stream stop, metadata close, buffer
+// release, emitter restore); a release is reported for every started
+// session except on unwinding. `GroupedEvaluation` covers a grouped route's
+// evaluation of its collected samples (detection, liveness and PAD per
+// sample, identity for the final admissible one), reported once per group
+// whatever its result; it follows the batch, so it lies inside
+// `Finalization`. No phase carries a score or a frame.
 diagnostic_enum!(TraceStage {
     CameraOpen,
     StreamArm,
@@ -730,6 +751,13 @@ diagnostic_enum!(TraceStage {
     CredentialUnseal,
     CaptureSetup,
     Finalization,
+    SequentialRgbStart,
+    SequentialRgbSample,
+    SequentialRgbRelease,
+    SequentialIrStart,
+    SequentialIrSample,
+    SequentialIrRelease,
+    GroupedEvaluation,
 });
 diagnostic_enum!(TraceRefusalReason {
     RgbPadPending,
@@ -894,6 +922,17 @@ impl TraceEventKind {
                 TraceStage::CaptureSetup | TraceStage::Finalization
             };
         }
+        macro_rules! sequential_capture_stage {
+            () => {
+                TraceStage::SequentialRgbStart
+                    | TraceStage::SequentialRgbSample
+                    | TraceStage::SequentialRgbRelease
+                    | TraceStage::SequentialIrStart
+                    | TraceStage::SequentialIrSample
+                    | TraceStage::SequentialIrRelease
+                    | TraceStage::GroupedEvaluation
+            };
+        }
         match schema {
             LEGACY_TRACE_SCHEMA_VERSION => !matches!(
                 self,
@@ -902,21 +941,31 @@ impl TraceEventKind {
                         stage: TraceStage::IdentityInference
                             | TraceStage::StreamOwnerRelease
                             | end_to_end_timing_stage!()
-                            | setup_and_finalization_stage!(),
+                            | setup_and_finalization_stage!()
+                            | sequential_capture_stage!(),
                         ..
                     }
             ),
             V2_TRACE_SCHEMA_VERSION => !matches!(
                 self,
                 Self::StageTiming {
-                    stage: end_to_end_timing_stage!() | setup_and_finalization_stage!(),
+                    stage: end_to_end_timing_stage!()
+                        | setup_and_finalization_stage!()
+                        | sequential_capture_stage!(),
                     ..
                 }
             ),
             V3_TRACE_SCHEMA_VERSION => !matches!(
                 self,
                 Self::StageTiming {
-                    stage: setup_and_finalization_stage!(),
+                    stage: setup_and_finalization_stage!() | sequential_capture_stage!(),
+                    ..
+                }
+            ),
+            V4_TRACE_SCHEMA_VERSION => !matches!(
+                self,
+                Self::StageTiming {
+                    stage: sequential_capture_stage!(),
                     ..
                 }
             ),
@@ -1556,7 +1605,7 @@ mod tests {
                 true,
             ),
         ];
-        for schema in [1, 2, 3] {
+        for schema in [1, 2, 3, 4, 5] {
             for record in &mut records {
                 record.trace_schema = schema;
             }
@@ -1570,7 +1619,7 @@ mod tests {
                 Err(TraceParseError::Schema)
             ));
         }
-        for schema in [0, 5, u32::MAX] {
+        for schema in [0, 6, u32::MAX] {
             records[0].trace_schema = schema;
             assert!(matches!(
                 parse_trace(std::io::Cursor::new(trace_jsonl(&records)), limits),
@@ -1708,6 +1757,69 @@ mod tests {
             .unwrap();
             assert!(typed.supports_schema(CURRENT_TRACE_SCHEMA_VERSION));
             assert!(typed.supports_schema(V3_TRACE_SCHEMA_VERSION));
+        }
+    }
+
+    /// Schema 5 adds the sequential capture phases and the grouped
+    /// evaluation; every older tier's parser would fail on them, so no
+    /// schema 1 to 4 record may carry one.
+    #[test]
+    fn trace_v5_sequential_capture_stages_are_not_valid_below_v5() {
+        let limits = TraceLimits::bounded(1000);
+        for stage in [
+            "sequential_rgb_start",
+            "sequential_rgb_sample",
+            "sequential_rgb_release",
+            "sequential_ir_start",
+            "sequential_ir_sample",
+            "sequential_ir_release",
+            "grouped_evaluation",
+        ] {
+            let event = serde_json::json!({
+                "event":"stage_timing", "stage":stage, "elapsed_us":12
+            });
+            let typed = serde_json::from_value::<TraceEventKind>(event.clone())
+                .expect("schema 5 closed event vocabulary must deserialize");
+            assert_eq!(serde_json::to_value(&typed).unwrap(), event);
+            assert!(typed.supports_schema(CURRENT_TRACE_SCHEMA_VERSION));
+            let mut record = trace_record(0, typed.clone(), false);
+            record.trace_schema = CURRENT_TRACE_SCHEMA_VERSION;
+            let mut validator = TraceValidator::new(limits).unwrap();
+            assert!(validator
+                .push_line(&serde_json::to_vec(&record).unwrap())
+                .is_ok());
+            for schema in [
+                V4_TRACE_SCHEMA_VERSION,
+                V3_TRACE_SCHEMA_VERSION,
+                V2_TRACE_SCHEMA_VERSION,
+                LEGACY_TRACE_SCHEMA_VERSION,
+            ] {
+                assert!(!typed.supports_schema(schema), "{event} under {schema}");
+                record.trace_schema = schema;
+                let mut validator = TraceValidator::new(limits).unwrap();
+                assert!(
+                    matches!(
+                        validator.push_line(&serde_json::to_vec(&record).unwrap()),
+                        Err(TraceParseError::Schema)
+                    ),
+                    "{event} under schema {schema}"
+                );
+            }
+        }
+        // Every earlier stage remains valid at the new tier and at schema 4.
+        for stage in [
+            "rgb_capture",
+            "ir_capture",
+            "stream_owner_release",
+            "capture_setup",
+            "finalization",
+        ] {
+            let typed = serde_json::from_value::<TraceEventKind>(
+                serde_json::json!({"event":"stage_timing", "stage":stage, "elapsed_us":1}),
+            )
+            .unwrap();
+            assert!(typed.supports_schema(CURRENT_TRACE_SCHEMA_VERSION));
+            assert!(typed.supports_schema(V4_TRACE_SCHEMA_VERSION));
         }
     }
 

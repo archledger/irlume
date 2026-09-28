@@ -258,19 +258,25 @@ each record it does not use, with the uids and the next step.
   key file as it was, and a key an enrollment write replaces is set aside
   unmoved, so a failed write puts it back as it was.
 - An enrollment write that replaces another uid's enrollment first records,
-  durably, what it replaces in `<user>.replacing` beside the enrollment:
-  the replaced key's envelope file, and digests of the enrollment, the
-  key's recovery envelope and the added-camera store as they are then.
-  The record goes once the write has finished or undone the replacement.
-  If irlumed stops part way, the new enrollment may not survive a power
-  loss, or a removal fails, the record stays, and the next operation that
-  takes the account's state lock (a write, or a load of the enrollment)
-  settles it first: while the stored enrollment is still the replaced one,
-  the replaced key goes back; otherwise the replaced key's recovery
-  envelope and the replaced enrollment's added-camera store are removed,
-  each only while it is still as recorded. A record that cannot be read
-  refuses those operations with a message that names it: check the
-  enrollment and template key, then move the record away.
+  durably, what it replaces in `template-keys/<user>.replacing`: the
+  replaced key's envelope file, and digests of the enrollment, the key's
+  recovery envelope, the added-camera store and its commit journal as they
+  are then. The record goes once the write has finished or undone the
+  replacement and synced what that changed. If irlumed stops part way, the
+  new enrollment may not survive a power loss, or a step fails, the record
+  stays, and the next operation that takes the account's state lock
+  settles it first: a write, a load of the enrollment or the template key
+  (face authentication included), and irlumed's start for an account with
+  a key. While the stored enrollment is still the replaced one, the
+  replaced key goes back; otherwise the replaced key's recovery envelope,
+  the replaced enrollment's added-camera store and its journal are
+  removed, each only while it is still as recorded. While that removal
+  fails, a write is refused and a load logs it and goes on. A record that
+  cannot be read, or a key that cannot be put back, refuses those
+  operations with a message that says what to do. The read-only loads
+  (the IR readiness assessment and the evaluation tools) and added-camera
+  writes on a host without a TPM leave the record for the next of those
+  operations.
 - `irlume recovery setup` does not wrap a template key for the account when
   the enrollment under it records another uid, whatever the key records.
   For a key that records no uid, over an enrollment that records none (or
@@ -301,9 +307,9 @@ each record it does not use, with the uids and the next step.
 - A record that is not used is never removed automatically: an account whose
   uid changed and is changed back finds its records usable again. To remove
   them by hand, stop irlumed and delete the account's files under
-  `/var/lib/irlume` (`<user>.json`, `<user>.replacing`,
-  `cameras/<user>.json`, `template-keys/<user>.json`, `recovery/<user>.json`,
-  `keyring/<user>.json`).
+  `/var/lib/irlume` (`<user>.json`, `cameras/<user>.json`,
+  `template-keys/<user>.json`, `template-keys/<user>.replacing`,
+  `recovery/<user>.json`, `keyring/<user>.json`).
 - Added-camera stores (`cameras/<user>.json`) record no uid. They are
   encrypted under the template key and used only together with the primary
   enrollment, whose check covers them; on a host without a TPM they are

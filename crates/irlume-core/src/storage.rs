@@ -914,7 +914,7 @@ fn save_with_key(
 pub fn load(user: &str) -> irlume_common::Result<Option<Enrollment>> {
     load_with(
         user,
-        template_key::UserStateLock::acquire,
+        template_key::UserStateLock::acquire_for_load,
         template_key::load_key_as,
     )
     .map(|loaded| loaded.map(|(enrollment, _)| enrollment))
@@ -935,7 +935,7 @@ pub type LoadedEnrollment = (Enrollment, Option<Zeroizing<Vec<u8>>>);
 pub fn load_with_key(user: &str) -> irlume_common::Result<Option<LoadedEnrollment>> {
     load_with(
         user,
-        template_key::UserStateLock::acquire,
+        template_key::UserStateLock::acquire_for_load,
         template_key::load_key_for_authentication_as,
     )
 }
@@ -976,7 +976,7 @@ pub struct PrimarySnapshot {
 pub fn load_snapshot(user: &str) -> irlume_common::Result<Option<PrimarySnapshot>> {
     load_snapshot_with(
         user,
-        template_key::UserStateLock::acquire,
+        template_key::UserStateLock::acquire_for_load,
         template_key::load_key_for_authentication_as,
     )
 }
@@ -2370,7 +2370,7 @@ mod tests {
                 rewritten_store,
                 "only the replaced store goes"
             );
-            assert_eq!(journal.exists(), rewritten_store);
+            assert!(!journal.exists(), "the replaced store's journal goes");
             let sealed =
                 crate::envelope::SealedEnvelope::load(&template_key::key_path(user)).unwrap();
             assert_eq!(sealed.private, *key, "the new key stays");
@@ -2409,10 +2409,11 @@ mod tests {
     }
 
     /// A replacement whose added-camera store cannot be removed keeps its
-    /// record, and the next acquisition of the state lock removes the store
-    /// once it can. On a host without a TPM, where no key is replaced, the
-    /// plaintext enrollment's replacement is recorded the same way and
-    /// leaves the recovery envelope alone.
+    /// record: the next writer of the account is refused while the removal
+    /// fails, a load goes on, and the next acquisition of the state lock
+    /// once the removal can succeed removes the store. On a host without a
+    /// TPM, where no key is replaced, a plaintext enrollment's replacement
+    /// is recorded the same way and leaves the recovery envelope alone.
     #[test]
     fn a_camera_store_a_replacement_could_not_remove_goes_on_the_next_change() {
         let _env = crate::testenv::ENV_LOCK
@@ -2428,30 +2429,36 @@ mod tests {
         let _now = crate::account::remember(user, 6402);
         let mut new = Enrollment::new(user);
         new.profiles = sample().profiles;
-        // A directory where the store's commit journal goes: the removal
-        // fails there.
+        new.uid = Some(6402);
+        // A directory where the store's commit journal was: the removal
+        // fails there, as it would in a damaged or read-only directory.
         let block_removal = || {
-            let _ = fs::remove_file(&journal);
+            fs::remove_file(&journal).unwrap();
             fs::create_dir_all(journal.join("blocked")).unwrap();
+        };
+        let pending = || {
+            assert!(
+                template_key::UserStateLock::acquire(user).is_err(),
+                "a writer is refused while the removal fails"
+            );
+            drop(template_key::UserStateLock::acquire_for_load(user).unwrap());
+            assert!(record.exists(), "the removal stays pending");
+            assert!(store.exists());
         };
 
         plant_replaced(user, &[34u8; 32], 6401);
+        let key = replace_key_and_stop(user);
+        fs::write(
+            profile_path(user),
+            serialize_enrollment(&new, Some(&key)).unwrap(),
+        )
+        .unwrap();
         block_removal();
-        let error = save_choosing_key(&new, false, &fake_seal)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("could not be removed"), "{error}");
-        assert!(record.exists(), "the removal stays pending");
-        assert!(!recovery.exists(), "removed before the store");
-        assert!(store.exists());
-        assert!(
-            template_key::UserStateLock::acquire(user).is_err(),
-            "still pending while the removal fails"
-        );
+        pending();
         fs::remove_dir_all(&journal).unwrap();
         drop(template_key::UserStateLock::acquire(user).unwrap());
         assert!(!store.exists(), "removed on the next change");
-        assert!(!record.exists());
+        assert!(!record.exists() && !recovery.exists());
 
         // No TPM and no key: a plaintext enrollment of another uid.
         let _ = fs::remove_file(template_key::key_path(user));
@@ -2465,13 +2472,102 @@ mod tests {
         .unwrap();
         fs::write(&recovery, b"a recovery envelope of this account's own").unwrap();
         plant_camera_store(user);
+        {
+            let _state = template_key::UserStateLock::acquire(user).unwrap();
+            crate::replacement::begin(user, None).unwrap();
+        }
+        fs::write(
+            profile_path(user),
+            serialize_enrollment(&new, None).unwrap(),
+        )
+        .unwrap();
         block_removal();
-        assert!(save(&new).is_err());
-        assert!(record.exists());
+        pending();
         fs::remove_dir_all(&journal).unwrap();
         drop(template_key::UserStateLock::acquire(user).unwrap());
         assert!(!store.exists() && !record.exists());
         assert!(recovery.exists(), "no key was replaced");
+        leave_uid_sandbox(&dir);
+    }
+
+    /// A write whose enrollment published nothing puts the replaced key
+    /// back and drops the record. A put-back that fails keeps the record,
+    /// and the next acquisition of the state lock puts the key back.
+    #[test]
+    fn a_replaced_key_goes_back_when_nothing_was_published_even_after_a_failed_put_back() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("replace-put-back");
+        let user = "replace-put-back";
+        let record = crate::replacement::record_path(user);
+        let key_path = template_key::key_path(user);
+        let _now = crate::account::remember(user, 6602);
+
+        let before = plant_replaced(user, &[36u8; 32], 6601);
+        {
+            let _state = template_key::UserStateLock::acquire(user).unwrap();
+            let key = template_key::ensure_key_with(
+                user,
+                &mut Account::new(user),
+                Some(&key_is_another_accounts),
+                fake_load,
+                no_move,
+                fake_seal,
+            )
+            .unwrap();
+            assert!(record.exists());
+            key.settle(None).unwrap();
+        }
+        assert_eq!(fs::read(&key_path).unwrap(), before, "put back");
+        assert!(!record.exists());
+
+        replace_key_and_stop(user);
+        // A directory where the key goes: the put-back fails there.
+        fs::remove_file(&key_path).unwrap();
+        fs::create_dir(&key_path).unwrap();
+        assert!(template_key::UserStateLock::acquire(user).is_err());
+        assert!(record.exists(), "kept while the put-back fails");
+        fs::remove_dir(&key_path).unwrap();
+        drop(template_key::UserStateLock::acquire(user).unwrap());
+        assert_eq!(
+            fs::read(&key_path).unwrap(),
+            before,
+            "put back on the next change"
+        );
+        assert!(!record.exists());
+        leave_uid_sandbox(&dir);
+    }
+
+    /// Finishing a replacement removes the replaced key's recovery envelope
+    /// only while it is the one recorded: an envelope written since stays.
+    #[test]
+    fn a_recovery_envelope_written_since_the_replacement_began_stays() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("replace-recovery-since");
+        let user = "replace-recovery-since";
+        let recovery = template_key::recovery_path(user);
+        let _now = crate::account::remember(user, 6702);
+        let mut new = Enrollment::new(user);
+        new.profiles = sample().profiles;
+        new.uid = Some(6702);
+
+        plant_replaced(user, &[37u8; 32], 6701);
+        let key = replace_key_and_stop(user);
+        fs::write(
+            profile_path(user),
+            serialize_enrollment(&new, Some(&key)).unwrap(),
+        )
+        .unwrap();
+        fs::write(&recovery, b"an envelope written since").unwrap();
+        drop(template_key::UserStateLock::acquire(user).unwrap());
+        assert_eq!(fs::read(&recovery).unwrap(), b"an envelope written since");
+        assert!(!crate::multi_camera::secondary_store_path(user).exists());
+        assert!(!crate::replacement::record_path(user).exists());
         leave_uid_sandbox(&dir);
     }
 

@@ -62,13 +62,22 @@ impl UserStateLock {
         Self::acquire_with_creation(user, false)
     }
 
-    /// The lock a writer takes. Taking it first settles a replacement of
+    /// The lock a write takes. Taking it first settles a replacement of
     /// the account's enrollment that a write left unfinished
     /// ([`crate::replacement::settle_interrupted`]), so the operation that
     /// takes it starts from a finished or undone replacement.
     pub(crate) fn acquire(user: &str) -> Result<Self> {
         let lock = Self::acquire_with_creation(user, true)?;
-        crate::replacement::settle_interrupted(user)?;
+        crate::replacement::settle_interrupted(user, false)?;
+        Ok(lock)
+    }
+
+    /// [`Self::acquire`] for a load of the enrollment or the key: a
+    /// replacement whose enrollment is published but whose removals fail
+    /// is logged and left for the next acquisition, and the load goes on.
+    pub(crate) fn acquire_for_load(user: &str) -> Result<Self> {
+        let lock = Self::acquire_with_creation(user, true)?;
+        crate::replacement::settle_interrupted(user, true)?;
         Ok(lock)
     }
 
@@ -280,8 +289,8 @@ pub(crate) type KeyIsAnotherAccounts<'f> =
 /// key of its own. Nothing else replaces it, and an error from `is_other`
 /// refuses the write with nothing replaced. The replacement is final only
 /// once that enrollment is published: the write settles it with
-/// [`WriteKey::settle`], which removes the replaced key's recovery envelope.
-/// `account` is the enrollment write's view of the account, so the key is
+/// [`WriteKey::settle`], which removes the replaced key's recovery envelope
+/// and the replaced enrollment's added-camera store. `account` is the enrollment write's view of the account, so the key is
 /// chosen against the uid the enrollment is written for. The key is checked
 /// on a load that writes nothing, and only a key the write keeps moves to a
 /// stronger TPM policy ([`move_kept_key`]).
@@ -481,7 +490,15 @@ pub(crate) fn ensure_key_with(
             (Err(error), _) => return Err(error),
         }
     }
-    let uid = account.uid_to_record(Record::TemplateKey, None)?;
+    let uid = match account.uid_to_record(Record::TemplateKey, None) {
+        Ok(uid) => uid,
+        Err(error) => {
+            if let Some(replaced) = replaced {
+                replaced.put_back(&error.to_string())?;
+            }
+            return Err(error);
+        }
+    };
     let key = crypto::generate_key();
     let sealed = reseal(user, &key, uid)
         .and_then(|()| load(user, account))
@@ -650,7 +667,7 @@ impl TemplateKeySource for RequestTemplateKey {
 /// caller must NOT generate one here; that would orphan already-encrypted data).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn load_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
-    let _state = UserStateLock::acquire(user)?;
+    let _state = UserStateLock::acquire_for_load(user)?;
     load_key_unlocked(user)
 }
 

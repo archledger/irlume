@@ -15,11 +15,14 @@
 //! function that differs from the synthetic attested shape
 //! (`attested_shape` in the parent tests, not the real file) in the one
 //! field a test names (two streams, a colour bit, a Microsoft unit without
-//! selector 0x06, a truncated header), a second VideoControl function on
+//! selector 0x06, a truncated header, a header total or a source that
+//! disagrees with the control block), a second VideoControl function on
 //! the same device, a vendor-class grabber and an extra configuration. They
 //! began as a transcription of a published `lsusb -v` report (linuxhw LsUSB
 //! `31A261423C`); the whole-device transcriptions are gone now that the
-//! real files back the T480 tests.
+//! real files back the T480 tests. The camera and Output Terminal builders,
+//! copied from the real 5986:1141 bytes, complete the synthetic source graph
+//! (#913).
 
 /// The device descriptor.
 pub(super) fn device(pid: u16, bcd_device: u16, strings: [u8; 3]) -> Vec<u8> {
@@ -89,6 +92,19 @@ pub(super) fn processing_unit(
     bytes.extend_from_slice(bitmap);
     bytes.extend_from_slice(tail);
     bytes
+}
+
+/// `VC_INPUT_TERMINAL` of type camera (0x0201), with no focal lengths and
+/// the three-byte `bmControls` 5986:1141 carries (`00 00 20`).
+pub(super) fn camera_terminal(id: u8, controls: [u8; 3]) -> Vec<u8> {
+    let mut bytes = vec![18, 0x24, 0x02, id, 0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 3];
+    bytes.extend_from_slice(&controls);
+    bytes
+}
+
+/// `VC_OUTPUT_TERMINAL` of type USB streaming (0x0101) fed by `source`.
+pub(super) fn output_terminal(id: u8, source: u8) -> Vec<u8> {
+    vec![9, 0x24, 0x03, id, 0x01, 0x01, 0, source, 0]
 }
 
 /// A GUID as `lsusb` prints it, in descriptor byte order: the first three

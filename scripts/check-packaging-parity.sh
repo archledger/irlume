@@ -569,7 +569,10 @@ APPARMOR_RUNTIME_RULES=(
   "/run/systemd/seats/ r,"
   "/run/systemd/seats/* r,"
   # Sealed-storage diagnostics read mount topology and enumerate every btrfs
-  # member so a partially encrypted filesystem is never reported encrypted.
+  # member so a partially encrypted filesystem is never reported encrypted,
+  # and stat /usr and /etc for the installed system (/ is listed above).
+  "/usr/ r,"
+  "/etc/ r,"
   "/proc/[0-9]*/mountinfo r,"
   "/sys/fs/btrfs/ r,"
   "/sys/fs/btrfs/*/devices/ r,"

@@ -104,7 +104,13 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   /sys/devices/** r,
 
   # Storage diagnostics read their mount topology and every btrfs member.
-  # Block-stack metadata resolves under /sys/devices; no device is opened.
+  # Block-stack metadata resolves under /sys/devices; no device is opened,
+  # and a mount source's /dev node is found through sysfs, never statted.
+  # The installed-system probe stats /, /usr and /etc. AppArmor checks a
+  # stat as read, so each directory is granted by itself (/ above), with
+  # nothing beneath it.
+  /usr/ r,
+  /etc/ r,
   /proc/[0-9]*/mountinfo r,
   /sys/fs/btrfs/ r,
   /sys/fs/btrfs/*/devices/ r,

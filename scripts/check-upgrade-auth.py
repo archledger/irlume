@@ -6,15 +6,16 @@
 Never invoke this on an installed host. The guard runs before any mutation.
 No enrollment, biometric template, recovery envelope or physical device is used.
 
-Source contract at candidate bf323a7e:
+Source contract for the 0.14.0 -> 0.15.0 release pair:
 * crates/irlume-daemon/src/retry_throttle.rs: Record v2, FaceBudget, Store::path.
 * crates/irlume-daemon/src/retry_throttle/recovery.rs: Attempts v1, status/reset.
 * crates/irlume-cli/src/retry.rs and main.rs::read_password: CLI and stdin.
 * crates/irlume-daemon/src/retry_recovery.rs: packaged password-helper gate.
-The v0.11.3 tree has no retry_throttle/retry_recovery or retry CLI. Synthetic
-counter preservation does not establish enforcement by that old release, nor
-biometric enrollment usability. Counter fixtures deliberately avoid cooldowns
-and pending operations, which status can legitimately settle or rewrite.
+Both versions have the retry CLI and these record formats. Seed counters on
+the old installation and verify their preservation and reported state through
+upgrade, rollback and re-upgrade. Synthetic counter checks do not establish
+biometric enrollment usability or face-budget enforcement. Counter fixtures
+avoid cooldowns and pending operations, which status can settle or rewrite.
 """
 import fcntl
 import hashlib
@@ -250,6 +251,50 @@ def status(account, strikes=2, budget=7, recovery=1):
     return check_status(output, strikes, budget, recovery)
 
 
+def check_retry_stage(stage, account, password, manifest):
+    if stage == "old-install":
+        manifest["retry"] = seed_retry(account.pw_uid)
+        manifest["recovery_failures"] = 0
+    else:
+        trusted_directory(RETRY, 0o700)
+        require(retry_fingerprints(account.pw_uid) == manifest["retry"], "retry-preservation-failed")
+    available = status(account, recovery=manifest["recovery_failures"])
+    require(retry_fingerprints(account.pw_uid) == manifest["retry"], "retry-status-altered-fixture")
+    result = {"face_fixture": "source-validated-synthetic-metadata",
+              "face_failures": 2, "cumulative_face_requests": 7,
+              "recovery_failures": manifest["recovery_failures"],
+              "status_verified": True, "password_reset_available": available}
+    if stage != "old-install":
+        result["bytes_and_private_modes_preserved"] = True
+    if stage.startswith("candidate-"):
+        result["candidate_status_verified"] = True
+        result["recovery_failure_created_by_cli"] = False
+    if stage in ("candidate-upgrade", "candidate-reupgrade") and available:
+        reset = ["irlume", "retry", "reset", "--user", USER]
+        wrong, _ = command(reset, input_text="wrong-" + password + "\n",
+                           capture=False, account=account)
+        require(wrong != 0, "retry-wrong-password-accepted")
+        manifest["recovery_failures"] += 1
+        status(account, recovery=manifest["recovery_failures"])
+        result["recovery_failures"] = manifest["recovery_failures"]
+        result["recovery_failure_created_by_cli"] = True
+        if stage == "candidate-reupgrade":
+            correct, _ = command(reset, input_text=password + "\n",
+                                 capture=False, account=account)
+            require(correct == 0, "retry-correct-password-refused")
+            status(account, strikes=0, budget=0, recovery=0)
+            manifest["recovery_failures"] = 0
+            result["pre_reset_counts"] = {key: result[key] for key in (
+                "face_failures", "cumulative_face_requests", "recovery_failures")}
+            result.update(face_failures=0, cumulative_face_requests=0, recovery_failures=0)
+            result["password_verified_reset"] = "passed-wrong-then-correct"
+            result["reset_counts_verified_zero"] = True
+        manifest["retry"] = retry_fingerprints(account.pw_uid)
+    elif stage == "candidate-reupgrade":
+        result["password_verified_reset"] = "not-available-on-installation"
+    return result
+
+
 def run_stage(stage, report):
     # All subprocesses inherit this no-core policy after admission, so accidental
     # child failure cannot leave a password-bearing core in exported evidence.
@@ -302,54 +347,9 @@ def run_stage(stage, report):
     report["pam"] = pam_checks(password)
     report["packaged_pam_module"] = str(module)
     report["camera_devices_absent"] = True
-    if stage == "candidate-upgrade":
-        manifest["retry"] = seed_retry(account.pw_uid)
-        available = status(account, recovery=0)
-        require(retry_fingerprints(account.pw_uid) == manifest["retry"], "retry-status-altered-fixture")
-        # Exercise a real password verification failure when the packaged backend
-        # is available, then preserve the daemon-written recovery record. Face
-        # counters remain synthetic because no enrollment/capture is performed.
-        recovery_failures = 0
-        if available:
-            wrong, _ = command(["irlume", "retry", "reset", "--user", USER],
-                               input_text="wrong-" + password + "\n", capture=False, account=account)
-            require(wrong != 0, "retry-wrong-password-accepted")
-            status(account, recovery=1)
-            recovery_failures = 1
-        manifest["recovery_failures"] = recovery_failures
-        manifest["retry"] = retry_fingerprints(account.pw_uid)
-        report["retry"] = {"face_fixture": "source-validated-synthetic-metadata",
-                           "face_failures": 2, "cumulative_face_requests": 7,
-                           "recovery_failures": recovery_failures,
-                           "recovery_failure_created_by_cli": available,
-                           "candidate_status_verified": True,
-                           "password_reset_available": available}
-    elif stage in ("old-rollback", "candidate-reupgrade"):
-        trusted_directory(RETRY, 0o700)
-        require(retry_fingerprints(account.pw_uid) == manifest["retry"], "retry-preservation-failed")
-        report["retry"] = {"bytes_and_private_modes_preserved": True,
-                           "old_version_retry_enforcement": "absent-in-v0.11.3"}
-        if stage == "candidate-reupgrade":
-            available = status(account, recovery=manifest["recovery_failures"])
-            report["retry"]["candidate_status_verified"] = True
-            require(retry_fingerprints(account.pw_uid) == manifest["retry"], "retry-status-altered-fixture")
-            if available:
-                reset = ["irlume", "retry", "reset", "--user", USER]
-                wrong, _ = command(reset, input_text="wrong-" + password + "\n",
-                                   capture=False, account=account)
-                require(wrong != 0, "retry-wrong-password-accepted")
-                status(account, recovery=manifest["recovery_failures"] + 1)
-                correct, _ = command(reset, input_text=password + "\n",
-                                     capture=False, account=account)
-                require(correct == 0, "retry-correct-password-refused")
-                status(account, strikes=0, budget=0, recovery=0)
-                report["retry"]["password_verified_reset"] = "passed-wrong-then-correct"
-                report["retry"]["reset_counts_verified_zero"] = True
-            else:
-                report["retry"]["password_verified_reset"] = "not-available-on-installation"
-                report["limitations"].append("candidate-daemon-reports-password-reset-unavailable")
-    else:
-        report["retry"] = {"old_version_retry_enforcement": "absent-in-v0.11.3"}
+    report["retry"] = check_retry_stage(stage, account, password, manifest)
+    if stage.startswith("candidate-") and not report["retry"]["password_reset_available"]:
+        report["limitations"].append("candidate-daemon-reports-password-reset-unavailable")
     require(admin_identity() == manifest["admin"], "independent-admin-changed")
     report["independent_admin_preserved"] = True
     manifest["stage"] = stage
@@ -360,7 +360,7 @@ def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
     report = {"passed": False, "limitations": [
         "synthetic-retry-metadata-is-not-biometric-enrollment-usability",
-        "old-release-byte-preservation-is-not-retry-enforcement",
+        "synthetic-counter-status-is-not-face-budget-enforcement",
     ]}
     try:
         require(len(args) == 1 and args[0] in STAGES, "invalid-stage")

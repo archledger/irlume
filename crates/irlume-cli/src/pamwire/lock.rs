@@ -2459,8 +2459,10 @@ mod tests {
     /// is not an earlier irlume: the waiter takes the lock once the holder
     /// lets go, which may be while the operation runs. Here the holder has
     /// exited while another process keeps the file open, which `/proc/locks`
-    /// lists only in the initial PID namespace; elsewhere it lists no holder,
-    /// and the operation stops for that instead. Which of the two refusals
+    /// lists only in the initial PID namespace; elsewhere it lists neither
+    /// that holder nor its waiters, and the operation stops for that instead.
+    /// Wait for the child's blocking flock syscall, which remains observable
+    /// in either namespace. Which of the two refusals
     /// that is does not depend on a sample of `/proc/locks` taken before the
     /// wait, which under load once disagreed with the reading at the
     /// deadline: the refusal itself says which, and only its invariants are
@@ -2476,19 +2478,38 @@ mod tests {
             .arg("true")
             .spawn()
             .expect("run flock");
-        let probe = File::open(&legacy).unwrap();
+        let syscall_path = format!("/proc/{}/syscall", waiter.id());
+        let flock_syscall = libc::SYS_flock.to_string();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !lock_users(&probe)
-            .unwrap_or_default()
-            .waiters
-            .contains(&waiter.id())
+        while std::fs::read_to_string(&syscall_path)
+            .expect("read the flock child's syscall")
+            .split_ascii_whitespace()
+            .next()
+            != Some(flock_syscall.as_str())
         {
+            assert!(
+                waiter.try_wait().expect("poll flock").is_none(),
+                "flock exited before waiting for the lock"
+            );
             assert!(Instant::now() < deadline, "flock never waited for the lock");
             std::thread::sleep(Duration::from_millis(20));
         }
         let path = scratch.path("run/pam.lock");
-        let refused = lock_pam_at(&path, Some(&legacy), uid(), Duration::from_millis(300))
-            .expect_err("went on while a process of the account waits for the legacy lock");
+        // Release an unexpected successful lock before reaping its waiter.
+        let result = lock_pam_at(&path, Some(&legacy), uid(), Duration::from_millis(300)).map(drop);
+        let still_waiting = waiter.try_wait().expect("poll flock").is_none();
+        drop(holder);
+        let status = waiter.wait().expect("reap flock");
+        assert!(
+            still_waiting,
+            "flock stopped waiting before its holder left"
+        );
+        assert!(
+            status.success(),
+            "flock failed after its holder left: {status}"
+        );
+        let refused =
+            result.expect_err("went on while a process of the account waits for the legacy lock");
         if !refused.contains("does not list") {
             assert!(
                 refused.contains(&format!("process {}", waiter.id()))
@@ -2496,8 +2517,6 @@ mod tests {
                 "{refused}"
             );
         }
-        drop(holder);
-        let _ = waiter.wait();
     }
 
     /// A canned `/proc/locks` reading: a POSIX lock on another inode, then a

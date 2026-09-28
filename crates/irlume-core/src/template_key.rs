@@ -62,8 +62,14 @@ impl UserStateLock {
         Self::acquire_with_creation(user, false)
     }
 
+    /// The lock a writer takes. Taking it first settles a replacement of
+    /// the account's enrollment that a write left unfinished
+    /// ([`crate::replacement::settle_interrupted`]), so the operation that
+    /// takes it starts from a finished or undone replacement.
     pub(crate) fn acquire(user: &str) -> Result<Self> {
-        Self::acquire_with_creation(user, true)
+        let lock = Self::acquire_with_creation(user, true)?;
+        crate::replacement::settle_interrupted(user)?;
+        Ok(lock)
     }
 
     fn acquire_with_creation(user: &str, create: bool) -> Result<Self> {
@@ -364,7 +370,9 @@ pub(crate) struct WriteKey {
 }
 
 /// The envelope file of a template key sealed for another uid, as it was
-/// before a new key replaced it.
+/// before a new key replaced it. Setting it aside records the replacement
+/// durably first ([`crate::replacement`]), so a write that stops part way
+/// is settled the next time the account's state lock is taken.
 struct ReplacedKey {
     user: String,
     envelope: Vec<u8>,
@@ -373,20 +381,23 @@ struct ReplacedKey {
 impl ReplacedKey {
     fn set_aside(user: &str) -> Result<Self> {
         let envelope = std::fs::read(key_path(user)).map_err(|e| Error::Io(e.to_string()))?;
+        crate::replacement::begin(user, Some(&envelope))?;
         Ok(Self {
             user: user.to_owned(),
             envelope,
         })
     }
 
-    /// Put the replaced key's envelope back in place of the new key.
+    /// Put the replaced key's envelope back in place of the new key; the
+    /// record of the replacement then goes.
     fn put_back(self, why: &str) -> Result<()> {
         irlume_common::write_0600_atomic(&key_path(&self.user), &self.envelope).map_err(|e| {
             Error::Io(format!(
                 "{why}, and the template key it replaced could not be put back ({e}); its \
                  recovery envelope is kept"
             ))
-        })
+        })?;
+        crate::replacement::undo(&self.user)
     }
 }
 
@@ -412,24 +423,21 @@ impl WriteKey {
     /// Finish or undo a replacement by how the enrollment write under this
     /// key went (`published`: what the write made visible, `None` when it
     /// published nothing). Published and durable: the replaced key's
-    /// recovery envelope, which can only restore that key, is removed. Not
-    /// published: the replaced key goes back, so the failed write leaves the
-    /// other account's key, enrollment and recovery envelope as they were.
-    /// Visible but not durable: the new key stays and so does the recovery
-    /// envelope, since a power loss may bring the replaced enrollment back.
+    /// recovery envelope, which can only restore that key, and the replaced
+    /// enrollment's added-camera store are removed
+    /// ([`crate::replacement::finish`]). Not published: the replaced key goes
+    /// back, so the failed write leaves the other account's key, enrollment
+    /// and recovery envelope as they were. Visible but not durable: the new
+    /// key stays and so do the recovery envelope and the store, since a
+    /// power loss may bring the replaced enrollment back; the record of the
+    /// replacement stays too, and the next acquisition of the state lock
+    /// settles it ([`crate::replacement::settle_interrupted`]).
     pub(crate) fn settle(self, published: Option<&irlume_common::AtomicWrite>) -> Result<()> {
         let Some(replaced) = self.replaced else {
             return Ok(());
         };
         match published {
-            Some(irlume_common::AtomicWrite::Durable) => forget_recovery_unlocked(&replaced.user)
-                .map_err(|e| {
-                    Error::Io(format!(
-                        "the enrollment of '{}' was saved under a new template key, but the \
-                         recovery envelope of the replaced key could not be removed: {e}",
-                        replaced.user
-                    ))
-                }),
+            Some(irlume_common::AtomicWrite::Durable) => crate::replacement::finish(&replaced.user),
             Some(irlume_common::AtomicWrite::VisibleNotDurable(_)) => Ok(()),
             None => replaced.put_back("the enrollment was not written"),
         }
@@ -1833,10 +1841,16 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         let tk = crate::test_tmp_dir("tk-uid-tpm");
         let rec = crate::test_tmp_dir("rec-uid-tpm");
+        // The enrollment's directory too: a replacement records itself
+        // beside the enrollment (`crate::replacement`).
+        let state = crate::test_tmp_dir("state-uid-tpm");
         std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &tk);
         std::env::set_var("IRLUME_RECOVERY_DIR", &rec);
+        std::env::set_var("IRLUME_STATE_DIR", &state);
         let _ = std::fs::remove_dir_all(&tk);
         let _ = std::fs::remove_dir_all(&rec);
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).unwrap();
         let user = "uid-tpm";
         let recorded = || SealedEnvelope::load(&key_path(user)).unwrap().uid;
 
@@ -1897,6 +1911,7 @@ mod tests {
             .unwrap();
         assert_eq!(recorded(), Some(5102));
         assert!(!has_recovery(user), "the replaced key's recovery file goes");
+        assert!(!crate::replacement::record_path(user).exists(), "settled");
 
         let mut legacy = SealedEnvelope::load(&key_path(user)).unwrap();
         legacy.uid = None;
@@ -1907,9 +1922,6 @@ mod tests {
 
         // The added-camera store's write key does not reuse such a key when
         // its recovery envelope records another uid, or cannot be read.
-        let state = crate::test_tmp_dir("state-uid-tpm");
-        let _ = std::fs::remove_dir_all(&state);
-        std::env::set_var("IRLUME_STATE_DIR", &state);
         *TPM_PRESENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(true);
         legacy.save(&key_path(user)).unwrap();
         let mut other = crate::recovery::wrap(b"recovery passphrase", &second).unwrap();

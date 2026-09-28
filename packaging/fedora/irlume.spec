@@ -2,7 +2,7 @@
 %global ort_ver 1.28.1
 
 Name:           irlume
-Version:        0.14.0
+Version:        0.15.0
 Release:        1%{?dist}
 Summary:        Face authentication for Linux
 
@@ -336,6 +336,11 @@ restorecon /run/irlume.sock 2>/dev/null || :
 
 
 %changelog
+* Mon Sep 28 2026 Wisbendji Fimerlus <archledger236@gmail.com> - 0.15.0-1
+- Prepare the 0.15.0 candidate with PAM wiring and keyring updates
+- Refresh TUI account views, diagnostics and capture tracing
+- Include account-state, authorization and packaging corrections
+
 * Sat Sep 19 2026 Wisbendji Fimerlus <archledger236@gmail.com> - 0.14.0-1
 - Encrypt secondary camera stores under the account template key
 - Add the optional irlume-kcm Plasma System Settings module

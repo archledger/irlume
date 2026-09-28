@@ -8,8 +8,8 @@ four real package transactions in one disposable systemd guest:
 3. Restore the complete old package (`old-rollback`).
 4. Upgrade to the candidate again (`candidate-reupgrade`).
 
-The current harness requires upstream versions **0.11.3 → 0.12.0 → 0.11.3 →
-0.12.0**. It checks package metadata and installed CLI versions; renaming an
+The current harness requires upstream versions **0.14.0 → 0.15.0 → 0.14.0 →
+0.15.0**. It checks package metadata and installed CLI versions; renaming an
 artifact does not change its version. For a later release pair, review and
 update the harness's version and state-format assertions before running it.
 This document describes a procedure, not a completed qualification result.
@@ -149,8 +149,12 @@ allowed; synthetic descendant metadata must remain unchanged.
 
 The authentication checker creates a throwaway account, a private PAM service,
 and a randomly generated guest-only password. It tests correct and incorrect
-password fallback at every stage, plus candidate retry status and reset behavior
-when available. Passwords travel over stdin and stay inside
+password fallback at every stage. Both versions support retry status: synthetic
+counters are seeded on the old installation, then their bytes, private modes
+and reported values are checked across upgrade, rollback and re-upgrade,
+including after each stage's password login. Candidate stages exercise a wrong
+reset password when reset is available; re-upgrade also checks the correct
+password and zeroed counters. Passwords travel over stdin and stay inside
 `/var/tmp/irlume-upgrade-private`; never print, copy, or publish that directory.
 
 Export **only the sanitized JSON receipt** for shared evidence. Raw package
@@ -235,8 +239,9 @@ inactive case: the check itself could activate the socket and invalidate it.
 - Synthetic configuration, state bytes, and retry records establish preservation
   of those fixtures. They do not establish cryptographic enrollment usability,
   TPM-sealed credential recovery, camera behavior, liveness, or biometric login.
-- Version 0.11.3 has no retry enforcement. Retaining candidate retry files during
-  rollback does not mean that the old daemon enforces their limits.
+- Both versions report the preserved retry counters. Preserved bytes and
+  reported counts do not establish face-budget enforcement during biometric
+  authentication.
 - An enforcing AppArmor installation can intentionally report password-verified
   retry reset unavailable. Record that limitation; password fallback is tested
   separately. Do not turn off confinement to change the outcome.

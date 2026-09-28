@@ -22,6 +22,85 @@ SPEC.loader.exec_module(auth)
 
 
 class AuthCheckerTests(unittest.TestCase):
+    def test_retry_state_is_seeded_on_old_install_and_checked_on_every_stage(self):
+        account = SimpleNamespace(pw_uid=1234)
+        fingerprints = {"1234.json": "face", "1234.reset.json": "reset"}
+        output = (
+            "Face retry state for 'irlume-upgrade-fixture': 2 recorded failures, 0s cooldown.\n"
+            "Cumulative face requests: 7/50 consecutive unsuccessful; available after any cooldown.\n"
+            "Password-verified retry reset: unavailable on this installation; 0 failed checks, 0s cooldown.\n"
+            "Ordinary password login remains available.\n"
+        )
+        manifest = {}
+        with patch.object(auth, "seed_retry", return_value=fingerprints), \
+                patch.object(auth, "retry_fingerprints", return_value=fingerprints), \
+                patch.object(auth, "trusted_directory"), \
+                patch.object(auth, "command", return_value=(0, output)):
+            for stage in auth.STAGES:
+                with self.subTest(stage=stage):
+                    result = auth.check_retry_stage(stage, account, "synthetic", manifest)
+                    self.assertTrue(result["status_verified"])
+                    self.assertEqual(manifest["retry"], fingerprints)
+                    self.assertEqual(manifest["recovery_failures"], 0)
+            for stage in ("candidate-upgrade", "old-rollback", "candidate-reupgrade"):
+                with self.subTest(corrupt_stage=stage), \
+                        patch.object(auth, "retry_fingerprints", return_value={"1234.json": "changed"}):
+                    with self.assertRaisesRegex(auth.Failure, "retry-preservation-failed"):
+                        auth.check_retry_stage(stage, account, "synthetic", manifest)
+
+    def test_old_release_retry_status_must_report_the_preserved_counters(self):
+        account = SimpleNamespace(pw_uid=1234)
+        fingerprints = {"1234.json": "face", "1234.reset.json": "reset"}
+        manifest = {"retry": fingerprints, "recovery_failures": 0}
+        with patch.object(auth, "retry_fingerprints", return_value=fingerprints), \
+                patch.object(auth, "trusted_directory"), \
+                patch.object(auth, "command", return_value=(0, "wrong counter state")):
+            with self.assertRaisesRegex(auth.Failure, "retry-status-mismatch"):
+                auth.check_retry_stage("old-rollback", account, "synthetic", manifest)
+
+    def test_candidate_reset_failures_survive_rollback_until_verified_reset(self):
+        account = SimpleNamespace(pw_uid=1234)
+        initial = {"face": "initial", "reset": "zero"}
+        failed = {"face": "initial", "reset": "one"}
+        cleared = {"face": "zero", "reset": "zero"}
+        manifest = {"retry": initial, "recovery_failures": 0}
+
+        def reply(strikes, budget, recovery):
+            return (0,
+                    f"Face retry state for 'irlume-upgrade-fixture': {strikes} recorded failures, 0s cooldown.\n"
+                    f"Cumulative face requests: {budget}/50 consecutive unsuccessful; available after any cooldown.\n"
+                    f"Password-verified retry reset: available for supported local accounts; {recovery} failed checks, 0s cooldown.\n"
+                    "Ordinary password login remains available.\n")
+
+        with patch.object(auth, "trusted_directory"), \
+                patch.object(auth, "retry_fingerprints", side_effect=[initial, initial, failed]), \
+                patch.object(auth, "command", side_effect=[reply(2, 7, 0), (1, ""), reply(2, 7, 1)]):
+            result = auth.check_retry_stage("candidate-upgrade", account, "synthetic", manifest)
+            self.assertTrue(result["recovery_failure_created_by_cli"])
+            self.assertEqual(manifest, {"retry": failed, "recovery_failures": 1})
+        with patch.object(auth, "trusted_directory"), \
+                patch.object(auth, "retry_fingerprints", return_value=failed), \
+                patch.object(auth, "command", return_value=reply(2, 7, 1)):
+            self.assertTrue(auth.check_retry_stage(
+                "old-rollback", account, "synthetic", manifest)["status_verified"])
+        with patch.object(auth, "trusted_directory"), \
+                patch.object(auth, "retry_fingerprints", side_effect=[failed, failed, cleared]), \
+                patch.object(auth, "command", side_effect=[reply(2, 7, 1), (1, ""), reply(2, 7, 2),
+                                                           (0, ""), reply(0, 0, 0)]):
+            result = auth.check_retry_stage("candidate-reupgrade", account, "synthetic", manifest)
+            self.assertTrue(result["reset_counts_verified_zero"])
+            self.assertEqual(result["pre_reset_counts"], {
+                "face_failures": 2, "cumulative_face_requests": 7, "recovery_failures": 2})
+            self.assertEqual([result[key] for key in (
+                "face_failures", "cumulative_face_requests", "recovery_failures")], [0, 0, 0])
+            self.assertEqual(manifest, {"retry": cleared, "recovery_failures": 0})
+        with patch.object(auth, "trusted_directory"), \
+                patch.object(auth, "retry_fingerprints", return_value=initial), \
+                patch.object(auth, "command", side_effect=[reply(2, 7, 0), (0, "")]):
+            with self.assertRaisesRegex(auth.Failure, "retry-wrong-password-accepted"):
+                auth.check_retry_stage("candidate-upgrade", account, "synthetic",
+                                       {"retry": initial, "recovery_failures": 0})
+
     def test_nonroot_refused_before_command_or_mutation(self):
         with patch.object(auth.os, "geteuid", return_value=1000), \
                 patch.object(auth, "command") as command, \

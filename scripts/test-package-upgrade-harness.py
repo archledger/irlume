@@ -22,6 +22,15 @@ SPEC.loader.exec_module(upgrade)
 
 
 class HarnessTests(unittest.TestCase):
+    def test_release_policy_packages_match_the_014_to_015_main_packages(self):
+        metadata = ["irlume-selinux\t(none)\t0.14.0\t1.fc44\tnoarch",
+                    "irlume-selinux\t(none)\t0.15.0\t1.fc44\tnoarch"]
+        with patch.object(upgrade, "package_path", side_effect=[Path("/old.rpm"), Path("/new.rpm")]), \
+                patch.object(upgrade, "read_command", side_effect=metadata):
+            self.assertEqual(upgrade.rpm_companions(
+                "/old.rpm", "/new.rpm", ("0.14.0-1.fc44", "0.15.0-1.fc44")),
+                (Path("/old.rpm"), Path("/new.rpm")))
+
     def test_rpm_metadata_checks_upstream_name_epoch_and_architecture(self):
         good = "irlume\t(none)\t0.12.0\t1.20260910.fc44\tx86_64"
         with patch.object(upgrade, "read_command", return_value=good):
@@ -332,7 +341,7 @@ class HarnessTests(unittest.TestCase):
                 processes.append(process)
             with patch.object(upgrade, "INPUT_ROOT", root), \
                  patch.object(upgrade, "admit_guest", return_value="kvm"), \
-                 patch.object(upgrade, "read_command", side_effect=["irlume", "0.11.3", "irlume", "0.12.0"]), \
+                 patch.object(upgrade, "read_command", side_effect=["irlume", "0.14.0", "irlume", "0.15.0"]), \
                  patch.object(upgrade.subprocess, "Popen", side_effect=processes) as command, \
                  patch.object(upgrade.sys, "stdout", io.StringIO()):
                 self.assertEqual(upgrade.main(["--old", str(old), "--candidate", str(candidate),

@@ -38,12 +38,19 @@ fixtures remain to verify that these fields are optional within contract 1.
 `camera-census.json` was captured on the same engine with physical video nodes,
 covering the census's documented device paths even on camera-free CI runners.
 
+The `*-0.15.0.json` fixtures were captured as root from the installed 0.15.0
+candidate in a disposable Ubuntu 24.04 guest, after its upgrade/rollback trial.
+That guest has no camera, enrollment, graphical login manager or armed wallet.
+The version suffix preserves the earlier populated-profile, wired-login and
+hardware snapshots as additional compatibility cases. These files keep the
+capture script's bytes, including the reported engine version.
+
 Two things are not verbatim, and both are deliberate:
 
 - profile and scan display names are replaced with placeholders, because they
   are user text and the maintainer capturing a fixture should not have to
   publish their own. Counts, ordering and every other field are as captured;
-- the host facts are one machine's. `login-status.json` shows a Fedora KDE box
+- the host facts are one machine's. The older `login-status.json` shows a Fedora KDE box
   with plasmalogin wired, and `doctor.json` reports that machine's checks. Read
   them as shapes, not as expected values.
 

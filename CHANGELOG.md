@@ -5,6 +5,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.0] - Unreleased candidate
+
+Feature scope is frozen for release qualification. The publication date will
+be recorded when the candidate is approved for release.
+
 ### Added
 
 - `irlume login enable --adjust-jumps` adds irlume's lines to an `/etc`

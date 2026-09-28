@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright the irlume contributors.
-"""Strict 0.11.3 -> 0.12.0 -> 0.11.3 -> 0.12.0 disposable QEMU test.
+"""Strict 0.14.0 -> 0.15.0 -> 0.14.0 -> 0.15.0 disposable QEMU test.
 
 Run inside a fresh root-owned guest only. Prepare dependencies/package inputs
 separately; this script does not alter service security settings. The marker is
@@ -37,6 +37,8 @@ SYNTHETIC_ROOT = STATE_ROOT / "upgrade-validation"
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin", "LANG": "C", "LC_ALL": "C",
        "DEBIAN_FRONTEND": "noninteractive", "SYSTEMD_PAGER": "cat"}
 RPM_QUERY = "%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\\n"
+OLD_VERSION = "0.14.0"
+CANDIDATE_VERSION = "0.15.0"
 
 
 class Failure(Exception):
@@ -133,7 +135,7 @@ def rpm_companions(old_value, candidate_value, versions):
     paths = (package_path(old_value), package_path(candidate_value))
     require(all(package_format(path) == "rpm" for path in paths), "mixed-package-formats")
     policy_versions = tuple(package_metadata(path, "rpm", expected, "irlume-selinux")
-                            for path, expected in zip(paths, ("0.11.3", "0.12.0")))
+                            for path, expected in zip(paths, (OLD_VERSION, CANDIDATE_VERSION)))
     require(policy_versions == versions, "rpm-main-policy-version-mismatch")
     return paths
 
@@ -439,14 +441,14 @@ def execute(runner, kind, old, candidate, versions, result, stage_check=None, po
     previous = None
     baseline_payload = candidate_payload = config = synthetic = root = enabled = None
     for label, path, version, cli_version in (
-        ("old-install", old, versions[0], "0.11.3"),
-        ("candidate-upgrade", candidate, versions[1], "0.12.0"),
-        ("old-rollback", old, versions[0], "0.11.3"),
-        ("candidate-reupgrade", candidate, versions[1], "0.12.0"),
+        ("old-install", old, versions[0], OLD_VERSION),
+        ("candidate-upgrade", candidate, versions[1], CANDIDATE_VERSION),
+        ("old-rollback", old, versions[0], OLD_VERSION),
+        ("candidate-reupgrade", candidate, versions[1], CANDIDATE_VERSION),
     ):
         row = {"step": label, "passed": False}
         result["steps"].append(row)
-        policy = policies[0 if cli_version == "0.11.3" else 1] if policies else None
+        policy = policies[0 if cli_version == OLD_VERSION else 1] if policies else None
         runner.install(kind, path, label, policy)
         require(runner.installed_version(kind) == version, "installed-version-mismatch")
         row["package_version"] = version
@@ -465,7 +467,7 @@ def execute(runner, kind, old, candidate, versions, result, stage_check=None, po
             unit: runner.command(["systemctl", "is-enabled", unit], check=False)
             for unit in ("irlumed.service", "irlumed.socket")
         }
-        if cli_version == "0.12.0":
+        if cli_version == CANDIDATE_VERSION:
             check_candidate_payload(payload, kind)
             candidate_payload = payload
         if label == "old-install":
@@ -518,7 +520,8 @@ def main(argv=None):
         stage_check = package_path(args.stage_check) if args.stage_check else None
         kind = package_format(old)
         require(package_format(candidate) == kind, "mixed-package-formats")
-        versions = (package_metadata(old, kind, "0.11.3"), package_metadata(candidate, kind, "0.12.0"))
+        versions = (package_metadata(old, kind, OLD_VERSION),
+                    package_metadata(candidate, kind, CANDIDATE_VERSION))
         policies = None
         if kind == "rpm":
             policies = rpm_companions(args.old_selinux, args.candidate_selinux, versions)

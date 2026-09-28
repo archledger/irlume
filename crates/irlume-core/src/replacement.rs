@@ -62,13 +62,35 @@ pub(crate) fn record_path(user: &str) -> PathBuf {
     template_key::key_dir().join(format!("{user}.replacing"))
 }
 
-/// SHA-256 of the file at `path`, or `None` when there is none.
+/// SHA-256 of the file at `path`, or `None` when there is none. The files
+/// may hold plaintext templates (a host without a TPM), so they are hashed
+/// through one zeroized buffer, never copied whole.
 fn digest(path: &Path) -> Result<Option<String>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(irlume_common::sha256_hex(&bytes))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(Error::Io(format!("read {}: {e}", path.display()))),
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+    let unreadable = |e: std::io::Error| Error::Io(format!("read {}: {e}", path.display()));
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(e)),
+    };
+    let mut hasher = Sha256::new();
+    let mut buffer = zeroize::Zeroizing::new([0u8; 8192]);
+    loop {
+        match file.read(&mut buffer[..]) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(unreadable(e)),
+        }
     }
+    Ok(Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    ))
 }
 
 /// Sync the directory holding `path`, so a rename or removal in it lasts.
@@ -314,5 +336,32 @@ pub(crate) fn settle_interrupted(user: &str, loading: bool) -> Result<()> {
             Ok(())
         }
         settled => settled,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::digest;
+
+    /// The streamed digest is the digest of the whole file, across buffer
+    /// boundaries; a missing file has none, and a directory is an error.
+    #[test]
+    fn a_streamed_digest_is_the_whole_files() {
+        let dir = std::path::PathBuf::from(crate::test_tmp_dir("replacement-digest"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file");
+        for len in [0usize, 1, 8191, 8192, 8193, 20_000] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                digest(&path).unwrap(),
+                Some(irlume_common::sha256_hex(&bytes)),
+                "{len} bytes"
+            );
+        }
+        assert_eq!(digest(&dir.join("missing")).unwrap(), None);
+        assert!(digest(&dir).is_err(), "a directory");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

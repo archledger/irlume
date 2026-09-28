@@ -53,6 +53,15 @@ a name may be shown, never matched on.
 
 ## Decision
 
+Amended by [ADR-0032](0032-cross-device-pairing-by-administrator-pin.md)
+(2026-09-28): `SplitPair` is a separate, explicitly authorized cross-device
+candidate class, usable for enrollment/authentication only after that ADR's
+activation gate is satisfied. `ConnectedPair` retains the one-physical-camera
+invariant. Existing account-scoped ranking and the implemented `NotApplicable`
+behavior for incomplete legacy bindings are preserved; that fallback does not
+authorize a split pair. ADR-0032 also extends section 6's coherent-publication
+requirement to updates that both authorize and select a split pair.
+
 1. **Selection is per request, from the requesting account's enrollment,
    before any device is opened.** The order of an authentication request
    in `automatic` mode is: enumerate the connected candidates **camera-

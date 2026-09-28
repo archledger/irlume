@@ -2,451 +2,346 @@
 
 ## Status
 
-Proposed 2026-09-28, revised 2026-09-28 in response to maintainer review
-(PR #937, review 5340620155). Amends ADR-0029 §1 by adding a second pairing
-class: a `ConnectedPair` remains one physical camera, and a new `SplitPair`
-is the only structure permitted to span two. Depends on ADR-0007 (descriptor
-identity, and the finding at ADR-0007 lines 97-105 that USB bus and device
-numbers are diagnostic only, allocated dynamically, and are not persistent
-identity), ADR-0024 §2 (a pair is authorized as a complete role-labelled
-pair), ADR-0029 §1, ADR-0030 §4 and §5, and ADR-0031 §1. Changes nothing in
-ADR-0031 §4: a YUYV luma exposure ceiling stays refused, and §7 says why
-pairing does not change that — but see the Phasing section for why that
-refusal must not be relied on as a safety net for anything else.
+Proposed 2026-09-28. Based on the proposal in #938 by @maurerr, with
+maintainer refinements to identity, selection, compatibility and activation.
 
-The ThinkPad T480 of #887 is the first hardware this applies to. Its IR module
-(5986:1141) and its colour module (5986:2113) are two USB devices on separate
-ports, and every layer that pairs cameras treats one USB device as one camera.
+Amends ADR-0029 sections 1 and 6 to add a separate pairing class and coherent
+publication of its authorization and selection. `ConnectedPair` retains its
+one-physical-camera invariant. Existing account selection, including the
+implemented incomplete-legacy-binding `NotApplicable` behavior, remains in
+force for ordinary pairs.
+
+Depends on ADR-0007 (identity and capture qualification), ADR-0024 (complete
+role-labelled credential bindings), ADR-0029 (selection), ADR-0030 (display
+and redaction), and ADR-0031 (descriptor-based YUYV IR classification).
+ADR-0031 section 4's YUYV exposure refusal remains in force.
+
+This ADR defines the contract for later implementation PRs. Its acceptance
+tests and activation gate must be satisfied before split-pair enrollment or
+authentication becomes available.
 
 ## Context
 
-ADR-0029 §1 pairs a camera when one physical camera's capture nodes hold
-exactly one RGB role and one IR role. The rule is per inventory entry, so two
-devices cannot combine: a split host is not a pair at any layer. Today it is
-refused with a reason that names the cause (ADR-0030 §4, `SpansPhysicalCameras`),
-and that refusal is correct as written. A machine with a working IR sensor
-simply cannot authenticate.
+The ThinkPad T480 in #887 has a Bison IR module, `5986:1141`, and a colour
+module, `5986:2113`, on two USB devices. Its descriptor-attested IR role does
+not make those devices an ordinary connected pair. ADR-0029 section 1 and
+`connected::pair_camera` construct a `ConnectedPair` from one physical
+camera with exactly one RGB and one IR capture node, classified at the
+current generation. The lease currently refuses a request spanning physical
+cameras with `SpansPhysicalCameras`.
 
-Widening `ConnectedPair` is not the fix. That type carries one `identity`, one
-`vid_pid`, one `serial_present`, one `fixed`, one `port_chain`, one
-`instance_id` and one `generation`. The lease keys on `CameraInstanceId`;
-`camera_binding` and the secondary store bind a credential to a pair identity
-(ADR-0024 §2); a non-root peer sees neither node path nor either identity
-(ADR-0030 §4). All of that assumes one physical camera per pair, and all of it
-would have to become conditional if a pair could quietly be two devices.
+An administrator needs a way to authorize that cross-device relationship
+without changing the meaning of every existing pair. Such authorization is
+distinct from enrolling a pair for an account, selecting it for a request,
+or qualifying a capture schedule.
 
-What is missing is a second class of pair, reachable only by an explicit
-administrator record. The daemon's baseline trust in "one USB device is one
-camera" is physical. Crossing a device boundary is not physical, so it is a
-mandate, and a mandate is recorded rather than inferred.
-
-The hard part is not the recording. It is deciding which facts about a camera
-make a pin name one *unit* rather than one *model*, because `/dev/videoN` is
-renumbered across boots, a serial is not always unique, and — as this revision
-corrects — even the USB bus number a location string starts with is not the
-durable part of that location.
+The pin must also distinguish locations. Binding identities can lack a
+serial, and reported serials are not guaranteed unique. Node names and USB
+bus numbers can change on re-enumeration. A PCI controller plus relative
+ports is still incomplete: Linux xHCI creates USB2 and USB3 root hubs under
+one PCI device and numbers each hub's ports independently.
 
 ## Decision
 
-### 1. A split pair is a separate type, never a widened `ConnectedPair`
+### 1. A separate class, built only from an administrator authorization
 
-`SplitPair` is a new type holding two `CameraNode` values, one per side, each
-carrying that side's path, identity, `vid_pid`, `serial_present`, `fixed`,
-controller-qualified location (§2), `instance_id` and `generation`. Discovery
-never produces one. `pair_camera` and `ConnectedPair` are unchanged, so every
-invariant that rests on "one physical camera per pair" continues to hold for
-every existing path without conditionals.
+`SplitPair` represents two distinct physical USB cameras with one selected
+capture endpoint per role. Each side retains its own binding identity,
+qualified USB location, selected node path, built-in/external evidence,
+instance ID and generation. Discovery alone never creates a split pair.
+`ConnectedPair` and its ordinary construction rule are unchanged.
 
-`ConnectedPairs` gains a `split_pairs` list. It is empty unless a pin says
-otherwise, so a host with a split camera and no pin still sees exactly the
-single-camera view it saw before.
+The daemon constructs split candidates from one complete, current passive
+inventory publication. Descriptor, topology and role facts used for that
+construction belong to the publication; the pairing operation does not open
+cameras or infer new roles. A publication from another supervisor incarnation
+or revision cannot be mixed into the candidate pool. Each side has its own
+instance and generation; those values need not equal the other side's.
 
-### 2. What may authorize a pin
+The internal pairing view may carry a separate split-pair collection. It is
+empty without explicit authorization. Ordinary pairs retain their existing
+construction and claim their physical devices first. Ordered split records
+are then resolved without allowing a physical device to participate in two
+published pairs. A record that overlaps an ordinary pair or an earlier
+resolved split record is refused. Other independent valid records remain
+usable.
 
-A pin records, per side: the binding identity, the node path the
-administrator named, and the USB location. A side of that pin is resolved
-only when **all** of the following hold.
+An authorization selects endpoints already classified by the existing
+rules. It cannot turn RGB into IR, classify an unknown endpoint, or make a
+metadata node a capture endpoint. Missing USB evidence, missing roles or
+multiple capture nodes of the requested role leave that side unresolved.
+Existing descriptor requirements, including ADR-0031's YUYV attestation,
+still apply.
 
-1. The pin's identity is non-empty and equals the candidate's. A
-   descriptor-less camera reports the empty identity and can never be
-   resolved, which is what enforces descriptor attestation here (ADR-0031 §1).
-2. The pin's recorded path still names a capture node of that side holding the
-   wanted role.
-3. The pin recorded a USB location for that side, and the candidate currently
-   reports **the same** one. A location absent on either side authorizes
-   nothing.
+### 2. Persistent location includes the root-hub domain
 
-**Location is controller-qualified, not a bare port string.** The original
-form of this ADR treated `crate::usb_port_chain`'s `<bus>-<port>[.<port>…]`
-string — built from the *diagnostic* USB bus number — as the durable,
-unit-discriminating fact. That is wrong on this codebase's own evidence:
-ADR-0007 states plainly that "USB bus and device numbers are diagnostic only.
-They are allocated dynamically and are not persistent identity," and the
-daemon already carries the correct alternative elsewhere —
-`irlume-daemon/src/diagnostics.rs` and `irlume-cli/src/support_report.rs` both
-keep a durable `controller: SafeLabel` (the host controller's PCI address,
-e.g. `"0000:0d:00.3"`) separate from the volatile `usb_bus: u16` and the
-relative `usb_port_chain: Vec<u8>`.
+A split authorization records, for each side:
 
-ADR-0032's "USB location" is therefore redefined as the pair **(controller,
-relative port chain)**: the host controller's PCI address, plus the sequence
-of port numbers under that controller, with the kernel-assigned bus number
-excluded entirely. This is what a pin records and what the resolver compares.
-The existing `<bus>-<port>` string (`crate::usb_port_chain`) is demoted to a
-display value only — still share-safe (ADR-0030 §5), still useful in a TUI or
-log line, but never compared for pin resolution. A future accessor (working
-name `crate::usb_controller_location`) returns the `(controller,
-Vec<u8>)` pair from the same sysfs walk `usb_port_chain` already does.
+- the non-empty binding identity, in the existing `vid:pid[:serial]` form;
+- the selected node path;
+- a qualified USB location:
+  `(controller identity, root-hub protocol domain, relative port chain)`.
 
-The facts available for naming a unit are:
+The controller identity comes from the raw USB connection facts described
+in ADR-0007, not a sanitized display label. The root domain distinguishes
+independently numbered root hubs under that controller. For xHCI it must
+distinguish the USB2 and SuperSpeed root-hub domains. The relative port chain
+is interpreted within that domain. The implementation must derive these
+facts from the controller/root-hub topology, not infer the domain from an
+endpoint's negotiated speed alone.
 
-| fact | stable across a reboot | distinguishes units on different ports | usable alone in a pin |
-|---|---|---|---|
-| `identity`, `vid:pid[:serial]` | yes | no: a serial is optional, and where one is present it can be a batch serial that several units of a model share | no |
-| node path, `/dev/videoN` | no | no | no |
-| `usb_bus` (the diagnostic bus number) | **no** — ADR-0007: dynamically allocated, not persistent identity | no, by itself | no |
-| `controller` (host controller PCI address) | yes | yes, between controllers | no, alone — several ports share one controller |
-| relative port chain (`Vec<u8>`, no bus number) | yes, under one controller | yes, among concurrently connected units on that controller | no, alone — two controllers can coincidentally share port numbers |
-| `(controller, relative port chain)` together | yes | yes, among concurrently connected units, and across controllers | **yes** |
-| `descriptor_token` | yes | no, it fingerprints model and firmware | no |
-| `instance_id` | no | yes | no |
+If the available topology cannot identify the controller and root domain
+unambiguously, the side is unresolved. The dynamically allocated USB bus
+number, device address and `/dev/videoN` number are not part of the durable
+location. The existing `<bus>-<port>` display string and the diagnostic
+`SafeLabel` projection are not authorization keys.
 
-Only the controller-qualified pair is both boot-stable and able to
-discriminate units that are connected at the same time, including two units
-that happen to sit at the same relative port number under two different
-controllers — a case the bare port string could not tell apart and the
-controller-qualified location resolves correctly by construction. Identity is
-not a discriminator either: a serial is optional, and where one is present it
-can be a batch serial that several units of a model share.
+Resolution requires the recorded identity and complete location to match,
+and the recorded path to name the currently classified endpoint of the
+requested role. A missing location component never acts as a wildcard.
 
-So identity is a *precondition* and controller-qualified location is the
-*discriminator*. A side with no recorded location is refused, even when the
-other side is fully identified: refusing on either side is what stops a pin
-resolving against whichever unit happens to hold the recorded node name.
+| Change | Persistent location and credential key | Live resolution |
+|---|---|---|
+| USB bus number changes, controller/domain/ports unchanged | Unchanged | Revalidate current facts |
+| Selected node is renumbered | Unchanged | Refuse until the administrator updates the recorded path |
+| Controller, root domain or relative ports change | Different | Require a new pin; existing credential binding does not move |
+| Either side reconnects with all recorded facts unchanged | Unchanged | Re-prove its new incarnation before capture |
+| Controller or root domain is missing or ambiguous | No usable key | Refuse the split pair |
 
-The guarantee this buys is stated exactly, because it is narrower than the
-words "unit-discriminating" suggest. The rule binds a pin to **descriptor
-identity plus controller-qualified USB location and selected node**. It does
-not prove the same physical unit returned. A replacement module with the same
-descriptor identity, plugged into the same controller port and assigned the
-same node path, satisfies every recorded fact and is indistinguishable from
-the unit it replaced. Detecting that substitution would require a per-unit
-secret, a genuinely unique serial, or an enrollment-time hardware
-fingerprint, none of which this hardware offers. If replacement detection is
-required for some deployment, these facts are insufficient, and §5 treats
-that case as out of scope rather than as solved.
+These rules match reported hardware facts. They do not prove that the same
+physical unit returned. Replacement hardware presenting the same binding
+identity, qualified location and selected path is indistinguishable with
+these facts. Detecting that replacement needs a per-unit fact this design
+does not provide.
 
-The cost is stated rather than hidden: a camera whose sysfs path yields no
-readable controller or port chain can never be a side of a split pair, and
-that includes non-USB capture nodes. Split pairing is about two USB devices
-on known controllers, so this is the intended boundary, and it fails closed.
+### 3. Pairing authorization, selection and enrollment stay separate
 
-### 2a. Scope: sequential-only, one administrator record holding many pins
+The administrator's ordered collection authorizes which devices may form a
+split pair. Collection order resolves overlapping authorizations; it is not
+authentication preference order. Creating an authorization neither enrolls
+the pair for an account nor silently changes the selected default.
 
-Two scope questions the original text left implicit are stated outright:
+For authentication, the split pair must additionally match the requesting
+account's complete split-aware primary binding or an active secondary group.
+In automatic mode, keep eligible primary first, then eligible secondary
+pairs in canonical role-labelled pair-key order. Step 5 specifies the
+extended key ordering while preserving the relative order of existing
+ordinary-pair keys. Reordering non-overlapping authorization records does
+not change this account-scoped ranking.
 
-* **Initial support is sequential-only.** This ADR specifies no concurrent
-  dual-controller capture contract: nothing here promises that the RGB and IR
-  sides of a split pair can be opened and streamed at the same instant, only
-  that the daemon can identify and authorize the pair. Whatever capture
-  ordering the lease already imposes on two devices applies unchanged; a
-  true concurrent-capture guarantee, if ever needed, is a separate ADR.
-* **`set-cameras` holds an ordered collection of pins, not one.** The
-  resolver in §5 already assumes this — "a camera is claimed by the first
-  pair that uses it," pins are "honored independently, in pin order" — so the
-  configuration format is explicit here rather than left to be inferred from
-  the resolver's behavior: it is a list, administrator-ordered, and that
-  order is the tie-breaking priority when two pins overlap on a camera.
+Pinned mode still selects one pair and does not fall back to another when
+it is unavailable. A selected split pair refers to its complete pair key,
+not its position in the authorization list. Environment overrides retain
+their selection precedence, but do not themselves authorize a cross-device
+relationship. Enrollment uses the operation's explicit choice and existing
+approval path; choosing a split pair also requires a matching administrator
+authorization. Apply `forbid_external_cameras` to both sides: either side
+failing that policy makes the split pair ineligible.
 
-### 3. Moving a side to another controller port requires re-pinning
+The existing ordinary-pair and incomplete-legacy-binding behavior remains
+unchanged. In particular, `NotApplicable` can retain the standing ordinary
+pair as implemented today; that fallback never authorizes a split pair.
+There is no movement to another pair after a biometric or PAD refusal and
+no pooling of evidence between pairs (ADR-0024 section 5).
 
-A pin records a controller-qualified location, so a unit that moves to a
-different port — on the same controller or a different one — no longer
-matches, and the pair is refused until `set-cameras` records the new
-location. There is no serial-based exemption, because a serial is not what
-makes a side unique (§2).
+### 4. Whole-pair credential bindings and coherent configuration
 
-This is deliberate. A pin is the administrator's statement about which
-hardware to use; a change of USB topology is a physical change, and a second
-unit of the same model arriving at the old port is exactly the event a pin
-exists to make visible. Built-in modules do not move ports, so the common case
-is unaffected. A bus renumbering with no physical change — the case ADR-0007
-warns about — must **not** trigger this: see the acceptance tests.
+The durable unit key combines binding identity with the complete qualified
+location. A split credential binds the RGB unit key and then the IR unit key
+in role order. Swapping roles changes the pair key; discovery order does not.
+The encoding must distinguish the split class from legacy ordinary bindings
+and represent both sides without ambiguity. Matching compares the whole
+pair, never independently authorized halves from two enrollments.
 
-### 4. Pair binding survives a replug, and nothing is rebound automatically
+A legacy identity-only `camera_binding` or secondary-group entry is not
+silently interpreted as a split binding. A legacy four-key pin keeps its
+existing meaning and does not create a split authorization by inferring
+missing locations from whatever hardware is connected. Explicit enrollment
+or adding a camera establishes a new split-aware account binding. Removing
+or reordering machine authorization records does not rewrite enrollments or
+reactivate an inactive secondary store.
 
-A pin records no `instance_id` and no `generation`, deliberately: recording
-them would make the pin expire on every reboot, which is the failure mode
-§2's location rule exists to prevent.
+The administrator changes the root-owned authorization records through a
+daemon-validated privileged configuration operation. An update that both
+authorizes and selects a split pair publishes one coherent old or new state
+under the configuration lock, extending ADR-0029 section 6. A malformed or
+unreadable authorization state, or an unresolved selected-pair reference,
+refuses the split operation; it is not read as a fresh automatic setup.
 
-A replug mints a new `instance_id` and resets the generation. A clean return
-to the same controller port changes neither the descriptor identity nor the
-controller-qualified location, so the binding key for the pair is unchanged —
-including across a bus renumbering, since the bus number is excluded from
-that location by construction (§2). But a replug **may change the node
-path**: the kernel can renumber `/dev/videoN` on re-enumeration, and §2 rule 2
-then refuses to resolve until the pin's recorded path is updated. Automatic
-resolution therefore holds only when the recorded node path still matches.
-This is deliberate: the pin must not follow a node name onto hardware it
-never named, so a renumbered unit waits for `set-cameras` to record its new
-path rather than being quietly re-attached. Because the binding key carries
-the unit facts and not the path, that re-pointing needs no re-enrollment.
+Step 3 must specify the bounded, versioned collection encoding, selected-pair
+reference, atomic publication and upgrade behavior. The ordinary four-key
+pin remains compatible when split configuration is absent. New split
+management requests fail visibly against an older daemon; the client never
+downgrades them to the ordinary setter and reports success.
 
-What the replug does retire is the *proof*: the pair must be re-proved under
-the lease against the new instance ids and generations on both sides before
-anything is opened. A credential is never re-bound to a different key because
-a pair stopped matching. That follows ADR-0024 §5: no automatic movement to
-another pair after a mismatch, and no pooling of evidence across pairs. Note
-the boundary of that promise, from §2: a replacement unit presenting the same
-recorded facts is not a different key, and nothing here detects it.
+### 5. Sequential capture and two-incarnation revalidation
 
-The binding for a split pair follows ADR-0024 §2's complete role-labelled
-pair: the two sides' unit keys, in **role order** (the RGB key first, then
-the IR key, never sorted). Discovery order must not matter, and the builder
-guarantees it by assigning each side by role rather than by enumeration
-order, so the same physical pair builds the same key however the census
-listed it. But `RGB=A, IR=B` and `RGB=B, IR=A` are different
-authorizations, because the credential authorizes roles through a pair, not a
-set of two devices. ADR-0024's rule that enrolling pairs A and B never
-authorizes a hybrid applies unchanged, and is the reason a pair key is
-compared whole rather than side by side.
+Initial split support uses the sequential capture schedule. The capture
+layer enforces that choice. Acquiring both camera-instance leases reserves
+the devices; it does not authorize concurrent streaming. A split pair cannot
+inherit a concurrent qualification from an ordinary pair or either side
+alone. Existing sensor-policy, per-operation eligibility, PAD and quality
+requirements remain in force.
 
-### 5. What fails closed
+Both instance keys are acquired together in deterministic order and both
+selected incarnations are revalidated against one live publication before
+opening either side. Revalidate identity, qualified location, recorded path
+and classified role. Failure releases both leases and opens neither side.
+The opened descriptors and captured frames retain the existing anti-injection
+and provenance checks, extended to represent the two authorized incarnations
+rather than bypassing a single-camera check.
 
-* **Either side absent.** No pair, and the request is refused before any device
-  is opened. The side that is present is *not* usable on its own for a split
-  credential: a split pair has no single-camera path, as an unenrolled pair is
-  not a usable pair (ADR-0029).
-* **Either side's generation advanced.** Re-prove both sides under the lease.
-  If either no longer presents the same unit key, refuse rather than
-  re-resolve.
-* **A pool spanning two inventory incarnations.** Refuse every pin. Pairing
-  across a republication would pair a camera with a republication of itself.
-* **Two sides that cannot be told apart.** Refuse. Identical halves observed
-  twice are one ambiguous unit.
-* **A camera already claimed.** A camera is claimed by the first pair that uses
-  it; a later pin reusing either side is refused, so no camera is ever half of
-  two pairs and no enrollment binding is ambiguous.
-* **One unresolvable pin among several.** It alone is refused. Pins are
-  honored independently, in pin order (§2a).
-* **A bus renumbering with no physical change.** Must not be refused: the
-  controller-qualified location (§2) excludes the bus number, so this is not
-  a location mismatch.
+If either side changes or leaves during capture, the request cannot combine
+old and new evidence or retarget to a replacement. The normal refusal and
+password fallback apply. A reconnect with an unchanged persistent key still
+requires fresh live proof. Runtime incarnation IDs are never persisted as
+credential identity.
 
-### 6. Redaction and the wire
+Future concurrent split support needs its own qualification design covering
+the complete pair, both connection contexts and invalidation when either
+incarnation changes.
 
-**`CameraCandidate` stays exactly as it is today: role-free.** The original
-text of this section proposed sending a split pair's two sides to a non-root
-peer "as `CameraCandidate` endpoints... carrying their pair roles." That is
-not implementable: `CandidateWire` in `crates/irlume-common/src/live_camera.rs`
-is `#[serde(deny_unknown_fields)]` over exactly `instance_id`, `generation`
-and `endpoint_paths`, and the existing test
-`live_camera_wire_rejects_unsafe_names_zero_generation_and_invented_roles`
-specifically asserts that an injected `role` field fails to decode. Extending
-that type would break every decoder that relies on today's contract, old and
-new alike, since `deny_unknown_fields` rejects the payload in both
-directions.
+### 6. Existing wire contracts stay closed
 
-Split-pair role and location information therefore travels over **a new,
-separate reply that only a client which sends a new, distinct request ever
-receives.** `CameraCandidate`/`CandidateWire` is never touched: every client
-that continues to send the ordinary inventory request gets exactly the
-ordinary reply, byte for byte, whether or not the daemon has any split pairs
-configured. A client that wants split-pair information must opt in with a new
-request variant; the daemon answers that request with a new wire type —
-role-labelled `CameraCandidate`-shaped endpoints with pair roles attached —
-that old clients simply never ask for and therefore never see. This is a
-stronger backward-compatibility guarantee than relying on unknown-field
-tolerance: an old client's behavior is provably unchanged, because it never
-receives a payload it wasn't built to parse.
+`CameraCandidate` and `CandidateWire` retain their role-free physical-group
+contract. A candidate carries `instance_id`, `generation` and
+`endpoint_paths`; its decoder rejects unknown fields. Split-pair role and
+location information is exposed only through a separate opt-in request and
+reply. Existing clients keep receiving their existing reply shapes.
 
-Neither side's real node path, neither side's identity, and neither side's
-serial crosses the non-root boundary in either the old or the new reply
-(ADR-0030 §4); only endpoint tokens do, exactly as for an ordinary pair. The
-controller-qualified location's `controller` and port-chain components remain
-share-safe and may be sent (ADR-0030 §5), on the same terms the old
-`port_chain` display string always was.
+For non-root peers, both sides use the existing daemon-instance endpoint
+tokens. Neither real node path, binding identity nor serial is sent. Display
+controller labels, root-domain labels and relative ports are share-safe
+projections; the raw controller path and complete internal binding key are
+not made public merely because the new reply is opt-in. Root may receive the
+full pair facts under the existing posture rules.
 
-Whether the two sides sit on one USB device or two is therefore never named
-on the old wire at all, and on the new wire only to a client that explicitly
-asked. Root receives the full `SplitPair`, both real paths, both identities
-and both serials, exactly as it receives them for a `ConnectedPair`.
+The new request's authorization and effects must be explicit in the daemon's
+posture tables. Redaction tests cover every reply or event carrying its data
+and its error paths. A new client meeting an older daemon reports unsupported
+split management rather than falling back to a less specific operation.
 
-### 7. Pairing never creates an exposure ceiling
+### 7. Pairing does not establish exposure or enable authentication
 
-ADR-0031 §4 stands unchanged. `clipping_white_level(IrPixel::YuyvLuma, ...)`
-stays `None` under `only_native_8bit_grey_can_claim_a_clipping_ceiling`. A USB
-descriptor is a device-supplied claim, not proof of sensor modality, and
-crossing a device boundary is evidence of nothing at all. Enabling split
-pairing is not a route to a YUYV exposure ceiling, and a split pair's IR side
-is qualified exactly as a same-device IR side is.
+ADR-0031 section 4 remains unchanged: YUYV luma does not acquire a clipping
+ceiling from a USB descriptor or an administrator's pairing decision.
+`clipping_white_level(IrPixel::YuyvLuma, ...)` remains `None`.
 
-**This refusal must not be read as a safety net for anything else.** It stops
-a YUYV IR side from claiming a clipping ceiling; it says nothing about, and
-does not block, a split pair whose IR side is native GREY. See Phasing for
-why that distinction is load-bearing.
+That format-specific refusal is not the activation gate. A split pair with
+native GREY IR can already have a clipping ceiling. All split enrollment and
+authentication paths remain explicitly disabled until step 5's complete-pair
+binding and request-path enforcement are implemented and tested. A successful
+lease acquisition in step 4 cannot bypass this gate.
 
 ## Consequences
 
-* A pin becomes a new trust primitive: the only thing in the daemon that
-  authorizes a relationship physics does not imply. It is therefore root-only
-  configuration, written by `set-cameras`, and nothing else may create one.
-* `set-cameras` must record both identities, both paths and both
-  controller-qualified locations for a cross-device pair, as an ordered
-  collection of pins (§2a), and must keep warning when it saves one.
-* A single-device pin and every `ConnectedPair` path are unaffected.
-* `docs/PLATFORMS.md` gains the ThinkPad T480 as the first supported split
-  pair, and a host that has one still needs the separate exposure work in
-  ADR-0031 §4 before face authentication is released on it. Pairing and
-  exposure are independent, and neither substitutes for the activation gate
-  in Phasing.
-* Any side without a recorded controller-qualified location cannot
-  participate in a split pair, regardless of serial (§2). This is a real
-  restriction, chosen over the retarget it prevents.
-* Two units of the same model on the same controller port cannot both be
-  connected, so §5's "cannot be told apart" case is a descriptor ambiguity
-  rather than a topology one in practice.
-* The guarantee is bounded, and the bound is on the record. A binding key
-  proves descriptor identity plus controller-qualified location and role, not
-  that the same physical unit returned. A replacement unit with the same
-  descriptor identity at the same controller port under the same node name is
-  indistinguishable, and §2 requires that to be stated rather than implied.
-  Deployments that need replacement detection must bring a per-unit fact this
-  ADR does not have.
-* `CameraCandidate`/`CandidateWire` gains no field and no behavior change for
-  any existing client. Split-pair information is additive, opt-in, and lives
-  entirely on a new wire contract (§6).
+- A host such as the T480 can eventually use explicitly authorized separate
+  RGB and IR devices, with a distinct binding class and live two-device proof.
+- A pin authorizes a relationship; the account's enrollment and request policy
+  still decide whether it may authenticate. Names, discovery adjacency and
+  collection order do not supply that authority.
+- Moving a side to a different qualified location changes its binding key.
+  Renumbering a node requires updating its path but not re-enrolling when the
+  complete persistent pair key remains the same.
+- Non-USB nodes and USB nodes with incomplete or ambiguous controller/root
+  topology cannot participate in this initial split-pair class.
+- Ordinary connected pairs and their stored bindings retain their behavior.
+  Overlap with one is a refused split authorization, not an implicit override.
+- The T480 still needs the separate YUYV exposure work and attended validation
+  before it is documented as supporting face authentication. This ADR alone
+  is not that evidence.
 
 ## Rejected alternatives
 
-* **Widen `ConnectedPair` to span devices.** Rejected: it would void the
-  single-camera invariants the lease, `camera_binding`, the secondary store and
-  ADR-0030 §4 all rest on, and would turn a physical assumption into a
-  configurable one everywhere at once.
-* **Trust identity alone.** Rejected: serials repeat across units of a model,
-  which this repository's own evidence records, and a serial-less unit's
-  identity names a model.
-* **Trust the node path alone.** Rejected: renumbered across boots, which is
-  the retarget this ADR exists to close.
-* **Compare the raw `<bus>-<port>` string as the durable location.**
-  Rejected: ADR-0007 already established USB bus numbers as diagnostic-only
-  and dynamically allocated; using the bus number as part of the
-  discriminator reintroduces exactly the churn ADR-0007 warned about, and
-  fails to distinguish two controllers that coincidentally enumerate the same
-  relative port number under different diagnostic bus numbers on different
-  boots.
-* **Treat an unrecorded location as a wildcard.** Rejected: it reintroduces the
-  retarget for exactly the hardware that has no other discriminator.
-* **Let a serial-bearing side skip the location check.** Rejected: batch
-  serials are the documented reason a serial does not name a unit, so a serial
-  is not an exemption.
-* **Infer a pair from hub or port adjacency.** Rejected: an inference is not an
-  authorization, and adjacency does not survive a reboot.
-* **Let a replug silently re-bind a credential to a different binding key.**
-  Rejected by ADR-0024 §5's no-automatic-movement rule. Note the boundary
-  from §2: replacement hardware presenting the same recorded facts is not a
-  different key, and remains undetectable.
-* **Detect replacement hardware from descriptor facts.** Out of scope: as §2
-  records, a replacement unit presenting the same descriptor identity at the
-  same location under the same node name is indistinguishable, and no
-  combination of the facts a pin may record closes that gap.
-* **Add a `role` field to the existing `CameraCandidate` wire type.**
-  Rejected: `CandidateWire` is `#[serde(deny_unknown_fields)]` and is
-  specifically tested to reject an invented role field
-  (`live_camera_wire_rejects_unsafe_names_zero_generation_and_invented_roles`);
-  extending it would break every existing decoder rather than only the ones
-  that opt in.
-* **Rely on the ADR-0031 §4 YUYV exposure refusal as the activation gate for
-  split-pair enrollment/authentication.** Rejected: that refusal is
-  pixel-format-specific and does not fire for a native-GREY IR side, so it
-  would leave a real exposure window between Steps 4 and 5 rather than close
-  it. See Phasing.
+- **Widen `ConnectedPair`.** That would make its one-camera identity and
+  incarnation conditional in every existing consumer.
+- **Use identity or the node name alone.** Identity can name several units,
+  and node names can move between units.
+- **Use a USB bus number as persistent location.** Bus numbers are allocated
+  dynamically (ADR-0007).
+- **Use only controller and relative ports.** xHCI's independently numbered
+  USB2 and USB3 root hubs can share that tuple.
+- **Infer a cross-device pair from proximity or missing pin fields.** Neither
+  establishes the administrator's requested relationship.
+- **Treat authorization-list order as account preference.** That would replace
+  the existing primary-first, canonical-secondary selection contract.
+- **Add roles to `CameraCandidate`.** Its existing closed decoder rejects them;
+  new data belongs to the opt-in contract.
+- **Use the YUYV refusal as the activation gate.** It does not cover native
+  GREY or establish a complete credential binding.
 
 ## Acceptance tests
 
-* No pin, no split pair: a host with a split camera and no `set-cameras`
-  publishes the single-camera view, byte for byte.
-* A pin whose sides are two same-model serial-less units whose node
-  assignments swap resolves to **no** pair, even when both sides report no
-  location. No recorded location on either side authorizes nothing.
-* The same pin resolves only after the administrator records the location the
-  unit is actually at, and then names that unit and not the one that inherited
-  its old node name.
-* A pin naming an identity that is not connected, a side with no descriptors,
-  or a side with two nodes of the wanted role is refused.
-* A pool spanning two inventory incarnations refuses every pin, including a pin
-  naming only the homogeneous majority.
-* Overlapping, non-identical pins produce one pair; the second is refused in
-  either order, and pin order (§2a) decides the winner.
-* Two serial-less pairs of the same models on different controller ports have
-  different binding keys.
-* `RGB=A, IR=B` and `RGB=B, IR=A` have different binding keys, because the key
-  is role-labelled. The same candidates in the opposite enumeration order
-  build the same pair with the same key.
-* A replug of one side at the same controller port leaves the binding key
-  unchanged, while the pair requires re-proof against the new instance ids and
-  generations. If the renumber moved the node path, the pin does not resolve
-  until `set-cameras` records the new path, and the re-pointing needs no
-  re-enrollment.
-* **A bus renumbering with no physical change does not break a pin:** the same
-  controller and the same relative port chain, under a new kernel-assigned bus
-  number, still resolves.
-* **Two controllers that coincidentally enumerate the same relative port
-  chain are different locations:** a pin for a unit on one controller must
-  not resolve against a unit at the same port number on a different
-  controller.
-* A replacement unit presenting the same recorded identity at the same
-  controller port with the same node path is not distinguished. This is
-  stated as a residual limitation, with a test pinning the current behavior
-  rather than the impossible one.
-* A split pair never yields a YUYV clipping ceiling.
-* **An old client's ordinary inventory request, against a daemon with one or
-  more configured split pairs, returns byte-for-byte the pre-ADR-0032 reply
-  shape:** `CandidateWire` gains no field, and the old client never receives,
-  and therefore never has to decode, anything about split pairs.
-* A new client's opt-in request receives role-labelled endpoints for each
-  split pair's two sides, with neither side's real path, identity or serial,
-  exactly as an ordinary pair's tokenized endpoints are redacted today.
-* **Split-pair enrollment and authentication remain refused end-to-end until
-  Step 5's binding enforcement is implemented and tested**, including for a
-  split pair whose IR side is native GREY — the fixture that proves the gate
-  does not depend on the YUYV refusal firing.
+These cases gate the implementation phases:
+
+1. No split authorization: ordinary pairing, selection and existing inventory
+   wire shapes match the prior behavior for the same publication.
+2. A pin cannot classify an unknown, metadata-only or wrong-role node. Missing
+   USB evidence, two wanted-role nodes or a missing side refuse it.
+3. Mixed supervisor incarnations or publication revisions refuse candidate
+   construction. Different per-side instance IDs and generations are retained
+   as two distinct device proofs, not mistaken for mixed publications.
+4. Two same-identity units at equal relative ports in the USB2 and SuperSpeed
+   root domains of one controller have different unit and pair keys. Equal
+   relative ports under different controllers differ too.
+5. Bus renumbering with unchanged controller/domain/ports preserves the key.
+   Node renumbering still requires the recorded-path update. Missing or
+   ambiguous controller/domain facts never match a wildcard.
+6. Replugging either side invalidates live proof but preserves the credential
+   key when all persistent facts match. Replacement hardware presenting every
+   recorded fact remains indistinguishable, as the documented limitation.
+7. RGB=A/IR=B and RGB=B/IR=A produce different pair keys. Reordering discovery
+   does not change either key, and two authorized pairs cannot form a hybrid.
+8. Ordinary pairs retain their device claims. Overlapping split records yield
+   only the first resolvable pair; reordering independent records does not
+   alter the account's primary-first and canonical-secondary ranking.
+9. A split authorization alone does not satisfy enrollment binding. Legacy
+   pins, incomplete bindings and `NotApplicable` fallback do not authorize it.
+   Removing authorization does not move credentials or reactivate a store.
+10. Pinned selection names one complete pair key. A missing selected record
+    refuses; environment overrides cannot bypass authorization; forbidding
+    external cameras rejects either external side.
+11. Concurrent readers and crash recovery observe a coherent old or new
+    configuration. Malformed state is a refusal, not automatic selection.
+    Mixed-version management fails visibly without an old-setter fallback.
+12. Both leases and revalidation precede the first open. Either side changing
+    before or during capture refuses the attempt without mixing generations,
+    pooling pairs or retaining one lease after a two-sided failure.
+13. A valid ordinary concurrent qualification cannot enable concurrent split
+    capture. Existing sensor-policy and quality checks still run.
+14. Frozen old decoders accept existing replies from a daemon with split
+    records. New non-root replies, events and errors expose no raw paths,
+    binding identities, serials or internal controller paths.
+15. Every split enrollment and authentication entry point is refused before
+    step 5, including a native-GREY fixture. After activation, a mismatched
+    complete binding still refuses before any grant.
+16. Pairing never yields a YUYV clipping ceiling. T480 face-authentication
+    support waits for separate exposure work and hardware acceptance.
 
 ## Phasing
 
-1. This ADR, landing alone as `docs(adr): ADR-0032 cross-device pairing by
-   administrator pin`.
-2. The data model and the pin resolver, with `split_pairs` still published
-   empty, so nothing can acquire a pair yet.
-3. `set-cameras` records the two identities, both controller-qualified
-   locations and both paths as an ordered collection of pins (§2a), and the
-   inventory publishes `split_pairs` from the live configuration.
-4. Split-aware `acquire_operation`: both instance keys acquired together in a
-   deterministic order, both validated against one live publication, both
-   released if either validation fails, with the single-device path preserved
-   unchanged.
-5. Split-aware `camera_binding`, secondary store and `resolve_saved_pair`.
+1. Land this proposed ADR alone, with the ADR-0029 amendment pointers.
+2. Add the separate data model, qualified-location facts and pure pin resolver;
+   publish no usable split candidates yet. Test identity and ambiguity cases.
+3. Add administrator configuration, selection references and the opt-in wire
+   contract. Define and test serialization, upgrades, coherent publication and
+   redaction. Configured candidates remain unavailable to enrollment/auth.
+4. Add split-aware lease acquisition, revalidation and sequential capture
+   provenance. Keep the explicit enrollment/authentication gate closed and
+   prove that it holds for native GREY as well as YUYV.
+5. Add complete split-aware primary/secondary bindings and request-path
+   resolution. Validate legacy separation, account selection and all activation
+   tests before enabling split enrollment or authentication.
 
-### Activation gate
+The YUYV exposure change required by the T480 remains separate from these
+phases. Neither accepting this ADR nor completing an intermediate phase
+establishes supported face authentication on that hardware.
 
-Steps 2 through 4 land the data model, resolver, publication and split-aware
-lease acquisition. **None of them may be exercised end-to-end**: split-pair
-enrollment and authentication must remain refused by an explicit gate until
-Step 5's split-aware `camera_binding`, secondary-store and
-`resolve_saved_pair` enforcement is implemented and tested. Today,
-enrollment acquires the configured endpoints and `current_binding` stores
-only device-identity strings; neither is split-pair-aware, so a split pair
-that clears Step 4's lease acquisition could otherwise be enrolled and
-authenticated with a binding that does not actually enforce the pair as a
-whole.
+## Sources for USB location
 
-The ADR-0031 §4 YUYV exposure refusal is **not** an acceptable substitute for
-this gate (§7): it is pixel-format-specific, and a split pair whose IR side
-reports native GREY is not held by it at all. Step 4's acceptance tests must
-therefore include a native-GREY split fixture that proves the activation gate
-holds on its own terms, independent of any device format that happens to
-refuse for an unrelated reason. Steps 3 through 5 complete the split-pair
-data model, resolver, publication, lease acquisition and binding plumbing;
-none of them, including Step 4 in isolation, enables T480 face authentication,
-which additionally needs both the activation gate's Step 5 enforcement and the
-separate YUYV exposure work of ADR-0031 §4.
+- [ADR-0007](0007-context-bound-capture-qualification.md), durable identity and
+  connection context.
+- [Linux v6.8 xHCI PCI setup](https://github.com/torvalds/linux/blob/v6.8/drivers/usb/host/xhci-pci.c#L568-L632),
+  two root hubs under one PCI device.
+- [Linux v6.8 root-hub port arrays](https://github.com/torvalds/linux/blob/v6.8/drivers/usb/host/xhci-mem.c#L2139-L2164),
+  [constructed independently](https://github.com/torvalds/linux/blob/v6.8/drivers/usb/host/xhci-mem.c#L2276-L2277).

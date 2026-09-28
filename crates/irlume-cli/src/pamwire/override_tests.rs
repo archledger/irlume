@@ -11,7 +11,10 @@
 //! vendor file (by then carrying `pam_oo7` lines) and dropped the hand-added
 //! line without a message, so fingerprint at the login screen stopped working.
 
-use super::tests::{fixture, greeter, ship_vendor_only, under_root, TestDir, UPSTREAM_FEDORA};
+use super::tests::{
+    fixture, greeter, ship_vendor_only, under_root, TestDir, FEDORA_PASSWORD_AUTH,
+    FEDORA_POSTLOGIN, UPSTREAM_FEDORA,
+};
 use super::*;
 
 /// A fingerprint line an administrator adds after the SELinux line. Its
@@ -2600,4 +2603,402 @@ fn enable_still_refuses_a_line_that_needs_a_new_place_inside_a_jump() {
     assert_eq!(change_id(&on), "keep-edited-override", "{on}");
     assert!(on.unmet, "{on}");
     assert_eq!(read_file(svc.etc), before, "nothing written");
+}
+
+// ---- lines read as libpam reads them ---------------------------------------------
+
+/// libpam's `_pam_parse_control` skips blanks before and after each `=` and
+/// needs none after a jump, so each of these spellings is the same jump as
+/// `[success=1 default=ignore]`: the fingerprint's success jumps to irlume's
+/// keyring line. Enabling face login would move that landing, so the file
+/// is kept, as it is for the compact spelling; and a disable keeps irlume's
+/// lines as inactive lines, so the jump lands where it did. irlume used to
+/// see no jump in them at all and moved its landing (#858).
+#[test]
+fn a_jump_spelled_with_blanks_around_its_equals_sign_counts_as_a_jump() {
+    let outcomes = |spelling: &str| {
+        let dir = TestDir::new("ovr-spelled-jump");
+        let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+        wire_service(&svc, true, true, &keyring_only).unwrap();
+        let jump = format!("auth       {spelling}   pam_fprintd.so   # local");
+        let before = with_line(&read_file(svc.etc), &jump);
+        std::fs::write(svc.etc, &before).unwrap();
+        assert_eq!(
+            lands_after(&before, "pam_fprintd.so", 1),
+            KEYRING_UNSEAL,
+            "{spelling}: {before}"
+        );
+        let on = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+        assert_eq!(change_id(&on), "keep-edited-override", "{spelling}: {on}");
+        assert!(on.unmet, "{spelling}: {on}");
+        assert!(on.message.contains("move a jump"), "{spelling}: {on}");
+        assert_eq!(read_file(svc.etc), before, "{spelling}: nothing written");
+        let off = wire_service(&svc, false, true, &face_and_keyring).unwrap();
+        assert_eq!(change_id(&off), "strip-in-place", "{spelling}: {off}");
+        let after = read_file(svc.etc);
+        assert!(!content_has_module(&after), "{spelling}: {after}");
+        assert_eq!(
+            lands_after(&after, "pam_fprintd.so", 1),
+            lands_after(&before, "pam_fprintd.so", 1).replace(
+                KEYRING_UNSEAL,
+                &crate::pamwire::stanzas::inert_line("auth", "keyring")
+            ),
+            "{spelling}: the jump lands on the keyring line's place\n{after}"
+        );
+        after.replace(spelling, "JUMP")
+    };
+    let compact = outcomes("[success=1 default=ignore]");
+    for spelling in [
+        "[success = 1 default=ignore]",
+        "[success =1 default = ignore]",
+        "[success=\t1 default=ignore]",
+        "[success=1default=ignore]",
+        "[default=ignore success = 1]",
+    ] {
+        assert_eq!(outcomes(spelling), compact, "{spelling}");
+    }
+}
+
+/// Lines irlume does not read as libpam does, each added by an administrator
+/// to an override with irlume's lines in it. An enable and a method switch
+/// keep the file byte for byte and name the line; doctor says why; reconcile
+/// writes nothing to such an edited file. A disable takes irlume's lines out
+/// and keeps every other byte, since no numeric jump counts them: the
+/// `password-auth` and `postlogin` the file includes above irlume's session
+/// line keep their jumps inside them.
+#[test]
+fn an_override_with_a_line_irlume_does_not_read_as_pam_does_is_kept() {
+    for (n, line) in [
+        "auht       optional     pam_foo.so",
+        "\u{a0}auth       optional     pam_foo.so",
+        "\u{b}session    optional     pam_foo.so",
+        "\u{c}auth       optional     pam_foo.so",
+        "\u{feff}auth       optional     pam_foo.so",
+        "auth\u{b}optional     pam_foo.so",
+        "auth       optional\rpam_foo.so",
+        "auth       [success=1\u{a0}default=ignore]   pam_foo.so",
+        "-[auth]    optional     pam_foo.so",
+        "auht       include      postlogin",
+        "auth       substack",
+        "auth       optional     .so",
+        "auth       optional     pam_foo.so\0",
+        "@include",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dir = TestDir::new(&format!("ovr-unread-{n}"));
+        let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+        let pam_d = dir.0.join("etc/pam.d");
+        std::fs::write(pam_d.join("password-auth"), FEDORA_PASSWORD_AUTH).unwrap();
+        std::fs::write(pam_d.join("postlogin"), FEDORA_POSTLOGIN).unwrap();
+        let vendor_path = svc.vendor.unwrap();
+        wire_service(&svc, true, true, &face_and_keyring).unwrap();
+        let edited = with_line(&read_file(svc.etc), line);
+        std::fs::write(svc.etc, &edited).unwrap();
+        let number = edited.lines().position(|l| l == line).unwrap() + 1;
+        let named = format!("irlume does not read line {number} as PAM does (");
+        for wire in [
+            &face_and_keyring as &dyn Fn(&str) -> (String, bool),
+            &keyring_only,
+        ] {
+            for apply in [false, true] {
+                let o = wire_service(&svc, true, apply, wire).unwrap();
+                assert_eq!(change_id(&o), "keep-edited-override", "{line:?}: {o}");
+                assert!(o.unmet, "{line:?}: {o}");
+                assert!(o.message.contains(&named), "{line:?}: {o}");
+                assert!(!o.message.contains("delete it to use"), "{line:?}: {o}");
+                assert_eq!(read_file(svc.etc), edited, "{line:?}: byte for byte");
+            }
+        }
+        assert!(!exists(&backup_of(&svc)), "{line:?}");
+        assert_eq!(maintain(&svc, overrides::Recipe::Greeter), None, "{line:?}");
+        let (level, note) = overrides::assess(
+            overrides::Recipe::Greeter,
+            &edited,
+            vendor_path,
+            Some(UPSTREAM_FEDORA),
+            &[],
+            None,
+            "",
+        );
+        let note = note.unwrap_or_default();
+        assert_eq!(level, overrides::Level::Warn, "{line:?}: {note}");
+        assert!(
+            note.starts_with(&format!(
+                "irlume does not read line {number} of it as PAM does ("
+            )),
+            "{line:?}: {note}"
+        );
+        assert!(!note.contains("pam_foo"), "no PAM line is quoted: {note}");
+        // PAM reads these two as includes in the auth chain, above irlume's
+        // auth lines: a jump in the stack they name could count them.
+        let include = line.contains("include");
+        for apply in [false, true] {
+            let off = wire_service(&svc, false, apply, &face_and_keyring).unwrap();
+            let expect = if include {
+                "keep-edited-override"
+            } else {
+                "strip-in-place"
+            };
+            assert_eq!(change_id(&off), expect, "{line:?}: {off}");
+            assert_eq!(off.unmet, include, "{line:?}: {off}");
+            assert!(off.message.contains(&named), "{line:?}: {off}");
+            assert!(
+                off.message
+                    .contains(&format!("delete it to use {vendor_path}")),
+                "{line:?}: {off}"
+            );
+        }
+        let after = read_file(svc.etc);
+        if include {
+            assert_eq!(after, edited, "{line:?}: kept byte for byte");
+            continue;
+        }
+        assert_eq!(after, without_irlume_lines(&edited), "{line:?}");
+        assert!(!after.lines().any(is_irlume_line), "{line:?}: {after}");
+        assert!(after.contains(line), "{line:?}: every other byte kept");
+    }
+}
+
+/// Such a line in an override whose numeric jump counts irlume's lines: a
+/// disable keeps the file as it is and names the line, since taking irlume's
+/// lines out would move where that jump lands.
+#[test]
+fn an_unread_override_whose_jump_counts_irlume_lines_is_kept_on_disable() {
+    let dir = TestDir::new("ovr-unread-jump");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    let jump = "auth       [success=1 default=ignore]   pam_fprintd.so   # local";
+    let typo = "auht       optional     pam_foo.so secret=kept-out-of-logs";
+    let edited = with_line(&with_line(&read_file(svc.etc), jump), typo);
+    std::fs::write(svc.etc, &edited).unwrap();
+    let number = edited.lines().position(|l| l == typo).unwrap() + 1;
+    for apply in [false, true] {
+        let off = wire_service(&svc, false, apply, &face_and_keyring).unwrap();
+        assert_eq!(change_id(&off), "keep-edited-override", "{off}");
+        assert!(off.unmet, "{off}");
+        let named = format!("irlume does not read line {number} as PAM does (");
+        assert!(off.message.contains(&named), "{off}");
+        assert!(!off.message.contains("kept-out-of-logs"), "{off}");
+    }
+    assert_eq!(read_file(svc.etc), edited);
+}
+
+/// A vendor file with such a line is not made into an override, and a
+/// `--force` rebuild from one is refused: irlume makes no file from one it
+/// cannot read as PAM does.
+#[test]
+fn no_override_is_made_from_a_vendor_copy_irlume_does_not_read_as_pam_does() {
+    let typo = "auht       optional     pam_foo.so";
+    let vendor = with_line(UPSTREAM_FEDORA, typo);
+    let number = vendor.lines().position(|l| l == typo).unwrap() + 1;
+    let dir = TestDir::new("ovr-unread-vendor");
+    let svc = plasmalogin(&dir.0, &vendor);
+    let vendor_path = svc.vendor.unwrap();
+    for apply in [false, true] {
+        let on = wire_service(&svc, true, apply, &face_and_keyring).unwrap();
+        assert_eq!(change_id(&on), "keep-edited-override", "{on}");
+        assert!(on.unmet, "{on}");
+        assert!(
+            on.message.contains(&format!(
+                ": not created: irlume does not read line {number} of {vendor_path} as PAM does ("
+            )),
+            "{on}"
+        );
+        assert!(!exists(svc.etc), "no override is made");
+    }
+    // An edited override of a readable vendor copy, which then gains the
+    // line: `--force` does not rebuild from it.
+    let dir = TestDir::new("ovr-unread-vendor-force");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    let vendor_path = svc.vendor.unwrap();
+    std::fs::write(svc.etc, thinkpad_before(vendor_path)).unwrap();
+    std::fs::write(vendor_path, &vendor).unwrap();
+    let before = read_file(svc.etc);
+    let on = wire_service_with(&svc, true, &force_apply(), &face_and_keyring).unwrap();
+    assert_eq!(change_id(&on), "keep-edited-override", "{on}");
+    assert!(on.unmet, "{on}");
+    assert!(
+        on.message.contains(&format!(
+            ": not rebuilt from {vendor_path}: irlume does not read line {number} of"
+        )),
+        "{on}"
+    );
+    assert_eq!(read_file(svc.etc), before);
+    assert!(!exists(&backup_of(&svc)));
+    // A vendor copy saved with CRLF endings: PAM reads each carriage return
+    // as part of its line, so irlume makes no LF copy of it, which PAM would
+    // read differently.
+    let dir = TestDir::new("ovr-crlf-vendor");
+    let svc = plasmalogin(&dir.0, &UPSTREAM_FEDORA.replace('\n', "\r\n"));
+    let vendor_path = svc.vendor.unwrap();
+    let on = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert_eq!(change_id(&on), "keep-edited-override", "{on}");
+    assert!(on.unmet, "{on}");
+    assert!(
+        on.message.contains(&format!(
+            ": not created: irlume does not read line 1 of {vendor_path} as PAM does ("
+        )) && on.message.contains("a CRLF line ending"),
+        "{on}"
+    );
+    assert!(!exists(svc.etc), "no override is made");
+}
+
+/// Reconcile keeps an override nobody edited as it is when it, or the vendor
+/// copy it would be rebuilt from, has a line irlume does not read as PAM
+/// does, and says so in its log; no rebuild is offered. A file that predates
+/// tracking does not get its tracking line either. `login enable` keeps
+/// irlume's lines on the old vendor text instead of rebuilding from such a
+/// vendor copy.
+#[test]
+fn reconcile_keeps_an_override_with_a_line_irlume_does_not_read_as_pam_does() {
+    // Its argument stands for one that holds a secret: no message quotes it.
+    let typo = "auht       optional     pam_foo.so secret=kept-out-of-logs";
+    let (wired, ok) = face_and_keyring(&unwire_lines(UPSTREAM_FEDORA).0);
+    assert!(ok);
+    let unread_vendor = with_line(UPSTREAM_FEDORA, typo);
+    let unread_body = with_line(&wired, typo);
+    let dir = TestDir::new("ovr-unread-reconcile");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    let vendor_path = svc.vendor.unwrap();
+    let unedited = overrides::render(vendor_path, &unread_vendor, &unread_body);
+    let legacy = legacy_override(vendor_path, &unread_body);
+    let readable = overrides::render(vendor_path, UPSTREAM_FEDORA, &wired);
+    let unread_update = with_line(&fedora_with_oo7(), typo);
+    for (label, file, vendor_now) in [
+        // Nobody edited it, and its vendor copy changed since.
+        ("unedited", unedited.as_str(), fedora_with_oo7()),
+        // It matches its vendor copy but predates tracking.
+        ("legacy", legacy.as_str(), unread_vendor.clone()),
+        // Readable, but the vendor copy it would be rebuilt from is not.
+        ("vendor", readable.as_str(), unread_update.clone()),
+        // Its vendor copy was saved with CRLF endings since.
+        (
+            "vendor-crlf",
+            readable.as_str(),
+            fedora_with_oo7().replace('\n', "\r\n"),
+        ),
+    ] {
+        std::fs::write(svc.etc, file).unwrap();
+        std::fs::write(vendor_path, &vendor_now).unwrap();
+        let logged = maintain(&svc, overrides::Recipe::Greeter)
+            .unwrap_or_else(|| panic!("{label}: reconcile says why"));
+        assert!(
+            logged.contains(": left as it is: irlume does not read line "),
+            "{label}: {logged}"
+        );
+        assert!(!logged.contains("kept-out-of-logs"), "{label}: {logged}");
+        assert!(
+            logged.ends_with("and reconcile changes no file it cannot read as PAM does"),
+            "{label}: {logged}"
+        );
+        assert_eq!(read_file(svc.etc), file, "{label}: nothing written");
+        assert!(
+            !refresh_due_for(&svc, overrides::Recipe::Greeter),
+            "{label}"
+        );
+        let (level, note) = overrides::assess(
+            overrides::Recipe::Greeter,
+            file,
+            vendor_path,
+            Some(&vendor_now),
+            &[],
+            None,
+            "",
+        );
+        assert_ne!(level, overrides::Level::Pass, "{label}: {note:?}");
+        assert!(
+            note.as_deref()
+                .is_some_and(|n| n.contains("does not read line")),
+            "{label}: {note:?}"
+        );
+    }
+    // `login enable` on the readable file: not rebuilt from the vendor copy
+    // it cannot read, irlume's lines kept on the text they were built from.
+    std::fs::write(svc.etc, &readable).unwrap();
+    std::fs::write(vendor_path, &unread_update).unwrap();
+    let on = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert_eq!(change_id(&on), "already-correct", "{on}");
+    assert!(!on.unmet, "{on}");
+    assert!(
+        on.message.contains(&format!(
+            "not rebuilt from {vendor_path}, which changed since irlume created this \
+             override: irlume does not read line "
+        )),
+        "{on}"
+    );
+    assert_eq!(read_file(svc.etc), readable);
+}
+
+// ---- the stack a first auth include names ----------------------------------------
+
+/// A login screen whose first auth line includes a stack irlume does not
+/// know is wired only when that stack starts with the password step, read
+/// where libpam finds it for the file: under the root the file sits in, in
+/// `etc/pam.d` and then `usr/lib/pam.d`. That holds for a stack irlume edits
+/// in place, for an override made from a vendor file, and for reconcile's
+/// rebuild of one; without the stack, or with another line first, which the
+/// face jump would skip in the step's place, each is left as it is.
+#[test]
+fn the_stack_a_first_auth_include_names_is_read_where_libpam_finds_it() {
+    let vendor = "#%PAM-1.0\nauth       include      site-auth\n-auth      optional     \
+                  pam_gnome_keyring.so\naccount    include      site-auth\n\
+                  session    include      site-auth\n";
+    let decides = "auth       required     pam_unix.so\nauth       required     pam_nologin.so\n";
+    // In place: the stack in /etc/pam.d, then only in /usr/lib/pam.d.
+    for dir_of_stack in ["etc/pam.d", "usr/lib/pam.d"] {
+        let dir = TestDir::new("include-in-place");
+        let etc = dir.0.join("etc/pam.d/ly");
+        std::fs::create_dir_all(etc.parent().unwrap()).unwrap();
+        std::fs::write(&etc, vendor).unwrap();
+        let svc = Svc {
+            etc: leak_path(&etc),
+            vendor: None,
+        };
+        let on = wire_service(&svc, true, false, &face_and_keyring).unwrap();
+        assert_eq!(on.change, PlannedChange::NoAnchor, "{on}");
+        let stacks = dir.0.join(dir_of_stack);
+        std::fs::create_dir_all(&stacks).unwrap();
+        std::fs::write(stacks.join("site-auth"), decides).unwrap();
+        let on = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+        assert_eq!(on.change, PlannedChange::Wire, "{dir_of_stack}: {on}");
+        let wired = with_stack_reader(stack_reader(svc.etc), || face_and_keyring(vendor));
+        assert!(wired.1);
+        assert_eq!(read_file(svc.etc), wired.0);
+        // A stack whose password line fails nothing is no anchor.
+        std::fs::write(&etc, vendor).unwrap();
+        std::fs::remove_file(format!("{}{BACKUP}", svc.etc)).unwrap();
+        for stack in [
+            "auth sufficient pam_unix.so\n",
+            // A gate the face jump would skip in the password step's place.
+            "auth requisite pam_nologin.so\nauth required pam_unix.so\n",
+        ] {
+            std::fs::write(stacks.join("site-auth"), stack).unwrap();
+            let on = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+            assert_eq!(on.change, PlannedChange::NoAnchor, "{stack}: {on}");
+            assert_eq!(read_file(svc.etc), vendor);
+        }
+    }
+    // An override made from a vendor file, and reconcile's rebuild of one.
+    let dir = TestDir::new("include-override");
+    let svc = plasmalogin(&dir.0, vendor);
+    let on = wire_service(&svc, true, true, &keyring_only).unwrap();
+    assert_eq!(on.change, PlannedChange::NoAnchor, "{on}");
+    assert!(!exists(svc.etc));
+    let stack = dir.0.join("usr/lib/pam.d/site-auth");
+    std::fs::write(&stack, decides).unwrap();
+    let on = wire_service(&svc, true, true, &keyring_only).unwrap();
+    assert_eq!(change_id(&on), "materialize-override", "{on}");
+    let vendor_path = svc.vendor.unwrap();
+    let updated = format!("{vendor}-session   optional     pam_kwallet5.so auto_start\n");
+    std::fs::write(vendor_path, &updated).unwrap();
+    std::fs::remove_file(&stack).unwrap();
+    assert_eq!(maintain(&svc, overrides::Recipe::Greeter), None);
+    std::fs::write(&stack, decides).unwrap();
+    let logged = maintain(&svc, overrides::Recipe::Greeter).expect("rebuilt");
+    assert!(logged.contains("rebuilt"), "{logged}");
+    let body = read_file(svc.etc);
+    assert!(body.contains("pam_kwallet5.so auto_start"), "{body}");
+    assert!(body.contains(KEYRING_UNSEAL), "{body}");
 }

@@ -258,7 +258,7 @@ reused for a different meaning. The registry as of this contract:
 | `polkit-helper-sandbox` | whether the polkit helper's sandbox permits what irlume needs |
 | `ir-calibration` | whether this account's IR enrollment carries the per-user liveness floor |
 | `login-wiring` | whether face auth is wired into the login stack, read from its authentication mode: a stack holding only irlume's reseal lines is not wired |
-| `login-overrides` | whether the `/etc/pam.d` copies irlume made of vendor PAM files are in step with them. `warn` names a copy with CRLF line endings (PAM does not read it), a copy with lines irlume did not write whose vendor copy changed since irlume wrote it (or that predates vendor tracking and differs from its vendor copy, including one that only lacks lines its vendor copy has), or one that predates vendor tracking, lacks irlume's lines and has a numeric jump that may have counted them; `info` names one waiting for the next reconcile, one whose vendor copy changed but that reconcile does not rebuild (and why), one whose vendor copy is gone (it is then the service's only configuration), one without irlume's lines that keeps lines irlume did not write, or one where inactive lines hold the places of irlume's lines after a disable; `pass` with none. The detail is one `<service>: <note>` per copy, joined with ` \| ` (no note contains that), and names services and commands, never paths or PAM lines |
+| `login-overrides` | whether the `/etc/pam.d` copies irlume made of vendor PAM files are in step with them. `warn` names a copy with a line irlume does not read as PAM does, by its line number and why (a carriage return outside its comments among them, as CRLF line endings leave, which PAM reads as part of its line; irlume adds nothing to the copy until that line is corrected), a copy with lines irlume did not write whose vendor copy changed since irlume wrote it (or that predates vendor tracking and differs from its vendor copy, including one that only lacks lines its vendor copy has), or one that predates vendor tracking, lacks irlume's lines and has a numeric jump that may have counted them; `info` names one waiting for the next reconcile, one whose vendor copy changed but that reconcile does not rebuild (and why), one whose vendor copy is gone (it is then the service's only configuration), one without irlume's lines that keeps lines irlume did not write, or one where inactive lines hold the places of irlume's lines after a disable; `pass` with none. The detail is one `<service>: <note>` per copy, joined with ` \| ` (no note contains that), and names services and commands, never paths or PAM lines |
 | `display-manager` | whether the active display manager is one irlume can target; `warn` with a detail when irlume keeps face off it on purpose (a LightDM whose XDMCP or VNC server is on) |
 | `pam-regeneration-guard` | whether a distro PAM regeneration would strip the wiring unnoticed |
 | `install-hygiene` | leftover backups, and hand-installed builds overlaying packaged ones |
@@ -717,9 +717,26 @@ move one of irlume's lines past an administrator's line. A stack irlume edits
 in place reports it too when a disable left inactive lines in the places of
 irlume's lines because a numeric jump counts them, and irlume's lines no
 longer fit those places; while they fit, `wire` puts irlume's lines back in
-them, so the jump lands where it did. When irlume's lines in the kept file
-are not the ones this run wants (the plan's `kept`), `login apply` counts
-such a surface as failed (`applied: false`, and the apply fails), since
+them, so the jump lands where it did. A write to an override or to a stack
+irlume edits in place, and an override made from a vendor file, is not made
+either when that file has a line irlume does not read as PAM does (a type
+PAM does not know, a blank other than a space or a tab between fields, a
+carriage return outside a comment, as CRLF line endings leave, a NUL byte, an
+`@include` without a file, a `substack` without a stack, or a module path PAM
+takes no module name from): the surface reports `keep-edited-override` with
+`kept` true. A disable still deletes an override nobody edited and restores a
+backup that is the file without irlume's lines, byte for byte where the file
+has a carriage return; from any other such file it takes irlume's lines out
+and keeps every other byte (`strip-in-place`) when no numeric jump in the
+file could count irlume's lines, and reports `keep-edited-override` with
+`kept` true otherwise. A login or lock screen stack that names no shared
+password stack irlume knows reports `no-anchor` unless its first auth line is
+the password step (a `pam_unix.so`, `pam_unix2.so` or `pam_sss.so` rule whose
+failure fails the stack) or an `include` of a stack that runs one, read where
+PAM finds it, with no auth line below it that can check a password.
+When irlume's lines in the kept file are not the ones this run wants (the
+plan's `kept`), `login apply` counts such a surface as failed
+(`applied: false`, and the apply fails), since
 irlume's lines are not the ones it was asked for; as on the command line, the
 self-heal marker still follows the other surfaces. A copy nobody edited is not
 rebuilt either when irlume's lines would make a numeric jump in its new vendor
@@ -783,7 +800,8 @@ every surface as the success document does (`surface`, `role`, `change`,
 `applied`), so a caller can name the surface that failed. Each change in either
 document also carries `kept`: true for a surface irlume left as it was rather
 than update it (its lines would have moved an administrator's jump or line, or
-the file has a continued line; the plan marks it `kept`),
+the file has a continued line or a line irlume does not read as PAM does; the
+plan marks it `kept`),
 which fails the apply without anything written there.
 
 **verify** answers whether the machine is still as that transaction left it,

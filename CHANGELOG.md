@@ -349,6 +349,64 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- irlume now wires a login or lock screen stack that names no shared
+  password stack it knows next to the stack's first auth line only when
+  that line is the password step, a `pam_unix.so`, `pam_unix2.so` or
+  `pam_sss.so` rule that counts a correct password and whose failure fails
+  the stack, or an `include` of a stack whose first line is such a step,
+  which irlume reads where PAM finds it, and when no auth line below it can
+  check a password. irlume's lines are designed to follow the password step
+  and a line whose failure fails the stack. PAM puts an included stack's
+  lines in the include's place and irlume's face line jumps over the first
+  of them, so a face match stands in for the password step alone and every
+  other line of the stack still runs, gates such as `pam_nologin.so`
+  included. LightDM on openSUSE and on Alpine is wired that way; ly and
+  cinnamon-screensaver on Arch, whose included `login` checks
+  `pam_nologin.so` first, are no longer wired, and such a stack an earlier
+  release wired keeps irlume's lines until `irlume login disable` takes
+  them out. A Debian `@include` of `common-account` and the like below the
+  first auth line is read where PAM finds it too, and its auth lines held
+  to the same rule. Any other such stack is left as it is and reported as
+  having no anchor to wire (#858). So is any stack with an auth line PAM
+  runs as one that always fails (a type with no control, no module, or a
+  control PAM rejects), since a face line above it could end the stack
+  before that line fails.
+
+- irlume now reads the lines of a PAM stack as libpam does and refuses to
+  change a stack with a line it cannot read that way. A control is parsed
+  as libpam parses it, blanks around `=` included, so
+  `[success = 1 default=ignore]` is the same jump as
+  `[success=1 default=ignore]`, and a control libpam rejects has no jump;
+  a line with a type but no control counts in its stack; Debian's
+  `@include`, the type and the `include` or `substack` keyword are read
+  case-insensitively and as whole fields (the file a Debian `@include`
+  names still counts as the password stack by how its name starts, as
+  `common-auth-local` does); and a line continues on the next one only
+  when it ends in `\`, spaces and tabs aside, outside a comment. So the
+  check that keeps a numeric jump landing where it did sees every jump PAM
+  sees (#858). A line whose type PAM does not know (a typo, or a line led
+  by a no-break space, vertical tab or form feed), which PAM counts in the
+  auth stack as a line that always fails, a blank other than a space or a
+  tab between fields, a carriage return outside a comment (CRLF line
+  endings, which PAM reads as part of each line), a NUL byte, an
+  `@include` without a file, a `substack` without a stack or a module path
+  PAM takes no module name from keeps the file as it is: `irlume login
+  enable` names the line and exits 1, an override is not made from a
+  vendor file with such a line, reconcile leaves the file and logs why,
+  `irlume doctor`'s `login-overrides` check gives its line number, and the
+  machine API reports the surface as `keep-edited-override` with `kept`.
+  `irlume login disable` takes irlume's lines out of such a file and keeps
+  every other byte, unless a numeric jump in it could count irlume's
+  lines, a jump in a stack an `include` or `@include` above them names
+  (read where PAM finds it) included, when it keeps the file, names the
+  line and exits 1. A file with
+  CRLF line endings is no longer rewritten with LF endings, which would
+  change which lines PAM runs. Messages about such a line give its number
+  and why, never its text, since a module's arguments can hold a secret
+  and reconcile's messages reach the system journal. The fingerprint line
+  irlume's keyring line follows, and the keyring modules it looks for, are
+  told by a rule's module path, never by an argument that names one.
+
 - Under irlumed's AppArmor profile in enforce mode, as Debian and Ubuntu
   load it, `irlume doctor`'s `sealed-storage` check and the guidance after
   a seal establish the storage under `/usr`, `/etc` and a btrfs mount

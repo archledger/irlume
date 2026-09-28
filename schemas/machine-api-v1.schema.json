@@ -1348,7 +1348,7 @@
         },
         "kept": {
           "type": "boolean",
-          "description": "True when the apply will keep this surface as it is although irlume's lines there are not the ones this run wants, which fails the apply (login.apply's kept). False for every other surface, including a keep-edited-override whose irlume lines are already right. Added in 0.15.0; absent from older builds."
+          "description": "True when the apply will keep this surface as it is although irlume's lines there are not the ones this run wants, or because the file (or the vendor file an override would be made from) has a line irlume does not read as PAM does and irlume's lines would be added, changed or, where a numeric jump could count them, removed, which fails the apply (login.apply's kept). False for every other surface, including a keep-edited-override whose irlume lines are already right. Added in 0.15.0; absent from older builds."
         }
       }
     },

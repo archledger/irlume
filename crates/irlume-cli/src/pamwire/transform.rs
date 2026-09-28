@@ -47,9 +47,10 @@ pub(super) struct KeyringHandoff {
 /// `report_keyring_handoff` walks only `GREETERS`, because a warm screen unlock
 /// runs against a wallet the login already opened.
 pub(super) fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHandoff> {
-    // A continued file cannot be judged line-by-line; silence beats a verdict
-    // reached on lines PAM does not evaluate as written.
-    if has_line_continuation(content) {
+    // A continued file cannot be judged line-by-line, nor one with a line PAM
+    // reads differently; silence beats a verdict reached on lines PAM does
+    // not evaluate as written.
+    if has_line_continuation(content) || unreadable_line(content).is_some() {
         return None;
     }
     let lines: Vec<&str> = content.lines().collect();
@@ -69,13 +70,9 @@ pub(super) fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHan
     // order-sensitive.
     let has_session_line = |module: &str| {
         lines.iter().any(|l| {
-            let d = directive(l);
-            let phase = d.strip_prefix('-').unwrap_or(d);
-            phase.split_whitespace().next() == Some("session")
-                && d.contains(module)
-                // The session half is gated by `only_if=` exactly as the auth
-                // half is: gkr-pam checks it in `pam_sm_open_session` too.
-                && consumer_active_for(l, service).is_some()
+            // The session half is gated by `only_if=` exactly as the auth
+            // half is: gkr-pam checks it in `pam_sm_open_session` too.
+            is_session_directive(l) && consumer_active_for(l, service) == Some(module)
         })
     };
     // Only lines BELOW ours can see the token we set, so the search starts past
@@ -103,7 +100,7 @@ pub(super) fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHan
 /// Insert irlume's greeter block: `unseal` before the password substack, a
 /// `pam_permit` landing + `reseal` after it, and a `session reseal` after the
 /// session substack. Idempotent; falls back to the first `auth` line if there's
-/// no password substack.
+/// no password substack, only where that is safe ([`find_auth_anchor`]).
 /// Wire a display-manager greeter. `face` adds the face-first login lines
 /// (Secure-tier credential release); `keyring` adds the post-auth keyring-unseal
 /// line (fingerprint keyring unlock; needed in gdm-password too, since GDM's
@@ -117,7 +114,10 @@ pub(super) fn wire_greeter_impl(
     keyring: bool,
     ondemand: bool,
 ) -> (String, bool) {
-    if has_line_continuation(content) {
+    if has_line_continuation(content)
+        || unreadable_line(content).is_some()
+        || has_failing_auth_line(content)
+    {
         return (content.to_string(), false);
     }
     if content_has_module(content) {
@@ -146,7 +146,7 @@ pub(super) fn wire_greeter_impl(
                     out.push(KEYRING_UNSEAL.to_string());
                 }
                 out.push(RESEAL_AUTH.to_string());
-            } else if l.trim_start().starts_with("@include common-session") {
+            } else if is_session_include(l) {
                 out.push((*l).to_string());
                 out.push(RESEAL_SESSION.to_string());
             } else {
@@ -204,7 +204,10 @@ pub(super) fn wire_greeter_impl(
 /// screen unlock releases no credential). Handles both the Debian `@include`
 /// and the Fedora `substack` layouts.
 pub(super) fn wire_lock(content: &str) -> (String, bool) {
-    if has_line_continuation(content) {
+    if has_line_continuation(content)
+        || unreadable_line(content).is_some()
+        || has_failing_auth_line(content)
+    {
         return (content.to_string(), false);
     }
     if content_has_module(content) {
@@ -247,7 +250,7 @@ pub(super) fn wire_lock(content: &str) -> (String, bool) {
 /// (`gdm-fingerprint`): insert it right after the `pam_fprintd.so` auth line so
 /// the sealed password is set before pam_gnome_keyring's auth line runs.
 pub(super) fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
-    if has_line_continuation(content) {
+    if has_line_continuation(content) || unreadable_line(content).is_some() {
         return (content.to_string(), false);
     }
     if content.lines().any(|l| irlume_rule_has_arg(l, "keyring")) {
@@ -277,12 +280,9 @@ pub(super) fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
             .iter()
             .skip(fp_at + 1)
             .any(|l| is_auth_directive(l) && consumer_active_for(l, service) == Some(module));
-        let session_present = lines.iter().any(|l| {
-            let d = directive(l);
-            let phase = d.strip_prefix('-').unwrap_or(d);
-            phase.split_whitespace().next() == Some("session")
-                && consumer_active_for(l, service) == Some(module)
-        });
+        let session_present = lines
+            .iter()
+            .any(|l| is_session_directive(l) && consumer_active_for(l, service) == Some(module));
         auth_below_anchor && session_present
     });
     let mut out = Vec::with_capacity(lines.len() + 3);
@@ -335,7 +335,10 @@ pub(super) fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
 /// on a failed face would then fail the whole prompt instead of falling back to
 /// the password.
 pub(super) fn wire_verify_service(content: &str) -> (String, bool) {
-    if has_line_continuation(content) {
+    if has_line_continuation(content)
+        || unreadable_line(content).is_some()
+        || has_failing_auth_line(content)
+    {
         return (content.to_string(), false);
     }
     if content_has_module(content) {
@@ -398,7 +401,10 @@ fn insert_verify_stanza(content: &str, stanza: &str) -> (String, bool) {
 /// would miss a second stray irlume line and leave a plain-`sufficient` control
 /// under which a shake is silently `default=ignore`d.
 pub(super) fn wire_polkit_service(content: &str) -> (String, bool) {
-    if has_line_continuation(content) {
+    if has_line_continuation(content)
+        || unreadable_line(content).is_some()
+        || has_failing_auth_line(content)
+    {
         return (content.to_string(), false);
     }
     if content_has_module(content) {
@@ -413,7 +419,11 @@ pub(super) fn wire_polkit_service(content: &str) -> (String, bool) {
 /// vendor's own lane, not a verify service an administrator gates, so it keeps
 /// that placement rather than [`insert_verify_stanza`]'s.
 pub(super) fn wire_omarchy_lock(content: &str) -> (String, bool) {
-    if has_line_continuation(content) || content_has_module(content) {
+    if has_line_continuation(content)
+        || unreadable_line(content).is_some()
+        || has_failing_auth_line(content)
+        || content_has_module(content)
+    {
         return (content.to_string(), false);
     }
     let lines: Vec<&str> = content.lines().collect();
@@ -444,13 +454,23 @@ pub(super) fn is_irlume_line(l: &str) -> bool {
     // module's arguments (`pam_exec.so /usr/local/libexec/
     // check-pam_irlume.so`) is never taken for irlume's. The tags are
     // matched on the RAW line, because that is where they live; they are
-    // comments, invisible to PAM by design.
-    irlume_rule(l).is_some()
-        || (rule_names_module(l, "pam_permit.so")
-            && (l.contains("# irlume-landing") || l.contains(INERT_TAG)))
+    // comments, invisible to PAM by design. libpam reads a line up to its
+    // first NUL byte, so the module and the tags are told from what comes
+    // before one: a tag after it marks no line of irlume's.
+    let read = l.split('\0').next().unwrap_or(l);
+    irlume_rule(read).is_some()
+        || (rule_names_module(read, "pam_permit.so")
+            && (read.contains("# irlume-landing") || read.contains(INERT_TAG)))
         // Only the gnome-keyring lines WE tagged; a distro-shipped
         // keyring line carries no tag and must survive unwiring.
-        || (rule_names_module(l, "pam_gnome_keyring.so") && l.contains(KEYRING_TAG))
+        || (rule_names_module(read, "pam_gnome_keyring.so") && read.contains(KEYRING_TAG))
+}
+
+/// Whether `text` holds a line of irlume's, each line told with every
+/// carriage return at its end taken off ([`is_irlume_line`]).
+pub(super) fn holds_irlume_line(text: &str) -> bool {
+    text.split('\n')
+        .any(|l| is_irlume_line(l.trim_end_matches('\r')))
 }
 
 /// Remove every irlume line AND the pam_permit landing we added (used only when
@@ -470,4 +490,47 @@ pub(super) fn unwire_lines(content: &str) -> (String, bool) {
         })
         .collect();
     (format!("{}\n", kept.join("\n")), changed)
+}
+
+/// `content` without irlume's lines ([`is_irlume_line`]), every other byte
+/// kept as it is, a carriage return before a newline included.
+pub(super) fn without_irlume_lines(content: &str) -> String {
+    content
+        .split_inclusive('\n')
+        .filter(|l| {
+            let line = l.strip_suffix('\n').unwrap_or(l);
+            !is_irlume_line(line.trim_end_matches('\r'))
+        })
+        .collect()
+}
+
+/// Whether a numeric jump could count irlume's lines: a line above one of
+/// them that is not irlume's carries a numeric action ([`numeric_actions`]),
+/// read as libpam reads it, up to its first NUL byte, or is an `include` or
+/// a Debian `@include` whose lines a jump could leave for irlume's
+/// ([`include_could_jump_past`]). When none does, taking irlume's lines out
+/// moves no other line's landing, whatever else in the file irlume does not
+/// read as PAM does.
+pub(super) fn jump_could_count_irlume_lines(content: &str) -> bool {
+    let irlume = |l: &str| is_irlume_line(l.trim_end_matches('\r'));
+    let lines: Vec<&str> = content.split('\n').collect();
+    let Some(last) = lines.iter().rposition(|l| irlume(l)) else {
+        return false;
+    };
+    // Whether one of irlume's lines of type `phase` comes after `at`.
+    let later_irlume = |at: usize, phase: &str| {
+        lines[at + 1..]
+            .iter()
+            .any(|m| irlume(m) && head(m.trim_end_matches('\r')).is_some_and(|h| h.phase == phase))
+    };
+    lines[..last].iter().enumerate().any(|(at, l)| {
+        let read = l.split('\0').next().unwrap_or(l);
+        if irlume(l) {
+            return false;
+        }
+        if let Some(past) = include_could_jump_past(read, |phase| later_irlume(at, phase)) {
+            return past;
+        }
+        head(read).is_some_and(|h| !numeric_actions(&h).is_empty())
+    })
 }

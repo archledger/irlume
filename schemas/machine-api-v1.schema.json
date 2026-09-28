@@ -246,6 +246,29 @@
             "const": true
           },
           "command": {
+            "const": "login.plan"
+          }
+        },
+        "required": [
+          "ok",
+          "command"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/loginPlanData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "command": {
             "const": "login.apply"
           }
         },
@@ -1259,6 +1282,73 @@
             "type": "string"
           },
           "minItems": 1
+        }
+      }
+    },
+    "loginPlanData": {
+      "type": "object",
+      "description": "What login enable or login disable would change, without changing anything.",
+      "required": [
+        "plan_id",
+        "action",
+        "changes",
+        "writes",
+        "requires_root"
+      ],
+      "properties": {
+        "plan_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "action": {
+          "enum": [
+            "enable",
+            "disable"
+          ]
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/loginPlanChange"
+          }
+        },
+        "writes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "requires_root": {
+          "type": "boolean"
+        }
+      }
+    },
+    "loginPlanChange": {
+      "type": "object",
+      "description": "One surface of a login plan: what the apply would do there.",
+      "required": [
+        "surface",
+        "role",
+        "change",
+        "writes"
+      ],
+      "properties": {
+        "surface": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1
+        },
+        "change": {
+          "type": "string",
+          "minLength": 1
+        },
+        "writes": {
+          "type": "boolean"
+        },
+        "kept": {
+          "type": "boolean",
+          "description": "True when the apply will keep this surface as it is although irlume's lines there are not the ones this run wants, which fails the apply (login.apply's kept). False for every other surface, including a keep-edited-override whose irlume lines are already right. Added in 0.15.0; absent from older builds."
         }
       }
     },

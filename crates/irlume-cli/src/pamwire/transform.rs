@@ -454,13 +454,15 @@ pub(super) fn is_irlume_line(l: &str) -> bool {
     // module's arguments (`pam_exec.so /usr/local/libexec/
     // check-pam_irlume.so`) is never taken for irlume's. The tags are
     // matched on the RAW line, because that is where they live; they are
-    // comments, invisible to PAM by design.
-    irlume_rule(l).is_some()
-        || (rule_names_module(l, "pam_permit.so")
+    // comments, invisible to PAM by design. libpam reads a line up to its
+    // first NUL byte, so the module is told from what comes before one.
+    let read = l.split('\0').next().unwrap_or(l);
+    irlume_rule(read).is_some()
+        || (rule_names_module(read, "pam_permit.so")
             && (l.contains("# irlume-landing") || l.contains(INERT_TAG)))
         // Only the gnome-keyring lines WE tagged; a distro-shipped
         // keyring line carries no tag and must survive unwiring.
-        || (rule_names_module(l, "pam_gnome_keyring.so") && l.contains(KEYRING_TAG))
+        || (rule_names_module(read, "pam_gnome_keyring.so") && l.contains(KEYRING_TAG))
 }
 
 /// Whether `text` holds a line of irlume's, each line told with every

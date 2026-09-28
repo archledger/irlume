@@ -7602,6 +7602,34 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
         assert!(jump_could_count_irlume_lines(&jumped));
     }
 
+    /// libpam reads a line up to its first NUL byte, so a line of irlume's
+    /// with a NUL right after the module name is still irlume's: a disable
+    /// finds it and takes it out, every other byte kept.
+    #[test]
+    fn a_line_of_irlume_s_followed_by_a_nul_is_told() {
+        let line = format!("{VERIFY_STANZA}\0garbage");
+        assert!(is_irlume_line(&line));
+        let text = format!("{line}\nauth       include      system-auth\n");
+        assert!(holds_irlume_line(&text));
+        assert_eq!(
+            without_irlume_lines(&text),
+            "auth       include      system-auth\n"
+        );
+        let dir = TestDir::new("nul-disable");
+        let etc = dir.0.join("sudo");
+        std::fs::write(&etc, &text).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let off = wire_service(&svc, false, true, &wire_verify_service).unwrap();
+        assert_eq!(off.change, PlannedChange::StripInPlace, "{off}");
+        assert_eq!(
+            std::fs::read_to_string(&etc).unwrap(),
+            "auth       include      system-auth\n"
+        );
+    }
+
     /// The disable of a stack irlume edits in place tells a verify line that
     /// ends in the module name with doubled carriage returns as irlume's
     /// before anything else, and takes it out with every other byte kept.

@@ -2887,16 +2887,20 @@ fn wire_override(
     } else {
         None
     };
-    let decision = overrides::decide(&overrides::Input {
-        etc: s.etc,
-        vendor_path,
-        current: current.as_deref(),
-        vendor: vendor.as_deref(),
-        backup: backup.as_deref(),
-        enable,
-        force: opts.force,
-        scope_flag: scope_flag(s.etc),
-        wire,
+    // The stacks an include names are read where libpam finds them for this
+    // file, as the recipe reads them.
+    let decision = with_stack_reader(stack_reader(s.etc), || {
+        overrides::decide(&overrides::Input {
+            etc: s.etc,
+            vendor_path,
+            current: current.as_deref(),
+            vendor: vendor.as_deref(),
+            backup: backup.as_deref(),
+            enable,
+            force: opts.force,
+            scope_flag: scope_flag(s.etc),
+            wire,
+        })
     })?;
     if opts.apply {
         // The vendor copy as decided on above, and as it is now. A package can
@@ -3206,7 +3210,7 @@ fn wire_service_with(
                     Ok(kept_continued(s.etc, false))
                 } else if let Some(line) = unreadable_line(&current) {
                     // Likewise a line PAM reads differently from irlume.
-                    if current.lines().any(is_irlume_line) {
+                    if holds_irlume_line(&current) {
                         let note = format!(
                             " (file changed since wiring; backup kept at {}{})",
                             s.etc, BACKUP
@@ -3228,8 +3232,7 @@ fn wire_service_with(
                         ),
                     )
                 }
-            } else if let Some(current) =
-                read_optional(etc)?.filter(|text| text.lines().any(is_irlume_line))
+            } else if let Some(current) = read_optional(etc)?.filter(|text| holds_irlume_line(text))
             {
                 // The module, or only inactive lines a disable left holding
                 // irlume's places: either way there are lines of irlume's to
@@ -3283,7 +3286,8 @@ fn kept_unreadable(etc: &str, enable: bool, line: &UnreadLine<'_>) -> WireOutcom
 /// A disable of a stack irlume edits in place that holds irlume's lines and
 /// a line irlume does not read as PAM does ([`unreadable_line`]). When no
 /// numeric jump could count irlume's lines
-/// ([`jump_could_count_irlume_lines`]), they come out and every other byte
+/// ([`jump_could_count_irlume_lines`], the stacks an include names read
+/// where libpam finds them for this file), they come out and every other byte
 /// stays as it is ([`without_irlume_lines`]), so PAM reads each other line
 /// as before. Otherwise the file is kept as it is ([`kept_unreadable`]).
 /// `note` ends the line that reports a write.
@@ -3294,7 +3298,7 @@ fn disable_unread(
     apply: bool,
     note: &str,
 ) -> Result<WireOutcome, WriteError> {
-    if jump_could_count_irlume_lines(current) {
+    if with_stack_reader(stack_reader(etc), || jump_could_count_irlume_lines(current)) {
         return Ok(kept_unreadable(etc, false, line));
     }
     if apply {
@@ -3353,7 +3357,7 @@ fn stack_reader(path: &str) -> StackReader {
 /// takes in the next line instead, the password line included. A stack
 /// without irlume's lines has nothing to take out and is judged as ever.
 fn continued_with_irlume_lines(current: &str) -> bool {
-    has_line_continuation(current) && current.lines().any(is_irlume_line)
+    has_line_continuation(current) && holds_irlume_line(current)
 }
 
 /// irlume's lines taken out of a stack irlume edits in place, for a disable:
@@ -3427,7 +3431,7 @@ enum KeptPlaces {
 /// the places the inactive lines hold, nothing is written: a jump is never
 /// moved to make room.
 fn keep_places(etc: &str, current: &str, wired: &str) -> Option<KeptPlaces> {
-    if !current.lines().any(is_irlume_line) {
+    if !holds_irlume_line(current) {
         return None;
     }
     let shifts = overrides::jump_shifts(current, wired);
@@ -5929,6 +5933,38 @@ session     include       password-auth
 session     include       postlogin
 "#;
 
+    /// Fedora's authselect `password-auth`, as the stack an `include` of it
+    /// reads: its jumps land inside it.
+    pub(super) const FEDORA_PASSWORD_AUTH: &str = "\
+auth        required      pam_env.so
+auth        required      pam_faildelay.so delay=2000000
+auth        [default=1 ignore=ignore success=ok] pam_usertype.so isregular
+auth        [default=1 ignore=ignore success=ok] pam_localuser.so
+auth        sufficient    pam_unix.so nullok
+auth        [default=1 ignore=ignore success=ok] pam_usertype.so isregular
+auth        sufficient    pam_sss.so forward_pass
+auth        required      pam_deny.so
+
+account     required      pam_unix.so
+
+password    requisite     pam_pwquality.so local_users_only
+password    sufficient    pam_unix.so yescrypt shadow nullok use_authtok
+password    required      pam_deny.so
+
+session     optional      pam_keyinit.so revoke
+session     required      pam_limits.so
+-session    optional      pam_systemd.so
+session     [success=1 default=ignore] pam_succeed_if.so service in crond quiet use_uid
+session     required      pam_unix.so
+";
+    /// Fedora's authselect `postlogin`: its jumps land inside it too.
+    pub(super) const FEDORA_POSTLOGIN: &str = "\
+session     optional                   pam_umask.so silent
+session     [success=1 default=ignore] pam_succeed_if.so service !~ gdm* service !~ su* quiet
+session     [default=1]                pam_lastlog2.so silent
+session     optional                   pam_lastlog2.so silent
+";
+
     const UPSTREAM_ARCH: &str = r#"#%PAM-1.0
 
 # SPDX-License-Identifier: CC0-1.0
@@ -6465,6 +6501,11 @@ auth       optional      pam_gnome_keyring.so\n";
     const ARCH_SYSTEM_LOCAL_LOGIN: &str = "#%PAM-1.0\n\nauth      include   system-login\n\
          account   include   system-login\npassword  include   system-login\n\
          session   include   system-login\n";
+    /// A `postlogin-auth` for `xdm` to include that holds only an optional
+    /// keyring line, which a face match may skip. The real file is read
+    /// where it is, and its lines decide.
+    const OPENSUSE_POSTLOGIN_AUTH: &str =
+        "#%PAM-1.0\nauth     optional       pam_gnome_keyring.so\n";
     const ALPINE_BASE_AUTH: &str = "# basic PAM configuration for Alpine.\n\n\
          auth required pam_unix.so nullok\nauth required pam_nologin.so\n\
          auth required pam_env.so\n\n-auth optional pam_gnome_keyring.so\n\
@@ -6541,24 +6582,61 @@ auth       optional      pam_gnome_keyring.so\n";
                 "auth [success=ok new_authtok_reqd=ok ignore=ignore default=bad] pam_unix.so",
                 "auth required pam_deny.so",
             ],
-            &[
-                "auth required pam_unix.so",
-                "@include common-account",
-                "@include common-session",
-                "account required pam_unix.so",
-                "session optional pam_foo.so",
-            ],
             &["auth required pam_sss.so forward_pass"],
             &["auth required /usr/lib64/security/pam_unix2.so"],
         ] {
             assert_eq!(find_auth_anchor(lines), Some(0), "{lines:?}");
         }
+        // A later `@include` is read where libpam finds it: stacks with no
+        // auth line keep the guess, and one that cannot be read refuses it.
+        let later = [
+            "auth required pam_unix.so",
+            "@include common-account",
+            "@include common-session",
+            "account required pam_unix.so",
+            "session optional pam_foo.so",
+        ];
+        let found = with_stack_reader(
+            stacks_of(&[
+                ("common-account", "account required pam_unix.so\n"),
+                ("common-session", "session optional pam_foo.so\n"),
+            ]),
+            || find_auth_anchor(&later),
+        );
+        assert_eq!(found, Some(0));
+        assert_eq!(find_auth_anchor(&later), None);
+        // Such a file is read as the lines below the anchor are: an auth line
+        // in it that checks a password refuses the guess, as it does written
+        // in the file itself, and a gate does not.
+        for (account, anchored) in [
+            ("auth sufficient pam_sss.so\n", false),
+            ("@include common-password\n", false),
+            ("auth requisite pam_nologin.so\n", true),
+            (
+                "auth [success=die default=ignore] pam_succeed_if.so user ingroup x\n",
+                true,
+            ),
+        ] {
+            let found = with_stack_reader(
+                stacks_of(&[
+                    ("common-account", account),
+                    ("common-password", "auth required pam_unix.so\n"),
+                    ("common-session", "session optional pam_foo.so\n"),
+                ]),
+                || find_auth_anchor(&later),
+            );
+            assert_eq!(found, anchored.then_some(0), "{account}");
+        }
         // openSUSE's `auth include xdm`: its stack runs the password
         // substack, read where libpam finds it.
         let xdm = ["auth include xdm", "account include xdm"];
-        let found = with_stack_reader(stacks_of(&[("xdm", OPENSUSE_XDM)]), || {
-            find_auth_anchor(&xdm)
-        });
+        let found = with_stack_reader(
+            stacks_of(&[
+                ("xdm", OPENSUSE_XDM),
+                ("postlogin-auth", OPENSUSE_POSTLOGIN_AUTH),
+            ]),
+            || find_auth_anchor(&xdm),
+        );
         assert_eq!(found, Some(0));
     }
 
@@ -6616,9 +6694,10 @@ auth       optional      pam_gnome_keyring.so\n";
     /// password step: ly and cinnamon-screensaver on Arch (`auth include
     /// login`, which includes `system-local-login` below `pam_nologin.so`),
     /// LightDM on Alpine (`auth include base-auth`, `pam_unix.so` first) and
-    /// on openSUSE (`auth include xdm`). Each is wired next to the include,
-    /// as before, once the stack it names can be read; an include of a stack
-    /// that includes itself, or one too deep, is not.
+    /// on openSUSE (`auth include xdm`). Only openSUSE's, whose stacks hold
+    /// no gate, is wired next to the include, once the stacks it names can
+    /// be read; an include of a stack that includes itself, one too deep, or
+    /// one followed by a gate in the file itself is not.
     #[test]
     fn a_first_auth_include_of_a_stack_that_decides_is_the_anchor() {
         let stacks = stacks_of(&[
@@ -6626,12 +6705,19 @@ auth       optional      pam_gnome_keyring.so\n";
             ("system-local-login", ARCH_SYSTEM_LOCAL_LOGIN),
             ("base-auth", ALPINE_BASE_AUTH),
             ("xdm", OPENSUSE_XDM),
+            ("postlogin-auth", OPENSUSE_POSTLOGIN_AUTH),
             ("loop", "auth include loop\n"),
             ("a", "auth include b\n"),
             ("b", "auth include c\n"),
             ("c", "auth include d\n"),
             ("d", "auth required pam_unix.so\n"),
             ("e", "auth include a\n"),
+            (
+                "gated",
+                "auth [success=die default=ignore] pam_succeed_if.so user ingroup x\n\
+                 auth required pam_unix.so\n",
+            ),
+            ("common-account", "auth requisite pam_nologin.so\n"),
         ]);
         let ly = "#%PAM-1.0\n\nauth       include      login\n\
                   -auth      optional     pam_gnome_keyring.so\n\
@@ -6650,10 +6736,22 @@ auth       optional      pam_gnome_keyring.so\n";
                       -session   optional     pam_gnome_keyring.so auto_start\n";
         let cinnamon = "#%PAM-1.0\nauth include login\n";
         let suse = fixture("opensuse", "lightdm");
+        // The include layout's face line skips the whole included stack on a
+        // face match, so a stack with a gate in it is no anchor: Arch's
+        // `login` checks pam_nologin before the password, Alpine's
+        // `base-auth` after it.
+        for text in [ly, alpine, cinnamon] {
+            let lines: Vec<&str> = text.lines().collect();
+            let (anchor, face) = with_stack_reader(stacks.clone(), || {
+                (
+                    find_auth_anchor(&lines),
+                    wire_greeter_impl(text, true, true, true),
+                )
+            });
+            assert_eq!(anchor, None, "{text}");
+            assert!(!face.1, "{text}");
+        }
         for (text, include) in [
-            (ly, "auth       include      login"),
-            (alpine, "auth       include      base-auth"),
-            (cinnamon, "auth include login"),
             (suse.as_str(), "auth\t include\txdm"),
             ("auth include d\n", "auth include d"),
             ("auth include a\n", "auth include a"),
@@ -6700,11 +6798,25 @@ auth       optional      pam_gnome_keyring.so\n";
             assert_eq!(find_auth_anchor(&lines), None, "{text}");
             assert!(!wire_greeter_impl(text, true, true, true).1, "{text}");
         }
-        for text in ["auth include loop\n", "auth include e\n"] {
+        // A gate is any line that can fail the stack, a bracketed one that
+        // dies on success included.
+        for text in [
+            "auth include loop\n",
+            "auth include e\n",
+            "auth include d\nauth requisite pam_nologin.so\n",
+            "auth include d\nauth [success=die default=ignore] pam_succeed_if.so user ingroup x\n",
+            "auth include d\nauth [ignore=bad default=ignore] pam_succeed_if.so user ingroup x\n",
+            "auth include gated\n",
+            "auth include d\n@include common-account\n",
+        ] {
             let lines: Vec<&str> = text.lines().collect();
             let anchor = with_stack_reader(stacks.clone(), || find_auth_anchor(&lines));
             assert_eq!(anchor, None, "{text}");
         }
+        // The jump layout skips only the password line, so a gate after a
+        // password step still runs on a face match.
+        let gated = ["auth required pam_unix.so", "auth requisite pam_nologin.so"];
+        assert_eq!(find_auth_anchor(&gated), Some(0));
     }
 
     #[test]
@@ -7328,9 +7440,11 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
     /// unwired whole where its reseal-only recipe cannot land, so no face
     /// line stays behind. One with a line irlume does not read as PAM does
     /// is such a file: the unwire takes irlume's lines out, face lines
-    /// included, and keeps every other byte, carriage returns too. With a
-    /// numeric jump above irlume's lines, it keeps the file and names the
-    /// line.
+    /// included, and keeps every other byte, when the `password-auth` its
+    /// `session include` names keeps its jumps inside it. With a numeric
+    /// jump above irlume's lines, or CRLF endings (PAM then looks for a
+    /// `password-auth` with a carriage return in its name, which irlume
+    /// cannot read), it keeps the file and names the line.
     #[test]
     fn a_remote_seat_greeter_with_an_unread_line_loses_irlume_lines_on_the_unwire() {
         let wired = "auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so\n\
@@ -7357,6 +7471,7 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
             let dir = TestDir::new("remote-unread");
             let etc = dir.0.join("lightdm");
             std::fs::write(&etc, text).unwrap();
+            std::fs::write(dir.0.join("password-auth"), FEDORA_PASSWORD_AUTH).unwrap();
             let svc = Svc {
                 etc: leak(&etc),
                 vendor: None,
@@ -7364,6 +7479,13 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
             assert!(carries_face_lines(svc.etc));
             assert!(!greeter_want(&svc, true, true, &reseal_only), "{text}");
             let off = wire_service(&svc, false, true, &reseal_only).unwrap();
+            if text != &typo {
+                assert_eq!(off.change, PlannedChange::KeepEditedOverride, "{off}");
+                assert!(off.unmet, "{off}");
+                assert!(off.message.contains("a CRLF line ending"), "{off}");
+                assert_eq!(&std::fs::read_to_string(&etc).unwrap(), text);
+                continue;
+            }
             assert_eq!(off.change, PlannedChange::StripInPlace, "{off}");
             assert!(!off.unmet, "{off}");
             let after = std::fs::read_to_string(&etc).unwrap();
@@ -7371,10 +7493,6 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
             assert!(!carries_face_lines(svc.etc), "{after}");
             assert!(!after.lines().any(is_irlume_line), "{after}");
             assert_eq!(after.lines().count() + 5, text.lines().count(), "{after}");
-            assert_eq!(
-                after.split('\n').all(|l| l.is_empty() || l.ends_with('\r')),
-                text != &typo
-            );
             // A jump above irlume's lines could count them: kept.
             let jumped = format!("auth [success=2 default=ignore] pam_foo.so\n{text}");
             std::fs::write(&etc, &jumped).unwrap();
@@ -7399,6 +7517,176 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
         assert!(!jump_could_count_irlume_lines(&text));
         let jumped = format!("auth [success=1 default=ignore] pam_foo.so\r\r\n{text}");
         assert!(jump_could_count_irlume_lines(&jumped));
+    }
+
+    /// The disable of a stack irlume edits in place tells a verify line that
+    /// ends in the module name with doubled carriage returns as irlume's
+    /// before anything else, and takes it out with every other byte kept.
+    #[test]
+    fn a_disable_finds_irlume_s_line_with_doubled_carriage_returns() {
+        let dir = TestDir::new("crcrlf-disable");
+        let etc = dir.0.join("sudo");
+        let text = format!("{VERIFY_STANZA}\r\r\nauth       include      system-auth\r\r\n");
+        std::fs::write(&etc, &text).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let off = wire_service(&svc, false, true, &wire_verify_service).unwrap();
+        assert_eq!(off.change, PlannedChange::StripInPlace, "{off}");
+        assert_eq!(
+            std::fs::read_to_string(&etc).unwrap(),
+            "auth       include      system-auth\r\r\n"
+        );
+    }
+
+    /// libpam puts the lines of the stack an `include` names in its place,
+    /// and all of a Debian `@include`'s file in every type's stack, so a
+    /// numeric jump among them that lands past them counts the lines after
+    /// the include. Each stack is read where libpam finds it; one that
+    /// cannot be read counts, as does an include of a type PAM does not
+    /// know. A `substack` is one line, whose jumps stay inside it.
+    #[test]
+    fn a_jump_in_an_included_stack_counts_irlume_s_lines_when_it_lands_past_it() {
+        let (common_auth, system_login, system_auth) = (
+            fixture("debian", "common-auth"),
+            fixture("arch", "system-login"),
+            fixture("arch", "system-auth"),
+        );
+        let stacks = stacks_of(&[
+            ("common-auth", &common_auth),
+            ("system-login", &system_login),
+            ("system-auth", &system_auth),
+            ("password-auth", FEDORA_PASSWORD_AUTH),
+            ("postlogin", FEDORA_POSTLOGIN),
+            ("leaves", "auth [success=1 default=ignore] pam_foo.so\n"),
+            (
+                "leaves-session",
+                "session [success=2 default=ignore] pam_foo.so\nsession optional pam_bar.so\n",
+            ),
+            ("outer", "auth include leaves\nauth required pam_env.so\n"),
+            (
+                "outer-leaves",
+                "auth required pam_env.so\nauth include leaves\n",
+            ),
+            ("typo", "auht optional pam_foo.so\n"),
+        ]);
+        let auth = format!("{KEYRING_UNSEAL}\n{RESEAL_AUTH}\n");
+        let session = format!("{RESEAL_SESSION}\n");
+        let counts =
+            |text: &str| with_stack_reader(stacks.clone(), || jump_could_count_irlume_lines(text));
+        for (above, below, expect) in [
+            ("@include common-auth", &auth, false),
+            ("auth include system-login", &auth, false),
+            (
+                "session include password-auth\nsession include postlogin",
+                &session,
+                false,
+            ),
+            ("auth include outer", &auth, false),
+            ("auth substack leaves", &auth, false),
+            ("session include leaves", &session, false),
+            ("auth include leaves-session", &auth, false),
+            ("account include leaves", &auth, false),
+            ("auth include leaves", &auth, true),
+            ("@include leaves", &auth, true),
+            ("auth include outer-leaves", &auth, true),
+            ("session include leaves-session", &session, true),
+            ("@include leaves-session", &session, true),
+            ("auth include missing", &auth, true),
+            ("auth include typo", &auth, true),
+            ("auht include postlogin", &auth, true),
+        ] {
+            let text = format!("{VERIFY_STANZA}\n{above}\n{below}");
+            assert_eq!(counts(&text), expect, "{text}");
+        }
+        // Below irlume's last line, no include counts; with no reader, one
+        // above them always does.
+        let last = format!("{VERIFY_STANZA}\nauth include leaves\n@include missing\n");
+        assert!(!jump_could_count_irlume_lines(&last));
+        let unread = format!("{VERIFY_STANZA}\n@include common-auth\n{auth}");
+        assert!(jump_could_count_irlume_lines(&unread));
+    }
+
+    /// ly on Arch as an earlier release wired it, with the jump layout
+    /// around `auth include login`: an enable now finds no anchor and leaves
+    /// the file as it is, and a disable takes irlume's lines out.
+    #[test]
+    fn a_stack_an_earlier_release_wired_around_an_include_comes_out_on_disable() {
+        let stock = "#%PAM-1.0\n\nauth       include      login\n\
+                     -auth      optional     pam_gnome_keyring.so\n\
+                     account    include      login\npassword   include      login\n\
+                     session    include      login\n";
+        let old = stock.replacen(
+            "auth       include      login\n",
+            &format!(
+                "{GREETER_UNSEAL_COSMIC_JUMP}\nauth       include      login\n\
+                 {PERMIT_LANDING}\n{KEYRING_UNSEAL}\n{RESEAL_AUTH}\n"
+            ),
+            1,
+        );
+        let dir = TestDir::new("old-include-jump");
+        let etc = dir.0.join("ly");
+        std::fs::write(&etc, &old).unwrap();
+        for (name, text) in [
+            ("login", ARCH_LOGIN),
+            ("system-local-login", ARCH_SYSTEM_LOCAL_LOGIN),
+        ] {
+            std::fs::write(dir.0.join(name), text).unwrap();
+        }
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let wire = |c: &str| wire_greeter_impl(c, true, true, true);
+        let on = wire_service(&svc, true, true, &wire).unwrap();
+        assert_eq!(on.change, PlannedChange::NoAnchor, "{on}");
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), old);
+        let off = wire_service(&svc, false, true, &wire).unwrap();
+        assert_eq!(off.change, PlannedChange::StripInPlace, "{off}");
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), stock);
+    }
+
+    /// The disable of a stack irlume edits in place with a line irlume does
+    /// not read as PAM does reads the stacks its includes name where libpam
+    /// finds them for that file: Arch's LightDM, which includes
+    /// `system-login` above irlume's keyring and reseal lines, loses
+    /// irlume's lines with every other byte kept, and is kept as it is when
+    /// those stacks cannot be read.
+    #[test]
+    fn an_in_place_disable_reads_the_stacks_an_include_names() {
+        let (wired, changed) = wire_greeter_impl(&fixture("arch", "lightdm"), true, true, true);
+        assert!(changed);
+        let typo = wired.replacen("#%PAM-1.0\n", "#%PAM-1.0\nauht optional pam_foo.so\n", 1);
+        assert_ne!(typo, wired);
+        for readable in [true, false] {
+            let dir = TestDir::new("unread-include-disable");
+            let etc = dir.0.join("lightdm");
+            std::fs::write(&etc, &typo).unwrap();
+            if readable {
+                for name in ["system-login", "system-auth"] {
+                    std::fs::write(dir.0.join(name), fixture("arch", name)).unwrap();
+                }
+            }
+            let svc = Svc {
+                etc: leak(&etc),
+                vendor: None,
+            };
+            let off = wire_service(&svc, false, true, &|c: &str| {
+                wire_greeter_impl(c, true, true, true)
+            })
+            .unwrap();
+            let after = std::fs::read_to_string(&etc).unwrap();
+            if readable {
+                assert_eq!(off.change, PlannedChange::StripInPlace, "{off}");
+                assert_eq!(after, without_irlume_lines(&typo));
+                assert!(!holds_irlume_line(&after), "{after}");
+            } else {
+                assert_eq!(off.change, PlannedChange::KeepEditedOverride, "{off}");
+                assert!(off.unmet, "{off}");
+                assert_eq!(after, typo);
+            }
+        }
     }
 
     #[test]
@@ -9220,11 +9508,14 @@ auth required pam_fprintd.so\n\
             for &service in services {
                 let stock = fixture(distro, service);
                 // openSUSE's lightdm includes xdm, which its own package
-                // ships (see `OPENSUSE_XDM`).
-                let (wired, changed) =
-                    with_stack_reader(stacks_of(&[("xdm", OPENSUSE_XDM)]), || {
-                        wire_greeter_impl(&stock, true, true, false)
-                    });
+                // ships (see `OPENSUSE_XDM`), and xdm its postlogin-auth.
+                let (wired, changed) = with_stack_reader(
+                    stacks_of(&[
+                        ("xdm", OPENSUSE_XDM),
+                        ("postlogin-auth", OPENSUSE_POSTLOGIN_AUTH),
+                    ]),
+                    || wire_greeter_impl(&stock, true, true, false),
+                );
                 assert!(
                     changed,
                     "{distro}/{service}: the recipe refused to wire the real shipped file"

@@ -29,8 +29,8 @@ use super::grammar::{
 };
 use super::stanzas::{inert_line, BACKUP, CREATED_PREFIX, INERT_TAG, KEYRING_TAG};
 use super::transform::{
-    is_irlume_line, jump_could_count_irlume_lines, unwire_lines, wire_greeter_impl, wire_lock,
-    wire_polkit_service, wire_verify_service, without_irlume_lines,
+    holds_irlume_line, is_irlume_line, jump_could_count_irlume_lines, unwire_lines,
+    wire_greeter_impl, wire_lock, wire_polkit_service, wire_verify_service, without_irlume_lines,
 };
 use super::PlannedChange;
 
@@ -266,7 +266,7 @@ pub(super) fn classify(p: &Parsed<'_>, vendor: Option<&str>) -> Class {
 }
 
 fn has_irlume_line(text: &str) -> bool {
-    text.lines().any(is_irlume_line)
+    holds_irlume_line(text)
 }
 
 /// Whether irlume's lines in `text` are held by inactive lines (see

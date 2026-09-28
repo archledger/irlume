@@ -359,8 +359,17 @@ All notable changes to irlume are documented here. This project adheres to
   stack. An `include` there gets irlume's include layout, the face line
   `sufficient` above it and the keyring and reseal lines below it, since
   PAM puts the included lines in its place and a jump over it would skip
-  only the first of them. Any other such stack is left as it is and
-  reported as having no anchor to wire (#858).
+  only the first of them. That face line skips the included stack and
+  every auth line after it on a face match, so an `include` is taken only
+  when none of them is a gate, a line that can fail the stack such as
+  `pam_nologin.so`: ly and cinnamon-screensaver on Arch and LightDM on
+  Alpine are no longer wired, and LightDM on openSUSE is wired when `xdm`
+  and its `postlogin-auth` hold none. Such a stack an earlier release
+  wired keeps irlume's lines until `irlume login disable` takes them out.
+  A Debian `@include` of `common-account` and the like below the first
+  auth line is read where PAM finds it too, and its auth lines held to the
+  same rule. Any other such stack is left as it is and reported as having
+  no anchor to wire (#858).
 
 - irlume now reads the lines of a PAM stack as libpam does and refuses to
   change a stack with a line it cannot read that way. A control is parsed
@@ -387,7 +396,9 @@ All notable changes to irlume are documented here. This project adheres to
   machine API reports the surface as `keep-edited-override` with `kept`.
   `irlume login disable` takes irlume's lines out of such a file and keeps
   every other byte, unless a numeric jump in it could count irlume's
-  lines, when it keeps the file, names the line and exits 1. A file with
+  lines, a jump in a stack an `include` or `@include` above them names
+  (read where PAM finds it) included, when it keeps the file, names the
+  line and exits 1. A file with
   CRLF line endings is no longer rewritten with LF endings, which would
   change which lines PAM runs.
 

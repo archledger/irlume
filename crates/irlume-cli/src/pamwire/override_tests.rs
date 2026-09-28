@@ -11,7 +11,10 @@
 //! vendor file (by then carrying `pam_oo7` lines) and dropped the hand-added
 //! line without a message, so fingerprint at the login screen stopped working.
 
-use super::tests::{fixture, greeter, ship_vendor_only, under_root, TestDir, UPSTREAM_FEDORA};
+use super::tests::{
+    fixture, greeter, ship_vendor_only, under_root, TestDir, FEDORA_PASSWORD_AUTH,
+    FEDORA_POSTLOGIN, UPSTREAM_FEDORA,
+};
 use super::*;
 
 /// A fingerprint line an administrator adds after the SELinux line. Its
@@ -2660,7 +2663,9 @@ fn a_jump_spelled_with_blanks_around_its_equals_sign_counts_as_a_jump() {
 /// to an override with irlume's lines in it. An enable and a method switch
 /// keep the file byte for byte and name the line; doctor says why; reconcile
 /// writes nothing to such an edited file. A disable takes irlume's lines out
-/// and keeps every other byte, since no numeric jump counts them.
+/// and keeps every other byte, since no numeric jump counts them: the
+/// `password-auth` and `postlogin` the file includes above irlume's session
+/// line keep their jumps inside them.
 #[test]
 fn an_override_with_a_line_irlume_does_not_read_as_pam_does_is_kept() {
     for (n, line) in [
@@ -2684,6 +2689,9 @@ fn an_override_with_a_line_irlume_does_not_read_as_pam_does_is_kept() {
     {
         let dir = TestDir::new(&format!("ovr-unread-{n}"));
         let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+        let pam_d = dir.0.join("etc/pam.d");
+        std::fs::write(pam_d.join("password-auth"), FEDORA_PASSWORD_AUTH).unwrap();
+        std::fs::write(pam_d.join("postlogin"), FEDORA_POSTLOGIN).unwrap();
         let vendor_path = svc.vendor.unwrap();
         wire_service(&svc, true, true, &face_and_keyring).unwrap();
         let edited = with_line(&read_file(svc.etc), line);
@@ -2723,10 +2731,18 @@ fn an_override_with_a_line_irlume_does_not_read_as_pam_does_is_kept() {
             "{line:?}: {note}"
         );
         assert!(!note.contains("pam_foo"), "no PAM line is quoted: {note}");
+        // PAM reads these two as includes in the auth chain, above irlume's
+        // auth lines: a jump in the stack they name could count them.
+        let include = line.contains("include");
         for apply in [false, true] {
             let off = wire_service(&svc, false, apply, &face_and_keyring).unwrap();
-            assert_eq!(change_id(&off), "strip-in-place", "{line:?}: {off}");
-            assert!(!off.unmet, "{line:?}: {off}");
+            let expect = if include {
+                "keep-edited-override"
+            } else {
+                "strip-in-place"
+            };
+            assert_eq!(change_id(&off), expect, "{line:?}: {off}");
+            assert_eq!(off.unmet, include, "{line:?}: {off}");
             assert!(off.message.contains(&named), "{line:?}: {off}");
             assert!(
                 off.message
@@ -2735,6 +2751,10 @@ fn an_override_with_a_line_irlume_does_not_read_as_pam_does_is_kept() {
             );
         }
         let after = read_file(svc.etc);
+        if include {
+            assert_eq!(after, edited, "{line:?}: kept byte for byte");
+            continue;
+        }
         assert_eq!(after, without_irlume_lines(&edited), "{line:?}");
         assert!(!after.lines().any(is_irlume_line), "{line:?}: {after}");
         assert!(after.contains(line), "{line:?}: every other byte kept");
@@ -2915,13 +2935,14 @@ fn reconcile_keeps_an_override_with_a_line_irlume_does_not_read_as_pam_does() {
 /// libpam finds it for the file: under the root the file sits in, in
 /// `etc/pam.d` and then `usr/lib/pam.d`. That holds for a stack irlume edits
 /// in place, for an override made from a vendor file, and for reconcile's
-/// rebuild of one; without the stack, each is left as it is.
+/// rebuild of one; without the stack, or with a gate in it that the include
+/// layout's face line would skip, each is left as it is.
 #[test]
 fn the_stack_a_first_auth_include_names_is_read_where_libpam_finds_it() {
     let vendor = "#%PAM-1.0\nauth       include      site-auth\n-auth      optional     \
                   pam_gnome_keyring.so\naccount    include      site-auth\n\
                   session    include      site-auth\n";
-    let decides = "auth       requisite    pam_nologin.so\nauth       required     pam_unix.so\n";
+    let decides = "auth       required     pam_env.so\nauth       required     pam_unix.so\n";
     // In place: the stack in /etc/pam.d, then only in /usr/lib/pam.d.
     for dir_of_stack in ["etc/pam.d", "usr/lib/pam.d"] {
         let dir = TestDir::new("include-in-place");
@@ -2945,10 +2966,16 @@ fn the_stack_a_first_auth_include_names_is_read_where_libpam_finds_it() {
         // A stack whose password line fails nothing is no anchor.
         std::fs::write(&etc, vendor).unwrap();
         std::fs::remove_file(format!("{}{BACKUP}", svc.etc)).unwrap();
-        std::fs::write(stacks.join("site-auth"), "auth sufficient pam_unix.so\n").unwrap();
-        let on = wire_service(&svc, true, true, &face_and_keyring).unwrap();
-        assert_eq!(on.change, PlannedChange::NoAnchor, "{on}");
-        assert_eq!(read_file(svc.etc), vendor);
+        for stack in [
+            "auth sufficient pam_unix.so\n",
+            // A gate a face match through the include layout would skip.
+            "auth requisite pam_nologin.so\nauth required pam_unix.so\n",
+        ] {
+            std::fs::write(stacks.join("site-auth"), stack).unwrap();
+            let on = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+            assert_eq!(on.change, PlannedChange::NoAnchor, "{stack}: {on}");
+            assert_eq!(read_file(svc.etc), vendor);
+        }
     }
     // An override made from a vendor file, and reconcile's rebuild of one.
     let dir = TestDir::new("include-override");

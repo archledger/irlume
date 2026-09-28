@@ -464,6 +464,13 @@ pub(super) fn is_irlume_line(l: &str) -> bool {
         || (rule_names_module(l, "pam_gnome_keyring.so") && l.contains(KEYRING_TAG))
 }
 
+/// Whether `text` holds a line of irlume's, each line told with every
+/// carriage return at its end taken off ([`is_irlume_line`]).
+pub(super) fn holds_irlume_line(text: &str) -> bool {
+    text.split('\n')
+        .any(|l| is_irlume_line(l.trim_end_matches('\r')))
+}
+
 /// Remove every irlume line AND the pam_permit landing we added (used only when
 /// no backup exists; the backup-restore path is preferred).
 pub(super) fn unwire_lines(content: &str) -> (String, bool) {
@@ -497,17 +504,31 @@ pub(super) fn without_irlume_lines(content: &str) -> String {
 
 /// Whether a numeric jump could count irlume's lines: a line above one of
 /// them that is not irlume's carries a numeric action ([`numeric_actions`]),
-/// read as libpam reads it, up to its first NUL byte. When none does, taking
-/// irlume's lines out moves no other line's landing, whatever else in the
-/// file irlume does not read as PAM does.
+/// read as libpam reads it, up to its first NUL byte, or is an `include` or
+/// a Debian `@include` whose lines a jump could leave for irlume's
+/// ([`include_could_jump_past`]). When none does, taking irlume's lines out
+/// moves no other line's landing, whatever else in the file irlume does not
+/// read as PAM does.
 pub(super) fn jump_could_count_irlume_lines(content: &str) -> bool {
     let irlume = |l: &str| is_irlume_line(l.trim_end_matches('\r'));
     let lines: Vec<&str> = content.split('\n').collect();
     let Some(last) = lines.iter().rposition(|l| irlume(l)) else {
         return false;
     };
-    lines[..last].iter().any(|l| {
+    // Whether one of irlume's lines of type `phase` comes after `at`.
+    let later_irlume = |at: usize, phase: &str| {
+        lines[at + 1..]
+            .iter()
+            .any(|m| irlume(m) && head(m.trim_end_matches('\r')).is_some_and(|h| h.phase == phase))
+    };
+    lines[..last].iter().enumerate().any(|(at, l)| {
         let read = l.split('\0').next().unwrap_or(l);
-        !irlume(l) && head(read).is_some_and(|h| !numeric_actions(&h).is_empty())
+        if irlume(l) {
+            return false;
+        }
+        if let Some(past) = include_could_jump_past(read, |phase| later_irlume(at, phase)) {
+            return past;
+        }
+        head(read).is_some_and(|h| !numeric_actions(&h).is_empty())
     })
 }

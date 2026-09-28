@@ -92,20 +92,33 @@ or `pam_sss.so` rule (without pam_sss's `ignore_unknown_user` or
 and no jump. irlume reads the included stack where PAM finds it
 (`/etc/pam.d`, then `/usr/lib/pam.d`), and the stacks it includes in turn,
 four deep at most; a line of it that names the shared password stack irlume
-knows counts as the step. A numeric jump or a `reset` before the step, or a
-stack irlume cannot read or does not read as PAM does, leaves the file
-unwired. Below the first auth line every auth line must be one of the
-modules that check no password (`pam_env.so`, `pam_nologin.so`,
+knows counts as the step and is not read further, as where irlume wires
+next to such a line directly. A numeric jump or a `reset` anywhere in an
+included stack, or a stack irlume cannot read or does not read as PAM does,
+leaves the file unwired. Below the first auth line every auth line must be
+one of the modules that check no password (`pam_env.so`, `pam_nologin.so`,
 `pam_faillock.so`, `pam_succeed_if.so`, `pam_permit.so`, `pam_deny.so` and
-the like, or a keyring module), with no `include`, `substack` or other
-`@include` than `common-account`, `common-password`, `common-session` and
-`common-session-noninteractive`. Otherwise `irlume login enable` reports
-`no anchor to wire` for it and leaves it as it is: irlume's lines are
-designed to follow the password step and a line whose failure fails the
-stack. An `include` taken as that line gets the include layout (the face
-line `sufficient` above it, the keyring and reseal lines below it), as
-`@include common-auth` does: PAM puts the included stack's lines in the
-include's place, so a jump over it would skip only the first of them.
+the like, or a keyring module), with no `include` or `substack`, and a
+Debian `@include` only of `common-account`, `common-password`,
+`common-session` or `common-session-noninteractive`. PAM reads such a file
+into the auth stack too, so irlume reads it where PAM finds it and holds
+its auth lines to the same rule. Otherwise
+`irlume login enable` reports `no anchor to wire` for it and leaves it as
+it is: irlume's lines are designed to follow the password step and a line
+whose failure fails the stack. An `include` taken as that line gets the
+include layout (the face line `sufficient` above it, the keyring and reseal
+lines below it), as `@include common-auth` does: PAM puts the included
+stack's lines in the include's place, so a jump over it would skip only the
+first of them. On a face match that face line skips the included stack and
+every auth line after it, so neither may hold a gate: a line that can fail
+the stack (`bad` or `die` for any return value), such as
+`auth requisite pam_nologin.so`, other than `pam_env.so`,
+`pam_faildelay.so`, `pam_warn.so` or a keyring module. ly and
+cinnamon-screensaver on Arch, whose `login` checks `pam_nologin.so`, and
+LightDM on Alpine, whose `base-auth` does, are left unwired for that
+reason; LightDM on openSUSE is wired when `xdm` and the `postlogin-auth` it
+includes hold no gate. Such a stack that an earlier release wired keeps
+irlume's lines until `irlume login disable` takes them out.
 
 An override written by a release before this tracking gets the line at the
 first reconcile when it still matches its vendor copy. One that no longer
@@ -192,10 +205,15 @@ The disable also:
   exits 1; join those lines or take irlume's lines out by hand. From a
   file with a line irlume does not read as PAM does (see `enable` above),
   `disable` takes irlume's lines out and keeps every other byte, carriage
-  returns included, when no numeric jump in the file could count irlume's
-  lines; otherwise it leaves the file as it is, names that line and exits
-  1. An override nobody edited is still deleted, and a backup that is the
-  file without irlume's lines still restored. An override whose vendor copy
+  returns included, when nothing in the file could count irlume's lines:
+  no numeric jump above one of them, and no `include` or Debian `@include`
+  above one of them whose stack has a numeric jump that could land past
+  its end. PAM puts the included lines in the include's place, so such a
+  jump counts the lines after it; irlume reads each stack where PAM finds
+  it, and one it cannot read counts. Otherwise it leaves the file as it
+  is, names that line and exits 1. An override nobody edited is still
+  deleted, and a backup that is the file without irlume's lines still
+  restored. An override whose vendor copy
   is gone is kept the same way, since PAM has nothing else for that
   service,
 - removes the SELinux module on Fedora (`semodule -r irlume`, checked: a

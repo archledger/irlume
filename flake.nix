@@ -141,6 +141,11 @@
             == "${sys.config.services.irlume.package}/share/irlume/models/flir.onnx";
           pkgs.runCommand "irlume-module-checks-ok" { } "echo 'irlume module PAM decision table verified' > $out";
 
+        # Actual helper/PAM recovery under NixOS, including unsafe-mode refusal.
+        # Limit the VM check to the architecture supported by the bundled ORT.
+        checks.${if system == "x86_64-linux" then "irlume-retry-recovery" else null} =
+          pkgs.testers.runNixOSTest { imports = [ ./nix/tests/retry-recovery.nix ]; };
+
         devShells.default = pkgs.mkShell {
           # Tools that run at build time (compilers, generators).
           nativeBuildInputs = [

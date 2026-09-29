@@ -250,6 +250,14 @@ in
       documentation = [ "https://github.com/archledger/irlume" ];
       wantedBy = [ "multi-user.target" ];
       after = [ "multi-user.target" ];
+      # /nix/store is normally group-writable (1775), even when mounted read-only.
+      # Recovery deliberately rejects writable ancestry. Stage the selected
+      # helper in a private, root-owned runtime directory instead of relaxing
+      # that trust check. A service restart replaces it with this generation's
+      # helper; RuntimeDirectory removes it when the service stops.
+      preStart = ''
+        ${pkgs.coreutils}/bin/install -m0755 ${cfg.package}/libexec/irlume-password-verify /run/irlume-recovery/irlume-password-verify
+      '';
       serviceConfig = {
         Type = "simple";
         ExecStart = "${cfg.package}/bin/irlumed";
@@ -292,6 +300,8 @@ in
         # by hand with packaging/systemd/irlumed.service, which nothing in CI
         # enforces.
         ConfigurationDirectory = "irlume";
+        RuntimeDirectory = "irlume-recovery";
+        RuntimeDirectoryMode = "0700";
         PrivateTmp = true;
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
@@ -339,6 +349,9 @@ in
     '';
 
     # Splice pam_irlume into each opted-in service with its resolved control.
+    # The same ancestry check applies to the dedicated PAM service. Copy this
+    # root-owned file rather than resolving an /etc symlink through /nix/store.
+    environment.etc."pam.d/irlume-retry-reset".mode = "0644";
     security.pam.services = lib.mkMerge [
       # A dedicated fixed local-password stack; defaults must not add biometrics.
       {

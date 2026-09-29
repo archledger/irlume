@@ -122,9 +122,11 @@ rustPlatform.buildRustPackage {
   preBuild = ''
     export BINDGEN_EXTRA_CLANG_ARGS="$BINDGEN_EXTRA_CLANG_ARGS -isystem ${linuxHeaders}/include"
 
+    # The NixOS module stages this generation's helper outside the normally
+    # group-writable Nix store, preserving recovery's ancestry trust checks.
     substituteInPlace crates/irlume-daemon/src/retry_recovery.rs \
       --replace-fail '"/usr/libexec/irlume-password-verify"' \
-        "\"$out/libexec/irlume-password-verify\""
+        '"/run/irlume-recovery/irlume-password-verify"'
 
     # The compiled-in helper path is an FHS path that does not exist on NixOS,
     # so the PAM module would look for it, not find it, and decline. Nothing

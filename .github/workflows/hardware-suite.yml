@@ -1,5 +1,5 @@
 # Nightly hardware-in-the-loop suite on the self-hosted runner carrying the
-# `ir-camera` label (archhost; both cameras live there), with a real TPM at
+# `ir-camera` label (minihost, with the NexiGo N930W), with a real TPM at
 # /dev/tpmrm0 via the tss group
 # and an IR camera via the video group. Software fakes have proven blind spots:
 # the Tier-1 signed-PCR bug passed swtpm-based CI completely and only failed
@@ -31,8 +31,8 @@ jobs:
     # Manual dispatch must not run privileged hardware code from another ref.
     if: github.ref == 'refs/heads/main'
     name: build · test · real-TPM · IR camera
-    # Either available runner may take this lane when it carries every
-    # required capability label. Labels describe capabilities, not priority.
+    # Any runner that carries every required capability label may take this
+    # lane. Labels describe capabilities, not priority.
     runs-on: [self-hosted, arch, tpm, ir-camera]
     timeout-minutes: 90
     steps:
@@ -75,9 +75,10 @@ jobs:
             tpm_key_and_recovery_lifecycle --test-threads=1
 
       # Real-camera smoke: find the IR node by the same classifier users run,
-      # then capture a strobe burst and require real frames. Skips cleanly when
-      # the camera is unplugged (it gets borrowed for the mini-PC OS bench) so
-      # a borrowed camera never reads as a red run. Frames stay on the runner
+      # then capture a strobe burst and require real frames. The stage treats
+      # the camera as absent (a clean skip) only when doctor lists no video
+      # nodes at all. The coverage job's loopback nodes are always listed, so
+      # an unplugged camera fails as "none as Ir". Frames stay on the runner
       # and are deleted; they are never uploaded (they picture the room).
       - name: IR camera strobe-burst capture
         run: |
@@ -333,8 +334,8 @@ jobs:
   coverage:
     name: coverage (hardware-inclusive, nightly floor)
     needs: hardware
-    # Either available runner may take this lane when it carries every
-    # required capability label. Labels describe capabilities, not priority.
+    # Any runner that carries every required capability label may take this
+    # lane. Labels describe capabilities, not priority.
     runs-on: [self-hosted, arch, tpm, ir-camera]
     timeout-minutes: 90
     steps:

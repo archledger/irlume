@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright the irlume contributors.
-# Prepare coverage on either rolling-Arch runner without changing its user tools.
+# Prepare coverage on a rolling-Arch runner without changing its user tools.
 set -euo pipefail
 : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
 : "${GITHUB_ENV:?GITHUB_ENV is required}"
 
-# These runners use distro Rust, so rustup's llvm-tools component is not the
-# source of the reporting tools. Refuse incompatible profile readers early.
+# The runner uses distro Rust, built against the system LLVM, so rustup's
+# llvm-tools component is not the source of the reporting tools. Refuse
+# incompatible profile readers early.
 rust_version=$(rustc -vV)
 rust_llvm=$(sed -nE 's/^LLVM version: ([0-9]+)\..*/\1/p' <<<"$rust_version")
 [[ "$rust_llvm" =~ ^[0-9]+$ ]] || { echo 'Cannot determine rustc LLVM version' >&2; exit 1; }

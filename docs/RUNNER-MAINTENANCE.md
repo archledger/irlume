@@ -1,13 +1,16 @@
 # Trusted runner maintenance
 
-The self-hosted runners (minihost, archhost) carry two operational
-requirements that have each silently red-shifted the nightly hardware suite
-for days. Both are quick once known. This is the runbook for both.
+The self-hosted runner (minihost; archhost's runner was removed on
+2026-09-28) has operational requirements that have each silently
+red-shifted the nightly hardware suite for days. Each is quick once known.
+This is the runbook for them.
 
-## 1. Capture promotion on archhost
+## 1. Capture promotion (runners with the restricted helper)
 
 `scripts/ci/irlume-ci-capture.py` is the root-installed, source-bound capture
-the hardware suite's strobe stage uses on archhost. It executes only the ELF
+the hardware suite's strobe stage uses where an administrator installed it.
+archhost used it until its runner was removed on 2026-09-28; no current
+runner has it. It executes only the ELF
 recorded in `/usr/local/lib/irlume-ci/capture.json`, which binds three facts:
 
 ```json
@@ -15,7 +18,7 @@ recorded in `/usr/local/lib/irlume-ci/capture.json`, which binds three facts:
   "schema": 1,
   "source_tree": "<40-hex git tree of the exact sources>",
   "sha256": "<digest of /usr/local/lib/irlume-ci/burst_dump>",
-  "device": "/dev/video2"
+  "device": "<approved IR node, for example /dev/video2>"
 }
 ```
 
@@ -37,14 +40,14 @@ when you promote: the IR node's number can change when cameras are replugged.
 Promote before a release, after camera changes, and at least weekly while
 main moves:
 
-1. Ship the exact tree to archhost (rsync a clean checkout, no `.git`
-   needed for the build itself).
+1. Ship the exact tree to the runner host (rsync a clean checkout, no
+   `.git` needed for the build itself).
 2. Build the example from that tree:
    `cargo build --release --locked -p irlume-camera --example burst_dump`
    (isolated `CARGO_TARGET_DIR`).
 3. Record the tree hash on your build machine:
    `git rev-parse HEAD^{tree}`. The manifest binds the TREE, not the commit.
-4. On archhost, as root, atomically install and rebind:
+4. On the runner host, as root, atomically install and rebind:
 
 ```sh
 sudo install -m0755 -o root -g root <burst_dump> /usr/local/lib/irlume-ci/burst_dump.new
@@ -53,10 +56,11 @@ sudo mv -f /usr/local/lib/irlume-ci/burst_dump.new /usr/local/lib/irlume-ci/burs
 sudo chmod 0644 /usr/local/lib/irlume-ci/capture.json  # root:root, no group/world write
 ```
 
-5. Verify with one real invocation (opens the IR camera once, bounded):
+5. Verify with one real invocation (opens the IR camera once, bounded),
+   passing the manifest's `device` as `<device>`:
 
 ```sh
-sudo /usr/local/libexec/irlume-ci-capture <tree> /dev/video2 | tar -t
+sudo /usr/local/libexec/irlume-ci-capture <tree> <device> | tar -t
 ```
 
 Six `frame*.pgm` files plus `means.txt`, and one emitter proof line on
@@ -65,8 +69,9 @@ step warns while the approval is stale and fails once it is more than seven
 days old, at which point the daily `ci-alert` workflow flags the suite red;
 this page is how you fix it.
 
-minihost has no installed helper; its lane uses the direct `sudo burst_dump`
-fallback and needs no promotion.
+minihost, which has carried `ir-camera` since 2026-09-28, has no installed
+helper; its lane uses the direct `sudo burst_dump` fallback and needs no
+promotion.
 
 ## 2. Restart a runner after host group changes
 
@@ -89,15 +94,36 @@ id <runner-user>   # the two lists must agree
 
 ## 3. Release-build memory on minihost
 
-The PR hardware-checks lane builds with LTO and can need several gigabytes
+The hardware-checks lane builds with LTO and can need several gigabytes
 at link time; minihost has 7.5 GiB total and routinely has only a few
 hundred MiB available. A link there dies as `signal: 9, SIGKILL` from the
-OOM killer while the same job passes on archhost. If that signature appears
-in a hardware-checks or hardware-suite log, free memory on minihost or let
-the job land on archhost (briefly stopping the minihost runner service moves
-the next queued job there), then rerun the failed job.
+OOM killer. The runner service carries `OOMScoreAdjust=500` (drop-in
+`60-oom-score.conf`), so under memory pressure the kernel kills the CI build
+before the host's other services. If that signature appears in a
+hardware-checks or hardware-suite log, free memory on minihost, then rerun
+the failed job. There is no second runner to move it to.
 
-## Watching for all three
+## 4. Toolchain and PAM tools for the coverage lane
+
+The coverage job needs `rustc` and the system `llvm-cov` on the same LLVM
+major; `scripts/ci/setup-coverage-tools.sh` stops with `LLVM mismatch`
+otherwise. That happened on minihost on 2026-09-11: the runner's PATH put
+`~/.cargo/bin` first, so a rustup 1.88 default (LLVM 20) shadowed
+distribution Rust (LLVM 22). The runner's `.env` and `.path` now list
+`/usr/local/sbin:/usr/local/bin:/usr/bin:/home/test/.cargo/bin`. After
+editing either file, restart the runner service while it is idle, then
+check what a job will see:
+
+```sh
+env -i HOME=/home/test PATH="$(cat /home/test/actions-runner/.path)" \
+  bash -c 'command -v rustc llvm-cov; rustc -vV | grep ^LLVM; llvm-cov --version | grep -i "llvm version"'
+```
+
+The coverage step sets `IRLUME_REQUIRE_PAM_TOOLS=1`, so `pamtester` (AUR on
+Arch) and `pam_wrapper` must be installed on the runner; a missing tool fails
+the PAM lane instead of skipping it.
+
+## Watching for all four
 
 The `ci-alert` workflow (`.github/workflows/ci-alert.yml`) checks every
 scheduled workflow once a day, the nightly hardware suite and the weekly

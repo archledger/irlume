@@ -95,7 +95,7 @@ fn parse_v1(line: &str) -> Option<(String, String)> {
 
 /// An override split into its header lines and its body.
 pub(super) struct Parsed<'a> {
-    /// The two header lines, without carriage returns, like the body.
+    /// The two header lines, without trailing carriage returns, like the body.
     first: &'a str,
     track_line: Option<&'a str>,
     /// Which line of the file the tracking line is, counting from 0.
@@ -105,18 +105,19 @@ pub(super) struct Parsed<'a> {
     /// `(vendor, body)` digests from a readable tracking line.
     digests: Option<(String, String)>,
     /// Every line except the two header lines, newline-terminated, without
-    /// carriage returns.
+    /// the carriage returns lines end in.
     body: String,
-    /// The file has a carriage return. Linux-PAM reads one in a line as
+    /// A line of the file ends in a carriage return. Linux-PAM reads one as
     /// part of that line, so irlume changes nothing in a file with one
     /// outside a comment ([`Parsed::unreadable`]). The digests leave them
     /// out, so such a file still reads as unedited; every write irlume makes
-    /// has LF endings.
+    /// has LF endings. A carriage return inside a line, which PAM skips in a
+    /// bracketed control, stays in the body and is not one of these.
     crlf: bool,
 }
 
-/// Said when a write drops carriage returns, which can then only be in
-/// comments: irlume changes nothing in a file with one PAM reads.
+/// Said when a write drops trailing carriage returns, which can then only
+/// be in comments: a CRLF ending in what PAM reads makes the file unreadable.
 const CRLF_FIXED: &str = "the carriage returns in its comments are gone";
 
 /// Split an override. `None` when the text is not one (no first header line).
@@ -161,7 +162,7 @@ pub(super) fn parse(content: &str) -> Option<Parsed<'_>> {
         text: content,
         digests: track_line.and_then(parse_v1),
         body,
-        crlf: content.contains('\r'),
+        crlf: content.split('\n').any(|l| l.ends_with('\r')),
     })
 }
 

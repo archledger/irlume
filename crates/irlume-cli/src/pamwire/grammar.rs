@@ -525,7 +525,10 @@ pub(crate) enum Unread {
     /// A blank other than a space or a tab. libpam splits fields only at
     /// spaces and tabs, so it reads this blank as part of a field (a type
     /// libpam does not know, when it leads the line), where irlume's line
-    /// tests would take it for a separator.
+    /// tests would take it for a separator. Not a vertical tab, form feed or
+    /// carriage return inside a control written in brackets closed on the
+    /// line that libpam parses without an error: `_pam_parse_control` skips
+    /// those as it skips a space, and so does irlume ([`control_blank`]).
     Blank(char),
     /// A carriage return that ends the line, as in a file saved with CRLF
     /// line endings: libpam reads it as the end of the line's last field (a
@@ -617,6 +620,52 @@ fn libpam_names_module(path: &str) -> bool {
     !name.is_empty() && name != "?"
 }
 
+/// Where the inside of the control of `d`, a line's [`directive`], is when
+/// that control is written in brackets closed on the line and libpam
+/// parses it without an error: the bytes libpam hands `_pam_parse_control`,
+/// which skips each vertical tab, form feed and carriage return there as it
+/// skips a space ([`control_blank`]). An empty range for an `@include` line,
+/// a control without brackets, one never closed and one libpam rejects.
+fn bracketed_control(d: &str) -> Range<usize> {
+    let mut rest = d;
+    if type_field(&mut rest).is_none_or(|kind| kind.eq_ignore_ascii_case("@include")) {
+        return 0..0;
+    }
+    let Some(inner) = rest.trim_start_matches(FIELD_DELIMITERS).strip_prefix('[') else {
+        return 0..0;
+    };
+    let control = next_field(&mut rest).unwrap_or("");
+    // The control runs to the first `]` not written `\]`; one that runs to
+    // the end of the line was never closed.
+    if control.len() == inner.len() || control_pairs(control).is_none() {
+        return 0..0;
+    }
+    let start = d.len() - inner.len();
+    start..start + control.len()
+}
+
+/// The blanks other than a space or a tab in `read`, a line's [`directive`]
+/// without the carriage returns it ends in, that libpam reads as part of a
+/// field: all of them but a vertical tab, form feed or carriage return in a
+/// control [`bracketed_control`] finds, which libpam skips as a space. With
+/// `controls` false those count too, for a line that may continue another,
+/// whose second field libpam need not read as a control.
+fn field_blanks(read: &str, controls: bool) -> impl Iterator<Item = char> + '_ {
+    let control = if controls {
+        bracketed_control(read)
+    } else {
+        0..0
+    };
+    read.char_indices()
+        .filter(move |&(at, c)| {
+            c != ' '
+                && c != '\t'
+                && c.is_whitespace()
+                && !(control.contains(&at) && u8::try_from(c).is_ok_and(control_blank))
+        })
+        .map(|(_, c)| c)
+}
+
 /// Why irlume does not read `line` as libpam does, `None` when it does.
 fn unread(line: &str) -> Option<Unread> {
     if line.contains('\0') {
@@ -624,10 +673,7 @@ fn unread(line: &str) -> Option<Unread> {
     }
     let d = directive(line);
     let before_cr = d.trim_end_matches('\r');
-    if let Some(c) = before_cr
-        .chars()
-        .find(|&c| c != ' ' && c != '\t' && c.is_whitespace())
-    {
+    if let Some(c) = field_blanks(before_cr, true).next() {
         return Some(Unread::Blank(c));
     }
     if before_cr.len() < d.len() {
@@ -664,11 +710,13 @@ fn unread(line: &str) -> Option<Unread> {
 /// type's chain, a control is parsed as `_pam_parse_control` parses it, and
 /// a type is read case-insensitively, without its `-` and brackets. These
 /// are not: a NUL byte, a blank other than a space or a tab in what PAM
-/// reads (it is part of a field to PAM), a type PAM does not know (which
-/// chain PAM puts the line in depends on whether another file includes this
-/// one), an `@include` without a file and a module path PAM takes no module
-/// name from (either makes PAM refuse the whole service), and a `substack`
-/// without a stack (PAM counts it as two lines).
+/// reads (it is part of a field to PAM), save a vertical tab, form feed or
+/// carriage return inside a bracketed control PAM parses (it skips those as
+/// a space), a type PAM does not know (which chain PAM puts the line in
+/// depends on whether another file includes this one), an `@include`
+/// without a file and a module path PAM takes no module name from (either
+/// makes PAM refuse the whole service), and a `substack` without a stack
+/// (PAM counts it as two lines).
 ///
 /// Lines are split at each newline alone, so the carriage return of a CRLF
 /// ending stays in its line, as it does for libpam, which splits fields at
@@ -697,18 +745,23 @@ pub(crate) fn unreadable_line(content: &str) -> Option<UnreadLine<'_>> {
 /// Whether a line of `content` holds a carriage return in the part PAM
 /// reads (before any `#`), as each line of a file saved with CRLF line
 /// endings does: PAM reads it as part of that line ([`unreadable_line`]).
+/// One inside a bracketed control PAM parses does not count, as it does not
+/// for [`unreadable_line`]: PAM skips it there as a space.
 pub(crate) fn has_read_carriage_return(content: &str) -> bool {
     carriage_return_line(content).is_some()
 }
 
 /// The first line of `content` with a carriage return in what libpam reads,
 /// named as [`unreadable_line`] names one, whether or not the file has a
-/// continued line (for which [`unreadable_line`] names none).
+/// continued line (for which [`unreadable_line`] names none). In a file with
+/// one, a carriage return inside a bracketed control counts too: a line
+/// libpam joins to the one before it has no control of its own.
 pub(crate) fn carriage_return_line(content: &str) -> Option<UnreadLine<'_>> {
+    let controls = !has_line_continuation(content);
     content.split('\n').enumerate().find_map(|(i, text)| {
         let read = directive(text);
         let before = read.trim_end_matches('\r');
-        let why = if before.contains('\r') {
+        let why = if field_blanks(before, controls).any(|c| c == '\r') {
             Unread::Blank('\r')
         } else if before.len() < read.len() {
             Unread::CrlfEnding

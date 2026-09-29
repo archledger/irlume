@@ -5,6 +5,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- PAM wiring accepts vertical tabs, form feeds and carriage returns inside
+  closed bracketed controls that Linux-PAM parses. A line such as
+  `auth [success=1<VT>default=ignore] pam_unix.so` keeps its bytes and is
+  treated as it is with a space there by enable, disable, reconcile,
+  doctor and `--adjust-jumps`. An embedded carriage return in a control
+  or comment no longer makes an enable rewrite an already-correct override
+  while claiming its comments were changed. These characters outside
+  comments and valid bracketed controls, and CRLF line endings outside
+  comments, remain refused (#931).
+
 ## [0.15.0] - 2026-09-29
 
 ### Added

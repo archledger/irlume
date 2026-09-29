@@ -2820,6 +2820,149 @@ fn an_unread_override_whose_jump_counts_irlume_lines_is_kept_on_disable() {
     assert_eq!(read_file(svc.etc), edited);
 }
 
+/// A vertical tab, form feed or carriage return inside a bracketed control
+/// is a blank libpam skips there as a space (#931). An override with such a
+/// line an administrator added is wired, wired again, reconciled, assessed
+/// and taken apart as with a space in its place, the line kept byte for
+/// byte; a carriage return there is not taken for one in a comment or a
+/// CRLF ending, and `--adjust-jumps` lowers a jump written that way as it
+/// lowers one written with a space.
+#[test]
+fn a_blank_pam_skips_in_a_bracketed_control_of_an_override_reads_as_a_space() {
+    let transcript = |b: &str, name: &str| -> Vec<String> {
+        let local = format!("auth       [success=ok{b}default=ignore]   pam_foo.so   # local");
+        let gate = format!(
+            "auth       [success=2{b}default=ignore]   pam_succeed_if.so user ingroup fpusers"
+        );
+        let mut steps = Vec::new();
+        let dir = TestDir::new(&format!("ovr-control-blank-{name}"));
+        let root = dir.0.display().to_string();
+        let mut step = |label: &str, text: String| {
+            steps.push(format!(
+                "{label}: {}",
+                text.replace(&root, "<root>").replace(b, " ")
+            ));
+        };
+        let outcome = |o: &WireOutcome| {
+            format!(
+                "{} unmet={} adjustable={} {} | {}",
+                change_id(o),
+                o.unmet,
+                o.adjustable,
+                o.message,
+                detail_text(o)
+            )
+        };
+        let svc = plasmalogin(&dir.0.join("a"), UPSTREAM_FEDORA);
+        let pam_d = dir.0.join("a/etc/pam.d");
+        std::fs::write(pam_d.join("password-auth"), FEDORA_PASSWORD_AUTH).unwrap();
+        std::fs::write(pam_d.join("postlogin"), FEDORA_POSTLOGIN).unwrap();
+        let vendor_path = svc.vendor.unwrap();
+        wire_service(&svc, true, true, &face_and_keyring).unwrap();
+        std::fs::write(svc.etc, with_line(&read_file(svc.etc), &local)).unwrap();
+        for apply in [false, true, true] {
+            let o = wire_service(&svc, true, apply, &keyring_only).unwrap();
+            step("enable", outcome(&o));
+            assert!(read_file(svc.etc).contains(&local), "{b:?}: byte for byte");
+        }
+        step(
+            "maintain",
+            format!("{:?}", maintain(&svc, overrides::Recipe::Greeter)),
+        );
+        let assessed = overrides::assess(
+            overrides::Recipe::Greeter,
+            &read_file(svc.etc),
+            vendor_path,
+            Some(UPSTREAM_FEDORA),
+            &[],
+            None,
+            "",
+        );
+        step("assess", format!("{assessed:?}"));
+        let off = wire_service(&svc, false, true, &face_and_keyring).unwrap();
+        step("disable", outcome(&off));
+        let after = read_file(svc.etc);
+        assert!(after.contains(&local), "{b:?}: byte for byte");
+        step("disabled", after);
+
+        let svc = plasmalogin(&dir.0.join("b"), &fedora_with_oo7());
+        ship_stack(&svc, "password-auth");
+        wire_service(&svc, true, true, &face_and_keyring).unwrap();
+        std::fs::write(svc.etc, with_line(&read_file(svc.etc), &gate)).unwrap();
+        let held = wire_service(&svc, false, false, &face_and_keyring).unwrap();
+        step("disable preview", outcome(&held));
+        let off = wire_service_with(&svc, false, &adjusting(true), &face_and_keyring).unwrap();
+        step("disable --adjust-jumps", outcome(&off));
+        let after = read_file(svc.etc);
+        let lowered = gate.replacen("success=2", "success=1", 1);
+        assert!(
+            after.contains(&lowered),
+            "{b:?}: only the digit changes\n{after}"
+        );
+        step("adjusted", after);
+
+        // The line in the vendor file: an override is made from it, and
+        // reconcile rebuilds that unedited override when the vendor file
+        // changes.
+        let svc = plasmalogin(&dir.0.join("c"), &with_line(UPSTREAM_FEDORA, &local));
+        let pam_d = dir.0.join("c/etc/pam.d");
+        std::fs::write(pam_d.join("password-auth"), FEDORA_PASSWORD_AUTH).unwrap();
+        std::fs::write(pam_d.join("postlogin"), FEDORA_POSTLOGIN).unwrap();
+        let made = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+        step("override made", outcome(&made));
+        let vendor_path = svc.vendor.unwrap();
+        std::fs::write(vendor_path, with_line(&fedora_with_oo7(), &local)).unwrap();
+        step(
+            "reconcile",
+            format!("{:?}", maintain(&svc, overrides::Recipe::Greeter)),
+        );
+        let after = read_file(svc.etc);
+        assert!(after.contains(&local), "{b:?}: byte for byte");
+        // The digests are of the vendor file's bytes, the blank included.
+        step("reconciled", after.replacen(&track_line(&after), "", 1));
+        steps
+    };
+    let plain = transcript(" ", "space");
+    // What a space gives: enabled, then already wired, never refused, and a
+    // jump lowered.
+    assert!(
+        plain[0].starts_with("enable: rewire-override unmet=false"),
+        "{plain:#?}"
+    );
+    assert!(
+        plain[2].starts_with("enable: already-correct"),
+        "{plain:#?}"
+    );
+    assert!(
+        plain.iter().any(|s| s.contains("adjustable=true")),
+        "{plain:#?}"
+    );
+    assert!(
+        !plain.iter().any(|s| s.contains("carriage return")),
+        "{plain:#?}"
+    );
+    for (b, name) in [("\u{b}", "vt"), ("\u{c}", "ff"), ("\r", "cr")] {
+        assert_eq!(transcript(b, name), plain, "{name}");
+    }
+}
+
+#[test]
+fn a_mid_line_carriage_return_in_a_comment_does_not_rewrite_an_override() {
+    let dir = TestDir::new("ovr-comment-mid-cr");
+    let svc = plasmalogin(&dir.0, UPSTREAM_FEDORA);
+    ship_stack(&svc, "password-auth");
+    wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    let edited = with_line(
+        &read_file(svc.etc),
+        "# local comment with\ra carriage return",
+    );
+    std::fs::write(svc.etc, &edited).unwrap();
+    let outcome = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert_eq!(change_id(&outcome), "already-correct");
+    assert!(!outcome.unmet);
+    assert_eq!(read_file(svc.etc), edited);
+}
+
 /// A vendor file with such a line is not made into an override, and a
 /// `--force` rebuild from one is refused: irlume makes no file from one it
 /// cannot read as PAM does.

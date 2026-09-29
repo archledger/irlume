@@ -39,7 +39,10 @@ let
           (
             { i, r }:
             let n = jumpSkip r.control;
-            in n > 0 && i < position && position <= i + n
+            # n > 0 && i < position && position <= i + n
+            # also covers position == i + n + 1: inserting exactly where
+            # the jump used to land changes its landing rule as well.
+            in n > 0 && i < position && position <= i + n + 1
           )
           (lib.imap0 (i: r: { inherit i r; }) rendered);
     in
@@ -82,18 +85,49 @@ let
 
   # Required gates (pam_nologin, pam_faillock, an access gate) inside the
   # substack the jump would skip must never be bypassed by a face success;
-  # a required pam_deny is the stack's own refusal terminator.
+  # a required pam_deny is the stack's own refusal terminator. Delegation
+  # (`substack` or `include` naming another service) is followed
+  # recursively with a cycle guard; a delegation by file path cannot be
+  # resolved here and marks the layout unproven.
   substackGate =
-    { inner }:
-    lib.findFirst
-      (
-        r:
-        r.enable
-        && (r.control == "required" || r.control == "requisite")
-        && !(lib.hasSuffix "pam_deny.so" r.modulePath)
-      )
-      null
-      inner;
+    { innerOf, seen, rules }:
+    let
+      direct =
+        lib.findFirst
+          (
+            r:
+            r.enable
+            && (r.control == "required" || r.control == "requisite")
+            && !(lib.hasSuffix "pam_deny.so" r.modulePath)
+          )
+          null
+          rules;
+      delegations =
+        lib.filter
+          (r: r.enable && (r.control == "substack" || r.control == "include"))
+          rules;
+      walk =
+        acc: r:
+        if acc ? gate || acc ? unproven then
+          acc
+        else if lib.hasInfix "/" r.modulePath then
+          { unproven = "delegation by file path '${r.modulePath}' cannot be inspected"; }
+        else if lib.elem r.modulePath seen then
+          { unproven = "delegation cycle through '${r.modulePath}'"; }
+        else
+          (
+            let deeper = substackGate {
+              inherit innerOf;
+              rules = innerOf r.modulePath;
+              seen = seen ++ [ r.modulePath ];
+            };
+            in if deeper == null then acc else deeper
+          );
+      folded = lib.foldl' walk { } delegations;
+    in
+    if direct != null then { gate = direct; }
+    else if folded ? gate || folded ? unproven then folded
+    else null;
 in
 {
   inherit passwordStackNames;
@@ -101,9 +135,9 @@ in
   # profile: "login" | "lock"
   # others: the service's own auth rules as plain attrsets
   #   { name, control, modulePath, order, enable }
-  # innerOf: callback returning the named substack service's own auth
-  #   rules in the same shape, so gate inspection does not duplicate the
-  #   anchor selection here
+  # innerOf: callback returning the named service's own auth rules in the
+  #   same shape; gate inspection follows substack/include delegation
+  #   recursively through it
   # Result: { ok, unsealOrder, landingEnable, landingOrder, reason? }
   computePlacement =
     {
@@ -128,10 +162,11 @@ in
       substacks = lib.filter (r: r.control == "substack") rendered;
       named = lib.filter (r: builtins.elem r.modulePath passwordStackNames) substacks;
       anchor =
+        # Only a KNOWN password stack may carry the face line, sole or not:
+        # an unrecognized substack could be a policy stack the jump would
+        # skip. nixpkgs' own SDDM delegates through `login`, which is known.
         if substacks == [ ] then
           null
-        else if lib.length substacks == 1 then
-          lib.head substacks
         else if lib.length named == 1 then
           lib.head named
         else
@@ -146,7 +181,7 @@ in
           reject "several auth substacks and not exactly one known password stack (${lib.concatStringsSep ", " passwordStackNames}) among them"
         else
           let
-            gate = substackGate { inner = innerOf anchor.modulePath; };
+            gateResult = substackGate { inherit innerOf; seen = [ anchor.modulePath ]; rules = innerOf anchor.modulePath; };
             before = slotBefore { rendered = rendered; anchor = anchor; };
             after = slotAfter { rendered = rendered; anchor = anchor; };
             beforeBreaker =
@@ -154,8 +189,10 @@ in
             afterBreaker =
               if after ? slot then jumpRewrittenAt { rendered = rendered; slot = after.slot; } else null;
           in
-          if gate != null then
-            reject "the '${anchor.modulePath}' stack the face success would skip contains the required rule '${gate.name}', which would never run on a face login"
+          if gateResult ? gate then
+            reject "the '${anchor.modulePath}' stack the face success would skip contains the required rule '${gateResult.gate.name}', which would never run on a face login"
+          else if gateResult ? unproven then
+            reject "the '${anchor.modulePath}' stack delegates in a way that cannot be proven safe (${gateResult.unproven})"
           else if before ? bad then
             reject before.bad
           else if after ? bad then

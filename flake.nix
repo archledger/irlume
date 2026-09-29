@@ -211,10 +211,27 @@
               (plain "other" "optional" "/lib/security/pam_env.so" 10100)
               (sub "login" 10100)
             ];
-            gatedInner = n: [
+            loneUnknownSub = [
+              (sub "company-policy" 10100)
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+            ];
+            jumpLanding = [
+              (plain "gate" "[success=1 default=ignore]" "/lib/security/pam_succeed_if.so" 10000)
+              (plain "filler" "optional" "/lib/security/pam_env.so" 10100)
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+            ];
+            gatedInner = sn: [
               (plain "nologin" "required" "/lib/security/pam_nologin.so" 10000)
               (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
             ];
+            delegatingInner = sn:
+              if sn == "login" then
+                [ (plain "via" "include" "common-auth" 11000) ]
+              else
+                [
+                  (plain "nologin" "required" "/lib/security/pam_nologin.so" 10000)
+                  (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+                ];
           in
           # Login greeters keep the keyring in the stack; lock screens grant
           # outright; text-mode greeters force pam_kwallet to run.
@@ -270,6 +287,13 @@
           assert !(r "login" occupied).ok;
           assert !(r "login" tie).ok;
           assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = gatedInner; }).ok;
+          # A lone substack that is not a known password stack is rejected,
+          # not anchored on.
+          assert !(r "login" loneUnknownSub).ok;
+          # Inserting exactly where an existing jump lands also rewrites it.
+          assert !(r "login" jumpLanding).ok;
+          # A required gate behind a nested include is still found.
+          assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = delegatingInner; }).ok;
           assert sys.config.systemd.services.irlumed.environment.IRLUME_SOCKET == "/run/irlume.sock";
           # These shipped PAD cues default to /etc/irlume in the daemon.
           # A NixOS service must resolve them from its selected package too.

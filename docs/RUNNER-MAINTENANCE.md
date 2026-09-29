@@ -1,7 +1,7 @@
 # Trusted runner maintenance
 
-The self-hosted runner (minihost; archhost's runner was removed on
-2026-09-28) has operational requirements that have each silently
+The self-hosted runners (minihost; archhost, on NixOS since 2026-09-29) have
+operational requirements that have each silently
 red-shifted the nightly hardware suite for days. Each is quick once known.
 This is the runbook for them.
 
@@ -101,7 +101,8 @@ OOM killer. The runner service carries `OOMScoreAdjust=500` (drop-in
 `60-oom-score.conf`), so under memory pressure the kernel kills the CI build
 before the host's other services. If that signature appears in a
 hardware-checks or hardware-suite log, free memory on minihost, then rerun
-the failed job. There is no second runner to move it to.
+the failed job; archhost (30 GiB) can also take the lane — briefly stopping
+the minihost runner service moves the next job there.
 
 ## 4. Toolchain and PAM tools for the coverage lane
 
@@ -123,7 +124,31 @@ The coverage step sets `IRLUME_REQUIRE_PAM_TOOLS=1`, so `pamtester` (AUR on
 Arch) and `pam_wrapper` must be installed on the runner; a missing tool fails
 the PAM lane instead of skipping it.
 
-## Watching for all four
+## 5. archhost runs NixOS: declarative environment, restart after switch
+
+archhost re-joined the fleet on NixOS (2026-09-29, qualified green on the
+full suite, run 36537023186). Its whole runner environment is declared in
+`/etc/nixos/ssh-bootstrap.nix` on the host: the toolchain (`rustc` and
+`llvm-cov` are both 21.x there, so the same-major check passes), the pinned
+ONNX Runtime and TFLite runtimes under
+`/var/lib/github-runner/archhost/`, the `pam_wrapper` build, the sudoers
+rule for the direct `sudo burst_dump` route, and the bind-mounted
+`/bin`, `/usr/bin` and `/usr/lib` (plus an `ID=arch` os-release shadow)
+that the bwrap-based CLI tests need, because NixOS ships none of them at
+those paths and `flock -c` execs the invoking user's login shell.
+
+Two rules specific to that host:
+
+- Restart the runner service after every `nixos-rebuild switch`: the unit's
+  bind paths resolve `/run/current-system` when the unit starts, so a new
+  generation leaves the live runner looking at the old environment.
+- The runner unit's systemd sandbox knobs (ProtectSystem, PrivateTmp,
+  CapabilityBoundingSet, …) are deliberately relaxed: the module's defaults
+  block the bubblewrap sandboxes and the setuid `sudo` the hardware lane
+  needs. Re-tightening them without a full suite run will red-shift the
+  nightly.
+
+## Watching for all of them
 
 The `ci-alert` workflow (`.github/workflows/ci-alert.yml`) checks every
 scheduled workflow once a day, the nightly hardware suite and the weekly

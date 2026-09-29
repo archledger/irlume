@@ -14,6 +14,8 @@ roll back package changes already applied. Synthetic bytes prove preservation, n
 enrollment, cryptographic rollback, password fallback, or camera functionality.
 RPM qualification targets x86_64 Fedora with DNF5 and enforcing SELinux; supply
 both --old-selinux and --candidate-selinux for the matching policy packages.
+For the Ubuntu 26.04 PPA packages, select --deb-lane=ppa explicitly; the
+default Debian lane checks the universal package's version and payload modes.
 """
 import argparse
 import hashlib
@@ -111,14 +113,18 @@ def parse_rpm_metadata(text, package, expected=None):
     return version + "-" + release
 
 
-def package_metadata(path, kind, expected, package="irlume"):
+def package_metadata(path, kind, expected, package="irlume", *, deb_lane="universal"):
     if kind == "rpm":
         return parse_rpm_metadata(read_command(["rpm", "-qp", "--qf", RPM_QUERY, str(path)]),
                                   package, expected)
     if kind == "deb":
+        require(deb_lane in {"universal", "ppa"}, "invalid-debian-lane")
         name = read_command(["dpkg-deb", "-f", str(path), "Package"])
         version = read_command(["dpkg-deb", "-f", str(path), "Version"])
-        valid = version == expected or re.fullmatch(re.escape(expected) + r"-[0-9]+", version)
+        if deb_lane == "ppa":
+            valid = re.fullmatch(re.escape(expected) + r"-0ppa[1-9][0-9]*~resolute[1-9][0-9]*", version)
+        else:
+            valid = version == expected or re.fullmatch(re.escape(expected) + r"-[0-9]+", version)
     else:
         text = read_command(["tar", "--zstd", "-xOf", str(path), ".PKGINFO"])
         names = re.findall(r"^pkgname = (.+)$", text, re.M)
@@ -407,7 +413,8 @@ def seed_synthetic():
         os.chown(path, 0, 0)
 
 
-def check_candidate_payload(payload, kind):
+def check_candidate_payload(payload, kind, *, deb_lane="universal"):
+    require(deb_lane in {"universal", "ppa"}, "invalid-debian-lane")
     pam = {"deb": "/usr/lib/x86_64-linux-gnu/security/pam_irlume.so",
            "arch": "/usr/lib/security/pam_irlume.so",
            "rpm": "/usr/lib64/security/pam_irlume.so"}[kind]
@@ -417,9 +424,9 @@ def check_candidate_payload(payload, kind):
              "/etc/pam.d/irlume-retry-reset": 0o644,
              "/usr/share/polkit-1/actions/org.irlume.enroll.policy": 0o644,
              "/usr/share/polkit-1/actions/org.irlume.recovery-manage.policy": 0o644,
-             # nfpm retains the executable bit from the Rust cdylib; Arch
-             # explicitly installs the module 0644 in PKGBUILD.
-             pam: 0o755 if kind == "deb" else 0o644}
+              # nfpm retains the Rust cdylib's executable bit. The PPA,
+              # Arch and Fedora recipes install the module 0644.
+              pam: 0o755 if kind == "deb" and deb_lane == "universal" else 0o644}
     if kind == "rpm":
         modes["/usr/share/selinux/packages/irlume.pp"] = 0o644
     for path, mode in modes.items():
@@ -428,7 +435,8 @@ def check_candidate_payload(payload, kind):
                 and row.get("uid") == row.get("gid") == 0, "candidate-required-payload")
 
 
-def execute(runner, kind, old, candidate, versions, result, stage_check=None, policies=None):
+def execute(runner, kind, old, candidate, versions, result, stage_check=None, policies=None,
+            *, deb_lane="universal"):
     # A clean guest is essential: do not downgrade an unrelated installation.
     if kind == "rpm":
         require(policies is not None, "rpm-selinux-pair-required")
@@ -468,7 +476,7 @@ def execute(runner, kind, old, candidate, versions, result, stage_check=None, po
             for unit in ("irlumed.service", "irlumed.socket")
         }
         if cli_version == CANDIDATE_VERSION:
-            check_candidate_payload(payload, kind)
+            check_candidate_payload(payload, kind, deb_lane=deb_lane)
             candidate_payload = payload
         if label == "old-install":
             baseline_payload = payload
@@ -512,6 +520,8 @@ def main(argv=None):
     parser.add_argument("--stage-check", help="Optional trusted Python checker emitting credential-free JSON with passed=true")
     parser.add_argument("--old-selinux", help="RPM only: matching old irlume-selinux package")
     parser.add_argument("--candidate-selinux", help="RPM only: matching candidate irlume-selinux package")
+    parser.add_argument("--deb-lane", choices=("universal", "ppa"),
+                        help="Debian only: package lane (default: universal; PPA targets Resolute)")
     args = parser.parse_args(argv)
     # No log, output, fixture or package write before all admission checks.
     try:
@@ -520,8 +530,10 @@ def main(argv=None):
         stage_check = package_path(args.stage_check) if args.stage_check else None
         kind = package_format(old)
         require(package_format(candidate) == kind, "mixed-package-formats")
-        versions = (package_metadata(old, kind, OLD_VERSION),
-                    package_metadata(candidate, kind, CANDIDATE_VERSION))
+        require(kind == "deb" or args.deb_lane is None, "deb-lane-requires-deb")
+        deb_lane = args.deb_lane or "universal"
+        versions = (package_metadata(old, kind, OLD_VERSION, deb_lane=deb_lane),
+                    package_metadata(candidate, kind, CANDIDATE_VERSION, deb_lane=deb_lane))
         policies = None
         if kind == "rpm":
             policies = rpm_companions(args.old_selinux, args.candidate_selinux, versions)
@@ -543,10 +555,13 @@ def main(argv=None):
               "package_sha256": {"old": digest(old), "candidate": digest(candidate)}}
     if policies:
         result["package_sha256"].update(old_selinux=digest(policies[0]), candidate_selinux=digest(policies[1]))
+    if kind == "deb":
+        result["deb_lane"] = deb_lane
     with output.open("x") as report, log_path.open("xb") as log:
         runner = Runner(log)
         try:
-            execute(runner, kind, old, candidate, versions, result, stage_check, policies)
+            execute(runner, kind, old, candidate, versions, result, stage_check, policies,
+                    deb_lane=deb_lane)
             result["passed"] = True
         except (Failure, OSError, ValueError, KeyboardInterrupt) as error:
             result["failure"] = str(error) if isinstance(error, Failure) else "harness-operation-failed"

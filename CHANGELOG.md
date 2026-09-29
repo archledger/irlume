@@ -5,10 +5,7 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
-## [0.15.0] - Unreleased candidate
-
-Feature scope is frozen for release qualification. The publication date will
-be recorded when the candidate is approved for release.
+## [0.15.0] - 2026-09-29
 
 ### Added
 
@@ -5262,7 +5259,10 @@ is always the fallback: no lockout, ever.
 
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
-[Unreleased]: https://github.com/archledger/irlume/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/archledger/irlume/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/archledger/irlume/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/archledger/irlume/compare/v0.13.0...v0.14.0
+[0.13.0]: https://github.com/archledger/irlume/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/archledger/irlume/compare/v0.11.3...v0.12.0
 [0.11.3]: https://github.com/archledger/irlume/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/archledger/irlume/compare/v0.11.1...v0.11.2

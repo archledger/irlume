@@ -19,7 +19,6 @@ import time
 USER = "irlume-recovery-test"
 HELPER = Path("/run/irlume-recovery/irlume-password-verify")
 SERVICE = Path("/etc/pam.d/irlume-retry-reset")
-PASSWORD = Path("/run/irlume-recovery-test-password")
 
 
 def run(argv, *, data=None, account=None):
@@ -102,9 +101,12 @@ def main():
     account = pwd.getpwnam(USER)
     mode = sys.argv[1] if len(sys.argv) == 2 else "normal"
     require(mode in ("normal", "missing", "restored"), "unknown test phase")
+    # Each phase owns a fresh synthetic password, supplied only through stdin.
+    # Package switching is checked against retry state, not a saved credential.
+    password = secrets.token_urlsafe(36)
+    require(run(["chpasswd"], data=f"{USER}:{password}\n").returncode == 0, "password setup failed")
     if mode != "normal":
         ready()
-        password = PASSWORD.read_text()
         if mode == "missing":
             require(not HELPER.exists(), "missing package retained a stale verifier")
             status(account, 0, 0, 0, available=False)
@@ -118,10 +120,6 @@ def main():
             reset_roundtrip(account, password, 0, 0)
         print(f"PASS: daemon ready and recovery behavior correct for {mode} helper")
         return
-    password = secrets.token_urlsafe(36)
-    with PASSWORD.open("x") as stream:
-        stream.write(password)
-    require(run(["chpasswd"], data=f"{USER}:{password}\n").returncode == 0, "password setup failed")
     retry = Path("/var/lib/irlume/retry")
     retry.mkdir(mode=0o700, exist_ok=True)
     for name, value in {

@@ -107,12 +107,13 @@ PAM reads differently from how irlume would: a type PAM does not know (a typo
 such as `auht`, or a line led by a no-break space, vertical tab or form feed,
 which PAM reads as part of the type; PAM counts such a line in the auth stack
 as one that always fails), a blank other than a space or a tab between
-fields, a carriage return outside a comment (a file saved with CRLF line
-endings: PAM reads it as part of the line), a NUL byte, an `@include`
-without a file, a `substack` without a stack, or a module path PAM takes no
-module name from. `irlume login enable` names the line and exits 1, and no
-override is made from a vendor file with such a line; correct it (save the
-file with LF line endings) and run the command again. Every other line is
+fields, a carriage return outside comments and valid closed bracketed
+controls (including CRLF line endings, which PAM reads as part of the line),
+a NUL byte, an `@include` without a file, a `substack` without a stack, or a
+module path PAM takes no module name from. `irlume login enable` names the
+line and exits 1, and no override is made from a vendor file with such a
+line; correct it (save the file with LF line endings) and run the command
+again. Every other line is
 read as PAM reads it: `[success = 1 default=ignore]`, blanks around `=`
 included, is the same jump as `[success=1 default=ignore]`. When irlume's
 lines are not in such a file at all (after a disable, or taken out by hand),

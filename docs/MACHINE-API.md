@@ -258,7 +258,7 @@ reused for a different meaning. The registry as of this contract:
 | `polkit-helper-sandbox` | whether the polkit helper's sandbox permits what irlume needs |
 | `ir-calibration` | whether this account's IR enrollment carries the per-user liveness floor |
 | `login-wiring` | whether face auth is wired into the login stack, read from its authentication mode: a stack holding only irlume's reseal lines is not wired |
-| `login-overrides` | whether the `/etc/pam.d` copies irlume made of vendor PAM files are in step with them. `warn` names a copy with a line irlume does not read as PAM does, by its line number and why (a carriage return outside its comments among them, as CRLF line endings leave, which PAM reads as part of its line; irlume adds nothing to the copy until that line is corrected), a copy with lines irlume did not write whose vendor copy changed since irlume wrote it (or that predates vendor tracking and differs from its vendor copy, including one that only lacks lines its vendor copy has), or one that predates vendor tracking, lacks irlume's lines and has a numeric jump that may have counted them; `info` names one waiting for the next reconcile, one whose vendor copy changed but that reconcile does not rebuild (and why), one whose vendor copy is gone (it is then the service's only configuration), one without irlume's lines that keeps lines irlume did not write, or one where inactive lines hold the places of irlume's lines after a disable; `pass` with none. The detail is one `<service>: <note>` per copy, joined with ` \| ` (no note contains that), and names services and commands, never paths or PAM lines |
+| `login-overrides` | whether the `/etc/pam.d` copies irlume made of vendor PAM files are in step with them. `warn` names a copy with a line irlume does not read as PAM does, by its line number and why (a carriage return outside comments and valid closed bracketed controls among them, as CRLF line endings leave, which PAM reads as part of its line; irlume adds nothing to the copy until that line is corrected), a copy with lines irlume did not write whose vendor copy changed since irlume wrote it (or that predates vendor tracking and differs from its vendor copy, including one that only lacks lines its vendor copy has), or one that predates vendor tracking, lacks irlume's lines and has a numeric jump that may have counted them; `info` names one waiting for the next reconcile, one whose vendor copy changed but that reconcile does not rebuild (and why), one whose vendor copy is gone (it is then the service's only configuration), one without irlume's lines that keeps lines irlume did not write, or one where inactive lines hold the places of irlume's lines after a disable; `pass` with none. The detail is one `<service>: <note>` per copy, joined with ` \| ` (no note contains that), and names services and commands, never paths or PAM lines |
 | `display-manager` | whether the active display manager is one irlume can target; `warn` with a detail when irlume keeps face off it on purpose (a LightDM whose XDMCP or VNC server is on) |
 | `pam-regeneration-guard` | whether a distro PAM regeneration would strip the wiring unnoticed |
 | `install-hygiene` | leftover backups, and hand-installed builds overlaying packaged ones |
@@ -740,10 +740,11 @@ them, so the jump lands where it did. A write to an override or to a stack
 irlume edits in place, and an override made from a vendor file, is not made
 either when that file has a line irlume does not read as PAM does (a type
 PAM does not know, a blank other than a space or a tab between fields, a
-carriage return outside a comment, as CRLF line endings leave, a NUL byte, an
-`@include` without a file, a `substack` without a stack, or a module path PAM
-takes no module name from): the surface reports `keep-edited-override` with
-`kept` true. A disable still deletes an override nobody edited and restores a
+carriage return outside comments and valid closed bracketed controls, as
+CRLF line endings leave, a NUL byte, an `@include` without a file, a
+`substack` without a stack, or a module path PAM takes no module name from):
+the surface reports `keep-edited-override` with `kept` true. A disable still
+deletes an override nobody edited and restores a
 backup that is the file without irlume's lines, byte for byte where the file
 has a carriage return; from any other such file it takes irlume's lines out
 and keeps every other byte (`strip-in-place`) when no numeric jump in the

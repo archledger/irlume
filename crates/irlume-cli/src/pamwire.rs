@@ -8348,6 +8348,142 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
         assert_eq!(unreadable_line(&continued), None);
     }
 
+    /// Inside a bracketed control libpam keeps every byte up to the `]`
+    /// (`_pam_tokenize`), and `_pam_parse_control` skips a vertical tab, form
+    /// feed or carriage return (`isspace`) before a pair, around its `=` and
+    /// between pairs, as a space: such a line is read as libpam reads it, the
+    /// same as with spaces. Anywhere else libpam splits fields at spaces,
+    /// tabs and newlines only, so the line is still named: between fields, in
+    /// the type, the module path or its arguments, in a control written
+    /// without brackets, never closed or rejected by libpam, and for a blank
+    /// libpam does not skip (#931).
+    #[test]
+    fn a_blank_libpam_skips_inside_a_bracketed_control_is_read() {
+        let stack = |line: &str| {
+            format!("#%PAM-1.0\nauth [success=1 default=ignore] pam_x.so\n{line}\nauth substack password-auth\n")
+        };
+        for blank in ['\u{b}', '\u{c}', '\r'] {
+            let b = blank.to_string();
+            for (written, plain) in [
+                (
+                    format!("auth [success=1{b}default=ignore] pam_unix.so nullok"),
+                    "auth [success=1 default=ignore] pam_unix.so nullok",
+                ),
+                (
+                    format!("auth [success{b}={b}2{b}{b}default{b}={b}ignore] pam_unix.so"),
+                    "auth [success = 2  default = ignore] pam_unix.so",
+                ),
+                (
+                    format!("auth [{b}success=1 default=ignore{b}] pam_unix.so"),
+                    "auth [ success=1 default=ignore ] pam_unix.so",
+                ),
+                (
+                    format!("-auth [default=ignore{b}success=3] pam_fprintd.so"),
+                    "-auth [default=ignore success=3] pam_fprintd.so",
+                ),
+                (
+                    format!("auth [success=ok{b}new_authtok_reqd=ok{b}default=die] pam_unix.so"),
+                    "auth [success=ok new_authtok_reqd=ok default=die] pam_unix.so",
+                ),
+                (format!("auth [{b}] pam_unix.so"), "auth [ ] pam_unix.so"),
+            ] {
+                assert_eq!(unreadable_line(&stack(&written)), None, "{written:?}");
+                assert!(!has_read_carriage_return(&stack(&written)), "{written:?}");
+                let (h, p) = (head(&written).unwrap(), head(plain).unwrap());
+                assert_eq!(h.phase, p.phase, "{written:?}");
+                assert_eq!(numeric_actions(&h), numeric_actions(&p), "{written:?}");
+                let (r, q) = (rule(&written).unwrap(), rule(plain).unwrap());
+                assert_eq!((r.module, &r.args), (q.module, &q.args), "{written:?}");
+            }
+            // A CRLF ending, a NUL byte and a blank libpam does not skip are
+            // named as before, blanks inside the control or not.
+            let crlf = format!("auth [success=1{b}default=ignore] pam_unix.so\r");
+            assert_eq!(
+                unreadable_line(&stack(&crlf)).map(|l| l.why),
+                Some(Unread::CrlfEnding),
+                "{crlf:?}"
+            );
+            let nul = format!("auth [success=1{b}default=ignore] pam_unix.so\0");
+            assert_eq!(
+                unreadable_line(&stack(&nul)).map(|l| l.why),
+                Some(Unread::Nul),
+                "{nul:?}"
+            );
+            for other in ['\u{a0}', '\u{2003}'] {
+                let line = format!("auth [success=1{other}default=ignore{b}] pam_unix.so");
+                assert_eq!(
+                    unreadable_line(&stack(&line)).map(|l| l.why),
+                    Some(Unread::Blank(other)),
+                    "{line:?}"
+                );
+            }
+            for line in [
+                // Between fields.
+                format!("auth{b}[success=1 default=ignore] pam_unix.so"),
+                format!("auth [success=1 default=ignore]{b}pam_unix.so"),
+                format!("auth [success=1 default=ignore] pam_unix.so{b}nullok"),
+                format!("auth [success=1{b}default=ignore]{b} pam_unix.so"),
+                // In the type, the module path and an argument.
+                format!("{b}auth [success=1 default=ignore] pam_unix.so"),
+                format!("au{b}th [success=1 default=ignore] pam_unix.so"),
+                format!("[auth{b}] [success=1{b}default=ignore] pam_unix.so"),
+                format!("auth [success=1{b}default=ignore] [pam_unix.so{b}]"),
+                format!("auth [success=1 default=ignore] pam_unix.so [a{b}b]"),
+                format!("auth [success=1{b}default=ignore] pam_unix.so null{b}ok"),
+                // A stack an include names, and Debian's `@include`.
+                format!("auth [include] [password{b}auth]"),
+                format!("@include [common{b}auth]"),
+                // A control without brackets, one never closed, and one
+                // libpam rejects (a keyword is not one with a blank in it).
+                format!("auth success=1{b}default=ignore pam_unix.so"),
+                format!("auth [success=1{b}default=ignore pam_unix.so"),
+                format!("auth [success=1{b}default=ignore"),
+                format!("auth [required{b}] pam_unix.so"),
+                format!("auth [success=1{b}bogus=2] pam_unix.so"),
+                format!("auth [success=1{b}default=ignore\\]] pam_unix.so"),
+            ] {
+                assert_eq!(
+                    unreadable_line(&stack(&line)).map(|l| (l.number, l.why)),
+                    Some((3, Unread::Blank(blank))),
+                    "{line:?}"
+                );
+                assert_eq!(
+                    has_read_carriage_return(&stack(&line)),
+                    blank == '\r',
+                    "{line:?}"
+                );
+            }
+        }
+        // In a continued file a line may be the rest of the one before it,
+        // with no control of its own: a carriage return anywhere in what
+        // PAM reads is named.
+        let continued = "#%PAM-1.0\nauth optional pam_foo.so \\\n  x\nauth [success=1\rdefault=ignore] pam_unix.so\n";
+        assert!(has_line_continuation(continued));
+        assert_eq!(unreadable_line(continued), None);
+        assert_eq!(
+            carriage_return_line(continued).map(|l| (l.number, l.why)),
+            Some((4, Unread::Blank('\r')))
+        );
+        // A stack wired through such a control is wired as with spaces.
+        let body = |control: &str| {
+            format!(
+                "#%PAM-1.0\nauth [{control}] pam_env.so\nauth include system-auth\n\
+                 account include system-auth\n"
+            )
+        };
+        let plain = wire_verify_service(&body("success=ok default=ignore"));
+        assert!(plain.1, "{}", plain.0);
+        for blank in ['\u{b}', '\u{c}', '\r'] {
+            let control = format!("success=ok{blank}default=ignore");
+            let wired = wire_verify_service(&body(&control));
+            assert_eq!(
+                wired,
+                (plain.0.replace("success=ok default=ignore", &control), true),
+                "{blank:?}"
+            );
+        }
+    }
+
     /// Only spaces and tabs lead a line away from its type, as in libpam's
     /// `_pam_str_trim`; any other blank stays, and libpam reads it as part
     /// of the type.

@@ -405,6 +405,12 @@ be recorded when the candidate is approved for release.
 
 ### Fixed
 
+- Make password-verified retry reset available on NixOS by staging its
+  verifier in a private root-owned runtime directory and copying its
+  dedicated PAM service into `/etc`. Keep the existing trusted-path checks
+  and daemon privilege restrictions; no writable-store exception is added
+  (#952).
+
 - Release VEX generation requires a completed advisory scan before writing
   an artifact. It passes an actual temporary configuration file to
   `cargo-deny`, preserves other settings, and refuses scan errors,

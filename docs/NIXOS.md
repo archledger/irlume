@@ -118,6 +118,31 @@ rebuild. `irlume login status` still reports the stacks, and where it or
 `irlume doctor` finds no login screen wired, it names that option, not `irlume
 login enable`.
 
+## Password-verified retry recovery
+
+The matching Nix package and module stage the password verifier at
+`/run/irlume-recovery/irlume-password-verify` before starting the daemon.
+The directory is root-owned `0700`; the regular helper file is `0755` and
+comes from the selected package. Stopping the service removes that runtime
+directory, and the next start stages the selected generation's helper.
+If a pinned or custom package omits the verifier, the daemon still starts,
+but self-service retry recovery is unavailable. Startup removes any stale
+runtime verifier rather than using one from a different package.
+
+The dedicated `/etc/pam.d/irlume-retry-reset` service is copied as a
+root-owned `0644` file. These paths satisfy the daemon's existing ancestry
+checks without exceptions for `/nix/store`, whose normal `1775` mode has a
+group-write bit even when the store is mounted read-only. The verifier's
+trust checks and the daemon's privilege restrictions remain in force.
+
+The disposable-VM regression exercises local-password reset, wrong-password
+refusal, unsafe-mode rejection, runtime-helper cleanup/recreation and a
+package override that omits the verifier:
+
+```sh
+nix build .#checks.x86_64-linux.irlume-retry-recovery --no-link
+```
+
 ## Keyring unlock
 
 On NixOS irlume seals only the login password, the kind the module's PAM rules

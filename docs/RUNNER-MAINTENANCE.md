@@ -135,7 +135,11 @@ ONNX Runtime and TFLite runtimes under
 rule for the direct `sudo burst_dump` route, and the bind-mounted
 `/bin`, `/usr/bin` and `/usr/lib` (plus an `ID=arch` os-release shadow)
 that the bwrap-based CLI tests need, because NixOS ships none of them at
-those paths and `flock -c` execs the invoking user's login shell.
+those paths and `flock -c` execs the invoking user's login shell. The
+pinned TFLite runtime is also bound at the FHS packaging path
+`/usr/share/irlume/tflite/libtensorflowlite_c.so` inside the runner unit,
+because `hardware-checks.yml` sets `IRLUME_TFLITE_LIB` to that path
+explicitly and an explicit value does not fall back.
 
 Two rules specific to that host:
 
@@ -149,7 +153,7 @@ Two rules specific to that host:
   sudo systemctl restart github-runner-archhost.service
   ```
 - The runner unit's systemd sandbox knobs (ProtectSystem, PrivateTmp,
-  CapabilityBoundingSet, …) are deliberately relaxed: the module's defaults
+  CapabilityBoundingSet, and so on) are deliberately relaxed: the module's defaults
   block the bubblewrap sandboxes and the setuid `sudo` the hardware lane
   needs. Re-tightening them without a full suite run will red-shift the
   nightly.

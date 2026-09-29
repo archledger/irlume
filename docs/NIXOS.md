@@ -111,19 +111,30 @@ services.irlume.pam.services.my-custom-locker.profile = "lock";
 
 The module renders the jump form FHS distros get from
 `irlume login enable`: the face line's success skips exactly one rule, so
-its placement is derived from the neighbouring rules and the module fails
-evaluation when no adjacent slot is free. Current nixpkgs renders SDDM's
-authentication as `substack login` rather than a flat module chain, and for
-such a service the face line goes immediately before that substack with a
-`pam_permit.so` landing immediately after it: an empty Enter runs the face
-scan first, a face success jumps over the whole substack (whose `pam_unix`
-would fail on that same empty password) and lands on the permit, and the
-login grants; the required-by-default substack keeps a failed password
-attempt fatal, so the permit cannot authenticate a failure. On a flat chain
-the face line sits immediately before the password-prompting `pam_unix`
-and no landing is rendered: the jump skips that prompt, and the keyring
-module plus the `try_first_pass` `pam_unix` still see the released token.
-Lock screens stay a single `sufficient` line.
+its placement is derived from the rendered stack and every layout where
+that jump cannot be proven safe is rejected at evaluation time with a
+message naming the conflicting rule. Current nixpkgs renders SDDM's
+authentication as `substack login` rather than a flat module chain, and
+for such a service the face line goes immediately before the password
+substack (several substacks are disambiguated by the known password stack
+names, so an earlier policy substack still runs above the face line) with
+a `pam_permit.so` landing immediately after it: an empty Enter runs the
+face scan first, a face success jumps over the whole substack (whose
+`pam_unix` would fail on that same empty password) and lands on the
+permit, and the login grants; the required-by-default substack keeps a
+failed password attempt fatal, so the permit cannot authenticate a
+failure. On a flat chain the face line sits immediately before the
+password-prompting `pam_unix` and no landing is rendered: the jump skips
+that prompt, and the keyring module plus the `try_first_pass` `pam_unix`
+still see the released token. Lock screens stay a single `sufficient`
+line.
+
+Evaluation refuses, instead of rendering a broken stack: ambiguous
+substacks (several, without exactly one known password stack among them),
+an order slot another rule occupies or shares, a numeric jump on an
+existing rule whose destination the new rules would change, and a
+required gate (such as `pam_nologin` or `pam_faillock`) inside the
+substack the jump would skip.
 
 A flat chain with only one `pam_unix` (no keyring or second-unix trigger
 in its stack) cannot complete a greeter face grant: the jump would skip

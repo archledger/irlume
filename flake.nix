@@ -141,20 +141,16 @@
                   # Give the flat `login` chain a keyring rule so the
                   # placement assertions exercise the real anchor shape.
                   security.pam.services.login.kwallet.enable = true;
-                  # A synthetic service with two substacks whose attribute
-                  # names invert their rendered order: the face line must
-                  # sit before the earliest RENDERED substack, not the
-                  # alphabetically first attribute.
-                  security.pam.services.irlume-two-substacks.rules.auth = {
-                    "zz-first" = {
+                  security.pam.services.irlume-policy-then-login.rules.auth = {
+                    company-policy = {
+                      control = "substack";
+                      modulePath = "company-policy";
+                      order = 10000;
+                    };
+                    login = {
                       control = "substack";
                       modulePath = "login";
                       order = 10100;
-                    };
-                    "aa-second" = {
-                      control = "substack";
-                      modulePath = "login";
-                      order = 10500;
                     };
                   };
                   services.irlume = {
@@ -162,7 +158,7 @@
                     pam.services = {
                       sddm = { }; # substack architecture
                       login = { }; # flat tty chain
-                      "irlume-two-substacks" = { }; # synthetic multi-substack
+                      "irlume-policy-then-login" = { };
                     };
                   };
                 }
@@ -180,7 +176,45 @@
               in found;
             sddmText = sysSddm.config.security.pam.services.sddm.text;
             loginText = sysSddm.config.security.pam.services.login.text;
-            twoSubstacksText = sysSddm.config.security.pam.services.irlume-two-substacks.text;
+            policyThenLoginText = sysSddm.config.security.pam.services.irlume-policy-then-login.text;
+            # Pure placement unit tests: every rejection returns ok = false
+            # instead of throwing, so no tryEval is needed.
+            placement = import ./nix/lib.nix { inherit lib; };
+            r =
+              n: o: placement.computePlacement { profile = n; others = o; };
+            sub = name: order: { inherit name order; control = "substack"; modulePath = name; enable = true; };
+            plain = name: control: modulePath: order: { inherit name control modulePath order; enable = true; };
+            sddmShape = [ (sub "login" 10100) ];
+            policyFirst = [
+              (sub "company-policy" 10000)
+              (sub "login" 10100)
+            ];
+            flatShape = [
+              (plain "unix-early" "optional" "/lib/security/pam_unix.so" 11700)
+              (plain "kwallet" "optional" "/lib/security/pam_kwallet5.so" 12100)
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 12900)
+              (plain "deny" "required" "/lib/security/pam_deny.so" 13700)
+            ];
+            ambiguous = [
+              (sub "foo-policy" 10000)
+              (sub "bar-auth" 10100)
+            ];
+            jumpBreaker = [
+              (plain "gate" "[success=1 default=ignore]" "/lib/security/pam_succeed_if.so" 10000)
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+            ];
+            occupied = [
+              (plain "rootok" "sufficient" "/lib/security/pam_rootok.so" 10099)
+              (sub "login" 10100)
+            ];
+            tie = [
+              (plain "other" "optional" "/lib/security/pam_env.so" 10100)
+              (sub "login" 10100)
+            ];
+            gatedInner = n: [
+              (plain "nologin" "required" "/lib/security/pam_nologin.so" 10000)
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+            ];
           in
           # Login greeters keep the keyring in the stack; lock screens grant
           # outright; text-mode greeters force pam_kwallet to run.
@@ -215,10 +249,27 @@
           assert (lineIndexOf loginText "pam_irlume.so unseal") + 1 == (lineIndexOf loginText "pam_unix.so likeauth nullok");
           assert !(lib.strings.hasInfix "pam_permit.so" loginText);
           assert (lineIndexOf loginText "pam_unix.so likeauth nullok") < (lineIndexOf loginText "pam_kwallet5.so");
-          # With several substacks, the face line precedes the earliest one
-          # in rendered order, not the alphabetically first attribute.
-          assert (lineIndexOf twoSubstacksText "pam_irlume.so unseal") + 1 == (lineIndexOf twoSubstacksText "# zz-first");
-          assert (lineIndexOf twoSubstacksText "pam_irlume.so unseal") < (lineIndexOf twoSubstacksText "# aa-second");
+          # With a policy substack ahead of the known password substack, the
+          # face line anchors on the password stack (here `login`), and the
+          # policy still renders ABOVE the face line, so a face success never
+          # skips it.
+          assert (lineIndexOf policyThenLoginText "substack company-policy") != -1;
+          assert (lineIndexOf policyThenLoginText "substack company-policy") < (lineIndexOf policyThenLoginText "pam_irlume.so unseal");
+          assert (lineIndexOf policyThenLoginText "pam_irlume.so unseal") + 1 == (lineIndexOf policyThenLoginText "substack login");
+          assert (lineIndexOf policyThenLoginText "substack login") + 1 == (lineIndexOf policyThenLoginText "pam_permit.so");
+          # Placement unit tests: the accepted shapes compute their slots and
+          # every unsafe layout is rejected with a reason (ok = false), which
+          # the module turns into an evaluation error.
+          assert (r "login" sddmShape).ok && (r "login" sddmShape).unsealOrder == 10050 && (r "login" sddmShape).landingEnable && (r "login" sddmShape).landingOrder == 10150;
+          assert (r "login" policyFirst).ok && (r "login" policyFirst).unsealOrder == 10099;
+          assert (r "login" flatShape).ok && (r "login" flatShape).unsealOrder == 11650 && !(r "login" flatShape).landingEnable;
+          assert (r "lock" flatShape).ok && (r "lock" flatShape).unsealOrder == 11000 && !(r "lock" flatShape).landingEnable;
+          assert !(r "login" ambiguous).ok;
+          assert builtins.isString (r "login" ambiguous).reason;
+          assert !(r "login" jumpBreaker).ok;
+          assert !(r "login" occupied).ok;
+          assert !(r "login" tie).ok;
+          assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = gatedInner; }).ok;
           assert sys.config.systemd.services.irlumed.environment.IRLUME_SOCKET == "/run/irlume.sock";
           # These shipped PAD cues default to /etc/irlume in the daemon.
           # A NixOS service must resolve them from its selected package too.

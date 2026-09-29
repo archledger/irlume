@@ -405,6 +405,11 @@ be recorded when the candidate is approved for release.
 
 ### Fixed
 
+- Update the transitive `chacha20` dependency to 0.10.2 so the RNG's SSE2
+  fallback uses only SSE2 instructions. The previous 0.10.1 pin used an
+  SSE4.1 intrinsic on that path and was yanked upstream
+  ([RustCrypto/stream-ciphers#580](https://github.com/RustCrypto/stream-ciphers/pull/580)).
+
 - Both AppArmor profiles allow ONNX Runtime to enumerate PCI devices while
   the daemon loads models, removing the startup denial for
   `/sys/bus/pci/devices/` (#925).

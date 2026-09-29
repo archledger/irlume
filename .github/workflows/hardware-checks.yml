@@ -26,7 +26,8 @@ jobs:
   hardware:
     name: hardware checks (real TPM, pinned TFLite runtime)
     # Every runner with the `ci` label carries a real TPM and the pinned
-    # runtime, so whichever is free takes it (minihost alone since 2026-09-28).
+    # runtime, so whichever is free takes it (minihost, or archhost since
+    # 2026-09-29).
     runs-on: [self-hosted, ci]
     timeout-minutes: 30
     steps:

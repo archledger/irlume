@@ -15,9 +15,10 @@ carries that release's version label.
    not close a full-suite failure. Audit failed, cancelled and skipped jobs;
    resolve actual failures without lowering floors or removing tests.
 3. Check the permanent runner-health monitor, GitHub runner status and the handoff
-   for minihost, the only self-hosted runner since archhost's was removed on
-   2026-09-28. Trusted hardware jobs select runners by capability labels, so a
-   runner added later with the same labels can accept them. Fork PR jobs stay hosted.
+   for both self-hosted runners: minihost, and archhost (re-qualified on
+   NixOS 2026-09-29 with the same capability labels). Trusted hardware jobs
+   select runners by capability labels, so either can accept them. Fork PR
+   jobs stay hosted.
 4. Build the actual Debian, Arch, Fedora and Nix outputs for the channels being
    released. Inspect package contents, ownership, runtime dependencies and version
    metadata. The recipe parity script checks declarations; it does not replace

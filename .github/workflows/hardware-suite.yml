@@ -1,6 +1,7 @@
-# Nightly hardware-in-the-loop suite on the self-hosted runner carrying the
-# `ir-camera` label (minihost, with the NexiGo N930W), with a real TPM at
-# /dev/tpmrm0 via the tss group
+# Nightly hardware-in-the-loop suite on the self-hosted runners carrying the
+# `ir-camera` label (minihost, with the NexiGo N930W; or archhost, NixOS since
+# 2026-09-29, with the Logitech BRIO), with a real TPM at /dev/tpmrm0 via the
+# tss group
 # and an IR camera via the video group. Software fakes have proven blind spots:
 # the Tier-1 signed-PCR bug passed swtpm-based CI completely and only failed
 # on a real TPM, and the camera paths excluded from coverage are exactly the
@@ -49,7 +50,7 @@ jobs:
       - name: Fetch model weights (models-v1 release, sha256-verified)
         run: bash scripts/fetch-models.sh
 
-      - name: build (system rust, rolling Arch)
+      - name: build (system rust, self-hosted)
         run: cargo build --workspace --locked
 
       # Guarded because `cargo test` exits 0 even when it discovers no tests at

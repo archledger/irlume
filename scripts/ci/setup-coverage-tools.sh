@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright the irlume contributors.
-# Prepare coverage on a rolling-Arch runner without changing its user tools.
+# Prepare coverage on a self-hosted runner without changing its user tools.
 set -euo pipefail
 : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
 : "${GITHUB_ENV:?GITHUB_ENV is required}"

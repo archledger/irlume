@@ -10,12 +10,16 @@ import pwd
 import re
 import resource
 import secrets
+import socket
 import stat
 import subprocess
+import sys
+import time
 
 USER = "irlume-recovery-test"
 HELPER = Path("/run/irlume-recovery/irlume-password-verify")
 SERVICE = Path("/etc/pam.d/irlume-retry-reset")
+PASSWORD = Path("/run/irlume-recovery-test-password")
 
 
 def run(argv, *, data=None, account=None):
@@ -54,6 +58,39 @@ def protected(path, mode):
         require(info.st_uid == 0 and info.st_mode & 0o022 == 0, "untrusted recovery ancestry")
 
 
+def ready():
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.settimeout(min(2, max(0.1, deadline - time.monotonic())))
+            peer.connect("/run/irlume.sock")
+            peer.sendall(b'"Ping"\n')
+            response = bytearray()
+            while b"\n" not in response and len(response) < 256:
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, "daemon readiness deadline exceeded")
+                peer.settimeout(min(2, remaining))
+                block = peer.recv(256 - len(response))
+                if not block:
+                    break
+                response.extend(block)
+        if bytes(response).strip() == b'"Pong"':
+            return
+        require(json.loads(response) == {"Ok": "starting"}, "unexpected daemon readiness response")
+        time.sleep(0.25)
+    raise RuntimeError("daemon readiness deadline exceeded")
+
+
+def reset_roundtrip(account, password, strikes, budget):
+    reset = ["irlume", "retry", "reset", "--user", USER]
+    require(run(reset, data="wrong-" + password + "\n", account=account).returncode == 1,
+            "wrong password was not normally refused")
+    status(account, strikes, budget, 1)
+    require(run(reset, data=password + "\n", account=account).returncode == 0,
+            "correct password reset failed")
+    status(account, 0, 0, 0)
+
+
 def main():
     require(os.geteuid() == 0, "guest root required")
     require(run(["systemd-detect-virt"]).stdout.strip() in ("qemu", "kvm"), "QEMU required")
@@ -63,7 +100,27 @@ def main():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     os.umask(0o077)
     account = pwd.getpwnam(USER)
+    mode = sys.argv[1] if len(sys.argv) == 2 else "normal"
+    require(mode in ("normal", "missing", "restored"), "unknown test phase")
+    if mode != "normal":
+        ready()
+        password = PASSWORD.read_text()
+        if mode == "missing":
+            require(not HELPER.exists(), "missing package retained a stale verifier")
+            status(account, 0, 0, 0, available=False)
+            require(run(["irlume", "retry", "reset", "--user", USER],
+                        data=password + "\n", account=account).returncode == 1,
+                    "missing verifier allowed a password reset")
+            status(account, 0, 0, 0, available=False)
+        else:
+            protected(HELPER, 0o755)
+            status(account, 0, 0, 0)
+            reset_roundtrip(account, password, 0, 0)
+        print(f"PASS: daemon ready and recovery behavior correct for {mode} helper")
+        return
     password = secrets.token_urlsafe(36)
+    with PASSWORD.open("x") as stream:
+        stream.write(password)
     require(run(["chpasswd"], data=f"{USER}:{password}\n").returncode == 0, "password setup failed")
     retry = Path("/var/lib/irlume/retry")
     retry.mkdir(mode=0o700, exist_ok=True)
@@ -108,13 +165,7 @@ def main():
             path.chmod(mode)
         status(account, 2, 7, 0)
 
-    reset = ["irlume", "retry", "reset", "--user", USER]
-    require(run(reset, data="wrong-" + password + "\n", account=account).returncode == 1,
-            "wrong password was not normally refused")
-    status(account, 2, 7, 1)
-    require(run(reset, data=password + "\n", account=account).returncode == 0,
-            "correct password reset failed")
-    status(account, 0, 0, 0)
+    reset_roundtrip(account, password, 2, 7)
     print("PASS: trusted Nix recovery inputs, unsafe-mode refusal, wrong/correct password reset")
 
 

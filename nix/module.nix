@@ -256,7 +256,14 @@ in
       # that trust check. A service restart replaces it with this generation's
       # helper; RuntimeDirectory removes it when the service stops.
       preStart = ''
-        ${pkgs.coreutils}/bin/install -m0755 ${cfg.package}/libexec/irlume-password-verify /run/irlume-recovery/irlume-password-verify
+        if [ -e ${cfg.package}/libexec/irlume-password-verify ]; then
+          ${pkgs.coreutils}/bin/install -m0755 ${cfg.package}/libexec/irlume-password-verify /run/irlume-recovery/irlume-password-verify
+        else
+          # Older or custom package overrides may omit optional recovery.
+          # Never reuse a verifier left by a different selected package.
+          ${pkgs.coreutils}/bin/rm -f /run/irlume-recovery/irlume-password-verify
+          echo "irlumed: selected package has no password verifier; self-service recovery unavailable" >&2
+        fi
       '';
       serviceConfig = {
         Type = "simple";

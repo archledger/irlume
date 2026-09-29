@@ -109,18 +109,26 @@ services.irlume.pam.services.my-custom-locker.profile = "lock";
 
 ### Where the face line goes
 
-The module renders the same three-part block `irlume login enable` writes
-on FHS distros: the face line, the rule its success jumps over, and a
-`pam_permit.so` landing that catches the jump. Current nixpkgs renders
-SDDM's authentication as `substack login` rather than a flat module chain,
-so for such a service the face line goes before the substack and the
-landing after it: an empty Enter runs the face scan first, a face success
-jumps over the whole substack (whose `pam_unix` would fail on that same
-empty password) and lands on the permit, and the login grants. On a flat
-chain the face line sits after the password prompt and before the keyring
-module, with the landing directly after the jump, so `pam_kwallet` and the
-`try_first_pass` `pam_unix` still see the released token. Lock screens
-stay a single `sufficient` line with no landing.
+The module renders the jump form FHS distros get from
+`irlume login enable`: the face line's success skips exactly one rule, so
+its placement is derived from the neighbouring rules and the module fails
+evaluation when no adjacent slot is free. Current nixpkgs renders SDDM's
+authentication as `substack login` rather than a flat module chain, and for
+such a service the face line goes immediately before that substack with a
+`pam_permit.so` landing immediately after it: an empty Enter runs the face
+scan first, a face success jumps over the whole substack (whose `pam_unix`
+would fail on that same empty password) and lands on the permit, and the
+login grants; the required-by-default substack keeps a failed password
+attempt fatal, so the permit cannot authenticate a failure. On a flat chain
+the face line sits immediately before the password-prompting `pam_unix`
+and no landing is rendered: the jump skips that prompt, and the keyring
+module plus the `try_first_pass` `pam_unix` still see the released token.
+Lock screens stay a single `sufficient` line.
+
+A flat chain with only one `pam_unix` (no keyring or second-unix trigger
+in its stack) cannot complete a greeter face grant: the jump would skip
+the only rule that grants. A face attempt there still verifies and falls
+back to the password.
 
 ## PAM changes go through the module
 

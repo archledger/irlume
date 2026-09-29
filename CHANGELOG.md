@@ -18,14 +18,18 @@ All notable changes to irlume are documented here. This project adheres to
   comments, remain refused (#931).
 - The NixOS module renders its login-profile PAM wiring against current
   nixpkgs, where SDDM's authentication `substack`s the `login` service
-  instead of listing the module chain. The face line now precedes that
-  substack and a `pam_permit.so` landing follows it, mirroring the block
-  `irlume login enable` writes on FHS distros, so an empty-Enter face
-  attempt at the greeter completes the login instead of failing after the
-  daemon already matched the face and unsealed the password. Flat login
-  chains keep the line after the password prompt and before the keyring
-  module. Found in live NixOS 26.05 acceptance: the lock screen worked,
-  the greeter fell back to the password after a 0.93-score match.
+  instead of listing the module chain. The face line now sits immediately
+  before that substack with a `pam_permit.so` landing immediately after
+  it, mirroring the block `irlume login enable` writes on FHS distros, so
+  an empty-Enter face attempt at the greeter completes the login instead
+  of failing after the daemon already matched the face and unsealed the
+  password. Flat login chains place the face line immediately before the
+  password prompt and render no landing. Placement slots are derived from
+  the neighbouring rules, and with several substacks the face line
+  precedes the earliest one in rendered order; evaluation fails when no
+  adjacent slot is free rather than skipping a load-bearing rule. Found
+  in live NixOS 26.05 acceptance: the lock screen worked, the greeter
+  fell back to the password after a 0.93-score match.
 
 ## [0.15.0] - 2026-09-29
 

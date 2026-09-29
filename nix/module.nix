@@ -16,11 +16,13 @@
 ##     still runs and unseals the wallet, and pam_unix grants on the token the
 ##     daemon unsealed. `sufficient` would short-circuit past the keyring and
 ##     leave the session with a locked wallet. A pam_permit landing rule
-##     catches the jump; on services whose auth nixpkgs renders as a
-##     `substack` (SDDM on current nixpkgs) the face line goes before that
-##     substack and the landing after it, so a face success skips the whole
-##     substack, whose pam_unix would fail on the empty Enter that armed the
-##     face scan.
+##     catches the jump on services whose auth nixpkgs renders as a
+##     `substack` (SDDM on current nixpkgs); there the face line goes
+##     immediately before that substack and the landing immediately after it,
+##     so a face success skips the whole substack, whose pam_unix would fail
+##     on the empty Enter that armed the face scan. Flat chains get no
+##     landing; the face line goes immediately before the password-prompting
+##     pam_unix instead.
 ##
 ##   * A lock screen (kde, swaylock, hyprlock) gets `sufficient`. The wallet is
 ##     already open in the live session, so there is no keyring handoff to make;
@@ -119,41 +121,103 @@ let
   # Turn one opted-in service into its NixOS PAM auth rules.
   #
   # A lock screen stays one `sufficient` line: the wallet is already open and
-  # the unlock grants outright. A login greeter needs the jump form plus a
-  # `pam_permit` landing, mirroring the block `irlume login enable` writes on
-  # FHS distros (crates/irlume-cli/src/pamwire.rs): the face success skips
-  # exactly one rule, and that rule must be a harmless permit, never
-  # something load-bearing.
+  # the unlock grants outright. A login greeter needs the jump form, mirroring
+  # the block `irlume login enable` writes on FHS distros
+  # (crates/irlume-cli/src/pamwire.rs): the face success skips exactly one
+  # rule, and that rule must be a harmless one, never something load-bearing.
   #
   # Current nixpkgs renders SDDM's auth as `substack login` rather than a
-  # flat module chain. On that architecture the unseal line goes BEFORE the
-  # substack and the landing AFTER it: an empty Enter at the greeter runs the
-  # face scan first, and a face success jumps over the whole substack (whose
-  # pam_unix would fail on that same empty password) and lands on the permit,
-  # so the login still grants. On a flat chain the unseal line sits after the
-  # password prompt (nixpkgs' unix-early, order 11700) and before the keyring
-  # module (12100), with the landing directly after the jump, so pam_kwallet
-  # and the try_first_pass pam_unix still see the released token.
+  # flat module chain. On that architecture the unseal line goes IMMEDIATELY
+  # before that substack and a `pam_permit` landing IMMEDIATELY after it: an
+  # empty Enter at the greeter runs the face scan first, and a face success
+  # jumps over the whole substack (whose pam_unix would fail on that same
+  # empty password) and lands on the permit, so the login still grants; the
+  # required-by-default substack keeps a failed password attempt fatal, so
+  # the permit cannot authenticate a failure. Strict adjacency matters: any
+  # rule left in the jump's path would be skipped instead of the substack,
+  # bypassing a gate such as pam_nologin, so the order slots are derived from
+  # the neighbouring rules and evaluation fails when no adjacent slot is
+  # free. On a flat chain the unseal line sits immediately before the
+  # password-prompting pam_unix, and NO landing is rendered: the jump skips
+  # that prompt, and pam_kwallet plus the try_first_pass pam_unix still see
+  # the released token, while an optional permit on the failure path would
+  # become a deny-less stack's only success.
   #
   # Reading the service's own rules minus ours cannot recurse: attribute
   # names are strict, but removeAttrs leaves the filtered values lazy.
+  svcOthers =
+    name:
+    removeAttrs (config.security.pam.services.${name}.rules.auth or { }) [
+      "irlume"
+      "irlume-landing"
+    ];
+
+  svcEnabledOthers =
+    name: lib.filter (r: r.enable) (lib.attrValues (svcOthers name));
+
+  # The earliest substack in RENDERED order, not attribute-name order:
+  # lib.attrValues iterates by name, so a lowest-order substack with a later
+  # name would otherwise be skipped past.
   svcSubstackOrder =
     name:
     let
-      others = removeAttrs (config.security.pam.services.${name}.rules.auth or { }) [
-        "irlume"
-        "irlume-landing"
-      ];
-      substacks = lib.filter (r: r.enable && r.control == "substack") (lib.attrValues others);
+      orders = lib.map (r: r.order) (
+        lib.filter (r: r.control == "substack") (svcEnabledOthers name)
+      );
     in
-    if substacks == [ ] then null else (lib.head substacks).order;
+    if orders == [ ] then null else lib.foldl' lib.min (lib.head orders) (lib.tail orders);
 
-  flatUnsealOrder = 11800;
-  flatLandingOrder = 11850;
+  # The earliest password-prompting rule a flat chain's face line must
+  # precede so the jump skips the prompt itself.
+  svcFirstUnixOrder =
+    name:
+    let
+      orders = lib.map (r: r.order) (
+        lib.filter (r: lib.hasSuffix "pam_unix.so" r.modulePath) (svcEnabledOthers name)
+      );
+    in
+    if orders == [ ] then null else lib.foldl' lib.min (lib.head orders) (lib.tail orders);
+
+  # An order slot directly before `target`, keeping strict adjacency to it.
+  # A default gap of 50 when nothing renders below; an error when another
+  # enabled rule occupies the adjacent slot, because the jump would then skip
+  # that rule instead of the intended one.
+  slotBefore =
+    name: target:
+    let
+      below = lib.filter (r: r.order < target) (svcEnabledOthers name);
+      maxBelow = lib.foldl' (acc: r: if acc == null || r.order > acc then r.order else acc) null below;
+    in
+    if maxBelow == null then
+      target - 50
+    else if maxBelow < target - 1 then
+      target - 1
+    else
+      throw "services.irlume.pam.services.${name}: another auth rule (order ${toString maxBelow}) occupies the order slot directly below ${toString target}, so the face line cannot be placed adjacently; move that rule or wire ${name} manually.";
+
+  # An order slot directly after `target`, same rules.
+  slotAfter =
+    name: target:
+    let
+      above = lib.filter (r: r.order > target) (svcEnabledOthers name);
+      minAbove = lib.foldl' (acc: r: if acc == null || r.order < acc then r.order else acc) null above;
+    in
+    if minAbove == null then
+      target + 50
+    else if minAbove > target + 1 then
+      target + 1
+    else
+      throw "services.irlume.pam.services.${name}: another auth rule (order ${toString minAbove}) occupies the order slot directly above ${toString target}, so the permit landing cannot be placed adjacently; move that rule or wire ${name} manually.";
 
   mkAuthRules =
     name: svc:
-    let substackOrder = svcSubstackOrder name;
+    let
+      substackOrder = svcSubstackOrder name;
+      firstUnixOrder = svcFirstUnixOrder name;
+      # No mkIf here: a condition that reads this same option's merge would
+      # force itself while the module system filters conditional definitions,
+      # so the landing disables itself through its own `enable` instead.
+      landing = svc.profile == "login" && substackOrder != null;
     in
     {
       irlume = {
@@ -161,17 +225,23 @@ let
         modulePath = pamModule;
         args = pamArgs;
         order =
+          # A lock screen grants outright at its own line; adjacency and the
+          # slots below exist only for the login jump, so keep the fixed
+          # order and never throw over a lock stack's shape.
           if svc.profile == "lock" then
             11000
           else if substackOrder != null then
-            substackOrder - 50
+            slotBefore name substackOrder
+          else if firstUnixOrder != null then
+            slotBefore name firstUnixOrder
           else
-            flatUnsealOrder;
+            11000;
       };
-      irlume-landing = lib.mkIf (svc.profile == "login") {
+      irlume-landing = {
+        enable = landing;
         control = "optional";
         modulePath = "${config.security.pam.package}/lib/security/pam_permit.so";
-        order = if substackOrder != null then substackOrder + 50 else flatLandingOrder;
+        order = if substackOrder != null then slotAfter name substackOrder else 11000;
       };
     };
 

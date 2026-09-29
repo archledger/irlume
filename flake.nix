@@ -141,11 +141,28 @@
                   # Give the flat `login` chain a keyring rule so the
                   # placement assertions exercise the real anchor shape.
                   security.pam.services.login.kwallet.enable = true;
+                  # A synthetic service with two substacks whose attribute
+                  # names invert their rendered order: the face line must
+                  # sit before the earliest RENDERED substack, not the
+                  # alphabetically first attribute.
+                  security.pam.services.irlume-two-substacks.rules.auth = {
+                    "zz-first" = {
+                      control = "substack";
+                      modulePath = "login";
+                      order = 10100;
+                    };
+                    "aa-second" = {
+                      control = "substack";
+                      modulePath = "login";
+                      order = 10500;
+                    };
+                  };
                   services.irlume = {
                     enable = true;
                     pam.services = {
                       sddm = { }; # substack architecture
                       login = { }; # flat tty chain
+                      "irlume-two-substacks" = { }; # synthetic multi-substack
                     };
                   };
                 }
@@ -153,14 +170,17 @@
             };
             lineIndexOf = text: needle:
               let
-                lines = builtins.split "\n" text;
+                # builtins.split interleaves null separators; drop them so
+                # indices count rendered lines and adjacency means +1.
+                lines = lib.filter builtins.isString (builtins.split "\n" text);
                 found = lib.lists.findFirstIndex
-                  (l: builtins.isString l && lib.strings.hasInfix needle l)
+                  (l: lib.strings.hasInfix needle l)
                   (-1)
                   lines;
               in found;
             sddmText = sysSddm.config.security.pam.services.sddm.text;
             loginText = sysSddm.config.security.pam.services.login.text;
+            twoSubstacksText = sysSddm.config.security.pam.services.irlume-two-substacks.text;
           in
           # Login greeters keep the keyring in the stack; lock screens grant
           # outright; text-mode greeters force pam_kwallet to run.
@@ -173,25 +193,32 @@
           assert authCtl "kde" == "sufficient";
           assert authCtl "swaylock" == "sufficient";
           assert authCtl "hyprlock" == "sufficient";
-          # Lock screens never get a landing rule; the sufficient grant needs
-          # no jump.
-          assert !(pam.kde.rules.auth ? "irlume-landing");
-          # SDDM: the unseal line precedes the login substack and the
-          # pam_permit landing follows it, so a face success jumps over the
-          # substack (whose pam_unix would fail on an empty password) and
-          # lands on the permit.
+          # Lock screens never get an enabled landing rule; the sufficient
+          # grant needs no jump.
+          assert !pam.kde.rules.auth.irlume-landing.enable;
+          # SDDM: the unseal line is immediately before the login substack
+          # and the pam_permit landing immediately after it, so a face
+          # success jumps over exactly that substack (whose pam_unix would
+          # fail on the empty Enter that armed the face scan) and lands on
+          # the permit. Strict adjacency: no other auth rule may sit in the
+          # jump's path.
           assert (lineIndexOf sddmText "pam_irlume.so unseal") != -1;
-          assert (lineIndexOf sddmText "pam_irlume.so unseal") < (lineIndexOf sddmText "substack login");
-          assert (lineIndexOf sddmText "pam_permit.so") > (lineIndexOf sddmText "substack login");
-          assert (lineIndexOf sddmText "[success=1 default=ignore]") < (lineIndexOf sddmText "substack login");
-          # A flat login chain keeps the irlume line after the password
-          # prompt (unix-early) and before the keyring module, with the
-          # permit landing directly after the jump, so kwallet and the
-          # try_first_pass unix still see the released token.
-          assert (lineIndexOf loginText "pam_unix.so likeauth nullok") < (lineIndexOf loginText "pam_irlume.so unseal");
-          assert (lineIndexOf loginText "pam_irlume.so unseal") < (lineIndexOf loginText "pam_kwallet5.so");
-          assert (lineIndexOf loginText "pam_irlume.so unseal") < (lineIndexOf loginText "pam_permit.so");
-          assert (lineIndexOf loginText "pam_permit.so") < (lineIndexOf loginText "pam_kwallet5.so");
+          assert (lineIndexOf sddmText "pam_irlume.so unseal") + 1 == (lineIndexOf sddmText "substack login");
+          assert (lineIndexOf sddmText "substack login") + 1 == (lineIndexOf sddmText "pam_permit.so");
+          # A flat login chain gets NO permit landing (the trailing required
+          # pam_deny makes an optional success on the failure path a
+          # bypass on deny-less stacks, and pamwire adds one only around
+          # substacks). The face line sits immediately before the password
+          # prompt (unix-early), so a face success skips that prompt and
+          # pam_kwallet and the try_first_pass pam_unix still see the
+          # released token.
+          assert (lineIndexOf loginText "pam_irlume.so unseal") + 1 == (lineIndexOf loginText "pam_unix.so likeauth nullok");
+          assert !(lib.strings.hasInfix "pam_permit.so" loginText);
+          assert (lineIndexOf loginText "pam_unix.so likeauth nullok") < (lineIndexOf loginText "pam_kwallet5.so");
+          # With several substacks, the face line precedes the earliest one
+          # in rendered order, not the alphabetically first attribute.
+          assert (lineIndexOf twoSubstacksText "pam_irlume.so unseal") + 1 == (lineIndexOf twoSubstacksText "# zz-first");
+          assert (lineIndexOf twoSubstacksText "pam_irlume.so unseal") < (lineIndexOf twoSubstacksText "# aa-second");
           assert sys.config.systemd.services.irlumed.environment.IRLUME_SOCKET == "/run/irlume.sock";
           # These shipped PAD cues default to /etc/irlume in the daemon.
           # A NixOS service must resolve them from its selected package too.

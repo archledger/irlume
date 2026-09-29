@@ -50,7 +50,7 @@ jobs:
       - name: Fetch model weights (models-v1 release, sha256-verified)
         run: bash scripts/fetch-models.sh
 
-      - name: build (system rust, rolling Arch)
+      - name: build (system rust, self-hosted)
         run: cargo build --workspace --locked
 
       # Guarded because `cargo test` exits 0 even when it discovers no tests at

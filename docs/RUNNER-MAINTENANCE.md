@@ -101,7 +101,7 @@ OOM killer. The runner service carries `OOMScoreAdjust=500` (drop-in
 `60-oom-score.conf`), so under memory pressure the kernel kills the CI build
 before the host's other services. If that signature appears in a
 hardware-checks or hardware-suite log, free memory on minihost, then rerun
-the failed job; archhost (30 GiB) can also take the lane — briefly stopping
+the failed job; archhost (30 GiB) can also take the lane: briefly stopping
 the minihost runner service moves the next job there.
 
 ## 4. Toolchain and PAM tools for the coverage lane
@@ -139,9 +139,15 @@ those paths and `flock -c` execs the invoking user's login shell.
 
 Two rules specific to that host:
 
-- Restart the runner service after every `nixos-rebuild switch`: the unit's
-  bind paths resolve `/run/current-system` when the unit starts, so a new
-  generation leaves the live runner looking at the old environment.
+- Restart the runner after every `nixos-rebuild switch`: the unit's bind
+  paths resolve `/run/current-system` when the unit starts, so a new
+  generation leaves the live runner looking at the old environment. The
+  NixOS module's unit is `github-runner-archhost.service` (not the
+  `actions.runner.*` name section 2 uses for the Arch runners):
+
+  ```sh
+  sudo systemctl restart github-runner-archhost.service
+  ```
 - The runner unit's systemd sandbox knobs (ProtectSystem, PrivateTmp,
   CapabilityBoundingSet, …) are deliberately relaxed: the module's defaults
   block the bubblewrap sandboxes and the setuid `sudo` the hardware lane

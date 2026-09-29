@@ -174,24 +174,30 @@ let
   # conditional definitions.
   placement = import ./lib.nix { inherit lib; };
 
+  # null for an unknown service: a delegation to it is a broken reference
+  # the password path would surface, so the placement treats it as
+  # unproven instead of scanning an empty rule list.
   svcRuleList =
     name:
-    lib.map
-      (r: {
-        name = r.name;
-        control = r.control;
-        modulePath = r.modulePath;
-        order = r.order;
-        enable = r.enable;
-      })
-      (
-        lib.attrValues (
-          removeAttrs (config.security.pam.services.${name}.rules.auth or { }) [
-            "irlume"
-            "irlume-landing"
-          ]
+    if builtins.hasAttr name config.security.pam.services then
+      lib.map
+        (r: {
+          name = r.name;
+          control = r.control;
+          modulePath = r.modulePath;
+          order = r.order;
+          enable = r.enable;
+        })
+        (
+          lib.attrValues (
+            removeAttrs (config.security.pam.services.${name}.rules.auth or { }) [
+              "irlume"
+              "irlume-landing"
+            ]
+          )
         )
-      );
+    else
+      null;
 
   mkAuthRules =
     name: svc:

@@ -23,10 +23,65 @@ let
     "login"
   ];
 
+  # The largest numeric action in a bracketed control: PAM allows any
+  # result token to carry a jump (`success=1`, `default = 2`, ...), with
+  # whitespace around the equals, so parse every word=N pair and take the
+  # largest jump any outcome can make.
   jumpSkip =
     control:
-    let m = builtins.match ".*success=([0-9]+).*" control;
-    in if m == null then 0 else lib.toInt (lib.head m);
+    let
+      bracket = builtins.match ".*[[](.*)[]].*" control;
+      tokens = lib.optionals (bracket != null) (
+        lib.filter builtins.isString (builtins.split "[[:space:]]+" (lib.head bracket))
+      );
+      isWord = t: builtins.match "^[a-zA-Z_]+$" t != null;
+      isNum = t: builtins.match "^[0-9]+$" t != null;
+      # `word = n` and its one-sided spacings split into separate tokens,
+      # so pair them with a state walk, then keep the word=n results.
+      stepped =
+        lib.foldl'
+          (
+            { st, out }:
+            t:
+            if st ? w then
+              (
+                if isNum t then
+                  { st = null; out = out ++ [ "${st.w}=${t}" ]; }
+                else
+                  { st = if isWord t then t else null; inherit out; }
+              )
+            else if st != null then
+              (
+                if t == "=" then
+                  { st = { w = st; }; inherit out; }
+                else
+                  { st = if isWord t then t else null; inherit out; }
+              )
+            else
+              (
+                if builtins.match "^[a-zA-Z_]+=[0-9]+$" t != null then
+                  {
+                    st = null;
+                    out = out ++ [ t ];
+                  }
+                else
+                  {
+                    st = if isWord t then t else null;
+                    inherit out;
+                  }
+              )
+          )
+          {
+            st = null;
+            out = [ ];
+          }
+          tokens;
+      jumps =
+        lib.map
+          (pair: lib.toInt (lib.elemAt (builtins.match "^[a-zA-Z_]+=([0-9]+)$" pair) 0))
+          stepped.out;
+    in
+    if jumps == [ ] then 0 else lib.foldl' lib.max (lib.head jumps) (lib.tail jumps);
 
   # Refuse to insert inside another rule's numeric jump window: the
   # insertion would silently change what that rule skips.
@@ -83,51 +138,72 @@ let
     else
       { slot = anchor.order + 1; };
 
-  # Required gates (pam_nologin, pam_faillock, an access gate) inside the
-  # substack the jump would skip must never be bypassed by a face success;
-  # a required pam_deny is the stack's own refusal terminator. Delegation
-  # (`substack` or `include` naming another service) is followed
-  # recursively with a cycle guard; a delegation by file path cannot be
-  # resolved here and marks the layout unproven.
-  substackGate =
+  # Inspect the stack the face success would skip. Three questions, one
+  # recursive traversal (delegation via `substack`/`include` naming another
+  # service is followed with a cycle guard):
+  #   gate:        a required/requisite rule that is not pam_deny and would
+  #                never run on a face login (pam_nologin, pam_faillock, an
+  #                access gate);
+  #   unproven:    a layout this cannot reason about: a bracketed extended
+  #                control (it may encode a fatal action), a delegation by
+  #                file path, a delegation cycle, or a delegation to an
+  #                unknown service (a broken reference the password path
+  #                would surface but the face path would skip past);
+  #   sawRequired: any required/requisite rule exists, so a failed password
+  #                leaves a fatal failure behind (pam_deny counts: it is the
+  #                refusal terminator); without one, an optional permit
+  #                landing after the substack would be a wrong password's
+  #                only success.
+  scanStack =
     { innerOf, seen, rules }:
     let
-      direct =
+      enabled = lib.filter (r: r.enable) rules;
+      bracketed = lib.findFirst (r: lib.hasPrefix "[" r.control) null enabled;
+      gate =
         lib.findFirst
           (
             r:
-            r.enable
-            && (r.control == "required" || r.control == "requisite")
+            (r.control == "required" || r.control == "requisite")
             && !(lib.hasSuffix "pam_deny.so" r.modulePath)
           )
           null
-          rules;
+          enabled;
+      sawRequired =
+        lib.any (r: r.control == "required" || r.control == "requisite") enabled;
       delegations =
-        lib.filter
-          (r: r.enable && (r.control == "substack" || r.control == "include"))
-          rules;
+        lib.filter (r: r.control == "substack" || r.control == "include") enabled;
       walk =
         acc: r:
         if acc ? gate || acc ? unproven then
           acc
         else if lib.hasInfix "/" r.modulePath then
-          { unproven = "delegation by file path '${r.modulePath}' cannot be inspected"; }
+          acc // { unproven = "delegation by file path '${r.modulePath}' cannot be inspected"; }
         else if lib.elem r.modulePath seen then
-          { unproven = "delegation cycle through '${r.modulePath}'"; }
+          acc // { unproven = "delegation cycle through '${r.modulePath}'"; }
         else
           (
-            let deeper = substackGate {
-              inherit innerOf;
-              rules = innerOf r.modulePath;
-              seen = seen ++ [ r.modulePath ];
-            };
-            in if deeper == null then acc else deeper
+            let inner = innerOf r.modulePath;
+            in
+            if inner == null then
+              acc // { unproven = "delegation to unknown service '${r.modulePath}'"; }
+            else
+              (
+                let deeper = scanStack {
+                  inherit innerOf;
+                  rules = inner;
+                  seen = seen ++ [ r.modulePath ];
+                };
+                in acc // { inherit (deeper) sawRequired; } // lib.optionalAttrs (deeper ? gate) { gate = deeper.gate; } // lib.optionalAttrs (deeper ? unproven) { unproven = deeper.unproven; }
+              )
           );
-      folded = lib.foldl' walk { } delegations;
+      folded = lib.foldl' walk { inherit sawRequired; } delegations;
     in
-    if direct != null then { gate = direct; }
-    else if folded ? gate || folded ? unproven then folded
-    else null;
+    if bracketed != null then
+      folded // { unproven = "rule '${bracketed.name}' uses the extended control '${bracketed.control}'"; }
+    else if gate != null then
+      folded // { gate = gate; }
+    else
+      folded;
 in
 {
   inherit passwordStackNames;
@@ -181,7 +257,12 @@ in
           reject "several auth substacks and not exactly one known password stack (${lib.concatStringsSep ", " passwordStackNames}) among them"
         else
           let
-            gateResult = substackGate { inherit innerOf; seen = [ anchor.modulePath ]; rules = innerOf anchor.modulePath; };
+            anchorInner = innerOf anchor.modulePath;
+            gateResult =
+              if anchorInner == null then
+                { unproven = "delegation to unknown service '${anchor.modulePath}'"; }
+              else
+                scanStack { inherit innerOf; seen = [ anchor.modulePath ]; rules = anchorInner; };
             before = slotBefore { rendered = rendered; anchor = anchor; };
             after = slotAfter { rendered = rendered; anchor = anchor; };
             beforeBreaker =
@@ -192,7 +273,9 @@ in
           if gateResult ? gate then
             reject "the '${anchor.modulePath}' stack the face success would skip contains the required rule '${gateResult.gate.name}', which would never run on a face login"
           else if gateResult ? unproven then
-            reject "the '${anchor.modulePath}' stack delegates in a way that cannot be proven safe (${gateResult.unproven})"
+            reject "the '${anchor.modulePath}' stack cannot be proven safe: ${gateResult.unproven}"
+          else if !gateResult.sawRequired then
+            reject "the '${anchor.modulePath}' stack has no required rule, so a failed password would leave no fatal failure and the permit landing could authenticate it"
           else if before ? bad then
             reject before.bad
           else if after ? bad then

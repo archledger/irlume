@@ -133,11 +133,13 @@ Evaluation refuses, instead of rendering a broken stack: substacks
 without exactly one known password stack among them (a lone unrecognized
 substack may be a policy stack, not a password carrier), an order slot
 another rule occupies or shares, a numeric jump on an existing rule whose
-destination the new rules would change (including landing exactly on it),
-and a required gate (such as `pam_nologin` or `pam_faillock`) inside the
-substack the jump would skip or behind a nested `include`/`substack`
-delegation of it (a delegation this cannot resolve is refused as
-unproven).
+destination the new rules would change (any `word = N` action in a
+bracketed control, including landing exactly on it), a required gate
+(such as `pam_nologin` or `pam_faillock`) inside the substack the jump
+would skip or behind a nested `include`/`substack` delegation of it, an
+extended control or a delegation that cannot be resolved (by file path,
+cyclic, or to an unknown service), and a password stack with no required
+rule at all, where a failed password would leave no fatal failure behind.
 
 A flat chain with only one `pam_unix` (no keyring or second-unix trigger
 in its stack) cannot complete a greeter face grant: the jump would skip

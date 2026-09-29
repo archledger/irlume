@@ -32,7 +32,7 @@ All notable changes to irlume are documented here. This project adheres to
   position), or a required gate inside or behind the skipped substack.
   Found
   in live NixOS 26.05 acceptance: the lock screen worked, the greeter
-  fell back to the password after a 0.93-score match.
+  fell back to the password after a 0.93-score match (#955).
 
 ## [0.15.0] - 2026-09-29
 

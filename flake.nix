@@ -180,8 +180,16 @@
             # Pure placement unit tests: every rejection returns ok = false
             # instead of throwing, so no tryEval is needed.
             placement = import ./nix/lib.nix { inherit lib; };
+            # The accept-shape inner stack mirrors nixpkgs' login chain,
+            # whose required pam_deny makes a wrong password fatal.
+            defaultInner = sn: [
+              (plain "unix-early" "optional" "/lib/security/pam_unix.so" 11700)
+              (plain "kwallet" "optional" "/lib/security/pam_kwallet5.so" 12100)
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 12900)
+              (plain "deny" "required" "/lib/security/pam_deny.so" 13700)
+            ];
             r =
-              n: o: placement.computePlacement { profile = n; others = o; };
+              n: o: placement.computePlacement { profile = n; others = o; innerOf = defaultInner; };
             sub = name: order: { inherit name order; control = "substack"; modulePath = name; enable = true; };
             plain = name: control: modulePath: order: { inherit name control modulePath order; enable = true; };
             sddmShape = [ (sub "login" 10100) ];
@@ -232,6 +240,25 @@
                   (plain "nologin" "required" "/lib/security/pam_nologin.so" 10000)
                   (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
                 ];
+            bracketedGateInner = sn: [
+              (plain "allow" "[success=done default=die]" "/lib/security/pam_succeed_if.so" 10000)
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+              (plain "deny" "required" "/lib/security/pam_deny.so" 12000)
+            ];
+            noFatalInner = sn: [
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+              (plain "kwallet" "optional" "/lib/security/pam_kwallet5.so" 12000)
+            ];
+            jumpSpaced = [
+              (plain "gate" "[success = 1 default=ignore]" "/lib/security/pam_succeed_if.so" 10000)
+              (plain "filler" "optional" "/lib/security/pam_env.so" 10100)
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+            ];
+            jumpOnDefault = [
+              (plain "gate" "[success=ok default=1]" "/lib/security/pam_succeed_if.so" 10000)
+              (plain "filler" "optional" "/lib/security/pam_env.so" 10100)
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+            ];
           in
           # Login greeters keep the keyring in the stack; lock screens grant
           # outright; text-mode greeters force pam_kwallet to run.
@@ -294,6 +321,15 @@
           assert !(r "login" jumpLanding).ok;
           # A required gate behind a nested include is still found.
           assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = delegatingInner; }).ok;
+          # An extended control inside the skipped stack is unproven.
+          assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = bracketedGateInner; }).ok;
+          # A delegation to an unknown service is unproven, not empty-safe.
+          assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = sn: null; }).ok;
+          # A stack with no required rule cannot keep a wrong password fatal.
+          assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = noFatalInner; }).ok;
+          # Numeric jumps in spaced or non-success forms still parse.
+          assert !(r "login" jumpSpaced).ok;
+          assert !(r "login" jumpOnDefault).ok;
           assert sys.config.systemd.services.irlumed.environment.IRLUME_SOCKET == "/run/irlume.sock";
           # These shipped PAD cues default to /etc/irlume in the daemon.
           # A NixOS service must resolve them from its selected package too.

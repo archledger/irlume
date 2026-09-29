@@ -89,6 +89,7 @@
         # (what CI runs); the derivation itself is trivial to build.
         checks.irlume-module =
           let
+            lib = nixpkgs.lib;
             sys = nixpkgs.lib.nixosSystem {
               inherit system;
               modules = [
@@ -120,6 +121,46 @@
             pam = sys.config.security.pam.services;
             authCtl = svc: pam.${svc}.rules.auth.irlume.control;
             login = "[success=1 default=ignore]";
+            # Current nixpkgs renders SDDM's PAM as a `substack login` line
+            # (order 10100) instead of a flat module chain, so the module must
+            # place its unseal line before that substack and a pam_permit
+            # landing after it. Assert the rendered text on a system that
+            # actually enables SDDM; the minimal system above has no DM.
+            sysSddm = nixpkgs.lib.nixosSystem {
+              inherit system;
+              modules = [
+                ./nix/module.nix
+                {
+                  boot.loader.grub.enable = false;
+                  fileSystems."/" = {
+                    device = "/dev/sda1";
+                    fsType = "ext4";
+                  };
+                  system.stateVersion = "25.11";
+                  services.displayManager.sddm.enable = true;
+                  # Give the flat `login` chain a keyring rule so the
+                  # placement assertions exercise the real anchor shape.
+                  security.pam.services.login.kwallet.enable = true;
+                  services.irlume = {
+                    enable = true;
+                    pam.services = {
+                      sddm = { }; # substack architecture
+                      login = { }; # flat tty chain
+                    };
+                  };
+                }
+              ];
+            };
+            lineIndexOf = text: needle:
+              let
+                lines = builtins.split "\n" text;
+                found = lib.lists.findFirstIndex
+                  (l: builtins.isString l && lib.strings.hasInfix needle l)
+                  (-1)
+                  lines;
+              in found;
+            sddmText = sysSddm.config.security.pam.services.sddm.text;
+            loginText = sysSddm.config.security.pam.services.login.text;
           in
           # Login greeters keep the keyring in the stack; lock screens grant
           # outright; text-mode greeters force pam_kwallet to run.
@@ -132,6 +173,25 @@
           assert authCtl "kde" == "sufficient";
           assert authCtl "swaylock" == "sufficient";
           assert authCtl "hyprlock" == "sufficient";
+          # Lock screens never get a landing rule; the sufficient grant needs
+          # no jump.
+          assert !(pam.kde.rules.auth ? "irlume-landing");
+          # SDDM: the unseal line precedes the login substack and the
+          # pam_permit landing follows it, so a face success jumps over the
+          # substack (whose pam_unix would fail on an empty password) and
+          # lands on the permit.
+          assert (lineIndexOf sddmText "pam_irlume.so unseal") != -1;
+          assert (lineIndexOf sddmText "pam_irlume.so unseal") < (lineIndexOf sddmText "substack login");
+          assert (lineIndexOf sddmText "pam_permit.so") > (lineIndexOf sddmText "substack login");
+          assert (lineIndexOf sddmText "[success=1 default=ignore]") < (lineIndexOf sddmText "substack login");
+          # A flat login chain keeps the irlume line after the password
+          # prompt (unix-early) and before the keyring module, with the
+          # permit landing directly after the jump, so kwallet and the
+          # try_first_pass unix still see the released token.
+          assert (lineIndexOf loginText "pam_unix.so likeauth nullok") < (lineIndexOf loginText "pam_irlume.so unseal");
+          assert (lineIndexOf loginText "pam_irlume.so unseal") < (lineIndexOf loginText "pam_kwallet5.so");
+          assert (lineIndexOf loginText "pam_irlume.so unseal") < (lineIndexOf loginText "pam_permit.so");
+          assert (lineIndexOf loginText "pam_permit.so") < (lineIndexOf loginText "pam_kwallet5.so");
           assert sys.config.systemd.services.irlumed.environment.IRLUME_SOCKET == "/run/irlume.sock";
           # These shipped PAD cues default to /etc/irlume in the daemon.
           # A NixOS service must resolve them from its selected package too.

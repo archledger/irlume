@@ -86,19 +86,19 @@ sudo irlume keyring arm
 | `services.irlume.pam.services.<name>.profile` | auto | `"login"` or `"lock"`; override when a service name is not recognised. |
 
 ### How a service gets its control flag
-
 Name a PAM service under `pam.services` and the module classifies it:
 
 - Login greeters (`sddm`, `gdm-password`, `greetd`, `ly`, `login`) get
-  `[success=1 default=ignore]`. This records the face success but skips exactly
-  one rule, so `pam_kwallet` or `pam_gnome_keyring` still runs and unseals the
-  wallet, and `pam_unix` grants on the token the daemon unsealed. Plain
-  `sufficient` would short-circuit past the keyring and leave you with a locked
-  wallet after login.
+  `[success=1 default=ignore]`. This records the face success but skips
+  exactly one rule, so `pam_kwallet` or `pam_gnome_keyring` still runs and
+  unseals the wallet, and `pam_unix` grants on the token the daemon
+  unsealed. Plain `sufficient` would short-circuit past the keyring and
+  leave you with a locked wallet after login.
 - Lock screens (`kde`, `swaylock`, `hyprlock`, `gtklock`, `waylock`) get
-  `sufficient`. The wallet is already open in the live session, so there is no
-  keyring handoff; and `pam_unix` on a verify-only unlock cannot grant, so a
-  `success=1` jump would fall through to `pam_deny`. `sufficient` grants outright.
+  `sufficient`. The wallet is already open in the live session, so there
+  is no keyring handoff; and `pam_unix` on a verify-only unlock cannot
+  grant, so a `success=1` jump would fall through to `pam_deny`.
+  `sufficient` grants outright.
 
 A name the module does not recognise defaults to the login profile. Set
 `profile` yourself for anything unusual:
@@ -106,6 +106,21 @@ A name the module does not recognise defaults to the login profile. Set
 ```nix
 services.irlume.pam.services.my-custom-locker.profile = "lock";
 ```
+
+### Where the face line goes
+
+The module renders the same three-part block `irlume login enable` writes
+on FHS distros: the face line, the rule its success jumps over, and a
+`pam_permit.so` landing that catches the jump. Current nixpkgs renders
+SDDM's authentication as `substack login` rather than a flat module chain,
+so for such a service the face line goes before the substack and the
+landing after it: an empty Enter runs the face scan first, a face success
+jumps over the whole substack (whose `pam_unix` would fail on that same
+empty password) and lands on the permit, and the login grants. On a flat
+chain the face line sits after the password prompt and before the keyring
+module, with the landing directly after the jump, so `pam_kwallet` and the
+`try_first_pass` `pam_unix` still see the released token. Lock screens
+stay a single `sufficient` line with no landing.
 
 ## PAM changes go through the module
 
@@ -236,6 +251,16 @@ used a sealed login password, before irlume could seal a KDE wallet key or a
 GNOME keyring token (#253, #256). The matrix has not been re-run since against
 the current module, irlume or nixpkgs, so no row is a current result, and only
 the login password kind is supported (see "Keyring unlock").
+
+Live host checks on 2026-09-29 (NixOS 26.05, SDDM 0.21, Plasma 6.6, BRIO
+RGB+IR, irlume 0.15.0 from merged main) verified enrollment, camera
+qualification, the `kde` lock-screen face unlock, liveness rejections and the
+password fallback on every surface. SDDM greeter face login on that nixpkgs
+failed before this module rendered the substack-aware placement: the daemon
+matched the face (0.93) and unsealed the sealed password, but the old rule
+order could not complete the grant. The rendered layouts are asserted at
+eval time in the flake's `irlume-module` check; a live greeter re-test with
+the corrected placement is still pending.
 
 | Surface | Service | Control | Keyring backend | Result |
 | --- | --- | --- | --- | --- |

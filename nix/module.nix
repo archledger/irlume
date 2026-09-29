@@ -15,7 +15,12 @@
 ##     success but skips exactly one rule, so pam_kwallet / pam_gnome_keyring
 ##     still runs and unseals the wallet, and pam_unix grants on the token the
 ##     daemon unsealed. `sufficient` would short-circuit past the keyring and
-##     leave the session with a locked wallet.
+##     leave the session with a locked wallet. A pam_permit landing rule
+##     catches the jump; on services whose auth nixpkgs renders as a
+##     `substack` (SDDM on current nixpkgs) the face line goes before that
+##     substack and the landing after it, so a face success skips the whole
+##     substack, whose pam_unix would fail on the empty Enter that armed the
+##     face scan.
 ##
 ##   * A lock screen (kde, swaylock, hyprlock) gets `sufficient`. The wallet is
 ##     already open in the live session, so there is no keyring handoff to make;
@@ -111,13 +116,64 @@ let
     "ondemand"
   ];
 
-  # Turn one opted-in service into a NixOS PAM auth rule.
-  mkAuthRule = svc: {
-    control = if svc.profile == "lock" then "sufficient" else "[success=1 default=ignore]";
-    modulePath = pamModule;
-    args = pamArgs;
-    order = 11000;
-  };
+  # Turn one opted-in service into its NixOS PAM auth rules.
+  #
+  # A lock screen stays one `sufficient` line: the wallet is already open and
+  # the unlock grants outright. A login greeter needs the jump form plus a
+  # `pam_permit` landing, mirroring the block `irlume login enable` writes on
+  # FHS distros (crates/irlume-cli/src/pamwire.rs): the face success skips
+  # exactly one rule, and that rule must be a harmless permit, never
+  # something load-bearing.
+  #
+  # Current nixpkgs renders SDDM's auth as `substack login` rather than a
+  # flat module chain. On that architecture the unseal line goes BEFORE the
+  # substack and the landing AFTER it: an empty Enter at the greeter runs the
+  # face scan first, and a face success jumps over the whole substack (whose
+  # pam_unix would fail on that same empty password) and lands on the permit,
+  # so the login still grants. On a flat chain the unseal line sits after the
+  # password prompt (nixpkgs' unix-early, order 11700) and before the keyring
+  # module (12100), with the landing directly after the jump, so pam_kwallet
+  # and the try_first_pass pam_unix still see the released token.
+  #
+  # Reading the service's own rules minus ours cannot recurse: attribute
+  # names are strict, but removeAttrs leaves the filtered values lazy.
+  svcSubstackOrder =
+    name:
+    let
+      others = removeAttrs (config.security.pam.services.${name}.rules.auth or { }) [
+        "irlume"
+        "irlume-landing"
+      ];
+      substacks = lib.filter (r: r.enable && r.control == "substack") (lib.attrValues others);
+    in
+    if substacks == [ ] then null else (lib.head substacks).order;
+
+  flatUnsealOrder = 11800;
+  flatLandingOrder = 11850;
+
+  mkAuthRules =
+    name: svc:
+    let substackOrder = svcSubstackOrder name;
+    in
+    {
+      irlume = {
+        control = if svc.profile == "lock" then "sufficient" else "[success=1 default=ignore]";
+        modulePath = pamModule;
+        args = pamArgs;
+        order =
+          if svc.profile == "lock" then
+            11000
+          else if substackOrder != null then
+            substackOrder - 50
+          else
+            flatUnsealOrder;
+      };
+      irlume-landing = lib.mkIf (svc.profile == "login") {
+        control = "optional";
+        modulePath = "${config.security.pam.package}/lib/security/pam_permit.so";
+        order = if substackOrder != null then substackOrder + 50 else flatLandingOrder;
+      };
+    };
 
   # greetd on a wlroots compositor does not export the keyring's control socket
   # into the session, so a second, locked daemon spawns and apps prompt. Wrap
@@ -364,7 +420,7 @@ in
       {
         irlume-retry-reset.text = lib.mkForce (builtins.readFile ../packaging/pam/irlume-retry-reset);
       }
-      (lib.mapAttrs (_: svc: { rules.auth.irlume = mkAuthRule svc; }) cfg.pam.services)
+      (lib.mapAttrs (name: svc: { rules.auth = mkAuthRules name svc; }) cfg.pam.services)
       # Text-mode greeters are not a graphical session, so pam_kwallet skips
       # itself unless forced. Only meaningful when the service actually enables
       # kwallet; harmless otherwise.

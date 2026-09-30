@@ -12,6 +12,11 @@ All notable changes to irlume are documented here. This project adheres to
   provider even when it is `yes`. Camera-free status reads preserve the
   explicit IR-only policy and existing daemon authorization (#967).
 
+- A failed account-home lookup no longer skips the GNOME keyring token
+  delivery check before `irlume keyring arm`. The CLI treats an unknown home
+  as a possible token because irlumed resolves the account independently
+  (#859).
+
 - PAM no-anchor cleanup now removes old irlume lines byte-exactly from
   unreadable or safely continued stacks and edited overrides when no jump
   counts them and no unreadable auth rule may still be an anchor. A changed

@@ -295,20 +295,24 @@ pub(crate) fn initialize_for_forget(session: &impl Session, me: libc::uid_t) -> 
     }
 }
 
-/// Whether irlumed, asked for an arm without a forced kind, seals a GNOME
-/// keyring token: the decision it makes from the account's passwd home and
-/// whether the CLI sent a KDE wallet salt (`detect_kind`).
+/// Whether irlumed, asked for an arm without a forced kind, could seal a GNOME
+/// keyring token. An unknown home is treated as possible: irlumed resolves the
+/// account independently and may find a GNOME keyring after this lookup fails.
 fn arms_a_token(home: Option<&Path>, has_wallet_salt: bool) -> bool {
-    home.is_some_and(|home| {
-        irlume_core::kwallet::detect_kind(home, has_wallet_salt)
-            == irlume_core::envelope::SecretKind::GnomeKeyringToken
-    })
+    match home {
+        Some(home) => {
+            irlume_core::kwallet::detect_kind(home, has_wallet_salt)
+                == irlume_core::envelope::SecretKind::GnomeKeyringToken
+        }
+        None => !has_wallet_salt,
+    }
 }
 
 /// The refusal for a token arm, ending in what to do, or `None`. Asked before
 /// `SealPassword`, so a refused arm mints and seals nothing: the answer is
-/// `None` unless irlumed would seal a token for `user` (the account's home
-/// holds a GNOME login keyring and no KDE wallet salt was found), and then
+/// `None` unless irlumed could seal a token for `user` (the account's home
+/// holds a GNOME login keyring, or its home could not be resolved here, and
+/// no KDE wallet salt was found), and then
 /// either no login would deliver the token (the login screen's stack lacks
 /// irlume's session line, or the account logs in automatically) or the
 /// session's gnome-keyring is a `--login` daemon that nothing initialized.
@@ -623,7 +627,18 @@ mod tests {
     }
 
     #[test]
-    fn a_token_is_predicted_from_the_same_home_test_irlumed_makes() {
+    fn an_unknown_home_still_checks_whether_a_token_can_be_delivered() {
+        let refusal = token_arm_refusal_in(
+            arms_a_token(None, false),
+            || Some("no login session line".to_string()),
+            None::<&Fake>,
+            ME,
+        );
+        assert_eq!(refusal.as_deref(), Some("no login session line"));
+    }
+
+    #[test]
+    fn a_known_home_matches_daemon_detection_and_unknown_stays_guarded() {
         let home = std::env::temp_dir().join(format!(
             "irlume-gkr-session-home-{}-{}",
             std::process::id(),
@@ -637,7 +652,8 @@ mod tests {
             !arms_a_token(Some(&home), true),
             "a KDE wallet sits beside it"
         );
-        assert!(!arms_a_token(None, false), "no passwd home");
+        assert!(arms_a_token(None, false), "unknown passwd home");
+        assert!(!arms_a_token(None, true), "KDE wallet salt supplied");
         std::fs::remove_dir_all(&home).unwrap();
     }
 

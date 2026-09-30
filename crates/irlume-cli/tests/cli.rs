@@ -74,6 +74,20 @@ impl Sandbox {
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// A real passwd home with no keyring, so arms in unrelated CLI tests
+    /// select the login-password path on hosts without a login manager too.
+    fn fake_tester_home_without_keyring(&self) {
+        let home = self.path("home");
+        std::fs::create_dir_all(&home).unwrap();
+        self.fake_tool(
+            "getent",
+            &format!(
+                "[ \"$*\" = \"passwd tester\" ] || exit 2\nprintf '%s\\n' 'tester:x:4242:4242::{}:/bin/sh'",
+                home.display()
+            ),
+        );
+    }
+
     /// A Command for the irlume binary, isolated from the host system.
     fn cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(BIN);
@@ -678,6 +692,7 @@ fn enroll_fails_cleanly_without_a_daemon() {
 #[test]
 fn keyring_usage_and_daemon_failures() {
     let sb = Sandbox::new("keyring");
+    sb.fake_tester_home_without_keyring();
     let (code, _, err) = run(&mut sb.cmd(&["keyring"]));
     assert_eq!(code, 2);
     assert!(
@@ -686,13 +701,16 @@ fn keyring_usage_and_daemon_failures() {
     );
 
     // Piped empty stdin: the arm aborts before any request is built.
-    let (code, _, err) = run_stdin(&mut sb.cmd(&["keyring", "arm", "--user", "tester"]), "");
+    let (code, _, err) = run_stdin(
+        &mut sb.cmd_with_fakes(&["keyring", "arm", "--user", "tester"]),
+        "",
+    );
     assert_eq!(code, 2);
     assert!(err.contains("empty password; aborted"), "{err}");
 
     // A piped password reaches the (dead) socket and reports the failure.
     let (code, out, err) = run_stdin(
-        &mut sb.cmd(&["keyring", "arm", "--user", "tester"]),
+        &mut sb.cmd_with_fakes(&["keyring", "arm", "--user", "tester"]),
         "sekrit\n",
     );
     assert_eq!(code, 1);
@@ -1403,6 +1421,7 @@ fn biopolicy_write_refuses_unknown_content_and_preserves_other_preferences() {
 #[test]
 fn keyring_success_paths_with_a_live_daemon() {
     let sb = Sandbox::new("keyringok");
+    sb.fake_tester_home_without_keyring();
     let log = serve(&sock(&sb), |req| match req {
         Request::SealPassword { .. } => Response::PasswordSealed,
         Request::HasSealedPassword { .. } => Response::HasPassword(true),
@@ -1422,7 +1441,7 @@ fn keyring_success_paths_with_a_live_daemon() {
     });
 
     let (code, out, _) = run_stdin(
-        &mut sb.cmd(&["keyring", "arm", "--user", "tester"]),
+        &mut sb.cmd_with_fakes(&["keyring", "arm", "--user", "tester"]),
         "hunter2\n",
     );
     assert_eq!(code, 0);
@@ -1509,6 +1528,7 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_forget_before_upgrading_to_45() {
     // off the host's package database.
     let sandbox = |tag: &str, os_release: &str, armed: bool, kind: Option<K>| {
         let sb = Sandbox::new(tag);
+        sb.fake_tester_home_without_keyring();
         for tool in ["rpm", "dnf", "dpkg-query", "apt-cache", "pacman"] {
             sb.fake_tool(tool, "exit 1");
         }
@@ -1747,6 +1767,7 @@ fn sealed_secrets_off_encrypted_storage_are_told_the_remedies() {
                    metadata: Metadata,
                    encrypted: bool| {
         let sb = Sandbox::new(tag);
+        sb.fake_tester_home_without_keyring();
         for tool in ["rpm", "dnf", "dpkg-query", "apt-cache", "pacman"] {
             sb.fake_tool(tool, "exit 1");
         }
@@ -2099,6 +2120,7 @@ fn keyring_arm_asks_for_the_login_password_where_oo7_provides_secrets() {
                 &format!("arm-kind-{provider}-{}", command.join("-")),
                 provider,
             );
+            sb.fake_tester_home_without_keyring();
             let log = serve(&sock(&sb), |req| match req {
                 Request::SealPassword { .. } => Response::PasswordSealed,
                 Request::HasSealedPassword { .. } => Response::HasPassword(true),
@@ -4723,6 +4745,7 @@ fn set_cameras_and_ir_setup_success_paths() {
 #[test]
 fn setup_walks_every_step_noninteractively() {
     let sb = Sandbox::new("setupok");
+    sb.fake_tester_home_without_keyring();
     serve(&sock(&sb), |req| match req {
         Request::Ping => Response::Pong,
         Request::Health => Response::Health {
@@ -4759,7 +4782,10 @@ fn setup_walks_every_step_noninteractively() {
     });
     // Piped stdin: yes/no prompts take their defaults (enroll: yes, arm: yes),
     // and the keyring arm reads this line as the login password.
-    let (code, out, _) = run_stdin(&mut sb.cmd(&["setup", "--user", "tester"]), "pw\n");
+    let (code, out, _) = run_stdin(
+        &mut sb.cmd_with_fakes(&["setup", "--user", "tester"]),
+        "pw\n",
+    );
     assert_eq!(code, 0);
     assert!(out.contains("[1/7] Preflight"), "{out}");
     // The third-party offer step is REMOVED (ADR-0015: shipped cues are

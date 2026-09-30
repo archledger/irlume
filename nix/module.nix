@@ -12,10 +12,25 @@
 ##
 ##   * A login greeter (sddm, gdm-password, greetd, ly, tty login) gets
 ##     `[success=1 default=ignore]`, NOT `sufficient`. It records the face
-##     success but skips exactly one rule, so pam_kwallet / pam_gnome_keyring
-##     still runs and unseals the wallet, and pam_unix grants on the token the
-##     daemon unsealed. `sufficient` would short-circuit past the keyring and
-##     leave the session with a locked wallet.
+##     success but skips exactly one rule, so on a flat chain pam_kwallet /
+##     pam_gnome_keyring still runs and unseals the wallet, and pam_unix
+##     grants on the token the daemon unsealed. `sufficient` would
+##     short-circuit past the keyring and leave the session with a locked
+##     wallet. A pam_permit landing rule catches the jump on services whose
+##     auth nixpkgs renders as a `substack` (SDDM on current nixpkgs); there
+##     the face line goes immediately before that substack and the landing
+##     immediately after it, so a face success skips the whole substack,
+##     whose pam_unix would fail on the empty Enter that armed the face
+##     scan. Because that jump also skips any keyring rule inside the
+##     substack, every greeter face line carries the `kr` (keyring-continue)
+##     arg, which re-drives the keyring handoff from the daemon, the same
+##     arg `irlume login enable` writes on FHS greeters
+##     (crates/irlume-cli/src/pamwire.rs). Flat chains get no landing; the
+##     face line goes immediately before the password-prompting pam_unix
+##     instead. The one login layout that DOES get `sufficient` is an
+##     `include` anchor: libpam expands an include inline, so a success=N
+##     jump would skip only its first expanded rule; the module IGNOREs on
+##     cold login and a face match returns immediately.
 ##
 ##   * A lock screen (kde, swaylock, hyprlock) gets `sufficient`. The wallet is
 ##     already open in the live session, so there is no keyring handoff to make;
@@ -70,9 +85,11 @@ let
           default = if lib.elem name knownLock then "lock" else "login";
           description = ''
             Which PAM profile to splice in. "login" (greeters, tty login) uses
-            `[success=1 default=ignore]` so the keyring still unseals; "lock"
-            (screen lockers) uses `sufficient`. Recognised service names get the
-            right default; set this explicitly for anything unusual.
+            `[success=1 default=ignore]` so the keyring still unseals, or
+            `sufficient` when the password chain arrives through an `include`;
+            "lock" (screen lockers) uses `sufficient`. Recognised service
+            names get the right default; set this explicitly for anything
+            unusual.
           '';
         };
       };
@@ -110,14 +127,152 @@ let
     "unseal"
     "ondemand"
   ];
+  # Greeter face lines carry `kr` (keyring-continue), the same arg the FHS
+  # wiring puts on every greeter line (pamwire.rs, include_greeter_line): a
+  # face grant skips the password stack, including any pam_kwallet /
+  # pam_gnome_keyring auth rule inside the skipped delegation, and `kr`
+  # re-drives the keyring handoff from the daemon so the session starts
+  # with the wallet unlocked. On cold login the module IGNOREs and `kr` is
+  # inert. Lock screens never carry it: the wallet is already open.
+  pamArgsLogin = pamArgs ++ [ "kr" ];
 
-  # Turn one opted-in service into a NixOS PAM auth rule.
-  mkAuthRule = svc: {
-    control = if svc.profile == "lock" then "sufficient" else "[success=1 default=ignore]";
-    modulePath = pamModule;
-    args = pamArgs;
-    order = 11000;
-  };
+  # Turn one opted-in service into its NixOS PAM auth rules.
+  #
+  # A lock screen stays one `sufficient` line: the wallet is already open and
+  # the unlock grants outright. A login greeter needs the jump form, mirroring
+  # the block `irlume login enable` writes on FHS distros
+  # (crates/irlume-cli/src/pamwire.rs): the face success skips exactly one
+  # rule, and that rule must be a harmless one, never something load-bearing.
+  #
+  # Current nixpkgs renders SDDM's auth as `substack login` rather than a
+  # flat module chain. On that architecture the unseal line goes IMMEDIATELY
+  # before that substack and a `pam_permit` landing IMMEDIATELY after it: an
+  # empty Enter at the greeter runs the face scan first, and a face success
+  # jumps over the whole substack (whose pam_unix would fail on that same
+  # empty password) and lands on the permit, so the login still grants; the
+  # required-by-default substack keeps a failed password attempt fatal, so
+  # the permit cannot authenticate a failure. Strict adjacency matters: any
+  # rule left in the jump's path would be skipped instead of the substack,
+  # bypassing a gate such as pam_nologin, so the order slots are derived from
+  # the neighbouring rules and evaluation fails when no adjacent slot is
+  # free. On a flat chain the unseal line sits immediately before the
+  # password-prompting pam_unix, and NO landing is rendered: the jump skips
+  # that prompt, and pam_kwallet plus the try_first_pass pam_unix still see
+  # the released token, while an optional permit on the failure path would
+  # become a deny-less stack's only success.
+  #
+  # Reading the service's own rules minus ours cannot recurse: attribute
+  # names are strict, but removeAttrs leaves the filtered values lazy.
+  # Placement of the PAM rules lives in ./lib.nix as pure functions the
+  # flake's irlume-module check unit-tests directly; this module only maps
+  # the merged config into that shape and turns a rejection into an
+  # evaluation error.
+  #
+  # Design recap: the face line's success jumps over exactly one rule. On a
+  # service whose auth nixpkgs renders as a `substack` (SDDM on current
+  # nixpkgs), the face line goes immediately before the PASSWORD substack
+  # and a pam_permit landing immediately after it, so the jump skips the
+  # whole substack (whose pam_unix would fail on the empty Enter that armed
+  # the face scan) while any earlier policy substack still runs above the
+  # face line. On a flat chain the face line goes immediately before the
+  # password-prompting pam_unix and NO landing is rendered: the jump skips
+  # that prompt, the keyring module and the try_first_pass pam_unix still
+  # see the released token, and an optional permit on the failure path
+  # would be a deny-less stack's only success. Lock screens keep a single
+  # sufficient line. Every layout the pure functions cannot prove safe
+  # (ambiguous substacks, occupied slots, order ties, a numeric jump the
+  # insertion would rewrite, required gates inside the skipped substack) is
+  # rejected instead of rendered wrong.
+  #
+  # Reading the service's own rules minus ours cannot recurse: attribute
+  # names are strict, but removeAttrs leaves the filtered values lazy. The
+  # landing disables itself through its enable flag rather than mkIf,
+  # because a conditional definition whose condition reads the same
+  # option's merge would force itself while the module system filters
+  # conditional definitions.
+  placement = import ./lib.nix { inherit lib; };
+
+  # null for an unknown service: a delegation to it is a broken reference
+  # the password path would surface, so the placement treats it as
+  # unproven instead of scanning an empty rule list.
+  svcRuleList =
+    name:
+    if builtins.hasAttr name config.security.pam.services then
+      lib.map
+        (r: {
+          name = r.name;
+          control = r.control;
+          modulePath = r.modulePath;
+          order = r.order;
+          enable = r.enable;
+        })
+        (
+          lib.attrValues (
+            removeAttrs (config.security.pam.services.${name}.rules.auth or { }) [
+              "irlume"
+              "irlume-landing"
+            ]
+          )
+        )
+    else
+      null;
+
+  # A delegated service whose text was overridden (the mkDefault-generated
+  # file replaced by an explicit definition) no longer executes the rules
+  # the placement inspects: libpam reads the file, and the file is the
+  # override, so a delegation into it is refused rather than validated
+  # against a rule set nothing runs. The wired service itself needs no
+  # guard: an override there leaves these rules unrendered and irlume
+  # inert, not unsafe. `irlume`/`irlume-landing` are tolerated: the
+  # delegated service may itself be wired.
+  svcTextOpaque =
+    name:
+    !placement.textMatchesRules {
+      text = config.security.pam.services.${name}.text;
+      rules = svcRuleList name;
+      extraNames = [
+        "irlume"
+        "irlume-landing"
+      ];
+    };
+
+  mkAuthRules =
+    name: svc:
+    let
+      result = placement.computePlacement {
+        profile = svc.profile;
+        others = svcRuleList name;
+        innerOf =
+          sn:
+          if svcRuleList sn == null then
+            null
+          else if svcTextOpaque sn then
+            throw "services.irlume.pam wiring: security.pam.services.${sn}.text overrides the generated file, so the '${sn}' delegation cannot be inspected; wire the service manually"
+          else
+            svcRuleList sn;
+      };
+      placementOrder = if result.ok then result.unsealOrder else throw result.reason;
+      landingOrder = if result.ok then result.landingOrder else throw result.reason;
+      # The pure placement decides the control: the jump form for a substack
+      # or flat chain (the keyring must still run), `sufficient` for a lock
+      # screen and for an include anchor, where libpam would expand the
+      # rules inline and the jump form would skip only the first one.
+      unsealControl = if result.ok then result.unsealControl else throw result.reason;
+    in
+    {
+      irlume = {
+        control = unsealControl;
+        modulePath = pamModule;
+        args = if svc.profile == "login" then pamArgsLogin else pamArgs;
+        order = placementOrder;
+      };
+      irlume-landing = {
+        enable = result.ok && result.landingEnable;
+        control = "optional";
+        modulePath = "${config.security.pam.package}/lib/security/pam_permit.so";
+        order = landingOrder;
+      };
+    };
 
   # greetd on a wlroots compositor does not export the keyring's control socket
   # into the session, so a second, locked daemon spawns and apps prompt. Wrap
@@ -364,7 +519,7 @@ in
       {
         irlume-retry-reset.text = lib.mkForce (builtins.readFile ../packaging/pam/irlume-retry-reset);
       }
-      (lib.mapAttrs (_: svc: { rules.auth.irlume = mkAuthRule svc; }) cfg.pam.services)
+      (lib.mapAttrs (name: svc: { rules.auth = mkAuthRules name svc; }) cfg.pam.services)
       # Text-mode greeters are not a graphical session, so pam_kwallet skips
       # itself unless forced. Only meaningful when the service actually enables
       # kwallet; harmless otherwise.

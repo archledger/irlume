@@ -7,6 +7,42 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The NixOS module renders its login-profile PAM wiring against current
+  nixpkgs, where SDDM's authentication `substack`s the `login` service
+  instead of listing the module chain. The face line now sits immediately
+  before that substack with a `pam_permit.so` landing immediately after
+  it, mirroring the block `irlume login enable` writes on FHS distros, so
+  an empty-Enter face attempt at the greeter completes the login instead
+  of failing after the daemon already matched the face and unsealed the
+  password. Flat login chains place the face line immediately before the
+  password prompt and render no landing, and a password chain reached
+  through an `include` takes the `sufficient` form instead, because libpam
+  expands an include inline and a jump would skip only its first expanded
+  rule. Greeter face lines carry the `kr` keyring-continue arg, so a face
+  grant still hands the keyring over when the skipped stack contains the
+  keyring module. The face line anchors only on a known password stack
+  (password-auth, system-auth, common-auth, login), and evaluation fails
+  on any layout the placement cannot prove safe: no or ambiguous password
+  delegation, an occupied or shared order slot, a numeric jump in the
+  outer chain or an include expansion (libpam counts flattened lines, so
+  such a jump can land outside its own file; a substack's internal jumps
+  are atomic and stay allowed), a required gate inside or behind the
+  skipped stack (the password verifier pam_unix and the terminator
+  pam_deny are not gates, though pam_deny must sit after the verifier,
+  not before it or alone), a module that is neither password, keyring
+  nor denial inside the skipped stack (a face grant would silently skip
+  its policy), a required or requisite pam_unix or pam_deny above the
+  anchor, directly or inside a preceding delegation, where the
+  empty-Enter arm could never complete, and for an include anchor any
+  required, requisite or bracketed control after it, direct or inside a
+  delegation after it (the sufficient form returns at the face line), an extended
+  control or unresolvable delegation (including one into a service
+  whose text was overridden, since the inspected rules no longer
+  describe the file libpam runs), or, for substack anchors, a password
+  stack with no required rule at all. Controls are compared case-insensitively
+  with surrounding whitespace trimmed, as libpam reads them. Found in live
+  NixOS 26.05 acceptance: the lock screen worked, the greeter fell back to
+  the password after a 0.93-score match (#955).
 - PAM wiring accepts vertical tabs, form feeds and carriage returns inside
   closed bracketed controls that Linux-PAM parses. A line such as
   `auth [success=1<VT>default=ignore] pam_unix.so` keeps its bytes and is

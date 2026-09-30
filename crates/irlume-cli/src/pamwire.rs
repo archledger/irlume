@@ -3294,7 +3294,9 @@ fn wire_service_with(
                 // a file without irlume's lines has nothing to take out and
                 // is judged as ever.
                 if holds_irlume_line(&current) {
-                    return unwire_no_anchor(s.etc, etc, &current, &base, apply);
+                    return with_stack_reader(reader.clone(), || {
+                        unwire_no_anchor(s.etc, etc, &current, &base, apply)
+                    });
                 }
                 if let Some(line) = unreadable_line(&current) {
                     return Ok(kept_unreadable(s.etc, true, &line));
@@ -3324,34 +3326,35 @@ fn wire_service_with(
             // A numeric jump that counts irlume's lines, or the inactive lines
             // a disable left in their places, keeps its landing only while
             // they stay in those places.
-            let (wired, note) = match keep_places(s.etc, &current, &wired) {
-                None => (wired, String::new()),
-                Some(KeptPlaces::Unchanged) => return already(),
-                Some(KeptPlaces::Filled(text)) => {
-                    let unused = if text.contains(INERT_TAG) {
-                        "; an inactive line still holds the place of each of irlume's lines \
+            let (wired, note) =
+                match with_stack_reader(reader.clone(), || keep_places(s.etc, &current, &wired)) {
+                    None => (wired, String::new()),
+                    Some(KeptPlaces::Unchanged) => return already(),
+                    Some(KeptPlaces::Filled(text)) => {
+                        let unused = if text.contains(INERT_TAG) {
+                            "; an inactive line still holds the place of each of irlume's lines \
                          this configuration does not use"
-                    } else {
-                        ""
-                    };
-                    (
-                        text,
-                        format!(
-                            "; irlume's lines take the places inactive lines held, so every \
+                        } else {
+                            ""
+                        };
+                        (
+                            text,
+                            format!(
+                                "; irlume's lines take the places inactive lines held, so every \
                              jump lands where it did{unused}"
-                        ),
-                    )
-                }
-                Some(KeptPlaces::Refused(message)) => {
-                    return Ok(WireOutcome {
-                        change: PlannedChange::KeepEditedOverride,
-                        message,
-                        detail: None,
-                        unmet: true,
-                        adjustable: false,
-                    });
-                }
-            };
+                            ),
+                        )
+                    }
+                    Some(KeptPlaces::Refused(message)) => {
+                        return Ok(WireOutcome {
+                            change: PlannedChange::KeepEditedOverride,
+                            message,
+                            detail: None,
+                            unmet: true,
+                            adjustable: false,
+                        });
+                    }
+                };
             if wired == current {
                 return already();
             }
@@ -3423,7 +3426,9 @@ fn wire_service_with(
                         out(PlannedChange::NotWired, format!("· {}: not wired", s.etc))
                     }
                 } else {
-                    let (body, change, message) = strip_in_place(s.etc, &current, false);
+                    let (body, change, message) = with_stack_reader(reader.clone(), || {
+                        strip_in_place(s.etc, &current, false)
+                    });
                     if let (true, Some(body)) = (apply, &body) {
                         write_atomic(etc, body)?;
                     }
@@ -3446,7 +3451,8 @@ fn wire_service_with(
                 if let Some(line) = unreadable_line(&current) {
                     return disable_unread(s.etc, &current, &line, apply, "");
                 }
-                let (body, change, message) = strip_in_place(s.etc, &current, false);
+                let (body, change, message) =
+                    with_stack_reader(reader.clone(), || strip_in_place(s.etc, &current, false));
                 if let (true, Some(body)) = (apply, &body) {
                     write_atomic(etc, body)?;
                 }
@@ -3736,10 +3742,9 @@ enum KeptPlaces {
 
 /// irlume's lines for an enable of a stack irlume edits in place. `wired` is
 /// what the recipe makes of the stack without irlume's lines. `None` when the
-/// caller writes `wired`, as for any stack: the stack has none of irlume's
-/// lines, writing `wired` keeps every numeric jump's landing, or the stack
-/// holds no inactive line (see [`strip_in_place`]) and its irlume lines are
-/// not already the recipe's.
+/// caller writes `wired`: its new lines do not move a readable included
+/// stack's jump, or the stack holds no inactive line (see [`strip_in_place`])
+/// and its irlume lines are not already the recipe's.
 ///
 /// Otherwise a jump another line carries counts irlume's lines or the
 /// inactive lines a disable left in their places, and writing `wired` would
@@ -3750,7 +3755,14 @@ enum KeptPlaces {
 /// moved to make room.
 fn keep_places(etc: &str, current: &str, wired: &str) -> Option<KeptPlaces> {
     if !holds_irlume_line(current) {
-        return None;
+        let shifts = overrides::included_jumps_moved_by_irlume(current, wired);
+        return (!shifts.is_empty()).then(|| {
+            KeptPlaces::Refused(format!(
+                "⚠ {etc}: not wired, left as it is: wiring would move a jump: {}; a jump in an \
+                 included stack cannot be adjusted from this file",
+                overrides::shift_reason(&shifts, &[overrides::Names::whole(current)])
+            ))
+        });
     }
     let shifts = overrides::jump_shifts(current, wired);
     if shifts.is_empty() {
@@ -5195,6 +5207,211 @@ mod tests {
             }
             other => panic!("expected a refusal: {other:?}"),
         }
+    }
+
+    /// A numeric jump in a stack an `include` above irlume's lines names
+    /// that lands past it counts those lines (#934), so an enable of a
+    /// stack irlume edits in place keeps them where they are: inactive
+    /// lines a disable left are refilled in their places, and a stack whose
+    /// places do not fit is left as it is. An include below irlume's lines
+    /// of the phase it feeds holds nothing.
+    #[test]
+    fn an_in_place_enable_holds_the_places_an_included_jump_counts() {
+        let dir = TestDir::new("inplace-included-jump");
+        let etc = dir.0.join("sudo");
+        std::fs::write(
+            dir.0.join("leap-auth"),
+            "auth [success=3 default=die] pam_foo.so\n",
+        )
+        .unwrap();
+        let stock = format!(
+            "auth       include       leap-auth\n{VERIFY_STANZA}\n             auth       required      pam_unix.so\nauth       required      pam_deny.so\n"
+        );
+        let decide = |current: &str| {
+            with_stack_reader(stack_reader(&etc.display().to_string()), || {
+                let (wired, changed) = wire_verify_service(&unwire_lines(current).0);
+                assert!(changed, "{current}");
+                keep_places("/etc/pam.d/sudo", current, &wired)
+            })
+        };
+        let held = overrides::neutralize(&stock);
+        assert!(held.contains(INERT_TAG), "{held}");
+        // The recipe puts the verify line before this include, so an inactive
+        // place after it cannot be refilled without moving that line.
+        match decide(&held) {
+            Some(KeptPlaces::Refused(message)) => {
+                assert!(message.contains("the include on line 1"), "{message}");
+            }
+            other => panic!("expected a refusal: {other:?}"),
+        }
+        // Moving the inactive place does not make the recipe's line fit.
+        let lines: Vec<&str> = held.lines().collect();
+        let moved = format!(
+            "{}\n{}\n{}\n{}\n",
+            lines[0],
+            lines[2],
+            lines[1],
+            lines[3..].join("\n")
+        );
+        match decide(&moved) {
+            Some(KeptPlaces::Refused(message)) => {
+                assert!(message.contains("the include on line 1"), "{message}");
+                assert!(!message.contains("leap-auth"), "{message}");
+            }
+            other => panic!("expected a refusal: {other:?}"),
+        }
+        // An include below irlume's lines of the phase it feeds: the
+        // recipe's own write.
+        let below = format!(
+            "{VERIFY_STANZA}\nauth       include       leap-auth\n             auth       required      pam_unix.so\nauth       required      pam_deny.so\n"
+        );
+        let held_below = overrides::neutralize(&below);
+        assert_eq!(decide(&held_below), None);
+    }
+
+    /// The second include expands in the parent chain too. Counting it as
+    /// one line would miss a jump from the first include that reaches past
+    /// those expanded lines and counts irlume's line.
+    #[test]
+    fn an_included_jump_counts_past_a_second_include() {
+        let dir = TestDir::new("nested-included-jump");
+        let etc = dir.0.join("sudo");
+        std::fs::write(
+            dir.0.join("leap-auth"),
+            "auth [success=4 default=die] pam_foo.so\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.0.join("middle"),
+            "auth optional pam_one.so\nauth optional pam_two.so\nauth optional pam_three.so\n",
+        )
+        .unwrap();
+        let current = format!(
+            "auth include leap-auth\nauth include middle\n{VERIFY_STANZA}\nauth required pam_unix.so\n"
+        );
+        let stripped = unwire_lines(&current).0;
+        let shifts = with_stack_reader(stack_reader(&etc.display().to_string()), || {
+            overrides::jump_shifts(&current, &stripped)
+        });
+        assert!(!shifts.is_empty(), "the included jump should move");
+        assert!(
+            overrides::shift_reason(&shifts, &[overrides::Names::whole(&current)])
+                .contains("the include on line 1"),
+            "the first include should be named"
+        );
+        std::fs::write(
+            dir.0.join("short-leap"),
+            "auth [success=1 default=die] pam_foo.so\n",
+        )
+        .unwrap();
+        let within_middle = current.replace("leap-auth", "short-leap");
+        let stripped = unwire_lines(&within_middle).0;
+        let shifts = with_stack_reader(stack_reader(&etc.display().to_string()), || {
+            overrides::jump_shifts(&within_middle, &stripped)
+        });
+        assert!(
+            shifts.is_empty(),
+            "a jump landing inside the second include should stay there"
+        );
+    }
+
+    /// A later include with no auth modules contributes no jump-counted
+    /// line. Treating its directive as one line hides a moved landing.
+    #[test]
+    fn an_empty_intervening_include_does_not_hide_a_moved_jump() {
+        let dir = TestDir::new("empty-intervening-include");
+        let etc = dir.0.join("sudo");
+        std::fs::write(
+            dir.0.join("leap-auth"),
+            "auth [success=1 default=die] pam_foo.so\n",
+        )
+        .unwrap();
+        std::fs::write(dir.0.join("empty-auth"), "account required pam_unix.so\n").unwrap();
+        let before = "auth include leap-auth\nauth include empty-auth\nauth required pam_unix.so\n";
+        let after = format!("{before}{VERIFY_STANZA}\n");
+        let shifts = with_stack_reader(stack_reader(&etc.display().to_string()), || {
+            overrides::jump_shifts(before, &after)
+        });
+        assert!(!shifts.is_empty(), "the included jump should move");
+    }
+
+    /// A vendor change can move the bare target even when the old and new
+    /// wired files still land on the same irlume role.
+    #[test]
+    fn a_vendor_change_rechecks_an_included_jumps_bare_landing() {
+        let dir = TestDir::new("included-vendor-change");
+        let etc = dir.0.join("sudo");
+        std::fs::write(
+            dir.0.join("leap-auth"),
+            "auth [success=1 default=die] pam_foo.so\n",
+        )
+        .unwrap();
+        let before = format!(
+            "auth include leap-auth\nauth required pam_gate.so\n{VERIFY_STANZA}\nauth required pam_old.so\n"
+        );
+        let after = before.replace("pam_old.so", "pam_new.so");
+        let shifts = with_stack_reader(stack_reader(&etc.display().to_string()), || {
+            overrides::jumps_moved_by_irlume(&before, &after)
+        });
+        assert!(!shifts.is_empty(), "the changed vendor landing should hold");
+    }
+
+    /// First-time in-place wiring has no inactive or active irlume line to
+    /// refill, but an included jump can still count the new face block.
+    #[test]
+    fn a_first_in_place_enable_refuses_to_move_an_included_jump() {
+        let dir = TestDir::new("first-inplace-included-jump");
+        let etc = dir.0.join("kde");
+        std::fs::write(
+            dir.0.join("leap-auth"),
+            "auth [success=1 default=die] pam_foo.so\n",
+        )
+        .unwrap();
+        let before =
+            "auth include leap-auth\nauth substack password-auth\nauth required pam_deny.so\n";
+        std::fs::write(&etc, before).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let planned = wire_service(&svc, true, false, &wire_lock).unwrap();
+        assert_eq!(
+            planned.change,
+            PlannedChange::KeepEditedOverride,
+            "{planned}"
+        );
+        assert!(planned.unmet, "{planned}");
+        assert!(
+            planned.message.contains("the include on line 1"),
+            "{planned}"
+        );
+        let applied = wire_service(&svc, true, true, &wire_lock).unwrap();
+        assert_eq!(
+            applied.change,
+            PlannedChange::KeepEditedOverride,
+            "{applied}"
+        );
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), before);
+        // Landing on the first parent line moves as well when the face line
+        // is inserted between this include and the password substack.
+        std::fs::write(
+            dir.0.join("leap-auth"),
+            "auth [success=1 default=die] pam_foo.so\nauth required pam_bar.so\n",
+        )
+        .unwrap();
+        let planned = wire_service(&svc, true, false, &wire_lock).unwrap();
+        assert_eq!(
+            planned.change,
+            PlannedChange::KeepEditedOverride,
+            "{planned}"
+        );
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), before);
+        // The same included jump below the changed block does not count any
+        // new line; first-time wiring still proceeds there.
+        let safe = "auth substack password-auth\nauth include leap-auth\nauth required pam_deny.so\nauth required pam_unix.so\n";
+        std::fs::write(&etc, safe).unwrap();
+        let applied = wire_service(&svc, true, true, &wire_lock).unwrap();
+        assert_eq!(applied.change, PlannedChange::Wire, "{applied}");
     }
 
     /// A refusal on an enable writes nothing and fails the run: a greeter a

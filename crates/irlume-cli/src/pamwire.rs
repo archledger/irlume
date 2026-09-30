@@ -880,15 +880,18 @@ fn removal_orphans_for(file_exists: bool, vendor_exists: bool) -> bool {
 
 /// The rest of reconcile: the regression checks and, when one fires, the
 /// re-apply of the recorded wiring.
-/// Whether this surface counts for [`anchor_gone_regression`]: the active
-/// display manager's own greeter, whose recipe this configuration wants, or
-/// an opt-in scope in this run. A remote-seat greeter is governed by
-/// [`remote_seat_change`]; a greeter nothing wants is unwired by any apply;
-/// the lock screen and the fingerprint services keep their presence-based
-/// checks ([`lockscreen_regressed`], [`wired_surface_regressed`]).
+/// Whether this surface counts for [`anchor_gone_regression`]: a surface
+/// this configuration wants its recipe to land in, the active display
+/// manager's own greeter among them. A remote-seat greeter is governed by
+/// [`remote_seat_change`]; a surface nothing wants is unwired by any apply,
+/// which reconcile's other checks scope as ever.
 fn anchor_gone_counts(role: &str, want: bool, blocked: bool, primary: &str, svc: &str) -> bool {
     (role == ROLE_LOGIN && !blocked && want && svc == primary)
-        || ((role == ROLE_SUDO || role == ROLE_POLKIT) && want)
+        || (want
+            && (role == ROLE_SUDO
+                || role == ROLE_POLKIT
+                || role == ROLE_LOCK
+                || role == ROLE_LOGIN_FP))
 }
 
 /// Whether a wired surface's recipe can no longer land: the surface holds
@@ -896,8 +899,9 @@ fn anchor_gone_counts(role: &str, want: bool, blocked: bool, primary: &str, svc:
 /// no anchor qualifies anymore (#932). The stale layout still answers every
 /// presence check (the module is in the file), so reconcile re-applies the
 /// wiring, which performs that removal, instead of fast-pathing over it:
-/// the active login greeter, and the opt-in surfaces the marker claims,
-/// exactly as [`wired_surface_regressed`] scopes them.
+/// every surface this configuration wants wired, the active login greeter
+/// among them, the opt-in surfaces as [`wired_surface_regressed`] scopes
+/// them.
 fn anchor_gone_regression(with_sudo: bool, with_polkit: bool) -> bool {
     let Some(dm) = active_display_manager() else {
         return false;
@@ -8205,9 +8209,10 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
     }
 
     /// Which surfaces the reconcile regression counts: the active greeter
-    /// whose recipe this configuration wants, and the opt-in scopes; not a
-    /// remote-seat greeter (remote_seat_change governs it), an unwanted one,
-    /// another greeter, or the lock and fingerprint services.
+    /// whose recipe this configuration wants, the opt-in scopes, and the
+    /// lock and fingerprint services this configuration wants; not a
+    /// remote-seat greeter (remote_seat_change governs it), an unwanted
+    /// one, or another greeter.
     #[test]
     fn the_anchor_gone_regression_counts_the_surfaces_reconcile_maintains() {
         for (role, want, blocked, svc, primary, counts) in [
@@ -8218,8 +8223,10 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
             (ROLE_SUDO, true, false, "sudo", "ly", true),
             (ROLE_POLKIT, true, false, "polkit-1", "ly", true),
             (ROLE_SUDO, false, false, "sudo", "ly", false),
-            (ROLE_LOCK, true, false, "kde", "ly", false),
-            (ROLE_LOGIN_FP, true, false, "gdm-fingerprint", "ly", false),
+            (ROLE_LOCK, true, false, "kde", "ly", true),
+            (ROLE_LOCK, false, false, "kde", "ly", false),
+            (ROLE_LOGIN_FP, true, false, "gdm-fingerprint", "ly", true),
+            (ROLE_LOGIN_FP, false, false, "gdm-fingerprint", "ly", false),
         ] {
             assert_eq!(
                 anchor_gone_counts(role, want, blocked, primary, svc),

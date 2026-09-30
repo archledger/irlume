@@ -3248,7 +3248,9 @@ fn an_override_loses_irlumes_lines_when_its_include_stops_qualifying() {
 
 /// The same override after its vendor copy is gone: the file is the
 /// service's only configuration, so the no-anchor enable strips irlume's
-/// lines in place and keeps every other line, as a disable does.
+/// lines in place and keeps every other line, as a disable does. `--force`
+/// rebuilds from the vendor when it can; with the anchor gone it takes the
+/// lines out the same way, rather than keep them.
 #[test]
 fn a_vendor_gone_override_loses_irlumes_lines_when_its_include_stops_qualifying() {
     let (dir, svc) = wired_site_auth_override("ovr-noanchor-vendor-gone", &face_and_keyring);
@@ -3263,6 +3265,38 @@ fn a_vendor_gone_override_loses_irlumes_lines_when_its_include_stops_qualifying(
         after.contains("auth       include      site-auth"),
         "{after}"
     );
+}
+
+/// `--force` on an edited override whose include stopped qualifying: the
+/// rebuild has no anchor to land either, so the lines an earlier release
+/// wired come out as in the plain enable, and the administrator's lines are
+/// kept.
+#[test]
+fn a_forced_enable_removes_irlumes_lines_when_the_include_stops_qualifying() {
+    let (dir, svc) = wired_site_auth_override("ovr-noanchor-forced", &face_and_keyring);
+    let with_admin = read_file(svc.etc).replacen(
+        "auth       include      site-auth\n",
+        &format!("auth       include      site-auth\n{LOCAL_LINE}\n"),
+        1,
+    );
+    std::fs::write(svc.etc, &with_admin).unwrap();
+    std::fs::write(dir.0.join("etc/pam.d/site-auth"), SITE_AUTH_GATE_FIRST).unwrap();
+    let forced = wire_service_with(
+        &svc,
+        true,
+        &WireOpts {
+            apply: true,
+            force: true,
+            ..WireOpts::default()
+        },
+        &face_and_keyring,
+    )
+    .unwrap();
+    assert_eq!(change_id(&forced), "strip-in-place", "{forced}");
+    assert!(forced.message.contains("no anchor to wire"), "{forced}");
+    let after = read_file(svc.etc);
+    assert!(!after.contains("pam_irlume.so"), "{after}");
+    assert!(after.contains(LOCAL_LINE), "{after}");
 }
 
 /// A remote-seat greeter whose edited override already holds exactly the

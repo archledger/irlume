@@ -1782,7 +1782,7 @@ pub(super) fn decide(i: &Input<'_>) -> Result<Decision, String> {
         return Ok(unreadable(i, &line));
     }
     if i.force && matches!(class, E1 | E2 | L2) {
-        return forced(i, current, &p);
+        return forced(i, current, &p, class);
     }
     Ok(match class {
         U3 | E3 | L3 => vendor_gone(i, &p, class),
@@ -1988,7 +1988,7 @@ fn remove_or_strip(i: &Input<'_>, p: &Parsed<'_>, class: Class, no_anchor: bool)
     }
 }
 
-fn forced(i: &Input<'_>, current: &str, p: &Parsed<'_>) -> Result<Decision, String> {
+fn forced(i: &Input<'_>, current: &str, p: &Parsed<'_>, class: Class) -> Result<Decision, String> {
     let (etc, vendor_path) = (i.etc, i.vendor_path);
     let v = i
         .vendor
@@ -2008,6 +2008,12 @@ fn forced(i: &Input<'_>, current: &str, p: &Parsed<'_>) -> Result<Decision, Stri
     }
     let (wired, ok) = (i.wire)(&base(v));
     if !ok {
+        // #932: the forced rebuild has no anchor to land either, so the
+        // lines an earlier release wired come out as in the plain enable,
+        // the administrator's lines kept.
+        if has_irlume_line(&p.body) {
+            return Ok(remove_or_strip(i, p, class, true));
+        }
         return Ok(no_anchor(etc));
     }
     if i.backup.is_some_and(|b| b != current) {

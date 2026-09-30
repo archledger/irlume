@@ -171,8 +171,8 @@ unwired. LightDM on openSUSE (`auth include xdm`, whose first line is the
 password substack) and on Alpine (`auth include base-auth`, `pam_unix.so`
 first) are wired that way. ly and cinnamon-screensaver on Arch, whose
 `login` checks `pam_nologin.so` first, are left unwired; such a stack that
-an earlier release wired keeps irlume's lines until `irlume login disable`
-takes them out.
+an earlier release wired loses irlume's lines, taken out by the next
+enable or reconcile as described above.
 
 An override written by a release before this tracking gets the line at the
 first reconcile when it still matches its vendor copy. One that no longer

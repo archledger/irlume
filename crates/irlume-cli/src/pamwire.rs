@@ -880,6 +880,48 @@ fn removal_orphans_for(file_exists: bool, vendor_exists: bool) -> bool {
 
 /// The rest of reconcile: the regression checks and, when one fires, the
 /// re-apply of the recorded wiring.
+/// Whether this surface counts for [`anchor_gone_regression`]: the active
+/// display manager's own greeter, whose recipe this configuration wants, or
+/// an opt-in scope in this run. A remote-seat greeter is governed by
+/// [`remote_seat_change`]; a greeter nothing wants is unwired by any apply;
+/// the lock screen and the fingerprint services keep their presence-based
+/// checks ([`lockscreen_regressed`], [`wired_surface_regressed`]).
+fn anchor_gone_counts(role: &str, want: bool, blocked: bool, primary: &str, svc: &str) -> bool {
+    (role == ROLE_LOGIN && !blocked && want && svc == primary)
+        || ((role == ROLE_SUDO || role == ROLE_POLKIT) && want)
+}
+
+/// Whether a wired surface's recipe can no longer land: the surface holds
+/// irlume's lines, and the enable for it would only take them out, because
+/// no anchor qualifies anymore (#932). The stale layout still answers every
+/// presence check (the module is in the file), so reconcile re-applies the
+/// wiring, which performs that removal, instead of fast-pathing over it:
+/// the active login greeter, and the opt-in surfaces the marker claims,
+/// exactly as [`wired_surface_regressed`] scopes them.
+fn anchor_gone_regression(with_sudo: bool, with_polkit: bool) -> bool {
+    let Some(dm) = active_display_manager() else {
+        return false;
+    };
+    let (primary, _) = dm_pam_services(&dm);
+    if primary == "(unknown)" {
+        return false;
+    }
+    let mut gone = false;
+    walk_surfaces(
+        true,
+        with_sudo,
+        with_polkit,
+        &mut |svc, role, wire, want, blocked| {
+            if gone || !anchor_gone_counts(role, want, blocked, primary, service_name(svc.etc)) {
+                return;
+            }
+            gone = wire_service(svc, true, false, wire)
+                .is_ok_and(|o| enable_drops(true, false, Some(&o)));
+        },
+    );
+    gone
+}
+
 fn reconcile_wiring(
     with_sudo: bool,
     with_polkit: bool,
@@ -903,6 +945,7 @@ fn reconcile_wiring(
         && remote_seat.is_none()
         && !lockscreen_regressed(with_lock)
         && !wired_surface_regressed(with_sudo, with_polkit)
+        && !anchor_gone_regression(with_sudo, with_polkit)
         && !reclaim
         && !lane_yield
     {
@@ -1116,6 +1159,7 @@ pub(crate) fn reconcile_needed() -> bool {
         || remote_seat_change().is_some()
         || lockscreen_regressed(with_lock)
         || wired_surface_regressed(with_sudo, with_polkit)
+        || anchor_gone_regression(with_sudo, with_polkit)
         || lane_reclaim_for(face_lock_intent, omarchy, face_lane_present, stock_wired)
         || lane_yield_for(omarchy, face_lane_present, stock_wired, with_lock, || {
             wants().face_lock
@@ -2341,9 +2385,10 @@ enum ScopeOrigin {
 /// Whether an opt-in surface asked for on the command line came to nothing:
 /// no stack for it on this machine, no line irlume can wire next to, or an
 /// anchor gone from a file an earlier release wired, whose lines an enable
-/// then takes out. In each the surface ends the run unwired, which must fail
-/// rather than report success. Reconcile only replays what an earlier run
-/// observed, and a disable delivers nothing, so neither counts.
+/// then takes out, an unedited override removed with the vendor copy
+/// restored among them. In each the surface ends the run unwired, which must
+/// fail rather than report success. Reconcile only replays what an earlier
+/// run observed, and a disable delivers nothing, so neither counts.
 fn requested_scope_unmet(
     origin: ScopeOrigin,
     enable: bool,
@@ -2359,6 +2404,7 @@ fn requested_scope_unmet(
                 | PlannedChange::NoAnchor
                 | PlannedChange::RestoreBackup
                 | PlannedChange::StripInPlace
+                | PlannedChange::RemoveOverride
         )
 }
 
@@ -5579,14 +5625,20 @@ mod tests {
     /// `--with-sudo` and `--with-polkit` are explicit requests: when the
     /// surface resolves to nothing (no stack at all, no auth line to anchor
     /// to, or an anchor gone from a file an earlier release wired, whose
-    /// lines an enable then takes out) the run fails instead of reporting
-    /// success. Reconcile replays the marker rather than a request, and
-    /// disable has nothing to deliver.
+    /// lines an enable then takes out, override included) the run fails
+    /// instead of reporting success. Reconcile replays the marker rather
+    /// than a request, and disable has nothing to deliver, so neither counts.
     #[test]
     fn a_requested_surface_that_resolves_to_nothing_fails_the_run() {
         use PlannedChange::*;
         use ScopeOrigin::{Command, Marker};
-        for change in [NotInstalled, NoAnchor, RestoreBackup, StripInPlace] {
+        for change in [
+            NotInstalled,
+            NoAnchor,
+            RestoreBackup,
+            StripInPlace,
+            RemoveOverride,
+        ] {
             assert!(
                 requested_scope_unmet(Command, true, true, change),
                 "{change:?}"
@@ -5610,7 +5662,6 @@ mod tests {
             MaterializeOverride,
             Wire,
             AlreadyCorrect,
-            RemoveOverride,
             RewireOverride,
             KeepEditedOverride,
             NotWired,
@@ -8151,6 +8202,31 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
         assert!(on.message.contains("no anchor to wire"), "{on}");
         assert!(on.message.contains("inactive lines"), "{on}");
         assert_eq!(std::fs::read_to_string(&etc).unwrap(), inert);
+    }
+
+    /// Which surfaces the reconcile regression counts: the active greeter
+    /// whose recipe this configuration wants, and the opt-in scopes; not a
+    /// remote-seat greeter (remote_seat_change governs it), an unwanted one,
+    /// another greeter, or the lock and fingerprint services.
+    #[test]
+    fn the_anchor_gone_regression_counts_the_surfaces_reconcile_maintains() {
+        for (role, want, blocked, svc, primary, counts) in [
+            (ROLE_LOGIN, true, false, "ly", "ly", true),
+            (ROLE_LOGIN, true, false, "sddm", "ly", false),
+            (ROLE_LOGIN, false, false, "ly", "ly", false),
+            (ROLE_LOGIN, true, true, "ly", "ly", false),
+            (ROLE_SUDO, true, false, "sudo", "ly", true),
+            (ROLE_POLKIT, true, false, "polkit-1", "ly", true),
+            (ROLE_SUDO, false, false, "sudo", "ly", false),
+            (ROLE_LOCK, true, false, "kde", "ly", false),
+            (ROLE_LOGIN_FP, true, false, "gdm-fingerprint", "ly", false),
+        ] {
+            assert_eq!(
+                anchor_gone_counts(role, want, blocked, primary, svc),
+                counts,
+                "{role} {svc}"
+            );
+        }
     }
 
     /// A remote-seat greeter an earlier release wired around an include

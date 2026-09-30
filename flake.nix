@@ -142,10 +142,18 @@
                   # placement assertions exercise the real anchor shape.
                   security.pam.services.login.kwallet.enable = true;
                   # A real (harmless) policy stack for the integration
-                  # fixture below to delegate through: nixpkgs' default
-                  # rule set (optional env/rootok, sufficient pam_unix,
-                  # required pam_deny terminator) applies to it.
-                  security.pam.services.company-policy = { };
+                  # fixture below to delegate through: without nixpkgs'
+                  # default rule set (its required pam_deny terminator above
+                  # the anchor would make the empty-Enter arm dead), so a
+                  # single optional env rule stands in for site policy.
+                  security.pam.services.company-policy = {
+                    useDefaultRules = false;
+                    rules.auth.policy-env = {
+                      control = "optional";
+                      modulePath = "/lib/security/pam_env.so";
+                      order = 10100;
+                    };
+                  };
                   security.pam.services.irlume-policy-then-login.rules.auth = {
                     company-policy = {
                       control = "include";
@@ -203,6 +211,13 @@
               (sub "company-policy" 10000)
               (sub "login" 10100)
             ];
+            # The policy delegation above the anchor is optional-only; a
+            # password-shaped inner would now be refused by fatalAbove.
+            policyEnvInner = sn:
+              if sn == "company-policy" then
+                [ (plain "policy-env" "optional" "/lib/security/pam_env.so" 10000) ]
+              else
+                defaultInner sn;
             flatShape = [
               (plain "unix-early" "optional" "/lib/security/pam_unix.so" 11700)
               (plain "kwallet" "optional" "/lib/security/pam_kwallet5.so" 12100)
@@ -353,6 +368,27 @@
                 [ (plain "unixreq" "required" "/lib/security/pam_unix.so" 10000) ]
               else
                 defaultInner sn;
+            # A required pam_unix is the password verifier, not a gate: a
+            # face success skips it and a wrong password stays fatal.
+            requiredUnixInner = sn: [
+              (plain "unix" "required" "/lib/security/pam_unix.so" 11000)
+              (plain "deny" "required" "/lib/security/pam_deny.so" 12000)
+            ];
+            # A denial terminator above the anchor records its failure on
+            # the empty Enter before the face line can arm.
+            denyPolicyInner = sn:
+              if sn == "company-policy" then
+                [ (plain "deny" "required" "/lib/security/pam_deny.so" 10000) ]
+              else
+                defaultInner sn;
+            includeThenGate = [
+              (inc "login" 10100)
+              (plain "nologin" "required" "/lib/security/pam_nologin.so" 10200)
+            ];
+            subThenGate = [
+              (sub "login" 10100)
+              (plain "nologin" "required" "/lib/security/pam_nologin.so" 10200)
+            ];
           in
           # Login greeters keep the keyring in the stack; lock screens grant
           # outright; text-mode greeters force pam_kwallet to run.
@@ -403,7 +439,8 @@
           # every unsafe layout is rejected with a reason (ok = false), which
           # the module turns into an evaluation error.
           assert (r "login" sddmShape).ok && (r "login" sddmShape).unsealOrder == 10050 && (r "login" sddmShape).landingEnable && (r "login" sddmShape).landingOrder == 10150;
-          assert (r "login" policyFirst).ok && (r "login" policyFirst).unsealOrder == 10099;
+          assert (placement.computePlacement { profile = "login"; others = policyFirst; innerOf = policyEnvInner; }).ok
+            && (placement.computePlacement { profile = "login"; others = policyFirst; innerOf = policyEnvInner; }).unsealOrder == 10099;
           assert (r "login" flatShape).ok && (r "login" flatShape).unsealOrder == 11650 && !(r "login" flatShape).landingEnable;
           assert (r "lock" flatShape).ok && (r "lock" flatShape).unsealOrder == 11000 && !(r "lock" flatShape).landingEnable;
           assert !(r "login" ambiguous).ok;
@@ -456,6 +493,16 @@
           # anchor form.
           assert !(placement.computePlacement { profile = "login"; others = includeLogin; innerOf = allowlistInner; }).ok;
           assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = allowlistInner; }).ok;
+          # A required pam_unix is the password verifier, not a gate.
+          assert (placement.computePlacement { profile = "login"; others = sddmShape; innerOf = requiredUnixInner; }).ok;
+          # A denial terminator above the anchor, direct or delegated, is
+          # as fatal as a required password rule.
+          assert !(placement.computePlacement { profile = "login"; others = policyFirst; innerOf = denyPolicyInner; }).ok;
+          # The sufficient form returns at the face line, so a required
+          # rule after an include anchor would never run on a face login;
+          # the jump form lands and runs it, so the same shape is fine.
+          assert !(r "login" includeThenGate).ok;
+          assert (r "login" subThenGate).ok && (r "login" subThenGate).landingEnable;
           # A lone include of an unknown stack is refused, with or without a
           # direct pam_unix to fall back on.
           assert !(r "login" loneUnknownInc).ok;

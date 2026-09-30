@@ -146,12 +146,14 @@ let
   ];
   skippedSafe = modulePath: lib.any (m: lib.hasSuffix m modulePath) skippedSafeModules;
 
-  # A fatal password rule anywhere the empty-Enter arm passes through
-  # BEFORE the face line: a direct rule above the anchor, or one inside a
-  # delegation above it (both kinds run their rules before the face line).
-  # A requisite ends the stack outright on the empty Enter that should arm
-  # the scan; a required failure cannot be cleared by the later face grant.
-  # Either way the arm is dead, so the layout is refused.
+  # A fatal rule anywhere the empty-Enter arm passes through BEFORE the
+  # face line: a direct rule above the anchor, or one inside a delegation
+  # above it (both kinds run their rules before the face line). A
+  # requisite ends the stack outright on the empty Enter that should arm
+  # the scan; a required failure cannot be cleared by the later face
+  # grant. pam_unix (the password verifier) and pam_deny (the refusal
+  # terminator) are the fatal ones; either way the arm is dead, so the
+  # layout is refused.
   fatalAbove =
     { innerOf, seen, rules }:
     if rules == null then
@@ -159,11 +161,13 @@ let
     else
       let
         enabled = lib.filter (r: r.enable) rules;
-        isFatalUnix =
+        isFatal =
           r:
           let c = norm r.control;
-          in (c == "required" || c == "requisite") && lib.hasSuffix "pam_unix.so" r.modulePath;
-        direct = lib.findFirst isFatalUnix null enabled;
+          in
+          (c == "required" || c == "requisite")
+          && (lib.hasSuffix "pam_unix.so" r.modulePath || lib.hasSuffix "pam_deny.so" r.modulePath);
+        direct = lib.findFirst isFatal null enabled;
         delegs =
           lib.filter
             (r:
@@ -230,9 +234,12 @@ let
   # Inspect the stack the face success would skip. Four questions, one
   # recursive traversal (delegation via `substack`/`include` naming another
   # service is followed with a cycle guard):
-  #   gate:        a required/requisite rule that is not pam_deny and would
-  #                never run on a face login (pam_nologin, pam_faillock, an
-  #                access gate);
+  #   gate:        a required/requisite rule that is neither pam_deny nor
+  #                pam_unix (the password verifier: a face success skips
+  #                it, and a wrong password leaves its required failure
+  #                fatal, exactly the denial path sawRequired checks) and
+  #                would never run on a face login (pam_nologin,
+  #                pam_faillock, an access gate);
   #   unproven:    a layout this cannot reason about: a bracketed extended
   #                control (it may encode a fatal action), a module that is
   #                neither password, keyring nor denial (a face success
@@ -257,7 +264,10 @@ let
           (
             r:
             let c = norm r.control;
-            in (c == "required" || c == "requisite") && !(lib.hasSuffix "pam_deny.so" r.modulePath)
+            in
+            (c == "required" || c == "requisite")
+            && !(lib.hasSuffix "pam_deny.so" r.modulePath)
+            && !(lib.hasSuffix "pam_unix.so" r.modulePath)
           )
           null
           enabled;
@@ -408,6 +418,23 @@ in
             # unable to complete.
             up = lib.filter (r: r.order < anchor.order) others;
             fatalResult = fatalAbove { inherit innerOf; seen = [ ]; rules = up; };
+            # The sufficient form returns at the face line, so on a face
+            # grant nothing after the include anchor runs at all: a
+            # required or requisite rule there is policy a face login
+            # would bypass. (The jump form lands on the permit and runs
+            # everything after it, so only include anchors need this.)
+            gatedAfter =
+              if anchorIsInclude then
+                lib.findFirst
+                  (
+                    r:
+                    let c = norm r.control;
+                    in c == "required" || c == "requisite"
+                  )
+                  null
+                  (lib.filter (r: r.order > anchor.order) rendered)
+              else
+                null;
           in
           if jumps ? jump then
             reject "the chain already contains a numeric jump on '${jumps.jump.name}' (${jumps.jump.control}) whose destination an insertion could change; libpam counts flattened lines, so a jump inside a delegation can land outside its own file"
@@ -423,6 +450,8 @@ in
             reject "the ${norm fatalResult.fatal.control} rule '${fatalResult.fatal.name}' runs before the '${anchor.modulePath}' delegation, so an empty-Enter face grant can never complete"
           else if fatalResult ? unproven then
             reject "a delegation above the '${anchor.modulePath}' anchor cannot be inspected: ${fatalResult.unproven}"
+          else if gatedAfter != null then
+            reject "the ${norm gatedAfter.control} rule '${gatedAfter.name}' sits after the '${anchor.modulePath}' include, and the sufficient form returns at the face line, so a face login would bypass it"
           else if before ? bad then
             reject before.bad
           else if !anchorIsInclude && (after ? bad) then

@@ -147,17 +147,21 @@ a numeric jump in the outer chain or inside an include expansion (libpam
 counts flattened lines, so a jump can land outside its own file and this
 module cannot prove an insertion leaves it alone; a `substack` is atomic
 for jump counting, so its internal jumps stay allowed), a required gate
-(such as `pam_nologin` or `pam_faillock`) inside the stack the face
-success would skip or behind a nested delegation of it, a module that is
-neither password, keyring nor denial inside that stack (a face grant
-would silently skip its policy, so an allowlist stack is refused rather
-than bypassed), a required or requisite `pam_unix` above the anchor,
-directly or inside a preceding delegation, where the empty-Enter arm
-could never complete, an extended control or a delegation that cannot be
-resolved (by file path, cyclic, or to an unknown service), and a password
-stack with no required rule at all, where a failed password would leave
-no fatal failure behind. Control keywords are compared case-insensitively
-with surrounding whitespace trimmed, as libpam reads them.
+(such as `pam_nologin` or `pam_faillock`; the password verifier
+`pam_unix` and the terminator `pam_deny` are not gates) inside the stack
+the face success would skip or behind a nested delegation of it, a
+module that is neither password, keyring nor denial inside that stack (a
+face grant would silently skip its policy, so an allowlist stack is
+refused rather than bypassed), a required or requisite `pam_unix` or
+`pam_deny` above the anchor, directly or inside a preceding delegation,
+where the empty-Enter arm could never complete, and for an include
+anchor any required or requisite rule after it, since the sufficient
+form returns at the face line and a face login would bypass it, an
+extended control or a delegation that cannot be resolved (by file path,
+cyclic, or to an unknown service), and a password stack with no required
+rule at all, where a failed password would leave no fatal failure
+behind. Control keywords are compared case-insensitively with
+surrounding whitespace trimmed, as libpam reads them.
 
 A flat chain with only one `pam_unix` (no keyring or second-unix trigger
 in its stack) cannot complete a greeter face grant: the jump would skip

@@ -141,9 +141,23 @@
                   # Give the flat `login` chain a keyring rule so the
                   # placement assertions exercise the real anchor shape.
                   security.pam.services.login.kwallet.enable = true;
+                  # A real (harmless) policy stack for the integration
+                  # fixture below to delegate through.
+                  security.pam.services.company-policy.rules.auth = {
+                    env = {
+                      control = "optional";
+                      modulePath = "/lib/security/pam_env.so";
+                      order = 10100;
+                    };
+                    deny = {
+                      control = "required";
+                      modulePath = "/lib/security/pam_deny.so";
+                      order = 10200;
+                    };
+                  };
                   security.pam.services.irlume-policy-then-login.rules.auth = {
                     company-policy = {
-                      control = "substack";
+                      control = "include";
                       modulePath = "company-policy";
                       order = 10000;
                     };
@@ -259,6 +273,50 @@
               (plain "filler" "optional" "/lib/security/pam_env.so" 10100)
               (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
             ];
+            inc = name: order: { inherit name order; control = "include"; modulePath = name; enable = true; };
+            includeLogin = [ (inc "login" 10100) ];
+            loneUnknownInc = [ (inc "company-policy" 10100) ];
+            loneUnknownIncUnix = [
+              (inc "company-policy" 10100)
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+            ];
+            noAnchor = [
+              (plain "env" "optional" "/lib/security/pam_env.so" 10000)
+            ];
+            jumpEqRight = [
+              (plain "gate" "[success =1 default=ignore]" "/lib/security/pam_succeed_if.so" 10000)
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+            ];
+            jumpEqLeft = [
+              (plain "gate" "[success= 1 default=ignore]" "/lib/security/pam_succeed_if.so" 10000)
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+            ];
+            subUpper = [
+              { name = "login"; order = 10100; control = "Substack"; modulePath = "login"; enable = true; }
+            ];
+            sawRequiredInner = sn:
+              if sn == "login" then
+                [
+                  (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+                  (plain "deny" "required" "/lib/security/pam_deny.so" 12000)
+                  (plain "sess" "include" "common-session" 13000)
+                ]
+              else
+                [ (plain "kwallet" "optional" "/lib/security/pam_kwallet5.so" 10000) ];
+            gateCaseInner = sn: [
+              (plain "nologin" "Required" "/lib/security/pam_nologin.so" 10000)
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+              (plain "deny" "required" "/lib/security/pam_deny.so" 12000)
+            ];
+            includeJumpPair = [
+              (inc "site-policy" 10000)
+              (inc "login" 10100)
+            ];
+            sitePolicyJump = sn:
+              if sn == "site-policy" then
+                [ (plain "fp" "[success=1 default=ignore]" "/lib/security/pam_fprintd.so" 10000) ]
+              else
+                defaultInner sn;
           in
           # Login greeters keep the keyring in the stack; lock screens grant
           # outright; text-mode greeters force pam_kwallet to run.
@@ -293,12 +351,12 @@
           assert (lineIndexOf loginText "pam_irlume.so unseal") + 1 == (lineIndexOf loginText "pam_unix.so likeauth nullok");
           assert !(lib.strings.hasInfix "pam_permit.so" loginText);
           assert (lineIndexOf loginText "pam_unix.so likeauth nullok") < (lineIndexOf loginText "pam_kwallet5.so");
-          # With a policy substack ahead of the known password substack, the
+          # With a policy include ahead of the known password substack, the
           # face line anchors on the password stack (here `login`), and the
           # policy still renders ABOVE the face line, so a face success never
           # skips it.
-          assert (lineIndexOf policyThenLoginText "substack company-policy") != -1;
-          assert (lineIndexOf policyThenLoginText "substack company-policy") < (lineIndexOf policyThenLoginText "pam_irlume.so unseal");
+          assert (lineIndexOf policyThenLoginText "include company-policy") != -1;
+          assert (lineIndexOf policyThenLoginText "include company-policy") < (lineIndexOf policyThenLoginText "pam_irlume.so unseal");
           assert (lineIndexOf policyThenLoginText "pam_irlume.so unseal") + 1 == (lineIndexOf policyThenLoginText "substack login");
           assert (lineIndexOf policyThenLoginText "substack login") + 1 == (lineIndexOf policyThenLoginText "pam_permit.so");
           # Placement unit tests: the accepted shapes compute their slots and
@@ -330,6 +388,29 @@
           # Numeric jumps in spaced or non-success forms still parse.
           assert !(r "login" jumpSpaced).ok;
           assert !(r "login" jumpOnDefault).ok;
+          # A top-level include anchors exactly like a substack, and its
+          # stack is inspected for gates.
+          assert (r "login" includeLogin).ok && (r "login" includeLogin).unsealOrder == 10050 && (r "login" includeLogin).landingEnable && (r "login" includeLogin).landingOrder == 10150;
+          assert !(placement.computePlacement { profile = "login"; others = includeLogin; innerOf = gatedInner; }).ok;
+          # A lone include of an unknown stack is refused, with or without a
+          # direct pam_unix to fall back on.
+          assert !(r "login" loneUnknownInc).ok;
+          assert !(r "login" loneUnknownIncUnix).ok;
+          # A non-empty chain with no pam_unix and no delegation has no
+          # anchor; an empty chain stays inert.
+          assert !(r "login" noAnchor).ok;
+          assert (r "login" [ ]).ok;
+          # One-sided whitespace in a numeric action still parses as a jump.
+          assert !(r "login" jumpEqRight).ok;
+          assert !(r "login" jumpEqLeft).ok;
+          # Control keywords are case-insensitive: Substack delegates, and an
+          # uppercase Required gate is still a gate.
+          assert (r "login" subUpper).ok && (r "login" subUpper).unsealOrder == 10050;
+          assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = gateCaseInner; }).ok;
+          # Required evidence survives an optional-only nested include.
+          assert (placement.computePlacement { profile = "login"; others = sddmShape; innerOf = sawRequiredInner; }).ok;
+          # A jump inside an include expansion refuses the whole wiring.
+          assert !(placement.computePlacement { profile = "login"; others = includeJumpPair; innerOf = sitePolicyJump; }).ok;
           assert sys.config.systemd.services.irlumed.environment.IRLUME_SOCKET == "/run/irlume.sock";
           # These shipped PAD cues default to /etc/irlume in the daemon.
           # A NixOS service must resolve them from its selected package too.

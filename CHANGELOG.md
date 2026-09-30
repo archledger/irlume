@@ -25,12 +25,14 @@ All notable changes to irlume are documented here. This project adheres to
   of failing after the daemon already matched the face and unsealed the
   password. Flat login chains place the face line immediately before the
   password prompt and render no landing. The face line anchors only on a
-  known password stack (password-auth, system-auth, common-auth, login),
-  and evaluation fails on any layout the placement cannot prove safe: no
-  or ambiguous password substacks, an occupied or shared order slot, a
-  numeric jump the insertion would rewrite (including its landing
-  position), or a required gate inside or behind the skipped substack.
-  Found
+  known password stack (password-auth, system-auth, common-auth, login;
+  include delegations anchor the same way), and evaluation fails on any
+  layout the placement cannot prove safe: no or ambiguous password
+  delegation, an occupied or shared order slot, any numeric jump already
+  in the chain or its include expansions (libpam counts flattened lines,
+  so such a jump can land outside its own file), a required gate inside
+  or behind the skipped stack, an extended control or unresolvable
+  delegation, or a password stack with no required rule at all. Found
   in live NixOS 26.05 acceptance: the lock screen worked, the greeter
   fell back to the password after a 0.93-score match (#955).
 

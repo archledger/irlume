@@ -129,17 +129,19 @@ that prompt, and the keyring module plus the `try_first_pass` `pam_unix`
 still see the released token. Lock screens stay a single `sufficient`
 line.
 
-Evaluation refuses, instead of rendering a broken stack: substacks
+Evaluation refuses, instead of rendering a broken stack: delegations
 without exactly one known password stack among them (a lone unrecognized
-substack may be a policy stack, not a password carrier), an order slot
-another rule occupies or shares, a numeric jump on an existing rule whose
-destination the new rules would change (any `word = N` action in a
-bracketed control, including landing exactly on it), a required gate
-(such as `pam_nologin` or `pam_faillock`) inside the substack the jump
-would skip or behind a nested `include`/`substack` delegation of it, an
-extended control or a delegation that cannot be resolved (by file path,
-cyclic, or to an unknown service), and a password stack with no required
-rule at all, where a failed password would leave no fatal failure behind.
+delegation may be a policy stack, not a password carrier; `include` and
+`substack` both anchor), an order slot another rule occupies or shares,
+any numeric jump already present in the chain or inside an include
+expansion (libpam counts flattened lines, so a jump can land outside its
+own file and this module cannot prove an insertion leaves it alone), a
+required gate (such as `pam_nologin` or `pam_faillock`) inside the stack
+the jump would skip or behind a nested delegation of it, an extended
+control or a delegation that cannot be resolved (by file path, cyclic, or
+to an unknown service), and a password stack with no required rule at
+all, where a failed password would leave no fatal failure behind. Control
+keywords are compared case-insensitively, as libpam reads them.
 
 A flat chain with only one `pam_unix` (no keyring or second-unix trigger
 in its stack) cannot complete a greeter face grant: the jump would skip

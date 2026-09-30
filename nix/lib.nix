@@ -27,6 +27,12 @@ let
   # result token to carry a jump (`success=1`, `default = 2`, ...), with
   # whitespace around the equals, so parse every word=N pair and take the
   # largest jump any outcome can make.
+  # libpam reads control keywords case-insensitively and allows whitespace
+  # on either side of the equals in a bracketed control, so normalize and
+  # pair `word=N`, `word =N`, `word= N` and `word = N` alike, then keep the
+  # largest numeric action any outcome can make.
+  norm = ctrl: lib.toLower ctrl;
+
   jumpSkip =
     control:
     let
@@ -36,14 +42,17 @@ let
       );
       isWord = t: builtins.match "^[a-zA-Z_]+$" t != null;
       isNum = t: builtins.match "^[0-9]+$" t != null;
-      # `word = n` and its one-sided spacings split into separate tokens,
-      # so pair them with a state walk, then keep the word=n results.
+      wordEqNum = t: builtins.match "^[a-zA-Z_]+=[0-9]+$" t != null;
+      wordEq = t: builtins.match "^([a-zA-Z_]+)=$" t;
+      eqNum = t: builtins.match "^=([0-9]+)$" t;
       stepped =
         lib.foldl'
           (
             { st, out }:
             t:
-            if st ? w then
+            if wordEqNum t then
+              { st = null; out = out ++ [ t ]; }
+            else if st ? w then
               (
                 if isNum t then
                   { st = null; out = out ++ [ "${st.w}=${t}" ]; }
@@ -54,22 +63,18 @@ let
               (
                 if t == "=" then
                   { st = { w = st; }; inherit out; }
+                else if eqNum t != null then
+                  { st = null; out = out ++ [ ("${st}=" + (lib.head (eqNum t))) ]; }
                 else
                   { st = if isWord t then t else null; inherit out; }
               )
+            else if wordEq t != null then
+              { st = { w = lib.head (wordEq t); }; inherit out; }
             else
-              (
-                if builtins.match "^[a-zA-Z_]+=[0-9]+$" t != null then
-                  {
-                    st = null;
-                    out = out ++ [ t ];
-                  }
-                else
-                  {
-                    st = if isWord t then t else null;
-                    inherit out;
-                  }
-              )
+              {
+                st = if isWord t then t else null;
+                inherit out;
+              }
           )
           {
             st = null;
@@ -83,25 +88,41 @@ let
     in
     if jumps == [ ] then 0 else lib.foldl' lib.max (lib.head jumps) (lib.tail jumps);
 
-  # Refuse to insert inside another rule's numeric jump window: the
-  # insertion would silently change what that rule skips.
-  jumpRewrittenAt =
-    { rendered, slot }:
-    let
-      position = lib.length (lib.filter (r: r.order < slot) rendered);
-      broken =
-        lib.filter
-          (
-            { i, r }:
-            let n = jumpSkip r.control;
-            # n > 0 && i < position && position <= i + n
-            # also covers position == i + n + 1: inserting exactly where
-            # the jump used to land changes its landing rule as well.
-            in n > 0 && i < position && position <= i + n + 1
-          )
-          (lib.imap0 (i: r: { inherit i r; }) rendered);
-    in
-    if broken == [ ] then null else (lib.head broken).r;
+  # Any numeric jump in the whole reachable chain: the outer rules and,
+  # recursively, every include/substack expansion behind them. libpam
+  # counts flattened lines for jumps, so an inner jump can land outside
+  # its own file; proving any of them unaffected is beyond this module,
+  # so one existing jump anywhere refuses the wiring.
+  anyJump =
+    { innerOf, seen, rules }:
+    if rules == null then
+      { unproven = "delegation to an unknown service"; }
+    else
+      let
+        enabled = lib.filter (r: r.enable) rules;
+        jump = lib.findFirst (r: jumpSkip (norm r.control) > 0) null enabled;
+        delegations =
+          lib.filter (r: (norm r.control) == "substack" || (norm r.control) == "include") enabled;
+        walk =
+          acc: r:
+          if acc ? jump || acc ? unproven then
+            acc
+          else if lib.hasInfix "/" r.modulePath then
+            acc // { unproven = "delegation by file path '${r.modulePath}' cannot be inspected"; }
+          else if lib.elem r.modulePath seen then
+            acc // { unproven = "delegation cycle through '${r.modulePath}'"; }
+          else
+            acc // anyJump {
+              inherit innerOf;
+              rules = innerOf r.modulePath;
+              seen = seen ++ [ r.modulePath ];
+            };
+        folded = lib.foldl' walk { } delegations;
+      in
+      if jump != null then
+        folded // { jump = jump; }
+      else
+        folded;
 
   # An order slot directly before the anchor, keeping strict adjacency: the
   # jump must skip the anchor itself, never a rule left in between.
@@ -158,20 +179,29 @@ let
     { innerOf, seen, rules }:
     let
       enabled = lib.filter (r: r.enable) rules;
-      bracketed = lib.findFirst (r: lib.hasPrefix "[" r.control) null enabled;
+      # libpam reads control keywords case-insensitively.
+      bracketed = lib.findFirst (r: lib.hasPrefix "[" (norm r.control)) null enabled;
       gate =
         lib.findFirst
           (
             r:
-            (r.control == "required" || r.control == "requisite")
-            && !(lib.hasSuffix "pam_deny.so" r.modulePath)
+            let c = norm r.control;
+            in (c == "required" || c == "requisite") && !(lib.hasSuffix "pam_deny.so" r.modulePath)
           )
           null
           enabled;
       sawRequired =
-        lib.any (r: r.control == "required" || r.control == "requisite") enabled;
+        lib.any
+          (r:
+            let c = norm r.control;
+            in c == "required" || c == "requisite"
+          )
+          enabled;
       delegations =
-        lib.filter (r: r.control == "substack" || r.control == "include") enabled;
+        lib.filter (r:
+          let c = norm r.control;
+          in c == "substack" || c == "include"
+        ) enabled;
       walk =
         acc: r:
         if acc ? gate || acc ? unproven then
@@ -193,7 +223,11 @@ let
                   rules = inner;
                   seen = seen ++ [ r.modulePath ];
                 };
-                in acc // { inherit (deeper) sawRequired; } // lib.optionalAttrs (deeper ? gate) { gate = deeper.gate; } // lib.optionalAttrs (deeper ? unproven) { unproven = deeper.unproven; }
+                in
+                acc
+                // { sawRequired = acc.sawRequired || deeper.sawRequired; }
+                // lib.optionalAttrs (deeper ? gate) { gate = deeper.gate; }
+                // lib.optionalAttrs (deeper ? unproven) { unproven = deeper.unproven; }
               )
           );
       folded = lib.foldl' walk { inherit sawRequired; } delegations;
@@ -225,23 +259,35 @@ in
       rendered = lib.sort (a: b: a.order < b.order) (lib.filter (r: r.enable) others);
       reject = reason: { ok = false; reason = "services.irlume.pam wiring: ${reason}; wire the service manually."; };
 
-      # A lock screen grants outright at a fixed order; only the
-      # jump-rewrite guard applies to it.
+      # A lock screen grants outright at a fixed order; only the existing-
+      # jump guard applies to it.
       lockResult =
-        let breaker = jumpRewrittenAt { rendered = rendered; slot = 11000; };
+        let j = anyJump { inherit innerOf; seen = [ ]; rules = others; };
         in
-        if breaker != null then
-          reject "inserting a rule at order 11000 would change the destination of the numeric jump on '${breaker.name}' (${breaker.control})"
+        if j ? jump then
+          reject "the chain already contains a numeric jump on '${j.jump.name}' (${j.jump.control}) whose destination an insertion could change"
+        else if j ? unproven then
+          reject "the chain cannot be inspected: ${j.unproven}"
         else
           { ok = true; unsealOrder = 11000; landingEnable = false; landingOrder = 11000; };
 
-      substacks = lib.filter (r: r.control == "substack") rendered;
-      named = lib.filter (r: builtins.elem r.modulePath passwordStackNames) substacks;
+      # libpam expands include and substack inline, and a success=N jump
+      # skips the delegation line whole, so both carry the password chain
+      # for anchoring purposes (the FHS wiring anchors on @include lines
+      # the same way).
+      delegating =
+        lib.filter
+          (r:
+            let c = norm r.control;
+            in c == "substack" || c == "include"
+          )
+          rendered;
+      named = lib.filter (r: builtins.elem r.modulePath passwordStackNames) delegating;
       anchor =
         # Only a KNOWN password stack may carry the face line, sole or not:
-        # an unrecognized substack could be a policy stack the jump would
+        # an unrecognized delegation could be a policy stack the jump would
         # skip. nixpkgs' own SDDM delegates through `login`, which is known.
-        if substacks == [ ] then
+        if delegating == [ ] then
           null
         else if lib.length named == 1 then
           lib.head named
@@ -265,12 +311,13 @@ in
                 scanStack { inherit innerOf; seen = [ anchor.modulePath ]; rules = anchorInner; };
             before = slotBefore { rendered = rendered; anchor = anchor; };
             after = slotAfter { rendered = rendered; anchor = anchor; };
-            beforeBreaker =
-              if before ? slot then jumpRewrittenAt { rendered = rendered; slot = before.slot; } else null;
-            afterBreaker =
-              if after ? slot then jumpRewrittenAt { rendered = rendered; slot = after.slot; } else null;
+            jumps = anyJump { inherit innerOf; seen = [ ]; rules = others; };
           in
-          if gateResult ? gate then
+          if jumps ? jump then
+            reject "the chain already contains a numeric jump on '${jumps.jump.name}' (${jumps.jump.control}) whose destination an insertion could change; libpam counts flattened lines, so a jump inside a delegation can land outside its own file"
+          else if jumps ? unproven then
+            reject "the chain cannot be inspected: ${jumps.unproven}"
+          else if gateResult ? gate then
             reject "the '${anchor.modulePath}' stack the face success would skip contains the required rule '${gateResult.gate.name}', which would never run on a face login"
           else if gateResult ? unproven then
             reject "the '${anchor.modulePath}' stack cannot be proven safe: ${gateResult.unproven}"
@@ -280,10 +327,6 @@ in
             reject before.bad
           else if after ? bad then
             reject after.bad
-          else if beforeBreaker != null then
-            reject "inserting the face line at order ${toString before.slot} would change the destination of the numeric jump on '${beforeBreaker.name}' (${beforeBreaker.control})"
-          else if afterBreaker != null then
-            reject "inserting the permit landing at order ${toString after.slot} would change the destination of the numeric jump on '${afterBreaker.name}' (${afterBreaker.control})"
           else
             {
               ok = true;
@@ -293,18 +336,28 @@ in
             };
 
       flatResult =
-        if firstUnix == null then
-          { ok = true; unsealOrder = 11000; landingEnable = false; landingOrder = 11000; }
+        let
+          jumps = anyJump { inherit innerOf; seen = [ ]; rules = others; };
+        in
+        if jumps ? jump then
+          reject "the chain already contains a numeric jump on '${jumps.jump.name}' (${jumps.jump.control}) whose destination an insertion could change; libpam counts flattened lines, so a jump inside a delegation can land outside its own file"
+        else if jumps ? unproven then
+          reject "the chain cannot be inspected: ${jumps.unproven}"
+        else if firstUnix == null then
+          # No password rule and no delegation to anchor on: an empty chain
+          # is inert, anything else is unproven.
+          (
+            if rendered == [ ] then
+              { ok = true; unsealOrder = 11000; landingEnable = false; landingOrder = 11000; }
+            else
+              reject "no pam_unix rule and no include/substack delegation to anchor the face line on"
+          )
         else
           let
             before = slotBefore { rendered = rendered; anchor = firstUnix; };
-            breaker =
-              if before ? slot then jumpRewrittenAt { rendered = rendered; slot = before.slot; } else null;
           in
           if before ? bad then
             reject before.bad
-          else if breaker != null then
-            reject "inserting the face line at order ${toString before.slot} would change the destination of the numeric jump on '${breaker.name}' (${breaker.control})"
           else
             {
               ok = true;

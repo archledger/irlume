@@ -7,6 +7,23 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume login enable` and reconcile take irlume's lines out of a stack
+  they find no anchor in when an earlier release wired it (ly and
+  cinnamon-screensaver's `auth include login`, whose included stack starts
+  with `pam_nologin.so`, stopped qualifying in 0.15), as `login disable`
+  takes them out, with the same checks for the numeric jumps that count
+  them, and report both facts. This covers a stack irlume edits in place,
+  where a matching backup is restored as a disable restores it, and an
+  irlume-created override, which nobody edited is removed with the vendor
+  copy restored; `login enable --force` takes the lines out the same way
+  when its rebuild cannot land. Reconcile no longer fast-paths over such a
+  stack: an anchor its recipe can no longer land on counts as a regression,
+  so the self-heal performs the removal. A remote-seat greeter whose edited
+  override already holds the right lines keeps them, a wanted surface whose
+  lines come out this way counts as dropping for the GNOME keyring token
+  guard, and an opt-in `--with-sudo` or `--with-polkit` surface that comes
+  to nothing this way, override included, still fails the run (#932).
+
 - The NixOS module renders its login-profile PAM wiring against current
   nixpkgs, where SDDM's authentication `substack`s the `login` service
   instead of listing the module chain. The face line now sits immediately

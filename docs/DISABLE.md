@@ -144,9 +144,18 @@ be one of the modules that check no password (`pam_env.so`,
 `common-password`, `common-session` or `common-session-noninteractive`.
 PAM reads such a file into the auth stack too, so irlume reads it where
 PAM finds it and holds its auth lines to the same rule. Otherwise
-`irlume login enable` reports `no anchor to wire` for it and leaves it as
-it is: irlume's lines are designed to follow the password step and a line
-whose failure fails the stack.
+`irlume login enable` reports `no anchor to wire` for it: irlume's lines
+are designed to follow the password step and a line whose failure fails
+the stack. A file that still holds lines an earlier release wired around
+an anchor that no longer qualifies (ly and cinnamon-screensaver's
+`auth include login`, whose stack starts with `pam_nologin.so`) loses
+them, taken out as `login disable` takes them out, with the same checks
+for the jumps that count them, and both facts are reported: a stack
+irlume edits in place is stripped (a matching backup restored as a
+disable restores it), an irlume-created override nobody edited is removed
+with the vendor copy restored, and one an administrator put lines in is
+kept and loses irlume's lines only. A file without irlume's lines is
+left as it is.
 
 PAM puts the lines of an included stack in the include's place, and
 irlume's face line jumps over the first of them onto its landing after the
@@ -162,8 +171,8 @@ unwired. LightDM on openSUSE (`auth include xdm`, whose first line is the
 password substack) and on Alpine (`auth include base-auth`, `pam_unix.so`
 first) are wired that way. ly and cinnamon-screensaver on Arch, whose
 `login` checks `pam_nologin.so` first, are left unwired; such a stack that
-an earlier release wired keeps irlume's lines until `irlume login disable`
-takes them out.
+an earlier release wired loses irlume's lines, taken out by the next
+enable or reconcile as described above.
 
 An override written by a release before this tracking gets the line at the
 first reconcile when it still matches its vendor copy. One that no longer

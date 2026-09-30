@@ -1774,7 +1774,7 @@ pub(super) fn decide(i: &Input<'_>) -> Result<Decision, String> {
     };
     let class = classify(&p, i.vendor);
     if !i.enable {
-        return Ok(remove_or_strip(i, &p, class));
+        return Ok(remove_or_strip(i, &p, class, false));
     }
     // Every enable reads the file's own lines, if only to check where their
     // jumps land, even one that rebuilds it from the vendor file.
@@ -1782,7 +1782,7 @@ pub(super) fn decide(i: &Input<'_>) -> Result<Decision, String> {
         return Ok(unreadable(i, &line));
     }
     if i.force && matches!(class, E1 | E2 | L2) {
-        return forced(i, current, &p);
+        return forced(i, current, &p, class);
     }
     Ok(match class {
         U3 | E3 | L3 => vendor_gone(i, &p, class),
@@ -1791,13 +1791,16 @@ pub(super) fn decide(i: &Input<'_>) -> Result<Decision, String> {
     })
 }
 
-/// Disable. A file nobody edited is deleted, which restores the vendor copy.
-/// Any other is kept: irlume's lines are removed from it, or replaced by
-/// inactive lines in the same places when a numeric jump in the other lines
-/// counts them and would land somewhere else without them, or when irlume
-/// could not tell where to put them back without them (see
-/// [`strip_loses_place`]).
-fn remove_or_strip(i: &Input<'_>, p: &Parsed<'_>, class: Class) -> Decision {
+/// Disable, and the removal an enable that finds no anchor makes
+/// (`no_anchor` true, #932). A file nobody edited is deleted, which restores
+/// the vendor copy. Any other is kept: irlume's lines are removed from it,
+/// or replaced by inactive lines in the same places when a numeric jump in
+/// the other lines counts them and would land somewhere else without them,
+/// or when irlume could not tell where to put them back without them (see
+/// [`strip_loses_place`]). `no_anchor` words the reports as the reason the
+/// lines come out, and the held file reports `NoAnchor` rather than
+/// `NotWired`, so a requested scope still counts as unmet.
+fn remove_or_strip(i: &Input<'_>, p: &Parsed<'_>, class: Class, no_anchor: bool) -> Decision {
     let (etc, vendor_path) = (i.etc, i.vendor_path);
     if matches!(class, Class::U1 | Class::U2 | Class::L1) {
         // Vendor text plus irlume's lines: deleting it loses nothing.
@@ -1805,7 +1808,14 @@ fn remove_or_strip(i: &Input<'_>, p: &Parsed<'_>, class: Class) -> Decision {
             write: Write::Remove,
             ..keep(
                 PlannedChange::RemoveOverride,
-                format!("✓ {etc}: removed override (vendor restored)"),
+                if no_anchor {
+                    format!(
+                        "✓ {etc}: no anchor to wire, so the override came out ({vendor_path} \
+                             restored)"
+                    )
+                } else {
+                    format!("✓ {etc}: removed override (vendor restored)")
+                },
             )
         };
     }
@@ -1889,14 +1899,26 @@ fn remove_or_strip(i: &Input<'_>, p: &Parsed<'_>, class: Class) -> Decision {
     let (body, message) = match (held, &lowered) {
         (None, _) => (
             stripped,
-            format!("✓ {etc}: removed irlume's lines and kept the file; {kept_why}"),
+            if no_anchor {
+                format!("✓ {etc}: no anchor to wire, so irlume's lines came out; {kept_why}")
+            } else {
+                format!("✓ {etc}: removed irlume's lines and kept the file; {kept_why}")
+            },
         ),
         (Some(_), Some(Ok(adjusted))) if i.adjust_jumps => (
             adjusted.text.clone(),
-            format!(
-                "✓ {etc}: removed irlume's lines and kept the file; {kept_why}{}",
-                adjusted_note(adjusted)
-            ),
+            if no_anchor {
+                format!(
+                    "✓ {etc}: no anchor to wire, so irlume's lines came out and the jump that \
+                     counted them was lowered; {kept_why}{}",
+                    adjusted_note(adjusted)
+                )
+            } else {
+                format!(
+                    "✓ {etc}: removed irlume's lines and kept the file; {kept_why}{}",
+                    adjusted_note(adjusted)
+                )
+            },
         ),
         (Some((change, without, until)), _) => {
             let then = match &lowered {
@@ -1916,21 +1938,41 @@ fn remove_or_strip(i: &Input<'_>, p: &Parsed<'_>, class: Class) -> Decision {
                 return Decision {
                     adjustable,
                     ..keep(
-                        PlannedChange::NotWired,
-                        format!(
-                            "· {etc}: not wired; inactive lines hold the places of irlume's \
-                             lines, because {without}{then}"
-                        ),
+                        if no_anchor {
+                            PlannedChange::NoAnchor
+                        } else {
+                            PlannedChange::NotWired
+                        },
+                        if no_anchor {
+                            format!(
+                                "· {etc}: no anchor to wire; inactive lines hold the places of \
+                                 irlume's lines, because {without}{then}"
+                            )
+                        } else {
+                            format!(
+                                "· {etc}: not wired; inactive lines hold the places of irlume's \
+                                 lines, because {without}{then}"
+                            )
+                        },
                     )
                 };
             }
             (
                 inert,
-                format!(
-                    "✓ {etc}: turned irlume's lines into inactive pam_permit.so lines and kept \
-                     the file; {kept_why}\n    removing them instead would {change}; {until}, \
-                     `sudo irlume login disable --apply` removes them{then}"
-                ),
+                if no_anchor {
+                    format!(
+                        "✓ {etc}: no anchor to wire, so irlume's lines turned into inactive \
+                         pam_permit.so lines and kept the file; {kept_why}\n    removing them \
+                         instead would {change}; {until}, `sudo irlume login disable --apply` \
+                         removes them{then}"
+                    )
+                } else {
+                    format!(
+                        "✓ {etc}: turned irlume's lines into inactive pam_permit.so lines and \
+                         kept the file; {kept_why}\n    removing them instead would {change}; \
+                         {until}, `sudo irlume login disable --apply` removes them{then}"
+                    )
+                },
             )
         }
     };
@@ -1946,7 +1988,7 @@ fn remove_or_strip(i: &Input<'_>, p: &Parsed<'_>, class: Class) -> Decision {
     }
 }
 
-fn forced(i: &Input<'_>, current: &str, p: &Parsed<'_>) -> Result<Decision, String> {
+fn forced(i: &Input<'_>, current: &str, p: &Parsed<'_>, class: Class) -> Result<Decision, String> {
     let (etc, vendor_path) = (i.etc, i.vendor_path);
     let v = i
         .vendor
@@ -1966,6 +2008,12 @@ fn forced(i: &Input<'_>, current: &str, p: &Parsed<'_>) -> Result<Decision, Stri
     }
     let (wired, ok) = (i.wire)(&base(v));
     if !ok {
+        // #932: the forced rebuild has no anchor to land either, so the
+        // lines an earlier release wired come out as in the plain enable,
+        // the administrator's lines kept.
+        if has_irlume_line(&p.body) {
+            return Ok(remove_or_strip(i, p, class, true));
+        }
         return Ok(no_anchor(etc));
     }
     if i.backup.is_some_and(|b| b != current) {
@@ -2092,6 +2140,7 @@ fn rebuild(i: &Input<'_>, current: &str, p: &Parsed<'_>, class: Class) -> Decisi
     in_place(
         i,
         p,
+        class,
         InPlace {
             edited: false,
             unchanged: (
@@ -2129,8 +2178,10 @@ struct InPlace {
 /// Update irlume's lines in an override and keep every other line, the
 /// header included. Refused, with nothing written, when the update would
 /// change where a numeric jump in the other lines lands or would move one of
-/// irlume's lines past an administrator's line.
-fn in_place(i: &Input<'_>, p: &Parsed<'_>, m: InPlace) -> Decision {
+/// irlume's lines past an administrator's line. An override that holds
+/// irlume's lines and whose recipe finds no anchor loses them here, as a
+/// disable takes them out (#932); `class` says how.
+fn in_place(i: &Input<'_>, p: &Parsed<'_>, class: Class, m: InPlace) -> Decision {
     let etc = i.etc;
     // Checked on the whole file: the recipe refuses a continued line in the
     // lines irlume did not write, but a `\` added to one of irlume's own
@@ -2145,6 +2196,13 @@ fn in_place(i: &Input<'_>, p: &Parsed<'_>, m: InPlace) -> Decision {
     let bare = base(&p.body);
     let (wired, ok) = (i.wire)(&bare);
     if !ok {
+        // #932: no anchor for the recipe, and the override holds lines an
+        // earlier release wired: they come out, as a disable takes them
+        // out, with its checks for the jumps that count them. An override
+        // without irlume's lines has nothing to take out and is skipped.
+        if has_irlume_line(&p.body) {
+            return remove_or_strip(i, p, class, true);
+        }
         return no_anchor(etc);
     }
     let InPlace {
@@ -2372,6 +2430,7 @@ fn rewire_edited(i: &Input<'_>, p: &Parsed<'_>, class: Class) -> Decision {
             return in_place(
                 i,
                 p,
+                class,
                 InPlace {
                     edited: true,
                     unchanged: (
@@ -2395,6 +2454,7 @@ fn rewire_edited(i: &Input<'_>, p: &Parsed<'_>, class: Class) -> Decision {
     in_place(
         i,
         p,
+        class,
         InPlace {
             edited: true,
             unchanged: (
@@ -2433,6 +2493,7 @@ fn vendor_gone(i: &Input<'_>, p: &Parsed<'_>, class: Class) -> Decision {
     in_place(
         i,
         p,
+        class,
         InPlace {
             edited: class.edited(),
             unchanged: (

@@ -144,9 +144,14 @@ be one of the modules that check no password (`pam_env.so`,
 `common-password`, `common-session` or `common-session-noninteractive`.
 PAM reads such a file into the auth stack too, so irlume reads it where
 PAM finds it and holds its auth lines to the same rule. Otherwise
-`irlume login enable` reports `no anchor to wire` for it and leaves it as
-it is: irlume's lines are designed to follow the password step and a line
-whose failure fails the stack.
+`irlume login enable` reports `no anchor to wire` for it: irlume's lines
+are designed to follow the password step and a line whose failure fails
+the stack. A file that still holds lines an earlier release wired around
+an anchor that no longer qualifies (ly and cinnamon-screensaver's
+`auth include login`, whose stack starts with `pam_nologin.so`) loses
+them, taken out as `login disable` takes them out, with the same checks
+for the jumps that count them, and both facts are reported; a file without
+irlume's lines is left as it is.
 
 PAM puts the lines of an included stack in the include's place, and
 irlume's face line jumps over the first of them onto its landing after the

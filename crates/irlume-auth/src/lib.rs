@@ -8287,7 +8287,7 @@ impl Engine {
         let enr = if replace {
             Enrollment::new(user)
         } else {
-            storage::load(user)?.unwrap_or_else(|| Enrollment::new(user))
+            storage::load_unmoved(user)?.unwrap_or_else(|| Enrollment::new(user))
         };
         let want = want.clamp(1, MAX_SCANS_PER_PROFILE);
         // Fail fast on an explicit duplicate name, before the camera opens. The
@@ -8785,7 +8785,7 @@ impl Engine {
     ) -> irlume_common::Result<AddScanOutcome> {
         observer.check()?;
         use irlume_core::storage::{self, FaceScan, MAX_SCANS_PER_PROFILE};
-        let mut enr = storage::load(user)?
+        let mut enr = storage::load_unmoved(user)?
             .ok_or_else(|| irlume_common::Error::Protocol(format!("'{user}' is not enrolled")))?;
         let idx = enr
             .profiles
@@ -8956,7 +8956,7 @@ impl Engine {
     ) -> irlume_common::Result<String> {
         use irlume_core::storage::{self, MAX_SCANS_PER_PROFILE};
         observer.check()?;
-        let enr = storage::load(user)?
+        let enr = storage::load_unmoved(user)?
             .ok_or_else(|| irlume_common::Error::Protocol(format!("'{user}' is not enrolled")))?;
         // The group's scans belong to ONE primary profile: resolve it now,
         // before the camera opens. `None` is only unambiguous when the
@@ -15764,6 +15764,22 @@ mod engine_tests {
         teardown_sandbox(&dir);
     }
 
+    /// The missing/full-profile and capture refusals in add-scan occur after
+    /// its preliminary enrollment read. That read must not reseal a key.
+    #[test]
+    fn add_scan_refusals_use_the_unmoving_key_loader() {
+        let source = include_str!("lib.rs");
+        let method = source
+            .split_once("pub fn add_scan_observed(")
+            .expect("add-scan engine entry exists")
+            .1
+            .split_once("/// One framing-guide sample")
+            .expect("add-scan method ends before the framing guide")
+            .0;
+        assert!(method.contains("storage::load_unmoved(user)?"));
+        assert!(!method.contains("storage::load(user)?"));
+    }
+
     #[test]
     fn add_scan_pre_camera_guards() {
         let _g = env_guard();
@@ -15794,8 +15810,14 @@ mod engine_tests {
             ir_calibs: Default::default(),
         });
         write_enrollment(&dir, &e);
+        let primary_before = std::fs::read(dir.join("irlume-test-add.json")).unwrap();
         let err = s.engine.add_scan("irlume-test-add", "nope", 1).unwrap_err();
         assert!(err.to_string().contains("no face profile 'nope'"), "{err}");
+        assert_eq!(
+            std::fs::read(dir.join("irlume-test-add.json")).unwrap(),
+            primary_before,
+            "an unknown profile leaves the primary enrollment untouched"
+        );
         // Full profile: refused before any capture.
         let mut e = Enrollment::new("irlume-test-full");
         e.profiles.push(FaceProfile {

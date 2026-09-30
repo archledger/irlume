@@ -920,6 +920,21 @@ pub fn load(user: &str) -> irlume_common::Result<Option<Enrollment>> {
     .map(|loaded| loaded.map(|(enrollment, _)| enrollment))
 }
 
+/// Load an enrollment before a possible write without moving its sealed key
+/// to a stronger TPM policy. The write moves a key only after deciding to keep
+/// it, so a refused mutation leaves the key envelope as it was.
+///
+/// # Errors
+/// As [`load`].
+pub fn load_unmoved(user: &str) -> irlume_common::Result<Option<Enrollment>> {
+    load_with(
+        user,
+        template_key::UserStateLock::acquire_for_load,
+        template_key::load_key_unmoved_as,
+    )
+    .map(|loaded| loaded.map(|(enrollment, _)| enrollment))
+}
+
 /// An enrollment together with the template key its load unsealed (`None`
 /// for a plaintext store).
 pub type LoadedEnrollment = (Enrollment, Option<Zeroizing<Vec<u8>>>);
@@ -3210,6 +3225,22 @@ mod tests {
         assert_eq!(sealed.private, key.to_vec(), "a new key is sealed");
         assert_eq!(sealed.uid, Some(7202), "for the account");
         leave_uid_sandbox(&dir);
+    }
+
+    /// The production loader for a read before a possible write must not
+    /// upgrade a sealed key before the write decides whether to keep it.
+    #[test]
+    fn a_read_before_a_write_uses_the_unmoved_key_loader() {
+        let source = include_str!("storage.rs");
+        let loader = source
+            .split_once("pub fn load_unmoved(user: &str)")
+            .expect("the production read-before-write loader exists")
+            .1
+            .split_once("/// An enrollment together with the template key")
+            .expect("the loader ends before the next public API")
+            .0;
+        assert!(loader.contains("template_key::load_key_unmoved_as"));
+        assert!(!loader.contains("template_key::load_key_as,"));
     }
 
     /// A write moves an existing template key to a stronger TPM policy only

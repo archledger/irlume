@@ -3525,13 +3525,16 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             structured_errors,
             ..
         } => {
+            let uid = attempt_record::arrival_uid(&user, peer.uid);
             attempt_record::record_on_arrival(
                 user.clone(),
-                peer.uid,
+                uid,
                 attempt_record::Filed {
                     at: attempt_record::unix_now(),
                     kind: irlume_common::AttemptKind::Authenticate,
-                    surface: attempt_surface(&user, service.as_deref(), peer),
+                    surface: uid
+                        .map(|uid| attempt_surface(uid, service.as_deref(), peer))
+                        .unwrap_or(irlume_common::AttemptSurface::Other),
                     result: irlume_common::AttemptResult::Failed,
                     cause: Some(EarlyRefusal::DaemonStarting.cause()),
                     elapsed_ms: 0,
@@ -3553,13 +3556,16 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             }
         }
         Request::UnsealPassword { user, service } => {
+            let uid = attempt_record::arrival_uid(&user, peer.uid);
             attempt_record::record_on_arrival(
                 user.clone(),
-                peer.uid,
+                uid,
                 attempt_record::Filed {
                     at: attempt_record::unix_now(),
                     kind: irlume_common::AttemptKind::Authenticate,
-                    surface: attempt_surface(&user, service.as_deref(), peer),
+                    surface: uid
+                        .map(|uid| attempt_surface(uid, service.as_deref(), peer))
+                        .unwrap_or(irlume_common::AttemptSurface::Other),
                     result: irlume_common::AttemptResult::Failed,
                     cause: Some(EarlyRefusal::DaemonStarting.cause()),
                     elapsed_ms: 0,
@@ -3574,9 +3580,10 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
         // Past pregate, so an `IdentifyFor` peer may act for the account.
         Request::Identify | Request::IdentifyFor { .. } => {
             if let Some(name) = identify_account(&req, peer) {
+                let uid = attempt_record::arrival_uid(&name, peer.uid);
                 attempt_record::record_on_arrival(
                     name.clone(),
-                    peer.uid,
+                    uid,
                     attempt_record::Filed {
                         at: attempt_record::unix_now(),
                         kind: irlume_common::AttemptKind::Identify,
@@ -6893,18 +6900,23 @@ fn note_decided(cause: Option<irlume_common::OutcomeCause>) {
 }
 
 /// The surface an authentication serves (ADR-0030 §5): the operation
-/// class with the session state bound to this login; `Other` only when
-/// the account cannot be resolved. The gate keeps its own classification.
-fn attempt_surface(
-    user: &str,
+/// class with the session state bound to this login's registered uid;
+/// `Other` when that state cannot be resolved. The gate keeps its own
+/// classification.
+fn attempt_surface(uid: u32, service: Option<&str>, peer: &Peer) -> irlume_common::AttemptSurface {
+    attempt_surface_with(uid, service, peer.pid, attempt_record::session_state_for)
+}
+
+fn attempt_surface_with(
+    uid: u32,
     service: Option<&str>,
-    peer: &Peer,
+    peer_pid: i32,
+    session_state: impl FnOnce(i32, u32) -> Option<irlume_core::biopolicy::SessionState>,
 ) -> irlume_common::AttemptSurface {
     // Unresolvable session state is `Other` in the record (the contract),
     // even though policy would treat it as cold: a dual-purpose greeter
     // must not be filed as a login on a guess.
-    crate::users::uid_for_name(user)
-        .and_then(|uid| attempt_record::session_state_for(peer.pid, uid))
+    session_state(peer_pid, uid)
         .map(|state| irlume_core::biopolicy::classify(service.unwrap_or(""), state))
         .map(attempt_record::surface_for)
         .unwrap_or(irlume_common::AttemptSurface::Other)
@@ -6915,10 +6927,10 @@ impl AttemptContext {
     /// opens); a path that never reaches a camera passes `|| None`. `owner`
     /// is the request's diagnostic owner, which records the uid it acts for
     /// ([`request_account_uid`]). A request that acts for no uid (root's
-    /// request for a name that did not resolve when it was registered)
-    /// files nothing: a lookup when the reply is filed could only find an
-    /// account the name was given since, and the attempt is not that
-    /// account's history.
+    /// request for a name that was absent or whose lookup failed when it was
+    /// registered) files nothing: a later lookup might return a uid after
+    /// a name change or a transient lookup failure, but the attempt was not
+    /// registered for that uid.
     fn for_request(
         req: &Request,
         peer: &Peer,
@@ -6934,7 +6946,7 @@ impl AttemptContext {
             | Request::UnsealPassword { user, service } => (
                 user.clone(),
                 irlume_common::AttemptKind::Authenticate,
-                attempt_surface(user, service.as_deref(), peer),
+                attempt_surface(uid, service.as_deref(), peer),
             ),
             Request::Identify | Request::IdentifyFor { .. } => {
                 // Root's account-less identify has no account to file under.
@@ -8877,7 +8889,7 @@ fn mutate_enrollment(
     user: &str,
     f: impl FnOnce(&mut irlume_core::storage::Enrollment) -> Result<String, String>,
 ) -> Response {
-    let mut enr = match irlume_core::storage::load(user) {
+    let mut enr = match irlume_core::storage::load_unmoved(user) {
         Ok(Some(e)) => e,
         Ok(None) => return Response::Error(format!("'{user}' is not enrolled")),
         Err(e) => return Response::Error(e.to_string()),
@@ -8962,7 +8974,7 @@ fn add_camera_group(
 ) -> Response {
     // The enrollment gate first (the engine re-checks; this is the UX
     // order): an account with no primary enrollment has nothing to extend.
-    if matches!(irlume_core::storage::load(user), Ok(None)) {
+    if matches!(irlume_core::storage::load_unmoved(user), Ok(None)) {
         return Response::Error(format!("'{user}' is not enrolled"));
     }
     let pair = engine.live_pair();
@@ -11238,12 +11250,19 @@ mod tests {
             // did (`EnrollmentSummary::serves`), which asks NSS for a root
             // peer.
             "account::resolve(",
+            "account::resolve_fresh(",
+            "arrival_uid(",
+            "record_on_arrival(",
             "summary_owner(",
             "dispatch_status(",
             // Holds a uid for the name a request names, which every lookup
             // of that name answers while it is held.
             "worker_account_uid(",
         ];
+        assert!(
+            readers.contains(&"arrival_uid("),
+            "the startup attempt helper reaches NSS and needs an environment guard"
+        );
         /// Drops char literals, string literals and line comments so a brace
         /// inside one is not counted as structure.
         ///
@@ -12692,6 +12711,16 @@ mod tests {
                 "a structured client must get a retryable operational failure, got {other:?}"
             ),
         }
+    }
+
+    #[test]
+    fn attempt_surface_uses_the_registered_account_uid() {
+        use irlume_core::biopolicy::SessionState;
+        let surface = attempt_surface_with(4242, Some("gdm-password"), 77, |pid, uid| {
+            assert_eq!((pid, uid), (77, 4242));
+            Some(SessionState::Warm)
+        });
+        assert_eq!(surface, irlume_common::AttemptSurface::Lock);
     }
 
     /// The startup path answers a keyring release before the engine exists,

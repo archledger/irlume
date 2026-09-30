@@ -642,7 +642,7 @@ fn add_camera_group_refuses_before_the_camera_opens() {
     });
     enr.profiles.push(enr.profiles[0].clone());
     enr.profiles[1].name = "Second".into();
-    let _bytes = sandbox.write_primary("pad-contract", &enr);
+    let bytes = sandbox.write_primary("pad-contract", &enr);
     let refused = s
         .engine
         .add_camera_group_observed(
@@ -677,6 +677,11 @@ fn add_camera_group_refuses_before_the_camera_opens() {
         refused.to_string().contains("no face profile named"),
         "{refused}"
     );
+    assert_eq!(
+        std::fs::read(sandbox.primary_path("pad-contract")).unwrap(),
+        bytes,
+        "refused profile selection leaves the primary enrollment untouched"
+    );
 
     // A single-profile enrollment passes the profile gate but the shared
     // engine's cameras carry no USB identity: a group cannot bind.
@@ -705,6 +710,22 @@ fn add_camera_group_refuses_before_the_camera_opens() {
     assert!(refused.to_string().contains("no USB identity"), "{refused}");
     assert!(s.engine.secondary_attempt.is_none());
     s.engine.begin_attempt();
+}
+
+/// Refused add-camera requests must not move the primary's sealed key before
+/// profile, pair, and authorization checks decide whether to publish.
+#[test]
+fn add_camera_group_loads_the_primary_without_moving_its_key() {
+    let source = include_str!("../lib.rs");
+    let method = source
+        .split_once("pub fn add_camera_group_observed(")
+        .expect("add-camera engine entry exists")
+        .1
+        .split_once("/// Removes one secondary camera group")
+        .expect("add-camera method ends before remove-camera")
+        .0;
+    assert!(method.contains("storage::load_unmoved(user)?"));
+    assert!(!method.contains("storage::load(user)?"));
 }
 
 #[test]

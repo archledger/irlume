@@ -1184,6 +1184,53 @@ pub(super) fn include_could_jump_past(
     )
 }
 
+/// The phase lines an include puts in the parent chain, with nested includes
+/// expanded. An include of another phase contributes no lines; one we cannot
+/// read has no answer.
+pub(super) fn expanded_include_lines(line: &str, phase: &str) -> Option<Vec<String>> {
+    let name = if is_at_include(line) {
+        at_include_target(line)?
+    } else {
+        let h = head(line)?;
+        if !h.control.eq_ignore_ascii_case("include") {
+            return None;
+        }
+        if h.phase != phase {
+            return Some(Vec::new());
+        }
+        third_field(&h)?
+    };
+    included_lines(name, phase, 1)
+}
+
+/// The parent-chain offsets a readable included stack's numeric jumps can
+/// land on past its first following line. For a first in-place enable,
+/// `first_following` also returns offset zero: a new line directly after the
+/// include can change that landing. The other paths retain their established
+/// treatment of jumps onto the first following line. An unreadable stack or
+/// a line that is not an include has no answer.
+pub(super) fn included_jump_offsets(
+    line: &str,
+    phase: &str,
+    first_following: bool,
+) -> Option<Vec<usize>> {
+    let lines = expanded_include_lines(line, phase)?;
+    let mut offsets = Vec::new();
+    for (at, included) in lines.iter().enumerate() {
+        if let Some(h) = head(included) {
+            for (_, reach) in numeric_actions(&h) {
+                let target = at.saturating_add(reach).saturating_add(1);
+                if target > lines.len() || first_following && target == lines.len() {
+                    offsets.push(target - lines.len());
+                }
+            }
+        }
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    Some(offsets)
+}
+
 /// Whether irlume can read the lines an `include` or a Debian `@include`
 /// line puts in its place, the stacks they include in turn among them, as
 /// [`include_could_jump_past`] reads them ([`included_lines`]): `false` for

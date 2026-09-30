@@ -7,6 +7,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- PAM wiring checks jumps in readable stacks brought in by `include` or
+  `@include` when they reach into later lines of the parent stack. An edited
+  override or in-place stack keeps the counted lines in their places instead
+  of moving the jump; a disable can still remove irlume's lines when that
+  restores the included jump's vendor landing (#934).
+
 - `irlume login enable` and reconcile take irlume's lines out of a stack
   they find no anchor in when an earlier release wired it (ly and
   cinnamon-screensaver's `auth include login`, whose included stack starts

@@ -4272,3 +4272,141 @@ fn an_enable_over_inactive_lines_names_the_disable_with_the_flag() {
     assert!(after.contains(&raised), "{after}");
     assert_eq!(lands_after(&after, "pam_fprintd.so", 2), PERMIT_LANDING);
 }
+
+/// A numeric jump in a stack an `include` of the file names that lands past
+/// that stack counts the lines after the include, irlume's among them
+/// (#934). An override made from a vendor file with such an include above
+/// irlume's lines is created with a warning naming the include's line; an
+/// enable of the edited file is refused, and `--adjust-jumps` cannot help,
+/// for the jump is not in this file; a disable turns irlume's lines into
+/// inactive ones so the count stays. An include whose stack's jumps land
+/// inside it, and one below irlume's lines of the phase it feeds, hold
+/// nothing. Unreadable included stacks are tracked separately by #935.
+#[test]
+fn a_jump_in_an_included_stack_holds_an_override_write_that_moves_it() {
+    let leaves = "auth [success=3 default=die] pam_foo.so\n";
+    let stays = "auth [success=1 default=die] pam_foo.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n";
+    let include_of = |stack: &str| format!("auth       include       {stack}");
+    // The TestDir must outlive the service: dropping it removes the tree.
+    let setup = |name: &str, stack: Option<&str>, vendor: &str| -> (TestDir, Svc) {
+        let dir = TestDir::new(&format!("ovr-included-jump-{name}"));
+        let svc = plasmalogin(&dir.0, vendor);
+        let pam_d = Path::new(svc.etc).parent().unwrap();
+        if let Some(text) = stack {
+            std::fs::write(pam_d.join("leap-auth"), text).unwrap();
+        }
+        std::fs::write(pam_d.join("password-auth"), FEDORA_PASSWORD_AUTH).unwrap();
+        std::fs::write(pam_d.join("postlogin"), FEDORA_POSTLOGIN).unwrap();
+        (dir, svc)
+    };
+    let with_local = |svc: &Svc, line: &str| -> String {
+        let edited = with_line(&read_file(svc.etc), line);
+        std::fs::write(svc.etc, &edited).unwrap();
+        edited
+    };
+    let local = "auth       required      pam_local.so   # local";
+
+    // The stack's jump lands past it: the override is created, warning about
+    // the include by its line in the vendor file.
+    let vendor = with_line(UPSTREAM_FEDORA, &include_of("leap-auth"));
+    let (_dir, svc) = setup("leaps", Some(leaves), &vendor);
+    let made = wire_service(&svc, true, true, &keyring_only).unwrap();
+    assert_eq!(change_id(&made), "materialize-override", "{made}");
+    assert!(made.message.contains("the include on line 2 of"), "{made}");
+    assert!(
+        made.message.contains("counts the lines irlume adds"),
+        "{made}"
+    );
+
+    // An administrator's line, then a face line the existing keyring-only
+    // wiring has no place for: the write that would move the include's jump
+    // is refused; the flag cannot raise a jump that is not in this file.
+    let edited = with_local(&svc, local);
+    let tail = "auth       optional      pam_tail.so   # local tail";
+    let edited = edited.replacen(
+        &format!("{}\n", include_of("leap-auth")),
+        &format!("{}\n{tail}\n", include_of("leap-auth")),
+        1,
+    );
+    std::fs::write(svc.etc, &edited).unwrap();
+    let rewire = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert_eq!(change_id(&rewire), "keep-edited-override", "{rewire}");
+    assert!(rewire.unmet, "{rewire}");
+    assert!(rewire.message.contains("the include on line 5"), "{rewire}");
+    assert_eq!(read_file(svc.etc), edited);
+    let flagged = wire_service_with(&svc, true, &adjusting(true), &face_and_keyring).unwrap();
+    assert_eq!(change_id(&flagged), "keep-edited-override", "{flagged}");
+    assert!(
+        flagged.message.contains("--adjust-jumps cannot"),
+        "{flagged}"
+    );
+    assert!(
+        flagged.message.contains("a stack this file includes"),
+        "{flagged}"
+    );
+    assert_eq!(read_file(svc.etc), edited);
+
+    // A disable keeps every jump's landing: irlume's lines turn into
+    // inactive ones in their places, with or without the flag.
+    for opts in [
+        WireOpts {
+            apply: true,
+            ..WireOpts::default()
+        },
+        adjusting(true),
+    ] {
+        let off = wire_service_with(&svc, false, &opts, &keyring_only).unwrap();
+        let after = read_file(svc.etc);
+        assert!(after.contains(&include_of("leap-auth")), "{after}");
+        assert!(after.contains(INERT_TAG), "{off}\n{after}");
+        assert!(off.message.contains("the include on line 5"), "{off}");
+        std::fs::write(svc.etc, &edited).unwrap();
+    }
+
+    // Once the only edit after the include is gone, removing irlume's lines
+    // restores the vendor's landing and needs no inactive placeholders.
+    let vendor_landing = edited.replacen(&format!("{tail}\n"), "", 1);
+    std::fs::write(svc.etc, vendor_landing).unwrap();
+    let off = wire_service(&svc, false, true, &keyring_only).unwrap();
+    assert!(!read_file(svc.etc).contains(INERT_TAG), "{off}");
+
+    // The stack's jumps land inside it: nothing holds the write.
+    let (_dir, svc) = setup("stays", Some(stays), &vendor);
+    let made = wire_service(&svc, true, true, &keyring_only).unwrap();
+    assert_eq!(change_id(&made), "materialize-override", "{made}");
+    assert!(!made.message.contains("the include on line 2 of"), "{made}");
+    let edited = with_local(&svc, local);
+    let rewire = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert_eq!(change_id(&rewire), "rewire-override", "{rewire}");
+    assert!(!rewire.unmet, "{rewire}");
+    assert!(read_file(svc.etc) != edited);
+    let off = wire_service(&svc, false, true, &keyring_only).unwrap();
+    assert!(!off.message.contains("the include on line 5"), "{off}");
+
+    // Below irlume's lines of the phase it feeds: no include holds the
+    // write, whatever its stack does.
+    let tail = UPSTREAM_FEDORA.replacen(
+        "auth        include       postlogin\n",
+        "auth        include       postlogin\nauth       include       leap-auth\n",
+        1,
+    );
+    let (_dir, svc) = setup("below", Some(leaves), &tail);
+    let made = wire_service(&svc, true, true, &keyring_only).unwrap();
+    assert_eq!(change_id(&made), "materialize-override", "{made}");
+    let tail_line = tail
+        .lines()
+        .position(|line| line.contains("leap-auth"))
+        .unwrap()
+        + 1;
+    assert!(
+        !made
+            .message
+            .contains(&format!("the include on line {tail_line} of")),
+        "{made}"
+    );
+    let edited = with_local(&svc, local);
+    let rewire = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert_eq!(change_id(&rewire), "rewire-override", "{rewire}");
+    assert!(!rewire.unmet, "{rewire}");
+    assert_ne!(read_file(svc.etc), edited);
+}

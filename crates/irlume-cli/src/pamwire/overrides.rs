@@ -840,6 +840,7 @@ pub(super) struct Shift {
     /// Which line of its phase with that text it is, counting from 1.
     ordinal: usize,
     now: Landing,
+    included: bool,
 }
 
 fn find_landing(set: &[Jump], j: &Jump) -> Option<Landing> {
@@ -864,10 +865,121 @@ pub(super) fn jump_shifts(before: &str, after: &str) -> Vec<Shift> {
                 line: j.line,
                 ordinal: j.ordinal,
                 now: j.landing,
+                included: false,
             });
         }
     }
+    out.extend(included_shifts(before, after, false, false));
     out
+}
+
+/// Where an included stack's jump lands in this parent chain. Its offset is
+/// counted from the first line after the include, with zero naming that line.
+fn included_landing(
+    text: &str,
+    phase: &str,
+    include: &str,
+    ordinal: usize,
+    offset: usize,
+) -> Option<Landing> {
+    let chain = chain(text, phase);
+    let at = chain
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| is_include(line) && norm(line) == include)
+        .nth(ordinal - 1)
+        .map(|(at, _)| at)?;
+    // Each later include contributes its modules, not one directive. Keep
+    // the source include as a marker so its jump starts at the right place.
+    let mut expanded: Vec<String> = chain[..=at].iter().map(|line| line.to_string()).collect();
+    let target = at.saturating_add(offset).saturating_add(1);
+    for line in chain.iter().skip(at + 1) {
+        if expanded.len() > target {
+            break;
+        }
+        if is_include(line) {
+            expanded.extend(grammar::expanded_include_lines(line, phase)?);
+        } else {
+            expanded.push(line.to_string());
+        }
+    }
+    let lines: Vec<&str> = expanded.iter().map(String::as_str).collect();
+    Some(landing_of(&lines, at, offset.min(lines.len())))
+}
+
+/// An included stack may jump onto lines after its include. Compare those
+/// actual landing lines, rather than every later irlume line: adding a line
+/// beyond the jump's reach does not move it. For the enable check, compare
+/// with the proposed file without irlume's lines to exclude vendor-only
+/// changes. The caller's reader resolves the include in this service's PAM
+/// directory.
+fn included_shifts(
+    before: &str,
+    after: &str,
+    caused_by_irlume: bool,
+    first_following: bool,
+) -> Vec<Shift> {
+    let mut out = Vec::new();
+    let old_bare = caused_by_irlume.then(|| base(before));
+    let new_bare = caused_by_irlume.then(|| base(after));
+    for phase_name in PHASES {
+        let mut seen: Vec<(String, usize)> = Vec::new();
+        for line in chain(after, phase_name) {
+            if !is_include(line) {
+                continue;
+            }
+            let key = norm(line);
+            let ordinal = match seen.iter_mut().find(|(name, _)| *name == key) {
+                Some((_, count)) => {
+                    *count += 1;
+                    *count
+                }
+                None => {
+                    seen.push((key.clone(), 1));
+                    1
+                }
+            };
+            // An unreadable include is handled by the separate no-read
+            // policy; this check compares jumps in stacks we can inspect.
+            let Some(offsets) = grammar::included_jump_offsets(line, phase_name, first_following)
+            else {
+                continue;
+            };
+            for offset in offsets {
+                let prior = included_landing(before, phase_name, &key, ordinal, offset);
+                let next = included_landing(after, phase_name, &key, ordinal, offset);
+                if let (Some(old_bare), Some(new_bare)) = (&old_bare, &new_bare) {
+                    let bare = included_landing(new_bare, phase_name, &key, ordinal, offset);
+                    let moved_by_irlume = bare
+                        .as_ref()
+                        .is_some_and(|bare| next.as_ref() != Some(bare));
+                    let already = prior == next
+                        && included_landing(old_bare, phase_name, &key, ordinal, offset) == bare;
+                    if !moved_by_irlume || already {
+                        continue;
+                    }
+                } else if prior == next {
+                    continue;
+                }
+                let Some(now) = next else { continue };
+                out.push(Shift {
+                    phase: phase_name,
+                    line: key.clone(),
+                    ordinal,
+                    now,
+                    included: true,
+                });
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Included jumps moved by irlume's new lines, including a first write to
+/// an in-place stack that has no existing irlume lines to refill.
+pub(super) fn included_jumps_moved_by_irlume(before: &str, after: &str) -> Vec<Shift> {
+    included_shifts(before, after, true, true)
 }
 
 /// The lines of `stripped`, a file without irlume's lines, each of whose
@@ -933,6 +1045,24 @@ fn strip_shifts(body: &str, stripped: &str, vendor: Option<&str>) -> Vec<Shift> 
     shifts
         .into_iter()
         .filter(|s| {
+            if s.included {
+                let include = chain(stripped, s.phase)
+                    .into_iter()
+                    .filter(|line| is_include(line) && norm(line) == s.line)
+                    .nth(s.ordinal - 1);
+                let Some(offsets) =
+                    include.and_then(|line| grammar::included_jump_offsets(line, s.phase, false))
+                else {
+                    return true;
+                };
+                let vendor_bare = base(v);
+                return !offsets.into_iter().all(|offset| {
+                    let now = included_landing(stripped, s.phase, &s.line, s.ordinal, offset);
+                    now.is_some()
+                        && now
+                            == included_landing(&vendor_bare, s.phase, &s.line, s.ordinal, offset)
+                });
+            }
             !stripped_jumps
                 .iter()
                 .filter(|j| j.line == s.line)
@@ -956,6 +1086,12 @@ pub(super) fn shift_reason(shifts: &[Shift], names: &[Names<'_>]) -> String {
         1 => String::new(),
         n => format!(" (and {} more)", n - 1),
     };
+    if first.included {
+        return format!(
+            "the include on {} would count different lines{more}",
+            first.named(names)
+        );
+    }
     format!(
         "the jump on {} would then land on {}{more}",
         first.named(names),
@@ -967,6 +1103,12 @@ fn shift_warnings(shifts: &[Shift], why: &str, names: &[Names<'_>]) -> String {
     shifts
         .iter()
         .map(|s| {
+            if s.included {
+                return format!(
+                    "\n    ⚠ the include on {} counts the lines irlume adds; check that include",
+                    s.named(names)
+                );
+            }
             format!(
                 "\n    ⚠ the jump on {} now lands on {}{why}; check that jump",
                 s.named(names),
@@ -1015,9 +1157,11 @@ pub(super) fn jumps_moved_by_irlume(before: &str, after: &str) -> Vec<Shift> {
                 line: j.line,
                 ordinal: j.ordinal,
                 now: j.landing,
+                included: false,
             });
         }
     }
+    out.extend(included_shifts(before, after, true, false));
     out
 }
 
@@ -1891,8 +2035,13 @@ fn remove_or_strip(i: &Input<'_>, p: &Parsed<'_>, class: Class, no_anchor: bool)
         number: &|at| p.line_number(at),
         vendor: i.vendor,
     };
-    let lowered =
-        (!shifts.is_empty() && !loses_place).then(|| adjust::lower(&p.body, &stripped, &source));
+    let lowered = (!shifts.is_empty() && !loses_place).then(|| {
+        if shifts.iter().any(|shift| shift.included) {
+            Err("the jump is in a stack this file includes".to_string())
+        } else {
+            adjust::lower(&p.body, &stripped, &source)
+        }
+    });
     // The plan marks a surface the flag would handle differently: inactive
     // lines without it, irlume's lines removed with it.
     let adjustable = held.is_some() && !i.adjust_jumps && matches!(lowered, Some(Ok(_)));
@@ -2316,6 +2465,16 @@ fn in_place(i: &Input<'_>, p: &Parsed<'_>, class: Class, m: InPlace) -> Decision
             Some((text, check)) => (text, check, true),
             None => {
                 let why = format!("move a jump: {reason}");
+                if jumps_moved_by_irlume(&p.body, &arranged)
+                    .iter()
+                    .any(|shift| shift.included)
+                {
+                    return refuse(
+                        why,
+                        adjust_refusal("the jump is in a stack this file includes"),
+                        false,
+                    );
+                }
                 let source = adjust::Source {
                     carriage_return: has_read_carriage_return(p.text),
                     opens: i.opens,

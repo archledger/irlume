@@ -12,22 +12,25 @@
 ##
 ##   * A login greeter (sddm, gdm-password, greetd, ly, tty login) gets
 ##     `[success=1 default=ignore]`, NOT `sufficient`. It records the face
-##     success but skips exactly one rule, so pam_kwallet / pam_gnome_keyring
-##     still runs and unseals the wallet, and pam_unix grants on the token the
-##     daemon unsealed. `sufficient` would short-circuit past the keyring and
-##     leave the session with a locked wallet. A pam_permit landing rule
-##     catches the jump on services whose auth nixpkgs renders as a
-##     `substack` (SDDM on current nixpkgs); there the face line goes
-##     immediately before that substack and the landing immediately after it,
-##     so a face success skips the whole substack, whose pam_unix would fail
-##     on the empty Enter that armed the face scan. Flat chains get no
-##     landing; the face line goes immediately before the password-prompting
-##     pam_unix instead. The one login layout that DOES get `sufficient` is
-##     an `include` anchor: libpam expands an include inline, so a success=N
+##     success but skips exactly one rule, so on a flat chain pam_kwallet /
+##     pam_gnome_keyring still runs and unseals the wallet, and pam_unix
+##     grants on the token the daemon unsealed. `sufficient` would
+##     short-circuit past the keyring and leave the session with a locked
+##     wallet. A pam_permit landing rule catches the jump on services whose
+##     auth nixpkgs renders as a `substack` (SDDM on current nixpkgs); there
+##     the face line goes immediately before that substack and the landing
+##     immediately after it, so a face success skips the whole substack,
+##     whose pam_unix would fail on the empty Enter that armed the face
+##     scan. Because that jump also skips any keyring rule inside the
+##     substack, every greeter face line carries the `kr` (keyring-continue)
+##     arg, which re-drives the keyring handoff from the daemon, the same
+##     arg `irlume login enable` writes on FHS greeters
+##     (crates/irlume-cli/src/pamwire.rs). Flat chains get no landing; the
+##     face line goes immediately before the password-prompting pam_unix
+##     instead. The one login layout that DOES get `sufficient` is an
+##     `include` anchor: libpam expands an include inline, so a success=N
 ##     jump would skip only its first expanded rule; the module IGNOREs on
-##     cold login and a face match returns immediately, exactly the form
-##     `irlume login enable` writes for include layouts on FHS distros
-##     (crates/irlume-cli/src/pamwire/grammar.rs, is_include_auth_layout).
+##     cold login and a face match returns immediately.
 ##
 ##   * A lock screen (kde, swaylock, hyprlock) gets `sufficient`. The wallet is
 ##     already open in the live session, so there is no keyring handoff to make;
@@ -124,6 +127,14 @@ let
     "unseal"
     "ondemand"
   ];
+  # Greeter face lines carry `kr` (keyring-continue), the same arg the FHS
+  # wiring puts on every greeter line (pamwire.rs, include_greeter_line): a
+  # face grant skips the password stack, including any pam_kwallet /
+  # pam_gnome_keyring auth rule inside the skipped delegation, and `kr`
+  # re-drives the keyring handoff from the daemon so the session starts
+  # with the wallet unlocked. On cold login the module IGNOREs and `kr` is
+  # inert. Lock screens never carry it: the wallet is already open.
+  pamArgsLogin = pamArgs ++ [ "kr" ];
 
   # Turn one opted-in service into its NixOS PAM auth rules.
   #
@@ -226,7 +237,7 @@ let
       irlume = {
         control = unsealControl;
         modulePath = pamModule;
-        args = pamArgs;
+        args = if svc.profile == "login" then pamArgsLogin else pamArgs;
         order = placementOrder;
       };
       irlume-landing = {

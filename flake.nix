@@ -142,19 +142,10 @@
                   # placement assertions exercise the real anchor shape.
                   security.pam.services.login.kwallet.enable = true;
                   # A real (harmless) policy stack for the integration
-                  # fixture below to delegate through.
-                  security.pam.services.company-policy.rules.auth = {
-                    env = {
-                      control = "optional";
-                      modulePath = "/lib/security/pam_env.so";
-                      order = 10100;
-                    };
-                    deny = {
-                      control = "required";
-                      modulePath = "/lib/security/pam_deny.so";
-                      order = 10200;
-                    };
-                  };
+                  # fixture below to delegate through: nixpkgs' default
+                  # rule set (optional env/rootok, sufficient pam_unix,
+                  # required pam_deny terminator) applies to it.
+                  security.pam.services.company-policy = { };
                   security.pam.services.irlume-policy-then-login.rules.auth = {
                     company-policy = {
                       control = "include";
@@ -191,6 +182,7 @@
             sddmText = sysSddm.config.security.pam.services.sddm.text;
             loginText = sysSddm.config.security.pam.services.login.text;
             policyThenLoginText = sysSddm.config.security.pam.services.irlume-policy-then-login.text;
+            kdeText = sys.config.security.pam.services.kde.text;
             # Pure placement unit tests: every rejection returns ok = false
             # instead of throwing, so no tryEval is needed.
             placement = import ./nix/lib.nix { inherit lib; };
@@ -345,8 +337,20 @@
             ];
             lockSubStack = [ (sub "common-auth" 11000) ];
             policySubJumpInner = sn:
+               if sn == "company-policy" then
+                 [ (plain "gate" "[success=1 default=ignore]" "/lib/security/pam_succeed_if.so" 10000) ]
+               else
+                 defaultInner sn;
+            # A sufficient allowlist plus a deny terminator: the password
+            # path denies outsiders, but a face grant that skips the stack
+            # wholesale would bypass the allowlist.
+            allowlistInner = sn: [
+              (plain "allow" "sufficient" "/lib/security/pam_succeed_if.so" 10000)
+              (plain "deny" "required" "/lib/security/pam_deny.so" 11000)
+            ];
+            fatalPolicyInner = sn:
               if sn == "company-policy" then
-                [ (plain "gate" "[success=1 default=ignore]" "/lib/security/pam_succeed_if.so" 10000) ]
+                [ (plain "unixreq" "required" "/lib/security/pam_unix.so" 10000) ]
               else
                 defaultInner sn;
           in
@@ -371,6 +375,10 @@
           # the permit. Strict adjacency: no other auth rule may sit in the
           # jump's path.
           assert (lineIndexOf sddmText "pam_irlume.so unseal") != -1;
+          # Greeter face lines carry the kr keyring-continue arg (the jump
+          # also skips an in-stack keyring module); lock lines never do.
+          assert lib.strings.hasInfix "pam_irlume.so unseal ondemand kr" sddmText;
+          assert !lib.strings.hasInfix " kr" kdeText;
           assert (lineIndexOf sddmText "pam_irlume.so unseal") + 1 == (lineIndexOf sddmText "substack login");
           assert (lineIndexOf sddmText "substack login") + 1 == (lineIndexOf sddmText "pam_permit.so");
           # A flat login chain gets NO permit landing (the trailing required
@@ -437,9 +445,17 @@
           # block a lock screen nor a policy substack above the anchor.
           assert (placement.computePlacement { profile = "lock"; others = lockSubStack; innerOf = commonAuthJumpInner; }).ok;
           assert (placement.computePlacement { profile = "login"; others = policyFirst; innerOf = policySubJumpInner; }).ok;
-          # A fatal password rule above the anchor makes the face line dead.
+          # A fatal password rule above the anchor makes the face line dead,
+          # directly or inside a preceding delegation.
           assert !(r "login" fatalBeforeSub).ok;
           assert !(r "login" fatalBeforeInc).ok;
+          assert !(placement.computePlacement { profile = "login"; others = policyFirst; innerOf = fatalPolicyInner; }).ok;
+          # Only password, keyring and denial modules may sit in a stack the
+          # face success skips whole: a sufficient allowlist the password
+          # path honors must not be bypassed by a face grant, on either
+          # anchor form.
+          assert !(placement.computePlacement { profile = "login"; others = includeLogin; innerOf = allowlistInner; }).ok;
+          assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = allowlistInner; }).ok;
           # A lone include of an unknown stack is refused, with or without a
           # direct pam_unix to fall back on.
           assert !(r "login" loneUnknownInc).ok;

@@ -128,6 +128,70 @@ let
       else
         folded;
 
+  # Modules that may sit inside a stack the face success skips whole (an
+  # include anchor's expansion, or a substack the jump clears): password
+  # verification, the keyring handoff modules, and the denial terminator.
+  # The face line's kr arg re-drives the keyring handoff itself, so those
+  # rules being skipped is fine. Anything else - an allowlist
+  # (sufficient pam_succeed_if), faillock, nologin, an exec, a permit - is
+  # policy or a side effect the face path would silently skip, so the
+  # wiring is refused as unproven.
+  skippedSafeModules = [
+    "pam_unix.so"
+    "pam_deny.so"
+    "pam_kwallet.so"
+    "pam_kwallet5.so"
+    "pam_kwallet6.so"
+    "pam_gnome_keyring.so"
+  ];
+  skippedSafe = modulePath: lib.any (m: lib.hasSuffix m modulePath) skippedSafeModules;
+
+  # A fatal password rule anywhere the empty-Enter arm passes through
+  # BEFORE the face line: a direct rule above the anchor, or one inside a
+  # delegation above it (both kinds run their rules before the face line).
+  # A requisite ends the stack outright on the empty Enter that should arm
+  # the scan; a required failure cannot be cleared by the later face grant.
+  # Either way the arm is dead, so the layout is refused.
+  fatalAbove =
+    { innerOf, seen, rules }:
+    if rules == null then
+      { unproven = "delegation to an unknown service"; }
+    else
+      let
+        enabled = lib.filter (r: r.enable) rules;
+        isFatalUnix =
+          r:
+          let c = norm r.control;
+          in (c == "required" || c == "requisite") && lib.hasSuffix "pam_unix.so" r.modulePath;
+        direct = lib.findFirst isFatalUnix null enabled;
+        delegs =
+          lib.filter
+            (r:
+              let c = norm r.control;
+              in c == "substack" || c == "include"
+            )
+            enabled;
+        walk =
+          acc: r:
+          if acc ? fatal || acc ? unproven then
+            acc
+          else if lib.hasInfix "/" r.modulePath then
+            acc // { unproven = "delegation by file path '${r.modulePath}' cannot be inspected"; }
+          else if lib.elem r.modulePath seen then
+            acc // { unproven = "delegation cycle through '${r.modulePath}'"; }
+          else
+            acc // fatalAbove {
+              inherit innerOf;
+              rules = innerOf r.modulePath;
+              seen = seen ++ [ r.modulePath ];
+            };
+        folded = lib.foldl' walk { } delegs;
+      in
+      if direct != null then
+        folded // { fatal = direct; }
+      else
+        folded;
+
   # An order slot directly before the anchor, keeping strict adjacency: the
   # jump must skip the anchor itself, never a rule left in between.
   slotBefore =
@@ -163,17 +227,20 @@ let
     else
       { slot = anchor.order + 1; };
 
-  # Inspect the stack the face success would skip. Three questions, one
+  # Inspect the stack the face success would skip. Four questions, one
   # recursive traversal (delegation via `substack`/`include` naming another
   # service is followed with a cycle guard):
   #   gate:        a required/requisite rule that is not pam_deny and would
   #                never run on a face login (pam_nologin, pam_faillock, an
   #                access gate);
   #   unproven:    a layout this cannot reason about: a bracketed extended
-  #                control (it may encode a fatal action), a delegation by
-  #                file path, a delegation cycle, or a delegation to an
-  #                unknown service (a broken reference the password path
-  #                would surface but the face path would skip past);
+  #                control (it may encode a fatal action), a module that is
+  #                neither password, keyring nor denial (a face success
+  #                would silently skip its policy or side effect), a
+  #                delegation by file path, a delegation cycle, or a
+  #                delegation to an unknown service (a broken reference the
+  #                password path would surface but the face path would
+  #                skip past);
   #   sawRequired: any required/requisite rule exists, so a failed password
   #                leaves a fatal failure behind (pam_deny counts: it is the
   #                refusal terminator); without one, an optional permit
@@ -200,6 +267,14 @@ let
             let c = norm r.control;
             in c == "required" || c == "requisite"
           )
+          enabled;
+      # Only password/keyring/deny modules may sit in a stack the face
+      # success skips whole; anything else is policy that would be
+      # silently bypassed.
+      offender =
+        lib.findFirst
+          (r: !((skippedSafe r.modulePath) || (norm r.control) == "substack" || (norm r.control) == "include"))
+          null
           enabled;
       delegations =
         lib.filter (r:
@@ -235,13 +310,15 @@ let
               )
           );
       folded = lib.foldl' walk { inherit sawRequired; } delegations;
-    in
-    if bracketed != null then
-      folded // { unproven = "rule '${bracketed.name}' uses the extended control '${bracketed.control}'"; }
-    else if gate != null then
-      folded // { gate = gate; }
-    else
-      folded;
+      in
+      if bracketed != null then
+        folded // { unproven = "rule '${bracketed.name}' uses the extended control '${bracketed.control}'"; }
+      else if gate != null then
+        folded // { gate = gate; }
+      else if offender != null then
+        folded // { unproven = "rule '${offender.name}' loads '${offender.modulePath}', which is neither a password, keyring nor denial module, and a face success would skip it"; }
+      else
+        folded;
 in
 {
   inherit passwordStackNames;
@@ -326,22 +403,11 @@ in
             before = slotBefore { rendered = rendered; anchor = anchor; };
             after = slotAfter { rendered = rendered; anchor = anchor; };
             jumps = anyJump { inherit innerOf; seen = [ ]; rules = others; };
-            # A fatal password rule above the anchor makes the face line
-            # dead: a requisite ends the stack on the empty Enter that
-            # should arm the scan, and a required failure cannot be cleared
-            # by the later face grant.
-            fatalBefore =
-              lib.findFirst
-                (
-                  r:
-                  let c = norm r.control;
-                  in
-                  (c == "required" || c == "requisite")
-                  && lib.hasSuffix "pam_unix.so" r.modulePath
-                  && r.order < anchor.order
-                )
-                null
-                rendered;
+            # A fatal password rule anywhere above the face line - direct
+            # or inside a preceding delegation - leaves the empty-Enter arm
+            # unable to complete.
+            up = lib.filter (r: r.order < anchor.order) others;
+            fatalResult = fatalAbove { inherit innerOf; seen = [ ]; rules = up; };
           in
           if jumps ? jump then
             reject "the chain already contains a numeric jump on '${jumps.jump.name}' (${jumps.jump.control}) whose destination an insertion could change; libpam counts flattened lines, so a jump inside a delegation can land outside its own file"
@@ -353,8 +419,10 @@ in
             reject "the '${anchor.modulePath}' stack cannot be proven safe: ${gateResult.unproven}"
           else if !gateResult.sawRequired then
             reject "the '${anchor.modulePath}' stack has no required rule, so a failed password would leave no fatal failure and the permit landing could authenticate it"
-          else if fatalBefore != null then
-            reject "the ${norm fatalBefore.control} rule '${fatalBefore.name}' (order ${toString fatalBefore.order}) runs before the '${anchor.modulePath}' delegation, so an empty-Enter face grant can never complete"
+          else if fatalResult ? fatal then
+            reject "the ${norm fatalResult.fatal.control} rule '${fatalResult.fatal.name}' runs before the '${anchor.modulePath}' delegation, so an empty-Enter face grant can never complete"
+          else if fatalResult ? unproven then
+            reject "a delegation above the '${anchor.modulePath}' anchor cannot be inspected: ${fatalResult.unproven}"
           else if before ? bad then
             reject before.bad
           else if !anchorIsInclude && (after ? bad) then

@@ -18,20 +18,24 @@ All notable changes to irlume are documented here. This project adheres to
   password prompt and render no landing, and a password chain reached
   through an `include` takes the `sufficient` form instead, because libpam
   expands an include inline and a jump would skip only its first expanded
-  rule. The face line anchors only on a known password stack
+  rule. Greeter face lines carry the `kr` keyring-continue arg, so a face
+  grant still hands the keyring over when the skipped stack contains the
+  keyring module. The face line anchors only on a known password stack
   (password-auth, system-auth, common-auth, login), and evaluation fails
   on any layout the placement cannot prove safe: no or ambiguous password
   delegation, an occupied or shared order slot, a numeric jump in the
   outer chain or an include expansion (libpam counts flattened lines, so
   such a jump can land outside its own file; a substack's internal jumps
   are atomic and stay allowed), a required gate inside or behind the
-  skipped stack, a required or requisite `pam_unix` above the anchor
-  where the empty-Enter arm could never complete, an extended control or
-  unresolvable delegation, or a password stack with no required rule at
-  all. Controls are compared case-insensitively with surrounding
-  whitespace trimmed, as libpam reads them. Found in live NixOS 26.05
-  acceptance: the lock screen worked, the greeter fell back to the
-  password after a 0.93-score match (#955).
+  skipped stack, a module that is neither password, keyring nor denial
+  inside the skipped stack (a face grant would silently skip its policy),
+  a required or requisite `pam_unix` above the anchor, directly or inside
+  a preceding delegation, where the empty-Enter arm could never complete,
+  an extended control or unresolvable delegation, or a password stack
+  with no required rule at all. Controls are compared case-insensitively
+  with surrounding whitespace trimmed, as libpam reads them. Found in live
+  NixOS 26.05 acceptance: the lock screen worked, the greeter fell back to
+  the password after a 0.93-score match (#955).
 - PAM wiring accepts vertical tabs, form feeds and carriage returns inside
   closed bracketed controls that Linux-PAM parses. A line such as
   `auth [success=1<VT>default=ignore] pam_unix.so` keeps its bytes and is

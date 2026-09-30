@@ -131,8 +131,13 @@ still see the released token. A password chain reached through an
 landing: libpam expands an include inline, so a `success=N` jump would
 skip only its first expanded rule; the module ignores on cold login and a
 face match returns immediately, the same form `irlume login enable`
-writes for include layouts on FHS distros. Lock screens stay a single
-`sufficient` line.
+writes for include layouts on FHS distros. Because both delegation forms
+skip the password stack whole, and that stack may carry the keyring
+module (`security.pam.services.login.kwallet.enable` puts it inside
+`login`), every greeter face line carries the `kr` keyring-continue arg,
+which re-drives the keyring handoff from the daemon; the session starts
+with the wallet unlocked either way. Lock screens stay a single
+`sufficient` line without `kr`.
 
 Evaluation refuses, instead of rendering a broken stack: delegations
 without exactly one known password stack among them (a lone unrecognized
@@ -143,9 +148,12 @@ counts flattened lines, so a jump can land outside its own file and this
 module cannot prove an insertion leaves it alone; a `substack` is atomic
 for jump counting, so its internal jumps stay allowed), a required gate
 (such as `pam_nologin` or `pam_faillock`) inside the stack the face
-success would skip or behind a nested delegation of it, a required or
-requisite `pam_unix` above the anchor, where the empty-Enter arm could
-never complete, an extended control or a delegation that cannot be
+success would skip or behind a nested delegation of it, a module that is
+neither password, keyring nor denial inside that stack (a face grant
+would silently skip its policy, so an allowlist stack is refused rather
+than bypassed), a required or requisite `pam_unix` above the anchor,
+directly or inside a preceding delegation, where the empty-Enter arm
+could never complete, an extended control or a delegation that cannot be
 resolved (by file path, cyclic, or to an unknown service), and a password
 stack with no required rule at all, where a failed password would leave
 no fatal failure behind. Control keywords are compared case-insensitively

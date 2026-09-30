@@ -317,6 +317,38 @@
                 [ (plain "fp" "[success=1 default=ignore]" "/lib/security/pam_fprintd.so" 10000) ]
               else
                 defaultInner sn;
+            # libpam expands an include inline, so an include anchor takes
+            # the sufficient form; a deny-first password stack is safe under
+            # it (a face match returns before any expanded rule runs).
+            denyFirstInner = sn: [
+              (plain "deny" "required" "/lib/security/pam_deny.so" 10000)
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+            ];
+            # A substack is atomic for jump counting: rules inserted outside
+            # cannot move its internal jumps.
+            commonAuthJumpInner = sn:
+              if sn == "common-auth" then
+                [
+                  (plain "gate" "[success=1 default=ignore]" "/lib/security/pam_succeed_if.so" 10000)
+                  (plain "filler" "optional" "/lib/security/pam_env.so" 10100)
+                  (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+                ]
+              else
+                defaultInner sn;
+            fatalBeforeSub = [
+              (plain "unixreq" "required" "/lib/security/pam_unix.so" 9500)
+              (sub "login" 10100)
+            ];
+            fatalBeforeInc = [
+              (plain "unixreq" "requisite" "/lib/security/pam_unix.so" 9500)
+              (inc "login" 10100)
+            ];
+            lockSubStack = [ (sub "common-auth" 11000) ];
+            policySubJumpInner = sn:
+              if sn == "company-policy" then
+                [ (plain "gate" "[success=1 default=ignore]" "/lib/security/pam_succeed_if.so" 10000) ]
+              else
+                defaultInner sn;
           in
           # Login greeters keep the keyring in the stack; lock screens grant
           # outright; text-mode greeters force pam_kwallet to run.
@@ -388,10 +420,26 @@
           # Numeric jumps in spaced or non-success forms still parse.
           assert !(r "login" jumpSpaced).ok;
           assert !(r "login" jumpOnDefault).ok;
-          # A top-level include anchors exactly like a substack, and its
-          # stack is inspected for gates.
-          assert (r "login" includeLogin).ok && (r "login" includeLogin).unsealOrder == 10050 && (r "login" includeLogin).landingEnable && (r "login" includeLogin).landingOrder == 10150;
+          # A top-level include anchors the wiring but takes the sufficient
+          # form: libpam expands it inline, so a success=N jump would skip
+          # only its first expanded rule. Its stack is still inspected for
+          # gates, and a deny-first password stack is safe under sufficient.
+          assert (r "login" includeLogin).ok && (r "login" includeLogin).unsealOrder == 10050 && !(r "login" includeLogin).landingEnable && (r "login" includeLogin).unsealControl == "sufficient";
           assert !(placement.computePlacement { profile = "login"; others = includeLogin; innerOf = gatedInner; }).ok;
+          assert (placement.computePlacement { profile = "login"; others = includeLogin; innerOf = denyFirstInner; }).ok
+            && !(placement.computePlacement { profile = "login"; others = includeLogin; innerOf = denyFirstInner; }).landingEnable;
+          # Substack and flat anchors keep the jump stanza.
+          assert (r "login" sddmShape).unsealControl == "[success=1 default=ignore]";
+          assert (r "login" flatShape).unsealControl == "[success=1 default=ignore]";
+          assert (r "login" subUpper).unsealControl == "[success=1 default=ignore]";
+          assert (r "lock" flatShape).unsealControl == "sufficient";
+          # A substack is atomic for jump counting: internal jumps neither
+          # block a lock screen nor a policy substack above the anchor.
+          assert (placement.computePlacement { profile = "lock"; others = lockSubStack; innerOf = commonAuthJumpInner; }).ok;
+          assert (placement.computePlacement { profile = "login"; others = policyFirst; innerOf = policySubJumpInner; }).ok;
+          # A fatal password rule above the anchor makes the face line dead.
+          assert !(r "login" fatalBeforeSub).ok;
+          assert !(r "login" fatalBeforeInc).ok;
           # A lone include of an unknown stack is refused, with or without a
           # direct pam_unix to fall back on.
           assert !(r "login" loneUnknownInc).ok;

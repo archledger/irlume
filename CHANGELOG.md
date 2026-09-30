@@ -7,6 +7,31 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The NixOS module renders its login-profile PAM wiring against current
+  nixpkgs, where SDDM's authentication `substack`s the `login` service
+  instead of listing the module chain. The face line now sits immediately
+  before that substack with a `pam_permit.so` landing immediately after
+  it, mirroring the block `irlume login enable` writes on FHS distros, so
+  an empty-Enter face attempt at the greeter completes the login instead
+  of failing after the daemon already matched the face and unsealed the
+  password. Flat login chains place the face line immediately before the
+  password prompt and render no landing, and a password chain reached
+  through an `include` takes the `sufficient` form instead, because libpam
+  expands an include inline and a jump would skip only its first expanded
+  rule. The face line anchors only on a known password stack
+  (password-auth, system-auth, common-auth, login), and evaluation fails
+  on any layout the placement cannot prove safe: no or ambiguous password
+  delegation, an occupied or shared order slot, a numeric jump in the
+  outer chain or an include expansion (libpam counts flattened lines, so
+  such a jump can land outside its own file; a substack's internal jumps
+  are atomic and stay allowed), a required gate inside or behind the
+  skipped stack, a required or requisite `pam_unix` above the anchor
+  where the empty-Enter arm could never complete, an extended control or
+  unresolvable delegation, or a password stack with no required rule at
+  all. Controls are compared case-insensitively with surrounding
+  whitespace trimmed, as libpam reads them. Found in live NixOS 26.05
+  acceptance: the lock screen worked, the greeter fell back to the
+  password after a 0.93-score match (#955).
 - PAM wiring accepts vertical tabs, form feeds and carriage returns inside
   closed bracketed controls that Linux-PAM parses. A line such as
   `auth [success=1<VT>default=ignore] pam_unix.so` keeps its bytes and is
@@ -16,25 +41,6 @@ All notable changes to irlume are documented here. This project adheres to
   while claiming its comments were changed. These characters outside
   comments and valid bracketed controls, and CRLF line endings outside
   comments, remain refused (#931).
-- The NixOS module renders its login-profile PAM wiring against current
-  nixpkgs, where SDDM's authentication `substack`s the `login` service
-  instead of listing the module chain. The face line now sits immediately
-  before that substack with a `pam_permit.so` landing immediately after
-  it, mirroring the block `irlume login enable` writes on FHS distros, so
-  an empty-Enter face attempt at the greeter completes the login instead
-  of failing after the daemon already matched the face and unsealed the
-  password. Flat login chains place the face line immediately before the
-  password prompt and render no landing. The face line anchors only on a
-  known password stack (password-auth, system-auth, common-auth, login;
-  include delegations anchor the same way), and evaluation fails on any
-  layout the placement cannot prove safe: no or ambiguous password
-  delegation, an occupied or shared order slot, any numeric jump already
-  in the chain or its include expansions (libpam counts flattened lines,
-  so such a jump can land outside its own file), a required gate inside
-  or behind the skipped stack, an extended control or unresolvable
-  delegation, or a password stack with no required rule at all. Found
-  in live NixOS 26.05 acceptance: the lock screen worked, the greeter
-  fell back to the password after a 0.93-score match (#955).
 
 ## [0.15.0] - 2026-09-29
 

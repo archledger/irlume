@@ -27,11 +27,12 @@ let
   # result token to carry a jump (`success=1`, `default = 2`, ...), with
   # whitespace around the equals, so parse every word=N pair and take the
   # largest jump any outcome can make.
-  # libpam reads control keywords case-insensitively and allows whitespace
-  # on either side of the equals in a bracketed control, so normalize and
-  # pair `word=N`, `word =N`, `word= N` and `word = N` alike, then keep the
-  # largest numeric action any outcome can make.
-  norm = ctrl: lib.toLower ctrl;
+  # libpam reads control keywords case-insensitively, treats whitespace
+  # around a control as field separation, and allows whitespace on either
+  # side of the equals in a bracketed control, so trim and lowercase before
+  # every comparison and pair `word=N`, `word =N`, `word= N` and `word = N`
+  # alike, keeping the largest numeric action any outcome can make.
+  norm = ctrl: lib.toLower (lib.trim ctrl);
 
   jumpSkip =
     control:
@@ -88,11 +89,15 @@ let
     in
     if jumps == [ ] then 0 else lib.foldl' lib.max (lib.head jumps) (lib.tail jumps);
 
-  # Any numeric jump in the whole reachable chain: the outer rules and,
-  # recursively, every include/substack expansion behind them. libpam
-  # counts flattened lines for jumps, so an inner jump can land outside
-  # its own file; proving any of them unaffected is beyond this module,
-  # so one existing jump anywhere refuses the wiring.
+  # A numeric jump in the reachable flattened chain: the outer rules plus,
+  # recursively, every `include` expansion behind them. libpam expands an
+  # include inline, so those lines share the outer stack's index space and
+  # an insertion here can shift a jump that even lands outside its own
+  # file; proving any of them unaffected is beyond this module, so one
+  # existing jump anywhere in that space refuses the wiring. A `substack`
+  # is atomic for jump counting (grammar.rs is_include_auth_layout): its
+  # internal jumps are confined to the substack and cannot be moved by
+  # rules inserted outside it, so the walk does not descend into one.
   anyJump =
     { innerOf, seen, rules }:
     if rules == null then
@@ -101,8 +106,7 @@ let
       let
         enabled = lib.filter (r: r.enable) rules;
         jump = lib.findFirst (r: jumpSkip (norm r.control) > 0) null enabled;
-        delegations =
-          lib.filter (r: (norm r.control) == "substack" || (norm r.control) == "include") enabled;
+        includes = lib.filter (r: (norm r.control) == "include") enabled;
         walk =
           acc: r:
           if acc ? jump || acc ? unproven then
@@ -117,7 +121,7 @@ let
               rules = innerOf r.modulePath;
               seen = seen ++ [ r.modulePath ];
             };
-        folded = lib.foldl' walk { } delegations;
+        folded = lib.foldl' walk { } includes;
       in
       if jump != null then
         folded // { jump = jump; }
@@ -248,7 +252,8 @@ in
   # innerOf: callback returning the named service's own auth rules in the
   #   same shape; gate inspection follows substack/include delegation
   #   recursively through it
-  # Result: { ok, unsealOrder, landingEnable, landingOrder, reason? }
+  # Result: { ok, unsealOrder, unsealControl, landingEnable, landingOrder,
+  #           reason? }
   computePlacement =
     {
       profile,
@@ -269,12 +274,13 @@ in
         else if j ? unproven then
           reject "the chain cannot be inspected: ${j.unproven}"
         else
-          { ok = true; unsealOrder = 11000; landingEnable = false; landingOrder = 11000; };
+          { ok = true; unsealOrder = 11000; unsealControl = "sufficient"; landingEnable = false; landingOrder = 11000; };
 
-      # libpam expands include and substack inline, and a success=N jump
-      # skips the delegation line whole, so both carry the password chain
-      # for anchoring purposes (the FHS wiring anchors on @include lines
-      # the same way).
+      # libpam expands include and substack into the auth flow, so both can
+      # carry the password chain for anchoring purposes; which control the
+      # anchor uses then decides the wiring form (jump stanza and landing for
+      # an atomic substack, sufficient for an inlined include, as the FHS
+      # wiring does).
       delegating =
         lib.filter
           (r:
@@ -303,6 +309,14 @@ in
           reject "several auth substacks and not exactly one known password stack (${lib.concatStringsSep ", " passwordStackNames}) among them"
         else
           let
+            # libpam expands an include inline: a success=N jump would skip
+            # only its first expanded rule, not the delegation whole, so an
+            # include anchor takes the `sufficient` form the FHS wiring uses
+            # for include layouts (grammar.rs is_include_auth_layout): the
+            # module IGNOREs on cold login, a face match returns immediately,
+            # and no landing is rendered. A substack is atomic and keeps the
+            # jump stanza with the permit landing.
+            anchorIsInclude = (norm anchor.control) == "include";
             anchorInner = innerOf anchor.modulePath;
             gateResult =
               if anchorInner == null then
@@ -312,6 +326,22 @@ in
             before = slotBefore { rendered = rendered; anchor = anchor; };
             after = slotAfter { rendered = rendered; anchor = anchor; };
             jumps = anyJump { inherit innerOf; seen = [ ]; rules = others; };
+            # A fatal password rule above the anchor makes the face line
+            # dead: a requisite ends the stack on the empty Enter that
+            # should arm the scan, and a required failure cannot be cleared
+            # by the later face grant.
+            fatalBefore =
+              lib.findFirst
+                (
+                  r:
+                  let c = norm r.control;
+                  in
+                  (c == "required" || c == "requisite")
+                  && lib.hasSuffix "pam_unix.so" r.modulePath
+                  && r.order < anchor.order
+                )
+                null
+                rendered;
           in
           if jumps ? jump then
             reject "the chain already contains a numeric jump on '${jumps.jump.name}' (${jumps.jump.control}) whose destination an insertion could change; libpam counts flattened lines, so a jump inside a delegation can land outside its own file"
@@ -323,16 +353,19 @@ in
             reject "the '${anchor.modulePath}' stack cannot be proven safe: ${gateResult.unproven}"
           else if !gateResult.sawRequired then
             reject "the '${anchor.modulePath}' stack has no required rule, so a failed password would leave no fatal failure and the permit landing could authenticate it"
+          else if fatalBefore != null then
+            reject "the ${norm fatalBefore.control} rule '${fatalBefore.name}' (order ${toString fatalBefore.order}) runs before the '${anchor.modulePath}' delegation, so an empty-Enter face grant can never complete"
           else if before ? bad then
             reject before.bad
-          else if after ? bad then
+          else if !anchorIsInclude && (after ? bad) then
             reject after.bad
           else
             {
               ok = true;
               unsealOrder = before.slot;
-              landingEnable = true;
-              landingOrder = after.slot;
+              unsealControl = if anchorIsInclude then "sufficient" else "[success=1 default=ignore]";
+              landingEnable = !anchorIsInclude;
+              landingOrder = if anchorIsInclude then before.slot else after.slot;
             };
 
       flatResult =
@@ -348,7 +381,7 @@ in
           # is inert, anything else is unproven.
           (
             if rendered == [ ] then
-              { ok = true; unsealOrder = 11000; landingEnable = false; landingOrder = 11000; }
+              { ok = true; unsealOrder = 11000; unsealControl = "[success=1 default=ignore]"; landingEnable = false; landingOrder = 11000; }
             else
               reject "no pam_unix rule and no include/substack delegation to anchor the face line on"
           )
@@ -362,6 +395,7 @@ in
             {
               ok = true;
               unsealOrder = before.slot;
+              unsealControl = "[success=1 default=ignore]";
               landingEnable = false;
               landingOrder = 11000;
             };

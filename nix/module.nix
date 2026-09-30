@@ -22,7 +22,12 @@
 ##     so a face success skips the whole substack, whose pam_unix would fail
 ##     on the empty Enter that armed the face scan. Flat chains get no
 ##     landing; the face line goes immediately before the password-prompting
-##     pam_unix instead.
+##     pam_unix instead. The one login layout that DOES get `sufficient` is
+##     an `include` anchor: libpam expands an include inline, so a success=N
+##     jump would skip only its first expanded rule; the module IGNOREs on
+##     cold login and a face match returns immediately, exactly the form
+##     `irlume login enable` writes for include layouts on FHS distros
+##     (crates/irlume-cli/src/pamwire/grammar.rs, is_include_auth_layout).
 ##
 ##   * A lock screen (kde, swaylock, hyprlock) gets `sufficient`. The wallet is
 ##     already open in the live session, so there is no keyring handoff to make;
@@ -77,9 +82,11 @@ let
           default = if lib.elem name knownLock then "lock" else "login";
           description = ''
             Which PAM profile to splice in. "login" (greeters, tty login) uses
-            `[success=1 default=ignore]` so the keyring still unseals; "lock"
-            (screen lockers) uses `sufficient`. Recognised service names get the
-            right default; set this explicitly for anything unusual.
+            `[success=1 default=ignore]` so the keyring still unseals, or
+            `sufficient` when the password chain arrives through an `include`;
+            "lock" (screen lockers) uses `sufficient`. Recognised service
+            names get the right default; set this explicitly for anything
+            unusual.
           '';
         };
       };
@@ -209,10 +216,15 @@ let
       };
       placementOrder = if result.ok then result.unsealOrder else throw result.reason;
       landingOrder = if result.ok then result.landingOrder else throw result.reason;
+      # The pure placement decides the control: the jump form for a substack
+      # or flat chain (the keyring must still run), `sufficient` for a lock
+      # screen and for an include anchor, where libpam would expand the
+      # rules inline and the jump form would skip only the first one.
+      unsealControl = if result.ok then result.unsealControl else throw result.reason;
     in
     {
       irlume = {
-        control = if svc.profile == "lock" then "sufficient" else "[success=1 default=ignore]";
+        control = unsealControl;
         modulePath = pamModule;
         args = pamArgs;
         order = placementOrder;

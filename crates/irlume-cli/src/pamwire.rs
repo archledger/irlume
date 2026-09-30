@@ -5361,6 +5361,7 @@ mod tests {
     #[test]
     fn a_first_in_place_enable_refuses_to_move_an_included_jump() {
         let dir = TestDir::new("first-inplace-included-jump");
+        ship_fedora_stacks(&dir.0);
         let etc = dir.0.join("kde");
         std::fs::write(
             dir.0.join("leap-auth"),
@@ -5420,6 +5421,7 @@ mod tests {
     #[test]
     fn an_in_place_enable_that_would_move_a_jump_leaves_the_stack() {
         let dir = TestDir::new("refill-refused");
+        ship_fedora_stacks(&dir.0);
         let etc = dir.0.join("gdm-password");
         let base = "auth       required     pam_env.so\n\
                     auth       [success=2 default=ignore] pam_succeed_if.so user ingroup kiosk\n\
@@ -5453,6 +5455,7 @@ mod tests {
     #[test]
     fn an_in_place_greeter_keeps_an_unused_place_held() {
         let dir = TestDir::new("refill-greeter");
+        ship_fedora_stacks(&dir.0);
         let etc = dir.0.join("gdm-password");
         let base = "auth       required     pam_env.so\n\
                     auth       [success=4 default=ignore] pam_succeed_if.so user ingroup kiosk\n\
@@ -5641,6 +5644,7 @@ mod tests {
     #[test]
     fn a_suse_vendor_only_sddm_materializes_and_wires() {
         let dir = TestDir::new("suse-sddm");
+        ship_opensuse_stacks(&dir.0);
         let vendor = dir.0.join("sddm.vendor");
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/pam/opensuse/sddm");
@@ -5667,6 +5671,7 @@ mod tests {
     #[test]
     fn fedora_cosmic_vendor_service_materializes_and_removes_only_its_override() {
         let dir = TestDir::new("fedora-cosmic-vendor");
+        ship_fedora_stacks(&dir.0.join("usr/lib/pam.d"));
         let declared = GREETERS
             .iter()
             .find(|service| service.etc == "/etc/pam.d/cosmic-greeter")
@@ -5738,6 +5743,29 @@ mod tests {
         std::fs::write(vendor, content).unwrap();
     }
 
+    /// Supply the shared Fedora PAM files a service fixture refers to. Their
+    /// auth and jump behavior is part of a file-level wiring test's setup.
+    pub(super) fn ship_fedora_stacks(pam_d: &Path) {
+        std::fs::create_dir_all(pam_d).unwrap();
+        for (name, text) in [
+            ("password-auth", FEDORA_PASSWORD_AUTH),
+            ("system-auth", FEDORA_PASSWORD_AUTH),
+            ("gdm-password-auth-substack", FEDORA_PASSWORD_AUTH),
+            ("postlogin", FEDORA_POSTLOGIN),
+        ] {
+            std::fs::write(pam_d.join(name), text).unwrap();
+        }
+    }
+
+    pub(super) fn ship_opensuse_stacks(pam_d: &Path) {
+        std::fs::create_dir_all(pam_d).unwrap();
+        std::fs::write(
+            pam_d.join("common-auth"),
+            fixture("opensuse", "common-auth"),
+        )
+        .unwrap();
+    }
+
     pub(super) fn greeter(etc: &str) -> &'static Svc {
         GREETERS
             .iter()
@@ -5776,6 +5804,7 @@ mod tests {
         let declared = greeter("/etc/pam.d/greetd");
         let stock = fixture("fedora-45", "greetd");
         ship_vendor_only(&dir.0, "greetd", &stock);
+        ship_fedora_stacks(&dir.0.join("usr/lib/pam.d"));
         let svc = under_root(&dir.0, declared);
         let ondemand = dm_profile(declared.etc, None).ondemand;
         assert!(ondemand, "greetd arms on an empty Enter");
@@ -5811,6 +5840,7 @@ mod tests {
         let declared = greeter("/etc/pam.d/gdm-password");
         let stock = fixture("fedora-45", "gdm-password");
         ship_vendor_only(&dir.0, "gdm-password", &stock);
+        ship_fedora_stacks(&dir.0.join("usr/lib/pam.d"));
         let svc = under_root(&dir.0, declared);
         let ondemand = dm_profile(declared.etc, Some(51)).ondemand;
         let wire = |c: &str| wire_greeter_impl(c, true, true, ondemand);
@@ -5842,6 +5872,7 @@ mod tests {
         assert_eq!(SUDO.etc, "/etc/pam.d/sudo");
         let stock = fixture("opensuse", "sudo");
         ship_vendor_only(&dir.0, "sudo", &stock);
+        ship_opensuse_stacks(&dir.0.join("usr/lib/pam.d"));
         let svc = under_root(&dir.0, &SUDO);
         let outcome = wire_service(&svc, true, true, &wire_verify_service).unwrap();
         assert_eq!(
@@ -6497,6 +6528,109 @@ mod tests {
             "auth [success=1 default=bad] pam_unix.so\n\
              auth [default=die] pam_faillock.so authfail\n"
         ));
+    }
+
+    #[test]
+    fn a_missing_shared_auth_stack_is_not_wired() {
+        for (label, content) in [
+            ("include", "auth include system-auth\n"),
+            ("substack", "auth substack system-auth\n"),
+            ("debian include", "@include common-auth\n"),
+        ] {
+            let (wired, changed) = with_stack_reader(stacks_of(&[]), || {
+                wire_greeter_impl(content, true, true, true)
+            });
+            assert!(!changed, "{label}: {wired}");
+            assert_eq!(wired, content, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_shared_auth_stack_with_an_unreadable_nested_stack_is_not_wired() {
+        for nested in [
+            "auth include system-auth\n",
+            "auth substack system-auth\n",
+            "@include system-auth\n",
+        ] {
+            let (wired, changed) =
+                with_stack_reader(stacks_of(&[("system-login", nested)]), || {
+                    wire_greeter_impl("auth include system-login\n", true, true, true)
+                });
+            assert!(!changed, "{nested}: {wired}");
+            assert_eq!(wired, "auth include system-login\n");
+        }
+
+        let (wired, changed) = with_stack_reader(
+            stacks_of(&[
+                ("system-login", "auth include system-auth\n"),
+                ("system-auth", "auth include system-login\n"),
+            ]),
+            || wire_greeter_impl("auth include system-login\n", true, true, true),
+        );
+        assert!(!changed, "cyclic include: {wired}");
+
+        let (wired, changed) = with_stack_reader(
+            stacks_of(&[
+                ("system-login", "auth include system-auth\n"),
+                ("system-auth", "auth required pam_unix.so\n"),
+            ]),
+            || wire_greeter_impl("auth include system-login\n", true, true, true),
+        );
+        assert!(changed, "readable nested include: {wired}");
+    }
+
+    #[test]
+    fn a_service_is_wired_only_after_its_shared_password_stack_can_be_read() {
+        let dir = TestDir::new("missing-password-stack");
+        let etc = dir.0.join("kde");
+        let stack = dir.0.join("password-auth");
+        let original = "auth substack password-auth\n";
+        std::fs::write(&etc, original).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+
+        for unreadable in [false, true] {
+            if unreadable {
+                std::fs::create_dir(&stack).unwrap();
+            }
+            let result = wire_service(&svc, true, true, &wire_lock).unwrap();
+            assert_eq!(result.change, PlannedChange::NoAnchor, "{result}");
+            assert_eq!(std::fs::read_to_string(&etc).unwrap(), original);
+            assert!(!dir.0.join(format!("kde{BACKUP}")).exists());
+            if unreadable {
+                std::fs::remove_dir(&stack).unwrap();
+            }
+        }
+
+        std::fs::write(&stack, "auth required pam_unix.so\n").unwrap();
+        let result = wire_service(&svc, true, true, &wire_lock).unwrap();
+        assert_eq!(result.change, PlannedChange::Wire, "{result}");
+        assert!(content_has_module(&std::fs::read_to_string(&etc).unwrap()));
+    }
+
+    #[test]
+    fn a_service_is_not_wired_while_a_nested_shared_stack_is_missing() {
+        let dir = TestDir::new("missing-nested-stack");
+        let etc = dir.0.join("lightdm");
+        let original = "auth include system-login\n";
+        std::fs::write(&etc, original).unwrap();
+        std::fs::write(dir.0.join("system-login"), "auth include system-auth\n").unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+
+        let missing = wire_service(&svc, true, true, &wire_lock).unwrap();
+        assert_eq!(missing.change, PlannedChange::NoAnchor, "{missing}");
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), original);
+        assert!(!dir.0.join(format!("lightdm{BACKUP}")).exists());
+
+        std::fs::write(dir.0.join("system-auth"), "auth required pam_unix.so\n").unwrap();
+        let readable = wire_service(&svc, true, true, &wire_lock).unwrap();
+        assert_eq!(readable.change, PlannedChange::Wire, "{readable}");
+        assert!(content_has_module(&std::fs::read_to_string(&etc).unwrap()));
     }
 
     // ---- keyring hand-off (KWallet / gnome-keyring) --------------------------
@@ -7318,11 +7452,13 @@ auth       optional      pam_gnome_keyring.so\n";
     /// include of a stack that includes itself or one too deep.
     #[test]
     fn a_first_auth_include_of_a_stack_that_decides_is_the_anchor() {
+        let opensuse_auth = fixture("opensuse", "common-auth");
         let stacks = stacks_of(&[
             ("login", ARCH_LOGIN),
             ("system-local-login", ARCH_SYSTEM_LOCAL_LOGIN),
             ("base-auth", ALPINE_BASE_AUTH),
             ("xdm", OPENSUSE_XDM),
+            ("common-auth", &opensuse_auth),
             ("postlogin-auth", OPENSUSE_POSTLOGIN_AUTH),
             ("loop", "auth include loop\n"),
             ("a", "auth include b\n"),
@@ -10455,6 +10591,7 @@ auth required pam_fprintd.so\n\
     #[test]
     fn wire_service_override_materialize_idempotent_then_remove() {
         let dir = TestDir::new("wsvc-override");
+        ship_fedora_stacks(&dir.0);
         let vendor = dir.0.join("plasmalogin.vendor");
         std::fs::write(&vendor, VENDOR_GREETER).unwrap();
         let etc = dir.0.join("plasmalogin"); // no admin /etc copy yet
@@ -10528,6 +10665,13 @@ auth required pam_fprintd.so\n\
     #[test]
     fn wire_service_edit_enable_backs_up_then_recognises_already_wired() {
         let dir = TestDir::new("wsvc-enable");
+        // This test exercises backup/idempotence, not jumps inside Fedora's
+        // shared session stack; supply a readable carrier without those jumps.
+        std::fs::write(
+            dir.0.join("password-auth"),
+            "auth required pam_unix.so\nsession required pam_unix.so\n",
+        )
+        .unwrap();
         let etc = dir.0.join("gdm-password");
         std::fs::write(&etc, GDM).unwrap();
         let svc = Svc {
@@ -10716,15 +10860,44 @@ auth required pam_fprintd.so\n\
         for (distro, services) in dialects {
             for &service in services {
                 let stock = fixture(distro, service);
-                // openSUSE's lightdm includes xdm, which its own package
-                // ships (see `OPENSUSE_XDM`), and xdm its postlogin-auth.
-                let (wired, changed) = with_stack_reader(
-                    stacks_of(&[
-                        ("xdm", OPENSUSE_XDM),
-                        ("postlogin-auth", OPENSUSE_POSTLOGIN_AUTH),
+                // The reader sees the shared files the distro ships beside
+                // this service; a missing one is a different, failing stack.
+                let stacks = match distro {
+                    "arch" => {
+                        let login = fixture("arch", "system-login");
+                        let local = fixture("arch", "system-local-login");
+                        let auth = fixture("arch", "system-auth");
+                        stacks_of(&[
+                            ("system-login", &login),
+                            ("system-local-login", &local),
+                            ("system-auth", &auth),
+                        ])
+                    }
+                    "debian" => {
+                        let auth = fixture("debian", "common-auth");
+                        stacks_of(&[
+                            ("common-auth", &auth),
+                            ("common-account", "account required pam_unix.so\n"),
+                        ])
+                    }
+                    "fedora" | "fedora-45" => stacks_of(&[
+                        ("password-auth", FEDORA_PASSWORD_AUTH),
+                        ("system-auth", FEDORA_PASSWORD_AUTH),
+                        ("gdm-password-auth-substack", FEDORA_PASSWORD_AUTH),
+                        ("postlogin", FEDORA_POSTLOGIN),
                     ]),
-                    || wire_greeter_impl(&stock, true, true, false),
-                );
+                    "opensuse" => {
+                        let auth = fixture("opensuse", "common-auth");
+                        stacks_of(&[
+                            ("common-auth", &auth),
+                            ("xdm", OPENSUSE_XDM),
+                            ("postlogin-auth", OPENSUSE_POSTLOGIN_AUTH),
+                        ])
+                    }
+                    _ => unreachable!(),
+                };
+                let (wired, changed) =
+                    with_stack_reader(stacks, || wire_greeter_impl(&stock, true, true, false));
                 assert!(
                     changed,
                     "{distro}/{service}: the recipe refused to wire the real shipped file"

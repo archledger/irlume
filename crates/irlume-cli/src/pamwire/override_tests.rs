@@ -12,8 +12,8 @@
 //! line without a message, so fingerprint at the login screen stopped working.
 
 use super::tests::{
-    fixture, greeter, ship_vendor_only, under_root, TestDir, FEDORA_PASSWORD_AUTH,
-    FEDORA_POSTLOGIN, UPSTREAM_FEDORA,
+    fixture, greeter, ship_fedora_stacks, ship_opensuse_stacks, ship_vendor_only, under_root,
+    TestDir, FEDORA_PASSWORD_AUTH, FEDORA_POSTLOGIN, UPSTREAM_FEDORA,
 };
 use super::*;
 
@@ -63,6 +63,7 @@ fn keyring_only(content: &str) -> (String, bool) {
 /// A vendor-only plasmalogin under `root`, shipping `vendor`.
 fn plasmalogin(root: &Path, vendor: &str) -> Svc {
     ship_vendor_only(root, "plasmalogin", vendor);
+    ship_fedora_stacks(&root.join("usr/lib/pam.d"));
     under_root(root, greeter("/etc/pam.d/plasmalogin"))
 }
 
@@ -284,6 +285,7 @@ fn an_unedited_sudo_override_follows_a_vendor_update() {
     let dir = TestDir::new("ovr-sudo");
     let stock = fixture("opensuse", "sudo");
     ship_vendor_only(&dir.0, "sudo", &stock);
+    ship_opensuse_stacks(&dir.0.join("usr/lib/pam.d"));
     let svc = under_root(&dir.0, &SUDO);
     wire_service(&svc, true, true, &wire_verify_service).unwrap();
     let updated = format!("{stock}auth     required       pam_faildelay.so delay=2000000\n");
@@ -308,6 +310,7 @@ const FEDORA_POLKIT: &str = "#%PAM-1.0\nauth       include      system-auth\nacc
 fn an_unedited_polkit_override_follows_a_vendor_update() {
     let dir = TestDir::new("ovr-polkit");
     ship_vendor_only(&dir.0, "polkit-1", FEDORA_POLKIT);
+    ship_fedora_stacks(&dir.0.join("usr/lib/pam.d"));
     let svc = under_root(&dir.0, &POLKIT);
     wire_service(&svc, true, true, &wire_polkit_service).unwrap();
     let updated = format!("{FEDORA_POLKIT}session    optional     pam_keyinit.so revoke\n");
@@ -333,6 +336,7 @@ fn an_unedited_polkit_override_follows_a_vendor_update() {
 fn an_edited_polkit_override_keeps_its_faillock_line_while_its_stanza_migrates() {
     let dir = TestDir::new("ovr-polkit-edited");
     ship_vendor_only(&dir.0, "polkit-1", FEDORA_POLKIT);
+    ship_fedora_stacks(&dir.0.join("usr/lib/pam.d"));
     let svc = under_root(&dir.0, &POLKIT);
     let faillock = "auth       required     pam_faillock.so preauth   # local";
     let old = legacy_override(
@@ -819,6 +823,7 @@ fn a_sudo_override_keeps_irlume_below_faillock_through_disable_and_enable() {
     let dir = TestDir::new("ovr-sudo-faillock");
     let stock = fixture("opensuse", "sudo");
     ship_vendor_only(&dir.0, "sudo", &stock);
+    ship_opensuse_stacks(&dir.0.join("usr/lib/pam.d"));
     let svc = under_root(&dir.0, &SUDO);
     wire_service(&svc, true, true, &wire_verify_service).unwrap();
     let created = read_file(svc.etc);
@@ -846,6 +851,7 @@ fn a_sudo_override_keeps_irlume_below_faillock_through_disable_and_enable() {
 
 fn polkit_override(root: &Path, above: &str) -> (Svc, String) {
     ship_vendor_only(root, "polkit-1", FEDORA_POLKIT);
+    ship_fedora_stacks(&root.join("usr/lib/pam.d"));
     let svc = under_root(root, &POLKIT);
     let old = legacy_override(
         svc.vendor.unwrap(),
@@ -1035,6 +1041,11 @@ fn a_faillock_line_stays_above_irlume_when_the_vendor_file_goes() {
         for sequence in 0..3 {
             let dir = TestDir::new("ovr-gone-faillock");
             ship_vendor_only(&dir.0, service, vendor);
+            if service == "sudo" {
+                ship_opensuse_stacks(&dir.0.join("usr/lib/pam.d"));
+            } else {
+                ship_fedora_stacks(&dir.0.join("usr/lib/pam.d"));
+            }
             let svc = under_root(&dir.0, declared);
             wire_service(&svc, true, true, wire).unwrap();
             let created = read_file(svc.etc);
@@ -1095,6 +1106,7 @@ fn a_copied_password_include_stays_above_the_polkit_line() {
     for vendor_gone in [false, true] {
         let dir = TestDir::new("ovr-copied-include");
         ship_vendor_only(&dir.0, "polkit-1", FEDORA_POLKIT);
+        ship_fedora_stacks(&dir.0.join("usr/lib/pam.d"));
         let svc = under_root(&dir.0, &POLKIT);
         wire_service(&svc, true, true, &wire_polkit_service).unwrap();
         let copy = "auth       include      system-auth";
@@ -1266,6 +1278,7 @@ fn a_surface_refused_for_vendor_drift_does_not_block_the_rollback() {
     // Refused: an sddm override irlume created earlier, with a backup next
     // to it.
     ship_vendor_only(&dir.0, "sddm", UPSTREAM_FEDORA);
+    ship_fedora_stacks(&dir.0.join("usr/lib/pam.d"));
     let refused = under_root(&dir.0, greeter("/etc/pam.d/sddm"));
     wire_service(&refused, true, true, &face_and_keyring).unwrap();
     let refused_before = read_file(refused.etc);
@@ -1418,6 +1431,7 @@ fn a_rollback_does_not_rewrite_a_surface_the_apply_left_alone() {
     // An administrator's /etc/pam.d/sddm with a backup, whose vendor copy
     // changes after the plan, so the apply leaves both alone.
     ship_vendor_only(&dir.0, "sddm", UPSTREAM_FEDORA);
+    ship_fedora_stacks(&dir.0.join("usr/lib/pam.d"));
     let untouched = under_root(&dir.0, greeter("/etc/pam.d/sddm"));
     std::fs::write(untouched.etc, ADMIN_STACK).unwrap();
     std::fs::set_permissions(untouched.etc, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -1579,6 +1593,7 @@ fn a_rollback_keeps_the_file_a_refused_write_left_in_place() {
 fn a_rollback_keeps_the_file_a_refused_removal_put_back() {
     let dir = TestDir::new("ovr-refused-remove");
     ship_vendor_only(&dir.0, "sddm", UPSTREAM_FEDORA);
+    ship_fedora_stacks(&dir.0.join("usr/lib/pam.d"));
     let svc = under_root(&dir.0, greeter("/etc/pam.d/sddm"));
     wire_service(&svc, true, true, &face_and_keyring).unwrap();
     let planned = [plan_surface(
@@ -1607,6 +1622,7 @@ fn a_rollback_keeps_the_file_a_refused_removal_put_back() {
 fn a_rollback_keeps_the_stack_a_refused_in_place_write_left() {
     let dir = TestDir::new("ovr-refused-in-place");
     std::fs::create_dir_all(dir.0.join("etc/pam.d")).unwrap();
+    ship_fedora_stacks(&dir.0.join("usr/lib/pam.d"));
     let svc = Svc {
         etc: leak_path(&dir.0.join("etc/pam.d/sudo")),
         vendor: None,
@@ -1690,6 +1706,7 @@ fn a_write_that_failed_after_landing_is_rolled_back() {
 fn a_rollback_removes_the_backup_the_apply_made() {
     let dir = TestDir::new("ovr-rollback-made-backup");
     std::fs::create_dir_all(dir.0.join("etc/pam.d")).unwrap();
+    ship_fedora_stacks(&dir.0.join("usr/lib/pam.d"));
     let svc = Svc {
         etc: leak_path(&dir.0.join("etc/pam.d/sudo")),
         vendor: None,
@@ -2311,6 +2328,7 @@ fn a_backup_another_writer_published_meanwhile_survives_the_rollback() {
             "ovr-foreign-backup"
         });
         std::fs::create_dir_all(dir.0.join("etc/pam.d")).unwrap();
+        ship_fedora_stacks(&dir.0.join("usr/lib/pam.d"));
         let svc = Svc {
             etc: leak_path(&dir.0.join("etc/pam.d/sudo")),
             vendor: None,
@@ -4014,12 +4032,12 @@ struct Odd<'a> {
     why: &'a str,
 }
 
-/// With `odd.lines` in the #875 file: the plain enable keeps the file and
-/// does not offer the flag, the plan does not mark the surface adjustable,
-/// and the enable with the flag keeps the file and says why. With
-/// `odd.raised` in the stack a raise would have written: the plain disable
-/// does not offer the flag either, and the disable with the flag keeps
-/// inactive lines, as without it, and says why. `setup` prepares each
+/// With `odd.lines` in the #875 file, the broken shared stack now makes the
+/// plain enable remove irlume's active lines while keeping the administrator's
+/// jump. Neither the plan nor an enable with the flag offers an adjustment.
+/// With `odd.raised` in the stack a raise would have written, the plain
+/// disable does not offer the flag either, and the disable with the flag
+/// keeps inactive lines, as without it, and says why. `setup` prepares each
 /// temporary root.
 fn refused_both_ways(odd: &Odd<'_>, setup: &dyn Fn(&Svc)) {
     // Tests run in parallel in one process: a root of its own for each call.
@@ -4031,21 +4049,24 @@ fn refused_both_ways(odd: &Odd<'_>, setup: &dyn Fn(&Svc)) {
     setup(&svc);
     let before = issue_override(&svc, odd.lines);
     let plain = wire_service(&svc, true, true, &face_and_keyring).unwrap();
-    assert!(plain.unmet && !plain.adjustable, "{label}: {plain}");
+    assert_eq!(change_id(&plain), "strip-in-place", "{label}: {plain}");
+    assert!(!plain.adjustable, "{label}: {plain}");
     assert!(
         !plain.message.contains("--apply --adjust-jumps"),
         "{label}: {plain}"
     );
-    assert_eq!(read_file(svc.etc), before, "{label}");
+    let cleaned = read_file(svc.etc);
+    assert_ne!(cleaned, before, "{label}: unreadable stack is unwired");
+    assert!(!content_has_module(&cleaned), "{label}: {cleaned}");
+    assert!(cleaned.contains(odd.lines), "{label}: {cleaned}");
     let planned = plan_surface(&svc, ROLE_LOGIN, &face_and_keyring, true, false);
-    assert!(planned.kept && !planned.adjustable, "{label}");
+    assert_eq!(planned.change, PlannedChange::NoAnchor, "{label}");
+    assert!(!planned.adjustable, "{label}");
     let with = wire_service_with(&svc, true, &adjusting(true), &face_and_keyring).unwrap();
-    assert_eq!(change_id(&with), "keep-edited-override", "{label}: {with}");
-    assert!(with.unmet && !with.adjustable, "{label}: {with}");
-    for named in ["--adjust-jumps cannot keep", odd.why] {
-        assert!(with.message.contains(named), "{label}: {named}\n{with}");
-    }
-    assert_eq!(read_file(svc.etc), before, "{label}");
+    assert_eq!(change_id(&with), "no-anchor", "{label}: {with}");
+    assert!(!with.adjustable, "{label}: {with}");
+    assert!(!content_has_module(&read_file(svc.etc)), "{label}: {with}");
+    assert_eq!(read_file(svc.etc), cleaned, "{label}");
 
     let dir = TestDir::new(&format!("ovr-adjust-odd-off-{n}"));
     let svc = plasmalogin(&dir.0, &fedora_with_oo7());
@@ -4081,10 +4102,11 @@ fn refused_both_ways(odd: &Odd<'_>, setup: &dyn Fn(&Svc)) {
 /// substack, then one that always fails. irlume counts one line. A gate's
 /// success or a failed fingerprint over it and the password substack,
 /// raised by irlume's count, would land a line further in PAM, on irlume's
-/// permit landing. Refused both ways, the file kept on enable, whether the
-/// file is missing or the name is a directory in `/etc/pam.d` over a file in
-/// `/usr/lib/pam.d` (PAM opens the first). A substack whose file PAM loads
-/// is adjusted like any line, in `/etc/pam.d` or `/usr/lib/pam.d`, and the
+/// permit landing. The enable unwires the face lines and keeps the
+/// administrator's jump, whether the file is missing or the name is a
+/// directory in `/etc/pam.d` over a file in `/usr/lib/pam.d` (PAM opens the
+/// first). A substack whose file PAM loads is adjusted like any line, in
+/// `/etc/pam.d` or `/usr/lib/pam.d`, and the
 /// disable with the flag gives the file back. One that names no stack is a
 /// line irlume does not read as PAM does
 /// (`adjust_jumps_changes_nothing_in_a_file_irlume_does_not_read_as_pam_does`).

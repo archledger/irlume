@@ -7,6 +7,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- PAM wiring does not place a face-success line before an authentication
+  `include`, `substack` or Debian `@include` whose shared stack, or a stack
+  it references, cannot be loaded; it also unwires an active face line if
+  such a stack later becomes unreadable (#935).
+
 - NixOS PAM placement refuses a password substack where a required
   `pam_unix.so` is followed by a required or requisite `pam_deny.so`,
   because that chain denies password login even after the verifier

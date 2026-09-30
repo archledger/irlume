@@ -2860,6 +2860,14 @@ fn login_reconcile_rewrites_only_the_override_whose_vendor_copy_changed() {
     let vendor = sb.path("pam-vendor");
     std::fs::create_dir_all(&etc).unwrap();
     std::fs::create_dir_all(&vendor).unwrap();
+    for (name, content) in [
+        ("password-auth", "auth required pam_unix.so\n"),
+        ("postlogin", "session optional pam_permit.so\n"),
+        ("system-auth", "auth required pam_unix.so\n"),
+        ("common-auth", "auth required pam_unix.so\n"),
+    ] {
+        std::fs::write(vendor.join(name), content).unwrap();
+    }
     let header = |service: &str| {
         format!(
             "# irlume: created from /usr/lib/pam.d/{service}; delete this file to restore the \
@@ -3555,6 +3563,13 @@ impl LightdmBed {
             "#%PAM-1.0\n@include common-auth\n@include common-account\n@include common-session\n",
         )
         .unwrap();
+        for (name, content) in [
+            ("common-auth", "auth required pam_unix.so\n"),
+            ("common-account", "account required pam_unix.so\n"),
+            ("common-session", "session required pam_unix.so\n"),
+        ] {
+            std::fs::write(pam.join(name), content).unwrap();
+        }
         std::os::unix::fs::symlink(
             "/usr/lib/systemd/system/lightdm.service",
             units.join("display-manager.service"),

@@ -29,8 +29,9 @@ use super::grammar::{
 };
 use super::stanzas::{inert_line, BACKUP, CREATED_PREFIX, INERT_TAG, KEYRING_TAG};
 use super::transform::{
-    holds_irlume_line, is_irlume_line, jump_could_count_irlume_lines, unwire_lines,
-    wire_greeter_impl, wire_lock, wire_polkit_service, wire_verify_service, without_irlume_lines,
+    holds_irlume_line, is_irlume_line, jump_could_count_irlume_lines, recipe_has_no_anchor,
+    removal_preserves_continuations, unwire_lines, wire_greeter_impl, wire_lock,
+    wire_polkit_service, wire_verify_service, without_irlume_lines,
 };
 use super::PlannedChange;
 
@@ -1920,8 +1921,19 @@ pub(super) fn decide(i: &Input<'_>) -> Result<Decision, String> {
     if !i.enable {
         return Ok(remove_or_strip(i, &p, class, false));
     }
+    // An unedited override follows its vendor copy. The old body's anchor
+    // may be gone while the updated vendor supplies a new one; rebuild from
+    // that copy before considering no-anchor removal of the old lines.
+    if class == U2 && i.vendor.is_some_and(|v| (i.wire)(&base(v)).1) {
+        return Ok(rebuild(i, current, &p, class));
+    }
     // Every enable reads the file's own lines, if only to check where their
     // jumps land, even one that rebuilds it from the vendor file.
+    // A no-anchor cleanup can discard an unedited override whole, even if
+    // one of its lines cannot be parsed. An edited one keeps its other bytes.
+    if has_irlume_line(&p.body) && recipe_has_no_anchor(&base(&p.body), i.wire) {
+        return Ok(remove_or_strip(i, &p, class, true));
+    }
     if let Some(line) = p.unreadable() {
         return Ok(unreadable(i, &line));
     }
@@ -1967,7 +1979,7 @@ fn remove_or_strip(i: &Input<'_>, p: &Parsed<'_>, class: Class, no_anchor: bool)
     if !had {
         return keep(PlannedChange::NotWired, format!("· {etc}: not wired"));
     }
-    if has_line_continuation(p.text) {
+    if has_line_continuation(p.text) && (!no_anchor || !removal_preserves_continuations(p.text)) {
         return continued(i);
     }
     let kept_why = match (i.vendor, lacks(&p.body, i.vendor)) {
@@ -1997,6 +2009,18 @@ fn remove_or_strip(i: &Input<'_>, p: &Parsed<'_>, class: Class, no_anchor: bool)
                 "✓ {etc}: removed irlume's lines and kept every other byte as it is, since {}; \
                  {kept_why}",
                 unread_sentence(&line, None)
+            ),
+        );
+    }
+    if has_line_continuation(p.text) {
+        if jump_could_count_irlume_lines(p.text) {
+            return continued(i);
+        }
+        return replace(
+            PlannedChange::StripInPlace,
+            without_irlume_lines(p.text),
+            format!(
+                "✓ {etc}: removed irlume's lines and kept every other byte as it is; {kept_why}"
             ),
         );
     }
@@ -2336,15 +2360,9 @@ fn in_place(i: &Input<'_>, p: &Parsed<'_>, class: Class, m: InPlace) -> Decision
     // lines irlume did not write, but a `\` added to one of irlume's own
     // lines is gone once they are taken out. Read with its carriage returns,
     // since a `\` before one does not continue the line.
-    if has_line_continuation(p.text) {
-        return continued(i);
-    }
-    if let Some(line) = p.unreadable() {
-        return unreadable(i, &line);
-    }
     let bare = base(&p.body);
     let (wired, ok) = (i.wire)(&bare);
-    if !ok {
+    if !ok && recipe_has_no_anchor(&bare, i.wire) {
         // #932: no anchor for the recipe, and the override holds lines an
         // earlier release wired: they come out, as a disable takes them
         // out, with its checks for the jumps that count them. An override
@@ -2353,6 +2371,12 @@ fn in_place(i: &Input<'_>, p: &Parsed<'_>, class: Class, m: InPlace) -> Decision
             return remove_or_strip(i, p, class, true);
         }
         return no_anchor(etc);
+    }
+    if has_line_continuation(p.text) {
+        return continued(i);
+    }
+    if let Some(line) = p.unreadable() {
+        return unreadable(i, &line);
     }
     let InPlace {
         edited,

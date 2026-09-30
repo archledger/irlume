@@ -3285,6 +3285,78 @@ fn a_vendor_gone_override_loses_irlumes_lines_when_its_include_stops_qualifying(
     );
 }
 
+/// A parser refusal must not preserve stale wiring after the included stack
+/// loses its anchor. An unedited override can be removed whole; an edited one
+/// keeps every other byte, including the unusual line.
+#[test]
+fn no_anchor_override_cleanup_handles_unreadable_and_continued_lines() {
+    for flaw in [
+        "auht optional pam_echo.so\n",
+        "session optional pam_echo.so note \\\n    argument\n",
+    ] {
+        for edited in [false, true] {
+            let (dir, svc) = wired_site_auth_override("ovr-noanchor-flaw", &face_and_keyring);
+            let original = read_file(svc.etc);
+            let flawed = if edited {
+                format!("{original}{flaw}")
+            } else {
+                let vendor = format!("{SITE_AUTH_VENDOR}{flaw}");
+                std::fs::write(svc.vendor.unwrap(), &vendor).unwrap();
+                let body = format!(
+                    "{}\n{flaw}",
+                    original.lines().skip(2).collect::<Vec<_>>().join("\n")
+                );
+                overrides::render(svc.vendor.unwrap(), &vendor, &body)
+            };
+            std::fs::write(svc.etc, &flawed).unwrap();
+            std::fs::write(dir.0.join("etc/pam.d/site-auth"), SITE_AUTH_GATE_FIRST).unwrap();
+            let on = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+            if edited {
+                assert_eq!(on.change, PlannedChange::StripInPlace, "{on}");
+                assert_eq!(read_file(svc.etc), without_irlume_lines(&flawed));
+            } else {
+                assert_eq!(on.change, PlannedChange::RemoveOverride, "{on}");
+                assert!(!exists(svc.etc));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_greeter_keeps_face_wiring_when_an_unreadable_rule_may_be_its_anchor() {
+    let (_dir, svc) = wired_site_auth_override("ovr-nul-password-anchor", &face_and_keyring);
+    let before = read_file(svc.etc).replacen(
+        "auth       include      site-auth\n",
+        "auth required pam_unix.so\0ignored\n",
+        1,
+    );
+    std::fs::write(svc.etc, &before).unwrap();
+    let on = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert_eq!(on.change, PlannedChange::KeepEditedOverride, "{on}");
+    assert_eq!(read_file(svc.etc), before);
+    assert!(before.contains("pam_irlume.so"));
+}
+
+#[test]
+fn a_changed_vendor_with_a_new_anchor_rebuilds_the_unedited_override() {
+    let (dir, svc) = wired_site_auth_override("ovr-new-vendor-anchor", &face_and_keyring);
+    std::fs::write(dir.0.join("etc/pam.d/site-auth"), SITE_AUTH_GATE_FIRST).unwrap();
+    let updated = SITE_AUTH_VENDOR.replacen(
+        "auth       include      site-auth",
+        "auth       required     pam_unix.so",
+        1,
+    );
+    std::fs::write(svc.vendor.unwrap(), &updated).unwrap();
+    let on = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert_eq!(on.change, PlannedChange::MaterializeOverride, "{on}");
+    let after = read_file(svc.etc);
+    assert!(after.contains("pam_irlume.so"), "{after}");
+    assert!(
+        after.contains("auth       required     pam_unix.so"),
+        "{after}"
+    );
+}
+
 /// `--force` on an edited override whose include stopped qualifying: the
 /// rebuild has no anchor to land either, so the lines an earlier release
 /// wired come out as in the plain enable, and the administrator's lines are

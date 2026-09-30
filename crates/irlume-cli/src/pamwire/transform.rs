@@ -504,6 +504,63 @@ pub(super) fn without_irlume_lines(content: &str) -> String {
         .collect()
 }
 
+/// Removing irlume's physical lines must not splice a PAM continuation onto
+/// a different next line, remove part of a continued logical rule, or shift
+/// a jump whose numeric control spans physical lines before ours.
+pub(super) fn removal_preserves_continuations(content: &str) -> bool {
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let last_ours = lines.iter().rposition(|line| {
+        let physical = line.strip_suffix('\n').unwrap_or(line);
+        is_irlume_line(physical.trim_end_matches('\r'))
+    });
+    let mut previous_continues = false;
+    for (index, line) in lines.into_iter().enumerate() {
+        let physical = line.strip_suffix('\n').unwrap_or(line);
+        let ours = is_irlume_line(physical.trim_end_matches('\r'));
+        let continues = has_line_continuation(physical);
+        if (ours && (previous_continues || continues))
+            || (continues && last_ours.is_some_and(|last| index < last))
+        {
+            return false;
+        }
+        previous_continues = continues;
+    }
+    true
+}
+
+/// A recipe's `false` also means it refused unreadable or continued text.
+/// Probe only the readable physical rules to establish that its anchor is
+/// genuinely absent. An unreadable auth rule or include may still contain the
+/// anchor PAM reads, so dropping it cannot establish absence. A continued auth
+/// rule cannot establish absence without assembling PAM's logical rule first.
+pub(super) fn recipe_has_no_anchor(content: &str, wire: &dyn Fn(&str) -> (String, bool)) -> bool {
+    if content.split_inclusive('\n').any(|line| {
+        has_line_continuation(line) && head(line).is_some_and(|rule| rule.phase == "auth")
+    }) {
+        return false;
+    }
+    let mut may_hide_anchor = false;
+    let readable: String = content
+        .split_inclusive('\n')
+        .filter(|line| {
+            if has_line_continuation(line) {
+                return false;
+            }
+            if let Some(unreadable) = unreadable_line(line) {
+                let pam_prefix = line.split('\0').next().unwrap_or(line);
+                may_hide_anchor |= is_at_include(pam_prefix)
+                    || head(pam_prefix).is_some_and(|rule| {
+                        rule.phase == "auth"
+                            && !matches!(unreadable.why, Unread::UnknownType { names_stack: false })
+                    });
+                return false;
+            }
+            true
+        })
+        .collect();
+    !may_hide_anchor && !wire(&readable).1
+}
+
 /// Whether a numeric jump could count irlume's lines: a line above one of
 /// them that is not irlume's carries a numeric action ([`numeric_actions`]),
 /// read as libpam reads it, up to its first NUL byte, or is an `include` or

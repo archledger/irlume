@@ -7,6 +7,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- PAM no-anchor cleanup now removes old irlume lines byte-exactly from
+  unreadable or safely continued stacks and edited overrides when no jump
+  counts them and no unreadable auth rule may still be an anchor. A changed
+  vendor override is rebuilt if its new recipe can land. Reconcile avoids
+  repeated attempts on an active greeter whose recipe cannot land, retries
+  when its anchor returns, and removes LightDM's reseal-only lines if their
+  anchor disappears on a remote seat (#959).
+
 - PAM wiring does not place a face-success line before an authentication
   `include`, `substack` or Debian `@include` whose shared stack, or a stack
   it references, cannot be loaded; it also unwires an active face line if

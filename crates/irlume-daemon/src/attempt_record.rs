@@ -698,18 +698,21 @@ pub(crate) fn record_in_background(uid: u32, user: String, filed: Filed) {
     enqueue(uid, user, filed);
 }
 
-/// File an attempt its request ended with as it arrived (while irlumed is
-/// still starting). A peer other than root (`peer_uid`) is admitted only as
-/// the account it names, so the record is its own uid's, not the uid a
-/// second lookup of the name might answer. Root's request is filed for the
-/// uid `user` resolves to now: no queue lies between the request and this
-/// lookup, so it is the request's own.
-pub(crate) fn record_on_arrival(user: String, peer_uid: u32, filed: Filed) {
-    let uid = if peer_uid == 0 {
-        crate::users::uid_for_name(&user)
+/// The account a startup request acts for. A non-root peer is admitted only
+/// as its own uid; root resolves the requested name once before both surface
+/// classification and filing.
+pub(crate) fn arrival_uid(user: &str, peer_uid: u32) -> Option<u32> {
+    if peer_uid == 0 {
+        crate::users::uid_for_name(user)
     } else {
         Some(peer_uid)
-    };
+    }
+}
+
+/// File an attempt its request ended with as it arrived (while irlumed is
+/// still starting), under the uid resolved for that request. The caller also
+/// uses this uid to classify the attempt's surface.
+pub(crate) fn record_on_arrival(user: String, uid: Option<u32>, filed: Filed) {
     match uid {
         Some(uid) => record_in_background(uid, user, filed),
         None => not_written(&user, &invalid()),
@@ -1532,13 +1535,15 @@ mod tests {
         // Admitted as another uid than the name has now.
         record_on_arrival(
             me.clone(),
-            uid.wrapping_add(1),
+            Some(uid.wrapping_add(1)),
             refusal(AttemptKind::Authenticate),
         );
         assert!(latest(uid).latest_authenticate.is_none(), "not the name's");
-        record_on_arrival(me.clone(), uid, refusal(AttemptKind::Authenticate));
+        record_on_arrival(me.clone(), Some(uid), refusal(AttemptKind::Authenticate));
         assert!(latest(uid).latest_authenticate.is_some(), "the peer's own");
-        record_on_arrival(me.clone(), 0, refusal(AttemptKind::Identify));
+        let root_uid = arrival_uid(&me, 0);
+        assert_eq!(root_uid, Some(uid));
+        record_on_arrival(me.clone(), root_uid, refusal(AttemptKind::Identify));
         assert!(latest(uid).latest_identify.is_some(), "root's: the name's");
         std::env::remove_var("IRLUME_STATE_DIR");
         let _ = std::fs::remove_dir_all(&dir);

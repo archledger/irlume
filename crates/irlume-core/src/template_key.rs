@@ -234,14 +234,11 @@ pub(crate) fn unbound_key_has_another_accounts_recovery(
 
 /// Whether the refusal over an unreadable recovery envelope at `path` names
 /// `irlume recovery forget` as the next step: for a regular file, or a
-/// symbolic link whose target exists, which [`forget_recovery_unlocked`]
-/// removes (the link, not its target). It leaves a directory, and a link
-/// whose target does not resolve, in place, so for those, and for any other
-/// kind of file, the refusal says to move the path away instead.
+/// symbolic link, socket, or device, which [`forget_recovery_unlocked`]
+/// removes. It leaves a directory in place, so that refusal says to move
+/// the path away instead.
 fn recovery_forget_removes(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
-        metadata.is_file() || (metadata.file_type().is_symlink() && path.exists())
-    })
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_dir())
 }
 
 /// Whether a recovery envelope exists for `user`.
@@ -1096,8 +1093,10 @@ pub fn forget_recovery(user: &str) -> Result<()> {
 
 pub(crate) fn forget_recovery_unlocked(user: &str) -> Result<()> {
     let path = recovery_path(user);
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| Error::Io(e.to_string()))?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => std::fs::remove_file(&path).map_err(|e| Error::Io(e.to_string()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::Io(e.to_string())),
     }
     Ok(())
 }
@@ -1114,11 +1113,7 @@ fn forget_key_unlocked_no_lock(user: &str) -> Result<()> {
 
 #[cfg(test)]
 fn forget_recovery_unlocked_no_lock(user: &str) -> Result<()> {
-    let path = recovery_path(user);
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| Error::Io(e.to_string()))?;
-    }
-    Ok(())
+    forget_recovery_unlocked(user)
 }
 
 fn save_recovery(user: &str, env: &RecoveryEnvelope) -> Result<()> {
@@ -1702,11 +1697,40 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Pin the production wrappers exercised by the kept-key move seam: a
+    /// moving loader here would rewrite a key before ownership is checked.
+    #[test]
+    fn writes_that_check_a_key_first_use_the_unmoved_loader() {
+        let source = include_str!("template_key.rs");
+        for wrapper in [
+            "ensure_key_unlocked",
+            "ensure_enrollment_key_unlocked",
+            "ensure_camera_store_key",
+            "setup_recovery",
+        ] {
+            let signature = format!("fn {wrapper}(");
+            let body = source
+                .split_once(&signature)
+                .unwrap_or_else(|| panic!("missing production wrapper {wrapper}"))
+                .1
+                .split_once("\n}\n")
+                .unwrap_or_else(|| panic!("missing end of production wrapper {wrapper}"))
+                .0;
+            assert!(
+                body.contains("load_key_unmoved_as"),
+                "{wrapper} must check the key before it can move"
+            );
+            assert!(
+                !body.contains("load_key_as,"),
+                "{wrapper} must not pass the moving loader"
+            );
+        }
+    }
+
     /// The refusal over an unreadable recovery envelope names
     /// `irlume recovery forget` only for what that command removes: a file,
-    /// or a symbolic link whose target exists (the link goes, the target
-    /// stays). For a directory, or a link that does not resolve, it says to
-    /// move the path away instead, since the command leaves those in place.
+    /// socket, or symbolic link (the link goes, the target stays). A directory
+    /// must be moved away instead.
     #[test]
     fn an_unreadable_recovery_envelope_names_forget_only_where_forget_removes_it() {
         let _env = crate::testenv::ENV_LOCK
@@ -1737,13 +1761,17 @@ mod tests {
         let a_link_loop = || std::os::unix::fs::symlink(&path, &path).unwrap();
         let a_dangling_link =
             || std::os::unix::fs::symlink(elsewhere.join("missing"), &path).unwrap();
-        let kinds: [(&str, &dyn Fn(), bool); 6] = [
+        let a_socket = || {
+            let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        };
+        let kinds: [(&str, &dyn Fn(), bool); 7] = [
             ("a file", &not_json, true),
+            ("a socket", &a_socket, true),
             ("a link to a file", &link_to_a_file, true),
             ("a link to a directory", &link_to_a_directory, true),
             ("a directory", &a_directory, false),
-            ("a link that does not resolve", &a_link_loop, false),
-            ("a link to a missing file", &a_dangling_link, false),
+            ("a link that does not resolve", &a_link_loop, true),
+            ("a link to a missing file", &a_dangling_link, true),
         ];
         let forget_step = format!(
             "remove it with `irlume recovery forget`, or move {} away",

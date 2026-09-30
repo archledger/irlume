@@ -7,6 +7,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- NixOS PAM placement refuses a password substack where a required
+  `pam_unix.so` is followed by a required or requisite `pam_deny.so`,
+  because that chain denies password login even after the verifier
+  succeeds. A sufficient verifier inside a nested `substack` cannot skip
+  a later parent denial. The checks use exact PAM module basenames and
+  validate the shape of irlume lines tolerated in a delegated service's
+  rendered text, so a lookalike module or forged comment cannot hide a
+  rule from placement checks (#958).
+
 - PAM wiring checks jumps in readable stacks brought in by `include` or
   `@include` when they reach into later lines of the parent stack. An edited
   override or in-place stack keeps the counted lines in their places instead

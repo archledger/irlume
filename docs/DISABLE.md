@@ -155,7 +155,9 @@ irlume edits in place is stripped (a matching backup restored as a
 disable restores it), an irlume-created override nobody edited is removed
 with the vendor copy restored, and one an administrator put lines in is
 kept and loses irlume's lines only. A file without irlume's lines is
-left as it is.
+left as it is. An unreadable auth rule can still contain the anchor PAM
+reads, so enable leaves irlume's lines in place until the rule is corrected
+instead of treating that anchor as absent.
 
 PAM puts the lines of an included stack in the include's place, and
 irlume's face line jumps over the first of them onto its landing after the

@@ -938,6 +938,14 @@ fn reconcile_wiring(
     with_lock: bool,
     face_lock_intent: bool,
 ) -> ExitCode {
+    // The checks below derive `want` from daemon capabilities. Do not cache
+    // a transient no-camera fallback while the daemon starts: it can hide a
+    // stripped greeter or an anchor lost from one that still holds our lines.
+    wait_for_daemon_start();
+    if !crate::caps_established() {
+        eprintln!("[login] cannot assess PAM repair until daemon capabilities are established");
+        return ExitCode::FAILURE;
+    }
     // #607: the Omarchy lane pair is its own regression shape. The lane facts
     // are read once here and given to both pure cores, so this check and
     // `reconcile_needed` cannot disagree about them.
@@ -951,7 +959,7 @@ fn reconcile_wiring(
     // A greeter `remote_seats` governs can need its face lines stripped or
     // put back while the module stays in its stack.
     let remote_seat = remote_seat_change();
-    if active_login_wired()
+    if !active_login_regressed()
         && remote_seat.is_none()
         && !lockscreen_regressed(with_lock)
         && !wired_surface_regressed(with_sudo, with_polkit)
@@ -979,6 +987,8 @@ fn reconcile_wiring(
         eprintln!(
             "[login] LightDM no longer serves remote login screens; restoring its face lines"
         );
+    } else if let Some(RemoteSeat::Unwire) = &remote_seat {
+        eprintln!("[login] LightDM's reseal lines lost their anchor; removing them");
     } else {
         eprintln!("[login] greeter PAM configuration changed; re-applying irlume wiring");
     }
@@ -1034,6 +1044,39 @@ pub(crate) fn active_login_wired() -> bool {
     }
     let etc = PathBuf::from(format!("/etc/pam.d/{primary}"));
     etc.exists() && file_has_module(&etc)
+}
+
+/// A missing active greeter is repairable only when today's recipe can land.
+/// This also handles old markers: no new marker field is needed, and a later
+/// PAM update that restores the anchor makes the greeter eligible again.
+fn active_login_regressed() -> bool {
+    if active_login_wired() {
+        return false;
+    }
+    missing_greeter_regressed(crate::caps_established(), || {
+        let Some(dm) = active_display_manager() else {
+            return true;
+        };
+        let (primary, _) = dm_pam_services(&dm);
+        if primary == "(unknown)" {
+            return true;
+        }
+        let mut repairable = false;
+        walk_surfaces(true, false, false, &mut |svc, role, wire, want, _| {
+            if role == ROLE_LOGIN && service_name(svc.etc) == primary {
+                repairable = greeter_repairable(svc, want, wire);
+            }
+        });
+        repairable
+    })
+}
+
+fn missing_greeter_regressed(ready: bool, probe: impl FnOnce() -> bool) -> bool {
+    !ready || probe()
+}
+
+fn greeter_repairable(svc: &Svc, want: bool, wire: &dyn Fn(&str) -> (String, bool)) -> bool {
+    want && wire_service(svc, true, false, wire).is_ok_and(|o| recipe_lands(&o))
 }
 
 /// Whether the KDE lock-screen face wiring regressed. Two shapes, both of which
@@ -1165,7 +1208,7 @@ pub(crate) fn reconcile_needed() -> bool {
     let omarchy = irlume_common::platform::omarchy_present();
     let face_lane_present = Path::new(OMARCHY_FACE_LANE).exists();
     let stock_wired = lock_wired();
-    !active_login_wired()
+    active_login_regressed()
         || remote_seat_change().is_some()
         || lockscreen_regressed(with_lock)
         || wired_surface_regressed(with_sudo, with_polkit)
@@ -1387,17 +1430,19 @@ fn greeter_want(
     // leaves the greeter with none of them, the outcome unwiring it whole
     // exists for. A kept override whose lines are the recipe's is landed:
     // the enable keeps them where they are.
-    wire_service(s, true, false, wire).is_ok_and(|outcome| {
-        !outcome.unmet
-            && matches!(
-                outcome.change,
-                PlannedChange::Wire
-                    | PlannedChange::AlreadyCorrect
-                    | PlannedChange::MaterializeOverride
-                    | PlannedChange::RewireOverride
-                    | PlannedChange::KeepEditedOverride
-            )
-    })
+    wire_service(s, true, false, wire).is_ok_and(|outcome| recipe_lands(&outcome))
+}
+
+fn recipe_lands(outcome: &WireOutcome) -> bool {
+    !outcome.unmet
+        && matches!(
+            outcome.change,
+            PlannedChange::Wire
+                | PlannedChange::AlreadyCorrect
+                | PlannedChange::MaterializeOverride
+                | PlannedChange::RewireOverride
+                | PlannedChange::KeepEditedOverride
+        )
 }
 
 /// Every login manager irlume knows, and the PAM services it consults.
@@ -1464,6 +1509,7 @@ fn carries_face_lines(etc: &str) -> bool {
 enum RemoteSeat {
     Strip(String),
     Restore,
+    Unwire,
 }
 
 fn remote_seat_change() -> Option<RemoteSeat> {
@@ -1472,19 +1518,23 @@ fn remote_seat_change() -> Option<RemoteSeat> {
         if !path.exists() || !file_has_module(path) {
             return None;
         }
-        match (
-            remote_seats::face_blocked(service_name(s.etc)),
-            carries_face_lines(s.etc),
-        ) {
-            (Some(why), true) => Some(RemoteSeat::Strip(why)),
-            // Only this rule leaves a greeter with irlume's module and no
-            // face or keyring line: a greeter nothing wants is unwired whole.
-            (None, false) if remote_seats::governs(service_name(s.etc)) => {
-                Some(RemoteSeat::Restore)
-            }
-            _ => None,
-        }
+        remote_seat_change_for(s, remote_seats::face_blocked(service_name(s.etc)))
     })
+}
+
+fn remote_seat_change_for(s: &Svc, blocked: Option<String>) -> Option<RemoteSeat> {
+    match (blocked, carries_face_lines(s.etc)) {
+        (Some(why), true) => Some(RemoteSeat::Strip(why)),
+        (Some(_), false) => {
+            let ondemand = dm_profile(s.etc, gnome_shell_major()).ondemand;
+            let reseal_only = |c: &str| wire_greeter_impl(c, false, false, ondemand);
+            (!greeter_want(s, true, true, &reseal_only)).then_some(RemoteSeat::Unwire)
+        }
+        // Only this rule leaves a greeter with irlume's module and no
+        // face or keyring line: a greeter nothing wants is unwired whole.
+        (None, false) if remote_seats::governs(service_name(s.etc)) => Some(RemoteSeat::Restore),
+        _ => None,
+    }
 }
 
 /// Login managers verified not to display PAM informational messages.
@@ -2502,16 +2552,7 @@ fn act_holding_lock(
     // a dead or unreachable one is not, so the wait watches the
     // classification and stops the moment it is anything but Starting.
     if enable {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while crate::commands::classify_reach(irlume_common::client::request_poll(
-            &irlume_common::Request::Ping,
-        )) == crate::commands::DaemonReach::Starting
-        {
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
+        wait_for_daemon_start();
     }
     if let Err(why) = enable_permitted(enable, crate::caps_established()) {
         eprintln!("{why}");
@@ -2823,6 +2864,19 @@ fn act_holding_lock(
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+fn wait_for_daemon_start() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while crate::commands::classify_reach(irlume_common::client::request_poll(
+        &irlume_common::Request::Ping,
+    )) == crate::commands::DaemonReach::Starting
+    {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }
 
@@ -3294,9 +3348,25 @@ fn wire_service_with(
                 // a file without irlume's lines has nothing to take out and
                 // is judged as ever.
                 if holds_irlume_line(&current) {
-                    return with_stack_reader(reader.clone(), || {
-                        unwire_no_anchor(s.etc, etc, &current, &base, apply)
-                    });
+                    let matching_backup = bak.exists()
+                        && read(&bak.to_string_lossy()).is_ok_and(|saved| {
+                            if current.contains('\r') {
+                                without_irlume_lines(&current) == saved
+                            } else {
+                                base == saved
+                            }
+                        });
+                    if matching_backup || recipe_has_no_anchor(&base, wire) {
+                        return with_stack_reader(reader.clone(), || {
+                            unwire_no_anchor(s.etc, etc, &current, &base, apply)
+                        });
+                    }
+                    if continued_with_irlume_lines(&current) {
+                        return Ok(kept_continued(s.etc, true));
+                    }
+                    if let Some(line) = unreadable_line(&current) {
+                        return Ok(kept_unreadable(s.etc, true, &line));
+                    }
                 }
                 if let Some(line) = unreadable_line(&current) {
                     return Ok(kept_unreadable(s.etc, true, &line));
@@ -3531,10 +3601,10 @@ fn disable_unread(
 /// earlier release wired ([`wire_service_with`]): they come out, as a
 /// disable takes them out, in the disable's order. A backup that is the
 /// current file without irlume's lines is restored and consumed first,
-/// whatever else the file carries, as a disable restores it; then a line
-/// that ends in `\\` or one irlume does not read as PAM does holds the file
-/// as it is (a rename is safe, line surgery is not); then the lines are
-/// stripped in place, with the same jump checks a disable makes
+/// whatever else the file carries, as a disable restores it. An unreadable
+/// or continued line permits byte-exact removal only when no jump counts the
+/// removed lines and no continuation touches them; otherwise the file stays.
+/// Readable files use the disable's in-place jump checks
 /// ([`strip_in_place`]). Both facts are reported: no anchor, and what came
 /// out. When the lines cannot come out because a jump another line carries
 /// counts them, and inactive lines already hold their places, nothing is
@@ -3582,11 +3652,28 @@ fn unwire_no_anchor(
     // does not read as PAM does hides where a jump lands: taking single
     // lines out of such a file can change another rule, so the file is kept
     // as it is, as the disable keeps it.
-    if continued_with_irlume_lines(current) {
+    if continued_with_irlume_lines(current) && !removal_preserves_continuations(current) {
         return Ok(kept_continued(etc, true));
     }
     if let Some(line) = unreadable_line(current) {
-        return Ok(kept_unreadable(etc, true, &line));
+        return disable_unread(etc, current, &line, apply, "; no anchor to wire");
+    }
+    if has_line_continuation(current) {
+        if with_stack_reader(stack_reader(etc), || jump_could_count_irlume_lines(current)) {
+            return Ok(kept_continued(etc, true));
+        }
+        if apply {
+            write_atomic(path, &without_irlume_lines(current))?;
+        }
+        return Ok(WireOutcome {
+            change: PlannedChange::StripInPlace,
+            message: format!(
+                "✓ {etc}: no anchor to wire, so irlume's lines came out; every other byte was kept"
+            ),
+            detail: None,
+            unmet: false,
+            adjustable: false,
+        });
     }
     let (body, change, message) = strip_in_place(etc, current, true);
     let change = match body {
@@ -6277,9 +6364,9 @@ mod tests {
         assert!(outcome.message.ends_with(way), "{outcome}");
     }
 
-    /// `login enable` keeps a stack irlume edits in place as it is, byte for
-    /// byte, when PAM reads one of its lines differently from irlume, whether
-    /// irlume's lines are in it or not, and names the line. `login disable`
+    /// `login enable` keeps a bare stack it cannot read as PAM does. When an
+    /// earlier wiring remains but its anchor no longer qualifies, it removes
+    /// irlume's lines byte-exactly and names the unreadable line. `login disable`
     /// takes irlume's lines out and keeps every other byte, unless a numeric
     /// jump could count irlume's lines: then it keeps the file too. A
     /// disable still puts back a backup that is the file without irlume's
@@ -6288,6 +6375,7 @@ mod tests {
     #[test]
     fn an_in_place_stack_with_a_line_irlume_does_not_read_as_pam_does_is_kept() {
         let dir = TestDir::new("unread-in-place");
+        std::fs::write(dir.0.join("common-auth"), fixture("debian", "common-auth")).unwrap();
         let etc = dir.0.join("sudo");
         let bak = dir.0.join(format!("sudo{BACKUP}"));
         let svc = Svc {
@@ -6299,12 +6387,22 @@ mod tests {
         assert!(changed);
         let wired = unread_above_include(&wired);
         for current in [&bare, &wired] {
-            std::fs::write(&etc, current).unwrap();
             for apply in [false, true] {
+                std::fs::write(&etc, current).unwrap();
                 let on = wire_service(&svc, true, apply, &wire_verify_service).unwrap();
-                assert_kept_unread(&on, current, true);
+                if current == &wired {
+                    assert_eq!(on.change, PlannedChange::StripInPlace, "{on}");
+                    assert!(on.message.contains("no anchor to wire"), "{on}");
+                } else {
+                    assert_kept_unread(&on, current, true);
+                }
+                let expected = if current == &wired && apply {
+                    &bare
+                } else {
+                    current
+                };
+                assert_eq!(&std::fs::read_to_string(&etc).unwrap(), expected);
             }
-            assert_eq!(&std::fs::read_to_string(&etc).unwrap(), current);
             assert!(!bak.exists());
         }
         // Disable without a backup, and with one that differs: irlume's
@@ -6356,9 +6454,9 @@ mod tests {
 
     /// libpam reads the carriage return of a CRLF ending as part of the
     /// line: `pam_warn.so\r` names a module it cannot load, and a Debian
-    /// `@include common-auth\r` a file it does not find. Writing such a stack
-    /// with LF endings would change which lines PAM runs, so an enable keeps
-    /// it as it is and names the line, and a disable takes irlume's lines out
+    /// `@include common-auth\r` a file it does not find. An enable keeps a
+    /// bare stack as it is; a wired one has no usable anchor and removes only
+    /// irlume's lines byte-exactly. A disable takes irlume's lines out
     /// and keeps every other byte, carriage returns included. A backup goes
     /// back only when it is the file without irlume's lines byte for byte.
     #[test]
@@ -6385,11 +6483,22 @@ mod tests {
             assert!(outcome.message.contains("a CRLF line ending"), "{outcome}");
         };
         for current in [&bare, &wired] {
-            std::fs::write(&etc, current).unwrap();
             for apply in [false, true] {
-                kept(&wire_service(&svc, true, apply, &wire_verify_service).unwrap());
+                std::fs::write(&etc, current).unwrap();
+                let on = wire_service(&svc, true, apply, &wire_verify_service).unwrap();
+                if current == &wired {
+                    assert_eq!(on.change, PlannedChange::StripInPlace, "{on}");
+                    assert!(on.message.contains("a CRLF line ending"), "{on}");
+                } else {
+                    kept(&on);
+                }
+                let expected = if current == &wired && apply {
+                    &bare
+                } else {
+                    current
+                };
+                assert_eq!(&std::fs::read_to_string(&etc).unwrap(), expected);
             }
-            assert_eq!(&std::fs::read_to_string(&etc).unwrap(), current);
             assert!(!bak.exists());
         }
         // An LF backup of the file without irlume's lines stays where it is,
@@ -8536,6 +8645,79 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
         }
     }
 
+    /// With no backup, a lost anchor removes old lines even when an unrelated
+    /// unreadable or continued rule exists. All other physical bytes survive.
+    #[test]
+    fn no_anchor_cleanup_keeps_unreadable_and_safe_continued_bytes() {
+        let wired = format!("{VERIFY_STANZA}\nsession required pam_limits.so\n");
+        for flaw in [
+            "auht optional pam_echo.so\n",
+            "session optional pam_echo.so note \\\n    argument\n",
+        ] {
+            let dir = TestDir::new("no-anchor-flaw");
+            let etc = dir.0.join("sudo");
+            let before = format!("{wired}{flaw}");
+            std::fs::write(&etc, &before).unwrap();
+            let svc = Svc {
+                etc: leak(&etc),
+                vendor: None,
+            };
+            let on = wire_service(&svc, true, true, &wire_verify_service).unwrap();
+            assert_eq!(on.change, PlannedChange::StripInPlace, "{on}");
+            assert_eq!(
+                std::fs::read_to_string(&etc).unwrap(),
+                without_irlume_lines(&before)
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_line_does_not_disguise_a_valid_anchor_as_missing() {
+        let dir = TestDir::new("unread-with-anchor");
+        let etc = dir.0.join("sudo");
+        let before =
+            format!("auth required pam_unix.so\n{VERIFY_STANZA}\nauht optional pam_echo.so\n");
+        std::fs::write(&etc, &before).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let on = wire_service(&svc, true, true, &wire_verify_service).unwrap();
+        assert_eq!(on.change, PlannedChange::KeepEditedOverride, "{on}");
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), before);
+    }
+
+    #[test]
+    fn a_nul_tainted_password_anchor_does_not_trigger_no_anchor_cleanup() {
+        let dir = TestDir::new("nul-password-anchor");
+        let etc = dir.0.join("sudo");
+        let before = format!("auth required pam_unix.so\0ignored\n{VERIFY_STANZA}\n");
+        std::fs::write(&etc, &before).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let on = wire_service(&svc, true, true, &wire_verify_service).unwrap();
+        assert_eq!(on.change, PlannedChange::KeepEditedOverride, "{on}");
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), before);
+    }
+
+    #[test]
+    fn a_split_numeric_control_before_our_session_line_stays_untouched() {
+        let dir = TestDir::new("split-control-no-anchor");
+        let etc = dir.0.join("sudo");
+        let before =
+            format!("session [success=\\\n1 default=ignore] pam_echo.so\n{RESEAL_SESSION}\n");
+        std::fs::write(&etc, &before).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let on = wire_service(&svc, true, true, &wire_verify_service).unwrap();
+        assert_eq!(on.change, PlannedChange::KeepEditedOverride, "{on}");
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), before);
+    }
+
     /// A no-anchor enable on a file whose inactive lines hold irlume's
     /// places, because a numeric jump another line carries counts them
     /// (a disable left them so): nothing comes out and nothing is written,
@@ -8733,6 +8915,53 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
         let off = wire_service(&svc, false, true, &reseal_only).unwrap();
         assert_eq!(off.change, PlannedChange::StripInPlace, "{off}");
         assert_eq!(std::fs::read_to_string(&etc).unwrap(), stock);
+    }
+
+    /// Reconcile stays quiet after a lost anchor, then can repair the greeter
+    /// as soon as the included password stack offers a usable anchor again.
+    /// A blocked LightDM with reseal-only lines must first be unwired when
+    /// that anchor disappears.
+    #[test]
+    fn reconcile_tracks_reseal_only_anchor_loss_and_return() {
+        let dir = TestDir::new("reconcile-reseal-anchor");
+        let etc = dir.0.join("lightdm");
+        let login = dir.0.join("login");
+        std::fs::write(&etc, "auth include login\nsession include login\n").unwrap();
+        std::fs::write(&login, "auth required pam_unix.so\n").unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let reseal = |c: &str| wire_greeter_impl(c, false, false, true);
+        let wired = wire_service(&svc, true, true, &reseal).unwrap();
+        assert_eq!(wired.change, PlannedChange::Wire, "{wired}");
+        assert!(!carries_face_lines(svc.etc));
+        assert!(remote_seat_change_for(&svc, Some("remote seats".into())).is_none());
+
+        std::fs::write(
+            &login,
+            "auth requisite pam_nologin.so\nauth required pam_unix.so\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            remote_seat_change_for(&svc, Some("remote seats".into())),
+            Some(RemoteSeat::Unwire)
+        ));
+        let off = wire_service(&svc, false, true, &reseal).unwrap();
+        assert_eq!(off.change, PlannedChange::RestoreBackup, "{off}");
+        assert!(!greeter_repairable(&svc, true, &reseal));
+        assert!(!greeter_repairable(&svc, false, &reseal));
+        std::fs::write(&login, "auth required pam_unix.so\n").unwrap();
+        assert!(greeter_repairable(&svc, true, &reseal));
+    }
+
+    #[test]
+    fn an_unestablished_capability_read_cannot_hide_a_missing_greeter() {
+        assert!(missing_greeter_regressed(false, || {
+            panic!("factor intent must not be read from transient capabilities")
+        }));
+        assert!(!missing_greeter_regressed(true, || false));
+        assert!(missing_greeter_regressed(true, || true));
     }
 
     /// The token guard counts the no-anchor removal as dropping: a wanted

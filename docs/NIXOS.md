@@ -155,13 +155,17 @@ face grant would silently skip its policy, so an allowlist stack is
 refused rather than bypassed), a required or requisite `pam_unix` or
 `pam_deny` above the anchor, directly or inside a preceding delegation,
 where the empty-Enter arm could never complete, and for an include
-anchor any required or requisite rule after it, since the sufficient
-form returns at the face line and a face login would bypass it, an
-extended control or a delegation that cannot be resolved (by file path,
-cyclic, or to an unknown service), and a password stack with no required
-rule at all, where a failed password would leave no fatal failure
-behind. Control keywords are compared case-insensitively with
-surrounding whitespace trimmed, as libpam reads them.
+anchor any required or requisite rule after it, direct or inside a
+delegation after it, since the sufficient form returns at the face line
+and a face login would bypass it, an extended control or a delegation
+that cannot be resolved (by file path, cyclic, or to an unknown
+service), a password stack with no required rule at all (substack
+anchors only: there a failed password could otherwise find the permit
+landing as its only success), and a delegation into a service whose
+`text` was overridden, because the rules this module inspects no longer
+describe the file libpam runs. Control keywords are compared
+case-insensitively with surrounding whitespace trimmed, as libpam reads
+them.
 
 A flat chain with only one `pam_unix` (no keyring or second-unix trigger
 in its stack) cannot complete a greeter face grant: the jump would skip

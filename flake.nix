@@ -389,6 +389,30 @@
               (sub "login" 10100)
               (plain "nologin" "required" "/lib/security/pam_nologin.so" 10200)
             ];
+            includeThenDelegatedGate = [
+              (inc "login" 10100)
+              (inc "site-policy" 10200)
+            ];
+            sitePolicyGateInner = sn:
+              if sn == "site-policy" then
+                [ (plain "nologin" "required" "/lib/security/pam_nologin.so" 10000) ]
+              else
+                defaultInner sn;
+            # An all-sufficient password include: a wrong password yields no
+            # success, and with no permit landing there is nothing to abuse,
+            # so the required-rule requirement must not apply.
+            sufficientOnlyInner = sn: [
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+            ];
+            genText = ''
+              # Authentication management.
+              auth optional /lib/security/pam_env.so # policy-env (order 10100)
+              auth sufficient /lib/security/pam_unix.so # unix (order 11000)
+            '';
+            genRules = [
+              (plain "policy-env" "optional" "/lib/security/pam_env.so" 10100)
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+            ];
           in
           # Login greeters keep the keyring in the stack; lock screens grant
           # outright; text-mode greeters force pam_kwallet to run.
@@ -503,6 +527,26 @@
           # the jump form lands and runs it, so the same shape is fine.
           assert !(r "login" includeThenGate).ok;
           assert (r "login" subThenGate).ok && (r "login" subThenGate).landingEnable;
+          # A required rule hiding inside a delegation after the include
+          # anchor is equally bypassed by the sufficient form.
+          assert !(placement.computePlacement { profile = "login"; others = includeThenDelegatedGate; innerOf = sitePolicyGateInner; }).ok;
+          # An all-sufficient include anchor is accepted: with no permit
+          # landing there is no denial-path hazard to require.
+          assert (placement.computePlacement { profile = "login"; others = includeLogin; innerOf = sufficientOnlyInner; }).ok
+            && !(placement.computePlacement { profile = "login"; others = includeLogin; innerOf = sufficientOnlyInner; }).landingEnable;
+          # textMatchesRules: generated text matches (ours tolerated in a
+          # wired service), overrides and dropped rules do not.
+          assert placement.textMatchesRules { text = genText; rules = genRules; };
+          assert placement.textMatchesRules {
+            text = "# Authentication management.\nauth optional /lib/security/pam_env.so # policy-env (order 10100)\nauth [success=1 default=ignore] /nix/store/x/pam_irlume.so unseal ondemand kr # irlume (order 10500)\nauth sufficient /lib/security/pam_unix.so # unix (order 11000)\n";
+            rules = genRules;
+            extraNames = [ "irlume" ];
+          };
+          assert !placement.textMatchesRules {
+            text = "# Authentication management.\nauth optional /lib/security/pam_env.so # policy-env (order 10100)\nauth required /lib/security/pam_nologin.so # hidden-gate (order 10900)\nauth sufficient /lib/security/pam_unix.so # unix (order 11000)\n";
+            rules = genRules;
+          };
+          assert !placement.textMatchesRules { text = genText; rules = lib.drop 1 genRules; };
           # A lone include of an unknown stack is refused, with or without a
           # direct pam_unix to fall back on.
           assert !(r "login" loneUnknownInc).ok;

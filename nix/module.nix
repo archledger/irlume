@@ -217,13 +217,39 @@ let
     else
       null;
 
+  # A delegated service whose text was overridden (the mkDefault-generated
+  # file replaced by an explicit definition) no longer executes the rules
+  # the placement inspects: libpam reads the file, and the file is the
+  # override, so a delegation into it is refused rather than validated
+  # against a rule set nothing runs. The wired service itself needs no
+  # guard: an override there leaves these rules unrendered and irlume
+  # inert, not unsafe. `irlume`/`irlume-landing` are tolerated: the
+  # delegated service may itself be wired.
+  svcTextOpaque =
+    name:
+    !placement.textMatchesRules {
+      text = config.security.pam.services.${name}.text;
+      rules = svcRuleList name;
+      extraNames = [
+        "irlume"
+        "irlume-landing"
+      ];
+    };
+
   mkAuthRules =
     name: svc:
     let
       result = placement.computePlacement {
         profile = svc.profile;
         others = svcRuleList name;
-        innerOf = sn: svcRuleList sn;
+        innerOf =
+          sn:
+          if svcRuleList sn == null then
+            null
+          else if svcTextOpaque sn then
+            throw "services.irlume.pam wiring: security.pam.services.${sn}.text overrides the generated file, so the '${sn}' delegation cannot be inspected; wire the service manually"
+          else
+            svcRuleList sn;
       };
       placementOrder = if result.ok then result.unsealOrder else throw result.reason;
       landingOrder = if result.ok then result.landingOrder else throw result.reason;

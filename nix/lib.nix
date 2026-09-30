@@ -196,6 +196,54 @@ let
       else
         folded;
 
+  # A required/requisite rule anywhere after the anchor, direct or inside a
+  # delegation after it. The sufficient form returns at the face line, so
+  # on a face grant nothing after an include anchor runs at all: any
+  # required/requisite rule there (policy gate, terminator, or password
+  # rule) is either bypassed or makes password and face paths disagree,
+  # and inside a delegation it is equally invisible. (The jump form lands
+  # on the permit and runs everything after it, so only include anchors
+  # need this.)
+  gatedAfter =
+    { innerOf, seen, rules }:
+    if rules == null then
+      { unproven = "delegation to an unknown service"; }
+    else
+      let
+        enabled = lib.filter (r: r.enable) rules;
+        isFatal =
+          r:
+          let c = norm r.control;
+          in c == "required" || c == "requisite";
+        direct = lib.findFirst isFatal null enabled;
+        delegs =
+          lib.filter
+            (r:
+              let c = norm r.control;
+              in c == "substack" || c == "include"
+            )
+            enabled;
+        walk =
+          acc: r:
+          if acc ? gate || acc ? unproven then
+            acc
+          else if lib.hasInfix "/" r.modulePath then
+            acc // { unproven = "delegation by file path '${r.modulePath}' cannot be inspected"; }
+          else if lib.elem r.modulePath seen then
+            acc // { unproven = "delegation cycle through '${r.modulePath}'"; }
+          else
+            acc // gatedAfter {
+              inherit innerOf;
+              rules = innerOf r.modulePath;
+              seen = seen ++ [ r.modulePath ];
+            };
+        folded = lib.foldl' walk { } delegs;
+      in
+      if direct != null then
+        folded // { gate = direct; }
+      else
+        folded;
+
   # An order slot directly before the anchor, keeping strict adjacency: the
   # jump must skip the anchor itself, never a rule left in between.
   slotBefore =
@@ -333,6 +381,67 @@ in
 {
   inherit passwordStackNames;
 
+  # Whether a PAM service's rendered text is still the file nixpkgs
+  # generates from its rules: the rules' auth lines (control + module
+  # path as fields, the generator's `# <name> (order <N>)` comment as the
+  # tail) must appear in order, and every other auth line must belong to
+  # one of `extraNames` (the module's own injected lines in a service
+  # that is itself wired). A service whose text was overridden no longer
+  # executes the rules the placement inspects, so the module treats a
+  # delegation into it as opaque. Module arguments are not compared: the
+  # placement depends only on control, module, name and order. A nixpkgs
+  # format change can only make this fail closed, never accept a stale
+  # rule set.
+  textMatchesRules =
+    {
+      text,
+      rules,
+      extraNames ? [ ],
+    }:
+    let
+      authLines =
+        lib.filter
+          (l: lib.hasPrefix "auth " l)
+          (lib.filter builtins.isString (builtins.split "\n" text));
+      isExtra =
+        l: lib.any (n: lib.hasInfix "# ${n} (order " l) extraNames;
+      # Walk the rendered lines: each either matches the next expected
+      # rule or is one of ours; anything else is an override.
+      walk =
+        { lines, expected }:
+        if expected == [ ] then
+          lib.all isExtra lines
+        else if lines == [ ] then
+          false
+        else
+          (
+            let
+              l = lib.head lines;
+              e = lib.head expected;
+            in
+            if lib.hasPrefix ("${e.prefix}") l && lib.hasSuffix e.suffix l then
+              walk { lines = lib.tail lines; expected = lib.tail expected; }
+            else if isExtra l then
+              walk { lines = lib.tail lines; inherit expected; }
+            else
+              false
+          );
+      expected =
+        map
+          (
+            r:
+            {
+              prefix = "auth ${r.control} ${r.modulePath}";
+              suffix = "# ${r.name} (order ${toString r.order})";
+            }
+          )
+          (
+            lib.sort (a: b: a.order < b.order)
+              (lib.filter (r: r.enable) rules)
+          );
+    in
+    walk { lines = authLines; inherit expected; };
+
   # profile: "login" | "lock"
   # others: the service's own auth rules as plain attrsets
   #   { name, control, modulePath, order, enable }
@@ -420,21 +529,15 @@ in
             fatalResult = fatalAbove { inherit innerOf; seen = [ ]; rules = up; };
             # The sufficient form returns at the face line, so on a face
             # grant nothing after the include anchor runs at all: a
-            # required or requisite rule there is policy a face login
-            # would bypass. (The jump form lands on the permit and runs
-            # everything after it, so only include anchors need this.)
-            gatedAfter =
+            # required or requisite rule there, direct or inside a
+            # delegation after it, is policy a face login would bypass.
+            # (The jump form lands on the permit and runs everything after
+            # it, so only include anchors need this.)
+            afterResult =
               if anchorIsInclude then
-                lib.findFirst
-                  (
-                    r:
-                    let c = norm r.control;
-                    in c == "required" || c == "requisite"
-                  )
-                  null
-                  (lib.filter (r: r.order > anchor.order) rendered)
+                gatedAfter { inherit innerOf; seen = [ ]; rules = (lib.filter (r: r.order > anchor.order) others); }
               else
-                null;
+                { };
           in
           if jumps ? jump then
             reject "the chain already contains a numeric jump on '${jumps.jump.name}' (${jumps.jump.control}) whose destination an insertion could change; libpam counts flattened lines, so a jump inside a delegation can land outside its own file"
@@ -444,14 +547,16 @@ in
             reject "the '${anchor.modulePath}' stack the face success would skip contains the required rule '${gateResult.gate.name}', which would never run on a face login"
           else if gateResult ? unproven then
             reject "the '${anchor.modulePath}' stack cannot be proven safe: ${gateResult.unproven}"
-          else if !gateResult.sawRequired then
+          else if !anchorIsInclude && !gateResult.sawRequired then
             reject "the '${anchor.modulePath}' stack has no required rule, so a failed password would leave no fatal failure and the permit landing could authenticate it"
           else if fatalResult ? fatal then
             reject "the ${norm fatalResult.fatal.control} rule '${fatalResult.fatal.name}' runs before the '${anchor.modulePath}' delegation, so an empty-Enter face grant can never complete"
           else if fatalResult ? unproven then
             reject "a delegation above the '${anchor.modulePath}' anchor cannot be inspected: ${fatalResult.unproven}"
-          else if gatedAfter != null then
-            reject "the ${norm gatedAfter.control} rule '${gatedAfter.name}' sits after the '${anchor.modulePath}' include, and the sufficient form returns at the face line, so a face login would bypass it"
+          else if afterResult ? gate then
+            reject "the ${norm afterResult.gate.control} rule '${afterResult.gate.name}' sits after the '${anchor.modulePath}' include, and the sufficient form returns at the face line, so a face login would bypass it"
+          else if afterResult ? unproven then
+            reject "a delegation after the '${anchor.modulePath}' include anchor cannot be inspected: ${afterResult.unproven}"
           else if before ? bad then
             reject before.bad
           else if !anchorIsInclude && (after ? bad) then

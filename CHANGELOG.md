@@ -33,9 +33,12 @@ All notable changes to irlume are documented here. This project adheres to
   its policy), a required or requisite pam_unix or pam_deny above the
   anchor, directly or inside a preceding delegation, where the
   empty-Enter arm could never complete, and for an include anchor any
-  required or requisite rule after it (the sufficient form returns at
-  the face line), an extended control or unresolvable delegation, or a
-  password stack with no required rule at all. Controls are compared case-insensitively
+  required or requisite rule after it, direct or inside a delegation
+  after it (the sufficient form returns at the face line), an extended
+  control or unresolvable delegation (including one into a service
+  whose text was overridden, since the inspected rules no longer
+  describe the file libpam runs), or, for substack anchors, a password
+  stack with no required rule at all. Controls are compared case-insensitively
   with surrounding whitespace trimmed, as libpam reads them. Found in live
   NixOS 26.05 acceptance: the lock screen worked, the greeter fell back to
   the password after a 0.93-score match (#955).

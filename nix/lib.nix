@@ -200,10 +200,11 @@ let
   # delegation after it. The sufficient form returns at the face line, so
   # on a face grant nothing after an include anchor runs at all: any
   # required/requisite rule there (policy gate, terminator, or password
-  # rule) is either bypassed or makes password and face paths disagree,
-  # and inside a delegation it is equally invisible. (The jump form lands
-  # on the permit and runs everything after it, so only include anchors
-  # need this.)
+  # rule) and any bracketed extended control (it may encode a fatal
+  # action, `[success=ok default=die]`) is either bypassed or makes
+  # password and face paths disagree, and inside a delegation it is
+  # equally invisible. (The jump form lands on the permit and runs
+  # everything after it, so only include anchors need this.)
   gatedAfter =
     { innerOf, seen, rules }:
     if rules == null then
@@ -214,7 +215,7 @@ let
         isFatal =
           r:
           let c = norm r.control;
-          in c == "required" || c == "requisite";
+          in c == "required" || c == "requisite" || lib.hasPrefix "[" c;
         direct = lib.findFirst isFatal null enabled;
         delegs =
           lib.filter
@@ -300,7 +301,42 @@ let
   #                leaves a fatal failure behind (pam_deny counts: it is the
   #                refusal terminator); without one, an optional permit
   #                landing after the substack would be a wrong password's
-  #                only success.
+  #                only success;
+  #   denyFirst:   pam_deny appears before any pam_unix in the stack's run
+  #                order (or with none at all): the password path denies
+  #                every login, so a face grant would turn an
+  #                administrator's unconditional denial into a grant.
+  # The run order flattens delegations at their position: libpam expands
+  # them inline, so a nested rule runs where its delegation sits.
+  flattenRules =
+    { innerOf, seen, rules }:
+    if rules == null then
+      [ ]
+    else
+      let
+        enabled = lib.filter (r: r.enable) rules;
+        sorted = lib.sort (a: b: a.order < b.order) enabled;
+      in
+      lib.concatMap
+        (
+          r:
+          let c = norm r.control;
+          in
+          if
+            (c == "substack" || c == "include")
+            && !(lib.hasInfix "/" r.modulePath)
+            && !(lib.elem r.modulePath seen)
+            && innerOf r.modulePath != null
+          then
+            flattenRules {
+              inherit innerOf;
+              rules = innerOf r.modulePath;
+              seen = seen ++ [ r.modulePath ];
+            }
+          else
+            [ r ]
+        )
+        sorted;
   scanStack =
     { innerOf, seen, rules }:
     let
@@ -368,6 +404,12 @@ let
               )
           );
       folded = lib.foldl' walk { inherit sawRequired; } delegations;
+      flat = flattenRules { inherit innerOf seen rules; };
+      firstIndexOf =
+        m: lib.lists.findFirstIndex (r: lib.hasSuffix m r.modulePath) (-1) flat;
+      denyAt = firstIndexOf "pam_deny.so";
+      unixAt = firstIndexOf "pam_unix.so";
+      denyFirst = denyAt != -1 && (unixAt == -1 || denyAt < unixAt);
       in
       if bracketed != null then
         folded // { unproven = "rule '${bracketed.name}' uses the extended control '${bracketed.control}'"; }
@@ -375,6 +417,8 @@ let
         folded // { gate = gate; }
       else if offender != null then
         folded // { unproven = "rule '${offender.name}' loads '${offender.modulePath}', which is neither a password, keyring nor denial module, and a face success would skip it"; }
+      else if denyFirst then
+        folded // { unproven = "pam_deny appears before any password verifier, so the stack denies every login and a face success would skip the denial"; }
       else
         folded;
 in
@@ -382,16 +426,18 @@ in
   inherit passwordStackNames;
 
   # Whether a PAM service's rendered text is still the file nixpkgs
-  # generates from its rules: the rules' auth lines (control + module
-  # path as fields, the generator's `# <name> (order <N>)` comment as the
-  # tail) must appear in order, and every other auth line must belong to
-  # one of `extraNames` (the module's own injected lines in a service
-  # that is itself wired). A service whose text was overridden no longer
-  # executes the rules the placement inspects, so the module treats a
-  # delegation into it as opaque. Module arguments are not compared: the
-  # placement depends only on control, module, name and order. A nixpkgs
-  # format change can only make this fail closed, never accept a stale
-  # rule set.
+  # generates from its rules: every authentication line must carry a
+  # rule's control and module path as its fields and the generator's
+  # `# <name> (order <N>)` comment as its tail, in order, with the
+  # module's own injected lines (`extraNames`) tolerated. Anything else
+  # the file might do to authentication - an `@include`, an auth line
+  # the rules do not list, tab or indent spellings, a line that is not a
+  # comment and not a PAM directive - makes the text opaque: a
+  # delegation into the service is refused rather than validated against
+  # a rule set the file no longer follows. Other phases (account,
+  # password, session) are tolerated without inspection: the placement
+  # depends only on the auth stack. A nixpkgs format change can only
+  # make this fail closed, never accept a stale rule set.
   textMatchesRules =
     {
       text,
@@ -399,14 +445,25 @@ in
       extraNames ? [ ],
     }:
     let
-      authLines =
-        lib.filter
-          (l: lib.hasPrefix "auth " l)
-          (lib.filter builtins.isString (builtins.split "\n" text));
+      lines =
+        lib.filter builtins.isString (builtins.split "\n" text);
+      trimmed = map lib.strings.trim lines;
+      isComment = l: l == "" || lib.hasPrefix "#" l;
+      isAtInclude = l: lib.hasPrefix "@" l;
+      # A PAM directive line: first field is a phase token.
+      phaseOf =
+        l:
+        let m = builtins.match "^(auth|account|password|session)[[:space:]]+.*$" l;
+        in if m == null then null else lib.head m;
+      authLines = lib.filter (l: phaseOf l == "auth") trimmed;
+      # Every non-comment line must be a PAM directive (indented and
+      # tab-separated spellings included) or the text was overridden.
+      foreignLine =
+        l: !(isComment l) && (isAtInclude l || phaseOf l == null);
       isExtra =
         l: lib.any (n: lib.hasInfix "# ${n} (order " l) extraNames;
-      # Walk the rendered lines: each either matches the next expected
-      # rule or is one of ours; anything else is an override.
+      # Walk the rendered auth lines: each either matches the next
+      # expected rule or is one of ours; anything else is an override.
       walk =
         { lines, expected }:
         if expected == [ ] then
@@ -440,7 +497,8 @@ in
               (lib.filter (r: r.enable) rules)
           );
     in
-    walk { lines = authLines; inherit expected; };
+    !(lib.any foreignLine trimmed)
+    && walk { lines = authLines; inherit expected; };
 
   # profile: "login" | "lock"
   # others: the service's own auth rules as plain attrsets

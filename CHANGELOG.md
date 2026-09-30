@@ -28,13 +28,14 @@ All notable changes to irlume are documented here. This project adheres to
   such a jump can land outside its own file; a substack's internal jumps
   are atomic and stay allowed), a required gate inside or behind the
   skipped stack (the password verifier pam_unix and the terminator
-  pam_deny are not gates), a module that is neither password, keyring
+  pam_deny are not gates, though pam_deny must sit after the verifier,
+  not before it or alone), a module that is neither password, keyring
   nor denial inside the skipped stack (a face grant would silently skip
   its policy), a required or requisite pam_unix or pam_deny above the
   anchor, directly or inside a preceding delegation, where the
   empty-Enter arm could never complete, and for an include anchor any
-  required or requisite rule after it, direct or inside a delegation
-  after it (the sufficient form returns at the face line), an extended
+  required, requisite or bracketed control after it, direct or inside a
+  delegation after it (the sufficient form returns at the face line), an extended
   control or unresolvable delegation (including one into a service
   whose text was overridden, since the inspected rules no longer
   describe the file libpam runs), or, for substack anchors, a password

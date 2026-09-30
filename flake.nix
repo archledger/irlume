@@ -324,12 +324,14 @@
                 [ (plain "fp" "[success=1 default=ignore]" "/lib/security/pam_fprintd.so" 10000) ]
               else
                 defaultInner sn;
-            # libpam expands an include inline, so an include anchor takes
-            # the sufficient form; a deny-first password stack is safe under
-            # it (a face match returns before any expanded rule runs).
+            # pam_deny before any password verifier: the password path
+            # denies every login, and a face grant would skip that denial.
             denyFirstInner = sn: [
               (plain "deny" "required" "/lib/security/pam_deny.so" 10000)
               (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+            ];
+            denyOnlyInner = sn: [
+              (plain "deny" "required" "/lib/security/pam_deny.so" 11000)
             ];
             # A substack is atomic for jump counting: rules inserted outside
             # cannot move its internal jumps.
@@ -388,6 +390,12 @@
             subThenGate = [
               (sub "login" 10100)
               (plain "nologin" "required" "/lib/security/pam_nologin.so" 10200)
+            ];
+            # A bracketed fatal control after an include anchor is bypassed
+            # by the sufficient form like a required gate is.
+            includeThenBracketed = [
+              (inc "login" 10100)
+              (plain "gate" "[success=ok default=die]" "/lib/security/pam_succeed_if.so" 10200)
             ];
             includeThenDelegatedGate = [
               (inc "login" 10100)
@@ -495,8 +503,10 @@
           # gates, and a deny-first password stack is safe under sufficient.
           assert (r "login" includeLogin).ok && (r "login" includeLogin).unsealOrder == 10050 && !(r "login" includeLogin).landingEnable && (r "login" includeLogin).unsealControl == "sufficient";
           assert !(placement.computePlacement { profile = "login"; others = includeLogin; innerOf = gatedInner; }).ok;
-          assert (placement.computePlacement { profile = "login"; others = includeLogin; innerOf = denyFirstInner; }).ok
-            && !(placement.computePlacement { profile = "login"; others = includeLogin; innerOf = denyFirstInner; }).landingEnable;
+          # pam_deny before (or without) any password verifier turns an
+          # administrator's unconditional denial into a face grant.
+          assert !(placement.computePlacement { profile = "login"; others = includeLogin; innerOf = denyFirstInner; }).ok;
+          assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = denyOnlyInner; }).ok;
           # Substack and flat anchors keep the jump stanza.
           assert (r "login" sddmShape).unsealControl == "[success=1 default=ignore]";
           assert (r "login" flatShape).unsealControl == "[success=1 default=ignore]";
@@ -526,6 +536,7 @@
           # rule after an include anchor would never run on a face login;
           # the jump form lands and runs it, so the same shape is fine.
           assert !(r "login" includeThenGate).ok;
+          assert !(r "login" includeThenBracketed).ok;
           assert (r "login" subThenGate).ok && (r "login" subThenGate).landingEnable;
           # A required rule hiding inside a delegation after the include
           # anchor is equally bypassed by the sufficient form.
@@ -547,6 +558,20 @@
             rules = genRules;
           };
           assert !placement.textMatchesRules { text = genText; rules = lib.drop 1 genRules; };
+          # Noncanonical spellings an override could hide behind: an
+          # @include, a tab-separated auth line, an indented one.
+          assert !placement.textMatchesRules {
+            text = "# Authentication management.\n@include site-policy\n" + (lib.concatMapStringsSep "\n" (r: "auth ${r.control} ${r.modulePath} # ${r.name} (order ${toString r.order})") genRules) + "\n";
+            rules = genRules;
+          };
+          assert !placement.textMatchesRules {
+            text = "# Authentication management.\nauth\trequired\t/lib/security/pam_nologin.so\n" + (lib.concatMapStringsSep "\n" (r: "auth ${r.control} ${r.modulePath} # ${r.name} (order ${toString r.order})") genRules) + "\n";
+            rules = genRules;
+          };
+          assert placement.textMatchesRules {
+            text = "# Authentication management.\n  auth optional /lib/security/pam_env.so # policy-env (order 10100)\n    auth sufficient /lib/security/pam_unix.so # unix (order 11000)\n";
+            rules = genRules;
+          };
           # A lone include of an unknown stack is refused, with or without a
           # direct pam_unix to fall back on.
           assert !(r "login" loneUnknownInc).ok;

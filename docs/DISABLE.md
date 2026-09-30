@@ -150,8 +150,12 @@ the stack. A file that still holds lines an earlier release wired around
 an anchor that no longer qualifies (ly and cinnamon-screensaver's
 `auth include login`, whose stack starts with `pam_nologin.so`) loses
 them, taken out as `login disable` takes them out, with the same checks
-for the jumps that count them, and both facts are reported; a file without
-irlume's lines is left as it is.
+for the jumps that count them, and both facts are reported: a stack
+irlume edits in place is stripped (a matching backup restored as a
+disable restores it), an irlume-created override nobody edited is removed
+with the vendor copy restored, and one an administrator put lines in is
+kept and loses irlume's lines only. A file without irlume's lines is
+left as it is.
 
 PAM puts the lines of an included stack in the include's place, and
 irlume's face line jumps over the first of them onto its landing after the

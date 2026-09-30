@@ -3181,6 +3181,122 @@ fn the_stack_a_first_auth_include_names_is_read_where_libpam_finds_it() {
     assert!(body.contains(KEYRING_UNSEAL), "{body}");
 }
 
+// ---- a wired override whose include stops qualifying (#932) -----------------------
+
+/// A vendor file whose first auth line includes `site-auth`, and the stacks
+/// that stack can be: one whose first line is the password step, and one a
+/// gate comes first in, which no recipe anchors to.
+const SITE_AUTH_VENDOR: &str = "#%PAM-1.0\nauth       include      site-auth\n\
+                                -auth      optional     pam_gnome_keyring.so\n\
+                                account    include      site-auth\n\
+                                session    include      site-auth\n";
+const SITE_AUTH_ANCHORS: &str = "auth       required     pam_unix.so\n\
+                                 auth       required     pam_nologin.so\n";
+const SITE_AUTH_GATE_FIRST: &str = "auth requisite pam_nologin.so\nauth required pam_unix.so\n";
+
+/// An override irlume created from `SITE_AUTH_VENDOR`, wired while the stack
+/// its include names started with the password step.
+fn wired_site_auth_override(tag: &str, wire: &dyn Fn(&str) -> (String, bool)) -> (TestDir, Svc) {
+    let dir = TestDir::new(tag);
+    let svc = plasmalogin(&dir.0, SITE_AUTH_VENDOR);
+    let pam_d = dir.0.join("etc/pam.d");
+    std::fs::create_dir_all(&pam_d).unwrap();
+    std::fs::write(pam_d.join("site-auth"), SITE_AUTH_ANCHORS).unwrap();
+    let on = wire_service(&svc, true, true, wire).unwrap();
+    assert_eq!(change_id(&on), "materialize-override", "{on}");
+    assert!(read_file(svc.etc).contains("pam_irlume.so"));
+    (dir, svc)
+}
+
+/// The stack the include names stops starting with the password step: an
+/// enable that finds no anchor takes irlume's lines out of a wired override,
+/// as it takes them out of a stack irlume edits in place. One nobody edited
+/// comes out whole (the vendor copy is restored); one an administrator put
+/// lines in keeps them and loses irlume's only.
+#[test]
+fn an_override_loses_irlumes_lines_when_its_include_stops_qualifying() {
+    for edited in [false, true] {
+        let (dir, svc) =
+            wired_site_auth_override(&format!("ovr-noanchor-{edited}"), &face_and_keyring);
+        if edited {
+            let with_admin = read_file(svc.etc).replacen(
+                "auth       include      site-auth\n",
+                &format!("auth       include      site-auth\n{LOCAL_LINE}\n"),
+                1,
+            );
+            assert_ne!(with_admin, read_file(svc.etc));
+            std::fs::write(svc.etc, &with_admin).unwrap();
+        }
+        std::fs::write(dir.0.join("etc/pam.d/site-auth"), SITE_AUTH_GATE_FIRST).unwrap();
+        let again = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+        assert!(
+            again.message.contains("no anchor to wire"),
+            "{again} (edited: {edited})"
+        );
+        if edited {
+            assert_eq!(change_id(&again), "strip-in-place", "{again}");
+            let after = read_file(svc.etc);
+            assert!(!after.contains("pam_irlume.so"), "{after}");
+            assert!(after.contains(LOCAL_LINE), "{after}");
+        } else {
+            assert_eq!(change_id(&again), "remove-override", "{again}");
+            assert!(!exists(svc.etc), "the vendor copy serves the service again");
+            assert!(exists(svc.vendor.unwrap()), "the vendor copy stays");
+        }
+    }
+}
+
+/// The same override after its vendor copy is gone: the file is the
+/// service's only configuration, so the no-anchor enable strips irlume's
+/// lines in place and keeps every other line, as a disable does.
+#[test]
+fn a_vendor_gone_override_loses_irlumes_lines_when_its_include_stops_qualifying() {
+    let (dir, svc) = wired_site_auth_override("ovr-noanchor-vendor-gone", &face_and_keyring);
+    std::fs::remove_file(svc.vendor.unwrap()).unwrap();
+    std::fs::write(dir.0.join("etc/pam.d/site-auth"), SITE_AUTH_GATE_FIRST).unwrap();
+    let again = wire_service(&svc, true, true, &face_and_keyring).unwrap();
+    assert_eq!(change_id(&again), "strip-in-place", "{again}");
+    assert!(again.message.contains("no anchor to wire"), "{again}");
+    let after = read_file(svc.etc);
+    assert!(!after.contains("pam_irlume.so"), "{after}");
+    assert!(
+        after.contains("auth       include      site-auth"),
+        "{after}"
+    );
+}
+
+/// A remote-seat greeter whose edited override already holds exactly the
+/// reseal-only lines irlume wants there: the enable keeps them (a kept,
+/// unrefused override is a landed recipe), so `greeter_want` counts it wired
+/// and the unwire-whole path never runs. The vendor copy moved on after the
+/// wiring, so the file is kept rather than rebuilt, exactly the shape a
+/// kept-and-correct override has.
+#[test]
+fn a_remote_seat_greeter_whose_edited_override_is_right_keeps_it() {
+    let reseal_only = |c: &str| wire_greeter_impl(c, false, false, true);
+    let (_dir, svc) = wired_site_auth_override("ovr-remote-right", &reseal_only);
+    let with_admin = read_file(svc.etc).replacen(
+        "auth       include      site-auth\n",
+        &format!("auth       include      site-auth\n{LOCAL_LINE}\n"),
+        1,
+    );
+    std::fs::write(svc.etc, &with_admin).unwrap();
+    // The vendor copy the override was created from changed afterwards.
+    std::fs::write(
+        svc.vendor.unwrap(),
+        format!("{SITE_AUTH_VENDOR}-session   optional     pam_kwallet5.so auto_start\n"),
+    )
+    .unwrap();
+    let probe = wire_service(&svc, true, false, &reseal_only).unwrap();
+    assert_eq!(probe.change, PlannedChange::KeepEditedOverride, "{probe}");
+    assert!(!probe.unmet, "{probe}");
+    assert!(greeter_want(&svc, true, true, &reseal_only));
+    let again = wire_service(&svc, true, true, &reseal_only).unwrap();
+    assert_eq!(read_file(svc.etc), with_admin, "{again}");
+    assert_eq!(change_id(&again), "keep-edited-override", "{again}");
+    assert!(!again.unmet, "{again}");
+}
+
 // ---- --adjust-jumps (#875) ---------------------------------------------------------
 
 /// The fingerprint line of #875, as an administrator wrote it on a Fedora 44
@@ -3643,10 +3759,11 @@ fn no_jump_message_quotes_a_line() {
 /// Auth lines PAM installs as modules that always fail: a type with no
 /// control, or with no module. No recipe wires a file with one, so an enable
 /// inside the range of the administrator's jump, with the flag or without
-/// it, reports no anchor to wire, offers no flag, and leaves the file as it
-/// is. A session line with no control is in no auth chain: there the plain
-/// enable offers the flag, `enable --adjust-jumps` raises the jump over
-/// irlume's lines, and `disable --adjust-jumps` gives the file back.
+/// it, finds no anchor: irlume's lines come out of the file (#932), the
+/// jump lowered past them with the flag, the administrator's lines kept. A
+/// session line with no control is in no auth chain: there the plain enable
+/// offers the flag, `enable --adjust-jumps` raises the jump over irlume's
+/// lines, and `disable --adjust-jumps` gives the file back.
 #[test]
 fn adjust_jumps_and_a_line_with_a_type_and_no_control() {
     let gate = "auth       [success=1 default=ignore]   pam_succeed_if.so user ingroup fpusers";
@@ -3661,12 +3778,21 @@ fn adjust_jumps_and_a_line_with_a_type_and_no_control() {
             let dir = TestDir::new("ovr-adjust-failing-line");
             let svc = plasmalogin(&dir.0, &fedora_with_oo7());
             let before = issue_override(&svc, &format!("{jump}\n{odd}"));
+            assert!(before.contains("pam_irlume.so"), "{label}: {before}");
             for opts in [plain(), adjusting(true)] {
                 let on = wire_service_with(&svc, true, &opts, &face_and_keyring).unwrap();
-                assert_eq!(change_id(&on), "no-anchor", "{label}: {on}");
-                assert!(!on.adjustable, "{label}: {on}");
-                assert!(!on.message.contains("--adjust-jumps"), "{label}: {on}");
-                assert_eq!(read_file(svc.etc), before, "{label}");
+                assert!(on.message.contains("no anchor to wire"), "{label}: {on}");
+                assert!(!on.unmet, "{label}: {on}");
+                let after = read_file(svc.etc);
+                assert!(!after.contains("pam_irlume.so"), "{label}: {after}");
+                assert!(after.contains(odd), "{label}: {after}");
+                let module = jump.rsplit("   ").next().unwrap_or(jump);
+                assert!(after.contains(module), "{label}: {after}");
+                assert_ne!(after, before, "{label}");
+                // the next enable has nothing of irlume's to take out
+                let again = wire_service_with(&svc, true, &opts, &face_and_keyring).unwrap();
+                assert_eq!(change_id(&again), "no-anchor", "{label}: {again}");
+                assert_eq!(read_file(svc.etc), after, "{label}");
             }
         }
     }

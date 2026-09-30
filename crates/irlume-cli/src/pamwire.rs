@@ -1331,7 +1331,8 @@ fn greeter_want(
     // The recipe must land, not merely succeed: an enable that finds no
     // anchor in a file that holds irlume's lines takes them out, which
     // leaves the greeter with none of them, the outcome unwiring it whole
-    // exists for.
+    // exists for. A kept override whose lines are the recipe's is landed:
+    // the enable keeps them where they are.
     wire_service(s, true, false, wire).is_ok_and(|outcome| {
         !outcome.unmet
             && matches!(
@@ -1340,6 +1341,7 @@ fn greeter_want(
                     | PlannedChange::AlreadyCorrect
                     | PlannedChange::MaterializeOverride
                     | PlannedChange::RewireOverride
+                    | PlannedChange::KeepEditedOverride
             )
     })
 }
@@ -1689,30 +1691,53 @@ fn walk_surfaces(enable: bool, with_sudo: bool, with_polkit: bool, visit: &mut S
     }
 }
 
+/// Whether an enable leaves this surface without irlume's lines: it is not
+/// wanted, or its recipe cannot land and the enable would only take the
+/// lines an earlier release wired out (#932), which drops the delivery line
+/// a keyring token needs with the rest. `probed` is the enable's own
+/// decision for the surface ([`wire_service`], nothing applied); a
+/// remote-seat greeter is never counted here, as ever.
+fn enable_drops(want: bool, blocked: bool, probed: Option<&WireOutcome>) -> bool {
+    if !want {
+        return !blocked;
+    }
+    !blocked
+        && probed.is_some_and(|o| {
+            matches!(
+                o.change,
+                PlannedChange::StripInPlace
+                    | PlannedChange::RestoreBackup
+                    | PlannedChange::RemoveOverride
+            )
+        })
+}
+
 /// The accounts whose GNOME keyring token this login run would leave with
 /// no delivery: every token holder when the run leaves a login stack that
 /// carries irlume's `reseal` line without irlume's lines. A disable leaves
 /// every one so, without asking what the configuration wants; an enable
-/// leaves those the configuration no longer wants wired.
+/// leaves those the configuration no longer wants wired, and those whose
+/// lines come out because no anchor qualifies anymore (#932).
 pub(crate) fn tokens_a_run_strands(enable: bool) -> Result<Vec<String>, String> {
     if !enable {
         return tokens_a_disable_strands();
     }
     let mut dropping: Vec<&'static str> = Vec::new();
-    walk_surfaces(
-        true,
-        false,
-        false,
-        &mut |svc, role, _wire, want, blocked| {
-            // A login screen remote users reach loses its lines whatever a
-            // token needs: leaving a face line there is the worse failure,
-            // and the envelope still lets `irlume keyring forget` re-key the
-            // keyring back (`greeter_want`, `remote_seats`).
-            if (role == ROLE_LOGIN || role == ROLE_LOGIN_FP) && !want && !blocked {
-                dropping.push(svc.etc);
-            }
-        },
-    );
+    walk_surfaces(true, false, false, &mut |svc, role, wire, want, blocked| {
+        if role != ROLE_LOGIN && role != ROLE_LOGIN_FP {
+            return;
+        }
+        // A login screen remote users reach loses its lines whatever a
+        // token needs: leaving a face line there is the worse failure,
+        // and the envelope still lets `irlume keyring forget` re-key the
+        // keyring back (`greeter_want`, `remote_seats`).
+        let probed = (want && !blocked)
+            .then(|| wire_service(svc, true, false, wire).ok())
+            .flatten();
+        if enable_drops(want, blocked, probed.as_ref()) {
+            dropping.push(svc.etc);
+        }
+    });
     token::tokens_stranded_by(&dropping)
 }
 
@@ -8167,6 +8192,79 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
         let off = wire_service(&svc, false, true, &reseal_only).unwrap();
         assert_eq!(off.change, PlannedChange::StripInPlace, "{off}");
         assert_eq!(std::fs::read_to_string(&etc).unwrap(), stock);
+    }
+
+    /// The token guard counts the no-anchor removal as dropping: a wanted
+    /// surface whose lines an enable only takes out (#932) loses the
+    /// `reseal` line a keyring token needs, exactly as an unwanted one
+    /// does, so the run must refuse while a token is armed against it.
+    #[test]
+    fn the_token_guard_counts_a_no_anchor_removal_as_dropping() {
+        let outcome = |change| WireOutcome {
+            change,
+            message: String::new(),
+            detail: None,
+            unmet: false,
+            adjustable: false,
+        };
+        // Unwanted surfaces drop as ever, a remote-seat greeter apart.
+        assert!(enable_drops(false, false, None));
+        assert!(!enable_drops(false, true, None));
+        // A wanted surface drops only when the enable's own decision says
+        // its lines come out; wiring, keeping and skipping do not.
+        for change in [
+            PlannedChange::StripInPlace,
+            PlannedChange::RestoreBackup,
+            PlannedChange::RemoveOverride,
+        ] {
+            assert!(
+                enable_drops(true, false, Some(&outcome(change))),
+                "{change:?}"
+            );
+        }
+        for change in [
+            PlannedChange::Wire,
+            PlannedChange::AlreadyCorrect,
+            PlannedChange::NoAnchor,
+            PlannedChange::NotWired,
+            PlannedChange::KeepEditedOverride,
+        ] {
+            assert!(
+                !enable_drops(true, false, Some(&outcome(change))),
+                "{change:?}"
+            );
+        }
+        assert!(!enable_drops(true, false, None));
+        // The ly file itself: the enable's probe takes its lines out.
+        let stock = "#%PAM-1.0\n\nauth       include      login\n\
+                     -auth      optional     pam_gnome_keyring.so\n\
+                     account    include      login\npassword   include      login\n\
+                     session    include      login\n";
+        let old = stock.replacen(
+            "auth       include      login\n",
+            &format!(
+                "{GREETER_UNSEAL_COSMIC_JUMP}\nauth       include      login\n\
+                 {PERMIT_LANDING}\n{KEYRING_UNSEAL}\n{RESEAL_AUTH}\n"
+            ),
+            1,
+        );
+        let dir = TestDir::new("old-include-guard");
+        let etc = dir.0.join("ly");
+        std::fs::write(&etc, &old).unwrap();
+        for (name, text) in [
+            ("login", ARCH_LOGIN),
+            ("system-local-login", ARCH_SYSTEM_LOCAL_LOGIN),
+        ] {
+            std::fs::write(dir.0.join(name), text).unwrap();
+        }
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let wire = |c: &str| wire_greeter_impl(c, true, true, true);
+        let probed = wire_service(&svc, true, false, &wire).unwrap();
+        assert_eq!(probed.change, PlannedChange::StripInPlace, "{probed}");
+        assert!(enable_drops(true, false, Some(&probed)));
     }
 
     /// The disable of a stack irlume edits in place with a line irlume does

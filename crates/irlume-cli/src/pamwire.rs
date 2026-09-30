@@ -885,8 +885,14 @@ fn removal_orphans_for(file_exists: bool, vendor_exists: bool) -> bool {
 /// manager's own greeter among them. A remote-seat greeter is governed by
 /// [`remote_seat_change`]; a surface nothing wants is unwired by any apply,
 /// which reconcile's other checks scope as ever.
-fn anchor_gone_counts(role: &str, want: bool, blocked: bool, primary: &str, svc: &str) -> bool {
-    (role == ROLE_LOGIN && !blocked && want && svc == primary)
+fn anchor_gone_counts(
+    role: &str,
+    want: bool,
+    blocked: bool,
+    primary: Option<&str>,
+    svc: &str,
+) -> bool {
+    (role == ROLE_LOGIN && !blocked && want && primary == Some(svc))
         || (want
             && (role == ROLE_SUDO
                 || role == ROLE_POLKIT
@@ -903,13 +909,13 @@ fn anchor_gone_counts(role: &str, want: bool, blocked: bool, primary: &str, svc:
 /// among them, the opt-in surfaces as [`wired_surface_regressed`] scopes
 /// them.
 fn anchor_gone_regression(with_sudo: bool, with_polkit: bool) -> bool {
-    let Some(dm) = active_display_manager() else {
-        return false;
-    };
-    let (primary, _) = dm_pam_services(&dm);
-    if primary == "(unknown)" {
-        return false;
-    }
+    // `(unknown)` and no display manager at all name no greeter, so the
+    // greeter leg of the walk never counts; the lock, fingerprint and
+    // opt-in surfaces do not depend on the active display manager and are
+    // probed as ever.
+    let primary = active_display_manager()
+        .map(|dm| dm_pam_services(&dm).0)
+        .filter(|primary| *primary != "(unknown)");
     let mut gone = false;
     walk_surfaces(
         true,
@@ -3243,18 +3249,6 @@ fn wire_service_with(
                 );
             }
             let current = read(s.etc)?;
-            // The recipes refuse a continued line in the lines irlume did not
-            // write, but a `\` added to one of irlume's own lines is gone once
-            // they are taken out, so the whole file is checked, as for an
-            // override.
-            if continued_with_irlume_lines(&current) {
-                return Ok(kept_continued(s.etc, true));
-            }
-            // A line irlume does not read as PAM does leaves it unable to
-            // tell where a jump lands or which chain a line is in.
-            if let Some(line) = unreadable_line(&current) {
-                return Ok(kept_unreadable(s.etc, true, &line));
-            }
             // Rebuild from the CURRENT file with irlume's own lines stripped,
             // not from the backup.
             //
@@ -3295,15 +3289,31 @@ fn wire_service_with(
                 // longer qualifies would keep wiring that no longer works
                 // (a face match there skips the included stack's first line
                 // only, the password still asked). They come out, as a
-                // disable takes them out; a file without irlume's lines has
-                // nothing to take out and is skipped as ever.
-                if !holds_irlume_line(&current) {
-                    return out(
-                        PlannedChange::NoAnchor,
-                        format!("· {}: no anchor to wire (skipped)", s.etc),
-                    );
+                // disable takes them out, which restores a matching backup
+                // whatever else the file carries, before any refusal holds;
+                // a file without irlume's lines has nothing to take out and
+                // is judged as ever.
+                if holds_irlume_line(&current) {
+                    return unwire_no_anchor(s.etc, etc, &current, &base, apply);
                 }
-                return unwire_no_anchor(s.etc, etc, &current, &base, apply);
+                if let Some(line) = unreadable_line(&current) {
+                    return Ok(kept_unreadable(s.etc, true, &line));
+                }
+                return out(
+                    PlannedChange::NoAnchor,
+                    format!("· {}: no anchor to wire (skipped)", s.etc),
+                );
+            }
+            // The recipes refuse a continued line in the lines irlume did not
+            // write, but a `\` added to one of irlume's own lines is gone once
+            // they are taken out, so the whole file is checked, as for an
+            // override. A line irlume does not read as PAM does leaves it
+            // unable to tell where a jump lands or which chain a line is in.
+            if continued_with_irlume_lines(&current) {
+                return Ok(kept_continued(s.etc, true));
+            }
+            if let Some(line) = unreadable_line(&current) {
+                return Ok(kept_unreadable(s.etc, true, &line));
             }
             let already = || {
                 out(
@@ -3513,14 +3523,16 @@ fn disable_unread(
 
 /// An enable or reconcile that finds no anchor in a file that holds lines an
 /// earlier release wired ([`wire_service_with`]): they come out, as a
-/// disable takes them out. A backup that is the current file without
-/// irlume's lines is restored and consumed, as a disable restores it; one
-/// the file moved on from is kept and the lines are stripped in place,
-/// with the same jump checks a disable makes ([`strip_in_place`]). Both
-/// facts are reported: no anchor, and what came out. When the lines cannot
-/// come out because a jump another line carries counts them, and inactive
-/// lines already hold their places, nothing is written and the outcome is
-/// the no-anchor skip naming why they stay.
+/// disable takes them out, in the disable's order. A backup that is the
+/// current file without irlume's lines is restored and consumed first,
+/// whatever else the file carries, as a disable restores it; then a line
+/// that ends in `\\` or one irlume does not read as PAM does holds the file
+/// as it is (a rename is safe, line surgery is not); then the lines are
+/// stripped in place, with the same jump checks a disable makes
+/// ([`strip_in_place`]). Both facts are reported: no anchor, and what came
+/// out. When the lines cannot come out because a jump another line carries
+/// counts them, and inactive lines already hold their places, nothing is
+/// written and the outcome is the no-anchor skip naming why they stay.
 fn unwire_no_anchor(
     etc: &str,
     path: &Path,
@@ -3559,6 +3571,16 @@ fn unwire_no_anchor(
                 adjustable: false,
             });
         }
+    }
+    // A line that ends in `\` joins lines PAM runs as one, and one irlume
+    // does not read as PAM does hides where a jump lands: taking single
+    // lines out of such a file can change another rule, so the file is kept
+    // as it is, as the disable keeps it.
+    if continued_with_irlume_lines(current) {
+        return Ok(kept_continued(etc, true));
+    }
+    if let Some(line) = unreadable_line(current) {
+        return Ok(kept_unreadable(etc, true, &line));
     }
     let (body, change, message) = strip_in_place(etc, current, true);
     let change = match body {
@@ -8216,23 +8238,106 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
     #[test]
     fn the_anchor_gone_regression_counts_the_surfaces_reconcile_maintains() {
         for (role, want, blocked, svc, primary, counts) in [
-            (ROLE_LOGIN, true, false, "ly", "ly", true),
-            (ROLE_LOGIN, true, false, "sddm", "ly", false),
-            (ROLE_LOGIN, false, false, "ly", "ly", false),
-            (ROLE_LOGIN, true, true, "ly", "ly", false),
-            (ROLE_SUDO, true, false, "sudo", "ly", true),
-            (ROLE_POLKIT, true, false, "polkit-1", "ly", true),
-            (ROLE_SUDO, false, false, "sudo", "ly", false),
-            (ROLE_LOCK, true, false, "kde", "ly", true),
-            (ROLE_LOCK, false, false, "kde", "ly", false),
-            (ROLE_LOGIN_FP, true, false, "gdm-fingerprint", "ly", true),
-            (ROLE_LOGIN_FP, false, false, "gdm-fingerprint", "ly", false),
+            (ROLE_LOGIN, true, false, "ly", Some("ly"), true),
+            (ROLE_LOGIN, true, false, "sddm", Some("ly"), false),
+            (ROLE_LOGIN, false, false, "ly", Some("ly"), false),
+            (ROLE_LOGIN, true, true, "ly", Some("ly"), false),
+            // No active display manager names no greeter.
+            (ROLE_LOGIN, true, false, "ly", None, false),
+            (ROLE_SUDO, true, false, "sudo", None, true),
+            (ROLE_LOCK, true, false, "kde", None, true),
+            (ROLE_LOGIN_FP, true, false, "gdm-fingerprint", None, true),
+            (ROLE_SUDO, true, false, "sudo", Some("ly"), true),
+            (ROLE_POLKIT, true, false, "polkit-1", Some("ly"), true),
+            (ROLE_SUDO, false, false, "sudo", Some("ly"), false),
+            (ROLE_LOCK, true, false, "kde", Some("ly"), true),
+            (ROLE_LOCK, false, false, "kde", Some("ly"), false),
+            (
+                ROLE_LOGIN_FP,
+                true,
+                false,
+                "gdm-fingerprint",
+                Some("ly"),
+                true,
+            ),
+            (
+                ROLE_LOGIN_FP,
+                false,
+                false,
+                "gdm-fingerprint",
+                Some("ly"),
+                false,
+            ),
         ] {
             assert_eq!(
                 anchor_gone_counts(role, want, blocked, primary, svc),
                 counts,
                 "{role} {svc}"
             );
+        }
+    }
+
+    /// A no-anchor file whose backup matches and which also carries a line
+    /// that ends in `\`, or one irlume does not read as PAM does: the
+    /// restore is a rename of the whole file, safe where taking single
+    /// lines out is not, so it happens first, as a disable does it, and the
+    /// refusals never fire.
+    #[test]
+    fn a_no_anchor_enable_restores_a_matching_backup_before_the_refusals() {
+        let stock = "#%PAM-1.0\n\nauth       include      login \\\n\
+                     -auth      optional     pam_gnome_keyring.so\n\
+                     account    include      login\npassword   include      login\n\
+                     session    include      login\n";
+        let old = stock.replacen(
+            "auth       include      login \\\n",
+            &format!(
+                "{GREETER_UNSEAL_COSMIC_JUMP}\nauth       include      login \\\n\
+                 {PERMIT_LANDING}\n{KEYRING_UNSEAL}\n{RESEAL_AUTH}\n"
+            ),
+            1,
+        );
+        for unreadable in [false, true] {
+            let current = if unreadable {
+                old.replacen(
+                    "-auth      optional     pam_gnome_keyring.so",
+                    // A vertical tab inside a line: one irlume does not
+                    // read as PAM does, and no line ends in `\`.
+                    "-auth      optional\u{0b}    pam_gnome_keyring.so",
+                    1,
+                )
+            } else {
+                old.clone()
+            };
+            let dir = TestDir::new("old-include-restore-first");
+            let etc = dir.0.join("ly");
+            std::fs::write(&etc, &current).unwrap();
+            // The backup the earlier release took, of the same flawed file.
+            let flawed = if unreadable {
+                stock.replacen(
+                    "-auth      optional     pam_gnome_keyring.so",
+                    "-auth      optional\u{0b}    pam_gnome_keyring.so",
+                    1,
+                )
+            } else {
+                stock.to_string()
+            };
+            std::fs::write(dir.0.join(format!("ly{BACKUP}")), &flawed).unwrap();
+            for (name, text) in [
+                ("login", ARCH_LOGIN),
+                ("system-local-login", ARCH_SYSTEM_LOCAL_LOGIN),
+            ] {
+                std::fs::write(dir.0.join(name), text).unwrap();
+            }
+            let svc = Svc {
+                etc: leak(&etc),
+                vendor: None,
+            };
+            let wire = |c: &str| wire_greeter_impl(c, true, true, true);
+            let on = wire_service(&svc, true, true, &wire).unwrap();
+            assert_eq!(on.change, PlannedChange::RestoreBackup, "{on}");
+            assert!(on.message.contains("no anchor to wire"), "{on}");
+            assert_eq!(std::fs::read_to_string(&etc).unwrap(), flawed);
+            assert!(!dir.0.join(format!("ly{BACKUP}")).exists());
         }
     }
 

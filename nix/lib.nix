@@ -144,7 +144,10 @@ let
     "pam_kwallet6.so"
     "pam_gnome_keyring.so"
   ];
-  skippedSafe = modulePath: lib.any (m: lib.hasSuffix m modulePath) skippedSafeModules;
+  # Keep a trailing empty component: baseNameOf normalizes a final slash
+  # and would mistake an unloadable "pam_unix.so/" for the real module.
+  moduleName = modulePath: lib.last (lib.splitString "/" modulePath);
+  skippedSafe = modulePath: lib.elem (moduleName modulePath) skippedSafeModules;
 
   # A fatal rule anywhere the empty-Enter arm passes through BEFORE the
   # face line: a direct rule above the anchor, or one inside a delegation
@@ -166,7 +169,7 @@ let
           let c = norm r.control;
           in
           (c == "required" || c == "requisite")
-          && (lib.hasSuffix "pam_unix.so" r.modulePath || lib.hasSuffix "pam_deny.so" r.modulePath);
+          && (moduleName r.modulePath == "pam_unix.so" || moduleName r.modulePath == "pam_deny.so");
         direct = lib.findFirst isFatal null enabled;
         delegs =
           lib.filter
@@ -302,12 +305,16 @@ let
   #                refusal terminator); without one, an optional permit
   #                landing after the substack would be a wrong password's
   #                only success;
-  #   denyFirst:   pam_deny appears before any pam_unix in the stack's run
-  #                order (or with none at all): the password path denies
-  #                every login, so a face grant would turn an
-  #                administrator's unconditional denial into a grant.
-  # The run order flattens delegations at their position: libpam expands
-  # them inline, so a nested rule runs where its delegation sits.
+  #   denyFirst:   a required/requisite pam_deny appears before any
+  #                sufficient pam_unix in the stack's run order (or with
+  #                none at all): a required pam_unix does not short-circuit
+  #                that denial, so the password path denies every login
+  #                while a face grant would skip it. An optional deny's
+  #                failure is not fatal after a successful verifier.
+  # Flatten includes for the denial check in this stack. A substack is
+  # atomic here: a sufficient verifier inside it returns only from that
+  # substack, so it cannot skip a fatal deny later in the parent. scanStack
+  # separately checks each substack's own denial path.
   flattenRules =
     { innerOf, seen, rules }:
     if rules == null then
@@ -323,7 +330,7 @@ let
           let c = norm r.control;
           in
           if
-            (c == "substack" || c == "include")
+            c == "include"
             && !(lib.hasInfix "/" r.modulePath)
             && !(lib.elem r.modulePath seen)
             && innerOf r.modulePath != null
@@ -350,8 +357,8 @@ let
             let c = norm r.control;
             in
             (c == "required" || c == "requisite")
-            && !(lib.hasSuffix "pam_deny.so" r.modulePath)
-            && !(lib.hasSuffix "pam_unix.so" r.modulePath)
+            && moduleName r.modulePath != "pam_deny.so"
+            && moduleName r.modulePath != "pam_unix.so"
           )
           null
           enabled;
@@ -405,11 +412,17 @@ let
           );
       folded = lib.foldl' walk { inherit sawRequired; } delegations;
       flat = flattenRules { inherit innerOf seen rules; };
-      firstIndexOf =
-        m: lib.lists.findFirstIndex (r: lib.hasSuffix m r.modulePath) (-1) flat;
-      denyAt = firstIndexOf "pam_deny.so";
-      unixAt = firstIndexOf "pam_unix.so";
-      denyFirst = denyAt != -1 && (unixAt == -1 || denyAt < unixAt);
+      denyAt = lib.lists.findFirstIndex
+        (r:
+          moduleName r.modulePath == "pam_deny.so"
+          && lib.elem (norm r.control) [ "required" "requisite" ])
+        (-1)
+        flat;
+      sufficientUnixAt = lib.lists.findFirstIndex
+        (r: moduleName r.modulePath == "pam_unix.so" && norm r.control == "sufficient")
+        (-1)
+        flat;
+      denyFirst = denyAt != -1 && (sufficientUnixAt == -1 || denyAt < sufficientUnixAt);
       in
       if bracketed != null then
         folded // { unproven = "rule '${bracketed.name}' uses the extended control '${bracketed.control}'"; }
@@ -418,7 +431,7 @@ let
       else if offender != null then
         folded // { unproven = "rule '${offender.name}' loads '${offender.modulePath}', which is neither a password, keyring nor denial module, and a face success would skip it"; }
       else if denyFirst then
-        folded // { unproven = "pam_deny appears before any password verifier, so the stack denies every login and a face success would skip the denial"; }
+        folded // { unproven = "a fatal pam_deny appears before any sufficient password verifier, so the stack denies every login and a face success would skip the denial"; }
       else
         folded;
 in
@@ -460,8 +473,25 @@ in
       # tab-separated spellings included) or the text was overridden.
       foreignLine =
         l: !(isComment l) && (isAtInclude l || phaseOf l == null);
-      isExtra =
-        l: lib.any (n: lib.hasInfix "# ${n} (order " l) extraNames;
+      # A marker alone cannot make an override's auth rule look like one
+      # generated by this module. Accept only the controls, module names,
+      # arguments and trailing order comments that our two rules render.
+      extraRule = name: controls: module: args: l:
+        lib.elem name extraNames
+        && lib.any
+          (control:
+            let
+              prefix = "auth ${control} ";
+              rest = builtins.substring (builtins.stringLength prefix) (builtins.stringLength l) l;
+              fields = builtins.match
+                "([^[:space:]]+)${args} # ${name} [(]order -?[0-9]+[)]"
+                rest;
+            in
+            lib.hasPrefix prefix l && fields != null && moduleName (lib.head fields) == module)
+          controls;
+      isExtra = l:
+        extraRule "irlume" [ "[success=1 default=ignore]" "sufficient" ] "pam_irlume.so" " unseal ondemand( kr)?" l
+        || extraRule "irlume-landing" [ "optional" ] "pam_permit.so" "" l;
       # Walk the rendered auth lines: each either matches the next
       # expected rule or is one of ours; anything else is an override.
       walk =
@@ -555,7 +585,7 @@ in
           { ambiguous = true; };
 
       firstUnix =
-        let unixRules = lib.filter (r: lib.hasSuffix "pam_unix.so" r.modulePath) rendered;
+        let unixRules = lib.filter (r: moduleName r.modulePath == "pam_unix.so") rendered;
         in if unixRules == [ ] then null else lib.foldl' (acc: r: if acc == null || r.order < acc.order then r else acc) null unixRules;
 
       substackResult =

@@ -207,6 +207,7 @@
             sub = name: order: { inherit name order; control = "substack"; modulePath = name; enable = true; };
             plain = name: control: modulePath: order: { inherit name control modulePath order; enable = true; };
             sddmShape = [ (sub "login" 10100) ];
+            negativeOrderSub = [ (sub "login" (-100)) ];
             policyFirst = [
               (sub "company-policy" 10000)
               (sub "login" 10100)
@@ -370,11 +371,63 @@
                 [ (plain "unixreq" "required" "/lib/security/pam_unix.so" 10000) ]
               else
                 defaultInner sn;
-            # A required pam_unix is the password verifier, not a gate: a
-            # face success skips it and a wrong password stays fatal.
+            # A required pam_unix does not short-circuit. The later deny
+            # still makes every password login fail.
             requiredUnixInner = sn: [
               (plain "unix" "required" "/lib/security/pam_unix.so" 11000)
               (plain "deny" "required" "/lib/security/pam_deny.so" 12000)
+            ];
+            optionalDenyInner = sn: [
+              (plain "unix" "required" "/lib/security/pam_unix.so" 11000)
+              (plain "deny" "optional" "/lib/security/pam_deny.so" 12000)
+            ];
+            substackVerifierThenParentDeny = sn:
+              if sn == "login" then
+                [
+                  (sub "common-auth" 11000)
+                  (plain "deny" "required" "/lib/security/pam_deny.so" 12000)
+                ]
+              else
+                [ (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000) ];
+            substackVerifierAndDeny = sn:
+              if sn == "login" then
+                [ (sub "common-auth" 11000) ]
+              else
+                [
+                  (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+                  (plain "deny" "required" "/lib/security/pam_deny.so" 12000)
+                ];
+            includeVerifierThenParentDeny = sn:
+              if sn == "login" then
+                [
+                  (inc "common-auth" 11000)
+                  (plain "deny" "required" "/lib/security/pam_deny.so" 12000)
+                ]
+              else
+                [ (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000) ];
+            trailingSlashUnixInner = sn: [
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so/" 11000)
+              (plain "deny" "required" "/lib/security/pam_deny.so" 12000)
+            ];
+            spoofedDenyInner = sn: [
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+              (plain "site-deny" "required" "/lib/security/company_pam_deny.so" 11500)
+              (plain "deny" "required" "/lib/security/pam_deny.so" 12000)
+            ];
+            spoofedKeyringInner = sn: [
+              (plain "unix" "sufficient" "/lib/security/pam_unix.so" 11000)
+              (plain "site-keyring" "optional" "/lib/security/company_pam_kwallet.so" 11500)
+              (plain "deny" "required" "/lib/security/pam_deny.so" 12000)
+            ];
+            spoofedUnixInner = sn: [
+              (plain "site-unix" "sufficient" "/lib/security/company_pam_unix.so" 11000)
+              (plain "deny" "required" "/lib/security/pam_deny.so" 12000)
+            ];
+            spoofedFlatUnix = [
+              (plain "site-unix" "sufficient" "/lib/security/company_pam_unix.so" 11000)
+            ];
+            trailingSlashFlatUnix = [
+              (plain "site-unix" "sufficient" "/lib/security/pam_unix.so/" 11000)
             ];
             # A denial terminator above the anchor records its failure on
             # the empty Enter before the face line can arm.
@@ -471,6 +524,7 @@
           # every unsafe layout is rejected with a reason (ok = false), which
           # the module turns into an evaluation error.
           assert (r "login" sddmShape).ok && (r "login" sddmShape).unsealOrder == 10050 && (r "login" sddmShape).landingEnable && (r "login" sddmShape).landingOrder == 10150;
+          assert (r "login" negativeOrderSub).ok && (r "login" negativeOrderSub).unsealOrder == -150 && (r "login" negativeOrderSub).landingOrder == -50;
           assert (placement.computePlacement { profile = "login"; others = policyFirst; innerOf = policyEnvInner; }).ok
             && (placement.computePlacement { profile = "login"; others = policyFirst; innerOf = policyEnvInner; }).unsealOrder == 10099;
           assert (r "login" flatShape).ok && (r "login" flatShape).unsealOrder == 11650 && !(r "login" flatShape).landingEnable;
@@ -527,8 +581,26 @@
           # anchor form.
           assert !(placement.computePlacement { profile = "login"; others = includeLogin; innerOf = allowlistInner; }).ok;
           assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = allowlistInner; }).ok;
-          # A required pam_unix is the password verifier, not a gate.
-          assert (placement.computePlacement { profile = "login"; others = sddmShape; innerOf = requiredUnixInner; }).ok;
+          # A required verifier cannot pass the later unconditional deny.
+          assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = requiredUnixInner; }).ok;
+          # An optional denial failure does not override a required
+          # verifier's success; a trailing slash cannot name a loadable
+          # verifier even if baseNameOf would normalize it.
+          assert (placement.computePlacement { profile = "login"; others = sddmShape; innerOf = optionalDenyInner; }).ok;
+          # A sufficient verifier inside a substack returns only from that
+          # substack, not past a fatal deny in the parent. A deny inside the
+          # same substack is safe when the verifier precedes it.
+          assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = substackVerifierThenParentDeny; }).ok;
+          assert (placement.computePlacement { profile = "login"; others = sddmShape; innerOf = substackVerifierAndDeny; }).ok;
+          assert (placement.computePlacement { profile = "login"; others = sddmShape; innerOf = includeVerifierThenParentDeny; }).ok;
+          assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = trailingSlashUnixInner; }).ok;
+          assert !(r "login" trailingSlashFlatUnix).ok;
+          # Module-name suffixes cannot impersonate the password verifier,
+          # denial terminator, or a skipped keyring module.
+          assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = spoofedDenyInner; }).ok;
+          assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = spoofedKeyringInner; }).ok;
+          assert !(placement.computePlacement { profile = "login"; others = sddmShape; innerOf = spoofedUnixInner; }).ok;
+          assert !(r "login" spoofedFlatUnix).ok;
           # A denial terminator above the anchor, direct or delegated, is
           # as fatal as a required password rule.
           assert !(placement.computePlacement { profile = "login"; others = policyFirst; innerOf = denyPolicyInner; }).ok;
@@ -552,6 +624,37 @@
             text = "# Authentication management.\nauth optional /lib/security/pam_env.so # policy-env (order 10100)\nauth [success=1 default=ignore] /nix/store/x/pam_irlume.so unseal ondemand kr # irlume (order 10500)\nauth sufficient /lib/security/pam_unix.so # unix (order 11000)\n";
             rules = genRules;
             extraNames = [ "irlume" ];
+          };
+          assert placement.textMatchesRules {
+            text = "# Authentication management.\nauth optional /lib/security/pam_env.so # policy-env (order 10100)\nauth [success=1 default=ignore] /nix/store/x/pam_irlume.so unseal ondemand kr # irlume (order 10500)\nauth optional /nix/store/y/pam_permit.so # irlume-landing (order 10700)\nauth sufficient /lib/security/pam_unix.so # unix (order 11000)\n";
+            rules = genRules;
+            extraNames = [ "irlume" "irlume-landing" ];
+          };
+          # Generated order slots can be negative when the anchor is.
+          assert placement.textMatchesRules {
+            text = "# Authentication management.\nauth [success=1 default=ignore] /nix/store/x/pam_irlume.so unseal ondemand kr # irlume (order -150)\nauth optional /nix/store/y/pam_permit.so # irlume-landing (order -50)\nauth optional /lib/security/pam_env.so # policy-env (order 10100)\nauth sufficient /lib/security/pam_unix.so # unix (order 11000)\n";
+            rules = genRules;
+            extraNames = [ "irlume" "irlume-landing" ];
+          };
+          assert !placement.textMatchesRules {
+            text = "# Authentication management.\nauth optional /lib/security/pam_env.so # policy-env (order 10100)\nauth required /lib/security/pam_nologin.so # irlume (order 10500)\nauth sufficient /lib/security/pam_unix.so # unix (order 11000)\n";
+            rules = genRules;
+            extraNames = [ "irlume" ];
+          };
+          assert !placement.textMatchesRules {
+            text = "# Authentication management.\nauth optional /lib/security/pam_env.so # policy-env (order 10100)\nauth optional /lib/security/pam_permit.so # irlume (order 10500)\nauth sufficient /lib/security/pam_unix.so # unix (order 11000)\n";
+            rules = genRules;
+            extraNames = [ "irlume" ];
+          };
+          assert !placement.textMatchesRules {
+            text = "# Authentication management.\nauth optional /lib/security/pam_env.so # policy-env (order 10100)\nauth sufficient /lib/security/company_pam_irlume.so unseal ondemand # irlume (order 10500)\nauth sufficient /lib/security/pam_unix.so # unix (order 11000)\n";
+            rules = genRules;
+            extraNames = [ "irlume" ];
+          };
+          assert !placement.textMatchesRules {
+            text = "# Authentication management.\nauth optional /lib/security/pam_env.so # policy-env (order 10100)\nauth optional /lib/security/pam_permit.so extra # irlume-landing (order 10700)\nauth sufficient /lib/security/pam_unix.so # unix (order 11000)\n";
+            rules = genRules;
+            extraNames = [ "irlume-landing" ];
           };
           assert !placement.textMatchesRules {
             text = "# Authentication management.\nauth optional /lib/security/pam_env.so # policy-env (order 10100)\nauth required /lib/security/pam_nologin.so # hidden-gate (order 10900)\nauth sufficient /lib/security/pam_unix.so # unix (order 11000)\n";

@@ -4467,6 +4467,165 @@ fn usb_port_chain(usb_devpath: &str) -> Option<String> {
     well_formed.then(|| name.to_owned())
 }
 
+/// A USB location that survives bus renumbering: the host controller plus
+/// the port chain beneath it (ADR-0032 §2). The kernel-assigned bus number
+/// is excluded by construction: ADR-0007 records bus and device numbers as
+/// diagnostic-only and dynamically allocated, so a location that carried
+/// them would break pins on a re-enumeration that moved nothing physical.
+///
+/// NOTE — resolved: merged ADR-0032 §2 requires a root-hub protocol domain
+/// alongside controller and ports, and `domain` above carries it, populated
+/// from the hub's own `idProduct` (`0002` USB2, `0003` SuperSpeed) with
+/// anything else refusing. What remains out of scope by §2 is detecting a
+/// same-facts replacement unit, not the domain itself.
+///
+/// Public because `CameraNode` and `SplitPin` carry it in their API; those
+/// types live in the private `connected` module until Step 3 re-exports
+/// them alongside `ConnectedPair`, so this is crate-visible API for now
+/// rather than a stabilized contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsbLocation {
+    /// The host controller's PCI address, e.g. `"0000:00:14.0"`.
+    pub controller: String,
+    /// Which root-hub protocol domain under that controller the device sits
+    /// behind. USB2 and SuperSpeed root hubs are numbered independently
+    /// under one xHCI controller, so controller plus ports alone cannot tell
+    /// them apart (ADR-0032 §2).
+    pub domain: RootHubDomain,
+    /// The port numbers from the controller down, e.g. `[8]` or `[2, 3]`.
+    pub ports: Vec<u8>,
+}
+
+/// Which root-hub protocol domain a USB device sits under. Linux xHCI
+/// numbers its USB2 and SuperSpeed root hubs separately under one PCI
+/// controller, so two devices at the same relative ports can still be on
+/// different domains — the domain is load-bearing identity, not a speed
+/// hint, and must never be inferred from a device's negotiated link speed
+/// (ADR-0032 §2).
+///
+/// Exhaustive over the two known domains, deliberately with no third
+/// variant: an unrecognized hub product is a lookup failure, reported as a
+/// refusal where the location is resolved, not absorbed into the type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootHubDomain {
+    /// USB2 root hub (`idProduct 0002`).
+    Usb2,
+    /// SuperSpeed root hub (`idProduct 0003`).
+    SuperSpeed,
+}
+
+/// The root-hub protocol domain for a hub `idProduct` string, as the
+/// kernel reports it: lowercase hex, no prefix, e.g. `"0002"`. Verified
+/// against real `udev::Device` attribute reads on T480 hardware (which
+/// return byte-identical content to the sysfs files); anything else —
+/// including an unknown future product — is `None`, and the caller refuses
+/// rather than guessing.
+fn root_hub_domain(id_product: &str) -> Option<RootHubDomain> {
+    match id_product {
+        "0002" => Some(RootHubDomain::Usb2),
+        "0003" => Some(RootHubDomain::SuperSpeed),
+        _ => None,
+    }
+}
+
+impl UsbLocation {
+    /// `controller` NUL `domain` NUL `dotted ports`, for embedding in a
+    /// NUL-separated binding key. Injective: NUL appears in no component,
+    /// because all three arrive as kernel sysfs text, which carries none —
+    /// the same property the daemon already leans on where it
+    /// domain-separates a hash with `b"irlume-attempt-unit\0"`.
+    pub(crate) fn key_string(&self) -> String {
+        let domain = match self.domain {
+            RootHubDomain::Usb2 => "usb2",
+            RootHubDomain::SuperSpeed => "ss",
+        };
+        let ports: Vec<String> = self.ports.iter().map(|port| port.to_string()).collect();
+        format!("{}\0{}\0{}", self.controller, domain, ports.join("."))
+    }
+}
+
+/// Whether `component` is a PCI device address in sysfs form
+/// (`DDDD:BB:DD.F`, hex, either case). Only PCI parents yield a controller:
+/// anything else — a platform device, a missing parent — fails closed to
+/// `None`, and a camera behind it can never be a split-pair side.
+fn is_pci_address(component: &str) -> bool {
+    let mut parts = component.split(':');
+    let (Some(domain), Some(bus), Some(slot)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    let mut slot = slot.split('.');
+    let (Some(device), Some(function)) = (slot.next(), slot.next()) else {
+        return false;
+    };
+    if slot.next().is_some() {
+        return false;
+    }
+    let hex = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit());
+    hex(domain, 4) && hex(bus, 2) && hex(device, 2) && hex(function, 1)
+}
+
+/// `(controller PCI address, root-hub domain, relative port chain)` from a
+/// sysfs USB device path, or `None` when the path does not yield all three.
+///
+/// The device directory is the last component (`<bus>-<ports>`); only its
+/// port numbers are read, and the bus prefix is never compared. The
+/// controller is the PCI parent of the nearest `usbN` root-hub component.
+/// The domain comes from that hub's own `idProduct` attribute, read through
+/// [`hostfs::sys_root`] like every other sysfs read in this crate (which is
+/// what keeps it hermetic under `cfg(test)` fixtures): `0002` is a USB2 hub,
+/// `0003` a SuperSpeed hub, and anything else fails closed. A path with no
+/// `usbN`, a path ending at a hub, a non-PCI parent, a malformed port list,
+/// or an unreadable or unrecognized hub product all yield `None`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "ADR-0032 step 3 will capture passive location observations"
+    )
+)]
+pub(crate) fn usb_controller_location(usb_devpath: &str) -> Option<UsbLocation> {
+    let components: Vec<&str> = std::path::Path::new(usb_devpath)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect();
+    let hub_index = components.iter().rposition(|component| {
+        component
+            .strip_prefix("usb")
+            .is_some_and(|bus| !bus.is_empty() && bus.bytes().all(|b| b.is_ascii_digit()))
+    })?;
+    let controller = components.get(hub_index.checked_sub(1)?)?;
+    if !is_pci_address(controller) {
+        return None;
+    }
+    let device = components.last()?;
+    if device.starts_with("usb") {
+        return None;
+    }
+    let (_, ports) = device.split_once('-')?;
+    let mut parsed = Vec::new();
+    for port in ports.split('.') {
+        parsed.push(port.parse::<u8>().ok()?);
+    }
+    if parsed.is_empty() {
+        return None;
+    }
+    let hub_dir: std::path::PathBuf = components[..=hub_index].iter().collect();
+    let id_product =
+        std::fs::read_to_string(hostfs::sys_root().join(hub_dir).join("idProduct")).ok()?;
+    let domain = root_hub_domain(id_product.trim())?;
+    Some(UsbLocation {
+        controller: (*controller).to_owned(),
+        domain,
+        ports: parsed,
+    })
+}
+
 /// A camera's name for people, read from sysfs without opening a device:
 /// the video node's `name`, else the USB device's `product` string. Display
 /// only — identification stays with the descriptor ids (ADR-0007), so a
@@ -17674,6 +17833,112 @@ mod tests {
         assert_eq!(usb_port_chain("/sys/devices/x/1-"), None);
         assert_eq!(usb_port_chain("/sys/devices/x/1-2..3"), None);
         assert_eq!(camera_location("/dev/irlume-no-such-node"), None);
+    }
+
+    /// Controller-qualified locations come from the PCI parent, the hub's
+    /// own product, and the port numbers alone. The kernel-assigned bus
+    /// number is never compared: the same controller and ports under a new
+    /// bus number resolve identically, which is the whole of ADR-0032 §2's
+    /// bus-renumbering rule. Hub products come from fixture files, because
+    /// the accessor reads them through `hostfs::sys_root` like every other
+    /// sysfs read in this crate.
+    #[test]
+    fn usb_controller_locations_ignore_the_bus_number() {
+        let _fixture = crate::hostfs::test::fixture_with(|_, sys| {
+            let hub = |controller: &str, hub: &str, product: &str| {
+                let dir = sys.join(
+                    ["devices", "pci0000:00", controller, hub]
+                        .iter()
+                        .collect::<std::path::PathBuf>(),
+                );
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("idProduct"), product).unwrap();
+            };
+            hub("0000:00:14.0", "usb1", "0002");
+            hub("0000:00:14.0", "usb2", "0003");
+            hub("0000:00:14.0", "usb3", "0002");
+            hub("0000:0d:00.3", "usb1", "0002");
+            hub("0000:00:1a.0", "usb1", "0009");
+        });
+        let located = |controller: &str, domain: RootHubDomain, ports: &[u8]| {
+            Some(UsbLocation {
+                controller: controller.into(),
+                domain,
+                ports: ports.to_vec(),
+            })
+        };
+        assert_eq!(
+            usb_controller_location("/devices/pci0000:00/0000:00:14.0/usb1/1-8"),
+            located("0000:00:14.0", RootHubDomain::Usb2, &[8])
+        );
+        assert_eq!(
+            usb_controller_location("/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2.3"),
+            located("0000:00:14.0", RootHubDomain::Usb2, &[2, 3])
+        );
+        // Same controller and ports under a renumbered bus: identical,
+        // because the bus number is excluded by construction. The renumbered
+        // hub keeps its USB2 product — only the bus number moved.
+        assert_eq!(
+            usb_controller_location("/devices/pci0000:00/0000:00:14.0/usb3/3-8"),
+            located("0000:00:14.0", RootHubDomain::Usb2, &[8])
+        );
+        // Same ports under the SuperSpeed hub of the same controller: a
+        // different domain, and therefore a different location.
+        assert_eq!(
+            usb_controller_location("/devices/pci0000:00/0000:00:14.0/usb2/2-8"),
+            located("0000:00:14.0", RootHubDomain::SuperSpeed, &[8])
+        );
+        // Same relative ports under a different controller: different.
+        assert_eq!(
+            usb_controller_location("/devices/pci0000:00/0000:0d:00.3/usb1/1-8"),
+            located("0000:0d:00.3", RootHubDomain::Usb2, &[8])
+        );
+        // An unrecognized hub product refuses rather than guessing a domain.
+        assert_eq!(
+            usb_controller_location("/devices/pci0000:00/0000:00:1a.0/usb1/1-4"),
+            None
+        );
+        // Non-PCI parents, missing hubs, hubs as endpoints, and malformed
+        // port lists all fail closed.
+        assert_eq!(
+            usb_controller_location("/devices/platform/soc/fea00000.usb/usb3/3-1"),
+            None
+        );
+        assert_eq!(
+            usb_controller_location("/devices/pci0000:00/0000:00:14.0/usb1"),
+            None
+        );
+        assert_eq!(usb_controller_location("/devices/x/1-8"), None);
+        assert_eq!(
+            usb_controller_location("/devices/pci0000:00/0000:00:14.0/usb1/1-"),
+            None
+        );
+        assert_eq!(
+            usb_controller_location("/devices/pci0000:00/0000:00:14.0/usb1/1-2..3"),
+            None
+        );
+        assert_eq!(
+            usb_controller_location("/devices/pci0000:00/0000:00:14.0/usb1/1-8:1.0"),
+            None
+        );
+        assert_eq!(
+            usb_controller_location("/devices/pci0000:00/0000:00:14.0/usb1/1-999"),
+            None
+        );
+    }
+
+    /// Hub product to domain: the two known USB-IF root-hub products map,
+    /// and anything else — including an empty string from a missing file —
+    /// refuses. Verified byte-for-byte against real `udev::Device` reads,
+    /// which return `"0002"`/`"0003"` with no prefix or whitespace.
+    #[test]
+    fn root_hub_products_map_to_exactly_two_domains() {
+        assert_eq!(root_hub_domain("0002"), Some(RootHubDomain::Usb2));
+        assert_eq!(root_hub_domain("0003"), Some(RootHubDomain::SuperSpeed));
+        assert_eq!(root_hub_domain("0009"), None);
+        assert_eq!(root_hub_domain(""), None);
+        assert_eq!(root_hub_domain("0x0002"), None);
+        assert_eq!(root_hub_domain("0002\n"), None);
     }
 
     /// A device's nodes share one location but can read different display

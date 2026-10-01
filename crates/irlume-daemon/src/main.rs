@@ -10208,6 +10208,8 @@ mod tests {
 
     #[test]
     fn identify_rate_limit_is_per_uid_and_exempts_root() {
+        // Other tests clear this process-wide map under the same guard.
+        let _g = env_lock();
         let uid = 0xfffe_fffd;
         let other_uid = 0xfffe_fffc;
 
@@ -11258,6 +11260,9 @@ mod tests {
             // Holds a uid for the name a request names, which every lookup
             // of that name answers while it is held.
             "worker_account_uid(",
+            // The probe interval shares this guard with tests that reset it.
+            "camera_probe_rate_limited(",
+            "clear_camera_probe_rate_state(",
         ];
         assert!(
             readers.contains(&"arrival_uid("),

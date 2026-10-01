@@ -4479,12 +4479,10 @@ fn usb_port_chain(usb_devpath: &str) -> Option<String> {
 /// anything else refusing. What remains out of scope by §2 is detecting a
 /// same-facts replacement unit, not the domain itself.
 ///
-/// Public because `CameraNode` and `SplitPin` carry it in their API; those
-/// types live in the private `connected` module until Step 3 re-exports
-/// them alongside `ConnectedPair`, so this is crate-visible API for now
-/// rather than a stabilized contract.
+/// Crate-private along with the split-pair model. Step 3 must define the
+/// public listing contract before these internal observations are exposed.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UsbLocation {
+pub(crate) struct UsbLocation {
     /// The host controller's PCI address, e.g. `"0000:00:14.0"`.
     pub controller: String,
     /// Which root-hub protocol domain under that controller the device sits
@@ -4507,7 +4505,7 @@ pub struct UsbLocation {
 /// variant: an unrecognized hub product is a lookup failure, reported as a
 /// refusal where the location is resolved, not absorbed into the type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RootHubDomain {
+pub(crate) enum RootHubDomain {
     /// USB2 root hub (`idProduct 0002`).
     Usb2,
     /// SuperSpeed root hub (`idProduct 0003`).

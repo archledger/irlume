@@ -7,6 +7,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Privileged PAM prompts skip the face invitation when the daemon reports
+  the RGB-only convenience tier, leaving the first input to the password
+  provider even when it is `yes`. Camera-free status reads preserve the
+  explicit IR-only policy and existing daemon authorization (#967).
+
 - PAM no-anchor cleanup now removes old irlume lines byte-exactly from
   unreadable or safely continued stacks and edited overrides when no jump
   counts them and no unreadable auth rule may still be an anchor. A changed

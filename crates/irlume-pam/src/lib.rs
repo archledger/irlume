@@ -122,6 +122,30 @@ fn confirm_face_intent(pamh: &Pam, service: ServiceKind) -> IntentConfirmation {
     )
 }
 
+/// Suppress a known-impossible privileged face choice without deciding a grant.
+/// Health is the daemon's published hardware tier, not the effective IR-only
+/// policy, so a convenience observation needs the camera-free policy read too.
+/// Older daemons may not implement status: an unknown tier keeps the existing
+/// consent path and its daemon-side authorization. Once RGB-only is known,
+/// only an explicit IR-only policy can keep the choice available.
+fn privileged_face_is_rgb_only() -> bool {
+    use irlume_common::client::request_until;
+    use irlume_common::config::FaceSensorPolicy;
+
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    if !matches!(
+        request_until(&Request::Health, deadline),
+        Ok(Response::Health { tier, .. }) if tier == "convenience"
+    ) {
+        return false;
+    }
+    !matches!(
+        request_until(&Request::FaceSensorStatus { user: None }, deadline),
+        Ok(Response::FaceSensorStatus { policy, .. })
+            if matches!(policy.resolve(), Ok(FaceSensorPolicy::IrOnlyExperimental))
+    )
+}
+
 /// COSMIC discards empty submissions before answering PAM. Ask for a fresh,
 /// nonempty choice in its hidden prompt; an earlier module's token is never
 /// consent, even when that password happens to be `yes`.
@@ -729,6 +753,12 @@ impl PamServiceModule for IrlumePam {
                     // A single response cannot authorize a retry loop or the
                     // structurally different credential-release request.
                     if wait || unseal {
+                        return PamError::IGNORE;
+                    }
+                    // Do not consume a password as `yes` when this tier can
+                    // never satisfy elevation. The password provider owns the
+                    // first prompt, including when consent is waived.
+                    if privileged_face_is_rgb_only() {
                         return PamError::IGNORE;
                     }
                     // The machine's owner can put privileged services on the

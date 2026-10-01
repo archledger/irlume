@@ -797,7 +797,14 @@ fn pamwrap_ssh_markers_make_no_request_and_leave_the_password_path() {
         "without a marker a confirmed face path must grant: {out}"
     );
     assert_eq!(out.matches(FACE_INTENT_INFO).count(), 1, "{out}");
-    assert_eq!(log.lock().unwrap().len(), 2, "one request per control run");
+    assert!(matches!(
+        log.lock().unwrap().as_slice(),
+        [
+            Request::Authenticate { .. },
+            Request::Health,
+            Request::Authenticate { .. }
+        ]
+    ));
 }
 
 /// `PAM_RHOST` decides local or remote on its own, set by a pam_set_items.so
@@ -989,13 +996,24 @@ fn pamwrap_consent_from_a_remote_or_unknown_session_makes_no_request() {
     agent_session(&h.root, scope, Some("UID=1000\nREMOTE=0\nTYPE=wayland\n"));
     let (ok, out) = h.run("polkit-1", &["authenticate"], "yes\n", None);
     assert!(ok, "{out}");
-    assert_eq!(log.lock().unwrap().len(), 1);
+    assert!(matches!(
+        log.lock().unwrap().as_slice(),
+        [Request::Health, Request::Authenticate { .. }]
+    ));
     // A non-consent service does not ask where the agent is.
     agent_session(&h.root, scope, Some("UID=1000\nREMOTE=1\n"));
     h.write_service("sudo", &[h.auth_line("required", "")]);
     let (ok, out) = h.run("sudo", &["authenticate"], "yes\n", None);
     assert!(ok, "{out}");
-    assert_eq!(log.lock().unwrap().len(), 2);
+    assert!(matches!(
+        log.lock().unwrap().as_slice(),
+        [
+            Request::Health,
+            Request::Authenticate { .. },
+            Request::Health,
+            Request::Authenticate { .. }
+        ]
+    ));
 }
 
 /// An elevation command (`sudo`, `su`, `doas`) never reaches the camera when
@@ -1117,9 +1135,13 @@ fn pamwrap_elevation_from_a_remote_or_unknown_session_makes_no_request() {
             assert_eq!(out.matches(FACE_INTENT_INFO).count(), 1, "{out}");
             assert_eq!(
                 log.lock().unwrap().len(),
-                before + 1,
-                "{service} from {why}: one request"
+                before + 2,
+                "{service} from {why}: one status and one face request"
             );
+            assert!(matches!(
+                &log.lock().unwrap()[before..],
+                [Request::Health, Request::Authenticate { .. }]
+            ));
         }
     }
 }
@@ -1128,6 +1150,173 @@ const FACE_INTENT_INFO: &str = "Type yes to use face authentication";
 
 const FIXED_TEST_TOKEN: &str = "fixed-test-token";
 const WRONG_TEST_TOKEN: &str = "wrong-fixed-token";
+
+/// RGB-only elevation must leave the first input to the password provider,
+/// including a password that happens to be the face-intent word.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_rgb_only_privileged_prompt_leaves_password_untouched() {
+    let Some(h) = Harness::try_new("rgb-only-privileged") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| {
+        match req {
+        Request::Health => serde_json::from_str(
+            r#"{"Health":{"tier":"convenience","rgb_dev":null,"ir_dev":null,"mesh":false,"adapter":false}}"#,
+        )
+        .unwrap(),
+        Request::FaceSensorStatus { user: None } => Response::FaceSensorStatus {
+            policy: irlume_common::config::FaceSensorPolicyObservation::DefaultDual,
+            ir_readiness: None,
+            ir_target_issue: None,
+            ir_readiness_detail: None,
+            ir_scope: None,
+            ir_scope_index: None,
+        },
+        _ => Response::Error("RGB-only convenience: face limited to screen unlock".into()),
+    }
+    });
+    for consent in ["1", "0"] {
+        h.write_settings(Some(&format!("privileged_face_consent={consent}\n")));
+        for service in ["sudo", "polkit-1"] {
+            for password in [FIXED_TEST_TOKEN, "yes"] {
+                let checker = h.token_checker("rgb-only", password);
+                h.write_service(
+                    service,
+                    &[
+                        h.auth_line("sufficient", ""),
+                        format!(
+                            "auth required pam_exec.so expose_authtok {}",
+                            checker.display()
+                        ),
+                    ],
+                );
+                let (ok, out) = h.run(service, &["authenticate"], &format!("{password}\n"), None);
+                assert!(
+                    !out.contains(FACE_INTENT_INFO),
+                    "impossible face invitation: {out}"
+                );
+                assert!(
+                    ok,
+                    "one password input must work: {service}, consent={consent}: {out}"
+                );
+            }
+        }
+    }
+    let requests = log.lock().unwrap();
+    assert_eq!(requests.len(), 16, "two status reads per transaction");
+    for pair in requests.chunks_exact(2) {
+        assert!(matches!(
+            pair,
+            [Request::Health, Request::FaceSensorStatus { user: None }]
+        ));
+    }
+}
+
+/// IR-only policy is distinct from the published hardware tier. Unknown
+/// health replies retain the old consent path; a known RGB-only tier without
+/// an explicit IR-only policy leaves the password provider in charge.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_privileged_tier_observation_preserves_policy_and_older_daemons() {
+    use irlume_common::config::{
+        FaceSensorPolicy as Policy, FaceSensorPolicyObservation as Observed,
+    };
+    for (tier, policy, offered) in [
+        ("secure", Some(Observed::DefaultDual), true),
+        (
+            "convenience",
+            Some(Observed::Explicit(Policy::IrOnlyExperimental)),
+            true,
+        ),
+        ("convenience", Some(Observed::Explicit(Policy::Dual)), false),
+        ("convenience", Some(Observed::Invalid), false),
+        ("convenience", Some(Observed::Unreadable), false),
+        ("convenience", None, false),
+        ("older-no-health", None, true),
+        ("future-tier", None, true),
+    ] {
+        let Some(h) = Harness::try_new("privileged-tier-compat") else {
+            return;
+        };
+        let log = serve(&h.socket, move |request| match request {
+            Request::Health if tier == "older-no-health" => Response::Error("bad request".into()),
+            Request::Health => Response::Health {
+                tier: tier.into(),
+                rgb_dev: None,
+                ir_dev: None,
+                mesh: false,
+                adapter: false,
+                rgb_pad: None,
+                ir_pad: None,
+                version: String::new(),
+                apparmor: None,
+            },
+            Request::FaceSensorStatus { user: None } => match policy {
+                Some(policy) => Response::FaceSensorStatus {
+                    policy,
+                    ir_readiness: None,
+                    ir_target_issue: None,
+                    ir_readiness_detail: None,
+                    ir_scope: None,
+                    ir_scope_index: None,
+                },
+                None => Response::Error("bad request".into()),
+            },
+            Request::Authenticate { .. } => grant(),
+            _ => Response::Error("unexpected request".into()),
+        });
+        for consent in ["1", "0"] {
+            h.write_settings(Some(&format!("privileged_face_consent={consent}\n")));
+            // No password provider: only the daemon's face grant can succeed.
+            h.write_service("sudo", &[h.auth_line("required", "")]);
+            let before = log.lock().unwrap().len();
+            let (ok, out) = h.run("sudo", &["authenticate"], "yes\n", None);
+            assert_eq!(ok, offered, "{tier}, {policy:?}, consent={consent}: {out}");
+            assert_eq!(
+                out.contains(FACE_INTENT_INFO),
+                offered && consent == "1",
+                "{out}"
+            );
+            let requests = log.lock().unwrap();
+            let requests = &requests[before..];
+            assert!(matches!(requests[0], Request::Health));
+            let face_index = if tier == "convenience" {
+                assert!(matches!(
+                    requests[1],
+                    Request::FaceSensorStatus { user: None }
+                ));
+                2
+            } else {
+                1
+            };
+            assert_eq!(requests.len(), face_index + usize::from(offered));
+            if offered {
+                let expected = if consent == "1" {
+                    IntentAttestation::PamConversation
+                } else {
+                    IntentAttestation::PolicyWaived
+                };
+                assert!(matches!(&requests[face_index], Request::Authenticate {
+                    user, service: Some(service), intent_confirmation: Some(intent), ..
+                } if user == "tester" && service == "sudo" && *intent == expected));
+            }
+        }
+        // RGB-only screen unlock must still reach authentication, without a
+        // privileged status query or intent prompt.
+        let before = log.lock().unwrap().len();
+        h.write_service("kde", &[h.auth_line("required", "")]);
+        let (ok, out) = h.run("kde", &["authenticate"], "", None);
+        assert!(ok && !out.contains(FACE_INTENT_INFO), "{out}");
+        assert!(matches!(
+            &log.lock().unwrap()[before..],
+            [Request::Authenticate {
+                intent_confirmation: None,
+                ..
+            }]
+        ));
+    }
+}
 
 /// Every privileged spelling comes from the shared service table. A hidden
 /// `yes` authorizes exactly one request, and that request carries the typed
@@ -1166,9 +1355,14 @@ fn pamwrap_privileged_yes_prompts_once_and_attests_every_service() {
     }
 
     let reqs = log.lock().unwrap();
-    assert_eq!(reqs.len(), services.len(), "one request per service");
-    for (request, expected_service) in reqs.iter().zip(services) {
-        match request {
+    assert_eq!(
+        reqs.len(),
+        services.len() * 2,
+        "status then face per service"
+    );
+    for (pair, expected_service) in reqs.chunks_exact(2).zip(services) {
+        assert!(matches!(pair[0], Request::Health));
+        match &pair[1] {
             Request::Authenticate {
                 structured_errors: false,
                 user,
@@ -1188,7 +1382,7 @@ fn pamwrap_privileged_yes_prompts_once_and_attests_every_service() {
 }
 
 /// Any response other than bounded ASCII `yes`, including EOF/conversation
-/// failure, chooses the ordinary fallback and never contacts the daemon.
+/// failure, chooses the ordinary fallback after the camera-free tier query.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_privileged_fallback_responses_send_no_request() {
@@ -1213,7 +1407,15 @@ fn pamwrap_privileged_fallback_responses_send_no_request() {
         assert!(out.contains(FACE_INTENT_INFO), "prompt missing: {out}");
     }
     assert!(
-        log.lock().unwrap().is_empty(),
+        matches!(
+            log.lock().unwrap().as_slice(),
+            [
+                Request::Health,
+                Request::Health,
+                Request::Health,
+                Request::Health
+            ]
+        ),
         "fallback responses must not start a face request"
     );
 }
@@ -1283,8 +1485,8 @@ fn pamwrap_password_input_is_reused_once() {
         "echo-off input must not be displayed: {out}"
     );
     assert!(
-        log.lock().unwrap().is_empty(),
-        "password input must not contact the daemon"
+        matches!(log.lock().unwrap().as_slice(), [Request::Health]),
+        "password input permits only the camera-free tier query"
     );
 }
 
@@ -1319,8 +1521,8 @@ fn pamwrap_empty_input_clears_before_password_fallback() {
     assert_eq!(out.matches(FACE_INTENT_INFO).count(), 1, "{out}");
     assert!(!out.contains(FIXED_TEST_TOKEN), "secret displayed: {out}");
     assert!(
-        log.lock().unwrap().is_empty(),
-        "empty input must not contact the daemon"
+        matches!(log.lock().unwrap().as_slice(), [Request::Health]),
+        "empty input permits only the camera-free tier query"
     );
 }
 
@@ -1380,9 +1582,14 @@ fn pamwrap_face_denial_clears_yes_before_password_fallback() {
             "{out}"
         );
         let requests = log.lock().unwrap();
-        assert_eq!(requests.len(), 1, "exactly one face request: {requests:?}");
+        assert_eq!(
+            requests.len(),
+            2,
+            "status then one face request: {requests:?}"
+        );
+        assert!(matches!(requests[0], Request::Health));
         assert!(matches!(
-            &requests[0],
+            &requests[1],
             Request::Authenticate {
                 intent_confirmation: Some(IntentAttestation::PamConversation),
                 ..
@@ -1480,8 +1687,11 @@ fn pamwrap_wrong_password_is_camera_free_and_fresh_retry_accepts() {
         "secret displayed: {right_out}"
     );
     assert!(
-        log.lock().unwrap().is_empty(),
-        "password attempts must not contact the daemon"
+        matches!(
+            log.lock().unwrap().as_slice(),
+            [Request::Health, Request::Health]
+        ),
+        "password attempts permit only camera-free tier queries"
     );
 }
 
@@ -1683,12 +1893,16 @@ fn pamwrap_polkit_shake_aborts_only_the_polkit_stack() {
         3,
         "each case must reach the daemon: {reqs:?}"
     );
-    assert!(reqs.iter().all(|request| matches!(
-        request,
-        Request::Authenticate {
-            intent_confirmation: Some(IntentAttestation::PamConversation),
-            ..
-        }
+    assert_eq!(reqs.len(), 6);
+    assert!(reqs.chunks_exact(2).all(|pair| matches!(
+        pair,
+        [
+            Request::Health,
+            Request::Authenticate {
+                intent_confirmation: Some(IntentAttestation::PamConversation),
+                ..
+            }
+        ]
     )));
 }
 
@@ -3467,10 +3681,17 @@ fn pamwrap_authentication_deadline_keeps_fresh_password_fallback() {
             "expiry must reach a fresh password prompt: {service}: {out}"
         );
         assert!(!out.contains(FIXED_TEST_TOKEN));
-        assert_eq!(
-            log.lock().unwrap().len(),
-            1,
-            "expiry cannot trigger another face request"
-        );
+        let requests = log.lock().unwrap();
+        if service == "sudo" {
+            assert!(matches!(
+                requests.as_slice(),
+                [Request::Health, Request::Authenticate { .. }]
+            ));
+        } else {
+            assert!(matches!(
+                requests.as_slice(),
+                [Request::UnsealPassword { .. }]
+            ));
+        }
     }
 }

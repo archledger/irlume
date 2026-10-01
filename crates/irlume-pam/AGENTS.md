@@ -36,7 +36,11 @@ login or locks a person out. It is critical-tier
 - The module holds no camera, models, templates or images and decides no
   grant: it maps each daemon reply to a PAM code
   ([docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) "Privilege separation").
-  Three bounded paths send more than one request, and all stay: `wait` retries
+  Before privileged intent, camera-free `Health` and, for convenience tier,
+  `FaceSensorStatus { user: None }` share a 1.5-second deadline. Known RGB-only
+  without explicit IR-only policy returns IGNORE before prompting or consuming
+  input; unknown health keeps the existing consent and daemon authorization.
+  Three other bounded paths send more than one request, and all stay: `wait` retries
   `try_verify` or `try_unseal` until a match or until an attempt ends after
   `WAIT_BUDGET` (20 s); with `facefirst` or `ondemand` an `UnsealUnavailable`
   (release refused before any face attempt) falls back to one identity-only

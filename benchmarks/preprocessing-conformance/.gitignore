@@ -1,0 +1,5 @@
+/build/
+/__pycache__/
+/results.json
+/checks.json
+/checks.json.tmp

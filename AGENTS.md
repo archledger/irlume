@@ -47,7 +47,7 @@ The main TUI, camera, daemon and auth files run 16k to 25k lines: search, do not
   step in `ci.yml` (later steps add swtpm, ffmpeg and more).
 - The CLI's fixed-path root-probe tests, its tests that bind fixture PAM
   directories at system paths, and the daemon's shared-greeter
-  runtime-directory test exec `/usr/bin/bwrap` (Ubuntu 24.04:
+  runtime-directory and software-TPM eyes-open tests exec `/usr/bin/bwrap` (Ubuntu 24.04:
   `bash scripts/ci-bubblewrap.sh --check`); the CLI's other black-box tests
   do not. Without pamtester and pam_wrapper most PAM end-to-end tests pass
   vacuously and the COSMIC ones fail; `IRLUME_REQUIRE_PAM_TOOLS=1`, set in CI,

@@ -3525,13 +3525,16 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             structured_errors,
             ..
         } => {
+            let uid = attempt_record::arrival_uid(&user, peer.uid);
             attempt_record::record_on_arrival(
                 user.clone(),
-                peer.uid,
+                uid,
                 attempt_record::Filed {
                     at: attempt_record::unix_now(),
                     kind: irlume_common::AttemptKind::Authenticate,
-                    surface: attempt_surface(&user, service.as_deref(), peer),
+                    surface: uid
+                        .map(|uid| attempt_surface(uid, service.as_deref(), peer))
+                        .unwrap_or(irlume_common::AttemptSurface::Other),
                     result: irlume_common::AttemptResult::Failed,
                     cause: Some(EarlyRefusal::DaemonStarting.cause()),
                     elapsed_ms: 0,
@@ -3553,13 +3556,16 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             }
         }
         Request::UnsealPassword { user, service } => {
+            let uid = attempt_record::arrival_uid(&user, peer.uid);
             attempt_record::record_on_arrival(
                 user.clone(),
-                peer.uid,
+                uid,
                 attempt_record::Filed {
                     at: attempt_record::unix_now(),
                     kind: irlume_common::AttemptKind::Authenticate,
-                    surface: attempt_surface(&user, service.as_deref(), peer),
+                    surface: uid
+                        .map(|uid| attempt_surface(uid, service.as_deref(), peer))
+                        .unwrap_or(irlume_common::AttemptSurface::Other),
                     result: irlume_common::AttemptResult::Failed,
                     cause: Some(EarlyRefusal::DaemonStarting.cause()),
                     elapsed_ms: 0,
@@ -3574,9 +3580,10 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
         // Past pregate, so an `IdentifyFor` peer may act for the account.
         Request::Identify | Request::IdentifyFor { .. } => {
             if let Some(name) = identify_account(&req, peer) {
+                let uid = attempt_record::arrival_uid(&name, peer.uid);
                 attempt_record::record_on_arrival(
                     name.clone(),
-                    peer.uid,
+                    uid,
                     attempt_record::Filed {
                         at: attempt_record::unix_now(),
                         kind: irlume_common::AttemptKind::Identify,
@@ -6893,18 +6900,23 @@ fn note_decided(cause: Option<irlume_common::OutcomeCause>) {
 }
 
 /// The surface an authentication serves (ADR-0030 §5): the operation
-/// class with the session state bound to this login; `Other` only when
-/// the account cannot be resolved. The gate keeps its own classification.
-fn attempt_surface(
-    user: &str,
+/// class with the session state bound to this login's registered uid;
+/// `Other` when that state cannot be resolved. The gate keeps its own
+/// classification.
+fn attempt_surface(uid: u32, service: Option<&str>, peer: &Peer) -> irlume_common::AttemptSurface {
+    attempt_surface_with(uid, service, peer.pid, attempt_record::session_state_for)
+}
+
+fn attempt_surface_with(
+    uid: u32,
     service: Option<&str>,
-    peer: &Peer,
+    peer_pid: i32,
+    session_state: impl FnOnce(i32, u32) -> Option<irlume_core::biopolicy::SessionState>,
 ) -> irlume_common::AttemptSurface {
     // Unresolvable session state is `Other` in the record (the contract),
     // even though policy would treat it as cold: a dual-purpose greeter
     // must not be filed as a login on a guess.
-    crate::users::uid_for_name(user)
-        .and_then(|uid| attempt_record::session_state_for(peer.pid, uid))
+    session_state(peer_pid, uid)
         .map(|state| irlume_core::biopolicy::classify(service.unwrap_or(""), state))
         .map(attempt_record::surface_for)
         .unwrap_or(irlume_common::AttemptSurface::Other)
@@ -6915,10 +6927,10 @@ impl AttemptContext {
     /// opens); a path that never reaches a camera passes `|| None`. `owner`
     /// is the request's diagnostic owner, which records the uid it acts for
     /// ([`request_account_uid`]). A request that acts for no uid (root's
-    /// request for a name that did not resolve when it was registered)
-    /// files nothing: a lookup when the reply is filed could only find an
-    /// account the name was given since, and the attempt is not that
-    /// account's history.
+    /// request for a name that was absent or whose lookup failed when it was
+    /// registered) files nothing: a later lookup might return a uid after
+    /// a name change or a transient lookup failure, but the attempt was not
+    /// registered for that uid.
     fn for_request(
         req: &Request,
         peer: &Peer,
@@ -6934,7 +6946,7 @@ impl AttemptContext {
             | Request::UnsealPassword { user, service } => (
                 user.clone(),
                 irlume_common::AttemptKind::Authenticate,
-                attempt_surface(user, service.as_deref(), peer),
+                attempt_surface(uid, service.as_deref(), peer),
             ),
             Request::Identify | Request::IdentifyFor { .. } => {
                 // Root's account-less identify has no account to file under.
@@ -8877,7 +8889,7 @@ fn mutate_enrollment(
     user: &str,
     f: impl FnOnce(&mut irlume_core::storage::Enrollment) -> Result<String, String>,
 ) -> Response {
-    let mut enr = match irlume_core::storage::load(user) {
+    let mut enr = match irlume_core::storage::load_unmoved(user) {
         Ok(Some(e)) => e,
         Ok(None) => return Response::Error(format!("'{user}' is not enrolled")),
         Err(e) => return Response::Error(e.to_string()),
@@ -8962,7 +8974,7 @@ fn add_camera_group(
 ) -> Response {
     // The enrollment gate first (the engine re-checks; this is the UX
     // order): an account with no primary enrollment has nothing to extend.
-    if matches!(irlume_core::storage::load(user), Ok(None)) {
+    if matches!(irlume_core::storage::load_unmoved(user), Ok(None)) {
         return Response::Error(format!("'{user}' is not enrolled"));
     }
     let pair = engine.live_pair();
@@ -9072,7 +9084,7 @@ fn set_require_eyes_open_off(user: &str, engine: &irlume_auth::Engine) -> Respon
         Ok(owner) => owner,
         Err(error) => return Response::Error(error.to_string()),
     };
-    let mut enrollment = match irlume_core::storage::load(user) {
+    let mut enrollment = match irlume_core::storage::load_unmoved(user) {
         Ok(Some(enrollment)) => enrollment,
         Ok(None) => return Response::Error(format!("'{user}' is not enrolled")),
         Err(error) => return Response::Error(error.to_string()),
@@ -11238,12 +11250,19 @@ mod tests {
             // did (`EnrollmentSummary::serves`), which asks NSS for a root
             // peer.
             "account::resolve(",
+            "account::resolve_fresh(",
+            "arrival_uid(",
+            "record_on_arrival(",
             "summary_owner(",
             "dispatch_status(",
             // Holds a uid for the name a request names, which every lookup
             // of that name answers while it is held.
             "worker_account_uid(",
         ];
+        assert!(
+            readers.contains(&"arrival_uid("),
+            "the startup attempt helper reaches NSS and needs an environment guard"
+        );
         /// Drops char literals, string literals and line comments so a brace
         /// inside one is not counted as structure.
         ///
@@ -12692,6 +12711,16 @@ mod tests {
                 "a structured client must get a retryable operational failure, got {other:?}"
             ),
         }
+    }
+
+    #[test]
+    fn attempt_surface_uses_the_registered_account_uid() {
+        use irlume_core::biopolicy::SessionState;
+        let surface = attempt_surface_with(4242, Some("gdm-password"), 77, |pid, uid| {
+            assert_eq!((pid, uid), (77, 4242));
+            Some(SessionState::Warm)
+        });
+        assert_eq!(surface, irlume_common::AttemptSurface::Lock);
     }
 
     /// The startup path answers a keyring release before the engine exists,
@@ -22798,6 +22827,107 @@ mod tests {
     }
 
     // ---- env-gated: swtpm ------------------------------------------------
+
+    #[test]
+    #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
+    fn tpm_refused_eyes_open_off_keeps_the_enrollment_and_key_unmoved() {
+        let _g = env_lock();
+        assert!(
+            std::env::var("IRLUME_TCTI").is_ok_and(|tcti| tcti.starts_with("swtpm:")),
+            "this regression requires an explicit software TPM"
+        );
+        let namespace = std::fs::read_link("/proc/self/ns/mnt").unwrap();
+        if let Some(parent) = std::env::var_os("IRLUME_TEST_EYES_OPEN_PARENT_MNT") {
+            assert_ne!(namespace, std::path::PathBuf::from(parent));
+            use std::os::unix::fs::MetadataExt as _;
+            assert_eq!(
+                std::fs::metadata("/dev/tpmrm0").unwrap().rdev(),
+                std::fs::metadata("/dev/null").unwrap().rdev()
+            );
+        } else {
+            // storage::save selects encryption by device presence. Supply a
+            // harmless presence marker even on CI hosts without a TPM; every
+            // TSS operation still uses the explicit swtpm transport above.
+            let result = std::process::Command::new("/usr/bin/timeout")
+                .args(["--kill-after=5", "90", "/usr/bin/bwrap"])
+                .args([
+                    "--die-with-parent",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--tmpfs",
+                    "/tmp",
+                    "--dev",
+                    "/dev",
+                    "--ro-bind",
+                    "/dev/null",
+                    "/dev/tpmrm0",
+                    "--",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "tests::tpm_refused_eyes_open_off_keeps_the_enrollment_and_key_unmoved",
+                    "--nocapture",
+                ])
+                .env("IRLUME_TEST_EYES_OPEN_PARENT_MNT", namespace)
+                .env("TMPDIR", "/tmp")
+                .output()
+                .expect("timeout and bubblewrap are required for the software-TPM regression");
+            assert!(
+                result.status.success(),
+                "software-TPM regression failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let mut e = engine();
+        let sb = sandbox("tpm-eyes-open-refusal");
+        // SAFETY: geteuid has no preconditions.
+        let user = users::name_for_uid(unsafe { libc::geteuid() }).unwrap();
+        let key = zeroize::Zeroizing::new(vec![13u8; 32]);
+        // A legacy key bound only to an OS-measured PCR can move to PCR 7.
+        let weak = irlume_core::tpm::seal_with_pcrs(&key, &[11]).unwrap();
+        assert!(irlume_core::tpm::stronger_tier_available_than(&weak));
+        assert!(weak.uid.is_none());
+        let key_path = irlume_core::template_key::key_path(&user);
+        weak.save(&key_path).unwrap();
+        let enrollment = enrollment_with(&user, &["Face Scan 1"]);
+        assert!(enrollment.uid.is_none());
+        let path = sb.dir.join(format!("{user}.json"));
+        std::fs::write(
+            &path,
+            irlume_core::storage::serialize_enrollment(&enrollment, Some(&key)).unwrap(),
+        )
+        .unwrap();
+        let recovery = irlume_core::template_key::recovery_path(&user);
+        std::fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+        std::fs::write(&recovery, b"not a recovery envelope").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let key_before = std::fs::read(&key_path).unwrap();
+
+        let response = dispatch(
+            Request::SetRequireEyesOpen {
+                user: user.clone(),
+                on: false,
+            },
+            &peer(0),
+            &mut e,
+        );
+        assert!(
+            matches!(&response, Response::Error(message)
+            if message.contains("recovery envelope") && message.contains("nothing was written")),
+            "{response:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&key_path).unwrap(), key_before);
+        assert_eq!(
+            std::fs::read(&recovery).unwrap(),
+            b"not a recovery envelope"
+        );
+    }
 
     #[test]
     #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]

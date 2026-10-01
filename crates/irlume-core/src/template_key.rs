@@ -234,14 +234,11 @@ pub(crate) fn unbound_key_has_another_accounts_recovery(
 
 /// Whether the refusal over an unreadable recovery envelope at `path` names
 /// `irlume recovery forget` as the next step: for a regular file, or a
-/// symbolic link whose target exists, which [`forget_recovery_unlocked`]
-/// removes (the link, not its target). It leaves a directory, and a link
-/// whose target does not resolve, in place, so for those, and for any other
-/// kind of file, the refusal says to move the path away instead.
+/// symbolic link, FIFO, socket, or device, which [`forget_recovery_unlocked`]
+/// removes. It leaves a directory in place, so that refusal says to move
+/// the path away instead.
 fn recovery_forget_removes(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
-        metadata.is_file() || (metadata.file_type().is_symlink() && path.exists())
-    })
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_dir())
 }
 
 /// Whether a recovery envelope exists for `user`.
@@ -1096,8 +1093,10 @@ pub fn forget_recovery(user: &str) -> Result<()> {
 
 pub(crate) fn forget_recovery_unlocked(user: &str) -> Result<()> {
     let path = recovery_path(user);
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| Error::Io(e.to_string()))?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => std::fs::remove_file(&path).map_err(|e| Error::Io(e.to_string()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::Io(e.to_string())),
     }
     Ok(())
 }
@@ -1114,11 +1113,7 @@ fn forget_key_unlocked_no_lock(user: &str) -> Result<()> {
 
 #[cfg(test)]
 fn forget_recovery_unlocked_no_lock(user: &str) -> Result<()> {
-    let path = recovery_path(user);
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| Error::Io(e.to_string()))?;
-    }
-    Ok(())
+    forget_recovery_unlocked(user)
 }
 
 fn save_recovery(user: &str, env: &RecoveryEnvelope) -> Result<()> {
@@ -1132,15 +1127,39 @@ fn save_recovery(user: &str, env: &RecoveryEnvelope) -> Result<()> {
 }
 
 fn load_recovery(user: &str) -> Result<RecoveryEnvelope> {
-    let data = std::fs::read(recovery_path(user)).map_err(|e| Error::Io(e.to_string()))?;
+    let data = read_recovery_file(&recovery_path(user)).map_err(|e| Error::Io(e.to_string()))?;
     serde_json::from_slice(&data).map_err(|e| Error::Protocol(e.to_string()))
+}
+
+/// Read only regular files, retaining the ownership check through links to
+/// valid envelopes. A special node must not block the worker or account lock.
+fn read_recovery_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error as IoError, ErrorKind, Read as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let not_regular = || IoError::new(ErrorKind::InvalidInput, "not a regular file");
+    // Avoid opening devices at all. Recheck the opened descriptor as well:
+    // a replacement FIFO between metadata and open must not block or be read.
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(not_regular());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(not_regular());
+    }
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
+    Ok(data)
 }
 
 /// [`load_recovery`], with `Ok(None)` when no recovery envelope is stored.
 /// A stored one that cannot be read or parsed is an error.
 fn stored_recovery(user: &str) -> Result<Option<RecoveryEnvelope>> {
     let path = recovery_path(user);
-    let data = match std::fs::read(&path) {
+    let data = match read_recovery_file(&path) {
         Ok(data) => data,
         // A link whose target is missing also reads as not found, but an
         // entry is there, and it shows no uid: it is not an absent envelope.
@@ -1424,6 +1443,34 @@ mod tests {
         assert!(!has_key(user), "nothing was sealed");
         assert_eq!(std::fs::read(recovery_path(user)).unwrap(), before);
 
+        // A link to a valid regular envelope must still enforce its owner;
+        // rejecting every link as unreadable would let forget bypass this.
+        let target = PathBuf::from(&rec).join("linked-envelope");
+        std::fs::rename(recovery_path(user), &target).unwrap();
+        std::os::unix::fs::symlink(&target, recovery_path(user)).unwrap();
+        {
+            let _now = crate::account::remember(user, 4202);
+            let error = forget_recovery(user).unwrap_err().to_string();
+            assert!(error.contains("uid 4201"), "{error}");
+            assert!(std::fs::symlink_metadata(recovery_path(user))
+                .unwrap()
+                .is_symlink());
+        }
+        {
+            let _unknown =
+                crate::account::remember_resolution(user, crate::account::Resolution::Unknown);
+            assert!(forget_recovery(user).is_err());
+            assert!(std::fs::symlink_metadata(recovery_path(user))
+                .unwrap()
+                .is_symlink());
+        }
+        {
+            let _owner = crate::account::remember(user, 4201);
+            forget_recovery(user).unwrap();
+            assert!(std::fs::symlink_metadata(recovery_path(user)).is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), before);
+        }
+
         std::env::remove_var("IRLUME_RECOVERY_DIR");
         std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
         let _ = std::fs::remove_dir_all(&rec);
@@ -1702,11 +1749,40 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Pin the production wrappers exercised by the kept-key move seam: a
+    /// moving loader here would rewrite a key before ownership is checked.
+    #[test]
+    fn writes_that_check_a_key_first_use_the_unmoved_loader() {
+        let source = include_str!("template_key.rs");
+        for wrapper in [
+            "ensure_key_unlocked",
+            "ensure_enrollment_key_unlocked",
+            "ensure_camera_store_key",
+            "setup_recovery",
+        ] {
+            let signature = format!("fn {wrapper}(");
+            let body = source
+                .split_once(&signature)
+                .unwrap_or_else(|| panic!("missing production wrapper {wrapper}"))
+                .1
+                .split_once("\n}\n")
+                .unwrap_or_else(|| panic!("missing end of production wrapper {wrapper}"))
+                .0;
+            assert!(
+                body.contains("load_key_unmoved_as"),
+                "{wrapper} must check the key before it can move"
+            );
+            assert!(
+                !body.contains("load_key_as,"),
+                "{wrapper} must not pass the moving loader"
+            );
+        }
+    }
+
     /// The refusal over an unreadable recovery envelope names
     /// `irlume recovery forget` only for what that command removes: a file,
-    /// or a symbolic link whose target exists (the link goes, the target
-    /// stays). For a directory, or a link that does not resolve, it says to
-    /// move the path away instead, since the command leaves those in place.
+    /// socket, or symbolic link (the link goes, the target stays). A directory
+    /// must be moved away instead.
     #[test]
     fn an_unreadable_recovery_envelope_names_forget_only_where_forget_removes_it() {
         let _env = crate::testenv::ENV_LOCK
@@ -1737,13 +1813,17 @@ mod tests {
         let a_link_loop = || std::os::unix::fs::symlink(&path, &path).unwrap();
         let a_dangling_link =
             || std::os::unix::fs::symlink(elsewhere.join("missing"), &path).unwrap();
-        let kinds: [(&str, &dyn Fn(), bool); 6] = [
+        let a_socket = || {
+            let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        };
+        let kinds: [(&str, &dyn Fn(), bool); 7] = [
             ("a file", &not_json, true),
+            ("a socket", &a_socket, true),
             ("a link to a file", &link_to_a_file, true),
             ("a link to a directory", &link_to_a_directory, true),
             ("a directory", &a_directory, false),
-            ("a link that does not resolve", &a_link_loop, false),
-            ("a link to a missing file", &a_dangling_link, false),
+            ("a link that does not resolve", &a_link_loop, true),
+            ("a link to a missing file", &a_dangling_link, true),
         ];
         let forget_step = format!(
             "remove it with `irlume recovery forget`, or move {} away",
@@ -1793,6 +1873,89 @@ mod tests {
         clear();
         std::env::remove_var("IRLUME_STATE_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovery_fifo_reads_refuse_and_forget_unlinks_without_a_writer() {
+        use std::os::unix::{ffi::OsStrExt as _, fs::OpenOptionsExt as _};
+
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("recovery-fifo"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        let user = "recovery-fifo";
+        let path = recovery_path(user);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let target = dir.join("fifo");
+        let c_path = std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is NUL-terminated and lives through the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let weak: SealedEnvelope =
+            serde_json::from_str(r#"{"version":1,"pcrs":[7],"public":"","private":""}"#).unwrap();
+        weak.save(&key_path(user)).unwrap();
+        let mut blocked = Vec::new();
+        for linked in [false, true] {
+            for operation in ["load", "ownership", "forget"] {
+                if linked {
+                    std::os::unix::fs::symlink(&target, &path).unwrap();
+                } else {
+                    std::fs::hard_link(&target, &path).unwrap();
+                }
+                let (tx, rx) = std::sync::mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    let result = match operation {
+                        "load" => load_recovery(user).map(|_| ()),
+                        "ownership" => {
+                            unbound_key_has_another_accounts_recovery(user, &mut Account::new(user))
+                                .map(|_| ())
+                        }
+                        "forget" => forget_recovery(user),
+                        _ => unreachable!(),
+                    };
+                    tx.send(result).unwrap();
+                });
+                let result = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                    Ok(result) => result,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        blocked.push((linked, operation));
+                        // Release a regressed blocking open/read, then join it
+                        // before changing the environment or removing fixtures.
+                        let writer = std::fs::OpenOptions::new()
+                            .write(true)
+                            .custom_flags(libc::O_NONBLOCK)
+                            .open(&target)
+                            .unwrap();
+                        drop(writer);
+                        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap()
+                    }
+                    Err(error) => panic!("FIFO worker disconnected: {error}"),
+                };
+                worker.join().unwrap();
+                if operation == "forget" {
+                    result.unwrap();
+                    assert!(std::fs::symlink_metadata(&path).is_err());
+                } else {
+                    let error = result.unwrap_err().to_string();
+                    if !blocked.contains(&(linked, operation)) {
+                        assert!(error.contains("not a regular file"), "{error}");
+                        if operation == "ownership" {
+                            assert!(error.contains("remove it with `irlume recovery forget`"));
+                        }
+                    }
+                    std::fs::remove_file(&path).unwrap();
+                }
+                assert!(target.exists(), "forget must leave the link target alone");
+            }
+        }
+        std::env::remove_var("IRLUME_STATE_DIR");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            blocked.is_empty(),
+            "recovery operations blocked on a FIFO: {blocked:?}"
+        );
     }
 
     /// A template key on a weaker policy stays there through an

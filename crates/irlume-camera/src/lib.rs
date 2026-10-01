@@ -4473,7 +4473,7 @@ fn usb_port_chain(usb_devpath: &str) -> Option<String> {
 /// diagnostic-only and dynamically allocated, so a location that carried
 /// them would break pins on a re-enumeration that moved nothing physical.
 ///
-/// NOTE — resolved: merged ADR-0032 §2 requires a root-hub protocol domain
+/// Merged ADR-0032 §2 requires a root-hub protocol domain
 /// alongside controller and ports, and `domain` above carries it, populated
 /// from the hub's own `idProduct` (`0002` USB2, `0003` SuperSpeed) with
 /// anything else refusing. What remains out of scope by §2 is detecting a
@@ -4499,7 +4499,7 @@ pub struct UsbLocation {
 /// Which root-hub protocol domain a USB device sits under. Linux xHCI
 /// numbers its USB2 and SuperSpeed root hubs separately under one PCI
 /// controller, so two devices at the same relative ports can still be on
-/// different domains — the domain is load-bearing identity, not a speed
+/// different domains. The domain is load-bearing identity, not a speed
 /// hint, and must never be inferred from a device's negotiated link speed
 /// (ADR-0032 §2).
 ///
@@ -4517,8 +4517,8 @@ pub enum RootHubDomain {
 /// The root-hub protocol domain for a hub `idProduct` string, as the
 /// kernel reports it: lowercase hex, no prefix, e.g. `"0002"`. Verified
 /// against real `udev::Device` attribute reads on T480 hardware (which
-/// return byte-identical content to the sysfs files); anything else —
-/// including an unknown future product — is `None`, and the caller refuses
+/// return byte-identical content to the sysfs files); anything else,
+/// including an unknown future product, is `None`, and the caller refuses
 /// rather than guessing.
 fn root_hub_domain(id_product: &str) -> Option<RootHubDomain> {
     match id_product {
@@ -4531,7 +4531,7 @@ fn root_hub_domain(id_product: &str) -> Option<RootHubDomain> {
 impl UsbLocation {
     /// `controller` NUL `domain` NUL `dotted ports`, for embedding in a
     /// NUL-separated binding key. Injective: NUL appears in no component,
-    /// because all three arrive as kernel sysfs text, which carries none —
+    /// because all three arrive as kernel sysfs text, which carries none;
     /// the same property the daemon already leans on where it
     /// domain-separates a hash with `b"irlume-attempt-unit\0"`.
     pub(crate) fn key_string(&self) -> String {
@@ -4546,7 +4546,7 @@ impl UsbLocation {
 
 /// Whether `component` is a PCI device address in sysfs form
 /// (`DDDD:BB:DD.F`, hex, either case). Only PCI parents yield a controller:
-/// anything else — a platform device, a missing parent — fails closed to
+/// anything else, including a platform device or missing parent, fails closed to
 /// `None`, and a camera behind it can never be a split-pair side.
 fn is_pci_address(component: &str) -> bool {
     let mut parts = component.split(':');
@@ -17877,7 +17877,7 @@ mod tests {
         );
         // Same controller and ports under a renumbered bus: identical,
         // because the bus number is excluded by construction. The renumbered
-        // hub keeps its USB2 product — only the bus number moved.
+        // hub keeps its USB2 product; only the bus number moved.
         assert_eq!(
             usb_controller_location("/devices/pci0000:00/0000:00:14.0/usb3/3-8"),
             located("0000:00:14.0", RootHubDomain::Usb2, &[8])
@@ -17928,7 +17928,7 @@ mod tests {
     }
 
     /// Hub product to domain: the two known USB-IF root-hub products map,
-    /// and anything else — including an empty string from a missing file —
+    /// and anything else, including an empty string from a missing file,
     /// refuses. Verified byte-for-byte against real `udev::Device` reads,
     /// which return `"0002"`/`"0003"` with no prefix or whitespace.
     #[test]

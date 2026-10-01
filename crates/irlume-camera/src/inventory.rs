@@ -528,14 +528,6 @@ impl CameraInventory {
             supervisor_id: Some(self.supervisor_id.as_str().to_owned()),
             revision: self.revision,
             pairs: Vec::new(),
-            // No split pair is published here. The `SplitPair` type and its
-            // pin-authorized builder exist and are tested, but nothing calls
-            // the builder yet: reading pins, filling this list, and the
-            // Step 5 activation gate that must guard any end-to-end use are
-            // later steps (ADR-0032). A host with a split camera therefore
-            // still sees the single-camera view it saw before, and this
-            // publication is byte for byte unchanged.
-            split_pairs: Vec::new(),
             unclassified: Vec::new(),
         };
         for entry in self.published_entries() {

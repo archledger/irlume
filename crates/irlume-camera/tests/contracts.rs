@@ -10,6 +10,19 @@ use irlume_camera::contracts::{
 const TOPOLOGY: &str = "/devices/pci0000:00/usb1/1-2/1-2.1";
 const INSTANCE_ID: &str = "00000000000000000000000000000001";
 
+#[test]
+fn ordinary_inventory_keeps_its_public_construction_contract() {
+    let view = irlume_camera::ConnectedPairs {
+        state: Default::default(),
+        reason: None,
+        supervisor_id: None,
+        revision: 0,
+        pairs: Vec::new(),
+        unclassified: Vec::new(),
+    };
+    assert_eq!(view, irlume_camera::ConnectedPairs::default());
+}
+
 fn physical_id() -> PhysicalCameraId {
     PhysicalCameraId::new(TOPOLOGY, Some("200901010001".into()))
         .expect("valid raw identity evidence")

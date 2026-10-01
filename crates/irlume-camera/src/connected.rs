@@ -58,13 +58,13 @@ pub struct CameraNode {
 }
 
 /// A user-pinned RGB+IR pair whose two nodes are on **two different USB
-/// devices** — the ThinkPad T480's Bison IR (`5986:1141`) and SunplusIT RGB
+/// devices**, such as the ThinkPad T480's Bison IR (`5986:1141`) and SunplusIT RGB
 /// (`5986:2113`) modules, on separate ports of `0000:00:14.0` (ADR-0032).
 ///
 /// This is deliberately a *separate type* from [`ConnectedPair`], which
 /// stays one physical camera (ADR-0029 §1). Every invariant that rests on
-/// that — the lease's per-instance key, `camera_binding`'s pair identity,
-/// the secondary-camera store, ADR-0030 §4 redaction — holds unchanged for
+/// that (the lease's per-instance key, `camera_binding`'s pair identity,
+/// the secondary-camera store, ADR-0030 §4 redaction) holds unchanged for
 /// `ConnectedPair`, because nothing implicit ever produces this: a split
 /// pair exists only where an administrator pinned it. The daemon's baseline
 /// trust in "one USB device is one camera" is physics; crossing a device
@@ -112,6 +112,13 @@ impl SplitPair {
     /// replacement unit with the same descriptor identity, plugged into the
     /// same controller port and assigned the same node path, satisfies every
     /// recorded fact and is indistinguishable (ADR-0032 §2).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "split credential bindings remain gated on ADR-0032 step 5"
+        )
+    )]
     pub fn binding_key(&self) -> String {
         // No fallback: both halves always carry a real location
         // (`CameraNode::location` is total), so there is no empty component
@@ -194,15 +201,6 @@ pub struct ConnectedPairs {
     pub revision: u64,
     /// In inventory order (USB topology path); never ranked.
     pub pairs: Vec<ConnectedPair>,
-    /// Pairs whose two nodes are on two different USB devices, in pin order:
-    /// the first pin that claims a camera keeps it, so position is the
-    /// administrator's priority. Empty unless an administrator pinned each
-    /// one (ADR-0032); discovery alone never fills it, so the default
-    /// publication is exactly the single-camera view of `pairs`.
-    ///
-    /// A camera listed in `pairs` never also appears here: a same-device
-    /// RGB+IR pair is a [`ConnectedPair`] and stays one.
-    pub split_pairs: Vec<SplitPair>,
     /// Cameras that may still become pairs once their capture nodes are
     /// classified, in inventory order.
     pub unclassified: Vec<UnclassifiedCamera>,
@@ -279,8 +277,6 @@ pub(crate) fn pair_camera(
     })
 }
 
-use std::collections::BTreeSet;
-
 /// An administrator's recorded intent to pair two named capture nodes that
 /// discovery found on two different USB devices (ADR-0032). The values are
 /// what `set-cameras` persists; nothing else in the daemon may create one.
@@ -291,7 +287,7 @@ use std::collections::BTreeSet;
 /// shared by every serial-less unit of a model. Together they still admit a
 /// silent retarget: two serial-less units of one model, pinned when the unit
 /// on one port held `/dev/video2`, can come back with the unit on another
-/// port holding `/dev/video2` — identity and path both still match, and
+/// port holding `/dev/video2`: identity and path both still match, and
 /// neither is the unit that was pinned. The recorded controller-qualified
 /// location is what makes the pin name a USB location rather than a model.
 /// It does not prove the same physical unit returned; see ADR-0032 §2 for
@@ -336,8 +332,29 @@ pub(crate) struct SplitCandidate<'a> {
 }
 
 impl<'a> SplitCandidate<'a> {
+    fn is_ordinary_pair(&self) -> bool {
+        matches!(
+            pair_camera(self.input, |endpoint| {
+                self.roles
+                    .iter()
+                    .find(|(path, _)| *path == endpoint)
+                    .map(|(_, role)| *role)
+            }),
+            Pairing::Pair(_)
+        )
+    }
+
+    /// Claims follow both the live instance and a known physical unit key,
+    /// so duplicate observations cannot put one device in multiple pairs.
+    fn overlaps(&self, other: &Self) -> bool {
+        self.input.instance_id == other.input.instance_id
+            || (self.location.is_some()
+                && self.location == other.location
+                && self.identity() == other.identity())
+    }
+
     /// This camera's binding identity, as the pairing rule would report it,
-    /// or the empty string when its device carries no descriptors — which
+    /// or the empty string when its device carries no descriptors, which
     /// is also how a candidate fails to match a pin.
     pub(crate) fn identity(&self) -> String {
         self.input
@@ -380,8 +397,8 @@ impl<'a> SplitCandidate<'a> {
     /// Build a candidate from one publication's entry, revision, observed
     /// location and current-generation roles. A caller must supply the
     /// location captured by that publication, not refresh it here.
-    /// The capture-node filter is exactly [`pair_camera`]'s —
-    /// endpoints minus metadata nodes — so the two views of "what is a
+    /// The capture-node filter is exactly [`pair_camera`]'s:
+    /// endpoints minus metadata nodes. The two views of "what is a
     /// capture node" cannot drift; Step 3 calls this instead of hand-filling
     /// `roles`. A capture node without a role makes the whole candidate
     /// `None`, mirroring `pair_camera`'s unclassified rule: an unknown node
@@ -434,7 +451,7 @@ impl<'a> SplitCandidate<'a> {
 ///   descriptor-attested as ADR-0031 requires;
 /// * the RGB side holds exactly one `Role::Rgb` node, the IR side exactly
 ///   one `Role::Ir`, and neither is already an ordinary [`ConnectedPair`];
-/// * the two sides are **different instances** — a same-device pair is an
+/// * the two sides are **different instances**: a same-device pair is an
 ///   ordinary [`ConnectedPair`] and must not be duplicated here;
 /// * the pin's recorded path for each side still names a capture node of
 ///   that side, so a stale `/dev/videoN` cannot silently retarget the pin
@@ -451,7 +468,7 @@ impl<'a> SplitCandidate<'a> {
 ///
 /// A camera is claimed by the first pair that uses it: pins are honored in
 /// pin order, and a later pin reusing either side of a pair already built is
-/// refused with the earlier pin implied — not just an identical duplicate,
+/// refused with the earlier pin implied, not just an identical duplicate,
 /// which two pins for `RGB A + IR B` would be, but any overlap: pins for
 /// `RGB A + IR B` and `RGB A + IR C` would otherwise hand A to two pairs
 /// and leave the enrollment binding unable to say which pair a credential
@@ -464,7 +481,7 @@ impl<'a> SplitCandidate<'a> {
 /// candidate from another incarnation suppressed every pin.
 ///
 /// This builder is where a [`SplitPair`] is *decided*. It says nothing about
-/// whether the pair is still live — that is the lease's re-check, against both
+/// whether the pair is still live; that is the lease's re-check, against both
 /// sides' `instance_id` and `generation`.
 #[cfg_attr(
     not(test),
@@ -506,7 +523,7 @@ pub(crate) fn pinned_split_pairs(
     // Every camera already committed to a pair. A camera is one physical unit
     // and cannot be half of two pairs; see the doc above for why the first
     // pin wins.
-    let mut claimed: BTreeSet<&str> = BTreeSet::new();
+    let mut claimed = Vec::new();
     let mut outcomes = Vec::with_capacity(pins.len());
     for pin in pins {
         outcomes.push(resolve_pin(candidates, pin, &mut claimed));
@@ -560,7 +577,7 @@ pub(crate) enum PinRefusal {
     /// the complete publication required by ADR-0032 section 1.
     PoolSpansRevisions,
     /// The RGB side did not resolve, for the recorded reason. Sides resolve
-    /// in role order — RGB first, then IR — so a pin whose both sides are
+    /// in role order (RGB first, then IR), so a pin whose both sides are
     /// broken reports only the RGB refusal on this run; fixing it surfaces
     /// the IR refusal on the next. One failure at a time is the deliberate
     /// tradeoff for a first cut: reporting both would need the IR lookup to
@@ -586,7 +603,7 @@ pub(crate) enum PinRefusal {
 }
 
 /// Why one side of a pin did not resolve. `.max()` in `resolve_side` uses
-/// the derived `Ord`, ranked by declaration order below — reordering this
+/// the derived `Ord`, ranked by declaration order below. Reordering this
 /// list changes which reason a pin reports when several candidates fail
 /// differently. `AmbiguousMatch` is never passed to `.max()` (it is
 /// returned directly when more than one full match is found), so its
@@ -598,7 +615,7 @@ pub(crate) enum SideRefusal {
     /// (`NoCandidateWithIdentity`) can never produce this variant.
     EmptyIdentity,
     /// The pin's identity is non-empty, but no currently-connected
-    /// candidate reports it — including a descriptor-less camera, which
+    /// candidate reports it, including a descriptor-less camera, which
     /// always reports the empty identity and so can never equal a
     /// non-empty pin identity. Says only that nothing matched right now:
     /// it does not distinguish a typo in the pin from hardware that is
@@ -622,7 +639,7 @@ pub(crate) enum SideRefusal {
     LocationMismatch,
     /// Two or more indistinguishable full matches: same identity, path, role
     /// and controller-qualified location on distinct entries. Returned
-    /// directly by `resolve_side`, never through `best.max(...)` —
+    /// directly by `resolve_side`, never through `best.max(...)`,
     /// refusing to guess which of two identical observations the pin meant.
     AmbiguousMatch,
 }
@@ -664,8 +681,8 @@ fn pool_state(candidates: &[SplitCandidate<'_>]) -> PoolState {
 }
 
 /// One side of a pin, resolved: the candidate plus the controller-qualified
-/// USB location that matched. The location is the verified value — `Some` on
-/// both pin and candidate and equal — captured at match time, so downstream
+/// USB location that matched. The location is the verified value (`Some` on
+/// both pin and candidate and equal), captured at match time, so downstream
 /// code never re-derives an `Option` it would have to default.
 struct ResolvedSide<'a, 'b> {
     candidate: &'b SplitCandidate<'a>,
@@ -677,7 +694,7 @@ struct ResolvedSide<'a, 'b> {
 fn resolve_pin<'a, 'b>(
     candidates: &'b [SplitCandidate<'a>],
     pin: &SplitPin,
-    claimed: &mut BTreeSet<&'b str>,
+    claimed: &mut Vec<&'b SplitCandidate<'a>>,
 ) -> PinOutcome {
     let rgb = match resolve_side(
         candidates,
@@ -708,19 +725,13 @@ fn resolve_pin<'a, 'b>(
     if same_unit(&rgb, &ir) {
         return PinOutcome::Refused(PinRefusal::SameUnitTwice);
     }
-    if [
-        rgb.candidate.input.instance_id,
-        ir.candidate.input.instance_id,
-    ]
-    .iter()
-    .any(|instance| claimed.contains(instance))
+    if claimed
+        .iter()
+        .any(|owner| owner.overlaps(rgb.candidate) || owner.overlaps(ir.candidate))
     {
         return PinOutcome::Refused(PinRefusal::SideAlreadyClaimed);
     }
-    claimed.extend([
-        rgb.candidate.input.instance_id,
-        ir.candidate.input.instance_id,
-    ]);
+    claimed.extend([rgb.candidate, ir.candidate]);
     // Both sides were resolved out of one homogeneous pool (checked by the
     // caller), so either side's incarnation is the pool's.
     PinOutcome::Paired(Box::new(SplitPair {
@@ -745,8 +756,8 @@ fn resolve_side<'a, 'b>(
     location: &Option<UsbLocation>,
     role: Role,
 ) -> Result<ResolvedSide<'a, 'b>, SideRefusal> {
-    // A pin identity is never empty — `binding_identity` always yields at
-    // least `vid:pid` — and a camera with no USB descriptors reports the
+    // A pin identity is never empty (`binding_identity` always yields at
+    // least `vid:pid`), and a camera with no USB descriptors reports the
     // empty identity, so requiring a non-blank identity is what enforces
     // descriptor attestation (ADR-0031 §1): a descriptor-less camera can
     // never satisfy a pin, because it can never match a real one.
@@ -761,6 +772,10 @@ fn resolve_side<'a, 'b>(
     // absent location never matches. The bus number plays no part: it is not
     // stored in [`UsbLocation`] at all, so a renumbering cannot mismatch.
     let recorded = location.as_ref();
+    let ordinary: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| candidate.is_ordinary_pair())
+        .collect();
     let mut full_matches = Vec::new();
     let mut best = SideRefusal::NoCandidateWithIdentity;
     for candidate in candidates
@@ -772,14 +787,7 @@ fn resolve_side<'a, 'b>(
             .iter()
             .filter(|(_, held)| *held == role)
             .collect();
-        let ordinary = pair_camera(candidate.input, |endpoint| {
-            candidate
-                .roles
-                .iter()
-                .find(|(path, _)| *path == endpoint)
-                .map(|(_, role)| *role)
-        });
-        if matches!(ordinary, Pairing::Pair(_)) {
+        if ordinary.iter().any(|owner| owner.overlaps(candidate)) {
             best = best.max(SideRefusal::OrdinaryPair);
             continue;
         }
@@ -1220,7 +1228,7 @@ mod split_pair {
     }
 
     /// The default publication: no pin, no split pair. This is the property
-    /// #887's reporter depends on — a host with a split camera and no
+    /// #887's reporter depends on: a host with a split camera and no
     /// `set-cameras` still gets the safe single-camera view.
     #[test]
     fn no_pin_means_no_split_pair() {
@@ -1415,7 +1423,7 @@ mod split_pair {
     /// Two nodes of one device are an ordinary `ConnectedPair`; the pin
     /// must not produce a second, overlapping representation of it. The
     /// realistic shape is one candidate holding both roles, as a real
-    /// same-device RGB+IR module does — not two devices sharing an instance
+    /// same-device RGB+IR module does, not two devices sharing an instance
     /// id, which the inventory never produces.
     #[test]
     fn a_same_device_pair_is_never_also_a_split_pair() {
@@ -1466,6 +1474,62 @@ mod split_pair {
             ))],
             "a camera that already holds both roles is not a split side"
         );
+    }
+
+    #[test]
+    fn ordinary_pair_claims_cover_duplicate_observations_of_either_side() {
+        let _hubs = usb_hubs();
+        for role in [Role::Rgb, Role::Ir] {
+            for same_instance in [false, true] {
+                let (rgb, ir) = t480();
+                let (input, wanted, opposite, location) = match role {
+                    Role::Rgb => (&rgb, "/dev/video2", Role::Ir, pin().rgb_location),
+                    Role::Ir => (&ir, "/dev/video0", Role::Rgb, pin().ir_location),
+                    Role::Other => unreachable!(),
+                };
+                let endpoints = vec![wanted.to_owned(), "/dev/video4".into()];
+                let ordinary = PairingInput {
+                    endpoints: &endpoints,
+                    metadata_endpoints: &[],
+                    ..*input
+                };
+                let duplicate = PairingInput {
+                    instance_id: if same_instance {
+                        input.instance_id
+                    } else {
+                        "duplicate-instance"
+                    },
+                    ..*input
+                };
+                let mut pool = if role == Role::Rgb {
+                    candidates(&duplicate, &ir)
+                } else {
+                    candidates(&rgb, &duplicate)
+                };
+                pool.push(
+                    SplitCandidate::classified(
+                        &ordinary,
+                        SUPERVISOR,
+                        7,
+                        if same_instance { None } else { location },
+                        |endpoint| Some(if endpoint == wanted { role } else { opposite }),
+                    )
+                    .unwrap(),
+                );
+                let refusal = if role == Role::Rgb {
+                    PinRefusal::RgbSide(SideRefusal::OrdinaryPair)
+                } else {
+                    PinRefusal::IrSide(SideRefusal::OrdinaryPair)
+                };
+                for _ in 0..2 {
+                    assert_eq!(
+                        pinned_split_pairs(&pool, &[pin()]),
+                        vec![PinOutcome::Refused(refusal.clone())]
+                    );
+                    pool.reverse();
+                }
+            }
+        }
     }
 
     /// Spanning two inventory incarnations is a republication race, not a
@@ -1708,13 +1772,43 @@ mod split_pair {
             panic!("first pin pairs, overlapping second is refused: {outcomes:?}");
         };
         assert_eq!(first.ir.path, "/dev/video0");
-        let outcomes = pinned_split_pairs(&pool, &[second, pin()]);
+        let outcomes = pinned_split_pairs(&pool, &[second.clone(), pin()]);
         let [PinOutcome::Paired(first), PinOutcome::Refused(PinRefusal::SideAlreadyClaimed)] =
             outcomes.as_slice()
         else {
             panic!("first pin still wins when listed first: {outcomes:?}");
         };
         assert_eq!(first.ir.path, "/dev/video6");
+
+        let duplicate_nodes = vec!["/dev/video4".into()];
+        let duplicate = PairingInput {
+            endpoints: &duplicate_nodes,
+            metadata_endpoints: &[],
+            instance_id: "55555555555555555555555555555555",
+            ..rgb
+        };
+        let mut duplicated = pool.clone();
+        duplicated.push(
+            SplitCandidate::classified(&duplicate, SUPERVISOR, 7, pin().rgb_location, |_| {
+                Some(Role::Rgb)
+            })
+            .unwrap(),
+        );
+        let second = SplitPin {
+            rgb_path: "/dev/video4".into(),
+            ..second
+        };
+        let outcomes = pinned_split_pairs(&duplicated, &[pin(), second]);
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [
+                    PinOutcome::Paired(_),
+                    PinOutcome::Refused(PinRefusal::SideAlreadyClaimed)
+                ]
+            ),
+            "another observation of a claimed physical unit cannot form a second split pair"
+        );
     }
 
     /// Two serial-less RGB modules of one model, each paired with a
@@ -1768,7 +1862,7 @@ mod split_pair {
 
     /// Descriptor attestation is a documented condition of a split pair, so
     /// a camera the census could not read descriptors for can never be
-    /// attested into one — not even by a pin whose identity is empty, which is
+    /// attested into one, not even by a pin whose identity is empty, which is
     /// what such a camera reports.
     #[test]
     fn a_descriptor_less_camera_is_never_attested_into_a_split_pair() {
@@ -2133,7 +2227,7 @@ mod split_pair {
     /// Enumeration order is not part of the pair. The builder assigns each
     /// side by role rather than by position, so the same pin over the same
     /// candidates in either order builds the same pair with the same key.
-    /// What matters is which side is RGB — see the role test above — and not
+    /// What matters is which side is RGB (see the role test above), not
     /// which the census happened to list first.
     #[test]
     fn pool_enumeration_order_does_not_change_the_pair_key() {
@@ -2168,8 +2262,8 @@ mod split_pair {
     }
 
     /// A replacement unit that presents every recorded fact of the unit it
-    /// replaced — same descriptor identity, same controller port, same node
-    /// path — is indistinguishable by anything a pin may record (ADR-0032
+    /// replaced (same descriptor identity, same controller port, same node
+    /// path) is indistinguishable by anything a pin may record (ADR-0032
     /// §2). The pin still resolves, because the recorded facts still match:
     /// this test pins the actual guarantee (descriptor identity plus USB
     /// location and node) rather than the impossible one (same physical
@@ -2202,8 +2296,8 @@ mod split_pair {
         assert_eq!(pair.rgb.instance_id, "99999999999999999999999999999999");
     }
 
-    /// One serial-less unit observed as two inventory entries — same identity,
-    /// same controller-qualified location, distinct instances — is one
+    /// One serial-less unit observed as two inventory entries (same identity,
+    /// same controller-qualified location, distinct instances) is one
     /// ambiguous unit, not two sides of a pair. The entries hold complementary
     /// roles, so each side resolves on its own and only the `same_unit` guard
     /// sees that the two halves cannot be told apart. No physical topology
@@ -2272,8 +2366,8 @@ mod split_pair {
         );
     }
 
-    /// Two entries that match a side indistinguishably — same identity, path,
-    /// role and controller-qualified location on distinct instances — refuse
+    /// Two entries that match a side indistinguishably (same identity, path,
+    /// role and controller-qualified location on distinct instances) refuse
     /// rather than let the resolver take the first. `find` would silently
     /// pick one; exactly-one is the consistent rule alongside `sole_node`'s
     /// refusal to guess which of two nodes a pin meant.
@@ -2448,7 +2542,7 @@ mod split_pair {
     /// A bus renumbering with no physical change does not break a pin. The
     /// location excludes the kernel-assigned bus number by construction
     /// (ADR-0032 §2), so the same controller and the same relative ports
-    /// under a new bus resolve identically — including to an identical
+    /// under a new bus resolve identically, including to an identical
     /// binding key. The renumbered hub keeps its USB2 product: only the bus
     /// number moved, not the physical hub, so the domain is unchanged.
     #[test]
@@ -2491,7 +2585,7 @@ mod split_pair {
 
     /// Two controllers that coincidentally enumerate the same relative port
     /// chain are different locations. A pin for a unit on one controller
-    /// must not resolve against a unit at the same port number on another —
+    /// must not resolve against a unit at the same port number on another,
     /// the case the bare `<bus>-<port>` string could not tell apart and the
     /// controller-qualified location resolves correctly by construction.
     #[test]
@@ -2580,7 +2674,7 @@ mod split_pair {
     /// instead of guessing a domain, panicking, or falling back to
     /// controller-plus-ports. The fixture hub at `0000:00:1a.0` reports
     /// `0009`: well-formed sysfs, unknown protocol. Uses the shared hub
-    /// fixture like every other location test — no hardware, no udev daemon.
+    /// fixture like every other location test, with no hardware or udev daemon.
     #[test]
     fn an_unrecognized_hub_product_refuses_instead_of_guessing_a_domain() {
         let (_, ir) = t480();

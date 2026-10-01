@@ -112,7 +112,7 @@ fn reason_with(
 }
 
 /// Whether a running LightDM started before its configuration last changed.
-/// No LightDM running, or no configuration file, is "no".
+/// No LightDM running, or no configuration-change evidence, is "no".
 fn running_lightdm_predates_its_configuration() -> Result<bool, String> {
     let changed = latest_change(Path::new("/"))?;
     Ok(predates(lightdm_started()?, changed))
@@ -131,11 +131,12 @@ fn predates(started: Option<SystemTime>, changed: Option<SystemTime>) -> bool {
 fn latest_change(root: &Path) -> Result<Option<SystemTime>, String> {
     use std::os::unix::fs::MetadataExt as _;
     // Each drop-in directory and its parent, which is LightDM's own
-    // (`.../lightdm`), and the main file's directory, but not that
-    // directory's parent: that is /etc, which every package transaction
-    // changes.
+    // (`.../lightdm`), and the main file's directory. Only when the main
+    // directory is missing do we consult its parent (/etc): its deletion
+    // changed that parent, but unrelated /etc changes must not count while
+    // the LightDM directory still exists.
     let mut dirs: Vec<PathBuf> = Vec::new();
-    let main_dir = Path::new(LIGHTDM_MAIN).parent();
+    let main_dir = Path::new(LIGHTDM_MAIN).parent().map(|dir| root.join(dir));
     for dir in LIGHTDM_DROP_IN_DIRS.iter().map(Path::new) {
         for path in [Some(dir), dir.parent()].into_iter().flatten() {
             let path = root.join(path);
@@ -144,14 +145,23 @@ fn latest_change(root: &Path) -> Result<Option<SystemTime>, String> {
             }
         }
     }
-    if let Some(main_dir) = main_dir.map(|dir| root.join(dir)) {
-        if !dirs.contains(&main_dir) {
-            dirs.push(main_dir);
+    if let Some(main_dir) = &main_dir {
+        if !dirs.contains(main_dir) {
+            dirs.push(main_dir.clone());
         }
     }
     let mut latest = None;
-    for path in lightdm_files(root)?.into_iter().chain(dirs) {
-        match std::fs::metadata(&path) {
+    for mut path in lightdm_files(root)?.into_iter().chain(dirs) {
+        let metadata = match std::fs::metadata(&path) {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound && Some(&path) == main_dir.as_ref() =>
+            {
+                path.pop();
+                std::fs::metadata(&path)
+            }
+            result => result,
+        };
+        match metadata {
             Ok(meta) => {
                 let ctime = u64::try_from(meta.ctime()).ok().map(|secs| {
                     SystemTime::UNIX_EPOCH
@@ -346,6 +356,69 @@ mod tests {
         assert_eq!(lightdm_start_ticks(&stat("lightdm-gtk-gre")), None);
         assert_eq!(lightdm_start_ticks(&stat("x) (lightdm")), None);
         assert_eq!(lightdm_start_ticks("garbage"), None);
+    }
+
+    #[test]
+    fn removing_the_main_configuration_directory_blocks_until_restart() {
+        let root = Root::new("removed-main-dir");
+        let main = root.put("etc/lightdm/lightdm.conf", "[XDMCPServer]\nenabled=true\n");
+        assert_eq!(root.servers(), vec![("XDMCP", main.clone())]);
+        // Pin the observed ordering without sleeping for filesystem timestamps.
+        let started = SystemTime::now() + Duration::from_secs(60);
+        assert!(!predates(Some(started), latest_change(&root.0).unwrap()));
+        std::fs::remove_dir_all(main.parent().unwrap()).unwrap();
+        let removed = started + Duration::from_secs(60);
+        std::fs::File::open(root.0.join("etc"))
+            .unwrap()
+            .set_modified(removed)
+            .unwrap();
+        assert!(root.servers().is_empty(), "disk no longer enables XDMCP");
+        let changed = latest_change(&root.0).unwrap();
+        let why = reason_with(
+            "lightdm",
+            || lightdm_remote_servers_in(&root.0),
+            || Ok(predates(Some(started), changed)),
+        )
+        .expect("the running daemon may still serve its removed XDMCP configuration");
+        assert!(why.contains("until it restarts"), "{why}");
+        assert_eq!(changed, Some(removed));
+        let restarted = removed + Duration::from_secs(1);
+        assert_eq!(
+            reason_with(
+                "lightdm",
+                || lightdm_remote_servers_in(&root.0),
+                || Ok(predates(Some(restarted), changed)),
+            ),
+            None,
+            "a restart after removal reads the current configuration"
+        );
+        assert!(!predates(None, changed), "no running daemon");
+    }
+
+    #[test]
+    fn an_existing_empty_main_directory_does_not_count_unrelated_etc_changes() {
+        let root = Root::new("existing-empty-main-dir");
+        std::fs::create_dir_all(root.0.join("etc/lightdm")).unwrap();
+        let started = SystemTime::now() + Duration::from_secs(60);
+        let before = latest_change(&root.0).unwrap();
+        root.put("etc/unrelated.conf", "x\n");
+        std::fs::File::open(root.0.join("etc"))
+            .unwrap()
+            .set_modified(started + Duration::from_secs(60))
+            .unwrap();
+        let changed = latest_change(&root.0).unwrap();
+        assert_eq!(
+            changed, before,
+            "a missing main file is not a missing directory"
+        );
+        assert_eq!(
+            reason_with(
+                "lightdm",
+                || lightdm_remote_servers_in(&root.0),
+                || Ok(predates(Some(started), changed)),
+            ),
+            None
+        );
     }
 
     #[test]

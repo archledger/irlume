@@ -7,6 +7,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- LightDM's restart gate checks `/etc` when `/etc/lightdm` is missing, so
+  removing the configuration directory does not restore irlume's authentication
+  lines while the running daemon may still serve remote login screens.
+  Unrelated `/etc` changes stay excluded while `/etc/lightdm` exists (#859).
+
 - Privileged PAM prompts skip the face invitation when the daemon reports
   the RGB-only convenience tier, leaving the first input to the password
   provider even when it is `yes`. Camera-free status reads preserve the

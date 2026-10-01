@@ -9,8 +9,9 @@ All notable changes to irlume are documented here. This project adheres to
 
 - Enrollment requests that later refuse a write leave the template key's TPM
   policy untouched during their preliminary read. Recovery refusals offer
-  `irlume recovery forget` for removable sockets and symbolic links, and
-  startup attempt records use one account uid for classification and filing
+  `irlume recovery forget` for removable sockets, FIFOs and symbolic links;
+  recovery reads reject special nodes without blocking. Startup attempt
+  records use one account uid for classification and filing
   (#920).
 
 - PAM no-anchor cleanup now removes old irlume lines byte-exactly from

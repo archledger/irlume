@@ -2160,6 +2160,7 @@ fn keyring_arm_asks_for_the_login_password_where_oo7_provides_secrets() {
 #[test]
 fn keyring_arm_keeps_an_armed_token_where_oo7_provides_secrets() {
     let sb = secret_service_sandbox("arm-oo7-token", "oo7-daemon");
+    sb.fake_tester_home_without_keyring();
     let log = serve(&sock(&sb), |req| match req {
         Request::SealPassword { .. } => Response::PasswordSealed,
         Request::KeyringInfo { .. } => Response::KeyringInfo {

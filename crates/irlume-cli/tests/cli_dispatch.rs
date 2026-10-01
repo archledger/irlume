@@ -82,6 +82,20 @@ impl Sandbox {
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// Give unrelated keyring-arm dispatch tests a known home without a
+    /// keyring, so they test daemon replies on headless runners too.
+    fn fake_tester_home_without_keyring(&self) {
+        let home = self.path("home");
+        std::fs::create_dir_all(&home).unwrap();
+        self.fake_tool(
+            "getent",
+            &format!(
+                "[ \"$*\" = \"passwd tester\" ] || exit 2\nprintf '%s\\n' 'tester:x:4242:4242::{}:/bin/sh'",
+                home.display()
+            ),
+        );
+    }
+
     /// A Command for the irlume binary, isolated from the host system.
     fn cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(BIN);
@@ -108,6 +122,19 @@ impl Sandbox {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        c
+    }
+
+    fn cmd_with_fakes(&self, args: &[&str]) -> Command {
+        let mut c = self.cmd(args);
+        c.env(
+            "PATH",
+            format!(
+                "{}:{}",
+                self.root.join("bin").display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
         c
     }
 
@@ -765,6 +792,7 @@ fn reseal_aborts_on_empty_password_and_flags_unexpected_response() {
 #[test]
 fn setup_already_enrolled_skips_reenroll_and_reports_arm_failure() {
     let sb = Sandbox::new("setupenrolled");
+    sb.fake_tester_home_without_keyring();
     serve(&sb.sock(), |req| match req {
         Request::Ping => Response::Pong,
         Request::Health => Response::Health {
@@ -790,7 +818,11 @@ fn setup_already_enrolled_skips_reenroll_and_reports_arm_failure() {
         Request::SealPassword { .. } => Response::Error("tpm busy".into()),
         _ => Response::Error("unexpected request".into()),
     });
-    let (code, out, err) = run_stdin(&mut sb.cmd(&["setup", "--user", "tester"]), "pw\n", "setup");
+    let (code, out, err) = run_stdin(
+        &mut sb.cmd_with_fakes(&["setup", "--user", "tester"]),
+        "pw\n",
+        "setup",
+    );
     assert_eq!(code, 0);
     assert!(out.contains("already enrolled."), "{out}");
     assert!(out.contains("[7/7] PAM login wiring"), "{out}");
@@ -893,6 +925,7 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
 #[test]
 fn daemon_error_responses_surface_per_command() {
     let sb = Sandbox::new("allerr");
+    sb.fake_tester_home_without_keyring();
     serve(&sb.sock(), |_| Response::Error("nope".into()));
 
     // (argv, stdin, needle in stderr)
@@ -938,9 +971,9 @@ fn daemon_error_responses_surface_per_command() {
     for (argv, input, needle) in cases {
         let desc = argv.join(" ");
         let (code, _, err) = if input.is_empty() {
-            run(&mut sb.cmd(argv), &desc)
+            run(&mut sb.cmd_with_fakes(argv), &desc)
         } else {
-            run_stdin(&mut sb.cmd(argv), input, &desc)
+            run_stdin(&mut sb.cmd_with_fakes(argv), input, &desc)
         };
         assert_eq!(code, 1, "`{desc}` on a daemon error must exit 1: {err}");
         assert!(err.contains(needle), "`{desc}` stderr: {err}");
@@ -1012,6 +1045,7 @@ fn forget_model_sends_the_resolved_space_over_the_wire() {
 #[test]
 fn unexpected_responses_for_keyring_and_recovery_writes() {
     let sb = Sandbox::new("pongwrites");
+    sb.fake_tester_home_without_keyring();
     serve(&sb.sock(), |_| Response::Pong);
     let cases: &[(&[&str], &str)] = &[
         (&["keyring", "arm", "--user", "tester"], "pw\n"),
@@ -1028,9 +1062,9 @@ fn unexpected_responses_for_keyring_and_recovery_writes() {
     for (argv, input) in cases {
         let desc = argv.join(" ");
         let (code, _, err) = if input.is_empty() {
-            run(&mut sb.cmd(argv), &desc)
+            run(&mut sb.cmd_with_fakes(argv), &desc)
         } else {
-            run_stdin(&mut sb.cmd(argv), input, &desc)
+            run_stdin(&mut sb.cmd_with_fakes(argv), input, &desc)
         };
         assert_eq!(code, 1, "`{desc}` must reject a nonsense response: {err}");
         assert!(

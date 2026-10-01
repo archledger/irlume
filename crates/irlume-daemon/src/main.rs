@@ -9084,7 +9084,7 @@ fn set_require_eyes_open_off(user: &str, engine: &irlume_auth::Engine) -> Respon
         Ok(owner) => owner,
         Err(error) => return Response::Error(error.to_string()),
     };
-    let mut enrollment = match irlume_core::storage::load(user) {
+    let mut enrollment = match irlume_core::storage::load_unmoved(user) {
         Ok(Some(enrollment)) => enrollment,
         Ok(None) => return Response::Error(format!("'{user}' is not enrolled")),
         Err(error) => return Response::Error(error.to_string()),
@@ -22827,6 +22827,107 @@ mod tests {
     }
 
     // ---- env-gated: swtpm ------------------------------------------------
+
+    #[test]
+    #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
+    fn tpm_refused_eyes_open_off_keeps_the_enrollment_and_key_unmoved() {
+        let _g = env_lock();
+        assert!(
+            std::env::var("IRLUME_TCTI").is_ok_and(|tcti| tcti.starts_with("swtpm:")),
+            "this regression requires an explicit software TPM"
+        );
+        let namespace = std::fs::read_link("/proc/self/ns/mnt").unwrap();
+        if let Some(parent) = std::env::var_os("IRLUME_TEST_EYES_OPEN_PARENT_MNT") {
+            assert_ne!(namespace, std::path::PathBuf::from(parent));
+            use std::os::unix::fs::MetadataExt as _;
+            assert_eq!(
+                std::fs::metadata("/dev/tpmrm0").unwrap().rdev(),
+                std::fs::metadata("/dev/null").unwrap().rdev()
+            );
+        } else {
+            // storage::save selects encryption by device presence. Supply a
+            // harmless presence marker even on CI hosts without a TPM; every
+            // TSS operation still uses the explicit swtpm transport above.
+            let result = std::process::Command::new("/usr/bin/timeout")
+                .args(["--kill-after=5", "90", "/usr/bin/bwrap"])
+                .args([
+                    "--die-with-parent",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--tmpfs",
+                    "/tmp",
+                    "--dev",
+                    "/dev",
+                    "--ro-bind",
+                    "/dev/null",
+                    "/dev/tpmrm0",
+                    "--",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "tests::tpm_refused_eyes_open_off_keeps_the_enrollment_and_key_unmoved",
+                    "--nocapture",
+                ])
+                .env("IRLUME_TEST_EYES_OPEN_PARENT_MNT", namespace)
+                .env("TMPDIR", "/tmp")
+                .output()
+                .expect("timeout and bubblewrap are required for the software-TPM regression");
+            assert!(
+                result.status.success(),
+                "software-TPM regression failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let mut e = engine();
+        let sb = sandbox("tpm-eyes-open-refusal");
+        // SAFETY: geteuid has no preconditions.
+        let user = users::name_for_uid(unsafe { libc::geteuid() }).unwrap();
+        let key = zeroize::Zeroizing::new(vec![13u8; 32]);
+        // A legacy key bound only to an OS-measured PCR can move to PCR 7.
+        let weak = irlume_core::tpm::seal_with_pcrs(&key, &[11]).unwrap();
+        assert!(irlume_core::tpm::stronger_tier_available_than(&weak));
+        assert!(weak.uid.is_none());
+        let key_path = irlume_core::template_key::key_path(&user);
+        weak.save(&key_path).unwrap();
+        let enrollment = enrollment_with(&user, &["Face Scan 1"]);
+        assert!(enrollment.uid.is_none());
+        let path = sb.dir.join(format!("{user}.json"));
+        std::fs::write(
+            &path,
+            irlume_core::storage::serialize_enrollment(&enrollment, Some(&key)).unwrap(),
+        )
+        .unwrap();
+        let recovery = irlume_core::template_key::recovery_path(&user);
+        std::fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+        std::fs::write(&recovery, b"not a recovery envelope").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let key_before = std::fs::read(&key_path).unwrap();
+
+        let response = dispatch(
+            Request::SetRequireEyesOpen {
+                user: user.clone(),
+                on: false,
+            },
+            &peer(0),
+            &mut e,
+        );
+        assert!(
+            matches!(&response, Response::Error(message)
+            if message.contains("recovery envelope") && message.contains("nothing was written")),
+            "{response:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&key_path).unwrap(), key_before);
+        assert_eq!(
+            std::fs::read(&recovery).unwrap(),
+            b"not a recovery envelope"
+        );
+    }
 
     #[test]
     #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]

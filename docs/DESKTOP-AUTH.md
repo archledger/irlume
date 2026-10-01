@@ -47,6 +47,14 @@ The separate `irlume auth consent` setting controls typed confirmation for
 privileged sudo/polkit requests. Its existing owner opt-in is retained and does
 not enable automatic desktop scanning.
 
+Before offering privileged face authentication, PAM reads the daemon's
+camera-free hardware status. A reported RGB-only convenience tier skips the
+invitation and leaves the first input to the password provider, including a
+password of `yes`. An explicit IR-only sensor policy retains the face path.
+The two status reads share a 1.5-second deadline; unknown hardware status from
+an older or unavailable daemon retains the existing consent path. Every face
+attempt still requires the daemon's ordinary authorization and live match.
+
 The separate experimental sensor policy is also machine-wide and owner-selected.
 Absent configuration remains dual RGB+IR; root must use
 `irlume auth sensor ir-only --yes` to write

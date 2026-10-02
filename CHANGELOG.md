@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Login-manager checks follow manager-specific hash and quote rules and
+  refuse malformed GDM/LightDM files or unsupported Plasma Login syntax.
+  Token arming refuses when Qt drop-in ordering or the Plasma parser version
+  can change the autologin result. Ordinary higher-priority settings override
+  supported alternatives; unreadable or potentially immutable files still
+  refuse (#859).
+
 - PAM's optional fingerprint-keyring auth line withholds requests on warm
   or unknown desktop state even while an older daemon runs during an upgrade.
   Bounded account and session checks preserve password fallback and GNOME's

@@ -25233,6 +25233,124 @@ mod split_management_tests {
     }
 
     #[test]
+    fn split_replies_redact_every_non_root_surface() {
+        let env = env();
+        let pubn = publication();
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &pubn),
+            Response::Ok(_)
+        ));
+        let mut surfaces = vec![
+            serde_json::to_string(&split_list_response(1000, &pubn)).unwrap(),
+            serde_json::to_string(&split_status_response()).unwrap(),
+        ];
+        // The refusal paths a non-root peer can reach carry only static
+        // reasons (ADR-0032 §6 covers reply and error paths).
+        surfaces.push(
+            serde_json::to_string(&split_add_response(
+                &{
+                    let mut stale = guard();
+                    stale.revision = 99;
+                    stale
+                },
+                &rgb_facts(),
+                &ir_facts(),
+                &pubn,
+            ))
+            .unwrap(),
+        );
+        surfaces.push(
+            serde_json::to_string(&split_remove_response("split1;n|c|usb2|1;m|c|usb2|2")).unwrap(),
+        );
+        // Malformed and digest-mismatched stores, listed non-root.
+        irlume_common::config::publish_kv_changes(
+            irlume_common::config::CAMERAS_CONF,
+            &[
+                ("split_generation", "1"),
+                (
+                    "split_digest",
+                    "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                ),
+            ],
+            &[],
+        )
+        .unwrap();
+        surfaces.push(serde_json::to_string(&split_list_response(1000, &pubn)).unwrap());
+        // Share-safe projections carry the display controller label, the
+        // root-domain label and the relative ports (ADR-0032 §6); what must
+        // never appear is an identity, a serial, a node path, the raw
+        // controller path or the complete binding key.
+        for surface in &surfaces {
+            for forbidden in [
+                "5986:2113",
+                "5986:1141",
+                "s1",
+                "s2",
+                "/dev/video",
+                "/sys/",
+                "/devices/pci",
+                "split1;",
+            ] {
+                assert!(
+                    !surface.contains(forbidden),
+                    "a non-root surface leaked {forbidden}: {surface}"
+                );
+            }
+        }
+        drop(env);
+    }
+
+    #[test]
+    fn a_native_grey_fixture_pair_keeps_the_activation_gate_closed() {
+        // §4.1.8 item 8 with a native-GREY fixture pair: a published
+        // authorization naming a GREY IR side and an RGB side (two USB
+        // devices) changes nothing about enrollment and authentication.
+        // Those stay refused because the grant path cannot reach the split
+        // store at all: the engine has no reference to it, which the
+        // source-shape assertions below pin. The fixture-level live
+        // enrollment refusal for a configured pair rides with the wire work,
+        // when candidates first reach daemon enroll/auth paths.
+        let env = env();
+        let pubn = publication();
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &pubn),
+            Response::Ok(_)
+        ));
+        match irlume_common::split_publish::read_split() {
+            irlume_common::split_publish::SplitReadState::Valid { records, .. } => {
+                assert_eq!(records.len(), 1, "the GREY fixture pair is authorized");
+                assert_eq!(records[0].ir.identity, "5986:1141:s2");
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+        // The grant path (the engine) cannot read the split store.
+        let auth_sources = [
+            include_str!("../../irlume-auth/src/lib.rs"),
+            include_str!("../../irlume-auth/src/ir_assessment.rs"),
+            include_str!("../../irlume-auth/src/ir_only_evaluation.rs"),
+        ];
+        for source in auth_sources {
+            assert!(
+                !source.contains("split_publish") && !source.contains("split_wire"),
+                "the engine must not reach the split store"
+            );
+        }
+        // Enroll and Authenticate keep their capture-and-trust posture: no
+        // split fact can substitute for a capture or add trust.
+        assert!(matches!(
+            posture(&Request::Enroll {
+                user: "u".into(),
+                profile: None,
+                scans: None,
+                reset: false,
+            })
+            .camera,
+            CameraUse::Captures
+        ));
+        drop(env);
+    }
+
+    #[test]
     fn non_root_listing_carries_only_share_safe_facts() {
         let env = env();
         let pubn = publication();

@@ -36,7 +36,9 @@ fn lightdm_remote_servers_in(root: &Path) -> Result<Vec<(&'static str, PathBuf)>
     let mut vnc: Option<(bool, PathBuf)> = None;
     for path in lightdm_files(root)? {
         let Some(text) = read(&path)? else { continue };
-        for (section, key, value) in assignments(&text) {
+        for (section, key, value) in
+            assignments(&text).map_err(|e| format!("{}: {e}", path.display()))?
+        {
             let slot = match section.as_str() {
                 "XDMCPServer" => &mut xdmcp,
                 "VNCServer" => &mut vnc,
@@ -269,6 +271,47 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn malformed_gkeyfile_cannot_clear_a_remote_server() {
+        let root = Root::new("malformed-gkeyfile");
+        root.put(
+            "etc/lightdm/lightdm.conf.d/10-remote.conf",
+            "[XDMCPServer]\nenabled=true\n",
+        );
+        for text in [
+            "[XDMCPServer]\nenabled=true\n[Seat:*] # comment\nenabled=false\n",
+            "[XDMCPServer]\nenabled=false\n[Seat:*] # comment\n",
+            "[XDMCPServer]\nenabled=false\nnot an assignment\n",
+            "[XDMCPServer]\nenabled=false\n[Seat:*]\r",
+        ] {
+            let path = root.put("etc/lightdm/lightdm.conf", text);
+            let why = reason_with(
+                "lightdm",
+                || lightdm_remote_servers_in(&root.0),
+                || Ok(false),
+            )
+            .expect("malformed main configuration must block the face path");
+            assert!(why.contains("could not read"), "{why}");
+            assert!(why.contains(path.to_str().unwrap()), "{why}");
+            assert!(lightdm_remote_servers_in(&root.0).is_err());
+        }
+        // Ordinary, valid higher-priority configuration can still turn it off.
+        root.put("etc/lightdm/lightdm.conf", "[XDMCPServer]\nenabled=false\n");
+        assert_eq!(
+            reason_with(
+                "lightdm",
+                || lightdm_remote_servers_in(&root.0),
+                || Ok(false)
+            ),
+            None
+        );
+        root.put(
+            "etc/lightdm/lightdm.conf",
+            "[XDMCPServer]\r\nenabled=false\r\n",
+        );
+        assert_eq!(lightdm_remote_servers_in(&root.0), Ok(Vec::new()));
     }
 
     #[test]

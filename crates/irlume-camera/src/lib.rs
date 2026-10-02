@@ -41,7 +41,10 @@ pub use capture_timing::{CaptureTimings, RateFillFailure};
 pub mod capture_qualification;
 pub mod census;
 mod connected;
-pub use connected::{ConnectedPair, ConnectedPairs, UnclassifiedCamera};
+pub use connected::{
+    revalidate_against, revalidate_split_incarnations, ConnectedPair, ConnectedPairs,
+    SplitRevalidationRefusal, SplitSideExpectation, UnclassifiedCamera,
+};
 /// Versioned, backend-neutral camera data contracts.
 pub mod contracts;
 pub mod emitter_journal;

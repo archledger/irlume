@@ -149,6 +149,13 @@ impl Harness {
         .unwrap();
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&salt_helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let getent = root.join("getent");
+        std::fs::write(
+            &getent,
+            "#!/bin/sh\n[ \"$1\" = passwd ] && [ \"$2\" = tester ] && [ \"$#\" -eq 2 ] || exit 2\nprintf 'tester:x:4242:4242::/nonexistent:/bin/sh\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&getent, std::fs::Permissions::from_mode(0o700)).unwrap();
         Some(Harness {
             wrapper,
             set_items,
@@ -230,6 +237,7 @@ impl Harness {
             .env("IRLUME_CONFIG_DIR", &self.config_dir)
             .env("IRLUME_PROC_DIR", self.root.join("proc"))
             .env("IRLUME_LOGIND_DIR", self.root.join("logind"))
+            .env("IRLUME_GETENT", self.root.join("getent"))
             .env(
                 "IRLUME_KWALLET_INIT",
                 self.kwallet_init.as_ref().unwrap_or(&self.salt_helper),
@@ -2200,8 +2208,8 @@ fn pamwrap_failed_unseal_never_starts_another_face_attempt() {
     }
 }
 
-/// `keyring` mode (fingerprint path, post-auth landing): the module always
-/// asks the daemon, and REPORTS whether the transaction already holds a
+/// `keyring` mode on a cold account (fingerprint path, post-auth landing):
+/// the module asks the daemon, and REPORTS whether the transaction holds a
 /// password rather than deciding on it. That decision moved daemon-side with
 /// #250: a token-armed keyring does not open with the typed password, so only
 /// the daemon, which can read the envelope's kind, can tell whether the unseal
@@ -2275,6 +2283,290 @@ fn pamwrap_keyring_mode_reports_whether_a_password_is_present() {
         ),
         other => panic!("expected UnsealKeyring, daemon saw {other:?}"),
     }
+}
+
+/// An old daemon ignores the phase flag. The module must withhold the request
+/// itself on a warm desktop, without consuming the password or granting auth.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_keyring_upgrade_withholds_warm_release_and_preserves_password() {
+    let Some(h) = Harness::try_new("keyring-upgrade") else {
+        return;
+    };
+    let log = serve(&h.socket, |_| unsealed("old-daemon-secret"));
+    std::fs::write(
+        h.root.join("logind/sessions/9"),
+        "UID=4242\nCLASS=user\nSTATE=online\nTYPE=wayland\nREMOTE=0\n",
+    )
+    .unwrap();
+    let check = h.token_checker("upgrade", "typed-password");
+    h.write_service(
+        "gdm-fingerprint",
+        &[
+            format!("auth required {}", h.set_items.display()),
+            h.auth_line("sufficient", "keyring"),
+            format!(
+                "auth required pam_exec.so expose_authtok {}",
+                check.display()
+            ),
+        ],
+    );
+    let (ok, out) = h.run(
+        "gdm-fingerprint",
+        &["authenticate"],
+        "",
+        Some("typed-password"),
+    );
+    assert!(ok, "typed password must survive: {out}");
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "old daemon must never be asked"
+    );
+    h.write_service(
+        "gdm-fingerprint",
+        &[
+            h.auth_line("sufficient", "keyring"),
+            "auth required pam_deny.so".into(),
+        ],
+    );
+    let (ok, out) = h.run("gdm-fingerprint", &["authenticate"], "", None);
+    assert!(!ok, "keyring guard must not authenticate: {out}");
+    assert!(log.lock().unwrap().is_empty());
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_keyring_upgrade_unknown_state_withholds_release() {
+    let Some(h) = Harness::try_new("keyring-unknown") else {
+        return;
+    };
+    let log = serve(&h.socket, |_| unsealed("old-daemon-secret"));
+    h.write_service(
+        "sddm",
+        &[
+            h.auth_line("optional", "keyring"),
+            "auth required pam_permit.so".into(),
+        ],
+    );
+    let missing = h.root.join("missing-logind");
+    let (ok, out) = h.run_with_env(
+        "sddm",
+        &["authenticate"],
+        "",
+        None,
+        &[("IRLUME_LOGIND_DIR", missing.to_str().unwrap())],
+    );
+    assert!(ok, "other-factor login must survive: {out}");
+    assert!(log.lock().unwrap().is_empty(), "unknown is not cold");
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_keyring_upgrade_requires_explicit_graphical_evidence() {
+    let Some(h) = Harness::try_new("keyring-evidence") else {
+        return;
+    };
+    let log = serve(&h.socket, |_| Response::KeyringUnlockNotNeeded);
+    h.write_service(
+        "sddm",
+        &[
+            h.auth_line("optional", "keyring"),
+            "auth required pam_permit.so".into(),
+        ],
+    );
+    // A runtime directory or bus alone is not evidence of a graphical user.
+    std::fs::create_dir_all(h.root.join("runtime/4242")).unwrap();
+    std::fs::write(h.root.join("runtime/4242/bus"), "not a desktop").unwrap();
+    for (facts, release) in [
+        (
+            "UID=4242\nCLASS=user\nSTATE=active\nTYPE=x11\nREMOTE=0\n",
+            false,
+        ),
+        (
+            "UID=4242\nCLASS=user\nSTATE=online\nTYPE=mir\nREMOTE=0\n",
+            false,
+        ),
+        (
+            "UID=4242\nCLASS=user\nSTATE=active\nTYPE=wayland\nREMOTE=1\n",
+            true,
+        ),
+        (
+            "UID=4242\nCLASS=user\nSTATE=active\nTYPE=tty\nREMOTE=0\n",
+            true,
+        ),
+        (
+            "UID=4242\nCLASS=greeter\nSTATE=active\nTYPE=wayland\nREMOTE=0\n",
+            true,
+        ),
+        (
+            "UID=4242\nCLASS=user\nSTATE=closing\nTYPE=wayland\nREMOTE=0\n",
+            true,
+        ),
+        (
+            "UID=4243\nCLASS=user\nSTATE=active\nTYPE=wayland\nREMOTE=0\n",
+            true,
+        ),
+        ("UID=4242\nCLASS=user\nSTATE=active\nTYPE=wayland\n", false),
+        ("UID=4242\nCLASS=user\nSTATE=active\nREMOTE=0\n", false),
+        (
+            "UID=4242\nUID=4243\nCLASS=user\nSTATE=active\nTYPE=wayland\nREMOTE=0\n",
+            false,
+        ),
+        (
+            "UID=4242\nCLASS=user\nSTATE=active\nTYPE=wayland\nREMOTE=garbage\n",
+            false,
+        ),
+    ] {
+        std::fs::write(h.root.join("logind/sessions/9"), facts).unwrap();
+        log.lock().unwrap().clear();
+        let (ok, out) = h.run_with_env(
+            "sddm",
+            &["authenticate"],
+            "",
+            None,
+            &[(
+                "XDG_RUNTIME_DIR",
+                h.root.join("runtime/4242").to_str().unwrap(),
+            )],
+        );
+        assert!(ok, "{facts}: {out}");
+        assert_eq!(!log.lock().unwrap().is_empty(), release, "{facts}");
+    }
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_keyring_upgrade_account_probe_is_bounded_and_fail_closed() {
+    let Some(h) = Harness::try_new("keyring-probe") else {
+        return;
+    };
+    let log = serve(&h.socket, |_| unsealed("old-daemon-secret"));
+    h.write_service(
+        "sddm",
+        &[
+            h.auth_line("optional", "keyring"),
+            "auth required pam_permit.so".into(),
+        ],
+    );
+    for body in [
+        "exit 2",
+        "printf 'tester:x:bad:4242::/nonexistent:/bin/sh\\n'",
+        "printf 'different:x:4242:4242::/nonexistent:/bin/sh\\n'",
+        "printf 'tester:x:4242:4242::/nonexistent:/bin/sh\\ntester:x:4243:4243::/:/bin/sh\\n'",
+        "exec head -c 70000 /dev/zero",
+        "exec sleep 20",
+    ] {
+        std::fs::write(h.root.join("getent"), format!("#!/bin/sh\n{body}\n")).unwrap();
+        let start = std::time::Instant::now();
+        let (ok, out) = h.run("sddm", &["authenticate"], "", None);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "probe hung: {body}"
+        );
+        assert!(ok, "login must survive failed probe: {out}");
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "failed probe allowed release: {body}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_keyring_upgrade_cold_password_reaches_auth_consumer() {
+    let Some(h) = Harness::try_new("keyring-cold") else {
+        return;
+    };
+    let log = serve(&h.socket, |_| unsealed("legacy-login-password"));
+    let check = h.token_checker("cold", "legacy-login-password");
+    h.write_service(
+        "sddm",
+        &[
+            h.auth_line("optional", "keyring"),
+            format!(
+                "auth required pam_exec.so expose_authtok {}",
+                check.display()
+            ),
+        ],
+    );
+    let (ok, out) = h.run("sddm", &["authenticate"], "", None);
+    assert!(ok, "the auth consumer must get the password: {out}");
+    assert!(matches!(
+        log.lock().unwrap().as_slice(),
+        [Request::UnsealKeyring {
+            auth_phase: true,
+            have_password: false,
+            ..
+        }]
+    ));
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_keyring_upgrade_session_files_are_bounded_and_nofollow() {
+    let Some(h) = Harness::try_new("keyring-files") else {
+        return;
+    };
+    let log = serve(&h.socket, |_| Response::KeyringUnlockNotNeeded);
+    h.write_service(
+        "sddm",
+        &[
+            h.auth_line("optional", "keyring"),
+            "auth required pam_permit.so".into(),
+        ],
+    );
+    let path = h.root.join("logind/sessions/9");
+    for case in ["oversized", "directory", "symlink", "fifo"] {
+        match case {
+            "oversized" => std::fs::write(&path, vec![b'x'; 17000]).unwrap(),
+            "directory" => std::fs::create_dir(&path).unwrap(),
+            "symlink" => std::os::unix::fs::symlink(h.root.join("missing"), &path).unwrap(),
+            "fifo" => {
+                let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                // SAFETY: a valid C string naming this test's private FIFO.
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+            _ => unreachable!(),
+        }
+        let start = std::time::Instant::now();
+        let (ok, out) = h.run("sddm", &["authenticate"], "", None);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "{case} hung"
+        );
+        assert!(ok, "{case}: {out}");
+        assert!(log.lock().unwrap().is_empty(), "{case} permitted release");
+        if case == "directory" {
+            std::fs::remove_dir(&path).unwrap();
+        } else {
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+    // Legacy logind reference FIFOs are not session records, and must not hang
+    // or suppress a cold login just because they share the directory.
+    let reference = path.with_extension("ref");
+    let name = std::ffi::CString::new(reference.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid C string naming this test's private reference FIFO.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let (ok, out) = h.run("sddm", &["authenticate"], "", None);
+    assert!(ok, "{out}");
+    assert_eq!(
+        log.lock().unwrap().len(),
+        1,
+        "reference FIFO is not a session"
+    );
+    log.lock().unwrap().clear();
+    for id in 0..1024 {
+        std::fs::write(h.root.join(format!("logind/sessions/c{id}")), "UID=1000\n").unwrap();
+    }
+    let start = std::time::Instant::now();
+    let (ok, out) = h.run("sddm", &["authenticate"], "", None);
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    assert!(ok, "{out}");
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "incomplete scan is not cold"
+    );
 }
 
 /// `kr` (Debian `@include` keyring-continue): a COLD face login that released
@@ -2708,6 +3000,48 @@ fn pamwrap_gnome_token_from_the_auth_stash_is_delivered_once() {
         ),
         "one UnsealKeyring in the whole transaction, from the auth line: {reqs:?}"
     );
+}
+
+/// A second login for an already-running account is warm during auth, but
+/// opening its session still needs its GNOME token. The legacy daemon ignores
+/// auth_phase; verify the only request actually sent is the session request.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_keyring_upgrade_still_delivers_gnome_token_in_session() {
+    let Some(mut h) = Harness::try_new("keyring-session") else {
+        return;
+    };
+    let log = serve(&h.socket, |_| gnome_token());
+    std::fs::write(
+        h.root.join("logind/sessions/9"),
+        "UID=4242\nCLASS=user\nSTATE=online\nTYPE=wayland\nREMOTE=0\n",
+    )
+    .unwrap();
+    h.set_gkr_unlock(write_gkr_fake_helper(&h.root, "detach"));
+    gkr_service(&h, true);
+    let (ok, out) = h.run(
+        "irlume-gkr",
+        &[
+            "authenticate",
+            "open_session",
+            "close_session",
+            "open_session",
+        ],
+        "",
+        None,
+    );
+    kill_recorded(&h, "gkr-waiter.pid");
+    assert!(ok, "{out}");
+    assert_eq!(gkr_record(&h, "gkr-argv"), ["tester"]);
+    assert_eq!(gkr_record(&h, "gkr-stdin"), [FAKE_GKR_TOKEN_SHA256]);
+    assert!(matches!(
+        log.lock().unwrap().as_slice(),
+        [Request::UnsealKeyring {
+            auth_phase: false,
+            have_password: true,
+            ..
+        }]
+    ));
 }
 
 /// The typed-password path delivers once per handle too: the second

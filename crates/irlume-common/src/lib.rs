@@ -24,6 +24,9 @@ pub mod pam_service;
 pub mod platform;
 pub mod process;
 pub mod secureboot;
+pub mod split_key;
+pub mod split_publish;
+pub mod split_schema;
 pub mod storage_encryption;
 
 pub use storage_encryption::StorageDirectory;

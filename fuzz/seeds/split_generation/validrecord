@@ -1,0 +1,11 @@
+version=1
+pair.0.rgb_identity=a:1
+pair.0.rgb_path=/dev/video0
+pair.0.rgb_controller=0000:00:14.0
+pair.0.rgb_domain=usb2
+pair.0.rgb_ports=8
+pair.0.ir_identity=b:2
+pair.0.ir_path=/dev/video1
+pair.0.ir_controller=0000:00:14.0
+pair.0.ir_domain=usb2
+pair.0.ir_ports=5

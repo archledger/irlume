@@ -63,3 +63,17 @@ path = "fuzz_targets/uvc_illumination.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "split_key_text"
+path = "fuzz_targets/split_key_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "split_generation"
+path = "fuzz_targets/split_generation.rs"
+test = false
+doc = false
+bench = false

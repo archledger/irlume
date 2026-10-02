@@ -13,6 +13,7 @@
 pub mod artifact;
 pub mod client;
 pub mod config;
+pub mod split_key;
 pub mod dbglog;
 pub mod diagnostics;
 pub mod gkr_wire;

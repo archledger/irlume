@@ -7,6 +7,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Queued keyring releases whose account did not resolve at registration
+  refuse before retrying NSS on the authentication worker. They cannot
+  borrow a later request's account binding; a new request can retry after
+  account resolution recovers (#859).
+
 - LightDM's restart gate checks `/etc` when `/etc/lightdm` is missing, so
   removing the configuration directory does not restore irlume's authentication
   lines while the running daemon may still serve remote login screens.

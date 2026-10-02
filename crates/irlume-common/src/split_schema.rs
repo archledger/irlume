@@ -208,11 +208,23 @@ pub fn parse_generation(text: &str) -> GenerationObservation {
         if raw.len() > MAX_LINE_BYTES {
             problems.push(format!("line {line_no} is over {MAX_LINE_BYTES} bytes"));
         }
-        let Some((key, value)) = line.split_once('=') else {
+        let Some((raw_key, written)) = raw.split_once('=') else {
             problems.push(format!("line {line_no} has no '='"));
             continue;
         };
-        let (key, value) = (key.trim(), value.trim());
+        // The unsafe-value rule, checked on the raw text: a line separator or
+        // control character at a value boundary must not normalize away under
+        // trimming (the `cameras.conf` rule is the same).
+        if written
+            .chars()
+            .any(|c| c != '\t' && (c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')))
+        {
+            problems.push(format!(
+                "line {line_no} has a line break or control character in its value"
+            ));
+            continue;
+        }
+        let (key, value) = (raw_key.trim(), written.trim());
         if key == "version" {
             version_lines += 1;
             if value != "1" {
@@ -462,6 +474,15 @@ pair.2.ir_domain=usb2\npair.2.ir_ports=5\n";
         assert!(matches!(
             serialize_generation(&[one]),
             Err(SchemaError::InvalidField)
+        ));
+    }
+
+    #[test]
+    fn a_value_with_a_line_separator_is_malformed() {
+        let text = "version=1\npair.0.rgb_identity=a\u{2028}\n";
+        assert!(matches!(
+            parse_generation(text),
+            GenerationObservation::Malformed { .. }
         ));
     }
 

@@ -441,6 +441,90 @@ pub fn write_kv(file: &str, key: &str, val: &str) -> std::io::Result<()> {
     write_kvs(file, &[(key, val)])
 }
 
+/// Apply `set` and `remove` to the lines of `existing` in one pass: removals
+/// drop every line with that key, sets replace the first line and drop later
+/// duplicates, everything else is kept. Pure (no I/O).
+fn apply_kv_changes(existing: &str, set: &[(&str, &str)], remove: &[&str]) -> String {
+    let mut out = String::new();
+    let mut written = vec![false; set.len()];
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        let key = if trimmed.starts_with('#') {
+            None
+        } else {
+            trimmed.split_once('=').map(|(k, _)| k.trim())
+        };
+        if let Some(key) = key {
+            if remove.contains(&key) {
+                continue;
+            }
+            if let Some(idx) = set.iter().position(|(k, _)| *k == key) {
+                if !written[idx] {
+                    out.push_str(&format!("{}={}\n", set[idx].0, set[idx].1));
+                    written[idx] = true;
+                }
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    for (idx, (k, v)) in set.iter().enumerate() {
+        if !written[idx] {
+            out.push_str(&format!("{k}={v}\n"));
+        }
+    }
+    out
+}
+
+/// Set and remove config keys in ONE atomic publish: removals delete every
+/// line carrying the key (an empty value only reads back as absent and would
+/// leave the key present), sets behave as [`write_kvs`]. Creates the file at
+/// 0600 if absent.
+///
+/// # Errors
+/// As [`write_kvs`].
+pub fn publish_kv_changes(
+    file: &str,
+    set: &[(&str, &str)],
+    remove: &[&str],
+) -> std::io::Result<()> {
+    let path = config_path(file);
+    check_updates(&path, set)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let existing = match read_regular_file(&path) {
+        Ok(text) => text,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(&path).is_ok() =>
+        {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "{} is a symbolic link to a file that does not exist; refusing to replace \
+                     the link",
+                    path.display()
+                ),
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "{} exists but cannot be read ({e}); refusing to rewrite it, which would \
+                     drop its other lines",
+                    path.display()
+                ),
+            ))
+        }
+    };
+    let out = apply_kv_changes(&existing, set, remove);
+    crate::write_0600_atomic(&path, out.as_bytes())
+}
+
 /// Insert or update several keys in ONE atomic publish, preserving every other
 /// line (including comments) and dropping duplicate keys. Creates the file at
 /// 0600 if absent.
@@ -882,10 +966,11 @@ pub fn parse_camera_conf(text: &str) -> CameraConfObservation {
     // beside them. A missing half, a misplaced pair or a malformed value
     // refuses the operation and never falls back to the ordinary pin.
     let mut split = SplitConfObservation::None;
-    // An empty value clears a key, so every reader sees it as absent; that is
-    // how `write_kvs` drops split keys at all.
-    let split_at = |slot: usize| seen[slot].filter(|(_, v)| !v.is_empty());
-    let split_inputs = (split_at(5), split_at(6), split_at(7));
+    // A split key present with an empty value is malformed, not absent:
+    // Absent means no split key at all (ADR-0032 §4.1.3). Removal deletes
+    // the key lines physically (`publish_kv_changes`), so no writer of ours
+    // leaves an empty split key behind.
+    let split_inputs = (seen[5], seen[6], seen[7]);
     if split_inputs != (None, None, None) {
         let valid_generation = split_inputs
             .0
@@ -2580,6 +2665,16 @@ mod split_conf_tests {
             SplitConfObservation::Malformed,
             "split keys in a malformed file must refuse, never read as Absent"
         );
+    }
+
+    #[test]
+    fn an_empty_split_value_is_malformed_not_absent() {
+        let got = parse_camera_conf("split_generation=\n");
+        assert!(matches!(
+            got.selection,
+            CameraSelectionObservation::Malformed { .. }
+        ));
+        assert_eq!(got.split, SplitConfObservation::Malformed);
     }
 
     #[test]

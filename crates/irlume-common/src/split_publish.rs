@@ -111,17 +111,20 @@ fn parse_generation_name(name: &str) -> Option<u64> {
     (n >= 1).then_some(n)
 }
 
-/// Writer temporaries from `write_0600_atomic`: `.{name}.tmp.{pid}.{seq}`.
-/// Only that exact shape is swept, so a foreign file is never deleted
-/// (ADR-0032 §4.1.3).
+/// Writer temporaries from `write_0600_atomic`: `.{name}.tmp.{pid}.{seq}`
+/// where `{name}` is a canonical generation name. Only that exact shape is
+/// swept, so a foreign file is never deleted (ADR-0032 §4.1.3).
 fn is_writer_temp(name: &str) -> bool {
-    let Some(rest) = name
-        .strip_prefix('.')
-        .and_then(|n| n.split_once(".tmp.").map(|(_, tail)| tail))
-    else {
+    let Some(stripped) = name.strip_prefix('.') else {
         return false;
     };
-    rest.split_once('.').is_some_and(|(pid, seq)| {
+    let Some((target, tail)) = stripped.split_once(".tmp.") else {
+        return false;
+    };
+    if parse_generation_name(target).is_none() {
+        return false;
+    }
+    tail.split_once('.').is_some_and(|(pid, seq)| {
         !pid.is_empty()
             && pid.bytes().all(|b| b.is_ascii_digit())
             && !seq.is_empty()
@@ -264,13 +267,10 @@ pub fn publish_split(
     if records.is_empty() {
         // Removal of the last record drops the split keys entirely; the just
         // de-referenced generation counts as the predecessor and is kept.
-        config::write_kvs(
+        config::publish_kv_changes(
             config::CAMERAS_CONF,
-            &[
-                ("split_generation", ""),
-                ("split_digest", ""),
-                ("split_pair", ""),
-            ],
+            &[],
+            &["split_generation", "split_digest", "split_pair"],
         )
         .map_err(PublishError::Io)?;
         retain_only(&dir, &predecessor.into_iter().collect::<Vec<_>>());
@@ -293,18 +293,23 @@ pub fn publish_split(
     crate::write_0600_atomic(&dir.join(generation_name(n)), bytes).map_err(PublishError::Io)?;
     let digest = digest_key(bytes);
     let n_text = n.to_string();
-    let pair_text = selected
-        .map(SplitPairKey::format_canonical)
-        .unwrap_or_default();
-    config::write_kvs(
-        config::CAMERAS_CONF,
-        &[
-            ("split_generation", &n_text),
-            ("split_digest", &digest),
-            ("split_pair", &pair_text),
-        ],
-    )
-    .map_err(PublishError::Io)?;
+    let pair_text = match selected {
+        Some(key) => Some(
+            key.format_canonical()
+                .map_err(|_| PublishError::Schema(SchemaError::InvalidField))?,
+        ),
+        None => None,
+    };
+    let mut set: Vec<(&str, &str)> = vec![("split_generation", &n_text), ("split_digest", &digest)];
+    if let Some(text) = &pair_text {
+        set.push(("split_pair", text));
+    }
+    let remove: &[&str] = if pair_text.is_none() {
+        &["split_pair"]
+    } else {
+        &[]
+    };
+    config::publish_kv_changes(config::CAMERAS_CONF, &set, remove).map_err(PublishError::Io)?;
     let mut keep = vec![n];
     if let Some(p) = predecessor {
         if p != n {
@@ -360,7 +365,12 @@ fn read_generation(
             if digest.strip_prefix("sha256:") != Some(digest_value(&bytes).as_str()) {
                 return SplitReadState::DigestMismatch;
             }
-            match split_schema::parse_generation(&String::from_utf8_lossy(&bytes)) {
+            // The generation is text under the same rules as cameras.conf:
+            // invalid UTF-8 is Malformed, never normalized into records.
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                return SplitReadState::Malformed;
+            };
+            match split_schema::parse_generation(text) {
                 GenerationObservation::Malformed { .. } => SplitReadState::Malformed,
                 GenerationObservation::Valid { records } => match pair {
                     None => SplitReadState::Valid {
@@ -506,11 +516,7 @@ mod tests {
         let digest = digest_key(referenced.as_bytes());
         config::write_kvs(
             config::CAMERAS_CONF,
-            &[
-                ("split_generation", "3"),
-                ("split_digest", &digest),
-                ("split_pair", ""),
-            ],
+            &[("split_generation", "3"), ("split_digest", &digest)],
         )
         .unwrap();
         let published = publish_split(&[record("e:5", "f:6")], None).expect("publication");
@@ -671,7 +677,6 @@ mod tests {
             &[
                 ("split_generation", "2"),
                 ("split_digest", &digest_key(text.as_bytes())),
-                ("split_pair", ""),
             ],
         )
         .unwrap();
@@ -706,7 +711,6 @@ mod tests {
             &[
                 ("split_generation", "1"),
                 ("split_digest", &digest_key(body.as_bytes())),
-                ("split_pair", ""),
             ],
         )
         .unwrap();
@@ -777,6 +781,52 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_file_is_never_swept() {
+        let env = env();
+        std::fs::create_dir_all(env.dir.join(GENERATION_DIR)).unwrap();
+        let foreign = env.dir.join(GENERATION_DIR).join(".notes.tmp.1.0");
+        let real_temp = env.dir.join(GENERATION_DIR).join(".9.conf.tmp.1.0");
+        std::fs::write(&foreign, b"foreign").unwrap();
+        std::fs::write(&real_temp, b"temp").unwrap();
+        sweep_split_artifacts().expect("sweep");
+        assert!(foreign.exists(), "a foreign file must never be deleted");
+        assert!(!real_temp.exists(), "a real writer temporary is swept");
+        drop(env);
+    }
+
+    #[test]
+    fn invalid_utf8_in_a_generation_is_malformed() {
+        let env = env();
+        std::fs::create_dir_all(env.dir.join(GENERATION_DIR)).unwrap();
+        let body: &[u8] = b"\xff\xfeversion=1\n";
+        std::fs::write(env.dir.join(GENERATION_DIR).join(generation_name(1)), body).unwrap();
+        config::publish_kv_changes(
+            config::CAMERAS_CONF,
+            &[
+                ("split_generation", "1"),
+                ("split_digest", &digest_key(body)),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(read_split(), SplitReadState::Malformed);
+        drop(env);
+    }
+
+    #[test]
+    fn removal_drops_the_key_lines_entirely() {
+        let env = env();
+        publish_split(&[record("a:1", "b:2")], Some(&pair_key("a:1", "b:2"))).expect("publication");
+        publish_split(&[], None).expect("removal");
+        let text = std::fs::read_to_string(config::config_path(config::CAMERAS_CONF)).unwrap();
+        assert!(
+            !text.contains("split_"),
+            "removal must drop the key lines, got {text:?}"
+        );
+        drop(env);
+    }
+
+    #[test]
     fn the_writer_refuses_a_malformed_config() {
         let env = env();
         config::write_kvs(
@@ -832,7 +882,6 @@ mod tests {
             &[
                 ("split_generation", "3"),
                 ("split_digest", &digest_key(text.as_bytes())),
-                ("split_pair", ""),
             ],
         )
         .unwrap();
@@ -858,7 +907,6 @@ mod tests {
             &[
                 ("split_generation", "3"),
                 ("split_digest", &digest_key(referenced.as_bytes())),
-                ("split_pair", ""),
             ],
         )
         .unwrap();

@@ -201,14 +201,26 @@ impl SplitDomain {
 
 impl SplitUnitKey {
     /// Canonical unit text: four percent-encoded fields separated by `|`.
-    pub fn format_canonical(&self) -> String {
-        format!(
+    /// Refuses a side the parser would reject, so the encoder never writes a
+    /// non-canonical key (ADR-0032 §4.1.1).
+    ///
+    /// # Errors
+    /// [`KeyError::EmptyField`] for an empty identity or controller,
+    /// [`KeyError::BadPorts`] for an empty port chain or a zero element.
+    pub fn format_canonical(&self) -> Result<String, KeyError> {
+        if self.identity.is_empty() || self.controller.is_empty() {
+            return Err(KeyError::EmptyField);
+        }
+        if self.ports.is_empty() || self.ports.contains(&0) {
+            return Err(KeyError::BadPorts);
+        }
+        Ok(format!(
             "{}|{}|{}|{}",
             percent_encode(&self.identity),
             percent_encode(&self.controller),
             self.domain.as_str(),
             format_ports_text(&self.ports),
-        )
+        ))
     }
 
     /// Parse canonical unit text. `|` and `;` are always escaped in values,
@@ -238,12 +250,15 @@ impl SplitUnitKey {
 
 impl SplitPairKey {
     /// Canonical pair text: `split1;<rgb unit>;<ir unit>`.
-    pub fn format_canonical(&self) -> String {
-        format!(
+    ///
+    /// # Errors
+    /// [`KeyError`] from either side's [`SplitUnitKey::format_canonical`].
+    pub fn format_canonical(&self) -> Result<String, KeyError> {
+        Ok(format!(
             "split1;{};{}",
-            self.rgb.format_canonical(),
-            self.ir.format_canonical()
-        )
+            self.rgb.format_canonical()?,
+            self.ir.format_canonical()?
+        ))
     }
 
     /// Parse canonical pair text.
@@ -290,7 +305,7 @@ mod tests {
     fn the_adr_example_round_trips() {
         let key = SplitPairKey::parse_canonical(example()).expect("example parses");
         assert_eq!(key, example_key());
-        assert_eq!(key.format_canonical(), example());
+        assert_eq!(key.format_canonical().unwrap(), example());
     }
 
     #[test]
@@ -307,10 +322,10 @@ mod tests {
             domain: SplitDomain::SuperSpeed,
             ports: vec![1, 2],
         };
-        let text = one.format_canonical();
+        let text = one.format_canonical().unwrap();
         assert!(!text.contains("a|b"));
         assert_eq!(SplitUnitKey::parse_canonical(&text).unwrap(), one);
-        assert_ne!(text, two.format_canonical());
+        assert_ne!(text, two.format_canonical().unwrap());
     }
 
     #[test]
@@ -358,6 +373,19 @@ mod tests {
             ports,
         };
         assert!(at(vec![8]) < at(vec![8, 1]));
+    }
+
+    #[test]
+    fn the_encoder_refuses_unrepresentable_sides() {
+        let mut key = example_key();
+        key.rgb.identity = String::new();
+        assert_eq!(key.format_canonical(), Err(KeyError::EmptyField));
+        let mut key = example_key();
+        key.ir.ports = vec![0];
+        assert_eq!(key.format_canonical(), Err(KeyError::BadPorts));
+        let mut key = example_key();
+        key.rgb.ports.clear();
+        assert_eq!(key.format_canonical(), Err(KeyError::BadPorts));
     }
 
     #[test]

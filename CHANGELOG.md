@@ -15,6 +15,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Uninstall and login guards read irlumed's environment files and ordered
+  environment resets, refusing unreadable or ambiguous settings. Uninstall
+  carries one daemon-generation snapshot through stop and custom-store cleanup,
+  retains installation configuration when cleanup fails, and keeps the TPM
+  storage key for moved state trees or surviving envelopes. A durable retention
+  record refuses destructive retries after an incomplete uninstall or retained
+  data until earlier stores have been reconciled. Successful `--keep-data` and
+  intentional override keeps prominently report that future refusal and link
+  the manual-only recovery protocol. Unit numeric escapes require exact ASCII
+  digits; sign-prefixed forms such as `\u+0e9` refuse rather than selecting a
+  different store (#859).
+
 - LightDM configuration checks retain deletion evidence for symlink targets
   without counting changes beside intact targets. Explicit `-c`/`--config`
   invocations keep irlume's authentication lines out of the greeter. Bounded

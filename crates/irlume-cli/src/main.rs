@@ -39,6 +39,7 @@ mod retry;
 mod seal_storage;
 mod secrets;
 mod sensor_policy;
+mod split;
 mod strays;
 mod suncal;
 mod support_report;
@@ -224,6 +225,7 @@ fn main() -> std::process::ExitCode {
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("camera-tune"), _) => camera_tune(&args),
         (Some("camera-mode"), _) => camera_mode(&args),
+        (Some("split"), _) => split::run(&args),
         (Some("set-cameras"), _) => set_cameras(&args),
         (Some("update"), _) => commands::update(&args),
         (Some("uninstall"), _) => uninstall::run(&args),

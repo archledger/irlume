@@ -7,11 +7,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
-- Split-pair authorization storage groundwork (ADR-0032 Step 3): immutable
-  generation files under `/etc/irlume/split-pairs/` and the coherent
-  publication protocol behind the `split_generation` / `split_digest` /
-  `split_pair` keys of `cameras.conf`. No command writes them yet and split
-  enrollment and authentication stay refused until the later steps.
+- Split-pair authorization storage and management (ADR-0032 Step 3): immutable
+  generation files under `/etc/irlume/split-pairs/`, the coherent publication
+  protocol behind the `split_generation` / `split_digest` / `split_pair` keys
+  of `cameras.conf`, and root-only `irlume split add|remove|select|status`
+  commands with a share-safe `irlume split list`. Split enrollment and
+  authentication stay refused until the later steps.
 
 ### Fixed
 

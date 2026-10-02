@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- GNOME keyring token arming requires a provably reached `reseal` session
+  rule, following PAM includes, substacks and numeric jumps. Unreadable or
+  unsupported stacks refuse the arm. GDM's fingerprint stack must also
+  deliver the token, including while an enrolled reader is disconnected.
+  This check does not query or activate fprintd. PAM reads reject special
+  files and bound bytes and include expansion before further reads (#859).
+
 - Login-manager checks follow manager-specific hash and quote rules and
   refuse malformed GDM/LightDM files or unsupported Plasma Login syntax.
   Token arming refuses when Qt drop-in ordering or the Plasma parser version

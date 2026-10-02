@@ -401,6 +401,122 @@ fn control_actions(control: &str) -> Option<[Action; 32]> {
     }))
 }
 
+/// Per-file byte ceiling shared by the token reader and session proof.
+pub(super) const SESSION_STACK_MAX_BYTES: usize = 64 * 1024;
+
+/// Prove that every modeled session path invokes a reseal rule. Includes
+/// expand in the parent's chain; a substack is one jump target whose `done`,
+/// `die` and out-of-range jumps return to the parent. Module results are
+/// unknown: even a `done` suppressed by an earlier failure is conservatively
+/// treated as a possible exit. This proves invocation, not module success.
+/// Unsupported syntax or unreadable references cannot establish delivery.
+pub(super) fn session_reaches_reseal(content: &str, read: &dyn Fn(&str) -> Option<String>) -> bool {
+    enum Step {
+        Reseal,
+        Rule(Box<[Action; 32]>),
+        Substack(Vec<Step>),
+    }
+
+    struct Budget {
+        lines: usize,
+        reads: usize,
+    }
+
+    fn parse(
+        text: &str,
+        read: &dyn Fn(&str) -> Option<String>,
+        depth: usize,
+        budget: &mut Budget,
+    ) -> Option<Vec<Step>> {
+        if depth > INCLUDE_DEPTH
+            || text.len() > SESSION_STACK_MAX_BYTES
+            || has_line_continuation(text)
+            || unreadable_line(text).is_some()
+        {
+            return None;
+        }
+        let mut steps = Vec::new();
+        for line in text.lines() {
+            // Bound expansion as well as depth, including empty includes.
+            budget.lines = budget.lines.checked_sub(1)?;
+            let h = head(line);
+            let reference = if is_at_include(line) {
+                Some((at_include_target(line)?, false))
+            } else if let Some(h) = &h {
+                if h.phase != "session" {
+                    continue;
+                }
+                if names_stack(h) {
+                    Some((stack_name(h)?, h.control.eq_ignore_ascii_case("substack")))
+                } else {
+                    None
+                }
+            } else {
+                continue;
+            };
+            if let Some((name, substack)) = reference {
+                // Check before I/O, including empty/duplicate references. With
+                // the bounded production reader this permits at most 64 reads
+                // of 64 KiB + one overflow byte, plus the root file.
+                if depth >= INCLUDE_DEPTH || budget.lines == 0 {
+                    return None;
+                }
+                budget.reads = budget.reads.checked_sub(1)?;
+                let nested = parse(&read(name)?, read, depth + 1, budget)?;
+                if substack {
+                    steps.push(Step::Substack(nested));
+                } else {
+                    steps.extend(nested);
+                }
+                continue;
+            }
+            let rule = rule(line)?;
+            if control_is_rejected(rule.control) {
+                return None;
+            }
+            steps.push(
+                if irlume_rule(line).is_some() && rule.args.contains(&"reseal") {
+                    Step::Reseal
+                } else {
+                    Step::Rule(Box::new(control_actions(rule.control)?))
+                },
+            );
+        }
+        Some(steps)
+    }
+
+    fn reaches(steps: &[Step], on_return: bool) -> bool {
+        // All edges are forward. Each cell proves the suffix from that point;
+        // substack exits use the parent's suffix, not the parent's stack exit.
+        let mut suffix = vec![on_return; steps.len() + 1];
+        for (at, step) in steps.iter().enumerate().rev() {
+            suffix[at] = match step {
+                Step::Reseal => true,
+                Step::Substack(nested) => reaches(nested, suffix[at + 1]),
+                Step::Rule(actions) => actions.iter().all(|action| match action {
+                    Action::Done | Action::Die => on_return,
+                    Action::Jump(n) => {
+                        suffix[at.saturating_add(*n).saturating_add(1).min(steps.len())]
+                    }
+                    Action::Ignore | Action::Ok | Action::Bad | Action::Reset => suffix[at + 1],
+                }),
+            };
+        }
+        suffix[0]
+    }
+
+    parse(
+        content,
+        read,
+        0,
+        &mut Budget {
+            lines: 4096,
+            reads: 64,
+        },
+    )
+    .is_some_and(|steps| reaches(&steps, false))
+}
+
 /// The numeric jumps of a control, as `(value, N)`: every `value=N` pair
 /// whose jump libpam keeps, in the order written, `value` being the return
 /// value or `default` as written. libpam reads every control that is not one

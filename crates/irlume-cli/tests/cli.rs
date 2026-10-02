@@ -4098,9 +4098,9 @@ fn a_token_arm_is_refused_before_sealing_where_gnome_keyring_was_never_initializ
     });
     let runtime_dir = sb.path("run");
     let _keyring = FakeLoginKeyring::start(&runtime_dir);
-    // A GDM login screen whose stack carries irlume's session line, so the
-    // token would be delivered and only the session decides. The host's own
-    // login manager and GDM settings stay out of it.
+    // Both GDM login paths must deliver, including their referenced stacks,
+    // before the session check can decide. Keep the complete PAM graph in the
+    // fixture; no host vendor stack supplies a missing prerequisite.
     let pam = sb.path("pam-etc");
     let units = sb.path("units");
     std::fs::create_dir_all(&pam).unwrap();
@@ -4110,6 +4110,18 @@ fn a_token_arm_is_refused_before_sealing_where_gnome_keyring_was_never_initializ
         "auth     substack      password-auth\n\
          session  include       password-auth\n\
          session    optional                     pam_irlume.so reseal\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pam.join("password-auth"),
+        "auth required pam_unix.so\nsession required pam_unix.so\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pam.join("gdm-fingerprint"),
+        "auth required pam_fprintd.so\n\
+         session include password-auth\n\
+         session optional pam_irlume.so reseal\n",
     )
     .unwrap();
     std::os::unix::fs::symlink(
@@ -4127,7 +4139,7 @@ fn a_token_arm_is_refused_before_sealing_where_gnome_keyring_was_never_initializ
                 BIN,
                 &["keyring", "arm", "--user", "tester"],
                 &["getent", "busctl"],
-                &["/etc/gdm", "/etc/gdm3"],
+                &["/etc/gdm", "/etc/gdm3", "/usr/lib/pam.d"],
                 &[(&pam, "/etc/pam.d"), (&units, "/etc/systemd/system")],
             )
             .env("IRLUME_KWALLET_INIT", sb.path("wallet-salt-helper"))
@@ -4158,6 +4170,25 @@ fn a_token_arm_is_refused_before_sealing_where_gnome_keyring_was_never_initializ
     // A GNOME-only home, where irlumed would mint a token: refused, and
     // irlumed never asked.
     std::fs::write(keyrings.join("login.keyring"), b"fixture").unwrap();
+    // An initialized session cannot bypass either missing delivery path.
+    // Hide vendor stacks above so each missing file is genuinely absent.
+    for (file, service) in [
+        ("password-auth", "gdm-password"),
+        ("gdm-fingerprint", "gdm-fingerprint"),
+    ] {
+        let path = pam.join(file);
+        let saved = pam.join(format!("{file}.saved"));
+        std::fs::rename(&path, &saved).unwrap();
+        let (code, text, requests) = arm("true");
+        std::fs::rename(saved, path).unwrap();
+        assert_ne!(code, 0, "{text}");
+        assert!(requests.is_empty(), "nothing reaches irlumed: {requests:?}");
+        assert!(
+            text.contains(&format!("the {service} login stack")),
+            "{text}"
+        );
+        assert!(text.contains("Nothing was changed"), "{text}");
+    }
     let (code, text, requests) = arm("false");
     assert!(requests.is_empty(), "nothing reaches irlumed: {requests:?}");
     assert_ne!(code, 0, "{text}");

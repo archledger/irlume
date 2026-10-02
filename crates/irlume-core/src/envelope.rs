@@ -75,8 +75,7 @@ impl PolicyKind {
     /// numbers name the boot setup, not the strength. pcrlock and the literal
     /// PCR 7 policy bind the firmware and Secure Boot state; the signed policy
     /// binds only PCR 11, which the operating system measures itself. Used,
-    /// through [`SealedEnvelope::strength_rank`], to decide whether a re-seal
-    /// would upgrade an existing envelope.
+    /// through [`SealedEnvelope::strength_rank`], to rank a recorded binding.
     pub fn strength_rank(&self) -> u8 {
         match self {
             PolicyKind::PcrlockNv { .. } => 3,
@@ -189,7 +188,7 @@ pub fn binds_firmware_state(pcrs: &[u32]) -> bool {
 }
 
 impl SealedEnvelope {
-    /// The strength rank of this envelope's binding: its policy's
+    /// The strength rank of this envelope's recorded binding: its policy's
     /// [`PolicyKind::strength_rank`], except that a literal or pcrlock
     /// policy leaving out every firmware-measured PCR (an `IRLUME_PCRS`
     /// override such as `11`, or a custom pcrlock policy over OS PCRs only)
@@ -200,6 +199,11 @@ impl SealedEnvelope {
     /// systemd's PCR 11 one) ranks as the literal policy, so a reseal moves it
     /// only to pcrlock and never swaps its update tolerance for a literal seal
     /// that binds no more.
+    ///
+    /// For pcrlock this describes seal-time metadata only: reprovisioning can
+    /// change the binding without changing the envelope. Migration decisions
+    /// use the currently provisioned policy through [`crate::tpm`], refusing
+    /// replacement when its association with the envelope is unknown.
     pub fn strength_rank(&self) -> u8 {
         match self.policy {
             PolicyKind::PcrLiteral | PolicyKind::PcrlockNv { .. }

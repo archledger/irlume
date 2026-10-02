@@ -7,6 +7,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- TPM policy upgrades rank pcrlock envelopes against the current prediction
+  for their NV index. A policy re-provisioned over OS-only PCRs can move to
+  literal PCR 7 at template-key startup migration or a password-verified
+  keyring reseal. Unreadable, invalid or unrelated predictions leave the
+  existing envelope in place (#859).
+
 - Queued keyring releases whose account did not resolve at registration
   refuse before retrying NSS on the authentication worker. They cannot
   borrow a later request's account binding; a new request can retry after

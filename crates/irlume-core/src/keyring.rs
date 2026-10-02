@@ -550,7 +550,7 @@ pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) 
                     // hand 56 bytes of key to pam_gnome_keyring as an AUTHTOK.
                     candidate.secret = kind;
                     candidate.uid = uid;
-                    if candidate.strength_rank() > env.strength_rank() {
+                    if tpm::policy_is_stronger(&candidate, &env) {
                         candidate.save(&envelope_path(user))?;
                         return Ok(Reseal::Upgraded);
                     }
@@ -614,7 +614,7 @@ fn climbed_token(
     // change.
     candidate.secret = SecretKind::GnomeKeyringToken;
     candidate.password_wrap = env.password_wrap.clone();
-    Ok((candidate.strength_rank() > env.strength_rank()).then_some(candidate))
+    Ok(tpm::policy_is_stronger(&candidate, env).then_some(candidate))
 }
 
 /// The token half of [`reseal_password`]. A token cannot be re-derived, so the
@@ -1585,7 +1585,7 @@ mod tests {
         // synthetic Tier 2 makes the climb real: a genuine PolicyAuthorizeNV
         // session and TPM round trip, which is the boundary the credential-leak
         // regression lives behind.
-        let _pcrlock = tpm::tests::PcrlockFixture::provision(0x0181_C111);
+        let pcrlock = tpm::tests::PcrlockFixture::provision(0x0181_C111);
 
         let pw = b"climb-password";
         let token = mint_gnome_token();
@@ -1628,6 +1628,38 @@ mod tests {
             token.as_bytes(),
             "and the new seal must still hold it too"
         );
+
+        // The existing pcrlock envelope's recorded PCR 7 must not hide an
+        // OS-only reprovision. Exercise both token and login-password writers.
+        let _owner = crate::account::remember("pw-climb", 4137);
+        let mut password_env = tpm::seal(pw).unwrap();
+        password_env.uid = Some(4137);
+        password_env.save(&envelope_path("pw-climb")).unwrap();
+        pcrlock.reprovision(&[11, 15]);
+        assert_eq!(&*unseal_password("climb").unwrap(), token.as_bytes());
+        assert_eq!(
+            reseal_password("climb", pw, None).unwrap(),
+            Reseal::Upgraded
+        );
+        let moved = SealedEnvelope::load(&envelope_path("climb")).unwrap();
+        assert_eq!(moved.policy, crate::envelope::PolicyKind::PcrLiteral);
+        assert_eq!(moved.secret, SecretKind::GnomeKeyringToken);
+        assert_eq!(moved.uid, env.uid);
+        assert_eq!(
+            serde_json::to_value(&moved.password_wrap).unwrap(),
+            serde_json::to_value(&env.password_wrap).unwrap()
+        );
+        assert_eq!(&*unseal_password("climb").unwrap(), token.as_bytes());
+        assert_eq!(
+            reseal_password("pw-climb", pw, None).unwrap(),
+            Reseal::Upgraded
+        );
+        let moved = SealedEnvelope::load(&envelope_path("pw-climb")).unwrap();
+        assert_eq!(moved.policy, crate::envelope::PolicyKind::PcrLiteral);
+        assert_eq!(moved.secret, SecretKind::LoginPassword);
+        assert_eq!(moved.uid, Some(4137));
+        assert_eq!(&*unseal_password("pw-climb").unwrap(), pw);
+        forget_password("pw-climb").unwrap();
 
         forget_password("climb").unwrap();
         std::env::remove_var("IRLUME_KEYRING_DIR");

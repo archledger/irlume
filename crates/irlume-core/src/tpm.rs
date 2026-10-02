@@ -800,20 +800,55 @@ fn with_srk_mode<T>(
 /// already at its best available policy. Only signals availability; the
 /// actual round-trip verification happens in [`seal`].
 pub fn stronger_tier_available_than(current: &SealedEnvelope) -> bool {
+    let binding = read_pcrlock_json().ok().and_then(|p| p.binding());
+    let Some(rank) = current_strength_rank(current, binding.as_ref()) else {
+        // An unrelated or unreadable prediction cannot establish that a
+        // working envelope lost protection. Keep it until a verified reseal.
+        return false;
+    };
     stronger_tier_than(
-        current.strength_rank(),
-        || pcrlock_for_sealing().is_some(),
+        rank,
+        || binding.is_some_and(|b| b.rank > 0),
         || crate::envelope::binds_firmware_state(&policy_pcrs()),
     )
 }
 
-/// [`stronger_tier_available_than`] over the envelope's
-/// [`SealedEnvelope::strength_rank`], with the pcrlock probe, and whether
-/// the configured literal PCRs bind firmware state, passed in. The ladder can
-/// reach the literal policy's rank when its PCRs bind firmware state (the
-/// default PCR 7 does), and pcrlock's once one is provisioned; whether a
-/// provisioned pcrlock policy binds firmware state is known only after
-/// sealing, where the caller compares ranks again.
+/// Rank both sides against the same current prediction, after sealing and
+/// before publication. Unknown is not a weak rank: neither a candidate nor an
+/// existing envelope with an unestablished binding may authorize a move.
+pub(crate) fn policy_is_stronger(candidate: &SealedEnvelope, current: &SealedEnvelope) -> bool {
+    let binding = if matches!(candidate.policy, PolicyKind::PcrlockNv { .. })
+        || matches!(current.policy, PolicyKind::PcrlockNv { .. })
+    {
+        read_pcrlock_json().ok().and_then(|p| p.binding())
+    } else {
+        None
+    };
+    match (
+        current_strength_rank(candidate, binding.as_ref()),
+        current_strength_rank(current, binding.as_ref()),
+    ) {
+        (Some(candidate), Some(current)) => candidate > current,
+        _ => false,
+    }
+}
+
+/// pcrlock replays the current prediction, not the seal-time PCR list. The NV
+/// index must match; unseal still verifies the NV Name bound into the object's
+/// authPolicy and the policy digest stored in that index. No TPM probe here.
+fn current_strength_rank(env: &SealedEnvelope, binding: Option<&PcrlockBinding>) -> Option<u8> {
+    match env.policy {
+        PolicyKind::PcrlockNv { nv_index } => {
+            let binding = binding.filter(|b| b.nv_index == nv_index)?;
+            Some(binding.rank)
+        }
+        _ => Some(env.strength_rank()),
+    }
+}
+
+/// Availability over the current rank, with the validated pcrlock binding and
+/// configured literal firmware binding passed in. The final comparison reads
+/// the prediction again, since it may change while a candidate is sealed.
 fn stronger_tier_than(
     current: u8,
     pcrlock: impl FnOnce() -> bool,
@@ -1475,6 +1510,44 @@ struct PcrlockEntry {
     values: Vec<String>,
 }
 
+/// A usable prediction's association and firmware-binding rank. This is file
+/// evidence for migration decisions, not proof that the TPM accepts the policy.
+struct PcrlockBinding {
+    nv_index: u32,
+    rank: u8,
+}
+
+impl PcrlockJson {
+    fn binding(&self) -> Option<PcrlockBinding> {
+        let nv_index = u32::try_from(self.nv_index?).ok()?;
+        NvIndexTpmHandle::new(nv_index).ok()?;
+        // Validate every entry before calling an OS-only policy weak. The
+        // parser checks the bank and nonempty mask; hex32 is also used by the
+        // real policy replay. Duplicates and unsupported PCRs/OR fanout cannot
+        // describe a usable systemd super-PCR policy.
+        let mut seen = [false; 24];
+        for entry in &self.pcr_values {
+            let selected = seen.get_mut(entry.pcr as usize)?;
+            if *selected || entry.values.len() > 8 {
+                return None;
+            }
+            *selected = true;
+            for value in &entry.values {
+                hex32(value).ok()?;
+            }
+        }
+        let pcrs: Vec<_> = self.pcr_values.iter().map(|e| e.pcr).collect();
+        Some(PcrlockBinding {
+            nv_index,
+            rank: if crate::envelope::binds_firmware_state(&pcrs) {
+                PolicyKind::PcrlockNv { nv_index }.strength_rank()
+            } else {
+                0
+            },
+        })
+    }
+}
+
 fn read_pcrlock_json() -> Result<PcrlockJson> {
     // IRLUME_PCRLOCK_JSON redirects the prediction file, like the other
     // sandbox overrides; tests provision a TPM and point this at a fixture.
@@ -1928,12 +2001,8 @@ pub fn pcrlock_provisioned() -> Option<u32> {
 /// seal, so the ladder takes that instead, and the upgrade check does not
 /// count it. `seal_with_pcrlock` still seals under any provisioned policy.
 pub fn pcrlock_for_sealing() -> Option<u32> {
-    let plock = read_pcrlock_json().ok()?;
-    let pcrs: Vec<u32> = plock.pcr_values.iter().map(|e| e.pcr).collect();
-    if !crate::envelope::binds_firmware_state(&pcrs) {
-        return None;
-    }
-    u32::try_from(plock.nv_index?).ok()
+    let binding = read_pcrlock_json().ok()?.binding()?;
+    (binding.rank > 0).then_some(binding.nv_index)
 }
 
 /// Marker `policy_aware_err` embeds when it diagnoses PCR drift;
@@ -3021,6 +3090,192 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Prediction files only; no NV space or TPM operation. Hold ENV_LOCK.
+    pub(crate) struct PredictionFixture {
+        pub(crate) path: std::path::PathBuf,
+        previous: Option<std::ffi::OsString>,
+        previous_pcrs: Option<std::ffi::OsString>,
+    }
+
+    impl PredictionFixture {
+        pub(crate) const NV: u32 = 0x0181_C859;
+
+        pub(crate) fn new() -> Self {
+            let path = std::path::PathBuf::from(crate::test_tmp_dir("prediction-859"));
+            let previous = std::env::var_os("IRLUME_PCRLOCK_JSON");
+            let previous_pcrs = std::env::var_os("IRLUME_PCRS");
+            std::env::set_var("IRLUME_PCRLOCK_JSON", &path);
+            std::env::set_var("IRLUME_PCRS", "7");
+            Self {
+                path,
+                previous,
+                previous_pcrs,
+            }
+        }
+
+        pub(crate) fn write(&self, pcrs: &[u32]) {
+            let entries: Vec<_> = pcrs
+                .iter()
+                .map(|pcr| serde_json::json!({"pcr": pcr, "values": ["ab".repeat(32)]}))
+                .collect();
+            std::fs::write(
+                &self.path,
+                serde_json::to_vec(&serde_json::json!({
+                    "pcrBank": "sha256", "pcrValues": entries, "nvIndex": Self::NV
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        pub(crate) fn envelope(pcrs: &[u32]) -> SealedEnvelope {
+            serde_json::from_value(serde_json::json!({
+                "version": 1, "policy": {"kind": "PcrlockNv", "nv_index": Self::NV},
+                "pcrs": pcrs, "public": "", "private": ""
+            }))
+            .unwrap()
+        }
+    }
+
+    impl Drop for PredictionFixture {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("IRLUME_PCRLOCK_JSON", value),
+                None => std::env::remove_var("IRLUME_PCRLOCK_JSON"),
+            }
+            match &self.previous_pcrs {
+                Some(value) => std::env::set_var("IRLUME_PCRS", value),
+                None => std::env::remove_var("IRLUME_PCRS"),
+            }
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[test]
+    fn reprovisioned_pcrlock_opens_the_upgrade_gate() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let prediction = PredictionFixture::new();
+        let old = PredictionFixture::envelope(&[0, 7]);
+        prediction.write(&[11, 15]);
+        assert!(
+            stronger_tier_available_than(&old),
+            "current OS-only binding must move to literal PCR 7"
+        );
+    }
+
+    #[test]
+    fn reprovisioned_pcrlock_ranks_both_sides_from_the_same_current_policy() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let prediction = PredictionFixture::new();
+        let firmware_record = PredictionFixture::envelope(&[0, 7]);
+        let os_record = PredictionFixture::envelope(&[11, 15]);
+        let mut literal = PredictionFixture::envelope(&[7]);
+        literal.policy = PolicyKind::PcrLiteral;
+        for pcrs in [&[7][..], &[0, 7, 15], &[11, 15]] {
+            prediction.write(pcrs);
+            let firmware = pcrs.contains(&7);
+            for old in [&firmware_record, &os_record] {
+                assert_eq!(stronger_tier_available_than(old), !firmware);
+                assert_eq!(policy_is_stronger(&literal, old), !firmware);
+                assert_eq!(policy_is_stronger(old, &literal), firmware);
+                assert!(!policy_is_stronger(&firmware_record, old));
+                assert!(!policy_is_stronger(&os_record, old));
+            }
+            assert_eq!(pcrlock_for_sealing().is_some(), firmware);
+        }
+        // A literal override covering no firmware PCR is not an upgrade from
+        // the now OS-only pcrlock binding, and must not start any seal attempt.
+        std::env::set_var("IRLUME_PCRS", "11,15");
+        literal.pcrs = vec![11, 15];
+        assert!(!stronger_tier_available_than(&firmware_record));
+        assert!(!policy_is_stronger(&literal, &firmware_record));
+    }
+
+    #[test]
+    fn reprovisioned_pcrlock_unknown_binding_never_authorizes_replacement() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let prediction = PredictionFixture::new();
+        let mut literal = PredictionFixture::envelope(&[7]);
+        literal.policy = PolicyKind::PcrLiteral;
+        let refuse = || {
+            for recorded in [&[7][..], &[11, 15]] {
+                let old = PredictionFixture::envelope(recorded);
+                assert!(!stronger_tier_available_than(&old));
+                assert!(!policy_is_stronger(&literal, &old));
+                assert!(!policy_is_stronger(&old, &literal));
+            }
+        };
+        prediction.write(&[11, 15]);
+        let valid: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&prediction.path).unwrap()).unwrap();
+        let mut variants = Vec::new();
+        for nv in [
+            serde_json::Value::Null,
+            serde_json::json!(PredictionFixture::NV + 1),
+            serde_json::json!(u64::MAX),
+            serde_json::json!(1),
+        ] {
+            let mut bad = valid.clone();
+            bad["nvIndex"] = nv;
+            variants.push(bad);
+        }
+        let mut missing_nv = valid.clone();
+        missing_nv.as_object_mut().unwrap().remove("nvIndex");
+        variants.push(missing_nv);
+        for (field, value) in [
+            ("pcrBank", serde_json::json!("sha1")),
+            ("pcrValues", serde_json::json!([])),
+            ("pcrValues", serde_json::json!([{"pcr": 11, "values": []}])),
+            (
+                "pcrValues",
+                serde_json::json!([{"pcr": 24, "values": ["ab".repeat(32)]}]),
+            ),
+            (
+                "pcrValues",
+                serde_json::json!([{"pcr": 11, "values": ["zz".repeat(32)]}]),
+            ),
+            (
+                "pcrValues",
+                serde_json::json!([{"pcr": 11, "values": ["aa"]}]),
+            ),
+            (
+                "pcrValues",
+                serde_json::json!([{"pcr": 11, "values": vec!["ab".repeat(32); 9]}]),
+            ),
+            (
+                "pcrValues",
+                serde_json::json!([
+                    {"pcr": 11, "values": ["ab".repeat(32)]},
+                    {"pcr": 11, "values": ["cd".repeat(32)]}
+                ]),
+            ),
+        ] {
+            let mut bad = valid.clone();
+            bad[field] = value;
+            variants.push(bad);
+        }
+        for bad in variants {
+            std::fs::write(&prediction.path, serde_json::to_vec(&bad).unwrap()).unwrap();
+            refuse();
+        }
+        std::fs::write(&prediction.path, b"{broken").unwrap();
+        refuse();
+        std::fs::remove_file(&prediction.path).unwrap();
+        refuse();
+        std::fs::create_dir(&prediction.path).unwrap();
+        refuse();
+        std::fs::remove_dir(&prediction.path).unwrap();
+    }
+
     /// The upgrade predicate: a signed envelope, or a literal one over no
     /// firmware-measured PCR, has a stronger policy to move to when pcrlock
     /// is provisioned or the configured literal PCRs bind firmware state (the
@@ -3168,6 +3423,49 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
 
             Self { nv_index, dir }
         }
+
+        /// Rewrite this fixture's existing NV index without changing its Name,
+        /// then publish the matching prediction, as make-policy does. Test-only
+        /// owner writes; this does not simulate systemd's protected NV update.
+        pub(crate) fn reprovision(&self, pcrs: &[u32]) {
+            use tss_esapi::structures::MaxNvBuffer;
+            let mut ctx = open_context().unwrap();
+            let values = read_pcr_values(&mut ctx, pcrs).unwrap();
+            let digest = with_session(&mut ctx, None, SessionType::Trial, |ctx, session| {
+                let policy = PolicySession::try_from(session).map_err(tpm_err)?;
+                ctx.policy_pcr(policy, Digest::default(), pcr_selection(pcrs)?)
+                    .map_err(tpm_err)?;
+                ctx.policy_get_digest(policy).map_err(tpm_err)
+            })
+            .unwrap();
+            let nv = nv_index_handle(&mut ctx, self.nv_index).unwrap();
+            let mut content = vec![0x00, 0x0b];
+            content.extend_from_slice(digest.value());
+            ctx.execute_with_nullauth_session(|ctx| {
+                ctx.nv_write(
+                    NvAuth::Owner,
+                    nv,
+                    MaxNvBuffer::try_from(content).unwrap(),
+                    0,
+                )
+            })
+            .unwrap();
+            let entries: Vec<_> = values
+                .iter()
+                .map(|v| {
+                    let hex: String = v.value.iter().map(|b| format!("{b:02x}")).collect();
+                    serde_json::json!({"pcr": v.pcr, "values": [hex]})
+                })
+                .collect();
+            std::fs::write(
+                self.dir.join("pcrlock.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "pcrBank": "sha256", "pcrValues": entries, "nvIndex": self.nv_index
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
     }
 
     impl Drop for PcrlockFixture {
@@ -3207,6 +3505,21 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert!(matches!(env.policy, PolicyKind::PcrlockNv { .. }));
         let got = unseal(&env).expect("pcrlock unseal");
         assert_eq!(&*got, secret, "round-trip must match");
+
+        // A healthy current binding does not churn. Reprovisioning the SAME
+        // NV index to OS PCRs preserves unseal but changes the upgrade rank.
+        assert!(!stronger_tier_available_than(&env));
+        fixture.reprovision(&[11, 15]);
+        assert_eq!(
+            &*unseal(&env).expect("old envelope after reprovision"),
+            secret
+        );
+        assert_eq!(env.pcrs, [7], "recorded PCRs did not change");
+        assert!(stronger_tier_available_than(&env));
+        let replacement = seal(secret).unwrap();
+        assert_eq!(replacement.policy, PolicyKind::PcrLiteral);
+        assert!(policy_is_stronger(&replacement, &env));
+        assert_eq!(&*unseal(&replacement).unwrap(), secret);
 
         // Drift: rewrite the NV policy to one the live PCRs cannot satisfy
         // (what a firmware change looks like) and the unseal must refuse.

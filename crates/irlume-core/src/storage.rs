@@ -2218,7 +2218,9 @@ mod tests {
                 let mut env: crate::envelope::SealedEnvelope =
                     serde_json::from_str(r#"{"version":1,"pcrs":[7],"public":"","private":""}"#)
                         .unwrap();
-                env.policy = crate::envelope::PolicyKind::PcrlockNv { nv_index: 1 };
+                env.policy = crate::envelope::PolicyKind::PcrlockNv {
+                    nv_index: crate::tpm::tests::PredictionFixture::NV,
+                };
                 env.private = key.to_vec();
                 Ok(env)
             },
@@ -3258,6 +3260,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _tpm = crate::testenv::NoTpm::set();
+        let prediction = crate::tpm::tests::PredictionFixture::new();
+        prediction.write(&[7]);
         let dir = uid_sandbox("uid-kept-key-move");
         let user = "uid-kept-key-move";
         let old_key = [19u8; 32];

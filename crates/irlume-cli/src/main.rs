@@ -4481,8 +4481,9 @@ fn doctor_run(
             "none (no Tier 1 on this boot chain)"
         }
     );
-    // A provisioned policy that covers no firmware-measured PCR is passed
-    // over for sealing (`pcrlock_for_sealing`), so it is not a passing rung.
+    // An invalid policy or one covering no firmware-measured PCR is passed
+    // over for sealing. An index from pcrlock_provisioned alone does not
+    // establish which condition made pcrlock_for_sealing reject the policy.
     let pcrlock = (
         irlume_core::tpm::pcrlock_provisioned(),
         irlume_core::tpm::pcrlock_for_sealing(),
@@ -4503,8 +4504,8 @@ fn doctor_run(
                 "provisioned, NV 0x{nv:x}; an arm binds to it if it unseals on this boot (Tier 2)"
             ),
             (Some(nv), None) => format!(
-                "provisioned, NV 0x{nv:x}, over no firmware-measured PCR (0 to 7), so seals \
-                 use the literal PCR-7 policy; Tier 2 needs a pcrlock policy that covers one"
+                "NV 0x{nv:x} reported, not eligible for new seals (invalid policy or no \
+                 firmware-measured PCR (0 to 7)); seals use the configured literal PCR policy"
             ),
             (None, _) =>
                 "not provisioned: seals use the literal PCR-7 policy + recovery passphrase \

@@ -1152,7 +1152,7 @@ pub fn diag(args: &[String]) -> ExitCode {
             "  pcrlock       : provisioned, NV 0x{nv:x} (Tier 2 candidate: an arm uses it only if it unseals on this boot, else falls back to literal PCR 7)"
         ),
         (Some(nv), None) => println!(
-            "  pcrlock       : provisioned, NV 0x{nv:x}, over no firmware-measured PCR (0 to 7), so seals use literal PCR 7"
+            "  pcrlock       : NV 0x{nv:x} reported, not eligible for new seals (invalid policy or no firmware-measured PCR (0 to 7)); seals use the configured literal PCR policy"
         ),
         (None, _) => println!(
             "  pcrlock       : not provisioned (optional; `systemd-pcrlock make-policy` enables Tier 2, else seals use literal PCR 7)"

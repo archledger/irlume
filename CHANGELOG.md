@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- LightDM configuration checks retain deletion evidence for symlink targets
+  without counting changes beside intact targets. Explicit `-c`/`--config`
+  invocations keep irlume's authentication lines out of the greeter. Bounded
+  reads pin and type-check files before opening them for data, and unrelated
+  non-UTF-8 process names no longer invalidate the process check. The existing
+  timestamp-based restart rule is unchanged (#859).
+
 - GNOME keyring token arming requires a provably reached `reseal` session
   rule, following PAM includes, substacks and numeric jumps. Unreadable or
   unsupported stacks refuse the arm. GDM's fingerprint stack must also

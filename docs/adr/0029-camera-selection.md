@@ -190,19 +190,25 @@ requirement to updates that both authorize and select a split pair.
 
    Amended by [ADR-0032](0032-cross-device-pairing-by-administrator-pin.md)
    (2026-10-02): `cameras.conf` gains three optional split-selection
-   keys, all or none. `split_pair` carries the canonical text of the
-   selected split pair key (ADR-0032 §4.1); `split_generation` names the
-   decimal authorization generation in use; `split_digest` carries
+   keys: `split_generation` and `split_digest` come together, and
+   `split_pair` is valid only alongside them. `split_generation` names
+   the decimal authorization generation in use; `split_digest` carries
    `sha256:` plus 64 lowercase hex digits over that generation file's
-   bytes. Any subset of the three, a malformed value, or a `split_pair`
+   bytes; `split_pair` carries the canonical text of the selected split
+   pair key (ADR-0032 §4.1). A missing half of the generation pair, a
+   `split_pair` without them, a malformed value, or a `split_pair`
    missing from the referenced generation makes split selection
-   Malformed, without touching the ordinary pin: `read_camera_pin` and
-   its four keys are unchanged. In `pinned` mode a valid split reference
-   selects that authorized pair, with no fallback to the ordinary pin or
-   another pair when it cannot resolve; without one the ordinary
-   four-key pin keeps its existing meaning. In `automatic` mode a
-   retained pin does not override account-scoped selection, and adding
-   an authorization neither selects nor enrolls it; split-aware
+   Malformed and refuses the operation: it never falls back to the
+   ordinary pin or another pair. `read_camera_pin` and its four keys
+   parse unchanged. A file carrying no split key at all keeps the
+   ordinary pin's existing meaning, and so does a file that references a
+   generation without `split_pair`: that is a live authorization
+   collection with no split selection, which neither selects nor
+   enrolls anything. In `pinned` mode a valid split reference selects
+   that authorized pair, with no fallback to the ordinary pin or another
+   pair when it cannot resolve. In `automatic`
+   mode a retained pin does not override account-scoped selection, and
+   adding an authorization neither selects nor enrolls it; split-aware
    automatic selection is ADR-0032 step 5. Environment selection keeps
    its precedence and cannot authorize a cross-device relationship. The
    known-key list grows by these three keys; anything else unknown stays

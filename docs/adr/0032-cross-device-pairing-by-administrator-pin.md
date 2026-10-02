@@ -207,7 +207,7 @@ downgrades them to the ordinary setter and reports success.
 
 #### 4.1. Step 3 schema and publication
 
-#### 4.1.1 Typed keys, canonical text and ordering
+##### 4.1.1 Typed keys, canonical text and ordering
 
 A **unit key** is `(binding identity, controller identity, root-hub
 protocol domain, relative port chain)`. A **pair key** is a class tag plus,
@@ -219,22 +219,30 @@ Comparison uses typed fields, never concatenated text or
 `SplitPair::binding_key()` (whose dotted port text is not numeric):
 
 - identity and controller: bytewise on the canonical raw text;
-- root-hub domain: by the table below, not by enum declaration order;
+- root-hub domain: bytewise on the canonical text in the table below, so
+  text order and typed order always agree; never by enum declaration
+  order;
 - port chain: element by element as numbers; a proper prefix sorts before
   the longer chain.
 
 | Domain | Canonical text | Order |
 |---|---|---|
-| USB2 root hub | `usb2` | 0 |
-| SuperSpeed root hub | `superspeed` | 1 |
+| SuperSpeed root hub | `superspeed` | 0 |
+| USB2 root hub | `usb2` | 1 |
 
-The order is a canonical, arbitrary-but-fixed choice. It exists only so
-equal fields compare equal and ranking is deterministic; it carries no
-preference. A new domain value requires an ADR amendment and may not be
-inserted before an existing one. The canonical domain text is distinct
-from `SplitPair::binding_key()`'s NUL-joined encoding (which renders the
-domain `ss`); the two encodings never meet, and typed equality is
-authoritative.
+The order is exactly the bytewise order of the canonical text. In effect
+it is an arbitrary-but-fixed choice: it exists only so equal fields
+compare equal and ranking is deterministic, and it carries no
+preference. A new domain value requires an ADR amendment, and its
+canonical text must keep text order and typed order consistent; an
+existing order position is never renumbered. The canonical domain text
+names the root-hub protocol domain, never the dynamically numbered
+sysfs `usbN` bus, and is distinct from `SplitPair::binding_key()`'s
+NUL-joined encoding (which renders the domain `ss`); the two encodings
+never meet, and typed equality is authoritative. The serialized
+pair-key text as a whole is never sorted for ranking; only the typed
+comparator is, and its field order is exactly the per-field orders
+above, including the domain's canonical-text order.
 
 **Canonical text of a split pair key** (used where a key must be stored;
 the typed form is authoritative):
@@ -246,12 +254,17 @@ ports = <decimal>(.<decimal>)*          each 1..=255, no leading zeros
 ```
 
 The observation-side parser accepts the wider `u8` form; the canonical
-text is what the encoder writes. Fields are percent-encoded: every byte
-outside `A-Z a-z 0-9 : . _ -` becomes `%XX` with uppercase hex. This keeps
-`;` `|` `=` whitespace, control bytes and any serial text unambiguous.
-The encoding is injective and the decoder rejects non-canonical input
-(lowercase hex digits, unnecessary escapes, leading zeros), so each key
-has exactly one text and text equality equals typed equality. Example:
+text is what the encoder writes, and a side whose observed chain is
+empty or holds a `0` element has no canonical text, so the encoder
+refuses that side rather than writing a non-canonical key. Fields are
+percent-encoded: every byte outside `A-Z a-z 0-9 : . _ -` becomes `%XX`
+with uppercase hex. This keeps `;` `|` `=` whitespace, control bytes and
+any serial text unambiguous. This is its own encoding, not RFC 3986
+percent-encoding (which reserves `:` and leaves `~` unescaped), so a
+URL encoder or decoder must not be substituted for it. The encoding is
+injective and the decoder rejects non-canonical input (lowercase hex
+digits, unnecessary escapes, leading zeros), so each key has exactly
+one text and text equality equals typed equality. Example:
 
 ```
 split1;5986:2113:200901010001|0000:00:14.0|usb2|8;5986:1141:200901010001|0000:00:14.0|usb2|5
@@ -260,13 +273,16 @@ split1;5986:2113:200901010001|0000:00:14.0|usb2|8;5986:1141:200901010001|0000:00
 Node paths are not part of the key; they remain part of the
 authorization record's live-resolution checks (section 2).
 
-#### 4.1.2 Authorization generations
+##### 4.1.2 Authorization generations
 
 The ordered authorization collection is stored as **immutable generation
-files** under `/etc/irlume`, root-owned, mode 0600:
+files** in `/etc/irlume/split-pairs/`, a root-owned directory (mode
+0700) that holds only these generations and their writer temporaries:
 
-- name: `split-pairs.<N>.conf`, `N` a decimal `u64` >= 1 without leading
-  zeros;
+- name: `<N>.conf`, `N` a decimal `u64` >= 1 without leading zeros; a
+  name that does not match this grammar is not a generation: it is
+  ignored by the `N` scan and never deleted by retention; each
+  generation file is root-owned, mode 0600;
 - a generation is never modified after publication; a change is a new
   generation with a larger `N`;
 - contents: line-oriented `key=value`, same unsafe-value rules as
@@ -281,7 +297,11 @@ files** under `/etc/irlume`, root-owned, mode 0600:
 - bounds, enforced by parser and writer: at most 16 records, 1024 bytes
   per line, 64 KiB per file, 6 port elements per chain (the chain bound is
   the USB limit of five cascaded hubs: a root port plus one element per
-  hub);
+  hub). The chain bound is stricter than the existing diagnostics wire
+  bound (`MAX_USB_PORT_DEPTH`, 8) and than the passive observation
+  parser, both of which accept longer chains; no such chain can
+  enumerate under the USB limit, so the diagnostics bound can be
+  tightened later;
 - unknown keys in a generation are Malformed (the file is immutable and
   versioned, so there is no forward-compat ignoring); an unknown `version`
   is Malformed.
@@ -290,7 +310,7 @@ The parser is pure and scans the whole file so every problem is reported.
 States: **Absent** (no generation referenced), **Unreadable**,
 **Malformed**, **DigestMismatch**, **Valid**.
 
-#### 4.1.3 Publication protocol
+##### 4.1.3 Publication protocol
 
 Selection and the reference live in `cameras.conf` (ADR-0029 section 6,
 as amended with this change). Authorization data lives in a generation.
@@ -303,28 +323,33 @@ Writer, holding `lock_exclusive` on `cameras.conf` to serialize writers:
 
 1. Read and validate the current `cameras.conf`; refuse if it is
    unreadable or malformed. Compute `N = max(highest generation number
-   on disk, referenced generation) + 1` so a number is never reused,
-   including after a crash.
+   in the generation directory, referenced generation) + 1` so a number
+   is never reused, including after a crash; only canonical names count
+   as generations for that scan.
 2. Write the new generation to a temporary file in the same directory
-   (0600), fsync the file, rename it to `split-pairs.<N>.conf`, fsync the
+   (0600), fsync the file, rename it to `<N>.conf`, fsync the
    directory: the same temp-file, fsync, rename and directory-fsync
    discipline the existing atomic writers use.
 3. Compute `sha256` over the exact bytes of the generation file.
 4. Publish `cameras.conf` in one atomic rename containing the existing
-   five keys unchanged plus `split_pair`, `split_generation` and
-   `split_digest`, then fsync the directory.
+   five keys unchanged plus `split_generation` and `split_digest`, and
+   `split_pair` when a pair is selected, then fsync the directory.
 5. Best-effort retention (4.1.5).
 
 Reader (any process):
 
 1. Read `cameras.conf` once; the rename guarantees a whole file.
-2. If no split keys: split selection is Absent; behavior is exactly as
-   before this ADR.
-3. Otherwise open exactly generation `split_generation`, verify its digest
-   equals `split_digest`, then parse it. A missing file, digest mismatch,
-   malformed file or unresolved `split_pair` reference refuses the split
-   operation. It never falls back to the ordinary pin or another pair,
-   and never reads as a fresh automatic setup.
+2. If no split key is present at all: split selection is Absent;
+   behavior is exactly as before this ADR.
+3. Otherwise open exactly generation `split_generation`, verify its
+   digest equals `split_digest`, then parse it. A missing file, digest
+   mismatch or malformed file refuses the split operation. A present
+   `split_pair` must resolve inside that generation or the operation
+   refuses; it never falls back to the ordinary pin or another pair,
+   and never reads as a fresh automatic setup. A referenced generation
+   with no `split_pair` is Valid with no split selection: authorizations
+   are live, nothing is selected, and the ordinary pin keeps its
+   existing meaning.
 4. If the open fails because the file is missing, re-read `cameras.conf`
    once; if the referenced generation changed, retry with the new one
    (bounded to one retry), otherwise refuse.
@@ -338,25 +363,46 @@ Crash analysis:
 | during step 4 | rename is atomic: old or new `cameras.conf` | old or new coherent state |
 | after step 4, before step 5 | extra old generations | none; collected later |
 
-#### 4.1.4 Removal and the selected pair
+##### 4.1.4 Removal and the selected pair
 
 Removing an authorization publishes a new generation without it, and does
 not need the cameras to be connected (section 4). If the removed record
-is the selected pair, the same `cameras.conf` publication removes the
-split keys, so selection never references a pair the generation no longer
-holds. In `pinned` mode without a split reference the ordinary four-key
-pin applies again; removal never authorizes a replacement.
+is the selected pair, the same `cameras.conf` publication drops
+`split_pair` only, so selection never references a pair the generation no
+longer holds while the remaining records stay reachable; in `pinned`
+mode the ordinary four-key pin applies again. Removing the last record
+drops the split keys entirely. Removal never authorizes a replacement.
 
-#### 4.1.5 Retention
+##### 4.1.5 Retention
 
-Keep the generation referenced by `cameras.conf` and its immediate
-predecessor, so a reader that holds the previous `cameras.conf` can still
-open its generation. After a successful publication, delete older
-generations and any unreferenced orphan with a lower number than the
-predecessor. Failure to delete is harmless and is retried on the next
-write and at daemon start. The referenced generation is never deleted.
+After a successful publication, keep exactly two generations: the one
+the new `cameras.conf` references, and its **immediate predecessor**,
+defined as the generation the `cameras.conf` the writer read in step 1
+referenced, which is what the previous publication pointed at. That is
+what lets a reader holding the previous `cameras.conf` still open its
+generation. Every other generation file is deleted, including
+unreferenced orphans with numbers above the predecessor (such as a
+generation written before a crash interrupted publication). The
+referenced generation is never deleted.
 
-#### 4.1.6 Upgrade, downgrade and visible failure
+Generation cleanup runs only in the writer, at publication time,
+because only there is the predecessor known: it comes from the
+`cameras.conf` read in step 1, not from the directory contents, and a
+restart that finds several generations cannot tell an orphan from the
+predecessor. Failure to delete is harmless and is retried at the next
+publication. Every deletion runs under the `cameras.conf` writer lock.
+At daemon start, a sweep under that lock deletes leftover writer
+temporary files and unreferenced generations numbered above the
+referenced one, which cannot be the predecessor; generations below the
+reference wait for the next publication.
+
+Edges: on the first split publication only the referenced generation is
+kept, nothing having been de-referenced; after a publication that
+removed the split keys, the just de-referenced generation counts as the
+predecessor and is kept. Either way a reader holding the previous
+`cameras.conf` can still open its generation.
+
+##### 4.1.6 Upgrade, downgrade and visible failure
 
 - Without split keys, every reader and writer behaves exactly as today,
   and the ordinary four-key pin keeps its meaning.
@@ -374,7 +420,7 @@ write and at daemon start. The referenced generation is never deleted.
   persisted and status contract only, and does not assume automatic
   selection is integrated.
 
-#### 4.1.7 Status and redaction
+##### 4.1.7 Status and redaction
 
 A root-only status reports the state (Absent / Unreadable / Malformed /
 DigestMismatch / Valid), record count, referenced generation and whether
@@ -382,15 +428,19 @@ the selection resolves. Non-root peers receive no identities, serials,
 paths or raw controller paths, only the share-safe projections of
 section 6.
 
-#### 4.1.8 Additional tests required for Step 3
+##### 4.1.8 Additional tests required for Step 3
 
 - Concurrent reader while a writer publishes: always a whole old or
   whole new state, never a mix.
 - Crash injection after each writer step in 4.1.3, including leftover
   temp files and orphan generations; `N` never reused.
-- Digest mismatch, missing generation, malformed generation, partial
-  split keys, and an unresolved `split_pair` each refuse with no
-  fallback.
+- Digest mismatch, missing generation, malformed generation, a missing
+  half of the generation pair, `split_pair` without the pair, and an
+  unresolved `split_pair` each refuse with no fallback. A referenced
+  generation with no `split_pair` is Valid and selects nothing.
+- Removing the selected record drops only `split_pair`; removing the
+  last record drops all split keys; both keep the ordinary pin
+  coherent.
 - Retention never deletes the referenced generation and keeps the
   predecessor.
 - Canonical key round-trip, rejection of non-canonical text, numeric

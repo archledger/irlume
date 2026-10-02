@@ -542,6 +542,7 @@ APPARMOR_PROFILES=(
   packaging/apparmor/usr.local.bin.irlumed
 )
 APPARMOR_RUNTIME_RULES=(
+  "signal (send, receive) set=(kill, chld) peer=irlumed,"
   "/usr/share/irlume/tflite/libtensorflowlite_c.so mr,"
   "/var/lib/systemd/pcrlock.json r,"
   "deny capability sys_ptrace,"
@@ -581,6 +582,12 @@ APPARMOR_RUNTIME_RULES=(
   "/sys/bus/pci/devices/ r,"
 )
 for profile in "${APPARMOR_PROFILES[@]}"; do
+  executable="${profile##*/}"
+  executable="/${executable//./\/}"
+  if ! grep -Fqx "  $executable mrix," "$profile"; then
+    printf '  MISS  self-exec NSS confinement %s\n' "$profile"
+    fail=1
+  fi
   for rule in "${APPARMOR_RUNTIME_RULES[@]}"; do
     if grep -Fqx "  $rule" "$profile"; then
       printf '  ok    %-48s %s\n' "$rule" "$profile"

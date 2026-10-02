@@ -6,30 +6,55 @@
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const MAX_OUTPUT: usize = 64 * 1024;
+const MAX_CHILDREN: usize = 32;
 
 /// Collect a short helper's output within one observation deadline.
 ///
 /// Standard input is closed and combined output is limited to 64 KiB. On any
-/// failure the direct child is killed and reaped, using a background waiter if
-/// the kernel has not yet completed its exit. No unbounded wait occurs on the
+/// failure the direct child is killed and reaped by one shared polling reaper
+/// if the kernel has not yet completed its exit. At most 32 children, including
+/// pending reaps, are admitted per process. No unbounded wait occurs on the
 /// caller. Callers retain control of executable, arguments and environment.
 ///
 /// # Errors
 /// Returns spawn/I/O errors, `TimedOut` on expiry, or `InvalidData` when output
-/// exceeds the limit. A nonzero helper exit is returned in `Output::status`.
+/// exceeds the limit, or `WouldBlock` when the child budget is exhausted.
+/// A nonzero helper exit is returned in `Output::status`.
 pub fn output_until(command: &mut Command, deadline: Instant) -> io::Result<Output> {
+    static BUDGET: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+    output_with_budget(
+        command,
+        deadline,
+        Arc::clone(BUDGET.get_or_init(Default::default)),
+    )
+}
+
+fn output_with_budget(
+    command: &mut Command,
+    deadline: Instant,
+    budget: Arc<AtomicUsize>,
+) -> io::Result<Output> {
+    remaining(deadline)?;
+    let permit = ChildPermit::acquire(budget)?;
+    let reaper = Reaper::global()?;
     remaining(deadline)?;
     let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let mut owner = ObservedChild(Some(child));
+    let mut owner = ObservedChild {
+        child: Some(child),
+        permit: Some(permit),
+        reaper: Arc::clone(reaper),
+    };
     let child = owner
-        .0
+        .child
         .as_mut()
         .ok_or_else(|| io::Error::other("missing helper child"))?;
     let mut stdout = child
@@ -62,7 +87,7 @@ pub fn output_until(command: &mut Command, deadline: Instant) -> io::Result<Outp
         remaining(deadline)?;
         if let Some(status) = status {
             if out_eof && err_eof {
-                owner.0.take(); // try_wait has reaped this child.
+                owner.child.take(); // try_wait has reaped this child.
                 return Ok(Output {
                     status,
                     stdout: out,
@@ -136,16 +161,85 @@ fn collect(
     }
 }
 
-struct ObservedChild(Option<Child>);
+struct ChildPermit(Arc<AtomicUsize>);
+
+impl ChildPermit {
+    fn acquire(budget: Arc<AtomicUsize>) -> io::Result<Self> {
+        budget
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_CHILDREN).then_some(n + 1)
+            })
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "helper child budget exhausted")
+            })?;
+        Ok(Self(budget))
+    }
+}
+
+impl Drop for ChildPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+#[derive(Default)]
+struct Reaper {
+    pending: Mutex<Vec<(Child, ChildPermit)>>,
+    wake: Condvar,
+}
+
+impl Reaper {
+    fn global() -> io::Result<&'static Arc<Self>> {
+        static REAPER: OnceLock<Result<Arc<Reaper>, String>> = OnceLock::new();
+        REAPER
+            .get_or_init(|| {
+                let reaper = Arc::new(Self::default());
+                let worker = Arc::clone(&reaper);
+                std::thread::Builder::new()
+                    .name("irlume-helper-reaper".into())
+                    .spawn(move || worker.run())
+                    .map_err(|e| e.to_string())?;
+                Ok(reaper)
+            })
+            .as_ref()
+            .map_err(|e| io::Error::other(e.clone()))
+    }
+
+    fn run(&self) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            while pending.is_empty() {
+                pending = self.wake.wait(pending).unwrap_or_else(|e| e.into_inner());
+            }
+            // WNOHANG only. A child stuck in the kernel retains its permit;
+            // later callers cannot accumulate more children or waiter threads.
+            pending.retain_mut(|(child, _)| !matches!(child.try_wait(), Ok(Some(_))));
+            pending = self
+                .wake
+                .wait_timeout(pending, Duration::from_millis(10))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+}
+
+struct ObservedChild {
+    child: Option<Child>,
+    permit: Option<ChildPermit>,
+    reaper: Arc<Reaper>,
+}
 
 impl Drop for ObservedChild {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
+        if let (Some(mut child), Some(permit)) = (self.child.take(), self.permit.take()) {
             let _ = child.kill();
             if !matches!(child.try_wait(), Ok(Some(_))) {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
+                self.reaper
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((child, permit));
+                self.reaper.wake.notify_one();
             }
         }
     }
@@ -156,6 +250,56 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn exhausted_child_budget_refuses_before_spawning() {
+        let budget = Arc::new(AtomicUsize::new(MAX_CHILDREN));
+        let error = output_with_budget(
+            &mut Command::new("/nonexistent/no-capacity"),
+            Instant::now() + Duration::from_secs(1),
+            Arc::clone(&budget),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(budget.load(Ordering::Acquire), MAX_CHILDREN);
+    }
+
+    #[test]
+    fn child_capacity_returns_after_success_spawn_failure_and_timeout_reap() {
+        let budget = Arc::new(AtomicUsize::new(0));
+        output_with_budget(
+            &mut Command::new("/bin/true"),
+            Instant::now() + Duration::from_secs(2),
+            Arc::clone(&budget),
+        )
+        .unwrap();
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+        assert!(output_with_budget(
+            &mut Command::new("/nonexistent/helper"),
+            Instant::now() + Duration::from_secs(2),
+            Arc::clone(&budget),
+        )
+        .is_err());
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+        for _ in 0..3 {
+            let error = output_with_budget(
+                Command::new("/bin/sleep").arg("20"),
+                Instant::now() + Duration::from_millis(100),
+                Arc::clone(&budget),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        }
+        let until = Instant::now() + Duration::from_secs(2);
+        while budget.load(Ordering::Acquire) != 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            budget.load(Ordering::Acquire),
+            0,
+            "the shared reaper returns every permit"
+        );
+    }
 
     #[test]
     fn collects_both_streams_and_exit_status() {

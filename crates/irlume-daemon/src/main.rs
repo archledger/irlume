@@ -32,8 +32,8 @@ use zeroize::Zeroize;
 /// two `users.rs` tests resolved usernames against every environment writer
 /// with nothing between them (#380 review).
 ///
-/// A `RwLock`, not a `Mutex`, because the hazard is asymmetric. `getpwnam_r`
-/// READS `environ` inside glibc; `set_var` REWRITES it. Concurrent readers do
+/// A `RwLock`, not a `Mutex`, because the hazard is asymmetric. Launching an
+/// NSS helper reads the environment; `set_var` REWRITES it. Concurrent readers do
 /// not race each other, only a writer. Shared read guards let the passwd
 /// lookups overlap, which is what keeps a suite-wide guard from serialising
 /// every socket timeout behind it: an earlier attempt at this took the daemon
@@ -49,11 +49,13 @@ pub(crate) mod test_support {
     /// Shared: this test only READS the environment, which is what a passwd
     /// lookup does inside glibc.
     pub(crate) fn env_read() -> std::sync::RwLockReadGuard<'static, ()> {
+        crate::users::initialize();
         ENV_LOCK.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Exclusive: this test calls `set_var`/`remove_var`.
     pub(crate) fn env_write() -> std::sync::RwLockWriteGuard<'static, ()> {
+        crate::users::initialize();
         ENV_LOCK.write().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -582,6 +584,11 @@ fn main() {
             std::process::exit(1);
         }
     }
+    // The NSS subprocess exits before sockets, models, TPM or worker startup.
+    if users::run_helper() {
+        return;
+    }
+    users::initialize();
     // Next, before models load. The watchdog deadline starts ticking the moment
     // systemd execs us, and loading the ONNX sessions takes tens of seconds on a
     // cold cache; starting the pings after that made the daemon miss its own
@@ -11250,6 +11257,9 @@ mod tests {
             "account(",
             "uid_for_name(",
             "name_for_uid(",
+            "name_for_record_writer(",
+            "native_lookup(",
+            "resolve_account(",
             "shared_unlock::Binding::capture(",
             "Harness::new(",
             "identify_scope(",
@@ -18076,6 +18086,85 @@ mod tests {
             "a new registration reaches the corrupt envelope after recovery: {response:?}"
         );
         assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn registered_keyring_worker_uses_held_uid_without_querying_a_blocked_provider() {
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("held-uid-blocked-provider");
+        let user = "irlume-test-held-worker";
+        plant_fake_envelope(user);
+        let req = Request::UnsealKeyring {
+            user: user.into(),
+            service: Some("kde".into()),
+            auth_phase: false,
+            have_password: false,
+        };
+        let state = diagnostics::DiagnosticState::default();
+        let scope = state.begin_for(
+            diagnostic_operation_class(&req),
+            diagnostics::Owner::Account(4100),
+        );
+        let (response, calls) = users::probe_provider(true, || {
+            dispatch_scoped(req, &peer(0), &mut e, &scope, None)
+        });
+        assert!(
+            matches!(&response, Response::Error(message) if message.starts_with("protocol:")),
+            "{response:?}"
+        );
+        assert_eq!(calls, 0, "the worker must use its registered UID");
+    }
+
+    #[test]
+    fn authentication_worker_progresses_after_blocked_nss_and_records_the_refusal() {
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("worker-blocked-nss");
+        let (me, owner) = own_account();
+        let request = || Request::Authenticate {
+            user: me.clone(),
+            service: Some("kde-fingerprint".into()),
+            structured_errors: false,
+            intent_confirmation: None,
+        };
+        let state = diagnostics::DiagnosticState::default();
+        let scope = state.begin_for(
+            diagnostic_operation_class(&request()),
+            diagnostics::Owner::Account(owner.uid),
+        );
+        let initial = dispatch_scoped(request(), &peer(0), &mut e, &scope, None);
+        assert!(!is_face_grant(&initial));
+        let history = attempt_record::load(&me).unwrap();
+        assert_ne!(
+            history,
+            Default::default(),
+            "normal refusals are still recorded"
+        );
+        let started = std::time::Instant::now();
+        let (response, calls) = users::probe_provider(true, || {
+            dispatch_scoped(request(), &peer(0), &mut e, &scope, None)
+        });
+        assert!(calls > 0, "exercise the retry canonical-name provider");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            matches!(&response, Response::AuthResult {
+                granted: false, refused_by_policy: true, reason, ..
+            } if reason == retry_throttle::UNAVAILABLE),
+            "{response:?}"
+        );
+        let recorded = attempt_record::load(&me)
+            .unwrap()
+            .latest_authenticate
+            .unwrap();
+        assert!(
+            recorded.seq > history.latest_authenticate.unwrap().seq,
+            "the helper deadline must not discard the refused attempt"
+        );
+        assert!(matches!(
+            dispatch(Request::Ping, &peer(0), &mut e),
+            Response::Pong
+        ));
     }
 
     /// A queued root request acts for the uid its account resolved to when

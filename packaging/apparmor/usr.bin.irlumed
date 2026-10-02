@@ -51,7 +51,9 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   # its enforce soak proves nothing about this path.
   /run/systemd/notify w,
 
-  /usr/bin/irlumed mr,
+  # Fresh-process NSS lookup inherits this same confinement.
+  /usr/bin/irlumed mrix,
+  signal (send, receive) set=(kill, chld) peer=irlumed,
 
   # Device-class enumeration (camera discovery walks /sys/class).
   /sys/class/ r,

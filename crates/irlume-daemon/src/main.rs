@@ -5444,8 +5444,9 @@ fn gate_account_uid(
 /// long time before it writes (an enrollment captures first and saves at
 /// the end; `SealPassword` verifies the password and then seals it), and its
 /// records stay bound to that uid whatever a later lookup answers. A name
-/// that did not resolve holds nothing: the request's records then go by the
-/// lookups they make, and its events and live entry stay root's alone.
+/// that did not resolve holds nothing, and a keyring release is refused:
+/// it must not retry NSS on the serialized worker or use another request's
+/// held uid. Other requests retain their own unresolved-account handling.
 ///
 /// # Errors
 /// Another request irlumed is serving holds another uid for the name, as
@@ -5453,6 +5454,7 @@ fn gate_account_uid(
 /// the uid held first keeps answering until its request ends, and this
 /// request is refused with the error before it checks or writes a record,
 /// so neither request's records open for the other's uid.
+/// A keyring release whose registration established no uid is also refused.
 fn worker_account_uid(
     req: &Request,
     peer: &Peer,
@@ -5462,6 +5464,13 @@ fn worker_account_uid(
         return gate_account_uid(req, peer);
     }
     let (Some(user), Some(uid)) = (posture(req).user, request_account_uid(peer, owner)) else {
+        if matches!(req, Request::UnsealKeyring { .. }) {
+            return Err(irlume_common::Error::Policy(
+                "the keyring account did not resolve when this request was registered, so \
+                 nothing was released; retry when the account resolves"
+                    .into(),
+            ));
+        }
         return Ok(None);
     };
     irlume_core::account::hold(user, uid).map(Some)
@@ -17935,6 +17944,140 @@ mod tests {
         );
     }
 
+    /// An unresolved keyring request must not repeat NSS on the worker or
+    /// borrow another request's held uid. A later successful lookup belongs
+    /// to a new registration, not to the unresolved request in the queue.
+    #[test]
+    fn an_unresolved_keyring_request_cannot_use_a_later_or_held_uid() {
+        use diagnostics::Owner;
+        use irlume_core::account::{self, Resolution};
+        let _g = env_lock();
+        let user = "irlume-test-unresolved-keyring";
+        let request = |auth_phase, have_password| Request::UnsealKeyring {
+            user: user.into(),
+            service: Some("plasmalogin".into()),
+            auth_phase,
+            have_password,
+        };
+        assert_eq!(account::resolve_fresh(user), Resolution::NoAccount);
+        let owner = diagnostic_owner(&request(false, false), &peer(0));
+        assert_eq!(owner, Owner::Unresolved);
+        let _later = account::remember(user, 4100);
+        for other_hold in [false, true] {
+            let _other = other_hold.then(|| account::hold(user, 4200).unwrap());
+            for auth_phase in [false, true] {
+                for have_password in [false, true] {
+                    let req = request(auth_phase, have_password);
+                    let result = worker_account_uid(&req, &peer(0), owner);
+                    assert!(
+                        result.is_err(),
+                        "an unresolved request must not reach NSS or a secret"
+                    );
+                    let reply = held_account_refusal(&req, &result.err().unwrap());
+                    assert!(matches!(reply, Response::Error(_)), "{reply:?}");
+                    assert_eq!(
+                        account::resolve(user),
+                        Resolution::Uid(if other_hold { 4200 } else { 4100 }),
+                        "refusal must neither acquire nor replace a hold"
+                    );
+                }
+            }
+        }
+        // A subsequent registration can use the recovered database answer;
+        // the earlier refusal leaves no negative cache or held uid behind.
+        let req = request(false, false);
+        let owner = diagnostic_owner(&req, &peer(0));
+        assert_eq!(owner, Owner::Account(4100));
+        let held = worker_account_uid(&req, &peer(0), owner).unwrap();
+        assert!(held.is_some());
+        let _changed = account::remember(user, 4300);
+        assert_eq!(account::resolve(user), Resolution::Uid(4100));
+        drop(held);
+        assert_eq!(account::resolve(user), Resolution::Uid(4300));
+    }
+
+    /// A resolved release pins even uid zero, refuses a conflicting hold,
+    /// and releases its own hold when the worker's scope unwinds or ends.
+    #[test]
+    fn a_registered_keyring_uid_is_scoped_and_conflicts_fail_closed() {
+        use diagnostics::Owner;
+        use irlume_core::account::{self, Resolution};
+        let _g = env_lock();
+        let user = "irlume-test-registered-keyring";
+        let req = Request::UnsealKeyring {
+            user: user.into(),
+            service: Some("plasmalogin".into()),
+            auth_phase: false,
+            have_password: false,
+        };
+        let _nss = account::remember(user, 4100);
+        for uid in [0, 4200] {
+            {
+                let held = worker_account_uid(&req, &peer(0), Owner::Account(uid)).unwrap();
+                assert!(held.is_some());
+                assert_eq!(account::resolve(user), Resolution::Uid(uid));
+                assert_eq!(account::resolve_fresh(user), Resolution::Uid(4100));
+                assert!(worker_account_uid(&req, &peer(0), Owner::Account(4100)).is_err());
+                assert!(worker_account_uid(&req, &peer(0), Owner::Unresolved).is_err());
+                assert_eq!(account::resolve(user), Resolution::Uid(uid));
+            }
+            assert_eq!(account::resolve(user), Resolution::Uid(4100));
+            let later = worker_account_uid(&req, &peer(0), Owner::Account(4100)).unwrap();
+            assert!(later.is_some());
+            drop(later);
+        }
+        assert!(worker_account_uid(&req, &peer(0), Owner::Daemon).is_err());
+    }
+
+    /// Exercise the worker dispatch, including its status and posture gates:
+    /// a queued unresolved owner must not reach even a corrupt envelope after
+    /// NSS recovers, while a newly registered request reaches that envelope.
+    #[test]
+    fn an_unresolved_keyring_dispatch_refuses_before_envelope_access() {
+        use diagnostics::Owner;
+        use irlume_core::account::{self, Resolution};
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("unresolved-keyring-dispatch");
+        let user = "irlume-test-keyring-dispatch";
+        let request = |auth_phase, have_password| Request::UnsealKeyring {
+            user: user.into(),
+            service: Some("plasmalogin".into()),
+            auth_phase,
+            have_password,
+        };
+        assert_eq!(account::resolve_fresh(user), Resolution::NoAccount);
+        let owner = diagnostic_owner(&request(false, false), &peer(0));
+        assert_eq!(owner, Owner::Unresolved);
+        plant_fake_envelope(user);
+        let path = irlume_core::keyring::envelope_path(user);
+        let before = std::fs::read(&path).unwrap();
+        let _recovered = account::remember(user, 4100);
+        let state = diagnostics::DiagnosticState::default();
+        for other_hold in [false, true] {
+            let _other = other_hold.then(|| account::hold(user, 4200).unwrap());
+            for auth_phase in [false, true] {
+                for have_password in [false, true] {
+                    let req = request(auth_phase, have_password);
+                    let scope = state.begin_for(diagnostic_operation_class(&req), owner);
+                    let response = dispatch_scoped(req, &peer(0), &mut e, &scope, None);
+                    assert!(
+                        matches!(&response, Response::Error(message)
+                            if message.contains("did not resolve when this request was registered")),
+                        "the unresolved request must refuse before envelope parsing: {response:?}"
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                }
+            }
+        }
+        let response = dispatch(request(false, false), &peer(0), &mut e);
+        assert!(
+            matches!(&response, Response::Error(message) if message.starts_with("protocol:")),
+            "a new registration reaches the corrupt envelope after recovery: {response:?}"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
     /// A queued root request acts for the uid its account resolved to when
     /// it was registered, the uid its live entry and events are shown to,
     /// even when the name resolves to another uid by the time the worker
@@ -20679,6 +20822,9 @@ mod tests {
     #[test]
     fn unseal_keyring_gates_peer_service_class_and_envelope_integrity() {
         let _g = env_lock();
+        // These checks need an established account so they reach the
+        // envelope and service gates, rather than the registration refusal.
+        let _account = irlume_core::account::remember("carol", 4100);
         let mut e = engine();
         let sb = sandbox("unseal-keyring");
         let _ = &sb;
@@ -22943,6 +23089,7 @@ mod tests {
             return;
         }
         let _g = env_lock();
+        let _account = irlume_core::account::remember("carol", 4100);
         let mut e = engine();
         let sb = sandbox("tpm-keyring");
         let _ = &sb;

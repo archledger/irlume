@@ -15,6 +15,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Login reconciliation deactivates LightDM's existing `pam_irlume` face and
+  credential-release rules before querying daemon capabilities when remote
+  seats are blocked. It preserves PAM jump slots and existing reseal lines;
+  adding or restoring rules still requires established capabilities (#859).
+
 - Uninstall and login guards read irlumed's environment files and ordered
   environment resets, refusing unreadable or ambiguous settings. Uninstall
   carries one daemon-generation snapshot through stop and custom-store cleanup,

@@ -23089,6 +23089,7 @@ mod tests {
             return;
         }
         let _g = env_lock();
+        let _account = irlume_core::account::remember("carol", 4100);
         let mut e = engine();
         let sb = sandbox("tpm-keyring");
         let _ = &sb;

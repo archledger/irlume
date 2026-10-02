@@ -264,6 +264,14 @@ pub fn publish_split(
     // retention below collects it.
     sweep_temps(&dir).map_err(PublishError::Io)?;
 
+    // The selection must resolve inside the records being published
+    // (ADR-0032 §4: selection never references a pair the generation does
+    // not hold). Refuse before any file is touched.
+    if let Some(key) = selected {
+        if !records.iter().any(|r| record_matches(r, key)) {
+            return Err(PublishError::Schema(SchemaError::InvalidField));
+        }
+    }
     if records.is_empty() {
         // Removal of the last record drops the split keys entirely; the just
         // de-referenced generation counts as the predecessor and is kept.
@@ -719,11 +727,39 @@ mod tests {
     }
 
     #[test]
+    fn the_writer_refuses_an_unresolved_selection() {
+        let env = env();
+        assert!(matches!(
+            publish_split(&[record("a:1", "b:2")], Some(&pair_key("x:9", "y:8"))),
+            Err(PublishError::Schema(_))
+        ));
+        assert_eq!(
+            read_split(),
+            SplitReadState::Absent,
+            "nothing was published"
+        );
+        drop(env);
+    }
+
+    #[test]
     fn an_unresolved_pair_refuses_with_no_fallback() {
         let env = env();
-        let published = publish_split(&[record("a:1", "b:2")], Some(&pair_key("x:9", "y:8")))
-            .expect("publication writes the reference");
-        assert!(published.digest.starts_with("sha256:"));
+        // A hand-built state that names a pair the generation does not hold:
+        // the reader must refuse, never fall back to the ordinary pin.
+        let text = generation_file(&env.dir, 1, &[record("a:1", "b:2")]);
+        config::publish_kv_changes(
+            config::CAMERAS_CONF,
+            &[
+                ("split_generation", "1"),
+                ("split_digest", &digest_key(text.as_bytes())),
+                (
+                    "split_pair",
+                    &pair_key("x:9", "y:8").format_canonical().unwrap(),
+                ),
+            ],
+            &[],
+        )
+        .unwrap();
         assert_eq!(read_split(), SplitReadState::Malformed);
         drop(env);
     }

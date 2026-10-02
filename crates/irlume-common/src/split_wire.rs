@@ -136,8 +136,8 @@ impl SplitSideGuard {
     /// # Errors
     /// Returns a static reason for malformed identity or endpoint text.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.instance_id.is_empty() {
-            return Err("empty split guard instance id");
+        if !crate::live_camera::valid_id(&self.instance_id) {
+            return Err("invalid split guard instance id");
         }
         if self.endpoint.is_empty() {
             return Err("empty split guard endpoint");
@@ -152,29 +152,75 @@ impl SplitMutationGuard {
     /// # Errors
     /// Returns a static reason for malformed supervisor or side metadata.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.supervisor_id.is_empty() {
-            return Err("empty split guard supervisor id");
+        if !crate::live_camera::valid_id(&self.supervisor_id) {
+            return Err("invalid split guard supervisor id");
         }
         self.rgb.validate()?;
         self.ir.validate()
     }
 }
 
+/// Verify a mutation guard against the current inventory publication
+/// (ADR-0032 §4): the expected supervisor and revision, and both displayed
+/// sides in role order, each naming its own distinct candidate with the
+/// recorded instance id, generation and endpoint.
+///
+/// Role classification itself is the daemon's publication fact; this check
+/// proves the guard names two distinct physical groups from the displayed
+/// snapshot and nothing else.
+///
+/// # Errors
+/// A static reason when the publication is not current, the supervisor or
+/// revision is stale, a side is missing from the publication, or both sides
+/// name the same candidate.
+pub fn verify_split_guard(
+    guard: &SplitMutationGuard,
+    snapshot: &crate::live_camera::CameraInventorySnapshot,
+) -> Result<(), &'static str> {
+    use crate::live_camera::CameraInventoryState;
+    guard.validate()?;
+    if snapshot.validate().is_err()
+        || snapshot.state != CameraInventoryState::Current
+        || snapshot.supervisor_id.as_deref() != Some(guard.supervisor_id.as_str())
+        || snapshot.revision != guard.revision
+    {
+        return Err("split guard does not match the current publication");
+    }
+    let side_candidate = |side: &SplitSideGuard| {
+        snapshot.candidates.iter().position(|c| {
+            c.instance_id == side.instance_id
+                && c.generation == side.generation
+                && c.endpoint_paths.iter().any(|p| p == &side.endpoint)
+        })
+    };
+    let (Some(rgb), Some(ir)) = (side_candidate(&guard.rgb), side_candidate(&guard.ir)) else {
+        return Err("split guard side is not in the publication");
+    };
+    if rgb == ir {
+        return Err("split guard sides must name two distinct candidates");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const SUPER: &str = "0123456789abcdef0123456789abcdef";
+    const RGB_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const IR_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
     fn guard() -> SplitMutationGuard {
         SplitMutationGuard {
-            supervisor_id: "sup-1".into(),
+            supervisor_id: SUPER.into(),
             revision: 7,
             rgb: SplitSideGuard {
-                instance_id: "inst-rgb".into(),
+                instance_id: RGB_ID.into(),
                 generation: 1,
                 endpoint: "/dev/video0".into(),
             },
             ir: SplitSideGuard {
-                instance_id: "inst-ir".into(),
+                instance_id: IR_ID.into(),
                 generation: 2,
                 endpoint: "/dev/video1".into(),
             },
@@ -185,10 +231,10 @@ mod tests {
     fn guards_validate_and_bound() {
         assert_eq!(guard().validate(), Ok(()));
         let mut bad = guard();
-        bad.supervisor_id = String::new();
+        bad.supervisor_id = "0".repeat(32);
         assert!(bad.validate().is_err());
         let mut bad = guard();
-        bad.rgb.instance_id = String::new();
+        bad.rgb.instance_id = "0".repeat(32);
         assert!(bad.validate().is_err());
         let mut bad = guard();
         bad.ir.endpoint = String::new();
@@ -252,10 +298,68 @@ mod tests {
         );
     }
 
+    fn snapshot() -> crate::live_camera::CameraInventorySnapshot {
+        crate::live_camera::CameraInventorySnapshot {
+            state: crate::live_camera::CameraInventoryState::Current,
+            supervisor_id: Some(SUPER.into()),
+            revision: 7,
+            observed_ago_ms: Some(100),
+            reason: None,
+            candidates: vec![
+                crate::live_camera::CameraCandidate {
+                    instance_id: RGB_ID.into(),
+                    generation: 1,
+                    endpoint_paths: vec!["/dev/video0".into(), "/dev/video2".into()],
+                },
+                crate::live_camera::CameraCandidate {
+                    instance_id: IR_ID.into(),
+                    generation: 2,
+                    endpoint_paths: vec!["/dev/video1".into(), "/dev/video3".into()],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn a_valid_guard_matches_the_current_publication() {
+        assert_eq!(verify_split_guard(&guard(), &snapshot()), Ok(()));
+    }
+
+    #[test]
+    fn a_stale_revision_or_wrong_supervisor_refuses() {
+        let mut stale = snapshot();
+        stale.revision = 8;
+        assert!(verify_split_guard(&guard(), &stale).is_err());
+        let mut wrong = snapshot();
+        wrong.supervisor_id = Some("f".repeat(32));
+        assert!(verify_split_guard(&guard(), &wrong).is_err());
+        let mut refreshing = snapshot();
+        refreshing.state = crate::live_camera::CameraInventoryState::Refreshing;
+        assert!(verify_split_guard(&guard(), &refreshing).is_err());
+    }
+
+    #[test]
+    fn a_guard_side_missing_from_the_publication_refuses() {
+        let mut missing = guard();
+        missing.ir.endpoint = "/dev/video9".into();
+        assert!(verify_split_guard(&missing, &snapshot()).is_err());
+        let mut missing = guard();
+        missing.rgb.generation = 9;
+        assert!(verify_split_guard(&missing, &snapshot()).is_err());
+    }
+
+    #[test]
+    fn both_sides_must_name_distinct_candidates() {
+        let mut same = guard();
+        same.ir.instance_id = same.rgb.instance_id.clone();
+        same.ir.endpoint = "/dev/video2".into();
+        assert!(verify_split_guard(&same, &snapshot()).is_err());
+    }
+
     #[test]
     fn store_states_round_trip() {
         let view = SplitPublicationView {
-            supervisor_id: "sup-1".into(),
+            supervisor_id: SUPER.into(),
             revision: 7,
             store_state: SplitStoreState::Valid,
             records: vec![SplitRecordView {

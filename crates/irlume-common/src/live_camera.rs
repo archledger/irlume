@@ -186,7 +186,7 @@ impl CameraCandidate {
     }
 }
 
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     id.len() == 32
         && id
             .bytes()

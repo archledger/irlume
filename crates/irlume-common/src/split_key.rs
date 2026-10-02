@@ -136,7 +136,8 @@ fn percent_decode(text: &str) -> Result<String, KeyError> {
     String::from_utf8(out).map_err(|_| KeyError::BadEscape)
 }
 
-fn format_ports(ports: &[u8]) -> String {
+/// Canonical ports text: decimal elements 1..=255, dotted, no leading zeros.
+pub fn format_ports_text(ports: &[u8]) -> String {
     let mut out = String::new();
     for (i, p) in ports.iter().enumerate() {
         if i > 0 {
@@ -147,7 +148,11 @@ fn format_ports(ports: &[u8]) -> String {
     out
 }
 
-fn parse_ports(text: &str) -> Result<Vec<u8>, KeyError> {
+/// Parse canonical ports text (ADR-0032 §4.1.1).
+///
+/// # Errors
+/// [`KeyError::BadPorts`] for anything non-canonical.
+pub fn parse_ports_text(text: &str) -> Result<Vec<u8>, KeyError> {
     let mut ports = Vec::new();
     for part in text.split('.') {
         if part.is_empty()
@@ -193,7 +198,7 @@ impl SplitUnitKey {
             percent_encode(&self.identity),
             percent_encode(&self.controller),
             self.domain.as_str(),
-            format_ports(&self.ports),
+            format_ports_text(&self.ports),
         )
     }
 
@@ -213,7 +218,7 @@ impl SplitUnitKey {
             identity,
             controller,
             domain: SplitDomain::parse_canonical(fields[2])?,
-            ports: parse_ports(fields[3])?,
+            ports: parse_ports_text(fields[3])?,
         })
     }
 }

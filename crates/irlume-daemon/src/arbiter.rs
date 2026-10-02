@@ -109,7 +109,9 @@ pub fn classify(req: &Request) -> Class {
         // Served directly by its connection thread before this classification
         // is consulted; Status documents that it never belongs to the camera
         // worker if a caller reaches this seam independently.
-        | TraceSubscribe { .. } => Class::Status,
+        | TraceSubscribe { .. }
+        | ListSplitAuthorizations
+        | SplitStatus => Class::Status,
         PositionSample { .. }
         | PositionSession { .. }
         | Identify
@@ -145,6 +147,9 @@ pub fn classify(req: &Request) -> Class {
         // not a capture.
         SetCameras { .. }
         | SetCamerasIfCurrent { .. }
+        | AddSplitAuthorization { .. }
+        | RemoveSplitAuthorization { .. }
+        | SelectSplitPair { .. }
         | DeleteProfile { .. }
         | DeleteScan { .. }
         | ForgetRecognizer { .. }

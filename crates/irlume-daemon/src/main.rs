@@ -4319,6 +4319,50 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             enrollment: Reads,
             camera: NoCapture,
         },
+        // Split management (ADR-0032 §4, §6): machine configuration, no
+        // account and no capture. The listing is open to any peer at
+        // share-safe projections; status and the three mutations are
+        // root-only. The mutations rewrite machine configuration, never an
+        // enrollment, so `enrollment: Reads`: no enrollment summary is
+        // invalidated by them.
+        ListSplitAuthorizations => RequestPosture {
+            user: None,
+            privilege: AnyPeer,
+            enrollment: Reads,
+            camera: NoCapture,
+        },
+        SplitStatus => RequestPosture {
+            user: None,
+            privilege: RootOnly {
+                command: "split_status",
+            },
+            enrollment: Reads,
+            camera: NoCapture,
+        },
+        AddSplitAuthorization { .. } => RequestPosture {
+            user: None,
+            privilege: RootOnly {
+                command: "split_add",
+            },
+            enrollment: Reads,
+            camera: NoCapture,
+        },
+        RemoveSplitAuthorization { .. } => RequestPosture {
+            user: None,
+            privilege: RootOnly {
+                command: "split_remove",
+            },
+            enrollment: Reads,
+            camera: NoCapture,
+        },
+        SelectSplitPair { .. } => RequestPosture {
+            user: None,
+            privilege: RootOnly {
+                command: "split_select",
+            },
+            enrollment: Reads,
+            camera: NoCapture,
+        },
         HasSealedPassword { user }
         | KeyringMetadata { user }
         | KeyringInfo { user }
@@ -6561,7 +6605,12 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | RecoveryStatus { .. }
         | RecoveryForget { .. }
         | RetryStatus { .. }
-        | RetryReset { .. } => OperationClass::Status,
+        | RetryReset { .. }
+        | ListSplitAuthorizations
+        | SplitStatus
+        | AddSplitAuthorization { .. }
+        | RemoveSplitAuthorization { .. }
+        | SelectSplitPair { .. } => OperationClass::Status,
     }
 }
 
@@ -6816,6 +6865,338 @@ fn set_cameras_if_current(
         );
     }
     set_camera_devices(rgb, ir, engine)
+}
+
+/// The split store's records and selection a mutation builds on: `Some` with
+/// empty records when nothing is referenced yet (the first add starts the
+/// collection), `None` when the store is in a state a mutation must not
+/// build on (ADR-0032 §4.1.2).
+fn split_store_base() -> Option<(
+    Vec<irlume_common::split_schema::AuthorizationRecord>,
+    Option<irlume_common::split_key::SplitPairKey>,
+)> {
+    use irlume_common::split_publish::SplitReadState;
+    match irlume_common::split_publish::read_split() {
+        SplitReadState::Valid {
+            records, selected, ..
+        } => Some((records, selected)),
+        SplitReadState::Absent => Some((Vec::new(), None)),
+        _ => None,
+    }
+}
+
+/// Map the wire's root-only side facts to the store's record fields.
+///
+/// # Errors
+/// A static reason when the domain text is not canonical.
+fn split_side_fields(
+    facts: &irlume_common::split_wire::SplitSideFacts,
+) -> Result<irlume_common::split_schema::SideFields, &'static str> {
+    Ok(irlume_common::split_schema::SideFields {
+        identity: facts.identity.clone(),
+        path: facts.path.clone(),
+        controller: facts.controller.clone(),
+        domain: irlume_common::split_key::SplitDomain::parse_canonical(&facts.domain)
+            .map_err(|_| "unrecognized split domain text")?,
+        ports: facts.ports.clone(),
+    })
+}
+
+/// One mutation side against one publication (ADR-0032 §4): the guard names
+/// the displayed instance, generation and endpoint, and the record's facts
+/// must equal what that publication recorded for it (identity, location and
+/// role). The endpoint is the record's path.
+fn split_side_matches(
+    facts: &irlume_common::split_wire::SplitSideFacts,
+    guard_side: &irlume_common::split_wire::SplitSideGuard,
+    role: irlume_auth::CameraRole,
+    classified: &[irlume_auth::ClassifiedEndpoint],
+) -> Result<(), &'static str> {
+    let found = classified
+        .iter()
+        .find(|e| {
+            e.instance_id == guard_side.instance_id
+                && e.generation == guard_side.generation
+                && e.endpoint == guard_side.endpoint
+        })
+        .ok_or("a guard side is not in the current publication")?;
+    if found.role != role {
+        return Err("a guard side's classified role does not match its record's role");
+    }
+    if facts.path != guard_side.endpoint
+        || facts.identity != found.identity
+        || facts.controller != found.controller
+        || facts.domain != found.domain
+        || facts.ports != found.ports
+    {
+        return Err("the record's facts do not match the current publication");
+    }
+    Ok(())
+}
+
+/// Add or replace one authorization (ADR-0032 §4). The guard, and both
+/// sides' identities, locations and roles, come from one publication; any
+/// mismatch refuses without changing authorization or selection.
+fn split_add_response(
+    guard: &irlume_common::split_wire::SplitMutationGuard,
+    rgb: &irlume_common::split_wire::SplitSideFacts,
+    ir: &irlume_common::split_wire::SplitSideFacts,
+    publication: &(
+        irlume_common::live_camera::CameraInventorySnapshot,
+        Vec<irlume_auth::ClassifiedEndpoint>,
+    ),
+) -> Response {
+    let (snapshot, classified) = publication;
+    if let Err(why) = irlume_common::split_wire::verify_split_guard(guard, snapshot) {
+        return Response::Error(format!("split mutation refused: {why}"));
+    }
+    if let Err(why) = split_side_matches(rgb, &guard.rgb, irlume_auth::CameraRole::Rgb, classified)
+    {
+        return Response::Error(format!("split mutation refused: {why}"));
+    }
+    if let Err(why) = split_side_matches(ir, &guard.ir, irlume_auth::CameraRole::Ir, classified) {
+        return Response::Error(format!("split mutation refused: {why}"));
+    }
+    let Some((mut records, selected)) = split_store_base() else {
+        return Response::Error(
+            "the split store is in a state that refuses configuration changes".into(),
+        );
+    };
+    let (Ok(rgb_fields), Ok(ir_fields)) = (split_side_fields(rgb), split_side_fields(ir)) else {
+        return Response::Error("split mutation refused: a record field is not canonical".into());
+    };
+    let record = irlume_common::split_schema::AuthorizationRecord {
+        rgb: rgb_fields,
+        ir: ir_fields,
+    };
+    match records
+        .iter()
+        .position(|r| r.pair_key() == record.pair_key())
+    {
+        Some(index) => records[index] = record,
+        None => records.push(record),
+    }
+    let kept = selected.filter(|key| records.iter().any(|r| r.pair_key() == *key));
+    match irlume_common::split_publish::publish_split(&records, kept.as_ref()) {
+        Ok(published) => Response::Ok(format!(
+            "split authorization published as generation {}",
+            published.generation
+        )),
+        Err(e) => Response::Error(format!("split publication refused: {e:?}")),
+    }
+}
+
+/// Remove the authorization named by `pair` (ADR-0032 §4, §4.1.4). No
+/// publication guard: removal needs no connected cameras and never
+/// authorizes a replacement. Removing the selected pair drops the selection.
+fn split_remove_response(pair_text: &str) -> Response {
+    let Ok(key) = irlume_common::split_key::SplitPairKey::parse_canonical(pair_text) else {
+        return Response::Error("split removal refused: not canonical pair key text".into());
+    };
+    let Some((mut records, selected)) = split_store_base() else {
+        return Response::Error(
+            "the split store is in a state that refuses configuration changes".into(),
+        );
+    };
+    let before = records.len();
+    records.retain(|record| record.pair_key() != key);
+    if records.len() == before {
+        return Response::Error("split removal refused: no such authorization".into());
+    }
+    let kept = selected.filter(|k| *k != key && records.iter().any(|r| r.pair_key() == *k));
+    match irlume_common::split_publish::publish_split(&records, kept.as_ref()) {
+        Ok(published) => Response::Ok(format!(
+            "split authorization removed; generation {} published",
+            published.generation
+        )),
+        Err(e) => Response::Error(format!("split publication refused: {e:?}")),
+    }
+}
+
+/// Select the pair named by `pair`, or with empty text clear the selection
+/// (ADR-0032 §4). The guard names the pair's displayed sides and must match
+/// the same publication the selection is validated against.
+fn split_select_response(
+    guard: &irlume_common::split_wire::SplitMutationGuard,
+    pair_text: &str,
+    publication: &(
+        irlume_common::live_camera::CameraInventorySnapshot,
+        Vec<irlume_auth::ClassifiedEndpoint>,
+    ),
+) -> Response {
+    let (snapshot, classified) = publication;
+    if let Err(why) = irlume_common::split_wire::verify_split_guard(guard, snapshot) {
+        return Response::Error(format!("split selection refused: {why}"));
+    }
+    let Some((records, _)) = split_store_base() else {
+        return Response::Error(
+            "the split store is in a state that refuses configuration changes".into(),
+        );
+    };
+    let selected = if pair_text.is_empty() {
+        None
+    } else {
+        let Ok(key) = irlume_common::split_key::SplitPairKey::parse_canonical(pair_text) else {
+            return Response::Error("split selection refused: not canonical pair key text".into());
+        };
+        let Some(record) = records.iter().find(|r| r.pair_key() == key) else {
+            return Response::Error("split selection refused: no such authorization".into());
+        };
+        // Selecting names both sides of the record; their facts must still
+        // hold at the guarded publication (§4).
+        let rgb_facts = irlume_common::split_wire::SplitSideFacts {
+            identity: record.rgb.identity.clone(),
+            path: record.rgb.path.clone(),
+            controller: record.rgb.controller.clone(),
+            domain: record.rgb.domain.as_str().to_owned(),
+            ports: record.rgb.ports.clone(),
+        };
+        let ir_facts = irlume_common::split_wire::SplitSideFacts {
+            identity: record.ir.identity.clone(),
+            path: record.ir.path.clone(),
+            controller: record.ir.controller.clone(),
+            domain: record.ir.domain.as_str().to_owned(),
+            ports: record.ir.ports.clone(),
+        };
+        if let Err(why) = split_side_matches(
+            &rgb_facts,
+            &guard.rgb,
+            irlume_auth::CameraRole::Rgb,
+            classified,
+        ) {
+            return Response::Error(format!("split selection refused: {why}"));
+        }
+        if let Err(why) = split_side_matches(
+            &ir_facts,
+            &guard.ir,
+            irlume_auth::CameraRole::Ir,
+            classified,
+        ) {
+            return Response::Error(format!("split selection refused: {why}"));
+        }
+        Some(key)
+    };
+    match irlume_common::split_publish::publish_split(&records, selected.as_ref()) {
+        Ok(published) => Response::Ok(format!(
+            "split selection published as generation {}",
+            published.generation
+        )),
+        Err(e) => Response::Error(format!("split publication refused: {e:?}")),
+    }
+}
+
+/// The opt-in listing (ADR-0032 §6): root receives full facts, non-root
+/// share-safe projections only.
+fn split_list_response(
+    peer_uid: u32,
+    publication: &(
+        irlume_common::live_camera::CameraInventorySnapshot,
+        Vec<irlume_auth::ClassifiedEndpoint>,
+    ),
+) -> Response {
+    use irlume_common::split_publish::SplitReadState;
+    use irlume_common::split_wire::{
+        SplitPublicationView, SplitRecordSide, SplitRecordView, SplitSelectionView, SplitSideFacts,
+        SplitSideProjection, SplitStoreState,
+    };
+    let (snapshot, _) = publication;
+    let (store_state, records, selected, resolves) =
+        match irlume_common::split_publish::read_split() {
+            SplitReadState::Valid {
+                records, selected, ..
+            } => (SplitStoreState::Valid, records, selected, true),
+            SplitReadState::Absent => (SplitStoreState::Absent, Vec::new(), None, true),
+            SplitReadState::Unreadable => (SplitStoreState::Unreadable, Vec::new(), None, false),
+            SplitReadState::Malformed => (SplitStoreState::Malformed, Vec::new(), None, false),
+            SplitReadState::DigestMismatch => {
+                (SplitStoreState::DigestMismatch, Vec::new(), None, false)
+            }
+        };
+    let root = peer_uid == 0;
+    let side_view = |side: &irlume_common::split_schema::SideFields| {
+        if root {
+            SplitRecordSide::Root(SplitSideFacts {
+                identity: side.identity.clone(),
+                path: side.path.clone(),
+                controller: side.controller.clone(),
+                domain: side.domain.as_str().to_owned(),
+                ports: side.ports.clone(),
+            })
+        } else {
+            SplitRecordSide::ShareSafe(SplitSideProjection {
+                controller_label: side.controller.clone(),
+                domain_label: side.domain.as_str().to_owned(),
+                ports: side.ports.clone(),
+            })
+        }
+    };
+    let selected_view = selected.as_ref().map(|key| {
+        if root {
+            SplitSelectionView::Root {
+                key: key.format_canonical().unwrap_or_default(),
+                resolves,
+            }
+        } else {
+            SplitSelectionView::ShareSafe { resolves }
+        }
+    });
+    Response::SplitInventory(SplitPublicationView {
+        supervisor_id: snapshot.supervisor_id.clone().unwrap_or_default(),
+        revision: snapshot.revision,
+        store_state,
+        records: records
+            .iter()
+            .map(|record| SplitRecordView {
+                rgb: side_view(&record.rgb),
+                ir: side_view(&record.ir),
+            })
+            .collect(),
+        selected: selected_view,
+    })
+}
+
+/// Split store status (ADR-0032 §4.1.7). Root-only at the posture table.
+fn split_status_response() -> Response {
+    use irlume_common::split_publish::SplitReadState;
+    use irlume_common::split_wire::SplitStoreState;
+    match irlume_common::split_publish::read_split() {
+        SplitReadState::Valid {
+            generation,
+            records,
+            selected,
+        } => Response::SplitStatusView {
+            state: SplitStoreState::Valid,
+            record_count: records.len(),
+            generation: Some(generation),
+            selection_resolves: selected
+                .as_ref()
+                .is_some_and(|key| records.iter().any(|r| r.pair_key() == *key)),
+        },
+        SplitReadState::Absent => Response::SplitStatusView {
+            state: SplitStoreState::Absent,
+            record_count: 0,
+            generation: None,
+            selection_resolves: false,
+        },
+        SplitReadState::Unreadable => Response::SplitStatusView {
+            state: SplitStoreState::Unreadable,
+            record_count: 0,
+            generation: None,
+            selection_resolves: false,
+        },
+        SplitReadState::Malformed => Response::SplitStatusView {
+            state: SplitStoreState::Malformed,
+            record_count: 0,
+            generation: None,
+            selection_resolves: false,
+        },
+        SplitReadState::DigestMismatch => Response::SplitStatusView {
+            state: SplitStoreState::DigestMismatch,
+            record_count: 0,
+            generation: None,
+            selection_resolves: false,
+        },
+    }
 }
 
 /// What the attempt record needs from a request before it is served
@@ -7799,6 +8180,20 @@ fn dispatch_scoped_session_inner(
             engine,
         ),
         Request::SetCameras { rgb, ir } => set_camera_devices(&rgb, &ir, engine),
+        Request::ListSplitAuthorizations => {
+            split_list_response(peer.uid, &irlume_auth::camera_inventory_publication())
+        }
+        Request::SplitStatus => split_status_response(),
+        Request::AddSplitAuthorization { guard, rgb, ir } => split_add_response(
+            &guard,
+            &rgb,
+            &ir,
+            &irlume_auth::camera_inventory_publication(),
+        ),
+        Request::RemoveSplitAuthorization { pair } => split_remove_response(&pair),
+        Request::SelectSplitPair { guard, pair } => {
+            split_select_response(&guard, &pair, &irlume_auth::camera_inventory_publication())
+        }
         Request::Enroll {
             user,
             profile,
@@ -11796,6 +12191,58 @@ mod tests {
         RecoveryForget => Request::RecoveryForget { user: u() },
         RetryStatus => Request::RetryStatus { user: u() },
         RetryReset => Request::RetryReset { user: u(), password: secret() },
+        ListSplitAuthorizations => Request::ListSplitAuthorizations,
+        SplitStatus => Request::SplitStatus,
+        AddSplitAuthorization => Request::AddSplitAuthorization {
+            guard: Box::new(irlume_common::split_wire::SplitMutationGuard {
+                supervisor_id: "0123456789abcdef0123456789abcdef".into(),
+                revision: 1,
+                rgb: irlume_common::split_wire::SplitSideGuard {
+                    instance_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    generation: 1,
+                    endpoint: "/dev/video0".into(),
+                },
+                ir: irlume_common::split_wire::SplitSideGuard {
+                    instance_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                    generation: 2,
+                    endpoint: "/dev/video1".into(),
+                },
+            }),
+            rgb: Box::new(irlume_common::split_wire::SplitSideFacts {
+                identity: "5986:2113:s1".into(),
+                path: "/dev/video0".into(),
+                controller: "0000:00:14.0".into(),
+                domain: "usb2".into(),
+                ports: vec![8],
+            }),
+            ir: Box::new(irlume_common::split_wire::SplitSideFacts {
+                identity: "5986:1141:s2".into(),
+                path: "/dev/video1".into(),
+                controller: "0000:00:14.0".into(),
+                domain: "usb2".into(),
+                ports: vec![5],
+            }),
+        },
+        RemoveSplitAuthorization => Request::RemoveSplitAuthorization {
+            pair: "split1;x|c|usb2|8;y|c|usb2|5".into(),
+        },
+        SelectSplitPair => Request::SelectSplitPair {
+            guard: Box::new(irlume_common::split_wire::SplitMutationGuard {
+                supervisor_id: "0123456789abcdef0123456789abcdef".into(),
+                revision: 1,
+                rgb: irlume_common::split_wire::SplitSideGuard {
+                    instance_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    generation: 1,
+                    endpoint: "/dev/video0".into(),
+                },
+                ir: irlume_common::split_wire::SplitSideGuard {
+                    instance_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                    generation: 2,
+                    endpoint: "/dev/video1".into(),
+                },
+            }),
+            pair: "split1;x|c|usb2|8;y|c|usb2|5".into(),
+        },
     }
 
     /// Second shapes of variants the catalog already covers, where the posture
@@ -24533,5 +24980,276 @@ mod tests {
             }
             other => panic!("expected a cache hit, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod split_management_tests {
+    //! The split mutation boundary of ADR-0032 §4: the guard and both sides'
+    //! identities, locations and roles come from one publication, any
+    //! mismatch refuses without changing authorization or selection, and
+    //! removal needs no connected cameras.
+    use super::*;
+    use irlume_common::live_camera::{CameraCandidate, CameraInventoryState};
+    use irlume_common::split_wire::{
+        SplitMutationGuard, SplitSideFacts, SplitSideGuard, SplitStoreState,
+    };
+
+    const SUPER: &str = "0123456789abcdef0123456789abcdef";
+    const RGB_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const IR_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    struct Env {
+        _g: std::sync::RwLockWriteGuard<'static, ()>,
+        dir: std::path::PathBuf,
+    }
+
+    fn env() -> Env {
+        let g = crate::test_support::env_write();
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-split-mgmt-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        Env { _g: g, dir }
+    }
+
+    impl Drop for Env {
+        fn drop(&mut self) {
+            std::env::remove_var("IRLUME_CONFIG_DIR");
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn publication() -> (
+        irlume_common::live_camera::CameraInventorySnapshot,
+        Vec<irlume_auth::ClassifiedEndpoint>,
+    ) {
+        (
+            irlume_common::live_camera::CameraInventorySnapshot {
+                state: CameraInventoryState::Current,
+                supervisor_id: Some(SUPER.into()),
+                revision: 7,
+                observed_ago_ms: Some(100),
+                reason: None,
+                candidates: vec![
+                    CameraCandidate {
+                        instance_id: RGB_ID.into(),
+                        generation: 1,
+                        endpoint_paths: vec!["/dev/video0".into()],
+                    },
+                    CameraCandidate {
+                        instance_id: IR_ID.into(),
+                        generation: 2,
+                        endpoint_paths: vec!["/dev/video1".into()],
+                    },
+                ],
+            },
+            vec![
+                irlume_auth::ClassifiedEndpoint {
+                    instance_id: RGB_ID.into(),
+                    generation: 1,
+                    endpoint: "/dev/video0".into(),
+                    role: irlume_auth::CameraRole::Rgb,
+                    identity: "5986:2113:s1".into(),
+                    controller: "0000:00:14.0".into(),
+                    domain: "usb2".into(),
+                    ports: vec![8],
+                },
+                irlume_auth::ClassifiedEndpoint {
+                    instance_id: IR_ID.into(),
+                    generation: 2,
+                    endpoint: "/dev/video1".into(),
+                    role: irlume_auth::CameraRole::Ir,
+                    identity: "5986:1141:s2".into(),
+                    controller: "0000:00:14.0".into(),
+                    domain: "usb2".into(),
+                    ports: vec![5],
+                },
+            ],
+        )
+    }
+
+    fn guard() -> SplitMutationGuard {
+        SplitMutationGuard {
+            supervisor_id: SUPER.into(),
+            revision: 7,
+            rgb: SplitSideGuard {
+                instance_id: RGB_ID.into(),
+                generation: 1,
+                endpoint: "/dev/video0".into(),
+            },
+            ir: SplitSideGuard {
+                instance_id: IR_ID.into(),
+                generation: 2,
+                endpoint: "/dev/video1".into(),
+            },
+        }
+    }
+
+    fn rgb_facts() -> SplitSideFacts {
+        SplitSideFacts {
+            identity: "5986:2113:s1".into(),
+            path: "/dev/video0".into(),
+            controller: "0000:00:14.0".into(),
+            domain: "usb2".into(),
+            ports: vec![8],
+        }
+    }
+
+    fn ir_facts() -> SplitSideFacts {
+        SplitSideFacts {
+            identity: "5986:1141:s2".into(),
+            path: "/dev/video1".into(),
+            controller: "0000:00:14.0".into(),
+            domain: "usb2".into(),
+            ports: vec![5],
+        }
+    }
+
+    fn pair_text() -> String {
+        irlume_common::split_key::SplitPairKey {
+            rgb: irlume_common::split_key::SplitUnitKey {
+                identity: "5986:2113:s1".into(),
+                controller: "0000:00:14.0".into(),
+                domain: irlume_common::split_key::SplitDomain::Usb2,
+                ports: vec![8],
+            },
+            ir: irlume_common::split_key::SplitUnitKey {
+                identity: "5986:1141:s2".into(),
+                controller: "0000:00:14.0".into(),
+                domain: irlume_common::split_key::SplitDomain::Usb2,
+                ports: vec![5],
+            },
+        }
+        .format_canonical()
+        .unwrap()
+    }
+
+    #[test]
+    fn add_and_select_round_trip_with_a_current_guard() {
+        let env = env();
+        let pubn = publication();
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &pubn),
+            Response::Ok(_)
+        ));
+        assert!(matches!(
+            split_select_response(&guard(), &pair_text(), &pubn),
+            Response::Ok(_)
+        ));
+        match irlume_common::split_publish::read_split() {
+            irlume_common::split_publish::SplitReadState::Valid {
+                records, selected, ..
+            } => {
+                assert_eq!(records.len(), 1);
+                assert!(selected.is_some());
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+        drop(env);
+    }
+
+    #[test]
+    fn a_mismatched_guard_changes_nothing() {
+        let env = env();
+        let pubn = publication();
+        let mut stale = guard();
+        stale.revision = 8;
+        assert!(matches!(
+            split_add_response(&stale, &rgb_facts(), &ir_facts(), &pubn),
+            Response::Error(_)
+        ));
+        let mut wrong_side = guard();
+        wrong_side.rgb.generation = 9;
+        assert!(matches!(
+            split_add_response(&wrong_side, &rgb_facts(), &ir_facts(), &pubn),
+            Response::Error(_)
+        ));
+        // A role or fact that does not match the publication refuses too.
+        let mut wrong_role_facts = rgb_facts();
+        wrong_role_facts.identity = "5986:2113:other".into();
+        assert!(matches!(
+            split_add_response(&guard(), &wrong_role_facts, &ir_facts(), &pubn),
+            Response::Error(_)
+        ));
+        assert_eq!(
+            irlume_common::split_publish::read_split(),
+            irlume_common::split_publish::SplitReadState::Absent,
+            "a refused mutation changes no authorization or selection"
+        );
+        drop(env);
+    }
+
+    #[test]
+    fn removal_works_with_cameras_disconnected() {
+        let env = env();
+        let pubn = publication();
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &pubn),
+            Response::Ok(_)
+        ));
+        // No publication at all: removal carries no guard (ADR-0032 §4).
+        assert!(matches!(
+            split_remove_response(&pair_text()),
+            Response::Ok(_)
+        ));
+        assert_eq!(
+            irlume_common::split_publish::read_split(),
+            irlume_common::split_publish::SplitReadState::Absent
+        );
+        assert!(matches!(
+            split_remove_response(&pair_text()),
+            Response::Error(_)
+        ));
+        drop(env);
+    }
+
+    #[test]
+    fn status_reports_state_count_generation_and_resolution() {
+        let env = env();
+        let pubn = publication();
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &pubn),
+            Response::Ok(_)
+        ));
+        let Response::SplitStatusView {
+            state,
+            record_count,
+            generation,
+            selection_resolves,
+        } = split_status_response()
+        else {
+            panic!("expected a status view");
+        };
+        assert_eq!(state, SplitStoreState::Valid);
+        assert_eq!(record_count, 1);
+        assert_eq!(generation, Some(1));
+        assert!(!selection_resolves, "nothing is selected yet");
+        drop(env);
+    }
+
+    #[test]
+    fn non_root_listing_carries_only_share_safe_facts() {
+        let env = env();
+        let pubn = publication();
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &pubn),
+            Response::Ok(_)
+        ));
+        let non_root = serde_json::to_string(&split_list_response(1000, &pubn)).unwrap();
+        for forbidden in ["5986:2113", "5986:1141", "/dev/video", "split1;"] {
+            assert!(
+                !non_root.contains(forbidden),
+                "non-root listing leaked {forbidden}"
+            );
+        }
+        let root = serde_json::to_string(&split_list_response(0, &pubn)).unwrap();
+        assert!(root.contains("5986:2113"), "root listing carries the facts");
+        assert!(root.contains("/dev/video0"));
+        drop(env);
     }
 }

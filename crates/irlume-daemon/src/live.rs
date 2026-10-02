@@ -537,7 +537,12 @@ pub(crate) fn request_kind(req: &Request) -> Option<(LiveOperationKind, bool)> {
         // would make every client drop all of its daemon observations.
         Identify | IdentifyFor { .. } => (K::Identification, false),
         ListCameras => (K::CameraEnumeration, false),
-        SetCameras { .. } | SetCamerasIfCurrent { .. } => (K::CameraSetup, true),
+        SetCameras { .. }
+        | SetCamerasIfCurrent { .. }
+        | AddSplitAuthorization { .. }
+        | RemoveSplitAuthorization { .. }
+        | SelectSplitPair { .. } => (K::CameraSetup, true),
+        ListSplitAuthorizations | SplitStatus => return None,
         SetupIrEmitter { dry_run } => (K::CameraSetup, !dry_run),
         TuneCaptureMode { .. } => (K::CaptureQualification, true),
         CaptureModeStatus | CameraDiagnostics | SelfTest { .. } | SupportProbe { .. } => {

@@ -107,7 +107,12 @@ fn approval_operation(req: &Request) -> Option<(&'static str, &'static str)> {
         | Request::RecoveryRestore { .. }
         | Request::RecoveryStatus { .. }
         | Request::RetryStatus { .. }
-        | Request::RetryReset { .. } => return None,
+        | Request::RetryReset { .. }
+        | Request::ListSplitAuthorizations
+        | Request::SplitStatus
+        | Request::AddSplitAuthorization { .. }
+        | Request::RemoveSplitAuthorization { .. }
+        | Request::SelectSplitPair { .. } => return None,
     })
 }
 

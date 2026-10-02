@@ -994,11 +994,9 @@ pub enum Request {
         ir: Box<crate::split_wire::SplitSideFacts>,
     },
     /// Remove the authorization whose pair key is `pair`. PRIVILEGED: root.
-    /// Removal needs no connected cameras and never authorizes a replacement.
-    RemoveSplitAuthorization {
-        guard: Box<crate::split_wire::SplitMutationGuard>,
-        pair: String,
-    },
+    /// Removal carries no publication guard: it needs no connected cameras
+    /// and never authorizes a replacement (ADR-0032 §4).
+    RemoveSplitAuthorization { pair: String },
     /// Select the split pair named by `pair` (canonical key text), or with an
     /// empty `pair` clear the selection. PRIVILEGED: root.
     SelectSplitPair {

@@ -294,6 +294,19 @@ pub struct ClassifiedEndpoint {
     pub endpoint: String,
     /// The role discovery answered.
     pub role: crate::Role,
+    /// The binding identity (`vid:pid[:serial]`), empty when the device
+    /// carries no descriptors and can never be a pin side.
+    pub identity: String,
+    /// The controller identity (PCI address) of the publication-captured
+    /// location; the endpoint is omitted from this view entirely when no
+    /// location was captured (ADR-0032 §2: a missing component is never a
+    /// wildcard).
+    pub controller: String,
+    /// The root-hub domain in the schema's canonical text (`usb2` or
+    /// `superspeed`).
+    pub domain: String,
+    /// The relative port chain of the captured location.
+    pub ports: Vec<u8>,
 }
 
 /// Process-scoped physical-camera lifecycle state.
@@ -459,16 +472,58 @@ impl CameraInventory {
     /// closed `CameraInventorySnapshot` stays role-free (ADR-0032 §6):
     /// this is the only role-bearing view, and it never opens a node.
     pub(crate) fn classified_endpoints(&self) -> Vec<ClassifiedEndpoint> {
-        self.roles
-            .iter()
-            .filter(|(key, _)| key.supervisor_id == self.supervisor_id)
-            .map(|(key, role)| ClassifiedEndpoint {
-                instance_id: key.instance_id.as_str().to_owned(),
-                generation: key.generation.get(),
-                endpoint: key.endpoint.clone(),
-                role: *role,
-            })
-            .collect()
+        if self.publication_state == CameraInventoryState::Uninitialized {
+            return Vec::new();
+        }
+        let domain_text = |domain: crate::RootHubDomain| match domain {
+            crate::RootHubDomain::Usb2 => "usb2",
+            crate::RootHubDomain::SuperSpeed => "superspeed",
+        };
+        let mut out = Vec::new();
+        for entry in self.published_entries() {
+            let instance_id = entry.descriptor.camera_instance_id();
+            let generation = entry.descriptor.generation();
+            let identity = entry
+                .observation
+                .usb_device
+                .as_ref()
+                .map(|usb| {
+                    crate::binding_identity(usb.vid_pid(), entry.observation.physical_id.serial())
+                })
+                .unwrap_or_default();
+            // A publication-captured location only; a missing one is never
+            // refreshed here and never a wildcard (ADR-0032 §2).
+            let Some(location) =
+                crate::usb_controller_location(entry.observation.physical_id.topology_path())
+            else {
+                continue;
+            };
+            for endpoint in &entry.observation.endpoint_paths {
+                let Some(role) = self
+                    .roles
+                    .get(&RoleKey {
+                        supervisor_id: self.supervisor_id.clone(),
+                        instance_id: instance_id.clone(),
+                        generation,
+                        endpoint: endpoint.clone(),
+                    })
+                    .copied()
+                else {
+                    continue;
+                };
+                out.push(ClassifiedEndpoint {
+                    instance_id: instance_id.as_str().to_owned(),
+                    generation: generation.get(),
+                    endpoint: endpoint.clone(),
+                    role,
+                    identity: identity.clone(),
+                    controller: location.controller.clone(),
+                    domain: domain_text(location.domain).to_owned(),
+                    ports: location.ports.clone(),
+                });
+            }
+        }
+        out
     }
 
     pub(crate) fn endpoint_generations(&self) -> BTreeMap<String, EndpointGeneration> {

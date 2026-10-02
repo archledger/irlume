@@ -45,6 +45,24 @@ pub struct AuthorizationRecord {
     pub ir: SideFields,
 }
 
+impl AuthorizationRecord {
+    /// This record's canonical pair key (identity, controller, domain and
+    /// ports per side; node paths are not part of the key).
+    #[must_use]
+    pub fn pair_key(&self) -> crate::split_key::SplitPairKey {
+        let unit = |side: &SideFields| crate::split_key::SplitUnitKey {
+            identity: side.identity.clone(),
+            controller: side.controller.clone(),
+            domain: side.domain,
+            ports: side.ports.clone(),
+        };
+        crate::split_key::SplitPairKey {
+            rgb: unit(&self.rgb),
+            ir: unit(&self.ir),
+        }
+    }
+}
+
 /// Why a generation could not be written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SchemaError {

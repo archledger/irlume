@@ -4590,13 +4590,6 @@ fn is_pci_address(component: &str) -> bool {
 /// `0003` a SuperSpeed hub, and anything else fails closed. A path with no
 /// `usbN`, a path ending at a hub, a non-PCI parent, a malformed port list,
 /// or an unreadable or unrecognized hub product all yield `None`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "ADR-0032 step 3 will capture passive location observations"
-    )
-)]
 pub(crate) fn usb_controller_location(usb_devpath: &str) -> Option<UsbLocation> {
     let components: Vec<&str> = std::path::Path::new(usb_devpath)
         .components()

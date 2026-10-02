@@ -377,6 +377,55 @@ const VENDOR: &str =
     "#%PAM-1.0\n@include common-auth\naccount required pam_unix.so\n@include common-session\n";
 const RESTRICTED_VENDOR: &str = "#%PAM-1.0\n@include common-auth\naccount required pam_unix.so\naccount requisite pam_access.so accessfile=/fixture/allow\n@include common-session\n";
 
+#[test]
+fn adoption_repairs_a_legacy_remote_stack_after_its_only_module_was_stripped() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bed = Bed::new("adopt-no-reseal", false);
+    std::fs::write(
+        bed.root.join("pam/lightdm"),
+        "#%PAM-1.0\nauth sufficient pam_irlume.so\n@include common-auth\naccount required pam_unix.so\n@include common-session\n",
+    ).unwrap();
+    bed.caps_available.store(true, Ordering::Relaxed);
+    let tools = ["semodule", "systemctl", "restorecon"];
+    for tool in tools {
+        let path = bed.root.join("bin").join(tool);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = bed.run_args(&["login", "reconcile"], &tools);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_reseal_only(&bed.stack());
+    assert!(!bed.requested_before_strip.load(Ordering::Relaxed));
+}
+
+#[test]
+fn linked_password_or_reseal_only_stacks_do_not_block_capability_observation() {
+    for (tag, content) in [
+        ("password-only", "auth required pam_unix.so\nsession required pam_unix.so\n"),
+        ("reseal-only", "auth required pam_unix.so\nauth optional pam_irlume.so reseal\nsession optional pam_irlume.so reseal\n"),
+    ] {
+        for symlink in [false, true] {
+            let bed = Bed::new(&format!("{tag}-{symlink}"), true);
+            let path = bed.root.join("pam/lightdm");
+            let original = bed.root.join("pam/original");
+            std::fs::write(&original, content).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            if symlink {
+                std::os::unix::fs::symlink("original", &path).unwrap();
+            } else {
+                std::fs::hard_link(&original, &path).unwrap();
+            }
+            let output = bed.run();
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains("cannot assess PAM repair until daemon capabilities are established"), "{error}");
+            assert!(!error.contains("cannot remove LightDM authentication authority"), "{error}");
+            assert_eq!(bed.stack(), content);
+            assert_eq!(std::fs::read_to_string(original).unwrap(), content);
+        }
+    }
+}
+
 fn assert_tracked_vendor(stack: &str, vendor: &str) {
     use sha2::{Digest as _, Sha256};
     let digest: String = Sha256::digest(vendor.as_bytes())

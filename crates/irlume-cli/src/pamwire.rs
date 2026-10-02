@@ -501,11 +501,10 @@ fn reconcile() -> ExitCode {
         let maintained = maintain_overrides();
         // Package upgrades start this run, so the face lines of a LightDM
         // that serves remote login screens come out here, not on a later one.
-        let code = if remote_seat_change().is_some() {
-            reconcile_wiring(with_sudo, with_polkit, with_lock, false)
-        } else {
-            ExitCode::SUCCESS
-        };
+        // Safety removal can erase the last module before the remote-seat
+        // classifier runs. Still perform normal regression detection so a
+        // legacy adopted stack receives its reseal-only recipe when possible.
+        let code = reconcile_wiring(with_sudo, with_polkit, with_lock, false);
         return if maintained { code } else { ExitCode::FAILURE };
     };
     // The marker records what `login enable` wired, and it can drift: a real
@@ -590,13 +589,18 @@ fn prepare_reconcile() -> bool {
 /// from included stacks; the reseal hand-off and password path stay in place.
 fn strip_remote_auth(etc: &str) -> Result<bool, String> {
     let path = Path::new(etc);
-    inspect_target(path)?;
-    let Some(current) = read_optional(path)? else {
-        return Ok(false);
+    let current = match token::read_stack_file(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("{etc}: {error}")),
     };
     if !current.lines().any(irlume_auth_rule_beyond_reseal) {
         return Ok(false);
     }
+    // Linked password/reseal-only stacks need no write and must not prevent
+    // unrelated repairs. Validate replacement authority only after the bounded
+    // pinned read establishes that an authentication rule needs removal.
+    inspect_target(path)?;
     if effective_uid() != 0 {
         return Err("safety removal needs root; run: sudo irlume login reconcile".into());
     }

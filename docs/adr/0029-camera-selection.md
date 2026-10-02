@@ -188,6 +188,26 @@ requirement to updates that both authorize and select a split pair.
    before reporting success. `forbid_external_cameras` filters candidates
    in both modes.
 
+   Amended by [ADR-0032](0032-cross-device-pairing-by-administrator-pin.md)
+   (2026-10-02): `cameras.conf` gains three optional split-selection
+   keys, all or none. `split_pair` carries the canonical text of the
+   selected split pair key (ADR-0032 §4.1); `split_generation` names the
+   decimal authorization generation in use; `split_digest` carries
+   `sha256:` plus 64 lowercase hex digits over that generation file's
+   bytes. Any subset of the three, a malformed value, or a `split_pair`
+   missing from the referenced generation makes split selection
+   Malformed, without touching the ordinary pin: `read_camera_pin` and
+   its four keys are unchanged. In `pinned` mode a valid split reference
+   selects that authorized pair, with no fallback to the ordinary pin or
+   another pair when it cannot resolve; without one the ordinary
+   four-key pin keeps its existing meaning. In `automatic` mode a
+   retained pin does not override account-scoped selection, and adding
+   an authorization neither selects nor enrolls it; split-aware
+   automatic selection is ADR-0032 step 5. Environment selection keeps
+   its precedence and cannot authorize a cross-device relationship. The
+   known-key list grows by these three keys; anything else unknown stays
+   an ignored line.
+
 7. **Names, identities and roles on the wire, display only.**
    `CameraPairInfo` gains optional `name` (sysfs node name, then USB
    `product`, control characters removed), `identity` (the full binding

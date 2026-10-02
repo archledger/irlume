@@ -205,6 +205,202 @@ pin remains compatible when split configuration is absent. New split
 management requests fail visibly against an older daemon; the client never
 downgrades them to the ordinary setter and reports success.
 
+#### 4.1. Step 3 schema and publication
+
+#### 4.1.1 Typed keys, canonical text and ordering
+
+A **unit key** is `(binding identity, controller identity, root-hub
+protocol domain, relative port chain)`. A **pair key** is a class tag plus,
+for the split class, the RGB unit key followed by the IR unit key.
+Ordinary pairs keep their existing key and sort first (class tag 0); split
+pairs are class tag 1 (section 3).
+
+Comparison uses typed fields, never concatenated text or
+`SplitPair::binding_key()` (whose dotted port text is not numeric):
+
+- identity and controller: bytewise on the canonical raw text;
+- root-hub domain: by the table below, not by enum declaration order;
+- port chain: element by element as numbers; a proper prefix sorts before
+  the longer chain.
+
+| Domain | Canonical text | Order |
+|---|---|---|
+| USB2 root hub | `usb2` | 0 |
+| SuperSpeed root hub | `superspeed` | 1 |
+
+The order is a canonical, arbitrary-but-fixed choice. It exists only so
+equal fields compare equal and ranking is deterministic; it carries no
+preference. A new domain value requires an ADR amendment and may not be
+inserted before an existing one. The canonical domain text is distinct
+from `SplitPair::binding_key()`'s NUL-joined encoding (which renders the
+domain `ss`); the two encodings never meet, and typed equality is
+authoritative.
+
+**Canonical text of a split pair key** (used where a key must be stored;
+the typed form is authoritative):
+
+```
+split1;<rgb unit>;<ir unit>
+unit  = <identity>|<controller>|<domain>|<ports>
+ports = <decimal>(.<decimal>)*          each 1..=255, no leading zeros
+```
+
+The observation-side parser accepts the wider `u8` form; the canonical
+text is what the encoder writes. Fields are percent-encoded: every byte
+outside `A-Z a-z 0-9 : . _ -` becomes `%XX` with uppercase hex. This keeps
+`;` `|` `=` whitespace, control bytes and any serial text unambiguous.
+The encoding is injective and the decoder rejects non-canonical input
+(lowercase hex digits, unnecessary escapes, leading zeros), so each key
+has exactly one text and text equality equals typed equality. Example:
+
+```
+split1;5986:2113:200901010001|0000:00:14.0|usb2|8;5986:1141:200901010001|0000:00:14.0|usb2|5
+```
+
+Node paths are not part of the key; they remain part of the
+authorization record's live-resolution checks (section 2).
+
+#### 4.1.2 Authorization generations
+
+The ordered authorization collection is stored as **immutable generation
+files** under `/etc/irlume`, root-owned, mode 0600:
+
+- name: `split-pairs.<N>.conf`, `N` a decimal `u64` >= 1 without leading
+  zeros;
+- a generation is never modified after publication; a change is a new
+  generation with a larger `N`;
+- contents: line-oriented `key=value`, same unsafe-value rules as
+  `cameras.conf`; mandatory `version=1`; indexed records
+  `pair.<i>.rgb_identity`, `.rgb_path`, `.rgb_controller`, `.rgb_domain`,
+  `.rgb_ports` and the same with `ir_`; `<i>` contiguous from 0; record
+  order is overlap-resolution priority (section 1) and is not an account
+  preference (section 3);
+- a record is well-formed only if every field is present and valid. A
+  missing or unrecognized component is Malformed, never a wildcard
+  (section 2);
+- bounds, enforced by parser and writer: at most 16 records, 1024 bytes
+  per line, 64 KiB per file, 6 port elements per chain (the chain bound is
+  the USB limit of five cascaded hubs: a root port plus one element per
+  hub);
+- unknown keys in a generation are Malformed (the file is immutable and
+  versioned, so there is no forward-compat ignoring); an unknown `version`
+  is Malformed.
+
+The parser is pure and scans the whole file so every problem is reported.
+States: **Absent** (no generation referenced), **Unreadable**,
+**Malformed**, **DigestMismatch**, **Valid**.
+
+#### 4.1.3 Publication protocol
+
+Selection and the reference live in `cameras.conf` (ADR-0029 section 6,
+as amended with this change). Authorization data lives in a generation.
+Because camera-pin readers do not take the writer lock, a lock around two
+independent file replacements would not give readers a coherent state.
+The protocol instead makes `cameras.conf` the single atomic commit point
+that names an already-durable, immutable generation.
+
+Writer, holding `lock_exclusive` on `cameras.conf` to serialize writers:
+
+1. Read and validate the current `cameras.conf`; refuse if it is
+   unreadable or malformed. Compute `N = max(highest generation number
+   on disk, referenced generation) + 1` so a number is never reused,
+   including after a crash.
+2. Write the new generation to a temporary file in the same directory
+   (0600), fsync the file, rename it to `split-pairs.<N>.conf`, fsync the
+   directory: the same temp-file, fsync, rename and directory-fsync
+   discipline the existing atomic writers use.
+3. Compute `sha256` over the exact bytes of the generation file.
+4. Publish `cameras.conf` in one atomic rename containing the existing
+   five keys unchanged plus `split_pair`, `split_generation` and
+   `split_digest`, then fsync the directory.
+5. Best-effort retention (4.1.5).
+
+Reader (any process):
+
+1. Read `cameras.conf` once; the rename guarantees a whole file.
+2. If no split keys: split selection is Absent; behavior is exactly as
+   before this ADR.
+3. Otherwise open exactly generation `split_generation`, verify its digest
+   equals `split_digest`, then parse it. A missing file, digest mismatch,
+   malformed file or unresolved `split_pair` reference refuses the split
+   operation. It never falls back to the ordinary pin or another pair,
+   and never reads as a fresh automatic setup.
+4. If the open fails because the file is missing, re-read `cameras.conf`
+   once; if the referenced generation changed, retry with the new one
+   (bounded to one retry), otherwise refuse.
+
+Crash analysis:
+
+| Crash point | On-disk result | Effect |
+|---|---|---|
+| before step 2 completes | possibly a temp file | none; cleaned on next write |
+| after step 2, before step 4 | unreferenced generation `N` | none visible; collected by retention; `N` is never reused |
+| during step 4 | rename is atomic: old or new `cameras.conf` | old or new coherent state |
+| after step 4, before step 5 | extra old generations | none; collected later |
+
+#### 4.1.4 Removal and the selected pair
+
+Removing an authorization publishes a new generation without it, and does
+not need the cameras to be connected (section 4). If the removed record
+is the selected pair, the same `cameras.conf` publication removes the
+split keys, so selection never references a pair the generation no longer
+holds. In `pinned` mode without a split reference the ordinary four-key
+pin applies again; removal never authorizes a replacement.
+
+#### 4.1.5 Retention
+
+Keep the generation referenced by `cameras.conf` and its immediate
+predecessor, so a reader that holds the previous `cameras.conf` can still
+open its generation. After a successful publication, delete older
+generations and any unreferenced orphan with a lower number than the
+predecessor. Failure to delete is harmless and is retried on the next
+write and at daemon start. The referenced generation is never deleted.
+
+#### 4.1.6 Upgrade, downgrade and visible failure
+
+- Without split keys, every reader and writer behaves exactly as today,
+  and the ordinary four-key pin keeps its meaning.
+- An older daemon reads only the four pin keys and reports the new keys
+  as ignored lines with the usual startup warnings. Because split
+  enrollment and authentication stay refused until Step 5, an older
+  daemon ignoring split selection cannot authenticate with it.
+- New split management uses new request and reply types. An older daemon
+  fails them visibly; a new client reports "unsupported" and never falls
+  back to `SetCameras` or `SetCamerasIfCurrent`. The digest uses `sha256`,
+  already a dependency of the crate that hosts config parsing, so no new
+  dependency is involved.
+- Because `mode` is parsed but reserved on current main (automatic
+  selection has no production caller yet), Step 3 defines and tests the
+  persisted and status contract only, and does not assume automatic
+  selection is integrated.
+
+#### 4.1.7 Status and redaction
+
+A root-only status reports the state (Absent / Unreadable / Malformed /
+DigestMismatch / Valid), record count, referenced generation and whether
+the selection resolves. Non-root peers receive no identities, serials,
+paths or raw controller paths, only the share-safe projections of
+section 6.
+
+#### 4.1.8 Additional tests required for Step 3
+
+- Concurrent reader while a writer publishes: always a whole old or
+  whole new state, never a mix.
+- Crash injection after each writer step in 4.1.3, including leftover
+  temp files and orphan generations; `N` never reused.
+- Digest mismatch, missing generation, malformed generation, partial
+  split keys, and an unresolved `split_pair` each refuse with no
+  fallback.
+- Retention never deletes the referenced generation and keeps the
+  predecessor.
+- Canonical key round-trip, rejection of non-canonical text, numeric
+  port ordering (8 before 10), proper-prefix ordering, and domain
+  ordering pinned to the table.
+- The ordinary four-key pin and `cameras.conf` without split keys are
+  unchanged.
+- The activation gate stays closed for enrollment and authentication,
+  including a native-GREY fixture.
+
 ### 5. Sequential capture and two-incarnation revalidation
 
 Initial split support uses the sequential capture schedule. The capture
@@ -392,7 +588,8 @@ These cases gate the implementation phases:
    publish no usable split candidates yet. Test identity and ambiguity cases.
 3. Add administrator configuration, selection references and the opt-in wire
    contract. Define and test serialization, upgrades, displayed-inventory
-   guards, coherent publication and redaction. Configured candidates remain
+   guards, coherent publication and redaction, per the schema and
+   publication protocol in §4.1. Configured candidates remain
    unavailable to enrollment/auth.
 4. Add split-aware lease acquisition, revalidation and sequential capture
    provenance and unconditional split sequential admission posture. Keep the

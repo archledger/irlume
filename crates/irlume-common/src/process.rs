@@ -3,7 +3,7 @@
 
 //! Bounded output collection for short observation helpers.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 const MAX_OUTPUT: usize = 64 * 1024;
 const MAX_CHILDREN: usize = 32;
+const MAX_INPUT: usize = 4096;
+static BUDGET: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 
 /// Collect a short helper's output within one observation deadline.
 ///
@@ -26,9 +28,27 @@ const MAX_CHILDREN: usize = 32;
 /// exceeds the limit, or `WouldBlock` when the child budget is exhausted.
 /// A nonzero helper exit is returned in `Output::status`.
 pub fn output_until(command: &mut Command, deadline: Instant) -> io::Result<Output> {
-    static BUDGET: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
     output_with_budget(
         command,
+        deadline,
+        Arc::clone(BUDGET.get_or_init(Default::default)),
+    )
+}
+
+/// Collect helper output while supplying at most 4096 bytes through private stdin.
+/// Input writes and output reads share one deadline; stdin closes after delivery.
+///
+/// # Errors
+/// Returns the observation errors of [`output_until`], stdin write errors, or
+/// `InvalidInput` if the request exceeds 4096 bytes.
+pub fn output_with_input_until(
+    command: &mut Command,
+    input: &[u8],
+    deadline: Instant,
+) -> io::Result<Output> {
+    output_with_budget_and_input(
+        command,
+        input,
         deadline,
         Arc::clone(BUDGET.get_or_init(Default::default)),
     )
@@ -39,19 +59,38 @@ fn output_with_budget(
     deadline: Instant,
     budget: Arc<AtomicUsize>,
 ) -> io::Result<Output> {
+    output_with_budget_and_input(command, &[], deadline, budget)
+}
+
+fn output_with_budget_and_input(
+    command: &mut Command,
+    mut input: &[u8],
+    deadline: Instant,
+    budget: Arc<AtomicUsize>,
+) -> io::Result<Output> {
+    if input.len() > MAX_INPUT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "helper input exceeded limit",
+        ));
+    }
     remaining(deadline)?;
     let permit = ChildPermit::acquire(budget)?;
     let reaper = Reaper::global()?;
     remaining(deadline)?;
     let child = command
-        .stdin(Stdio::null())
+        .stdin(if input.is_empty() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     let mut owner = ObservedChild {
         child: Some(child),
         permit: Some(permit),
-        reaper: Arc::clone(reaper),
+        reaper,
     };
     let child = owner
         .child
@@ -65,6 +104,10 @@ fn output_with_budget(
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("missing stderr pipe"))?;
+    let mut stdin = child.stdin.take();
+    if let Some(pipe) = &stdin {
+        nonblocking(pipe)?;
+    }
     nonblocking(&stdout)?;
     nonblocking(&stderr)?;
     let mut out = Vec::new();
@@ -75,6 +118,29 @@ fn output_with_budget(
     loop {
         remaining(deadline)?;
         let mut progress = false;
+        if let Some(pipe) = &mut stdin {
+            match pipe.write(input) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "helper stdin closed",
+                    ))
+                }
+                Ok(n) => {
+                    input = &input[n..];
+                    progress = true;
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(e) => return Err(e),
+            }
+            if input.is_empty() {
+                stdin.take();
+            }
+        }
         if !out_eof {
             progress |= collect(&mut stdout, &mut out, err.len(), &mut out_eof)?;
         }
@@ -189,20 +255,28 @@ struct Reaper {
 }
 
 impl Reaper {
-    fn global() -> io::Result<&'static Arc<Self>> {
-        static REAPER: OnceLock<Result<Arc<Reaper>, String>> = OnceLock::new();
-        REAPER
-            .get_or_init(|| {
-                let reaper = Arc::new(Self::default());
-                let worker = Arc::clone(&reaper);
-                std::thread::Builder::new()
-                    .name("irlume-helper-reaper".into())
-                    .spawn(move || worker.run())
-                    .map_err(|e| e.to_string())?;
-                Ok(reaper)
-            })
-            .as_ref()
-            .map_err(|e| io::Error::other(e.clone()))
+    fn global() -> io::Result<Arc<Self>> {
+        static REAPER: Mutex<Option<Arc<Reaper>>> = Mutex::new(None);
+        Self::initialize(&REAPER, |worker| {
+            std::thread::Builder::new()
+                .name("irlume-helper-reaper".into())
+                .spawn(move || worker.run())
+                .map(|_| ())
+        })
+    }
+
+    fn initialize(
+        slot: &Mutex<Option<Arc<Reaper>>>,
+        spawn: impl FnOnce(Arc<Reaper>) -> io::Result<()>,
+    ) -> io::Result<Arc<Self>> {
+        let mut initialized = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(reaper) = &*initialized {
+            return Ok(Arc::clone(reaper));
+        }
+        let reaper = Arc::new(Self::default());
+        spawn(Arc::clone(&reaper))?;
+        *initialized = Some(Arc::clone(&reaper));
+        Ok(reaper)
     }
 
     fn run(&self) {
@@ -250,6 +324,65 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn reaper_creation_retries_after_transient_thread_failure() {
+        let slot = Mutex::new(None);
+        let calls = std::cell::Cell::new(0);
+        let first = Reaper::initialize(&slot, |_| {
+            calls.set(calls.get() + 1);
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "synthetic resource pressure",
+            ))
+        });
+        assert!(first.is_err());
+        let second = Reaper::initialize(&slot, |_| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert!(
+            second.is_ok(),
+            "a transient failure must not disable future helpers"
+        );
+        assert_eq!(calls.get(), 2);
+        assert!(Reaper::initialize(&slot, |_| panic!("already started")).is_ok());
+    }
+
+    #[test]
+    fn private_stdin_rejects_oversize_input_before_spawn_and_bounds_stalled_helpers() {
+        let error = output_with_input_until(
+            &mut Command::new("/nonexistent/no-input-capacity"),
+            &vec![b'x'; MAX_INPUT + 1],
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let started = Instant::now();
+        let error = output_with_input_until(
+            Command::new("/bin/sleep").arg("20"),
+            &vec![b'x'; MAX_INPUT],
+            started + Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn private_stdin_request_reaches_the_helper_without_argument_data() {
+        let request = b"synthetic-private-account-query";
+        let mut command = Command::new("/bin/cat");
+        let output = output_with_input_until(
+            &mut command,
+            request,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, request);
+        assert!(command.get_args().next().is_none());
+    }
 
     #[test]
     fn exhausted_child_budget_refuses_before_spawning() {

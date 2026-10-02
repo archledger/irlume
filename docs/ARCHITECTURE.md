@@ -83,7 +83,8 @@ flowchart LR
 Native `getpwnam_r` and `getpwuid_r` for worker checks run in a fresh execution of
 the running daemon image, in a private lookup mode that exits before opening
 sockets, models, cameras or the TPM. Each fresh lookup has a one-second deadline covering
-helper observation and a 64 KiB combined-output limit. Timeout, malformed reply
+helper observation and a 64 KiB combined-output limit. The query uses a private
+stdin pipe with a 4096-byte bound, never command-line arguments. Timeout, malformed reply
 or provider error means unknown; only a successful native no-entry result means
 no account. Name queries and UID queries are distinct, including numeric names.
 
@@ -104,6 +105,8 @@ exhausted capacity refuses a new helper instead of starting another waiting
 thread. NSS helpers inherit the daemon's confinement; AppArmor permits only
 same-profile execution of its executable and the self-profile signals needed
 for termination/reaping. This does not change socket messages or grant rules.
+Reaper initialization caches only a successfully started thread, so transient
+resource pressure does not permanently disable helper creation.
 
 ## Live interface observations
 

@@ -10,6 +10,7 @@
 //! variants with our own buffer.
 
 use std::ffi::CString;
+use std::io::Read as _;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -60,17 +61,26 @@ pub(crate) fn run_helper() -> bool {
     if args.next().as_deref() != Some(HELPER_ARG) {
         return false;
     }
-    let query = args.next().filter(|s| s.len() <= 4096);
     let result = if args.next().is_none() {
-        query
-            .and_then(|s| serde_json::from_str::<Query>(&s).ok())
-            .map(native_lookup)
-            .unwrap_or(Lookup::Unknown)
+        read_query().map(native_lookup).unwrap_or(Lookup::Unknown)
     } else {
         Lookup::Unknown
     };
     write_reply(result);
     true
+}
+
+fn read_query() -> Option<Query> {
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    std::io::stdin()
+        .lock()
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > 4096 {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn write_reply(result: Lookup) {
@@ -91,7 +101,7 @@ fn lookup(query: Query) -> Lookup {
     // neither PATH nor the request chooses an executable.
     let mut command = Command::new("/proc/self/exe");
     #[cfg(not(test))]
-    command.args([HELPER_ARG, &encoded]);
+    command.arg(HELPER_ARG);
     #[cfg(test)]
     {
         command
@@ -101,7 +111,6 @@ fn lookup(query: Query) -> Lookup {
                 "users::tests::nss_lookup_child",
                 "--nocapture",
             ])
-            .env("IRLUME_TEST_NSS_QUERY", &encoded)
             .env_remove("IRLUME_TEST_NSS_STALL");
         LOOKUP_PROBE.with(|probe| {
             let (block, calls) = probe.get();
@@ -111,11 +120,22 @@ fn lookup(query: Query) -> Lookup {
             }
         });
     }
-    observe(&query, &mut command, deadline)
+    observe_with_input(&query, &mut command, encoded.as_bytes(), deadline)
 }
 
+#[cfg(test)]
 fn observe(query: &Query, command: &mut Command, deadline: Instant) -> Lookup {
-    let Ok(output) = irlume_common::process::output_until(command, deadline) else {
+    observe_with_input(query, command, &[], deadline)
+}
+
+fn observe_with_input(
+    query: &Query,
+    command: &mut Command,
+    input: &[u8],
+    deadline: Instant,
+) -> Lookup {
+    let Ok(output) = irlume_common::process::output_with_input_until(command, input, deadline)
+    else {
         return Lookup::Unknown;
     };
     if !output.status.success() {
@@ -339,8 +359,9 @@ mod tests {
                 std::thread::park();
             }
         }
-        let encoded = std::env::var("IRLUME_TEST_NSS_QUERY").expect("parent supplied query");
-        write_reply(native_lookup(serde_json::from_str(&encoded).unwrap()));
+        write_reply(native_lookup(
+            read_query().expect("parent supplied private query"),
+        ));
     }
 
     #[test]

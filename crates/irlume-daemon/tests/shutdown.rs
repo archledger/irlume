@@ -28,7 +28,7 @@ fn nss_helper_exits_without_starting_the_daemon() {
     ] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_irlumed"));
         command
-            .args(["--internal-nss-lookup", query])
+            .arg("--internal-nss-lookup")
             .env("IRLUME_SOCKET", &socket)
             .env("IRLUME_STATE_DIR", &dir)
             .env("IRLUME_CONFIG_DIR", &dir)
@@ -36,8 +36,9 @@ fn nss_helper_exits_without_starting_the_daemon() {
             .env("IRLUME_FORCE_NO_IR", "1")
             .env("IRLUME_RGB_DEVICE", "/nonexistent-rgb")
             .env("IRLUME_IR_DEVICE", "/nonexistent-ir");
-        let output = irlume_common::process::output_until(
+        let output = irlume_common::process::output_with_input_until(
             &mut command,
+            query.as_bytes(),
             Instant::now() + Duration::from_secs(3),
         )
         .unwrap();

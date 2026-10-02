@@ -2955,6 +2955,29 @@ mod split_revalidation_tests {
     }
 
     #[test]
+    fn a_reconnect_requires_fresh_live_proof() {
+        // ADR-0032 §5: a reconnect with an unchanged persistent key still
+        // requires fresh live proof. Two consecutive checks against changed
+        // publications show nothing is cached between attempts.
+        assert_eq!(revalidate_against(&rgb(), &ir(), &publication()), Ok(()));
+        let (mut snapshot, classified) = publication();
+        snapshot.revision = 8;
+        assert_eq!(
+            revalidate_against(&rgb(), &ir(), &(snapshot, classified)),
+            Ok(()),
+            "the revision is not part of the incarnation facts"
+        );
+        let (mut snapshot, mut classified) = publication();
+        classified.remove(1);
+        snapshot.candidates.clear();
+        assert_eq!(
+            revalidate_against(&rgb(), &ir(), &(snapshot, classified)),
+            Err(SplitRevalidationRefusal::SideMissing),
+            "a side that left during capture refuses; nothing is retargeted"
+        );
+    }
+
+    #[test]
     fn revalidation_refuses_when_the_publication_is_not_current() {
         let (mut snapshot, classified) = publication();
         snapshot.state = irlume_common::live_camera::CameraInventoryState::Refreshing;

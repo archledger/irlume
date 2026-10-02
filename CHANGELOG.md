@@ -5,6 +5,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Split-pair authorization storage groundwork (ADR-0032 Step 3): immutable
+  generation files under `/etc/irlume/split-pairs/` and the coherent
+  publication protocol behind the `split_generation` / `split_digest` /
+  `split_pair` keys of `cameras.conf`. No command writes them yet and split
+  enrollment and authentication stay refused until the later steps.
+
 ### Fixed
 
 - LightDM configuration checks retain deletion evidence for symlink targets

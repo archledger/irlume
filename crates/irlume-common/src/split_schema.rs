@@ -115,11 +115,12 @@ pub fn serialize_generation(records: &[AuthorizationRecord]) -> Result<String, S
                 ("domain", fields.domain.as_str().to_owned()),
                 ("ports", format_ports_text(&fields.ports)),
             ] {
-                let line = format!("{}={}\n", record_key(i, side, field), value);
+                let line = format!("{}={}", record_key(i, side, field), value);
                 if line.len() > MAX_LINE_BYTES {
                     return Err(SchemaError::LineTooLong);
                 }
                 out.push_str(&line);
+                out.push('\n');
             }
         }
     }
@@ -284,10 +285,9 @@ pub fn parse_generation(text: &str) -> GenerationObservation {
             "version must appear exactly once, found {version_lines}"
         ));
     }
+    // Gaps in the index sequence surface below as missing fields for the
+    // skipped indices, which keeps every problem reported in file order.
     let count = max_index.map_or(0, |m| m + 1);
-    if seen.len() != count {
-        problems.push("record indices are not contiguous from 0".to_owned());
-    }
     let mut records = Vec::new();
     for (index, record_slots) in seen.iter().enumerate().take(count) {
         if let (Some(rgb), Some(ir)) = (

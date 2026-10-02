@@ -114,6 +114,7 @@ fn percent_decode(text: &str) -> Result<String, KeyError> {
             let hex = |c: u8| match c {
                 b'0'..=b'9' => Some(c - b'0'),
                 b'A'..=b'F' => Some(c - b'A' + 10),
+                b'a'..=b'f' => Some(c - b'a' + 10),
                 _ => None,
             };
             let (Some(h), Some(l)) = (hex(hi), hex(lo)) else {
@@ -128,9 +129,14 @@ fn percent_decode(text: &str) -> Result<String, KeyError> {
             }
             out.push(value);
             i += 3;
-        } else {
+        } else if is_safe_byte(bytes[i]) {
+            // Only safe bytes may appear unescaped: otherwise one key would
+            // have several texts and text equality would stop meaning typed
+            // equality (ADR-0032 §4.1.1).
             out.push(bytes[i]);
             i += 1;
+        } else {
+            return Err(KeyError::BadEscape);
         }
     }
     String::from_utf8(out).map_err(|_| KeyError::BadEscape)
@@ -320,6 +326,9 @@ mod tests {
             "split2;5986:2113:x|0000:00:14.0|usb2|8;5986:1141:y|0000:00:14.0|usb2|5",
             "split1;5986:2113:x|0000:00:14.0|usb2|8;5986:1141:y|0000:00:14.0|usb2",
             "split1;|0000:00:14.0|usb2|8;5986:1141:y|0000:00:14.0|usb2|5",
+            "split1;a b|c|usb2|8;x|c|usb2|5",
+            "split1;a;b|c|usb2|8;x|c|usb2|5",
+            "split1;a=b|c|usb2|8;x|c|usb2|5",
         ];
         for text in bad {
             assert!(

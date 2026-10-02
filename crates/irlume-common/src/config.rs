@@ -862,9 +862,17 @@ pub fn parse_camera_conf(text: &str) -> CameraConfObservation {
         }
     }
     if let Some((line, problem)) = problem {
+        // A malformed file that still carries split keys must never read as
+        // Absent: that would fall back to pre-ADR behavior where the ADR
+        // requires a refusal (ADR-0032 §4).
+        let split_keys_present = seen[5..].iter().any(|slot| slot.is_some());
         return CameraConfObservation {
             selection: Malformed { line, problem },
-            split: SplitConfObservation::None,
+            split: if split_keys_present {
+                SplitConfObservation::Malformed
+            } else {
+                SplitConfObservation::None
+            },
             ignored,
         };
     }
@@ -2556,6 +2564,22 @@ mod split_conf_tests {
             );
             assert_eq!(got.split, SplitConfObservation::Malformed);
         }
+    }
+
+    #[test]
+    fn a_malformed_file_with_split_keys_is_never_absent() {
+        let got = parse_camera_conf(&format!(
+            "rgb=/dev/a\nrgb=/dev/b\nsplit_generation=3\nsplit_digest={DIGEST}\n"
+        ));
+        assert!(matches!(
+            got.selection,
+            CameraSelectionObservation::Malformed { .. }
+        ));
+        assert_eq!(
+            got.split,
+            SplitConfObservation::Malformed,
+            "split keys in a malformed file must refuse, never read as Absent"
+        );
     }
 
     #[test]

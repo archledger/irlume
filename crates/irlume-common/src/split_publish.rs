@@ -44,6 +44,8 @@ pub enum PublishError {
     MalformedConfig,
     /// The records violate the generation schema.
     Schema(SchemaError),
+    /// Every `u64` generation number is spent; none may be reused.
+    GenerationExhausted,
 }
 
 /// What one lock-free read established (ADR-0032 §4.1.2 states).
@@ -72,6 +74,25 @@ fn generation_dir() -> PathBuf {
     config::config_path(GENERATION_DIR)
 }
 
+/// Create the generation directory root-only (ADR-0032 §4.1.2: mode 0700).
+/// The mode is set at creation; `create_dir_all` on an existing directory
+/// leaves its mode alone, which is the deployed truth.
+fn create_generation_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
+}
+
 fn generation_name(n: u64) -> String {
     format!("{n}.conf")
 }
@@ -91,8 +112,21 @@ fn parse_generation_name(name: &str) -> Option<u64> {
 }
 
 /// Writer temporaries from `write_0600_atomic`: `.{name}.tmp.{pid}.{seq}`.
+/// Only that exact shape is swept, so a foreign file is never deleted
+/// (ADR-0032 §4.1.3).
 fn is_writer_temp(name: &str) -> bool {
-    name.starts_with('.') && name.contains(".tmp.")
+    let Some(rest) = name
+        .strip_prefix('.')
+        .and_then(|n| n.split_once(".tmp.").map(|(_, tail)| tail))
+    else {
+        return false;
+    };
+    rest.split_once('.').is_some_and(|(pid, seq)| {
+        !pid.is_empty()
+            && pid.bytes().all(|b| b.is_ascii_digit())
+            && !seq.is_empty()
+            && seq.bytes().all(|b| b.is_ascii_digit())
+    })
 }
 
 fn digest_value(bytes: &[u8]) -> String {
@@ -220,7 +254,7 @@ pub fn publish_split(
     // only here is it known (ADR-0032 §4.1.5).
     let predecessor = split_keys_in(&obs).map(|(generation, _, _)| generation);
     let dir = generation_dir();
-    std::fs::create_dir_all(&dir).map_err(PublishError::Io)?;
+    create_generation_dir(&dir).map_err(PublishError::Io)?;
     // A crashed writer's temporaries go now, under the lock (§4.1.5).
     // Generation files are NOT swept here: `N` must see every number on disk
     // so a crashed generation's number is never reused, and publication-time
@@ -252,7 +286,8 @@ pub fn publish_split(
         .chain(predecessor)
         .max()
         .unwrap_or(0)
-        .saturating_add(1);
+        .checked_add(1)
+        .ok_or(PublishError::GenerationExhausted)?;
     let text = split_schema::serialize_generation(records).map_err(PublishError::Schema)?;
     let bytes = text.as_bytes();
     crate::write_0600_atomic(&dir.join(generation_name(n)), bytes).map_err(PublishError::Io)?;
@@ -738,6 +773,76 @@ mod tests {
         }
         // No caller in this slice hands split candidates to enrollment or
         // authentication: the store is inert for the engine (ADR-0032 §7).
+        drop(env);
+    }
+
+    #[test]
+    fn the_writer_refuses_a_malformed_config() {
+        let env = env();
+        config::write_kvs(
+            config::CAMERAS_CONF,
+            &[("rgb", "/dev/a"), ("rgb", "/dev/b")],
+        )
+        .unwrap();
+        let published = publish_split(&[record("a:1", "b:2")], None);
+        assert!(matches!(published, Err(PublishError::MalformedConfig)));
+        drop(env);
+    }
+
+    #[test]
+    fn a_schema_error_propagates_without_publishing() {
+        let env = env();
+        let mut bad = record("a:1", "b:2");
+        bad.rgb.ports = (1..=7).collect();
+        assert!(matches!(
+            publish_split(&[bad], None),
+            Err(PublishError::Schema(_))
+        ));
+        assert_eq!(read_split(), SplitReadState::Absent);
+        drop(env);
+    }
+
+    #[test]
+    fn the_generation_directory_is_created_root_only() {
+        let env = env();
+        publish_split(&[record("a:1", "b:2")], None).expect("publication");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(env.dir.join(GENERATION_DIR))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "generation dir must be 0700, got {mode:o}");
+        }
+        drop(env);
+    }
+
+    #[test]
+    fn crash_after_publish_leaves_extra_generations_that_the_next_write_collects() {
+        let env = env();
+        // A writer that crashed after step 4 but before retention: the
+        // reference landed and older generations linger (ADR-0032 §4.1.3
+        // crash table).
+        generation_file(&env.dir, 1, &[record("a:1", "b:2")]);
+        generation_file(&env.dir, 2, &[record("c:3", "d:4")]);
+        let text = generation_file(&env.dir, 3, &[record("e:5", "f:6")]);
+        config::write_kvs(
+            config::CAMERAS_CONF,
+            &[
+                ("split_generation", "3"),
+                ("split_digest", &digest_key(text.as_bytes())),
+                ("split_pair", ""),
+            ],
+        )
+        .unwrap();
+        let published = publish_split(&[record("g:7", "h:8")], None).expect("publication");
+        assert_eq!(published.generation, 4);
+        let names: Vec<u64> = list_generations(&env.dir.join(GENERATION_DIR))
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, vec![3, 4], "1 and 2 are collected later, i.e. now");
         drop(env);
     }
 

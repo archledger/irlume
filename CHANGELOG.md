@@ -11,7 +11,9 @@ All notable changes to irlume are documented here. This project adheres to
   generation files under `/etc/irlume/split-pairs/`, the coherent publication
   protocol behind the `split_generation` / `split_digest` / `split_pair` keys
   of `cameras.conf`, and root-only `irlume split add|remove|select|status`
-  commands with a share-safe `irlume split list`. Split enrollment and
+  commands with a share-safe `irlume split list`. Capture-side split support
+  (paired leases, incarnation revalidation and the unconditional sequential
+  admission posture) lands internally too. Split enrollment and
   authentication stay refused until the later steps.
 
 ### Fixed

@@ -7,15 +7,16 @@
 //! at it, and a GNOME keyring token armed for that account would never reach
 //! its keyring. A token arm asks here before anything is sealed.
 //!
-//! Each login manager's own files, read in the order it reads them, with the
-//! last assignment winning as it does there. Login managers irlume has no
-//! reader for answer "no".
+//! Each login manager's own files and assignment rules. When the outcome
+//! depends on an unknown daemon collation or parser version, refuse to guess.
+//! Login managers irlume has no reader for answer "no".
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 /// The file that turns on automatic login of `user` for login manager `dm`,
-/// or `None`. An error names a file that exists and could not be read: what
-/// it says is unknown, and the caller decides what that means.
+/// or `None`. An error identifies unreadable or ambiguous configuration;
+/// the caller decides what that means.
 pub(super) fn autologin_source(dm: &str, user: &str) -> Result<Option<PathBuf>, String> {
     autologin_source_in(Path::new("/"), dm, user)
 }
@@ -49,20 +50,21 @@ pub(super) fn autologin_source_in(
             for file in files {
                 let path = root.join(file);
                 if let Some(text) = read(&path)? {
-                    if gdm_logs_in(&text, user) {
+                    if gdm_logs_in(&text, user).map_err(|e| format!("{}: {e}", path.display()))? {
                         return Ok(Some(path));
                     }
                 }
             }
             Ok(None)
         }
-        // SDDM and its fork read the system drop-ins, then the admin's, each
-        // in name order, then the main file (sddm's ConfigBase::load).
+        // System drop-ins, then the admin's, then the main file. Their Qt
+        // collation need not match this CLI's locale or byte ordering.
         "sddm" => last_user_in(
             root,
             &["usr/lib/sddm/sddm.conf.d", "etc/sddm.conf.d"],
             "etc/sddm.conf",
             user,
+            false,
         ),
         "plasmalogin" => last_user_in(
             root,
@@ -72,6 +74,7 @@ pub(super) fn autologin_source_in(
             ],
             "etc/plasmalogin.conf",
             user,
+            true,
         ),
         "lightdm" => lightdm_source(root, user),
         // greetd's `[initial_session]` starts once at boot without asking.
@@ -86,10 +89,10 @@ pub(super) fn autologin_source_in(
             let Some(text) = read(&path)? else {
                 return Ok(None);
             };
-            let last = assignments(&text)
+            let last = ini_assignments(&text, IniComments::Ly)
                 .into_iter()
                 .filter(|(section, key, _)| section.is_empty() && key == "auto_login_user")
-                .map(|(_, _, value)| unquoted(&value).to_string())
+                .map(|(_, _, value)| value)
                 .next_back();
             let named = last.as_deref() == Some(user);
             Ok(named.then_some(path))
@@ -100,15 +103,16 @@ pub(super) fn autologin_source_in(
 
 /// A file's text, `None` when it does not exist.
 pub(super) fn read(path: &Path) -> Result<Option<String>, String> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
 }
 
-/// The files in `dir` a login manager reads, in name order; none when the
-/// directory does not exist. `conf_only` keeps LightDM's `*.conf` rule.
+/// Candidate files, in deterministic byte order; none when `dir` is absent.
+/// LightDM consumes this order and `*.conf` filter. Qt callers use the files
+/// as an unordered layer, since byte order does not establish Qt collation.
 fn drop_ins(dir: &Path, conf_only: bool) -> Result<Vec<PathBuf>, String> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -119,6 +123,11 @@ fn drop_ins(dir: &Path, conf_only: bool) -> Result<Vec<PathBuf>, String> {
     for entry in entries {
         let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
         let path = entry.path();
+        // QDir::Files without QDir::Hidden excludes dotfiles. LightDM's
+        // directory enumeration has no corresponding filter.
+        if !conf_only && entry.file_name().as_encoded_bytes().starts_with(b".") {
+            continue;
+        }
         if conf_only && path.extension().is_none_or(|ext| ext != "conf") {
             continue;
         }
@@ -137,15 +146,80 @@ fn drop_ins(dir: &Path, conf_only: bool) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-/// The `key=value` pairs of an INI-style file, each with its section. A `#`
-/// or `;` starts a comment; SDDM also cuts a `#` inside a line, and an
-/// account name has none, so every reader here does.
-pub(super) fn assignments(text: &str) -> Vec<(String, String, String)> {
+/// GKeyFile-style assignments for GDM and LightDM. Hashes inside values
+/// and group names are literal; quotes do not protect or remove them.
+/// Only a plain-key, unescaped-value subset is supported. Malformed or
+/// unsupported input is unknown, never a partial set of assignments: LightDM
+/// discards a whole file on a GKeyFile load error, retaining earlier files.
+pub(super) fn assignments(text: &str) -> Result<Vec<(String, String, String)>, String> {
+    let mut section = None;
+    let mut out = Vec::new();
+    for (index, raw) in text.split_inclusive('\n').enumerate() {
+        let invalid = || format!("unsupported or malformed GKeyFile line {}", index + 1);
+        // GLib removes CR only when followed by LF. A bare CR at EOF can
+        // invalidate the whole file, so do not normalize it into a valid header.
+        let line = if let Some(line) = raw.strip_suffix('\n') {
+            line.strip_suffix('\r').unwrap_or(line)
+        } else {
+            raw
+        };
+        let line = line.trim_start_matches([' ', '\t']);
+        if line.contains('\0') {
+            return Err(invalid());
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            let name = line
+                .trim_end_matches([' ', '\t'])
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .filter(|s| {
+                    !s.is_empty() && !s.contains(['[', ']']) && !s.chars().any(char::is_control)
+                })
+                .ok_or_else(invalid)?;
+            section = Some(name.to_string());
+        } else {
+            let group = section.as_ref().ok_or_else(invalid)?;
+            let (key, value) = line.split_once('=').ok_or_else(invalid)?;
+            let key = key.trim_end_matches([' ', '\t']);
+            if key.is_empty()
+                || !key
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+                || value.contains('\\')
+                || value.chars().any(|c| c.is_control() && c != '\t')
+                || (key == "Encoding" && value.trim_start_matches([' ', '\t']) != "UTF-8")
+            {
+                return Err(invalid());
+            }
+            out.push((
+                group.clone(),
+                key.to_string(),
+                value.trim_matches([' ', '\t']).to_string(),
+            ));
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Clone, Copy)]
+enum IniComments {
+    Inline,
+    Ly,
+}
+
+fn ini_assignments(text: &str, comments: IniComments) -> Vec<(String, String, String)> {
     let mut section = String::new();
     let mut out = Vec::new();
     for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with(';') {
+        let line = match comments {
+            IniComments::Inline => Cow::Borrowed(line.split('#').next().unwrap_or("")),
+            IniComments::Ly => Cow::Owned(ly_uncommented(line)),
+        };
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
         if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
@@ -163,14 +237,27 @@ pub(super) fn assignments(text: &str) -> Vec<(String, String, String)> {
     out
 }
 
-/// A value with one pair of surrounding quotes taken off, as the login
-/// managers' INI readers do.
-fn unquoted(value: &str) -> &str {
-    let value = value.trim();
-    ["\"", "'"]
-        .iter()
-        .find_map(|q| value.strip_prefix(q)?.strip_suffix(q))
-        .unwrap_or(value)
+/// Ly's zigini parser removes the backslash immediately before a hash.
+/// Quotes are ordinary value characters, not a way to escape comments.
+fn ly_uncommented(line: &str) -> String {
+    let mut value = String::new();
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '#' {
+            value.push(ch);
+        } else if value.ends_with('\\') {
+            value.pop();
+            value.push('#');
+            // ziglibs-ini resumes its comment scan one position beyond
+            // the escaped hash after removing the preceding backslash.
+            if let Some(next) = chars.next() {
+                value.push(next);
+            }
+        } else {
+            break;
+        }
+    }
+    value
 }
 
 /// A GKeyFile boolean, read leniently: a doubtful spelling counts as on,
@@ -180,40 +267,139 @@ pub(super) fn on(value: &str) -> bool {
 }
 
 /// GDM's `[daemon]` automatic or timed login of `user`.
-fn gdm_logs_in(text: &str, user: &str) -> bool {
+fn gdm_logs_in(text: &str, user: &str) -> Result<bool, String> {
     let mut values = std::collections::HashMap::new();
-    for (section, key, value) in assignments(text) {
+    for (section, key, value) in assignments(text)? {
         if section == "daemon" {
             values.insert(key, value);
         }
     }
     let get = |key: &str| values.get(key).map(String::as_str).unwrap_or("");
-    (on(get("AutomaticLoginEnable")) && get("AutomaticLogin") == user)
-        || (on(get("TimedLoginEnable")) && get("TimedLogin") == user)
+    Ok(
+        (on(get("AutomaticLoginEnable")) && get("AutomaticLogin") == user)
+            || (on(get("TimedLoginEnable")) && get("TimedLogin") == user),
+    )
 }
 
-/// SDDM's `[Autologin] User=`, the last one read deciding.
+/// Each directory is a priority layer. Without the daemon's Qt backend and
+/// locale, conservatively consider every file as a potential last assignment.
+/// Decide only when they agree about this account; a later layer replaces them.
 fn last_user_in(
     root: &Path,
     dirs: &[&str],
     main: &str,
     user: &str,
+    plasma: bool,
 ) -> Result<Option<PathBuf>, String> {
-    let mut files = Vec::new();
+    // Keep the two parser interpretations separate, including absence of an
+    // assignment. Each can inherit from or override a preceding layer.
+    let mut candidates: [Vec<(String, PathBuf)>; 2] = [Vec::new(), Vec::new()];
     for dir in dirs {
-        files.extend(drop_ins(&root.join(dir), false)?);
-    }
-    files.push(root.join(main));
-    let mut last: Option<(String, PathBuf)> = None;
-    for path in files {
-        let Some(text) = read(&path)? else { continue };
-        for (section, key, value) in assignments(&text) {
-            if section == "Autologin" && key == "User" {
-                last = Some((unquoted(&value).to_string(), path.clone()));
+        let mut layer = [Vec::new(), Vec::new()];
+        for path in drop_ins(&root.join(dir), false)? {
+            for (lane, value) in layer.iter_mut().zip(qt_users_in(&path, plasma, false)?) {
+                if let Some(value) = value {
+                    lane.push((value, path.clone()));
+                }
+            }
+        }
+        for (lane, next) in candidates.iter_mut().zip(layer) {
+            if !next.is_empty() {
+                *lane = next;
             }
         }
     }
-    Ok(last.and_then(|(value, path)| (value == user).then_some(path)))
+    let main = root.join(main);
+    for (lane, value) in candidates.iter_mut().zip(qt_users_in(&main, plasma, true)?) {
+        if let Some(value) = value {
+            *lane = vec![(value, main.clone())];
+        }
+    }
+    let lanes = &candidates[..if plasma { 2 } else { 1 }];
+    if let Some((_, path)) = lanes.iter().flatten().find(|(value, _)| value == user) {
+        if lanes
+            .iter()
+            .any(|lane| lane.is_empty() || lane.iter().any(|(value, _)| value != user))
+        {
+            return Err(format!(
+                "{}: autologin depends on the login manager's Qt collation or parser version",
+                path.display()
+            ));
+        }
+        return Ok(Some(path.clone()));
+    }
+    Ok(None)
+}
+
+fn qt_users_in(path: &Path, plasma: bool, main: bool) -> Result<[Option<String>; 2], String> {
+    if plasma && main {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_symlink() => {
+                // KConfig canonicalizes the main filename before deciding
+                // whether to read global sources. Do not guess that source graph.
+                return Err(format!(
+                    "{}: unsupported Plasma Login configuration symlink",
+                    path.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok([None, None]),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    let Some(text) = read(path)? else {
+        return Ok([None, None]);
+    };
+    let user = |entries: Vec<(String, String, String)>| {
+        entries
+            .into_iter()
+            .filter(|(section, key, _)| section == "Autologin" && key == "User")
+            .map(|(_, _, value)| value)
+            .next_back()
+    };
+    let legacy = user(ini_assignments(&text, IniComments::Inline));
+    // Plasma 6.6 uses ConfigReader; 6.7.5 uses KConfig. Only carry alternatives
+    // for the supported common grammar. Unsupported syntax could be immutable
+    // and must fail immediately, even if a later ordinary file sets User.
+    let current = if plasma {
+        let entries = plain_plasma_assignments(&text).map_err(|e| {
+            format!(
+                "{}: unsupported Plasma Login configuration: {e}",
+                path.display()
+            )
+        })?;
+        user(entries)
+    } else {
+        None
+    };
+    Ok([legacy, current])
+}
+
+/// Plain-ASCII grammar with a 4096-byte line limit. Accept no
+/// flags, nested/localized groups or keys, escapes, expansions, or directives.
+/// This is a refusal boundary, not an implementation of KConfig's full parser.
+fn plain_plasma_assignments(text: &str) -> Result<Vec<(String, String, String)>, String> {
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim_matches([' ', '\t']);
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let plain_group = !line.starts_with('[')
+            || line
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .is_some_and(|name| {
+                    !name.is_empty()
+                        && name
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
+                });
+        if !line.is_ascii() || line.len() > 4096 || line.contains(['\\', '$', '\0']) || !plain_group
+        {
+            return Err(format!("unsupported syntax on line {}", index + 1));
+        }
+    }
+    assignments(text)
 }
 
 /// LightDM's drop-in directories, in the order it reads them.
@@ -246,7 +432,9 @@ fn lightdm_source(root: &Path, user: &str) -> Result<Option<PathBuf>, String> {
         std::collections::HashMap::new();
     for path in files {
         let Some(text) = read(&path)? else { continue };
-        for (section, key, value) in assignments(&text) {
+        for (section, key, value) in
+            assignments(&text).map_err(|e| format!("{}: {e}", path.display()))?
+        {
             let seat = section.starts_with("Seat:") || section == "SeatDefaults";
             if seat && key == "autologin-user" {
                 seats.insert(section, (value, path.clone()));
@@ -314,6 +502,247 @@ mod tests {
     }
 
     #[test]
+    fn malformed_gkeyfile_autologin_is_unknown() {
+        let root = Root::new("malformed-gkeyfile-autologin");
+        for (dm, file, group, key) in [
+            ("gdm", "etc/gdm/custom.conf", "daemon", "AutomaticLogin"),
+            (
+                "lightdm",
+                "etc/lightdm/lightdm.conf",
+                "Seat:*",
+                "autologin-user",
+            ),
+        ] {
+            for malformed in [
+                "[Other] # not a GKeyFile comment",
+                "[Other",
+                "[]",
+                "not an assignment",
+                "=empty key",
+                "Encoding=not-UTF-8",
+                "Nul=\0",
+            ] {
+                root.put(file, &format!("[{group}]\n{malformed}\n{key}=bob\n"));
+                assert!(root.source(dm, "alice").is_err(), "{dm}: {malformed:?}");
+            }
+            let path = root.put(file, "");
+            let mut invalid_utf8 = format!("[{group}]\n{key}=").into_bytes();
+            invalid_utf8.push(0xff);
+            std::fs::write(path, invalid_utf8).unwrap();
+            assert!(root.source(dm, "alice").is_err(), "{dm}: invalid UTF-8");
+        }
+    }
+
+    #[test]
+    fn plasma_unsupported_syntax_is_not_agreement_or_overridable() {
+        let root = Root::new("plasma-unsupported");
+        root.put("etc/plasmalogin.conf", "[Autologin]\nUser=bob\n");
+        for text in [
+            "[Autologin][$i]\nUser=alice\n",
+            "[Autologin]\nUser[$i]=alice\n",
+            "[$i]\n[Autologin]\nUser=alice\n",
+            "[Autologin]\nUser[$e]=${USER}\n",
+            "[Autologin]\nUser=ali\\x63e\n",
+            "[Auto\\x6cogin]\nUser=alice\n",
+            "[Autologin]\nUs\\x65r=alice\n",
+            "[Autologin]\nUser[en_US]=alice\n",
+            "[Autologin]\nUser[$d]\n",
+            "[Autologin][Nested]\nUser=alice\n",
+        ] {
+            // Qt includes extensionless supplemental files as well as .conf.
+            root.put("usr/lib/plasmalogin/plasmalogin.conf.d/vendor", text);
+            assert!(root.source("plasmalogin", "alice").is_err(), "{text:?}");
+            assert!(root.source("plasmalogin", "bob").is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn plasma_nonplain_sources_cannot_be_hidden_by_a_main_override() {
+        let root = Root::new("plasma-nonplain-source");
+        let main = root.put("etc/plasmalogin.conf", "[Autologin]\nUser=bob\n");
+        let target = root.put("elsewhere/kdeglobals", "[Autologin][$i]\nUser=alice\n");
+        let vendor = root.0.join("usr/lib/plasmalogin/plasmalogin.conf.d/vendor");
+        std::fs::create_dir_all(vendor.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &vendor).unwrap();
+        assert!(root.source("plasmalogin", "alice").is_err());
+        // An ordinary drop-in alias has no KConfig main-file source routing.
+        // Once its content is supported, the main file can override it.
+        root.put("elsewhere/kdeglobals", "[Autologin]\nUser=alice\n");
+        assert_eq!(root.source("plasmalogin", "alice"), Ok(None));
+        assert_eq!(root.source("plasmalogin", "bob"), Ok(Some(main.clone())));
+        std::fs::remove_file(&vendor).unwrap();
+        // A canonical main path aliasing kdeglobals can alter KConfig's
+        // source selection, even though Plasma requested NoGlobals.
+        std::fs::remove_file(&main).unwrap();
+        std::os::unix::fs::symlink(&target, &main).unwrap();
+        assert!(root.source("plasmalogin", "alice").is_err());
+        std::fs::remove_file(&main).unwrap();
+        root.put("etc/plasmalogin.conf", "[Autologin]\nUser=bob\n");
+        std::os::unix::fs::symlink("vendor", &vendor).unwrap();
+        assert!(
+            root.source("plasmalogin", "bob").is_err(),
+            "unreadable source"
+        );
+    }
+
+    #[test]
+    fn plasma_supported_hash_alternatives_resolve_after_precedence() {
+        let root = Root::new("plasma-hash-precedence");
+        root.put(
+            "usr/lib/plasmalogin/plasmalogin.conf.d/vendor",
+            "[Autologin]\nUser=ops#1\n",
+        );
+        assert!(root.source("plasmalogin", "ops").is_err());
+        assert!(root.source("plasmalogin", "ops#1").is_err());
+        assert_eq!(root.source("plasmalogin", "bob"), Ok(None));
+        let main = root.put("etc/plasmalogin.conf", "[Autologin]\nUser=bob\n");
+        assert_eq!(root.source("plasmalogin", "bob"), Ok(Some(main)));
+        assert_eq!(root.source("plasmalogin", "ops#1"), Ok(None));
+        root.put("etc/plasmalogin.conf", "[General]\nTheme=plain\n");
+        assert!(root.source("plasmalogin", "ops#1").is_err());
+        let admin = root.put("etc/plasmalogin.conf.d/admin", "[Autologin]\nUser=alice\n");
+        assert_eq!(root.source("plasmalogin", "alice"), Ok(Some(admin)));
+        assert_eq!(root.source("plasmalogin", "ops"), Ok(None));
+    }
+
+    #[test]
+    fn gkeyfile_hashes_are_literal_inside_values_and_group_names() {
+        let root = Root::new("gkeyfile-hash");
+        let gdm = root.put(
+            "etc/gdm/custom.conf",
+            "# comment\n[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=ops#1\n",
+        );
+        assert_eq!(root.source("gdm", "ops#1"), Ok(Some(gdm)));
+        assert_eq!(root.source("gdm", "ops"), Ok(None));
+        let lightdm = root.put(
+            "etc/lightdm/lightdm.conf",
+            "[Seat:seat#1]\nautologin-user=ops#1\n",
+        );
+        assert_eq!(root.source("lightdm", "ops#1"), Ok(Some(lightdm)));
+        assert_eq!(root.source("lightdm", "ops"), Ok(None));
+    }
+
+    #[test]
+    fn gkeyfile_quotes_do_not_escape_or_remove_hashes() {
+        let root = Root::new("gkeyfile-quotes");
+        for value in ["\"ops#1\"", "'ops#1'", "ops # trailing text"] {
+            let path = root.put(
+                "etc/lightdm/lightdm.conf",
+                &format!("[Seat:*]\nautologin-user={value}\n"),
+            );
+            assert_eq!(root.source("lightdm", value), Ok(Some(path)), "{value}");
+            assert_eq!(root.source("lightdm", "ops"), Ok(None), "{value}");
+            assert_eq!(root.source("lightdm", "ops#1"), Ok(None), "{value}");
+        }
+    }
+
+    #[test]
+    fn lightdm_assignments_keep_hashes_for_remote_boolean_consumers() {
+        let parsed =
+            assignments("[XDMCPServer]\nenabled=true # literal\n[VNCServer]\nenabled=true\n")
+                .unwrap();
+        assert_eq!(parsed[0].2, "true # literal");
+        assert!(!on(&parsed[0].2));
+        assert!(on(&parsed[1].2));
+    }
+
+    #[test]
+    fn sddm_quotes_are_literal_and_do_not_protect_hashes() {
+        let root = Root::new("sddm-hash");
+        for (value, expected) in [
+            ("ops#1", "ops"),
+            ("\"ops#1\"", "\"ops"),
+            ("'ops#1'", "'ops"),
+            ("ops\\#1", "ops\\"),
+            ("\"alice\"", "\"alice\""),
+        ] {
+            let path = root.put("etc/sddm.conf", &format!("[Autologin]\nUser={value}\n"));
+            assert_eq!(root.source("sddm", expected), Ok(Some(path)), "{value}");
+            assert_eq!(root.source("sddm", "ops#1"), Ok(None), "{value}");
+            assert_eq!(root.source("sddm", "alice"), Ok(None), "{value}");
+        }
+    }
+
+    #[test]
+    fn ly_escaped_hash_is_a_value_but_quotes_are_literal() {
+        let root = Root::new("ly-hash");
+        for (value, expected) in [
+            ("ops\\#1", "ops#1"),
+            ("ops#1", "ops"),
+            ("\"ops#1\"", "\"ops"),
+            ("\"ops\\#1\"", "\"ops#1\""),
+        ] {
+            let path = root.put("etc/ly/config.ini", &format!("auto_login_user={value}\n"));
+            assert_eq!(root.source("ly", expected), Ok(Some(path)), "{value}");
+        }
+    }
+
+    #[test]
+    fn qt_order_sensitive_autologin_is_unknown_without_daemon_collation() {
+        let root = Root::new("qt-order");
+        for dm in ["sddm", "plasmalogin"] {
+            root.put(
+                &format!("etc/{dm}.conf.d/Z.conf"),
+                "[Autologin]\nUser=alice\n",
+            );
+            root.put(
+                &format!("etc/{dm}.conf.d/a.conf"),
+                "[Autologin]\nUser=bob\n",
+            );
+            assert!(root.source(dm, "alice").is_err(), "{dm}");
+            assert!(root.source(dm, "bob").is_err(), "{dm}");
+            assert_eq!(root.source(dm, "carol"), Ok(None));
+            // The main file decides irrespective of the drop-in comparator.
+            let main = root.put(&format!("etc/{dm}.conf"), "[Autologin]\nUser=alice\n");
+            assert_eq!(root.source(dm, "alice"), Ok(Some(main)));
+            assert_eq!(root.source(dm, "bob"), Ok(None));
+        }
+    }
+
+    #[test]
+    fn qt_order_independent_layers_and_hidden_files() {
+        let root = Root::new("qt-layers");
+        for dm in ["sddm", "plasmalogin"] {
+            root.put(
+                &format!("etc/{dm}.conf.d/.hidden"),
+                "[Autologin]\nUser=alice\n",
+            );
+            assert_eq!(
+                root.source(dm, "alice"),
+                Ok(None),
+                "Qt excludes hidden files"
+            );
+            root.put(
+                &format!("usr/lib/{dm}/{dm}.conf.d/Z.conf"),
+                "[Autologin]\nUser=alice\n",
+            );
+            root.put(
+                &format!("usr/lib/{dm}/{dm}.conf.d/a.conf"),
+                "[Autologin]\nUser=bob\n",
+            );
+            let admin = root.put(
+                &format!("etc/{dm}.conf.d/one.conf"),
+                "[Autologin]\nUser=carol\n",
+            );
+            assert_eq!(root.source(dm, "carol"), Ok(Some(admin)));
+            assert_eq!(root.source(dm, "alice"), Ok(None));
+            root.put(
+                &format!("etc/{dm}.conf.d/two.conf"),
+                "[Autologin]\nUser=carol\n",
+            );
+            assert!(root.source(dm, "carol").unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn plasma_inline_hash_needs_a_parser_version() {
+        let root = Root::new("plasma-parser");
+        root.put("etc/plasmalogin.conf", "[Autologin]\nUser=ops#1\n");
+        assert!(root.source("plasmalogin", "ops#1").is_err());
+        assert!(root.source("plasmalogin", "ops").is_err());
+    }
+
+    #[test]
     fn gdm_automatic_and_timed_login_name_the_account() {
         let root = Root::new("gdm");
         assert_eq!(root.source("gdm", "alice"), Ok(None), "no file");
@@ -375,7 +804,8 @@ mod tests {
         let main = root.put("etc/sddm.conf", "[General]\n[Autologin]\nUser=alice # me\n");
         assert_eq!(root.source("sddm", "alice"), Ok(Some(main)));
         let quoted = root.put("etc/sddm.conf", "[Autologin]\nUser=\"alice\"\n");
-        assert_eq!(root.source("sddm", "alice"), Ok(Some(quoted)));
+        assert_eq!(root.source("sddm", "alice"), Ok(None));
+        assert_eq!(root.source("sddm", "\"alice\""), Ok(Some(quoted)));
         assert_eq!(root.source("sddm", "bob"), Ok(None));
 
         assert_eq!(

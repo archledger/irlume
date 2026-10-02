@@ -14,6 +14,7 @@ pub mod artifact;
 pub mod client;
 pub mod config;
 pub mod split_key;
+pub mod split_publish;
 pub mod split_schema;
 pub mod dbglog;
 pub mod diagnostics;

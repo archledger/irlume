@@ -873,7 +873,10 @@ pub fn parse_camera_conf(text: &str) -> CameraConfObservation {
     // beside them. A missing half, a misplaced pair or a malformed value
     // refuses the operation and never falls back to the ordinary pin.
     let mut split = SplitConfObservation::None;
-    let split_inputs = (seen[5], seen[6], seen[7]);
+    // An empty value clears a key, so every reader sees it as absent; that is
+    // how `write_kvs` drops split keys at all.
+    let split_at = |slot: usize| seen[slot].filter(|(_, v)| !v.is_empty());
+    let split_inputs = (split_at(5), split_at(6), split_at(7));
     if split_inputs != (None, None, None) {
         let valid_generation = split_inputs.0.is_some_and(|(_, v)| is_canonical_generation(v));
         let valid_digest = split_inputs.1.is_some_and(|(_, v)| is_canonical_digest(v));

@@ -142,11 +142,7 @@ fn sweep_temps(dir: &Path) -> std::io::Result<()> {
         return Ok(());
     };
     for entry in entries.flatten() {
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| is_writer_temp(name))
-        {
+        if entry.file_name().to_str().is_some_and(is_writer_temp) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -488,7 +484,11 @@ mod tests {
             .into_iter()
             .map(|(n, _)| n)
             .collect();
-        assert_eq!(names, vec![3, 5], "orphan 4 is collected, 3 is the predecessor");
+        assert_eq!(
+            names,
+            vec![3, 5],
+            "orphan 4 is collected, 3 is the predecessor"
+        );
         drop(env);
     }
 
@@ -573,7 +573,11 @@ mod tests {
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     match read_split() {
-                        SplitReadState::Valid { generation, records, .. } => {
+                        SplitReadState::Valid {
+                            generation,
+                            records,
+                            ..
+                        } => {
                             assert_eq!(records.len(), 1);
                             assert!(generation >= 1);
                         }
@@ -643,7 +647,11 @@ mod tests {
         )
         .unwrap();
         match read_split() {
-            SplitReadState::Valid { generation, records, .. } => {
+            SplitReadState::Valid {
+                generation,
+                records,
+                ..
+            } => {
                 assert_eq!(generation, 2);
                 assert_eq!(records[0].rgb.identity, "c:3");
             }
@@ -706,6 +714,34 @@ mod tests {
     }
 
     #[test]
+    fn a_published_store_does_not_change_ordinary_selection() {
+        let env = env();
+        config::write_camera_pin("/dev/video0", "/dev/video2", "rid", "iid").unwrap();
+        publish_split(&[record("a:1", "b:2")], Some(&pair_key("a:1", "b:2"))).expect("publication");
+        let obs = config::observe_camera_conf();
+        assert!(
+            matches!(
+                obs.selection,
+                config::CameraSelectionObservation::Pinned { .. }
+            ),
+            "ordinary selection must be untouched by a split publication"
+        );
+        assert_eq!(
+            config::read_camera_pin().rgb.as_deref(),
+            Some("/dev/video0")
+        );
+        match read_split() {
+            SplitReadState::Valid {
+                selected: Some(_), ..
+            } => {}
+            other => panic!("expected Valid with a selection, got {other:?}"),
+        }
+        // No caller in this slice hands split candidates to enrollment or
+        // authentication: the store is inert for the engine (ADR-0032 §7).
+        drop(env);
+    }
+
+    #[test]
     fn the_start_sweep_deletes_only_temps_and_orphans_above_the_reference() {
         let env = env();
         let referenced = generation_file(&env.dir, 3, &[record("a:1", "b:2")]);
@@ -726,7 +762,11 @@ mod tests {
             .into_iter()
             .map(|(n, _)| n)
             .collect();
-        assert_eq!(names, vec![1, 3], "5 is an orphan above the reference, 1 may be the predecessor");
+        assert_eq!(
+            names,
+            vec![1, 3],
+            "5 is an orphan above the reference, 1 may be the predecessor"
+        );
         drop(env);
     }
 }

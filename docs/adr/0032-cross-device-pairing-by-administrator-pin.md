@@ -329,7 +329,10 @@ Writer, holding `lock_exclusive` on `cameras.conf` to serialize writers:
 2. Write the new generation to a temporary file in the same directory
    (0600), fsync the file, rename it to `<N>.conf`, fsync the
    directory: the same temp-file, fsync, rename and directory-fsync
-   discipline the existing atomic writers use.
+   discipline the existing atomic writers use. Writer temporaries carry
+   a leading dot and a `.tmp.` marker (`.{name}.tmp.{pid}.{seq}`), so
+   the sweep can tell them from generation names and from foreign
+   files, which it never deletes.
 3. Compute `sha256` over the exact bytes of the generation file.
 4. Publish `cameras.conf` in one atomic rename containing the existing
    five keys unchanged plus `split_generation` and `split_digest`, and

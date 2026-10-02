@@ -181,6 +181,9 @@ impl SplitDomain {
 
     /// Parse the canonical domain text; anything else (including `ss`) is
     /// rejected so each domain has exactly one schema spelling.
+    ///
+    /// # Errors
+    /// [`KeyError::BadDomain`] for any text other than `usb2`/`superspeed`.
     pub fn parse_canonical(text: &str) -> Result<Self, KeyError> {
         match text {
             "superspeed" => Ok(Self::SuperSpeed),
@@ -204,6 +207,10 @@ impl SplitUnitKey {
 
     /// Parse canonical unit text. `|` and `;` are always escaped in values,
     /// so splitting the raw text at those bytes is unambiguous.
+    ///
+    /// # Errors
+    /// [`KeyError`] when the shape, encoding, domain text or ports text is
+    /// not canonical.
     pub fn parse_canonical(text: &str) -> Result<Self, KeyError> {
         let fields: Vec<&str> = text.split('|').collect();
         if fields.len() != 4 {
@@ -226,10 +233,18 @@ impl SplitUnitKey {
 impl SplitPairKey {
     /// Canonical pair text: `split1;<rgb unit>;<ir unit>`.
     pub fn format_canonical(&self) -> String {
-        format!("split1;{};{}", self.rgb.format_canonical(), self.ir.format_canonical())
+        format!(
+            "split1;{};{}",
+            self.rgb.format_canonical(),
+            self.ir.format_canonical()
+        )
     }
 
     /// Parse canonical pair text.
+    ///
+    /// # Errors
+    /// [`KeyError`] when the class tag, unit shape or any field is not
+    /// canonical.
     pub fn parse_canonical(text: &str) -> Result<Self, KeyError> {
         let rest = text.strip_prefix("split1;").ok_or(KeyError::BadClassTag)?;
         let (rgb, ir) = rest.split_once(';').ok_or(KeyError::BadUnitShape)?;

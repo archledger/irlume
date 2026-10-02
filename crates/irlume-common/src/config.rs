@@ -681,7 +681,8 @@ impl std::fmt::Display for CameraConfProblem {
 /// What one strict read of `cameras.conf` establishes about camera selection
 /// (ADR-0029 §4). `Unreadable` and `Malformed` are never `Fresh`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CameraSelectionObservation {    /// No file, or a readable one with no complete pair and no `mode` line.
+pub enum CameraSelectionObservation {
+    /// No file, or a readable one with no complete pair and no `mode` line.
     Fresh,
     /// A complete pair; `explicit` when a `mode=pinned` line was present.
     Pinned { pair: PinnedPair, explicit: bool },
@@ -878,17 +879,23 @@ pub fn parse_camera_conf(text: &str) -> CameraConfObservation {
     let split_at = |slot: usize| seen[slot].filter(|(_, v)| !v.is_empty());
     let split_inputs = (split_at(5), split_at(6), split_at(7));
     if split_inputs != (None, None, None) {
-        let valid_generation = split_inputs.0.is_some_and(|(_, v)| is_canonical_generation(v));
+        let valid_generation = split_inputs
+            .0
+            .is_some_and(|(_, v)| is_canonical_generation(v));
         let valid_digest = split_inputs.1.is_some_and(|(_, v)| is_canonical_digest(v));
-        let valid_pair =
-            split_inputs.2.is_none_or(|(_, v)| crate::split_key::SplitPairKey::parse_canonical(v).is_ok());
+        let valid_pair = split_inputs
+            .2
+            .is_none_or(|(_, v)| crate::split_key::SplitPairKey::parse_canonical(v).is_ok());
         if valid_generation && valid_digest && valid_pair {
             split = SplitConfObservation::Reference {
                 generation: split_inputs
                     .0
                     .and_then(|(_, v)| v.parse().ok())
                     .unwrap_or_default(),
-                digest: split_inputs.1.map(|(_, v)| v.to_owned()).unwrap_or_default(),
+                digest: split_inputs
+                    .1
+                    .map(|(_, v)| v.to_owned())
+                    .unwrap_or_default(),
                 pair: split_inputs.2.map(|(_, v)| v.to_owned()),
             };
         } else {
@@ -2453,7 +2460,10 @@ mod split_conf_tests {
     fn no_split_keys_untouched() {
         let got = parse_camera_conf("rgb=/dev/video0\nir=/dev/video2\n");
         assert_eq!(got.split, SplitConfObservation::None);
-        assert!(matches!(got.selection, CameraSelectionObservation::Pinned { .. }));
+        assert!(matches!(
+            got.selection,
+            CameraSelectionObservation::Pinned { .. }
+        ));
     }
 
     #[test]
@@ -2533,8 +2543,11 @@ mod split_conf_tests {
         for text in [
             format!("split_generation=0\nsplit_digest={DIGEST}\n"),
             format!("split_generation=01\nsplit_digest={DIGEST}\n"),
-            format!("split_generation=3\nsplit_digest=sha256:xyz\n"),
-            format!("split_generation=3\nsplit_digest=SHA256:{}\n", "a".repeat(64)),
+            "split_generation=3\nsplit_digest=sha256:xyz\n".to_string(),
+            format!(
+                "split_generation=3\nsplit_digest=SHA256:{}\n",
+                "a".repeat(64)
+            ),
         ] {
             let got = parse_camera_conf(&text);
             assert!(

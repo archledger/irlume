@@ -104,7 +104,7 @@ pub fn serialize_generation(records: &[AuthorizationRecord]) -> Result<String, S
             }
             if fields.ports.is_empty()
                 || fields.ports.len() > MAX_PORT_ELEMENTS
-                || fields.ports.iter().any(|p| *p == 0)
+                || fields.ports.contains(&0)
             {
                 return Err(SchemaError::BadPorts);
             }
@@ -115,7 +115,7 @@ pub fn serialize_generation(records: &[AuthorizationRecord]) -> Result<String, S
                 ("domain", fields.domain.as_str().to_owned()),
                 ("ports", format_ports_text(&fields.ports)),
             ] {
-                let line = format!("{}={}\n", record_key(i, side, &field), value);
+                let line = format!("{}={}\n", record_key(i, side, field), value);
                 if line.len() > MAX_LINE_BYTES {
                     return Err(SchemaError::LineTooLong);
                 }
@@ -134,7 +134,56 @@ pub fn serialize_generation(records: &[AuthorizationRecord]) -> Result<String, S
 fn value_reads_back_as_one_line(value: &str) -> bool {
     !value.is_empty()
         && value.trim() == value
-        && !value.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        && !value
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+}
+
+/// Build one side from its five recorded fields, reporting every problem.
+fn build_side(
+    slots: &[Option<String>; 5],
+    index: usize,
+    side: &str,
+    problems: &mut Vec<String>,
+) -> Option<SideFields> {
+    let mut valid = true;
+    for (field_idx, field) in SIDE_KEYS.iter().enumerate() {
+        match &slots[field_idx] {
+            Some(value) if value_reads_back_as_one_line(value) => {}
+            _ => {
+                problems.push(format!("pair.{index}.{side}_{field} is missing or invalid"));
+                valid = false;
+            }
+        }
+    }
+    if !valid {
+        return None;
+    }
+    let domain = match SplitDomain::parse_canonical(slots[3].as_deref().unwrap_or("")) {
+        Ok(domain) => domain,
+        Err(_) => {
+            problems.push(format!(
+                "pair.{index}.{side}_{DOMAIN_FIELD} is not canonical"
+            ));
+            return None;
+        }
+    };
+    let ports = match parse_ports_text(slots[4].as_deref().unwrap_or("")) {
+        Ok(ports) if !ports.is_empty() && ports.len() <= MAX_PORT_ELEMENTS => ports,
+        _ => {
+            problems.push(format!(
+                "pair.{index}.{side}_{PORTS_FIELD} is not canonical"
+            ));
+            return None;
+        }
+    };
+    Some(SideFields {
+        identity: slots[0].clone().unwrap_or_default(),
+        path: slots[1].clone().unwrap_or_default(),
+        controller: slots[2].clone().unwrap_or_default(),
+        domain,
+        ports,
+    })
 }
 
 /// Parse generation-file text. Pure; never returns an I/O state.
@@ -194,7 +243,9 @@ pub fn parse_generation(text: &str) -> GenerationObservation {
             }
         };
         if index >= MAX_RECORDS {
-            problems.push(format!("line {line_no}: record index is over {MAX_RECORDS}"));
+            problems.push(format!(
+                "line {line_no}: record index is over {MAX_RECORDS}"
+            ));
             continue;
         }
         let Some((side, field)) = tail.split_once('_') else {
@@ -213,7 +264,13 @@ pub fn parse_generation(text: &str) -> GenerationObservation {
             continue;
         };
         if seen.len() <= index {
-            seen.resize(index + 1, [[None, None, None, None, None], [None, None, None, None, None]]);
+            seen.resize(
+                index + 1,
+                [
+                    [None, None, None, None, None],
+                    [None, None, None, None, None],
+                ],
+            );
         }
         if seen[index][side_idx][field_idx].is_some() {
             problems.push(format!("line {line_no}: '{key}' is set more than once"));
@@ -223,67 +280,21 @@ pub fn parse_generation(text: &str) -> GenerationObservation {
         max_index = Some(max_index.map_or(index, |m| m.max(index)));
     }
     if version_lines != 1 {
-        problems.push(format!("version must appear exactly once, found {version_lines}"));
+        problems.push(format!(
+            "version must appear exactly once, found {version_lines}"
+        ));
     }
     let count = max_index.map_or(0, |m| m + 1);
     if seen.len() != count {
         problems.push("record indices are not contiguous from 0".to_owned());
     }
     let mut records = Vec::new();
-    for index in 0..count {
-        let mut sides: [Option<SideFields>; 2] = [None, None];
-        for side_idx in 0..2 {
-            let mut fields: [Option<String>; 5] = [None, None, None, None, None];
-            for field_idx in 0..5 {
-                fields[field_idx] = seen[index][side_idx][field_idx].clone();
-            }
-            let mut missing = false;
-            for (field_idx, field) in SIDE_KEYS.iter().enumerate() {
-                match &fields[field_idx] {
-                    Some(v) if value_reads_back_as_one_line(v) => {}
-                    _ => {
-                        problems.push(format!(
-                            "pair.{index}.{}_{field} is missing or invalid",
-                            if side_idx == 0 { "rgb" } else { "ir" }
-                        ));
-                        missing = true;
-                    }
-                }
-            }
-            if missing {
-                continue;
-            }
-            let domain = match SplitDomain::parse_canonical(fields[3].as_deref().unwrap_or("")) {
-                Ok(domain) => domain,
-                Err(_) => {
-                    problems.push(format!(
-                        "pair.{index}.{}_{DOMAIN_FIELD} is not canonical",
-                        if side_idx == 0 { "rgb" } else { "ir" }
-                    ));
-                    continue;
-                }
-            };
-            let ports = match parse_ports_text(fields[4].as_deref().unwrap_or("")) {
-                Ok(ports) if !ports.is_empty() && ports.len() <= MAX_PORT_ELEMENTS => ports,
-                _ => {
-                    problems.push(format!(
-                        "pair.{index}.{}_{PORTS_FIELD} is not canonical",
-                        if side_idx == 0 { "rgb" } else { "ir" }
-                    ));
-                    continue;
-                }
-            };
-            sides[side_idx] = Some(SideFields {
-                identity: fields[0].clone().unwrap_or_default(),
-                path: fields[1].clone().unwrap_or_default(),
-                controller: fields[2].clone().unwrap_or_default(),
-                domain,
-                ports,
-            });
-        }
-        match (sides[0].take(), sides[1].take()) {
-            (Some(rgb), Some(ir)) => records.push(AuthorizationRecord { rgb, ir }),
-            _ => {}
+    for (index, record_slots) in seen.iter().enumerate().take(count) {
+        if let (Some(rgb), Some(ir)) = (
+            build_side(&record_slots[0], index, "rgb", &mut problems),
+            build_side(&record_slots[1], index, "ir", &mut problems),
+        ) {
+            records.push(AuthorizationRecord { rgb, ir });
         }
     }
     if problems.is_empty() {
@@ -359,7 +370,9 @@ pair.0.ir_domain=usb2\npair.0.ir_ports=5\nsurprise=yes\n";
     #[test]
     fn a_wrong_version_is_malformed() {
         let records = vec![record("a:1", "b:2")];
-        let text = serialize_generation(&records).unwrap().replace("version=1", "version=2");
+        let text = serialize_generation(&records)
+            .unwrap()
+            .replace("version=1", "version=2");
         assert!(matches!(
             parse_generation(&text),
             GenerationObservation::Malformed { .. }

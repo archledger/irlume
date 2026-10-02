@@ -56,7 +56,7 @@ fn read_stack(service: &str) -> Result<Option<String>, String> {
 /// then read only a regular file through that descriptor. Follow distro
 /// symlinks, including absolute includes; re-opening the pathname after a
 /// metadata check would let a replacement bypass the file-type check.
-fn read_stack_file(path: &Path) -> std::io::Result<String> {
+pub(super) fn read_stack_file(path: &Path) -> std::io::Result<String> {
     use std::io::{Error, ErrorKind, Read};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};

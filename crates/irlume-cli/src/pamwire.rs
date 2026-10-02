@@ -433,10 +433,9 @@ pub(crate) fn read_wired_marker() -> Option<WiredMarker> {
 
 /// Idempotent repair entry point, meant to run unattended from a systemd path
 /// unit watching the greeter PAM files. If login was enabled (marker present),
-/// first keep irlume's own overrides in step with their vendor files (see
-/// `maintain_overrides`); then, if the PAM stack is no longer wired, re-apply
-/// the recorded configuration; otherwise exit quietly. Always root (the path
-/// unit's service runs as root).
+/// first remove blocked remote-seat authentication authority, then establish
+/// capabilities before maintaining overrides and re-applying the recorded
+/// configuration. Always root (the path unit's service runs as root).
 fn reconcile() -> ExitCode {
     // This unit fires when a PAM file changes, which is exactly what every other
     // irlume path does, so without the lock reconcile is the most likely thing
@@ -496,14 +495,16 @@ fn reconcile() -> ExitCode {
         // upgrade or a state-directory recovery lands here, and its legacy
         // overrides get their tracking line and a changed vendor copy is
         // followed now rather than on the next reconcile.
+        if !prepare_reconcile() {
+            return ExitCode::FAILURE;
+        }
         let maintained = maintain_overrides();
         // Package upgrades start this run, so the face lines of a LightDM
         // that serves remote login screens come out here, not on a later one.
-        let code = if remote_seat_change().is_some() {
-            reconcile_wiring(with_sudo, with_polkit, with_lock, false)
-        } else {
-            ExitCode::SUCCESS
-        };
+        // Safety removal can erase the last module before the remote-seat
+        // classifier runs. Still perform normal regression detection so a
+        // legacy adopted stack receives its reseal-only recipe when possible.
+        let code = reconcile_wiring(with_sudo, with_polkit, with_lock, false);
         return if maintained { code } else { ExitCode::FAILURE };
     };
     // The marker records what `login enable` wired, and it can drift: a real
@@ -533,12 +534,15 @@ fn reconcile() -> ExitCode {
              (sudo={with_sudo}, polkit={with_polkit})"
         );
     }
-    // Overrides irlume created from vendor files are kept in step with those
-    // files here, before the regression checks and without asking the daemon:
+    // After safety removal and capability establishment, overrides irlume
+    // created from vendor files are kept in step before the regression checks:
     // a matching file written by an older release gets its tracking line, and
     // one nobody edited is rebuilt from a changed vendor copy with the settings
     // its irlume lines already have. An override with lines irlume did not
     // write is never written here. None of this starts a re-apply.
+    if !prepare_reconcile() {
+        return ExitCode::FAILURE;
+    }
     let maintained = effective_uid() != 0 || maintain_overrides();
     let code = reconcile_wiring(with_sudo, with_polkit, with_lock, face_lock_intent);
     if maintained {
@@ -546,6 +550,91 @@ fn reconcile() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Remove remote-seat authority before any capability query, camera fallback,
+/// or override refresh. Repair can add authentication rules and must wait for
+/// established capabilities; removing an existing grant path must not.
+/// Called with the PAM lock held, including on the marker-adoption path.
+fn prepare_reconcile() -> bool {
+    for svc in GREETERS {
+        if !remote_seats::governs(service_name(svc.etc)) {
+            continue;
+        }
+        let Some(why) = remote_seats::face_blocked(service_name(svc.etc)) else {
+            continue;
+        };
+        match strip_remote_auth(svc.etc) {
+            Ok(true) => eprintln!(
+                "[login] {why}; removing LightDM's face and fingerprint lines (pam_irlume only)"
+            ),
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("[login] cannot remove LightDM authentication authority: {e}");
+                return false;
+            }
+        }
+    }
+    wait_for_daemon_start();
+    if !crate::caps_established() {
+        eprintln!("[login] cannot assess PAM repair until daemon capabilities are established");
+        return false;
+    }
+    true
+}
+
+/// Replace only credential/face auth rules with the existing inert-slot form.
+/// No insertion, backup restoration, include rewrite, or session change is
+/// permitted here. Keeping one slot per rule also preserves jumps arriving
+/// from included stacks; the reseal hand-off and password path stay in place.
+fn strip_remote_auth(etc: &str) -> Result<bool, String> {
+    let path = Path::new(etc);
+    let current = match token::read_stack_file(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("{etc}: {error}")),
+    };
+    if !current.lines().any(irlume_auth_rule_beyond_reseal) {
+        return Ok(false);
+    }
+    // Linked password/reseal-only stacks need no write and must not prevent
+    // unrelated repairs. Validate replacement authority only after the bounded
+    // pinned read establishes that an authentication rule needs removal.
+    inspect_target(path)?;
+    if effective_uid() != 0 {
+        return Err("safety removal needs root; run: sudo irlume login reconcile".into());
+    }
+    // A physical-line replacement cannot safely reason about a continued or
+    // unrecognized directive. Report failure without changing its bytes.
+    if has_line_continuation(&current) || unreadable_line(&current).is_some() {
+        return Err(format!(
+            "{etc} contains a PAM line that cannot be safely rewritten"
+        ));
+    }
+    if current
+        .lines()
+        .filter(|line| irlume_auth_rule_beyond_reseal(line))
+        .filter_map(irlume_rule)
+        .any(|rule| !control_ignores_module_ignore(rule.control))
+    {
+        return Err(format!(
+            "{etc} gives PAM_IGNORE a non-inert control action; keeping the file"
+        ));
+    }
+    let mut next = String::with_capacity(current.len());
+    for line in current.split_inclusive('\n') {
+        if irlume_auth_rule_beyond_reseal(line) {
+            let inert = overrides::neutralize(line);
+            next.push_str(inert.trim_end_matches('\n'));
+            if line.ends_with('\n') {
+                next.push('\n');
+            }
+        } else {
+            next.push_str(line);
+        }
+    }
+    write_atomic_checked_if(path, &next, Some(&current), &|| Ok(()))?;
+    Ok(true)
 }
 
 /// Every surface with a vendor path, with the recipe its override takes.
@@ -641,6 +730,26 @@ fn maintain_override(svc: &Svc, recipe: overrides::Recipe) -> Result<Option<Stri
         }
         overrides::Maintenance::Nothing | overrides::Maintenance::Blocked(_) => return Ok(None),
     };
+    // The maintenance owner infers the reseal-only recipe from the reduced
+    // stack. Let that recipe propagate vendor policy updates while remote
+    // seats remain enabled, but never publish a result that restores their
+    // authentication authority. Check again at publication if policy changes
+    // after the first check; the PAM lock does not lock LightDM configuration.
+    let check_remote = || {
+        if (has_line_continuation(&content)
+            || unreadable_line(&content).is_some()
+            || content.lines().any(irlume_auth_rule_beyond_reseal))
+            && remote_seats::face_blocked(service_name(svc.etc)).is_some()
+        {
+            Err(format!(
+                "{}: override maintenance cannot prove remote-seat authentication stays disabled",
+                svc.etc
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check_remote()?;
     // Made from the vendor copy read above, so kept only while that copy is
     // still the same once the file is in place, as in `wire_override`. A
     // package that changed it meanwhile starts another reconcile, which
@@ -650,7 +759,7 @@ fn maintain_override(svc: &Svc, recipe: overrides::Recipe) -> Result<Option<Stri
         #[cfg(test)]
         change_vendor_for_test(Path::new(vendor_path));
         if vendor_digest_now(vendor_path) == decided {
-            Ok(())
+            check_remote()
         } else {
             vendor_moved.set(true);
             Err(format!(
@@ -938,14 +1047,8 @@ fn reconcile_wiring(
     with_lock: bool,
     face_lock_intent: bool,
 ) -> ExitCode {
-    // The checks below derive `want` from daemon capabilities. Do not cache
-    // a transient no-camera fallback while the daemon starts: it can hide a
-    // stripped greeter or an anchor lost from one that still holds our lines.
-    wait_for_daemon_start();
-    if !crate::caps_established() {
-        eprintln!("[login] cannot assess PAM repair until daemon capabilities are established");
-        return ExitCode::FAILURE;
-    }
+    // prepare_reconcile established capabilities before override maintenance
+    // and this repair pass. Its safety-only removal ran before that query.
     // #607: the Omarchy lane pair is its own regression shape. The lane facts
     // are read once here and given to both pure cores, so this check and
     // `reconcile_needed` cannot disagree about them.

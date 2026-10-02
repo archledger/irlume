@@ -15,6 +15,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Daemon account lookups use a deadline-bounded NSS subprocess instead of
+  blocking the authentication worker inside an account provider. Registered
+  UID holds still bind records, fresh ownership checks remain fresh, and
+  failed lookups remain unknown. Helper admission includes pending reaps, so
+  stalled providers cannot accumulate unbounded cleanup threads (#859).
+
 - Uninstall and login guards read irlumed's environment files and ordered
   environment resets, refusing unreadable or ambiguous settings. Uninstall
   carries one daemon-generation snapshot through stop and custom-store cleanup,

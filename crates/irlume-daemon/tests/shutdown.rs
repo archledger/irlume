@@ -15,6 +15,53 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+#[test]
+fn nss_helper_exits_without_starting_the_daemon() {
+    let dir = std::env::temp_dir().join(format!("irlumed-nss-helper-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("must-not-open.sock");
+    for (query, expected) in [
+        (r#"{"Uid":0}"#, "Found"),
+        (r#"{"Name":"root"}"#, "Found"),
+        (r#"{"Name":"a\u0000b"}"#, "Absent"),
+        ("malformed", "Unknown"),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_irlumed"));
+        command
+            .arg("--internal-nss-lookup")
+            .env("IRLUME_SOCKET", &socket)
+            .env("IRLUME_STATE_DIR", &dir)
+            .env("IRLUME_CONFIG_DIR", &dir)
+            .env("IRLUME_DET_MODEL", dir.join("no-model"))
+            .env("IRLUME_FORCE_NO_IR", "1")
+            .env("IRLUME_RGB_DEVICE", "/nonexistent-rgb")
+            .env("IRLUME_IR_DEVICE", "/nonexistent-ir");
+        let output = irlume_common::process::output_with_input_until(
+            &mut command,
+            query.as_bytes(),
+            Instant::now() + Duration::from_secs(3),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        let json = text
+            .lines()
+            .find_map(|line| line.strip_prefix("IRLUME_NSS_REPLY:"))
+            .unwrap();
+        let reply: serde_json::Value = serde_json::from_str(json).unwrap();
+        if expected == "Found" {
+            assert_eq!(reply["Found"]["uid"], 0);
+        } else {
+            assert_eq!(reply, expected);
+        }
+        assert!(
+            !socket.exists(),
+            "the private helper must not bind a daemon socket"
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 fn models_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models")
 }

@@ -3,33 +3,97 @@
 
 //! Bounded output collection for short observation helpers.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const MAX_OUTPUT: usize = 64 * 1024;
+const MAX_CHILDREN: usize = 32;
+const MAX_INPUT: usize = 4096;
+static BUDGET: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 
 /// Collect a short helper's output within one observation deadline.
 ///
 /// Standard input is closed and combined output is limited to 64 KiB. On any
-/// failure the direct child is killed and reaped, using a background waiter if
-/// the kernel has not yet completed its exit. No unbounded wait occurs on the
+/// failure the direct child is killed and reaped by one shared polling reaper
+/// if the kernel has not yet completed its exit. At most 32 children, including
+/// pending reaps, are admitted per process. No unbounded wait occurs on the
 /// caller. Callers retain control of executable, arguments and environment.
 ///
 /// # Errors
 /// Returns spawn/I/O errors, `TimedOut` on expiry, or `InvalidData` when output
-/// exceeds the limit. A nonzero helper exit is returned in `Output::status`.
+/// exceeds the limit, or `WouldBlock` when the child budget is exhausted.
+/// A nonzero helper exit is returned in `Output::status`.
 pub fn output_until(command: &mut Command, deadline: Instant) -> io::Result<Output> {
+    output_with_budget(
+        command,
+        deadline,
+        Arc::clone(BUDGET.get_or_init(Default::default)),
+    )
+}
+
+/// Collect helper output while supplying at most 4096 bytes through private stdin.
+/// Input writes and output reads share one deadline; stdin closes after delivery.
+///
+/// # Errors
+/// Returns the observation errors of [`output_until`], stdin write errors, or
+/// `InvalidInput` if the request exceeds 4096 bytes.
+pub fn output_with_input_until(
+    command: &mut Command,
+    input: &[u8],
+    deadline: Instant,
+) -> io::Result<Output> {
+    output_with_budget_and_input(
+        command,
+        input,
+        deadline,
+        Arc::clone(BUDGET.get_or_init(Default::default)),
+    )
+}
+
+fn output_with_budget(
+    command: &mut Command,
+    deadline: Instant,
+    budget: Arc<AtomicUsize>,
+) -> io::Result<Output> {
+    output_with_budget_and_input(command, &[], deadline, budget)
+}
+
+fn output_with_budget_and_input(
+    command: &mut Command,
+    mut input: &[u8],
+    deadline: Instant,
+    budget: Arc<AtomicUsize>,
+) -> io::Result<Output> {
+    if input.len() > MAX_INPUT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "helper input exceeded limit",
+        ));
+    }
+    remaining(deadline)?;
+    let permit = ChildPermit::acquire(budget)?;
+    let reaper = Reaper::global()?;
     remaining(deadline)?;
     let child = command
-        .stdin(Stdio::null())
+        .stdin(if input.is_empty() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let mut owner = ObservedChild(Some(child));
+    let mut owner = ObservedChild {
+        child: Some(child),
+        permit: Some(permit),
+        reaper,
+    };
     let child = owner
-        .0
+        .child
         .as_mut()
         .ok_or_else(|| io::Error::other("missing helper child"))?;
     let mut stdout = child
@@ -40,6 +104,10 @@ pub fn output_until(command: &mut Command, deadline: Instant) -> io::Result<Outp
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("missing stderr pipe"))?;
+    let mut stdin = child.stdin.take();
+    if let Some(pipe) = &stdin {
+        nonblocking(pipe)?;
+    }
     nonblocking(&stdout)?;
     nonblocking(&stderr)?;
     let mut out = Vec::new();
@@ -50,6 +118,29 @@ pub fn output_until(command: &mut Command, deadline: Instant) -> io::Result<Outp
     loop {
         remaining(deadline)?;
         let mut progress = false;
+        if let Some(pipe) = &mut stdin {
+            match pipe.write(input) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "helper stdin closed",
+                    ))
+                }
+                Ok(n) => {
+                    input = &input[n..];
+                    progress = true;
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(e) => return Err(e),
+            }
+            if input.is_empty() {
+                stdin.take();
+            }
+        }
         if !out_eof {
             progress |= collect(&mut stdout, &mut out, err.len(), &mut out_eof)?;
         }
@@ -62,7 +153,7 @@ pub fn output_until(command: &mut Command, deadline: Instant) -> io::Result<Outp
         remaining(deadline)?;
         if let Some(status) = status {
             if out_eof && err_eof {
-                owner.0.take(); // try_wait has reaped this child.
+                owner.child.take(); // try_wait has reaped this child.
                 return Ok(Output {
                     status,
                     stdout: out,
@@ -136,16 +227,93 @@ fn collect(
     }
 }
 
-struct ObservedChild(Option<Child>);
+struct ChildPermit(Arc<AtomicUsize>);
+
+impl ChildPermit {
+    fn acquire(budget: Arc<AtomicUsize>) -> io::Result<Self> {
+        budget
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_CHILDREN).then_some(n + 1)
+            })
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "helper child budget exhausted")
+            })?;
+        Ok(Self(budget))
+    }
+}
+
+impl Drop for ChildPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+#[derive(Default)]
+struct Reaper {
+    pending: Mutex<Vec<(Child, ChildPermit)>>,
+    wake: Condvar,
+}
+
+impl Reaper {
+    fn global() -> io::Result<Arc<Self>> {
+        static REAPER: Mutex<Option<Arc<Reaper>>> = Mutex::new(None);
+        Self::initialize(&REAPER, |worker| {
+            std::thread::Builder::new()
+                .name("irlume-helper-reaper".into())
+                .spawn(move || worker.run())
+                .map(|_| ())
+        })
+    }
+
+    fn initialize(
+        slot: &Mutex<Option<Arc<Reaper>>>,
+        spawn: impl FnOnce(Arc<Reaper>) -> io::Result<()>,
+    ) -> io::Result<Arc<Self>> {
+        let mut initialized = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(reaper) = &*initialized {
+            return Ok(Arc::clone(reaper));
+        }
+        let reaper = Arc::new(Self::default());
+        spawn(Arc::clone(&reaper))?;
+        *initialized = Some(Arc::clone(&reaper));
+        Ok(reaper)
+    }
+
+    fn run(&self) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            while pending.is_empty() {
+                pending = self.wake.wait(pending).unwrap_or_else(|e| e.into_inner());
+            }
+            // WNOHANG only. A child stuck in the kernel retains its permit;
+            // later callers cannot accumulate more children or waiter threads.
+            pending.retain_mut(|(child, _)| !matches!(child.try_wait(), Ok(Some(_))));
+            pending = self
+                .wake
+                .wait_timeout(pending, Duration::from_millis(10))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+}
+
+struct ObservedChild {
+    child: Option<Child>,
+    permit: Option<ChildPermit>,
+    reaper: Arc<Reaper>,
+}
 
 impl Drop for ObservedChild {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
+        if let (Some(mut child), Some(permit)) = (self.child.take(), self.permit.take()) {
             let _ = child.kill();
             if !matches!(child.try_wait(), Ok(Some(_))) {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
+                self.reaper
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((child, permit));
+                self.reaper.wake.notify_one();
             }
         }
     }
@@ -156,6 +324,115 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn reaper_creation_retries_after_transient_thread_failure() {
+        let slot = Mutex::new(None);
+        let calls = std::cell::Cell::new(0);
+        let first = Reaper::initialize(&slot, |_| {
+            calls.set(calls.get() + 1);
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "synthetic resource pressure",
+            ))
+        });
+        assert!(first.is_err());
+        let second = Reaper::initialize(&slot, |_| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert!(
+            second.is_ok(),
+            "a transient failure must not disable future helpers"
+        );
+        assert_eq!(calls.get(), 2);
+        assert!(Reaper::initialize(&slot, |_| panic!("already started")).is_ok());
+    }
+
+    #[test]
+    fn private_stdin_rejects_oversize_input_before_spawn_and_bounds_stalled_helpers() {
+        let error = output_with_input_until(
+            &mut Command::new("/nonexistent/no-input-capacity"),
+            &vec![b'x'; MAX_INPUT + 1],
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let started = Instant::now();
+        let error = output_with_input_until(
+            Command::new("/bin/sleep").arg("20"),
+            &vec![b'x'; MAX_INPUT],
+            started + Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn private_stdin_request_reaches_the_helper_without_argument_data() {
+        let request = b"synthetic-private-account-query";
+        let mut command = Command::new("/bin/cat");
+        let output = output_with_input_until(
+            &mut command,
+            request,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, request);
+        assert!(command.get_args().next().is_none());
+    }
+
+    #[test]
+    fn exhausted_child_budget_refuses_before_spawning() {
+        let budget = Arc::new(AtomicUsize::new(MAX_CHILDREN));
+        let error = output_with_budget(
+            &mut Command::new("/nonexistent/no-capacity"),
+            Instant::now() + Duration::from_secs(1),
+            Arc::clone(&budget),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(budget.load(Ordering::Acquire), MAX_CHILDREN);
+    }
+
+    #[test]
+    fn child_capacity_returns_after_success_spawn_failure_and_timeout_reap() {
+        let budget = Arc::new(AtomicUsize::new(0));
+        output_with_budget(
+            &mut Command::new("/bin/true"),
+            Instant::now() + Duration::from_secs(2),
+            Arc::clone(&budget),
+        )
+        .unwrap();
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+        assert!(output_with_budget(
+            &mut Command::new("/nonexistent/helper"),
+            Instant::now() + Duration::from_secs(2),
+            Arc::clone(&budget),
+        )
+        .is_err());
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+        for _ in 0..3 {
+            let error = output_with_budget(
+                Command::new("/bin/sleep").arg("20"),
+                Instant::now() + Duration::from_millis(100),
+                Arc::clone(&budget),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        }
+        let until = Instant::now() + Duration::from_secs(2);
+        while budget.load(Ordering::Acquire) != 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            budget.load(Ordering::Acquire),
+            0,
+            "the shared reaper returns every permit"
+        );
+    }
 
     #[test]
     fn collects_both_streams_and_exit_status() {

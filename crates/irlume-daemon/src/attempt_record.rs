@@ -576,8 +576,11 @@ fn account_uid(user: &str) -> io::Result<u32> {
 /// now, whose record the attempt is not part of. Failures are reported to
 /// the journal by the caller and never change the reply: the record is
 /// history, not policy.
-pub(crate) fn record(uid: u32, user: &str, filed: Filed) -> io::Result<()> {
-    if crate::users::name_for_uid(uid).as_deref() != Some(user) {
+fn record(uid: u32, user: &str, filed: Filed) -> io::Result<()> {
+    // This runs on the one queued history writer in production, not the
+    // authentication worker. Keep its identity check independent of the
+    // worker's lookup deadline so an otherwise valid attempt is not lost.
+    if crate::users::name_for_record_writer(uid).as_deref() != Some(user) {
         return Err(invalid());
     }
     let store = store()?;

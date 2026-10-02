@@ -77,6 +77,37 @@ flowchart LR
   shared pre-gate enforces it before any camera work
   ([THREAT_MODEL.md](THREAT_MODEL.md#camera-use-by-local-accounts)).
 
+### Account lookup boundary
+
+`irlumed` installs a process-isolated NSS resolver before starting its threads.
+Native `getpwnam_r` and `getpwuid_r` for worker checks run in a fresh execution of
+the running daemon image, in a private lookup mode that exits before opening
+sockets, models, cameras or the TPM. Each fresh lookup has a one-second deadline covering
+helper observation and a 64 KiB combined-output limit. The query uses a private
+stdin pipe with a 4096-byte bound, never command-line arguments. Timeout, malformed reply
+or provider error means unknown; only a successful native no-entry result means
+no account. Name queries and UID queries are distinct, including numeric names.
+
+The existing request UID holds still avoid lookups for core record checks.
+Canonical-name checks for retry records and fresh shared-greeter ownership
+checks retain their identity rules and use the bounded resolver. No account
+record or attempt-history path is removed. A failed required lookup refuses
+the operation. The existing history writer retains its native reverse-name
+lookup off the authentication worker: it can wait for NSS to recover without
+losing an otherwise valid queued attempt to the worker's helper deadline. Its
+single thread and 64-entry queue retain their existing bounds and canonical-name
+checks; account changes and actual lookup failures still prevent a wrong-owner
+write. Test builds keep the existing inline-writer fixture.
+
+The shared helper collector admits at most 32 children per process, counting a
+killed child until it is reaped. One polling reaper uses nonblocking waits;
+exhausted capacity refuses a new helper instead of starting another waiting
+thread. NSS helpers inherit the daemon's confinement; AppArmor permits only
+same-profile execution of its executable and the self-profile signals needed
+for termination/reaping. This does not change socket messages or grant rules.
+Reaper initialization caches only a successfully started thread, so transient
+resource pressure does not permanently disable helper creation.
+
 ## Live interface observations
 
 `LiveStatus` is an additive, unprivileged read on the peer-checked socket. It

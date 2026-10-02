@@ -48,7 +48,9 @@ profile irlumed /usr/local/bin/irlumed {
   # kills and restarts it every WatchdogSec forever.
   /run/systemd/notify w,
 
-  /usr/local/bin/irlumed mr,
+  # Fresh-process NSS lookup inherits this same confinement.
+  /usr/local/bin/irlumed mrix,
+  signal (send, receive) set=(kill, chld) peer=irlumed,
 
   # Device-class enumeration (camera discovery walks /sys/class).
   /sys/class/ r,

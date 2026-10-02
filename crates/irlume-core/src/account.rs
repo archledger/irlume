@@ -45,7 +45,7 @@
 
 use irlume_common::{Error, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// What NSS says about an account name now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,7 +73,19 @@ pub fn resolve(user: &str) -> Resolution {
 /// registers root's request for an account.
 #[must_use]
 pub fn resolve_fresh(user: &str) -> Resolution {
-    stood_in(user).unwrap_or_else(|| lookup(user))
+    stood_in(user).unwrap_or_else(|| RESOLVER.get().copied().unwrap_or(lookup)(user))
+}
+
+static RESOLVER: OnceLock<fn(&str) -> Resolution> = OnceLock::new();
+
+/// Install the application's fresh account resolver before starting requests.
+///
+/// irlumed supplies a deadline-bounded, process-isolated NSS resolver. Other
+/// consumers retain the native resolver. Holds and test stand-ins still take
+/// precedence; the callback must report failed lookups as [`Resolution::Unknown`].
+/// Returns false if a resolver was already installed; it is never replaced.
+pub fn install_resolver(resolver: fn(&str) -> Resolution) -> bool {
+    RESOLVER.set(resolver).is_ok()
 }
 
 fn lookup(user: &str) -> Resolution {

@@ -4123,6 +4123,12 @@ fn a_token_arm_is_refused_before_sealing_where_gnome_keyring_was_never_initializ
          org.freedesktop.DBus NameHasOwner s org.gnome.keyring') \
          echo \"b $IRLUME_TEST_KEYRING_OWNED\" ;;\n  *) exit 64 ;;\nesac",
     );
+    // Supply the selected non-Debian GDM unit instead of borrowing the host's
+    // service manager; this test concerns the later keyring session check.
+    sb.fake_tool(
+        "systemctl",
+        "[ \"$*\" = '--system --no-pager --no-ask-password show display-manager.service --property=Id --property=LoadState --property=ExecStart' ] || exit 64\nprintf '%s\\n' 'Id=gdm.service' 'LoadState=loaded' 'ExecStart={ path=/usr/sbin/gdm ; argv[]=/usr/sbin/gdm ; ignore_errors=no ; pid=0 ; }'",
+    );
     let log = serve(&sock(&sb), |request| match request {
         Request::SealPassword { .. } => Response::TokenSealed {
             token: irlume_common::SecretBytes::new(b"fixture-token".to_vec()),
@@ -4173,7 +4179,7 @@ fn a_token_arm_is_refused_before_sealing_where_gnome_keyring_was_never_initializ
                 &sb.root,
                 BIN,
                 &["keyring", "arm", "--user", "tester"],
-                &["getent", "busctl"],
+                &["getent", "busctl", "systemctl"],
                 &["/etc/gdm", "/etc/gdm3", "/usr/lib/pam.d"],
                 &[(&pam, "/etc/pam.d"), (&units, "/etc/systemd/system")],
             )

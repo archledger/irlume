@@ -14,6 +14,8 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
+mod gdm_package;
+
 /// The file that turns on automatic login of `user` for login manager `dm`,
 /// or `None`. An error identifies unreadable or ambiguous configuration;
 /// the caller decides what that means.
@@ -27,35 +29,27 @@ pub(super) fn autologin_source_in(
     dm: &str,
     user: &str,
 ) -> Result<Option<PathBuf>, String> {
+    source_with_gdm(root, dm, user, || gdm_package::custom_conf(root))
+}
+
+fn source_with_gdm(
+    root: &Path,
+    dm: &str,
+    user: &str,
+    gdm_config: impl FnOnce() -> Result<Option<PathBuf>, String>,
+) -> Result<Option<PathBuf>, String> {
     match dm {
-        // GDM reads one file, fixed at build time. Debian and Ubuntu build
-        // it as gdm3, reading /etc/gdm3 (daemon.conf on Debian, custom.conf
-        // on Ubuntu); the others read /etc/gdm/custom.conf. Where /etc/gdm3
-        // exists, a /etc/gdm left behind by another build is not read.
+        // Debian-family GDM's one custom file belongs to the same installed
+        // package as the selected executable. A stale file is not authority.
         "gdm" | "gdm3" => {
-            // A /etc/gdm3 this process cannot inspect (a link into a
-            // directory it cannot search) says nothing about which build is
-            // installed, and GDM, running as root, reads it all the same.
-            let gdm3 = root.join("etc/gdm3");
-            let debian = match std::fs::metadata(&gdm3) {
-                Ok(meta) => meta.is_dir(),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                Err(e) => return Err(format!("{}: {e}", gdm3.display())),
+            let (custom, runtime) = match gdm_config()? {
+                Some(path) => (path, root.join("run/gdm3/custom.conf")),
+                None => (
+                    root.join("etc/gdm/custom.conf"),
+                    root.join("run/gdm/custom.conf"),
+                ),
             };
-            let files: &[&str] = if debian {
-                &["etc/gdm3/daemon.conf", "etc/gdm3/custom.conf"]
-            } else {
-                &["etc/gdm/custom.conf"]
-            };
-            for file in files {
-                let path = root.join(file);
-                if let Some(text) = read(&path)? {
-                    if gdm_logs_in(&text, user).map_err(|e| format!("{}: {e}", path.display()))? {
-                        return Ok(Some(path));
-                    }
-                }
-            }
-            Ok(None)
+            gdm_source(&[custom, runtime], user)
         }
         // System drop-ins, then the admin's, then the main file. Their Qt
         // collation need not match this CLI's locale or byte ordering.
@@ -266,19 +260,32 @@ pub(super) fn on(value: &str) -> bool {
     matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes")
 }
 
-/// GDM's `[daemon]` automatic or timed login of `user`.
-fn gdm_logs_in(text: &str, user: &str) -> Result<bool, String> {
+/// GDM's runtime backend overrides the custom backend key by key.
+fn gdm_source(files: &[PathBuf], user: &str) -> Result<Option<PathBuf>, String> {
     let mut values = std::collections::HashMap::new();
-    for (section, key, value) in assignments(text)? {
-        if section == "daemon" {
-            values.insert(key, value);
+    for (index, path) in files.iter().enumerate() {
+        let Some(text) = read(path)? else { continue };
+        for (section, key, value) in
+            assignments(&text).map_err(|e| format!("{}: {e}", path.display()))?
+        {
+            if section == "daemon" {
+                values.insert(key, (value, index));
+            }
         }
     }
-    let get = |key: &str| values.get(key).map(String::as_str).unwrap_or("");
-    Ok(
-        (on(get("AutomaticLoginEnable")) && get("AutomaticLogin") == user)
-            || (on(get("TimedLoginEnable")) && get("TimedLogin") == user),
-    )
+    for (enabled, name) in [
+        ("AutomaticLoginEnable", "AutomaticLogin"),
+        ("TimedLoginEnable", "TimedLogin"),
+    ] {
+        if let (Some((flag, flag_file)), Some((account, name_file))) =
+            (values.get(enabled), values.get(name))
+        {
+            if on(flag) && account == user {
+                return Ok(Some(files[(*flag_file).max(*name_file)].clone()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Each directory is a priority layer. Without the daemon's Qt backend and
@@ -491,7 +498,37 @@ mod tests {
         }
 
         fn source(&self, dm: &str, user: &str) -> Result<Option<PathBuf>, String> {
-            autologin_source_in(&self.0, dm, user)
+            source_with_gdm(&self.0, dm, user, || {
+                if self.0.join("metadata/gdm-conffiles").exists() {
+                    gdm_package::observe(&self.0, |program, args| {
+                        use gdm_package::Program;
+                        match program {
+                            Program::Systemctl => Ok("Id=gdm.service\nLoadState=loaded\nExecStart={ path=/usr/sbin/gdm3 ; argv[]=/usr/sbin/gdm3 ; ignore_errors=no ; pid=0 ; }\n".into()),
+                            Program::DpkgQuery if args.iter().any(|a| a == "--search") => Ok("gdm3: /usr/sbin/gdm3\n".into()),
+                            Program::DpkgQuery if args.iter().any(|a| a == "--show") => Ok("gdm3\ninstalled\nok\ngdm3\n48.0-2\n".into()),
+                            Program::DpkgQuery if args.last().is_some_and(|a| a == "conffiles") => std::fs::read_to_string(self.0.join("metadata/gdm-conffiles")).map_err(|e| e.to_string()),
+                            Program::DpkgQuery if args.last().is_some_and(|a| a == "md5sums") => Ok("5caab312233f9e4910e942a59bf7f96d  usr/sbin/gdm3\n".into()),
+                            Program::Md5sum => {
+                                let mut command = std::process::Command::new("/usr/bin/md5sum");
+                                command.args(args);
+                                let output = irlume_common::process::output_until(&mut command, std::time::Instant::now() + std::time::Duration::from_secs(2)).map_err(|e| e.to_string())?;
+                                assert!(output.status.success());
+                                Ok(String::from_utf8(output.stdout).unwrap())
+                            }
+                            _ => panic!("unexpected observation: {program:?} {args:?}"),
+                        }
+                    })
+                } else {
+                    Ok(None)
+                }
+            })
+        }
+
+        fn install_gdm(&self, active: &str) {
+            use std::os::unix::fs::PermissionsExt;
+            let image = self.put("usr/sbin/gdm3", "fixture GDM executable\n");
+            std::fs::set_permissions(image, std::fs::Permissions::from_mode(0o755)).unwrap();
+            self.put("metadata/gdm-conffiles", &format!("/etc/gdm3/{active}\n"));
         }
     }
 
@@ -499,6 +536,69 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn installed_gdm_file_ignores_the_other_packagings_stale_file() {
+        let root = Root::new("installed-gdm-choice");
+        for (active, stale) in [
+            ("daemon.conf", "custom.conf"),
+            ("custom.conf", "daemon.conf"),
+        ] {
+            root.install_gdm(active);
+            root.put(
+                &format!("etc/gdm3/{active}"),
+                "[daemon]\nAutomaticLoginEnable=false\n",
+            );
+            root.put(
+                &format!("etc/gdm3/{stale}"),
+                "[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=alice\n",
+            );
+            // The package/executable association is supplied by the installed
+            // authority observer, independently of which candidate files exist.
+            let answer = root.source("gdm3", "alice");
+            assert_eq!(answer, Ok(None), "installed file: {active}");
+        }
+    }
+
+    #[test]
+    fn a_changed_gdm_image_cannot_select_package_configuration() {
+        let root = Root::new("gdm-replaced-image");
+        root.install_gdm("daemon.conf");
+        root.put(
+            "etc/gdm3/daemon.conf",
+            "[daemon]\nAutomaticLoginEnable=false\n",
+        );
+        assert_eq!(root.source("gdm3", "alice"), Ok(None));
+        root.put("usr/sbin/gdm3", "locally replaced executable\n");
+        let error = root.source("gdm3", "alice").unwrap_err();
+        assert!(
+            error.contains("differs from its installed package"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn gdm_runtime_overrides_the_selected_custom_file_per_key() {
+        let root = Root::new("gdm-runtime");
+        root.install_gdm("custom.conf");
+        root.put(
+            "etc/gdm3/custom.conf",
+            "[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=alice\n",
+        );
+        root.put(
+            "run/gdm3/custom.conf",
+            "[daemon]\nAutomaticLoginEnable=false\n",
+        );
+        assert_eq!(root.source("gdm3", "alice"), Ok(None));
+        let runtime = root.put("run/gdm3/custom.conf", "[daemon]\nAutomaticLogin=bob\n");
+        assert_eq!(root.source("gdm3", "alice"), Ok(None));
+        assert_eq!(root.source("gdm3", "bob"), Ok(Some(runtime)));
+        root.put(
+            "run/gdm3/custom.conf",
+            "[daemon] # malformed\nAutomaticLoginEnable=false\n",
+        );
+        assert!(root.source("gdm3", "bob").is_err());
     }
 
     #[test]
@@ -764,6 +864,7 @@ mod tests {
         );
         assert_eq!(root.source("gdm", "alice"), Ok(None), "not [daemon]");
         // Debian's gdm3 reads daemon.conf; timed login counts too.
+        root.install_gdm("daemon.conf");
         root.put(
             "etc/gdm/custom.conf",
             "[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=alice\n",
@@ -780,6 +881,7 @@ mod tests {
         );
         assert_eq!(root.source("gdm3", "alice"), Ok(Some(debian)));
         // Ubuntu's reads custom.conf there.
+        root.install_gdm("custom.conf");
         root.put("etc/gdm3/daemon.conf", "[daemon]\n");
         let ubuntu = root.put(
             "etc/gdm3/custom.conf",
@@ -965,6 +1067,7 @@ mod tests {
         assert_eq!(root.source("ly", "alice"), Ok(None), "no reader");
         // A /etc/gdm3 linked into a directory this process cannot search:
         // which GDM build reads what is unknown, so it is an error.
+        root.install_gdm("daemon.conf");
         let hidden = root.0.join("hidden");
         std::fs::create_dir_all(hidden.join("gdm3")).unwrap();
         std::fs::create_dir_all(root.0.join("etc")).unwrap();

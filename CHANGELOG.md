@@ -15,6 +15,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- GDM token-arm checks select Debian's or Ubuntu's configuration from the
+  installed package owning the selected executable, excluding the other
+  packaging's stale file. Removed packages, ambiguous ownership, replaced
+  executables and changing metadata refuse selection. Runtime settings
+  override the selected custom file per key (#859).
+
 - Login reconciliation deactivates LightDM's existing `pam_irlume` face and
   credential-release rules before querying daemon capabilities when remote
   seats are blocked. It preserves PAM jump slots and existing reseal lines;

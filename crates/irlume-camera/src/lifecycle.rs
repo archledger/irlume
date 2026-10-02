@@ -630,7 +630,11 @@ impl SnapshotSource for SysfsSnapshotSource {
             })?;
             let usb_device = usb_devices
                 .entry(usb.to_path_buf())
-                .or_insert_with(|| crate::usb_device_facts(usb))
+                .or_insert_with(|| {
+                    crate::usb_device_facts(usb).map(|facts| {
+                        facts.with_location(crate::usb_controller_location(&devpath(usb)))
+                    })
+                })
                 .clone();
             records.push(UdevNodeRecord {
                 usb_devpath: devpath(usb),

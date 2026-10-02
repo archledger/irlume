@@ -3753,6 +3753,8 @@ fn serve_peer_until(
                     | Request::PreferencesStatus
                     | Request::SealedStorage
                     | Request::LastAttempts { .. }
+                    | Request::ListSplitAuthorizations
+                    | Request::SplitStatus
             ) {
                 if let Some(resp) = pregate(&req, &peer) {
                     return respond(stream, &resp);
@@ -5683,6 +5685,16 @@ fn dispatch_status_with_diagnostics(
         Ok(held) => held,
         Err(error) => return Some(held_account_reply(req, &error)),
     };
+    match req {
+        Request::ListSplitAuthorizations => {
+            return Some(split_list_response(
+                peer.uid,
+                &irlume_auth::camera_inventory_publication(),
+            ));
+        }
+        Request::SplitStatus => return Some(split_status_response()),
+        _ => {}
+    }
     // Both views depend on the reader: root sees every operation, any other
     // account only its own and daemon-wide ones (`diagnostics::Owner`).
     if matches!(req, Request::LiveStatus) {
@@ -6912,6 +6924,17 @@ fn split_side_matches(
     role: irlume_auth::CameraRole,
     classified: &[irlume_auth::ClassifiedEndpoint],
 ) -> Result<(), &'static str> {
+    let role_count = classified
+        .iter()
+        .filter(|e| {
+            e.instance_id == guard_side.instance_id
+                && e.generation == guard_side.generation
+                && e.role == role
+        })
+        .count();
+    if role_count != 1 {
+        return Err("the requested role is missing or ambiguous in the publication");
+    }
     let found = classified
         .iter()
         .find(|e| {
@@ -7108,7 +7131,7 @@ fn split_list_response(
             SplitReadState::Absent => (SplitStoreState::Absent, Vec::new(), None, true),
             SplitReadState::Unreadable => (SplitStoreState::Unreadable, Vec::new(), None, false),
             SplitReadState::Malformed => (SplitStoreState::Malformed, Vec::new(), None, false),
-            SplitReadState::DigestMismatch => {
+            SplitReadState::DigestMismatch { .. } => {
                 (SplitStoreState::DigestMismatch, Vec::new(), None, false)
             }
         };
@@ -7152,6 +7175,62 @@ fn split_list_response(
             })
             .collect(),
         selected: selected_view,
+        candidates: if snapshot.state == irlume_common::live_camera::CameraInventoryState::Current {
+            publication
+                .1
+                .iter()
+                .filter_map(|endpoint| {
+                    use irlume_common::split_wire::{
+                        SplitCandidateRole, SplitCandidateView, SplitSideGuard,
+                    };
+                    let role = match endpoint.role {
+                        irlume_auth::CameraRole::Rgb => SplitCandidateRole::Rgb,
+                        irlume_auth::CameraRole::Ir => SplitCandidateRole::Ir,
+                        irlume_auth::CameraRole::Other => return None,
+                    };
+                    if publication
+                        .1
+                        .iter()
+                        .filter(|other| {
+                            other.instance_id == endpoint.instance_id
+                                && other.generation == endpoint.generation
+                                && other.role == endpoint.role
+                        })
+                        .count()
+                        != 1
+                    {
+                        return None;
+                    }
+                    let guard = SplitSideGuard {
+                        instance_id: endpoint.instance_id.clone(),
+                        generation: endpoint.generation,
+                        endpoint: if root {
+                            endpoint.endpoint.clone()
+                        } else {
+                            pair_handle_keyed(b"irlume-split-endpoint\0", &endpoint.endpoint)
+                        },
+                    };
+                    let facts = if root {
+                        SplitRecordSide::Root(SplitSideFacts {
+                            identity: endpoint.identity.clone(),
+                            path: endpoint.endpoint.clone(),
+                            controller: endpoint.controller.clone(),
+                            domain: endpoint.domain.clone(),
+                            ports: endpoint.ports.clone(),
+                        })
+                    } else {
+                        SplitRecordSide::ShareSafe(SplitSideProjection {
+                            controller_label: endpoint.controller.clone(),
+                            domain_label: endpoint.domain.clone(),
+                            ports: endpoint.ports.clone(),
+                        })
+                    };
+                    Some(SplitCandidateView { guard, role, facts })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -7190,10 +7269,10 @@ fn split_status_response() -> Response {
             generation: None,
             selection_resolves: false,
         },
-        SplitReadState::DigestMismatch => Response::SplitStatusView {
+        SplitReadState::DigestMismatch { generation } => Response::SplitStatusView {
             state: SplitStoreState::DigestMismatch,
             record_count: 0,
-            generation: None,
+            generation: Some(generation),
             selection_resolves: false,
         },
     }
@@ -8184,15 +8263,18 @@ fn dispatch_scoped_session_inner(
             split_list_response(peer.uid, &irlume_auth::camera_inventory_publication())
         }
         Request::SplitStatus => split_status_response(),
-        Request::AddSplitAuthorization { guard, rgb, ir } => split_add_response(
-            &guard,
-            &rgb,
-            &ir,
-            &irlume_auth::camera_inventory_publication(),
-        ),
+        Request::AddSplitAuthorization { guard, rgb, ir } => {
+            irlume_auth::with_camera_inventory_publication(|publication| {
+                split_add_response(&guard, &rgb, &ir, publication)
+            })
+            .unwrap_or_else(|why| Response::Error(format!("split mutation refused: {why}")))
+        }
         Request::RemoveSplitAuthorization { pair } => split_remove_response(&pair),
         Request::SelectSplitPair { guard, pair } => {
-            split_select_response(&guard, &pair, &irlume_auth::camera_inventory_publication())
+            irlume_auth::with_camera_inventory_publication(|publication| {
+                split_select_response(&guard, &pair, publication)
+            })
+            .unwrap_or_else(|why| Response::Error(format!("split selection refused: {why}")))
         }
         Request::Enroll {
             user,
@@ -13599,6 +13681,54 @@ mod tests {
         assert_eq!(event_facts(&after), event_facts(&before));
         arbiter.close();
         assert!(arbiter.take().is_none(), "observer must never queue");
+    }
+
+    #[test]
+    fn split_status_reads_answer_during_startup_without_queueing() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let _g = env_lock();
+        let _sb = sandbox("split-status-startup");
+        let arbiter = arbiter::Arbiter::<Queued>::new();
+        let ready = std::sync::atomic::AtomicBool::new(false);
+        let diagnostics = diagnostics::DiagnosticState::default();
+        for (req, uid, allowed) in [
+            (Request::ListSplitAuthorizations, NOBODY, true),
+            (Request::SplitStatus, 0, true),
+            (Request::SplitStatus, NOBODY, false),
+        ] {
+            let response = with_serve_as_peer_and_diagnostics(
+                &arbiter,
+                &ready,
+                &diagnostics,
+                peer(uid),
+                |client| {
+                    serde_json::to_writer(client, &req).unwrap();
+                    (&*client).write_all(b"\n").unwrap();
+                    let mut line = String::new();
+                    BufReader::new(client).read_line(&mut line).unwrap();
+                    serde_json::from_str::<Response>(&line).unwrap()
+                },
+            );
+            if allowed {
+                assert!(
+                    matches!(
+                        response,
+                        Response::SplitInventory(_) | Response::SplitStatusView { .. }
+                    ),
+                    "{response:?}"
+                );
+            } else {
+                assert!(matches!(response, Response::Error(_)));
+            }
+            assert!(
+                dispatch_status_with_diagnostics(&req, &peer(uid), Some(&diagnostics)).is_some()
+            );
+        }
+        arbiter.close();
+        assert!(
+            arbiter.take().is_none(),
+            "split reads never queue to the worker"
+        );
     }
 
     /// The recent-event ring and live status answer any local peer, so an
@@ -25151,6 +25281,87 @@ mod split_management_tests {
             other => panic!("expected Valid, got {other:?}"),
         }
         drop(env);
+    }
+
+    #[test]
+    fn split_review_ambiguous_role_refuses_before_any_publication() {
+        let _env = env();
+        let mut pubn = publication();
+        let mut duplicate = pubn.1[0].clone();
+        duplicate.endpoint = "/dev/video8".into();
+        pubn.0.candidates[0]
+            .endpoint_paths
+            .push(duplicate.endpoint.clone());
+        pubn.1.push(duplicate);
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &pubn),
+            Response::Error(_)
+        ));
+        assert_eq!(
+            irlume_common::split_publish::read_split(),
+            irlume_common::split_publish::SplitReadState::Absent
+        );
+        // The same ambiguity also blocks selecting a previously saved pair.
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &publication()),
+            Response::Ok(_)
+        ));
+        let before = std::fs::read(irlume_common::config::config_path("cameras.conf")).unwrap();
+        assert!(matches!(
+            split_select_response(&guard(), &pair_text(), &pubn),
+            Response::Error(_)
+        ));
+        assert_eq!(
+            before,
+            std::fs::read(irlume_common::config::config_path("cameras.conf")).unwrap()
+        );
+    }
+
+    #[test]
+    fn split_review_empty_store_listing_supplies_usable_guards() {
+        let _env = env();
+        let pubn = publication();
+        let reply = serde_json::to_value(split_list_response(0, &pubn)).unwrap();
+        let view = &reply["SplitInventory"];
+        let sides = view["candidates"]
+            .as_array()
+            .expect("classified sides on empty store");
+        assert_eq!(sides.len(), 2);
+        let rgb = sides.iter().find(|s| s["role"] == "rgb").unwrap();
+        let ir = sides.iter().find(|s| s["role"] == "ir").unwrap();
+        let expected = SplitMutationGuard {
+            supervisor_id: view["supervisor_id"].as_str().unwrap().into(),
+            revision: view["revision"].as_u64().unwrap(),
+            rgb: serde_json::from_value(rgb["guard"].clone()).unwrap(),
+            ir: serde_json::from_value(ir["guard"].clone()).unwrap(),
+        };
+        let rgb_facts = serde_json::from_value(rgb["facts"]["Root"].clone()).unwrap();
+        let ir_facts = serde_json::from_value(ir["facts"]["Root"].clone()).unwrap();
+        assert!(matches!(
+            split_add_response(&expected, &rgb_facts, &ir_facts, &pubn),
+            Response::Ok(_)
+        ));
+        let public = serde_json::to_value(split_list_response(1000, &pubn)).unwrap();
+        assert!(!public.to_string().contains("/dev/video"));
+        assert!(!public.to_string().contains("5986:2113:s1"));
+    }
+
+    #[test]
+    fn split_review_digest_failure_retains_the_reference() {
+        let env = env();
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &publication()),
+            Response::Ok(_)
+        ));
+        std::fs::write(env.dir.join("split-pairs/1.conf"), b"changed").unwrap();
+        let Response::SplitStatusView {
+            state, generation, ..
+        } = split_status_response()
+        else {
+            panic!("status reply");
+        };
+        assert_eq!(state, SplitStoreState::DigestMismatch);
+        assert_eq!(generation, Some(1));
     }
 
     #[test]

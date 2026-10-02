@@ -128,6 +128,33 @@ pub struct SplitPublicationView {
     pub records: Vec<SplitRecordView>,
     /// The selection, when one is recorded.
     pub selected: Option<SplitSelectionView>,
+    /// Current classified sides, independent of saved authorizations. Absent
+    /// from older replies; an empty list grants no mutation authority.
+    #[serde(default)]
+    pub candidates: Vec<SplitCandidateView>,
+}
+
+/// One side available for a guarded add or selection. Root gets the literal
+/// endpoint and facts; an ordinary peer gets a daemon-keyed endpoint token
+/// and share-safe projections. Tokens are display-only, not authorization.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitCandidateView {
+    /// Displayed instance, generation and endpoint guard.
+    pub guard: SplitSideGuard,
+    /// Classification from this publication, never supplied by the client.
+    pub role: SplitCandidateRole,
+    /// Facts at the caller's privilege level.
+    pub facts: SplitRecordSide,
+}
+
+/// Roles eligible for a split-pair side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitCandidateRole {
+    /// Color endpoint.
+    Rgb,
+    /// Infrared endpoint.
+    Ir,
 }
 
 impl SplitSideGuard {
@@ -359,6 +386,7 @@ mod tests {
     #[test]
     fn store_states_round_trip() {
         let view = SplitPublicationView {
+            candidates: Vec::new(),
             supervisor_id: SUPER.into(),
             revision: 7,
             store_state: SplitStoreState::Valid,

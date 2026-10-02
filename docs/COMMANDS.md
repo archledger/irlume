@@ -90,6 +90,45 @@ Conventions that apply everywhere:
 | `irlume update [--check]` | for install | update via the channel irlume was installed from (Copr/PPA: runs it; .deb/pkg/source: shows the steps); `--check` only reports |
 | `irlume uninstall [--keep-data] [--yes]` | yes | un-wire PAM first (lockout-safe order), stop the daemon, sweep the stale socket, the `/etc/systemd/system` unit copies and enabled timer, the kernel-loaded AppArmor profile, and per-user XDG state; wipe enrolled data unless `--keep-data`, evict the persisted TPM storage root key after a fully completed wipe (kept with `--keep-data` or an incomplete wipe; a non-irlume key at the handle is never touched), name the Bitwarden polkit leave-behind if present, then print the package-removal command |
 
+## Split camera authorizations
+
+`irlume split --help` prints the full syntax without contacting the daemon.
+These commands manage the authorization store described by ADR-0032; they
+do not enable split-pair enrollment or authentication.
+
+| Command | Sudo | What it does |
+|---|---|---|
+| `irlume split list` | for full facts | list saved authorizations and current role-classified candidate sides, including when the store is empty |
+| `irlume split status` | yes | report store state, record count, referenced generation and selection resolution; a digest failure still names its generation |
+| `irlume split add --guard JSON --rgb JSON --ir JSON` | yes | add or replace an authorization using the exact displayed publication and per-side guards |
+| `irlume split remove 'PAIRKEY'` | yes | remove an authorization without requiring its cameras to remain connected |
+| `irlume split select 'PAIRKEY' --guard JSON` | yes | select an authorized pair after checking its displayed incarnations and facts |
+| `irlume split select --clear --guard JSON` | yes | clear the selection using the displayed guard |
+
+Start with `sudo irlume split list`. Its `candidates` entries carry `role`,
+`guard` and `facts.Root`. Copy the RGB and IR guards, unchanged, into:
+
+```json
+{"supervisor_id":"<displayed supervisor>","revision":7,"rgb":{"instance_id":"<displayed RGB instance>","generation":1,"endpoint":"/dev/video0"},"ir":{"instance_id":"<displayed IR instance>","generation":2,"endpoint":"/dev/video1"}}
+```
+
+Pass each side's `facts.Root` object as `--rgb` or `--ir`:
+
+```json
+{"identity":"5986:2113:serial,with,commas","path":"/dev/video0","controller":"0000:00:14.0","domain":"usb2","ports":[8]}
+```
+
+Use the actual listing values, not the example IDs or revisions. Quote JSON
+and canonical pair keys in the shell. JSON preserves commas, quotes and
+Unicode in serials. Both `--name VALUE` and `--name=VALUE` work. A stale
+listing refuses; obtain a fresh listing and confirm again rather than
+silently refreshing a previously confirmed guard. Non-root listings contain
+endpoint tokens and projections, not raw paths or binding identities.
+
+The commands refuse on an older daemon; they never substitute `set-cameras`.
+`split` does not expose the versioned machine API: `--json` and `--contract`
+are rejected before sending a request.
+
 ## TUI access
 
 Open **Irlume** from your desktop's application menu or run `irlume tui`. The desktop

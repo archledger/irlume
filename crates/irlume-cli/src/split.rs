@@ -6,89 +6,22 @@
 //! daemon reports unsupported split management and never falls back to
 //! `set-cameras` or any less specific operation (ADR-0029 §6 as amended).
 
-use irlume_common::split_wire::{SplitMutationGuard, SplitSideFacts, SplitSideGuard};
+use super::flag;
+use irlume_common::split_wire::{SplitMutationGuard, SplitSideFacts};
 use irlume_common::Request;
 
-/// The guard every mutation except removal carries: displayed supervisor,
-/// revision and both sides in role order.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GuardArgs {
-    pub(crate) supervisor_id: String,
-    pub(crate) revision: u64,
-    pub(crate) rgb: SplitSideGuard,
-    pub(crate) ir: SplitSideGuard,
+/// Parse the guard copied from one root listing, without refreshing it after
+/// confirmation. JSON preserves every field boundary.
+fn parse_guard(text: &str) -> Result<SplitMutationGuard, &'static str> {
+    let guard: SplitMutationGuard =
+        serde_json::from_str(text).map_err(|_| "--guard needs a JSON guard object")?;
+    guard.validate()?;
+    Ok(guard)
 }
 
-/// Parse `SUPERV,REV,RGBINST,RGBGEN,RGBEND,IRINST,IRGEN,IREND`.
-fn parse_guard(text: &str) -> Result<GuardArgs, &'static str> {
-    let fields: Vec<&str> = text.split(',').collect();
-    if fields.len() != 8 {
-        return Err("the guard needs 8 comma-separated fields");
-    }
-    let revision: u64 = fields[1]
-        .parse()
-        .map_err(|_| "the revision is not a number")?;
-    let rgb_generation: u64 = fields[3]
-        .parse()
-        .map_err(|_| "the RGB generation is not a number")?;
-    let ir_generation: u64 = fields[6]
-        .parse()
-        .map_err(|_| "the IR generation is not a number")?;
-    Ok(GuardArgs {
-        supervisor_id: fields[0].to_owned(),
-        revision,
-        rgb: SplitSideGuard {
-            instance_id: fields[2].to_owned(),
-            generation: rgb_generation,
-            endpoint: fields[4].to_owned(),
-        },
-        ir: SplitSideGuard {
-            instance_id: fields[5].to_owned(),
-            generation: ir_generation,
-            endpoint: fields[7].to_owned(),
-        },
-    })
-}
-
-impl GuardArgs {
-    fn into_guard(self) -> SplitMutationGuard {
-        SplitMutationGuard {
-            supervisor_id: self.supervisor_id,
-            revision: self.revision,
-            rgb: self.rgb,
-            ir: self.ir,
-        }
-    }
-}
-
-/// Parse `IDENTITY,PATH,CONTROLLER,DOMAIN,PORTS` with dotted ports.
+/// JSON preserves serials containing commas, quotes, equals signs and Unicode.
 fn parse_side(text: &str) -> Result<SplitSideFacts, &'static str> {
-    let fields: Vec<&str> = text.split(',').collect();
-    if fields.len() != 5 {
-        return Err("a side needs 5 comma-separated fields");
-    }
-    let ports = fields[4]
-        .split('.')
-        .map(|p| p.parse::<u8>().map_err(|_| "a port is not a number"))
-        .collect::<Result<Vec<u8>, _>>()?;
-    if ports.is_empty() {
-        return Err("a side needs at least one port");
-    }
-    Ok(SplitSideFacts {
-        identity: fields[0].to_owned(),
-        path: fields[1].to_owned(),
-        controller: fields[2].to_owned(),
-        domain: fields[3].to_owned(),
-        ports,
-    })
-}
-
-/// Flag value lookup: `--name VALUE`.
-fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    args.iter()
-        .position(|a| a == name)
-        .and_then(|i| args.get(i + 1))
-        .map(String::as_str)
+    serde_json::from_str(text).map_err(|_| "--rgb and --ir need JSON side-facts objects")
 }
 
 /// What the daemon's answer means in words and exit code. Pure, so the
@@ -109,7 +42,7 @@ pub(crate) fn explain_split_reply(
             selection_resolves,
         }) => (
             format!(
-                "split store: {state:?}, {record_count} record(s), generation                  {generation:?}, selection resolves: {selection_resolves}",
+                "split store: {state:?}, {record_count} record(s), generation {generation:?}, selection resolves: {selection_resolves}",
             ),
             true,
         ),
@@ -125,17 +58,23 @@ pub(crate) fn explain_split_reply(
     }
 }
 
-fn usage() -> ! {
-    eprintln!(
-        "usage:\n  \
-         irlume split status                                      (root)\n  \
-         irlume split list\n  \
-         irlume split add --guard SUPER,REV,RGBINST,RGBGEN,RGBEND,IRINST,IRGEN,IREND \\\n    \
-         --rgb IDENTITY,PATH,CONTROLLER,DOMAIN,PORTS --ir IDENTITY,PATH,CONTROLLER,DOMAIN,PORTS   (root)\n  \
-         irlume split remove PAIRKEY                             (root)\n  \
-         irlume split select PAIRKEY|--clear --guard SUPER,REV,RGBINST,RGBGEN,RGBEND,IRINST,IRGEN,IREND   (root)"
-    );
-    std::process::exit(2);
+pub(crate) const HELP: &str = "usage:
+  irlume split list
+  irlume split status                                             (root)
+  irlume split add --guard JSON --rgb JSON --ir JSON                (root)
+  irlume split remove PAIRKEY                                      (root)
+  irlume split select PAIRKEY|--clear --guard JSON                  (root)
+
+Flags accept --name VALUE or --name=VALUE. Copy exact facts from sudo irlume split list.
+Guard JSON: {\"supervisor_id\":\"...\",\"revision\":1,\"rgb\":{\"instance_id\":\"...\",\"generation\":1,\"endpoint\":\"/dev/video0\"},\"ir\":{\"instance_id\":\"...\",\"generation\":1,\"endpoint\":\"/dev/video1\"}}
+Side JSON: {\"identity\":\"vid:pid:serial\",\"path\":\"/dev/video0\",\"controller\":\"0000:00:14.0\",\"domain\":\"usb2\",\"ports\":[8]}
+Quote JSON and PAIRKEY in the shell. Commas in serials need no extra escaping inside JSON.
+These commands manage authorization only; split enrollment/authentication remain disabled.
+The machine --json/--contract interface is not supported by split commands.";
+
+pub(crate) fn help() -> std::process::ExitCode {
+    println!("{HELP}");
+    std::process::ExitCode::SUCCESS
 }
 
 /// Build the request for one `split` invocation. Pure.
@@ -146,6 +85,35 @@ pub(crate) fn split_request(args: &[String]) -> Result<Request, &'static str> {
     let Some(sub) = args.get(1).map(String::as_str) else {
         return Err("a split subcommand is required");
     };
+    let (flags, mut index): (&[&str], usize) = match sub {
+        "status" | "list" => (&[], 2),
+        "add" => (&["--guard", "--rgb", "--ir"], 2),
+        "remove" => (&[], 3),
+        "select" => (&["--guard"], 3),
+        _ => return Err("unknown split subcommand"),
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    while index < args.len() {
+        let token = &args[index];
+        let (name, inline) = token
+            .split_once('=')
+            .map_or((token.as_str(), None), |(k, v)| (k, Some(v)));
+        if !flags.contains(&name) || !seen.insert(name) {
+            return Err("unknown or repeated split flag");
+        }
+        let value = if let Some(value) = inline {
+            value
+        } else {
+            index += 1;
+            args.get(index)
+                .map(String::as_str)
+                .ok_or("split flag needs a value")?
+        };
+        if value.is_empty() || value.starts_with("--") {
+            return Err("split flag needs a value");
+        }
+        index += 1;
+    }
     match sub {
         "status" => Ok(Request::SplitStatus),
         "list" => Ok(Request::ListSplitAuthorizations),
@@ -154,7 +122,7 @@ pub(crate) fn split_request(args: &[String]) -> Result<Request, &'static str> {
             let rgb = parse_side(flag(args, "--rgb").ok_or("add needs --rgb")?)?;
             let ir = parse_side(flag(args, "--ir").ok_or("add needs --ir")?)?;
             Ok(Request::AddSplitAuthorization {
-                guard: Box::new(guard.into_guard()),
+                guard: Box::new(guard),
                 rgb: Box::new(rgb),
                 ir: Box::new(ir),
             })
@@ -184,7 +152,7 @@ pub(crate) fn split_request(args: &[String]) -> Result<Request, &'static str> {
                 key.to_owned()
             };
             Ok(Request::SelectSplitPair {
-                guard: Box::new(guard.into_guard()),
+                guard: Box::new(guard),
                 pair,
             })
         }
@@ -194,11 +162,18 @@ pub(crate) fn split_request(args: &[String]) -> Result<Request, &'static str> {
 
 /// `irlume split <status|list|add|remove|select> ...`
 pub(crate) fn run(args: &[String]) -> std::process::ExitCode {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        return help();
+    }
     let request = match split_request(args) {
         Ok(request) => request,
         Err(reason) => {
             eprintln!("{reason}");
-            usage();
+            eprintln!("{HELP}");
+            return std::process::ExitCode::from(2);
         }
     };
     let (words, ok) = match super::daemon_request(&request) {
@@ -236,11 +211,11 @@ mod tests {
             "split",
             "add",
             "--guard",
-            "0123456789abcdef0123456789abcdef,7,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,1,/dev/video0,bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,2,/dev/video1",
+            r#"{"supervisor_id":"0123456789abcdef0123456789abcdef","revision":7,"rgb":{"instance_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","generation":1,"endpoint":"/dev/video0"},"ir":{"instance_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":2,"endpoint":"/dev/video1"}}"#,
             "--rgb",
-            "5986:2113:s1,/dev/video0,0000:00:14.0,usb2,8",
+            r#"{"identity":"5986:2113:s1","path":"/dev/video0","controller":"0000:00:14.0","domain":"usb2","ports":[8]}"#,
             "--ir",
-            "5986:1141:s2,/dev/video1,0000:00:14.0,usb2,5",
+            r#"{"identity":"5986:1141:s2","path":"/dev/video1","controller":"0000:00:14.0","domain":"usb2","ports":[5]}"#,
         ]);
         let Ok(Request::AddSplitAuthorization { guard, rgb, ir }) = split_request(&args) else {
             panic!("add must build");
@@ -276,5 +251,36 @@ mod tests {
         )));
         assert!(ok);
         assert!(words.contains("generation 2"));
+    }
+
+    #[test]
+    fn review_side_json_preserves_comma_and_quote_in_serial() {
+        let expected = SplitSideFacts {
+            identity: "5986:2113:serial,\"quoted\"".into(),
+            path: "/dev/video0".into(),
+            controller: "0000:00:14.0".into(),
+            domain: "usb2".into(),
+            ports: vec![8],
+        };
+        let text = serde_json::to_string(&expected).unwrap();
+        assert_eq!(parse_side(&text).unwrap(), expected);
+    }
+
+    #[test]
+    fn review_flag_equals_form_preserves_json_value() {
+        let args = argv(&["split", "add", "--rgb={\"identity\":\"a,b=c\"}"]);
+        assert_eq!(flag(&args, "--rgb"), Some("{\"identity\":\"a,b=c\"}"));
+    }
+
+    #[test]
+    fn review_split_rejects_unnegotiated_or_duplicate_flags_before_dispatch() {
+        for args in [
+            argv(&["split", "status", "--json"]),
+            argv(&["split", "remove", "key", "--contract=1"]),
+            argv(&["split", "add", "--guard", "{}", "--guard={}"]),
+            argv(&["split", "add", "--rgb"]),
+        ] {
+            assert!(split_request(&args).is_err(), "{args:?}");
+        }
     }
 }

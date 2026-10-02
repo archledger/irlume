@@ -20,6 +20,33 @@ mod support;
 
 const BIN: &str = env!("CARGO_BIN_EXE_irlume");
 
+#[test]
+fn split_help_documents_json_without_contacting_a_daemon() {
+    let sb = Sandbox::new("split-help");
+    for args in [
+        vec!["split", "--help"],
+        vec!["split", "add", "--rgb={}", "--help"],
+    ] {
+        let output = Command::new(BIN)
+            .args(&args)
+            .env("IRLUME_SOCKET", sb.path("missing.sock"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains("--guard JSON") && text.contains("--rgb JSON"),
+            "{text}"
+        );
+        assert!(text.contains("--name=VALUE"));
+    }
+    let output = Command::new(BIN).arg("--help").output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("split <list|status|add|remove|select>"));
+}
+
 fn is_root() -> bool {
     #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     unsafe {
@@ -1457,6 +1484,41 @@ fn serve(
 /// The socket path a Sandbox's commands connect to.
 fn sock(sb: &Sandbox) -> PathBuf {
     sb.path("no-daemon.sock")
+}
+
+#[test]
+fn split_json_flags_preserve_serials_and_older_daemon_never_triggers_fallback() {
+    let guard = r#"{"supervisor_id":"0123456789abcdef0123456789abcdef","revision":7,"rgb":{"instance_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","generation":1,"endpoint":"/dev/video0"},"ir":{"instance_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":2,"endpoint":"/dev/video1"}}"#;
+    let rgb = r#"{"identity":"5986:2113:comma,equals=quote\"serial","path":"/dev/video0","controller":"0000:00:14.0","domain":"usb2","ports":[8]}"#;
+    let ir = r#"{"identity":"5986:1141:serial","path":"/dev/video1","controller":"0000:00:14.0","domain":"usb2","ports":[5]}"#;
+    for equals in [false, true] {
+        let sb = Sandbox::new(if equals {
+            "split-json-equals"
+        } else {
+            "split-json-space"
+        });
+        let log = serve(&sock(&sb), |_| Response::Error("bad request".into()));
+        let mut args = vec!["split".to_owned(), "add".to_owned()];
+        for (name, value) in [("--guard", guard), ("--rgb", rgb), ("--ir", ir)] {
+            if equals {
+                args.push(format!("{name}={value}"));
+            } else {
+                args.extend([name.into(), value.into()]);
+            }
+        }
+        let borrowed: Vec<_> = args.iter().map(String::as_str).collect();
+        let (status, _, err) = run(&mut sb.cmd(&borrowed));
+        assert_ne!(status, 0);
+        assert!(err.contains("unsupported"), "{err}");
+        let requests = log.lock().unwrap();
+        assert_eq!(requests.len(), 1, "no legacy retry after bad request");
+        let Request::AddSplitAuthorization { guard, rgb, ir } = &requests[0] else {
+            panic!("unexpected fallback request");
+        };
+        assert_eq!(guard.revision, 7);
+        assert_eq!(rgb.identity, "5986:2113:comma,equals=quote\"serial");
+        assert_eq!(ir.ports, [5]);
+    }
 }
 
 #[test]

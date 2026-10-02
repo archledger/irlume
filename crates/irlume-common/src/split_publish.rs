@@ -58,7 +58,10 @@ pub enum SplitReadState {
     /// A referenced state is malformed or a selection does not resolve.
     Malformed,
     /// The referenced generation's bytes do not match `split_digest`.
-    DigestMismatch,
+    DigestMismatch {
+        /// Parsed reference whose bytes failed verification.
+        generation: u64,
+    },
     /// The publication is coherent; `selected` is the resolved selection.
     Valid {
         /// The referenced generation number.
@@ -371,7 +374,7 @@ fn read_generation(
     match std::fs::read(generation_dir().join(generation_name(generation))) {
         Ok(bytes) => {
             if digest.strip_prefix("sha256:") != Some(digest_value(&bytes).as_str()) {
-                return SplitReadState::DigestMismatch;
+                return SplitReadState::DigestMismatch { generation };
             }
             // The generation is text under the same rules as cameras.conf:
             // invalid UTF-8 is Malformed, never normalized into records.
@@ -654,7 +657,12 @@ mod tests {
         let mut bytes = std::fs::read(&path).unwrap();
         bytes.push(b'\n');
         std::fs::write(&path, &bytes).unwrap();
-        assert_eq!(read_split(), SplitReadState::DigestMismatch);
+        assert_eq!(
+            read_split(),
+            SplitReadState::DigestMismatch {
+                generation: published.generation
+            }
+        );
         drop(env);
     }
 

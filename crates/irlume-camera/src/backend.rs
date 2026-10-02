@@ -108,6 +108,25 @@ impl CameraSupervisor {
         Ok(())
     }
 
+    fn with_inventory_publication<R>(
+        &self,
+        commit: impl FnOnce(
+            &(
+                CameraInventorySnapshot,
+                Vec<crate::inventory::ClassifiedEndpoint>,
+            ),
+        ) -> R,
+    ) -> Result<R, &'static str> {
+        let inventory = self
+            .inventory
+            .lock()
+            .map_err(|_| "camera inventory lock is poisoned")?;
+        let publication = (inventory.snapshot(), inventory.classified_endpoints());
+        let result = commit(&publication);
+        drop(inventory);
+        Ok(result)
+    }
+
     pub(crate) fn retire_inventory_unavailable(
         &self,
         reason: CameraInventoryReason,
@@ -401,6 +420,20 @@ pub(crate) fn camera_inventory_snapshot() -> CameraInventorySnapshot {
     snapshot_from_slot(&DEFAULT_CAMERA_SUPERVISOR)
 }
 
+pub(crate) fn with_camera_inventory_publication<R>(
+    commit: impl FnOnce(
+        &(
+            CameraInventorySnapshot,
+            Vec<crate::inventory::ClassifiedEndpoint>,
+        ),
+    ) -> R,
+) -> Result<R, &'static str> {
+    let supervisor = DEFAULT_CAMERA_SUPERVISOR
+        .get()
+        .ok_or("camera inventory is not initialized")?;
+    supervisor.with_inventory_publication(commit)
+}
+
 pub(crate) fn camera_inventory_publication() -> (
     CameraInventorySnapshot,
     Vec<crate::inventory::ClassifiedEndpoint>,
@@ -647,6 +680,29 @@ pub(crate) mod tests {
             calls.lock().unwrap().is_empty(),
             "status called a discovery/open delegate"
         );
+    }
+
+    #[test]
+    fn split_commit_keeps_the_inventory_mutex_until_the_callback_returns() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let supervisor = CameraSupervisor::new(RecordingBackend::new(calls.clone()));
+        seed_test_endpoints(&supervisor, &["/dev/video0"]);
+        let committed_revision = supervisor
+            .with_inventory_publication(|publication| {
+                assert_eq!(publication.0.state, CameraInventoryState::Current);
+                // This is the same mutex reconciliation must acquire. Try-lock
+                // proves exclusion deterministically, with no sleep or scheduling
+                // assumption; dropping it before commit must fail this assertion.
+                assert!(matches!(
+                    supervisor.inventory.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                publication.0.revision
+            })
+            .unwrap();
+        assert_eq!(supervisor.inventory_snapshot().revision, committed_revision);
+        assert!(supervisor.inventory.try_lock().is_ok());
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[test]

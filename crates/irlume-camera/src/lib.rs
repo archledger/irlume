@@ -69,6 +69,24 @@ pub fn camera_inventory_snapshot() -> irlume_common::live_camera::CameraInventor
     backend::camera_inventory_snapshot()
 }
 
+/// Validate and commit while holding the inventory publication lock. The
+/// callback must not re-enter the supervisor or acquire a camera lease.
+/// Lock order is inventory, then configuration; reconciliation cannot retire
+/// the validated incarnation until the callback returns.
+///
+/// # Errors
+/// Refuses before calling `commit` if the supervisor is absent or poisoned.
+pub fn with_camera_inventory_publication<R>(
+    commit: impl FnOnce(
+        &(
+            irlume_common::live_camera::CameraInventorySnapshot,
+            Vec<ClassifiedEndpoint>,
+        ),
+    ) -> R,
+) -> Result<R, &'static str> {
+    backend::with_camera_inventory_publication(commit)
+}
+
 /// The closed connection snapshot and the role-bearing facts of the same
 /// publication, read under one lock (ADR-0032 §4: a split mutation validates
 /// its guard and the sides' roles against one publication). Never initializes

@@ -36,11 +36,21 @@ type InstanceIdSource = Box<dyn FnMut() -> CameraInstanceId + Send>;
 pub(crate) struct UsbDeviceFacts {
     vid_pid: String,
     fixed: bool,
+    location: Option<crate::UsbLocation>,
 }
 
 impl UsbDeviceFacts {
     pub(crate) fn new(vid_pid: String, fixed: bool) -> Self {
-        Self { vid_pid, fixed }
+        Self {
+            vid_pid,
+            fixed,
+            location: None,
+        }
+    }
+
+    pub(crate) fn with_location(mut self, location: Option<crate::UsbLocation>) -> Self {
+        self.location = location;
+        self
     }
 
     pub(crate) fn vid_pid(&self) -> &str {
@@ -493,12 +503,36 @@ impl CameraInventory {
                 .unwrap_or_default();
             // A publication-captured location only; a missing one is never
             // refreshed here and never a wildcard (ADR-0032 §2).
-            let Some(location) =
-                crate::usb_controller_location(entry.observation.physical_id.topology_path())
+            let Some(location) = entry
+                .observation
+                .usb_device
+                .as_ref()
+                .and_then(|usb| usb.location.as_ref())
             else {
                 continue;
             };
-            for endpoint in &entry.observation.endpoint_paths {
+            let captures: Vec<_> = entry
+                .observation
+                .endpoint_paths
+                .iter()
+                .filter(|path| !entry.observation.metadata_endpoints.contains(path))
+                .collect();
+            // An unclassified capture endpoint could be another endpoint of
+            // the requested role. Do not expose a partially classified unit.
+            let role_of = |endpoint: &String| {
+                self.roles
+                    .get(&RoleKey {
+                        supervisor_id: self.supervisor_id.clone(),
+                        instance_id: instance_id.clone(),
+                        generation,
+                        endpoint: endpoint.clone(),
+                    })
+                    .copied()
+            };
+            if captures.iter().any(|endpoint| role_of(endpoint).is_none()) {
+                continue;
+            }
+            for endpoint in captures {
                 let Some(role) = self
                     .roles
                     .get(&RoleKey {
@@ -1707,6 +1741,45 @@ mod tests {
         assert_eq!(inventory.recorded_role_count(), 2);
         assert_eq!(inventory.connected_pairs().pairs.len(), 1);
         inventory
+    }
+
+    #[test]
+    fn split_listing_uses_frozen_location_and_requires_complete_roles() {
+        let mut observed = brio().build();
+        // This topology need not exist in sysfs: publication reads must use
+        // these already-observed facts, not perform another lookup.
+        observed.usb_device.as_mut().unwrap().location = Some(crate::UsbLocation {
+            controller: "0000:00:14.0".into(),
+            domain: crate::RootHubDomain::Usb2,
+            ports: vec![9],
+        });
+        let mut inventory = CameraInventory::new();
+        inventory.reconcile(vec![observed.clone()]).unwrap();
+        record(&mut inventory, &BRIO_ROLES[..1]);
+        assert!(
+            inventory.classified_endpoints().is_empty(),
+            "unknown second capture role refuses the whole unit"
+        );
+        record(&mut inventory, &BRIO_ROLES);
+        let held = inventory.classified_endpoints();
+        assert_eq!(held.len(), 2, "metadata endpoints are not classified sides");
+        assert!(held.iter().all(|side| side.ports == [9]));
+        let old_revision = inventory.snapshot().revision;
+        observed
+            .usb_device
+            .as_mut()
+            .unwrap()
+            .location
+            .as_mut()
+            .unwrap()
+            .ports = vec![10];
+        inventory.reconcile(vec![observed]).unwrap();
+        assert!(inventory.snapshot().revision > old_revision);
+        assert!(
+            inventory.classified_endpoints().is_empty(),
+            "changed location retires old roles"
+        );
+        assert!(held.iter().all(|side| side.ports == [9]));
     }
 
     fn assert_lists_nothing(view: &ConnectedPairs) {

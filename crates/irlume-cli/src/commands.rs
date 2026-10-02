@@ -2025,6 +2025,9 @@ SETUP & STATUS
                         create a private 0600 report; default is read-only and
                         camera-free, while --probe is explicit and root-only
   deps                  verify runtime dependencies (onnxruntime, models, TPM)
+  split <list|status|add|remove|select>
+                        split camera authorizations; split --help gives JSON
+                        guard/side syntax. Status and changes require root.
 
 ENROLLMENT & AUTH
   enroll [--name N] [--scans K] [--reset] [--add-camera]   capture a face

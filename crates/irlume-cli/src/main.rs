@@ -147,6 +147,9 @@ fn main() -> std::process::ExitCode {
     // opened the uninstall confirmation. Asking a program what it does should
     // never be the thing that does it.
     if args.iter().any(|a| a == "--help" || a == "-h") {
+        if args.first().map(String::as_str) == Some("split") {
+            return split::help();
+        }
         return commands::help();
     }
     match (

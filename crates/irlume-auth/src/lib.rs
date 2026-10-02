@@ -32,6 +32,7 @@ pub use irlume_camera::measurement;
 /// camera-group status rows.
 pub use irlume_camera::present_device_identities;
 pub use irlume_camera::profiles;
+pub use irlume_camera::with_camera_inventory_publication;
 /// The role-bearing publication facts a split mutation validates its guard
 /// against (ADR-0032 §4). Re-exported so the daemon never depends on the
 /// camera crate directly.

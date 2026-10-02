@@ -59,6 +59,19 @@ impl Sandbox {
         self.root.join(rel)
     }
 
+    /// These PAM fixtures have no installed daemon. Hide every persistent
+    /// system-unit layer; namespace_command already supplies a private /run.
+    /// A test may bind its own /etc/systemd/system over the empty directory.
+    fn hide_system_units(&mut self) {
+        self.hidden.extend([
+            "/etc/systemd/system.control",
+            "/etc/systemd/system",
+            "/etc/systemd/system.attached",
+            "/usr/local/lib/systemd/system",
+            "/usr/lib/systemd/system",
+        ]);
+    }
+
     /// Where a test points `IRLUME_PAM_LOCK`: in a directory the lock creates
     /// at 0700, because it refuses one that group or others can write, as the
     /// sandbox root is under a umask of 002.
@@ -3223,7 +3236,7 @@ fn auth_lands_after(text: &str, needle: &str, n: usize) -> String {
 #[test]
 fn login_disable_keeps_a_failure_jump_on_the_password_stack() {
     let mut sb = Sandbox::new("disable-fail-jump");
-    sb.hidden.push("/etc/systemd/system");
+    sb.hide_system_units();
     let etc = sb.path("pam-etc");
     let vendor = sb.path("pam-vendor");
     std::fs::create_dir_all(&etc).unwrap();
@@ -3262,16 +3275,37 @@ session    optional                     pam_irlume.so reseal\n\
     // On a Fedora host disable also removes the SELinux module; a semodule
     // that lists nothing reports it not loaded.
     sb.fake_tool("semodule", "exit 0");
-    let (code, out, err) = run(support::isolated_root_command(
-        &sb.root,
-        BIN,
-        &["login", "disable", "--apply"],
-        &["semodule"],
-        &sb.hidden,
-        &[(&etc, "/etc/pam.d"), (&vendor, "/usr/lib/pam.d")],
-    )
-    .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
-    .env("IRLUME_PAM_LOCK", sb.pam_lock()));
+    let units = sb.path("units");
+    std::fs::create_dir_all(&units).unwrap();
+    let unit = units.join("irlumed.service");
+    std::fs::write(&unit, "[Service]\nExecStart=/usr/bin/irlumed\n").unwrap();
+    let disable = || {
+        run(support::isolated_root_command(
+            &sb.root,
+            BIN,
+            &["login", "disable", "--apply"],
+            &["semodule"],
+            &sb.hidden,
+            &[
+                (&etc, "/etc/pam.d"),
+                (&vendor, "/usr/lib/pam.d"),
+                (&units, "/etc/systemd/system"),
+            ],
+        )
+        .env("IRLUME_OS_RELEASE", sb.path("no-os-release"))
+        .env("IRLUME_PAM_LOCK", sb.pam_lock()))
+    };
+    // Missing manager evidence must still protect an installed daemon's
+    // unknown store, even when this fixture's default store is empty.
+    let (code, out, err) = disable();
+    assert_eq!(code, 1, "{out}\n{err}");
+    assert!(err.contains("store selection is unknown"), "{out}\n{err}");
+    assert_eq!(
+        std::fs::read_to_string(etc.join("plasmalogin")).unwrap(),
+        plasma
+    );
+    std::fs::remove_file(unit).unwrap();
+    let (code, out, err) = disable();
     assert_eq!(code, 0, "{out}\n{err}");
     let after = std::fs::read_to_string(etc.join("plasmalogin")).unwrap();
     assert!(
@@ -3365,7 +3399,7 @@ fn login_disable_keeps_an_in_place_stack_with_a_continued_line() {
 #[test]
 fn login_disable_refuses_while_a_keyring_token_depends_on_it() {
     let mut sb = Sandbox::new("disable-token");
-    sb.hidden.push("/etc/systemd/system");
+    sb.hide_system_units();
     let etc = sb.path("pam-etc");
     let vendor = sb.path("pam-vendor");
     std::fs::create_dir_all(&etc).unwrap();
@@ -3463,7 +3497,7 @@ session    optional                     pam_irlume.so reseal\n";
 #[test]
 fn login_enable_refuses_to_unwire_a_token_delivery() {
     let mut sb = Sandbox::new("enable-token");
-    sb.hidden.push("/etc/systemd/system");
+    sb.hide_system_units();
     let etc = sb.path("pam-etc");
     let vendor = sb.path("pam-vendor");
     std::fs::create_dir_all(&etc).unwrap();
@@ -3549,7 +3583,7 @@ session    optional                     pam_irlume.so reseal\n";
 #[test]
 fn login_rollback_refuses_while_a_keyring_token_depends_on_it() {
     let mut sb = Sandbox::new("rollback-token");
-    sb.hidden.push("/etc/systemd/system");
+    sb.hide_system_units();
     let etc = sb.path("pam-etc");
     std::fs::create_dir_all(&etc).unwrap();
     let before = "auth        substack      password-auth\n\
@@ -3657,7 +3691,8 @@ impl LightdmBed {
     }
 
     fn with_tier(tag: &str, tier: &'static str) -> Self {
-        let sb = Sandbox::new(tag);
+        let mut sb = Sandbox::new(tag);
+        sb.hide_system_units();
         let (pam, conf, units) = (sb.path("pam-etc"), sb.path("lightdm-etc"), sb.path("units"));
         for dir in [&pam, &conf, &units] {
             std::fs::create_dir_all(dir).unwrap();

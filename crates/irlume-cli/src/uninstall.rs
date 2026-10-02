@@ -28,6 +28,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod retention;
+mod runtime_environment;
+mod selected_keyrings;
+mod unit_environment;
+
 /// What the teardown actually did, so the CLI and the TUI can report it the
 /// same way.
 pub struct TeardownReport {
@@ -48,6 +53,18 @@ pub struct TeardownReport {
     /// after a fully completed wipe: sealed envelopes are children of that
     /// key, so kept or leftover data must keep it (audit F4, 2026-09-17).
     pub srk_eviction: SrkOutcome,
+    /// Established from the held record, never inferred from wipe intent.
+    pub retention: RetentionState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionState {
+    /// The record could not be opened or its durable update was not confirmed.
+    Unverified,
+    /// The record is retained and a later teardown requires manual recovery.
+    Retained,
+    /// The record was durably marked clean; it remains as a lock-bearing inode.
+    Clean,
 }
 
 /// The first argument `uninstall` does not accept, if any.
@@ -111,7 +128,9 @@ pub fn run(args: &[String]) -> ExitCode {
                 "[uninstall] refusing: could not read the sealed-envelope store ({store}). \
                  One of these may hold a GNOME keyring token, and deleting it would \
                  leave that keyring encrypted under a secret nothing can reproduce. \
-                 Fix the store (or move it aside deliberately) and re-run."
+                  Preserve the store and its configuration. See {guide}: \
+                  fixing this error alone does not clear an earlier retained record.",
+                guide = retention::RECOVERY_GUIDE,
             );
             return ExitCode::FAILURE;
         }
@@ -134,12 +153,18 @@ pub fn run(args: &[String]) -> ExitCode {
     println!("  1. remove irlume from every PAM stack (greeters, sudo, lock screen)");
     println!("  2. stop and disable the irlumed service");
     if keep_data {
-        println!("  3. keep your enrolled faces and sealed secrets (--keep-data)");
+        println!("  3. keep enrollment, template-key/recovery state, and application config (--keep-data)");
+        println!("     keyring disarm still runs; program files and packaged models are removed");
     } else {
         println!("  3. disarm the keyring seal, then delete every enrolled face,");
         println!("     sealed secret, and config file");
     }
     println!("  4. remove irlume itself (the package, or the installed files)");
+    println!("  Save earlier unit/envfile configurations and resolved store paths outside the wipe trees first.");
+    println!(
+        "  Failed or retained-data teardown can block later attempts; recovery is manual ({})",
+        retention::RECOVERY_GUIDE
+    );
     println!();
 
     if !assume_yes {
@@ -179,7 +204,7 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     );
     println!(
-        "[uninstall] service stopped and disabled: {}",
+        "[uninstall] service stopped: {}",
         yn(report.service_stopped)
     );
     // Three states, not two: a requested wipe that FAILED must never read as a
@@ -252,6 +277,7 @@ pub fn run(args: &[String]) -> ExitCode {
             println!("[uninstall] could not finish removal automatically: {e}");
             println!("[uninstall] the teardown above is done; remove the package by hand:");
             println!("  {}", removal_hint(&origin));
+            println!("[uninstall] {}", retention_notice(report.retention));
         }
     }
     // The exit code has to carry what the text already says. Returning success
@@ -270,12 +296,30 @@ pub fn run(args: &[String]) -> ExitCode {
 /// PAM stack still references `pam_irlume.so` (one `login disable` keeps as
 /// it is, such as a stack with a line that ends in `\`).
 fn removal_refusal(report: &TeardownReport) -> Option<String> {
+    let retry = match report.retention {
+        RetentionState::Retained => retention::manual_recovery(),
+        RetentionState::Unverified => format!("The retention state at {} is unverified. Preserve earlier configuration/store evidence, data and the SRK; do not assume a retry is safe. Follow {} before another attempt.", retention::PATH, retention::RECOVERY_GUIDE),
+        RetentionState::Clean => "The retention record is clean; after fixing the reported refusal, run `sudo irlume uninstall` again.".into(),
+    };
+    if !report.data_left.is_empty()
+        || (report.data_wipe_requested && !report.data_wiped)
+        || !report.service_stopped
+    {
+        let detail = if report.data_left.is_empty() {
+            "daemon stop or requested cleanup did not complete".into()
+        } else {
+            terminal_safe(&report.data_left.join(", "))
+        };
+        return Some(format!(
+            "irlume stays installed: teardown is incomplete ({detail}). {retry}"
+        ));
+    }
     (!report.pam_unwired).then(|| {
-        "irlume stays installed: a PAM stack still references pam_irlume.so (the lines \
+        format!(
+            "irlume stays installed: a PAM stack still references pam_irlume.so (the lines \
          above name it), and removing the module under it can make that stack fail. \
-         Take irlume's lines out of it by hand (`irlume login status` shows which), \
-         then run `sudo irlume uninstall` again."
-            .to_string()
+         Take irlume's lines out of it by hand (`irlume login status` shows which). {retry}"
+        )
     })
 }
 
@@ -608,12 +652,28 @@ fn dir_has_entry_named(dir: &Path, needle: &str) -> bool {
 /// cannot see inside snapshots or backups. A failed wipe never borrows the
 /// deleted phrasing; it names the paths that still hold data.
 fn closing_line(report: &TeardownReport, snapshots: &SnapshotEvidence) -> String {
+    format!(
+        "{}\n{}",
+        closing_data_line(report, snapshots),
+        retention_notice(report.retention)
+    )
+}
+
+fn retention_notice(state: RetentionState) -> String {
+    match state {
+        RetentionState::Retained => format!("WARNING: the SRK-retention record {} remains `retain`; later uninstall attempts will refuse even after a successful --keep-data or intentional override keep. Preserve earlier configuration/store evidence and the SRK. Manual recovery is required; see {}. Do not unlink or replace the record.", retention::PATH, retention::RECOVERY_GUIDE),
+        RetentionState::Unverified => format!("WARNING: the state of {} could not be confirmed. Preserve the record, earlier configurations, data and SRK; see {} before another teardown. Do not unlink or replace it.", retention::PATH, retention::RECOVERY_GUIDE),
+        RetentionState::Clean => format!("The clean SRK-retention record remains at {} as a synchronization file; it does not block a later teardown.", retention::PATH),
+    }
+}
+
+fn closing_data_line(report: &TeardownReport, snapshots: &SnapshotEvidence) -> String {
     const CHANNEL_RESIDUAL_NOTE: &str =
         "The install-channel removal is reported separately; shared signing keys may remain.";
     if !report.data_wipe_requested {
         return format!(
-            "irlume is removed; your enrolled faces, sealed secrets, models, and config \
-             were kept (--keep-data). {CHANNEL_RESIDUAL_NOTE}"
+            "irlume is removed; your enrolled faces, template-key/recovery state, and application config \
+             were kept (--keep-data); keyring disarm still ran. {CHANNEL_RESIDUAL_NOTE}"
         );
     }
     if !report.data_wiped {
@@ -645,6 +705,30 @@ fn closing_line(report: &TeardownReport, snapshots: &SnapshotEvidence) -> String
 /// Run the four teardown steps in the lockout-safe order. Public so the TUI
 /// calls the identical sequence behind its own confirmation.
 pub fn perform_teardown(keep_data: bool) -> TeardownReport {
+    // Persist uncertainty before observing a generation or changing anything.
+    // A failed attempt must not let a later retry forget an earlier store.
+    let mut retained = match retention::Retention::begin(Path::new(retention::PATH), 0) {
+        Ok(retained) => retained,
+        Err(e) => return refused_teardown(keep_data, e),
+    };
+    report_with_retention(&mut retained, |retained| {
+        perform_held_teardown(keep_data, retained)
+    })
+}
+
+fn report_with_retention(
+    retained: &mut retention::Retention,
+    teardown: impl FnOnce(&mut retention::Retention) -> TeardownReport,
+) -> TeardownReport {
+    let mut report = teardown(retained);
+    report.retention = retained.state();
+    report
+}
+
+fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -> TeardownReport {
+    if let Err(e) = retained.require_fresh() {
+        return refused_teardown(keep_data, e);
+    }
     // The state roots outside the default, resolved before anything is
     // removed: the one irlumed's unit names is lost once the unit goes, and
     // every one of them is both disarmed and wiped below. The token guard
@@ -657,15 +741,83 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     // never reached through a path again.
     let default_root = irlume_common::state_dir();
     let accounts = sweep_accounts();
-    let homes = home_trees(&accounts, &default_root);
+    let mut homes = home_trees(&accounts, &default_root);
     let account_trees: Vec<PathBuf> = accounts.iter().map(|a| home_state_path(&a.home)).collect();
-    let (extra_roots, roots_unknown) = match unit_state_roots(&default_root) {
-        Ok(mut roots) => {
-            roots.retain(|root| !account_trees.contains(root));
-            (roots, None)
-        }
-        Err(e) => (Vec::new(), Some(e)),
+    let snapshot = match runtime_environment::capture() {
+        Ok(snapshot) => snapshot,
+        Err(e) => return refused_teardown(keep_data, e),
     };
+    let mut extra_roots = unit_state_roots(&snapshot, &default_root);
+    extra_roots.retain(|root| !account_trees.contains(root));
+    homes.extend(
+        extra_roots
+            .iter()
+            .filter_map(|root| resolve_unit_tree(root, 0)),
+    );
+    // Freeze explicit stores before stopping the daemon or removing its unit.
+    // Unknown selection is a preflight refusal, never permission to wipe the
+    // default tree and then evict the key underneath an undiscovered store.
+    let selected = (|| {
+        let mut dirs = unit_keyring_dirs(&snapshot);
+        for root in &extra_roots {
+            let dir = root.join("keyring");
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+        let stores = selected_keyrings::hold(&dirs, 0)?;
+        let other_overrides = snapshot.disk.values[2..].iter().any(Option::is_some);
+        let sweep = sealed_token_holders_with(
+            irlume_core::keyring::list_sealed_kinds(),
+            &homes,
+            &extra_roots,
+            &dirs,
+            0,
+        )?;
+        if !sweep.holders.is_empty() {
+            return Err(format!("GNOME token holders: {}", sweep.holders.join(", ")));
+        }
+        Ok((dirs, stores, other_overrides))
+    })();
+    let (keyring_dirs, selected_stores, unit_other_overrides) = match selected {
+        Ok(selected) => selected,
+        Err(e) => {
+            return TeardownReport {
+                pam_unwired: false,
+                service_stopped: false,
+                users_cleared: 0,
+                data_wipe_requested: !keep_data,
+                data_wiped: false,
+                data_left: vec![format!(
+                    "store discovery refused before teardown: {}",
+                    terminal_safe(&e)
+                )],
+                srk_eviction: SrkOutcome::Kept,
+                retention: RetentionState::Unverified,
+            }
+        }
+    };
+    let config_root = irlume_common::config::config_path("");
+    let mut wipe_roots = vec![default_root.clone(), config_root.clone()];
+    wipe_roots.extend(extra_roots.iter().cloned());
+    wipe_roots.extend(account_trees);
+    for root in &wipe_roots {
+        match std::fs::canonicalize(root) {
+            Ok(root) if Path::new(retention::PATH).starts_with(&root) => {
+                return refused_teardown(
+                    keep_data,
+                    "wipe would remove the durable SRK retention record".into(),
+                )
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return refused_teardown(keep_data, format!("cannot resolve wipe root: {e}"))
+            }
+            _ => {}
+        }
+    }
+    if let Err(e) = snapshot.revalidate() {
+        return refused_teardown(keep_data, e);
+    }
     // 1. PAM FIRST. Un-wire every greeter, the lock screen, sudo, and polkit
     //    (disable puts the opt-in stacks in scope regardless of flags) so no
     //    stack references pam_irlume.so once the module is removed.
@@ -676,23 +828,27 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     // Every stack the disable covers, sudo and polkit-1 included: it keeps a
     // stack it cannot change safely as it is, and says so above.
     let pam_unwired = !pamwire::any_stack_wired();
+    if !pam_unwired {
+        return refused_teardown(
+            keep_data,
+            "PAM still references irlume; data and installation are retained".into(),
+        );
+    }
 
     // 2. Stop and disable the daemon, and the self-heal units with it. Leaving
     //    those enabled means a uninstalled irlume still wakes up on a PAM change
     //    or on the timer; they self-gate on the marker so they would no-op, but
     //    an uninstall should not leave units armed. Their failure is not counted
     //    against the daemon's: a box that never enabled login never had them.
+    if let Err(e) = snapshot.revalidate() {
+        return refused_teardown(keep_data, e);
+    }
+    for unit in runtime_environment::ACTIVATORS {
+        let _ = systemctl(&["stop", unit]);
+    }
     let stop = systemctl(&["stop", "irlumed.service"]);
-    let disable = systemctl(&["disable", "irlumed.service"]);
-    for unit in [
-        "irlume-reconcile.path",
-        "irlume-reconcile.timer",
-        "irlume-reconcile.service",
-        // The login-runner prune unit ships enabled-by-default in some lanes;
-        // an uninstall must not leave a dead unit armed (#335 class).
-        "irlume-runner-prune.service",
-    ] {
-        let _ = systemctl(&["disable", "--now", unit]);
+    if let Err(e) = snapshot.quiescent() {
+        return refused_teardown(keep_data, e);
     }
     // The socket unit does not unlink its socket file on stop, and a stopped
     // daemon leaves /run/irlume.sock behind as a stale node (found by the
@@ -710,50 +866,83 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
         // The machine-API session lock root uses without a runtime directory.
         remove_session_lock(Path::new(crate::machine::ROOT_SESSION_DIR));
     }
-    // `systemctl enable` copies units into /etc/systemd/system/ (Arch's
-    // systemd does this for units with [Install] aliases) — files pacman/apt
-    // do not own, so package removal leaves them behind as the second
-    // RC2 audit finding (4 files + a still-enabled timer). Remove exactly the
-    // irlume-named units from /etc; package-owned /usr/lib copies are the
-    // package manager's business.
-    for unit in [
-        "irlume-runner-prune.timer",
-        "irlume-runner-prune.service",
-        "irlume-reconcile.path",
-        "irlume-reconcile.timer",
-        "irlume-reconcile.service",
-        "irlumed.socket",
-        "irlumed.service",
-    ] {
-        let _ = systemctl(&["reset-failed", unit]);
-        let p = std::path::Path::new("/etc/systemd/system").join(unit);
-        if p.exists() {
-            let _ = std::fs::remove_file(&p);
+    // Keep the unit/drop-ins until all data cleanup has succeeded. In
+    // particular disable can remove linked units and must also wait.
+    let finish_services = || {
+        let disable = systemctl(&["disable", "irlumed.service"]);
+        if !disable {
+            return false;
         }
+        for unit in [
+            "irlume-reconcile.path",
+            "irlume-reconcile.timer",
+            "irlume-reconcile.service",
+            "irlume-runner-prune.service",
+        ] {
+            let _ = systemctl(&["disable", "--now", unit]);
+        }
+        // `systemctl enable` copies units into /etc/systemd/system/ (Arch's
+        // systemd does this for units with [Install] aliases) — files pacman/apt
+        // do not own, so package removal leaves them behind as the second
+        // RC2 audit finding (4 files + a still-enabled timer). Remove exactly the
+        // irlume-named units from /etc; package-owned /usr/lib copies are the
+        // package manager's business.
+        for unit in [
+            "irlume-runner-prune.timer",
+            "irlume-runner-prune.service",
+            "irlume-reconcile.path",
+            "irlume-reconcile.timer",
+            "irlume-reconcile.service",
+            "irlumed.socket",
+            "irlumed.service",
+        ] {
+            let _ = systemctl(&["reset-failed", unit]);
+            let p = std::path::Path::new("/etc/systemd/system").join(unit);
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        // Reload so a later `systemctl list-unit-files` reflects the removal.
+        let _ = systemctl(&["daemon-reload"]);
+        // AppArmor: removing the package deletes /etc/apparmor.d/usr.bin.irlumed
+        // but does NOT unload the profile from the kernel — the daemon binary is
+        // gone, so the residual profile can only cause confusion (and would
+        // silently re-confine a later non-irlume binary at the same path). Unload
+        // it explicitly; absence of apparmor_parser is not an error (non-AA boxes).
+        if std::path::Path::new("/etc/apparmor.d/usr.bin.irlumed").exists()
+            || Command::new("apparmor_status")
+                .output()
+                .map(|o| {
+                    o.status.success() && String::from_utf8_lossy(&o.stdout).contains("irlumed")
+                })
+                .unwrap_or(false)
+        {
+            let _ = Command::new("apparmor_parser")
+                .args(["-R", "/etc/apparmor.d/usr.bin.irlumed"])
+                .status();
+        }
+        // systemd keeps a monotonic stamp per timer under /var/lib/systemd/timers
+        // and deletes it neither on disable nor on package remove: the #335 audit
+        // found stamp-irlume-reconcile.timer still there after the uninstall AND a
+        // reboot. Removed here, right after the unit that owned it.
+        remove_timer_stamps(TIMER_STAMP_DIR);
+        disable
+    };
+    let service_stopped = stop;
+
+    // A running daemon can publish another envelope during disarm/wipe.
+    if !stop {
+        return TeardownReport {
+            pam_unwired,
+            service_stopped,
+            users_cleared: 0,
+            data_wipe_requested: !keep_data,
+            data_wiped: false,
+            data_left: vec!["daemon did not stop; data left in place".into()],
+            srk_eviction: SrkOutcome::Kept,
+            retention: RetentionState::Unverified,
+        };
     }
-    // Reload so a later `systemctl list-unit-files` reflects the removal.
-    let _ = systemctl(&["daemon-reload"]);
-    // AppArmor: removing the package deletes /etc/apparmor.d/usr.bin.irlumed
-    // but does NOT unload the profile from the kernel — the daemon binary is
-    // gone, so the residual profile can only cause confusion (and would
-    // silently re-confine a later non-irlume binary at the same path). Unload
-    // it explicitly; absence of apparmor_parser is not an error (non-AA boxes).
-    if std::path::Path::new("/etc/apparmor.d/usr.bin.irlumed").exists()
-        || Command::new("apparmor_status")
-            .output()
-            .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("irlumed"))
-            .unwrap_or(false)
-    {
-        let _ = Command::new("apparmor_parser")
-            .args(["-R", "/etc/apparmor.d/usr.bin.irlumed"])
-            .status();
-    }
-    // systemd keeps a monotonic stamp per timer under /var/lib/systemd/timers
-    // and deletes it neither on disable nor on package remove: the #335 audit
-    // found stamp-irlume-reconcile.timer still there after the uninstall AND a
-    // reboot. Removed here, right after the unit that owned it.
-    remove_timer_stamps(TIMER_STAMP_DIR);
-    let service_stopped = stop && disable;
 
     // 3. Disarm each enrolled user's keyring seal (idempotent), and 4. wipe the
     //    per-user enrollment + sealed secrets unless data is being kept. Every
@@ -762,10 +951,19 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     //    failure lands in data_left and pulls data_wiped false.
     let users = irlume_core::storage::list_users();
     let mut data_left: Vec<String> = Vec::new();
-    if let Some(e) = &roots_unknown {
-        data_left.push(format!(
-            "state roots irlumed's unit names (could not be read: {e}; not disarmed or wiped)"
-        ));
+    let (selected_cleared, selected_left) = selected_keyrings::disarm(&selected_stores, 0);
+    if !selected_left.is_empty() {
+        // A selected store may be inside any tree below. Keep every tree on a
+        // refusal so a later recursive wipe cannot erase the refused entry.
+        return TeardownReport {
+            pam_unwired, service_stopped, users_cleared: selected_cleared,
+            data_wipe_requested: !keep_data, data_wiped: false,
+            data_left: selected_left.into_iter().chain(std::iter::once(
+                "remaining state/config trees kept because selected keyring disarm was incomplete".into()
+            )).collect(),
+            srk_eviction: SrkOutcome::Kept,
+            retention: RetentionState::Unverified,
+        };
     }
     for user in &users {
         let _ = irlume_core::keyring::forget_password(user);
@@ -785,13 +983,7 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     // count must reflect every user this teardown actually disarmed (the
     // default-root enumeration above is blind to these roots for the same
     // environment reason as the token guard; 2026-09-17 audit).
-    let mut users_cleared = users.len() + disarm_home_trees(&homes);
-    for root in &extra_roots {
-        for user in irlume_core::storage::list_users_at(root) {
-            let _ = irlume_core::keyring::forget_password_in(root, &user);
-            users_cleared += 1;
-        }
-    }
+    let users_cleared = selected_cleared + users.len() + disarm_home_trees(&homes);
 
     // 4 (cont). Remove the state and config trees: any
     //    remaining sealed envelopes, cameras.conf/settings.conf (and any
@@ -804,10 +996,7 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
         // took the enrollments, template keys, recovery envelopes and keyring
         // seals with it. That is not hypothetical; the same split resolution in
         // template_key.rs destroyed a real machine's keys on 2026-08-05.
-        for dir in wipe_data_trees(&[
-            irlume_common::state_dir(),
-            irlume_common::config::CONFIG_ROOT.into(),
-        ]) {
+        for dir in wipe_data_trees(&[default_root]) {
             data_left.push(dir.display().to_string());
         }
         // Per-user XDG state (~/.local/share/irlume): login-runner records and
@@ -820,46 +1009,83 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
         // tree verified inside its home is removed, through the directory
         // that holds it; anything else there is named and left.
         data_left.extend(wipe_home_trees(&homes));
-        // And the root irlumed's unit named, when it is no account's tree.
-        // The unit's value comes from a configuration file, so only a
-        // directory named `irlume`, as install-host.sh writes it, is removed
-        // whole; any other is left and reported rather than trusted with a
-        // recursive delete.
-        let (ours, other): (Vec<PathBuf>, Vec<PathBuf>) = extra_roots
-            .iter()
-            .cloned()
-            .partition(|root| root.file_name().is_some_and(|name| name == "irlume"));
-        for dir in wipe_data_trees(&ours) {
-            data_left.push(format!("{} (state root)", dir.display()));
-        }
-        for dir in other.iter().filter(|dir| dir.exists()) {
-            data_left.push(format!(
-                "{} (state root irlumed's unit names; not an `irlume` directory, so left for you)",
-                dir.display()
-            ));
-        }
+        // Unit-selected state roots use the same descriptor-held, ownership-
+        // checked wipe as homes above. Removed links leave a retention note.
     }
 
+    if let Err(e) = selected_keyrings::empty(&selected_stores, &keyring_dirs) {
+        data_left.push(e);
+    }
+    // Keyring-only enumeration cannot prove a held state tree is empty: a
+    // renamed tree may still contain only template keys or recovery envelopes.
+    if !keep_data {
+        for home in &homes {
+            if let HomeTree::Verified(tree) = home {
+                let empty = fd_path(&tree.dir)
+                    .and_then(std::fs::read_dir)
+                    .map(|mut entries| entries.next().is_none());
+                if !matches!(empty, Ok(true)) {
+                    data_left.push(format!(
+                        "{} (held state tree still contains data or is unreadable)",
+                        terminal_safe(&tree.path.display().to_string())
+                    ));
+                }
+            }
+        }
+    }
+    if let Err(e) = snapshot.still_quiescent() {
+        data_left.push(e);
+    }
+    // Configuration can name a custom store. Keep it through every preceding
+    // refusal so the next attempt finds that store again.
+    if !keep_data && data_left.is_empty() {
+        data_left.extend(
+            wipe_data_trees(&[config_root])
+                .iter()
+                .map(|p| p.display().to_string()),
+        );
+    }
     let data_wipe_requested = !keep_data;
-    let data_wiped = data_wipe_requested && data_left.is_empty();
+    let mut data_wiped = data_wipe_requested && data_left.is_empty();
     // The persisted SRK is evicted only when NO sealed envelope can still
     // exist anywhere (audit F4 + the #757 review): `data_wiped` proves the
     // wiped trees are gone, but sealed data can live under the env overrides
     // (`IRLUME_KEYRING_DIR`, `IRLUME_RECOVERY_DIR`,
     // `IRLUME_TEMPLATE_KEY_DIR`) that the wipe never touched, so an active
-    // override blocks eviction outright - and the multi-root envelope
+    // override blocks eviction outright. The unit's other envelope overrides
+    // were captured before removing it. The frozen multi-root/all-kind envelope
     // enumeration must re-run EMPTY after the wipe (an unreadable store also
     // blocks it; the guard's own contract, and so does anything it only
     // named). Absent and Foreign are successes; a TPM error is non-fatal (the
     // key is a benign orphan).
-    let srk_eviction = if may_evict_srk(
+    let eligible = may_evict_srk(
         data_wiped,
-        srk_override_dirs_active(),
-        sealed_token_holders().and_then(|sweep| match sweep.notes.first() {
-            Some(note) => Err(note.clone()),
-            None => Ok(sweep.holders),
-        }),
-    ) {
+        srk_override_dirs_active() || unit_other_overrides || retained.prior_uncertain,
+        sealed_token_holders_with(
+            irlume_core::keyring::list_sealed_kinds(),
+            &homes,
+            &extra_roots,
+            &keyring_dirs,
+            0,
+        )
+        .and_then(TokenSweep::srk_survivors),
+    );
+    let record_ready = if eligible {
+        match snapshot
+            .still_quiescent()
+            .and_then(|()| retained.complete())
+        {
+            Ok(()) => true,
+            Err(e) => {
+                data_left.push(e);
+                data_wiped = false;
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let srk_eviction = if record_ready {
         match irlume_core::tpm::evict_persistent_srk() {
             Ok(irlume_core::tpm::SrkEviction::Evicted) => SrkOutcome::Evicted,
             Ok(irlume_core::tpm::SrkEviction::Absent) => SrkOutcome::Absent,
@@ -869,7 +1095,7 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     } else {
         SrkOutcome::Kept
     };
-    TeardownReport {
+    let mut report = TeardownReport {
         pam_unwired,
         service_stopped,
         users_cleared,
@@ -877,14 +1103,41 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
         data_wiped,
         data_left,
         srk_eviction,
+        retention: RetentionState::Unverified,
+    };
+    if finish_teardown(&report, finish_services) == Some(false) {
+        report.data_wiped = false;
+        report
+            .data_left
+            .push("service disabling failed; final unit cleanup was not performed".into());
+    }
+    report
+}
+
+fn refused_teardown(keep_data: bool, reason: String) -> TeardownReport {
+    TeardownReport {
+        pam_unwired: false,
+        service_stopped: false,
+        users_cleared: 0,
+        data_wipe_requested: !keep_data,
+        data_wiped: false,
+        data_left: vec![terminal_safe(&reason)],
+        srk_eviction: SrkOutcome::Kept,
+        retention: RetentionState::Unverified,
+    }
+}
+
+fn finish_teardown(report: &TeardownReport, finish: impl FnOnce() -> bool) -> Option<bool> {
+    if removal_refusal(report).is_some() {
+        None
+    } else {
+        Some(finish())
     }
 }
 
 /// True when any of the env overrides that can hold sealed data OUTSIDE the
-/// wiped trees is set for this process (the #757 review): the uninstaller can
-/// enumerate and re-check its own roots, but it cannot know where an
-/// overridden keyring/recovery/template-key dir points on a unit's behalf, so
-/// the destructive TPM step stays off whenever one is visible.
+/// wiped trees is set for this process (the #757 review). Unit-selected
+/// directories are captured separately before the unit is removed.
 fn srk_override_dirs_active() -> bool {
     [
         "IRLUME_KEYRING_DIR",
@@ -902,9 +1155,9 @@ fn srk_override_dirs_active() -> bool {
 fn may_evict_srk(
     data_wiped: bool,
     override_active: bool,
-    token_holders: Result<Vec<String>, String>,
+    envelopes: Result<Vec<String>, String>,
 ) -> bool {
-    data_wiped && !override_active && matches!(token_holders, Ok(holders) if holders.is_empty())
+    data_wiped && !override_active && matches!(envelopes, Ok(envelopes) if envelopes.is_empty())
 }
 
 /// An account whose home may hold per-user irlume state.
@@ -983,6 +1236,50 @@ struct VerifiedTree {
     parent: std::fs::File,
     /// The tree itself.
     dir: std::fs::File,
+}
+
+/// Unit-selected state roots share the home-tree deletion safeguards. Only a
+/// real root-controlled directory named `irlume` is eligible for whole-tree
+/// removal; other paths remain visible to the leftover and SRK gates.
+fn resolve_unit_tree(path: &Path, owner: u32) -> Option<HomeTree> {
+    use std::os::unix::fs::MetadataExt as _;
+    let skip = |reason: String| {
+        Some(HomeTree::Skipped {
+            path: path.into(),
+            account: "irlumed unit".into(),
+            reason,
+        })
+    };
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return skip(e.to_string()),
+        _ => {}
+    }
+    if path.file_name().is_none_or(|name| name != "irlume") {
+        return skip("not an `irlume` directory; left for the administrator".into());
+    }
+    let Some(parent_path) = path.parent() else {
+        return skip("no parent directory".into());
+    };
+    let parent = match open_dir(parent_path) {
+        Ok(dir) => dir,
+        Err(e) => return skip(e.to_string()),
+    };
+    let dir = match open_child_dir(&parent, "irlume") {
+        Ok(Child::Dir(dir)) => dir,
+        Ok(Child::Absent) => return None,
+        _ => return skip("not a real directory, or cannot be opened".into()),
+    };
+    match dir.metadata() {
+        Ok(meta) if meta.uid() == owner && meta.mode() & 0o022 == 0 => {}
+        _ => return skip("directory is not controlled by the expected owner".into()),
+    }
+    Some(HomeTree::Verified(VerifiedTree {
+        path: path.into(),
+        account: "irlumed unit".into(),
+        parent,
+        dir,
+    }))
 }
 
 /// The per-account trees below `accounts`' homes, each path once, leaving out
@@ -1302,14 +1599,23 @@ impl VerifiedTree {
 
     /// Remove the tree through the directory that holds it, and only while
     /// the name there is still the directory that was verified. A tree that
-    /// is gone already counts as removed. The number of symbolic links the
+    /// unlinked and empty counts as removed; a renamed tree does not. The number of symbolic links the
     /// removal took ([`Self::remove_held`]).
     fn wipe(&self) -> std::io::Result<usize> {
         use std::os::unix::fs::MetadataExt as _;
         let path = fd_path(&self.parent)?.join("irlume");
         let now = match std::fs::symlink_metadata(&path) {
             Ok(meta) => meta,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if self.dir.metadata()?.nlink() == 0
+                    && std::fs::read_dir(fd_path(&self.dir)?)?.next().is_none()
+                {
+                    return Ok(0);
+                }
+                return Err(std::io::Error::other(
+                    "held state tree moved; its data is retained",
+                ));
+            }
             Err(e) => return Err(e),
         };
         let verified = self.dir.metadata()?;
@@ -1525,11 +1831,20 @@ fn wipe_home_trees_as(homes: &[HomeTree], _root_uid: u32) -> Vec<String> {
 struct TokenSweep {
     /// The accounts whose sealed envelope is a GNOME keyring token.
     holders: Vec<String>,
+    /// Every kind still depends on the SRK, not only GNOME tokens.
+    envelopes: Vec<String>,
     /// What it passed over, by path, for the output.
     notes: Vec<String>,
 }
 
 impl TokenSweep {
+    fn srk_survivors(self) -> Result<Vec<String>, String> {
+        match self.notes.into_iter().next() {
+            Some(note) => Err(note),
+            None => Ok(self.envelopes),
+        }
+    }
+
     fn collect(&mut self, sealed: Vec<(String, irlume_core::envelope::SecretKind)>) {
         for (user, kind) in sealed {
             self.count(user, kind);
@@ -1537,6 +1852,9 @@ impl TokenSweep {
     }
 
     fn count(&mut self, user: String, kind: irlume_core::envelope::SecretKind) {
+        if !self.envelopes.contains(&user) {
+            self.envelopes.push(user.clone());
+        }
         if kind == irlume_core::envelope::SecretKind::GnomeKeyringToken
             && !self.holders.contains(&user)
         {
@@ -1550,55 +1868,41 @@ impl TokenSweep {
 /// instead of quietly leaving out the store the daemon uses).
 /// `install-host.sh` writes it for a source install whatever account ran it
 /// (one resolved through NSS, or with a UID outside the human range).
-fn unit_state_roots(default: &Path) -> Result<Vec<PathBuf>, String> {
-    Ok(unit_env("IRLUME_STATE_DIR")?
+fn unit_state_roots(snapshot: &runtime_environment::Snapshot, default: &Path) -> Vec<PathBuf> {
+    snapshot.disk.values[0]
+        .clone()
         .filter(|root| root != default)
-        .filter(|root| match std::fs::metadata(root) {
-            Ok(meta) => meta.is_dir(),
-            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-        })
         .into_iter()
-        .collect())
+        .collect()
 }
 
 /// systemd's unit directories for system services, highest precedence first.
-const UNIT_LAYERS: [&str; 7] = [
+const UNIT_LAYERS: [&str; 12] = [
     "etc/systemd/system.control",
     "run/systemd/system.control",
     "run/systemd/transient",
+    "run/systemd/generator.early",
     "etc/systemd/system",
+    "etc/systemd/system.attached",
     "run/systemd/system",
+    "run/systemd/system.attached",
+    "run/systemd/generator",
     "usr/local/lib/systemd/system",
     "usr/lib/systemd/system",
+    "run/systemd/generator.late",
 ];
 
-/// A directory variable (`IRLUME_STATE_DIR`, `IRLUME_KEYRING_DIR`) as systemd
-/// gives it to irlumed: the unit file from the highest layer that has one
+/// A directory variable selected on disk, verified against a running system
+/// daemon when present: the unit file from the highest layer that has one
 /// (`install-host.sh` writes /etc, a package ships /usr/lib), then every
 /// layer's drop-ins merged by name, a higher layer's file masking a lower
 /// one's, applied in name order; the last assignment wins, and an empty
 /// `Environment=` resets. A file that exists and cannot be read is an error:
 /// the directory it would name is unknown.
-pub(crate) fn unit_env(var: &str) -> Result<Option<PathBuf>, String> {
-    unit_env_under(Path::new("/"), var)
-}
-
+#[cfg(test)]
 fn unit_env_under(root: &Path, var: &str) -> Result<Option<PathBuf>, String> {
     let texts = unit_texts_under(root)?;
-    let mut found = None;
-    for text in &texts {
-        found = unit_env_in(text, var, found);
-    }
-    // systemd applies `UnsetEnvironment=` after every `Environment=`, whatever
-    // the order of the lines: a variable it names, bare or with the value it
-    // has, is not in the daemon's environment.
-    if let Some(value) = &found {
-        let assignment = format!("{var}={}", value.display());
-        if texts.iter().any(|text| unit_unsets(text, var, &assignment)) {
-            found = None;
-        }
-    }
-    Ok(found)
+    unit_environment::value(root, &texts, var)
 }
 
 /// A directory variable as irlumed gets it from systemd ([`daemon_env`]).
@@ -1760,13 +2064,29 @@ fn global_env_in(text: &str, var: &str) -> Result<Option<String>, ()> {
 }
 
 /// The text of irlumed's unit, the highest layer's, then its drop-ins merged
-/// by name in name order (see [`unit_env`]). A file that exists and cannot be
+/// by name in name order. A file that exists and cannot be
 /// read is an error.
 fn unit_texts_under(root: &Path) -> Result<Vec<String>, String> {
-    let read = |path: &Path| match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("{}: {e}", path.display())),
+    let read = |path: &Path| {
+        match std::fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if std::fs::read_link(path).ok().as_deref() == Some(Path::new("/dev/null")) {
+                    return Ok(Some(String::new())); // a mask, not a lower-layer fallback
+                }
+                if path.file_name().is_some_and(|n| n == "irlumed.service") {
+                    let target = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+                    if target.extension().is_some_and(|e| e == "service")
+                        && target.file_name() != path.file_name()
+                    {
+                        return Err("irlumed aliases another service; its additional drop-ins are unresolved".into());
+                    }
+                }
+            }
+            _ => {}
+        }
+        unit_environment::read_text(path).map(Some)
     };
     let mut texts = Vec::new();
     for layer in UNIT_LAYERS {
@@ -1777,8 +2097,16 @@ fn unit_texts_under(root: &Path) -> Result<Vec<String>, String> {
     }
     let mut drop_ins: std::collections::BTreeMap<std::ffi::OsString, PathBuf> =
         std::collections::BTreeMap::new();
-    for layer in UNIT_LAYERS {
-        let dir = root.join(layer).join("irlumed.service.d");
+    // Name-specific drop-ins take precedence over service-wide ones even
+    // across layers. Names that differ still apply in lexical order.
+    for dir in ["irlumed.service.d", "service.d"]
+        .into_iter()
+        .flat_map(|name| {
+            UNIT_LAYERS
+                .into_iter()
+                .map(move |layer| root.join(layer).join(name))
+        })
+    {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1800,54 +2128,11 @@ fn unit_texts_under(root: &Path) -> Result<Vec<String>, String> {
     Ok(texts)
 }
 
-/// Whether a unit file's `UnsetEnvironment=` lines name `var`, bare or as the
-/// exact `assignment` it has.
-fn unit_unsets(unit: &str, var: &str, assignment: &str) -> bool {
-    unit.lines()
-        .filter_map(|line| line.trim().strip_prefix("UnsetEnvironment="))
-        .flat_map(str::split_whitespace)
-        .map(|word| word.trim_matches('"'))
-        .any(|word| word == var || word == assignment)
-}
-
 /// The keyring directory irlumed's unit points `IRLUME_KEYRING_DIR` at, when
 /// it is not the one this process uses: a separately started CLI does not
 /// inherit the daemon's environment, so its own default misses that store.
-fn unit_keyring_dirs() -> Result<Vec<PathBuf>, String> {
-    Ok(unit_env("IRLUME_KEYRING_DIR")?.into_iter().collect())
-}
-
-/// `<var>` after a unit file's `Environment=` lines, starting from `found`:
-/// each line holds space-separated assignments, any of them in double quotes,
-/// and an empty `Environment=` resets the list.
-fn unit_env_in(unit: &str, var: &str, mut found: Option<PathBuf>) -> Option<PathBuf> {
-    for line in unit.lines() {
-        let Some(value) = line.trim().strip_prefix("Environment=") else {
-            continue;
-        };
-        if value.trim().is_empty() {
-            found = None;
-            continue;
-        }
-        let (mut word, mut quoted, mut words) = (String::new(), false, Vec::new());
-        for c in value.chars() {
-            match c {
-                '"' => quoted = !quoted,
-                ' ' | '\t' if !quoted => words.push(std::mem::take(&mut word)),
-                c => word.push(c),
-            }
-        }
-        words.push(word);
-        for word in words {
-            if let Some(dir) = word
-                .strip_prefix(var)
-                .and_then(|rest| rest.strip_prefix('='))
-            {
-                found = Some(PathBuf::from(dir));
-            }
-        }
-    }
-    found.filter(|dir| dir.is_absolute())
+fn unit_keyring_dirs(snapshot: &runtime_environment::Snapshot) -> Vec<PathBuf> {
+    snapshot.disk.values[1].clone().into_iter().collect()
 }
 
 /// Root's home in a passwd text (uid 0), `None` when it names none.
@@ -1868,11 +2153,12 @@ fn root_home_in(passwd: &str) -> Option<PathBuf> {
 /// a per-account tree for what root does not own ([`VerifiedTree::sweep`]).
 fn sealed_token_holders() -> Result<TokenSweep, String> {
     let default = irlume_common::state_dir();
+    let snapshot = runtime_environment::capture()?;
     sealed_token_holders_with(
         irlume_core::keyring::list_sealed_kinds(),
         &home_trees(&sweep_accounts(), &default),
-        &unit_state_roots(&default)?,
-        &unit_keyring_dirs()?,
+        &unit_state_roots(&snapshot, &default),
+        &unit_keyring_dirs(&snapshot),
         0,
     )
 }
@@ -1887,6 +2173,7 @@ fn sealed_token_holders() -> Result<TokenSweep, String> {
 /// read, and refuses on one it cannot only when root owns it.
 pub(crate) fn root_sealed_token_holders() -> Result<Vec<String>, String> {
     let default = irlume_common::state_dir();
+    let snapshot = runtime_environment::capture()?;
     let mut homes = Vec::new();
     let mut dirs = Vec::new();
     for home in home_trees(&sweep_accounts(), &default) {
@@ -1905,15 +2192,8 @@ pub(crate) fn root_sealed_token_holders() -> Result<Vec<String>, String> {
     }
     // What irlumed's own unit names is trusted by where it comes from (a unit
     // file only root writes), links followed as irlumed follows them.
-    let roots = unit_state_roots(&default)?;
-    for dir in unit_keyring_dirs()? {
-        match std::fs::metadata(&dir) {
-            Ok(meta) if meta.is_dir() => dirs.push(dir),
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("{}: {e}", dir.display())),
-        }
-    }
+    let roots = unit_state_roots(&snapshot, &default);
+    dirs.extend(unit_keyring_dirs(&snapshot));
     Ok(sealed_token_holders_with(
         irlume_core::keyring::list_sealed_kinds(),
         &homes,
@@ -2011,6 +2291,7 @@ fn sealed_token_holders_with(
     match sweep_sealed_token_holders(default, homes, roots, keyring_dirs, root_uid) {
         Ok(sweep) => Ok(TokenSweep {
             holders: sweep.holders.iter().map(|h| terminal_safe(h)).collect(),
+            envelopes: sweep.envelopes.iter().map(|h| terminal_safe(h)).collect(),
             notes: sweep.notes.iter().map(|n| terminal_safe(n)).collect(),
         }),
         Err(e) => Err(terminal_safe(&e)),
@@ -2573,6 +2854,11 @@ mod tests {
             } else {
                 SrkOutcome::Kept
             },
+            retention: if wiped {
+                RetentionState::Clean
+            } else {
+                RetentionState::Retained
+            },
         }
     }
 
@@ -2940,6 +3226,288 @@ mod tests {
     }
 
     #[test]
+    fn environment_review2_report_distinguishes_clean_and_unverified_records() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = std::env::temp_dir().join(format!("irlume-report-state-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let owner = std::fs::metadata(&root).unwrap().uid();
+        let mut held = retention::Retention::begin(&root.join("record"), owner).unwrap();
+        let clean = report_with_retention(&mut held, |held| {
+            held.complete().unwrap();
+            report(true, true, &[])
+        });
+        assert_eq!(clean.retention, RetentionState::Clean);
+        let notice = retention_notice(clean.retention);
+        assert!(notice.contains(retention::PATH));
+        assert!(notice.contains("does not block"));
+        assert!(!notice.contains("WARNING"));
+        let unreadable = root.join("not-a-file");
+        std::fs::create_dir(&unreadable).unwrap();
+        let error = retention::Retention::begin(&unreadable, owner)
+            .err()
+            .unwrap();
+        let unknown = refused_teardown(false, error);
+        assert_eq!(unknown.retention, RetentionState::Unverified);
+        let notice = retention_notice(unknown.retention);
+        assert!(notice.contains("could not be confirmed"));
+        assert!(notice.contains(retention::RECOVERY_GUIDE));
+        assert!(removal_refusal(&unknown).is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn environment_review2_successful_retention_warns_about_future_teardown() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root =
+            std::env::temp_dir().join(format!("irlume-report-retained-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let owner = std::fs::metadata(&root).unwrap().uid();
+        let mut held = retention::Retention::begin(&root.join("record"), owner).unwrap();
+        for keep_data in [true, false] {
+            let completed = report_with_retention(&mut held, |_| {
+                let mut completed = report(!keep_data, !keep_data, &[]);
+                completed.srk_eviction = SrkOutcome::Kept; // also the intentional override case
+                completed
+            });
+            assert_eq!(completed.retention, RetentionState::Retained);
+            assert!(removal_refusal(&completed).is_none());
+            let text = closing_line(&completed, &SnapshotEvidence::default());
+            assert!(text.contains("WARNING"), "{text}");
+            assert!(text.contains(retention::PATH), "{text}");
+            assert!(
+                text.contains("later uninstall attempts will refuse"),
+                "{text}"
+            );
+            assert!(text.contains("manual-uninstall-recovery"), "{text}");
+        }
+        drop(held);
+        assert!(retention::Retention::begin(&root.join("record"), owner)
+            .unwrap()
+            .require_fresh()
+            .is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn environment_review2_early_refusal_requires_manual_reconciliation_not_blind_retry() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = std::env::temp_dir().join(format!("irlume-report-early-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let owner = std::fs::metadata(&root).unwrap().uid();
+        let mut held = retention::Retention::begin(&root.join("record"), owner).unwrap();
+        let early = report_with_retention(&mut held, |_| {
+            refused_teardown(false, "PAM/config refused before inventory".into())
+        });
+        assert_eq!(early.retention, RetentionState::Retained);
+        let text = removal_refusal(&early).unwrap();
+        assert!(text.contains("PAM/config refused"));
+        assert!(text.contains("manual-uninstall-recovery"), "{text}");
+        assert!(text.contains("Fixing the reported error alone"), "{text}");
+        drop(held);
+        let retry = retention::Retention::begin(&root.join("record"), owner).unwrap();
+        let text = retry.require_fresh().unwrap_err();
+        assert!(text.contains("manual-uninstall-recovery"), "{text}");
+        assert!(text.contains("unlink or replace"), "{text}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn environment_review_moved_template_only_tree_keeps_srk() {
+        use std::os::unix::fs::MetadataExt as _;
+        let base = std::env::temp_dir().join(format!("irlume-review-move-{}", std::process::id()));
+        let path = base.join("irlume");
+        std::fs::create_dir_all(path.join("template-keys")).unwrap();
+        std::fs::write(path.join("template-keys/alice.json"), PASSWORD_ENVELOPE).unwrap();
+        let uid = std::fs::metadata(&path).unwrap().uid();
+        let home = resolve_unit_tree(&path, uid).unwrap();
+        std::fs::rename(&path, base.join("moved")).unwrap();
+        let left = wipe_home_trees_as(&[home], uid);
+        assert!(
+            !left.is_empty(),
+            "movement must not count as a completed wipe"
+        );
+        assert!(!may_evict_srk(left.is_empty(), false, Ok(Vec::new())));
+        assert!(base.join("moved/template-keys/alice.json").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn environment_review_incomplete_disarm_refuses_installation_removal_even_with_keep_data() {
+        for keep in [false, true] {
+            let mut outcome = report(!keep, false, &["/custom/store (unlink failed)"]);
+            outcome.pam_unwired = true;
+            outcome.service_stopped = true;
+            assert!(removal_refusal(&outcome).unwrap().contains("/custom/store"));
+        }
+    }
+
+    #[test]
+    fn environment_unit_tree_keeps_srk_for_linked_pcr_envelopes() {
+        use std::os::unix::fs::MetadataExt as _;
+        let base = std::env::temp_dir().join(format!("irlume-unit-tree-{}", std::process::id()));
+        let root = base.join("irlume");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("alice.json"), PASSWORD_ENVELOPE).unwrap();
+        let uid = std::fs::metadata(&root).unwrap().uid();
+        assert!(matches!(
+            resolve_unit_tree(&root, uid.wrapping_add(1)),
+            Some(HomeTree::Skipped { .. })
+        ));
+        std::os::unix::fs::symlink(&outside, root.join("template-keys")).unwrap();
+        let tree = resolve_unit_tree(&root, uid).unwrap();
+        let left = wipe_home_trees_as(&[tree], uid);
+        assert!(!left.is_empty(), "removed link must retain a leftover note");
+        assert!(!root.exists());
+        assert!(outside.join("alice.json").exists());
+        assert!(!may_evict_srk(left.is_empty(), false, Ok(Vec::new())));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn environment_generated_and_type_dropins_follow_specificity_and_masks() {
+        let root = std::env::temp_dir().join(format!("irlume-env-layers-{}", std::process::id()));
+        let put = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("[Service]\n{text}\n")).unwrap();
+        };
+        put(
+            "usr/lib/systemd/system/irlumed.service",
+            "Environment=IRLUME_KEYRING_DIR=/vendor",
+        );
+        put(
+            "run/systemd/generator.early/irlumed.service",
+            "Environment=IRLUME_KEYRING_DIR=/generated",
+        );
+        assert_eq!(
+            unit_env_under(&root, "IRLUME_KEYRING_DIR").unwrap(),
+            Some("/generated".into())
+        );
+        put(
+            "etc/systemd/system/service.d/10-path.conf",
+            "Environment=IRLUME_KEYRING_DIR=/generic",
+        );
+        put(
+            "usr/lib/systemd/system/irlumed.service.d/10-path.conf",
+            "Environment=IRLUME_KEYRING_DIR=/specific",
+        );
+        assert_eq!(
+            unit_env_under(&root, "IRLUME_KEYRING_DIR").unwrap(),
+            Some("/specific".into())
+        );
+        put(
+            "run/systemd/system/service.d/20-later.conf",
+            "Environment=IRLUME_KEYRING_DIR=/later",
+        );
+        assert_eq!(
+            unit_env_under(&root, "IRLUME_KEYRING_DIR").unwrap(),
+            Some("/later".into())
+        );
+        std::os::unix::fs::symlink(
+            "/dev/null",
+            root.join("usr/lib/systemd/system/irlumed.service.d/20-later.conf"),
+        )
+        .unwrap();
+        assert_eq!(
+            unit_env_under(&root, "IRLUME_KEYRING_DIR").unwrap(),
+            Some("/specific".into())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn environment_custom_password_store_must_keep_srk() {
+        let dir = std::env::temp_dir().join(format!("irlume-env-srk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("alice.json"), PASSWORD_ENVELOPE).unwrap();
+        let sweep =
+            sealed_token_holders_with(Ok(Vec::new()), &[], &[], std::slice::from_ref(&dir), 0)
+                .unwrap();
+        assert!(
+            sweep.holders.is_empty(),
+            "passwords do not block login disable"
+        );
+        assert!(
+            !may_evict_srk(true, false, sweep.srk_survivors()),
+            "a surviving password envelope needs its SRK too"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn environment_files_override_inline_assignments_with_their_own_quoting() {
+        let root = std::env::temp_dir().join(format!("irlume-envfiles-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("etc/systemd/system")).unwrap();
+        std::fs::write(
+            root.join("etc/systemd/system/irlumed.service"),
+            "[Service]\nEnvironmentFile=/etc/irlume.env\nEnvironment=IRLUME_KEYRING_DIR=/inline\n",
+        )
+        .unwrap();
+        for (input, expected) in [
+            ("IRLUME_KEYRING_DIR= /srv/key\\\nrings  \n", "/srv/keyrings"),
+            ("IRLUME_KEYRING_DIR='/srv/key rings'\n", "/srv/key rings"),
+            ("IRLUME_KEYRING_DIR=\"/srv/\\$keys\\q\"\n", "/srv/$keys\\q"),
+            (
+                "# comment\nIRLUME_KEYRING_DIR=/srv/%n#literal\n",
+                "/srv/%n#literal",
+            ),
+        ] {
+            std::fs::write(root.join("etc/irlume.env"), input).unwrap();
+            assert_eq!(
+                unit_env_under(&root, "IRLUME_KEYRING_DIR").unwrap(),
+                Some(expected.into()),
+                "{input:?}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unreadable_environment_files_refuse_even_when_optional() {
+        let root =
+            std::env::temp_dir().join(format!("irlume-envfile-refusal-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("etc/systemd/system")).unwrap();
+        // A directory is deterministically unreadable as file data, including as root.
+        std::fs::create_dir_all(root.join("etc/irlume.env")).unwrap();
+        for prefix in ["", "-"] {
+            std::fs::write(
+                root.join("etc/systemd/system/irlumed.service"),
+                format!("[Service]\nEnvironmentFile={prefix}/etc/irlume.env\n"),
+            )
+            .unwrap();
+            assert!(unit_env_under(&root, "IRLUME_KEYRING_DIR").is_err());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_unset_resets_preceding_layers_only() {
+        let root = std::env::temp_dir().join(format!("irlume-unset-reset-{}", std::process::id()));
+        let dropins = root.join("etc/systemd/system/irlumed.service.d");
+        std::fs::create_dir_all(&dropins).unwrap();
+        std::fs::write(root.join("etc/systemd/system/irlumed.service"),
+            "[Service]\nEnvironment=IRLUME_KEYRING_DIR=/keys\nUnsetEnvironment=IRLUME_KEYRING_DIR\n").unwrap();
+        std::fs::write(
+            dropins.join("10-reset.conf"),
+            "[Service]\nUnsetEnvironment=\n",
+        )
+        .unwrap();
+        assert_eq!(
+            unit_env_under(&root, "IRLUME_KEYRING_DIR").unwrap(),
+            Some("/keys".into())
+        );
+        std::fs::write(
+            dropins.join("20-unset.conf"),
+            "[Service]\nUnsetEnvironment=IRLUME_KEYRING_DIR=/keys\n",
+        )
+        .unwrap();
+        assert_eq!(unit_env_under(&root, "IRLUME_KEYRING_DIR").unwrap(), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn the_unit_environment_follows_systemd_layering() {
         let root = std::env::temp_dir().join(format!("irlume-unit-layers-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -3031,19 +3599,24 @@ mod tests {
         assert!(err.contains(dir.to_str().unwrap()), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
-            unit_env_in(
-                "Environment=IRLUME_KEYRING_DIR=/srv/keys IRLUME_STATE_DIR_X=/x\n",
-                "IRLUME_KEYRING_DIR",
-                None
-            ),
+            unit_environment::value(
+                Path::new("/"),
+                &[
+                    "[Service]\nEnvironment=IRLUME_KEYRING_DIR=/srv/keys IRLUME_STATE_DIR_X=/x\n"
+                        .into()
+                ],
+                "IRLUME_KEYRING_DIR"
+            )
+            .unwrap(),
             Some(PathBuf::from("/srv/keys"))
         );
         assert_eq!(
-            unit_env_in(
-                "Environment=IRLUME_STATE_DIR_X=/x\n",
-                "IRLUME_STATE_DIR",
-                None
-            ),
+            unit_environment::value(
+                Path::new("/"),
+                &["[Service]\nEnvironment=IRLUME_STATE_DIR_X=/x\n".into()],
+                "IRLUME_STATE_DIR"
+            )
+            .unwrap(),
             None,
             "a longer name is another variable"
         );
@@ -3055,29 +3628,33 @@ mod tests {
             Environment=\"ORT_DYLIB_PATH=/opt/ort/libonnxruntime.so\"\n\
             Environment=\"IRLUME_STATE_DIR=/home/ldap user/.local/share/irlume\"\n";
         assert_eq!(
-            unit_env_in(unit, "IRLUME_STATE_DIR", None),
+            unit_environment::value(Path::new("/"), &[unit.into()], "IRLUME_STATE_DIR").unwrap(),
             Some(PathBuf::from("/home/ldap user/.local/share/irlume"))
         );
         assert_eq!(
-            unit_env_in(
-                "Environment=A=1 IRLUME_STATE_DIR=/srv/irlume B=2\n",
-                "IRLUME_STATE_DIR",
-                None
-            ),
+            unit_environment::value(
+                Path::new("/"),
+                &["[Service]\nEnvironment=A=1 IRLUME_STATE_DIR=/srv/irlume B=2\n".into()],
+                "IRLUME_STATE_DIR"
+            )
+            .unwrap(),
             Some(PathBuf::from("/srv/irlume"))
         );
         assert_eq!(
-            unit_env_in("[Service]\nExecStart=/x\n", "IRLUME_STATE_DIR", None),
+            unit_environment::value(
+                Path::new("/"),
+                &["[Service]\nExecStart=/x\n".into()],
+                "IRLUME_STATE_DIR"
+            )
+            .unwrap(),
             None
         );
-        assert_eq!(
-            unit_env_in(
-                "Environment=IRLUME_STATE_DIR=relative\n",
-                "IRLUME_STATE_DIR",
-                None
-            ),
-            None
-        );
+        assert!(unit_environment::value(
+            Path::new("/"),
+            &["[Service]\nEnvironment=IRLUME_STATE_DIR=relative\n".into()],
+            "IRLUME_STATE_DIR"
+        )
+        .is_err());
     }
 
     #[test]

@@ -167,7 +167,17 @@ pub const STATE_DIR: &str = "/var/lib/irlume";
 /// `STATE_DIR` constant whenever you resolve a real path, so one override moves
 /// every consumer together.
 pub fn state_dir() -> std::path::PathBuf {
-    std::env::var_os("IRLUME_STATE_DIR")
+    state_dir_from_override(std::env::var_os("IRLUME_STATE_DIR").as_deref())
+}
+
+/// Resolve the state directory from an explicitly observed environment value.
+///
+/// Use [`state_dir`] for this process. An observer of another process passes
+/// that process's `IRLUME_STATE_DIR` value here, with `None` meaning observed
+/// absence, not failed observation. This never reads the caller's environment.
+#[must_use]
+pub fn state_dir_from_override(value: Option<&std::ffi::OsStr>) -> std::path::PathBuf {
+    value
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(STATE_DIR))
 }
@@ -2180,6 +2190,26 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn observed_state_directory_does_not_borrow_the_callers_override() {
+        use std::ffi::OsStr;
+        use std::path::PathBuf;
+
+        let _g = super::testenv::lock();
+        let previous = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_STATE_DIR", "/caller-sandbox");
+        let local = super::state_dir();
+        let remote = super::state_dir_from_override(Some(OsStr::new("/observed-daemon")));
+        let absent = super::state_dir_from_override(None);
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_STATE_DIR", value),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
+        assert_eq!(local, PathBuf::from("/caller-sandbox"));
+        assert_eq!(remote, PathBuf::from("/observed-daemon"));
+        assert_eq!(absent, PathBuf::from("/var/lib/irlume"));
+    }
+
     /// The observed prohibition is the effective one: the legacy
     /// `IRLUME_CAMERA_REQUIRE_FIXED=1` gate counts, so a client never
     /// presents an external pair as ready when the daemon would refuse it.

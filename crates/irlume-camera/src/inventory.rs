@@ -279,6 +279,23 @@ struct RoleKey {
     endpoint: String,
 }
 
+/// One classified endpoint from the published inventory: the role discovery
+/// answered, bound to the instance and generation it answered for
+/// (ADR-0029 §1). The split mutation boundary validates its guard's sides
+/// against these facts (ADR-0032 §4); no role is ever inferred at mutation
+/// time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassifiedEndpoint {
+    /// The inventory instance id for the camera behind this endpoint.
+    pub instance_id: String,
+    /// The connection generation the role was answered under.
+    pub generation: u64,
+    /// The capture endpoint path.
+    pub endpoint: String,
+    /// The role discovery answered.
+    pub role: crate::Role,
+}
+
 /// Process-scoped physical-camera lifecycle state.
 ///
 /// Reconciliation is transactional: malformed snapshots and instance-ID
@@ -437,6 +454,23 @@ impl CameraInventory {
     /// Every endpoint of a published camera with the connection generation
     /// it belongs to. An endpoint two observations both claim belongs to
     /// neither, so nothing is ever recorded for it.
+    /// Every role discovery answered under the current publication's
+    /// supervisor, bound to its instance, generation and endpoint. The
+    /// closed `CameraInventorySnapshot` stays role-free (ADR-0032 §6):
+    /// this is the only role-bearing view, and it never opens a node.
+    pub(crate) fn classified_endpoints(&self) -> Vec<ClassifiedEndpoint> {
+        self.roles
+            .iter()
+            .filter(|(key, _)| key.supervisor_id == self.supervisor_id)
+            .map(|(key, role)| ClassifiedEndpoint {
+                instance_id: key.instance_id.as_str().to_owned(),
+                generation: key.generation.get(),
+                endpoint: key.endpoint.clone(),
+                role: *role,
+            })
+            .collect()
+    }
+
     pub(crate) fn endpoint_generations(&self) -> BTreeMap<String, EndpointGeneration> {
         let mut generations = BTreeMap::new();
         let mut contested = BTreeSet::new();

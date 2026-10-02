@@ -32,6 +32,10 @@ pub use irlume_camera::measurement;
 /// camera-group status rows.
 pub use irlume_camera::present_device_identities;
 pub use irlume_camera::profiles;
+/// The role-bearing publication facts a split mutation validates its guard
+/// against (ADR-0032 §4). Re-exported so the daemon never depends on the
+/// camera crate directly.
+pub use irlume_camera::{camera_inventory_publication, ClassifiedEndpoint, Role as CameraRole};
 pub use irlume_camera::{camera_inventory_snapshot, initialize_camera_monitor};
 /// Enumerate the Hello camera pairs. Re-exported for the daemon's
 /// camera-class `ListCameras` arm: clients must not enumerate for themselves

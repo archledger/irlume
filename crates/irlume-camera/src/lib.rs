@@ -48,6 +48,7 @@ pub mod emitter_journal;
 pub mod frame_interval;
 pub mod frame_provenance;
 mod inventory;
+pub use inventory::ClassifiedEndpoint;
 pub mod ir_dark;
 pub mod ir_emitter;
 /// Public because its pure parsing half is attacker-reachable input to a
@@ -66,6 +67,18 @@ mod lifecycle;
 #[must_use]
 pub fn camera_inventory_snapshot() -> irlume_common::live_camera::CameraInventorySnapshot {
     backend::camera_inventory_snapshot()
+}
+
+/// The closed connection snapshot and the role-bearing facts of the same
+/// publication, read under one lock (ADR-0032 §4: a split mutation validates
+/// its guard and the sides' roles against one publication). Never initializes
+/// the supervisor, opens a node or classifies anything.
+#[must_use]
+pub fn camera_inventory_publication() -> (
+    irlume_common::live_camera::CameraInventorySnapshot,
+    Vec<ClassifiedEndpoint>,
+) {
+    backend::camera_inventory_publication()
 }
 
 /// Explicit daemon startup hook for passive connection monitoring. The existing

@@ -76,6 +76,27 @@ impl CameraSupervisor {
         }
     }
 
+    /// The closed snapshot and the role-bearing facts under ONE lock
+    /// acquisition, so a mutation guard is checked against one publication.
+    fn inventory_publication(
+        &self,
+    ) -> (
+        CameraInventorySnapshot,
+        Vec<crate::inventory::ClassifiedEndpoint>,
+    ) {
+        match self.inventory.lock() {
+            Ok(inventory) => (inventory.snapshot(), inventory.classified_endpoints()),
+            Err(_) => (
+                CameraInventorySnapshot {
+                    state: CameraInventoryState::Unavailable,
+                    reason: Some(CameraInventoryReason::Inventory),
+                    ..Default::default()
+                },
+                Vec::new(),
+            ),
+        }
+    }
+
     pub(crate) fn mark_inventory_unavailable(
         &self,
         reason: CameraInventoryReason,
@@ -378,6 +399,17 @@ fn snapshot_from_slot(slot: &OnceLock<Arc<CameraSupervisor>>) -> CameraInventory
 
 pub(crate) fn camera_inventory_snapshot() -> CameraInventorySnapshot {
     snapshot_from_slot(&DEFAULT_CAMERA_SUPERVISOR)
+}
+
+pub(crate) fn camera_inventory_publication() -> (
+    CameraInventorySnapshot,
+    Vec<crate::inventory::ClassifiedEndpoint>,
+) {
+    DEFAULT_CAMERA_SUPERVISOR
+        .get()
+        .map_or_else(Default::default, |supervisor| {
+            supervisor.inventory_publication()
+        })
 }
 
 fn connected_pairs_from_slot(slot: &OnceLock<Arc<CameraSupervisor>>) -> ConnectedPairs {

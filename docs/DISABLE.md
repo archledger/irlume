@@ -516,31 +516,133 @@ older daemons do not offer this reset path or enforce the reset-password budget.
 sudo irlume uninstall            # add --keep-data to preserve enrollment
 ```
 
-The teardown runs in the only safe order: un-wire PAM first (so no line can
-reference a module that is about to vanish), stop and disable the daemon,
-disarm every user's TPM keyring seal, then wipe templates, sealed secrets,
-third-party models, and config (unless `--keep-data`). When a stack is left
-as it is (a line that ends in `\`, for example), irlume itself stays
-installed and the uninstall exits 1: take irlume's lines out of that stack by
-hand, then run it again. After it finishes,
-remove the package through your manager, which also stops the daemon and
-reconcile units:
+Before confirming, preserve the configuration and store evidence described
+under [Manual uninstall recovery](#manual-uninstall-recovery). The uninstaller
+does not save that inventory for you.
 
-```sh
-sudo dnf remove irlume     # Fedora / Copr
-sudo pacman -R irlume      # Arch / AUR
-sudo apt remove irlume     # Ubuntu / PPA
+After confirmation, teardown records a durable retention barrier, resolves one
+daemon/store snapshot, and un-wires PAM. It stops the daemon and its known
+activation units, checks that execution did not change, disarms non-token
+keyring seals, and wipes enrollment/state/configuration unless `--keep-data`.
+Unit disabling/removal waits for cleanup success. Only then does `uninstall`
+remove the package through its manager, or remove a source installation itself;
+you do not need a second package-removal command after success.
+
+If PAM cannot be unwired, a store cannot be read or removed, or daemon identity
+changes, installation removal is refused. **Fixing that error and running the
+command again is not sufficient when the retention record is retained.** A PAM
+or configuration refusal can occur after the barrier was recorded but before
+any store was removed. Follow the manual procedure below; do not bypass the
+refusal with a package manager while PAM still references the module.
+
+`--keep-data` preserves enrollment, template-key/recovery state and application
+configuration (normally `/etc/irlume`); it does not skip keyring disarm or preserve
+service units/drop-ins. Program files, packaged models and contributor camera
+profiles are removed with the application. GNOME token holders must first
+disarm from their own sessions as the refusal directs. A successful retained-data
+removal may exit 0, but its **WARNING names the retained record and the resulting
+refusal of later uninstall attempts**, even with `--yes` or `--keep-data`.
+An intentional envelope-directory override can retain the SRK and record too.
+Neither application removal nor a reinstall automatically resets that record.
+
+Deliberate residuals include the persistent synchronization/retention file
+`/var/lib/irlume-uninstall-srk-retention`, and the Bitwarden polkit action when
+present (`irlume bitwarden setup --apply` writes Bitwarden's own policy file).
+The retention file remains even when clean; do not unlink its lock-bearing
+inode. Kept state keeps its TPM storage root key (SRK). A fully completed,
+eligible wipe attempts SRK eviction; its result is reported separately.
+Journald logs, filesystem snapshots and backups also survive.
+
+### Manual uninstall recovery
+
+The retention file contains only a versioned state bit. It contains **no phase,
+failure reason, historical configuration, store paths or envelope inventory**.
+There is no automatic recovery, force-reset option or safe inventory guess.
+
+The file holds exactly one of these ASCII lines, not both, ending in one newline:
+
+```text
+irlume-uninstall-srk-v1: retain
+irlume-uninstall-srk-v1: clean
 ```
 
-Two things are left behind on purpose, and the uninstall output names them:
-the Bitwarden polkit action (`irlume bitwarden setup --apply` writes
-Bitwarden's own policy file, which serves Bitwarden, not irlume - remove it
-by hand if Bitwarden is not used), and, after a full wipe, nothing else -
-with `--keep-data`, the enrolled faces and sealed secrets stay, and so does
-the TPM storage root key they are sealed under (a full, completed wipe
-evicts it). Contributor camera profiles live in the program tree, so they
-are removed even with `--keep-data`; journald logs and filesystem snapshots
-also survive, as the closing line notes.
+`retain` blocks another destructive teardown. The confirmed teardown writes and
+syncs it before its unit/store observation or PAM changes; an early refusal or an
+interruption therefore leaves it. Successful `--keep-data` and intentional
+override keeps can leave it as well. An existing empty record is also uncertain.
+Malformed or unsafe records refuse rather than authorizing cleanup. `clean`
+means the record does not itself block a fresh attempt; it does not prove that
+the TPM eviction succeeded or that no other data exists.
+
+Argument/root checks, cancellation and the initial token-store preflight occur
+before this attempt creates the barrier. Such a refusal does not create a new
+record, but it can coexist with a retained record from an earlier attempt. Do
+not infer its state from the exit code, current unit contents or file absence
+after a suspected loss of the record.
+
+**Preserve evidence outside every wipe tree before a confirmed attempt.** Keep
+private, access-controlled configuration history and records of:
+
+- the relevant earlier and current unit/drop-ins and environment-file settings;
+- resolved `IRLUME_STATE_DIR`, `IRLUME_KEYRING_DIR`, `IRLUME_RECOVERY_DIR` and
+  `IRLUME_TEMPLATE_KEY_DIR` selections, including defaults, manager inheritance
+  and the CLI's overrides where applicable;
+- the roots from source installs and account homes, separate envelope stores,
+  and any observed moved/replaced directories, including device/inode and
+  ownership facts needed to locate them;
+- the refusal/output and which configuration and daemon execution were being
+  used before a deployment change or stop.
+
+Record paths and non-secret metadata, not envelope contents, passwords, tokens
+or biometric material. Exclude unrelated secrets from configuration copies and
+do not publish the evidence in support reports. A new vendor unit or an empty
+current store does not account for an earlier custom store.
+
+For a retained or uncertain record, an administrator may authorize another
+teardown only through this procedure:
+
+1. Preserve the evidence and existing record. Reconstruct **every earlier store
+   implicated by the retained attempt**, including both sides of a deployment
+   change or a directory move. If the evidence cannot be reconstructed, **do not
+   clear the barrier: retain the data and SRK**. Fixing only the latest PAM error
+   or unlink failure is not reconciliation.
+2. Account for surviving envelopes and their owners. Restore the appropriate
+   configuration/store references, or perform an explicitly authorized cleanup
+   that accounts for those stores. Do not mark the record clean while a surviving
+   earlier store would be outside the next teardown's verified discovery. Do not
+   improvise envelope moves or remove a token envelope instead of disarming its
+   owner's keyring. After `--keep-data`, retained state still needs its SRK.
+3. Coordinate a maintenance window: stop additional uninstall attempts and
+   independent deployments/store writers. Ensure the previous uninstall and
+   any package transaction have finished. Preserve needed running-daemon store
+   evidence before stopping or changing it. The record lock serializes teardown
+   participants; it does not freeze unrelated writers or a package manager.
+4. Use an FD-based administrative tool on the **existing inode**. Pin it with
+   `O_PATH | O_NOFOLLOW`; verify a root-owned, private (`0600`), single-link regular
+   file under its root-controlled parent. Reopen the pinned descriptor read-write
+   through `/proc/self/fd`, **without truncating**, and acquire an exclusive
+   `flock` on that read-write descriptor (`LOCK_EX | LOCK_NB`; stop if busy).
+   Recheck that the named path still identifies the held device/inode and that
+   the ownership/type/link conditions still hold. If any check fails, stop and
+   investigate rather than replacing the object.
+5. Keep that lock while revalidating the reconstructed inventory and stable
+   configuration. Only after the preceding conditions hold, seek to offset zero
+   on the same descriptor, write the complete `clean` line shown above, truncate
+   to that newline-terminated payload's exact byte length, and `fsync` that same
+   descriptor. Check every operation and read back the exact line under the
+   lock. On an error, treat completion as unverified; retain data/SRK and do not
+   launch another teardown. Release the lock only after completion is confirmed.
+6. A later `sudo irlume uninstall` is a **new attempt**, not a resumed transaction.
+   It records `retain` again before observation and revalidates current state.
+   Another refusal or intentional keep can require manual reconciliation again.
+
+**Never unlink, rename, replace, recreate or atomically editor-save the record
+to reset it while an uninstaller may hold it.** Do not use shell redirection or
+an open-with-truncation before taking the lock. Removing/replacing the name
+creates another lock inode and can let a second process bypass the first holder;
+it also discards the uncertainty the record preserves. This procedure supplies
+no automatic bit-reset command: the inventory decision must come from the
+administrator's preserved evidence.
 
 ## Verify
 

@@ -15,6 +15,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Login reconciliation deactivates LightDM's existing `pam_irlume` face and
+  credential-release rules before querying daemon capabilities when remote
+  seats are blocked. It preserves PAM jump slots and existing reseal lines;
+  adding or restoring rules still requires established capabilities (#859).
+
 - Daemon account lookups use a deadline-bounded NSS subprocess instead of
   blocking the authentication worker inside an account provider. Registered
   UID holds still bind records, fresh ownership checks remain fresh, and

@@ -517,6 +517,17 @@ pub(super) fn session_reaches_reseal(content: &str, read: &dyn Fn(&str) -> Optio
     .is_some_and(|steps| reaches(&steps, false))
 }
 
+/// Whether replacing a module's PAM_IGNORE with an inert slot preserves its
+/// control effect. An explicit denial, reset, success or jump is not inert.
+pub(super) fn control_ignores_module_ignore(control: &str) -> bool {
+    control_actions(control).is_some_and(|table| {
+        RETURN_VALUES[..32]
+            .iter()
+            .position(|value| *value == "ignore")
+            .is_some_and(|at| table[at] == Action::Ignore)
+    })
+}
+
 /// The numeric jumps of a control, as `(value, N)`: every `value=N` pair
 /// whose jump libpam keeps, in the order written, `value` being the return
 /// value or `default` as written. libpam reads every control that is not one

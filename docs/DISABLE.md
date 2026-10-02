@@ -322,6 +322,17 @@ enables and starts the timer once, and the timer starts
 `irlume-reconcile.service` even while that is disabled: after such an
 upgrade, run the command above again.
 
+When LightDM's remote-seat check blocks face authentication, reconciliation
+first deactivates its existing `pam_irlume` authentication and credential-release
+rules, before waiting for irlumed or querying capabilities. Each rule becomes
+an inert slot, so numeric PAM jumps keep their positions. Existing reseal
+lines and other services stay untouched by this safety pass. A continued or
+unrecognized PAM line, a link, or an explicit non-inert `PAM_IGNORE` action
+refuses the rewrite and is reported. If capabilities remain unavailable,
+reconcile exits 1 after the safety pass; it does not refresh overrides or add
+or restore authentication rules. This does not exclude `pam_fprintd` from
+LightDM's shared stacks or install a hook before LightDM starts.
+
 ## Keep some surfaces
 
 Turn everything off, then re-add only what you want:

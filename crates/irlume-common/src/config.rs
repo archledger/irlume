@@ -655,6 +655,8 @@ pub enum CameraConfProblem {
     InvalidMode,
     /// `mode=pinned` without a complete pair.
     PinnedWithoutPair,
+    /// The split-selection keys are missing a half, misplaced or malformed.
+    InvalidSplitKeys,
 }
 
 impl std::fmt::Display for CameraConfProblem {
@@ -668,6 +670,10 @@ impl std::fmt::Display for CameraConfProblem {
             ),
             Self::InvalidMode => f.write_str("'mode' is neither 'automatic' nor 'pinned'"),
             Self::PinnedWithoutPair => f.write_str("'mode=pinned' needs both 'rgb' and 'ir'"),
+            Self::InvalidSplitKeys => f.write_str(
+                "the split-selection keys need 'split_generation' and 'split_digest' \
+                 together, with 'split_pair' only beside them, and canonical values",
+            ),
         }
     }
 }
@@ -675,8 +681,7 @@ impl std::fmt::Display for CameraConfProblem {
 /// What one strict read of `cameras.conf` establishes about camera selection
 /// (ADR-0029 §4). `Unreadable` and `Malformed` are never `Fresh`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CameraSelectionObservation {
-    /// No file, or a readable one with no complete pair and no `mode` line.
+pub enum CameraSelectionObservation {    /// No file, or a readable one with no complete pair and no `mode` line.
     Fresh,
     /// A complete pair; `explicit` when a `mode=pinned` line was present.
     Pinned { pair: PinnedPair, explicit: bool },
@@ -722,6 +727,27 @@ pub struct IgnoredLine {
     pub reason: IgnoredLineReason,
 }
 
+/// What the split-selection keys establish (ADR-0029 §6 as amended by
+/// ADR-0032 §4.1). `split_generation` and `split_digest` come together and
+/// name the authorization generation in use; `split_pair` is optional and
+/// valid only alongside them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitConfObservation {
+    /// No split key is present.
+    None,
+    /// A generation is referenced; `pair` is the selection, if any.
+    Reference {
+        /// The referenced generation number.
+        generation: u64,
+        /// The `sha256:` digest of that generation's bytes.
+        digest: String,
+        /// The selected pair's canonical key text, when selected.
+        pair: Option<String>,
+    },
+    /// Split keys are present but break the rule; the operation refuses.
+    Malformed,
+}
+
 /// One strict read of `cameras.conf`: the selection state and every skipped
 /// line, in file order (always empty for `Fresh` from a missing file and for
 /// `Unreadable`).
@@ -729,18 +755,45 @@ pub struct IgnoredLine {
 pub struct CameraConfObservation {
     /// What the file establishes about camera selection.
     pub selection: CameraSelectionObservation,
+    /// What the split-selection keys establish.
+    pub split: SplitConfObservation,
     /// Every skipped line, in file order.
     pub ignored: Vec<IgnoredLine>,
 }
 
 /// The keys the strict grammar governs, in the order [`parse_camera_conf`]
 /// records their first occurrence.
-const CAMERA_SELECTION_KEYS: [&str; 5] = ["rgb", "ir", "rgb_id", "ir_id", "mode"];
+const CAMERA_SELECTION_KEYS: [&str; 8] = [
+    "rgb",
+    "ir",
+    "rgb_id",
+    "ir_id",
+    "mode",
+    "split_generation",
+    "split_digest",
+    "split_pair",
+];
 
 /// The legacy per-camera capture-mode keys. Besides the pin they are the only
 /// keys irlume has written to `cameras.conf`, so they are known and silent.
 fn is_legacy_capture_mode_key(key: &str) -> bool {
     key.starts_with("capture_mode.") || key.starts_with("capture_mode_origin.")
+}
+
+/// A generation number as the schema writes it: decimal `u64` >= 1 without
+/// leading zeros (ADR-0032 §4.1.2).
+fn is_canonical_generation(text: &str) -> bool {
+    !text.is_empty()
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && !(text.len() > 1 && text.starts_with('0'))
+        && text.parse::<u64>().is_ok_and(|n| n >= 1)
+}
+
+/// `sha256:` plus 64 lowercase hex digits (ADR-0029 §6 as amended).
+fn is_canonical_digest(text: &str) -> bool {
+    text.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 /// Classify `cameras.conf` text under the strict grammar. Pure; never
@@ -757,7 +810,7 @@ pub fn parse_camera_conf(text: &str) -> CameraConfObservation {
     use CameraSelectionObservation::{Automatic, Fresh, Malformed, Pinned};
     // First occurrence of each selection key, indexed like
     // CAMERA_SELECTION_KEYS, recorded whether or not its line had a problem.
-    let mut seen: [Option<(usize, &str)>; 5] = [None; 5];
+    let mut seen: [Option<(usize, &str)>; 8] = [None; 8];
     let mut problem: Option<(usize, CameraConfProblem)> = None;
     let mut ignored = Vec::new();
     for (index, raw) in text.lines().enumerate() {
@@ -810,8 +863,47 @@ pub fn parse_camera_conf(text: &str) -> CameraConfObservation {
     if let Some((line, problem)) = problem {
         return CameraConfObservation {
             selection: Malformed { line, problem },
+            split: SplitConfObservation::None,
             ignored,
         };
+    }
+    // Split-selection keys (ADR-0029 §6 as amended by ADR-0032 §4.1):
+    // `split_generation` and `split_digest` come together and name the
+    // authorization generation; `split_pair` is optional and valid only
+    // beside them. A missing half, a misplaced pair or a malformed value
+    // refuses the operation and never falls back to the ordinary pin.
+    let mut split = SplitConfObservation::None;
+    let split_inputs = (seen[5], seen[6], seen[7]);
+    if split_inputs != (None, None, None) {
+        let valid_generation = split_inputs.0.is_some_and(|(_, v)| is_canonical_generation(v));
+        let valid_digest = split_inputs.1.is_some_and(|(_, v)| is_canonical_digest(v));
+        let valid_pair =
+            split_inputs.2.is_none_or(|(_, v)| crate::split_key::SplitPairKey::parse_canonical(v).is_ok());
+        if valid_generation && valid_digest && valid_pair {
+            split = SplitConfObservation::Reference {
+                generation: split_inputs
+                    .0
+                    .and_then(|(_, v)| v.parse().ok())
+                    .unwrap_or_default(),
+                digest: split_inputs.1.map(|(_, v)| v.to_owned()).unwrap_or_default(),
+                pair: split_inputs.2.map(|(_, v)| v.to_owned()),
+            };
+        } else {
+            let line = [split_inputs.0, split_inputs.1, split_inputs.2]
+                .into_iter()
+                .flatten()
+                .map(|(line, _)| line)
+                .min()
+                .unwrap_or(1);
+            return CameraConfObservation {
+                selection: Malformed {
+                    line,
+                    problem: CameraConfProblem::InvalidSplitKeys,
+                },
+                split: SplitConfObservation::Malformed,
+                ignored,
+            };
+        }
     }
     let value = |slot: usize| seen[slot].map(|(_, v)| v).filter(|v| !v.is_empty());
     let pair = match (value(0), value(1)) {
@@ -841,7 +933,11 @@ pub fn parse_camera_conf(text: &str) -> CameraConfObservation {
             problem: CameraConfProblem::PinnedWithoutPair,
         },
     };
-    CameraConfObservation { selection, ignored }
+    CameraConfObservation {
+        selection,
+        split,
+        ignored,
+    }
 }
 
 /// One read of `cameras.conf`, classified. Does not log. The file is 0600, so
@@ -855,6 +951,7 @@ pub fn observe_camera_conf() -> CameraConfObservation {
             kind: e.kind(),
             detail: e.to_string(),
         },
+        split: SplitConfObservation::None,
         ignored: Vec::new(),
     };
     match read_regular_file(&path) {
@@ -870,6 +967,7 @@ pub fn observe_camera_conf() -> CameraConfObservation {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => CameraConfObservation {
             selection: CameraSelectionObservation::Fresh,
+            split: SplitConfObservation::None,
             ignored: Vec::new(),
         },
         Err(e) => unreadable(&e),
@@ -2160,7 +2258,11 @@ mod tests {
         for (label, input, selection, ignored) in rows {
             assert_eq!(
                 parse_camera_conf(input),
-                CameraConfObservation { selection, ignored },
+                CameraConfObservation {
+                    selection,
+                    split: SplitConfObservation::None,
+                    ignored,
+                },
                 "{label}"
             );
         }
@@ -2211,6 +2313,7 @@ mod tests {
             CameraConfObservation {
                 selection: CameraSelectionObservation::Unreadable { kind, detail },
                 ignored,
+                ..
             } => {
                 assert_eq!(kind, want);
                 assert!(!detail.is_empty());
@@ -2223,6 +2326,7 @@ mod tests {
             observe_camera_conf(),
             CameraConfObservation {
                 selection: CameraSelectionObservation::Fresh,
+                split: SplitConfObservation::None,
                 ignored: vec![],
             }
         );
@@ -2324,6 +2428,7 @@ mod tests {
             observe_camera_conf(),
             CameraConfObservation {
                 selection: CameraSelectionObservation::Fresh,
+                split: SplitConfObservation::None,
                 ignored: vec![],
             }
         );
@@ -2331,5 +2436,116 @@ mod tests {
 
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod split_conf_tests {
+    use super::{parse_camera_conf, CameraSelectionObservation, SplitConfObservation};
+
+    const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const PAIR: &str = "split1;a|c|usb2|8;b|c|usb2|5";
+
+    #[test]
+    fn no_split_keys_untouched() {
+        let got = parse_camera_conf("rgb=/dev/video0\nir=/dev/video2\n");
+        assert_eq!(got.split, SplitConfObservation::None);
+        assert!(matches!(got.selection, CameraSelectionObservation::Pinned { .. }));
+    }
+
+    #[test]
+    fn the_generation_pair_without_a_selection_is_valid() {
+        let got = parse_camera_conf(&format!(
+            "rgb=/dev/a\nir=/dev/b\nsplit_generation=3\nsplit_digest={DIGEST}\n"
+        ));
+        assert!(
+            !matches!(got.selection, CameraSelectionObservation::Malformed { .. }),
+            "selection must stay usable: {:?}",
+            got.selection
+        );
+        assert_eq!(
+            got.split,
+            SplitConfObservation::Reference {
+                generation: 3,
+                digest: DIGEST.to_owned(),
+                pair: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_selected_pair_is_carried() {
+        let got = parse_camera_conf(&format!(
+            "split_generation=3\nsplit_digest={DIGEST}\nsplit_pair={PAIR}\n"
+        ));
+        assert_eq!(
+            got.split,
+            SplitConfObservation::Reference {
+                generation: 3,
+                digest: DIGEST.to_owned(),
+                pair: Some(PAIR.to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn split_pair_alone_is_malformed() {
+        let got = parse_camera_conf(&format!("split_pair={PAIR}\n"));
+        assert!(matches!(
+            got.selection,
+            CameraSelectionObservation::Malformed { .. }
+        ));
+        assert_eq!(got.split, SplitConfObservation::Malformed);
+    }
+
+    #[test]
+    fn half_a_generation_pair_is_malformed() {
+        for text in [
+            "split_generation=3\n".to_owned(),
+            format!("split_digest={DIGEST}\n"),
+        ] {
+            let got = parse_camera_conf(&text);
+            assert!(
+                matches!(got.selection, CameraSelectionObservation::Malformed { .. }),
+                "{text}"
+            );
+            assert_eq!(got.split, SplitConfObservation::Malformed);
+        }
+    }
+
+    #[test]
+    fn a_malformed_pair_text_is_malformed() {
+        let got = parse_camera_conf(&format!(
+            "split_generation=3\nsplit_digest={DIGEST}\nsplit_pair=split2;x\n"
+        ));
+        assert!(matches!(
+            got.selection,
+            CameraSelectionObservation::Malformed { .. }
+        ));
+        assert_eq!(got.split, SplitConfObservation::Malformed);
+    }
+
+    #[test]
+    fn a_bad_generation_or_digest_value_is_malformed() {
+        for text in [
+            format!("split_generation=0\nsplit_digest={DIGEST}\n"),
+            format!("split_generation=01\nsplit_digest={DIGEST}\n"),
+            format!("split_generation=3\nsplit_digest=sha256:xyz\n"),
+            format!("split_generation=3\nsplit_digest=SHA256:{}\n", "a".repeat(64)),
+        ] {
+            let got = parse_camera_conf(&text);
+            assert!(
+                matches!(got.selection, CameraSelectionObservation::Malformed { .. }),
+                "{text}"
+            );
+            assert_eq!(got.split, SplitConfObservation::Malformed);
+        }
+    }
+
+    #[test]
+    fn unknown_split_like_keys_stay_ignored() {
+        let got = parse_camera_conf("split_generation2=3\n");
+        assert_eq!(got.split, SplitConfObservation::None);
+        assert_eq!(got.ignored.len(), 1);
     }
 }

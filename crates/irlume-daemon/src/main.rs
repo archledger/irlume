@@ -22527,6 +22527,7 @@ mod tests {
                     },
                     explicit: false,
                 },
+                split: irlume_common::config::SplitConfObservation::None,
                 ignored: vec![],
             }
         );
@@ -22598,7 +22599,14 @@ mod tests {
         use std::io::ErrorKind;
         let path = std::path::Path::new("/etc/irlume/cameras.conf");
         let warnings = |selection, ignored| {
-            camera_conf_startup_warnings(&CameraConfObservation { selection, ignored }, path)
+            camera_conf_startup_warnings(
+                &CameraConfObservation {
+                    selection,
+                    split: irlume_common::config::SplitConfObservation::None,
+                    ignored,
+                },
+                path,
+            )
         };
         let pair = PinnedPair {
             rgb: "/dev/video0".into(),

@@ -27,6 +27,7 @@ pub mod secureboot;
 pub mod split_key;
 pub mod split_publish;
 pub mod split_schema;
+pub mod split_wire;
 pub mod storage_encryption;
 
 pub use storage_encryption::StorageDirectory;
@@ -978,6 +979,32 @@ pub enum Request {
     /// Reset retry state after independent password verification. Root is an
     /// explicit administrator override and may supply an empty password.
     RetryReset { user: String, password: SecretBytes },
+
+    // --- split-pair management (ADR-0032 §4, §6) ----------------------------
+    /// Opt-in listing of the split authorization collection. Any peer; root
+    /// receives full facts, non-root share-safe projections.
+    ListSplitAuthorizations,
+    /// Split store status (ADR-0032 §4.1.7). Root-only.
+    SplitStatus,
+    /// Add or replace one authorization record. PRIVILEGED: root. The guard
+    /// must match the current inventory publication exactly (ADR-0032 §4).
+    AddSplitAuthorization {
+        guard: Box<crate::split_wire::SplitMutationGuard>,
+        rgb: Box<crate::split_wire::SplitSideFacts>,
+        ir: Box<crate::split_wire::SplitSideFacts>,
+    },
+    /// Remove the authorization whose pair key is `pair`. PRIVILEGED: root.
+    /// Removal needs no connected cameras and never authorizes a replacement.
+    RemoveSplitAuthorization {
+        guard: Box<crate::split_wire::SplitMutationGuard>,
+        pair: String,
+    },
+    /// Select the split pair named by `pair` (canonical key text), or with an
+    /// empty `pair` clear the selection. PRIVILEGED: root.
+    SelectSplitPair {
+        guard: Box<crate::split_wire::SplitMutationGuard>,
+        pair: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1984,6 +2011,22 @@ pub enum Response {
         /// pre-0.9.0 daemon, which never sends it, does not read as key-missing.
         #[serde(default = "default_true")]
         key_present: bool,
+    },
+
+    // --- split-pair management responses (ADR-0032 §4, §6) ------------------
+    /// The opt-in split listing: publication, records and selection at the
+    /// caller's privilege level.
+    SplitInventory(crate::split_wire::SplitPublicationView),
+    /// Split store status (ADR-0032 §4.1.7).
+    SplitStatusView {
+        /// The store state.
+        state: crate::split_wire::SplitStoreState,
+        /// How many authorization records the generation holds.
+        record_count: usize,
+        /// The referenced generation, when one is referenced.
+        generation: Option<u64>,
+        /// Whether the recorded selection resolves in the generation.
+        selection_resolves: bool,
     },
 }
 

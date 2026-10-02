@@ -22,6 +22,8 @@ This ADR extends that to fingerprint.
 
 ## Decision
 
+The auth/session rules below are amended by the 2026-10-01 section.
+
 Add `pam_irlume.so keyring`, wired at the **post-auth landing** of the greeter /
 lock-screen stack (after `@include common-auth`, before `pam_gnome_keyring`). It
 runs only when a trusted factor has already succeeded in this transaction:
@@ -132,3 +134,108 @@ since the storage does not show how that volume unlocks, naming each sealed
 secret's policy another operating system may reproduce
 ([SECURITY_AT_REST.md](../SECURITY_AT_REST.md), layer 3). `irlume setup`,
 `irlume keyring reseal` and the TUI show the same guidance after a seal.
+
+## Amendment 2026-10-01: warm accounts, session delivery and upgrades
+
+### 1. Withhold the fingerprint lane's auth-phase release on a warm account
+
+The `keyring` auth line sends `UnsealKeyring { auth_phase: true, ... }`.
+As introduced by #863 and tightened by #864, irlumed answers
+`KeyringUnlockNotNeeded` without releasing a secret when the account has a
+live local graphical session, or its account/session state cannot be read.
+The rule covers every secret kind. It avoids re-opening a keyring the owner
+locked manually, or starting another wallet daemon, on a fingerprint unlock.
+
+Here a warm account has a logind session with that account's UID,
+`CLASS=user`, `STATE=active` or `online`, `TYPE=x11`, `wayland` or `mir`, and
+`REMOTE=0`. A remote desktop, SSH session, text console, greeter or closing
+session alone does not establish this condition. A runtime directory or
+session bus alone is insufficient. The rule is account-wide: a second login
+for an account with an existing desktop also withholds the auth-phase release.
+
+The module enforces this rule before sending the request too (#859). This
+covers a replaced `pam_irlume.so` talking to an older daemon that ignores
+`auth_phase` until the package restarts it. It resolves the UID through a
+bounded `getent passwd` child and scans logind's session records. It uses no
+`loginctl`, no in-process NSS lookup and no `/run/user` fallback for this
+guard. The UID must come from one record with the requested account name;
+an unavailable lookup or canonical-name disagreement withholds the release.
+
+The observation shares a 250 ms deadline. The existing PAM helper reader
+caps stdout at 4096 bytes and termination/reaping at another 200 ms. The
+session scan caps directory entries at 1024 and each record at 16 KiB,
+rejects symlinks and non-regular session records, and uses nonblocking opens
+so a FIFO cannot hold up authentication. Legacy `<id>.ref` FIFOs are not
+session records. Unreadable, malformed, unsupported or incomplete evidence
+withholds the release. The check reads logind's current state; it does not
+lock logind against session changes after the observation.
+
+Withholding returns `PAM_IGNORE`, leaves `PAM_AUTHTOK` untouched and grants
+no authentication. The typed password and other factor keep their existing
+PAM control flow. This module guard supplements the daemon's independent
+checks; root remains the trust boundary described above.
+
+### 2. Keep the current backend-specific phase contracts
+
+The original password-only decision has expanded to three secret kinds:
+
+| Kind | Cold-account `keyring` auth line | `reseal` session line |
+|---|---|---|
+| Login password | Sets `PAM_AUTHTOK` for the later vendor auth hook | Does not request or deliver this kind |
+| KDE wallet key | Hands the key to the wallet helper; stashes it only when the helper reports `NotReady` | Delivers that deferred key once; no stash-less release query |
+| GNOME keyring token | Stashes the token in zeroizing PAM data, never in `PAM_AUTHTOK` | Delivers the stash once, or requests a token if auth supplied none |
+
+The auth request reports `have_password`, including a wallet already started
+by an earlier face line. The daemon skips password-derived secrets when they
+are already served. A GNOME token still needs its own delivery because the
+typed login password does not open a token-keyed keyring.
+
+The GNOME session query uses `have_password: true, auth_phase: false`. It
+accepts only `GnomeKeyringToken`. This query remains available when the
+auth-phase warm guard withheld a release: a new session needs its token even
+though logind already lists the account as live. Resealing from a stashed,
+verified password precedes token delivery. Session delivery stays best-effort
+and returns `PAM_IGNORE` on failure.
+
+There is no wire change. Both flags retain their existing `serde(default)`
+behavior. Older modules omitting `auth_phase` still receive the historical
+release behavior from a newer daemon; the daemon cannot infer which phase
+such a caller meant. Updated modules suppress warm/unknown auth requests
+before an older daemon can act on them, while established cold requests and
+session queries retain their existing shapes.
+
+### 3. Deferred session-only migration
+
+Moving every fingerprint-lane release to `open_session` remains deferred.
+It is not implemented by the warm guard or by this amendment. In
+[GNOME Keyring 50.0](https://github.com/GNOME/gnome-keyring/blob/50.0/pam/gkr-pam-module.c),
+the auth hook reads `PAM_AUTHTOK` and can stash `gkr_system_authtok`; the
+session hook reads that stash. In
+[kwallet-pam v6.4.5](https://github.com/KDE/kwallet-pam/blob/v6.4.5/pam_kwallet.c),
+the auth hook stores `kwallet5_key` for the session hook. Assigning
+`PAM_AUTHTOK` only in irlume's session hook would not supply either auth stash.
+The KDE-key and GNOME-token paths also have different helper and stack-order
+contracts, as the table records.
+
+A later migration needs a tested delivery path for all three kinds, including
+vendor hook ordering, cold first login, second login, password fallback and
+mixed module/daemon versions. The #859 amendment item is therefore only
+partially addressed if it also requires that migration. The separate GNOME
+waiter initialization race is outside this amendment.
+
+### Acceptance tests
+
+`crates/irlume-pam/tests/pamwrap.rs` runs the real module in a synthetic PAM
+stack against a daemon fixture that ignores the phase flag. The
+`pamwrap_keyring_upgrade_*` tests require:
+
+- No auth request for a warm or unknown account; the typed password survives
+  and the guard cannot turn a failing authentication stack into a success.
+- Explicit graphical properties, with remote, TTY, greeter, closing and
+  other-account cases distinguished; runtime-directory presence is irrelevant.
+- Bounded refusal for stalled, failed, oversized or malformed account lookups
+  and oversized, symlinked, special or excessive session records.
+- Cold password delivery reaches the auth consumer; a warm account's new
+  session still obtains and delivers its GNOME token exactly once.
+
+Existing GNOME-stash and KDE auth/deferred-session tests must continue to pass.

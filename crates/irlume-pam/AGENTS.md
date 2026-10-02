@@ -48,6 +48,14 @@ login or locks a person out. It is critical-tier
   (`wait` retries those until the budget runs out); and the `reseal` session
   line can send `ResealPassword` and then an `UnsealKeyring` query
   (`try_reseal_session`, `deliver_gnome_token`).
+- The `keyring` auth line first requires bounded evidence that the account
+  has no live local graphical session (`keyring_session::auth_release_allowed`).
+  Warm or unknown state returns IGNORE before even an older daemon can release
+  a secret. The guard uses a bounded UID helper and explicit logind records,
+  never `loginctl` or runtime-directory presence. Keep the session-phase GNOME
+  query independent of this check (ADR-0003's 2026-10-01 amendment).
+  `IRLUME_GETENT` and `IRLUME_LOGIND_DIR` are fixture overrides read through
+  `secure_env`; setuid callers use the fixed system paths.
 - It runs in setuid stacks with the caller's environment: read socket and
   helper paths only through `irlume_common::client::secure_env` (`socket_path`,
   `secure_helper_path`). Anything else that environment can change, such as

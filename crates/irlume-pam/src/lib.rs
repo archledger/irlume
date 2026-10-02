@@ -537,6 +537,8 @@ fn session_is_local(
     })
 }
 
+mod keyring_session;
+
 impl PamServiceModule for IrlumePam {
     fn authenticate(pamh: Pam, _flags: PamFlags, args: Vec<String>) -> PamError {
         firewall(move || {
@@ -579,6 +581,13 @@ impl PamServiceModule for IrlumePam {
             // pam_gnome_keyring/pam_kwallet opens the wallet. ALWAYS IGNORE: keyring
             // unlock is best-effort and must never fail or block the login.
             if keyring {
+                // During upgrades an older daemon may ignore auth_phase. Do
+                // not even request a secret while the account has a desktop,
+                // or when bounded observation cannot establish that it has none.
+                // Session-phase token delivery remains independent of this guard.
+                if !keyring_session::auth_release_allowed(&user) {
+                    return PamError::IGNORE;
+                }
                 // A typed password used to be an early return here. It cannot
                 // be one any more: a token-armed keyring (#250) does not open
                 // with the typed password, so the release must proceed even

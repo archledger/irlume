@@ -7,6 +7,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- PAM's optional fingerprint-keyring auth line withholds requests on warm
+  or unknown desktop state even while an older daemon runs during an upgrade.
+  Bounded account and session checks preserve password fallback and GNOME's
+  session-phase token delivery (ADR-0003, 2026-10-01 amendment; #859).
+
 - TPM policy upgrades rank pcrlock envelopes against the current prediction
   for their NV index. A policy re-provisioned over OS-only PCRs can move to
   literal PCR 7 at template-key startup migration or a password-verified

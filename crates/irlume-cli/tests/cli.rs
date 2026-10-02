@@ -919,6 +919,87 @@ fn doctor_runs_fully_offline_with_a_source_origin() {
     assert!(out.contains("unknown (daemon not reachable"), "{out}");
 }
 
+fn pcrlock_diagnostic_lines(tag: &str, prediction: &serde_json::Value) -> Vec<String> {
+    let sb = Sandbox::new(tag);
+    for tool in ["rpm", "dnf", "dpkg-query", "apt-cache", "pacman"] {
+        sb.fake_tool(tool, "exit 1");
+    }
+    let path = sb.path("pcrlock.json");
+    std::fs::write(&path, serde_json::to_vec(prediction).unwrap()).unwrap();
+    ["diag", "doctor"]
+        .into_iter()
+        .map(|command| {
+            let (code, out, err) = run(sb
+                .cmd_with_fakes(&[command, "--user", "tester"])
+                .env("IRLUME_PCRLOCK_JSON", &path));
+            assert_eq!(code, 0, "{command}: {err}");
+            out.lines()
+                .find(|line| {
+                    line.trim_start().starts_with("pcrlock ")
+                        || line.starts_with("[doctor] pcrlock:")
+                })
+                .unwrap_or_else(|| panic!("missing {command} pcrlock result: {out}"))
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn pcrlock_diagnostics_do_not_call_invalid_pcr7_policies_os_only() {
+    let entry = serde_json::json!({"pcr": 7, "values": ["ab".repeat(32)]});
+    for (index, entries) in [
+        (
+            0x0181_C859,
+            serde_json::json!([{"pcr": 7, "values": ["aa"]}]),
+        ),
+        (
+            0x0181_C859,
+            serde_json::json!([entry.clone(), entry.clone()]),
+        ),
+        (1, serde_json::json!([entry])),
+    ] {
+        let prediction = serde_json::json!({
+            "pcrBank": "sha256", "pcrValues": entries, "nvIndex": index,
+        });
+        for line in pcrlock_diagnostic_lines("pcrlock-invalid", &prediction) {
+            assert!(!line.contains("over no firmware-measured PCR"), "{line}");
+            assert!(line.contains("invalid policy"), "{line}");
+            assert!(line.contains("not eligible for new seals"), "{line}");
+            assert!(line.contains("literal"), "{line}");
+        }
+    }
+}
+
+#[test]
+fn pcrlock_diagnostics_explain_os_only_policy_is_not_eligible() {
+    let prediction = serde_json::json!({
+        "pcrBank": "sha256", "nvIndex": 0x0181_C859,
+        "pcrValues": [{"pcr": 11, "values": ["ab".repeat(32)]}],
+    });
+    for line in pcrlock_diagnostic_lines("pcrlock-os-only", &prediction) {
+        assert!(line.contains("not eligible for new seals"), "{line}");
+        assert!(line.contains("no firmware-measured PCR"), "{line}");
+        assert!(line.contains("literal"), "{line}");
+    }
+}
+
+#[test]
+fn pcrlock_diagnostics_keep_healthy_pcr7_as_a_tier2_candidate() {
+    let prediction = serde_json::json!({
+        "pcrBank": "sha256", "nvIndex": 0x0181_C859,
+        "pcrValues": [{"pcr": 7, "values": ["ab".repeat(32)]}],
+    });
+    for line in pcrlock_diagnostic_lines("pcrlock-healthy", &prediction) {
+        assert!(line.contains("provisioned"), "{line}");
+        assert!(line.contains("Tier 2"), "{line}");
+        assert!(line.contains("if it unseals on this boot"), "{line}");
+        assert!(
+            !line.contains("not eligible") && !line.contains("invalid"),
+            "{line}"
+        );
+    }
+}
+
 #[test]
 fn deps_reports_every_probe() {
     let sb = Sandbox::new("deps");

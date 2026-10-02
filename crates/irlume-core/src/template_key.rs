@@ -795,7 +795,7 @@ fn move_with(
     let key = unseal(&env)?;
     let mut candidate = seal(&key)?;
     candidate.uid = env.uid;
-    if candidate.strength_rank() <= env.strength_rank() {
+    if !tpm::policy_is_stronger(&candidate, &env) {
         return Ok(false);
     }
     // Once the new envelope is visible the move happened, even when syncing
@@ -884,7 +884,7 @@ fn move_best_effort(
     }
     if let Ok(mut candidate) = seal(key) {
         candidate.uid = env.uid;
-        if candidate.strength_rank() > env.strength_rank() && candidate.save(path).is_ok() {
+        if tpm::policy_is_stronger(&candidate, env) && candidate.save(path).is_ok() {
             set_0600(path);
         }
     }
@@ -1356,6 +1356,8 @@ mod tests {
         let _env = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let prediction = tpm::tests::PredictionFixture::new();
+        prediction.write(&[7]);
         let dir = PathBuf::from(crate::test_tmp_dir("key-uid-move"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1369,7 +1371,9 @@ mod tests {
         let _now = crate::account::remember(user, 4111);
         let stronger = || {
             let mut stronger: SealedEnvelope = serde_json::from_str(legacy).unwrap();
-            stronger.policy = crate::envelope::PolicyKind::PcrlockNv { nv_index: 1 };
+            stronger.policy = crate::envelope::PolicyKind::PcrlockNv {
+                nv_index: tpm::tests::PredictionFixture::NV,
+            };
             Ok(stronger)
         };
         assert!(move_with(
@@ -1396,6 +1400,137 @@ mod tests {
         );
         std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reprovisioned_pcrlock_moves_a_kept_key_using_current_rank() {
+        reprovisioned_pcrlock_move(false);
+    }
+
+    #[test]
+    fn reprovisioned_pcrlock_replacement_ignores_the_old_recorded_rank() {
+        // Isolate the second decision from the availability gate: fixing just
+        // that gate must still fail this regression.
+        reprovisioned_pcrlock_move(true);
+    }
+
+    #[test]
+    fn reprovisioned_pcrlock_startup_rechecks_policy_but_authentication_never_moves() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let prediction = tpm::tests::PredictionFixture::new();
+        let dir = PathBuf::from(crate::test_tmp_dir("key-reprovision-startup"));
+        let previous = std::env::var_os("IRLUME_TEMPLATE_KEY_DIR");
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &dir);
+        let user = "reprovision-startup";
+        let _owner = crate::account::remember(user, 4138);
+        let mut old = tpm::tests::PredictionFixture::envelope(&[7]);
+        old.uid = Some(4138);
+        old.save(&key_path(user)).unwrap();
+        let before = std::fs::read(key_path(user)).unwrap();
+        let literal = |_: &[u8]| {
+            let mut env = tpm::tests::PredictionFixture::envelope(&[7]);
+            env.policy = crate::envelope::PolicyKind::PcrLiteral;
+            Ok(env)
+        };
+        prediction.write(&[7]);
+        assert!(!move_with(
+            user,
+            |_| panic!("healthy current policy must not unseal"),
+            tpm::stronger_tier_available_than,
+            |_| panic!("healthy current policy must not seal"),
+        )
+        .unwrap());
+
+        prediction.write(&[11, 15]);
+        let mut unseals = 0;
+        let key = load_key_with(
+            user,
+            &mut Account::new(user),
+            KeyLoadPolicy::Keep,
+            |_| {
+                unseals += 1;
+                Ok(Zeroizing::new(vec![42; 32]))
+            },
+            |_| panic!("authentication must not probe upgrades"),
+            |_| panic!("authentication must not seal"),
+        )
+        .unwrap();
+        assert_eq!(key.as_slice(), &[42; 32]);
+        assert_eq!(unseals, 1);
+        assert_eq!(std::fs::read(key_path(user)).unwrap(), before);
+
+        // The availability gate saw an OS-only policy, but publication must
+        // recheck after sealing: restored firmware coverage or missing state
+        // cannot be treated as permission to downgrade this working envelope.
+        for missing in [false, true] {
+            prediction.write(&[11, 15]);
+            assert!(!move_with(
+                user,
+                |_| Ok(Zeroizing::new(vec![42; 32])),
+                tpm::stronger_tier_available_than,
+                |key| {
+                    if missing {
+                        std::fs::remove_file(&prediction.path).unwrap();
+                    } else {
+                        prediction.write(&[7]);
+                    }
+                    literal(key)
+                },
+            )
+            .unwrap());
+            assert_eq!(std::fs::read(key_path(user)).unwrap(), before);
+        }
+        prediction.write(&[11, 15]);
+        assert!(move_with(
+            user,
+            |_| Ok(Zeroizing::new(vec![42; 32])),
+            tpm::stronger_tier_available_than,
+            literal,
+        )
+        .unwrap());
+        let moved = SealedEnvelope::load(&key_path(user)).unwrap();
+        assert_eq!(moved.policy, crate::envelope::PolicyKind::PcrLiteral);
+        assert_eq!(moved.uid, Some(4138));
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", value),
+            None => std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn reprovisioned_pcrlock_move(force_gate: bool) {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let prediction = tpm::tests::PredictionFixture::new();
+        prediction.write(&[11, 15]);
+        let dir = PathBuf::from(crate::test_tmp_dir("key-reprovision-859"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("alice.json");
+        let old = tpm::tests::PredictionFixture::envelope(&[0, 7]);
+        old.save(&path).unwrap();
+        let literal = || {
+            let mut env = tpm::tests::PredictionFixture::envelope(&[7]);
+            env.policy = crate::envelope::PolicyKind::PcrLiteral;
+            Ok(env)
+        };
+        move_best_effort(
+            &path,
+            &old,
+            &[42; 32],
+            |env| force_gate || tpm::stronger_tier_available_than(env),
+            |key| {
+                assert_eq!(key, &[42; 32]);
+                literal()
+            },
+        );
+        let got = SealedEnvelope::load(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got.policy, crate::envelope::PolicyKind::PcrLiteral);
     }
 
     /// A recovery file records the uid it was set up for; one recorded for
@@ -1516,6 +1651,8 @@ mod tests {
         let _env = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let prediction = tpm::tests::PredictionFixture::new();
+        prediction.write(&[7]);
         let dir = PathBuf::from(crate::test_tmp_dir("readonly-key"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1563,7 +1700,9 @@ mod tests {
             |key| {
                 assert_eq!(key, &[42; 32]);
                 let mut stronger: SealedEnvelope = serde_json::from_slice(&before).unwrap();
-                stronger.policy = crate::envelope::PolicyKind::PcrlockNv { nv_index: 1 };
+                stronger.policy = crate::envelope::PolicyKind::PcrlockNv {
+                    nv_index: tpm::tests::PredictionFixture::NV,
+                };
                 Ok(stronger)
             },
         )
@@ -1707,6 +1846,8 @@ mod tests {
         let _env = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let prediction = tpm::tests::PredictionFixture::new();
+        prediction.write(&[7]);
         let dir = PathBuf::from(crate::test_tmp_dir("move-with"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1718,7 +1859,9 @@ mod tests {
         let unseal = |_: &SealedEnvelope| Ok(Zeroizing::new(vec![42; 32]));
         let stronger = |_: &[u8]| {
             let mut env: SealedEnvelope = serde_json::from_slice(&before).unwrap();
-            env.policy = crate::envelope::PolicyKind::PcrlockNv { nv_index: 1 };
+            env.policy = crate::envelope::PolicyKind::PcrlockNv {
+                nv_index: tpm::tests::PredictionFixture::NV,
+            };
             Ok(env)
         };
 

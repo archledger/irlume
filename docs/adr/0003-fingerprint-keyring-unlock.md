@@ -239,3 +239,59 @@ stack against a daemon fixture that ignores the phase flag. The
   session still obtains and delivers its GNOME token exactly once.
 
 Existing GNOME-stash and KDE auth/deferred-session tests must continue to pass.
+
+## Amendment 2026-10-03: serialize token arm with PAM removal
+
+GNOME token `SealPassword` holds the same PAM writer lock as login disable,
+apply, rollback and reconcile. The authoritative delivery check and durable
+token-envelope publication occur under one uninterrupted lock lifetime.
+The CLI's earlier preflight remains advisory. A new daemon applies the check
+to every token arm and re-arm, including requests from older clients.
+
+The daemon resolves the installed `irlume` sibling of its own executable.
+Both the selected path and its resolved ancestry must be root-owned and
+non-writable by other accounts; setuid/setgid helpers are refused. The daemon
+checks the executable's identity and modification metadata again after the
+helper finishes. FHS packages install both binaries in `/usr/bin`, source
+installs use `/usr/local/bin`, and Nix keeps the sibling in the same store
+output. PATH and client requests select neither binary.
+
+The helper's fixed private mode requires root and a root-origin Unix socket
+on stdin. It reads one bounded account name, takes `lock_pam()` including
+legacy migration exclusions, and runs the existing delivery parser without
+daemon IPC or a capability query. Success transfers every held lock's open
+file description using `SCM_RIGHTS`. The daemon requires successful helper
+completion and descriptor proof, validates the private primary lock's inode,
+and retains all descriptions through `arm_gnome_token` or `rearm_gnome_token`.
+It rechecks the account binding after acquiring the guard. The transferred
+locks are released by closing their last descriptions, never by an explicit
+unlock during handoff.
+
+Helper observation and descriptor reception share a five-second deadline.
+The existing bounded child collector kills failed or expired helpers and
+retains pending reaps within its child budget. An absent helper, an older
+binary that sends no descriptors, a failed delivery check, or invalid proof
+refuses sealing and leaves the existing envelope intact. Upgrade both
+binaries and retry after checking login wiring. Login-password and KDE-key
+sealing keep their existing behavior and do not acquire this guard.
+
+If ordinary disable takes the lock first, the helper sees the removed
+delivery line and refuses arm. If arm takes it first, disable waits until
+the envelope is published, then its existing token check refuses removal.
+An explicit root `--force` remains an intentional bypass. Package managers
+and administrator edits do not take this lock. The change does not serialize
+all account-local arm/disarm/re-key operations or resolve a lost GNOME CHANGE
+reply; envelope-before-re-key ordering remains the recovery boundary.
+
+AppArmor's FHS and source-install profiles permit the fixed helper to inherit
+the daemon profile with `ix`, with PAM/manager/package reads and lock access.
+They retain the shadow deny and grant no PAM write permission. The systemd
+and Nix service sandboxes keep their existing read-only `/etc` and capability
+bounding set. A confinement refusal follows the same no-seal failure path.
+
+The `token_lock` CLI integration tests coordinate arm-first through the real
+disable lock-wait diagnostic and test disable-first through actual removal.
+The daemon tests exercise the installed sibling in a private root, reject
+missing, writable-ancestry and success-only helpers, retain descriptors after
+helper exit, and preserve envelopes when proof fails. Software-TPM tests use
+real subprocess/lock fixtures while keeping their existing seal assertions.

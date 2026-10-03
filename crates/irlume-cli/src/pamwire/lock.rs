@@ -26,6 +26,23 @@ pub(crate) struct PamLock {
     _legacy: Vec<File>,
 }
 
+impl PamLock {
+    /// Transfer references without explicitly unlocking: queued/received
+    /// descriptions must retain exclusion after this helper exits.
+    pub(super) fn handoff(
+        &self,
+        socket: &std::os::unix::net::UnixStream,
+        deadline: Instant,
+    ) -> std::io::Result<()> {
+        let mut files = Vec::with_capacity(self._legacy.len() + 1);
+        files.push(self._file.try_clone()?);
+        for file in &self._legacy {
+            files.push(file.try_clone()?);
+        }
+        irlume_common::pam_lock_handoff::send(socket, &files, deadline)
+    }
+}
+
 /// The lock's file name in [`crate::machine::ROOT_SESSION_DIR`].
 const LOCK_NAME: &str = "pam.lock";
 

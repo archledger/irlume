@@ -71,6 +71,7 @@ mod position_session;
 mod retry_recovery;
 mod retry_throttle;
 mod shared_unlock;
+mod token_delivery;
 mod users;
 
 /// Release checksums of the bundled models (models/SHA256SUMS, committed next
@@ -8678,6 +8679,16 @@ fn dispatch_scoped_session_inner(
                          GNOME once to create the keyring, or arm without forcing a kind."
                     ));
                 }
+                // The CLI helper checks the exact delivery stack under the same
+                // lock disable/rollback hold. Keep every transferred primary
+                // and legacy description until arm/rearm has durably finished.
+                let _delivery_lock = match token_delivery::acquire(&user) {
+                    Ok(guard) => guard,
+                    Err(reason) => return Response::Error(reason.into()),
+                };
+                if let Some(refusal) = refuse_moved_account("SealPassword", &user) {
+                    return refusal;
+                }
                 let armed = if already_token {
                     irlume_core::keyring::rearm_gnome_token(&user, password.expose())
                 } else {
@@ -11711,7 +11722,7 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 15] = [
+        let sources: [(&str, &str); 16] = [
             ("main.rs", include_str!("main.rs")),
             ("attempt_record.rs", include_str!("attempt_record.rs")),
             ("shared_unlock.rs", include_str!("shared_unlock.rs")),
@@ -11721,6 +11732,7 @@ mod tests {
             ),
             ("live.rs", include_str!("live.rs")),
             ("users.rs", include_str!("users.rs")),
+            ("token_delivery.rs", include_str!("token_delivery.rs")),
             (
                 "retry_throttle.rs",
                 concat!(
@@ -21858,7 +21870,9 @@ mod tests {
     /// reported in place of the account's real home for the calling test
     /// thread, so a `SealPassword` takes the token path on any host. Removed
     /// on drop; declare it after the sandbox.
-    struct GnomeHome;
+    struct GnomeHome {
+        _delivery: token_delivery::tests::HelperFixture,
+    }
 
     impl GnomeHome {
         fn plant(user: &str, sandbox: &Sandbox) -> Self {
@@ -21867,7 +21881,9 @@ mod tests {
             std::fs::create_dir_all(&keyrings).unwrap();
             std::fs::write(keyrings.join("login.keyring"), b"stand-in").unwrap();
             crate::users::HOME_STAND_IN.with(|h| *h.borrow_mut() = Some((user.into(), home)));
-            Self
+            Self {
+                _delivery: token_delivery::tests::HelperFixture::install(),
+            }
         }
 
         /// A home for `user` with no GNOME login keyring in it, as irlumed
@@ -21876,7 +21892,9 @@ mod tests {
             let home = sandbox.dir.join(format!("bare-home-{user}"));
             std::fs::create_dir_all(&home).unwrap();
             crate::users::HOME_STAND_IN.with(|h| *h.borrow_mut() = Some((user.into(), home)));
-            Self
+            Self {
+                _delivery: token_delivery::tests::HelperFixture::install(),
+            }
         }
     }
 
@@ -22013,6 +22031,36 @@ mod tests {
     fn owner_is_root() -> bool {
         // SAFETY: geteuid has no preconditions.
         unsafe { libc::geteuid() == 0 }
+    }
+
+    #[test]
+    fn token_seal_without_a_trusted_delivery_helper_keeps_existing_state() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("token-seal-no-helper");
+        let _tpm = NoTpm::install();
+        let (me, owner) = own_account();
+        let _shadow = ShadowStandIn::hash_for(&me);
+        let _home = GnomeHome::plant(&me, &sb);
+        // Exercise production helper discovery, rather than the software-TPM
+        // fixture's subprocess. A unit-test checkout is not a root installation.
+        token_delivery::tests::HELPER_PATH.with(|p| p.borrow_mut().take());
+        for rearm in [false, true] {
+            let before = if rearm {
+                Some(plant_token_envelope(&me, SHADOW_PASSWORD))
+            } else {
+                None
+            };
+            for who in [&peer(0), &owner] {
+                let response = dispatch(seal_request(&me, SHADOW_PASSWORD), who, &mut e);
+                assert!(
+                    matches!(&response, Response::Error(message)
+                    if message.contains("holding the PAM lock") && message.contains("nothing was sealed")),
+                    "{response:?}"
+                );
+                assert_eq!(envelope_bytes(&me), before);
+            }
+        }
     }
 
     /// The `reseal` session line is the only sender of `ResealPassword`, and

@@ -441,9 +441,17 @@ mod tests {
         let store = root.join("keys");
         std::fs::create_dir(&store).unwrap();
         let active = "LoadState=loaded\nActiveState=active\nMainPID=42\nNeedDaemonReload=no\nRootDirectory=\nRootImage=\nExecMainPID=42\nExecMainStartTimestampMonotonic=100\nInvocationID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        // Every store variable is pinned inside the fixture: a machine with
+        // real daemon state must not decide this test (the walk resolves the
+        // unset variables to the live defaults).
+        let state = root.join("state");
         std::fs::write(
             pid.join("environ"),
-            format!("IRLUME_KEYRING_DIR={}\0", store.display()),
+            format!(
+                "IRLUME_STATE_DIR={}\0IRLUME_KEYRING_DIR={}\0",
+                state.display(),
+                store.display()
+            ),
         )
         .unwrap();
         let unit = root.join("etc/systemd/system/irlumed.service");
@@ -451,7 +459,8 @@ mod tests {
         std::fs::write(
             &unit,
             format!(
-                "[Service]\nEnvironment=IRLUME_KEYRING_DIR={}\n",
+                "[Service]\nEnvironment=IRLUME_STATE_DIR={}\nEnvironment=IRLUME_KEYRING_DIR={}\n",
+                state.display(),
                 store.display()
             ),
         )

@@ -369,6 +369,15 @@ pub fn read_split() -> SplitReadState {
     match &obs.split {
         SplitConfObservation::None => SplitReadState::Absent,
         SplitConfObservation::Malformed => SplitReadState::Malformed,
+        SplitConfObservation::MalformedSelection { generation, digest } => {
+            match read_generation(*generation, digest, None, false) {
+                SplitReadState::Valid { records, .. } => SplitReadState::UnresolvedSelection {
+                    generation: *generation,
+                    record_count: records.len(),
+                },
+                other => other,
+            }
+        }
         SplitConfObservation::Reference {
             generation,
             digest,

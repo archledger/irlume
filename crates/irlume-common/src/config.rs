@@ -831,6 +831,14 @@ pub enum SplitConfObservation {
     },
     /// Split keys are present but break the rule; the operation refuses.
     Malformed,
+    /// Only the pair text is invalid. Retain the reference for diagnostics;
+    /// this is still malformed configuration and cannot authorize a mutation.
+    MalformedSelection {
+        /// Independently validated generation number.
+        generation: u64,
+        /// Independently validated digest text.
+        digest: String,
+    },
 }
 
 /// One strict read of `cameras.conf`: the selection state and every skipped
@@ -1003,7 +1011,20 @@ pub fn parse_camera_conf(text: &str) -> CameraConfObservation {
                     line,
                     problem: CameraConfProblem::InvalidSplitKeys,
                 },
-                split: SplitConfObservation::Malformed,
+                split: if valid_generation && valid_digest {
+                    SplitConfObservation::MalformedSelection {
+                        generation: split_inputs
+                            .0
+                            .and_then(|(_, v)| v.parse().ok())
+                            .unwrap_or_default(),
+                        digest: split_inputs
+                            .1
+                            .map(|(_, v)| v.to_owned())
+                            .unwrap_or_default(),
+                    }
+                } else {
+                    SplitConfObservation::Malformed
+                },
                 ignored,
             };
         }
@@ -2628,7 +2649,13 @@ mod split_conf_tests {
             got.selection,
             CameraSelectionObservation::Malformed { .. }
         ));
-        assert_eq!(got.split, SplitConfObservation::Malformed);
+        assert_eq!(
+            got.split,
+            SplitConfObservation::MalformedSelection {
+                generation: 3,
+                digest: DIGEST.into(),
+            }
+        );
     }
 
     #[test]

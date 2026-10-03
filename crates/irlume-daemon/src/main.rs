@@ -25479,17 +25479,27 @@ mod split_management_tests {
             Response::Ok(_)
         ));
         let missing = pair_text().replace("s1", "missing");
-        irlume_common::config::publish_kv_changes("cameras.conf", &[("split_pair", &missing)], &[])
+        for missing in [missing.as_str(), "split2;x"] {
+            irlume_common::config::publish_kv_changes(
+                "cameras.conf",
+                &[("split_pair", missing)],
+                &[],
+            )
             .unwrap();
-        assert!(matches!(
-            split_status_response(),
-            Response::SplitStatusView {
-                state: SplitStoreState::Malformed,
-                record_count: 1,
-                generation: Some(1),
-                selection_resolves: false,
-            }
-        ));
+            assert!(matches!(
+                split_status_response(),
+                Response::SplitStatusView {
+                    state: SplitStoreState::Malformed,
+                    record_count: 1,
+                    generation: Some(1),
+                    selection_resolves: false,
+                }
+            ));
+            assert!(matches!(
+                split_add_response(&guard(), &rgb_facts(), &ir_facts(), &publication()),
+                Response::Error(_)
+            ));
+        }
     }
 
     #[test]

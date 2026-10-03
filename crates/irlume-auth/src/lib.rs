@@ -236,6 +236,23 @@ pub struct Assessment {
     /// to the IR-identity-verified arms (fusion / IR fallback / centroid); see
     /// `rgb_primary_grant_admissible` and ADR-0014.
     pub sequential_pair: bool,
+    /// True when this assessment rests on two distinct physical USB devices
+    /// (ADR-0032 §5): a split pair is admitted under the sequential posture
+    /// whatever the measured skew, because a short gap does not make two
+    /// physical devices a concurrent pair. Provenance carried from the
+    /// capture; never inferred from elapsed time alone.
+    pub split_pair: bool,
+}
+
+impl Assessment {
+    /// The admission posture every grant arm keys on: sequential for any
+    /// split evidence and for sequential-schedule pairs (ADR-0014,
+    /// ADR-0032 §5). The RGB-primary and fusion arms stay refused when this
+    /// is true; only the IR-identity-verified arms may grant.
+    #[must_use]
+    pub fn sequential_posture(&self) -> bool {
+        self.sequential_pair || self.split_pair
+    }
 }
 
 // An unfinished assessment cannot enter the public identity-admission boundary.
@@ -4772,6 +4789,7 @@ impl Engine {
             rgb_pad,
             ir_pad: PadEvidence::NotApplicable,
             sequential_pair: false, // RGB-only path: no pair exists
+            split_pair: false,
         };
         Ok(DeferredAssessment {
             assessment,
@@ -5673,6 +5691,7 @@ impl Engine {
                     rgb_pad: PadEvidence::NotApplicable,
                     ir_pad: PadEvidence::NotApplicable,
                     sequential_pair: false, // rejected pair: no pair survives
+                    split_pair: false,
                 }, identity: (None, None) });
             }
         };
@@ -5901,6 +5920,7 @@ impl Engine {
             // ceiling: the bursts ran as separated one-shots (ADR-0014). Such
             // pairs defer the RGB-primary grant (rgb_primary_grant_admissible).
             sequential_pair: pair_admitted_sequentially(skew, rgb_top.is_some()),
+            split_pair: false,
         };
         Ok(DeferredAssessment {
             assessment,
@@ -7187,10 +7207,10 @@ impl Engine {
                 thr,
                 score >= thr,
             );
-            if rgb_primary_grant_admissible(score, thr, a.sequential_pair) {
+            if rgb_primary_grant_admissible(score, thr, a.sequential_posture()) {
                 return Ok(Outcome::grant(score, format!("match: {who} (rgb)")));
             }
-            if a.sequential_pair && score >= thr {
+            if a.sequential_posture() && score >= thr {
                 irlume_common::dlog!(
                     "match(rgb): {score:.3} >= thr {thr:.3} DEFERRED (sequential-schedule pair; \
                      IR-identity arms only, ADR-0014)"
@@ -7231,13 +7251,13 @@ impl Engine {
                         irlume_core::fusion::FUSION_PROB_THRESHOLD,
                         f.grant,
                     );
-                    if f.grant && !a.sequential_pair {
+                    if f.grant && !a.sequential_posture() {
                         let who = if ir_score >= score { ir_who } else { who };
                         return Ok(
                     Outcome::grant(f.prob,
                             format!("match: {who} (rgb+ir fusion p={:.2}; rgb {score:.2}/ir {ir_score:.2})", f.prob)));
                     }
-                    if f.grant && a.sequential_pair {
+                    if f.grant && a.sequential_posture() {
                         irlume_common::dlog!(
                             "fusion p={:.3} DEFERRED (sequential-schedule pair: the fusion \
                              IR floor is a presence bar, not an identity bar; ADR-0014)",
@@ -7301,7 +7321,7 @@ impl Engine {
             return Ok(Outcome::deny_live(
                 OutcomeKind::BelowThreshold,
                 score,
-                if a.sequential_pair && score >= thr {
+                if a.sequential_posture() && score >= thr {
                     format!(
                         "rgb {score:.2} matched but the sequentially captured pair \
                          requires an IR-verified match; fusion+ir missed"
@@ -10931,6 +10951,66 @@ mod tests {
     }
 
     #[test]
+    fn split_evidence_carries_the_sequential_posture_at_any_skew() {
+        // ADR-0032 §5: the split marker is provenance from the capture, not
+        // an elapsed-time rule. At zero skew a split pair still defers the
+        // RGB-primary arm; only the IR-identity-verified arms may grant.
+        let (_, mut assessment) = engine_tests::pad_matching_fixture(0.0, false);
+        assessment.split_pair = true;
+        for skew in [std::time::Duration::ZERO, MAX_CROSS_SPECTRUM_SKEW] {
+            assessment.sequential_pair = pair_admitted_sequentially(skew, true);
+            assert!(assessment.sequential_posture());
+            assert!(
+                !rgb_primary_grant_admissible(0.90, 0.60, assessment.sequential_posture()),
+                "split provenance must refuse RGB-primary independently of skew"
+            );
+        }
+        // `pair_admitted_sequentially` keeps its ordinary meaning and never
+        // manufactures the marker: it is a skew rule for one physical pair.
+        assert!(!pair_admitted_sequentially(std::time::Duration::ZERO, true));
+    }
+
+    #[test]
+    fn the_grant_arms_key_on_the_sequential_posture() {
+        // The RGB-primary arm and both fusion arms must read the posture that
+        // includes the split marker (ADR-0032 §5, ADR-0014). Pinned by source
+        // shape so a future gate cannot silently revert to the skew field.
+        let source = include_str!("lib.rs")
+            .split("\nmod tests {")
+            .next()
+            .unwrap();
+        assert!(
+            source.contains("rgb_primary_grant_admissible(score, thr, a.sequential_posture())"),
+            "the RGB-primary arm must read the posture"
+        );
+        assert!(
+            source.matches("a.sequential_posture()").count() >= 3,
+            "RGB-primary and both fusion gates must read the posture"
+        );
+    }
+
+    #[test]
+    fn elapsed_time_alone_never_sets_the_split_marker() {
+        // The marker is constructed false everywhere in production; only the
+        // split capture path (later wiring) and tests set it. A derivation
+        // from skew would show up as a `split_pair:` construction beside the
+        // skew rule.
+        let source = include_str!("lib.rs")
+            .split("\nmod tests {")
+            .next()
+            .unwrap();
+        assert!(
+            source.contains("split_pair: false,"),
+            "production constructions carry the marker as provenance, not a derivation"
+        );
+        let constructed_true = format!("split_pair: {},", true);
+        assert!(
+            !source.contains(&constructed_true),
+            "nothing in production may construct the marker true"
+        );
+    }
+
+    #[test]
     fn ir_match_skips_foreign_space_templates() {
         let (mut prof, probe) = calibrated_profile(16);
         for s in &mut prof.scans {
@@ -13007,6 +13087,7 @@ mod engine_tests {
             rgb_pad: PadEvidence::Score(p),
             ir_pad: PadEvidence::NotApplicable,
             sequential_pair: false,
+            split_pair: false,
         };
         (enr, a)
     }
@@ -13062,7 +13143,7 @@ mod engine_tests {
     fn unknown_ir_preserves_rgb_grants_and_denies_ir_dependent_paths() {
         let _guard = env_guard();
         let mut s = shared();
-        for case in ["rgb", "below-rgb", "sequential", "dark"] {
+        for case in ["rgb", "below-rgb", "sequential", "split", "dark"] {
             let (mut enr, mut a) = pad_matching_fixture(0.0, false);
             let identity = a.embedding.unwrap();
             enr.profiles[0].scans[0].ir = Some(identity.to_vec());
@@ -13074,6 +13155,7 @@ mod engine_tests {
                     a.embedding = Some(other);
                 }
                 "sequential" => a.sequential_pair = true,
+                "split" => a.split_pair = true,
                 "dark" => {
                     a.embedding = None;
                     a.rgb_frame_mean = 0.0;
@@ -15492,6 +15574,7 @@ mod engine_tests {
             rgb_pad: PadEvidence::NotApplicable,
             ir_pad: PadEvidence::NotApplicable,
             sequential_pair: false,
+            split_pair: false,
         };
         let facts = AttemptFacts::from_assessment(&a);
         assert_eq!(facts.rgb_face, Some((0.25, 0.75)));
@@ -15548,6 +15631,7 @@ mod engine_tests {
                 rgb_pad: PadEvidence::NotApplicable,
                 ir_pad: PadEvidence::NotApplicable,
                 sequential_pair: false,
+                split_pair: false,
             };
             auth_attempt_situation(kind, &AttemptFacts::from_assessment(&assessment))
         };

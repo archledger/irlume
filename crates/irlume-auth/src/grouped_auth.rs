@@ -372,7 +372,8 @@ impl Engine {
                 // matching schedule keys on this flag.
                 if modality == GroupModality::Pair {
                     evidence.assessment.sequential_pair |=
-                        evidence.assessment.signals.rgb_face.is_some();
+                        evidence.assessment.signals.rgb_face.is_some()
+                            || evidence.assessment.split_pair;
                 }
                 self.qualify_rgb_pad_evidence(&mut evidence.assessment);
                 let final_sample = index + 1 == VIT_PAD_VOTE_N;

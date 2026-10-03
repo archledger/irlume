@@ -239,6 +239,22 @@ impl CameraSupervisor {
         Ok(CameraOperationSession::new(lease))
     }
 
+    pub(crate) fn acquire_split_operation(
+        &self,
+        expected: &crate::lease::SplitLeaseRequest,
+        operation: CameraOperationKind,
+        deadline: Instant,
+    ) -> Result<CameraOperationSession, CameraLeaseError> {
+        let lease = CameraLease::acquire_split(
+            &self.leases,
+            self.inventory.clone(),
+            expected,
+            operation,
+            deadline,
+        )?;
+        Ok(CameraOperationSession::new(lease))
+    }
+
     fn scan_nodes(&self) -> NodeScan {
         let before = self.endpoint_generations();
         let scan = self.backend.scan_nodes();
@@ -502,10 +518,16 @@ pub(crate) fn list_pairs() -> Vec<CameraPair> {
 }
 
 pub(crate) fn open_rgb(device: &str, lease: CameraLease) -> irlume_common::Result<RgbCamera> {
+    lease
+        .require_stream_role(device, crate::contracts::StreamRole::Rgb)
+        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
     with_camera_supervisor(|supervisor| supervisor.open_rgb(device, lease))
 }
 
 pub(crate) fn open_ir(device: &str, lease: CameraLease) -> irlume_common::Result<IrCamera> {
+    lease
+        .require_stream_role(device, crate::contracts::StreamRole::Ir)
+        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
     with_camera_supervisor(|supervisor| supervisor.open_ir(device, lease))
 }
 
@@ -742,6 +764,180 @@ pub(crate) mod tests {
             "retaining the snapshot must not retain the permit"
         );
         assert_eq!(snapshot.state, CameraInventoryState::Current);
+    }
+
+    #[test]
+    fn split_public_acquisition_binds_two_incarnations_and_refuses_overlap() {
+        use crate::inventory::UsbDeviceFacts;
+        use crate::lease::{acquire_split_camera_operation, SplitLeaseRequest};
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let supervisor = Arc::new(CameraSupervisor::new(RecordingBackend::new(calls.clone())));
+        let observations = [
+            ("/devices/split-rgb", "/dev/video0", "1234:0001", 8),
+            ("/devices/split-ir", "/dev/video1", "1234:0002", 5),
+        ]
+        .map(|(topology, path, id, port)| {
+            CameraObservation::with_lifecycle_evidence_and_endpoints(
+                crate::contracts::BackendKind::UvcV4l2,
+                crate::contracts::PhysicalCameraId::new(topology, None).unwrap(),
+                crate::contracts::CameraCapabilities::default(),
+                vec!["fixture".into()],
+                vec![path.into()],
+            )
+            .with_usb_device(Some(UsbDeviceFacts::new(id.into(), true).with_location(
+                Some(crate::UsbLocation {
+                    controller: "0000:00:14.0".into(),
+                    domain: crate::RootHubDomain::Usb2,
+                    ports: vec![port],
+                }),
+            )))
+        });
+        supervisor.reconcile_inventory(observations.into()).unwrap();
+        let before = supervisor.endpoint_generations();
+        supervisor.record_roles(
+            &before,
+            [("/dev/video0", Role::Rgb), ("/dev/video1", Role::Ir)],
+        );
+        let (snapshot, sides) = supervisor.inventory_publication();
+        let expectation = |role| {
+            let side = sides.iter().find(|side| side.role == role).unwrap();
+            crate::SplitSideExpectation {
+                instance_id: side.instance_id.clone(),
+                generation: side.generation,
+                endpoint: side.endpoint.clone(),
+                identity: side.identity.clone(),
+                controller: side.controller.clone(),
+                domain: side.domain.clone(),
+                ports: side.ports.clone(),
+            }
+        };
+        let expected = SplitLeaseRequest {
+            supervisor_id: snapshot.supervisor_id.unwrap(),
+            revision: snapshot.revision,
+            rgb: expectation(Role::Rgb),
+            ir: expectation(Role::Ir),
+        };
+        let _installed = install_test_supervisor(supervisor.clone());
+        for operation in [
+            CameraOperationKind::Authentication,
+            CameraOperationKind::Enrollment,
+            CameraOperationKind::Capture,
+        ] {
+            assert!(matches!(
+                acquire_split_camera_operation(&expected, operation, std::time::Duration::ZERO),
+                Err(CameraLeaseError::SplitActivationDisabled)
+            ));
+        }
+        let held_ir = supervisor
+            .acquire_operation(&["/dev/video1"], CameraOperationKind::Setup, Instant::now())
+            .unwrap();
+        assert!(matches!(
+            acquire_split_camera_operation(
+                &expected,
+                CameraOperationKind::Diagnostics,
+                std::time::Duration::ZERO
+            ),
+            Err(CameraLeaseError::DeadlineExpired { .. })
+        ));
+        assert!(
+            supervisor
+                .acquire_operation(&["/dev/video0"], CameraOperationKind::Setup, Instant::now())
+                .is_ok(),
+            "failed split acquisition must not hold RGB"
+        );
+        drop(held_ir);
+        let session = acquire_split_camera_operation(
+            &expected,
+            CameraOperationKind::Diagnostics,
+            std::time::Duration::ZERO,
+        )
+        .expect("public split path must reserve both devices");
+        assert!(session.lease().covers_endpoint("/dev/video0"));
+        assert!(session.lease().covers_endpoint("/dev/video1"));
+        assert!(!session.lease().covers_endpoint("/dev/video9"));
+        assert!(session.lease().is_split_pair());
+        let rgb = session
+            .lease()
+            .frame_binding("/dev/video0", crate::contracts::StreamRole::Rgb)
+            .unwrap();
+        let ir = session
+            .lease()
+            .frame_binding("/dev/video1", crate::contracts::StreamRole::Ir)
+            .unwrap();
+        assert_ne!(rgb.camera_instance_id(), ir.camera_instance_id());
+        assert!(session
+            .lease()
+            .frame_binding("/dev/video1", crate::contracts::StreamRole::Rgb)
+            .is_err());
+        assert!(session.open_rgb("/dev/video1").is_err());
+        assert!(session.open_ir("/dev/video0").is_err());
+        session
+            .run(|| {
+                assert!(RgbCamera::open("/dev/video1").is_err());
+                assert!(IrCamera::open("/dev/video0").is_err());
+            })
+            .unwrap();
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "wrong-role opens must be refused before reaching the backend"
+        );
+        session.lease().start_stream().unwrap();
+        assert_eq!(
+            session.lease().start_stream(),
+            Err(CameraLeaseError::SplitRequiresSequential)
+        );
+        session.lease().stop_stream();
+        session.lease().start_stream().unwrap();
+        session.lease().stop_stream();
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "reservation never opens a camera"
+        );
+        assert!(matches!(
+            supervisor.acquire_operation(
+                &["/dev/video0"],
+                CameraOperationKind::Setup,
+                Instant::now()
+            ),
+            Err(CameraLeaseError::DeadlineExpired { .. })
+        ));
+        drop(session);
+        assert!(supervisor
+            .acquire_operation(&["/dev/video0"], CameraOperationKind::Setup, Instant::now())
+            .is_ok());
+        assert!(supervisor
+            .acquire_operation(&["/dev/video1"], CameraOperationKind::Setup, Instant::now())
+            .is_ok());
+        let mut stale = expected.clone();
+        stale.ir.generation += 1;
+        assert!(matches!(
+            acquire_split_camera_operation(
+                &stale,
+                CameraOperationKind::Diagnostics,
+                std::time::Duration::ZERO
+            ),
+            Err(CameraLeaseError::Stale)
+        ));
+        let session = acquire_split_camera_operation(
+            &expected,
+            CameraOperationKind::Diagnostics,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(
+            session.run(|| supervisor.invalidate_inventory().unwrap()),
+            Err(CameraLeaseError::Stale)
+        );
+        assert_eq!(
+            session
+                .lease()
+                .frame_binding("/dev/video0", crate::contracts::StreamRole::Rgb),
+            Err(CameraLeaseError::Stale)
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "invalidation did not open or retarget either device"
+        );
     }
 
     impl CameraBackend for RecordingBackend {

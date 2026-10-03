@@ -14,6 +14,136 @@ use irlume_common::live_camera::{CameraInventoryReason, CameraInventoryState};
 use crate::inventory::UsbDeviceFacts;
 use crate::{Role, UsbLocation};
 
+/// What a split mutation recorded for one side (ADR-0032 §5): the facts a
+/// two-incarnation revalidation must match at the guarded publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitSideExpectation {
+    /// The inventory instance id for the camera behind this side.
+    pub instance_id: String,
+    /// The connection generation the side was published under.
+    pub generation: u64,
+    /// The recorded capture endpoint path.
+    pub endpoint: String,
+    /// The recorded binding identity (`vid:pid[:serial]`).
+    pub identity: String,
+    /// The recorded controller identity (PCI address).
+    pub controller: String,
+    /// The recorded root-hub domain in schema canonical text.
+    pub domain: String,
+    /// The recorded relative port chain.
+    pub ports: Vec<u8>,
+}
+
+/// Why a two-incarnation revalidation refused (ADR-0032 §5). The caller
+/// releases BOTH leases and opens neither side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitRevalidationRefusal {
+    /// The current publication is unavailable or not a complete one.
+    PublicationUnavailable,
+    /// A side is not in the publication at its recorded instance and
+    /// generation and endpoint.
+    SideMissing,
+    /// The side's classified role is not the expected one.
+    RoleMismatch,
+    /// Identity, location or recorded path does not match the publication.
+    FactMismatch,
+}
+
+/// Revalidate both sides of a split capture against ONE current publication
+/// (ADR-0032 §5): identity, qualified location, recorded path and classified
+/// role for each side. The two incarnations are checked together or not at
+/// all. This observation alone reserves no device; use
+/// [`crate::lease::acquire_split_camera_operation`] for a session that binds
+/// validation and opens to the same two leases. Camera-free: reads only the
+/// already-published inventory.
+///
+/// # Errors
+/// [`SplitRevalidationRefusal`] naming what no longer matches.
+pub fn revalidate_split_incarnations(
+    rgb: &SplitSideExpectation,
+    ir: &SplitSideExpectation,
+) -> Result<(), SplitRevalidationRefusal> {
+    revalidate_against(rgb, ir, &crate::camera_inventory_publication())
+}
+
+/// [`revalidate_split_incarnations`] against a caller-supplied publication,
+/// so the one-publication rule is testable and a caller may already hold one.
+///
+/// # Errors
+/// [`SplitRevalidationRefusal`] naming what no longer matches.
+pub fn revalidate_against(
+    rgb: &SplitSideExpectation,
+    ir: &SplitSideExpectation,
+    publication: &(
+        irlume_common::live_camera::CameraInventorySnapshot,
+        Vec<crate::inventory::ClassifiedEndpoint>,
+    ),
+) -> Result<(), SplitRevalidationRefusal> {
+    use irlume_common::live_camera::CameraInventoryState;
+    let (snapshot, classified) = publication;
+    if snapshot.validate().is_err() || snapshot.state != CameraInventoryState::Current {
+        return Err(SplitRevalidationRefusal::PublicationUnavailable);
+    }
+    let present = |side: &SplitSideExpectation| {
+        snapshot.candidates.iter().any(|candidate| {
+            candidate.instance_id == side.instance_id
+                && candidate.generation == side.generation
+                && candidate.endpoint_paths.contains(&side.endpoint)
+        })
+    };
+    if !present(rgb) || !present(ir) {
+        return Err(SplitRevalidationRefusal::SideMissing);
+    }
+    if rgb.instance_id == ir.instance_id
+        || (rgb.identity == ir.identity
+            && rgb.controller == ir.controller
+            && rgb.domain == ir.domain
+            && rgb.ports == ir.ports)
+    {
+        return Err(SplitRevalidationRefusal::FactMismatch);
+    }
+    check_side(rgb, Role::Rgb, classified)?;
+    check_side(ir, Role::Ir, classified)
+}
+
+fn check_side(
+    side: &SplitSideExpectation,
+    role: Role,
+    classified: &[crate::inventory::ClassifiedEndpoint],
+) -> Result<(), SplitRevalidationRefusal> {
+    let found = classified
+        .iter()
+        .find(|e| {
+            e.instance_id == side.instance_id
+                && e.generation == side.generation
+                && e.endpoint == side.endpoint
+        })
+        .ok_or(SplitRevalidationRefusal::SideMissing)?;
+    if found.role != role {
+        return Err(SplitRevalidationRefusal::RoleMismatch);
+    }
+    if classified
+        .iter()
+        .filter(|candidate| {
+            candidate.instance_id == side.instance_id
+                && candidate.generation == side.generation
+                && candidate.role == role
+        })
+        .count()
+        != 1
+    {
+        return Err(SplitRevalidationRefusal::RoleMismatch);
+    }
+    if found.identity != side.identity
+        || found.controller != side.controller
+        || found.domain != side.domain
+        || found.ports != side.ports
+    {
+        return Err(SplitRevalidationRefusal::FactMismatch);
+    }
+    Ok(())
+}
+
 /// One side of a [`SplitPair`]: the capture node and the descriptor facts of
 /// the USB device behind it. Both sides of a split pair are ordinary
 /// single-camera observations, so this is the same shape
@@ -2725,6 +2855,178 @@ mod split_pair {
                 SideRefusal::LocationMismatch
             ))],
             "an unrecognized hub product refuses on LocationMismatch"
+        );
+    }
+}
+
+#[cfg(test)]
+mod split_revalidation_tests {
+    //! The two-incarnation revalidation of ADR-0032 §5: both sides match one
+    //! current publication or the caller releases both leases and opens
+    //! neither side.
+    use super::*;
+    use crate::inventory::ClassifiedEndpoint;
+
+    fn publication() -> (
+        irlume_common::live_camera::CameraInventorySnapshot,
+        Vec<ClassifiedEndpoint>,
+    ) {
+        (
+            irlume_common::live_camera::CameraInventorySnapshot {
+                state: irlume_common::live_camera::CameraInventoryState::Current,
+                supervisor_id: Some("0123456789abcdef0123456789abcdef".into()),
+                revision: 7,
+                observed_ago_ms: Some(100),
+                reason: None,
+                candidates: vec![
+                    irlume_common::live_camera::CameraCandidate {
+                        instance_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                        generation: 1,
+                        endpoint_paths: vec!["/dev/video0".into()],
+                    },
+                    irlume_common::live_camera::CameraCandidate {
+                        instance_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                        generation: 2,
+                        endpoint_paths: vec!["/dev/video1".into()],
+                    },
+                ],
+            },
+            vec![
+                ClassifiedEndpoint {
+                    instance_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    generation: 1,
+                    endpoint: "/dev/video0".into(),
+                    role: Role::Rgb,
+                    identity: "5986:2113:s1".into(),
+                    controller: "0000:00:14.0".into(),
+                    domain: "usb2".into(),
+                    ports: vec![8],
+                },
+                ClassifiedEndpoint {
+                    instance_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                    generation: 2,
+                    endpoint: "/dev/video1".into(),
+                    role: Role::Ir,
+                    identity: "5986:1141:s2".into(),
+                    controller: "0000:00:14.0".into(),
+                    domain: "usb2".into(),
+                    ports: vec![5],
+                },
+            ],
+        )
+    }
+
+    fn rgb() -> SplitSideExpectation {
+        SplitSideExpectation {
+            instance_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            generation: 1,
+            endpoint: "/dev/video0".into(),
+            identity: "5986:2113:s1".into(),
+            controller: "0000:00:14.0".into(),
+            domain: "usb2".into(),
+            ports: vec![8],
+        }
+    }
+
+    fn ir() -> SplitSideExpectation {
+        SplitSideExpectation {
+            instance_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            generation: 2,
+            endpoint: "/dev/video1".into(),
+            identity: "5986:1141:s2".into(),
+            controller: "0000:00:14.0".into(),
+            domain: "usb2".into(),
+            ports: vec![5],
+        }
+    }
+
+    #[test]
+    fn revalidation_accepts_one_current_publication() {
+        assert_eq!(revalidate_against(&rgb(), &ir(), &publication()), Ok(()));
+    }
+
+    #[test]
+    fn revalidation_refuses_on_any_side_mismatch() {
+        let mut bad = rgb();
+        bad.identity = "5986:2113:other".into();
+        assert_eq!(
+            revalidate_against(&bad, &ir(), &publication()),
+            Err(SplitRevalidationRefusal::FactMismatch)
+        );
+        let mut bad = ir();
+        bad.ports = vec![6];
+        assert_eq!(
+            revalidate_against(&rgb(), &bad, &publication()),
+            Err(SplitRevalidationRefusal::FactMismatch)
+        );
+        let mut bad = rgb();
+        bad.endpoint = "/dev/video9".into();
+        assert_eq!(
+            revalidate_against(&bad, &ir(), &publication()),
+            Err(SplitRevalidationRefusal::SideMissing)
+        );
+        let mut bad = rgb();
+        bad.generation = 9;
+        assert_eq!(
+            revalidate_against(&bad, &ir(), &publication()),
+            Err(SplitRevalidationRefusal::SideMissing)
+        );
+    }
+
+    #[test]
+    fn revalidation_refuses_a_role_that_no_longer_holds() {
+        // The IR side's classified role is the RGB one at this publication:
+        // roles come from discovery's answer, never from the expectation.
+        let (_, mut classified) = publication();
+        classified[1].role = Role::Rgb;
+        let mixed = (publication().0, classified);
+        assert_eq!(
+            revalidate_against(&rgb(), &ir(), &mixed),
+            Err(SplitRevalidationRefusal::RoleMismatch)
+        );
+    }
+
+    #[test]
+    fn both_sides_must_hold_or_none_open() {
+        let mut stale = ir();
+        stale.identity = "5986:1141:gone".into();
+        assert_eq!(
+            revalidate_against(&rgb(), &stale, &publication()),
+            Err(SplitRevalidationRefusal::FactMismatch),
+            "the whole pair fails when either side is stale"
+        );
+    }
+
+    #[test]
+    fn a_reconnect_requires_fresh_live_proof() {
+        // ADR-0032 §5: a reconnect with an unchanged persistent key still
+        // requires fresh live proof. Two consecutive checks against changed
+        // publications show nothing is cached between attempts.
+        assert_eq!(revalidate_against(&rgb(), &ir(), &publication()), Ok(()));
+        let (mut snapshot, classified) = publication();
+        snapshot.revision = 8;
+        assert_eq!(
+            revalidate_against(&rgb(), &ir(), &(snapshot, classified)),
+            Ok(()),
+            "the revision is not part of the incarnation facts"
+        );
+        let (mut snapshot, mut classified) = publication();
+        classified.remove(1);
+        snapshot.candidates.clear();
+        assert_eq!(
+            revalidate_against(&rgb(), &ir(), &(snapshot, classified)),
+            Err(SplitRevalidationRefusal::SideMissing),
+            "a side that left during capture refuses; nothing is retargeted"
+        );
+    }
+
+    #[test]
+    fn revalidation_refuses_when_the_publication_is_not_current() {
+        let (mut snapshot, classified) = publication();
+        snapshot.state = irlume_common::live_camera::CameraInventoryState::Refreshing;
+        assert_eq!(
+            revalidate_against(&rgb(), &ir(), &(snapshot, classified)),
+            Err(SplitRevalidationRefusal::PublicationUnavailable)
         );
     }
 }

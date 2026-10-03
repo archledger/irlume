@@ -496,6 +496,36 @@ pair.2.ir_domain=usb2\npair.2.ir_ports=5\n";
     }
 
     #[test]
+    fn incarnation_ids_are_not_credential_identity() {
+        // ADR-0032 §5: runtime incarnation ids are never persisted as
+        // credential identity. The authorization record holds durable facts
+        // only; instance ids and generations stay in the live publication.
+        let records = vec![AuthorizationRecord {
+            rgb: SideFields {
+                identity: "5986:2113:s1".into(),
+                path: "/dev/video0".into(),
+                controller: "0000:00:14.0".into(),
+                domain: SplitDomain::Usb2,
+                ports: vec![8],
+            },
+            ir: SideFields {
+                identity: "5986:1141:s2".into(),
+                path: "/dev/video1".into(),
+                controller: "0000:00:14.0".into(),
+                domain: SplitDomain::Usb2,
+                ports: vec![5],
+            },
+        }];
+        let text = serialize_generation(&records).unwrap();
+        for forbidden in ["instance", "generation", "supervisor"] {
+            assert!(
+                !text.contains(forbidden),
+                "the record must not persist {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn a_value_with_a_line_separator_is_malformed() {
         let text = "version=1\npair.0.rgb_identity=a\u{2028}\n";
         assert!(matches!(

@@ -52,8 +52,10 @@ pub enum SplitRevalidationRefusal {
 /// Revalidate both sides of a split capture against ONE current publication
 /// (ADR-0032 §5): identity, qualified location, recorded path and classified
 /// role for each side. The two incarnations are checked together or not at
-/// all: a caller that fails this check releases both leases and opens
-/// neither side. Camera-free: reads the already-published inventory only.
+/// all. This observation alone reserves no device; use
+/// [`crate::lease::acquire_split_camera_operation`] for a session that binds
+/// validation and opens to the same two leases. Camera-free: reads only the
+/// already-published inventory.
 ///
 /// # Errors
 /// [`SplitRevalidationRefusal`] naming what no longer matches.
@@ -82,6 +84,24 @@ pub fn revalidate_against(
     if snapshot.validate().is_err() || snapshot.state != CameraInventoryState::Current {
         return Err(SplitRevalidationRefusal::PublicationUnavailable);
     }
+    let present = |side: &SplitSideExpectation| {
+        snapshot.candidates.iter().any(|candidate| {
+            candidate.instance_id == side.instance_id
+                && candidate.generation == side.generation
+                && candidate.endpoint_paths.contains(&side.endpoint)
+        })
+    };
+    if !present(rgb) || !present(ir) {
+        return Err(SplitRevalidationRefusal::SideMissing);
+    }
+    if rgb.instance_id == ir.instance_id
+        || (rgb.identity == ir.identity
+            && rgb.controller == ir.controller
+            && rgb.domain == ir.domain
+            && rgb.ports == ir.ports)
+    {
+        return Err(SplitRevalidationRefusal::FactMismatch);
+    }
     check_side(rgb, Role::Rgb, classified)?;
     check_side(ir, Role::Ir, classified)
 }
@@ -100,6 +120,18 @@ fn check_side(
         })
         .ok_or(SplitRevalidationRefusal::SideMissing)?;
     if found.role != role {
+        return Err(SplitRevalidationRefusal::RoleMismatch);
+    }
+    if classified
+        .iter()
+        .filter(|candidate| {
+            candidate.instance_id == side.instance_id
+                && candidate.generation == side.generation
+                && candidate.role == role
+        })
+        .count()
+        != 1
+    {
         return Err(SplitRevalidationRefusal::RoleMismatch);
     }
     if found.identity != side.identity
@@ -2846,7 +2878,18 @@ mod split_revalidation_tests {
                 revision: 7,
                 observed_ago_ms: Some(100),
                 reason: None,
-                candidates: vec![],
+                candidates: vec![
+                    irlume_common::live_camera::CameraCandidate {
+                        instance_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                        generation: 1,
+                        endpoint_paths: vec!["/dev/video0".into()],
+                    },
+                    irlume_common::live_camera::CameraCandidate {
+                        instance_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                        generation: 2,
+                        endpoint_paths: vec!["/dev/video1".into()],
+                    },
+                ],
             },
             vec![
                 ClassifiedEndpoint {

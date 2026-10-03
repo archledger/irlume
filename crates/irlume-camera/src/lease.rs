@@ -65,6 +65,10 @@ pub enum CameraLeaseError {
     EndpointNotCovered,
     AmbiguousEndpointBinding,
     InvalidEndpoint(String),
+    /// Split capture is not enabled for enrollment or authentication.
+    SplitActivationDisabled,
+    /// One stream is already active on a split operation.
+    SplitRequiresSequential,
 }
 
 impl std::fmt::Display for CameraLeaseError {
@@ -104,6 +108,12 @@ impl std::fmt::Display for CameraLeaseError {
                 formatter.write_str("camera endpoint is covered by multiple lease references")
             }
             Self::InvalidEndpoint(message) => formatter.write_str(message),
+            Self::SplitActivationDisabled => {
+                formatter.write_str("split enrollment and authentication are not enabled")
+            }
+            Self::SplitRequiresSequential => {
+                formatter.write_str("split capture requires sequential streaming")
+            }
         }
     }
 }
@@ -199,6 +209,52 @@ pub fn acquire_camera_operation(
         }
     }
     result
+}
+
+/// Runtime expectations from one classified inventory publication. These are
+/// not credential identity and must not be persisted in an enrollment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitLeaseRequest {
+    /// Supervisor that supplied the displayed facts.
+    pub supervisor_id: String,
+    /// Publication revision that supplied the displayed facts.
+    pub revision: u64,
+    /// RGB incarnation and persistent facts.
+    pub rgb: crate::SplitSideExpectation,
+    /// IR incarnation and persistent facts.
+    pub ir: crate::SplitSideExpectation,
+}
+
+/// Reserve both split-camera instances atomically and bind all subsequent
+/// endpoint/stream validation to the supplied facts. Only diagnostics, setup
+/// and preview may use this primitive while the activation gate is closed.
+///
+/// # Errors
+/// Refuses stale facts, contention, unsupported operations or unavailable
+/// inventory. Failure retains neither instance; ordinary acquisition remains
+/// unchanged and still refuses cross-device endpoint sets.
+pub fn acquire_split_camera_operation(
+    expected: &SplitLeaseRequest,
+    operation: CameraOperationKind,
+    timeout: Duration,
+) -> Result<CameraOperationSession, CameraLeaseError> {
+    if !matches!(
+        operation,
+        CameraOperationKind::Diagnostics
+            | CameraOperationKind::Setup
+            | CameraOperationKind::Preview
+    ) {
+        return Err(CameraLeaseError::SplitActivationDisabled);
+    }
+    let deadline =
+        Instant::now()
+            .checked_add(timeout)
+            .ok_or(CameraLeaseError::DeadlineExpired {
+                current_owner: None,
+            })?;
+    crate::backend::with_camera_supervisor(|supervisor| {
+        supervisor.acquire_split_operation(expected, operation, deadline)
+    })
 }
 
 #[derive(Default)]
@@ -326,6 +382,7 @@ struct CameraLeaseInner {
     operation: CameraOperationKind,
     state: Mutex<CameraSessionState>,
     streams: AtomicUsize,
+    split: Option<Box<SplitLeaseRequest>>,
 }
 
 impl Drop for CameraLeaseInner {
@@ -349,6 +406,45 @@ impl CameraLease {
         operation: CameraOperationKind,
         deadline: Instant,
     ) -> Result<Self, CameraLeaseError> {
+        Self::acquire_bound(authority, inventory, references, operation, deadline, None)
+    }
+
+    pub(crate) fn acquire_split(
+        authority: &Arc<LeaseAuthority>,
+        inventory: Arc<Mutex<CameraInventory>>,
+        expected: &SplitLeaseRequest,
+        operation: CameraOperationKind,
+        deadline: Instant,
+    ) -> Result<Self, CameraLeaseError> {
+        let references = {
+            let held = inventory.lock().map_err(|_| CameraLeaseError::Poisoned)?;
+            validate_split_publication(&held, expected, true)?;
+            [&expected.rgb.endpoint, &expected.ir.endpoint]
+                .iter()
+                .map(|path| {
+                    held.reference_for_endpoints(&[path.as_str()])
+                        .map_err(|_| CameraLeaseError::Stale)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Self::acquire_bound(
+            authority,
+            inventory,
+            references,
+            operation,
+            deadline,
+            Some(Box::new(expected.clone())),
+        )
+    }
+
+    fn acquire_bound(
+        authority: &Arc<LeaseAuthority>,
+        inventory: Arc<Mutex<CameraInventory>>,
+        references: Vec<CameraInventoryRef>,
+        operation: CameraOperationKind,
+        deadline: Instant,
+        split: Option<Box<SplitLeaseRequest>>,
+    ) -> Result<Self, CameraLeaseError> {
         validate_references(&inventory, &references)?;
         let keys = references
             .iter()
@@ -363,8 +459,19 @@ impl CameraLease {
                 operation,
                 state: Mutex::new(CameraSessionState::Acquiring),
                 streams: AtomicUsize::new(0),
+                split,
             }),
         };
+        if let Some(expected) = lease.inner.split.as_ref() {
+            // A waiter may have slept through reconciliation. Validate again
+            // after both keys are held; any refusal drops the complete permit.
+            let held = lease
+                .inner
+                .inventory
+                .lock()
+                .map_err(|_| CameraLeaseError::Poisoned)?;
+            validate_split_publication(&held, expected, true)?;
+        }
         lease.validate()?;
         lease.set_state(CameraSessionState::Acquired);
         Ok(lease)
@@ -394,7 +501,24 @@ impl CameraLease {
             CameraSessionState::Fault => return Err(CameraLeaseError::Poisoned),
             _ => {}
         }
-        if let Err(error) = validate_references(&self.inner.inventory, &self.inner.references) {
+        let validation = if let Some(expected) = self.inner.split.as_ref() {
+            let held = self
+                .inner
+                .inventory
+                .lock()
+                .map_err(|_| CameraLeaseError::Poisoned)?;
+            self.inner
+                .references
+                .iter()
+                .try_for_each(|reference| {
+                    held.validate_reference(reference)
+                        .map_err(|_| CameraLeaseError::Stale)
+                })
+                .and_then(|()| validate_split_publication(&held, expected, false))
+        } else {
+            validate_references(&self.inner.inventory, &self.inner.references)
+        };
+        if let Err(error) = validation {
             self.set_state(CameraSessionState::ContinuityLost);
             return Err(error);
         }
@@ -402,6 +526,9 @@ impl CameraLease {
     }
 
     pub fn covers_endpoint(&self, path: &str) -> bool {
+        if let Some(expected) = self.inner.split.as_ref() {
+            return path == expected.rgb.endpoint || path == expected.ir.endpoint;
+        }
         self.inner
             .references
             .iter()
@@ -429,7 +556,7 @@ impl CameraLease {
         path: &str,
         stream_role: StreamRole,
     ) -> Result<FrameBinding, CameraLeaseError> {
-        self.validate()?;
+        self.require_stream_role(path, stream_role)?;
         let mut matching = self
             .inner
             .references
@@ -457,6 +584,28 @@ impl CameraLease {
             .unwrap_or(CameraSessionState::Fault)
     }
 
+    pub(crate) fn require_stream_role(
+        &self,
+        path: &str,
+        stream_role: StreamRole,
+    ) -> Result<(), CameraLeaseError> {
+        self.require_endpoint(path)?;
+        if let Some(expected) = self.inner.split.as_ref() {
+            if (path == expected.rgb.endpoint && stream_role != StreamRole::Rgb)
+                || (path == expected.ir.endpoint && stream_role != StreamRole::Ir)
+            {
+                return Err(CameraLeaseError::EndpointNotCovered);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this permit reserves two matched incarnations. Capture
+    /// code must carry this fact into evidence, never infer it from skew.
+    pub fn is_split_pair(&self) -> bool {
+        self.inner.split.is_some()
+    }
+
     pub(crate) fn start_stream(&self) -> Result<(), CameraLeaseError> {
         self.validate()?;
         let mut state = self
@@ -465,6 +614,9 @@ impl CameraLease {
             .lock()
             .map_err(|_| CameraLeaseError::Poisoned)?;
         let from = *state;
+        if self.inner.split.is_some() && self.inner.streams.load(Ordering::SeqCst) != 0 {
+            return Err(CameraLeaseError::SplitRequiresSequential);
+        }
         if !matches!(
             from,
             CameraSessionState::Acquired
@@ -519,6 +671,25 @@ fn validate_references(
             .map_err(|_| CameraLeaseError::Stale)?;
     }
     Ok(())
+}
+
+fn validate_split_publication(
+    inventory: &CameraInventory,
+    expected: &SplitLeaseRequest,
+    require_revision: bool,
+) -> Result<(), CameraLeaseError> {
+    let snapshot = inventory.snapshot();
+    if snapshot.supervisor_id.as_deref() != Some(expected.supervisor_id.as_str())
+        || (require_revision && snapshot.revision != expected.revision)
+    {
+        return Err(CameraLeaseError::Stale);
+    }
+    crate::connected::revalidate_against(
+        &expected.rgb,
+        &expected.ir,
+        &(snapshot, inventory.classified_endpoints()),
+    )
+    .map_err(|_| CameraLeaseError::Stale)
 }
 
 pub struct CameraOperationSession {

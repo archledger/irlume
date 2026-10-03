@@ -10955,10 +10955,16 @@ mod tests {
         // ADR-0032 §5: the split marker is provenance from the capture, not
         // an elapsed-time rule. At zero skew a split pair still defers the
         // RGB-primary arm; only the IR-identity-verified arms may grant.
-        assert!(
-            !rgb_primary_grant_admissible(0.90, 0.60, true),
-            "the posture the grant arms read refuses RGB-primary"
-        );
+        let (_, mut assessment) = engine_tests::pad_matching_fixture(0.0, false);
+        assessment.split_pair = true;
+        for skew in [std::time::Duration::ZERO, MAX_CROSS_SPECTRUM_SKEW] {
+            assessment.sequential_pair = pair_admitted_sequentially(skew, true);
+            assert!(assessment.sequential_posture());
+            assert!(
+                !rgb_primary_grant_admissible(0.90, 0.60, assessment.sequential_posture()),
+                "split provenance must refuse RGB-primary independently of skew"
+            );
+        }
         // `pair_admitted_sequentially` keeps its ordinary meaning and never
         // manufactures the marker: it is a skew rule for one physical pair.
         assert!(!pair_admitted_sequentially(std::time::Duration::ZERO, true));
@@ -10969,7 +10975,10 @@ mod tests {
         // The RGB-primary arm and both fusion arms must read the posture that
         // includes the split marker (ADR-0032 §5, ADR-0014). Pinned by source
         // shape so a future gate cannot silently revert to the skew field.
-        let source = include_str!("lib.rs");
+        let source = include_str!("lib.rs")
+            .split("\nmod tests {")
+            .next()
+            .unwrap();
         assert!(
             source.contains("rgb_primary_grant_admissible(score, thr, a.sequential_posture())"),
             "the RGB-primary arm must read the posture"
@@ -10986,12 +10995,15 @@ mod tests {
         // split capture path (later wiring) and tests set it. A derivation
         // from skew would show up as a `split_pair:` construction beside the
         // skew rule.
-        let source = include_str!("lib.rs");
+        let source = include_str!("lib.rs")
+            .split("\nmod tests {")
+            .next()
+            .unwrap();
         assert!(
             source.contains("split_pair: false,"),
             "production constructions carry the marker as provenance, not a derivation"
         );
-        let constructed_true = format!("split_pair: {}:", true).replace(':', ",");
+        let constructed_true = format!("split_pair: {},", true);
         assert!(
             !source.contains(&constructed_true),
             "nothing in production may construct the marker true"
@@ -13131,7 +13143,7 @@ mod engine_tests {
     fn unknown_ir_preserves_rgb_grants_and_denies_ir_dependent_paths() {
         let _guard = env_guard();
         let mut s = shared();
-        for case in ["rgb", "below-rgb", "sequential", "dark"] {
+        for case in ["rgb", "below-rgb", "sequential", "split", "dark"] {
             let (mut enr, mut a) = pad_matching_fixture(0.0, false);
             let identity = a.embedding.unwrap();
             enr.profiles[0].scans[0].ir = Some(identity.to_vec());
@@ -13143,6 +13155,7 @@ mod engine_tests {
                     a.embedding = Some(other);
                 }
                 "sequential" => a.sequential_pair = true,
+                "split" => a.split_pair = true,
                 "dark" => {
                     a.embedding = None;
                     a.rgb_frame_mean = 0.0;

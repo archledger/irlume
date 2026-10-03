@@ -313,10 +313,25 @@ pub(crate) mod tests {
         let _g = crate::test_support::env_read();
         let fixture = Fixture::new();
         let exe = std::env::current_exe().unwrap();
-        let cli = exe.parent().unwrap().parent().unwrap().join("irlume");
+        // Instrumented Cargo builds can place this test outside debug/deps.
+        // Their runner supplies the CLI's compiler-artifact executable receipt.
+        // Keep the ordinary stable workspace build usable without an override.
+        let cli = match std::env::var_os("IRLUME_TEST_CLI") {
+            Some(path) => PathBuf::from(path),
+            None => {
+                let deps = exe.parent().unwrap();
+                assert_eq!(
+                    deps.file_name().unwrap(),
+                    "deps",
+                    "pass IRLUME_TEST_CLI from Cargo's compiler-artifact executable receipt"
+                );
+                deps.parent().unwrap().join("irlume")
+            }
+        };
         assert!(
             cli.is_file(),
-            "build the workspace CLI before this integration test"
+            "build the matching workspace CLI before this integration test: {}",
+            cli.display()
         );
         for dir in ["trusted", "pam", "units", "lock"] {
             std::fs::create_dir(fixture.0.join(dir)).unwrap();

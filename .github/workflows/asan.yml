@@ -118,7 +118,7 @@ jobs:
       - name: Install nightly Rust (-Zsanitizer is unstable)
         # @master (declares the `toolchain` input); the version tag branches
         # have no such input and ignore `with: toolchain:`.
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master snapshot (2026-09-12)
         with:
           toolchain: nightly
           # The sanitizer runtimes ship with the standard library for the
@@ -141,6 +141,7 @@ jobs:
           echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
 
       - name: test (instrumented with AddressSanitizer + LeakSanitizer)
+        shell: bash
         env:
           RUSTFLAGS: -Zsanitizer=address
           # A leak report names the allocation, not the leak's owner, so keep
@@ -148,6 +149,21 @@ jobs:
           # test function that allocated it.
           ASAN_OPTIONS: detect_stack_use_after_return=1
         run: |
+          # Use the executable Cargo actually built, under this exact nightly,
+          # target and RUSTFLAGS. Test executables need not live in debug/deps.
+          cli=$(cargo +nightly build --locked -p irlume-cli --bin irlume \
+            --target x86_64-unknown-linux-gnu --message-format=json | python3 -c '
+          import json, sys
+          paths = [row["executable"] for row in map(json.loads, sys.stdin)
+                   if row.get("reason") == "compiler-artifact"
+                   and row.get("target", {}).get("name") == "irlume"
+                   and row.get("target", {}).get("kind") == ["bin"]
+                   and row.get("profile", {}).get("test") is False
+                   and row.get("executable")]
+          assert len(paths) == 1, paths
+          print(paths[0])
+          ')
+          export IRLUME_TEST_CLI="$cli"
           # print_suppressions puts "Suppressions used:" in the log, so a reader
           # can see the deliberate leak was matched rather than assume it.
           # Guarded because `cargo test` exits 0 even when it discovers no tests

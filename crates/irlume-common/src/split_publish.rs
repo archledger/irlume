@@ -62,6 +62,13 @@ pub enum SplitReadState {
         /// Referenced generation retained for root diagnostics.
         generation: u64,
     },
+    /// The generation is valid, but its configured selection does not resolve.
+    UnresolvedSelection {
+        /// Referenced generation retained for root diagnostics.
+        generation: u64,
+        /// Number of verified records in that generation.
+        record_count: usize,
+    },
     /// The referenced generation's bytes do not match `split_digest`.
     DigestMismatch {
         /// Parsed reference whose bytes failed verification.
@@ -404,7 +411,10 @@ fn read_generation(
                                 selected: Some(key),
                             }
                         }
-                        _ => SplitReadState::MalformedGeneration { generation },
+                        _ => SplitReadState::UnresolvedSelection {
+                            generation,
+                            record_count: records.len(),
+                        },
                     },
                 },
             }
@@ -787,7 +797,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             read_split(),
-            SplitReadState::MalformedGeneration { generation: 1 }
+            SplitReadState::UnresolvedSelection {
+                generation: 1,
+                record_count: 1
+            }
         );
         drop(env);
     }

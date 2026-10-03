@@ -516,9 +516,14 @@ fn request_with_timeouts_inner(
         cancelled: cancelled.unwrap_or(&never_cancelled),
         deadline: observation_deadline.unwrap_or_else(|| std::time::Instant::now() + rw_timeout),
     };
-    let buf = read_response_line(reader.by_ref().take(MAX_RESPONSE_BYTES))
-        .map_err(map_connect_failure)?;
-    if buf.len() as u64 >= MAX_RESPONSE_BYTES {
+    let response_limit = if matches!(req, Request::ListSplitAuthorizations) {
+        crate::split_wire::MAX_SPLIT_RESPONSE_BYTES
+    } else {
+        MAX_RESPONSE_BYTES
+    };
+    let buf =
+        read_response_line(reader.by_ref().take(response_limit)).map_err(map_connect_failure)?;
+    if buf.len() as u64 >= response_limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "response exceeded the size limit; refusing it",
@@ -1058,28 +1063,33 @@ mod tests {
     #[test]
     fn an_oversized_reply_is_refused_by_length_not_read_forever() {
         let _g = testenv::lock();
-        let path = sock("huge");
-        let listener = UnixListener::bind(&path).unwrap();
-        std::env::set_var("IRLUME_SOCKET", &path);
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut line = String::new();
-            let _ = BufReader::new(&stream).read_line(&mut line);
-            // No newline anywhere, more than the cap: the shape a peer that is
-            // not the daemon uses to make a client read without end.
-            let flood = vec![b'x'; MAX_RESPONSE_BYTES as usize * 2];
-            let _ = (&stream).write_all(&flood);
-        });
-        let err = request_with_timeout(&Request::Ping, Duration::from_secs(5))
-            .expect_err("an unbounded reply must be refused");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(
-            err.to_string().contains("response exceeded the size limit"),
-            "got: {err}"
-        );
-        let _ = server.join();
-        std::env::remove_var("IRLUME_SOCKET");
-        let _ = std::fs::remove_file(&path);
+        for (request, limit) in [
+            (Request::Ping, 64 * 1024),
+            (Request::ListSplitAuthorizations, 1024 * 1024),
+        ] {
+            let path = sock("huge");
+            let listener = UnixListener::bind(&path).unwrap();
+            std::env::set_var("IRLUME_SOCKET", &path);
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                let _ = BufReader::new(&stream).read_line(&mut line);
+                // No newline anywhere, more than the cap: the shape a peer that is
+                // not the daemon uses to make a client read without end.
+                let flood = vec![b'x'; limit * 2];
+                let _ = (&stream).write_all(&flood);
+            });
+            let err = request_with_timeout(&request, Duration::from_secs(5))
+                .expect_err("an unbounded reply must be refused");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                err.to_string().contains("response exceeded the size limit"),
+                "got: {err}"
+            );
+            let _ = server.join();
+            std::env::remove_var("IRLUME_SOCKET");
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     #[test]

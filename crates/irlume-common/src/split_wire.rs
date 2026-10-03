@@ -11,6 +11,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Opt-in listing limit, including JSON framing. A 64 KiB generation can
+/// expand through JSON escaping and canonical keys; leave room for candidates.
+/// Other requests retain the client's ordinary 64 KiB reply limit.
+pub const MAX_SPLIT_RESPONSE_BYTES: u64 = 1024 * 1024;
+
 /// The displayed guard for one side of a split mutation (ADR-0032 §4): the
 /// instance id, generation and selected endpoint from the displayed inventory.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +81,9 @@ pub enum SplitRecordSide {
 /// One authorization record as a reply carries it (RGB then IR).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SplitRecordView {
+    /// Canonical pair key, present only for root. Older replies omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     /// The RGB side.
     pub rgb: SplitRecordSide,
     /// The IR side.
@@ -391,6 +399,7 @@ mod tests {
             revision: 7,
             store_state: SplitStoreState::Valid,
             records: vec![SplitRecordView {
+                key: None,
                 rgb: SplitRecordSide::Root(SplitSideFacts {
                     identity: "a:1".into(),
                     path: "/dev/video0".into(),

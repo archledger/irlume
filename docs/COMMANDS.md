@@ -105,6 +105,10 @@ do not enable split-pair enrollment or authentication.
 | `irlume split select 'PAIRKEY' --guard JSON` | yes | select an authorized pair after checking its displayed incarnations and facts |
 | `irlume split select --clear --guard JSON` | yes | clear the selection using the displayed guard |
 
+Root listings include each saved record's canonical `key` for `select` and
+`remove`; non-root listings omit it. Split listings use a bounded 1 MiB socket
+reply envelope to accommodate JSON escaping of the 64 KiB generation store.
+
 Start with `sudo irlume split list`. Its `candidates` entries carry `role`,
 `guard` and `facts.Root`. Copy the RGB and IR guards, unchanged, into:
 

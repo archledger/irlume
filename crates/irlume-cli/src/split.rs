@@ -148,6 +148,8 @@ pub(crate) fn split_request(args: &[String]) -> Result<Request, &'static str> {
             // `--clear` selects nothing; the empty pair text clears.
             let pair = if key == "--clear" {
                 String::new()
+            } else if key.starts_with('-') {
+                return Err("select needs a pair key or --clear");
             } else {
                 key.to_owned()
             };
@@ -282,5 +284,17 @@ mod tests {
         ] {
             assert!(split_request(&args).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn review_select_rejects_option_like_keys_before_dispatch() {
+        let guard = r#"{"supervisor_id":"0123456789abcdef0123456789abcdef","revision":7,"rgb":{"instance_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","generation":1,"endpoint":"/dev/video0"},"ir":{"instance_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":2,"endpoint":"/dev/video1"}}"#;
+        for key in ["--json", "--contract=1", "--unknown"] {
+            assert!(split_request(&argv(&["split", "select", key, "--guard", guard])).is_err());
+        }
+        assert!(matches!(
+            split_request(&argv(&["split", "select", "--clear", "--guard", guard])),
+            Ok(Request::SelectSplitPair { pair, .. }) if pair.is_empty()
+        ));
     }
 }

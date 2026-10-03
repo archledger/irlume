@@ -7139,7 +7139,9 @@ fn split_list_response(
             } => (SplitStoreState::Valid, records, selected, true),
             SplitReadState::Absent => (SplitStoreState::Absent, Vec::new(), None, true),
             SplitReadState::Unreadable => (SplitStoreState::Unreadable, Vec::new(), None, false),
-            SplitReadState::Malformed | SplitReadState::MalformedGeneration { .. } => {
+            SplitReadState::Malformed
+            | SplitReadState::MalformedGeneration { .. }
+            | SplitReadState::UnresolvedSelection { .. } => {
                 (SplitStoreState::Malformed, Vec::new(), None, false)
             }
             SplitReadState::DigestMismatch { .. } => {
@@ -7174,13 +7176,19 @@ fn split_list_response(
             SplitSelectionView::ShareSafe { resolves }
         }
     });
-    Response::SplitInventory(SplitPublicationView {
+    let response = Response::SplitInventory(SplitPublicationView {
         supervisor_id: snapshot.supervisor_id.clone().unwrap_or_default(),
         revision: snapshot.revision,
         store_state,
         records: records
             .iter()
             .map(|record| SplitRecordView {
+                key: root.then(|| {
+                    record
+                        .pair_key()
+                        .format_canonical()
+                        .expect("validated record")
+                }),
                 rgb: side_view(&record.rgb),
                 ir: side_view(&record.ir),
             })
@@ -7242,7 +7250,15 @@ fn split_list_response(
         } else {
             Vec::new()
         },
-    })
+    });
+    match serde_json::to_vec(&response) {
+        Ok(bytes)
+            if (bytes.len() as u64) + 1 < irlume_common::split_wire::MAX_SPLIT_RESPONSE_BYTES =>
+        {
+            response
+        }
+        _ => Response::Error("split listing exceeds the bounded response size".into()),
+    }
 }
 
 /// Split store status (ADR-0032 §4.1.7). Root-only at the posture table.
@@ -7283,6 +7299,15 @@ fn split_status_response() -> Response {
         SplitReadState::MalformedGeneration { generation } => Response::SplitStatusView {
             state: SplitStoreState::Malformed,
             record_count: 0,
+            generation: Some(generation),
+            selection_resolves: false,
+        },
+        SplitReadState::UnresolvedSelection {
+            generation,
+            record_count,
+        } => Response::SplitStatusView {
+            state: SplitStoreState::Malformed,
+            record_count,
             generation: Some(generation),
             selection_resolves: false,
         },
@@ -25444,6 +25469,94 @@ mod split_management_tests {
             irlume_common::split_publish::read_split(),
             irlume_common::split_publish::SplitReadState::Absent
         );
+    }
+
+    #[test]
+    fn split_review_unresolved_selection_keeps_record_count() {
+        let _env = env();
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &publication()),
+            Response::Ok(_)
+        ));
+        let missing = pair_text().replace("s1", "missing");
+        irlume_common::config::publish_kv_changes("cameras.conf", &[("split_pair", &missing)], &[])
+            .unwrap();
+        assert!(matches!(
+            split_status_response(),
+            Response::SplitStatusView {
+                state: SplitStoreState::Malformed,
+                record_count: 1,
+                generation: Some(1),
+                selection_resolves: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn split_review_root_records_supply_removal_key() {
+        let _env = env();
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &publication()),
+            Response::Ok(_)
+        ));
+        let root = serde_json::to_value(split_list_response(0, &publication())).unwrap();
+        let key = root["SplitInventory"]["records"][0]["key"]
+            .as_str()
+            .expect("root key");
+        assert_eq!(key, pair_text());
+        let public = serde_json::to_value(split_list_response(1000, &publication())).unwrap();
+        assert!(public["SplitInventory"]["records"][0].get("key").is_none());
+        assert!(matches!(split_remove_response(key), Response::Ok(_)));
+    }
+
+    #[test]
+    fn split_review_large_valid_listing_round_trips_through_client() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let env = env();
+        let records: Vec<_> = (0..16)
+            .map(|index| {
+                let mut rgb = split_side_fields(&rgb_facts()).unwrap();
+                let mut ir = split_side_fields(&ir_facts()).unwrap();
+                rgb.identity = format!("{index:02}{}", "\"".repeat(940));
+                ir.identity = format!("{index:02}{}", "\\".repeat(940));
+                rgb.controller = "\"".repeat(940);
+                ir.controller = "\\".repeat(940);
+                irlume_common::split_schema::AuthorizationRecord { rgb, ir }
+            })
+            .collect();
+        irlume_common::split_publish::publish_split(&records, None).unwrap();
+        let reply = split_list_response(0, &publication());
+        let mut bytes = serde_json::to_vec(&reply).unwrap();
+        bytes.push(b'\n');
+        assert!(
+            bytes.len() > 64 * 1024,
+            "exercise expansion beyond the ordinary limit"
+        );
+        let socket = env.dir.join("listing.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let old_socket = std::env::var_os("IRLUME_SOCKET");
+        std::env::set_var("IRLUME_SOCKET", &socket);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(&stream).read_line(&mut request).unwrap();
+            let _ = stream.write_all(&bytes);
+        });
+        let result = irlume_common::client::request_with_timeout(
+            &Request::ListSplitAuthorizations,
+            std::time::Duration::from_secs(5),
+        );
+        server.join().unwrap();
+        match old_socket {
+            Some(value) => std::env::set_var("IRLUME_SOCKET", value),
+            None => std::env::remove_var("IRLUME_SOCKET"),
+        }
+        let Response::SplitInventory(view) = result.expect("valid large listing") else {
+            panic!("listing response");
+        };
+        assert_eq!(view.records.len(), 16);
+        assert_eq!(view.candidates.len(), 2);
     }
 
     #[test]

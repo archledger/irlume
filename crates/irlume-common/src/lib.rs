@@ -20,6 +20,8 @@ pub mod journal_out;
 pub mod live;
 pub mod live_camera;
 pub mod memlock;
+#[doc(hidden)]
+pub mod pam_lock_handoff;
 pub mod pam_service;
 pub mod platform;
 pub mod process;

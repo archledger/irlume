@@ -52,6 +52,53 @@ profile irlumed /usr/local/bin/irlumed {
   /usr/local/bin/irlumed mrix,
   signal (send, receive) set=(kill, chld) peer=irlumed,
 
+  # Token arm: the fixed CLI helper inherits this profile, including the
+  # service's read-only /etc view. No unconfined exec or PAM write grant.
+  /usr/{bin,local/bin}/irlume mrix,
+  /usr/bin/ r,
+  /usr/local/ r,
+  /usr/local/bin/ r,
+  /run/irlume/ rw,
+  /run/irlume/pam.lock rwk,
+  /run/lock/ r,
+  /run/lock/irlume-pam.lock rwk,
+  /run/lock/.irlume-pam.lock.* rwk,
+  # Existing CAP_FOWNER in the service bounding set permits replacing a
+  # foreign-owned legacy lock in the sticky /run/lock directory.
+  capability fowner,
+  /proc/locks r,
+  /etc/pam.d/ r,
+  /etc/pam.d/** r,
+  /usr/lib/pam.d/ r,
+  /usr/lib/pam.d/** r,
+  /{etc,run,usr/lib,usr/local/lib}/systemd/ r,
+  /{etc,run,usr/lib,usr/local/lib}/systemd/system/ r,
+  /{etc,run,usr/lib,usr/local/lib}/systemd/system/** r,
+  /etc/{gdm,gdm3,lightdm,sddm.conf.d,plasmalogin.conf.d,greetd,ly}/ r,
+  /etc/{gdm,gdm3,lightdm,sddm.conf.d,plasmalogin.conf.d,greetd,ly}/** r,
+  /etc/{sddm,plasmalogin}.conf r,
+  /etc/xdg/lightdm/ r,
+  /etc/xdg/lightdm/** r,
+  /usr/{share,local/share}/lightdm/ r,
+  /usr/{share,local/share}/lightdm/** r,
+  /usr/lib/{sddm,plasmalogin}/ r,
+  /usr/lib/{sddm,plasmalogin}/** r,
+  /run/{gdm,gdm3}/ r,
+  /run/{gdm,gdm3}/custom.conf r,
+  # GDM's selected package and executable are read-only authority.
+  /usr/bin/{systemctl,dpkg-query,md5sum} mrix,
+  /usr/sbin/ r,
+  /usr/sbin/gdm{,3} r,
+  /usr/bin/gdm r,
+  /var/lib/dpkg/ r,
+  /var/lib/dpkg/** r,
+  dbus (send) bus=system path=/org/freedesktop/systemd1
+       interface=org.freedesktop.systemd1.Manager member={GetUnit,LoadUnit}
+       peer=(name=org.freedesktop.systemd1),
+  dbus (send) bus=system path=/org/freedesktop/systemd1/unit/*
+       interface=org.freedesktop.DBus.Properties member={Get,GetAll}
+       peer=(name=org.freedesktop.systemd1),
+
   # Device-class enumeration (camera discovery walks /sys/class).
   /sys/class/ r,
   /sys/class/*/ r,

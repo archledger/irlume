@@ -18,6 +18,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- GNOME token arm and re-arm hold the PAM writer lock from the authoritative
+  delivery check through durable envelope publication. A private root CLI
+  helper transfers the primary and legacy lock descriptions to irlumed;
+  missing, older or untrusted helpers refuse token sealing. Ordinary disable
+  then either removes delivery before the check, making arm refuse, or sees
+  the published token and refuses removal (ADR-0003, 2026-10-03 amendment; #859).
+
 - GDM token-arm checks select Debian's or Ubuntu's configuration from the
   installed package owning the selected executable, excluding the other
   packaging's stale file. Removed packages, ambiguous ownership, replaced

@@ -123,6 +123,8 @@ root-or-account read, ask.
 
 ## Tests in this crate
 
+- Build `cargo build --locked -p irlume-cli` before the daemon suite: the
+  `token_delivery` private-root test runs the real installed sibling helper.
 - Take `env_lock()` (`test_support::env_read()` if the test only resolves
   users), then `engine()`, and declare the guard before `sandbox()` so the
   sandbox drops under it. `engine()` uses nonexistent devices and `IRLUME_FORCE_NO_IR=1`.

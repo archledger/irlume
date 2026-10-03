@@ -543,6 +543,16 @@ APPARMOR_PROFILES=(
 )
 APPARMOR_RUNTIME_RULES=(
   "signal (send, receive) set=(kill, chld) peer=irlumed,"
+  "/usr/{bin,local/bin}/irlume mrix,"
+  "/run/irlume/pam.lock rwk,"
+  "/run/lock/irlume-pam.lock rwk,"
+  "/run/lock/.irlume-pam.lock.* rwk,"
+  "capability fowner,"
+  "/proc/locks r,"
+  "/etc/pam.d/** r,"
+  "/usr/lib/pam.d/** r,"
+  "/usr/bin/{systemctl,dpkg-query,md5sum} mrix,"
+  "/var/lib/dpkg/** r,"
   "/usr/share/irlume/tflite/libtensorflowlite_c.so mr,"
   "/var/lib/systemd/pcrlock.json r,"
   "deny capability sys_ptrace,"

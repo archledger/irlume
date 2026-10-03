@@ -637,6 +637,77 @@ fn strip_remote_auth(etc: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Private daemon helper. No socket request or capability probe occurs here.
+pub(crate) fn token_lock_helper() -> ExitCode {
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    let serve = || -> Result<(), String> {
+        if effective_uid() != 0 {
+            return Err("token delivery lock helper requires root".into());
+        }
+        // SAFETY: fcntl validates stdin and creates a new owned descriptor.
+        let descriptor = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+        if descriptor < 0 {
+            return Err("private helper socket unavailable".into());
+        }
+        // SAFETY: descriptor was successfully duplicated and is uniquely owned.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        let mut socket = UnixStream::from(descriptor);
+        socket
+            .peer_addr()
+            .map_err(|_| "helper stdin is not a Unix socket")?;
+        // SAFETY: ucred contains plain integers; getsockopt fills the checked buffer.
+        let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of_val(&peer) as libc::socklen_t;
+        // SAFETY: peer and size are live writable buffers with their actual extent.
+        if unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                std::ptr::addr_of_mut!(peer).cast(),
+                &mut size,
+            )
+        } != 0
+            || size as usize != std::mem::size_of_val(&peer)
+            || peer.uid != 0
+        {
+            return Err("helper socket must originate from root".into());
+        }
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|e| e.to_string())?;
+        let mut bytes = zeroize::Zeroizing::new(Vec::new());
+        (&mut socket)
+            .take(4097)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.is_empty() || bytes.len() > 4096 {
+            return Err("invalid helper account".into());
+        }
+        let user = std::str::from_utf8(&bytes).map_err(|_| "invalid helper account")?;
+        if user.contains(['\0', '\n', '\r']) {
+            return Err("invalid helper account".into());
+        }
+        // Reuse the exact lock/recovery and delivery parser, including every
+        // legacy exclusion descriptor. The parent bounds this whole process.
+        let guard = lock_pam()?;
+        if let Some(reason) = token::token_delivery_refusal(user) {
+            return Err(reason);
+        }
+        guard
+            .handoff(&socket, Instant::now() + Duration::from_secs(1))
+            .map_err(|e| e.to_string())
+    };
+    match serve() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::FAILURE,
+    }
+}
+
 /// Every surface with a vendor path, with the recipe its override takes.
 fn override_surfaces() -> Vec<(&'static Svc, overrides::Recipe)> {
     GREETERS

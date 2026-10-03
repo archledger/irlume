@@ -51,6 +51,7 @@ pub fn output_with_input_until(
         input,
         deadline,
         Arc::clone(BUDGET.get_or_init(Default::default)),
+        None,
     )
 }
 
@@ -59,7 +60,29 @@ fn output_with_budget(
     deadline: Instant,
     budget: Arc<AtomicUsize>,
 ) -> io::Result<Output> {
-    output_with_budget_and_input(command, &[], deadline, budget)
+    output_with_budget_and_input(command, &[], deadline, budget, None)
+}
+
+/// Observe a short helper with an explicitly supplied stdin descriptor.
+///
+/// The caller owns the descriptor's input protocol and must arrange EOF or a
+/// bounded exchange. Child observation/reaping and output limits are unchanged.
+///
+/// # Errors
+/// Returns the spawn, output, resource-budget and deadline errors described by
+/// [`output_until`]. No input data is placed in command-line arguments.
+pub fn output_with_stdin_until(
+    command: &mut Command,
+    stdin: Stdio,
+    deadline: Instant,
+) -> io::Result<Output> {
+    output_with_budget_and_input(
+        command,
+        &[],
+        deadline,
+        Arc::clone(BUDGET.get_or_init(Default::default)),
+        Some(stdin),
+    )
 }
 
 fn output_with_budget_and_input(
@@ -67,6 +90,7 @@ fn output_with_budget_and_input(
     mut input: &[u8],
     deadline: Instant,
     budget: Arc<AtomicUsize>,
+    supplied_stdin: Option<Stdio>,
 ) -> io::Result<Output> {
     if input.len() > MAX_INPUT {
         return Err(io::Error::new(
@@ -79,11 +103,13 @@ fn output_with_budget_and_input(
     let reaper = Reaper::global()?;
     remaining(deadline)?;
     let child = command
-        .stdin(if input.is_empty() {
-            Stdio::null()
-        } else {
-            Stdio::piped()
-        })
+        .stdin(supplied_stdin.unwrap_or_else(|| {
+            if input.is_empty() {
+                Stdio::null()
+            } else {
+                Stdio::piped()
+            }
+        }))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -324,6 +350,32 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn supplied_stdin_socket_remains_bidirectional() {
+        use std::net::Shutdown;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let (mut parent, child) = UnixStream::pair().unwrap();
+        parent
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        parent.write_all(b"private query\n").unwrap();
+        parent.shutdown(Shutdown::Write).unwrap();
+        let child: OwnedFd = child.into();
+        let output = output_with_stdin_until(
+            Command::new("/bin/sh").args(["-c", "read -r request && printf '%s' \"$request\" >&0"]),
+            Stdio::from(child),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let mut reply = String::new();
+        parent.read_to_string(&mut reply).unwrap();
+        assert_eq!(reply, "private query");
+        assert!(output.stdout.is_empty());
+    }
 
     #[test]
     fn reaper_creation_retries_after_transient_thread_failure() {

@@ -106,6 +106,13 @@ fn main() -> std::process::ExitCode {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--internal-token-delivery-lock-v1") {
+        return if args.len() == 1 {
+            pamwire::token_lock_helper()
+        } else {
+            std::process::ExitCode::FAILURE
+        };
+    }
     // A TYPED `--user` that names nobody is a typo, and every per-user command
     // answers a typo with the same empty state a real but unenrolled user
     // produces ("none enrolled", "not armed"), so the operator cannot tell which

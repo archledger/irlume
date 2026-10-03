@@ -7028,6 +7028,9 @@ fn split_remove_response(pair_text: &str) -> Response {
     }
     let kept = selected.filter(|k| *k != key && records.iter().any(|r| r.pair_key() == *k));
     match irlume_common::split_publish::publish_split(&records, kept.as_ref()) {
+        Ok(_) if records.is_empty() => {
+            Response::Ok("split authorization removed; store is absent".into())
+        }
         Ok(published) => Response::Ok(format!(
             "split authorization removed; generation {} published",
             published.generation
@@ -7110,6 +7113,12 @@ fn split_select_response(
 
 /// The opt-in listing (ADR-0032 §6): root receives full facts, non-root
 /// share-safe projections only.
+fn split_controller_label(controller: &str) -> String {
+    irlume_common::diagnostics::SafeLabel::new(controller)
+        .map(|label| label.as_str().to_owned())
+        .unwrap_or_else(|_| "unavailable".into())
+}
+
 fn split_list_response(
     peer_uid: u32,
     publication: &(
@@ -7130,7 +7139,9 @@ fn split_list_response(
             } => (SplitStoreState::Valid, records, selected, true),
             SplitReadState::Absent => (SplitStoreState::Absent, Vec::new(), None, true),
             SplitReadState::Unreadable => (SplitStoreState::Unreadable, Vec::new(), None, false),
-            SplitReadState::Malformed => (SplitStoreState::Malformed, Vec::new(), None, false),
+            SplitReadState::Malformed | SplitReadState::MalformedGeneration { .. } => {
+                (SplitStoreState::Malformed, Vec::new(), None, false)
+            }
             SplitReadState::DigestMismatch { .. } => {
                 (SplitStoreState::DigestMismatch, Vec::new(), None, false)
             }
@@ -7147,7 +7158,7 @@ fn split_list_response(
             })
         } else {
             SplitRecordSide::ShareSafe(SplitSideProjection {
-                controller_label: side.controller.clone(),
+                controller_label: split_controller_label(&side.controller),
                 domain_label: side.domain.as_str().to_owned(),
                 ports: side.ports.clone(),
             })
@@ -7220,7 +7231,7 @@ fn split_list_response(
                         })
                     } else {
                         SplitRecordSide::ShareSafe(SplitSideProjection {
-                            controller_label: endpoint.controller.clone(),
+                            controller_label: split_controller_label(&endpoint.controller),
                             domain_label: endpoint.domain.clone(),
                             ports: endpoint.ports.clone(),
                         })
@@ -7267,6 +7278,12 @@ fn split_status_response() -> Response {
             state: SplitStoreState::Malformed,
             record_count: 0,
             generation: None,
+            selection_resolves: false,
+        },
+        SplitReadState::MalformedGeneration { generation } => Response::SplitStatusView {
+            state: SplitStoreState::Malformed,
+            record_count: 0,
+            generation: Some(generation),
             selection_resolves: false,
         },
         SplitReadState::DigestMismatch { generation } => Response::SplitStatusView {
@@ -25362,6 +25379,71 @@ mod split_management_tests {
         };
         assert_eq!(state, SplitStoreState::DigestMismatch);
         assert_eq!(generation, Some(1));
+    }
+
+    #[test]
+    fn split_review_malformed_generation_status_keeps_its_number() {
+        let env = env();
+        let body = "version=2\n";
+        std::fs::create_dir_all(env.dir.join("split-pairs")).unwrap();
+        std::fs::write(env.dir.join("split-pairs/7.conf"), body).unwrap();
+        use sha2::{Digest, Sha256};
+        let digest = format!(
+            "sha256:{}",
+            Sha256::digest(body.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        irlume_common::config::publish_kv_changes(
+            "cameras.conf",
+            &[("split_generation", "7"), ("split_digest", &digest)],
+            &[],
+        )
+        .unwrap();
+        let Response::SplitStatusView {
+            state, generation, ..
+        } = split_status_response()
+        else {
+            panic!("status");
+        };
+        assert_eq!(state, SplitStoreState::Malformed);
+        assert_eq!(generation, Some(7));
+    }
+
+    #[test]
+    fn split_review_public_controller_label_rejects_path_text() {
+        let _env = env();
+        let mut rgb = split_side_fields(&rgb_facts()).unwrap();
+        rgb.controller = "/sys/devices/private-controller".into();
+        let record = irlume_common::split_schema::AuthorizationRecord {
+            rgb,
+            ir: split_side_fields(&ir_facts()).unwrap(),
+        };
+        irlume_common::split_publish::publish_split(&[record], None).unwrap();
+        let reply = serde_json::to_string(&split_list_response(1000, &publication())).unwrap();
+        assert!(
+            !reply.contains("/sys/devices/private-controller"),
+            "{reply}"
+        );
+    }
+
+    #[test]
+    fn split_review_last_removal_reports_absent_instead_of_publication() {
+        let _env = env();
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &publication()),
+            Response::Ok(_)
+        ));
+        let Response::Ok(message) = split_remove_response(&pair_text()) else {
+            panic!("removal");
+        };
+        assert!(message.contains("absent"), "{message}");
+        assert!(!message.contains("generation"), "{message}");
+        assert_eq!(
+            irlume_common::split_publish::read_split(),
+            irlume_common::split_publish::SplitReadState::Absent
+        );
     }
 
     #[test]

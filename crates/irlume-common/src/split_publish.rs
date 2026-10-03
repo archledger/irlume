@@ -57,6 +57,11 @@ pub enum SplitReadState {
     Unreadable,
     /// A referenced state is malformed or a selection does not resolve.
     Malformed,
+    /// A valid reference names invalid or missing generation contents.
+    MalformedGeneration {
+        /// Referenced generation retained for root diagnostics.
+        generation: u64,
+    },
     /// The referenced generation's bytes do not match `split_digest`.
     DigestMismatch {
         /// Parsed reference whose bytes failed verification.
@@ -379,10 +384,12 @@ fn read_generation(
             // The generation is text under the same rules as cameras.conf:
             // invalid UTF-8 is Malformed, never normalized into records.
             let Ok(text) = std::str::from_utf8(&bytes) else {
-                return SplitReadState::Malformed;
+                return SplitReadState::MalformedGeneration { generation };
             };
             match split_schema::parse_generation(text) {
-                GenerationObservation::Malformed { .. } => SplitReadState::Malformed,
+                GenerationObservation::Malformed { .. } => {
+                    SplitReadState::MalformedGeneration { generation }
+                }
                 GenerationObservation::Valid { records } => match pair {
                     None => SplitReadState::Valid {
                         generation,
@@ -397,7 +404,7 @@ fn read_generation(
                                 selected: Some(key),
                             }
                         }
-                        _ => SplitReadState::Malformed,
+                        _ => SplitReadState::MalformedGeneration { generation },
                     },
                 },
             }
@@ -410,10 +417,12 @@ fn read_generation(
                 Some((g2, d2, p2)) if g2 != generation || d2 != digest => {
                     read_generation(g2, &d2, p2.as_deref(), false)
                 }
-                _ => SplitReadState::Malformed,
+                _ => SplitReadState::MalformedGeneration { generation },
             }
         }
-        Err(e) if e.kind() == ErrorKind::NotFound => SplitReadState::Malformed,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            SplitReadState::MalformedGeneration { generation }
+        }
         Err(_) => SplitReadState::Unreadable,
     }
 }
@@ -676,7 +685,12 @@ mod tests {
                 .join(generation_name(published.generation)),
         )
         .unwrap();
-        assert_eq!(read_split(), SplitReadState::Malformed);
+        assert_eq!(
+            read_split(),
+            SplitReadState::MalformedGeneration {
+                generation: published.generation
+            }
+        );
         drop(env);
     }
 
@@ -730,7 +744,10 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(read_split(), SplitReadState::Malformed);
+        assert_eq!(
+            read_split(),
+            SplitReadState::MalformedGeneration { generation: 1 }
+        );
         drop(env);
     }
 
@@ -768,7 +785,10 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(read_split(), SplitReadState::Malformed);
+        assert_eq!(
+            read_split(),
+            SplitReadState::MalformedGeneration { generation: 1 }
+        );
         drop(env);
     }
 
@@ -853,7 +873,10 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(read_split(), SplitReadState::Malformed);
+        assert_eq!(
+            read_split(),
+            SplitReadState::MalformedGeneration { generation: 1 }
+        );
         drop(env);
     }
 

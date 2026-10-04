@@ -5,8 +5,8 @@
 //! group, matches against exactly that group's scoped view, and re-valid
 //!ates BOTH stores at the grant-decision boundary. No camera is opened:
 //! the pin seam is `Engine::resolve_attempt_enrollment` with caller-supplied
-//! live identities - exactly what the sequencing core calls after the
-//! enrollment load - and the boundary seam is the same
+//! live identities. Snapshot-specific tests exercise the production resolver
+//! against retained primary bytes; the boundary seam is the same
 //! `authenticate_qualified_assessment` the capture paths end in.
 
 use super::super::tests::{env_guard, unit};
@@ -214,6 +214,121 @@ fn a_secondary_pair_pins_its_group_and_grants_from_scoped_data_only() {
     // grants on the scoped data.
     let out = assess(&mut s.engine, &resolved, assessment);
     assert!(out.granted, "scoped grant must succeed: {}", out.reason);
+}
+
+#[test]
+fn snapshot_secondary_resolution_retains_scope_and_grant_boundary() {
+    let _g = env_guard();
+    let mut s = shared();
+    let sandbox = Sandbox::new("snapshot-pin-grant");
+    let (enr, assessment) = pinned_fixture(&sandbox);
+    let bytes = std::fs::read(sandbox.primary_path("pad-contract")).unwrap();
+    s.engine.begin_attempt();
+    let resolved = s
+        .engine
+        .resolve_attempt_snapshot(
+            "pad-contract",
+            irlume_core::storage::PrimarySnapshot {
+                enrollment: enr,
+                key: None,
+                bytes,
+            },
+            &desk_pair(),
+        )
+        .unwrap();
+    let context = s
+        .engine
+        .secondary_attempt
+        .as_ref()
+        .expect("actual snapshot resolver retained pin");
+    assert_eq!(context.store_index(), 0);
+    assert_eq!(
+        resolved.camera_binding,
+        Some(GroupPair::Ordinary {
+            rgb: desk_pair().0,
+            ir: desk_pair().1
+        })
+    );
+    assert!(assess(&mut s.engine, &resolved, assessment).granted);
+}
+
+#[test]
+fn snapshot_resolution_preserves_primary_policy_before_secondary_bridge() {
+    let _g = env_guard();
+    let mut s = shared();
+    let sandbox = Sandbox::new("snapshot-policy");
+    let (mut enr, _) = pinned_fixture(&sandbox);
+    enr.require_eyes_open = true;
+    let bytes = sandbox.write_primary("pad-contract", &enr);
+    let store = desk_store(
+        "pad-contract",
+        &bytes,
+        "046d:desk",
+        "fixture",
+        enr.profiles[0].scans.clone(),
+    );
+    save_secondary(&secondary_store_path("pad-contract"), &store).unwrap();
+    s.engine.begin_attempt();
+    let refusal = s
+        .engine
+        .resolve_attempt_snapshot(
+            "pad-contract",
+            irlume_core::storage::PrimarySnapshot {
+                enrollment: enr,
+                key: None,
+                bytes,
+            },
+            &desk_pair(),
+        )
+        .unwrap_err();
+    assert!(refusal.reason.contains("require-eyes-open") && refusal.reason.contains("retired"));
+    assert!(s.engine.secondary_attempt.is_none());
+    s.engine.begin_attempt();
+}
+
+#[test]
+fn snapshot_primary_fallback_keeps_recognizer_and_binding_refusals() {
+    let _g = env_guard();
+    let mut s = shared();
+    let sandbox = Sandbox::new("snapshot-fallback");
+    let (mut enr, _) = pad_matching_fixture(0.2, false);
+    enr.camera_binding = None;
+    for scan in &mut enr.profiles[0].scans {
+        scan.embed_space = Some("other-recognizer".into());
+    }
+    let bytes = sandbox.write_primary("pad-contract", &enr);
+    s.engine.begin_attempt();
+    let refusal = s
+        .engine
+        .resolve_attempt_snapshot(
+            "pad-contract",
+            irlume_core::storage::PrimarySnapshot {
+                enrollment: enr,
+                key: None,
+                bytes,
+            },
+            &desk_pair(),
+        )
+        .unwrap_err();
+    assert_eq!(refusal.kind, OutcomeKind::SetupUnavailable);
+    assert!(refusal.reason.contains("current recognition model"));
+    let (enr, _) = pinned_fixture(&sandbox);
+    let bytes = std::fs::read(sandbox.primary_path("pad-contract")).unwrap();
+    let refusal = s
+        .engine
+        .resolve_attempt_snapshot(
+            "pad-contract",
+            irlume_core::storage::PrimarySnapshot {
+                enrollment: enr,
+                key: None,
+                bytes,
+            },
+            &(Some("unknown-rgb".into()), Some("unknown-ir".into())),
+        )
+        .unwrap_err();
+    assert_eq!(refusal.cause, Some(OutcomeCause::NotEnrolledOnThisCamera));
+    assert!(s.engine.secondary_attempt.is_none());
+    s.engine.begin_attempt();
 }
 
 #[test]

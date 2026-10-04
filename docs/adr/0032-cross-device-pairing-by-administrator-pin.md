@@ -769,3 +769,45 @@ The combined reader and its retry regressions do not complete Engine/daemon
 request enforcement. Step 5 must enforce this policy before preflight, probe
 or open and before adding trust or preparing a face-backed secret. Split
 activation stays closed until its software and physical acceptance passes.
+
+## Amendment 2026-10-04: request configuration gate
+
+The first runtime gate rejects invalid or unreadable selection and failed
+generation, digest or selected-key verification before considering an ordinary
+environment override. A valid selected split remains refused at the closed
+activation boundary unless the override proves a unique classified ordinary
+pair in one healthy Current publication. The existing combined external-camera
+policy includes both the configured prohibition and the legacy fixed-device
+gate. Paths or independently observed identities cannot prove ordinary class.
+
+`CameraRequestScope` retains that configuration observation and passive view
+across daemon enrollment probes and nested Engine entries. It clears request
+state and restores standing endpoints and IR availability on return or unwind.
+Nested entries refuse endpoint/availability mutation and drift of a retained
+ordinary pair's supervisor, instance, generation or pair facts. They do not
+reread selection or rerank in the middle of the request. Passive revalidation
+is an observation at the entry boundary; it neither reserves a device nor
+replaces lease/open continuity checks.
+
+Daemon enrollment and guided sessions prepare after authorization/account
+ownership and before session-start events, summary invalidation, probe or
+preflight. Direct Engine enrollment, addition, authentication, assessment and
+positioning entries also gate. Identify and positioning explicitly refuse
+selected split configuration rather than projecting it to an ordinary path.
+Authentication and face-backed password release retain their existing consent,
+retry admission and account-lock ordering. IR readiness and optional evaluation
+also reject invalid or selected split configuration without authorizing capture.
+
+Behavioral tests use a current-thread, non-granting camera fixture that records
+real lease/open attempts. Its backend always refuses opens and constructs no fd
+or camera handle. Native GREY fixture evidence exercises the real format-role
+classifier and decoder on synthetic bytes; it is not negotiation or physical
+acceptance. Ordinary controls reach preflight and lease/open boundaries, and
+refused requests retain primary/envelope bytes and emit no session-start event.
+
+This gate unit does not complete account routing. The encrypted dual loader
+still overlaps camera opens, automatic account selection is not wired into the
+Engine, and IR-only target resolution still uses its existing configured-pair
+reader. Exact primary snapshot/key adoption, secondary selection/pin coherence
+and chosen-pair IR targets remain the next Step 5 delivery. Split activation
+and physical acceptance remain separate gates.

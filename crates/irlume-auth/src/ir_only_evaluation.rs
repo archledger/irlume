@@ -322,6 +322,8 @@ impl Engine {
         &self,
         enr: &Enrollment,
     ) -> Result<irlume_camera::IrCaptureTarget, IrFailure> {
+        self.validate_camera_request()
+            .map_err(|_| IrFailure::CameraUnavailable)?;
         let target =
             irlume_camera::configured_ir_target().map_err(|_| IrFailure::CameraUnavailable)?;
         let selected =

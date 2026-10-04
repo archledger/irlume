@@ -10,6 +10,8 @@
 
 mod ir_assessment;
 pub use ir_assessment::{IrOnlyPreflight, IrOnlyRefusal};
+mod request_preparation;
+pub use request_preparation::CameraRequestScope;
 
 /// Non-granting developer IR evaluation; absent from normal builds.
 #[cfg(feature = "ir-only-evaluation")]
@@ -69,6 +71,7 @@ pub use irlume_camera::{
 
 /// Loaded models + camera device selection. Build once, reuse per request.
 pub struct Engine {
+    camera_selection: Option<request_preparation::PreparedSelection>,
     det: Detector,
     emb: Embedder,
     /// Optional IR domain-adaptation MLP (applied to IR embeddings in the dark).
@@ -3771,6 +3774,7 @@ impl Engine {
         // halves its strength per dropped character.
         let embed_space = format!("embed:{}", model.sha256());
         Ok(Self {
+            camera_selection: None,
             det: Detector::load_from_file(det_path)?,
             emb: Embedder::load_from_memory(model.bytes())?,
             ir_adapter: None,
@@ -4378,6 +4382,14 @@ impl Engine {
         &mut self,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Assessment> {
+        let mut request = self.prepare_camera_request()?;
+        request.assess_prepared(diagnostics)
+    }
+
+    fn assess_prepared(
+        &mut self,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<Assessment> {
         // One-shot entry: no authenticate_for/capture_scans ran to clear the
         // ViT vote ring, so repeated assess() calls must not accumulate a
         // cross-presentation vote (GLM review finding 2).
@@ -4427,6 +4439,14 @@ impl Engine {
     /// already-authorized emitter path.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn support_probe(
+        &mut self,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<irlume_common::diagnostics::SupportProbeResult> {
+        let mut request = self.prepare_camera_request()?;
+        request.support_probe_prepared(diagnostics)
+    }
+
+    fn support_probe_prepared(
         &mut self,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<irlume_common::diagnostics::SupportProbeResult> {
@@ -6290,8 +6310,6 @@ impl Engine {
         self.vit_scores.clear();
         self.check_request_active()?;
         let request_window = window;
-        let deadline = window.deadline;
-        let window = window.milliseconds;
         // Fingerprint mode: face is disabled so pam_fprintd drives; never engage
         // the camera, decline so the PAM stack cascades to fingerprint/password.
         if irlume_core::policy::method().face_disabled() {
@@ -6301,6 +6319,31 @@ impl Engine {
                 "face disabled (fingerprint mode)",
             ));
         }
+        let mut request = self.prepare_camera_request()?;
+        request.authenticate_prepared(
+            user,
+            service,
+            purpose,
+            request_window,
+            policy,
+            diagnostics,
+            deliver,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authenticate_prepared(
+        &mut self,
+        user: &str,
+        service: Option<&str>,
+        purpose: AuthenticationPurpose,
+        request_window: AuthenticationWindow,
+        policy: irlume_common::config::FaceSensorPolicy,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        deliver: DecisionDelivery<'_>,
+    ) -> irlume_common::Result<Outcome> {
+        let deadline = request_window.deadline;
+        let window = request_window.milliseconds;
         if policy == irlume_common::config::FaceSensorPolicy::IrOnlyExperimental {
             return self.authenticate_ir_in_window(user, request_window, diagnostics);
         }
@@ -8309,6 +8352,26 @@ impl Engine {
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
         publication: EnrollmentPublication<'_>,
     ) -> irlume_common::Result<EnrollOutcome> {
+        let mut request = self.prepare_camera_request()?;
+        request.enroll_profile_capture_prepared(
+            user,
+            profile_name,
+            want,
+            ir_preflight,
+            diagnostics,
+            publication,
+        )
+    }
+
+    fn enroll_profile_capture_prepared(
+        &mut self,
+        user: &str,
+        profile_name: Option<String>,
+        want: usize,
+        ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        publication: EnrollmentPublication<'_>,
+    ) -> irlume_common::Result<EnrollOutcome> {
         let EnrollmentPublication { replace, observer } = publication;
         observer.check()?;
         use irlume_core::storage::{self, Enrollment, MAX_SCANS_PER_PROFILE};
@@ -8812,6 +8875,18 @@ impl Engine {
         ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
         observer: &dyn EnrollmentObserver,
     ) -> irlume_common::Result<AddScanOutcome> {
+        let mut request = self.prepare_camera_request()?;
+        request.add_scan_prepared(user, profile_name, count, ir_preflight, observer)
+    }
+
+    fn add_scan_prepared(
+        &mut self,
+        user: &str,
+        profile_name: &str,
+        count: usize,
+        ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
+        observer: &dyn EnrollmentObserver,
+    ) -> irlume_common::Result<AddScanOutcome> {
         observer.check()?;
         use irlume_core::storage::{self, FaceScan, MAX_SCANS_PER_PROFILE};
         let mut enr = storage::load_unmoved(user)?
@@ -8951,6 +9026,24 @@ impl Engine {
     /// requires at least one bound side.
     #[must_use]
     pub fn live_pair(&self) -> irlume_core::multi_camera::GroupPair {
+        if self.camera_selection.as_ref().is_some_and(|selection| {
+            !selection.matches_devices(&self.rgb_dev, &self.ir_dev, self.ir_available)
+                || !selection.ordinary_is_current()
+        }) {
+            // Device mutation or passive-proof drift cannot retain the prepared
+            // pair's binding. Capture entry refuses rather than re-preparing.
+            return irlume_core::multi_camera::GroupPair::Ordinary {
+                rgb: None,
+                ir: None,
+            };
+        }
+        if let Some(pair) = self
+            .camera_selection
+            .as_ref()
+            .and_then(|selection| selection.binding())
+        {
+            return pair;
+        }
         irlume_core::multi_camera::GroupPair::Ordinary {
             rgb: irlume_camera::device_identity(&self.rgb_dev),
             ir: irlume_camera::device_identity(&self.ir_dev),
@@ -8974,6 +9067,29 @@ impl Engine {
     /// published unless every step succeeds.
     #[allow(clippy::too_many_arguments)]
     pub fn add_camera_group_observed(
+        &mut self,
+        user: &str,
+        profile_name: Option<String>,
+        want: usize,
+        authorization: &irlume_core::multi_camera::authz::EnrollmentAuthorization,
+        ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        observer: &dyn EnrollmentObserver,
+    ) -> irlume_common::Result<String> {
+        let mut request = self.prepare_camera_request()?;
+        request.add_camera_group_prepared(
+            user,
+            profile_name,
+            want,
+            authorization,
+            ir_preflight,
+            diagnostics,
+            observer,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_camera_group_prepared(
         &mut self,
         user: &str,
         profile_name: Option<String>,
@@ -9222,6 +9338,14 @@ impl Engine {
         &mut self,
         user: Option<&str>,
     ) -> irlume_common::Result<irlume_common::PositionReport> {
+        let mut request = self.prepare_camera_request()?;
+        request.position_sample_prepared(user)
+    }
+
+    fn position_sample_prepared(
+        &mut self,
+        user: Option<&str>,
+    ) -> irlume_common::Result<irlume_common::PositionReport> {
         // This user's calibrated pitch neutral, if any (read-only; absent = global default).
         let pitch_neutral = user
             .and_then(|u| irlume_core::storage::load(u).ok().flatten())
@@ -9246,6 +9370,15 @@ impl Engine {
     /// cancellation, deadline or sample-limit refusals. Calibration lookup
     /// failures use the same default band as `position_sample`.
     pub fn position_session(
+        &mut self,
+        user: Option<&str>,
+        observer: &dyn PositionObserver,
+    ) -> irlume_common::Result<()> {
+        let mut request = self.prepare_camera_request()?;
+        request.position_session_prepared(user, observer)
+    }
+
+    fn position_session_prepared(
         &mut self,
         user: Option<&str>,
         observer: &dyn PositionObserver,
@@ -12862,6 +12995,7 @@ mod engine_tests {
     mod grouped_tests;
     mod managed_pad_tests;
     mod pair_identity_tests;
+    mod request_preparation_tests;
     mod secondary_camera_tests;
     mod split_admission_tests;
     use super::tests::env_guard;

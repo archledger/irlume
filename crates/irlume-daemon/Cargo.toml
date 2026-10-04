@@ -20,5 +20,8 @@ sha2.workspace = true
 libc = "0.2"
 dbus.workspace = true
 
+[dev-dependencies]
+irlume-camera = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true

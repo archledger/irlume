@@ -2217,6 +2217,9 @@ impl Engine {
     pub fn ir_only_preflight_details(&self, user: &str) -> IrOnlyPreflight {
         use irlume_common::IrOnlyReadiness as Ready;
         use irlume_common::IrTargetIssue as Issue;
+        if self.validate_camera_request().is_err() {
+            return IrOnlyPreflight::target(Ready::TargetUnavailable, Issue::Unavailable);
+        }
         let window = AuthenticationWindow::new(GRACE_WINDOW_MS);
         let target = match irlume_camera::configured_ir_target() {
             Ok(target) => target,

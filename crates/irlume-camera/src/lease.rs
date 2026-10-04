@@ -187,6 +187,8 @@ pub fn acquire_camera_operation(
     operation: CameraOperationKind,
     timeout: Duration,
 ) -> Result<CameraOperationSession, CameraLeaseError> {
+    #[cfg(feature = "test-support")]
+    crate::backend::record_lease_request(endpoint_paths, operation);
     let result = crate::backend::with_camera_supervisor(|supervisor| {
         supervisor.acquire_operation(
             endpoint_paths,
@@ -238,6 +240,14 @@ pub fn acquire_split_camera_operation(
     operation: CameraOperationKind,
     timeout: Duration,
 ) -> Result<CameraOperationSession, CameraLeaseError> {
+    #[cfg(feature = "test-support")]
+    crate::backend::record_lease_request(
+        &[
+            expected.rgb.endpoint.as_str(),
+            expected.ir.endpoint.as_str(),
+        ],
+        operation,
+    );
     if !matches!(
         operation,
         CameraOperationKind::Diagnostics

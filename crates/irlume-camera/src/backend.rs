@@ -23,6 +23,12 @@ use crate::{CameraPair, IrCamera, NodeScan, RgbCamera, Role};
 
 /// One capture implementation owned by the process camera supervisor.
 trait CameraBackend: Send + Sync + 'static {
+    #[cfg(feature = "test-support")]
+    fn lease_requested(&self, _endpoints: &[&str], _kind: CameraOperationKind) {}
+    #[cfg(feature = "test-support")]
+    fn fixture_identity(&self, _endpoint: &str) -> Option<String> {
+        None
+    }
     fn scan_nodes(&self) -> NodeScan;
     /// The scan discovery runs, without the holder lookup of `scan_nodes`.
     /// Discovery callers receive only its `classified` bucket.
@@ -139,7 +145,7 @@ impl CameraSupervisor {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn reconcile_inventory(
         &self,
         observations: Vec<CameraObservation>,
@@ -451,6 +457,10 @@ fn snapshot_from_slot(slot: &OnceLock<Arc<CameraSupervisor>>) -> CameraInventory
 }
 
 pub(crate) fn camera_inventory_snapshot() -> CameraInventorySnapshot {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
+        return supervisor.inventory_snapshot();
+    }
     snapshot_from_slot(&DEFAULT_CAMERA_SUPERVISOR)
 }
 
@@ -462,6 +472,10 @@ pub(crate) fn with_camera_inventory_publication<R>(
         ),
     ) -> R,
 ) -> Result<R, &'static str> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
+        return supervisor.with_inventory_publication(commit);
+    }
     let supervisor = DEFAULT_CAMERA_SUPERVISOR
         .get()
         .ok_or("camera inventory is not initialized")?;
@@ -472,6 +486,10 @@ pub(crate) fn camera_inventory_publication() -> (
     CameraInventorySnapshot,
     Vec<crate::inventory::ClassifiedEndpoint>,
 ) {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
+        return supervisor.inventory_publication();
+    }
     DEFAULT_CAMERA_SUPERVISOR
         .get()
         .map_or_else(Default::default, |supervisor| {
@@ -488,7 +506,7 @@ fn connected_pairs_from_slot(slot: &OnceLock<Arc<CameraSupervisor>>) -> Connecte
 
 /// Read the pairing view without initializing the supervisor.
 pub(crate) fn connected_pairs() -> ConnectedPairs {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
         return supervisor.connected_pairs();
     }
@@ -509,7 +527,7 @@ fn connected_pairs_with_split_from_slot(
 pub(crate) fn connected_pairs_with_split(
     records: &[irlume_common::split_schema::AuthorizationRecord],
 ) -> ResolvedConnectedPairs {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
         return supervisor.connected_pairs_with_split(records);
     }
@@ -528,7 +546,7 @@ pub(crate) fn default_camera_supervisor() -> &'static CameraSupervisor {
         .as_ref()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static TEST_SUPERVISOR: std::cell::RefCell<Option<Arc<CameraSupervisor>>> =
         const { std::cell::RefCell::new(None) };
@@ -536,12 +554,33 @@ thread_local! {
 
 /// Route one compatibility operation through the process supervisor.
 pub(crate) fn with_camera_supervisor<T>(operation: impl FnOnce(&CameraSupervisor) -> T) -> T {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
         return operation(&supervisor);
     }
 
     operation(default_camera_supervisor())
+}
+
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
+#[cfg(feature = "test-support")]
+pub(crate) fn record_lease_request(endpoints: &[&str], kind: CameraOperationKind) {
+    TEST_SUPERVISOR.with(|slot| {
+        if let Some(supervisor) = slot.borrow().as_ref() {
+            supervisor.backend.lease_requested(endpoints, kind);
+        }
+    });
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture_identity(endpoint: &str) -> Option<String> {
+    TEST_SUPERVISOR.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|supervisor| supervisor.backend.fixture_identity(endpoint))
+    })
 }
 
 pub(crate) fn scan_nodes() -> NodeScan {

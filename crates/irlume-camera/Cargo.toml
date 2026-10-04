@@ -7,6 +7,8 @@ license.workspace = true
 [features]
 default = []
 capture-timing = []
+# Non-granting, current-thread fixture used by downstream request tests.
+test-support = []
 
 [dependencies]
 irlume-common.workspace = true

@@ -7920,6 +7920,8 @@ fn authenticate_for_dispatch(
     scope: &diagnostics::OperationScope,
     deliver: irlume_auth::DecisionDelivery<'_>,
 ) -> irlume_common::Result<irlume_auth::Outcome> {
+    let mut camera_request = engine.prepare_camera_request()?;
+    let engine = &mut *camera_request;
     // Only the test binary can replace the biometric result. Request policy,
     // completion checks and socket delivery remain the production code path.
     #[cfg(test)]
@@ -7980,6 +7982,49 @@ fn dispatch_scoped_session_inner(
             return Response::Error(error);
         }
     }
+    if matches!(
+        req,
+        Request::Enroll { .. }
+            | Request::EnrollmentSession { .. }
+            | Request::AddScan { .. }
+            | Request::AddCameraGroup { .. }
+            | Request::Identify
+            | Request::IdentifyFor { .. }
+            | Request::PositionSample { .. }
+            | Request::PositionSession { .. }
+            | Request::SupportProbe { .. }
+    ) {
+        let mut camera_request = match engine.prepare_camera_request() {
+            Ok(request) => request,
+            Err(error) => return Response::Error(error.to_string()),
+        };
+        return dispatch_after_authorization(
+            req,
+            peer,
+            &mut camera_request,
+            scope,
+            session,
+            position,
+            completion,
+            delivery,
+        );
+    }
+    dispatch_after_authorization(
+        req, peer, engine, scope, session, position, completion, delivery,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_after_authorization(
+    req: Request,
+    peer: &Peer,
+    engine: &mut irlume_auth::Engine,
+    scope: &diagnostics::OperationScope,
+    session: Option<&enrollment_session::Worker>,
+    position: Option<&position_session::Worker>,
+    completion: &mut Option<FaceCompletion>,
+    delivery: &mut Delivery<'_>,
+) -> Response {
     let req = match req {
         Request::EnrollmentSession {
             user,
@@ -9593,6 +9638,11 @@ fn add_camera_group(
     want: usize,
     diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
 ) -> Response {
+    let mut camera_request = match engine.prepare_camera_request() {
+        Ok(request) => request,
+        Err(error) => return Response::Error(error.to_string()),
+    };
+    let engine = &mut *camera_request;
     // The enrollment gate first (the engine re-checks; this is the UX
     // order): an account with no primary enrollment has nothing to extend.
     if matches!(irlume_core::storage::load_unmoved(user), Ok(None)) {
@@ -11797,8 +11847,12 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 16] = [
+        let sources: [(&str, &str); 17] = [
             ("main.rs", include_str!("main.rs")),
+            (
+                "request_preparation_tests.rs",
+                include_str!("request_preparation_tests.rs"),
+            ),
             ("attempt_record.rs", include_str!("attempt_record.rs")),
             ("shared_unlock.rs", include_str!("shared_unlock.rs")),
             (
@@ -17305,6 +17359,7 @@ mod tests {
     const NOBODY: u32 = 0xfffe_fffe;
 
     include!("shared_greeter_tests.rs");
+    include!("request_preparation_tests.rs");
 
     /// A waiver is a claim about the machine's policy, not about the caller, so
     /// the daemon has to agree with it independently. A root PAM client saying

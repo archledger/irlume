@@ -7,6 +7,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Camera-backed request entries share a validated configuration-gate snapshot
+  through daemon enrollment probes and nested Engine calls. Invalid selection
+  refuses before environment precedence; selected split capture stays closed.
+  An ordinary override needs a unique Current ordinary pair and both external
+  policy gates. Scope mutation or retained-pair inventory drift refuses before
+  nested capture, and cleanup restores standing devices (ADR-0032, request
+  configuration-gate amendment; #995).
+
 - Split-pair account foundations retain complete class-aware primary and
   secondary bindings, scoped approval and grant-boundary checks, and typed
   primary-first camera ranking. Ordinary stored forms and partial-primary

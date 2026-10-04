@@ -31,6 +31,8 @@
 //! panic on some drivers. Probe, don't assume.
 
 mod backend;
+#[cfg(feature = "test-support")]
+pub use backend::test_support;
 mod capture_control;
 mod capture_shutdown;
 mod capture_timing;
@@ -4168,6 +4170,10 @@ pub(crate) fn usb_device_facts(dev_dir: &std::path::Path) -> Option<inventory::U
 /// `":serial"` when the descriptor carries a serial (`idVendor:idProduct[:serial]`,
 /// lowercase). `None` if the node has no USB descriptors (e.g. a virtual cam).
 pub fn device_identity(device: &str) -> Option<String> {
+    #[cfg(feature = "test-support")]
+    if let Some(identity) = backend::fixture_identity(device) {
+        return Some(identity);
+    }
     let node = device.strip_prefix("/dev/").unwrap_or(device);
     let real = std::fs::canonicalize(hostfs::video_class_entry(node).join("device")).ok()?;
     let dev_dir = find_attr_dir(&real, "idVendor")?;

@@ -22,7 +22,9 @@ other irlume crate, and nearly every crate depends on it
   `/etc/irlume/cameras.conf`) are written only through `write_kv` or
   `write_kvs`. They refuse, before any I/O, a key or value that would not read
   back as one line, and never rebuild a file they cannot read.
-- Camera selection reads `/etc/irlume/cameras.conf` through `read_camera_pin`;
+- Ordinary advisory/startup selection reads `/etc/irlume/cameras.conf` through
+  `read_camera_pin`. Engine request gates use `split_publish::read_camera_selection`
+  to retain strict ordinary selection and split verification together;
   the strict observer (`parse_camera_conf`, pure, and `observe_camera_conf`)
   is what irlumed reports at start and checks before a save;
   `camera_conf_observation_agrees_with_read_camera_pin_on_files_irlume_writes`

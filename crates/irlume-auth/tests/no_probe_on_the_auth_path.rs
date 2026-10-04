@@ -97,7 +97,7 @@ fn one_camera_operation_spans_camera_open_and_every_authentication_retry() {
     let body = &text[start..end];
 
     let acquire = body
-        .find("acquire_camera_operation(")
+        .find("self.acquire_account_camera(")
         .expect("authentication acquires a camera operation");
     let open = body
         .find("camera_operation.open_rgb")
@@ -107,7 +107,7 @@ fn one_camera_operation_spans_camera_open_and_every_authentication_retry() {
         .expect("grace retry helper is called");
 
     assert_eq!(
-        body.matches("acquire_camera_operation(").count(),
+        body.matches("self.acquire_account_camera(").count(),
         1,
         "authenticate_for must acquire exactly one operation"
     );
@@ -115,6 +115,35 @@ fn one_camera_operation_spans_camera_open_and_every_authentication_retry() {
     let acquisition = &body[acquire..open];
     assert!(acquisition.contains("self.authentication_deadline") && acquisition.contains("saturating_duration_since"), "the actual authentication lease must use its remaining window, not only a diagnostics/assessment helper");
     assert!(body.contains("&camera_operation"));
+
+    // The request helper preserves the single lease while binding selected
+    // whole pairs; only an unproven legacy ordinary path uses the old acquire.
+    let preparation = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/request_preparation.rs"),
+    )
+    .expect("read request preparation");
+    let start = preparation
+        .find("pub(super) fn acquire_account_camera(")
+        .expect("account acquire exists");
+    let end = preparation[start..]
+        .find("pub(crate) fn validate_camera_request(")
+        .map(|offset| start + offset)
+        .expect("request validation follows acquire");
+    let acquire_helper = &preparation[start..end];
+    assert!(acquire_helper.contains("selection.expected_lease()"));
+    assert_eq!(
+        acquire_helper
+            .matches("lease::acquire_selected_camera_operation(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        acquire_helper
+            .matches("lease::acquire_camera_operation(")
+            .count(),
+        1
+    );
+    assert!(acquire_helper.contains("Some(expected)") && acquire_helper.contains("None =>"));
 
     let loop_start = text[end..]
         .find("    fn authentication_attempt_loop<")

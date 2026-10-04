@@ -843,3 +843,52 @@ secondary selection/pin snapshot coherence, chosen-pair IR targets, and daemon
 chosen-tier/window/standing-pair semantics remain the next delivery. Neither
 this prerequisite nor its synthetic tests enable split capture or satisfy
 physical acceptance.
+
+## Amendment 2026-10-04: automatic account routing
+
+Fresh or Automatic selection without an explicit ordinary environment pair
+uses `select_bound_for_account` before acquiring cameras. The Engine builds
+complete ordinary/split candidates from its retained Current view and checks
+template eligibility in each account-scoped enrollment. Primary precedence,
+secondary ordering, ambiguity, activation and external-camera policy remain
+the selector's decisions. `NotApplicable` retains the incomplete ordinary
+primary path. A chosen split or split primary refuses while activation is
+closed; biometric refusal never reranks to another camera.
+
+The primary load supplies the exact parsed bytes and one request-owned key.
+The Engine loads the secondary through that borrowed key, selects a group,
+and calls `pin_key_from_loaded` with that same secondary snapshot. Authorized
+authentication may resolve a pending commit first. Readiness uses read-only
+primary loading and non-recovering secondary resolution, including the legacy
+configured-target path. It leaves stores, journals and standing endpoints
+unchanged. No-candidate IR requests retain the configured-target guard and its
+refusal cause before protected loading.
+
+`OrdinaryLeaseRequest` retains the chosen supervisor and complete runtime pair.
+Acquisition checks them under one inventory lock, retains the resulting lease
+reference across contention, and revalidates before returning. The Engine also
+rechecks retained account-store authority after admission and lease contention,
+immediately before opening cameras. Camera continuity and account authority
+remain separate checks. IR routing uses `ir_target_for_pair` for a chosen pair,
+retaining the existing topology, metadata, emitter and privacy checks.
+
+The preparation-admission callback receives the selected Engine and final
+window before camera work. The daemon checks chosen-tier policy and binds any
+shared unlock there, after reserving `FaceAttempt`. Preparation refusal, errors
+and cancellation retain that charge. Static, pinned, forced-convenience and
+no-candidate guards keep their early ordering. The advisory only defers standing
+tier when Current candidates exist; it grants no selection authority.
+
+Selection can shorten the original window but cannot widen it or restart its
+clock, including an explicit grace override. Zero keeps one-shot semantics,
+and a finite cap cannot become unbounded. Capture, reply admission and
+`FaceCompletion` retain the same final window. Outer cleanup clears selection,
+primary/secondary pins and request-key authority on return or unwind; an
+automatic standing endpoint choice may remain as specified by ADR-0029.
+
+Regression tests cover primary/secondary preparation, store drift after
+admission and during a registered lease wait, capped-window/override/zero
+behavior, unwind cleanup, read-only journal refusal with a recovery control,
+and actual daemon tier/charge ordering. Synthetic backends refuse all opens.
+These tests establish software boundaries, not successful physical capture or
+split acceptance. Split activation remains closed.

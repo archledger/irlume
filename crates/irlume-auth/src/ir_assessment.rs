@@ -227,15 +227,42 @@ struct IrOnlyStores<'a> {
 fn resolve_ir_only_scope_at(
     stores: &IrOnlyStores<'_>,
     primary: irlume_core::storage::PrimarySnapshot,
+    pair: (&str, &str),
+    compatible_templates: &dyn Fn(&irlume_core::storage::Enrollment) -> usize,
+    keys: &mut dyn irlume_core::template_key::TemplateKeySource,
+) -> Result<IrOnlyResolution, IrOnlyRefusal> {
+    resolve_ir_only_scope_with_mode(stores, primary, pair, compatible_templates, keys, false)
+}
+
+fn resolve_ir_only_scope_read_only_at(
+    stores: &IrOnlyStores<'_>,
+    primary: irlume_core::storage::PrimarySnapshot,
+    pair: (&str, &str),
+    compatible_templates: &dyn Fn(&irlume_core::storage::Enrollment) -> usize,
+    keys: &mut dyn irlume_core::template_key::TemplateKeySource,
+) -> Result<IrOnlyResolution, IrOnlyRefusal> {
+    resolve_ir_only_scope_with_mode(stores, primary, pair, compatible_templates, keys, true)
+}
+
+fn resolve_ir_only_scope_with_mode(
+    stores: &IrOnlyStores<'_>,
+    primary: irlume_core::storage::PrimarySnapshot,
     (rgb, ir): (&str, &str),
     compatible_templates: &dyn Fn(&irlume_core::storage::Enrollment) -> usize,
     keys: &mut dyn irlume_core::template_key::TemplateKeySource,
+    read_only: bool,
 ) -> Result<IrOnlyResolution, IrOnlyRefusal> {
     use irlume_common::IrOnlyReadiness as Ready;
     use irlume_core::multi_camera::coordinator::{PinError, SecondaryAuthContext};
     let irlume_core::storage::PrimarySnapshot {
         enrollment, bytes, ..
     } = primary;
+    if matches!(
+        enrollment.camera_binding,
+        Some(irlume_core::storage::CameraBinding::Split(_))
+    ) {
+        return Err(IrOnlyRefusal::unscoped(Ready::BindingMismatch));
+    }
     // Today's primary readiness, in its order: account policy on the real
     // primary, then the binding, then the compatible templates. Only a
     // binding mismatch goes on to the secondary store.
@@ -268,18 +295,36 @@ fn resolve_ir_only_scope_at(
     // No existence pre-check: the pin resolves the commit journal first, so
     // a store missing after a crashed publication is recovered rather than
     // reported absent; an absent store is then a binding mismatch.
-    let pinned = SecondaryAuthContext::pin_strict_with_source(
-        irlume_core::multi_camera::coordinator::StrictPinStores {
-            user: stores.user,
-            secondary_path: stores.secondary_path,
-            primary_path: stores.primary_path,
-        },
-        &enrollment,
-        &bytes,
-        rgb,
-        ir,
-        keys,
-    );
+    let pin_stores = irlume_core::multi_camera::coordinator::StrictPinStores {
+        user: stores.user,
+        secondary_path: stores.secondary_path,
+        primary_path: stores.primary_path,
+    };
+    let pinned = if read_only {
+        if irlume_core::multi_camera::commit::intent_path_for(stores.secondary_path).exists() {
+            Err(PinError::Secondary(
+                "pending secondary commit; readiness cannot recover it".into(),
+            ))
+        } else {
+            match irlume_core::multi_camera::load_secondary_with_source(stores.secondary_path, keys)
+            {
+                Ok(Some(secondary)) => SecondaryAuthContext::pin_key_from_loaded(
+                    pin_stores,
+                    &enrollment,
+                    &bytes,
+                    &irlume_common::binding_key::CompletePairKey::Ordinary {
+                        rgb: rgb.into(),
+                        ir: ir.into(),
+                    },
+                    &secondary,
+                ),
+                Ok(None) => Err(PinError::Secondary("secondary store absent".into())),
+                Err(error) => Err(PinError::Secondary(error.to_string())),
+            }
+        }
+    } else {
+        SecondaryAuthContext::pin_strict_with_source(pin_stores, &enrollment, &bytes, rgb, ir, keys)
+    };
     let context = match pinned {
         Ok(context) => context,
         Err(PinError::GroupInactive { index, detail }) => {
@@ -555,6 +600,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn legacy_readiness_refuses_valid_pending_journal_without_recovering_it() {
+        use irlume_core::multi_camera::commit::{
+            intent_path_for, CommitIntent, INTENT_FORMAT_VERSION,
+        };
+        use irlume_core::template_key::RequestTemplateKey;
+        let rig = adr28::Rig::new("readiness-journal");
+        let primary = adr28::primary();
+        let bytes = rig.write_primary(&primary, None);
+        rig.write_secondary(
+            vec![adr28::group(
+                "desk",
+                Some(adr28::RGB_A),
+                Some(adr28::IR_X),
+                0.2,
+                true,
+            )],
+            &bytes,
+            None,
+        );
+        let secondary_path = rig.secondary_path();
+        let secondary_before = std::fs::read(&secondary_path).unwrap();
+        // Valid recover-forward payload: empty generation2 plaintext store,
+        // alice owner, all-zero activation digest. No biometric data in journal.
+        let intent = CommitIntent {
+            format_version: INTENT_FORMAT_VERSION, generation: 2, primary_snapshot_sha256: "0".repeat(64),
+            new_secondary_b64: "eyJmb3JtYXRfdmVyc2lvbiI6MSwib3duZXIiOiJhbGljZSIsImdlbmVyYXRpb24iOjIsInByaW1hcnlfc25hcHNob3Rfc2hhMjU2IjoiMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIsImdyb3VwcyI6W119".into(),
+        };
+        let journal = intent_path_for(&secondary_path);
+        let journal_bytes = serde_json::to_vec(&intent).unwrap();
+        std::fs::write(&journal, &journal_bytes).unwrap();
+        let primary_path = rig.primary_path();
+        let stores = IrOnlyStores {
+            user: adr28::USER,
+            primary_path: &primary_path,
+            secondary_path: &secondary_path,
+        };
+        let snapshot = irlume_core::storage::PrimarySnapshot {
+            enrollment: primary,
+            key: None,
+            bytes: bytes.clone(),
+        };
+        let refusal = resolve_ir_only_scope_read_only_at(
+            &stores,
+            snapshot,
+            (adr28::RGB_A, adr28::IR_X),
+            &adr28::compatible,
+            &mut RequestTemplateKey::production(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal.readiness,
+            irlume_common::IrOnlyReadiness::BindingMismatch
+        );
+        assert_eq!(
+            std::fs::read(&secondary_path).unwrap(),
+            secondary_before,
+            "readiness recovered the secondary store"
+        );
+        assert_eq!(std::fs::read(&journal).unwrap(), journal_bytes);
+        assert_eq!(std::fs::read(primary_path).unwrap(), bytes);
+        assert_eq!(
+            irlume_core::multi_camera::commit::resolve_commit(&secondary_path).unwrap(),
+            irlume_core::multi_camera::commit::CommitResolution::Completed
+        );
+        assert!(!journal.exists());
+        assert_ne!(
+            std::fs::read(secondary_path).unwrap(),
+            secondary_before,
+            "control journal did not actually recover"
+        );
     }
 
     struct SyntheticStages {
@@ -2219,6 +2337,26 @@ impl Engine {
         if self.validate_camera_request().is_err() {
             return IrOnlyPreflight::target(Ready::TargetUnavailable, Issue::Unavailable);
         }
+        let observed = if self.camera_selection.is_none() {
+            match crate::request_preparation::PreparedSelection::observe(
+                &self.rgb_dev,
+                &self.ir_dev,
+                self.ir_available,
+            ) {
+                Ok(selection) => Some(selection),
+                Err(_) => {
+                    return IrOnlyPreflight::target(Ready::TargetUnavailable, Issue::Unavailable)
+                }
+            }
+        } else {
+            None
+        };
+        let Some(selection) = self.camera_selection.as_ref().or(observed.as_ref()) else {
+            return IrOnlyPreflight::target(Ready::TargetUnavailable, Issue::Unavailable);
+        };
+        if selection.automatic() && selection.has_account_candidates() {
+            return self.ir_only_automatic_preflight(user, selection);
+        }
         let window = AuthenticationWindow::new(GRACE_WINDOW_MS);
         let target = match irlume_camera::configured_ir_target() {
             Ok(target) => target,
@@ -2251,7 +2389,17 @@ impl Engine {
         // keeps a second copy.
         let mut keys = irlume_core::template_key::RequestTemplateKey::production();
         keys.adopt(user, snapshot.key.take());
-        match self.resolve_ir_only_scope(user, snapshot, &target, &mut keys) {
+        match resolve_ir_only_scope_read_only_at(
+            &IrOnlyStores {
+                user,
+                primary_path: &irlume_core::multi_camera::primary_enrollment_path(user),
+                secondary_path: &irlume_core::multi_camera::secondary_store_path(user),
+            },
+            snapshot,
+            (target.rgb_identity(), target.identity()),
+            &|enrollment| self.compatible_ir_templates(enrollment),
+            &mut keys,
+        ) {
             Ok(resolution) => {
                 let (scope, scope_index) = resolution.scope.report();
                 IrOnlyPreflight {
@@ -2270,9 +2418,17 @@ impl Engine {
         user: &str,
         window: AuthenticationWindow,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        admission: PreparationAdmission<'_>,
     ) -> irlume_common::Result<Outcome> {
         use irlume_common::IrOnlyReadiness as Ready;
         self.check_request_active()?;
+        if self
+            .camera_selection
+            .as_ref()
+            .is_some_and(|selection| selection.automatic() && selection.has_account_candidates())
+        {
+            return self.authenticate_ir_automatic(user, window, diagnostics, admission);
+        }
         let target = match irlume_camera::configured_ir_target() {
             Ok(target) => target,
             // No camera was opened: a missing or unsupported configuration
@@ -2310,9 +2466,191 @@ impl Engine {
             Ok(resolution) => resolution,
             Err(refusal) => return Ok(readiness_refusal(refusal.readiness)),
         };
+        self.authenticate_ir_resolution(
+            window,
+            diagnostics,
+            admission,
+            target,
+            IrOnlyResolution { enrollment, scope },
+        )
+    }
+
+    fn ir_only_automatic_preflight(
+        &self,
+        user: &str,
+        selection: &crate::request_preparation::PreparedSelection,
+    ) -> IrOnlyPreflight {
+        use irlume_common::IrOnlyReadiness as Ready;
+        let window = AuthenticationWindow::new(GRACE_WINDOW_MS);
+        let mut snapshot = match self.load_request_enrollment(user, window, true, None) {
+            Ok(Some(snapshot)) => snapshot,
+            _ => return IrOnlyPreflight::unscoped(Ready::EnrollmentUnavailable),
+        };
+        if legacy_eye_policy(&snapshot.enrollment).is_err() {
+            return IrOnlyPreflight::unscoped(Ready::IncompatibleEnrollment);
+        }
+        let mut keys = irlume_core::template_key::RequestTemplateKey::production();
+        keys.adopt(user, snapshot.key.take());
+        let choice = crate::account_selection::select_account(
+            user,
+            snapshot,
+            selection.view(),
+            |enrollment| self.compatible_ir_templates(enrollment) != 0,
+            &mut keys,
+            true,
+        );
+        let (target, resolution, chosen) = match choice {
+            Err(_) => return IrOnlyPreflight::unscoped(Ready::BindingMismatch),
+            Ok(crate::account_selection::AccountChoice::Selected {
+                enrollment,
+                pair,
+                scope,
+            }) => {
+                if !selection.pair_is_current(&pair) {
+                    return IrOnlyPreflight::unscoped(Ready::Unavailable);
+                }
+                let target = match irlume_camera::ir_target_for_pair(&pair.rgb, &pair.ir) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        return IrOnlyPreflight::target(
+                            Ready::TargetUnavailable,
+                            target_issue(&error),
+                        )
+                    }
+                };
+                (target, IrOnlyResolution { enrollment, scope }, Some(pair))
+            }
+            Ok(crate::account_selection::AccountChoice::Legacy(snapshot)) => {
+                let target = match irlume_camera::ir_target_for_pair(&self.rgb_dev, &self.ir_dev) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        return IrOnlyPreflight::target(
+                            Ready::TargetUnavailable,
+                            target_issue(&error),
+                        )
+                    }
+                };
+                // NotApplicable is only the incomplete ordinary primary path.
+                // Resolve it in memory; readiness never recovers a commit journal.
+                let readiness = enrollment_readiness(
+                    &snapshot.enrollment,
+                    Some(target.rgb_identity()),
+                    target.identity(),
+                    self.compatible_ir_templates(&snapshot.enrollment),
+                );
+                if readiness != Ready::ReadyForExperimentalAttempt {
+                    return IrOnlyPreflight::unscoped(readiness);
+                }
+                let scope = IrOnlyScope::Primary {
+                    path: irlume_core::multi_camera::primary_enrollment_path(user),
+                    digest: irlume_common::sha256_hex(&snapshot.bytes),
+                };
+                (
+                    target,
+                    IrOnlyResolution {
+                        enrollment: snapshot.enrollment,
+                        scope,
+                    },
+                    None,
+                )
+            }
+        };
+        if self.check_authentication_completion(window).is_err()
+            || chosen
+                .as_ref()
+                .is_some_and(|pair| !selection.pair_is_current(pair))
+        {
+            return IrOnlyPreflight::unscoped(Ready::Unavailable);
+        }
+        if let Some(refusal) = self.ir_model_readiness(&target) {
+            return IrOnlyPreflight::unscoped(refusal);
+        }
+        let (scope, scope_index) = resolution.scope.report();
+        IrOnlyPreflight {
+            readiness: Ready::ReadyForExperimentalAttempt,
+            target_issue: None,
+            scope: Some(scope),
+            scope_index,
+        }
+    }
+
+    fn authenticate_ir_automatic(
+        &mut self,
+        user: &str,
+        window: AuthenticationWindow,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        admission: PreparationAdmission<'_>,
+    ) -> irlume_common::Result<Outcome> {
+        use irlume_common::IrOnlyReadiness as Ready;
+        let mut snapshot =
+            match self.load_request_enrollment(user, window, false, Some(diagnostics))? {
+                Some(snapshot) => snapshot,
+                None => return Ok(readiness_refusal(Ready::EnrollmentUnavailable)),
+            };
+        self.request_key().adopt(user, snapshot.key.take());
+        let selected = {
+            let mut keys = self.request_key();
+            crate::account_selection::select_account(
+                user,
+                snapshot,
+                self.camera_selection
+                    .as_ref()
+                    .expect("prepared selection")
+                    .view(),
+                |enrollment| self.compatible_ir_templates(enrollment) != 0,
+                &mut *keys,
+                false,
+            )
+        };
+        let (target, resolution) = match selected {
+            Err(outcome) => return Ok(outcome),
+            Ok(crate::account_selection::AccountChoice::Selected {
+                enrollment,
+                pair,
+                scope,
+            }) => {
+                self.select_account_camera(pair)?;
+                let target = match irlume_camera::ir_target_for_pair(&self.rgb_dev, &self.ir_dev) {
+                    Ok(target) => target,
+                    Err(_) => return Ok(readiness_refusal(Ready::TargetUnavailable)),
+                };
+                (target, IrOnlyResolution { enrollment, scope })
+            }
+            Ok(crate::account_selection::AccountChoice::Legacy(snapshot)) => {
+                let target = match irlume_camera::ir_target_for_pair(&self.rgb_dev, &self.ir_dev) {
+                    Ok(target) => target,
+                    Err(_) => return Ok(readiness_refusal(Ready::TargetUnavailable)),
+                };
+                let resolved = {
+                    let mut keys = self.request_key();
+                    self.resolve_ir_only_scope(user, snapshot, &target, &mut *keys)
+                };
+                let resolution = match resolved {
+                    Ok(resolution) => resolution,
+                    Err(refusal) => return Ok(readiness_refusal(refusal.readiness)),
+                };
+                (target, resolution)
+            }
+        };
+        if let Some(refusal) = self.ir_model_readiness(&target) {
+            return Ok(readiness_refusal(refusal));
+        }
+        self.authenticate_ir_resolution(window, diagnostics, admission, target, resolution)
+    }
+
+    fn authenticate_ir_resolution(
+        &mut self,
+        window: AuthenticationWindow,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        admission: PreparationAdmission<'_>,
+        target: irlume_camera::IrCaptureTarget,
+        resolution: IrOnlyResolution,
+    ) -> irlume_common::Result<Outcome> {
+        let IrOnlyResolution { enrollment, scope } = resolution;
         self.check_request_active()?;
         self.validate_camera_request()?;
-        let operation = match lease::acquire_camera_operation(
+        admission(self, window)?;
+        let operation = match self.acquire_account_camera(
             &target.lease_endpoints(),
             lease::CameraOperationKind::Authentication,
             window
@@ -2326,6 +2664,10 @@ impl Engine {
                 return Ok(refusal_outcome(lease_error_failure(error)));
             }
         };
+        if let Some(refusal) = scope.boundary_refusal(&mut *self.request_key()) {
+            return Ok(refusal);
+        }
+        self.check_request_active()?;
         let mut costliest = std::time::Duration::ZERO;
         self.authentication_attempt_loop_with(
             window.deadline,

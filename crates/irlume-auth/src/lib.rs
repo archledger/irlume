@@ -12,6 +12,7 @@ mod ir_assessment;
 pub use ir_assessment::{IrOnlyPreflight, IrOnlyRefusal};
 mod request_preparation;
 pub use request_preparation::CameraRequestScope;
+mod account_selection;
 
 /// Non-granting developer IR evaluation; absent from normal builds.
 #[cfg(feature = "ir-only-evaluation")]
@@ -128,6 +129,7 @@ pub struct Engine {
     /// `authenticate_qualified_assessment` - primary attempts never touch
     /// it, and a value here can only belong to the attempt in flight.
     secondary_attempt: Option<irlume_core::multi_camera::coordinator::SecondaryAuthContext>,
+    primary_attempt: Option<ir_assessment::IrOnlyScope>,
     /// The facts snapshot of the most recent authentication attempt's
     /// assessment. Set where the assessment binds in `authenticate_once`,
     /// read by the retry loop to write the situation line of a FAILED
@@ -3671,6 +3673,11 @@ impl<R, I> Drop for DeferredPairRelease<'_, R, I> {
 /// thread before the camera teardown. It cannot change the outcome.
 pub type DecisionDelivery<'a> = &'a mut dyn FnMut(&Engine, &Outcome);
 
+/// Caller policy admission after protected selection, before any camera work.
+/// The supplied window has already been clipped to the original caller cap.
+pub type PreparationAdmission<'a> =
+    &'a mut dyn FnMut(&Engine, AuthenticationWindow) -> irlume_common::Result<()>;
+
 /// Own streaming queues only for one assessment. The result cannot borrow
 /// either session, so both drop before matching, consent or another attempt.
 fn with_owned_pair<R, I, T>(
@@ -3780,6 +3787,7 @@ impl Engine {
             // `with_devices`, so `IRLUME_FORCE_NO_IR=1` still outranks it.
             ir_available: selected_ir_available(irlume_camera::DEFAULT_IR_DEVICE),
             secondary_attempt: None,
+            primary_attempt: None,
             stop_requested: None,
             request_cancelled: None,
             authentication_deadline: None,
@@ -6239,6 +6247,35 @@ impl Engine {
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
         deliver: DecisionDelivery<'_>,
     ) -> irlume_common::Result<Outcome> {
+        self.authenticate_for_in_window_with_policy_preparing_delivering(
+            user,
+            service,
+            purpose,
+            window,
+            policy,
+            diagnostics,
+            &mut |_, _| Ok(()),
+            deliver,
+        )
+    }
+
+    /// Authenticate with caller policy admission on the actual selected pair.
+    /// The admission hook receives the capped window used by capture and reply.
+    ///
+    /// # Errors
+    /// Returns preparation, policy, capture, model, cancellation or expiry errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authenticate_for_in_window_with_policy_preparing_delivering(
+        &mut self,
+        user: &str,
+        service: Option<&str>,
+        purpose: AuthenticationPurpose,
+        window: AuthenticationWindow,
+        policy: irlume_common::config::FaceSensorPolicy,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        admission: PreparationAdmission<'_>,
+        deliver: DecisionDelivery<'_>,
+    ) -> irlume_common::Result<Outcome> {
         let previous =
             std::mem::replace(&mut self.authentication_deadline, window.capture_deadline());
         let scope = authentication_window::Scope {
@@ -6256,6 +6293,7 @@ impl Engine {
             window,
             policy,
             diagnostics,
+            admission,
             deliver,
         );
         // Covers setup and cleanup paths that return before the retry loop.
@@ -6272,6 +6310,7 @@ impl Engine {
         window: AuthenticationWindow,
         policy: irlume_common::config::FaceSensorPolicy,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        admission: PreparationAdmission<'_>,
         deliver: DecisionDelivery<'_>,
     ) -> irlume_common::Result<Outcome> {
         // The daemon reuses this engine across requests. Setup refusals and
@@ -6307,6 +6346,7 @@ impl Engine {
             request_window,
             policy,
             diagnostics,
+            admission,
             deliver,
         )
     }
@@ -6320,12 +6360,19 @@ impl Engine {
         request_window: AuthenticationWindow,
         policy: irlume_common::config::FaceSensorPolicy,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        admission: PreparationAdmission<'_>,
         deliver: DecisionDelivery<'_>,
     ) -> irlume_common::Result<Outcome> {
-        let deadline = request_window.deadline;
-        let window = request_window.milliseconds;
         if policy == irlume_common::config::FaceSensorPolicy::IrOnlyExperimental {
-            return self.authenticate_ir_in_window(user, request_window, diagnostics);
+            // The IR-only allowance is independent of the chosen dual tier.
+            let request_window = request_window.clipped_to(self.authentication_window_from(
+                request_window.origin(),
+                service,
+                purpose,
+                policy,
+            ));
+            self.authentication_deadline = request_window.capture_deadline();
+            return self.authenticate_ir_in_window(user, request_window, diagnostics, admission);
         }
         // Preserve the no-store instant deny without starting a loader or
         // creating its lock files. Other metadata failures reach the real load.
@@ -6360,10 +6407,73 @@ impl Engine {
             irlume_camera::device_identity(&self.rgb_dev),
             irlume_camera::device_identity(&self.ir_dev),
         );
-        let enr = match self.resolve_attempt_snapshot(user, snapshot, &live_pair) {
-            Ok(enrollment) => enrollment,
-            Err(outcome) => return Ok(outcome),
+        let automatic = self
+            .camera_selection
+            .as_ref()
+            .is_some_and(|selection| selection.automatic());
+        let enr = if automatic {
+            let selected = {
+                let mut keys = self.request_key();
+                account_selection::select_account(
+                    user,
+                    snapshot,
+                    self.camera_selection
+                        .as_ref()
+                        .expect("prepared selection")
+                        .view(),
+                    |enrollment| {
+                        enrollment
+                            .profiles
+                            .iter()
+                            .any(|profile| profile.scans_in(&self.embed_space) != 0)
+                    },
+                    &mut *keys,
+                    false,
+                )
+            };
+            match selected {
+                Err(outcome) => return Ok(outcome),
+                Ok(account_selection::AccountChoice::Legacy(snapshot)) => {
+                    match self.enrollment_policy_refusal_for(user, &snapshot.enrollment, &live_pair)
+                    {
+                        Some(refusal) => return Ok(refusal),
+                        None => snapshot.enrollment,
+                    }
+                }
+                Ok(account_selection::AccountChoice::Selected {
+                    enrollment,
+                    pair,
+                    scope,
+                }) => {
+                    self.select_account_camera(pair)?;
+                    match scope {
+                        ir_assessment::IrOnlyScope::Primary { .. } => {
+                            self.primary_attempt = Some(scope)
+                        }
+                        ir_assessment::IrOnlyScope::Secondary(context) => {
+                            self.secondary_attempt = Some(*context)
+                        }
+                    }
+                    enrollment
+                }
+            }
+        } else {
+            match self.resolve_attempt_snapshot(user, snapshot, &live_pair) {
+                Ok(enrollment) => enrollment,
+                Err(outcome) => return Ok(outcome),
+            }
         };
+        let request_window = request_window.clipped_to(self.authentication_window_from(
+            request_window.origin(),
+            service,
+            purpose,
+            policy,
+        ));
+        self.authentication_deadline = request_window.capture_deadline();
+        self.check_request_active()?;
+        admission(self, request_window)?;
+        let deadline = request_window.deadline;
+        let window = request_window.milliseconds;
         let (rgb_dev, ir_dev) = (self.rgb_dev.clone(), self.ir_dev.clone());
         let endpoints: Vec<&str> = if self.ir_available {
             vec![rgb_dev.as_str(), ir_dev.as_str()]
@@ -6376,7 +6486,7 @@ impl Engine {
         // operation can interleave between captures and matching.
         self.check_request_active()?;
         self.validate_camera_request()?;
-        let camera_operation = match irlume_camera::lease::acquire_camera_operation(
+        let camera_operation = match self.acquire_account_camera(
             &endpoints,
             irlume_camera::lease::CameraOperationKind::Authentication,
             self.authentication_deadline
@@ -6395,6 +6505,12 @@ impl Engine {
         // Keep negotiated camera handles for this request. Each assessment
         // creates and drops its own streams, so loader/inference/retry delays
         // cannot overflow queues retained from an earlier capture.
+        self.check_request_active()?;
+        // Admission and lease contention may outlive the selected store facts.
+        // Camera continuity does not authorize a revoked account snapshot.
+        if let Some(refusal) = self.pre_open_account_refusal() {
+            return Ok(refusal);
+        }
         self.check_request_active()?;
         let camera_open_started = std::time::Instant::now();
         // On an RGB-only (convenience-tier) box the IR node may still OPEN
@@ -7016,7 +7132,12 @@ impl Engine {
         // state at the moment of the decision. A readable-but-drifted state
         // invalidates the whole attempt before any arm can grant - including
         // a legacy primary rewrite that never touched the secondary
-        // generation. Primary attempts never pay this check.
+        // generation. Automatic primary attempts retain their loaded-byte digest.
+        if let Some(scope) = &self.primary_attempt {
+            if let Some(refusal) = scope.boundary_refusal(&mut *self.request_key()) {
+                return Ok(refusal);
+            }
+        }
         if let Some(context) = &self.secondary_attempt {
             let decision = context.boundary_check_now_with(&mut *self.request_key());
             match decision {
@@ -8626,6 +8747,7 @@ impl Engine {
     /// leak into the next.
     fn begin_attempt(&mut self) {
         self.secondary_attempt = None;
+        self.primary_attempt = None;
         // The request's template key starts empty (ADR-0025 §3): the load
         // that follows adopts this request's key, never a previous one's.
         self.request_key().clear();

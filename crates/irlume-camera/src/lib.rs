@@ -63,7 +63,7 @@ pub mod ir_emitter;
 /// stream below it stay crate-internal.
 pub mod ir_metadata;
 mod ir_target;
-pub use ir_target::{configured_ir_target, IrCaptureTarget, IrTargetError};
+pub use ir_target::{configured_ir_target, ir_target_for_pair, IrCaptureTarget, IrTargetError};
 mod hostfs;
 pub mod lease;
 mod lifecycle;

@@ -257,6 +257,29 @@ pub fn configured_ir_target() -> Result<IrCaptureTarget, IrTargetError> {
     )
 }
 
+/// Resolve an explicit RGB/IR pair using the existing sysfs topology rules.
+///
+/// Reads the supplied paths and sysfs only, without reading the configured
+/// camera selection, opening video nodes, probing formats or discovering a
+/// replacement pair. Capture and revalidation retain the existing target's
+/// topology, metadata, emitter and privacy behavior.
+///
+/// # Errors
+/// Returns an endpoint, identity or supported-topology refusal for the supplied
+/// pair. An invalid pair never falls back to the configured selection.
+pub fn ir_target_for_pair(rgb: &str, ir: &str) -> Result<IrCaptureTarget, IrTargetError> {
+    ir_target_for_pair_with(rgb, ir, &crate::hostfs::video_class_root(), &HostDevices)
+}
+
+fn ir_target_for_pair_with(
+    rgb: &str,
+    ir: &str,
+    sysfs: &Path,
+    devices: &impl DeviceAccess,
+) -> Result<IrCaptureTarget, IrTargetError> {
+    resolve_configured_pair_with(Some((rgb.to_owned(), ir.to_owned())), sysfs, devices)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct NodeEvidence {
     endpoint: String,
@@ -615,6 +638,63 @@ mod tests {
         let t = f.resolve(Some((rgb, ir))).unwrap();
         assert_eq!(t.metadata_endpoint(), None);
         assert_eq!(t.lease_endpoints().len(), 1);
+    }
+
+    #[test]
+    fn explicit_pair_target_ignores_global_selection_and_retains_exact_metadata() {
+        use crate::testenv::{env_lock, EnvGuard};
+        let _lock = env_lock();
+        let f = Fixture::new("selected-pair");
+        let rgb_if = f.interface("1-1:1.0", None);
+        let ir_if = f.interface("1-1:1.2", Some("046d\n"));
+        let rgb = f.node("video0", &rgb_if, "0\n", "RGB Camera\n");
+        let ir = f.node("video2", &ir_if, "0\n", "IR Camera\n");
+        let metadata = f.node("video3", &ir_if, "1\n", "IR Camera\n");
+        let _rgb = EnvGuard::set("IRLUME_RGB_DEVICE", "/missing/standing-rgb");
+        let _ir = EnvGuard::set("IRLUME_IR_DEVICE", "/missing/standing-ir");
+        let target = ir_target_for_pair_with(&rgb, &ir, &f.sysfs, &f).unwrap();
+        assert_eq!(
+            target.endpoint(),
+            std::fs::canonicalize(&ir).unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            target.metadata_endpoint(),
+            std::fs::canonicalize(metadata).unwrap().to_str()
+        );
+        assert_eq!(target.rgb_identity(), "046d:1234:fixture");
+        let _changed = EnvGuard::set("IRLUME_IR_DEVICE", "/missing/replacement-ir");
+        assert_eq!(
+            ir_target_for_pair_with(&rgb, &ir, &f.sysfs, &f).unwrap(),
+            target
+        );
+        // The same resolver still rejects changed topology rather than adopting
+        // the standing pair or discovering a replacement image node.
+        std::fs::write(f.sysfs.join("video3/name"), "other metadata\n").unwrap();
+        assert!(matches!(
+            ir_target_for_pair_with(&rgb, &ir, &f.sysfs, &f),
+            Err(IrTargetError::UnsupportedTopology(_))
+        ));
+    }
+
+    #[test]
+    fn explicit_pair_public_target_refuses_supplied_paths_without_configuration_fallback() {
+        use crate::testenv::{env_lock, EnvGuard};
+        let _lock = env_lock();
+        let roots = crate::hostfs::test::empty_fixture();
+        let config = roots.dev().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let _config = EnvGuard::set("IRLUME_CONFIG_DIR", &config);
+        let _rgb = EnvGuard::unset("IRLUME_RGB_DEVICE");
+        let _ir = EnvGuard::unset("IRLUME_IR_DEVICE");
+        let rgb = roots.dev().join("selected-rgb");
+        let ir = roots.dev().join("selected-ir");
+        for contents in ["", "rgb=/missing/standing-rgb\nir=/missing/standing-ir\n"] {
+            std::fs::write(config.join("cameras.conf"), contents).unwrap();
+            let error =
+                crate::ir_target_for_pair(rgb.to_str().unwrap(), ir.to_str().unwrap()).unwrap_err();
+            assert!(matches!(error, IrTargetError::InvalidEndpoint(ref reason)
+                if reason.contains(rgb.to_str().unwrap())));
+        }
     }
     #[test]
     fn unsafe_or_ambiguous_topologies_fail_closed() {

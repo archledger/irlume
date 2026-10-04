@@ -7911,6 +7911,7 @@ fn verify_reply(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn authenticate_for_dispatch(
     engine: &mut irlume_auth::Engine,
     user: &str,
@@ -7918,6 +7919,7 @@ fn authenticate_for_dispatch(
     window: irlume_auth::AuthenticationWindow,
     policy: irlume_common::config::FaceSensorPolicy,
     scope: &diagnostics::OperationScope,
+    admission: irlume_auth::PreparationAdmission<'_>,
     deliver: irlume_auth::DecisionDelivery<'_>,
 ) -> irlume_common::Result<irlume_auth::Outcome> {
     let mut camera_request = engine.prepare_camera_request()?;
@@ -7926,15 +7928,17 @@ fn authenticate_for_dispatch(
     // completion checks and socket delivery remain the production code path.
     #[cfg(test)]
     if let Some(outcome) = tests::shared_greeter::biometric_outcome() {
+        admission(engine, window)?;
         return Ok(outcome);
     }
-    engine.authenticate_for_in_window_with_policy_delivering(
+    engine.authenticate_for_in_window_with_policy_preparing_delivering(
         user,
         service,
         irlume_auth::AuthenticationPurpose::for_service(service),
         window,
         policy,
         scope,
+        admission,
         deliver,
     )
 }
@@ -8259,12 +8263,13 @@ fn dispatch_after_authorization(
                 Err(error) => return early_refusal(EarlyRefusal::Configuration, error.to_string()),
             };
             let tier = face_tier(sensor_policy, engine.tier());
+            let automatic = engine.may_select_account_camera();
             // Smart-Auto tier gate: on a CONVENIENCE (RGB-only) device, a face
             // match may ONLY satisfy a screen unlock; never login, elevation, or
             // a remote/unknown service (those keep the password). Always-on for
             // RGB-only hardware (independent of the opt-in biopolicy for IR boxes).
             let mut shared_unlock = None;
-            if tier == irlume_core::biopolicy::Tier::Convenience {
+            if !automatic && tier == irlume_core::biopolicy::Tier::Convenience {
                 use irlume_core::biopolicy::{classify, OperationClass, SessionState};
                 let svc = service.as_deref().unwrap_or("");
                 // Runtime directories, lingering managers and somebody else's
@@ -8342,7 +8347,7 @@ fn dispatch_after_authorization(
             // decision over early (ADR-0027, concurrent path: before the camera
             // pair is released) or returns it the ordinary way. The retry
             // attempt and the completion binding move into whichever runs.
-            let mut reply_inputs = Some(VerifyReplyInputs {
+            let reply_inputs = std::cell::RefCell::new(Some(VerifyReplyInputs {
                 structured_errors,
                 retry_attempt,
                 shared_unlock: shared_unlock.clone(),
@@ -8350,11 +8355,11 @@ fn dispatch_after_authorization(
                 convenience,
                 started: t,
                 peer_uid: peer.uid,
-            });
+            }));
             let mut early: Option<Response> = None;
             let auth_result = {
                 let mut deliver = |engine: &irlume_auth::Engine, outcome: &irlume_auth::Outcome| {
-                    let Some(inputs) = reply_inputs.take() else {
+                    let Some(inputs) = reply_inputs.borrow_mut().take() else {
                         return;
                     };
                     let mut completed = None;
@@ -8371,6 +8376,25 @@ fn dispatch_after_authorization(
                     }
                     early = Some(response);
                 };
+                let mut admission = |selected: &irlume_auth::Engine, final_window| {
+                    let mut inputs = reply_inputs.borrow_mut();
+                    let inputs = inputs
+                        .as_mut()
+                        .expect("reply not delivered before preparation");
+                    inputs.window = final_window;
+                    inputs.convenience = face_tier(sensor_policy, selected.tier())
+                        == irlume_core::biopolicy::Tier::Convenience;
+                    if automatic {
+                        inputs.shared_unlock = admit_selected_verify(
+                            selected,
+                            &user,
+                            service.as_deref(),
+                            peer,
+                            sensor_policy,
+                        )?;
+                    }
+                    Ok(())
+                };
                 authenticate_for_dispatch(
                     engine,
                     &user,
@@ -8378,6 +8402,7 @@ fn dispatch_after_authorization(
                     window,
                     sensor_policy,
                     scope,
+                    &mut admission,
                     &mut deliver,
                 )
             };
@@ -8404,6 +8429,7 @@ fn dispatch_after_authorization(
             match auth_result {
                 Ok(o) => {
                     let inputs = reply_inputs
+                        .borrow_mut()
                         .take()
                         .expect("the reply inputs are consumed exactly once");
                     verify_reply(engine, &o, &user, inputs, completion)
@@ -8915,7 +8941,9 @@ fn dispatch_after_authorization(
             }
             // Smart-Auto: an RGB-only (convenience) device NEVER releases the
             // sealed credential: no cold-login / keyring unlock by RGB-only face.
-            if tier == irlume_core::biopolicy::Tier::Convenience {
+            if !engine.may_select_account_camera()
+                && tier == irlume_core::biopolicy::Tier::Convenience
+            {
                 jout_notice!("irlumed: convenience(RGB-only) refuses credential release for '{user}' -> password");
                 note_pre_camera(irlume_common::OutcomeCause::Policy);
                 return Response::UnsealUnavailable {
@@ -9879,6 +9907,71 @@ fn face_tier(
     }
 }
 
+/// Recheck request purpose against the selected route before camera ownership.
+fn admit_selected_verify(
+    engine: &irlume_auth::Engine,
+    user: &str,
+    service: Option<&str>,
+    peer: &Peer,
+    policy: irlume_common::config::FaceSensorPolicy,
+) -> irlume_common::Result<Option<std::sync::Arc<shared_unlock::Binding>>> {
+    use irlume_core::biopolicy::{classify, decide, Action, OperationClass, SessionState, Tier};
+    let tier = face_tier(policy, engine.tier());
+    let svc = service.unwrap_or("");
+    if tier == Tier::Convenience {
+        let mut class = classify(svc, SessionState::Cold);
+        let mut binding = None;
+        if svc.trim().eq_ignore_ascii_case("cosmic-greeter") {
+            binding = Some(std::sync::Arc::new(
+                shared_unlock::Binding::capture(user, peer)
+                    .map_err(|reason| irlume_common::Error::Policy(reason.into()))?,
+            ));
+            class = OperationClass::ScreenUnlock;
+        }
+        if class != OperationClass::ScreenUnlock {
+            return Err(irlume_common::Error::Policy(format!(
+                "RGB-only convenience: face limited to screen unlock (not {class:?})"
+            )));
+        }
+        return Ok(binding);
+    }
+    if biopolicy_enforced()
+        && decide(classify(svc, SessionState::Cold), Tier::Secure) == Action::Deny
+    {
+        return Err(irlume_common::Error::Policy(format!(
+            "biopolicy: face may not satisfy '{svc}'"
+        )));
+    }
+    Ok(None)
+}
+
+fn admit_selected_credential(
+    engine: &irlume_auth::Engine,
+    service: Option<&str>,
+    policy: irlume_common::config::FaceSensorPolicy,
+) -> irlume_common::Result<()> {
+    use irlume_core::biopolicy::{classify, decide, Action, OperationClass, SessionState, Tier};
+    let svc = service.unwrap_or("");
+    if classify(svc, SessionState::Cold) == OperationClass::AppConsent {
+        return Err(irlume_common::Error::Policy(format!(
+            "'{svc}' is verify-only: a polkit prompt never releases the credential"
+        )));
+    }
+    if face_tier(policy, engine.tier()) == Tier::Convenience {
+        return Err(irlume_common::Error::Policy(
+            "RGB-only convenience: face cannot release the login credential".into(),
+        ));
+    }
+    if biopolicy_enforced()
+        && decide(classify(svc, SessionState::Cold), Tier::Secure) != Action::Unseal
+    {
+        return Err(irlume_common::Error::Policy(format!(
+            "biopolicy: '{svc}' may not release the credential"
+        )));
+    }
+    Ok(())
+}
+
 /// Keep credential release distinct from session verification.
 fn credential_release_purpose() -> irlume_auth::AuthenticationPurpose {
     irlume_auth::AuthenticationPurpose::CredentialRelease
@@ -9967,6 +10060,8 @@ fn do_unseal_password_scoped(
     // (a TPM unseal, ~0.1 s on the raw device), so cold login gains the same
     // second as verification does.
     let mut retry_attempt = Some(retry_attempt);
+    let final_window = std::cell::Cell::new(window);
+    let automatic = engine.may_select_account_camera();
     let mut early: Option<Response> = None;
     let engine_result = {
         let mut deliver = |engine: &irlume_auth::Engine, outcome: &irlume_auth::Outcome| {
@@ -9974,7 +10069,15 @@ fn do_unseal_password_scoped(
                 return;
             };
             let mut completed = None;
-            let response = unseal_reply(engine, outcome, user, window, attempt, t, &mut completed);
+            let response = unseal_reply(
+                engine,
+                outcome,
+                user,
+                final_window.get(),
+                attempt,
+                t,
+                &mut completed,
+            );
             let sent = delivery.send(WorkerReply {
                 response: response.clone(),
                 completion: completed.take().filter(|_| is_face_grant(&response)),
@@ -9985,13 +10088,22 @@ fn do_unseal_password_scoped(
             }
             early = Some(response);
         };
-        engine.authenticate_for_in_window_with_policy_delivering(
+        let mut admission = |selected: &irlume_auth::Engine, selected_window| {
+            final_window.set(selected_window);
+            if automatic {
+                admit_selected_credential(selected, service, sensor_policy)
+            } else {
+                Ok(())
+            }
+        };
+        engine.authenticate_for_in_window_with_policy_preparing_delivering(
             user,
             service,
             credential_release_purpose(),
             window,
             sensor_policy,
             diagnostics,
+            &mut admission,
             &mut deliver,
         )
     };
@@ -10032,7 +10144,15 @@ fn do_unseal_password_scoped(
     let attempt = retry_attempt
         .take()
         .expect("the retry attempt is consumed exactly once");
-    unseal_reply(engine, &outcome, user, window, attempt, t, completion)
+    unseal_reply(
+        engine,
+        &outcome,
+        user,
+        final_window.get(),
+        attempt,
+        t,
+        completion,
+    )
 }
 
 /// The UnsealPassword reply for an engine outcome: completion check, the

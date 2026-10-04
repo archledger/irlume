@@ -295,4 +295,43 @@ mod request_preparation_gates {
         assert!(calls.contains(&Call::OpenRgb(RGB.into())), "{calls:?}");
         engine.set_devices(NO_RGB, NO_IR);
     }
+
+    #[test]
+    fn automatic_enrolled_pair_defers_standing_tier_and_retains_admitted_charges() {
+        let _guard = env_lock();
+        let mut engine = engine();
+        let sb = sandbox("automatic-account-dispatch");
+        let _environment = Environment::clear();
+        let recorder = fixture(false);
+        engine.set_devices(RGB, IR);
+        assert_eq!(engine.tier(), irlume_core::biopolicy::Tier::Convenience);
+        let user = users::name_for_uid(0).unwrap();
+        let mut enrollment = enrollment_with(&user, &["Face Scan 1"]);
+        enrollment.camera_binding = Some(irlume_core::storage::CameraBinding::Ordinary {
+            rgb: Some("1234:0001:ordinary".into()), ir: Some("1234:0001:ordinary".into()),
+        });
+        write_enrollment(&sb.dir, &enrollment);
+        let request = |service: &str| Request::Authenticate {
+            user: user.clone(), service: Some(service.into()), structured_errors: false, intent_confirmation: None,
+        };
+        let response = dispatch(request("gdm-password"), &peer(0), &mut engine);
+        assert!(!is_face_grant(&response), "fixture never grants: {response:?}");
+        assert!(recorder.calls().contains(&Call::OpenRgb(RGB.into())), "standing convenience tier denied before automatic selection: {response:?}");
+        let record_path = sb.dir.join("retry/0.json");
+        let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        assert_eq!(record["budget"]["unsuccessful_requests"], 1);
+
+        // Reset only standing availability. The enrolled route remains Secure,
+        // and its late remote-service refusal must retain the reserved charge.
+        engine.set_devices(RGB, IR);
+        std::fs::write(sb.dir.join("config/settings.conf"), "enforce_biopolicy=1\n").unwrap();
+        let before = recorder.calls();
+        let response = dispatch(request("sshd"), &peer(0), &mut engine);
+        assert!(matches!(response, Response::Error(ref reason) if reason.contains("biopolicy")), "{response:?}");
+        assert_eq!(recorder.calls(), before, "late selected-tier refusal acquired a camera");
+        let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        assert_eq!(record["budget"]["unsuccessful_requests"], 2);
+        assert_eq!(record["budget"]["pending"], true);
+        engine.set_devices(NO_RGB, NO_IR);
+    }
 }

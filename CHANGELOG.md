@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Split-pair account foundations retain complete class-aware primary and
+  secondary bindings, scoped approval and grant-boundary checks, and typed
+  primary-first camera ranking. Ordinary stored forms and partial-primary
+  behavior stay compatible; split strings refuse legacy struct readers.
+  Split enrollment and authentication remain disabled pending request-path
+  integration and acceptance (ADR-0032, 2026-10-04 amendment; #995).
+
 - Split-pair authorization storage and management (ADR-0032 Step 3): immutable
   generation files under `/etc/irlume/split-pairs/`, the coherent publication
   protocol behind the `split_generation` / `split_digest` / `split_pair` keys

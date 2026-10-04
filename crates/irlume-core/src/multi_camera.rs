@@ -38,11 +38,10 @@ use zeroize::Zeroizing;
 /// status surface): identity, connected/selected/stale state, and
 /// per-profile counts with calibration state.
 ///
-/// - `connected`: every BOUND side's identity appears in `present`
-///   (callers enumerate present identities from sysfs without opening
-///   devices).
-/// - `selected`: the group's complete pair matches `live` (the pair the
-///   engine would use).
+/// - `connected`: every bound ordinary side's identity appears in `present`.
+///   Identity-only observations never establish a split connection.
+/// - `selected`: the group's binding matches `live` (the pair the engine
+///   would use), retaining ordinary optional-side matching.
 /// - `stale`: the store-wide activation binding does not match the
 ///   CURRENT primary bytes (`primary` is `None` when the primary is
 ///   unreadable - that is a change, §1.1).
@@ -56,21 +55,71 @@ pub fn group_summaries(
     ir_space: &str,
     ir_dim: usize,
 ) -> Vec<irlume_common::CameraGroupSummary> {
+    group_summaries_with_presence(
+        store,
+        primary,
+        live,
+        &GroupPresence {
+            ordinary_identities: present,
+            split_pairs: &[],
+        },
+        embed_space,
+        ir_space,
+        ir_dim,
+    )
+}
+
+/// Current connection observations for summaries, never grant authority.
+/// Ordinary identities keep the legacy sysfs-only semantics. Split entries
+/// must come from whole-pair observations of both classified roles and their
+/// locations in one current publication, not from display identity strings.
+#[derive(Clone, Copy, Debug)]
+pub struct GroupPresence<'a> {
+    /// Identity-only presence for ordinary bindings.
+    pub ordinary_identities: &'a [String],
+    /// Complete observed split pairs. Invalid keys and ordinary-class entries
+    /// cannot establish split presence; split component bounds are checked.
+    pub split_pairs: &'a [CompletePairKey],
+}
+
+impl GroupPresence<'_> {
+    /// Whether the bound sides are present with the proof their class needs.
+    #[must_use]
+    pub fn connected(&self, binding: &GroupPair) -> bool {
+        match binding {
+            GroupPair::Ordinary { rgb, ir } => [rgb.as_deref(), ir.as_deref()]
+                .into_iter()
+                .flatten()
+                .all(|identity| self.ordinary_identities.iter().any(|p| p == identity)),
+            GroupPair::Split(_) => self.split_pairs.iter().any(|key| binding.matches_key(key)),
+        }
+    }
+}
+
+/// Builds the same rows as [`group_summaries`] with typed split presence.
+/// Only whole valid split keys can establish a split connection. Selection,
+/// activation and profile reporting follow the same policy as the legacy API.
+#[must_use]
+pub fn group_summaries_with_presence(
+    store: &SecondaryStore,
+    primary: Option<&[u8]>,
+    live: &GroupPair,
+    present: &GroupPresence<'_>,
+    embed_space: &str,
+    ir_space: &str,
+    ir_dim: usize,
+) -> Vec<irlume_common::CameraGroupSummary> {
     let stale = !matches!(store.activation_against(primary), Activation::Active);
     store
         .groups
         .iter()
         .map(|group| {
-            let connected = [&group.pair.rgb, &group.pair.ir]
-                .into_iter()
-                .flatten()
-                .all(|identity| present.iter().any(|p| p == identity));
             irlume_common::CameraGroupSummary {
                 id: group.id.as_str().to_owned(),
-                rgb: group.pair.rgb.clone(),
-                ir: group.pair.ir.clone(),
-                connected,
-                selected: group.pair.matches(live.rgb.as_deref(), live.ir.as_deref()),
+                rgb: group.pair.rgb_identity().map(str::to_owned),
+                ir: group.pair.ir_identity().map(str::to_owned),
+                connected: present.connected(&group.pair),
+                selected: group.pair.matches_binding(live),
                 stale,
                 generation: store.generation,
                 // Correlated by the daemon at response time (ADR-0030 §4).
@@ -307,39 +356,11 @@ impl TryFrom<String> for CameraGroupId {
     }
 }
 
-/// The complete role-labelled pair a group authorizes (ADR-0024 §2):
-/// each side is a `device_identity` string; at least one side must be
-/// bound, and membership checks compare the COMPLETE pair (a hybrid of two
-/// groups' endpoints never matches).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GroupPair {
-    #[serde(default)]
-    pub rgb: Option<String>,
-    #[serde(default)]
-    pub ir: Option<String>,
-}
-
-impl GroupPair {
-    /// Whether the live pair matches this group's complete pair under the
-    /// existing binding semantics: a bound side must match exactly; an
-    /// unbound side is not checked (the legacy rule, restated). Missing
-    /// identities are never wildcards FOR A BOUND SIDE: they fail.
-    #[must_use]
-    pub fn matches(&self, live_rgb: Option<&str>, live_ir: Option<&str>) -> bool {
-        if let Some(want) = &self.rgb {
-            if live_rgb != Some(want.as_str()) {
-                return false;
-            }
-        }
-        if let Some(want) = &self.ir {
-            if live_ir != Some(want.as_str()) {
-                return false;
-            }
-        }
-        true
-    }
-}
+/// A class-aware group binding: ordinary optional identity sides (ADR-0024
+/// §2), or a complete split key retaining both role-labelled identities and
+/// locations. Ordinary store records bind at least one side; split matching
+/// never projects the key to identity-only input.
+pub use irlume_common::binding_key::{CompletePairKey, PairBinding as GroupPair};
 
 /// One profile's scans captured on one secondary group. The profile
 /// reference is the primary store's profile name, made safe by the
@@ -429,13 +450,20 @@ impl SecondaryStore {
         }
         let mut total_scans = 0usize;
         for group in &self.groups {
-            if group.pair.rgb.is_none() && group.pair.ir.is_none() {
+            group
+                .pair
+                .validate()
+                .map_err(|error| SecondaryStoreError::Invalid(error.to_string()))?;
+            if group.pair.rgb_identity().is_none() && group.pair.ir_identity().is_none() {
                 return Err(SecondaryStoreError::Invalid(format!(
                     "group {} binds neither side",
                     group.id.as_str()
                 )));
             }
-            for identity in [&group.pair.rgb, &group.pair.ir].into_iter().flatten() {
+            for identity in [group.pair.rgb_identity(), group.pair.ir_identity()]
+                .into_iter()
+                .flatten()
+            {
                 if identity.is_empty() || identity.len() > MAX_ID_BYTES {
                     return Err(SecondaryStoreError::Invalid(
                         "pair identity out of bounds".into(),
@@ -534,6 +562,18 @@ impl SecondaryStore {
             .find(|group| group.pair.matches(live_rgb, live_ir))
     }
 
+    /// Resolves the first class-aware binding match in store order.
+    /// Ordinary bindings keep [`Self::group_for_pair`]'s partial-side and
+    /// first-match semantics; split bindings require valid whole-key equality.
+    /// This lookup does not check activation or resolve duplicate ambiguity;
+    /// grant callers use the strict complete-key policy instead.
+    #[must_use]
+    pub fn group_for_binding(&self, live: &GroupPair) -> Option<&SecondaryGroup> {
+        self.groups
+            .iter()
+            .find(|group| group.pair.matches_binding(live))
+    }
+
     /// ADR-0028 strict-pair resolution: a group resolves only when BOTH of
     /// its sides are present and equal to the configured identities.
     /// Unlike [`GroupPair::matches`], a missing side is never a wildcard, so
@@ -542,10 +582,21 @@ impl SecondaryStore {
     /// order never decides.
     #[must_use]
     pub fn strict_group_for_pair(&self, rgb: &str, ir: &str) -> StrictPairMatch<'_> {
+        self.strict_group_for_key(&CompletePairKey::Ordinary {
+            rgb: rgb.to_owned(),
+            ir: ir.to_owned(),
+        })
+    }
+
+    /// Resolves exactly one whole class-aware credential, never a partial binding.
+    #[must_use]
+    pub fn strict_group_for_key(&self, key: &CompletePairKey) -> StrictPairMatch<'_> {
+        if key.validate().is_err() {
+            return StrictPairMatch::None;
+        }
         let mut found = None;
         for (index, group) in self.groups.iter().enumerate() {
-            let exact =
-                group.pair.rgb.as_deref() == Some(rgb) && group.pair.ir.as_deref() == Some(ir);
+            let exact = group.pair.complete_key().as_ref() == Some(key);
             if exact {
                 if found.is_some() {
                     return StrictPairMatch::Ambiguous;
@@ -947,7 +998,7 @@ mod tests {
             primary_snapshot_sha256: "a".repeat(64),
             groups: vec![SecondaryGroup {
                 id: CameraGroupId::new("g1".into()).unwrap(),
-                pair: GroupPair {
+                pair: GroupPair::Ordinary {
                     rgb: Some("046d:085e:e179cb54".into()),
                     ir: Some("046d:085e:e179cb54".into()),
                 },
@@ -1233,6 +1284,191 @@ mod tests {
         assert!(s.group_for_pair(None, Some("046d:085e:e179cb54")).is_none());
     }
 
+    fn split_summary_pair() -> GroupPair {
+        GroupPair::Split(
+            irlume_common::split_key::SplitPairKey::parse_canonical(
+                "split1;5986:2113:rgb|0000:00:14.0|usb2|8;5986:1141:ir|0000:00:14.0|usb2|5",
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn group_for_binding_keeps_first_partial_ordinary_match() {
+        let mut s = store();
+        s.groups[0].pair = GroupPair::Ordinary {
+            rgb: Some("rgb".into()),
+            ir: None,
+        };
+        let mut second = s.groups[0].clone();
+        second.id = CameraGroupId::new("g2".into()).unwrap();
+        second.pair = GroupPair::Ordinary {
+            rgb: Some("rgb".into()),
+            ir: Some("ir".into()),
+        };
+        s.groups.push(second);
+        for ir in [None, Some("ir".into()), Some("hybrid".into())] {
+            let live = GroupPair::Ordinary {
+                rgb: Some("rgb".into()),
+                ir,
+            };
+            assert_eq!(s.group_for_binding(&live).unwrap().id.as_str(), "g1");
+        }
+        assert!(s.group_for_binding(&GroupPair::default()).is_none());
+    }
+
+    #[test]
+    fn group_for_binding_separates_classes_and_refuses_split_drift() {
+        let split = split_summary_pair();
+        let ordinary = GroupPair::Ordinary {
+            rgb: Some("5986:2113:rgb".into()),
+            ir: Some("5986:1141:ir".into()),
+        };
+        let mut s = store();
+        s.groups[0].pair = ordinary.clone();
+        assert!(s.group_for_binding(&split).is_none());
+        let mut second = s.groups[0].clone();
+        second.id = CameraGroupId::new("split".into()).unwrap();
+        second.pair = split.clone();
+        s.groups.push(second);
+        assert_eq!(s.group_for_binding(&ordinary).unwrap().id.as_str(), "g1");
+        assert_eq!(s.group_for_binding(&split).unwrap().id.as_str(), "split");
+        let GroupPair::Split(key) = split else {
+            panic!("split fixture");
+        };
+        let mut moved = key.clone();
+        moved.ir.ports = vec![6];
+        assert!(s.group_for_binding(&GroupPair::Split(moved)).is_none());
+        let swapped = GroupPair::Split(irlume_common::split_key::SplitPairKey {
+            rgb: key.ir,
+            ir: key.rgb,
+        });
+        assert!(s.group_for_binding(&swapped).is_none());
+        s.groups.remove(0);
+        assert!(s.group_for_binding(&ordinary).is_none());
+    }
+
+    #[test]
+    fn scoped_enrollment_bridge_retains_class_for_group_lookup() {
+        let mut s = store();
+        s.groups[0].pair = split_summary_pair();
+        let primary = crate::storage::Enrollment {
+            user: "alice".into(),
+            camera_binding: Some(crate::storage::CameraBinding::Ordinary {
+                rgb: Some("5986:2113:rgb".into()),
+                ir: Some("5986:1141:ir".into()),
+            }),
+            ..crate::storage::Enrollment::default()
+        };
+        let bytes = serde_json::to_vec(&primary).unwrap();
+        s.primary_snapshot_sha256 = irlume_common::sha256_hex(&bytes);
+        let views = views::CameraScopedViews::compose(&primary, &bytes, Some(&s)).unwrap();
+        let bridge = views
+            .secondary_view("g1")
+            .unwrap()
+            .matching_enrollment("alice");
+        let binding = bridge.camera_binding.as_ref().unwrap();
+        assert!(matches!(binding, crate::storage::CameraBinding::Split(_)));
+        assert_eq!(s.group_for_binding(binding).unwrap().id.as_str(), "g1");
+        assert!(s
+            .group_for_binding(primary.camera_binding.as_ref().unwrap())
+            .is_none());
+        let GroupPair::Split(mut moved) = binding.clone() else {
+            panic!("split bridge");
+        };
+        moved.ir.controller = "0000:00:15.0".into();
+        assert!(s.group_for_binding(&GroupPair::Split(moved)).is_none());
+    }
+
+    #[test]
+    fn group_summaries_keep_partial_ordinary_live_selection() {
+        let mut s = store();
+        s.groups[0].pair = GroupPair::Ordinary {
+            rgb: Some("rgb".into()),
+            ir: None,
+        };
+        let rows = group_summaries(
+            &s,
+            None,
+            &s.groups[0].pair,
+            &["rgb".into()],
+            "embed:test",
+            "ir:test",
+            4,
+        );
+        assert!(rows[0].connected);
+        assert!(rows[0].selected);
+        assert!(rows[0].stale);
+    }
+
+    #[test]
+    fn split_group_summary_never_claims_identity_only_connection() {
+        let mut s = store();
+        s.groups[0].pair = split_summary_pair();
+        let ordinary = GroupPair::Ordinary {
+            rgb: Some("5986:2113:rgb".into()),
+            ir: Some("5986:1141:ir".into()),
+        };
+        let present = ["5986:2113:rgb".into(), "5986:1141:ir".into()];
+        for (live, selected) in [(&ordinary, false), (&s.groups[0].pair, true)] {
+            let rows = group_summaries(&s, None, live, &present, "embed:test", "ir:test", 4);
+            assert!(!rows[0].connected);
+            assert_eq!(rows[0].selected, selected);
+            assert_eq!(rows[0].rgb.as_deref(), Some("5986:2113:rgb"));
+            assert_eq!(rows[0].ir.as_deref(), Some("5986:1141:ir"));
+        }
+    }
+
+    #[test]
+    fn typed_summary_presence_requires_complete_split_role_and_location() {
+        let mut s = store();
+        s.groups[0].pair = split_summary_pair();
+        let key = s.groups[0].pair.complete_key().unwrap();
+        let present = ["5986:2113:rgb".into(), "5986:1141:ir".into()];
+        let keys = [key.clone()];
+        let rows = group_summaries_with_presence(
+            &s,
+            None,
+            &s.groups[0].pair,
+            &GroupPresence {
+                ordinary_identities: &present,
+                split_pairs: &keys,
+            },
+            "embed:test",
+            "ir:test",
+            4,
+        );
+        assert!(rows[0].connected);
+        assert!(rows[0].selected);
+        let CompletePairKey::Split(key) = key else {
+            panic!("split fixture");
+        };
+        let mut moved = key.clone();
+        moved.rgb.controller = "0000:00:15.0".into();
+        let mut malformed = key.clone();
+        malformed.ir.ports = vec![0];
+        let swapped = irlume_common::split_key::SplitPairKey {
+            rgb: key.ir,
+            ir: key.rgb,
+        };
+        for key in [
+            CompletePairKey::Split(moved),
+            CompletePairKey::Split(malformed),
+            CompletePairKey::Split(swapped),
+            CompletePairKey::Ordinary {
+                rgb: "5986:2113:rgb".into(),
+                ir: "5986:1141:ir".into(),
+            },
+        ] {
+            let keys = [key];
+            let presence = GroupPresence {
+                ordinary_identities: &present,
+                split_pairs: &keys,
+            };
+            assert!(!presence.connected(&s.groups[0].pair));
+        }
+    }
+
     #[test]
     fn secondary_store_path_sits_outside_the_legacy_enrollment_namespace() {
         let _guard = crate::testenv::ENV_LOCK.lock().expect("env lock");
@@ -1443,7 +1679,7 @@ mod tests {
     #[test]
     fn group_summaries_report_connection_selection_activation_and_counts() {
         let mut store = store();
-        store.groups[0].pair = GroupPair {
+        store.groups[0].pair = GroupPair::Ordinary {
             rgb: Some("046d:desk".into()),
             ir: Some("046d:desk".into()),
         };
@@ -1477,7 +1713,7 @@ mod tests {
         let primary = b"primary-bytes";
         store.primary_snapshot_sha256 = irlume_common::sha256_hex(primary);
 
-        let live = GroupPair {
+        let live = GroupPair::Ordinary {
             rgb: Some("046d:desk".into()),
             ir: Some("046d:desk".into()),
         };
@@ -1527,7 +1763,7 @@ mod tests {
 
         // The same store against a DIFFERENT live pair, one side unplugged,
         // and a rewritten primary: disconnected, unselected, stale.
-        let other_live = GroupPair {
+        let other_live = GroupPair::Ordinary {
             rgb: Some("046d:lap".into()),
             ir: Some("046d:lap".into()),
         };
@@ -1565,7 +1801,7 @@ mod tests {
         many.groups = (0..MAX_GROUPS + 1)
             .map(|n| SecondaryGroup {
                 id: CameraGroupId::new(format!("g{n}")).unwrap(),
-                pair: GroupPair {
+                pair: GroupPair::Ordinary {
                     rgb: Some(format!("vid{n}")),
                     ir: None,
                 },

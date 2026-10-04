@@ -11,6 +11,7 @@
 //! requests such as enrollment.
 
 pub mod artifact;
+pub mod binding_key;
 pub mod client;
 pub mod config;
 pub mod dbglog;

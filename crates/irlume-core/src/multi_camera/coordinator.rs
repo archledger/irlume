@@ -13,7 +13,7 @@
 //! matching then read ONLY the group's scoped view. Before any grant
 //! decision, the daemon calls [`SecondaryAuthContext::boundary_check_now`], which re-reads BOTH
 //! stores at the boundary (never a cached descriptor) and applies
-//! [`grant_boundary_check`].
+//! [`grant_boundary_check_bound`].
 //!
 //! This is the Phase 1 primitive layer; the engine consumes it when the
 //! integrated flows land (Phase 2). Everything here is testable without
@@ -21,10 +21,11 @@
 //! software rows end to end.
 
 use super::commit::{
-    grant_boundary_check, grant_boundary_now, resolve_commit, GrantContext, GrantDecision,
+    grant_boundary_check_bound, grant_boundary_now_bound, grant_boundary_now_bound_with,
+    resolve_commit, GrantContext, GrantDecision,
 };
 use super::views::{CameraScopedViews, GroupScope};
-use super::SecondaryStore;
+use super::{CompletePairKey, GroupPair, SecondaryStore};
 use std::path::{Path, PathBuf};
 
 /// Why a pin attempt refused. Every refusal names the boundary that
@@ -73,6 +74,9 @@ pub struct SecondaryAuthContext {
     secondary_path: PathBuf,
     primary_path: PathBuf,
     pinned: GrantContext,
+    /// Exact stored binding, including class, roles, and split locations.
+    /// Kept separately so public grant metadata retains its existing shape.
+    pair: GroupPair,
     views: CameraScopedViews,
     group_index: usize,
     /// The pinned group's 0-based position in the store: the only handle
@@ -150,6 +154,7 @@ impl SecondaryAuthContext {
             .position(|candidate| candidate.id == group.id)
             .unwrap_or(0);
         let group_id = group.id.as_str().to_owned();
+        let pair = group.pair.clone();
         let Some(index) = views
             .group_views()
             .iter()
@@ -167,6 +172,7 @@ impl SecondaryAuthContext {
                 primary_snapshot_sha256: secondary.primary_snapshot_sha256.clone(),
                 group_id,
             },
+            pair,
             views,
             group_index: index,
             store_index,
@@ -199,6 +205,37 @@ impl SecondaryAuthContext {
         ir: &str,
         keys: &mut dyn crate::template_key::TemplateKeySource,
     ) -> Result<Self, PinError> {
+        Self::pin_key_with_source(
+            stores,
+            primary,
+            primary_bytes,
+            &CompletePairKey::Ordinary {
+                rgb: rgb.to_owned(),
+                ir: ir.to_owned(),
+            },
+            keys,
+        )
+    }
+
+    /// Pins one exact complete credential, ordinary or split, using the
+    /// requesting account's already-loaded primary and its exact file bytes.
+    /// Only the secondary is loaded here, under the same borrowed request key.
+    /// Split roles and locations are never projected to ordinary identities.
+    /// This primitive does not enable split authentication at the request gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PinError::Secondary`] for an unusable, absent or wrong-owner
+    /// store, [`PinError::GroupNotActive`] for an invalid or unmatched key,
+    /// [`PinError::GroupInactive`] for stale activation, and
+    /// [`PinError::Ambiguous`] for more than one exact key match.
+    pub fn pin_key_with_source(
+        stores: StrictPinStores<'_>,
+        primary: &crate::storage::Enrollment,
+        primary_bytes: &[u8],
+        key: &CompletePairKey,
+        keys: &mut dyn crate::template_key::TemplateKeySource,
+    ) -> Result<Self, PinError> {
         let StrictPinStores {
             user,
             secondary_path,
@@ -217,8 +254,10 @@ impl SecondaryAuthContext {
                 secondary.owner
             )));
         }
-        let (store_index, group_id) = match secondary.strict_group_for_pair(rgb, ir) {
-            super::StrictPairMatch::One { index, group } => (index, group.id.as_str().to_owned()),
+        let (store_index, group_id, pair) = match secondary.strict_group_for_key(key) {
+            super::StrictPairMatch::One { index, group } => {
+                (index, group.id.as_str().to_owned(), group.pair.clone())
+            }
             super::StrictPairMatch::None => {
                 return Err(PinError::GroupNotActive(
                     "no enrolled group has exactly the configured pair".into(),
@@ -256,6 +295,7 @@ impl SecondaryAuthContext {
                 primary_snapshot_sha256: secondary.primary_snapshot_sha256.clone(),
                 group_id,
             },
+            pair,
             views,
             group_index: index,
             store_index,
@@ -296,7 +336,12 @@ impl SecondaryAuthContext {
     /// Returns the boundary's commit error only for unreadable state; a
     /// readable-but-drifted state is a [`GrantDecision::Refuse`].
     pub fn boundary_check_now(&self) -> Result<GrantDecision, super::commit::CommitError> {
-        grant_boundary_now(&self.pinned, &self.secondary_path, &self.primary_path)
+        grant_boundary_now_bound(
+            &self.pinned,
+            &self.pair,
+            &self.secondary_path,
+            &self.primary_path,
+        )
     }
 
     /// [`Self::boundary_check_now`] lending the request's template key to the
@@ -310,8 +355,9 @@ impl SecondaryAuthContext {
         &self,
         keys: &mut dyn crate::template_key::TemplateKeySource,
     ) -> Result<GrantDecision, super::commit::CommitError> {
-        super::commit::grant_boundary_now_with(
+        grant_boundary_now_bound_with(
             &self.pinned,
+            &self.pair,
             &self.secondary_path,
             &self.primary_path,
             keys,
@@ -326,7 +372,12 @@ impl SecondaryAuthContext {
         current_primary_bytes: Option<&[u8]>,
         current_secondary: Option<&SecondaryStore>,
     ) -> GrantDecision {
-        grant_boundary_check(&self.pinned, current_primary_bytes, current_secondary)
+        grant_boundary_check_bound(
+            &self.pinned,
+            &self.pair,
+            current_primary_bytes,
+            current_secondary,
+        )
     }
 }
 
@@ -343,6 +394,442 @@ mod integration {
     };
     use super::*;
     use crate::storage::{Enrollment, FaceProfile, FaceScan};
+    use irlume_common::binding_key::CompletePairKey;
+    use irlume_common::split_key::{SplitDomain, SplitPairKey};
+
+    fn split_pair() -> GroupPair {
+        GroupPair::Split(
+            SplitPairKey::parse_canonical(
+                "split1;5986:2113:rgb|0000:00:14.0|usb2|8;5986:1141:ir|0000:00:14.0|usb2|5",
+            )
+            .unwrap(),
+        )
+    }
+
+    fn enroll_binding(rig: &Rig, pair: &GroupPair, key: Option<&[u8]>) -> (PathBuf, PathBuf) {
+        let (secondary_path, primary_path, _, _) = enroll_encrypted_pair(rig, key, key);
+        let mut store = super::super::load_secondary_with_key(&secondary_path, key)
+            .unwrap()
+            .unwrap();
+        store.groups[0].pair = pair.clone();
+        super::super::save_secondary_with_key(&secondary_path, &store, key).unwrap();
+        (secondary_path, primary_path)
+    }
+
+    #[test]
+    fn split_key_pin_keeps_the_whole_scoped_pair_and_all_boundaries() {
+        let _env = crate::testenv::ENV_LOCK.lock().unwrap();
+        let rig = Rig::new("split-pin");
+        let pair = split_pair();
+        let (secondary_path, primary_path) = enroll_binding(&rig, &pair, None);
+        let mut keys = counting_source(None);
+        let primary = crate::storage::load_path_with_source("alice", &primary_path, &mut keys)
+            .unwrap()
+            .unwrap();
+        let bytes = std::fs::read(&primary_path).unwrap();
+        let stores = StrictPinStores {
+            user: "alice",
+            secondary_path: &secondary_path,
+            primary_path: &primary_path,
+        };
+        let context = SecondaryAuthContext::pin_key_with_source(
+            stores,
+            &primary,
+            &bytes,
+            &pair.complete_key().unwrap(),
+            &mut keys,
+        )
+        .unwrap();
+        assert_eq!(context.store_index(), 0);
+        assert_eq!(context.group_view().pair, pair);
+        assert_eq!(
+            context
+                .group_view()
+                .matching_enrollment("alice")
+                .camera_binding,
+            Some(pair)
+        );
+        let mut current = super::super::load_secondary_with_key(&secondary_path, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            context.boundary_check(Some(&bytes), Some(&current)),
+            Boundary::Grant
+        );
+        assert!(matches!(context.boundary_check_now(), Ok(Boundary::Grant)));
+        assert!(matches!(
+            context.boundary_check_now_with(&mut keys),
+            Ok(Boundary::Grant)
+        ));
+        let GroupPair::Split(key) = &mut current.groups[0].pair else {
+            unreachable!()
+        };
+        key.ir.ports.push(1);
+        super::super::save_secondary_with_key(&secondary_path, &current, None).unwrap();
+        assert!(matches!(
+            context.boundary_check(Some(&bytes), Some(&current)),
+            Boundary::Refuse(_)
+        ));
+        assert!(matches!(
+            context.boundary_check_now(),
+            Ok(Boundary::Refuse(_))
+        ));
+        assert!(matches!(
+            context.boundary_check_now_with(&mut keys),
+            Ok(Boundary::Refuse(_))
+        ));
+        assert_eq!(keys.unseals(), 0);
+    }
+
+    #[test]
+    fn split_key_pin_refuses_wrong_roles_locations_class_and_invalid_keys() {
+        let _env = crate::testenv::ENV_LOCK.lock().unwrap();
+        let rig = Rig::new("split-wrong-key");
+        let pair = split_pair();
+        let (secondary_path, primary_path) = enroll_binding(&rig, &pair, None);
+        let mut keys = counting_source(None);
+        let primary = crate::storage::load_path_with_source("alice", &primary_path, &mut keys)
+            .unwrap()
+            .unwrap();
+        let bytes = std::fs::read(&primary_path).unwrap();
+        let stores = StrictPinStores {
+            user: "alice",
+            secondary_path: &secondary_path,
+            primary_path: &primary_path,
+        };
+        let GroupPair::Split(key) = pair else {
+            unreachable!()
+        };
+        let mut swapped = key.clone();
+        std::mem::swap(&mut swapped.rgb, &mut swapped.ir);
+        let mut wrong_keys = vec![
+            CompletePairKey::Split(swapped),
+            CompletePairKey::Ordinary {
+                rgb: key.rgb.identity.clone(),
+                ir: key.ir.identity.clone(),
+            },
+        ];
+        for rgb in [true, false] {
+            for change in 0..5 {
+                let mut wrong = key.clone();
+                let side = if rgb { &mut wrong.rgb } else { &mut wrong.ir };
+                match change {
+                    0 => side.identity = "other".into(),
+                    1 => side.controller = "0000:00:15.0".into(),
+                    2 => side.domain = SplitDomain::SuperSpeed,
+                    3 => side.ports.push(1),
+                    _ => side.ports = vec![0],
+                }
+                wrong_keys.push(CompletePairKey::Split(wrong));
+            }
+        }
+        for wrong in wrong_keys {
+            assert!(matches!(
+                SecondaryAuthContext::pin_key_with_source(
+                    stores, &primary, &bytes, &wrong, &mut keys
+                ),
+                Err(PinError::GroupNotActive(_))
+            ));
+        }
+        assert!(matches!(
+            SecondaryAuthContext::pin_with_source(
+                &secondary_path,
+                &primary_path,
+                Some(&key.rgb.identity),
+                Some(&key.ir.identity),
+                &mut keys
+            ),
+            Err(PinError::GroupNotActive(_))
+        ));
+        assert!(matches!(
+            SecondaryAuthContext::pin_strict_with_source(
+                stores,
+                &primary,
+                &bytes,
+                &key.rgb.identity,
+                &key.ir.identity,
+                &mut keys
+            ),
+            Err(PinError::GroupNotActive(_))
+        ));
+    }
+
+    #[test]
+    fn split_key_pin_refuses_wrong_owner_inactive_and_ambiguous_stores() {
+        let _env = crate::testenv::ENV_LOCK.lock().unwrap();
+        let rig = Rig::new("split-store-refusal");
+        let pair = split_pair();
+        let key = pair.complete_key().unwrap();
+        let (secondary_path, primary_path) = enroll_binding(&rig, &pair, None);
+        let mut keys = counting_source(None);
+        let primary = crate::storage::load_path_with_source("alice", &primary_path, &mut keys)
+            .unwrap()
+            .unwrap();
+        let bytes = std::fs::read(&primary_path).unwrap();
+        let stores = StrictPinStores {
+            user: "alice",
+            secondary_path: &secondary_path,
+            primary_path: &primary_path,
+        };
+        let original = super::super::load_secondary_with_key(&secondary_path, None)
+            .unwrap()
+            .unwrap();
+        let mut wrong_owner = original.clone();
+        wrong_owner.owner = "mallory".into();
+        super::super::save_secondary_with_key(&secondary_path, &wrong_owner, None).unwrap();
+        assert!(matches!(
+            SecondaryAuthContext::pin_key_with_source(stores, &primary, &bytes, &key, &mut keys),
+            Err(PinError::Secondary(_))
+        ));
+        let mut inactive = original.clone();
+        inactive.primary_snapshot_sha256 = "a".repeat(64);
+        super::super::save_secondary_with_key(&secondary_path, &inactive, None).unwrap();
+        assert!(matches!(
+            SecondaryAuthContext::pin_key_with_source(stores, &primary, &bytes, &key, &mut keys),
+            Err(PinError::GroupInactive { index: 0, .. })
+        ));
+        let mut ambiguous = original;
+        let mut duplicate = ambiguous.groups[0].clone();
+        duplicate.id = CameraGroupId::new("other".into()).unwrap();
+        ambiguous.groups.push(duplicate);
+        super::super::save_secondary_with_key(&secondary_path, &ambiguous, None).unwrap();
+        assert!(matches!(
+            SecondaryAuthContext::pin_key_with_source(stores, &primary, &bytes, &key, &mut keys),
+            Err(PinError::Ambiguous(_))
+        ));
+    }
+
+    #[test]
+    fn split_context_refuses_generation_digest_activation_and_revocation_drift() {
+        let _env = crate::testenv::ENV_LOCK.lock().unwrap();
+        let rig = Rig::new("split-context-drift");
+        let pair = split_pair();
+        let (secondary_path, primary_path) = enroll_binding(&rig, &pair, None);
+        let mut keys = counting_source(None);
+        let primary = crate::storage::load_path_with_source("alice", &primary_path, &mut keys)
+            .unwrap()
+            .unwrap();
+        let bytes = std::fs::read(&primary_path).unwrap();
+        let stores = StrictPinStores {
+            user: "alice",
+            secondary_path: &secondary_path,
+            primary_path: &primary_path,
+        };
+        let context = SecondaryAuthContext::pin_key_with_source(
+            stores,
+            &primary,
+            &bytes,
+            &pair.complete_key().unwrap(),
+            &mut keys,
+        )
+        .unwrap();
+        let original = super::super::load_secondary_with_key(&secondary_path, None)
+            .unwrap()
+            .unwrap();
+        for change in 0..3 {
+            let mut current = original.clone();
+            match change {
+                0 => current.generation += 1,
+                1 => current.primary_snapshot_sha256 = "a".repeat(64),
+                _ => current.groups.clear(),
+            }
+            super::super::save_secondary_with_key(&secondary_path, &current, None).unwrap();
+            assert!(matches!(
+                context.boundary_check(Some(&bytes), Some(&current)),
+                Boundary::Refuse(_)
+            ));
+            assert!(matches!(
+                context.boundary_check_now_with(&mut keys),
+                Ok(Boundary::Refuse(_))
+            ));
+        }
+        super::super::save_secondary_with_key(&secondary_path, &original, None).unwrap();
+        std::fs::write(&primary_path, b"rewritten primary").unwrap();
+        assert!(matches!(
+            context.boundary_check_now_with(&mut keys),
+            Ok(Boundary::Refuse(_))
+        ));
+        std::fs::remove_file(&primary_path).unwrap();
+        assert!(matches!(
+            context.boundary_check_now_with(&mut keys),
+            Ok(Boundary::Refuse(_))
+        ));
+    }
+
+    #[test]
+    fn split_key_pin_and_boundary_borrow_the_loaded_primary_key_without_another_unseal() {
+        let _env = crate::testenv::ENV_LOCK.lock().unwrap();
+        let rig = Rig::new("split-unseal");
+        let pair = split_pair();
+        let key = crate::crypto::generate_key();
+        let (secondary_path, primary_path) = enroll_binding(&rig, &pair, Some(&key));
+        let mut keys = counting_source(Some(key.to_vec()));
+        let bytes = std::fs::read(&primary_path).unwrap();
+        let primary = crate::storage::load_path_with_source("alice", &primary_path, &mut keys)
+            .unwrap()
+            .unwrap();
+        assert_eq!(keys.unseals(), 1);
+        let stores = StrictPinStores {
+            user: "alice",
+            secondary_path: &secondary_path,
+            primary_path: &primary_path,
+        };
+        let complete = pair.complete_key().unwrap();
+        let context = SecondaryAuthContext::pin_key_with_source(
+            stores, &primary, &bytes, &complete, &mut keys,
+        )
+        .unwrap();
+        assert!(matches!(
+            context.boundary_check_now_with(&mut keys),
+            Ok(Boundary::Grant)
+        ));
+        assert_eq!(
+            keys.unseals(),
+            1,
+            "pin and boundary lend the already-loaded request key"
+        );
+        let mut adopted = counting_source(None);
+        adopted.adopt("alice", Some(zeroize::Zeroizing::new(key.to_vec())));
+        let adopted_context = SecondaryAuthContext::pin_key_with_source(
+            stores,
+            &primary,
+            &bytes,
+            &complete,
+            &mut adopted,
+        )
+        .unwrap();
+        assert!(matches!(
+            adopted_context.boundary_check_now_with(&mut adopted),
+            Ok(Boundary::Grant)
+        ));
+        assert_eq!(adopted.unseals(), 0);
+        let mut none = counting_source(None);
+        assert!(matches!(
+            SecondaryAuthContext::pin_key_with_source(
+                stores, &primary, &bytes, &complete, &mut none
+            ),
+            Err(PinError::Secondary(_))
+        ));
+        let store = super::super::load_secondary_with_key(&secondary_path, Some(&key))
+            .unwrap()
+            .unwrap();
+        let other_key = crate::crypto::generate_key();
+        super::super::save_secondary_with_key(&secondary_path, &store, Some(&other_key)).unwrap();
+        assert!(context.boundary_check_now_with(&mut keys).is_err());
+        assert!(adopted_context
+            .boundary_check_now_with(&mut adopted)
+            .is_err());
+        assert_eq!(keys.unseals(), 1, "rekey refusal does not unseal again");
+        assert_eq!(adopted.unseals(), 0);
+    }
+
+    #[test]
+    fn ordinary_partial_pin_remains_partial_but_boundary_retains_its_exact_pair() {
+        let _env = crate::testenv::ENV_LOCK.lock().unwrap();
+        let rig = Rig::new("partial-pin");
+        let pair = GroupPair::Ordinary {
+            rgb: None,
+            ir: Some("ir".into()),
+        };
+        let (secondary_path, primary_path) = enroll_binding(&rig, &pair, None);
+        let mut keys = counting_source(None);
+        let context = SecondaryAuthContext::pin_with_source(
+            &secondary_path,
+            &primary_path,
+            Some("any-rgb"),
+            Some("ir"),
+            &mut keys,
+        )
+        .unwrap();
+        assert_eq!(context.group_view().pair, pair);
+        assert!(matches!(
+            context.boundary_check_now_with(&mut keys),
+            Ok(Boundary::Grant)
+        ));
+        let bytes = std::fs::read(&primary_path).unwrap();
+        let primary = crate::storage::load_path_with_source("alice", &primary_path, &mut keys)
+            .unwrap()
+            .unwrap();
+        let stores = StrictPinStores {
+            user: "alice",
+            secondary_path: &secondary_path,
+            primary_path: &primary_path,
+        };
+        assert!(matches!(
+            SecondaryAuthContext::pin_strict_with_source(
+                stores, &primary, &bytes, "any-rgb", "ir", &mut keys
+            ),
+            Err(PinError::GroupNotActive(_))
+        ));
+        let mut current = super::super::load_secondary_with_key(&secondary_path, None)
+            .unwrap()
+            .unwrap();
+        current.groups[0].pair = GroupPair::Ordinary {
+            rgb: Some("any-rgb".into()),
+            ir: Some("ir".into()),
+        };
+        super::super::save_secondary_with_key(&secondary_path, &current, None).unwrap();
+        assert!(matches!(
+            context.boundary_check_now_with(&mut keys),
+            Ok(Boundary::Refuse(_))
+        ));
+    }
+
+    #[test]
+    fn strict_ordinary_adapter_preserves_complete_key_matching_and_class() {
+        let _env = crate::testenv::ENV_LOCK.lock().unwrap();
+        let rig = Rig::new("strict-ordinary-adapter");
+        let pair = GroupPair::Ordinary {
+            rgb: Some("5986:2113:rgb".into()),
+            ir: Some("5986:1141:ir".into()),
+        };
+        let (secondary_path, primary_path) = enroll_binding(&rig, &pair, None);
+        let mut keys = counting_source(None);
+        let primary = crate::storage::load_path_with_source("alice", &primary_path, &mut keys)
+            .unwrap()
+            .unwrap();
+        let bytes = std::fs::read(&primary_path).unwrap();
+        let stores = StrictPinStores {
+            user: "alice",
+            secondary_path: &secondary_path,
+            primary_path: &primary_path,
+        };
+        let context = SecondaryAuthContext::pin_strict_with_source(
+            stores,
+            &primary,
+            &bytes,
+            "5986:2113:rgb",
+            "5986:1141:ir",
+            &mut keys,
+        )
+        .unwrap();
+        assert_eq!(context.group_view().pair, pair);
+        assert!(matches!(
+            context.boundary_check_now_with(&mut keys),
+            Ok(Boundary::Grant)
+        ));
+        assert!(matches!(
+            SecondaryAuthContext::pin_key_with_source(
+                stores,
+                &primary,
+                &bytes,
+                &split_pair().complete_key().unwrap(),
+                &mut keys
+            ),
+            Err(PinError::GroupNotActive(_))
+        ));
+        assert!(matches!(
+            SecondaryAuthContext::pin_strict_with_source(
+                stores,
+                &primary,
+                &bytes,
+                "other-rgb",
+                "5986:1141:ir",
+                &mut keys
+            ),
+            Err(PinError::GroupNotActive(_))
+        ));
+    }
 
     fn scan(pitch: f32) -> FaceScan {
         FaceScan {
@@ -405,7 +892,7 @@ mod integration {
                 primary_snapshot_sha256: irlume_common::sha256_hex(&bytes),
                 groups: vec![SecondaryGroup {
                     id: CameraGroupId::new("desk".into()).unwrap(),
-                    pair: GroupPair {
+                    pair: GroupPair::Ordinary {
                         rgb: Some(rgb.into()),
                         ir: Some(ir.into()),
                     },
@@ -457,7 +944,7 @@ mod integration {
             primary_snapshot_sha256: irlume_common::sha256_hex(&bytes),
             groups: vec![SecondaryGroup {
                 id: CameraGroupId::new("desk".into()).unwrap(),
-                pair: GroupPair {
+                pair: GroupPair::Ordinary {
                     rgb: Some("3443:c803".into()),
                     ir: Some("3443:c803".into()),
                 },
@@ -695,7 +1182,7 @@ mod integration {
             primary_snapshot_sha256: digest.clone(),
             groups: vec![SecondaryGroup {
                 id: CameraGroupId::new("desk".into()).unwrap(),
-                pair: GroupPair {
+                pair: GroupPair::Ordinary {
                     rgb: Some("3443:c803".into()),
                     ir: Some("3443:c803".into()),
                 },
@@ -735,7 +1222,7 @@ mod integration {
             primary_snapshot_sha256: digest.clone(),
             groups: vec![SecondaryGroup {
                 id: CameraGroupId::new("desk".into()).unwrap(),
-                pair: GroupPair {
+                pair: GroupPair::Ordinary {
                     rgb: Some("3443:c803".into()),
                     ir: Some("3443:c803".into()),
                 },

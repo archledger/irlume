@@ -10,6 +10,8 @@
 //! node. Nothing here opens, classifies or reads sysfs.
 
 use irlume_common::live_camera::{CameraInventoryReason, CameraInventoryState};
+use irlume_common::split_key::{KeyError, SplitDomain, SplitPairKey, SplitUnitKey};
+use irlume_common::split_schema::AuthorizationRecord;
 
 use crate::inventory::UsbDeviceFacts;
 use crate::{Role, UsbLocation};
@@ -154,8 +156,8 @@ pub struct CameraNode {
     /// This side's capture node. Root-only: a daemon reply to a non-root
     /// peer carries neither side's path (ADR-0030 §4).
     pub path: String,
-    /// The binding identity of the device behind this node, as
-    /// [`crate::binding_identity`] formats it. A split pair has no single
+    /// The binding identity of the device behind this node, in the format
+    /// [`crate::device_identity`] reports. A split pair has no single
     /// identity, so each side keeps its own. Never sent to a non-root peer.
     pub identity: String,
     /// `vid:pid`, lowercase hex.
@@ -173,13 +175,13 @@ pub struct CameraNode {
     /// Non-root output requires the display projection specified in section 6;
     /// this raw value is not permission to expose controller facts.
     ///
-    /// A plain [`UsbLocation`], never an `Option`: a split-pair side always
-    /// has a location, because [`resolve_side`] refuses any side whose
+    /// A plain `UsbLocation`, never an `Option`: a split-pair side always
+    /// has a location, because resolution refuses any side whose
     /// location is unrecorded or mismatched before a [`CameraNode`] is ever
     /// built. That makes "located" a type-level invariant instead of a
-    /// runtime check, so [`SplitPair::binding_key`] has no fallback that
+    /// runtime check, so [`SplitPair::pair_key`] has no fallback that
     /// could fold an unlocated side into a collision.
-    pub location: UsbLocation,
+    pub(crate) location: UsbLocation,
     /// The inventory instance id for this side. A split pair spans two.
     pub instance_id: String,
     /// This side's generation within its `instance_id`. The two sides
@@ -209,9 +211,35 @@ pub struct SplitPair {
     /// spanning two incarnations is a republication race, not a pair, so
     /// the builder only ever fills this from one publication.
     pub supervisor_id: String,
+    /// The complete Current publication that supplied both sides' facts.
+    pub revision: u64,
 }
 
 impl SplitPair {
+    /// The role-labelled durable key, using the common canonical representation.
+    /// Paths, supervisor, revision and connection incarnations are excluded.
+    /// This describes recorded facts, not proof that replacement hardware is
+    /// the same physical unit (ADR-0032 section 2).
+    ///
+    /// # Errors
+    /// [`KeyError`] if either side cannot be encoded canonically: an empty
+    /// identity or controller, an empty port chain or a zero port element.
+    pub fn pair_key(&self) -> Result<SplitPairKey, KeyError> {
+        SplitPairKey::try_from(self)
+    }
+
+    /// The two incarnation expectations for operation-scoped lease acquisition.
+    /// These runtime facts must never be persisted as credential identity.
+    #[must_use]
+    pub fn lease_request(&self) -> crate::lease::SplitLeaseRequest {
+        crate::lease::SplitLeaseRequest {
+            supervisor_id: self.supervisor_id.clone(),
+            revision: self.revision,
+            rgb: self.rgb.expectation(),
+            ir: self.ir.expectation(),
+        }
+    }
+
     /// A stable key for this pair: the RGB half first, then the IR half,
     /// each an identity plus its controller-qualified location, NUL-separated
     /// throughout.
@@ -246,10 +274,10 @@ impl SplitPair {
         not(test),
         expect(
             dead_code,
-            reason = "split credential bindings remain gated on ADR-0032 step 5"
+            reason = "legacy key comparison tests; production uses the typed canonical pair key"
         )
     )]
-    pub fn binding_key(&self) -> String {
+    pub(crate) fn binding_key(&self) -> String {
         // No fallback: both halves always carry a real location
         // (`CameraNode::location` is total), so there is no empty component
         // to collide.
@@ -260,6 +288,51 @@ impl SplitPair {
             self.ir.identity,
             self.ir.location.key_string()
         )
+    }
+}
+
+impl TryFrom<&SplitPair> for SplitPairKey {
+    type Error = KeyError;
+
+    /// Convert both complete role-labelled sides and validate with the common
+    /// encoder. No location component is inferred or replaced with a default.
+    ///
+    /// # Errors
+    /// [`KeyError`] if either side has no canonical unit representation.
+    fn try_from(pair: &SplitPair) -> Result<Self, Self::Error> {
+        let unit = |node: &CameraNode| SplitUnitKey {
+            identity: node.identity.clone(),
+            controller: node.location.controller.clone(),
+            domain: split_domain(node.location.domain),
+            ports: node.location.ports.clone(),
+        };
+        let key = Self {
+            rgb: unit(&pair.rgb),
+            ir: unit(&pair.ir),
+        };
+        key.format_canonical()?;
+        Ok(key)
+    }
+}
+
+fn split_domain(domain: crate::RootHubDomain) -> SplitDomain {
+    match domain {
+        crate::RootHubDomain::Usb2 => SplitDomain::Usb2,
+        crate::RootHubDomain::SuperSpeed => SplitDomain::SuperSpeed,
+    }
+}
+
+impl CameraNode {
+    fn expectation(&self) -> SplitSideExpectation {
+        SplitSideExpectation {
+            instance_id: self.instance_id.clone(),
+            generation: self.generation,
+            endpoint: self.path.clone(),
+            identity: self.identity.clone(),
+            controller: self.location.controller.clone(),
+            domain: split_domain(self.location.domain).as_str().to_owned(),
+            ports: self.location.ports.clone(),
+        }
     }
 }
 
@@ -334,6 +407,44 @@ pub struct ConnectedPairs {
     /// Cameras that may still become pairs once their capture nodes are
     /// classified, in inventory order.
     pub unclassified: Vec<UnclassifiedCamera>,
+}
+
+/// The ordinary pairing view plus outcomes for ordered split authorizations;
+/// see [`crate::connected_pairs_with_split`]. Both views use one inventory
+/// publication. This additive Rust API does not extend the closed inventory
+/// wire types or the public construction contract of [`ConnectedPairs`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResolvedConnectedPairs {
+    /// Ordinary pairs and publication metadata. NonCurrent or unhealthy
+    /// publications retain their metadata but expose no usable pairs here.
+    pub ordinary: ConnectedPairs,
+    /// Authorized split pairs, in record order, from one complete Current
+    /// publication. Empty when no authorizations were supplied.
+    pub split_pairs: Vec<SplitPair>,
+    /// Refused authorizations, indexed into the daemon-supplied record slice.
+    /// Empty when no authorizations were supplied.
+    pub split_refusals: Vec<SplitRefusal>,
+}
+
+impl ResolvedConnectedPairs {
+    pub(crate) fn refuse_split_records(mut self, count: usize) -> Self {
+        self.split_refusals = (0..count)
+            .map(|record_index| SplitRefusal {
+                record_index,
+                reason: PinRefusal::PublicationUnavailable,
+            })
+            .collect();
+        self
+    }
+}
+
+/// One refused authorization in [`ResolvedConnectedPairs`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitRefusal {
+    /// Zero-based index into the supplied ordered authorization records.
+    pub record_index: usize,
+    /// The rule that refused this record. Independent records remain usable.
+    pub reason: PinRefusal,
 }
 
 /// One inventory entry as the pairing rule sees it.
@@ -424,8 +535,8 @@ pub(crate) fn pair_camera(
 /// the stated boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SplitPin {
-    /// The binding identity of the RGB side, as
-    /// [`crate::binding_identity`] formats it: `vid:pid[:serial]`.
+    /// The binding identity of the RGB side, in the format
+    /// [`crate::device_identity`] reports: `vid:pid[:serial]`.
     pub rgb_identity: String,
     /// The node path the pin named for the RGB side.
     pub rgb_path: String,
@@ -443,6 +554,27 @@ pub struct SplitPin {
     /// The controller-qualified USB location the IR side was on when the pin
     /// was written, required and matched as for `rgb_location`.
     pub ir_location: Option<UsbLocation>,
+}
+
+impl From<&AuthorizationRecord> for SplitPin {
+    fn from(record: &AuthorizationRecord) -> Self {
+        let location = |side: &irlume_common::split_schema::SideFields| UsbLocation {
+            controller: side.controller.clone(),
+            domain: match side.domain {
+                SplitDomain::Usb2 => crate::RootHubDomain::Usb2,
+                SplitDomain::SuperSpeed => crate::RootHubDomain::SuperSpeed,
+            },
+            ports: side.ports.clone(),
+        };
+        Self {
+            rgb_identity: record.rgb.identity.clone(),
+            rgb_path: record.rgb.path.clone(),
+            rgb_location: Some(location(&record.rgb)),
+            ir_identity: record.ir.identity.clone(),
+            ir_path: record.ir.path.clone(),
+            ir_location: Some(location(&record.ir)),
+        }
+    }
 }
 
 /// One side of a candidate split pair, as the builder sees it: the same
@@ -529,18 +661,11 @@ impl<'a> SplitCandidate<'a> {
     /// location captured by that publication, not refresh it here.
     /// The capture-node filter is exactly [`pair_camera`]'s:
     /// endpoints minus metadata nodes. The two views of "what is a
-    /// capture node" cannot drift; Step 3 calls this instead of hand-filling
+    /// capture node" cannot drift; production publication calls this instead of hand-filling
     /// `roles`. A capture node without a role makes the whole candidate
     /// `None`, mirroring `pair_camera`'s unclassified rule: an unknown node
     /// might be a second node of the wanted role, and a pin must not resolve
     /// while that is open.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no production caller until ADR-0032 step 3 wires pins into publication"
-        )
-    )]
     pub(crate) fn classified(
         input: &'a PairingInput<'a>,
         supervisor_id: &'a str,
@@ -613,13 +738,6 @@ impl<'a> SplitCandidate<'a> {
 /// This builder is where a [`SplitPair`] is *decided*. It says nothing about
 /// whether the pair is still live; that is the lease's re-check, against both
 /// sides' `instance_id` and `generation`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no production caller until ADR-0032 step 3 wires pins into publication"
-    )
-)]
 pub(crate) fn pinned_split_pairs(
     candidates: &[SplitCandidate<'_>],
     pins: &[SplitPin],
@@ -661,9 +779,8 @@ pub(crate) fn pinned_split_pairs(
     outcomes
 }
 
-/// What one pin resolved to. Step 3 publishes the `Paired` halves and reports
-/// the `Refused` reasons; until then, tests match on these to prove *which*
-/// rule fired, which an empty list could never do.
+/// What one pin resolved to. The production adapter publishes the `Paired`
+/// halves and reports indexed `Refused` reasons without another resolver.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PinOutcome {
     /// Boxed: a `SplitPair` holds two full `CameraNode`s, an order of
@@ -673,15 +790,7 @@ pub(crate) enum PinOutcome {
 }
 
 impl PinOutcome {
-    /// The authorized pair, if this pin resolved to one. Step 3 publishes
-    /// through this; until then only tests call it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no production caller until ADR-0032 step 3 wires pins into publication"
-        )
-    )]
+    /// The authorized pair, if this pin resolved to one.
     pub(crate) fn paired(&self) -> Option<&SplitPair> {
         match self {
             Self::Paired(pair) => Some(pair),
@@ -690,11 +799,14 @@ impl PinOutcome {
     }
 }
 
-/// Why a pin was not honored. Every rule in [`pinned_split_pairs`] that can
-/// refuse has a variant, so "my pin stopped working" names the rule instead
-/// of an empty list.
+/// Why a pin was not honored. Every refusal rule has a variant, so
+/// [`ResolvedConnectedPairs::split_refusals`] names the rule instead of
+/// returning an unexplained empty list.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum PinRefusal {
+pub enum PinRefusal {
+    /// The inventory is unhealthy or not a complete Current publication.
+    /// Reported by the production adapter before resolving any record.
+    PublicationUnavailable,
     /// The pool holds no candidates at all: a healthy camera-free inventory,
     /// not an error, but nothing for any pin to resolve against.
     PoolEmpty,
@@ -712,7 +824,7 @@ pub(crate) enum PinRefusal {
     /// the IR refusal on the next. One failure at a time is the deliberate
     /// tradeoff for a first cut: reporting both would need the IR lookup to
     /// run against a pool the RGB side already failed, which answers a
-    /// question Step 3 never asks.
+    /// question the ordered resolver does not ask.
     RgbSide(SideRefusal),
     /// The IR side did not resolve, for the recorded reason. Reported only
     /// when the RGB side resolved; see `RgbSide` for why the order is fixed.
@@ -739,7 +851,7 @@ pub(crate) enum PinRefusal {
 /// returned directly when more than one full match is found), so its
 /// position here does not affect resolution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum SideRefusal {
+pub enum SideRefusal {
     /// The pin's own identity string is empty. Checked before the
     /// candidate loop runs at all; the loop's own fallback default
     /// (`NoCandidateWithIdentity`) can never produce this variant.
@@ -868,6 +980,7 @@ fn resolve_pin<'a, 'b>(
         rgb: rgb.candidate.node(&pin.rgb_path, rgb.location),
         ir: ir.candidate.node(&pin.ir_path, ir.location),
         supervisor_id: rgb.candidate.supervisor_id.to_owned(),
+        revision: rgb.candidate.revision,
     }))
 }
 
@@ -1353,6 +1466,7 @@ mod split_pair {
                     generation: 3,
                 },
                 supervisor_id: SUPERVISOR.into(),
+                revision: 7,
             }))]
         );
     }
@@ -1800,11 +1914,13 @@ mod split_pair {
             rgb: side("a:b", RGB_INSTANCE),
             ir: side("c", IR_INSTANCE),
             supervisor_id: SUPERVISOR.into(),
+            revision: 7,
         };
         let two = SplitPair {
             rgb: side("a", RGB_INSTANCE),
             ir: side("b:c", IR_INSTANCE),
             supervisor_id: SUPERVISOR.into(),
+            revision: 7,
         };
         assert_ne!(one.binding_key(), two.binding_key());
         assert_eq!(one.binding_key(), one.binding_key());
@@ -1816,6 +1932,7 @@ mod split_pair {
             rgb: one.ir.clone(),
             ir: one.rgb.clone(),
             supervisor_id: SUPERVISOR.into(),
+            revision: 7,
         };
         assert_ne!(one.binding_key(), swapped.binding_key());
     }
@@ -1963,11 +2080,13 @@ mod split_pair {
             rgb: side("5986:2113", CONTROLLER, RootHubDomain::Usb2, 8),
             ir: side("5986:1141", CONTROLLER, RootHubDomain::Usb2, 5),
             supervisor_id: SUPERVISOR.into(),
+            revision: 7,
         };
         let two = SplitPair {
             rgb: side("5986:2113", CONTROLLER, RootHubDomain::Usb2, 9),
             ir: side("5986:1141", CONTROLLER, RootHubDomain::Usb2, 6),
             supervisor_id: SUPERVISOR.into(),
+            revision: 7,
         };
         assert_ne!(
             one.binding_key(),
@@ -1981,6 +2100,7 @@ mod split_pair {
             rgb: two.ir.clone(),
             ir: two.rgb.clone(),
             supervisor_id: SUPERVISOR.into(),
+            revision: 7,
         };
         assert_ne!(swapped.rgb.path, two.rgb.path, "the halves really moved");
         assert_ne!(

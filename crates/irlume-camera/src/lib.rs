@@ -42,7 +42,8 @@ pub mod capture_qualification;
 pub mod census;
 mod connected;
 pub use connected::{
-    revalidate_against, revalidate_split_incarnations, ConnectedPair, ConnectedPairs,
+    revalidate_against, revalidate_split_incarnations, CameraNode, ConnectedPair, ConnectedPairs,
+    PinRefusal, ResolvedConnectedPairs, SideRefusal, SplitPair, SplitRefusal,
     SplitRevalidationRefusal, SplitSideExpectation, UnclassifiedCamera,
 };
 /// Versioned, backend-neutral camera data contracts.
@@ -120,6 +121,27 @@ pub fn initialize_camera_monitor() {
 #[must_use]
 pub fn connected_pairs() -> ConnectedPairs {
     backend::connected_pairs()
+}
+
+/// Resolve ordered split authorizations supplied by the daemon against one
+/// complete Current frozen inventory publication, under one inventory lock.
+/// Ordinary devices claim their pairs first; the first resolvable overlapping
+/// split record claims both devices. Independent records remain usable and
+/// refusals retain their record indices. No records means no split pairs.
+/// [`ResolvedConnectedPairs::ordinary`] carries the ordinary pairing view and
+/// the publication metadata; split outcomes stay in the wrapper's collections.
+///
+/// The caller supplies the records from its coherent configuration read. This
+/// function reads no configuration files, opens no camera, starts no monitor
+/// and performs no filesystem, sysfs, classification or probe I/O. It never
+/// initializes the supervisor. NonCurrent or unhealthy publications refuse
+/// every record and expose no usable pairs. Existing inventory wire shapes
+/// and [`connected_pairs`]' ordinary-only behavior are unchanged.
+#[must_use]
+pub fn connected_pairs_with_split(
+    records: &[irlume_common::split_schema::AuthorizationRecord],
+) -> ResolvedConnectedPairs {
+    backend::connected_pairs_with_split(records)
 }
 pub mod measurement;
 mod media_graph;

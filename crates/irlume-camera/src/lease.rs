@@ -915,6 +915,291 @@ mod tests {
         (authority, inventory, lease)
     }
 
+    struct SplitFixture {
+        authority: Arc<LeaseAuthority>,
+        inventory: Arc<Mutex<CameraInventory>>,
+        observations: Vec<CameraObservation>,
+        expected: SplitLeaseRequest,
+    }
+
+    fn split_request(inventory: &mut CameraInventory) -> SplitLeaseRequest {
+        let before = inventory.endpoint_generations();
+        inventory.record_roles(
+            &before,
+            [
+                ("/dev/video0", crate::Role::Rgb),
+                ("/dev/video1", crate::Role::Ir),
+            ],
+        );
+        let snapshot = inventory.snapshot();
+        let sides = inventory.classified_endpoints();
+        let expectation = |role| {
+            let side = sides.iter().find(|side| side.role == role).unwrap();
+            crate::SplitSideExpectation {
+                instance_id: side.instance_id.clone(),
+                generation: side.generation,
+                endpoint: side.endpoint.clone(),
+                identity: side.identity.clone(),
+                controller: side.controller.clone(),
+                domain: side.domain.clone(),
+                ports: side.ports.clone(),
+            }
+        };
+        SplitLeaseRequest {
+            supervisor_id: snapshot.supervisor_id.unwrap(),
+            revision: snapshot.revision,
+            rgb: expectation(crate::Role::Rgb),
+            ir: expectation(crate::Role::Ir),
+        }
+    }
+
+    fn split_fixture() -> SplitFixture {
+        let observations = [
+            ("/devices/split-rgb", "/dev/video0", "1234:0001", 8),
+            ("/devices/split-ir", "/dev/video1", "1234:0002", 5),
+        ]
+        .map(|(topology, path, identity, port)| {
+            CameraObservation::with_lifecycle_evidence_and_endpoints(
+                BackendKind::UvcV4l2,
+                PhysicalCameraId::new(topology, None).unwrap(),
+                CameraCapabilities::default(),
+                vec!["split-wait-fixture".into()],
+                vec![path.into()],
+            )
+            .with_usb_device(Some(
+                crate::inventory::UsbDeviceFacts::new(identity.into(), true).with_location(Some(
+                    crate::UsbLocation {
+                        controller: "0000:00:14.0".into(),
+                        domain: crate::RootHubDomain::Usb2,
+                        ports: vec![port],
+                    },
+                )),
+            ))
+        })
+        .to_vec();
+        let mut inventory =
+            CameraInventory::with_instance_ids_for_test(vec![instance('1'), instance('2')]);
+        inventory.reconcile(observations.clone()).unwrap();
+        let expected = split_request(&mut inventory);
+        SplitFixture {
+            authority: Arc::default(),
+            inventory: Arc::new(Mutex::new(inventory)),
+            observations,
+            expected,
+        }
+    }
+
+    fn hold_split_side(fixture: &SplitFixture, endpoint: &str) -> CameraLease {
+        let reference = fixture
+            .inventory
+            .lock()
+            .unwrap()
+            .reference_for_endpoints(&[endpoint])
+            .unwrap();
+        CameraLease::acquire(
+            &fixture.authority,
+            fixture.inventory.clone(),
+            vec![reference],
+            CameraOperationKind::Setup,
+            Instant::now(),
+        )
+        .unwrap()
+    }
+
+    fn acquire_fixture_split(
+        fixture: &SplitFixture,
+        expected: &SplitLeaseRequest,
+    ) -> Result<CameraLease, CameraLeaseError> {
+        CameraLease::acquire_split(
+            &fixture.authority,
+            fixture.inventory.clone(),
+            expected,
+            CameraOperationKind::Diagnostics,
+            Instant::now() + Duration::from_secs(5),
+        )
+    }
+
+    fn observe_split_waiter(fixture: &SplitFixture, held: &CameraLease) {
+        let mut keys = vec![
+            CameraInstanceId::new(fixture.expected.rgb.instance_id.clone()).unwrap(),
+            CameraInstanceId::new(fixture.expected.ir.instance_id.clone()).unwrap(),
+        ];
+        keys.sort();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let state = fixture.authority.state.lock().unwrap();
+            if state.waiters.values().any(|waiting| waiting == &keys) {
+                assert_eq!(state.waiters.len(), 1);
+                assert_eq!(
+                    state.active.len(),
+                    1,
+                    "a waiting split must not reserve its free side"
+                );
+                assert!(state
+                    .active
+                    .contains_key(held.inner.references[0].descriptor().camera_instance_id()));
+                return;
+            }
+            drop(state);
+            assert!(
+                Instant::now() < deadline,
+                "split acquisition never registered its waiter"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn assert_split_keys_released(fixture: &SplitFixture) {
+        {
+            let state = fixture.authority.state.lock().unwrap();
+            assert!(state.waiters.is_empty());
+            assert!(
+                state.active.is_empty(),
+                "neither split side may retain a permit"
+            );
+        }
+        // An immediate reservation of both original keys also catches a leaked
+        // permit after a side's inventory generation changed.
+        drop(authority_permit(
+            &fixture.authority,
+            &[
+                CameraInstanceId::new(fixture.expected.rgb.instance_id.clone()).unwrap(),
+                CameraInstanceId::new(fixture.expected.ir.instance_id.clone()).unwrap(),
+            ],
+        ));
+    }
+
+    #[test]
+    fn split_wait_revalidates_either_changed_side_and_releases_the_whole_permit() {
+        for held_endpoint in ["/dev/video0", "/dev/video1"] {
+            for lost_topology in ["/devices/split-rgb", "/devices/split-ir"] {
+                let fixture = split_fixture();
+                let held = hold_split_side(&fixture, held_endpoint);
+                std::thread::scope(|scope| {
+                    let waiter = scope.spawn(|| acquire_fixture_split(&fixture, &fixture.expected));
+                    observe_split_waiter(&fixture, &held);
+                    let refreshed = {
+                        let mut inventory = fixture.inventory.lock().unwrap();
+                        inventory.invalidate_topologies(&[lost_topology.into()].into());
+                        inventory.reconcile(fixture.observations.clone()).unwrap();
+                        split_request(&mut inventory)
+                    };
+                    if lost_topology == "/devices/split-rgb" {
+                        assert_ne!(refreshed.rgb.generation, fixture.expected.rgb.generation);
+                        assert_eq!(refreshed.ir, fixture.expected.ir);
+                    } else {
+                        assert_ne!(refreshed.ir.generation, fixture.expected.ir.generation);
+                        assert_eq!(refreshed.rgb, fixture.expected.rgb);
+                    }
+                    drop(held);
+                    // A refused acquisition returns no session to open or retarget.
+                    assert!(matches!(
+                        waiter.join().unwrap(),
+                        Err(CameraLeaseError::Stale)
+                    ));
+                    assert_split_keys_released(&fixture);
+                    drop(acquire_fixture_split(&fixture, &refreshed).unwrap());
+                    assert_split_keys_released(&fixture);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn split_wait_refuses_a_new_publication_even_when_both_sides_still_match() {
+        let fixture = split_fixture();
+        let held = hold_split_side(&fixture, "/dev/video1");
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| acquire_fixture_split(&fixture, &fixture.expected));
+            observe_split_waiter(&fixture, &held);
+            let refreshed = {
+                let mut inventory = fixture.inventory.lock().unwrap();
+                // A hotplug observation elsewhere advances the publication but
+                // preserves these two incarnations and all their persistent facts.
+                inventory.invalidate_topologies(&Default::default());
+                inventory.reconcile(fixture.observations.clone()).unwrap();
+                split_request(&mut inventory)
+            };
+            assert_ne!(refreshed.revision, fixture.expected.revision);
+            assert_eq!(refreshed.rgb, fixture.expected.rgb);
+            assert_eq!(refreshed.ir, fixture.expected.ir);
+            assert_eq!(held.validate(), Ok(()));
+            drop(held);
+            assert!(matches!(
+                waiter.join().unwrap(),
+                Err(CameraLeaseError::Stale)
+            ));
+            assert_split_keys_released(&fixture);
+            drop(acquire_fixture_split(&fixture, &refreshed).unwrap());
+            assert_split_keys_released(&fixture);
+        });
+    }
+
+    #[test]
+    fn split_wait_valid_wakeup_reserves_exactly_both_sides_until_session_drop() {
+        for endpoint in ["/dev/video0", "/dev/video1"] {
+            let fixture = split_fixture();
+            let held = hold_split_side(&fixture, endpoint);
+            std::thread::scope(|scope| {
+                let waiter = scope.spawn(|| acquire_fixture_split(&fixture, &fixture.expected));
+                observe_split_waiter(&fixture, &held);
+                drop(held);
+                let session = CameraOperationSession::new(waiter.join().unwrap().unwrap());
+                assert!(session.lease().is_split_pair());
+                for (endpoint, role, expected) in [
+                    ("/dev/video0", StreamRole::Rgb, &fixture.expected.rgb),
+                    ("/dev/video1", StreamRole::Ir, &fixture.expected.ir),
+                ] {
+                    let binding = session.lease().frame_binding(endpoint, role).unwrap();
+                    assert_eq!(binding.camera_instance_id().as_str(), expected.instance_id);
+                    assert_eq!(binding.generation().get(), expected.generation);
+                }
+                {
+                    let state = fixture.authority.state.lock().unwrap();
+                    assert!(state.waiters.is_empty());
+                    assert_eq!(state.active.len(), 2);
+                    let mut tokens = state.active.values().map(|active| active.token);
+                    assert_eq!(
+                        tokens.next(),
+                        tokens.next(),
+                        "one atomic permit owns both sides"
+                    );
+                }
+                // Model cancellation at the operation ownership boundary, without
+                // claiming that synthetic reservations exercised physical streams.
+                drop(session);
+                assert_split_keys_released(&fixture);
+            });
+        }
+    }
+
+    #[test]
+    fn split_side_loss_refuses_both_opens_before_backend_routing_and_drop_frees_both() {
+        for topology in ["/devices/split-rgb", "/devices/split-ir"] {
+            let fixture = split_fixture();
+            let session = CameraOperationSession::new(
+                acquire_fixture_split(&fixture, &fixture.expected).unwrap(),
+            );
+            fixture
+                .inventory
+                .lock()
+                .unwrap()
+                .invalidate_topologies(&[topology.into()].into());
+            assert_eq!(session.lease().validate(), Err(CameraLeaseError::Stale));
+            for error in [
+                session.open_rgb("/dev/video0").err().unwrap(),
+                session.open_ir("/dev/video1").err().unwrap(),
+            ] {
+                assert!(
+                    matches!(error, irlume_common::Error::Hardware(ref message) if message == "camera lifecycle reference is stale")
+                );
+            }
+            assert_eq!(session.state(), CameraSessionState::ContinuityLost);
+            drop(session);
+            assert_split_keys_released(&fixture);
+        }
+    }
+
     #[test]
     fn frame_binding_owns_exact_identity_and_rejects_uncovered_or_stale_endpoints() {
         let (_authority, inventory, lease) = lease_fixture();

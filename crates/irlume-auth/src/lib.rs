@@ -471,16 +471,8 @@ fn publish_camera_group(
     authorization: &irlume_core::multi_camera::authz::EnrollmentAuthorization,
     now_unix: u64,
 ) -> irlume_common::Result<String> {
-    use irlume_core::multi_camera::authz::{
-        ensure_not_consumed, EnrollmentOperation, GroupPairRef,
-    };
-    let operation = EnrollmentOperation::AddGroup {
-        group: group_id.into(),
-        pair: GroupPairRef {
-            rgb: pair.rgb.clone(),
-            ir: pair.ir.clone(),
-        },
-    };
+    use irlume_core::multi_camera::authz::{ensure_not_consumed, EnrollmentOperation};
+    let operation = EnrollmentOperation::add_group(group_id.into(), pair);
     authorization
         .validate_for(user, &operation, now_unix)
         .map_err(|error| irlume_common::Error::Policy(error.to_string()))?;
@@ -494,14 +486,16 @@ fn publish_camera_group(
             primary_snapshot_sha256: String::new(),
             groups: Vec::new(),
         });
-    if let Some(existing) = store.group_for_pair(pair.rgb.as_deref(), pair.ir.as_deref()) {
+    if let Some(existing) = store.group_for_binding(pair) {
         return Err(irlume_common::Error::Protocol(format!(
             "this camera pair is already enrolled as group '{}'; remove it first",
             existing.id.as_str()
         )));
     }
+    // Identity getters supply only the opaque ID stem. Credential authority
+    // remains the class-aware operation and whole binding above.
     let derived =
-        irlume_core::multi_camera::derive_group_id(&store, pair.rgb.as_deref(), pair.ir.as_deref());
+        irlume_core::multi_camera::derive_group_id(&store, pair.rgb_identity(), pair.ir_identity());
     if derived.as_str() != group_id {
         return Err(irlume_common::Error::Protocol(
             "the secondary store changed during capture so the authorized group id no longer applies; retry".into(),
@@ -585,12 +579,21 @@ fn binding_mismatch_for(
     bind: &irlume_core::storage::CameraBinding,
     live: &(Option<String>, Option<String>),
 ) -> Option<String> {
-    if let Some(want) = &bind.rgb {
+    let (rgb, ir) = match bind {
+        irlume_core::storage::CameraBinding::Ordinary { rgb, ir } => (rgb, ir),
+        irlume_core::storage::CameraBinding::Split(_) => {
+            return Some(
+                "split camera authentication is disabled on the identity-only path; use your password"
+                    .into(),
+            );
+        }
+    };
+    if let Some(want) = rgb {
         if live.0.as_ref() != Some(want) {
             return Some("camera changed since enrollment (RGB device identity differs); re-enroll on this camera".into());
         }
     }
-    if let Some(want) = &bind.ir {
+    if let Some(want) = ir {
         if live.1.as_ref() != Some(want) {
             return Some(
                 "IR camera changed or absent since enrollment; re-enroll on this camera".into(),
@@ -8619,7 +8622,7 @@ impl Engine {
     /// Snapshot the identity of the cameras this engine is bound to, for
     /// anti-swap verification at auth.
     fn current_binding(&self) -> irlume_core::storage::CameraBinding {
-        irlume_core::storage::CameraBinding {
+        irlume_core::storage::CameraBinding::Ordinary {
             rgb: irlume_camera::device_identity(&self.rgb_dev),
             ir: irlume_camera::device_identity(&self.ir_dev),
         }
@@ -8714,13 +8717,14 @@ impl Engine {
         // first line of defense; this is the second).
         self.secondary_attempt = None;
         let primary_path = irlume_core::multi_camera::primary_enrollment_path(user);
-        let primary_matches = enr.camera_binding.as_ref().is_none_or(|bind| {
-            irlume_core::multi_camera::GroupPair {
-                rgb: bind.rgb.clone(),
-                ir: bind.ir.clone(),
-            }
-            .matches(live.0.as_deref(), live.1.as_deref())
-        });
+        let live_binding = irlume_core::multi_camera::GroupPair::Ordinary {
+            rgb: live.0.clone(),
+            ir: live.1.clone(),
+        };
+        let primary_matches = enr
+            .camera_binding
+            .as_ref()
+            .is_none_or(|bind| bind.matches_binding(&live_binding));
         if !primary_matches {
             let secondary_path = irlume_core::multi_camera::secondary_store_path(user);
             let pinned =
@@ -8947,7 +8951,7 @@ impl Engine {
     /// requires at least one bound side.
     #[must_use]
     pub fn live_pair(&self) -> irlume_core::multi_camera::GroupPair {
-        irlume_core::multi_camera::GroupPair {
+        irlume_core::multi_camera::GroupPair::Ordinary {
             rgb: irlume_camera::device_identity(&self.rgb_dev),
             ir: irlume_camera::device_identity(&self.ir_dev),
         }
@@ -9005,7 +9009,7 @@ impl Engine {
             },
         };
         let pair = self.live_pair();
-        if pair.rgb.is_none() && pair.ir.is_none() {
+        if pair.rgb_identity().is_none() && pair.ir_identity().is_none() {
             return Err(irlume_common::Error::Protocol(
                 "the current cameras expose no USB identity; a camera group cannot bind to them"
                     .into(),
@@ -9014,7 +9018,7 @@ impl Engine {
         if enr
             .camera_binding
             .as_ref()
-            .is_some_and(|bind| pair.matches(bind.rgb.as_deref(), bind.ir.as_deref()))
+            .is_some_and(|bind| pair.matches_binding(bind))
         {
             return Err(irlume_common::Error::Protocol(
                 "this camera pair is already the primary camera; enroll a DIFFERENT pair as a secondary group".into(),
@@ -9024,13 +9028,15 @@ impl Engine {
         let existing = irlume_core::multi_camera::load_secondary(&secondary_path)
             .map_err(|error| irlume_common::Error::Protocol(error.to_string()))?;
         if let Some(store) = &existing {
-            if let Some(group) = store.group_for_pair(pair.rgb.as_deref(), pair.ir.as_deref()) {
+            if let Some(group) = store.group_for_binding(&pair) {
                 return Err(irlume_common::Error::Protocol(format!(
                     "this camera pair is already enrolled as group '{}'; remove it first",
                     group.id.as_str()
                 )));
             }
         }
+        // The display identities seed an opaque group ID, not the credential
+        // key validated by the class-aware operation below.
         let group_id = irlume_core::multi_camera::derive_group_id(
             existing
                 .as_ref()
@@ -9041,18 +9047,15 @@ impl Engine {
                     primary_snapshot_sha256: String::new(),
                     groups: Vec::new(),
                 }),
-            pair.rgb.as_deref(),
-            pair.ir.as_deref(),
+            pair.rgb_identity(),
+            pair.ir_identity(),
         )
         .as_str()
         .to_owned();
-        let operation = irlume_core::multi_camera::authz::EnrollmentOperation::AddGroup {
-            group: group_id.clone(),
-            pair: irlume_core::multi_camera::authz::GroupPairRef {
-                rgb: pair.rgb.clone(),
-                ir: pair.ir.clone(),
-            },
-        };
+        let operation = irlume_core::multi_camera::authz::EnrollmentOperation::add_group(
+            group_id.clone(),
+            &pair,
+        );
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -12860,6 +12863,7 @@ mod engine_tests {
     mod managed_pad_tests;
     mod pair_identity_tests;
     mod secondary_camera_tests;
+    mod split_admission_tests;
     use super::tests::env_guard;
     use super::*;
     use irlume_core::storage::{CameraBinding, Enrollment, FaceProfile, FaceScan};
@@ -14278,7 +14282,7 @@ mod engine_tests {
         };
         let stale = SecondaryGroup {
             id: CameraGroupId::new("stale".into()).unwrap(),
-            pair: GroupPair {
+            pair: GroupPair::Ordinary {
                 rgb: Some("1bcf:28c4".into()),
                 ir: Some("1bcf:28c4".into()),
             },
@@ -14352,7 +14356,7 @@ mod engine_tests {
         let bind = s.engine.current_binding();
         assert_eq!(
             bind,
-            CameraBinding {
+            CameraBinding::Ordinary {
                 rgb: None,
                 ir: None
             }
@@ -14360,14 +14364,14 @@ mod engine_tests {
         // Unbound sides are not checked (pre-binding enrollments keep working).
         assert_eq!(binding_mismatch_for(&bind, &(None, None)), None);
         // A bound RGB identity that no longer matches (or is gone) refuses.
-        let bind = CameraBinding {
+        let bind = CameraBinding::Ordinary {
             rgb: Some("dead:beef".into()),
             ir: None,
         };
         let msg = binding_mismatch_for(&bind, &(None, None)).expect("must refuse");
         assert!(msg.contains("RGB device identity differs"), "{msg}");
         // Same for a bound IR camera that is absent now.
-        let bind = CameraBinding {
+        let bind = CameraBinding::Ordinary {
             rgb: None,
             ir: Some("dead:beef".into()),
         };
@@ -14402,7 +14406,7 @@ mod engine_tests {
 
         // A changed bound camera keeps its security refusal even when all
         // saved scans also belong to a different recognizer.
-        enrollment.camera_binding = Some(CameraBinding {
+        enrollment.camera_binding = Some(CameraBinding::Ordinary {
             rgb: Some("dead:beef".into()),
             ir: None,
         });
@@ -14470,7 +14474,7 @@ mod engine_tests {
             ir_calib: None,
             ir_calibs: Default::default(),
         });
-        e.camera_binding = Some(CameraBinding {
+        e.camera_binding = Some(CameraBinding::Ordinary {
             rgb: Some("dead:beef".into()),
             ir: None,
         });

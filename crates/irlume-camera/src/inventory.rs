@@ -19,7 +19,7 @@ use irlume_common::live_camera::{
     MAX_CAMERA_CANDIDATES, MAX_CAMERA_ENDPOINTS, MAX_CAMERA_ENDPOINT_BYTES,
 };
 
-use crate::connected::{self, ConnectedPairs, Pairing, PairingInput};
+use crate::connected::{self, ConnectedPairs, Pairing, PairingInput, ResolvedConnectedPairs};
 use crate::contracts::{
     BackendKind, CameraCapabilities, CameraDescriptor, CameraGeneration, CameraInstanceId,
     PhysicalCameraId,
@@ -685,6 +685,84 @@ impl CameraInventory {
         view
     }
 
+    /// Resolve daemon-supplied coherent records from this frozen inventory.
+    /// The supervisor holds one lock for this complete operation. A nonCurrent
+    /// or unhealthy bounded publication supplies no usable pairs.
+    pub(crate) fn connected_pairs_with_split(
+        &self,
+        records: &[irlume_common::split_schema::AuthorizationRecord],
+    ) -> ResolvedConnectedPairs {
+        let mut view = ResolvedConnectedPairs {
+            ordinary: self.connected_pairs(),
+            ..Default::default()
+        };
+        let snapshot = self.snapshot();
+        if snapshot.state != CameraInventoryState::Current {
+            view.ordinary = ConnectedPairs {
+                state: snapshot.state,
+                reason: snapshot.reason,
+                supervisor_id: snapshot.supervisor_id,
+                revision: snapshot.revision,
+                ..Default::default()
+            };
+            return view.refuse_split_records(records.len());
+        }
+        let entries: Vec<_> = self.published_entries().collect();
+        let inputs: Vec<_> = entries
+            .iter()
+            .map(|entry| PairingInput {
+                topology_path: entry.observation.physical_id.topology_path(),
+                serial: entry.observation.physical_id.serial(),
+                usb_device: entry.observation.usb_device.as_ref(),
+                endpoints: &entry.observation.endpoint_paths,
+                metadata_endpoints: &entry.observation.metadata_endpoints,
+                instance_id: entry.descriptor.camera_instance_id().as_str(),
+                generation: entry.descriptor.generation().get(),
+            })
+            .collect();
+        let candidates: Vec<_> = entries
+            .iter()
+            .zip(&inputs)
+            .filter_map(|(entry, input)| {
+                connected::SplitCandidate::classified(
+                    input,
+                    self.supervisor_id.as_str(),
+                    self.revision,
+                    entry
+                        .observation
+                        .usb_device
+                        .as_ref()
+                        .and_then(|usb| usb.location.clone()),
+                    |endpoint| {
+                        self.roles
+                            .get(&RoleKey {
+                                supervisor_id: self.supervisor_id.clone(),
+                                instance_id: entry.descriptor.camera_instance_id().clone(),
+                                generation: entry.descriptor.generation(),
+                                endpoint: endpoint.to_owned(),
+                            })
+                            .copied()
+                    },
+                )
+            })
+            .collect();
+        let pins: Vec<_> = records.iter().map(connected::SplitPin::from).collect();
+        for (record_index, outcome) in connected::pinned_split_pairs(&candidates, &pins)
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(pair) = outcome.paired() {
+                view.split_pairs.push(pair.clone());
+            } else if let connected::PinOutcome::Refused(reason) = outcome {
+                view.split_refusals.push(connected::SplitRefusal {
+                    record_index,
+                    reason,
+                });
+            }
+        }
+        view
+    }
+
     fn mint_unique_instance_id(
         &mut self,
         active: &BTreeMap<String, InventoryEntry>,
@@ -1151,6 +1229,504 @@ pub(crate) mod fixtures {
             .with_metadata_endpoints(self.metadata)
             .with_usb_device(self.usb_device)
         }
+    }
+}
+
+#[cfg(test)]
+mod split_publication_tests {
+    use irlume_common::split_key::{KeyError, SplitDomain, SplitPairKey};
+    use irlume_common::split_schema::{AuthorizationRecord, SideFields};
+
+    use super::fixtures::ObservationFixture;
+    use super::*;
+    use crate::connected::{PinRefusal, SideRefusal, SplitRefusal};
+
+    const KEY: &str = "split1;5986:2113|0000:00:14.0|usb2|8;5986:1141|0000:00:14.0|usb2|5";
+    const OTHER_KEY: &str = "split1;1234:0001|0000:00:14.0|usb2|10;1234:0002|0000:00:14.0|usb2|6";
+    const ROLES: [(&str, Role); 4] = [
+        ("/dev/video0", Role::Rgb),
+        ("/dev/video2", Role::Ir),
+        ("/dev/video4", Role::Rgb),
+        ("/dev/video6", Role::Ir),
+    ];
+
+    fn record(identity: &str, path: &str, port: u8) -> SideFields {
+        SideFields {
+            identity: identity.into(),
+            path: path.into(),
+            controller: "0000:00:14.0".into(),
+            domain: SplitDomain::Usb2,
+            ports: vec![port],
+        }
+    }
+
+    fn records() -> Vec<AuthorizationRecord> {
+        vec![
+            AuthorizationRecord {
+                rgb: record("5986:2113", "/dev/video0", 8),
+                ir: record("5986:1141", "/dev/video2", 5),
+            },
+            AuthorizationRecord {
+                rgb: record("1234:0001", "/dev/video4", 10),
+                ir: record("1234:0002", "/dev/video6", 6),
+            },
+        ]
+    }
+
+    fn observed(topology: &str, fields: &SideFields) -> CameraObservation {
+        let metadata = match fields.path.as_str() {
+            "/dev/video0" => "/dev/video1",
+            "/dev/video2" => "/dev/video3",
+            "/dev/video4" => "/dev/video5",
+            "/dev/video6" => "/dev/video7",
+            _ => panic!("fixture path needs a metadata endpoint"),
+        };
+        ObservationFixture::usb(topology, &fields.identity)
+            .capture(&fields.path)
+            .metadata(metadata)
+            .build()
+            .with_usb_device(Some(
+                UsbDeviceFacts::new(fields.identity.clone(), false).with_location(Some(
+                    crate::UsbLocation {
+                        controller: fields.controller.clone(),
+                        domain: crate::RootHubDomain::Usb2,
+                        ports: fields.ports.clone(),
+                    },
+                )),
+            ))
+    }
+
+    fn observations() -> Vec<CameraObservation> {
+        let records = records();
+        vec![
+            observed("/devices/synthetic/a", &records[0].rgb),
+            observed("/devices/synthetic/b", &records[0].ir),
+            observed("/devices/synthetic/c", &records[1].rgb),
+            observed("/devices/synthetic/d", &records[1].ir),
+        ]
+    }
+
+    fn inventory(observations: Vec<CameraObservation>, roles: &[(&str, Role)]) -> CameraInventory {
+        let mut inventory = CameraInventory::with_instance_ids_for_test(
+            ['1', '2', '3', '4', '5', '6']
+                .map(|c| CameraInstanceId::new(c.to_string().repeat(32)).unwrap())
+                .to_vec(),
+        );
+        inventory.supervisor_id = CameraInstanceId::new("a".repeat(32)).unwrap();
+        inventory.reconcile(observations).unwrap();
+        classify(&mut inventory, roles);
+        inventory
+    }
+
+    fn classify(inventory: &mut CameraInventory, roles: &[(&str, Role)]) {
+        let before = inventory.endpoint_generations();
+        inventory.record_roles(&before, roles.iter().copied());
+    }
+
+    fn keys(view: &ResolvedConnectedPairs) -> Vec<String> {
+        view.split_pairs
+            .iter()
+            .map(|pair| pair.pair_key().unwrap().format_canonical().unwrap())
+            .collect()
+    }
+
+    fn refusal(record_index: usize, reason: PinRefusal) -> SplitRefusal {
+        SplitRefusal {
+            record_index,
+            reason,
+        }
+    }
+
+    #[test]
+    fn split_publication_resolves_records_with_both_incarnation_proofs_and_lease_facts() {
+        let inventory = inventory(observations(), &ROLES);
+        let ordinary = inventory.connected_pairs();
+        assert!(ordinary.pairs.is_empty());
+
+        let view = inventory.connected_pairs_with_split(&records());
+        assert_eq!(view.ordinary, ordinary);
+        assert_eq!(view.ordinary.state, CameraInventoryState::Current);
+        assert_eq!(keys(&view), [KEY, OTHER_KEY]);
+        assert!(view.split_refusals.is_empty());
+        let pair = &view.split_pairs[0];
+        assert_eq!(pair.supervisor_id, "a".repeat(32));
+        assert_eq!(pair.revision, 1);
+        assert_eq!(pair.rgb.instance_id, "1".repeat(32));
+        assert_eq!(pair.ir.instance_id, "2".repeat(32));
+        assert_eq!((pair.rgb.generation, pair.ir.generation), (1, 1));
+        assert_eq!(
+            SplitPairKey::try_from(pair)
+                .unwrap()
+                .format_canonical()
+                .unwrap(),
+            KEY
+        );
+        let lease = pair.lease_request();
+        assert_eq!(lease.supervisor_id, "a".repeat(32));
+        assert_eq!(lease.revision, 1);
+        assert_eq!(lease.rgb.endpoint, "/dev/video0");
+        assert_eq!(lease.ir.endpoint, "/dev/video2");
+        assert_eq!(lease.rgb.identity, "5986:2113");
+        assert_eq!(lease.ir.identity, "5986:1141");
+        assert_eq!(lease.rgb.controller, "0000:00:14.0");
+        assert_eq!(lease.rgb.domain, "usb2");
+        assert_eq!(lease.rgb.ports, [8]);
+        assert_eq!(lease.ir.ports, [5]);
+        assert_eq!(lease.rgb.instance_id, "1".repeat(32));
+        assert_eq!(lease.ir.instance_id, "2".repeat(32));
+        assert_eq!(
+            crate::revalidate_against(
+                &lease.rgb,
+                &lease.ir,
+                &(inventory.snapshot(), inventory.classified_endpoints())
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn split_publication_empty_authorizations_preserve_the_ordinary_view() {
+        let mut observations = observations();
+        observations.extend([
+            ObservationFixture::usb("/devices/synthetic/e", "046d:085e")
+                .four_node(8)
+                .build(),
+            ObservationFixture::usb("/devices/synthetic/f", "1111:2222")
+                .four_node(12)
+                .build(),
+        ]);
+        let mut roles = ROLES.to_vec();
+        roles.extend([("/dev/video8", Role::Rgb), ("/dev/video10", Role::Ir)]);
+        let inventory = inventory(observations, &roles);
+        let ordinary = inventory.connected_pairs();
+        assert_eq!(ordinary.pairs.len(), 1);
+        assert_eq!(ordinary.unclassified.len(), 1);
+
+        let view = inventory.connected_pairs_with_split(&[]);
+        assert_eq!(view.ordinary, ordinary);
+        assert!(view.split_pairs.is_empty());
+        assert!(view.split_refusals.is_empty());
+    }
+
+    #[test]
+    fn split_publication_refuses_every_record_until_the_whole_publication_is_current() {
+        let mut inventory = inventory(observations(), &ROLES);
+        inventory.mark_refreshing();
+        // Ordinary-only callers retain their existing partial refreshing view.
+        let refreshing = inventory.connected_pairs_with_split(&records());
+        assert_eq!(refreshing.ordinary.state, CameraInventoryState::Refreshing);
+        assert!(refreshing.ordinary.pairs.is_empty());
+        assert!(refreshing.split_pairs.is_empty());
+        assert_eq!(
+            refreshing.split_refusals,
+            [
+                refusal(0, PinRefusal::PublicationUnavailable),
+                refusal(1, PinRefusal::PublicationUnavailable),
+            ]
+        );
+        inventory.mark_unavailable(CameraInventoryReason::Monitor);
+        let unavailable = inventory.connected_pairs_with_split(&records());
+        assert_eq!(
+            unavailable.ordinary.reason,
+            Some(CameraInventoryReason::Monitor)
+        );
+        assert_eq!(unavailable.split_refusals, refreshing.split_refusals);
+        assert!(unavailable.ordinary.pairs.is_empty());
+        assert!(unavailable.split_pairs.is_empty());
+        let uninitialized = CameraInventory::new().connected_pairs_with_split(&records());
+        assert_eq!(
+            uninitialized.ordinary.state,
+            CameraInventoryState::Uninitialized
+        );
+        assert_eq!(uninitialized.split_refusals, refreshing.split_refusals);
+        inventory.reconcile(observations()).unwrap();
+        classify(&mut inventory, &ROLES);
+        assert_eq!(
+            keys(&inventory.connected_pairs_with_split(&records())),
+            [KEY, OTHER_KEY]
+        );
+    }
+
+    #[test]
+    fn split_publication_refuses_snapshot_bounds_without_exposing_usable_pairs() {
+        let mut observations = observations();
+        observations[0]
+            .endpoint_paths
+            .extend((20..40).map(|n| format!("/dev/video{n}")));
+        let inventory = inventory(observations, &ROLES);
+        let view = inventory.connected_pairs_with_split(&records());
+        assert_eq!(view.ordinary.state, CameraInventoryState::Unavailable);
+        assert_eq!(view.ordinary.reason, Some(CameraInventoryReason::Bounds));
+        assert!(view.ordinary.pairs.is_empty());
+        assert!(view.split_pairs.is_empty());
+        assert_eq!(
+            view.split_refusals,
+            [
+                refusal(0, PinRefusal::PublicationUnavailable),
+                refusal(1, PinRefusal::PublicationUnavailable),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_publication_failure_indices_preserve_independent_record_availability() {
+        let inventory = inventory(observations(), &ROLES);
+        let mut records = records();
+        records[0].rgb.path = "/dev/video99".into();
+        assert_eq!(
+            keys(&inventory.connected_pairs_with_split(&records)),
+            [OTHER_KEY]
+        );
+        assert_eq!(
+            inventory
+                .connected_pairs_with_split(&records)
+                .split_refusals,
+            [refusal(0, PinRefusal::RgbSide(SideRefusal::PathMismatch))]
+        );
+        records[0].rgb.path = "/dev/video0".into();
+        records[1].ir.ports = vec![7];
+        let view = inventory.connected_pairs_with_split(&records);
+        assert_eq!(keys(&view), [KEY]);
+        assert_eq!(
+            view.split_refusals,
+            [refusal(
+                1,
+                PinRefusal::IrSide(SideRefusal::LocationMismatch)
+            )]
+        );
+    }
+
+    #[test]
+    fn split_publication_ordinary_claims_precede_ordered_split_claims() {
+        let mut observations = observations();
+        observations[0].endpoint_paths.push("/dev/video8".into());
+        let mut roles = ROLES.to_vec();
+        roles.push(("/dev/video8", Role::Ir));
+        let ordinary_inventory = inventory(observations, &roles);
+        let view = ordinary_inventory.connected_pairs_with_split(&records());
+        assert_eq!(view.ordinary.pairs.len(), 1);
+        assert_eq!(view.ordinary.pairs[0].identity, "5986:2113");
+        assert_eq!(
+            view.ordinary.pairs,
+            ordinary_inventory.connected_pairs().pairs
+        );
+        assert_eq!(keys(&view), [OTHER_KEY]);
+        assert_eq!(
+            view.split_refusals,
+            [refusal(0, PinRefusal::RgbSide(SideRefusal::OrdinaryPair))]
+        );
+
+        let inventory = inventory(self::observations(), &ROLES);
+        let mut records = records();
+        let overlap = AuthorizationRecord {
+            rgb: records[0].rgb.clone(),
+            ir: records[1].ir.clone(),
+        };
+        records.insert(1, overlap.clone());
+        let first = inventory.connected_pairs_with_split(&records);
+        assert_eq!(keys(&first), [KEY, OTHER_KEY]);
+        assert_eq!(
+            first.split_refusals,
+            [refusal(1, PinRefusal::SideAlreadyClaimed)]
+        );
+        records.swap(0, 1);
+        let reversed = inventory.connected_pairs_with_split(&records);
+        assert_eq!(
+            keys(&reversed),
+            ["split1;5986:2113|0000:00:14.0|usb2|8;1234:0002|0000:00:14.0|usb2|6"]
+        );
+        assert_eq!(
+            reversed.split_refusals,
+            [
+                refusal(1, PinRefusal::SideAlreadyClaimed),
+                refusal(2, PinRefusal::SideAlreadyClaimed),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_publication_pin_cannot_classify_unknown_metadata_or_wrong_role_nodes() {
+        let observations = observations();
+        let cases = [
+            (
+                vec![ROLES[1], ROLES[2], ROLES[3]],
+                SideRefusal::NoCandidateWithIdentity,
+            ),
+            (
+                vec![("/dev/video0", Role::Other), ROLES[1], ROLES[2], ROLES[3]],
+                SideRefusal::RoleAmbiguous,
+            ),
+        ];
+        for (roles, expected) in cases {
+            let inventory = inventory(observations.clone(), &roles);
+            let view = inventory.connected_pairs_with_split(&records());
+            assert_eq!(keys(&view), [OTHER_KEY]);
+            assert_eq!(
+                view.split_refusals,
+                [refusal(0, PinRefusal::RgbSide(expected))]
+            );
+        }
+        let inventory = inventory(observations, &ROLES);
+        let mut records = records();
+        records[0].rgb.path = "/dev/video1".into();
+        assert_eq!(
+            inventory
+                .connected_pairs_with_split(&records)
+                .split_refusals,
+            [refusal(0, PinRefusal::RgbSide(SideRefusal::PathMismatch))]
+        );
+    }
+
+    #[test]
+    fn split_publication_uses_only_current_generation_and_supervisor_roles() {
+        for stale_supervisor in [false, true] {
+            let mut inventory = inventory(observations(), &ROLES);
+            let key = inventory
+                .roles
+                .keys()
+                .find(|key| key.endpoint == "/dev/video0")
+                .unwrap()
+                .clone();
+            let role = inventory.roles.remove(&key).unwrap();
+            let mut stale = key;
+            if stale_supervisor {
+                stale.supervisor_id = CameraInstanceId::new("b".repeat(32)).unwrap();
+            } else {
+                stale.generation = CameraGeneration::new(9).unwrap();
+            }
+            inventory.roles.insert(stale, role);
+            let view = inventory.connected_pairs_with_split(&records());
+            assert_eq!(keys(&view), [OTHER_KEY]);
+            assert_eq!(
+                view.split_refusals,
+                [refusal(
+                    0,
+                    PinRefusal::RgbSide(SideRefusal::NoCandidateWithIdentity)
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn split_publication_permutations_keep_frozen_keys_and_physical_proofs() {
+        let mut observations = observations();
+        let first = inventory(observations.clone(), &ROLES).connected_pairs_with_split(&records());
+        observations.reverse();
+        let inventory = inventory(observations, &ROLES);
+        let mut records = records();
+        records.reverse();
+        let permuted = inventory.connected_pairs_with_split(&records);
+        assert_eq!(keys(&permuted), [OTHER_KEY, KEY]);
+        assert_eq!(permuted.split_pairs[1], first.split_pairs[0]);
+        assert_eq!(permuted.split_pairs[0], first.split_pairs[1]);
+    }
+
+    #[test]
+    fn split_publication_replug_requires_new_live_proof_but_preserves_durable_key() {
+        for replugged in [0, 1] {
+            let observed = observations();
+            let mut inventory = inventory(observed.clone(), &ROLES);
+            let before = inventory
+                .connected_pairs_with_split(&records())
+                .split_pairs
+                .remove(0);
+            let before_lease = before.lease_request();
+            let mut disconnected = observed.clone();
+            disconnected.remove(replugged);
+            inventory.reconcile(disconnected).unwrap();
+            assert_eq!(
+                keys(&inventory.connected_pairs_with_split(&records())),
+                [OTHER_KEY]
+            );
+            inventory.reconcile(observed).unwrap();
+            assert_eq!(
+                keys(&inventory.connected_pairs_with_split(&records())),
+                [OTHER_KEY]
+            );
+            classify(&mut inventory, &ROLES);
+            let after = inventory
+                .connected_pairs_with_split(&records())
+                .split_pairs
+                .remove(0);
+            assert_eq!(after.pair_key().unwrap().format_canonical().unwrap(), KEY);
+            assert_ne!(before.revision, after.revision);
+            let (old, new, unchanged_old, unchanged_new) = if replugged == 0 {
+                (&before.rgb, &after.rgb, &before.ir, &after.ir)
+            } else {
+                (&before.ir, &after.ir, &before.rgb, &after.rgb)
+            };
+            assert_ne!(old.instance_id, new.instance_id);
+            assert_eq!(unchanged_old, unchanged_new);
+            assert_eq!(
+                crate::revalidate_against(
+                    &before_lease.rgb,
+                    &before_lease.ir,
+                    &(inventory.snapshot(), inventory.classified_endpoints())
+                ),
+                Err(crate::SplitRevalidationRefusal::SideMissing)
+            );
+        }
+    }
+
+    #[test]
+    fn split_publication_typed_keys_exclude_runtime_facts_and_refuse_invalid_locations() {
+        let inventory = inventory(observations(), &ROLES);
+        let original = inventory
+            .connected_pairs_with_split(&records())
+            .split_pairs
+            .remove(0);
+        let mut renamed = original.clone();
+        renamed.rgb.path = "/dev/video98".into();
+        renamed.ir.path = "/dev/video99".into();
+        renamed.rgb.instance_id = "f".repeat(32);
+        renamed.ir.generation = 77;
+        renamed.revision = 90;
+        renamed.supervisor_id = "b".repeat(32);
+        assert_eq!(renamed.pair_key().unwrap().format_canonical().unwrap(), KEY);
+        for rgb in [true, false] {
+            for ports in [vec![0], Vec::new()] {
+                let mut broken = original.clone();
+                let side = if rgb { &mut broken.rgb } else { &mut broken.ir };
+                side.location.ports = ports;
+                assert_eq!(broken.pair_key(), Err(KeyError::BadPorts));
+            }
+            let mut broken = original.clone();
+            let side = if rgb { &mut broken.rgb } else { &mut broken.ir };
+            side.location.controller.clear();
+            assert_eq!(broken.pair_key(), Err(KeyError::EmptyField));
+        }
+        let mut swapped = original;
+        std::mem::swap(&mut swapped.rgb, &mut swapped.ir);
+        assert_eq!(
+            swapped.pair_key().unwrap().format_canonical().unwrap(),
+            "split1;5986:1141|0000:00:14.0|usb2|5;5986:2113|0000:00:14.0|usb2|8"
+        );
+    }
+
+    #[test]
+    fn split_publication_keeps_the_closed_inventory_candidate_wire_shape() {
+        #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct FrozenCandidate {
+            instance_id: String,
+            generation: u64,
+            endpoint_paths: Vec<String>,
+        }
+        let inventory = inventory(observations(), &ROLES);
+        let before = serde_json::to_value(inventory.snapshot().candidates).unwrap();
+        let resolved = inventory.connected_pairs_with_split(&records());
+        assert_eq!(keys(&resolved), [KEY, OTHER_KEY]);
+        let after = serde_json::to_value(inventory.snapshot().candidates).unwrap();
+        assert_eq!(after, before);
+        let old: Vec<FrozenCandidate> = serde_json::from_value(after).unwrap();
+        assert_eq!(
+            old[0],
+            FrozenCandidate {
+                instance_id: "1".repeat(32),
+                generation: 1,
+                endpoint_paths: vec!["/dev/video0".into(), "/dev/video1".into()],
+            }
+        );
     }
 }
 

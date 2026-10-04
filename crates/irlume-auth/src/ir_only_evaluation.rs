@@ -298,6 +298,18 @@ fn evaluate_stages(
     }
 }
 
+// The single-endpoint diagnostic has no whole split-pair resolution. A split
+// credential cannot be reduced to its IR identity to authorize that endpoint.
+fn evaluation_ir_binding(
+    binding: Option<&irlume_core::storage::CameraBinding>,
+) -> Result<Option<&str>, IrFailure> {
+    match binding {
+        Some(irlume_core::storage::CameraBinding::Split(_)) => Err(IrFailure::CameraUnavailable),
+        Some(irlume_core::storage::CameraBinding::Ordinary { ir, .. }) => Ok(ir.as_deref()),
+        None => Ok(None),
+    }
+}
+
 impl Engine {
     /// Camera-free readiness check. Does not probe, capture or change enrollment.
     /// Models and protected enrollment must already have been loaded by the caller.
@@ -328,13 +340,10 @@ impl Engine {
         if !self.ir_available || self.ir_dev == self.rgb_dev {
             return Err(IrFailure::CameraUnavailable);
         }
-        if enr
-            .camera_binding
-            .as_ref()
-            .and_then(|b| b.ir.as_ref())
-            .is_some_and(|want| irlume_camera::device_identity(&self.ir_dev).as_ref() != Some(want))
-        {
-            return Err(IrFailure::CameraUnavailable);
+        if let Some(want) = evaluation_ir_binding(enr.camera_binding.as_ref())? {
+            if irlume_camera::device_identity(&self.ir_dev).as_deref() != Some(want) {
+                return Err(IrFailure::CameraUnavailable);
+            }
         }
         if !self.has_pad_ir() {
             return Err(IrFailure::PadUnavailable);
@@ -445,6 +454,33 @@ impl AssessmentStages for IrStages<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ir_only_evaluation_refuses_split_without_projecting_its_ir_identity() {
+        use irlume_core::storage::CameraBinding;
+        let split = CameraBinding::Split(
+            irlume_common::split_key::SplitPairKey::parse_canonical(
+                "split1;5986:2113:rgb|0000:00:14.0|usb2|8;5986:1141:ir|0000:00:14.0|usb2|5",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            super::evaluation_ir_binding(Some(&split)),
+            Err(super::IrFailure::CameraUnavailable)
+        );
+        let ordinary = CameraBinding::Ordinary {
+            rgb: None,
+            ir: Some("5986:1141:ir".into()),
+        };
+        assert_eq!(
+            super::evaluation_ir_binding(Some(&ordinary)),
+            Ok(Some("5986:1141:ir"))
+        );
+        assert_eq!(
+            super::evaluation_ir_binding(Some(&CameraBinding::default())),
+            Ok(None)
+        );
+        assert_eq!(super::evaluation_ir_binding(None), Ok(None));
+    }
     #[test]
     fn ir_only_evaluation_teardown_schema_has_exact_unreached_fields() {
         let record = super::Report::new(super::Category::InvalidRequest).to_json();

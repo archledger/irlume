@@ -6,33 +6,36 @@
 //! first enrollment uses, as pure functions over plain facts.
 //!
 //! Nothing here opens, lists or reads a device or a file. The caller hands
-//! in the connected pairs by identity (from the passive inventory), the
+//! in the connected pairs by complete key (from the passive inventory), the
 //! account's enrolled pairs, whether each enrolled pair can serve the
 //! requested mode, and the external-camera policy. A camera's name is not
 //! an input, so it cannot influence a choice (ADR-0029 §9).
 //!
-//! [`select_for_account`] ranks only the account's enrolled pairs:
+//! [`select_bound_for_account`] ranks only the account's enrolled pairs;
+//! [`select_for_account`] adapts ordinary identity-only candidates to it:
 //!
 //! 1. the primary binding, when both of its sides are bound and a connected
-//!    pair carries exactly those identities;
+//!    pair carries exactly that complete key;
 //! 2. then the active secondary groups whose complete pair is connected, in
-//!    the canonical order of their identities (RGB, then IR), never store
-//!    order, so removing and re-adding a group cannot change which of two
+//!    the canonical order of [`CompletePairKey`] (ordinary before split,
+//!    then RGB before IR), never store order, so removing and re-adding a
+//!    group cannot change which of two
 //!    connected cameras is chosen;
 //! 3. groups holding one exact pair are ambiguous and skipped, and so is an
-//!    enrolled pair that two connected cameras carry (units of one model
-//!    without a serial cannot be told apart, ADR-0024 §6);
+//!    enrolled complete key that two connected cameras carry (units of one
+//!    model without a serial cannot be told apart, ADR-0024 §6);
 //! 4. eligibility for the requested mode is part of the ranking: an
 //!    ineligible primary beside an eligible group selects the group;
 //! 5. when nothing usable is connected the request is refused, and the
 //!    refusal names why. A pair the account is not enrolled on is never
 //!    chosen.
 //!
-//! An account whose primary binding is missing or one-sided (enrolled
+//! An account whose ordinary primary binding is missing or one-sided (enrolled
 //! before bindings existed, or on a camera without an IR node) is not
 //! refused: when no complete group is chosen, automatic selection does not
-//! apply and the caller keeps the standing pair, as before automatic
-//! selection existed.
+//! apply and the caller keeps the standing ordinary pair, as before automatic
+//! selection existed. This fallback never authorizes a standing split pair.
+//! A malformed split primary is refused, never treated as a legacy binding.
 //!
 //! [`rank_enrollment_candidates`] orders the connected pairs a first
 //! enrollment may use: the `IRLUME_CAMERA_PIN` allowlist, then built-in
@@ -40,6 +43,7 @@
 
 use super::{Activation, GroupPair, SecondaryStore};
 use crate::storage::CameraBinding;
+use irlume_common::binding_key::CompletePairKey;
 
 /// One connected camera pair, by identity, as the caller's camera-free
 /// inventory reports it. It has no name: a name is shown, never compared.
@@ -61,7 +65,22 @@ pub struct CandidatePair<K> {
     pub fixed: bool,
 }
 
-/// The camera pairs one account is enrolled on, by identity.
+/// One connected pair with a complete, class-aware credential key.
+/// These are passive inventory facts, not machine authorization or live proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundCandidatePair<K> {
+    /// The caller's opaque handle, returned on selection and never compared.
+    pub key: K,
+    /// The ordinary identities or role-labelled split identities and locations.
+    /// Invalid keys are excluded by [`select_bound_for_account`].
+    pub pair: CompletePairKey,
+    /// The RGB unit reads `removable=fixed`. Unknown counts as external.
+    pub rgb_fixed: bool,
+    /// The IR unit reads `removable=fixed`. Unknown counts as external.
+    pub ir_fixed: bool,
+}
+
+/// The camera pairs one account is enrolled on, preserving their binding class.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AccountCameras {
     /// The primary enrollment's binding; `None` for an enrollment written
@@ -121,10 +140,7 @@ impl AccountCameras {
             SecondaryFacts::Unreadable | SecondaryFacts::Loaded(..) => (false, true, Vec::new()),
         };
         Self {
-            primary: binding.map(|binding| GroupPair {
-                rgb: binding.rgb.clone(),
-                ir: binding.ir.clone(),
-            }),
+            primary: binding.cloned(),
             secondary_active,
             secondary_unreadable,
             groups,
@@ -152,10 +168,10 @@ pub enum SkipReason {
     /// The group's store is inactive: the primary enrollment changed since
     /// it was authorized (ADR-0024 §1.1).
     SecondaryInactive,
-    /// Every connected pair carrying these identities is external, and
+    /// Every connected pair carrying this key has an external side, and
     /// external cameras are forbidden (ADR-0029 §6).
     ExternalForbidden,
-    /// Two or more connected pairs carry these identities, so the enrolled
+    /// Two or more connected pairs carry this complete key, so the enrolled
     /// unit cannot be told apart from another of its model (ADR-0024 §6).
     Indistinguishable,
     /// The enrollment cannot serve the requested mode (ADR-0029 §1,
@@ -185,6 +201,9 @@ pub struct Selection<K> {
 /// Why a request is refused before any camera opens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefusalCause {
+    /// The split primary is malformed. It cannot be interpreted as a missing
+    /// or partial legacy ordinary binding, or bypassed through another group.
+    InvalidBinding,
     /// None of the account's complete enrolled pairs is connected
     /// (ADR-0029 §1, item 5: "no enrolled camera is connected").
     NoEnrolledCameraConnected,
@@ -197,7 +216,7 @@ pub enum RefusalCause {
     Skipped(SkipReason),
 }
 
-/// The result of [`select_for_account`].
+/// The result of [`select_for_account`] or [`select_bound_for_account`].
 ///
 /// Every variant lists the connected enrolled pairs that were passed over,
 /// in rank order: each one skipped for a reason that does not depend on the
@@ -209,9 +228,11 @@ pub enum SelectionOutcome<K> {
     /// Open this pair for the attempt.
     Selected(Selection<K>),
     /// Automatic selection does not apply to this account: its primary
-    /// binding is missing or one-sided and no complete group was chosen.
-    /// The caller keeps the standing pair, as before automatic selection
-    /// existed; the owner can pin the camera or re-enroll to use automatic.
+    /// ordinary binding is missing or one-sided and no complete group was
+    /// chosen.
+    /// The caller keeps the standing ordinary pair under its existing checks;
+    /// this fallback never authorizes a standing split pair. The owner can pin
+    /// the camera or re-enroll to use automatic selection.
     NotApplicable { skipped: Vec<Skipped> },
     /// Refuse to the password before any camera opens.
     Refused {
@@ -223,12 +244,10 @@ pub enum SelectionOutcome<K> {
 /// Chooses the connected pair a request for one account uses when camera
 /// selection is automatic (ADR-0029 §1).
 ///
-/// The account's complete enrolled pairs are ranked: the primary first,
-/// then the groups in canonical identity order. An enrolled pair is usable
-/// when exactly one allowed connected pair carries both of its identities
-/// (compared exactly, as [`SecondaryStore::strict_group_for_pair`] does),
-/// a group's store is active and no other group holds the same pair, and
-/// `eligible` accepts its scope. The first usable pair is chosen.
+/// Adapts [`CandidatePair`] to ordinary complete keys and delegates to
+/// [`select_bound_for_account`]. It never projects a split binding to ordinary
+/// identities. A complete split primary with no matching enrolled ordinary
+/// group is refused rather than using the legacy `NotApplicable` fallback.
 ///
 /// `eligible` answers whether a scope's enrollment can serve the requested
 /// mode (for IR-only: compatible IR templates for the live recognizer). It
@@ -245,53 +264,116 @@ pub enum SelectionOutcome<K> {
 pub fn select_for_account<K: Clone>(
     connected: &[CandidatePair<K>],
     account: &AccountCameras,
+    eligible: impl FnMut(CandidateScope) -> bool,
+    forbid_external: bool,
+) -> SelectionOutcome<K> {
+    let connected: Vec<_> = connected
+        .iter()
+        .map(|pair| BoundCandidatePair {
+            key: &pair.key,
+            pair: CompletePairKey::Ordinary {
+                rgb: pair.rgb_identity.clone(),
+                ir: pair.ir_identity.clone(),
+            },
+            rgb_fixed: pair.fixed,
+            ir_fixed: pair.fixed,
+        })
+        .collect();
+    match select_bound_for_account(&connected, account, eligible, forbid_external) {
+        SelectionOutcome::Selected(selection) => SelectionOutcome::Selected(Selection {
+            key: (*selection.key).clone(),
+            scope: selection.scope,
+            skipped: selection.skipped,
+        }),
+        SelectionOutcome::NotApplicable { skipped } => SelectionOutcome::NotApplicable { skipped },
+        SelectionOutcome::Refused { cause, skipped } => {
+            SelectionOutcome::Refused { cause, skipped }
+        }
+    }
+}
+
+/// Chooses one connected, enrolled complete key (ADR-0029 §1, ADR-0032 §3).
+///
+/// The primary ranks first across classes. Secondary keys use [`CompletePairKey`]
+/// order: ordinary identities first, then split keys by RGB unit and IR unit.
+/// Each split unit compares identity, controller, domain table order and numeric
+/// port chain, with a proper prefix first. Encoded text and handles never rank.
+/// Bindings use the common [`GroupPair::complete_key`] validation; malformed
+/// candidate keys and incomplete or malformed groups never participate.
+///
+/// A scope is usable when one allowed connected candidate carries its exact key,
+/// its secondary store is active and no other group holds that key, and `eligible`
+/// accepts it. Group ambiguity precedes inactivity, then the external policy,
+/// then connected-key indistinguishability, then eligibility. Primary scopes are
+/// not made ambiguous by groups sharing their key.
+///
+/// With `forbid_external`, both RGB and IR must be fixed; either unknown or
+/// external side excludes the candidate before connected twins are counted.
+/// `eligible` is called at most once per otherwise usable scope, in rank order,
+/// and never after a choice. Mode-independent skips below the choice are still
+/// reported. Without a choice, the first ranked skip supplies the refusal cause.
+/// Missing or incomplete ordinary primaries retain `NotApplicable`; malformed
+/// split primaries refuse with [`RefusalCause::InvalidBinding`] before ranking.
+///
+/// This selects account credentials only. It supplies no machine authorization,
+/// endpoint role classification, admission proof or activation of split capture.
+#[must_use]
+pub fn select_bound_for_account<K: Clone>(
+    connected: &[BoundCandidatePair<K>],
+    account: &AccountCameras,
     mut eligible: impl FnMut(CandidateScope) -> bool,
     forbid_external: bool,
 ) -> SelectionOutcome<K> {
-    let primary = account.primary.as_ref().and_then(complete_pair);
-    let mut groups: Vec<(usize, (&str, &str))> = account
+    let primary = account.primary.as_ref().and_then(GroupPair::complete_key);
+    if primary.is_none() && matches!(account.primary.as_ref(), Some(GroupPair::Split(_))) {
+        return SelectionOutcome::Refused {
+            cause: RefusalCause::InvalidBinding,
+            skipped: Vec::new(),
+        };
+    }
+    let connected: Vec<_> = connected
+        .iter()
+        .filter(|pair| pair.pair.validate().is_ok())
+        .collect();
+    let mut groups: Vec<(usize, CompletePairKey)> = account
         .groups
         .iter()
         .enumerate()
-        .filter_map(|(index, pair)| complete_pair(pair).map(|pair| (index, pair)))
+        .filter_map(|(index, pair)| pair.complete_key().map(|key| (index, key)))
         .collect();
-    // Canonical order: the pair identities, never the store position. The
+    // Canonical order: the typed complete key, never the store position. The
     // position only orders groups that hold one exact pair, which are all
     // skipped, so it never decides a choice.
     groups.sort_by(|(a_index, a_pair), (b_index, b_pair)| {
         a_pair.cmp(b_pair).then(a_index.cmp(b_index))
     });
     let ranked = primary
+        .as_ref()
         .map(|pair| (CandidateScope::Primary, pair))
         .into_iter()
         .chain(
             groups
                 .iter()
-                .map(|&(index, pair)| (CandidateScope::Secondary { index }, pair)),
+                .map(|(index, pair)| (CandidateScope::Secondary { index: *index }, pair)),
         );
 
     let mut chosen: Option<(K, CandidateScope)> = None;
     let mut skipped = Vec::new();
-    for (scope, (rgb, ir)) in ranked {
-        let carrying: Vec<&CandidatePair<K>> = connected
+    for (scope, key) in ranked {
+        let carrying: Vec<&BoundCandidatePair<K>> = connected
             .iter()
-            .filter(|pair| pair.rgb_identity == rgb && pair.ir_identity == ir)
+            .copied()
+            .filter(|pair| &pair.pair == key)
             .collect();
         if carrying.is_empty() {
             continue;
         }
         let secondary = matches!(scope, CandidateScope::Secondary { .. });
-        let allowed: Vec<&CandidatePair<K>> = carrying
+        let allowed: Vec<&BoundCandidatePair<K>> = carrying
             .into_iter()
-            .filter(|pair| pair.fixed || !forbid_external)
+            .filter(|pair| !forbid_external || (pair.rgb_fixed && pair.ir_fixed))
             .collect();
-        let reason = if secondary
-            && groups
-                .iter()
-                .filter(|(_, other)| *other == (rgb, ir))
-                .count()
-                > 1
-        {
+        let reason = if secondary && groups.iter().filter(|(_, other)| other == key).count() > 1 {
             Some(SkipReason::AmbiguousGroups)
         } else if secondary && !account.secondary_active {
             Some(SkipReason::SecondaryInactive)
@@ -314,14 +396,14 @@ pub fn select_for_account<K: Clone>(
             skipped.push(Skipped { scope, reason });
         }
     }
-    match (chosen, primary) {
+    match (chosen, primary.is_some()) {
         (Some((key, scope)), _) => SelectionOutcome::Selected(Selection {
             key,
             scope,
             skipped,
         }),
-        (None, None) => SelectionOutcome::NotApplicable { skipped },
-        (None, Some(_)) => SelectionOutcome::Refused {
+        (None, false) => SelectionOutcome::NotApplicable { skipped },
+        (None, true) => SelectionOutcome::Refused {
             cause: match skipped.first() {
                 Some(first) => RefusalCause::Skipped(first.reason),
                 None if account.secondary_unreadable => RefusalCause::SecondaryUnreadable,
@@ -419,15 +501,6 @@ pub fn rank_enrollment_candidates<K: Clone + Ord>(
         .collect()
 }
 
-/// Both sides of `pair`, when both are bound. An empty identity counts as
-/// unbound: no connected camera can carry it.
-fn complete_pair(pair: &GroupPair) -> Option<(&str, &str)> {
-    match (pair.rgb.as_deref(), pair.ir.as_deref()) {
-        (Some(rgb), Some(ir)) if !rgb.is_empty() && !ir.is_empty() => Some((rgb, ir)),
-        _ => None,
-    }
-}
-
 /// The `vid:pid` an identity starts with: everything before its second
 /// colon, or the whole identity when it has no serial.
 fn vid_pid(identity: &str) -> &str {
@@ -436,6 +509,9 @@ fn vid_pid(identity: &str) -> &str {
         .nth(1)
         .map_or(identity, |(end, _)| &identity[..end])
 }
+
+#[cfg(test)]
+mod bound_tests;
 
 #[cfg(test)]
 mod tests {
@@ -453,7 +529,7 @@ mod tests {
     type Outcome = SelectionOutcome<&'static str>;
 
     fn pair(identity: &str) -> GroupPair {
-        GroupPair {
+        GroupPair::Ordinary {
             rgb: Some(identity.into()),
             ir: Some(identity.into()),
         }
@@ -518,26 +594,44 @@ mod tests {
     }
 
     #[test]
+    fn a_complete_split_primary_never_uses_the_legacy_not_applicable_fallback() {
+        let split = GroupPair::Split(
+            irlume_common::split_key::SplitPairKey::parse_canonical(
+                "split1;5986:2113:rgb|0000:00:14.0|usb2|8;5986:1141:ir|0000:00:14.0|usb2|5",
+            )
+            .unwrap(),
+        );
+        let account = enrolled(Some(split), &[]);
+        assert_eq!(
+            select(&[], &account),
+            SelectionOutcome::Refused {
+                cause: RefusalCause::NoEnrolledCameraConnected,
+                skipped: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
     fn an_incomplete_primary_binding_keeps_the_standing_pair_and_is_never_refused() {
         let incomplete = [
             None,
-            Some(GroupPair {
+            Some(GroupPair::Ordinary {
                 rgb: Some(BUILT_IN.into()),
                 ir: None,
             }),
-            Some(GroupPair {
+            Some(GroupPair::Ordinary {
                 rgb: None,
                 ir: Some(PRIMARY.into()),
             }),
-            Some(GroupPair {
+            Some(GroupPair::Ordinary {
                 rgb: None,
                 ir: None,
             }),
-            Some(GroupPair {
+            Some(GroupPair::Ordinary {
                 rgb: Some(PRIMARY.into()),
                 ir: Some(String::new()),
             }),
-            Some(GroupPair {
+            Some(GroupPair::Ordinary {
                 rgb: Some(String::new()),
                 ir: Some(PRIMARY.into()),
             }),
@@ -671,7 +765,7 @@ mod tests {
 
     #[test]
     fn the_canonical_order_compares_rgb_then_ir() {
-        let split = |rgb: &str, ir: &str| GroupPair {
+        let split = |rgb: &str, ir: &str| GroupPair::Ordinary {
             rgb: Some(rgb.into()),
             ir: Some(ir.into()),
         };
@@ -771,7 +865,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_store_is_the_cause_instead_of_no_enrolled_camera() {
-        let binding = CameraBinding {
+        let binding = CameraBinding::Ordinary {
             rgb: Some(PRIMARY.into()),
             ir: Some(PRIMARY.into()),
         };
@@ -925,7 +1019,7 @@ mod tests {
 
     #[test]
     fn a_one_sided_group_is_never_a_candidate() {
-        let one_sided = GroupPair {
+        let one_sided = GroupPair::Ordinary {
             rgb: None,
             ir: Some(ADDED_A.into()),
         };
@@ -1148,7 +1242,7 @@ mod tests {
     }
 
     /// Every ordering of `items` (Heap's algorithm).
-    fn permutations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+    pub(super) fn permutations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
         fn heap<T: Clone>(k: usize, items: &mut [T], out: &mut Vec<Vec<T>>) {
             if k <= 1 {
                 out.push(items.to_vec());
@@ -1237,7 +1331,7 @@ mod tests {
                             let eligible_pair = |pair: &GroupPair| {
                                 identities.iter().enumerate().any(|(bit, identity)| {
                                     eligible_mask & (1 << bit) != 0
-                                        && pair.rgb.as_deref() == Some(*identity)
+                                        && pair.rgb_identity() == Some(*identity)
                                 })
                             };
                             let run = |groups: &[GroupPair], connected: &[CandidatePair<&'static str>]| {
@@ -1292,7 +1386,7 @@ mod tests {
 
     #[test]
     fn from_stores_reads_the_binding_and_the_activation() {
-        let binding = CameraBinding {
+        let binding = CameraBinding::Ordinary {
             rgb: Some(PRIMARY.into()),
             ir: None,
         };
@@ -1315,7 +1409,7 @@ mod tests {
                 SecondaryFacts::Loaded(&store, Activation::Active)
             ),
             AccountCameras {
-                primary: Some(GroupPair {
+                primary: Some(GroupPair::Ordinary {
                     rgb: Some(PRIMARY.into()),
                     ir: None,
                 }),

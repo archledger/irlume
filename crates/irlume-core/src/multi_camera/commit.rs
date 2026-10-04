@@ -37,7 +37,7 @@
 
 #[cfg(test)]
 use super::load_secondary;
-use super::{Activation, SecondaryStore, SecondaryStoreError};
+use super::{Activation, GroupPair, SecondaryStore, SecondaryStoreError};
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -339,9 +339,34 @@ pub enum GrantDecision {
 ///
 /// This function is pure over its inputs so the serialized boundary can be
 /// tested exhaustively without a daemon.
+/// This metadata-only compatibility path admits ordinary groups only. A
+/// split group requires [`grant_boundary_check_bound`] with the retained pair.
 #[must_use]
 pub fn grant_boundary_check(
     pinned: &GrantContext,
+    current_primary_bytes: Option<&[u8]>,
+    current_secondary: Option<&SecondaryStore>,
+) -> GrantDecision {
+    grant_boundary_check_impl(pinned, None, current_primary_bytes, current_secondary)
+}
+
+/// The grant-boundary check with the exact pair retained at pinning. Every
+/// metadata check of [`grant_boundary_check`] still applies, and the group's
+/// whole binding must equal `pair`, even if generation and group id are unchanged.
+/// Ordinary partial bindings are compared exactly, without completing them.
+#[must_use]
+pub fn grant_boundary_check_bound(
+    pinned: &GrantContext,
+    pair: &GroupPair,
+    current_primary_bytes: Option<&[u8]>,
+    current_secondary: Option<&SecondaryStore>,
+) -> GrantDecision {
+    grant_boundary_check_impl(pinned, Some(pair), current_primary_bytes, current_secondary)
+}
+
+fn grant_boundary_check_impl(
+    pinned: &GrantContext,
+    pair: Option<&GroupPair>,
     current_primary_bytes: Option<&[u8]>,
     current_secondary: Option<&SecondaryStore>,
 ) -> GrantDecision {
@@ -369,12 +394,21 @@ pub fn grant_boundary_check(
     ) {
         return GrantDecision::Refuse("secondary activation binding stale (§1.1)");
     }
-    if !secondary
+    let Some(group) = secondary
         .groups
         .iter()
-        .any(|group| group.id.as_str() == pinned.group_id)
-    {
+        .find(|group| group.id.as_str() == pinned.group_id)
+    else {
         return GrantDecision::Refuse("pinned group no longer present (§4.2 revocation)");
+    };
+    match pair {
+        Some(pair) if pair.validate().is_err() || &group.pair != pair => {
+            return GrantDecision::Refuse("pinned pair changed during the attempt (§4.2 binding)");
+        }
+        None if matches!(&group.pair, GroupPair::Split(_)) => {
+            return GrantDecision::Refuse("split group requires a whole-pair grant context");
+        }
+        Some(_) | None => {}
     }
     GrantDecision::Grant
 }
@@ -413,14 +447,63 @@ pub fn grant_boundary_now_with(
     primary_path: &Path,
     keys: &mut dyn crate::template_key::TemplateKeySource,
 ) -> Result<GrantDecision, CommitError> {
+    grant_boundary_now_impl(pinned, None, secondary_path, primary_path, keys)
+}
+
+/// Reads both current stores and applies [`grant_boundary_check_bound`] with
+/// the pair retained at pinning. Journal recovery and key resolution are shared
+/// with the ordinary metadata-only reader.
+///
+/// # Errors
+///
+/// Returns [`CommitError`] when journal resolution or store loading fails.
+pub fn grant_boundary_now_bound(
+    pinned: &GrantContext,
+    pair: &GroupPair,
+    secondary_path: &Path,
+    primary_path: &Path,
+) -> Result<GrantDecision, CommitError> {
+    grant_boundary_now_bound_with(
+        pinned,
+        pair,
+        secondary_path,
+        primary_path,
+        &mut crate::template_key::RequestTemplateKey::production(),
+    )
+}
+
+/// [`grant_boundary_now_bound`] lending the request's existing template key.
+/// The current primary is checked by its exact bytes and needs no key.
+///
+/// # Errors
+///
+/// As [`grant_boundary_now_bound`].
+pub fn grant_boundary_now_bound_with(
+    pinned: &GrantContext,
+    pair: &GroupPair,
+    secondary_path: &Path,
+    primary_path: &Path,
+    keys: &mut dyn crate::template_key::TemplateKeySource,
+) -> Result<GrantDecision, CommitError> {
+    grant_boundary_now_impl(pinned, Some(pair), secondary_path, primary_path, keys)
+}
+
+fn grant_boundary_now_impl(
+    pinned: &GrantContext,
+    pair: Option<&GroupPair>,
+    secondary_path: &Path,
+    primary_path: &Path,
+    keys: &mut dyn crate::template_key::TemplateKeySource,
+) -> Result<GrantDecision, CommitError> {
     resolve_commit(secondary_path)?;
     let secondary = match super::load_secondary_with_source(secondary_path, keys)? {
         Some(store) => store,
-        None => return Ok(grant_boundary_check(pinned, None, None)),
+        None => return Ok(grant_boundary_check_impl(pinned, pair, None, None)),
     };
     let primary_bytes = std::fs::read(primary_path).ok();
-    Ok(grant_boundary_check(
+    Ok(grant_boundary_check_impl(
         pinned,
+        pair,
         primary_bytes.as_deref(),
         Some(&secondary),
     ))
@@ -431,6 +514,233 @@ mod tests {
     use super::super::{CameraGroupId, GroupPair, SecondaryGroup, SecondaryProfileScans};
     use super::*;
     use crate::storage::FaceScan;
+    use irlume_common::split_key::{SplitDomain, SplitPairKey};
+
+    fn split_pair() -> GroupPair {
+        GroupPair::Split(
+            SplitPairKey::parse_canonical(
+                "split1;5986:2113:rgb|0000:00:14.0|usb2|8;5986:1141:ir|0000:00:14.0|usb2|5",
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn metadata_only_boundary_never_admits_split_but_bound_check_can() {
+        let primary = b"primary-bytes";
+        let digest = irlume_common::sha256_hex(primary);
+        let mut store = store_for(&digest, 12);
+        let pair = split_pair();
+        store.groups[0].pair = pair.clone();
+        let pinned = GrantContext {
+            secondary_generation: 12,
+            primary_snapshot_sha256: digest,
+            group_id: "desk".into(),
+        };
+        assert!(matches!(
+            grant_boundary_check(&pinned, Some(primary), Some(&store)),
+            GrantDecision::Refuse(_)
+        ));
+        assert_eq!(
+            grant_boundary_check_bound(&pinned, &pair, Some(primary), Some(&store)),
+            GrantDecision::Grant
+        );
+    }
+
+    #[test]
+    fn bound_boundary_refuses_role_location_class_and_same_generation_pair_drift() {
+        let primary = b"primary-bytes";
+        let digest = irlume_common::sha256_hex(primary);
+        let mut store = store_for(&digest, 12);
+        let pair = split_pair();
+        store.groups[0].pair = pair.clone();
+        let pinned = GrantContext {
+            secondary_generation: 12,
+            primary_snapshot_sha256: digest,
+            group_id: "desk".into(),
+        };
+        let GroupPair::Split(key) = &pair else {
+            unreachable!()
+        };
+        let mut swapped = key.clone();
+        std::mem::swap(&mut swapped.rgb, &mut swapped.ir);
+        let mut wrong_pairs = vec![
+            GroupPair::Split(swapped),
+            GroupPair::Ordinary {
+                rgb: Some(key.rgb.identity.clone()),
+                ir: Some(key.ir.identity.clone()),
+            },
+        ];
+        for rgb in [true, false] {
+            for change in 0..4 {
+                let mut wrong = key.clone();
+                let side = if rgb { &mut wrong.rgb } else { &mut wrong.ir };
+                match change {
+                    0 => side.identity = "other".into(),
+                    1 => side.controller = "0000:00:15.0".into(),
+                    2 => side.domain = SplitDomain::SuperSpeed,
+                    _ => side.ports.push(1),
+                }
+                wrong_pairs.push(GroupPair::Split(wrong));
+            }
+        }
+        for wrong in wrong_pairs {
+            assert!(matches!(
+                grant_boundary_check_bound(&pinned, &wrong, Some(primary), Some(&store)),
+                GrantDecision::Refuse(_)
+            ));
+            let mut edited = store.clone();
+            edited.groups[0].pair = wrong;
+            assert!(matches!(
+                grant_boundary_check_bound(&pinned, &pair, Some(primary), Some(&edited)),
+                GrantDecision::Refuse(_)
+            ));
+        }
+        let mut invalid = key.clone();
+        invalid.rgb.ports = vec![0];
+        let invalid = GroupPair::Split(invalid);
+        store.groups[0].pair = invalid.clone();
+        assert!(matches!(
+            grant_boundary_check_bound(&pinned, &invalid, Some(primary), Some(&store)),
+            GrantDecision::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn bound_ordinary_boundary_retains_partial_pairs_and_checks_exact_pair_drift() {
+        let primary = b"primary-bytes";
+        let digest = irlume_common::sha256_hex(primary);
+        let mut store = store_for(&digest, 12);
+        let pinned = GrantContext {
+            secondary_generation: 12,
+            primary_snapshot_sha256: digest,
+            group_id: "desk".into(),
+        };
+        for pair in [
+            store.groups[0].pair.clone(),
+            GroupPair::Ordinary {
+                rgb: None,
+                ir: Some("ir".into()),
+            },
+        ] {
+            store.groups[0].pair = pair.clone();
+            assert_eq!(
+                grant_boundary_check_bound(&pinned, &pair, Some(primary), Some(&store)),
+                GrantDecision::Grant
+            );
+            store.groups[0].pair = GroupPair::Ordinary {
+                rgb: Some("changed".into()),
+                ir: Some("ir".into()),
+            };
+            assert!(matches!(
+                grant_boundary_check_bound(&pinned, &pair, Some(primary), Some(&store)),
+                GrantDecision::Refuse(_)
+            ));
+            // The metadata-only ordinary compatibility path keeps its old contract.
+            assert_eq!(
+                grant_boundary_check(&pinned, Some(primary), Some(&store)),
+                GrantDecision::Grant
+            );
+        }
+    }
+
+    #[test]
+    fn bound_split_boundary_keeps_generation_digest_activation_and_revocation_checks() {
+        let primary = b"primary-bytes";
+        let digest = irlume_common::sha256_hex(primary);
+        let mut store = store_for(&digest, 12);
+        let pair = split_pair();
+        store.groups[0].pair = pair.clone();
+        let pinned = GrantContext {
+            secondary_generation: 12,
+            primary_snapshot_sha256: digest,
+            group_id: "desk".into(),
+        };
+        assert_eq!(
+            grant_boundary_check_bound(&pinned, &pair, Some(primary), Some(&store)),
+            GrantDecision::Grant
+        );
+        assert!(matches!(
+            grant_boundary_check_bound(&pinned, &pair, None, Some(&store)),
+            GrantDecision::Refuse(_)
+        ));
+        assert!(matches!(
+            grant_boundary_check_bound(&pinned, &pair, Some(primary), None),
+            GrantDecision::Refuse(_)
+        ));
+        assert!(matches!(
+            grant_boundary_check_bound(&pinned, &pair, Some(b"rewritten"), Some(&store)),
+            GrantDecision::Refuse(_)
+        ));
+        for change in 0..3 {
+            let mut edited = store.clone();
+            match change {
+                0 => edited.generation += 1,
+                1 => edited.primary_snapshot_sha256 = "a".repeat(64),
+                _ => edited.groups.clear(),
+            }
+            assert!(matches!(
+                grant_boundary_check_bound(&pinned, &pair, Some(primary), Some(&edited)),
+                GrantDecision::Refuse(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn bound_and_metadata_readers_share_current_file_checks_without_split_fallback() {
+        let _env = crate::testenv::ENV_LOCK.lock().unwrap();
+        let (secondary_path, primary_path) = paths("bound-now");
+        let primary = b"primary-bytes";
+        std::fs::write(&primary_path, primary).unwrap();
+        let digest = irlume_common::sha256_hex(primary);
+        let mut store = store_for(&digest, 12);
+        let pair = split_pair();
+        store.groups[0].pair = pair.clone();
+        let pinned = GrantContext {
+            secondary_generation: 12,
+            primary_snapshot_sha256: digest.clone(),
+            group_id: "desk".into(),
+        };
+        publish_with_intent_key(&secondary_path, &store, &digest, None).unwrap();
+        let mut keys = crate::template_key::RequestTemplateKey::with_unsealer(|_| {
+            panic!("plaintext needs no key")
+        });
+        assert!(matches!(
+            grant_boundary_now_with(&pinned, &secondary_path, &primary_path, &mut keys),
+            Ok(GrantDecision::Refuse(_))
+        ));
+        assert!(matches!(
+            grant_boundary_now_bound_with(
+                &pinned,
+                &pair,
+                &secondary_path,
+                &primary_path,
+                &mut keys
+            ),
+            Ok(GrantDecision::Grant)
+        ));
+        assert!(matches!(
+            grant_boundary_now_bound(&pinned, &pair, &secondary_path, &primary_path),
+            Ok(GrantDecision::Grant)
+        ));
+        store.groups[0].pair = GroupPair::Ordinary {
+            rgb: Some("rgb".into()),
+            ir: Some("ir".into()),
+        };
+        publish_with_intent_key(&secondary_path, &store, &digest, None).unwrap();
+        assert!(matches!(
+            grant_boundary_now_bound_with(
+                &pinned,
+                &pair,
+                &secondary_path,
+                &primary_path,
+                &mut keys
+            ),
+            Ok(GrantDecision::Refuse(_))
+        ));
+        assert_eq!(keys.unseals(), 0);
+        std::fs::remove_dir_all(secondary_path.parent().unwrap()).unwrap();
+    }
 
     fn scan() -> FaceScan {
         FaceScan {
@@ -454,7 +764,7 @@ mod tests {
             primary_snapshot_sha256: primary_digest.to_owned(),
             groups: vec![SecondaryGroup {
                 id: CameraGroupId::new("desk".into()).unwrap(),
-                pair: GroupPair {
+                pair: GroupPair::Ordinary {
                     rgb: Some("3443:c803".into()),
                     ir: Some("3443:c803".into()),
                 },

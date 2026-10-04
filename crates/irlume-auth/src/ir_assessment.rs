@@ -14,19 +14,24 @@ pub(super) struct IrAssessment {
 /// Whether the configured pair is the primary binding: the bound IR
 /// identity must match; a bound RGB identity must match the configured
 /// RGB side when both are known (an unbound side is unchecked, as
-/// `GroupPair::matches` treats it on the dual path).
+/// `GroupPair::matches` treats it on the dual path). Identity-only input
+/// cannot match a split binding, even when both identity strings coincide.
 fn primary_binding_matches(
     enrollment: &irlume_core::storage::Enrollment,
     rgb_identity: Option<&str>,
     ir_identity: &str,
 ) -> Option<bool> {
-    let binding = enrollment.camera_binding.as_ref()?;
-    let ir = binding.ir.as_deref()?;
-    let rgb_matches = match (binding.rgb.as_deref(), rgb_identity) {
-        (Some(bound), Some(configured)) => bound == configured,
-        _ => true,
-    };
-    Some(ir == ir_identity && rgb_matches)
+    match enrollment.camera_binding.as_ref()? {
+        irlume_core::storage::CameraBinding::Ordinary { rgb, ir } => {
+            let ir = ir.as_deref()?;
+            let rgb_matches = match (rgb.as_deref(), rgb_identity) {
+                (Some(bound), Some(configured)) => bound == configured,
+                _ => true,
+            };
+            Some(ir == ir_identity && rgb_matches)
+        }
+        irlume_core::storage::CameraBinding::Split(_) => Some(false),
+    }
 }
 
 fn enrollment_readiness(
@@ -62,7 +67,7 @@ pub(super) enum IrOnlyScope {
         digest: String,
     },
     /// One active secondary group, pinned by the coordinator.
-    Secondary(irlume_core::multi_camera::coordinator::SecondaryAuthContext),
+    Secondary(Box<irlume_core::multi_camera::coordinator::SecondaryAuthContext>),
 }
 
 impl IrOnlyScope {
@@ -302,7 +307,7 @@ fn resolve_ir_only_scope_at(
     }
     Ok(IrOnlyResolution {
         enrollment: scoped,
-        scope: IrOnlyScope::Secondary(context),
+        scope: IrOnlyScope::Secondary(Box::new(context)),
     })
 }
 
@@ -744,7 +749,7 @@ mod tests {
             enrollment_readiness(&enrollment, None, "target", 1),
             Ready::BindingUnavailable
         );
-        enrollment.camera_binding = Some(CameraBinding {
+        enrollment.camera_binding = Some(CameraBinding::Ordinary {
             rgb: Some("irrelevant RGB".into()),
             ir: None,
         });
@@ -752,12 +757,18 @@ mod tests {
             enrollment_readiness(&enrollment, None, "target", 1),
             Ready::BindingUnavailable
         );
-        enrollment.camera_binding.as_mut().unwrap().ir = Some("different".into());
+        let CameraBinding::Ordinary { ir, .. } = enrollment.camera_binding.as_mut().unwrap() else {
+            panic!("ordinary fixture")
+        };
+        *ir = Some("different".into());
         assert_eq!(
             enrollment_readiness(&enrollment, None, "target", 1),
             Ready::BindingMismatch
         );
-        enrollment.camera_binding.as_mut().unwrap().ir = Some("target".into());
+        let CameraBinding::Ordinary { ir, .. } = enrollment.camera_binding.as_mut().unwrap() else {
+            panic!("ordinary fixture")
+        };
+        *ir = Some("target".into());
         assert_eq!(
             enrollment_readiness(&enrollment, None, "target", 0),
             Ready::IncompatibleEnrollment
@@ -770,6 +781,42 @@ mod tests {
         assert_eq!(
             enrollment_readiness(&enrollment, None, "target", 1),
             Ready::IncompatibleEnrollment
+        );
+    }
+
+    #[test]
+    fn ir_identity_only_readiness_never_treats_split_as_unbound_or_ready() {
+        use irlume_common::IrOnlyReadiness as Ready;
+        use irlume_core::storage::{CameraBinding, Enrollment};
+
+        let key = irlume_common::split_key::SplitPairKey::parse_canonical(
+            "split1;046d:desk|0000:00:14.0|usb2|8;046d:desk-ir|0000:00:14.0|usb2|5",
+        )
+        .unwrap();
+        let mut enrollment = Enrollment::new("synthetic");
+        enrollment.camera_binding = Some(CameraBinding::Split(key.clone()));
+        for rgb in [None, Some("046d:desk"), Some("different")] {
+            assert_eq!(
+                primary_binding_matches(&enrollment, rgb, "046d:desk-ir"),
+                Some(false)
+            );
+            assert_eq!(
+                enrollment_readiness(&enrollment, rgb, "046d:desk-ir", 1),
+                Ready::BindingMismatch
+            );
+        }
+        // Even an invalid split value is still a split binding, never legacy
+        // BindingUnavailable due to an absent ordinary IR field.
+        let mut invalid = key;
+        invalid.ir.identity.clear();
+        enrollment.camera_binding = Some(CameraBinding::Split(invalid));
+        assert_eq!(
+            primary_binding_matches(&enrollment, None, "046d:desk-ir"),
+            Some(false)
+        );
+        assert_eq!(
+            enrollment_readiness(&enrollment, None, "046d:desk-ir", 1),
+            Ready::BindingMismatch
         );
     }
 
@@ -909,7 +956,7 @@ mod tests {
                     ir_calib: None,
                     ir_calibs: Default::default(),
                 }],
-                camera_binding: Some(CameraBinding {
+                camera_binding: Some(CameraBinding::Ordinary {
                     rgb: Some(RGB_P.into()),
                     ir: Some(IR_P.into()),
                 }),
@@ -926,7 +973,7 @@ mod tests {
         ) -> SecondaryGroup {
             SecondaryGroup {
                 id: CameraGroupId::new(id.into()).unwrap(),
-                pair: GroupPair {
+                pair: GroupPair::Ordinary {
                     rgb: rgb.map(str::to_owned),
                     ir: ir.map(str::to_owned),
                 },
@@ -1074,6 +1121,41 @@ mod tests {
             irlume_common::IrOnlyReadiness::IncompatibleEnrollment
         );
         assert_eq!(refusal.scope, Some(IrScope::Primary));
+    }
+
+    #[test]
+    fn ir_only_scope_never_aliases_split_primary_or_secondary_identity_strings() {
+        use adr28::*;
+        use irlume_common::IrOnlyReadiness as Ready;
+        use irlume_core::storage::CameraBinding;
+
+        let rig = Rig::new("split-identity-only");
+        let mut split_primary = primary();
+        split_primary.camera_binding = Some(CameraBinding::Split(
+            irlume_common::split_key::SplitPairKey::parse_canonical(
+                "split1;046d:085e:P|0000:00:14.0|usb2|8;046d:085e:P-ir|0000:00:14.0|usb2|5",
+            )
+            .unwrap(),
+        ));
+        let bytes = rig.write_primary(&split_primary, None);
+        let refusal = resolve(&rig, split_primary, &bytes, (RGB_P, IR_P), &mut no_key())
+            .expect_err("split primary is not an ordinary alias");
+        assert_eq!(refusal.readiness, Ready::BindingMismatch);
+        assert_eq!(refusal.scope, None);
+
+        let bytes = rig.write_primary(&primary(), None);
+        let mut split_group = group("split", Some(RGB_A), Some(IR_X), 0.5, true);
+        split_group.pair = irlume_core::multi_camera::GroupPair::Split(
+            irlume_common::split_key::SplitPairKey::parse_canonical(
+                "split1;1bcf:28c4:A|0000:00:14.0|usb2|8;1bcf:28c4:X-ir|0000:00:14.0|usb2|5",
+            )
+            .unwrap(),
+        );
+        rig.write_secondary(vec![split_group], &bytes, None);
+        let refusal = resolve(&rig, primary(), &bytes, (RGB_A, IR_X), &mut no_key())
+            .expect_err("split secondary is not an ordinary alias");
+        assert_eq!(refusal.readiness, Ready::BindingMismatch);
+        assert_eq!(refusal.scope, None);
     }
 
     #[test]

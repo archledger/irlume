@@ -4582,6 +4582,9 @@ struct EngineBits {
     tier: String,
     rgb_dev: Option<String>,
     ir_dev: Option<String>,
+    /// Private class-aware live binding for summary selection. Device paths
+    /// alone cannot reconstruct a split key's role-labelled locations.
+    live_binding: irlume_core::multi_camera::GroupPair,
 }
 
 fn engine_bits() -> &'static std::sync::Mutex<EngineBits> {
@@ -4603,6 +4606,7 @@ fn publish_engine_camera_selection(engine: &irlume_auth::Engine) {
 fn copy_engine_camera_selection(bits: &mut EngineBits, engine: &irlume_auth::Engine) {
     bits.rgb_dev = (!engine.rgb_device().is_empty()).then(|| engine.rgb_device().to_owned());
     bits.ir_dev = (!engine.ir_device().is_empty()).then(|| engine.ir_device().to_owned());
+    bits.live_binding = engine.live_pair();
     bits.tier = if bits.rgb_dev.is_none() && bits.ir_dev.is_none() {
         "none"
     } else if engine.tier() == irlume_auth::Tier::Secure {
@@ -4679,6 +4683,13 @@ struct CameraStoreSnapshot {
     /// that may not recur. A store that does not parse or decrypt fails the
     /// same way on every load, so its error is served from the cache.
     key_unavailable: bool,
+    /// Whole group bindings retained by the worker, indexed by immutable id.
+    /// `None` is only the legacy/manual ordinary-row fixture path. A published
+    /// map with a missing entry never reconstructs a binding from wire fields.
+    bindings: Option<std::collections::BTreeMap<String, irlume_core::multi_camera::GroupPair>>,
+    /// Primary binding kept only to prevent split identities acquiring an
+    /// ordinary connected-device handle. Never part of a wire reply.
+    primary_binding: Option<irlume_core::multi_camera::GroupPair>,
 }
 
 impl Default for CameraStoreSnapshot {
@@ -4689,6 +4700,8 @@ impl Default for CameraStoreSnapshot {
             file: PrimaryDigest::Absent,
             activation: None,
             key_unavailable: false,
+            bindings: None,
+            primary_binding: None,
         }
     }
 }
@@ -4870,16 +4883,30 @@ fn correlate_handles(
 ) {
     let redact = !root && handles;
     if let Some(binding) = summary.primary_camera.as_mut() {
-        binding.connected_handle =
-            connected_handle_for(binding.rgb.as_deref(), binding.ir.as_deref(), present);
+        binding.connected_handle = match &summary.camera_store.primary_binding {
+            Some(irlume_core::multi_camera::GroupPair::Split(_)) => None,
+            Some(irlume_core::multi_camera::GroupPair::Ordinary { .. }) | None => {
+                connected_handle_for(binding.rgb.as_deref(), binding.ir.as_deref(), present)
+            }
+        };
         if redact {
             binding.rgb = binding.rgb.as_deref().map(identity_without_serial);
             binding.ir = binding.ir.as_deref().map(identity_without_serial);
         }
     }
     for group in &mut summary.camera_groups {
-        group.connected_handle =
-            connected_handle_for(group.rgb.as_deref(), group.ir.as_deref(), present);
+        let ordinary = match summary.camera_store.bindings.as_ref() {
+            None => true,
+            Some(bindings) => matches!(
+                bindings.get(&group.id),
+                Some(irlume_core::multi_camera::GroupPair::Ordinary { .. })
+            ),
+        };
+        group.connected_handle = if ordinary {
+            connected_handle_for(group.rgb.as_deref(), group.ir.as_deref(), present)
+        } else {
+            None
+        };
         if redact {
             group.rgb = group.rgb.as_deref().map(identity_without_serial);
             group.ir = group.ir.as_deref().map(identity_without_serial);
@@ -4976,6 +5003,8 @@ fn summarize_camera_groups_keyed(
         file: PrimaryDigest::settled(before, camera_store_digest_now(user)),
         activation: None,
         key_unavailable: key_unavailable.get(),
+        bindings: Some(Default::default()),
+        primary_binding: summary.camera_store.primary_binding.take(),
     };
     let store = match loaded {
         Ok(None) => return,
@@ -4988,7 +5017,7 @@ fn summarize_camera_groups_keyed(
     let primary = std::fs::read(irlume_core::multi_camera::primary_enrollment_path(user)).ok();
     let live = engine.live_pair();
     let present = irlume_auth::present_device_identities();
-    summary.camera_groups = irlume_core::multi_camera::group_summaries(
+    let rows = irlume_core::multi_camera::group_summaries(
         &store,
         primary.as_deref(),
         &live,
@@ -4997,7 +5026,25 @@ fn summarize_camera_groups_keyed(
         engine.ir_space(),
         engine.ir_dim(),
     );
-    summary.camera_store.activation = Some(store.primary_snapshot_sha256);
+    publish_loaded_camera_group_rows(summary, &store, rows);
+}
+
+/// Worker publication retains whole bindings beside the existing wire rows.
+/// Cached refresh never needs to decrypt the store to recover their class.
+fn publish_loaded_camera_group_rows(
+    summary: &mut EnrollmentSummary,
+    store: &irlume_core::multi_camera::SecondaryStore,
+    rows: Vec<irlume_common::CameraGroupSummary>,
+) {
+    summary.camera_groups = rows;
+    summary.camera_store.activation = Some(store.primary_snapshot_sha256.clone());
+    summary.camera_store.bindings = Some(
+        store
+            .groups
+            .iter()
+            .map(|group| (group.id.as_str().to_owned(), group.pair.clone()))
+            .collect(),
+    );
 }
 
 #[allow(clippy::type_complexity)]
@@ -5051,13 +5098,16 @@ fn summarize_enrollment(
             camera_store_error: None,
             primary_camera: enr.camera_binding.as_ref().map(|binding| {
                 irlume_common::PrimaryCameraBinding {
-                    rgb: binding.rgb.clone(),
-                    ir: binding.ir.clone(),
+                    rgb: binding.rgb_identity().map(str::to_owned),
+                    ir: binding.ir_identity().map(str::to_owned),
                     connected_handle: None,
                 }
             }),
             primary_digest: PrimaryDigest::Absent,
-            camera_store: CameraStoreSnapshot::default(),
+            camera_store: CameraStoreSnapshot {
+                primary_binding: enr.camera_binding.clone(),
+                ..CameraStoreSnapshot::default()
+            },
             owner: irlume_core::account::Resolution::Unknown,
             profiles: enr
                 .profiles
@@ -5898,6 +5948,7 @@ fn refresh_camera_group_flags(
         Ok(bytes) => bytes,
         Err(error) => {
             summary.camera_groups.clear();
+            summary.camera_store.bindings = Some(Default::default());
             summary.camera_store_error =
                 (error.kind() != std::io::ErrorKind::NotFound).then(|| {
                     irlume_core::multi_camera::SecondaryStoreError::Io(error.to_string())
@@ -5922,22 +5973,30 @@ fn refresh_camera_group_flags(
     let present = irlume_auth::present_device_identities();
     let live = {
         let bits = engine_bits().lock().unwrap_or_else(|e| e.into_inner());
-        irlume_core::multi_camera::GroupPair {
-            rgb: bits
-                .rgb_dev
-                .as_deref()
-                .and_then(irlume_auth::device_identity),
-            ir: bits
-                .ir_dev
-                .as_deref()
-                .and_then(irlume_auth::device_identity),
-        }
+        summary_live_pair(&bits, irlume_auth::device_identity)
     };
     for group in &mut summary.camera_groups {
         group.stale = stale;
     }
     refresh_camera_group_flags_with(summary, &present, &live);
     true
+}
+
+/// Ordinary cached selection retains passive current identity observations.
+/// Split selection uses the worker's whole binding, never its display ids.
+fn summary_live_pair(
+    bits: &EngineBits,
+    identity_for: impl Fn(&str) -> Option<String>,
+) -> irlume_core::multi_camera::GroupPair {
+    match &bits.live_binding {
+        irlume_core::multi_camera::GroupPair::Ordinary { .. } => {
+            irlume_core::multi_camera::GroupPair::Ordinary {
+                rgb: bits.rgb_dev.as_deref().and_then(&identity_for),
+                ir: bits.ir_dev.as_deref().and_then(&identity_for),
+            }
+        }
+        irlume_core::multi_camera::GroupPair::Split(_) => bits.live_binding.clone(),
+    }
 }
 
 /// The pure core of [`refresh_camera_group_flags`] over caller-supplied
@@ -5947,16 +6006,32 @@ fn refresh_camera_group_flags_with(
     present: &[String],
     live: &irlume_core::multi_camera::GroupPair,
 ) {
+    let presence = irlume_core::multi_camera::GroupPresence {
+        ordinary_identities: present,
+        split_pairs: &[],
+    };
     for group in &mut summary.camera_groups {
-        group.connected = [&group.rgb, &group.ir]
-            .into_iter()
-            .flatten()
-            .all(|identity| present.iter().any(|p| p == identity));
-        group.selected = irlume_core::multi_camera::GroupPair {
-            rgb: group.rgb.clone(),
-            ir: group.ir.clone(),
+        match summary.camera_store.bindings.as_ref() {
+            Some(bindings) => match bindings.get(&group.id) {
+                Some(binding) => {
+                    group.connected = presence.connected(binding);
+                    group.selected = binding.matches_binding(live);
+                }
+                None => {
+                    group.connected = false;
+                    group.selected = false;
+                }
+            },
+            None => {
+                // Historical manual fixtures contain ordinary wire rows only.
+                let binding = irlume_core::multi_camera::GroupPair::Ordinary {
+                    rgb: group.rgb.clone(),
+                    ir: group.ir.clone(),
+                };
+                group.connected = presence.connected(&binding);
+                group.selected = binding.matches_binding(live);
+            }
         }
-        .matches(live.rgb.as_deref(), live.ir.as_deref());
     }
 }
 
@@ -9524,7 +9599,13 @@ fn add_camera_group(
         return Response::Error(format!("'{user}' is not enrolled"));
     }
     let pair = engine.live_pair();
-    if pair.rgb.is_none() && pair.ir.is_none() {
+    if matches!(
+        &pair,
+        irlume_core::multi_camera::GroupPair::Ordinary {
+            rgb: None,
+            ir: None
+        }
+    ) {
         return Response::Error(
             "the current cameras expose no USB identity; a camera group cannot bind to them".into(),
         );
@@ -9541,16 +9622,10 @@ fn add_camera_group(
         Err(e) => return Response::Error(e.to_string()),
     };
     let group =
-        irlume_core::multi_camera::derive_group_id(&store, pair.rgb.as_deref(), pair.ir.as_deref())
+        irlume_core::multi_camera::derive_group_id(&store, pair.rgb_identity(), pair.ir_identity())
             .as_str()
             .to_owned();
-    let operation = irlume_core::multi_camera::authz::EnrollmentOperation::AddGroup {
-        group,
-        pair: irlume_core::multi_camera::authz::GroupPairRef {
-            rgb: pair.rgb.clone(),
-            ir: pair.ir.clone(),
-        },
-    };
+    let operation = irlume_core::multi_camera::authz::EnrollmentOperation::add_group(group, &pair);
     let authorization = match mint_group_authorization(peer, user, operation) {
         Ok(authz) => authz,
         Err(e) => return Response::Error(e.to_string()),
@@ -16042,6 +16117,7 @@ mod tests {
             tier: "none".into(),
             rgb_dev: None,
             ir_dev: None,
+            live_binding: Default::default(),
         });
         let peer = Peer {
             uid: 0,
@@ -24582,7 +24658,7 @@ mod tests {
         let sb = sandbox("remcam");
         // A plaintext primary plus a secondary store holding one group.
         let mut enr = Enrollment::new("carol");
-        enr.camera_binding = Some(irlume_core::storage::CameraBinding {
+        enr.camera_binding = Some(irlume_core::storage::CameraBinding::Ordinary {
             rgb: Some("046d:lap".into()),
             ir: None,
         });
@@ -24613,7 +24689,7 @@ mod tests {
             primary_snapshot_sha256: digest,
             groups: vec![irlume_core::multi_camera::SecondaryGroup {
                 id: irlume_core::multi_camera::CameraGroupId::new("cam-desk".into()).unwrap(),
-                pair: irlume_core::multi_camera::GroupPair {
+                pair: irlume_core::multi_camera::GroupPair::Ordinary {
                     rgb: Some("046d:desk".into()),
                     ir: None,
                 },
@@ -24677,7 +24753,7 @@ mod tests {
         dir: &std::path::Path,
     ) -> (Enrollment, irlume_core::multi_camera::SecondaryStore) {
         let mut enr = Enrollment::new("carol");
-        enr.camera_binding = Some(irlume_core::storage::CameraBinding {
+        enr.camera_binding = Some(irlume_core::storage::CameraBinding::Ordinary {
             rgb: Some("046d:lap".into()),
             ir: None,
         });
@@ -24707,7 +24783,7 @@ mod tests {
             ),
             groups: vec![irlume_core::multi_camera::SecondaryGroup {
                 id: irlume_core::multi_camera::CameraGroupId::new("cam-desk".into()).unwrap(),
-                pair: irlume_core::multi_camera::GroupPair {
+                pair: irlume_core::multi_camera::GroupPair::Ordinary {
                     rgb: Some("046d:desk".into()),
                     ir: None,
                 },
@@ -24740,6 +24816,274 @@ mod tests {
         summary.primary_digest = primary_digest_now("carol");
         publish_enrollment_summary("carol", summary.clone());
         summary
+    }
+
+    mod class_aware_summary_tests {
+        use super::*;
+        use irlume_core::multi_camera::{GroupPair, SecondaryStore};
+
+        fn split_pair() -> GroupPair {
+            GroupPair::Split(
+                irlume_common::split_key::SplitPairKey::parse_canonical(
+                    "split1;5986:2113:rgb|0000:00:14.0|usb2|8;5986:1141:ir|0000:00:14.0|usb2|5",
+                )
+                .unwrap(),
+            )
+        }
+
+        fn loaded_summary(
+            store: &SecondaryStore,
+            live: &GroupPair,
+            present: &[String],
+        ) -> EnrollmentSummary {
+            let mut summary = summarize_enrollment(None, "embed:test", "ir:test", 4);
+            let rows = irlume_core::multi_camera::group_summaries(
+                store,
+                None,
+                live,
+                present,
+                "embed:test",
+                "ir:test",
+                4,
+            );
+            publish_loaded_camera_group_rows(&mut summary, store, rows);
+            summary
+        }
+
+        #[test]
+        fn loaded_and_cached_partial_ordinary_flags_agree() {
+            let _g = env_lock();
+            let sb = sandbox("summary-partial-ordinary");
+            let (_, mut store) = camera_group_fixture(&sb.dir);
+            let live = GroupPair::Ordinary {
+                rgb: Some("046d:desk".into()),
+                ir: None,
+            };
+            let present = ["046d:desk".into()];
+            let mut summary = loaded_summary(&store, &live, &present);
+            assert!(summary.camera_groups[0].connected);
+            assert!(summary.camera_groups[0].selected);
+            refresh_camera_group_flags_with(&mut summary, &present, &live);
+            assert!(summary.camera_groups[0].connected);
+            assert!(summary.camera_groups[0].selected);
+            // Missing private state keeps historical manual ordinary fixtures.
+            summary.camera_store.bindings = None;
+            refresh_camera_group_flags_with(&mut summary, &present, &live);
+            assert!(summary.camera_groups[0].connected);
+            assert!(summary.camera_groups[0].selected);
+            // A missing entry in a worker-published map never guesses a class.
+            summary.camera_store.bindings = Some(Default::default());
+            refresh_camera_group_flags_with(&mut summary, &present, &live);
+            assert!(!summary.camera_groups[0].connected);
+            assert!(!summary.camera_groups[0].selected);
+            store.groups[0].pair = GroupPair::Ordinary {
+                rgb: Some("046d:desk".into()),
+                ir: Some("ir".into()),
+            };
+            let mut summary = loaded_summary(&store, &live, &present);
+            assert!(!summary.camera_groups[0].selected);
+            refresh_camera_group_flags_with(&mut summary, &present, &live);
+            assert!(!summary.camera_groups[0].selected);
+        }
+
+        #[test]
+        fn loaded_and_cached_split_flags_do_not_alias_ordinary_ids() {
+            let _g = env_lock();
+            let sb = sandbox("summary-split-collision");
+            let (_, mut store) = camera_group_fixture(&sb.dir);
+            let split = split_pair();
+            let ordinary = GroupPair::Ordinary {
+                rgb: Some("5986:2113:rgb".into()),
+                ir: Some("5986:1141:ir".into()),
+            };
+            store.groups[0].pair = ordinary.clone();
+            let mut second = store.groups[0].clone();
+            second.id = irlume_core::multi_camera::CameraGroupId::new("split".into()).unwrap();
+            second.pair = split.clone();
+            store.groups.push(second);
+            let present = ["5986:2113:rgb".into(), "5986:1141:ir".into()];
+            for (live, ordinary_selected, split_selected) in
+                [(&ordinary, true, false), (&split, false, true)]
+            {
+                let mut summary = loaded_summary(&store, live, &present);
+                for cached in [false, true] {
+                    if cached {
+                        refresh_camera_group_flags_with(&mut summary, &present, live);
+                    }
+                    assert!(summary.camera_groups[0].connected);
+                    assert_eq!(summary.camera_groups[0].selected, ordinary_selected);
+                    assert!(!summary.camera_groups[1].connected);
+                    assert_eq!(summary.camera_groups[1].selected, split_selected);
+                }
+            }
+        }
+
+        #[test]
+        fn cached_live_binding_keeps_split_class_without_identity_projection() {
+            let _g = env_lock();
+            let bits = EngineBits {
+                live_binding: split_pair(),
+                rgb_dev: Some("/dev/fixture-rgb".into()),
+                ir_dev: Some("/dev/fixture-ir".into()),
+                ..EngineBits::default()
+            };
+            let live = summary_live_pair(&bits, |_| {
+                panic!("a split live binding must never use identity-only observations")
+            });
+            assert!(matches!(live, GroupPair::Split(_)));
+            let ordinary = GroupPair::Ordinary {
+                rgb: Some("5986:2113:rgb".into()),
+                ir: Some("5986:1141:ir".into()),
+            };
+            assert!(!ordinary.matches_binding(&live));
+            let bits = EngineBits {
+                live_binding: GroupPair::default(),
+                ..bits
+            };
+            let partial = summary_live_pair(&bits, |path| {
+                (path == "/dev/fixture-rgb").then(|| "5986:2113:rgb".into())
+            });
+            assert_eq!(
+                partial,
+                GroupPair::Ordinary {
+                    rgb: Some("5986:2113:rgb".into()),
+                    ir: None,
+                }
+            );
+        }
+
+        #[test]
+        fn loaded_and_cached_split_selection_refuses_role_and_location_drift() {
+            let _g = env_lock();
+            let sb = sandbox("summary-split-drift");
+            let (_, mut store) = camera_group_fixture(&sb.dir);
+            store.groups[0].pair = split_pair();
+            let GroupPair::Split(key) = split_pair() else {
+                panic!("split fixture");
+            };
+            let mut moved = key.clone();
+            moved.ir.controller = "0000:00:15.0".into();
+            let mut new_domain = key.clone();
+            new_domain.rgb.domain = irlume_common::split_key::SplitDomain::SuperSpeed;
+            let mut new_ports = key.clone();
+            new_ports.ir.ports = vec![6];
+            let mut invalid = key.clone();
+            invalid.rgb.ports = vec![0];
+            let swapped = irlume_common::split_key::SplitPairKey {
+                rgb: key.ir,
+                ir: key.rgb,
+            };
+            let present = ["5986:2113:rgb".into(), "5986:1141:ir".into()];
+            for key in [moved, new_domain, new_ports, invalid, swapped] {
+                let live = GroupPair::Split(key);
+                let mut summary = loaded_summary(&store, &live, &present);
+                assert!(!summary.camera_groups[0].selected);
+                refresh_camera_group_flags_with(&mut summary, &present, &live);
+                assert!(!summary.camera_groups[0].selected);
+                assert!(!summary.camera_groups[0].connected);
+            }
+        }
+
+        #[test]
+        fn worker_publication_retains_split_bindings_for_cached_refresh() {
+            let _g = env_lock();
+            let e = engine();
+            let sb = sandbox("summary-split-worker");
+            let (enr, mut store) = camera_group_fixture(&sb.dir);
+            store.groups[0].pair = split_pair();
+            plant_encrypted_camera_store(&store);
+            let requests = std::cell::Cell::new(0);
+            let mut summary = publish_camera_group_summary(&enr, &e, |_| {
+                requests.set(requests.get() + 1);
+                Ok(Some(zeroize::Zeroizing::new(vec![7u8; 32])))
+            });
+            assert_eq!(requests.get(), 1);
+            assert_eq!(summary.camera_store_error, None);
+            assert_eq!(summary.camera_groups.len(), 1);
+            let present = ["5986:2113:rgb".into(), "5986:1141:ir".into()];
+            let ordinary = GroupPair::Ordinary {
+                rgb: Some("5986:2113:rgb".into()),
+                ir: Some("5986:1141:ir".into()),
+            };
+            refresh_camera_group_flags_with(&mut summary, &present, &ordinary);
+            assert!(!summary.camera_groups[0].selected);
+            assert!(!summary.camera_groups[0].connected);
+            refresh_camera_group_flags_with(&mut summary, &present, &split_pair());
+            assert!(summary.camera_groups[0].selected);
+            assert!(!summary.camera_groups[0].connected);
+            assert_eq!(requests.get(), 1, "cache refresh requests no key");
+            invalidate_enrollment_summary("carol");
+        }
+
+        #[test]
+        fn existing_enrollment_replies_disclose_no_private_split_key() {
+            let _g = env_lock();
+            let sb = sandbox("summary-split-wire");
+            let (mut enr, mut store) = camera_group_fixture(&sb.dir);
+            let GroupPair::Split(mut key) = split_pair() else {
+                panic!("split fixture");
+            };
+            // Equal identity strings at different locations must not acquire
+            // the existing ordinary device handle, even when both are present.
+            key.ir.identity = key.rgb.identity.clone();
+            let split = GroupPair::Split(key);
+            enr.camera_binding = Some(split.clone());
+            store.groups[0].pair = split.clone();
+            let present = ["5986:2113:rgb".into()];
+            let rows = irlume_core::multi_camera::group_summaries(
+                &store,
+                None,
+                &split,
+                &present,
+                "embed:test",
+                "ir:test",
+                4,
+            );
+            let mut summary = summarize_enrollment(Some(&enr), "embed:test", "ir:test", 4);
+            publish_loaded_camera_group_rows(&mut summary, &store, rows);
+            for (root, handles) in [(true, false), (true, true), (false, false), (false, true)] {
+                let mut reply_summary = summary.clone();
+                correlate_handles(&mut reply_summary, &present, root, handles);
+                assert_eq!(reply_summary.camera_groups[0].connected_handle, None);
+                assert_eq!(
+                    reply_summary
+                        .primary_camera
+                        .as_ref()
+                        .unwrap()
+                        .connected_handle,
+                    None
+                );
+                let value = serde_json::to_value(reply_summary.into_response()).unwrap();
+                let body = value["Enrollment"]
+                    .as_object()
+                    .expect("existing reply variant");
+                let mut fields: Vec<_> = body.keys().map(String::as_str).collect();
+                fields.sort_unstable();
+                assert_eq!(
+                    fields,
+                    [
+                        "camera_groups",
+                        "closure_calibrated",
+                        "ir_ratio_calibrated",
+                        "primary_camera",
+                        "profiles",
+                        "require_eyes_open",
+                    ]
+                );
+                let text = serde_json::to_string(&value).unwrap();
+                for forbidden in [
+                    "split1;",
+                    "0000:00:14.0",
+                    "usb2",
+                    "controller",
+                    "ports",
+                    "bindings",
+                    "primary_binding",
+                ] {
+                    assert!(!text.contains(forbidden), "private key leaked: {forbidden}");
+                }
+            }
+        }
     }
 
     /// Writes [`camera_group_fixture`]'s store encrypted under a test key,
@@ -24908,6 +25252,8 @@ mod tests {
                 file: camera_store_digest_now("carol"),
                 activation: Some(store.primary_snapshot_sha256.clone()),
                 key_unavailable: false,
+                bindings: None,
+                primary_binding: None,
             },
         }
     }
@@ -25049,7 +25395,7 @@ mod tests {
         // selected; hotplug since then: the identity is gone and the live
         // pair moved to another camera.
         let present: Vec<String> = vec!["046d:lap".into()];
-        let live = irlume_core::multi_camera::GroupPair {
+        let live = irlume_core::multi_camera::GroupPair::Ordinary {
             rgb: Some("046d:lap".into()),
             ir: None,
         };
@@ -25059,7 +25405,7 @@ mod tests {
         assert!(!row.selected, "the live pair moved");
         // Replug: both flags recover; store-backed facts stayed frozen.
         let present: Vec<String> = vec!["046d:desk".into()];
-        let live = irlume_core::multi_camera::GroupPair {
+        let live = irlume_core::multi_camera::GroupPair::Ordinary {
             rgb: Some("046d:desk".into()),
             ir: Some("046d:desk".into()),
         };
@@ -25075,7 +25421,7 @@ mod tests {
         let mut e = engine();
         let sb = sandbox("listcam");
         let mut enr = Enrollment::new("carol");
-        enr.camera_binding = Some(irlume_core::storage::CameraBinding {
+        enr.camera_binding = Some(irlume_core::storage::CameraBinding::Ordinary {
             rgb: Some("046d:lap".into()),
             ir: None,
         });
@@ -25106,7 +25452,7 @@ mod tests {
             primary_snapshot_sha256: digest,
             groups: vec![irlume_core::multi_camera::SecondaryGroup {
                 id: irlume_core::multi_camera::CameraGroupId::new("cam-desk".into()).unwrap(),
-                pair: irlume_core::multi_camera::GroupPair {
+                pair: irlume_core::multi_camera::GroupPair::Ordinary {
                     rgb: Some("046d:desk".into()),
                     ir: None,
                 },

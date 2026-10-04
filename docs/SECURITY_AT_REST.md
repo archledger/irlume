@@ -14,6 +14,18 @@ Live-tested on real hardware (Fedora TPM box + Arch TPM box); results below.
 > existing store does not encrypt it; the next authorized write does. Older
 > plaintext files and backups retain their earlier exposure.
 
+> **Update 2026-10-04 (split-pair bindings):** the account binding codec
+> distinguishes ordinary identity objects from canonical `split1;...` JSON
+> strings containing both role-labelled unit identities and USB locations.
+> Ordinary primary values retain their historical representation; secondary
+> stores retain their existing limits. Frozen old struct readers reject a
+> split value, including after decrypting an envelope, instead of dropping
+> an unfamiliar tag and treating the binding as ordinary or unbound. An older
+> secondary reader rejects the whole split-containing store. Encryption,
+> primary-snapshot activation and the account template-key lifecycle stay the
+> same. These storage and matching foundations do not enable split enrollment
+> or authentication; ADR-0032's request-path and acceptance gates remain open.
+
 ## What is stored and what is NOT
 
 **Never an image.** irlume stores only **L2-normalized 512-D face embeddings**

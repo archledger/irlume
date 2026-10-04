@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use crate::connected::ConnectedPairs;
+use crate::connected::{ConnectedPairs, ResolvedConnectedPairs};
 use crate::contracts::CameraDescriptor;
 use crate::inventory::{
     CameraInventory, CameraInventoryError, CameraInventoryEvent, CameraObservation,
@@ -329,6 +329,24 @@ impl CameraSupervisor {
         }
     }
 
+    fn connected_pairs_with_split(
+        &self,
+        records: &[irlume_common::split_schema::AuthorizationRecord],
+    ) -> ResolvedConnectedPairs {
+        match self.inventory.lock() {
+            Ok(inventory) => inventory.connected_pairs_with_split(records),
+            Err(_) => ResolvedConnectedPairs {
+                ordinary: ConnectedPairs {
+                    state: CameraInventoryState::Unavailable,
+                    reason: Some(CameraInventoryReason::Inventory),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+            .refuse_split_records(records.len()),
+        }
+    }
+
     fn open_rgb(&self, device: &str, lease: CameraLease) -> irlume_common::Result<RgbCamera> {
         self.backend.open_rgb(device, lease)
     }
@@ -475,6 +493,27 @@ pub(crate) fn connected_pairs() -> ConnectedPairs {
         return supervisor.connected_pairs();
     }
     connected_pairs_from_slot(&DEFAULT_CAMERA_SUPERVISOR)
+}
+
+fn connected_pairs_with_split_from_slot(
+    slot: &OnceLock<Arc<CameraSupervisor>>,
+    records: &[irlume_common::split_schema::AuthorizationRecord],
+) -> ResolvedConnectedPairs {
+    slot.get().map_or_else(
+        || ResolvedConnectedPairs::default().refuse_split_records(records.len()),
+        |supervisor| supervisor.connected_pairs_with_split(records),
+    )
+}
+
+/// Resolve supplied records without initializing the supervisor or performing I/O.
+pub(crate) fn connected_pairs_with_split(
+    records: &[irlume_common::split_schema::AuthorizationRecord],
+) -> ResolvedConnectedPairs {
+    #[cfg(test)]
+    if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
+        return supervisor.connected_pairs_with_split(records);
+    }
+    connected_pairs_with_split_from_slot(&DEFAULT_CAMERA_SUPERVISOR, records)
 }
 
 pub(crate) fn default_camera_supervisor() -> &'static CameraSupervisor {
@@ -1340,6 +1379,131 @@ pub(crate) mod tests {
 
     fn recorded_role_count(supervisor: &CameraSupervisor) -> usize {
         supervisor.inventory.lock().unwrap().recorded_role_count()
+    }
+
+    fn publication_record() -> irlume_common::split_schema::AuthorizationRecord {
+        use irlume_common::split_schema::{AuthorizationRecord, SideFields};
+        let side = |identity: &str, path: &str, port| SideFields {
+            identity: identity.into(),
+            path: path.into(),
+            controller: "0000:00:14.0".into(),
+            domain: irlume_common::split_key::SplitDomain::Usb2,
+            ports: vec![port],
+        };
+        AuthorizationRecord {
+            rgb: side("5986:2113", "/dev/video0", 8),
+            ir: side("5986:1141", "/dev/video2", 5),
+        }
+    }
+
+    #[test]
+    fn split_publication_public_adapter_never_scans_opens_or_refreshes_frozen_locations() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = RecordingBackend::new(calls.clone());
+        let record = publication_record();
+        let observations = [
+            (&record.rgb, "/devices/synthetic/rgb"),
+            (&record.ir, "/devices/synthetic/ir"),
+        ]
+        .map(|(side, topology)| {
+            ObservationFixture::usb(topology, &side.identity)
+                .capture(&side.path)
+                .build()
+                .with_usb_device(Some(
+                    crate::inventory::UsbDeviceFacts::new(side.identity.clone(), true)
+                        .with_location(Some(crate::UsbLocation {
+                            controller: side.controller.clone(),
+                            domain: crate::RootHubDomain::Usb2,
+                            ports: side.ports.clone(),
+                        })),
+                ))
+        });
+        let supervisor = spy_supervisor(&backend, observations.to_vec());
+        let before = supervisor.endpoint_generations();
+        supervisor.record_roles(
+            &before,
+            [("/dev/video0", Role::Rgb), ("/dev/video2", Role::Ir)],
+        );
+        let _installed = install_test_supervisor(supervisor.clone());
+        let _roots = crate::hostfs::test::empty_fixture();
+        let view = crate::connected_pairs_with_split(&[record]);
+        assert_eq!(view.split_pairs.len(), 1);
+        assert_eq!(
+            view.split_pairs[0]
+                .pair_key()
+                .unwrap()
+                .format_canonical()
+                .unwrap(),
+            "split1;5986:2113|0000:00:14.0|usb2|8;5986:1141|0000:00:14.0|usb2|5"
+        );
+        assert!(view.ordinary.pairs.is_empty());
+        assert!(view.split_refusals.is_empty());
+        assert_eq!(
+            crate::connected_pairs_with_split(&[publication_record()]),
+            view
+        );
+        assert_eq!(crate::connected_pairs(), view.ordinary);
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "resolution performed backend I/O"
+        );
+        let lease = supervisor.acquire_split_operation(
+            &view.split_pairs[0].lease_request(),
+            CameraOperationKind::Diagnostics,
+            Instant::now(),
+        );
+        assert!(
+            lease.is_ok(),
+            "the resolved pair's lease expectations must match; resolution reserves nothing"
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn split_publication_absent_supervisor_refuses_records_without_initializing() {
+        let slot = OnceLock::new();
+        let view = connected_pairs_with_split_from_slot(&slot, &[publication_record()]);
+        assert_eq!(view.ordinary.state, CameraInventoryState::Uninitialized);
+        assert!(view.split_pairs.is_empty());
+        assert_eq!(
+            view.split_refusals,
+            [crate::SplitRefusal {
+                record_index: 0,
+                reason: crate::PinRefusal::PublicationUnavailable,
+            }]
+        );
+        assert!(slot.get().is_none());
+    }
+
+    #[test]
+    fn split_publication_poison_refuses_each_supplied_record_and_no_backend_io() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = RecordingBackend::new(calls.clone());
+        let supervisor = spy_supervisor(&backend, vec![]);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = supervisor.inventory.lock().unwrap();
+            panic!("synthetic publication poison");
+        }));
+        let _installed = install_test_supervisor(supervisor);
+        let view = crate::connected_pairs_with_split(&[publication_record(), publication_record()]);
+        assert_eq!(view.ordinary.state, CameraInventoryState::Unavailable);
+        assert_eq!(view.ordinary.reason, Some(CameraInventoryReason::Inventory));
+        assert!(view.ordinary.pairs.is_empty());
+        assert!(view.split_pairs.is_empty());
+        assert_eq!(
+            view.split_refusals,
+            [
+                crate::SplitRefusal {
+                    record_index: 0,
+                    reason: crate::PinRefusal::PublicationUnavailable
+                },
+                crate::SplitRefusal {
+                    record_index: 1,
+                    reason: crate::PinRefusal::PublicationUnavailable
+                },
+            ]
+        );
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[test]

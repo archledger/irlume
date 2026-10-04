@@ -26,6 +26,7 @@
 //! recognized me" to "add this camera".
 
 use super::GroupPair;
+use irlume_common::split_key::SplitPairKey;
 use serde::{Deserialize, Serialize};
 
 /// How the credential-management authorization was presented. Exactly two
@@ -53,13 +54,67 @@ pub enum EnrollmentOperation {
         #[serde(flatten)]
         pair: GroupPairRef,
     },
+    /// A whole role-labelled split key. Its string shape cannot be read as
+    /// the ordinary operation by pre-split readers.
+    AddSplitGroup {
+        group: String,
+        #[serde(with = "split_pair_serde")]
+        pair: SplitPairKey,
+    },
     RemoveGroup {
         group: String,
     },
 }
 
-/// The pair an addition authorizes, mirrored from [`GroupPair`] in a
-/// serde-friendly shape.
+impl EnrollmentOperation {
+    /// Builds the explicit addition for this binding's class. Ordinary
+    /// partial bindings retain the existing operation and flattened encoding.
+    /// [`EnrollmentAuthorization::mint`] validates the resulting operation.
+    #[must_use]
+    pub fn add_group(group: String, pair: &GroupPair) -> Self {
+        match pair {
+            GroupPair::Ordinary { rgb, ir } => Self::AddGroup {
+                group,
+                pair: GroupPairRef {
+                    rgb: rgb.clone(),
+                    ir: ir.clone(),
+                },
+            },
+            GroupPair::Split(pair) => Self::AddSplitGroup {
+                group,
+                pair: pair.clone(),
+            },
+        }
+    }
+}
+
+// The common binding codec owns canonical text and component validation.
+// This adapter only restricts the allowed class at the operation boundary.
+mod split_pair_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        pair: &SplitPairKey,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        GroupPair::Split(pair.clone()).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<SplitPairKey, D::Error> {
+        match GroupPair::deserialize(deserializer)? {
+            GroupPair::Split(pair) => Ok(pair),
+            GroupPair::Ordinary { .. } => Err(serde::de::Error::custom(
+                "split addition requires a split key string",
+            )),
+        }
+    }
+}
+
+/// The ordinary pair an addition authorizes, mirrored in the historical
+/// serde-friendly shape. This type never carries split authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroupPairRef {
@@ -73,7 +128,7 @@ impl GroupPairRef {
     /// Converts to the store's pair type for comparison.
     #[must_use]
     pub fn to_pair(&self) -> GroupPair {
-        GroupPair {
+        GroupPair::Ordinary {
             rgb: self.rgb.clone(),
             ir: self.ir.clone(),
         }
@@ -132,7 +187,7 @@ impl EnrollmentAuthorization {
     /// # Errors
     ///
     /// Returns [`AuthorizationError::Malformed`] for empty or oversized
-    /// fields or an over-long validity window.
+    /// fields, an over-long validity window, or an invalid split key.
     pub fn mint(
         account: String,
         operation: EnrollmentOperation,
@@ -162,6 +217,14 @@ impl EnrollmentAuthorization {
                     "addition authorizes an empty pair",
                 ));
             }
+        }
+        if let EnrollmentOperation::AddSplitGroup { group, pair } = &operation {
+            if !bounded(group) {
+                return Err(AuthorizationError::Malformed("group id out of bounds"));
+            }
+            GroupPair::Split(pair.clone())
+                .validate()
+                .map_err(|_| AuthorizationError::Malformed("invalid split key"))?;
         }
         if let EnrollmentOperation::RemoveGroup { group } = &operation {
             if !bounded(group) {
@@ -237,6 +300,231 @@ pub fn ensure_not_consumed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use irlume_common::split_key::{SplitDomain, SplitPairKey};
+
+    const SPLIT: &str = "split1;5986:2113:rgb|0000:00:14.0|usb2|8;5986:1141:ir|0000:00:14.0|usb2|5";
+
+    // Frozen pre-split operation and pair shapes, independent of the new types.
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    enum FrozenOperation {
+        AddGroup {
+            group: String,
+            #[serde(flatten)]
+            pair: FrozenPair,
+        },
+        RemoveGroup {
+            group: String,
+        },
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FrozenPair {
+        #[serde(default)]
+        rgb: Option<String>,
+        #[serde(default)]
+        ir: Option<String>,
+    }
+
+    fn split_pair() -> GroupPair {
+        GroupPair::Split(SplitPairKey::parse_canonical(SPLIT).unwrap())
+    }
+
+    #[test]
+    fn ordinary_add_group_keeps_golden_encoding_and_partial_scope() {
+        for (pair, golden) in [
+            (
+                GroupPair::Ordinary {
+                    rgb: Some("rgb".into()),
+                    ir: Some("ir".into()),
+                },
+                r#"{"add-group":{"group":"desk","rgb":"rgb","ir":"ir"}}"#,
+            ),
+            (
+                GroupPair::Ordinary {
+                    rgb: None,
+                    ir: Some("ir".into()),
+                },
+                r#"{"add-group":{"group":"desk","rgb":null,"ir":"ir"}}"#,
+            ),
+        ] {
+            let operation = EnrollmentOperation::add_group("desk".into(), &pair);
+            assert_eq!(serde_json::to_string(&operation).unwrap(), golden);
+            let frozen: FrozenOperation = serde_json::from_str(golden).unwrap();
+            assert_eq!(serde_json::to_string(&frozen).unwrap(), golden);
+            assert_eq!(
+                serde_json::from_str::<EnrollmentOperation>(golden).unwrap(),
+                operation
+            );
+            let EnrollmentOperation::AddGroup {
+                pair: reference, ..
+            } = &operation
+            else {
+                panic!("ordinary additions keep the old variant");
+            };
+            assert_eq!(reference.to_pair(), pair);
+            minted(operation.clone())
+                .validate_for("alice", &operation, 1_000_300)
+                .unwrap();
+        }
+        let partial: EnrollmentOperation =
+            serde_json::from_str(r#"{"add-group":{"group":"desk","ir":"ir"}}"#).unwrap();
+        assert_eq!(
+            partial,
+            EnrollmentOperation::add_group(
+                "desk".into(),
+                &GroupPair::Ordinary {
+                    rgb: None,
+                    ir: Some("ir".into())
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn split_add_group_is_a_canonical_string_and_frozen_enum_refuses_it() {
+        let operation = EnrollmentOperation::add_group("desk".into(), &split_pair());
+        let golden = format!(r#"{{"add-split-group":{{"group":"desk","pair":"{SPLIT}"}}}}"#);
+        assert_eq!(serde_json::to_string(&operation).unwrap(), golden);
+        assert_eq!(
+            serde_json::from_str::<EnrollmentOperation>(&golden).unwrap(),
+            operation
+        );
+        assert!(serde_json::from_str::<FrozenOperation>(&golden).is_err());
+        let auth = minted(operation.clone());
+        let bytes = serde_json::to_vec(&auth).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<EnrollmentAuthorization>(&bytes).unwrap(),
+            auth
+        );
+        auth.validate_for("alice", &operation, 1_000_300).unwrap();
+    }
+
+    #[test]
+    fn split_add_group_refuses_unknown_wrong_class_and_malformed_values() {
+        for value in [
+            serde_json::json!({"rgb": "rgb", "ir": "ir"}),
+            serde_json::json!({"split_key": SPLIT}),
+            serde_json::json!(SPLIT.replacen("split1;", "split2;", 1)),
+            serde_json::json!(SPLIT.replacen("|8;", "|08;", 1)),
+            serde_json::json!(SPLIT.replacen("|usb2|", "|ss|", 1)),
+            serde_json::Value::Null,
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "add-split-group": {"group": "desk", "pair": value}
+            }))
+            .unwrap();
+            assert!(serde_json::from_slice::<EnrollmentOperation>(&bytes).is_err());
+        }
+        for value in [
+            serde_json::json!({"future-add": {"group": "desk", "pair": SPLIT}}),
+            serde_json::json!({"add-split-group": {"group": "desk", "pair": SPLIT, "future": true}}),
+            serde_json::json!({"add-group": {"group": "desk", "pair": SPLIT}}),
+        ] {
+            assert!(serde_json::from_value::<EnrollmentOperation>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn split_authorization_checks_whole_roles_locations_and_class() {
+        let pair = split_pair();
+        let operation = EnrollmentOperation::add_group("desk".into(), &pair);
+        let auth = minted(operation.clone());
+        let GroupPair::Split(key) = pair else {
+            unreachable!()
+        };
+        let mut swapped = key.clone();
+        std::mem::swap(&mut swapped.rgb, &mut swapped.ir);
+        let mut wrong_pairs = vec![
+            GroupPair::Split(swapped),
+            GroupPair::Ordinary {
+                rgb: Some(key.rgb.identity.clone()),
+                ir: Some(key.ir.identity.clone()),
+            },
+        ];
+        for rgb in [true, false] {
+            for change in 0..4 {
+                let mut wrong = key.clone();
+                let side = if rgb { &mut wrong.rgb } else { &mut wrong.ir };
+                match change {
+                    0 => side.identity = "other".into(),
+                    1 => side.controller = "0000:00:15.0".into(),
+                    2 => side.domain = SplitDomain::SuperSpeed,
+                    _ => side.ports.push(1),
+                }
+                wrong_pairs.push(GroupPair::Split(wrong));
+            }
+        }
+        for wrong in wrong_pairs {
+            assert_eq!(
+                auth.validate_for(
+                    "alice",
+                    &EnrollmentOperation::add_group("desk".into(), &wrong),
+                    1_000_300
+                ),
+                Err(AuthorizationError::WrongOperation)
+            );
+        }
+        assert_eq!(
+            auth.validate_for("bob", &operation, 1_000_300),
+            Err(AuthorizationError::WrongAccount)
+        );
+        assert_eq!(
+            auth.validate_for(
+                "alice",
+                &EnrollmentOperation::add_group("other".into(), &split_pair()),
+                1_000_300
+            ),
+            Err(AuthorizationError::WrongOperation)
+        );
+        assert_eq!(
+            auth.validate_for("alice", &operation, 1_000_601),
+            Err(AuthorizationError::Expired)
+        );
+        assert!(ensure_not_consumed(&auth, 2, Some("auth-1")).is_err());
+    }
+
+    #[test]
+    fn split_authorization_mint_validates_the_typed_key() {
+        for rgb in [true, false] {
+            for invalid in 0..5 {
+                let mut key = SplitPairKey::parse_canonical(SPLIT).unwrap();
+                let side = if rgb { &mut key.rgb } else { &mut key.ir };
+                match invalid {
+                    0 => side.identity.clear(),
+                    1 => side.controller = "a".repeat(257),
+                    2 => side.ports.clear(),
+                    3 => side.ports = vec![0],
+                    _ => side.ports = vec![1; 7],
+                }
+                let operation = EnrollmentOperation::AddSplitGroup {
+                    group: "desk".into(),
+                    pair: key,
+                };
+                assert!(matches!(
+                    EnrollmentAuthorization::mint(
+                        "alice".into(),
+                        operation,
+                        1,
+                        60,
+                        "x".into(),
+                        AuthorizationVia::Password
+                    ),
+                    Err(AuthorizationError::Malformed(_))
+                ));
+            }
+        }
+        assert!(EnrollmentAuthorization::mint(
+            "alice".into(),
+            EnrollmentOperation::add_group(String::new(), &split_pair()),
+            1,
+            60,
+            "x".into(),
+            AuthorizationVia::Password,
+        )
+        .is_err());
+    }
 
     fn add_desk() -> EnrollmentOperation {
         EnrollmentOperation::AddGroup {

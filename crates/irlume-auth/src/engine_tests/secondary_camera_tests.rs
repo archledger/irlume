@@ -99,6 +99,33 @@ fn laptop_pair() -> (Option<String>, Option<String>) {
     (Some("046d:lap".into()), Some("046d:lap".into()))
 }
 
+fn split_desk_key() -> irlume_common::split_key::SplitPairKey {
+    irlume_common::split_key::SplitPairKey::parse_canonical(
+        "split1;046d:desk|0000:00:14.0|usb2|8;046d:desk-ir|0000:00:14.0|usb2|5",
+    )
+    .expect("synthetic split key")
+}
+
+#[test]
+fn identity_only_binding_check_refuses_split_even_when_both_ids_match() {
+    let live: (Option<String>, Option<String>) =
+        (Some("046d:desk".into()), Some("046d:desk-ir".into()));
+    let ordinary = CameraBinding::Ordinary {
+        rgb: live.0.clone(),
+        ir: live.1.clone(),
+    };
+    assert_eq!(binding_mismatch_for(&ordinary, &live), None);
+
+    let split = CameraBinding::Split(split_desk_key());
+    for live in [live, (None, None)] {
+        let reason = binding_mismatch_for(&split, &live).expect("identity-only split refusal");
+        assert!(
+            reason.contains("split") && reason.contains("disabled"),
+            "{reason}"
+        );
+    }
+}
+
 /// A one-group store bound to `primary_bytes`, pair `pair`, one profile
 /// `profile` carrying `scans`.
 fn desk_store(
@@ -115,7 +142,7 @@ fn desk_store(
         primary_snapshot_sha256: irlume_common::sha256_hex(primary_bytes),
         groups: vec![SecondaryGroup {
             id: CameraGroupId::new("desk".into()).unwrap(),
-            pair: GroupPair {
+            pair: GroupPair::Ordinary {
                 rgb: Some(pair.into()),
                 ir: Some(pair.into()),
             },
@@ -132,7 +159,7 @@ fn desk_store(
 /// own scans: the granting assessment then grants on the scoped data too.
 fn pinned_fixture(sandbox: &Sandbox) -> (Enrollment, Assessment) {
     let (mut enr, assessment) = pad_matching_fixture(0.2, false);
-    enr.camera_binding = Some(CameraBinding {
+    enr.camera_binding = Some(CameraBinding::Ordinary {
         rgb: laptop_pair().0,
         ir: laptop_pair().1,
     });
@@ -175,7 +202,7 @@ fn a_secondary_pair_pins_its_group_and_grants_from_scoped_data_only() {
     // Scoped: the bridge carries the GROUP pair and only the group's scans.
     assert_eq!(
         resolved.camera_binding,
-        Some(CameraBinding {
+        Some(CameraBinding::Ordinary {
             rgb: Some("046d:desk".into()),
             ir: Some("046d:desk".into())
         })
@@ -216,6 +243,51 @@ fn a_primary_attempt_is_unchanged_by_a_present_secondary_store() {
 }
 
 #[test]
+fn identity_only_attempt_resolution_never_aliases_a_split_binding() {
+    let _g = env_guard();
+    let mut s = shared();
+    let sandbox = Sandbox::new("split-identity-only");
+    let (mut enr, _) = pad_matching_fixture(0.2, false);
+    enr.camera_binding = Some(CameraBinding::Split(split_desk_key()));
+    sandbox.write_primary("pad-contract", &enr);
+    let live = (Some("046d:desk".into()), Some("046d:desk-ir".into()));
+
+    s.engine.begin_attempt();
+    let refusal = s
+        .engine
+        .resolve_attempt_enrollment("pad-contract", enr, &live)
+        .expect_err("split primary cannot match identity-only input");
+    assert!(!refusal.granted && !refusal.live);
+    assert_eq!(refusal.cause, Some(OutcomeCause::NotEnrolledOnThisCamera));
+    assert!(refusal.reason.contains("split") && refusal.reason.contains("disabled"));
+    assert!(s.engine.secondary_attempt.is_none());
+
+    let (mut enr, _) = pad_matching_fixture(0.2, false);
+    enr.camera_binding = Some(CameraBinding::Ordinary {
+        rgb: laptop_pair().0,
+        ir: laptop_pair().1,
+    });
+    let bytes = sandbox.write_primary("pad-contract", &enr);
+    let mut store = desk_store(
+        "pad-contract",
+        &bytes,
+        "046d:desk",
+        "fixture",
+        enr.profiles[0].scans.clone(),
+    );
+    store.groups[0].pair = GroupPair::Split(split_desk_key());
+    save_secondary(&secondary_store_path("pad-contract"), &store).expect("save split group");
+    let refusal = s
+        .engine
+        .resolve_attempt_enrollment("pad-contract", enr, &live)
+        .expect_err("split group cannot match identity-only input");
+    assert!(!refusal.granted && !refusal.live);
+    assert_eq!(refusal.cause, Some(OutcomeCause::NotEnrolledOnThisCamera));
+    assert!(s.engine.secondary_attempt.is_none());
+    s.engine.begin_attempt();
+}
+
+#[test]
 fn an_unknown_pair_keeps_todays_binding_refusal() {
     let _g = env_guard();
     let mut s = shared();
@@ -247,7 +319,7 @@ fn a_stale_secondary_activation_refuses_instead_of_pinning() {
     let mut s = shared();
     let sandbox = Sandbox::new("stale-store");
     let (mut enr, _) = pad_matching_fixture(0.2, false);
-    enr.camera_binding = Some(CameraBinding {
+    enr.camera_binding = Some(CameraBinding::Ordinary {
         rgb: laptop_pair().0,
         ir: laptop_pair().1,
     });
@@ -365,7 +437,7 @@ fn group_calibrations_reach_ir_matching_through_the_bridge() {
     let mut s = shared();
     let sandbox = Sandbox::new("calib-bridge");
     let (mut enr, _) = pad_matching_fixture(0.2, false);
-    enr.camera_binding = Some(CameraBinding {
+    enr.camera_binding = Some(CameraBinding::Ordinary {
         rgb: laptop_pair().0,
         ir: laptop_pair().1,
     });
@@ -441,13 +513,13 @@ fn publish_camera_group_publishes_under_the_exact_authorized_scope() {
     let s = shared();
     let sandbox = Sandbox::new("publish-add");
     let (mut enr, _) = pad_matching_fixture(0.2, false);
-    enr.camera_binding = Some(CameraBinding {
+    enr.camera_binding = Some(CameraBinding::Ordinary {
         rgb: laptop_pair().0,
         ir: laptop_pair().1,
     });
     let bytes = sandbox.write_primary("pad-contract", &enr);
     let authz = mint("pad-contract", add_desk_operation());
-    let pair = GroupPair {
+    let pair = GroupPair::Ordinary {
         rgb: Some("046d:desk".into()),
         ir: Some("046d:desk".into()),
     };
@@ -487,11 +559,226 @@ fn publish_camera_group_publishes_under_the_exact_authorized_scope() {
 }
 
 #[test]
+fn publish_camera_group_requires_the_exact_split_operation_and_key() {
+    use irlume_common::split_key::SplitDomain;
+
+    let _g = env_guard();
+    let sandbox = Sandbox::new("publish-split-scope");
+    let (enr, _) = pad_matching_fixture(0.2, false);
+    let bytes = sandbox.write_primary("pad-contract", &enr);
+    let key = split_desk_key();
+    let pair = GroupPair::Split(key.clone());
+    let authorization = mint(
+        "pad-contract",
+        EnrollmentOperation::AddSplitGroup {
+            group: "cam-046d-desk".into(),
+            pair: key.clone(),
+        },
+    );
+    let ordinary = GroupPair::Ordinary {
+        rgb: Some("046d:desk".into()),
+        ir: Some("046d:desk-ir".into()),
+    };
+    let mut drifted = vec![("class", ordinary)];
+    for side in ["rgb", "ir"] {
+        for field in ["controller", "domain", "ports", "identity"] {
+            let mut changed = key.clone();
+            let unit = if side == "rgb" {
+                &mut changed.rgb
+            } else {
+                &mut changed.ir
+            };
+            match field {
+                "controller" => unit.controller = "0000:00:15.0".into(),
+                "domain" => unit.domain = SplitDomain::SuperSpeed,
+                "ports" => unit.ports = vec![10],
+                "identity" => unit.identity = "046d:other".into(),
+                _ => unreachable!("closed fixture fields"),
+            }
+            drifted.push((field, GroupPair::Split(changed)));
+        }
+    }
+    let swapped = irlume_common::split_key::SplitPairKey {
+        rgb: key.ir.clone(),
+        ir: key.rgb.clone(),
+    };
+    drifted.push(("roles", GroupPair::Split(swapped)));
+
+    for (field, changed) in drifted {
+        let refusal = publish_camera_group(
+            "pad-contract",
+            &changed,
+            "cam-046d-desk",
+            &desk_profile_payload(),
+            &enr,
+            &authorization,
+            1_000_300,
+        )
+        .expect_err("split authorization must refuse drift");
+        assert!(
+            refusal.to_string().contains("another operation"),
+            "{field}: {refusal}"
+        );
+        assert!(
+            !secondary_store_path("pad-contract").exists(),
+            "{field}: nothing published"
+        );
+    }
+
+    // An ordinary operation carrying the same identities cannot publish split.
+    let ordinary_authorization = mint(
+        "pad-contract",
+        EnrollmentOperation::AddGroup {
+            group: "cam-046d-desk".into(),
+            pair: GroupPairRef {
+                rgb: Some("046d:desk".into()),
+                ir: Some("046d:desk-ir".into()),
+            },
+        },
+    );
+    let refusal = publish_camera_group(
+        "pad-contract",
+        &pair,
+        "cam-046d-desk",
+        &desk_profile_payload(),
+        &enr,
+        &ordinary_authorization,
+        1_000_300,
+    )
+    .expect_err("ordinary scope cannot authorize split");
+    assert!(
+        refusal.to_string().contains("another operation"),
+        "{refusal}"
+    );
+    assert!(!secondary_store_path("pad-contract").exists());
+
+    let published = publish_camera_group(
+        "pad-contract",
+        &pair,
+        "cam-046d-desk",
+        &desk_profile_payload(),
+        &enr,
+        &authorization,
+        1_000_300,
+    )
+    .expect("exact whole split operation publishes synthetic data");
+    assert_eq!(published, "cam-046d-desk");
+    let store = irlume_core::multi_camera::load_secondary(&secondary_store_path("pad-contract"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(store.generation, 1);
+    assert_eq!(
+        store.primary_snapshot_sha256,
+        irlume_common::sha256_hex(&bytes)
+    );
+    assert_eq!(store.groups.len(), 1);
+    assert_eq!(store.groups[0].pair, pair);
+    assert_eq!(store.groups[0].id.as_str(), "cam-046d-desk");
+}
+
+#[test]
+fn publish_camera_group_distinguishes_split_locations_and_ordinary_aliases() {
+    let _g = env_guard();
+    let sandbox = Sandbox::new("publish-split-lookup");
+    let (enr, _) = pad_matching_fixture(0.2, false);
+    let bytes = sandbox.write_primary("pad-contract", &enr);
+    let ordinary = GroupPair::Ordinary {
+        rgb: Some("046d:desk".into()),
+        ir: Some("046d:desk-ir".into()),
+    };
+    let store = SecondaryStore {
+        format_version: SECONDARY_STORE_VERSION,
+        owner: "pad-contract".into(),
+        generation: 1,
+        primary_snapshot_sha256: irlume_common::sha256_hex(&bytes),
+        groups: vec![SecondaryGroup {
+            id: CameraGroupId::new("cam-046d-desk".into()).unwrap(),
+            pair: ordinary.clone(),
+            profiles: vec![desk_profile_payload()],
+        }],
+    };
+    save_secondary(&secondary_store_path("pad-contract"), &store).expect("save ordinary alias");
+    let key = split_desk_key();
+    let split = GroupPair::Split(key.clone());
+    publish_camera_group(
+        "pad-contract",
+        &split,
+        "cam-046d-desk-2",
+        &desk_profile_payload(),
+        &enr,
+        &mint(
+            "pad-contract",
+            EnrollmentOperation::AddSplitGroup {
+                group: "cam-046d-desk-2".into(),
+                pair: key.clone(),
+            },
+        ),
+        1_000_300,
+    )
+    .expect("ordinary alias is a different credential class");
+
+    let refusal = publish_camera_group(
+        "pad-contract",
+        &split,
+        "cam-046d-desk-3",
+        &desk_profile_payload(),
+        &enr,
+        &mint(
+            "pad-contract",
+            EnrollmentOperation::AddSplitGroup {
+                group: "cam-046d-desk-3".into(),
+                pair: key.clone(),
+            },
+        ),
+        1_000_300,
+    )
+    .expect_err("an exact split duplicate must refuse");
+    assert!(
+        refusal.to_string().contains("already enrolled"),
+        "{refusal}"
+    );
+    let after_refusal =
+        irlume_core::multi_camera::load_secondary(&secondary_store_path("pad-contract"))
+            .unwrap()
+            .unwrap();
+    assert_eq!(after_refusal.generation, 2, "duplicate publishes nothing");
+    assert_eq!(after_refusal.groups.len(), 2);
+
+    let mut moved = key;
+    moved.rgb.ports = vec![10];
+    let moved_pair = GroupPair::Split(moved.clone());
+    publish_camera_group(
+        "pad-contract",
+        &moved_pair,
+        "cam-046d-desk-3",
+        &desk_profile_payload(),
+        &enr,
+        &mint(
+            "pad-contract",
+            EnrollmentOperation::AddSplitGroup {
+                group: "cam-046d-desk-3".into(),
+                pair: moved,
+            },
+        ),
+        1_000_300,
+    )
+    .expect("a distinct location requires and accepts its own exact operation");
+    let store = irlume_core::multi_camera::load_secondary(&secondary_store_path("pad-contract"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(store.generation, 3);
+    assert_eq!(store.groups.len(), 3);
+    assert_eq!(store.groups[0].pair, ordinary);
+    assert_eq!(store.groups[1].pair, split);
+    assert_eq!(store.groups[2].pair, moved_pair);
+}
+
+#[test]
 fn publish_camera_group_refuses_a_primary_change_during_capture() {
     let _g = env_guard();
     let sandbox = Sandbox::new("publish-changed");
     let (mut enr, _) = pad_matching_fixture(0.2, false);
-    enr.camera_binding = Some(CameraBinding {
+    enr.camera_binding = Some(CameraBinding::Ordinary {
         rgb: laptop_pair().0,
         ir: laptop_pair().1,
     });
@@ -507,7 +794,7 @@ fn publish_camera_group_refuses_a_primary_change_during_capture() {
 
     let refused = publish_camera_group(
         "pad-contract",
-        &GroupPair {
+        &GroupPair::Ordinary {
             rgb: Some("046d:desk".into()),
             ir: Some("046d:desk".into()),
         },
@@ -535,12 +822,12 @@ fn publish_camera_group_refuses_wrong_scope_or_taken_pair() {
     let _g = env_guard();
     let sandbox = Sandbox::new("publish-scope");
     let (mut enr, _) = pad_matching_fixture(0.2, false);
-    enr.camera_binding = Some(CameraBinding {
+    enr.camera_binding = Some(CameraBinding::Ordinary {
         rgb: laptop_pair().0,
         ir: laptop_pair().1,
     });
     let _bytes = sandbox.write_primary("pad-contract", &enr);
-    let pair = GroupPair {
+    let pair = GroupPair::Ordinary {
         rgb: Some("046d:desk".into()),
         ir: Some("046d:desk".into()),
     };
@@ -636,7 +923,7 @@ fn add_camera_group_refuses_before_the_camera_opens() {
 
     // An ambiguous profile set must name its profile.
     let (mut enr, _) = pad_matching_fixture(0.2, false);
-    enr.camera_binding = Some(CameraBinding {
+    enr.camera_binding = Some(CameraBinding::Ordinary {
         rgb: laptop_pair().0,
         ir: laptop_pair().1,
     });
@@ -686,7 +973,7 @@ fn add_camera_group_refuses_before_the_camera_opens() {
     // A single-profile enrollment passes the profile gate but the shared
     // engine's cameras carry no USB identity: a group cannot bind.
     let (mut single, _) = pad_matching_fixture(0.2, false);
-    single.camera_binding = Some(CameraBinding {
+    single.camera_binding = Some(CameraBinding::Ordinary {
         rgb: laptop_pair().0,
         ir: laptop_pair().1,
     });

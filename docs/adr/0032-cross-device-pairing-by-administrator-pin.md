@@ -664,3 +664,75 @@ establishes supported face authentication on that hardware.
   two root hubs under one PCI device.
 - [Linux v6.8 root-hub port arrays](https://github.com/torvalds/linux/blob/v6.8/drivers/usb/host/xhci-mem.c#L2139-L2164),
   [constructed independently](https://github.com/torvalds/linux/blob/v6.8/drivers/usb/host/xhci-mem.c#L2276-L2277).
+
+## Amendment 2026-10-04: Step 5 ownership and account-binding contract
+
+Step 5 owns publication of resolved split pairs into the internal connected
+view. Camera code is the only producer: the daemon supplies a coherently read
+authorization generation, and `connected_pairs_with_split` resolves its records
+from one current inventory publication under one lock. It reads no configuration
+file, opens no camera and does not initialize a missing supervisor. Ordinary
+pairs retain their separate collection and device claims; indexed refusals
+retain the cause of each unresolved split record. Step 3 continues to own
+authorization-file publication and management, not usable account candidates.
+
+The public `ConnectedPairs` construction contract retains its original six
+fields. The richer result is a separate `ResolvedConnectedPairs` wrapper,
+containing the ordinary view plus split pairs and indexed refusals. Existing
+ordinary callers do not acquire required fields or a new return type.
+
+Primary and secondary account bindings use one semantic ordinary/split type.
+An ordinary value keeps the historical object containing optional `rgb` and
+`ir` identities. Ordinary primary parsing and serialization preserve empty
+and long strings accepted by the old representation; secondary-store limits
+still apply at the secondary validation boundary. A complete ordinary key
+requires both nonempty identities. No partial ordinary value authorizes split.
+
+A split binding is the canonical section 4.1.1 text encoded as a JSON string
+at the binding value. It contains the whole RGB unit key followed by the IR
+unit key, with no node path, instance ID or generation. Frozen old primary
+and secondary struct readers reject that string in plaintext and decrypted
+envelopes. An old secondary reader rejects its whole split-containing store,
+including ordinary groups beside the split record. There is no read-time
+conversion from legacy identities to split locations, and a newer writer
+does not rewrite ordinary values into tagged objects.
+
+The existing ordinary addition operation retains its encoding. A split
+addition has a distinct operation variant carrying the canonical whole key;
+it cannot be flattened into the ordinary identity fields. Confirmation,
+credential-management approval and publication validate the same exact
+account, group and role-labelled binding. Opaque group-ID stems and reply
+identity projections are display/handle data, never split authority.
+
+Core owns the pure account ranking policy. The ordinary adapter and typed
+mixed-class selector share one ranker, including existing skip precedence,
+ambiguity reporting and lazy eligibility. A split primary remains a complete
+binding when unavailable; it cannot become legacy `NotApplicable`. Malformed
+split primaries refuse. The external policy requires both sides to be fixed
+when external cameras are forbidden. Selection supplies no machine
+authorization or live camera proof.
+
+The secondary coordinator retains the exact binding privately alongside
+the existing generation, primary digest and group-ID metadata. Its bound
+grant check repeats those checks against current files and also requires
+whole-binding equality, including when a pair changes without a generation
+bump. A metadata-only compatibility check cannot admit a split group.
+Complete-key pinning borrows the requesting account's already loaded key
+and primary snapshot; it does not add a second unseal. Ordinary optional-side
+matching and exact ordinary pinning remain separate supported behaviors.
+
+Existing inventory and enrollment replies retain their wire shapes. Private
+daemon caches retain binding class so loaded and cached summaries cannot
+reinterpret split identities as ordinary. Identity-only presence never proves
+a split connection; typed whole-pair observations are required. Accountless
+and single-endpoint diagnostics do not grant, and do not derive a split
+matching target by dropping its location or other side.
+
+These foundations are an intermediate Step 5 slice. Engine request preparation
+must still consume the selected whole pair before any preflight or open,
+preserve its authority and provenance through the attempt, and enforce the
+behavioral native-GREY entry-point matrix. The split acquisition activation
+gate stays closed. Enabling enrollment/authentication remains a separate
+reviewed source change after the complete software and physical acceptance
+matrix. Section 7's YUYV exposure refusal and the T480 hardware gate remain
+unchanged.

@@ -18,7 +18,7 @@
 //! group's existing single-camera results.
 
 use super::{Activation, GroupPair, SecondaryStore};
-use crate::storage::{CameraBinding, Enrollment, FaceProfile, FaceScan};
+use crate::storage::{Enrollment, FaceProfile, FaceScan};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -183,10 +183,7 @@ impl CameraGroupView {
                     ir_calibs: view.ir_calibs.clone(),
                 })
                 .collect(),
-            camera_binding: Some(CameraBinding {
-                rgb: self.pair.rgb.clone(),
-                ir: self.pair.ir.clone(),
-            }),
+            camera_binding: Some(self.pair.clone()),
             ..Enrollment::default()
         }
     }
@@ -247,10 +244,7 @@ impl CameraScopedViews {
         }
         let mut groups = vec![CameraGroupView {
             scope: GroupScope::Primary,
-            pair: GroupPair {
-                rgb: primary.camera_binding.as_ref().and_then(|b| b.rgb.clone()),
-                ir: primary.camera_binding.as_ref().and_then(|b| b.ir.clone()),
-            },
+            pair: primary.camera_binding.clone().unwrap_or_default(),
             profiles: primary
                 .profiles
                 .iter()
@@ -360,7 +354,7 @@ mod tests {
             primary_snapshot_sha256: irlume_common::sha256_hex(primary_bytes),
             groups: vec![SecondaryGroup {
                 id: CameraGroupId::new("desk".into()).unwrap(),
-                pair: GroupPair {
+                pair: GroupPair::Ordinary {
                     rgb: Some("3443:c803".into()),
                     ir: Some("3443:c803".into()),
                 },
@@ -479,7 +473,7 @@ mod tests {
         assert_eq!(bridged.user, "alice");
         assert_eq!(
             bridged.camera_binding,
-            Some(crate::storage::CameraBinding {
+            Some(crate::storage::CameraBinding::Ordinary {
                 rgb: Some("3443:c803".into()),
                 ir: Some("3443:c803".into())
             })

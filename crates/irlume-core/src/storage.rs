@@ -204,16 +204,14 @@ impl FaceProfile {
     }
 }
 
-/// The physical camera(s) an enrollment was captured on, for anti-swap binding:
-/// at auth, the live camera identity must still match (a swapped/virtual camera
-/// is refused). Identities are `irlume_camera::device_identity` strings.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct CameraBinding {
-    #[serde(default)]
-    pub rgb: Option<String>,
-    #[serde(default)]
-    pub ir: Option<String>,
-}
+/// The role-labelled camera binding captured at enrollment for anti-swap checks.
+/// Ordinary bindings retain optional `irlume_camera::device_identity` strings;
+/// split bindings retain both unit keys. Identity-only matching never admits split.
+pub use irlume_common::binding_key::PairBinding as CameraBinding;
+
+#[cfg(test)]
+#[path = "binding_contract_tests.rs"]
+mod binding_contract_tests;
 
 /// All face data for one OS user.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

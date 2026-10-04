@@ -255,6 +255,11 @@ pub(crate) mod tests {
 
     #[test]
     fn publication_guard_retains_lock_after_helper_completion() {
+        if crate::test_support::isolated(
+            "token_delivery::tests::publication_guard_retains_lock_after_helper_completion",
+        ) {
+            return;
+        }
         let _g = crate::test_support::env_read();
         let fixture = Fixture::new();
         let owner = fixture.file().metadata().unwrap().uid();

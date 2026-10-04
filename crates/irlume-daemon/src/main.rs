@@ -58,6 +58,27 @@ pub(crate) mod test_support {
         crate::users::initialize();
         ENV_LOCK.write().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// Keep close/drop assertions away from other tests' fork-to-exec windows.
+    pub(crate) fn isolated(test: &str) -> bool {
+        let _env = env_read();
+        const CHILD: &str = "IRLUME_TEST_ISOLATED_DAEMON_CASE";
+        if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(test)) {
+            return false;
+        }
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD, test);
+        let output = irlume_common::process::output_until(
+            &mut command,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(output.status.success(), "isolated test failed: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        true
+    }
 }
 
 mod arbiter;
@@ -14982,6 +15003,11 @@ mod tests {
 
     #[test]
     fn peer_gone_reads_a_closed_peer_and_only_a_closed_peer() {
+        if crate::test_support::isolated(
+            "tests::peer_gone_reads_a_closed_peer_and_only_a_closed_peer",
+        ) {
+            return;
+        }
         // The primitive the disconnect check rests on, against a real socket pair
         // rather than an assumption about what `recv` returns. Being wrong in the
         // "gone" direction cancels a live authentication, so both states are pinned.

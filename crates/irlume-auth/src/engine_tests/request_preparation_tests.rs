@@ -37,6 +37,7 @@ impl Fixture {
             "IRLUME_FORCE_NO_IR",
             "IRLUME_CAMERA_REQUIRE_FIXED",
             "IRLUME_TEMPLATE_KEY_DIR",
+            "IRLUME_GRACE_MS",
         ];
         let saved = keys
             .into_iter()
@@ -49,6 +50,7 @@ impl Fixture {
             "IRLUME_RGB_DEVICE",
             "IRLUME_IR_DEVICE",
             "IRLUME_FORCE_NO_IR",
+            "IRLUME_GRACE_MS",
         ] {
             std::env::remove_var(key);
         }
@@ -640,6 +642,408 @@ fn encrypted_primary_load_failure_precedes_all_camera_work() {
 }
 
 #[test]
+fn automatic_account_primary_is_selected_instead_of_standing_pair_before_open() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(false);
+    let chosen_rgb = "/dev/automatic-chosen-rgb";
+    let chosen_ir = "/dev/automatic-chosen-ir";
+    let camera = |topology: &str, identity: &str, port, rgb: &str, ir: &str| Camera {
+        topology: topology.into(),
+        identity: identity.into(),
+        fixed: true,
+        controller: "0000:00:14.0".into(),
+        domain: irlume_common::split_key::SplitDomain::Usb2,
+        ports: vec![port],
+        endpoints: vec![
+            Endpoint {
+                path: rgb.into(),
+                formats: vec![*b"YUYV"],
+            },
+            Endpoint {
+                path: ir.into(),
+                formats: vec![*b"GREY"],
+            },
+        ],
+    };
+    let recorder = Guard::install(&[
+        camera(
+            "/devices/auto-standing",
+            "1234:0001:ordinary",
+            8,
+            &fixture.rgb,
+            &fixture.ir,
+        ),
+        camera(
+            "/devices/auto-chosen",
+            "1234:0002:chosen",
+            5,
+            chosen_rgb,
+            chosen_ir,
+        ),
+    ])
+    .unwrap();
+    let devices = Devices::new(&mut shared.engine, &fixture);
+    let (mut enrollment, _) = pad_matching_fixture(0.2, false);
+    enrollment.user = "request-fixture".into();
+    enrollment.camera_binding = Some(CameraBinding::Ordinary {
+        rgb: Some("1234:0002:chosen".into()),
+        ir: Some("1234:0002:chosen".into()),
+    });
+    enrollment.profiles[0].scans[0].ir = Some(vec![0.0; devices.engine.ir_dim()]);
+    enrollment.profiles[0].scans[0].ir_space = Some(devices.engine.ir_space().into());
+    std::fs::write(
+        fixture.dir.join("request-fixture.json"),
+        serde_json::to_vec(&enrollment).unwrap(),
+    )
+    .unwrap();
+    // A read-only load must not create the account lock. Seed it through the
+    // normal plaintext loader before checking positive account readiness.
+    let missing_lock = devices.engine.ir_only_preflight_details("request-fixture");
+    assert_eq!(
+        missing_lock.readiness,
+        irlume_common::IrOnlyReadiness::EnrollmentUnavailable
+    );
+    assert!(!fixture.dir.join("private-template-keys").exists());
+    assert!(irlume_core::storage::load_snapshot("request-fixture")
+        .unwrap()
+        .is_some());
+    let readiness = devices.engine.ir_only_preflight_details("request-fixture");
+    assert_eq!(
+        readiness.readiness,
+        irlume_common::IrOnlyReadiness::TargetUnavailable
+    );
+    assert_eq!(
+        readiness.target_issue,
+        Some(irlume_common::IrTargetIssue::Unavailable)
+    );
+    assert_eq!(
+        devices.engine.rgb_device(),
+        fixture.rgb,
+        "readiness mutated standing pair"
+    );
+    assert!(recorder.calls().is_empty());
+    let window = AuthenticationWindow::new(2000);
+    let mut admitted = 0;
+    let _result = devices
+        .engine
+        .authenticate_for_in_window_with_policy_preparing_delivering(
+            "request-fixture",
+            None,
+            AuthenticationPurpose::Verify,
+            window,
+            irlume_common::config::FaceSensorPolicy::Dual,
+            &(),
+            &mut |engine, final_window| {
+                admitted += 1;
+                assert_eq!(engine.rgb_device(), chosen_rgb);
+                assert_eq!(engine.ir_device(), chosen_ir);
+                assert_eq!(final_window.origin(), window.origin());
+                assert!(final_window.deadline <= window.deadline);
+                assert_eq!(
+                    engine.authentication_deadline,
+                    final_window.capture_deadline()
+                );
+                assert!(
+                    recorder.calls().is_empty(),
+                    "admission must precede lease/open"
+                );
+                Ok(())
+            },
+            &mut |_, _| {},
+        );
+    assert_eq!(admitted, 1);
+    let calls = recorder.calls();
+    assert!(
+        calls.contains(&Call::OpenRgb(chosen_rgb.into())),
+        "eligible enrolled primary not chosen before open: {calls:?}"
+    );
+    assert!(
+        !calls.contains(&Call::OpenRgb(fixture.rgb.clone())),
+        "standing unenrolled pair opened: {calls:?}"
+    );
+    let before = recorder.calls();
+    let refusal = devices
+        .engine
+        .authenticate_for_in_window_with_policy_preparing_delivering(
+            "request-fixture",
+            None,
+            AuthenticationPurpose::Verify,
+            AuthenticationWindow::new(2000),
+            irlume_common::config::FaceSensorPolicy::Dual,
+            &(),
+            &mut |engine, _| {
+                assert_eq!(engine.rgb_device(), chosen_rgb);
+                Err(irlume_common::Error::Policy("selected tier refused".into()))
+            },
+            &mut |_, _| panic!("preparation refusal cannot deliver a grant"),
+        )
+        .unwrap_err();
+    assert!(matches!(refusal, irlume_common::Error::Policy(_)));
+    assert_eq!(
+        recorder.calls(),
+        before,
+        "late refusal reached camera lease/open"
+    );
+    assert!(devices.engine.camera_selection.is_none());
+    assert_eq!(
+        devices.engine.rgb_device(),
+        chosen_rgb,
+        "automatic standing choice retained"
+    );
+    devices.engine.set_devices(&fixture.rgb, &fixture.ir);
+    devices.engine.ir_available = true;
+    let outcome = devices
+        .engine
+        .authenticate_for_in_window_with_policy(
+            "request-fixture",
+            None,
+            AuthenticationPurpose::Verify,
+            AuthenticationWindow::new(2000),
+            irlume_common::config::FaceSensorPolicy::IrOnlyExperimental,
+            &(),
+        )
+        .unwrap();
+    assert!(!outcome.granted);
+    assert_eq!(
+        devices.engine.rgb_device(),
+        chosen_rgb,
+        "IR authentication did not choose enrolled pair"
+    );
+    assert_eq!(
+        recorder.calls(),
+        before,
+        "missing physical IR target reached capture"
+    );
+
+    // With the complete primary disconnected, resolve the actual eligible
+    // secondary view and retain its generation through pre-open admission.
+    use irlume_core::multi_camera::{
+        CameraGroupId, GroupPair, SecondaryGroup, SecondaryProfileScans, SecondaryStore,
+        SECONDARY_STORE_VERSION,
+    };
+    enrollment.camera_binding = Some(CameraBinding::Ordinary {
+        rgb: Some("1234:0003:disconnected".into()),
+        ir: Some("1234:0003:disconnected".into()),
+    });
+    let bytes = serde_json::to_vec(&enrollment).unwrap();
+    let primary_path = fixture.dir.join("request-fixture.json");
+    std::fs::write(&primary_path, &bytes).unwrap();
+    let secondary_path = irlume_core::multi_camera::secondary_store_path("request-fixture");
+    let store = SecondaryStore {
+        format_version: SECONDARY_STORE_VERSION,
+        owner: "request-fixture".into(),
+        generation: 5,
+        primary_snapshot_sha256: irlume_common::sha256_hex(&bytes),
+        groups: vec![SecondaryGroup {
+            id: CameraGroupId::new("chosen".into()).unwrap(),
+            pair: GroupPair::Ordinary {
+                rgb: Some("1234:0002:chosen".into()),
+                ir: Some("1234:0002:chosen".into()),
+            },
+            profiles: vec![SecondaryProfileScans {
+                profile: enrollment.profiles[0].name.clone(),
+                scans: enrollment.profiles[0].scans.clone(),
+                ir_calibs: Default::default(),
+            }],
+        }],
+    };
+    std::fs::create_dir_all(secondary_path.parent().unwrap()).unwrap();
+    irlume_core::multi_camera::save_secondary_resolved(&secondary_path, &store, |_| Ok(None))
+        .unwrap();
+    let mut secondary_admitted = false;
+    let error = devices
+        .engine
+        .authenticate_for_in_window_with_policy_preparing_delivering(
+            "request-fixture",
+            None,
+            AuthenticationPurpose::Verify,
+            AuthenticationWindow::new(2000),
+            irlume_common::config::FaceSensorPolicy::Dual,
+            &(),
+            &mut |engine, _| {
+                secondary_admitted = true;
+                let pinned = engine
+                    .secondary_attempt
+                    .as_ref()
+                    .expect("chosen secondary pin");
+                assert_eq!(pinned.store_index(), 0);
+                assert_eq!(pinned.pinned().secondary_generation, 5);
+                assert_eq!(engine.rgb_device(), chosen_rgb);
+                Err(irlume_common::Error::Policy(
+                    "stop after secondary preparation".into(),
+                ))
+            },
+            &mut |_, _| panic!("preparation refusal cannot deliver"),
+        )
+        .unwrap_err();
+    assert!(matches!(error, irlume_common::Error::Policy(_)) && secondary_admitted);
+    assert_eq!(recorder.calls(), before);
+    assert!(
+        devices.engine.secondary_attempt.is_none(),
+        "request-local secondary authority survived refusal"
+    );
+    assert!(
+        devices.engine.primary_attempt.is_none(),
+        "request-local primary authority survived refusal"
+    );
+    for invalid in [false, true] {
+        if invalid {
+            std::fs::write(&secondary_path, b"malformed secondary").unwrap();
+        } else {
+            let mut drifted = bytes.clone();
+            drifted.push(b' ');
+            std::fs::write(&primary_path, drifted).unwrap();
+        }
+        let outcome = devices
+            .engine
+            .authenticate_for_in_window_with_policy_preparing_delivering(
+                "request-fixture",
+                None,
+                AuthenticationPurpose::Verify,
+                AuthenticationWindow::new(2000),
+                irlume_common::config::FaceSensorPolicy::Dual,
+                &(),
+                &mut |_, _| panic!("inactive/unreadable selection reached camera admission"),
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert!(!outcome.granted);
+        assert_eq!(recorder.calls(), before);
+    }
+    std::fs::write(&primary_path, &bytes).unwrap();
+    irlume_core::multi_camera::save_secondary_resolved(&secondary_path, &store, |_| Ok(None))
+        .unwrap();
+    for (cap, override_ms, expected) in [
+        (0, None, 0),
+        (2000, Some("60000"), 2000),
+        (30000, None, GRACE_WINDOW_MS),
+    ] {
+        if let Some(value) = override_ms {
+            std::env::set_var("IRLUME_GRACE_MS", value);
+        } else {
+            std::env::remove_var("IRLUME_GRACE_MS");
+        }
+        let window = AuthenticationWindow::new(cap);
+        let mut reached = false;
+        let error = devices
+            .engine
+            .authenticate_for_in_window_with_policy_preparing_delivering(
+                "request-fixture",
+                None,
+                AuthenticationPurpose::Verify,
+                window,
+                irlume_common::config::FaceSensorPolicy::Dual,
+                &(),
+                &mut |engine, final_window| {
+                    reached = true;
+                    assert_eq!(final_window.origin(), window.origin());
+                    assert_eq!(final_window.milliseconds, expected);
+                    assert_eq!(
+                        engine.authentication_deadline,
+                        final_window.capture_deadline()
+                    );
+                    Err(irlume_common::Error::Policy(
+                        "window observed before capture".into(),
+                    ))
+                },
+                &mut |_, _| {},
+            )
+            .unwrap_err();
+        assert!(matches!(error, irlume_common::Error::Policy(_)) && reached);
+        assert_eq!(recorder.calls(), before);
+    }
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = devices
+            .engine
+            .authenticate_for_in_window_with_policy_preparing_delivering(
+                "request-fixture",
+                None,
+                AuthenticationPurpose::Verify,
+                AuthenticationWindow::new(2000),
+                irlume_common::config::FaceSensorPolicy::Dual,
+                &(),
+                &mut |_, _| panic!("test admission unwind"),
+                &mut |_, _| {},
+            );
+    }));
+    assert!(unwound.is_err());
+    assert!(devices.engine.camera_selection.is_none());
+    assert!(devices.engine.secondary_attempt.is_none() && devices.engine.primary_attempt.is_none());
+    assert!(devices.engine.authentication_deadline.is_none());
+    assert_eq!(recorder.calls(), before);
+    // Revocation after successful preparation admission must precede opens.
+    for during_wait in [false, true] {
+        let stored = std::fs::read(&secondary_path).unwrap();
+        let calls_before = recorder.calls();
+        let outcome = if during_wait {
+            let held = irlume_camera::lease::acquire_camera_operation(
+                &[chosen_ir],
+                irlume_camera::lease::CameraOperationKind::Setup,
+                std::time::Duration::ZERO,
+            )
+            .unwrap();
+            let counts = recorder.lease_counts_observer();
+            let path = secondary_path.clone();
+            std::thread::scope(|threads| {
+                let writer = threads.spawn(move || {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    while counts().1 == 0 {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "authentication never registered lease wait"
+                        );
+                        std::thread::yield_now();
+                    }
+                    std::fs::remove_file(path).unwrap();
+                    drop(held);
+                });
+                let result = devices.engine.authenticate_for_in_window_with_policy(
+                    "request-fixture",
+                    None,
+                    AuthenticationPurpose::Verify,
+                    AuthenticationWindow::new(5000),
+                    irlume_common::config::FaceSensorPolicy::Dual,
+                    &(),
+                );
+                writer.join().unwrap();
+                result
+            })
+        } else {
+            devices
+                .engine
+                .authenticate_for_in_window_with_policy_preparing_delivering(
+                    "request-fixture",
+                    None,
+                    AuthenticationPurpose::Verify,
+                    AuthenticationWindow::new(2000),
+                    irlume_common::config::FaceSensorPolicy::Dual,
+                    &(),
+                    &mut |_, _| {
+                        std::fs::remove_file(&secondary_path).unwrap();
+                        Ok(())
+                    },
+                    &mut |_, _| {},
+                )
+        };
+        let calls = recorder.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, Call::OpenRgb(_) | Call::OpenIr(_)))
+                .count(),
+            calls_before
+                .iter()
+                .filter(|call| matches!(call, Call::OpenRgb(_) | Call::OpenIr(_)))
+                .count(),
+            "store revocation reached camera open (wait={during_wait}): {calls:?}"
+        );
+        assert!(!outcome.unwrap().granted);
+        std::fs::write(&secondary_path, stored).unwrap();
+    }
+}
+
+#[test]
 fn stored_split_primary_refuses_before_ordinary_camera_acquisition() {
     let _env = env_guard();
     let mut shared = shared();
@@ -677,6 +1081,71 @@ fn stored_split_primary_refuses_before_ordinary_camera_acquisition() {
         std::fs::read(fixture.dir.join("request-fixture.json")).unwrap(),
         bytes
     );
+}
+
+#[test]
+fn automatic_ir_without_candidates_preserves_target_guard_before_protected_load() {
+    use irlume_common::diagnostics::{DiagnosticSink, TraceEventKind, TraceStage};
+    struct NoProtectedLoad;
+    impl DiagnosticSink for NoProtectedLoad {
+        fn emit_trace(&self, event: TraceEventKind) {
+            assert!(
+                !matches!(
+                    event,
+                    TraceEventKind::StageTiming {
+                        stage: TraceStage::EnrollmentLoad,
+                        ..
+                    }
+                ),
+                "unconfigured IR target reached protected loading"
+            );
+        }
+    }
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(false);
+    let _empty = Guard::install(&[]).unwrap();
+    let devices = Devices::new(&mut shared.engine, &fixture);
+    for config in ["", "mode=automatic\n"] {
+        std::fs::write(fixture.dir.join("cameras.conf"), config).unwrap();
+        for enrolled in [false, true] {
+            if enrolled {
+                let (mut enrollment, _) = pad_matching_fixture(0.2, false);
+                enrollment.user = "request-fixture".into();
+                std::fs::write(
+                    fixture.dir.join("request-fixture.json"),
+                    serde_json::to_vec(&enrollment).unwrap(),
+                )
+                .unwrap();
+            }
+            let readiness = devices.engine.ir_only_preflight_details("request-fixture");
+            assert_eq!(
+                readiness.target_issue,
+                Some(irlume_common::IrTargetIssue::Unconfigured)
+            );
+            let outcome = devices
+                .engine
+                .authenticate_for_in_window_with_policy(
+                    "request-fixture",
+                    None,
+                    AuthenticationPurpose::Verify,
+                    AuthenticationWindow::new(2000),
+                    irlume_common::config::FaceSensorPolicy::IrOnlyExperimental,
+                    &NoProtectedLoad,
+                )
+                .unwrap();
+            assert!(!outcome.granted);
+            assert_eq!(
+                outcome.cause,
+                Some(irlume_common::OutcomeCause::Configuration)
+            );
+            assert!(!fixture.dir.join("private-template-keys").exists());
+            if enrolled {
+                std::fs::remove_file(fixture.dir.join("request-fixture.json")).unwrap();
+            }
+        }
+    }
+    assert!(fixture.recorder.calls().is_empty());
 }
 
 #[test]

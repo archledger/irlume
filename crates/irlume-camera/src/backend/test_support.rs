@@ -174,6 +174,24 @@ impl Guard {
             .expect("fixture recorder poisoned")
             .clone()
     }
+
+    /// Observe real lease ownership/wait registration from a coordinating thread.
+    /// The observer cannot acquire, redirect or open a camera.
+    ///
+    /// # Panics
+    /// Panics if this guard is not installed or a test poisoned lease state.
+    pub fn lease_counts_observer(&self) -> impl Fn() -> (usize, usize) + Send + Sync + 'static {
+        let leases = TEST_SUPERVISOR.with(|slot| {
+            Arc::clone(
+                &slot
+                    .borrow()
+                    .as_ref()
+                    .expect("installed fixture supervisor")
+                    .leases,
+            )
+        });
+        move || leases.counts_for_test()
+    }
 }
 
 impl Drop for Guard {

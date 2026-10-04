@@ -304,17 +304,50 @@ impl SecondaryAuthContext {
         key: &CompletePairKey,
         keys: &mut dyn crate::template_key::TemplateKeySource,
     ) -> Result<Self, PinError> {
+        resolve_commit(stores.secondary_path)
+            .map_err(|error| PinError::Secondary(error.to_string()))?;
+        let secondary: SecondaryStore =
+            super::load_secondary_with_source(stores.secondary_path, keys)
+                .and_then(|option| {
+                    option.ok_or_else(|| {
+                        super::SecondaryStoreError::Io("secondary store absent".into())
+                    })
+                })
+                .map_err(|error| PinError::Secondary(error.to_string()))?;
+        Self::pin_key_from_loaded(stores, primary, primary_bytes, key, &secondary)
+    }
+
+    /// Pins one exact complete credential from the request's already-loaded
+    /// primary and secondary snapshots. Validates the supplied secondary store,
+    /// account owner, strict key uniqueness, and activation against the exact
+    /// primary bytes, then composes the selected group's scoped view.
+    ///
+    /// This is pure: no journal resolution, store reads, or template key unseal.
+    /// The caller resolves any journal before loading the secondary snapshot.
+    /// Paths are retained only for later boundary checks, which must re-read
+    /// current state before opening cameras or granting. Split bindings retain
+    /// their whole key; this primitive does not enable split authentication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PinError::Secondary`] for an invalid or wrong-owner store,
+    /// [`PinError::GroupNotActive`] for an invalid or unmatched complete key,
+    /// [`PinError::GroupInactive`] for stale activation, and
+    /// [`PinError::Ambiguous`] for more than one exact key match.
+    pub fn pin_key_from_loaded(
+        stores: StrictPinStores<'_>,
+        primary: &crate::storage::Enrollment,
+        primary_bytes: &[u8],
+        key: &CompletePairKey,
+        secondary: &SecondaryStore,
+    ) -> Result<Self, PinError> {
         let StrictPinStores {
             user,
             secondary_path,
             primary_path,
         } = stores;
-        resolve_commit(secondary_path).map_err(|error| PinError::Secondary(error.to_string()))?;
-        let secondary: SecondaryStore = super::load_secondary_with_source(secondary_path, keys)
-            .and_then(|option| {
-                option
-                    .ok_or_else(|| super::SecondaryStoreError::Io("secondary store absent".into()))
-            })
+        secondary
+            .validate()
             .map_err(|error| PinError::Secondary(error.to_string()))?;
         if secondary.owner != user {
             return Err(PinError::Secondary(format!(
@@ -343,7 +376,7 @@ impl SecondaryAuthContext {
                 detail: "the primary enrollment changed since this camera was authorized".into(),
             });
         }
-        let views = CameraScopedViews::compose(primary, primary_bytes, Some(&secondary))
+        let views = CameraScopedViews::compose(primary, primary_bytes, Some(secondary))
             .map_err(|error| PinError::Secondary(error.to_string()))?;
         let Some(index) = views
             .group_views()
@@ -482,6 +515,271 @@ mod integration {
         store.groups[0].pair = pair.clone();
         super::super::save_secondary_with_key(&secondary_path, &store, key).unwrap();
         (secondary_path, primary_path)
+    }
+
+    #[test]
+    fn loaded_pin_keeps_read_snapshot_after_secondary_replacement_or_removal() {
+        let _env = crate::testenv::ENV_LOCK.lock().unwrap();
+        for (tag, pair) in [
+            (
+                "loaded-ordinary",
+                GroupPair::Ordinary {
+                    rgb: Some("3443:c803".into()),
+                    ir: Some("3443:c803".into()),
+                },
+            ),
+            ("loaded-split", split_pair()),
+        ] {
+            let rig = Rig::new(tag);
+            let template_key = crate::crypto::generate_key();
+            let (secondary_path, primary_path) = enroll_binding(&rig, &pair, Some(&template_key));
+            let mut keys = counting_source(Some(template_key.to_vec()));
+            let primary = crate::storage::load_path_with_source("alice", &primary_path, &mut keys)
+                .unwrap()
+                .unwrap();
+            let bytes = std::fs::read(&primary_path).unwrap();
+            let mut stored = super::super::load_secondary_with_source(&secondary_path, &mut keys)
+                .unwrap()
+                .unwrap();
+            let mut decoy = stored.groups[0].clone();
+            decoy.id = CameraGroupId::new("decoy".into()).unwrap();
+            decoy.pair = GroupPair::Ordinary {
+                rgb: Some("other-rgb".into()),
+                ir: Some("other-ir".into()),
+            };
+            decoy.profiles[0].scans = vec![scan(0.9)];
+            stored.groups.insert(0, decoy);
+            super::super::save_secondary_with_key(&secondary_path, &stored, Some(&template_key))
+                .unwrap();
+            let loaded = super::super::load_secondary_with_source(&secondary_path, &mut keys)
+                .unwrap()
+                .unwrap();
+            let stores = StrictPinStores {
+                user: "alice",
+                secondary_path: &secondary_path,
+                primary_path: &primary_path,
+            };
+            let key = pair.complete_key().unwrap();
+            let control =
+                SecondaryAuthContext::pin_key_from_loaded(stores, &primary, &bytes, &key, &loaded)
+                    .unwrap();
+            assert!(matches!(
+                control.boundary_check_now_with(&mut keys),
+                Ok(Boundary::Grant)
+            ));
+            let mut rebound = loaded.clone();
+            rebound.groups[1].pair = if matches!(&pair, GroupPair::Split(_)) {
+                GroupPair::Ordinary {
+                    rgb: pair.rgb_identity().map(str::to_owned),
+                    ir: pair.ir_identity().map(str::to_owned),
+                }
+            } else {
+                split_pair()
+            };
+            super::super::save_secondary_with_key(&secondary_path, &rebound, Some(&template_key))
+                .unwrap();
+            assert!(matches!(
+                control.boundary_check_now_with(&mut keys),
+                Ok(Boundary::Refuse(_))
+            ));
+            let mut replacement = loaded.clone();
+            replacement.generation = 2;
+            replacement.groups[1].profiles[0].scans = vec![scan(0.8)];
+            super::super::save_secondary_with_key(
+                &secondary_path,
+                &replacement,
+                Some(&template_key),
+            )
+            .unwrap();
+            for removed in [false, true] {
+                if removed {
+                    std::fs::remove_file(&secondary_path).unwrap();
+                }
+                let context = SecondaryAuthContext::pin_key_from_loaded(
+                    stores, &primary, &bytes, &key, &loaded,
+                )
+                .expect("pin must use the supplied snapshot, not reopen either store");
+                assert_eq!(context.pinned().secondary_generation, 1);
+                assert_eq!(context.pinned().group_id, "desk");
+                assert_eq!(
+                    context.pinned().primary_snapshot_sha256,
+                    loaded.primary_snapshot_sha256
+                );
+                assert_eq!(context.store_index(), 1);
+                assert_eq!(
+                    context.group_view().scope,
+                    GroupScope::Secondary("desk".into())
+                );
+                assert_eq!(context.group_view().pair, pair);
+                assert_eq!(context.group_view().profiles[0].scans.len(), 3);
+                assert_eq!(
+                    context
+                        .group_view()
+                        .matching_enrollment("alice")
+                        .camera_binding,
+                    Some(pair.clone())
+                );
+                assert_eq!(
+                    context.boundary_check(Some(&bytes), Some(&loaded)),
+                    Boundary::Grant
+                );
+                assert!(matches!(
+                    context.boundary_check_now_with(&mut keys),
+                    Ok(Boundary::Refuse(_))
+                ));
+                assert_eq!(keys.unseals(), 1, "the boundary borrows the loaded key");
+            }
+        }
+    }
+
+    #[test]
+    fn loaded_pin_refuses_invalid_owner_activation_duplicates_and_partial_keys() {
+        let _env = crate::testenv::ENV_LOCK.lock().unwrap();
+        for (tag, pair) in [
+            (
+                "loaded-ordinary-refusal",
+                GroupPair::Ordinary {
+                    rgb: Some("3443:c803".into()),
+                    ir: Some("3443:c803".into()),
+                },
+            ),
+            ("loaded-split-refusal", split_pair()),
+        ] {
+            let rig = Rig::new(tag);
+            let (secondary_path, primary_path) = enroll_binding(&rig, &pair, None);
+            let mut keys = counting_source(None);
+            let primary = crate::storage::load_path_with_source("alice", &primary_path, &mut keys)
+                .unwrap()
+                .unwrap();
+            let bytes = std::fs::read(&primary_path).unwrap();
+            let original = super::super::load_secondary_with_source(&secondary_path, &mut keys)
+                .unwrap()
+                .unwrap();
+            std::fs::remove_file(&primary_path).unwrap();
+            std::fs::remove_file(&secondary_path).unwrap();
+            let stores = StrictPinStores {
+                user: "alice",
+                secondary_path: &secondary_path,
+                primary_path: &primary_path,
+            };
+            let key = pair.complete_key().unwrap();
+            let mut wrong_owner = original.clone();
+            wrong_owner.owner = "mallory".into();
+            assert!(matches!(
+                SecondaryAuthContext::pin_key_from_loaded(
+                    stores,
+                    &primary,
+                    &bytes,
+                    &key,
+                    &wrong_owner
+                ),
+                Err(PinError::Secondary(_))
+            ));
+            let mut invalid = original.clone();
+            invalid.format_version += 1;
+            assert!(matches!(
+                SecondaryAuthContext::pin_key_from_loaded(stores, &primary, &bytes, &key, &invalid),
+                Err(PinError::Secondary(_))
+            ));
+            let mut inactive = original.clone();
+            inactive.primary_snapshot_sha256 = "a".repeat(64);
+            assert!(matches!(
+                SecondaryAuthContext::pin_key_from_loaded(
+                    stores, &primary, &bytes, &key, &inactive
+                ),
+                Err(PinError::GroupInactive { index: 0, .. })
+            ));
+            let mut ambiguous = original.clone();
+            let mut duplicate = ambiguous.groups[0].clone();
+            duplicate.id = CameraGroupId::new("other".into()).unwrap();
+            ambiguous.groups.push(duplicate);
+            assert!(matches!(
+                SecondaryAuthContext::pin_key_from_loaded(
+                    stores, &primary, &bytes, &key, &ambiguous
+                ),
+                Err(PinError::Ambiguous(_))
+            ));
+            let mut duplicate_id = original.clone();
+            duplicate_id.groups.push(duplicate_id.groups[0].clone());
+            assert!(matches!(
+                SecondaryAuthContext::pin_key_from_loaded(
+                    stores,
+                    &primary,
+                    &bytes,
+                    &key,
+                    &duplicate_id
+                ),
+                Err(PinError::Secondary(_))
+            ));
+            let mut partial = original.clone();
+            partial.groups[0].pair = GroupPair::Ordinary {
+                rgb: None,
+                ir: pair.ir_identity().map(str::to_owned),
+            };
+            assert!(matches!(
+                SecondaryAuthContext::pin_key_from_loaded(stores, &primary, &bytes, &key, &partial),
+                Err(PinError::GroupNotActive(_))
+            ));
+            assert!(SecondaryAuthContext::pin_key_from_loaded(
+                stores, &primary, &bytes, &key, &original,
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn loaded_split_pin_refuses_role_location_class_and_invalid_full_keys() {
+        let _env = crate::testenv::ENV_LOCK.lock().unwrap();
+        let rig = Rig::new("loaded-split-keys");
+        let pair = split_pair();
+        let (secondary_path, primary_path) = enroll_binding(&rig, &pair, None);
+        let mut keys = counting_source(None);
+        let primary = crate::storage::load_path_with_source("alice", &primary_path, &mut keys)
+            .unwrap()
+            .unwrap();
+        let bytes = std::fs::read(&primary_path).unwrap();
+        let secondary = super::super::load_secondary_with_source(&secondary_path, &mut keys)
+            .unwrap()
+            .unwrap();
+        let stores = StrictPinStores {
+            user: "alice",
+            secondary_path: &secondary_path,
+            primary_path: &primary_path,
+        };
+        let GroupPair::Split(key) = pair else {
+            unreachable!()
+        };
+        let mut swapped = key.clone();
+        std::mem::swap(&mut swapped.rgb, &mut swapped.ir);
+        let mut wrong_keys = vec![
+            CompletePairKey::Split(swapped),
+            CompletePairKey::Ordinary {
+                rgb: key.rgb.identity.clone(),
+                ir: key.ir.identity.clone(),
+            },
+        ];
+        for rgb in [true, false] {
+            for change in 0..5 {
+                let mut wrong = key.clone();
+                let side = if rgb { &mut wrong.rgb } else { &mut wrong.ir };
+                match change {
+                    0 => side.identity = "other".into(),
+                    1 => side.controller = "0000:00:15.0".into(),
+                    2 => side.domain = SplitDomain::SuperSpeed,
+                    3 => side.ports.push(1),
+                    _ => side.ports = vec![0],
+                }
+                wrong_keys.push(CompletePairKey::Split(wrong));
+            }
+        }
+        for wrong in wrong_keys {
+            assert!(matches!(
+                SecondaryAuthContext::pin_key_from_loaded(
+                    stores, &primary, &bytes, &wrong, &secondary
+                ),
+                Err(PinError::GroupNotActive(_))
+            ));
+        }
     }
 
     #[test]

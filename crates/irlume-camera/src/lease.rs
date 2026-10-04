@@ -213,6 +213,54 @@ pub fn acquire_camera_operation(
     result
 }
 
+/// One ordinary pair chosen from a classified inventory publication.
+///
+/// These runtime expectations are not credential identity and must not be
+/// persisted in an enrollment. Acquisition checks the complete pair even when
+/// only its IR endpoint and optional metadata are requested.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrdinaryLeaseRequest {
+    /// Supervisor that published the chosen pair.
+    pub supervisor_id: String,
+    /// Exact ordinary pair, including its instance, generation and USB facts.
+    pub pair: crate::ConnectedPair,
+}
+
+/// Acquire an operation for an exact selected ordinary camera incarnation.
+///
+/// Every requested endpoint must belong to the chosen physical unit. The
+/// complete RGB/IR pair is checked against one healthy Current publication;
+/// the resulting inventory reference is retained across contention and
+/// revalidated before returning a session and on subsequent opens. No fresh
+/// path lookup or discovery fallback substitutes a replacement camera.
+///
+/// # Errors
+///
+/// Returns [`CameraLeaseError::Stale`] for a foreign supervisor, nonCurrent or
+/// unhealthy publication, changed pair facts, or lost continuity while waiting.
+/// Returns [`CameraLeaseError::EndpointNotCovered`] for an empty endpoint set
+/// or paths outside the selected unit, [`CameraLeaseError::DeadlineExpired`]
+/// on contention or deadline overflow, [`CameraLeaseError::TokenExhausted`]
+/// on authority exhaustion, or [`CameraLeaseError::Poisoned`] on unsafe state.
+pub fn acquire_selected_camera_operation(
+    expected: &OrdinaryLeaseRequest,
+    endpoints: &[&str],
+    kind: CameraOperationKind,
+    timeout: Duration,
+) -> Result<CameraOperationSession, CameraLeaseError> {
+    #[cfg(feature = "test-support")]
+    crate::backend::record_lease_request(endpoints, kind);
+    let deadline =
+        Instant::now()
+            .checked_add(timeout)
+            .ok_or(CameraLeaseError::DeadlineExpired {
+                current_owner: None,
+            })?;
+    crate::backend::with_camera_supervisor(|supervisor| {
+        supervisor.acquire_selected_operation(expected, endpoints, kind, deadline)
+    })
+}
+
 /// Runtime expectations from one classified inventory publication. These are
 /// not credential identity and must not be persisted in an enrollment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -288,6 +336,16 @@ pub(crate) struct LeaseAuthority {
 }
 
 impl LeaseAuthority {
+    /// Inspect actual ownership and waiter registration for deterministic tests.
+    ///
+    /// # Panics
+    /// Panics if a test poisoned the lease-authority mutex.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn counts_for_test(&self) -> (usize, usize) {
+        let state = self.state.lock().unwrap();
+        (state.active.len(), state.waiters.len())
+    }
+
     fn acquire(
         self: &Arc<Self>,
         mut keys: Vec<CameraInstanceId>,

@@ -343,7 +343,8 @@ Reader (any process):
 
 1. Read `cameras.conf` once; the rename guarantees a whole file.
 2. If no split key is present at all: split selection is Absent;
-   behavior is exactly as before this ADR.
+   valid ordinary behavior is exactly as before this ADR. Invalid ordinary
+   selection refuses under the 2026-10-04 coherent-reader amendment below.
 3. Otherwise open exactly generation `split_generation`, verify its
    digest equals `split_digest`, then parse it. A missing file, digest
    mismatch or malformed file refuses the split operation. A present
@@ -736,3 +737,158 @@ gate stays closed. Enabling enrollment/authentication remains a separate
 reviewed source change after the complete software and physical acceptance
 matrix. Section 7's YUYV exposure refusal and the T480 hardware gate remain
 unchanged.
+
+## Amendment 2026-10-04: coherent selection reads and refusal precedence
+
+Request preparation consumes ordinary mode, ordinary pin and verified split
+authorization from one strict `cameras.conf` observation. The combined
+`CameraSelectionSnapshot` retains that observation with its `SplitReadState`;
+reading mode or pin separately can mix publications. This snapshot establishes
+configuration facts only; camera code must still resolve a whole pair from a
+current inventory publication and the request must retain live authority.
+
+When a referenced generation is missing, the reader observes `cameras.conf`
+once more. It returns the final observation with that observation's split
+verification or refusal. It reads a moved generation or digest once more,
+with no further retry. An unchanged missing generation/digest refuses without
+another generation read, including when the selected pair text becomes
+malformed. A final removal of the split reference uses the final ordinary
+selection and Absent state together. A valid generation cannot repair a
+malformed ordinary selection; an unreadable final configuration remains
+Unreadable. Existing malformed-pair generation/count diagnostics remain
+available when the referenced generation can be verified.
+
+Unreadable or malformed camera selection, an invalid referenced generation,
+and an unresolved selected split must refuse camera-backed requests even
+with a proven ordinary environment override. A valid explicit ordinary
+override keeps precedence over valid configured choices. Refusal preserves
+password fallback. This decision changes no parser grammar: `mode=pinned`
+still requires complete ordinary RGB/IR paths.
+
+The combined reader and its retry regressions do not complete Engine/daemon
+request enforcement. Step 5 must enforce this policy before preflight, probe
+or open and before adding trust or preparing a face-backed secret. Split
+activation stays closed until its software and physical acceptance passes.
+
+## Amendment 2026-10-04: request configuration gate
+
+The first runtime gate rejects invalid or unreadable selection and failed
+generation, digest or selected-key verification before considering an ordinary
+environment override. A valid selected split remains refused at the closed
+activation boundary unless the override proves a unique classified ordinary
+pair in one healthy Current publication. The existing combined external-camera
+policy includes both the configured prohibition and the legacy fixed-device
+gate. Paths or independently observed identities cannot prove ordinary class.
+
+`CameraRequestScope` retains that configuration observation and passive view
+across daemon enrollment probes and nested Engine entries. It clears request
+state and restores standing endpoints and IR availability on return or unwind.
+Nested entries refuse endpoint/availability mutation and drift of a retained
+ordinary pair's supervisor, instance, generation or pair facts. They do not
+reread selection or rerank in the middle of the request. Passive revalidation
+is an observation at the entry boundary; it neither reserves a device nor
+replaces lease/open continuity checks.
+
+Daemon enrollment and guided sessions prepare after authorization/account
+ownership and before session-start events, summary invalidation, probe or
+preflight. Direct Engine enrollment, addition, authentication, assessment and
+positioning entries also gate. Identify and positioning explicitly refuse
+selected split configuration rather than projecting it to an ordinary path.
+Authentication and face-backed password release retain their existing consent,
+retry admission and account-lock ordering. IR readiness and optional evaluation
+also reject invalid or selected split configuration without authorizing capture.
+
+Behavioral tests use a current-thread, non-granting camera fixture that records
+real lease/open attempts. Its backend always refuses opens and constructs no fd
+or camera handle. Native GREY fixture evidence exercises the real format-role
+classifier and decoder on synthetic bytes; it is not negotiation or physical
+acceptance. Ordinary controls reach preflight and lease/open boundaries, and
+refused requests retain primary/envelope bytes and emit no session-start event.
+
+This gate unit does not complete account routing. The encrypted dual loader
+still overlaps camera opens, automatic account selection is not wired into the
+Engine, and IR-only target resolution still uses its existing configured-pair
+reader. Exact primary snapshot/key adoption, secondary selection/pin coherence
+and chosen-pair IR targets remain the next Step 5 delivery. Split activation
+and physical acceptance remain separate gates.
+
+## Amendment 2026-10-04: pre-open primary snapshot
+
+Dual authentication now resolves `PrimarySnapshot` before its first camera
+lease or open, using the same owned-receiver loader lifecycle as IR-only. It
+retains the exact bytes parsed, including ciphertext for protected enrollment,
+and moves the load's key once into `RequestTemplateKey`. Secondary reads and
+grant checks borrow that allocation. Timeout/cancellation retains receiver
+ownership until load/lock work drains; this is cooperative cleanup, not a hard
+interruption of TPM work. The no-store instant denial remains before a loader
+starts or its timing/lock work is recorded. Windows and PAD budgets are unchanged.
+
+`pin_with_primary_snapshot` reads only the secondary, verifies the requesting
+owner, and checks activation against the supplied primary bytes. Complete bindings use the strict
+class-aware key pin; incomplete ordinary live bindings retain legacy ordinary
+partial matching. The primary path is retained for later boundary checks, not
+opened or decrypted again during pinning. Later missing or changed primary
+bytes still refuse a secondary grant. Real-primary retired-eye policy precedes
+the secondary bridge's default fields, and a stored split primary refuses before
+ordinary acquisition while activation is closed.
+
+The retained ordinary request proof is revalidated after protected load and
+again before acquisition, including any secondary resolution wait. IR-only
+also revalidates before its lease. These passive checks do not replace existing
+lease/open continuity checks or establish atomic selection/acquisition.
+
+This removes the dual loader/open overlap described in the earlier request-gate
+amendment. Automatic account ranking, expected selected-pair lease requests,
+secondary selection/pin snapshot coherence, chosen-pair IR targets, and daemon
+chosen-tier/window/standing-pair semantics remain the next delivery. Neither
+this prerequisite nor its synthetic tests enable split capture or satisfy
+physical acceptance.
+
+## Amendment 2026-10-04: automatic account routing
+
+Fresh or Automatic selection without an explicit ordinary environment pair
+uses `select_bound_for_account` before acquiring cameras. The Engine builds
+complete ordinary/split candidates from its retained Current view and checks
+template eligibility in each account-scoped enrollment. Primary precedence,
+secondary ordering, ambiguity, activation and external-camera policy remain
+the selector's decisions. `NotApplicable` retains the incomplete ordinary
+primary path. A chosen split or split primary refuses while activation is
+closed; biometric refusal never reranks to another camera.
+
+The primary load supplies the exact parsed bytes and one request-owned key.
+The Engine loads the secondary through that borrowed key, selects a group,
+and calls `pin_key_from_loaded` with that same secondary snapshot. Authorized
+authentication may resolve a pending commit first. Readiness uses read-only
+primary loading and non-recovering secondary resolution, including the legacy
+configured-target path. It leaves stores, journals and standing endpoints
+unchanged. No-candidate IR requests retain the configured-target guard and its
+refusal cause before protected loading.
+
+`OrdinaryLeaseRequest` retains the chosen supervisor and complete runtime pair.
+Acquisition checks them under one inventory lock, retains the resulting lease
+reference across contention, and revalidates before returning. The Engine also
+rechecks retained account-store authority after admission and lease contention,
+immediately before opening cameras. Camera continuity and account authority
+remain separate checks. IR routing uses `ir_target_for_pair` for a chosen pair,
+retaining the existing topology, metadata, emitter and privacy checks.
+
+The preparation-admission callback receives the selected Engine and final
+window before camera work. The daemon checks chosen-tier policy and binds any
+shared unlock there, after reserving `FaceAttempt`. Preparation refusal, errors
+and cancellation retain that charge. Static, pinned, forced-convenience and
+no-candidate guards keep their early ordering. The advisory only defers standing
+tier when Current candidates exist; it grants no selection authority.
+
+Selection can shorten the original window but cannot widen it or restart its
+clock, including an explicit grace override. Zero keeps one-shot semantics,
+and a finite cap cannot become unbounded. Capture, reply admission and
+`FaceCompletion` retain the same final window. Outer cleanup clears selection,
+primary/secondary pins and request-key authority on return or unwind; an
+automatic standing endpoint choice may remain as specified by ADR-0029.
+
+Regression tests cover primary/secondary preparation, store drift after
+admission and during a registered lease wait, capped-window/override/zero
+behavior, unwind cleanup, read-only journal refusal with a recovery control,
+and actual daemon tier/charge ordering. Synthetic backends refuse all opens.
+These tests establish software boundaries, not successful physical capture or
+split acceptance. Split activation remains closed.

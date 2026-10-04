@@ -23,6 +23,12 @@ use crate::{CameraPair, IrCamera, NodeScan, RgbCamera, Role};
 
 /// One capture implementation owned by the process camera supervisor.
 trait CameraBackend: Send + Sync + 'static {
+    #[cfg(feature = "test-support")]
+    fn lease_requested(&self, _endpoints: &[&str], _kind: CameraOperationKind) {}
+    #[cfg(feature = "test-support")]
+    fn fixture_identity(&self, _endpoint: &str) -> Option<String> {
+        None
+    }
     fn scan_nodes(&self) -> NodeScan;
     /// The scan discovery runs, without the holder lookup of `scan_nodes`.
     /// Discovery callers receive only its `classified` bucket.
@@ -139,7 +145,7 @@ impl CameraSupervisor {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn reconcile_inventory(
         &self,
         observations: Vec<CameraObservation>,
@@ -250,6 +256,66 @@ impl CameraSupervisor {
             self.inventory.clone(),
             expected,
             operation,
+            deadline,
+        )?;
+        Ok(CameraOperationSession::new(lease))
+    }
+
+    pub(crate) fn acquire_selected_operation(
+        &self,
+        expected: &crate::lease::OrdinaryLeaseRequest,
+        endpoints: &[&str],
+        kind: CameraOperationKind,
+        deadline: Instant,
+    ) -> Result<CameraOperationSession, CameraLeaseError> {
+        let reference = {
+            let inventory = self
+                .inventory
+                .lock()
+                .map_err(|_| CameraLeaseError::Poisoned)?;
+            let snapshot = inventory.snapshot();
+            if snapshot.state != CameraInventoryState::Current
+                || snapshot.validate().is_err()
+                || snapshot.supervisor_id.as_deref() != Some(expected.supervisor_id.as_str())
+            {
+                return Err(CameraLeaseError::Stale);
+            }
+            let pairs = inventory.connected_pairs();
+            if pairs
+                .pairs
+                .iter()
+                .filter(|pair| *pair == &expected.pair)
+                .count()
+                != 1
+            {
+                return Err(CameraLeaseError::Stale);
+            }
+            // Resolve the full pair, not the requested subset: IR-only still
+            // requires the selected RGB authority from this same locked view.
+            let reference = inventory
+                .reference_for_endpoints(&[expected.pair.rgb.as_str(), expected.pair.ir.as_str()])
+                .map_err(|_| CameraLeaseError::Stale)?;
+            if reference.descriptor().camera_instance_id().as_str() != expected.pair.instance_id
+                || reference.descriptor().generation().get() != expected.pair.generation
+            {
+                return Err(CameraLeaseError::Stale);
+            }
+            if endpoints.is_empty()
+                || endpoints
+                    .iter()
+                    .any(|path| !reference.endpoint_paths().iter().any(|known| known == path))
+            {
+                return Err(CameraLeaseError::EndpointNotCovered);
+            }
+            reference
+        };
+        // Never wait under the inventory mutex. Existing acquisition validates
+        // this exact reference both before reservation and after any wait.
+        let lease = CameraLease::acquire(
+            &self.leases,
+            self.inventory.clone(),
+            vec![reference],
+            kind,
             deadline,
         )?;
         Ok(CameraOperationSession::new(lease))
@@ -451,6 +517,10 @@ fn snapshot_from_slot(slot: &OnceLock<Arc<CameraSupervisor>>) -> CameraInventory
 }
 
 pub(crate) fn camera_inventory_snapshot() -> CameraInventorySnapshot {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
+        return supervisor.inventory_snapshot();
+    }
     snapshot_from_slot(&DEFAULT_CAMERA_SUPERVISOR)
 }
 
@@ -462,6 +532,10 @@ pub(crate) fn with_camera_inventory_publication<R>(
         ),
     ) -> R,
 ) -> Result<R, &'static str> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
+        return supervisor.with_inventory_publication(commit);
+    }
     let supervisor = DEFAULT_CAMERA_SUPERVISOR
         .get()
         .ok_or("camera inventory is not initialized")?;
@@ -472,6 +546,10 @@ pub(crate) fn camera_inventory_publication() -> (
     CameraInventorySnapshot,
     Vec<crate::inventory::ClassifiedEndpoint>,
 ) {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
+        return supervisor.inventory_publication();
+    }
     DEFAULT_CAMERA_SUPERVISOR
         .get()
         .map_or_else(Default::default, |supervisor| {
@@ -488,7 +566,7 @@ fn connected_pairs_from_slot(slot: &OnceLock<Arc<CameraSupervisor>>) -> Connecte
 
 /// Read the pairing view without initializing the supervisor.
 pub(crate) fn connected_pairs() -> ConnectedPairs {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
         return supervisor.connected_pairs();
     }
@@ -509,7 +587,7 @@ fn connected_pairs_with_split_from_slot(
 pub(crate) fn connected_pairs_with_split(
     records: &[irlume_common::split_schema::AuthorizationRecord],
 ) -> ResolvedConnectedPairs {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
         return supervisor.connected_pairs_with_split(records);
     }
@@ -528,7 +606,7 @@ pub(crate) fn default_camera_supervisor() -> &'static CameraSupervisor {
         .as_ref()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static TEST_SUPERVISOR: std::cell::RefCell<Option<Arc<CameraSupervisor>>> =
         const { std::cell::RefCell::new(None) };
@@ -536,12 +614,33 @@ thread_local! {
 
 /// Route one compatibility operation through the process supervisor.
 pub(crate) fn with_camera_supervisor<T>(operation: impl FnOnce(&CameraSupervisor) -> T) -> T {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
         return operation(&supervisor);
     }
 
     operation(default_camera_supervisor())
+}
+
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
+#[cfg(feature = "test-support")]
+pub(crate) fn record_lease_request(endpoints: &[&str], kind: CameraOperationKind) {
+    TEST_SUPERVISOR.with(|slot| {
+        if let Some(supervisor) = slot.borrow().as_ref() {
+            supervisor.backend.lease_requested(endpoints, kind);
+        }
+    });
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture_identity(endpoint: &str) -> Option<String> {
+    TEST_SUPERVISOR.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|supervisor| supervisor.backend.fixture_identity(endpoint))
+    })
 }
 
 pub(crate) fn scan_nodes() -> NodeScan {
@@ -1363,6 +1462,406 @@ pub(crate) mod tests {
         ObservationFixture::usb(BRIO_AT, "046d:085e")
             .serial("ABC123")
             .four_node(0)
+    }
+
+    fn selected_fixture() -> (
+        Arc<CameraSupervisor>,
+        Arc<Mutex<Vec<String>>>,
+        crate::lease::OrdinaryLeaseRequest,
+    ) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let supervisor =
+            spy_supervisor(&RecordingBackend::new(calls.clone()), vec![brio().build()]);
+        supervisor.record_roles(&supervisor.endpoint_generations(), BRIO_ANSWER);
+        let view = supervisor.connected_pairs();
+        let expected = crate::lease::OrdinaryLeaseRequest {
+            supervisor_id: view.supervisor_id.unwrap(),
+            pair: view.pairs.into_iter().next().unwrap(),
+        };
+        (supervisor, calls, expected)
+    }
+
+    fn assert_no_selected_permits(supervisor: &CameraSupervisor) {
+        assert_eq!(supervisor.leases.counts_for_test(), (0, 0));
+    }
+
+    #[test]
+    fn selected_ordinary_acquisition_accepts_pair_ir_and_metadata_subsets() {
+        let (supervisor, calls, expected) = selected_fixture();
+        let _installed = install_test_supervisor(supervisor.clone());
+        for endpoints in [
+            &["/dev/video0", "/dev/video2"][..],
+            &["/dev/video2"][..],
+            &["/dev/video2", "/dev/video3"][..],
+        ] {
+            let session = crate::lease::acquire_selected_camera_operation(
+                &expected,
+                endpoints,
+                CameraOperationKind::Authentication,
+                std::time::Duration::ZERO,
+            )
+            .unwrap();
+            assert!(!session.lease().is_split_pair());
+            let binding = session
+                .lease()
+                .frame_binding("/dev/video2", crate::contracts::StreamRole::Ir)
+                .unwrap();
+            assert_eq!(
+                binding.camera_instance_id().as_str(),
+                expected.pair.instance_id
+            );
+            assert_eq!(binding.generation().get(), expected.pair.generation);
+            assert!(session.lease().covers_endpoint("/dev/video3"));
+            assert!(!session.lease().covers_endpoint("/dev/video9"));
+            assert_eq!(supervisor.leases.counts_for_test(), (1, 0));
+            drop(session);
+            assert_no_selected_permits(&supervisor);
+        }
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "acquisition must not open or scan"
+        );
+    }
+
+    #[test]
+    fn selected_ordinary_refuses_changed_expectations_without_open_or_lease() {
+        let (supervisor, calls, expected) = selected_fixture();
+        let _installed = install_test_supervisor(supervisor.clone());
+        let mut wrong_supervisor = expected.clone();
+        wrong_supervisor.supervisor_id = "0".repeat(32);
+        if wrong_supervisor.supervisor_id == expected.supervisor_id {
+            wrong_supervisor.supervisor_id = "1".repeat(32);
+        }
+        let mut stale_generation = expected.clone();
+        stale_generation.pair.generation += 1;
+        let mut wrong_identity = expected.clone();
+        wrong_identity.pair.identity = "ffff:ffff:replacement".into();
+        let mut wrong_instance = expected.clone();
+        wrong_instance.pair.instance_id = "foreign-instance".into();
+        let mut wrong_role = expected.clone();
+        std::mem::swap(&mut wrong_role.pair.rgb, &mut wrong_role.pair.ir);
+        let mut wrong_fixed = expected.clone();
+        wrong_fixed.pair.fixed = !expected.pair.fixed;
+        let mut wrong_port = expected.clone();
+        wrong_port.pair.port_chain = Some("9-9".into());
+        let mut wrong_vid_pid = expected.clone();
+        wrong_vid_pid.pair.vid_pid = "ffff:ffff".into();
+        let mut wrong_serial_presence = expected.clone();
+        wrong_serial_presence.pair.serial_present = !expected.pair.serial_present;
+        let mut wrong_rgb = expected.clone();
+        wrong_rgb.pair.rgb = "/dev/replaced-rgb".into();
+        for stale in [
+            wrong_supervisor,
+            stale_generation,
+            wrong_identity,
+            wrong_instance,
+            wrong_role,
+            wrong_fixed,
+            wrong_port,
+            wrong_vid_pid,
+            wrong_serial_presence,
+            wrong_rgb,
+        ] {
+            assert!(matches!(
+                crate::lease::acquire_selected_camera_operation(
+                    &stale,
+                    &["/dev/video2"],
+                    CameraOperationKind::Authentication,
+                    std::time::Duration::ZERO,
+                ),
+                Err(CameraLeaseError::Stale)
+            ));
+            assert_no_selected_permits(&supervisor);
+        }
+        for endpoints in [&[][..], &["/dev/video9"][..]] {
+            assert!(matches!(
+                crate::lease::acquire_selected_camera_operation(
+                    &expected,
+                    endpoints,
+                    CameraOperationKind::Authentication,
+                    std::time::Duration::ZERO,
+                ),
+                Err(CameraLeaseError::EndpointNotCovered)
+            ));
+            assert_no_selected_permits(&supervisor);
+        }
+        assert!(calls.lock().unwrap().is_empty());
+        drop(
+            supervisor
+                .acquire_operation(
+                    &["/dev/video0", "/dev/video2"],
+                    CameraOperationKind::Setup,
+                    Instant::now(),
+                )
+                .unwrap(),
+        );
+        assert_no_selected_permits(&supervisor);
+    }
+
+    #[test]
+    fn selected_ordinary_refuses_same_path_replacement_and_noncurrent_role_facts() {
+        for change in [
+            "replacement",
+            "generation",
+            "identity",
+            "role",
+            "refreshing",
+            "unavailable",
+            "uninitialized",
+            "bounds",
+        ] {
+            let (supervisor, calls, expected) = selected_fixture();
+            let _installed = install_test_supervisor(supervisor.clone());
+            match change {
+                "replacement" => {
+                    supervisor.reconcile_inventory(Vec::new()).unwrap();
+                    supervisor
+                        .reconcile_inventory(vec![brio().build()])
+                        .unwrap();
+                    supervisor.record_roles(&supervisor.endpoint_generations(), BRIO_ANSWER);
+                    assert_ne!(
+                        supervisor.connected_pairs().pairs[0].instance_id,
+                        expected.pair.instance_id
+                    );
+                }
+                "generation" => {
+                    supervisor.invalidate_inventory().unwrap();
+                    supervisor
+                        .reconcile_inventory(vec![brio().build()])
+                        .unwrap();
+                    supervisor.record_roles(&supervisor.endpoint_generations(), BRIO_ANSWER);
+                    assert_ne!(
+                        supervisor.connected_pairs().pairs[0].generation,
+                        expected.pair.generation
+                    );
+                }
+                "identity" => {
+                    supervisor
+                        .reconcile_inventory(vec![ObservationFixture::usb(BRIO_AT, "ffff:ffff")
+                            .serial("replacement")
+                            .four_node(0)
+                            .build()])
+                        .unwrap();
+                    supervisor.record_roles(&supervisor.endpoint_generations(), BRIO_ANSWER);
+                }
+                "role" => supervisor.record_roles(
+                    &supervisor.endpoint_generations(),
+                    [("/dev/video0", Role::Ir), ("/dev/video2", Role::Rgb)],
+                ),
+                "refreshing" => supervisor
+                    .invalidate_inventory_topologies(&Default::default())
+                    .unwrap(),
+                "unavailable" => supervisor
+                    .mark_inventory_unavailable(CameraInventoryReason::Monitor)
+                    .unwrap(),
+                "uninitialized" => *supervisor.inventory.lock().unwrap() = CameraInventory::new(),
+                "bounds" => {
+                    let oversized = "/".to_owned() + &"x".repeat(4096);
+                    supervisor
+                        .reconcile_inventory(vec![
+                            brio().build(),
+                            ObservationFixture::usb("/devices/oversized", "1111:2222")
+                                .capture(&oversized)
+                                .build(),
+                        ])
+                        .unwrap();
+                    assert_eq!(
+                        supervisor.inventory_snapshot().state,
+                        CameraInventoryState::Unavailable
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    crate::lease::acquire_selected_camera_operation(
+                        &expected,
+                        &["/dev/video2", "/dev/video3"],
+                        CameraOperationKind::Authentication,
+                        std::time::Duration::ZERO,
+                    ),
+                    Err(CameraLeaseError::Stale)
+                ),
+                "{change} must refuse the old selection"
+            );
+            assert_no_selected_permits(&supervisor);
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "{change} reached the backend"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_ordinary_endpoints_cannot_retarget_another_current_unit() {
+        let (supervisor, calls, expected) = selected_fixture();
+        supervisor
+            .reconcile_inventory(vec![
+                brio().build(),
+                ObservationFixture::usb("/devices/other", "1111:2222")
+                    .four_node(4)
+                    .build(),
+            ])
+            .unwrap();
+        let _installed = install_test_supervisor(supervisor.clone());
+        for endpoints in [&["/dev/video6"][..], &["/dev/video2", "/dev/video7"][..]] {
+            assert!(matches!(
+                crate::lease::acquire_selected_camera_operation(
+                    &expected,
+                    endpoints,
+                    CameraOperationKind::Authentication,
+                    std::time::Duration::ZERO,
+                ),
+                Err(CameraLeaseError::EndpointNotCovered)
+            ));
+            assert_no_selected_permits(&supervisor);
+        }
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn selected_ordinary_wait_revalidates_original_reference_and_releases_on_failure() {
+        for invalidate in [false, true] {
+            let (supervisor, calls, expected) = selected_fixture();
+            let held = supervisor
+                .acquire_operation(&["/dev/video0"], CameraOperationKind::Setup, Instant::now())
+                .unwrap();
+            std::thread::scope(|scope| {
+                let waiter = scope.spawn(|| {
+                    let _installed = install_test_supervisor(supervisor.clone());
+                    crate::lease::acquire_selected_camera_operation(
+                        &expected,
+                        &["/dev/video2", "/dev/video3"],
+                        CameraOperationKind::Authentication,
+                        std::time::Duration::from_secs(5),
+                    )
+                });
+                let deadline = Instant::now() + std::time::Duration::from_secs(2);
+                while supervisor.leases.counts_for_test().1 == 0 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "selected acquisition never registered its waiter"
+                    );
+                    std::thread::yield_now();
+                }
+                assert_eq!(supervisor.leases.counts_for_test(), (1, 1));
+                // Registration proves the initial inventory check finished. The
+                // same mutex can now reconcile while the selected request waits.
+                if invalidate {
+                    supervisor.invalidate_inventory().unwrap();
+                    supervisor
+                        .reconcile_inventory(vec![brio().build()])
+                        .unwrap();
+                    supervisor.record_roles(&supervisor.endpoint_generations(), BRIO_ANSWER);
+                }
+                drop(held);
+                let result = waiter.join().unwrap();
+                if invalidate {
+                    assert!(matches!(result, Err(CameraLeaseError::Stale)));
+                } else {
+                    let session = result.unwrap();
+                    assert_eq!(session.lease().validate(), Ok(()));
+                    assert_eq!(supervisor.leases.counts_for_test(), (1, 0));
+                    drop(session);
+                }
+                assert_no_selected_permits(&supervisor);
+                assert!(calls.lock().unwrap().is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn selected_ordinary_held_reference_refuses_both_opens_after_replacement() {
+        let (supervisor, calls, expected) = selected_fixture();
+        let _installed = install_test_supervisor(supervisor.clone());
+        let session = crate::lease::acquire_selected_camera_operation(
+            &expected,
+            &["/dev/video0", "/dev/video2"],
+            CameraOperationKind::Authentication,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        supervisor.reconcile_inventory(Vec::new()).unwrap();
+        supervisor
+            .reconcile_inventory(vec![brio().build()])
+            .unwrap();
+        supervisor.record_roles(&supervisor.endpoint_generations(), BRIO_ANSWER);
+        assert!(session.open_rgb("/dev/video0").is_err());
+        assert!(session.open_ir("/dev/video2").is_err());
+        assert_eq!(
+            session.state(),
+            crate::lease::CameraSessionState::ContinuityLost
+        );
+        assert!(calls.lock().unwrap().is_empty());
+        drop(session);
+        assert_no_selected_permits(&supervisor);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn selected_ordinary_public_entry_records_refused_and_successful_attempts() {
+        use test_support::{Call, Camera, Endpoint, Guard};
+        let guard = Guard::install(&[Camera {
+            topology: "/devices/selected-recorder".into(),
+            identity: "1234:0001".into(),
+            fixed: true,
+            controller: "0000:00:14.0".into(),
+            domain: irlume_common::split_key::SplitDomain::Usb2,
+            ports: vec![8],
+            endpoints: vec![
+                Endpoint {
+                    path: "/dev/selected-rgb".into(),
+                    formats: vec![*b"YUYV"],
+                },
+                Endpoint {
+                    path: "/dev/selected-ir".into(),
+                    formats: vec![*b"GREY"],
+                },
+            ],
+        }])
+        .unwrap();
+        let view = crate::connected_pairs();
+        let expected = crate::lease::OrdinaryLeaseRequest {
+            supervisor_id: view.supervisor_id.unwrap(),
+            pair: view.pairs[0].clone(),
+        };
+        let mut stale = expected.clone();
+        stale.pair.generation += 1;
+        assert!(matches!(
+            crate::lease::acquire_selected_camera_operation(
+                &stale,
+                &["/dev/selected-ir"],
+                CameraOperationKind::Authentication,
+                std::time::Duration::ZERO,
+            ),
+            Err(CameraLeaseError::Stale)
+        ));
+        let session = crate::lease::acquire_selected_camera_operation(
+            &expected,
+            &["/dev/selected-rgb", "/dev/selected-ir"],
+            CameraOperationKind::Authentication,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        assert!(session.open_rgb("/dev/selected-rgb").is_err());
+        assert!(session.open_ir("/dev/selected-ir").is_err());
+        assert_eq!(
+            guard.calls(),
+            vec![
+                Call::Lease {
+                    endpoints: vec!["/dev/selected-ir".into()],
+                    kind: CameraOperationKind::Authentication
+                },
+                Call::Lease {
+                    endpoints: vec!["/dev/selected-rgb".into(), "/dev/selected-ir".into()],
+                    kind: CameraOperationKind::Authentication
+                },
+                Call::OpenRgb("/dev/selected-rgb".into()),
+                Call::OpenIr("/dev/selected-ir".into()),
+            ]
+        );
+        drop(session);
+        with_camera_supervisor(assert_no_selected_permits);
     }
 
     /// A spy supervisor over `backend`, whose inventory holds `observations`.

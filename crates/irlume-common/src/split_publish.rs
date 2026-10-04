@@ -85,6 +85,31 @@ pub enum SplitReadState {
     },
 }
 
+/// Strict camera selection and split verification from one publication.
+///
+/// A missing generation permits one new configuration observation. In that
+/// case both accessors describe the final observation, never an old ordinary
+/// pin combined with a new split generation. This is not live camera proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CameraSelectionSnapshot {
+    observation: config::CameraConfObservation,
+    split: SplitReadState,
+}
+
+impl CameraSelectionSnapshot {
+    /// The final strict mode, ordinary pin and split reference observation.
+    #[must_use]
+    pub fn observation(&self) -> &config::CameraConfObservation {
+        &self.observation
+    }
+
+    /// Verification of the split reference in [`Self::observation`].
+    #[must_use]
+    pub fn split(&self) -> &SplitReadState {
+        &self.split
+    }
+}
+
 fn generation_dir() -> PathBuf {
     config::config_path(GENERATION_DIR)
 }
@@ -359,30 +384,108 @@ fn record_matches(record: &AuthorizationRecord, key: &SplitPairKey) -> bool {
 /// Read the current publication without locks (ADR-0032 §4.1.3 reader).
 #[must_use]
 pub fn read_split() -> SplitReadState {
-    let obs = config::observe_camera_conf();
+    read_camera_selection().split
+}
+
+/// Read ordinary selection and split authorization as one coherent snapshot.
+///
+/// Only a missing referenced generation permits one configuration re-read.
+/// An unchanged missing reference refuses; a moved reference is read once
+/// more. Invalid final selection cannot be repaired by a valid generation.
+#[must_use]
+pub fn read_camera_selection() -> CameraSelectionSnapshot {
+    read_camera_selection_with(config::observe_camera_conf, |generation| {
+        std::fs::read(generation_dir().join(generation_name(generation)))
+    })
+}
+
+fn read_camera_selection_with(
+    mut observe: impl FnMut() -> config::CameraConfObservation,
+    mut read: impl FnMut(u64) -> std::io::Result<Vec<u8>>,
+) -> CameraSelectionSnapshot {
+    let mut observation = observe();
+    let split = match read_observation(&observation, &mut read) {
+        Ok(state) => state,
+        Err(generation) => {
+            let final_observation = observe();
+            // A mode/pin-only change does not make the missing immutable file
+            // appear. Retain the final config, but do not read that file twice.
+            let unchanged =
+                generation_reference(&observation) == generation_reference(&final_observation);
+            observation = final_observation;
+            if unchanged {
+                if matches!(
+                    observation.selection,
+                    config::CameraSelectionObservation::Malformed { .. }
+                ) && !matches!(
+                    observation.split,
+                    SplitConfObservation::MalformedSelection { .. }
+                ) {
+                    SplitReadState::Malformed
+                } else {
+                    SplitReadState::MalformedGeneration { generation }
+                }
+            } else {
+                read_observation(&observation, &mut read)
+                    .unwrap_or_else(|generation| SplitReadState::MalformedGeneration { generation })
+            }
+        }
+    };
+    CameraSelectionSnapshot { observation, split }
+}
+
+// Reader retry identity includes an invalid pair's independently validated
+// reference. The writer helper above deliberately accepts only valid config.
+fn generation_reference(obs: &config::CameraConfObservation) -> Option<(u64, &str)> {
+    match &obs.split {
+        SplitConfObservation::Reference {
+            generation, digest, ..
+        }
+        | SplitConfObservation::MalformedSelection { generation, digest } => {
+            Some((*generation, digest))
+        }
+        SplitConfObservation::None | SplitConfObservation::Malformed => None,
+    }
+}
+
+fn read_observation(
+    obs: &config::CameraConfObservation,
+    read: &mut impl FnMut(u64) -> std::io::Result<Vec<u8>>,
+) -> Result<SplitReadState, u64> {
     if matches!(
         obs.selection,
         config::CameraSelectionObservation::Unreadable { .. }
     ) {
-        return SplitReadState::Unreadable;
+        return Ok(SplitReadState::Unreadable);
+    }
+    // Malformed pair text retains generation diagnostics, but a malformed
+    // ordinary selection must not become Valid merely because its split
+    // reference and generation are well formed.
+    if matches!(
+        obs.selection,
+        config::CameraSelectionObservation::Malformed { .. }
+    ) && !matches!(obs.split, SplitConfObservation::MalformedSelection { .. })
+    {
+        return Ok(SplitReadState::Malformed);
     }
     match &obs.split {
-        SplitConfObservation::None => SplitReadState::Absent,
-        SplitConfObservation::Malformed => SplitReadState::Malformed,
+        SplitConfObservation::None => Ok(SplitReadState::Absent),
+        SplitConfObservation::Malformed => Ok(SplitReadState::Malformed),
         SplitConfObservation::MalformedSelection { generation, digest } => {
-            match read_generation(*generation, digest, None, false) {
-                SplitReadState::Valid { records, .. } => SplitReadState::UnresolvedSelection {
+            Ok(match read_generation(*generation, digest, None, read) {
+                Ok(SplitReadState::Valid { records, .. }) => SplitReadState::UnresolvedSelection {
                     generation: *generation,
                     record_count: records.len(),
                 },
-                other => other,
-            }
+                Ok(other) => other,
+                Err(generation) => SplitReadState::MalformedGeneration { generation },
+            })
         }
         SplitConfObservation::Reference {
             generation,
             digest,
             pair,
-        } => read_generation(*generation, digest, pair.as_deref(), true),
+        } => read_generation(*generation, digest, pair.as_deref(), read),
     }
 }
 
@@ -390,17 +493,17 @@ fn read_generation(
     generation: u64,
     digest: &str,
     pair: Option<&str>,
-    allow_retry: bool,
-) -> SplitReadState {
-    match std::fs::read(generation_dir().join(generation_name(generation))) {
+    read: &mut impl FnMut(u64) -> std::io::Result<Vec<u8>>,
+) -> Result<SplitReadState, u64> {
+    Ok(match read(generation) {
         Ok(bytes) => {
             if digest.strip_prefix("sha256:") != Some(digest_value(&bytes).as_str()) {
-                return SplitReadState::DigestMismatch { generation };
+                return Ok(SplitReadState::DigestMismatch { generation });
             }
             // The generation is text under the same rules as cameras.conf:
             // invalid UTF-8 is Malformed, never normalized into records.
             let Ok(text) = std::str::from_utf8(&bytes) else {
-                return SplitReadState::MalformedGeneration { generation };
+                return Ok(SplitReadState::MalformedGeneration { generation });
             };
             match split_schema::parse_generation(text) {
                 GenerationObservation::Malformed { .. } => {
@@ -428,22 +531,9 @@ fn read_generation(
                 },
             }
         }
-        // The file is missing: re-read cameras.conf once and retry only if
-        // the reference moved (a concurrent publication), else refuse.
-        Err(e) if e.kind() == ErrorKind::NotFound && allow_retry => {
-            let moved = split_keys_in(&config::observe_camera_conf());
-            match moved {
-                Some((g2, d2, p2)) if g2 != generation || d2 != digest => {
-                    read_generation(g2, &d2, p2.as_deref(), false)
-                }
-                _ => SplitReadState::MalformedGeneration { generation },
-            }
-        }
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            SplitReadState::MalformedGeneration { generation }
-        }
+        Err(e) if e.kind() == ErrorKind::NotFound => return Err(generation),
         Err(_) => SplitReadState::Unreadable,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -711,6 +801,337 @@ mod tests {
             }
         );
         drop(env);
+    }
+
+    #[test]
+    fn a_retry_refuses_a_moved_generation_with_malformed_ordinary_selection() {
+        let env = env();
+        let records = [record("c:3", "d:4")];
+        let text = generation_file(&env.dir, 2, &records);
+        std::fs::write(
+            config::config_path(config::CAMERAS_CONF),
+            format!(
+                "mode=pinned\nsplit_generation=2\nsplit_digest={}\n",
+                digest_key(text.as_bytes())
+            ),
+        )
+        .unwrap();
+        // The original reader observed generation 1 before publication moved.
+        // Its missing file forces the actual retry against the new config.
+        let initial = config::parse_camera_conf(&format!(
+            "split_generation=1\nsplit_digest={}\n",
+            digest_key(b"old generation")
+        ));
+        let mut first = Some(initial);
+        let snapshot = read_camera_selection_with(
+            || first.take().unwrap_or_else(config::observe_camera_conf),
+            |generation| std::fs::read(generation_dir().join(generation_name(generation))),
+        );
+        assert_eq!(
+            snapshot.split(),
+            &SplitReadState::Malformed,
+            "a valid generation cannot repair a malformed final selection"
+        );
+        assert!(matches!(
+            snapshot.observation().selection,
+            config::CameraSelectionObservation::Malformed {
+                problem: config::CameraConfProblem::PinnedWithoutPair,
+                ..
+            }
+        ));
+    }
+
+    fn reference_observation(generation: u64, ordinary: &str) -> config::CameraConfObservation {
+        config::parse_camera_conf(&format!(
+            "{ordinary}\nsplit_generation={generation}\nsplit_digest={}\n",
+            digest_key(b"removed generation")
+        ))
+    }
+
+    #[test]
+    fn snapshot_retry_retains_final_ordinary_pin_and_selected_split() {
+        let env = env();
+        let text = generation_file(&env.dir, 2, &[record("c:3", "d:4")]);
+        config::write_camera_pin("/dev/new-rgb", "/dev/new-ir", "new-rgb", "new-ir").unwrap();
+        config::write_kvs(
+            config::CAMERAS_CONF,
+            &[
+                ("mode", "pinned"),
+                ("split_generation", "2"),
+                ("split_digest", &digest_key(text.as_bytes())),
+                (
+                    "split_pair",
+                    &pair_key("c:3", "d:4").format_canonical().unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let mut first = Some(reference_observation(
+            1,
+            "rgb=/dev/old-rgb\nir=/dev/old-ir\nmode=pinned",
+        ));
+        let mut observations = 0;
+        let mut reads = Vec::new();
+        let snapshot = read_camera_selection_with(
+            || {
+                observations += 1;
+                first.take().unwrap_or_else(config::observe_camera_conf)
+            },
+            |generation| {
+                reads.push(generation);
+                std::fs::read(generation_dir().join(generation_name(generation)))
+            },
+        );
+        assert_eq!(observations, 2);
+        assert_eq!(reads, vec![1, 2]);
+        assert_eq!(
+            snapshot.observation().selection,
+            config::CameraSelectionObservation::Pinned {
+                pair: config::PinnedPair {
+                    rgb: "/dev/new-rgb".into(),
+                    ir: "/dev/new-ir".into(),
+                    rgb_id: Some("new-rgb".into()),
+                    ir_id: Some("new-ir".into()),
+                },
+                explicit: true,
+            }
+        );
+        match snapshot.split() {
+            SplitReadState::Valid {
+                generation,
+                records,
+                selected,
+            } => {
+                assert_eq!(*generation, 2);
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].rgb.identity, "c:3");
+                assert_eq!(records[0].ir.identity, "d:4");
+                assert_eq!(selected.as_ref(), Some(&pair_key("c:3", "d:4")));
+            }
+            other => panic!("expected coherent generation 2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_retry_retains_automatic_mode_instead_of_old_pin() {
+        let env = env();
+        let text = generation_file(&env.dir, 2, &[record("c:3", "d:4")]);
+        config::write_kvs(
+            config::CAMERAS_CONF,
+            &[
+                ("mode", "automatic"),
+                ("rgb", "/dev/retained-rgb"),
+                ("ir", "/dev/retained-ir"),
+                ("split_generation", "2"),
+                ("split_digest", &digest_key(text.as_bytes())),
+            ],
+        )
+        .unwrap();
+        let mut first = Some(reference_observation(
+            1,
+            "rgb=/dev/old-rgb\nir=/dev/old-ir\nmode=pinned",
+        ));
+        let snapshot = read_camera_selection_with(
+            || first.take().unwrap_or_else(config::observe_camera_conf),
+            |generation| std::fs::read(generation_dir().join(generation_name(generation))),
+        );
+        assert_eq!(
+            snapshot.observation().selection,
+            config::CameraSelectionObservation::Automatic {
+                retained: Some(config::PinnedPair {
+                    rgb: "/dev/retained-rgb".into(),
+                    ir: "/dev/retained-ir".into(),
+                    rgb_id: None,
+                    ir_id: None,
+                }),
+            }
+        );
+        assert!(matches!(
+            snapshot.split(),
+            SplitReadState::Valid {
+                generation: 2,
+                selected: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn snapshot_retry_is_bounded_when_second_generation_is_also_missing() {
+        let _env = env();
+        let mut observations = 0;
+        let mut reads = Vec::new();
+        let snapshot = read_camera_selection_with(
+            || {
+                observations += 1;
+                reference_observation(observations, "mode=automatic")
+            },
+            |generation| {
+                reads.push(generation);
+                std::fs::read(generation_dir().join(generation_name(generation)))
+            },
+        );
+        assert_eq!(observations, 2, "there is no third publication observation");
+        assert_eq!(reads, vec![1, 2]);
+        assert_eq!(
+            snapshot.split(),
+            &SplitReadState::MalformedGeneration { generation: 2 }
+        );
+        assert!(matches!(
+            snapshot.observation().split,
+            SplitConfObservation::Reference { generation: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn snapshot_missing_unchanged_generation_does_not_read_twice() {
+        let _env = env();
+        let mut observations = 0;
+        let mut reads = Vec::new();
+        let snapshot = read_camera_selection_with(
+            || {
+                observations += 1;
+                reference_observation(
+                    1,
+                    if observations == 1 {
+                        "mode=automatic"
+                    } else {
+                        "rgb=/dev/new-rgb\nir=/dev/new-ir\nmode=pinned"
+                    },
+                )
+            },
+            |generation| {
+                reads.push(generation);
+                std::fs::read(generation_dir().join(generation_name(generation)))
+            },
+        );
+        assert_eq!(observations, 2);
+        assert_eq!(reads, vec![1]);
+        assert_eq!(
+            snapshot.split(),
+            &SplitReadState::MalformedGeneration { generation: 1 }
+        );
+        assert!(matches!(
+            snapshot.observation().selection,
+            config::CameraSelectionObservation::Pinned { explicit: true, .. }
+        ));
+    }
+
+    #[test]
+    fn snapshot_unchanged_missing_reference_with_malformed_pair_is_not_read_twice() {
+        let _env = env();
+        let digest = digest_key(b"removed generation");
+        std::fs::write(
+            config::config_path(config::CAMERAS_CONF),
+            format!("split_generation=1\nsplit_digest={digest}\nsplit_pair=invalid\n"),
+        )
+        .unwrap();
+        let mut first = Some(reference_observation(1, "mode=automatic"));
+        let mut observations = 0;
+        let mut reads = Vec::new();
+        let snapshot = read_camera_selection_with(
+            || {
+                observations += 1;
+                first.take().unwrap_or_else(config::observe_camera_conf)
+            },
+            |generation| {
+                reads.push(generation);
+                std::fs::read(generation_dir().join(generation_name(generation)))
+            },
+        );
+        assert_eq!(observations, 2);
+        assert_eq!(
+            reads,
+            vec![1],
+            "an unchanged missing reference is read once"
+        );
+        assert_eq!(
+            snapshot.split(),
+            &SplitReadState::MalformedGeneration { generation: 1 }
+        );
+        assert_eq!(
+            snapshot.observation().split,
+            SplitConfObservation::MalformedSelection {
+                generation: 1,
+                digest
+            }
+        );
+        assert!(matches!(
+            snapshot.observation().selection,
+            config::CameraSelectionObservation::Malformed { .. }
+        ));
+    }
+
+    #[test]
+    fn snapshot_retry_retains_unreadable_final_config() {
+        let _env = env();
+        std::fs::create_dir(config::config_path(config::CAMERAS_CONF)).unwrap();
+        let mut first = Some(reference_observation(1, "mode=automatic"));
+        let mut reads = Vec::new();
+        let snapshot = read_camera_selection_with(
+            || first.take().unwrap_or_else(config::observe_camera_conf),
+            |generation| {
+                reads.push(generation);
+                std::fs::read(generation_dir().join(generation_name(generation)))
+            },
+        );
+        assert_eq!(reads, vec![1]);
+        assert_eq!(snapshot.split(), &SplitReadState::Unreadable);
+        assert!(matches!(
+            snapshot.observation().selection,
+            config::CameraSelectionObservation::Unreadable { .. }
+        ));
+    }
+
+    #[test]
+    fn snapshot_retry_to_fresh_clears_both_choices() {
+        let _env = env();
+        let mut first = Some(reference_observation(1, "rgb=/dev/old-rgb\nir=/dev/old-ir"));
+        let mut reads = Vec::new();
+        let snapshot = read_camera_selection_with(
+            || first.take().unwrap_or_else(config::observe_camera_conf),
+            |generation| {
+                reads.push(generation);
+                std::fs::read(generation_dir().join(generation_name(generation)))
+            },
+        );
+        assert_eq!(reads, vec![1]);
+        assert_eq!(snapshot.split(), &SplitReadState::Absent);
+        assert_eq!(
+            snapshot.observation().selection,
+            config::CameraSelectionObservation::Fresh
+        );
+        assert_eq!(snapshot.observation().split, SplitConfObservation::None);
+    }
+
+    #[test]
+    fn snapshot_preserves_ordinary_absent_and_unselected_authorization_controls() {
+        let _env = env();
+        config::write_camera_pin("/dev/ordinary-rgb", "/dev/ordinary-ir", "rid", "iid").unwrap();
+        let ordinary = read_camera_selection();
+        assert_eq!(ordinary.split(), &SplitReadState::Absent);
+        publish_split(&[record("c:3", "d:4")], None).unwrap();
+        let authorized = read_camera_selection();
+        assert_eq!(
+            authorized.observation().selection,
+            ordinary.observation().selection
+        );
+        assert!(matches!(
+            authorized.split(),
+            SplitReadState::Valid { selected: None, .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_ordinary_selection_without_split_keys_refuses() {
+        let _env = env();
+        std::fs::write(config::config_path(config::CAMERAS_CONF), "mode=pinned\n").unwrap();
+        let snapshot = read_camera_selection();
+        assert_eq!(snapshot.split(), &SplitReadState::Malformed);
+        assert!(matches!(
+            snapshot.observation().selection,
+            config::CameraSelectionObservation::Malformed { .. }
+        ));
     }
 
     #[test]

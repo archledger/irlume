@@ -7,6 +7,22 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Automatic face authentication selects an eligible enrolled whole pair before
+  capture, pins secondary selection to the same loaded store, and acquires the
+  exact selected camera incarnation. IR authentication and readiness resolve
+  the chosen pair. Daemon admission uses its tier and the clipped original
+  window, retaining admitted retry charges; request cleanup clears authority
+  while retaining an automatic standing choice (ADR-0032, automatic account
+  routing amendment; #995).
+
+- Camera-backed request entries share a validated configuration-gate snapshot
+  through daemon enrollment probes and nested Engine calls. Invalid selection
+  refuses before environment precedence; selected split capture stays closed.
+  An ordinary override needs a unique Current ordinary pair and both external
+  policy gates. Scope mutation or retained-pair inventory drift refuses before
+  nested capture, and cleanup restores standing devices (ADR-0032, request
+  configuration-gate amendment; #995).
+
 - Split-pair account foundations retain complete class-aware primary and
   secondary bindings, scoped approval and grant-boundary checks, and typed
   primary-first camera ranking. Ordinary stored forms and partial-primary
@@ -24,6 +40,25 @@ All notable changes to irlume are documented here. This project adheres to
   authentication stay refused until the later steps.
 
 ### Fixed
+
+- Authentication rechecks retained account stores after preparation admission
+  and lease contention, before opening cameras. IR readiness refuses pending
+  secondary journals without recovery, while no-candidate IR requests preserve
+  the configured-target guard before protected loading (ADR-0032, automatic
+  account routing amendment; #995).
+
+- Dual authentication resolves its exact primary snapshot and protected key
+  before camera acquisition. Secondary pinning borrows that request key and
+  uses the same parsed primary bytes, retaining ordinary partial bindings.
+  Protected-load failure, retired primary policy or split primary refusal
+  performs no camera work; inventory drift during the load refuses before
+  acquisition (ADR-0032, pre-open snapshot amendment; #995).
+
+- Camera-selection reads retain ordinary mode and pin alongside verified
+  split authorization through the bounded publication retry. A valid moved
+  generation cannot repair malformed camera selection, and an unchanged
+  missing reference is not read twice when its selected pair becomes
+  malformed (ADR-0032, 2026-10-04 coherent-reader amendment; #995).
 
 - GNOME token arm and re-arm hold the PAM writer lock from the authoritative
   delivery check through durable envelope publication. A private root CLI

@@ -343,7 +343,8 @@ Reader (any process):
 
 1. Read `cameras.conf` once; the rename guarantees a whole file.
 2. If no split key is present at all: split selection is Absent;
-   behavior is exactly as before this ADR.
+   valid ordinary behavior is exactly as before this ADR. Invalid ordinary
+   selection refuses under the 2026-10-04 coherent-reader amendment below.
 3. Otherwise open exactly generation `split_generation`, verify its
    digest equals `split_digest`, then parse it. A missing file, digest
    mismatch or malformed file refuses the split operation. A present
@@ -736,3 +737,35 @@ gate stays closed. Enabling enrollment/authentication remains a separate
 reviewed source change after the complete software and physical acceptance
 matrix. Section 7's YUYV exposure refusal and the T480 hardware gate remain
 unchanged.
+
+## Amendment 2026-10-04: coherent selection reads and refusal precedence
+
+Request preparation consumes ordinary mode, ordinary pin and verified split
+authorization from one strict `cameras.conf` observation. The combined
+`CameraSelectionSnapshot` retains that observation with its `SplitReadState`;
+reading mode or pin separately can mix publications. This snapshot establishes
+configuration facts only; camera code must still resolve a whole pair from a
+current inventory publication and the request must retain live authority.
+
+When a referenced generation is missing, the reader observes `cameras.conf`
+once more. It returns the final observation with that observation's split
+verification or refusal. It reads a moved generation or digest once more,
+with no further retry. An unchanged missing generation/digest refuses without
+another generation read, including when the selected pair text becomes
+malformed. A final removal of the split reference uses the final ordinary
+selection and Absent state together. A valid generation cannot repair a
+malformed ordinary selection; an unreadable final configuration remains
+Unreadable. Existing malformed-pair generation/count diagnostics remain
+available when the referenced generation can be verified.
+
+Unreadable or malformed camera selection, an invalid referenced generation,
+and an unresolved selected split must refuse camera-backed requests even
+with a proven ordinary environment override. A valid explicit ordinary
+override keeps precedence over valid configured choices. Refusal preserves
+password fallback. This decision changes no parser grammar: `mode=pinned`
+still requires complete ordinary RGB/IR paths.
+
+The combined reader and its retry regressions do not complete Engine/daemon
+request enforcement. Step 5 must enforce this policy before preflight, probe
+or open and before adding trust or preparing a face-backed secret. Split
+activation stays closed until its software and physical acceptance passes.

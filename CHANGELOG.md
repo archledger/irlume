@@ -25,6 +25,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Camera-selection reads retain ordinary mode and pin alongside verified
+  split authorization through the bounded publication retry. A valid moved
+  generation cannot repair malformed camera selection, and an unchanged
+  missing reference is not read twice when its selected pair becomes
+  malformed (ADR-0032, 2026-10-04 coherent-reader amendment; #995).
+
 - GNOME token arm and re-arm hold the PAM writer lock from the authoritative
   delivery check through durable envelope publication. A private root CLI
   helper transfers the primary and legacy lock descriptions to irlumed;

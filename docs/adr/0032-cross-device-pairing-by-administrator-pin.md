@@ -811,3 +811,35 @@ Engine, and IR-only target resolution still uses its existing configured-pair
 reader. Exact primary snapshot/key adoption, secondary selection/pin coherence
 and chosen-pair IR targets remain the next Step 5 delivery. Split activation
 and physical acceptance remain separate gates.
+
+## Amendment 2026-10-04: pre-open primary snapshot
+
+Dual authentication now resolves `PrimarySnapshot` before its first camera
+lease or open, using the same owned-receiver loader lifecycle as IR-only. It
+retains the exact bytes parsed, including ciphertext for protected enrollment,
+and moves the load's key once into `RequestTemplateKey`. Secondary reads and
+grant checks borrow that allocation. Timeout/cancellation retains receiver
+ownership until load/lock work drains; this is cooperative cleanup, not a hard
+interruption of TPM work. The no-store instant denial remains before a loader
+starts or its timing/lock work is recorded. Windows and PAD budgets are unchanged.
+
+`pin_with_primary_snapshot` reads only the secondary, verifies the requesting
+owner, and checks activation against the supplied primary bytes. Complete bindings use the strict
+class-aware key pin; incomplete ordinary live bindings retain legacy ordinary
+partial matching. The primary path is retained for later boundary checks, not
+opened or decrypted again during pinning. Later missing or changed primary
+bytes still refuse a secondary grant. Real-primary retired-eye policy precedes
+the secondary bridge's default fields, and a stored split primary refuses before
+ordinary acquisition while activation is closed.
+
+The retained ordinary request proof is revalidated after protected load and
+again before acquisition, including any secondary resolution wait. IR-only
+also revalidates before its lease. These passive checks do not replace existing
+lease/open continuity checks or establish atomic selection/acquisition.
+
+This removes the dual loader/open overlap described in the earlier request-gate
+amendment. Automatic account ranking, expected selected-pair lease requests,
+secondary selection/pin snapshot coherence, chosen-pair IR targets, and daemon
+chosen-tier/window/standing-pair semantics remain the next delivery. Neither
+this prerequisite nor its synthetic tests enable split capture or satisfy
+physical acceptance.

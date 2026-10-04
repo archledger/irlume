@@ -2144,7 +2144,7 @@ impl Engine {
 
     // Retain the existing helper lifetime rule: a cancelled/expired caller
     // drains the loader before returning. No camera or lease is held here.
-    pub(super) fn load_ir_enrollment(
+    pub(super) fn load_request_enrollment(
         &self,
         user: &str,
         window: AuthenticationWindow,
@@ -2152,16 +2152,15 @@ impl Engine {
         diagnostics: Option<&dyn irlume_common::diagnostics::DiagnosticSink>,
     ) -> irlume_common::Result<Option<irlume_core::storage::PrimarySnapshot>> {
         self.check_authentication_completion(window)?;
-        // This route dispatches before the dual-sensor loader's timing site.
-        // Include resolution and any cancellation drain, but not a request
-        // rejected before loading. Read-only readiness probes pass no sink.
+        // All sensor routes resolve protected account data before camera
+        // ownership. Include any cancellation drain; read-only probes have no sink.
         let _timer = diagnostics.map(|sink| {
             TraceStageTimer::new(sink, irlume_common::diagnostics::TraceStage::EnrollmentLoad)
         });
         let (sender, receiver) = std::sync::mpsc::channel();
         let user = user.to_string();
         std::thread::Builder::new()
-            .name("irlume-ir-enrollment".into())
+            .name("irlume-enrollment-load".into())
             .spawn(move || {
                 // The snapshot keeps the key and the bytes: the caller
                 // adopts the key into its request source and pins the
@@ -2241,7 +2240,7 @@ impl Engine {
         ) {
             return IrOnlyPreflight::unscoped(refusal);
         }
-        let mut snapshot = match self.load_ir_enrollment(user, window, true, None) {
+        let mut snapshot = match self.load_request_enrollment(user, window, true, None) {
             Ok(Some(snapshot)) => snapshot,
             _ => return IrOnlyPreflight::unscoped(Ready::EnrollmentUnavailable),
         };
@@ -2294,10 +2293,11 @@ impl Engine {
         if let Some(refusal) = self.ir_model_readiness(&target) {
             return Ok(readiness_refusal(refusal));
         }
-        let mut snapshot = match self.load_ir_enrollment(user, window, false, Some(diagnostics))? {
-            Some(snapshot) => snapshot,
-            None => return Ok(readiness_refusal(Ready::EnrollmentUnavailable)),
-        };
+        let mut snapshot =
+            match self.load_request_enrollment(user, window, false, Some(diagnostics))? {
+                Some(snapshot) => snapshot,
+                None => return Ok(readiness_refusal(Ready::EnrollmentUnavailable)),
+            };
         // The request key (ADR-0025 §3, ADR-0028 §5): the load's one key
         // allocation moves into the request source, which lends it to the
         // secondary store read and the grant boundary.
@@ -2311,6 +2311,7 @@ impl Engine {
             Err(refusal) => return Ok(readiness_refusal(refusal.readiness)),
         };
         self.check_request_active()?;
+        self.validate_camera_request()?;
         let operation = match lease::acquire_camera_operation(
             &target.lease_endpoints(),
             lease::CameraOperationKind::Authentication,

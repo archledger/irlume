@@ -33,6 +33,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Dual authentication resolves its exact primary snapshot and protected key
+  before camera acquisition. Secondary pinning borrows that request key and
+  uses the same parsed primary bytes, retaining ordinary partial bindings.
+  Protected-load failure, retired primary policy or split primary refusal
+  performs no camera work; inventory drift during the load refuses before
+  acquisition (ADR-0032, pre-open snapshot amendment; #995).
+
 - Camera-selection reads retain ordinary mode and pin alongside verified
   split authorization through the bounded publication retry. A valid moved
   generation cannot repair malformed camera selection, and an unchanged

@@ -1305,9 +1305,9 @@ impl AuthenticationPurpose {
     }
 }
 
-/// The deferred enrollment load's result, as sent by the loader thread in
-/// [`Engine::authenticate_for_with_diagnostics`]. The IR-only loader sends
-/// a [`irlume_core::storage::PrimarySnapshot`] through the same helpers.
+/// One owned enrollment-loader reply. Production sensor routes send an exact
+/// [`irlume_core::storage::PrimarySnapshot`] before camera acquisition; generic
+/// tests also exercise the legacy enrollment/key reply through these helpers.
 type EnrollmentLoad<
     T = (
         irlume_core::storage::Enrollment,
@@ -1315,8 +1315,8 @@ type EnrollmentLoad<
     ),
 > = irlume_common::Result<Option<T>>;
 
-/// Own an in-flight enrollment helper until setup consumes its result. Declared
-/// before camera owners so early exits drop those owners before draining it.
+/// Own an in-flight enrollment helper until resolution consumes its result.
+/// Production loaders drain on early exit while no camera owner exists.
 struct PendingEnrollmentLoad<
     T = (
         irlume_core::storage::Enrollment,
@@ -1333,13 +1333,9 @@ impl<T> Drop for PendingEnrollmentLoad<T> {
 }
 
 /// Wait out a still-running deferred enrollment load on an early exit, so the
-/// user-state flock and the TPM are free before this request returns. An
-/// immediate retry (decline, then a fallback attempt) would otherwise block
-/// on the orphaned loader's locks — the one way this overlap could make a
-/// retry SLOWER than the serial load it replaced. The exits that can still be
-/// waiting include cancellation during setup and camera-lease failure;
-/// the post-watch exits arrive seconds after the spawn, by which
-/// time the load has long finished.
+/// user-state flock and the TPM are free before this request returns. A receiver
+/// timeout/cancellation does not stop the producer. Keeping drain ownership
+/// prevents the next request from overlapping orphaned load/lock work.
 fn finish_loader<T>(loader: &mut Option<std::sync::mpsc::Receiver<EnrollmentLoad<T>>>) {
     if let Some(rx) = loader.take() {
         // The loader always sends or drops its sender (a panic drops it), so
@@ -1384,10 +1380,10 @@ enum LoaderExit {
     Fallback(irlume_common::Error),
 }
 
-/// Resolve the deferred loader's channel result into the enrollment (or the
+/// Resolve the owned loader's channel result into the enrollment (or the
 /// request-ending fallback). Pure, so every arm of the fail-closed mapping
-/// is unit-testable without camera hardware; the join in
-/// [`Engine::authenticate_for_with_diagnostics`] is exactly this mapping.
+/// is unit-testable without camera hardware; the guarded snapshot receiver
+/// uses this mapping before camera acquisition.
 fn resolve_loader<T>(
     recv: Result<EnrollmentLoad<T>, std::sync::mpsc::RecvTimeoutError>,
 ) -> Result<T, LoaderExit> {
@@ -1477,22 +1473,6 @@ fn liveness_deny_kind(verdict: Verdict, cause: irlume_liveness::DenyCause) -> Ou
         // Callers only classify rejections; a Live verdict never reaches here.
         (Verdict::Live, _) => OutcomeKind::OtherDeny,
     }
-}
-
-/// Report the enrollment-load boundary for a completed load. On the
-/// synchronous path this is the store load itself; on the deferred path it
-/// is the spawn-to-join resolution interval, which deliberately overlaps the
-/// camera preflight the unseal was deferred behind (stages may nest; never
-/// sum them). Not emitted when no load was ever attempted (the pre-check
-/// instant deny for a user with no store).
-fn emit_enrollment_load_timing(
-    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
-    started: std::time::Instant,
-) {
-    diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
-        stage: irlume_common::diagnostics::TraceStage::EnrollmentLoad,
-        elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-    });
 }
 
 fn emit_trace_stage_ms(
@@ -6347,50 +6327,32 @@ impl Engine {
         if policy == irlume_common::config::FaceSensorPolicy::IrOnlyExperimental {
             return self.authenticate_ir_in_window(user, request_window, diagnostics);
         }
-        // Load enrollment once per authentication, not once per retry. The key
-        // is dropped inside load; only the decrypted Enrollment stays in memory
-        // for this request. Encrypted stores load on a helper while the caller
-        // acquires the lease, opens camera handles.
-        // Join before arming streams: an unseal wait must not idle their queues.
-        // Plaintext stores remain synchronous, preserving deny-before-camera
-        // precedence. For an encrypted store whose camera preflight also fails,
-        // that hardware error can precede enrollment-dependent denials. Both
-        // paths retain password fallback; a loader panic maps to an error.
-        let load_started = std::time::Instant::now();
-        let mut loader = PendingEnrollmentLoad {
-            receiver: match irlume_core::storage::store_is_encrypted(user)
-                .map_err(enrollment_unreadable)?
-            {
-                // No file at all: the instant deny, before anything else wakes.
+        // Preserve the no-store instant deny without starting a loader or
+        // creating its lock files. Other metadata failures reach the real load.
+        if matches!(std::fs::metadata(irlume_core::storage::profile_path(user)), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Ok(Outcome::deny(
+                OutcomeKind::SetupUnavailable,
+                format!("'{user}' is not enrolled"),
+            ));
+        }
+        // Protected account data and its exact bytes resolve before any lease
+        // or open. Cancellation retains loader ownership through its drain.
+        let mut snapshot =
+            match self.load_request_enrollment(user, request_window, false, Some(diagnostics))? {
+                Some(snapshot) => snapshot,
                 None => {
                     return Ok(Outcome::deny(
                         OutcomeKind::SetupUnavailable,
                         format!("'{user}' is not enrolled"),
-                    ));
+                    ))
                 }
-                // Plaintext: cheap JSON load, synchronous, old precedence.
-                Some(false) => None,
-                // Encrypted: the TPM unseal is the expensive part — defer it
-                // into the overlap window. A channel, not a JoinHandle: the
-                // receiver can wait with a timeout at the join (a wedged unseal
-                // must not pin the camera lease past the auth deadline), and a
-                // dropped sender reports a loader panic as a disconnect.
-                Some(true) => Some({
-                    let loader_user = user.to_string();
-                    let (tx, rx) = std::sync::mpsc::channel::<EnrollmentLoad>();
-                    std::thread::Builder::new()
-                        .name("irlume-enrollment-load".into())
-                        .spawn(move || {
-                            let _ = tx.send(irlume_core::storage::load_with_key(&loader_user));
-                        })
-                        .map_err(|e| irlume_common::Error::Io(e.to_string()))?;
-                    rx
-                }),
-            },
-        };
-        // The synchronous-path enrollment (plaintext stores). The encrypted
-        // path resolves `enr` at the join below, after camera setup.
-        let loader_was_async = loader.receiver.is_some();
+            };
+        // Loading may wait on protected storage. Never acquire a replacement
+        // incarnation under the request's earlier passive pairing authority.
+        self.validate_camera_request()?;
+        self.request_key().adopt(user, snapshot.key.take());
+        self.begin_capture_setup();
         // The live pair the whole attempt is scoped to: the secondary-pin
         // decision and the binding check consume the SAME identities, so
         // they can never disagree about which cameras are present.
@@ -6398,35 +6360,9 @@ impl Engine {
             irlume_camera::device_identity(&self.rgb_dev),
             irlume_camera::device_identity(&self.ir_dev),
         );
-        let sync_enr = if loader.receiver.is_none() {
-            let loaded = irlume_core::storage::load_with_key(user).map_err(enrollment_unreadable);
-            // Completed work boundary: the plaintext store load itself,
-            // before any policy decision on its content. Attempt preparation
-            // starts here on this path (the deferred path starts it at its
-            // join below).
-            emit_enrollment_load_timing(diagnostics, load_started);
-            self.begin_capture_setup();
-            match loaded? {
-                Some((enr, key)) => {
-                    // The key this load unsealed serves the rest of the
-                    // request (ADR-0025): the pin and the grant boundary
-                    // borrow it instead of unsealing again.
-                    self.request_key().adopt(user, key);
-                    let resolved = self.resolve_attempt_enrollment(user, enr, &live_pair);
-                    match resolved {
-                        Err(outcome) => return Ok(outcome),
-                        Ok(scoped) => Some(scoped),
-                    }
-                }
-                None => {
-                    return Ok(Outcome::deny(
-                        OutcomeKind::SetupUnavailable,
-                        format!("'{user}' is not enrolled"),
-                    ));
-                }
-            }
-        } else {
-            None
+        let enr = match self.resolve_attempt_snapshot(user, snapshot, &live_pair) {
+            Ok(enrollment) => enrollment,
+            Err(outcome) => return Ok(outcome),
         };
         let (rgb_dev, ir_dev) = (self.rgb_dev.clone(), self.ir_dev.clone());
         let endpoints: Vec<&str> = if self.ir_available {
@@ -6439,6 +6375,7 @@ impl Engine {
         // lease across sequential fallbacks is deliberate: otherwise another
         // operation can interleave between captures and matching.
         self.check_request_active()?;
+        self.validate_camera_request()?;
         let camera_operation = match irlume_camera::lease::acquire_camera_operation(
             &endpoints,
             irlume_camera::lease::CameraOperationKind::Authentication,
@@ -6451,7 +6388,6 @@ impl Engine {
         ) {
             Ok(op) => op,
             Err(error) => {
-                finish_loader(&mut loader.receiver);
                 return Err(lease_unavailable(error));
             }
         };
@@ -6534,63 +6470,6 @@ impl Engine {
             (None, resolved_cams)
         };
         let held_cams = cameras_for_held_pair(sequential, resolved_cams);
-        // Resolve enrollment before streaming. A loader wait can exceed a
-        // camera queue's capacity; no stream may be armed across this wait.
-        // The wait remains bounded by the authentication deadline.
-        let mut enr = match loader.receiver.take() {
-            Some(rx) => {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                let resolved = resolve_loader(rx.recv_timeout(remaining));
-                // The deferred store load just finished (or failed bounded):
-                // report the resolution interval, which by design overlaps
-                // the camera preflight it was deferred behind.
-                emit_enrollment_load_timing(diagnostics, load_started);
-                match resolved {
-                    Ok((enr, key)) => {
-                        self.request_key().adopt(user, key);
-                        enr
-                    }
-                    Err(LoaderExit::NotEnrolled) => {
-                        return Ok(Outcome::deny(
-                            OutcomeKind::SetupUnavailable,
-                            format!("'{user}' is not enrolled"),
-                        ));
-                    }
-                    Err(LoaderExit::Fallback(e)) => return Err(e),
-                }
-            }
-            None => match sync_enr {
-                Some(enr) => enr,
-                // Unreachable by construction (the sync path resolves
-                // sync_enr or returns early); a deny rather than a panic so
-                // a future edit cannot crash the daemon here.
-                None => {
-                    return Ok(Outcome::deny(
-                        OutcomeKind::SetupUnavailable,
-                        format!("'{user}' is not enrolled"),
-                    ));
-                }
-            },
-        };
-        irlume_common::dlog!(
-            "auth: enrollment load took {:?} ({})",
-            load_started.elapsed(),
-            if loader_was_async {
-                "overlapped with camera preflight"
-            } else {
-                "plaintext, synchronous"
-            }
-        );
-        if loader_was_async {
-            // Attempt preparation starts at the join: secondary-camera
-            // resolution below can load and unseal further stores, and
-            // belongs to the interval.
-            self.begin_capture_setup();
-            enr = match self.resolve_attempt_enrollment(user, enr, &live_pair) {
-                Err(outcome) => return Ok(outcome),
-                Ok(scoped) => scoped,
-            };
-        }
         if let Some(cameras) = grouped_cams {
             let mut costliest_attempt = std::time::Duration::ZERO;
             return self
@@ -8696,8 +8575,7 @@ impl Engine {
     /// empty-profile refusal, anti-swap camera binding and recognizer compatibility. A pure
     /// decision over the loaded enrollment (plus sysfs identities for the
     /// binding); runs synchronously for plaintext stores (before the camera)
-    /// and at the loader join for encrypted stores (see
-    /// `authenticate_for_with_diagnostics` for the precedence note).
+    /// before camera acquisition for both plaintext and encrypted stores.
     /// The enrollment policy refusal over caller-supplied live device
     /// identities: the sequencing core resolves them once per attempt and
     /// hands the SAME pair to the secondary-pin decision, so the binding
@@ -8769,6 +8647,7 @@ impl Engine {
     /// Returns the enrollment the attempt must consume, or a refusal
     /// outcome. On success `self.secondary_attempt` holds the pin exactly
     /// when the returned enrollment is a secondary group's bridge.
+    #[cfg(test)]
     fn resolve_attempt_enrollment(
         &mut self,
         user: &str,
@@ -8817,6 +8696,66 @@ impl Engine {
         match self.enrollment_policy_refusal_for(user, &enr, live) {
             Some(refusal) => Err(refusal),
             None => Ok(enr),
+        }
+    }
+
+    fn resolve_attempt_snapshot(
+        &mut self,
+        user: &str,
+        snapshot: irlume_core::storage::PrimarySnapshot,
+        live: &(Option<String>, Option<String>),
+    ) -> Result<irlume_core::storage::Enrollment, Outcome> {
+        self.secondary_attempt = None;
+        let irlume_core::storage::PrimarySnapshot {
+            enrollment: primary,
+            bytes,
+            ..
+        } = snapshot;
+        // Account-wide policy belongs to the real primary, not the bridge's
+        // default fields. Split credentials never become legacy ordinary input.
+        if let Err(reason) = legacy_eye_policy(&primary) {
+            return Err(Outcome::deny(OutcomeKind::SetupUnavailable, reason));
+        }
+        if matches!(
+            primary.camera_binding,
+            Some(irlume_core::storage::CameraBinding::Split(_))
+        ) {
+            return Err(Outcome::deny_because(
+                OutcomeKind::OtherDeny,
+                OutcomeCause::NotEnrolledOnThisCamera,
+                "split enrollment and authentication are not enabled",
+            ));
+        }
+        let live_binding = irlume_core::multi_camera::GroupPair::Ordinary {
+            rgb: live.0.clone(),
+            ir: live.1.clone(),
+        };
+        if primary
+            .camera_binding
+            .as_ref()
+            .is_some_and(|binding| !binding.matches_binding(&live_binding))
+        {
+            let secondary_path = irlume_core::multi_camera::secondary_store_path(user);
+            let primary_path = irlume_core::multi_camera::primary_enrollment_path(user);
+            let pinned = irlume_core::multi_camera::coordinator::SecondaryAuthContext::pin_with_primary_snapshot(
+                irlume_core::multi_camera::coordinator::StrictPinStores { user, secondary_path: &secondary_path, primary_path: &primary_path },
+                &primary, &bytes, &live_binding, &mut *self.request_key(),
+            );
+            match pinned {
+                Ok(context) => {
+                    let scoped = context.group_view().matching_enrollment(user);
+                    if let Some(refusal) = self.enrollment_policy_refusal_for(user, &scoped, live) {
+                        return Err(refusal);
+                    }
+                    self.secondary_attempt = Some(context);
+                    return Ok(scoped);
+                }
+                Err(error) => irlume_common::dlog!("auth: snapshot secondary pin refused: {error}"),
+            }
+        }
+        match self.enrollment_policy_refusal_for(user, &primary, live) {
+            Some(refusal) => Err(refusal),
+            None => Ok(primary),
         }
     }
 
@@ -15040,7 +14979,7 @@ mod engine_tests {
         write_enrollment(&dir, &Enrollment::new(user));
         let loaded = s
             .engine
-            .load_ir_enrollment(user, AuthenticationWindow::new(10_000), false, Some(&sink))
+            .load_request_enrollment(user, AuthenticationWindow::new(10_000), false, Some(&sink))
             .unwrap()
             .unwrap();
         assert_eq!(loaded.enrollment.user, user);
@@ -15048,7 +14987,7 @@ mod engine_tests {
         // and each attempted load emits one completed boundary, no capture.
         assert!(s
             .engine
-            .load_ir_enrollment(
+            .load_request_enrollment(
                 "irlume-test-missing",
                 AuthenticationWindow::new(10_000),
                 false,
@@ -15059,7 +14998,7 @@ mod engine_tests {
         std::fs::write(dir.join(format!("{user}.json")), b"not json").unwrap();
         assert!(s
             .engine
-            .load_ir_enrollment(user, AuthenticationWindow::new(10_000), false, Some(&sink),)
+            .load_request_enrollment(user, AuthenticationWindow::new(10_000), false, Some(&sink),)
             .is_err());
         let events = sink.0.lock().unwrap();
         assert_eq!(events.len(), 3);
@@ -15080,7 +15019,7 @@ mod engine_tests {
         };
         assert!(matches!(
             s.engine
-                .load_ir_enrollment(user, expired, false, Some(&sink)),
+                .load_request_enrollment(user, expired, false, Some(&sink)),
             Err(irlume_common::Error::DeadlineExpired)
         ));
         assert_eq!(sink.0.lock().unwrap().len(), 3);

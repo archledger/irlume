@@ -36,6 +36,7 @@ impl Fixture {
             "IRLUME_IR_DEVICE",
             "IRLUME_FORCE_NO_IR",
             "IRLUME_CAMERA_REQUIRE_FIXED",
+            "IRLUME_TEMPLATE_KEY_DIR",
         ];
         let saved = keys
             .into_iter()
@@ -43,6 +44,7 @@ impl Fixture {
             .collect();
         std::env::set_var("IRLUME_CONFIG_DIR", &dir);
         std::env::set_var("IRLUME_STATE_DIR", &dir);
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", dir.join("private-template-keys"));
         for key in [
             "IRLUME_RGB_DEVICE",
             "IRLUME_IR_DEVICE",
@@ -597,5 +599,162 @@ fn inventory_replacement_cannot_reuse_prepared_ordinary_binding() {
         authorized,
         "old ordinary authority must not survive a replaced publication"
     );
+    assert!(fixture.recorder.calls().is_empty());
+}
+
+#[test]
+fn encrypted_primary_load_failure_precedes_all_camera_work() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(false);
+    let devices = Devices::new(&mut shared.engine, &fixture);
+    // Pure synthetic encryption fixture. The private key directory is absent;
+    // no hardware key or real enrollment is accessed by this test.
+    let enrollment = Enrollment::new("request-fixture");
+    let bytes = irlume_core::storage::serialize_enrollment(&enrollment, Some(&[0x42; 32])).unwrap();
+    let path = fixture.dir.join("request-fixture.json");
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(
+        irlume_core::storage::store_is_encrypted("request-fixture").unwrap(),
+        Some(true)
+    );
+    let result = devices.engine.authenticate_for_in_window_with_policy(
+        "request-fixture",
+        None,
+        AuthenticationPurpose::Verify,
+        AuthenticationWindow::new(2000),
+        irlume_common::config::FaceSensorPolicy::Dual,
+        &(),
+    );
+    assert!(
+        result.is_err(),
+        "unavailable protected enrollment must not grant"
+    );
+    assert!(
+        fixture.recorder.calls().is_empty(),
+        "camera reached before protected load resolved: {:?}",
+        fixture.recorder.calls()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(!devices.engine.request_key().holds_key());
+}
+
+#[test]
+fn stored_split_primary_refuses_before_ordinary_camera_acquisition() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(false);
+    let devices = Devices::new(&mut shared.engine, &fixture);
+    let (mut enrollment, _) = pad_matching_fixture(0.2, false);
+    enrollment.user = "request-fixture".into();
+    enrollment.camera_binding = Some(CameraBinding::Split(
+        irlume_common::split_key::SplitPairKey::parse_canonical(
+            "split1;1234:0001:rgb|0000:00:14.0|usb2|8;1234:0002:ir|0000:00:14.0|usb2|5",
+        )
+        .unwrap(),
+    ));
+    let bytes = serde_json::to_vec(&enrollment).unwrap();
+    std::fs::write(fixture.dir.join("request-fixture.json"), &bytes).unwrap();
+    let outcome = devices
+        .engine
+        .authenticate_for_in_window_with_policy(
+            "request-fixture",
+            None,
+            AuthenticationPurpose::Verify,
+            AuthenticationWindow::new(2000),
+            irlume_common::config::FaceSensorPolicy::Dual,
+            &(),
+        )
+        .unwrap();
+    assert!(
+        !outcome.granted
+            && outcome
+                .reason
+                .contains("split enrollment and authentication are not enabled")
+    );
+    assert!(fixture.recorder.calls().is_empty());
+    assert_eq!(
+        std::fs::read(fixture.dir.join("request-fixture.json")).unwrap(),
+        bytes
+    );
+}
+
+#[test]
+fn inventory_drift_during_primary_load_refuses_before_camera() {
+    use irlume_common::diagnostics::{DiagnosticSink, TraceEventKind, TraceStage};
+    thread_local! {
+        static LOAD_REPLACEMENT: std::cell::RefCell<Option<Guard>> = const { std::cell::RefCell::new(None) };
+    }
+    struct ClearReplacement;
+    impl Drop for ClearReplacement {
+        fn drop(&mut self) {
+            LOAD_REPLACEMENT.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    struct ReplaceOnLoad {
+        cameras: Vec<Camera>,
+    }
+    impl DiagnosticSink for ReplaceOnLoad {
+        fn emit_trace(&self, event: TraceEventKind) {
+            if matches!(
+                event,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::EnrollmentLoad,
+                    ..
+                }
+            ) {
+                LOAD_REPLACEMENT
+                    .with(|slot| *slot.borrow_mut() = Some(Guard::install(&self.cameras).unwrap()));
+            }
+        }
+    }
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(false);
+    let devices = Devices::new(&mut shared.engine, &fixture);
+    let _clear = ClearReplacement;
+    let (mut enrollment, _) = pad_matching_fixture(0.2, false);
+    enrollment.user = "request-fixture".into();
+    enrollment.camera_binding = None;
+    std::fs::write(
+        fixture.dir.join("request-fixture.json"),
+        serde_json::to_vec(&enrollment).unwrap(),
+    )
+    .unwrap();
+    let sink = ReplaceOnLoad {
+        cameras: vec![Camera {
+            topology: "/devices/fixture/load-replacement".into(),
+            identity: "1234:9999:load-replacement".into(),
+            fixed: true,
+            controller: "0000:00:14.0".into(),
+            domain: irlume_common::split_key::SplitDomain::Usb2,
+            ports: vec![8],
+            endpoints: vec![
+                Endpoint {
+                    path: fixture.rgb.clone(),
+                    formats: vec![*b"YUYV"],
+                },
+                Endpoint {
+                    path: fixture.ir.clone(),
+                    formats: vec![*b"GREY"],
+                },
+            ],
+        }],
+    };
+    let error = devices
+        .engine
+        .authenticate_for_in_window_with_policy(
+            "request-fixture",
+            None,
+            AuthenticationPurpose::Verify,
+            AuthenticationWindow::new(2000),
+            irlume_common::config::FaceSensorPolicy::Dual,
+            &sink,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("no longer Current"), "{error}");
+    LOAD_REPLACEMENT.with(|slot| assert!(slot.borrow().as_ref().unwrap().calls().is_empty()));
     assert!(fixture.recorder.calls().is_empty());
 }

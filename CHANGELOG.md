@@ -7,11 +7,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Split-camera diagnostics capture RGB then IR under one retained two-device
+  operation and return an operation-bound complete-pair receipt. Assessment
+  carries split sequential posture at every skew. Native opens validate the
+  selected descriptor before configuration; owned cleanup can restore a
+  surviving camera after peer loss. Split enrollment and authentication remain
+  disabled (ADR-0032, sequential capture amendment; #995).
+
 - Ordinary enrollment and add-camera requests accept an operation-scoped camera
   choice through `--camera-choice JSON`. The daemon validates the displayed
   connection guard and roles before camera work, retains the exact pair through
   probe and capture, and restores the standing selection afterward. Non-reset
-  additions require the existing primary binding; split capture stays disabled
+  additions require the existing primary binding; split enrollment stays disabled
   (ADR-0029, guarded ordinary operation-choice amendment; #995).
 
 - Automatic face authentication selects an eligible enrolled whole pair before

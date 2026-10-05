@@ -813,6 +813,8 @@ pub(crate) mod fake_camera {
     // needs it to.
     #[derive(Default)]
     pub(crate) struct Camera {
+        /// Keep real lease admission when testing an operation-bound restore.
+        pub(crate) enforce_lease: bool,
         /// A fake sysfs observation at the same pre-ioctl boundary as production.
         /// None preserves the ordinary valid-configuration fixture.
         pub(crate) configuration_check: Option<Box<dyn FnMut() -> XuResult<()>>>,
@@ -877,6 +879,15 @@ pub(crate) mod fake_camera {
 
     pub(crate) fn installed() -> bool {
         CAMERA.with(|camera| camera.borrow().is_some())
+    }
+
+    pub(crate) fn enforce_lease() -> bool {
+        CAMERA.with(|camera| {
+            camera
+                .borrow()
+                .as_ref()
+                .is_some_and(|camera| camera.enforce_lease)
+        })
     }
 
     pub(crate) fn check_configuration() -> Option<XuResult<()>> {
@@ -1093,7 +1104,7 @@ fn get_cur(fd: c_int, unit: u8, selector: u8, size: usize) -> XuResult<Vec<u8>> 
 /// thing this project can no longer afford to be casual about.
 fn validate_write_lease(fd: c_int) -> XuResult<()> {
     #[cfg(test)]
-    if fake_camera::installed() {
+    if fake_camera::installed() && !fake_camera::enforce_lease() {
         return Ok(());
     }
     let endpoint = std::fs::read_link(format!("/proc/self/fd/{fd}"))
@@ -1109,6 +1120,12 @@ fn validate_write_lease(fd: c_int) -> XuResult<()> {
 
 fn set_cur(fd: c_int, unit: u8, selector: u8, payload: &[u8]) -> XuResult<()> {
     validate_write_lease(fd)?;
+    set_cur_admitted(fd, unit, selector, payload)
+}
+
+// One shared write implementation. Forward writes require whole-operation
+// admission; an owned restore checks its surviving original fd separately.
+fn set_cur_admitted(fd: c_int, unit: u8, selector: u8, payload: &[u8]) -> XuResult<()> {
     validate_query_configuration(fd)?;
     if std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
         eprintln!("irlume: SET_CUR unit{unit}/sel{selector}: {payload:02x?}");
@@ -2202,7 +2219,39 @@ impl UvcMode {
                 );
                 Ok(())
             }
-            Ok(_) => set_cur(self.fd(), self.unit, self.selector, &self.restore),
+            Ok(_) => {
+                if let Some(lease) = self
+                    .handle
+                    .as_ref()
+                    .and_then(|handle| handle.lease.as_ref())
+                {
+                    if lease.is_split_pair() {
+                        let endpoint = std::fs::read_link(format!("/proc/self/fd/{}", self.fd()))
+                            .map_err(|_| XuError::Unresponsive(libc::ESTALE));
+                        match endpoint {
+                            Ok(endpoint) => match endpoint.to_str() {
+                                Some(endpoint) => lease
+                                    .require_restore_fd(endpoint, self.fd())
+                                    .map_err(|_| XuError::Unresponsive(libc::ESTALE))
+                                    .and_then(|()| {
+                                        set_cur_admitted(
+                                            self.fd(),
+                                            self.unit,
+                                            self.selector,
+                                            &self.restore,
+                                        )
+                                    }),
+                                None => Err(XuError::Unresponsive(libc::ESTALE)),
+                            },
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        set_cur(self.fd(), self.unit, self.selector, &self.restore)
+                    }
+                } else {
+                    set_cur(self.fd(), self.unit, self.selector, &self.restore)
+                }
+            }
             // An unreadable control authorises NOTHING: writing blind here
             // could put the restore value over bytes some other client set
             // mid-stream, the exact class this file exists to prevent. #184
@@ -2491,6 +2540,123 @@ mod shutdown_tests {
         assert!(events.lock().unwrap().is_empty());
         producer.stopped();
         assert_eq!(*events.lock().unwrap(), ["emitter-restore"]);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn split_peer_loss_restores_the_original_ir_control_after_confirmed_stop() {
+        let _env = crate::testenv::env_lock();
+        use crate::{lease::*, test_support::*, Role, SplitSideExpectation};
+        use std::time::Duration;
+        let _roots = crate::hostfs::test::fixture_with(|_, sys| {
+            use std::os::unix::fs::symlink;
+            let hub = sys.join("devices/pci0000:00/0000:00:14.0/usb2");
+            let usb = hub.join("2-2");
+            let iface = usb.join("2-2:1.0");
+            std::fs::create_dir_all(&iface).unwrap();
+            std::fs::create_dir_all(sys.join("dev/char")).unwrap();
+            symlink(&iface, sys.join("dev/char/1:3")).unwrap();
+            std::fs::write(hub.join("idProduct"), "0002\n").unwrap();
+            std::fs::write(usb.join("idVendor"), "1234\n").unwrap();
+            std::fs::write(usb.join("idProduct"), "0002\n").unwrap();
+            std::fs::write(usb.join("bConfigurationValue"), "1\n").unwrap();
+            std::fs::write(iface.join("bInterfaceNumber"), "00\n").unwrap();
+            std::fs::write(
+                usb.join("descriptors"),
+                [
+                    18, 1, 0, 2, 0, 0, 0, 64, 0x34, 0x12, 2, 0, 0, 1, 0, 0, 0, 1, 9, 2, 18, 0, 1,
+                    1, 0, 0x80, 50, 9, 4, 0, 0, 0, 14, 1, 0, 0,
+                ],
+            )
+            .unwrap();
+        });
+        let camera = |port, path: &str, format| Camera {
+            topology: format!("/devices/pci0000:00/0000:00:14.0/usb2/2-{port}"),
+            identity: format!("1234:000{port}"),
+            fixed: true,
+            controller: "0000:00:14.0".into(),
+            domain: irlume_common::split_key::SplitDomain::Usb2,
+            ports: vec![port],
+            endpoints: vec![Endpoint {
+                path: path.into(),
+                formats: vec![format],
+            }],
+        };
+        let guard = Guard::install(&[
+            camera(1, "/dev/restore-peer-rgb", *b"YUYV"),
+            camera(2, "/dev/null", *b"GREY"),
+        ])
+        .unwrap();
+        let (snapshot, sides) = crate::camera_inventory_publication();
+        let side = |role| {
+            let e = sides.iter().find(|e| e.role == role).unwrap();
+            SplitSideExpectation {
+                instance_id: e.instance_id.clone(),
+                generation: e.generation,
+                endpoint: e.endpoint.clone(),
+                identity: e.identity.clone(),
+                controller: e.controller.clone(),
+                domain: e.domain.clone(),
+                ports: e.ports.clone(),
+            }
+        };
+        let expected = SplitLeaseRequest {
+            supervisor_id: snapshot.supervisor_id.unwrap(),
+            revision: snapshot.revision,
+            rgb: side(Role::Rgb),
+            ir: side(Role::Ir),
+        };
+        let operation = acquire_split_camera_operation(
+            &expected,
+            CameraOperationKind::Diagnostics,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let device = v4l::Device::with_path("/dev/null").unwrap();
+        assert_eq!(
+            crate::uvc_descriptor::identity_from_fd(device.handle().fd())
+                .unwrap()
+                .usb_devpath,
+            "/devices/pci0000:00/0000:00:14.0/usb2/2-2"
+        );
+        let _fake = fake_camera::install(fake_camera::Camera {
+            current: vec![2],
+            len: 1,
+            info: 3,
+            enforce_lease: true,
+            ..Default::default()
+        });
+        let producer = crate::capture_shutdown::Producer::for_test();
+        producer.begin().unwrap();
+        let mut mode = StreamMode::new(Box::new(UvcMode {
+            handle: Some(EmitterHandle {
+                handle: device.handle(),
+                lease: Some(operation.lease().clone()),
+            }),
+            unit: 14,
+            selector: 6,
+            restore: vec![1],
+            applied: vec![2],
+            armed: true,
+            active: true,
+            record: None,
+            _lock: None,
+        }))
+        .with_producer(producer.clone());
+        guard.endpoint_invalidation_observer("/dev/restore-peer-rgb")();
+        assert!(operation.lease().validate().is_err());
+        assert!(
+            mode.restore().is_err(),
+            "unconfirmed producer still blocks every restore"
+        );
+        assert_eq!(fake_camera::current(), vec![2]);
+        producer.stopped();
+        let result = mode.restore();
+        assert!(
+            result.is_ok(),
+            "healthy original IR fd must restore after its RGB peer leaves: {result:?}"
+        );
+        assert_eq!(fake_camera::current(), vec![1]);
     }
 }
 

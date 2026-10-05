@@ -181,10 +181,14 @@ pub use paired_processing::process_pair_while_draining;
 mod rate_amortization;
 mod rate_gate;
 mod sequential_batch;
+mod split_capture;
 pub use sequential_batch::{
     capture_rgb_denoised_batch_with_control, capture_sequential_batch_observed,
     capture_sequential_batch_with_control, capture_sequential_batch_with_progress, RgbBatchRequest,
     SequentialBatchPhase, SequentialBatchRequest,
+};
+pub use split_capture::{
+    capture_split_pair_observed, capture_split_pair_with_control, SplitPairCapture,
 };
 // Public for exactly one item, `pending_summary`, doctor's read-only view of
 // the store (#429); every record type stays crate-private so no other code
@@ -683,7 +687,12 @@ impl Drop for BlcRestore<'_> {
         // and must not disturb an authentication's teardown.
         let read = self.cam.dev.control(V4L2_CID_BACKLIGHT_COMPENSATION);
         if let Some(put_back) = blc_restore_decision(self.displaced, read) {
-            if self.cam.lease.require_endpoint(&self.cam.device).is_err() {
+            if self
+                .cam
+                .lease
+                .require_restore_fd(&self.cam.device, self.cam.dev.handle().fd())
+                .is_err()
+            {
                 irlume_common::dlog!(
                     "{}: skipped backlight-compensation restore after lease invalidation",
                     self.cam.device
@@ -715,27 +724,45 @@ impl Drop for BlcRestore<'_> {
 /// whose result cannot be confirmed is undone on the spot, best-effort: the
 /// one thing known then is that irlume just changed the control.
 fn apply_blc(cam: &RgbCamera) -> Option<BlcRestore<'_>> {
-    let displaced = blc_write_decision(cam.dev.control(V4L2_CID_BACKLIGHT_COMPENSATION))?;
-    cam.lease.require_endpoint(&cam.device).ok()?;
-    cam.dev
-        .set_control(v4l::control::Control {
-            id: V4L2_CID_BACKLIGHT_COMPENSATION,
-            value: v4l::control::Value::Integer(BLC_WANTED),
-        })
-        .ok()?;
-    let confirm = cam.dev.control(V4L2_CID_BACKLIGHT_COMPENSATION);
+    apply_blc_with(
+        &cam.lease,
+        &cam.device,
+        cam.dev.handle().fd(),
+        || cam.dev.control(V4L2_CID_BACKLIGHT_COMPENSATION),
+        |value| {
+            cam.dev.set_control(v4l::control::Control {
+                id: V4L2_CID_BACKLIGHT_COMPENSATION,
+                value: v4l::control::Value::Integer(value),
+            })
+        },
+    )
+    .map(|displaced| BlcRestore {
+        cam,
+        displaced,
+        producer: None,
+    })
+}
+
+// Keep policy and both admissions real in tests; only control transport is
+// replaced. The original fd is supplied by the same owner used for its ioctls.
+fn apply_blc_with(
+    lease: &lease::CameraLease,
+    endpoint: &str,
+    fd: std::os::fd::RawFd,
+    mut read: impl FnMut() -> std::io::Result<v4l::control::Control>,
+    mut write: impl FnMut(i64) -> std::io::Result<()>,
+) -> Option<i64> {
+    let displaced = blc_write_decision(read())?;
+    lease.require_endpoint(endpoint).ok()?;
+    write(BLC_WANTED).ok()?;
+    let confirm = read();
     if blc_restore_decision(displaced, confirm).is_some() {
-        Some(BlcRestore {
-            cam,
-            displaced,
-            producer: None,
-        })
+        Some(displaced)
     } else {
-        cam.lease.require_endpoint(&cam.device).ok()?;
-        let _ = cam.dev.set_control(v4l::control::Control {
-            id: V4L2_CID_BACKLIGHT_COMPENSATION,
-            value: v4l::control::Value::Integer(displaced),
-        });
+        // No image producer has started. Undo only this owned write on the
+        // original surviving fd; peer loss still forbids all new capture.
+        lease.require_restore_fd(endpoint, fd).ok()?;
+        let _ = write(displaced);
         None
     }
 }
@@ -5052,6 +5079,7 @@ impl RgbCamera {
             )));
         }
         let dev = hostfs::open_video(device).map_err(|e| map_io(device, e))?;
+        lease.require_split_descriptor(device, &dev, contracts::StreamRole::Rgb)?;
         // Pick an uncompressed format the camera actually offers. Some webcams
         // advertise RGB only as MJPEG (or NV12) and reject YUYV; classify()
         // still labels them usable, so without this negotiation they would
@@ -6614,6 +6642,7 @@ impl IrCamera {
             .map_err(|error| Error::Hardware(error.to_string()))?;
         verify_pinned(device)?;
         let dev = hostfs::open_video(device).map_err(|e| map_io(device, e))?;
+        lease.require_split_descriptor(device, &dev, contracts::StreamRole::Ir)?;
         require_ir_privacy_released(device, &dev, "before IR negotiation")?;
         let negotiation = negotiate_ir_format_state(device, &dev, &state)?;
         let (fmt, pix) = (negotiation.format, negotiation.pixel);

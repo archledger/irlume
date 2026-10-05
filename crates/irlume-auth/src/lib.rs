@@ -284,6 +284,28 @@ struct IdentityImage {
 
 type PairIdentity = (Option<IdentityImage>, Option<IdentityImage>);
 
+enum PairCapture {
+    Ordinary(
+        irlume_camera::Frame,
+        irlume_camera::Frame,
+        irlume_camera::IrCaptureStats,
+    ),
+    Split(irlume_camera::SplitPairCapture),
+}
+
+struct SplitDiagnosticState<'a> {
+    engine: &'a mut Engine,
+}
+
+impl Drop for SplitDiagnosticState<'_> {
+    fn drop(&mut self) {
+        // Admission required empty/unprepared state. Only this diagnostic's
+        // votes and setup accounting can exist here, even during unwinding.
+        self.engine.vit_scores.clear();
+        self.engine.capture_setup_started = None;
+    }
+}
+
 enum PreparedPairAuthentication {
     // Already qualified once; final admission must not reset a pending vote by
     // entering the qualifying eager wrapper again.
@@ -292,6 +314,7 @@ enum PreparedPairAuthentication {
 }
 
 struct PairAssessmentContext<'a> {
+    operation: &'a irlume_camera::lease::CameraOperationSession,
     sequential: bool,
     pair_sequential_retried: bool,
     rgb_hard_retried: bool,
@@ -4451,6 +4474,70 @@ impl Engine {
             .map_err(lease_unavailable)?
     }
 
+    /// Assess a selected split capture for diagnostics under its original lease.
+    ///
+    /// This produces evidence only: it loads no enrollment, matches no account,
+    /// releases no credential and enables no split authentication entry point.
+    /// The caller supplies a Diagnostics capability and the Engine's endpoints
+    /// must match both selected sides. IR-off policy remains authoritative.
+    ///
+    /// # Errors
+    /// Refuses an ordinary/non-diagnostic or stale operation, disabled IR,
+    /// cancellation/deadline, capture/provenance failure or inference failure.
+    pub fn assess_split_in_operation(
+        &mut self,
+        operation: &irlume_camera::lease::CameraOperationSession,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<Assessment> {
+        self.with_split_diagnostic_state(operation, diagnostics, |engine| {
+            engine.assess_full(
+                &unavailable_capture_mode_selection(),
+                operation,
+                diagnostics,
+            )
+        })
+    }
+
+    fn with_split_diagnostic_state<T>(
+        &mut self,
+        operation: &irlume_camera::lease::CameraOperationSession,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        assess: impl FnOnce(&mut Self) -> irlume_common::Result<T>,
+    ) -> irlume_common::Result<T> {
+        if !operation.lease().is_split_pair()
+            || operation.lease().operation()
+                != irlume_camera::lease::CameraOperationKind::Diagnostics
+            || !self.ir_available
+        {
+            return Err(irlume_common::Error::Hardware(
+                "split assessment requires a diagnostic operation with IR enabled".into(),
+            ));
+        }
+        if self.camera_selection.is_some()
+            || self.primary_attempt.is_some()
+            || self.secondary_attempt.is_some()
+            || !self.vit_scores.is_empty()
+            || self.capture_setup_started.is_some()
+        {
+            return Err(irlume_common::Error::Hardware(
+                "split diagnostics cannot enter a pending Engine request".into(),
+            ));
+        }
+        operation
+            .lease()
+            .frame_binding(&self.rgb_dev, irlume_camera::contracts::StreamRole::Rgb)
+            .map_err(lease_unavailable)?;
+        operation
+            .lease()
+            .frame_binding(&self.ir_dev, irlume_camera::contracts::StreamRole::Ir)
+            .map_err(lease_unavailable)?;
+        self.check_request_active()?;
+        let state = SplitDiagnosticState { engine: self };
+        state.engine.begin_capture_setup();
+        state.engine.emit_capture_setup(diagnostics);
+        Self::run_camera_operation(operation, || assess(state.engine))
+    }
+
     /// Perform one bounded, production-shaped camera capture for a support
     /// report. This publishes no enrollment or qualification state and never
     /// discovers emitter controls; IR session creation uses only the ordinary
@@ -4968,6 +5055,56 @@ impl Engine {
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
         finish: impl FnOnce(&mut Self, DeferredAssessment<PairIdentity>) -> Result<T, CapturePathError>,
     ) -> Result<T, CapturePathError> {
+        if operation.lease().is_split_pair() {
+            if held.is_some() {
+                return Err(irlume_common::Error::Hardware(
+                    "split capture cannot use a held concurrent pair".into(),
+                )
+                .into());
+            }
+            // A split capability reserves both devices, never a concurrent
+            // qualification. Every attempt pays complete sequential one-shots
+            // under the original capability; no single-side recovery survives.
+            let captured = irlume_camera::capture_split_pair_observed(
+                &self.rgb_dev,
+                &self.ir_dev,
+                operation,
+                &self.capture_control(),
+                &|role, elapsed| {
+                    let stage = match role {
+                        irlume_camera::contracts::StreamRole::Rgb => {
+                            Some(irlume_common::diagnostics::TraceStage::RgbCapture)
+                        }
+                        irlume_camera::contracts::StreamRole::Ir => {
+                            Some(irlume_common::diagnostics::TraceStage::IrCapture)
+                        }
+                        _ => None,
+                    };
+                    if let Some(stage) = stage {
+                        emit_trace_stage_ms(diagnostics, stage, elapsed.as_millis());
+                    }
+                },
+            )?;
+            captured.revalidate(operation)?;
+            let detection = self.detect_rgb_assessment(captured.rgb(), None, diagnostics)?;
+            let evidence = self.assess_captured_pair(
+                PairCapture::Split(captured),
+                detection,
+                PairAssessmentContext {
+                    operation,
+                    sequential: true,
+                    pair_sequential_retried: false,
+                    rgb_hard_retried: false,
+                    held_sessions: false,
+                    ir_ms: None,
+                    diagnostics,
+                },
+            )?;
+            operation.lease().validate().map_err(lease_unavailable)?;
+            let result = finish(self, evidence)?;
+            operation.lease().validate().map_err(lease_unavailable)?;
+            return Ok(result);
+        }
         // Median-denoise the RGB frame so a single blurry/over-exposed frame
         // can't false-reject a genuine user (IR is already brightest-of-burst).
         //
@@ -5472,11 +5609,10 @@ impl Engine {
             Err(e) => return Err(e.into()),
         };
         let evidence = self.assess_captured_pair(
-            rgb,
-            ir,
-            ir_stats,
+            PairCapture::Ordinary(rgb, ir, ir_stats),
             (rgb_faces, rgb_top),
             PairAssessmentContext {
+                operation,
                 sequential,
                 pair_sequential_retried,
                 rgb_hard_retried,
@@ -5540,14 +5676,13 @@ impl Engine {
 
     fn assess_captured_pair(
         &mut self,
-        mut rgb: irlume_camera::Frame,
-        ir: irlume_camera::Frame,
-        ir_stats: irlume_camera::IrCaptureStats,
+        capture: PairCapture,
         (mut rgb_faces, mut rgb_top): (Vec<Detection>, Option<Detection>),
         context: PairAssessmentContext<'_>,
     ) -> Result<DeferredAssessment<PairIdentity>, CapturePathError> {
         self.check_request_active()?;
         let PairAssessmentContext {
+            operation,
             sequential,
             pair_sequential_retried,
             rgb_hard_retried,
@@ -5555,6 +5690,22 @@ impl Engine {
             ir_ms,
             diagnostics,
         } = context;
+        let (mut rgb, ir, ir_stats, split_pair) = match capture {
+            PairCapture::Split(captured) => {
+                let (rgb, ir, stats) = captured.into_parts(operation)?;
+                (rgb, ir, stats, operation.lease().is_split_pair())
+            }
+            PairCapture::Ordinary(rgb, ir, stats) => {
+                if operation.lease().is_split_pair() {
+                    return Err(irlume_common::Error::Hardware(
+                        "split assessment requires its complete capture receipt".into(),
+                    )
+                    .into());
+                }
+                (rgb, ir, stats, false)
+            }
+        };
+        let sequential = sequential || split_pair;
         let control = self.capture_control();
         let ir_grey_rgb = irlume_camera::grey_to_rgb(&ir.data);
         let ir_view = align::RgbView {
@@ -5732,7 +5883,7 @@ impl Engine {
                     rgb_pad: PadEvidence::NotApplicable,
                     ir_pad: PadEvidence::NotApplicable,
                     sequential_pair: false, // rejected pair: no pair survives
-                    split_pair: false,
+                    split_pair,
                 }, identity: (None, None) });
             }
         };
@@ -5957,12 +6108,15 @@ impl Engine {
             shipped_ir_fake,
             rgb_pad,
             ir_pad,
-            // Paired under the schedule-aware budget AND beyond the concurrent
-            // ceiling: the bursts ran as separated one-shots (ADR-0014). Such
-            // pairs defer the RGB-primary grant (rgb_primary_grant_admissible).
-            sequential_pair: pair_admitted_sequentially(skew, rgb_top.is_some()),
-            split_pair: false,
+            // Ordinary pairs retain the skew rule (ADR-0014). Every paired
+            // split capture carries sequential posture at any skew (ADR-0032).
+            sequential_pair: (split_pair && rgb_top.is_some())
+                || pair_admitted_sequentially(skew, rgb_top.is_some()),
+            split_pair,
         };
+        if split_pair {
+            operation.lease().validate().map_err(lease_unavailable)?;
+        }
         Ok(DeferredAssessment {
             assessment,
             identity: (
@@ -6632,6 +6786,7 @@ impl Engine {
                                     service,
                                     &cameras,
                                     &capture_mode,
+                                    &camera_operation,
                                     deadline,
                                     diagnostics,
                                 )
@@ -6815,6 +6970,7 @@ impl Engine {
                             service,
                             cameras,
                             capture_mode,
+                            camera_operation,
                             deadline,
                             &mut held_pair_failed,
                             diagnostics,
@@ -11295,8 +11451,8 @@ mod tests {
 
     #[test]
     fn elapsed_time_alone_never_sets_the_split_marker() {
-        // The marker is constructed false everywhere in production; only the
-        // split capture path (later wiring) and tests set it. A derivation
+        // The marker comes from the retained operation, not a constant or a
+        // timing comparison. A derivation
         // from skew would show up as a `split_pair:` construction beside the
         // skew rule.
         let source = include_str!("lib.rs")
@@ -11310,7 +11466,7 @@ mod tests {
         let constructed_true = format!("split_pair: {},", true);
         assert!(
             !source.contains(&constructed_true),
-            "nothing in production may construct the marker true"
+            "a hardcoded true cannot manufacture split provenance"
         );
     }
 
@@ -13166,6 +13322,7 @@ mod engine_tests {
     mod request_preparation_tests;
     mod secondary_camera_tests;
     mod split_admission_tests;
+    mod split_capture_tests;
     use super::tests::env_guard;
     use super::*;
     use irlume_core::storage::{CameraBinding, Enrollment, FaceProfile, FaceScan};

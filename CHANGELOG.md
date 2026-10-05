@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Ordinary enrollment and add-camera requests accept an operation-scoped camera
+  choice through `--camera-choice JSON`. The daemon validates the displayed
+  connection guard and roles before camera work, retains the exact pair through
+  probe and capture, and restores the standing selection afterward. Non-reset
+  additions require the existing primary binding; split capture stays disabled
+  (ADR-0029, guarded ordinary operation-choice amendment; #995).
+
 - Automatic face authentication selects an eligible enrolled whole pair before
   capture, pins secondary selection to the same loaded store, and acquires the
   exact selected camera incarnation. IR authentication and readiness resolve

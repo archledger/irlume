@@ -1,0 +1,1 @@
+{"EnrollOn":{"user":"alice","profile":null,"scans":1,"reset":false,"pair":{"rgb":"/dev/video0","ir":"/dev/video9","expected":{"supervisor_id":"11111111111111111111111111111111","candidate":{"instance_id":"22222222222222222222222222222222","generation":7,"endpoint_paths":["/dev/video0","/dev/video1"]}}}}}

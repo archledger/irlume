@@ -22,8 +22,9 @@ use irlume_liveness::{LivenessGate, Signals, Verdict};
 use irlume_vision::{align, Adapter, Detection, Embedder, Landmarks5, EMBED_DIM};
 
 pub use irlume_camera::capture_qualification::{
-    AttemptOutcome, CaptureQualificationRecord, InconclusiveReason, QualificationMismatch,
-    QualificationResolution, QualificationStore, QualificationStoreError, SequentialReason,
+    AttemptOutcome, CaptureQualificationRecord, InconclusiveReason, QualificationAttempt,
+    QualificationMismatch, QualificationResolution, QualificationStore, QualificationStoreError,
+    SequentialReason,
 };
 pub use irlume_camera::lease;
 /// The evidence-grade measurement types (ADR-0023), re-exported for the
@@ -36,6 +37,7 @@ pub use irlume_camera::measurement;
 pub use irlume_camera::present_device_identities;
 pub use irlume_camera::profiles;
 pub use irlume_camera::with_camera_inventory_publication;
+pub use irlume_camera::with_selected_camera_publication;
 /// The role-bearing publication facts a split mutation validates its guard
 /// against (ADR-0032 §4). Re-exported so the daemon never depends on the
 /// camera crate directly.
@@ -57,18 +59,19 @@ pub use irlume_camera::{
 pub use irlume_camera::{
     capabilities, device_identity, nodes_share_usb_device, select_pair, select_rgb,
 };
-/// Resolve explicitly configured devices without camera discovery or image opens.
-pub use irlume_camera::{configured_ir_target, configured_pair_no_probe};
 /// IR-emitter auto-setup (integrated linux-enable-ir-emitter), re-exported for
 /// the daemon. See [`irlume_camera::setup_ir_emitter`].
 pub use irlume_camera::{
-    current_capture_qualification_context, list_ir_controls,
+    collect_qualification_context_in_operation, current_capture_qualification_context,
+    list_ir_controls, measure_capture_qualification_in_operation,
     measure_capture_qualification_with_progress, measure_contention,
     measure_contention_with_progress, no_progress, setup_ir_emitter, store_capture_mode,
     store_capture_mode_if_absent, stored_capture_mode, stored_capture_qualification, CaptureMode,
     CaptureModeOrigin, CaptureQualificationMeasurement, ContentionReport, MeasurementSource,
     PairSample, Progress, StoreIfAbsent,
 };
+/// Resolve explicitly configured devices without camera discovery or image opens.
+pub use irlume_camera::{configured_ir_target, configured_pair_no_probe};
 
 /// Loaded models + camera device selection. Build once, reuse per request.
 pub struct Engine {
@@ -467,6 +470,7 @@ struct CapturedScan {
 /// since capture (source revision). Only then builds the next store -
 /// generation bumped, digest bound to the CURRENT primary bytes - and
 /// publishes. Failure at any step publishes nothing.
+#[cfg(test)]
 fn publish_camera_group(
     user: &str,
     pair: &irlume_core::multi_camera::GroupPair,
@@ -476,6 +480,49 @@ fn publish_camera_group(
     authorization: &irlume_core::multi_camera::authz::EnrollmentAuthorization,
     now_unix: u64,
 ) -> irlume_common::Result<String> {
+    publish_camera_group_with(
+        CameraGroupPublication {
+            user,
+            pair,
+            group_id,
+            profile,
+            start_enr,
+            authorization,
+            now_unix,
+        },
+        |prepared| {
+            prepared
+                .publish()
+                .map_err(|error| irlume_common::Error::Protocol(error.to_string()))
+        },
+    )
+}
+
+struct CameraGroupPublication<'a> {
+    user: &'a str,
+    pair: &'a irlume_core::multi_camera::GroupPair,
+    group_id: &'a str,
+    profile: &'a irlume_core::multi_camera::SecondaryProfileScans,
+    start_enr: &'a irlume_core::storage::Enrollment,
+    authorization: &'a irlume_core::multi_camera::authz::EnrollmentAuthorization,
+    now_unix: u64,
+}
+
+fn publish_camera_group_with(
+    input: CameraGroupPublication<'_>,
+    publish: impl FnOnce(
+        irlume_core::multi_camera::commit::PreparedSecondaryCommit,
+    ) -> irlume_common::Result<()>,
+) -> irlume_common::Result<String> {
+    let CameraGroupPublication {
+        user,
+        pair,
+        group_id,
+        profile,
+        start_enr,
+        authorization,
+        now_unix,
+    } = input;
     use irlume_core::multi_camera::authz::{ensure_not_consumed, EnrollmentOperation};
     let operation = EnrollmentOperation::add_group(group_id.into(), pair);
     authorization
@@ -542,12 +589,13 @@ fn publish_camera_group(
     });
     ensure_not_consumed(authorization, next.generation, None)
         .map_err(|error| irlume_common::Error::Policy(error.to_string()))?;
-    irlume_core::multi_camera::commit::publish_with_intent(
+    let prepared = irlume_core::multi_camera::commit::prepare_with_intent(
         &secondary_path,
         &next,
         &next.primary_snapshot_sha256,
     )
     .map_err(|error| irlume_common::Error::Protocol(error.to_string()))?;
+    publish(prepared)?;
     Ok(group_id.to_owned())
 }
 
@@ -790,24 +838,6 @@ fn dark_ir_rgb_only_enrollment_refusal(
          emitter (`sudo irlume ir-setup`), then enroll again"
             .into(),
     ))
-}
-
-/// Whether the stored qualification authorizes CONCURRENT capture for this
-/// pair: the only pair shape an RGB-only enrollment can ever authenticate on
-/// (rgb-primary admission requires a non-sequential pair). Absent, unreadable,
-/// and context-mismatched records all read "not concurrent": the unmeasured
-/// default captures one frame at a time, and so does a stored sequential
-/// verdict. No camera is opened; the store is the whole question.
-fn pair_qualifies_concurrent(rgb_dev: &str, ir_dev: &str) -> bool {
-    let resolved = (|| {
-        let context = current_capture_qualification_context(rgb_dev, ir_dev).ok()?;
-        let record = QualificationStore::system().load(&context).ok()??;
-        Some(matches!(
-            record.resolve(&context),
-            QualificationResolution::ConcurrentQualified
-        ))
-    })();
-    resolved.unwrap_or(false)
 }
 
 /// Mean of the GREY bytes inside a pixel bbox (x1, y1, x2, y2), clamped to
@@ -7796,12 +7826,15 @@ impl Engine {
         } else {
             vec![rgb_dev.as_str()]
         };
-        let operation = irlume_camera::lease::acquire_camera_operation(
-            &endpoints,
-            irlume_camera::lease::CameraOperationKind::Enrollment,
-            std::time::Duration::from_secs(2),
-        )
-        .map_err(lease_unavailable)?;
+        self.validate_camera_request()?;
+        let operation = self
+            .acquire_account_camera(
+                &endpoints,
+                irlume_camera::lease::CameraOperationKind::Enrollment,
+                std::time::Duration::from_secs(2),
+            )
+            .map_err(lease_unavailable)?;
+        self.validate_camera_request()?;
         let cams = if use_ir {
             match (operation.open_rgb(&rgb_dev), operation.open_ir(&ir_dev)) {
                 (Ok(r), Ok(i)) => Some((r, i)),
@@ -8075,7 +8108,18 @@ impl Engine {
             return None;
         }
         let held_mean = shape.rgb_mean_sum / shape.attempts as f32;
-        let frame = irlume_camera::capture_rgb(&self.rgb_dev).ok()?;
+        self.validate_camera_request().ok()?;
+        let operation = self
+            .acquire_account_camera(
+                &[self.rgb_dev.as_str()],
+                irlume_camera::lease::CameraOperationKind::Diagnostics,
+                std::time::Duration::from_secs(2),
+            )
+            .ok()?;
+        let frame = operation
+            .run(|| irlume_camera::capture_rgb(&self.rgb_dev))
+            .ok()?
+            .ok()?;
         let solo_mean = irlume_camera::frame_mean(&frame.data);
         let view = align::RgbView {
             data: &frame.data,
@@ -8123,7 +8167,10 @@ impl Engine {
         if !self.ir_available {
             return false;
         }
-        let operation = match irlume_camera::lease::acquire_camera_operation(
+        if self.validate_camera_request().is_err() {
+            return false;
+        }
+        let operation = match self.acquire_account_camera(
             &[rgb_dev.as_str(), ir_dev.as_str()],
             irlume_camera::lease::CameraOperationKind::Authentication,
             std::time::Duration::from_secs(2),
@@ -8204,7 +8251,7 @@ impl Engine {
         if consecutive_ir_only < SELF_HEAL_SWITCH_AFTER as usize {
             return;
         }
-        let selection = standalone_capture_mode_selection(&self.rgb_dev, &self.ir_dev);
+        let selection = self.capture_mode_selection_for_request();
         if selection.is_sequential() || selection.source == ENV_CAPTURE_MODE_SOURCE {
             return;
         }
@@ -8215,6 +8262,31 @@ impl Engine {
             return;
         }
         trip_runtime_capture_health(context_key, RuntimeDegradation::ConfirmedSignalLoss);
+    }
+
+    fn capture_mode_selection_for_request(&self) -> CaptureModeSelection {
+        if self.validate_camera_request().is_err() {
+            return unavailable_capture_mode_selection();
+        }
+        let operation = match self.acquire_account_camera(
+            &[&self.rgb_dev, &self.ir_dev],
+            irlume_camera::lease::CameraOperationKind::Diagnostics,
+            std::time::Duration::from_secs(2),
+        ) {
+            Ok(operation) => operation,
+            Err(_) => return unavailable_capture_mode_selection(),
+        };
+        let selected = match (
+            operation.open_rgb(&self.rgb_dev),
+            operation.open_ir(&self.ir_dev),
+        ) {
+            (Ok(rgb), Ok(ir)) => capture_mode_selection(&rgb, &ir),
+            _ => return unavailable_capture_mode_selection(),
+        };
+        if operation.lease().validate().is_err() {
+            return unavailable_capture_mode_selection();
+        }
+        selected
     }
 
     /// Enroll `want` scans (capped at MAX_SCANS_PER_PROFILE). If the captured
@@ -8380,6 +8452,7 @@ impl Engine {
         } else {
             storage::load_unmoved(user)?.unwrap_or_else(|| Enrollment::new(user))
         };
+        self.validate_operation_primary(&enr, replace)?;
         let want = want.clamp(1, MAX_SCANS_PER_PROFILE);
         // Fail fast on an explicit duplicate name, before the camera opens. The
         // auto-generated name can't collide.
@@ -8398,7 +8471,10 @@ impl Engine {
         let preflight_dark = self.ir_available && !ir_preflight(&mut self.det);
         if preflight_dark {
             dark_ir_rgb_only_enrollment_refusal(|| {
-                pair_qualifies_concurrent(&self.rgb_dev, &self.ir_dev)
+                matches!(
+                    self.capture_qualification_for_request(),
+                    Ok(QualificationResolution::ConcurrentQualified)
+                )
             })?;
         }
         let force_rgb_only = !self.ir_available || preflight_dark;
@@ -8436,10 +8512,17 @@ impl Engine {
                 "enrollment stopped before publication".into(),
             ));
         }
+        self.validate_camera_request()?;
+        let publish = |path: &std::path::Path, bytes: &[u8]| {
+            self.with_prepared_camera_publication(|| {
+                irlume_common::write_atomic_reporting(path, bytes, 0o600)
+                    .map_err(|error| irlume_common::Error::Io(error.to_string()))
+            })
+        };
         if replace {
-            storage::save_replacement(&enr)?;
+            storage::save_replacement_with_publisher(&enr, publish)?;
         } else {
-            storage::save(&enr)?;
+            storage::save_with_publisher(&enr, publish)?;
         }
         Ok(outcome)
     }
@@ -8685,6 +8768,13 @@ impl Engine {
     /// Snapshot the identity of the cameras this engine is bound to, for
     /// anti-swap verification at auth.
     fn current_binding(&self) -> irlume_core::storage::CameraBinding {
+        if let Some(binding) = self
+            .camera_selection
+            .as_ref()
+            .and_then(|selection| selection.binding())
+        {
+            return binding;
+        }
         irlume_core::storage::CameraBinding::Ordinary {
             rgb: irlume_camera::device_identity(&self.rgb_dev),
             ir: irlume_camera::device_identity(&self.ir_dev),
@@ -8975,7 +9065,10 @@ impl Engine {
         let preflight_dark = self.ir_available && !ir_preflight(&mut self.det);
         if preflight_dark {
             dark_ir_rgb_only_enrollment_refusal(|| {
-                pair_qualifies_concurrent(&self.rgb_dev, &self.ir_dev)
+                matches!(
+                    self.capture_qualification_for_request(),
+                    Ok(QualificationResolution::ConcurrentQualified)
+                )
             })?;
         }
         let force_rgb_only = !self.ir_available || preflight_dark;
@@ -9245,7 +9338,10 @@ impl Engine {
         let preflight_dark = self.ir_available && !ir_preflight(&mut self.det);
         if preflight_dark {
             dark_ir_rgb_only_enrollment_refusal(|| {
-                pair_qualifies_concurrent(&self.rgb_dev, &self.ir_dev)
+                matches!(
+                    self.capture_qualification_for_request(),
+                    Ok(QualificationResolution::ConcurrentQualified)
+                )
             })?;
         }
         let force_rgb_only = !self.ir_available || preflight_dark;
@@ -9326,18 +9422,29 @@ impl Engine {
         }
         let mut group_profile = captured;
         self.refit_profile_calib(&mut group_profile);
-        publish_camera_group(
-            user,
-            &pair,
-            &group_id,
-            &irlume_core::multi_camera::SecondaryProfileScans {
-                profile: group_profile.name.clone(),
-                scans: group_profile.scans.clone(),
-                ir_calibs: group_profile.ir_calibs.clone(),
+        self.validate_camera_request()?;
+        publish_camera_group_with(
+            CameraGroupPublication {
+                user,
+                pair: &pair,
+                group_id: &group_id,
+                profile: &irlume_core::multi_camera::SecondaryProfileScans {
+                    profile: group_profile.name.clone(),
+                    scans: group_profile.scans.clone(),
+                    ir_calibs: group_profile.ir_calibs.clone(),
+                },
+                start_enr: &enr,
+                authorization,
+                now_unix,
             },
-            &enr,
-            authorization,
-            now_unix,
+            |prepared| {
+                let publish = || {
+                    prepared
+                        .publish()
+                        .map_err(|error| irlume_common::Error::Protocol(error.to_string()))
+                };
+                self.with_prepared_camera_publication(publish)
+            },
         )
     }
 

@@ -529,9 +529,12 @@ pub(crate) fn request_kind(req: &Request) -> Option<(LiveOperationKind, bool)> {
         UnsealPassword { .. } | UnsealKeyring { .. } | ReleaseTokenForDisarm { .. } => {
             (K::WalletAuthentication, false)
         }
-        Enroll { .. } | EnrollmentSession { .. } | AddScan { .. } | AddCameraGroup { .. } => {
-            (K::Enrollment, true)
-        }
+        Enroll { .. }
+        | EnrollOn { .. }
+        | EnrollmentSession { .. }
+        | AddScan { .. }
+        | AddCameraGroup { .. }
+        | AddCameraGroupOn { .. } => (K::Enrollment, true),
         PositionSample { .. } | PositionSession { .. } => (K::Framing, false),
         // A recognition test changes no state: advancing the revision
         // would make every client drop all of its daemon observations.

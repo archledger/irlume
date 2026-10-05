@@ -4260,17 +4260,19 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             enrollment: AddsTrust,
             camera: Captures,
         },
-        Enroll { user, .. } | EnrollmentSession { user, .. } => RequestPosture {
-            privilege: RootOrTarget { verb: "enroll" },
-            user: Some(user.as_str()),
-            enrollment: AddsTrust,
-            camera: Captures,
-        },
+        Enroll { user, .. } | EnrollOn { user, .. } | EnrollmentSession { user, .. } => {
+            RequestPosture {
+                privilege: RootOrTarget { verb: "enroll" },
+                user: Some(user.as_str()),
+                enrollment: AddsTrust,
+                camera: Captures,
+            }
+        }
         // A camera-group addition is an enrollment addition on another
         // camera (ADR-0024 §4): same trust, same approval class. Removal
         // rewrites the secondary store only; the primary summary stays
         // valid until group reporting ships.
-        AddCameraGroup { user, .. } => RequestPosture {
+        AddCameraGroup { user, .. } | AddCameraGroupOn { user, .. } => RequestPosture {
             privilege: RootOrTarget { verb: "enroll" },
             user: Some(user.as_str()),
             enrollment: AddsTrust,
@@ -6226,10 +6228,36 @@ fn run_capture_mode_probe(
     policy: ProbeStore,
     emit_record_path: Option<&str>,
 ) -> Result<String, String> {
+    run_capture_mode_probe_selected(rgb_dev, ir_dev, rounds, policy, emit_record_path, None)
+}
+
+fn run_capture_mode_probe_selected(
+    rgb_dev: &str,
+    ir_dev: &str,
+    rounds: usize,
+    policy: ProbeStore,
+    emit_record_path: Option<&str>,
+    expected: Option<&irlume_auth::lease::OrdinaryLeaseRequest>,
+) -> Result<String, String> {
+    let operation = expected
+        .map(|expected| {
+            irlume_auth::lease::acquire_selected_camera_operation(
+                expected,
+                &[rgb_dev, ir_dev],
+                irlume_auth::lease::CameraOperationKind::Diagnostics,
+                std::time::Duration::from_secs(2),
+            )
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let store = irlume_auth::QualificationStore::system();
     let automatic_baseline = if policy == ProbeStore::AutomaticIfAbsent {
-        let context = irlume_auth::current_capture_qualification_context(rgb_dev, ir_dev)
-            .map_err(|error| error.to_string())?;
+        let context = if let Some(operation) = &operation {
+            irlume_auth::collect_qualification_context_in_operation(rgb_dev, ir_dev, operation)
+        } else {
+            irlume_auth::current_capture_qualification_context(rgb_dev, ir_dev)
+        }
+        .map_err(|error| error.to_string())?;
         if store
             .load(&context)
             .map_err(|error| error.to_string())?
@@ -6248,9 +6276,13 @@ fn run_capture_mode_probe(
     // wedged driver by the watchdog (#141), and per silent warm-up window
     // inside each capture (#336).
     let progress: irlume_auth::Progress = std::sync::Arc::new(note_worker_progress);
-    let measurement = irlume_auth::measure_capture_qualification_with_progress(
-        rgb_dev, ir_dev, rounds, &progress,
-    )
+    let measurement = if let Some(operation) = &operation {
+        irlume_auth::measure_capture_qualification_in_operation(
+            rgb_dev, ir_dev, rounds, &progress, operation,
+        )
+    } else {
+        irlume_auth::measure_capture_qualification_with_progress(rgb_dev, ir_dev, rounds, &progress)
+    }
     .map_err(|e| e.to_string())?;
     let report = measurement.report();
     if let Some(path) = emit_record_path {
@@ -6284,7 +6316,7 @@ fn run_capture_mode_probe(
             .as_ref()
             .map(irlume_auth::CaptureQualificationRecord::revision)
     };
-    let saved = store.save_attempt(attempt, expected_revision);
+    let saved = save_selected_capture_qualification(&store, attempt, expected_revision, expected);
     count_qualification_write(&saved);
     let stored = match saved {
         Ok(record) => record,
@@ -6329,6 +6361,27 @@ fn run_capture_mode_probe(
         persisted_outcome,
         rounds,
     ))
+}
+
+fn save_selected_capture_qualification(
+    store: &irlume_auth::QualificationStore,
+    attempt: irlume_auth::QualificationAttempt,
+    expected_revision: Option<u64>,
+    expected: Option<&irlume_auth::lease::OrdinaryLeaseRequest>,
+) -> Result<irlume_auth::CaptureQualificationRecord, irlume_auth::QualificationStoreError> {
+    if let Some(expected) = expected {
+        store.save_attempt_with_publisher(attempt, expected_revision, |path, bytes| {
+            irlume_auth::with_selected_camera_publication(expected, || {
+                irlume_common::write_atomic_reporting(path, bytes, 0o600)
+                    .map_err(|error| irlume_auth::QualificationStoreError::Io(error.to_string()))
+            })
+            .map_err(|error| {
+                irlume_auth::QualificationStoreError::PublicationRefused(error.to_string())
+            })?
+        })
+    } else {
+        store.save_attempt(attempt, expected_revision)
+    }
 }
 
 /// Exact typed delivered-rate facts in stable role order. The role labels come
@@ -6595,7 +6648,30 @@ fn enrollment_capture_uses_ir<E>(emitter: &Result<bool, E>) -> bool {
 }
 
 fn prepare_enrollment_ir(device: &str, det: &mut irlume_auth::Detector) -> bool {
-    let emitter = irlume_auth::apply_known_ir_emitter_subject_region(device, det);
+    prepare_enrollment_ir_selected(device, det, None)
+}
+
+fn prepare_enrollment_ir_selected(
+    device: &str,
+    det: &mut irlume_auth::Detector,
+    expected: Option<&irlume_auth::lease::OrdinaryLeaseRequest>,
+) -> bool {
+    let emitter = if let Some(expected) = expected {
+        irlume_auth::lease::acquire_selected_camera_operation(
+            expected,
+            &[device],
+            irlume_auth::lease::CameraOperationKind::Enrollment,
+            std::time::Duration::from_secs(2),
+        )
+        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))
+        .and_then(|operation| {
+            operation
+                .run(|| irlume_auth::apply_known_ir_emitter_subject_region(device, det))
+                .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?
+        })
+    } else {
+        irlume_auth::apply_known_ir_emitter_subject_region(device, det)
+    };
     match &emitter {
         Ok(true) => {}
         Ok(false) => jout_notice!(
@@ -6670,9 +6746,11 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | ReleaseTokenForDisarm { .. }
         | SealPassword { .. } => OperationClass::Authentication,
         Enroll { .. }
+        | EnrollOn { .. }
         | EnrollmentSession { .. }
         | AddScan { .. }
         | AddCameraGroup { .. }
+        | AddCameraGroupOn { .. }
         | RemoveCameraGroup { .. }
         | PositionSample { .. }
         | PositionSession { .. } => OperationClass::Enrollment,
@@ -8007,6 +8085,27 @@ fn dispatch_scoped_session_inner(
             return Response::Error(error);
         }
     }
+    if let Request::EnrollOn { pair, .. } | Request::AddCameraGroupOn { pair, .. } = &req {
+        let mut camera_request = match engine.prepare_enrollment_camera(pair) {
+            Ok(request) => request,
+            Err(error) => return Response::Error(error.to_string()),
+        };
+        if let Request::EnrollOn { user, reset, .. } = &req {
+            if let Err(error) = camera_request.validate_enrollment_camera_primary(user, *reset) {
+                return Response::Error(error.to_string());
+            }
+        }
+        return dispatch_after_authorization(
+            req,
+            peer,
+            &mut camera_request,
+            scope,
+            session,
+            position,
+            completion,
+            delivery,
+        );
+    }
     if matches!(
         req,
         Request::Enroll { .. }
@@ -8051,6 +8150,28 @@ fn dispatch_after_authorization(
     delivery: &mut Delivery<'_>,
 ) -> Response {
     let req = match req {
+        Request::EnrollOn {
+            user,
+            profile,
+            scans,
+            reset,
+            ..
+        } => Request::Enroll {
+            user,
+            profile,
+            scans,
+            reset,
+        },
+        Request::AddCameraGroupOn {
+            user,
+            profile,
+            scans,
+            ..
+        } => Request::AddCameraGroup {
+            user,
+            profile,
+            scans,
+        },
         Request::EnrollmentSession {
             user,
             profile,
@@ -8121,6 +8242,9 @@ fn dispatch_after_authorization(
         invalidate_enrollment_summary(user);
     }
     match req {
+        Request::EnrollOn { .. } | Request::AddCameraGroupOn { .. } => {
+            Response::Error("operation camera choice requires its prepared request scope".into())
+        }
         Request::RetryStatus { .. } | Request::RetryReset { .. } => {
             Response::Error("retry recovery requires its live connection".into())
         }
@@ -8492,6 +8616,7 @@ fn dispatch_after_authorization(
             scans,
             reset,
         } => {
+            let expected = engine.prepared_camera_lease();
             let want = scans.unwrap_or(irlume_core::storage::DEFAULT_ENROLL_SCANS);
             // Apply the known emitter control so dark-mode scans enroll cleanly.
             // Asking to enroll a face is not consent to probe camera firmware
@@ -8515,8 +8640,7 @@ fn dispatch_after_authorization(
             // module) has nowhere to store a result either (#340 review).
             let identifiable = irlume_auth::device_identity(&rgb_dev).is_some()
                 && irlume_auth::device_identity(&ir_dev).is_some();
-            let qualified_mode = match irlume_auth::stored_capture_qualification(&rgb_dev, &ir_dev)
-            {
+            let qualified_mode = match engine.capture_qualification_for_request() {
                 Ok(irlume_auth::QualificationResolution::ConcurrentQualified) => {
                     Some(irlume_auth::CaptureMode::Concurrent)
                 }
@@ -8534,17 +8658,19 @@ fn dispatch_after_authorization(
                          running the one-time contention probe before the scans (up to a \
                          minute; the IR emitter fires)"
                     );
-                    run_capture_mode_probe(
+                    run_capture_mode_probe_selected(
                         &rgb_dev,
                         &ir_dev,
                         TUNE_DEFAULT_ROUNDS,
                         ProbeStore::AutomaticIfAbsent,
                         None,
+                        expected.as_ref(),
                     )
                 },
                 || {
-                    let preflight =
-                        |det: &mut irlume_auth::Detector| prepare_enrollment_ir(&ir_dev, det);
+                    let preflight = |det: &mut irlume_auth::Detector| {
+                        prepare_enrollment_ir_selected(&ir_dev, det, expected.as_ref())
+                    };
                     let result = if let Some(observer) = session {
                         engine.enroll_profile_observed(
                             &user, profile, want, preflight, scope, observer,
@@ -9692,6 +9818,7 @@ fn add_camera_group(
         Err(error) => return Response::Error(error.to_string()),
     };
     let engine = &mut *camera_request;
+    let expected = engine.prepared_camera_lease();
     // The enrollment gate first (the engine re-checks; this is the UX
     // order): an account with no primary enrollment has nothing to extend.
     if matches!(irlume_core::storage::load_unmoved(user), Ok(None)) {
@@ -9737,7 +9864,7 @@ fn add_camera_group(
     // new pair should authenticate concurrently if it qualifies.
     let identifiable = irlume_auth::device_identity(&rgb_dev).is_some()
         && irlume_auth::device_identity(&ir_dev).is_some();
-    let qualified_mode = match irlume_auth::stored_capture_qualification(&rgb_dev, &ir_dev) {
+    let qualified_mode = match engine.capture_qualification_for_request() {
         Ok(irlume_auth::QualificationResolution::ConcurrentQualified) => {
             Some(irlume_auth::CaptureMode::Concurrent)
         }
@@ -9756,16 +9883,19 @@ fn add_camera_group(
                  running the one-time contention probe before the scans (up to a \
                  minute; the IR emitter fires)"
             );
-            run_capture_mode_probe(
+            run_capture_mode_probe_selected(
                 &rgb_dev,
                 &ir_dev,
                 TUNE_DEFAULT_ROUNDS,
                 ProbeStore::AutomaticIfAbsent,
                 None,
+                expected.as_ref(),
             )
         },
         || {
-            let preflight = |det: &mut irlume_auth::Detector| prepare_enrollment_ir(&ir_dev, det);
+            let preflight = |det: &mut irlume_auth::Detector| {
+                prepare_enrollment_ir_selected(&ir_dev, det, expected.as_ref())
+            };
             match engine.add_camera_group_observed(
                 &user,
                 profile.clone(),
@@ -12442,6 +12572,22 @@ mod tests {
         ));
     }
 
+    fn catalog_enrollment_choice() -> Box<irlume_common::live_camera::EnrollmentCameraChoice> {
+        use irlume_common::live_camera::*;
+        Box::new(EnrollmentCameraChoice {
+            rgb: "/dev/video0".into(),
+            ir: "/dev/video1".into(),
+            expected: CameraSelection {
+                supervisor_id: "11111111111111111111111111111111".into(),
+                candidate: CameraCandidate {
+                    instance_id: "22222222222222222222222222222222".into(),
+                    generation: 1,
+                    endpoint_paths: vec!["/dev/video0".into(), "/dev/video1".into()],
+                },
+            },
+        })
+    }
+
     request_catalog! {
         u, secret;
         Authenticate => Request::Authenticate {
@@ -12457,10 +12603,17 @@ mod tests {
             scans: None,
             reset: false,
         },
+        EnrollOn => Request::EnrollOn {
+            user: u(), profile: None, scans: None, reset: false,
+            pair: catalog_enrollment_choice(),
+        },
         AddCameraGroup => Request::AddCameraGroup {
             user: u(),
             profile: None,
             scans: None,
+        },
+        AddCameraGroupOn => Request::AddCameraGroupOn {
+            user: u(), profile: None, scans: None, pair: catalog_enrollment_choice(),
         },
         RemoveCameraGroup => Request::RemoveCameraGroup {
             user: u(),
@@ -12781,7 +12934,9 @@ mod tests {
             [
                 "EnrollmentSession",
                 "Enroll",
+                "EnrollOn",
                 "AddCameraGroup",
+                "AddCameraGroupOn",
                 "RemoveCameraGroup",
                 "AddScan",
                 "DeleteProfile",
@@ -13129,10 +13284,12 @@ mod tests {
             captures,
             vec![
                 "AddCameraGroup",
+                "AddCameraGroupOn",
                 "AddScan",
                 "Authenticate",
                 "CameraDiagnostics",
                 "Enroll",
+                "EnrollOn",
                 "EnrollmentSession",
                 "Identify",
                 "IdentifyFor",
@@ -15346,9 +15503,11 @@ mod tests {
         // it changes the key material the enrollment is sealed under.
         let mutates = [
             "Enroll",
+            "EnrollOn",
             "EnrollmentSession",
             "AddScan",
             "AddCameraGroup",
+            "AddCameraGroupOn",
             "RemoveCameraGroup",
             "DeleteProfile",
             "DeleteScan",

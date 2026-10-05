@@ -2030,7 +2030,8 @@ SETUP & STATUS
                         guard/side syntax. Status and changes require root.
 
 ENROLLMENT & AUTH
-  enroll [--name N] [--scans K] [--reset] [--add-camera]   capture a face
+  enroll [--name N] [--scans K] [--reset] [--add-camera]
+         [--camera-choice JSON]   capture a face on a guarded ordinary pair
                         profile (or a second camera group: ADR-0024)
   profiles [list|add-scan|remove-camera|rename|delete|forget-model|eyes-open off]   manage profiles
                         (one-release migration only: clears the retired gate;

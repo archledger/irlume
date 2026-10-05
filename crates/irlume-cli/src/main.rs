@@ -326,10 +326,14 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
         Ok(s) => s,
         Err(code) => return code,
     };
+    let choice = match enrollment_camera_choice_flag(args) {
+        Ok(choice) => choice,
+        Err(code) => return code,
+    };
     let reset = args.iter().any(|a| a == "--reset");
     let add_camera = args.iter().any(|a| a == "--add-camera");
     if add_camera {
-        return enroll_add_camera(&user, name, scans);
+        return enroll_add_camera(&user, name, scans, choice);
     }
     eprintln!("[enroll] approve the system authentication dialog before capture; each additional scan request needs approval");
     if reset {
@@ -345,12 +349,23 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
         "[enroll] if this camera pair has no measured capture mode yet, irlume measures \
          it first (one time, up to a minute; the IR emitter fires)"
     );
-    match daemon_request(&Request::Enroll {
-        user: user.clone(),
-        profile: name,
-        scans,
-        reset,
-    }) {
+    let explicit = choice.is_some();
+    let request = match choice {
+        Some(pair) => Request::EnrollOn {
+            user: user.clone(),
+            profile: name,
+            scans,
+            reset,
+            pair,
+        },
+        None => Request::Enroll {
+            user: user.clone(),
+            profile: name,
+            scans,
+            reset,
+        },
+    };
+    match daemon_request(&request) {
         Ok(Response::Enrolled {
             profile,
             created,
@@ -378,7 +393,7 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         Ok(Response::Error(e)) => {
-            eprintln!("enroll failed: {e}");
+            eprintln!("enroll failed: {}", enrollment_choice_error(&e, explicit));
             std::process::ExitCode::FAILURE
         }
         Ok(other) => {
@@ -392,6 +407,44 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
     }
 }
 
+fn enrollment_camera_choice_flag(
+    args: &[String],
+) -> Result<Option<Box<irlume_common::live_camera::EnrollmentCameraChoice>>, std::process::ExitCode>
+{
+    let count = args
+        .iter()
+        .filter(|arg| arg.as_str() == "--camera-choice" || arg.starts_with("--camera-choice="))
+        .count();
+    if count == 0 {
+        return Ok(None);
+    }
+    let parse = || {
+        if count != 1 {
+            return Err("--camera-choice may be given only once".to_owned());
+        }
+        let text = flag(args, "--camera-choice")
+            .ok_or_else(|| "--camera-choice needs a JSON choice".to_owned())?;
+        serde_json::from_str::<irlume_common::live_camera::EnrollmentCameraChoice>(text)
+            .map(Box::new)
+            .map_err(|error| format!("invalid --camera-choice: {error}"))
+    };
+    match parse() {
+        Ok(choice) => Ok(Some(choice)),
+        Err(reason) => {
+            eprintln!("[enroll] {reason}");
+            Err(std::process::ExitCode::from(2))
+        }
+    }
+}
+
+fn enrollment_choice_error(error: &str, explicit: bool) -> String {
+    if explicit && error == "bad request" {
+        "operation-scoped camera choice needs a newer irlumed; restart it after the upgrade (no fallback attempted)".into()
+    } else {
+        error.into()
+    }
+}
+
 /// `irlume enroll --add-camera [--name P]`: enroll the CURRENT camera pair
 /// as a secondary camera group (ADR-0024 §4). Attended capture on the new
 /// pair; the daemon derives the group from the pair's USB identities and
@@ -401,6 +454,7 @@ fn enroll_add_camera(
     user: &str,
     profile: Option<String>,
     scans: Option<usize>,
+    choice: Option<Box<irlume_common::live_camera::EnrollmentCameraChoice>>,
 ) -> std::process::ExitCode {
     use irlume_common::{Request, Response};
     eprintln!("[add-camera] approve the system authentication dialog before capture");
@@ -412,11 +466,21 @@ fn enroll_add_camera(
         "[add-camera] an unmeasured pair is measured first (one time, up to a minute; \
          the IR emitter fires)"
     );
-    match daemon_request(&Request::AddCameraGroup {
-        user: user.to_owned(),
-        profile,
-        scans,
-    }) {
+    let explicit = choice.is_some();
+    let request = match choice {
+        Some(pair) => Request::AddCameraGroupOn {
+            user: user.to_owned(),
+            profile,
+            scans,
+            pair,
+        },
+        None => Request::AddCameraGroup {
+            user: user.to_owned(),
+            profile,
+            scans,
+        },
+    };
+    match daemon_request(&request) {
         Ok(Response::Ok(message)) => {
             println!("[add-camera] {message}");
             println!(
@@ -426,7 +490,10 @@ fn enroll_add_camera(
             std::process::ExitCode::SUCCESS
         }
         Ok(Response::Error(e)) => {
-            eprintln!("add-camera failed: {e}");
+            eprintln!(
+                "add-camera failed: {}",
+                enrollment_choice_error(&e, explicit)
+            );
             std::process::ExitCode::FAILURE
         }
         Ok(other) => {
@@ -1991,8 +2058,10 @@ pub(crate) fn daemon_request(
     let seconds = if matches!(
         req,
         irlume_common::Request::Enroll { .. }
+            | irlume_common::Request::EnrollOn { .. }
             | irlume_common::Request::AddScan { .. }
             | irlume_common::Request::AddCameraGroup { .. }
+            | irlume_common::Request::AddCameraGroupOn { .. }
             | irlume_common::Request::RemoveCameraGroup { .. }
             | irlume_common::Request::RecoverySetup { .. }
             | irlume_common::Request::RecoveryForget { .. }

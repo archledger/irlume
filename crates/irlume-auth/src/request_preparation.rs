@@ -19,11 +19,15 @@ pub(crate) struct PreparedSelection {
     ir_available: bool,
     automatic: bool,
     retain_standing: bool,
+    enrollment_choice: bool,
 }
 
 impl PreparedSelection {
     pub(super) fn automatic(&self) -> bool {
         self.automatic
+    }
+    pub(super) fn enrollment_choice(&self) -> bool {
+        self.enrollment_choice
     }
     pub(super) fn has_account_candidates(&self) -> bool {
         self.view.ordinary.state == irlume_common::live_camera::CameraInventoryState::Current
@@ -102,6 +106,15 @@ impl PreparedSelection {
     }
 
     pub(super) fn observe(rgb: &str, ir: &str, ir_available: bool) -> irlume_common::Result<Self> {
+        Self::observe_choice(rgb, ir, ir_available, None)
+    }
+
+    fn observe_choice(
+        rgb: &str,
+        ir: &str,
+        ir_available: bool,
+        choice: Option<&irlume_common::live_camera::EnrollmentCameraChoice>,
+    ) -> irlume_common::Result<Self> {
         let snapshot = irlume_common::split_publish::read_camera_selection();
         if matches!(
             snapshot.observation().selection,
@@ -127,14 +140,21 @@ impl PreparedSelection {
                 ));
             }
         };
-        let view = irlume_camera::connected_pairs_with_split(records);
-        let env = ordinary_environment_pair();
+        let view = if let Some(choice) = choice {
+            irlume_camera::enrollment_connected_pairs(choice, records)
+                .map_err(|reason| Error::Policy(reason.into()))?
+        } else {
+            irlume_camera::connected_pairs_with_split(records)
+        };
+        let env = choice
+            .map(|choice| (choice.rgb.clone(), choice.ir.clone()))
+            .or_else(ordinary_environment_pair);
         let automatic = env.is_none()
             && matches!(
                 snapshot.observation().selection,
                 CameraSelectionObservation::Fresh | CameraSelectionObservation::Automatic { .. }
             );
-        let (rgb, ir) = if selected.is_some() {
+        let (rgb, ir) = if selected.is_some() || choice.is_some() {
             let (rgb, ir) = env.ok_or_else(|| {
                 Error::Policy(
                     irlume_camera::lease::CameraLeaseError::SplitActivationDisabled.to_string(),
@@ -171,6 +191,7 @@ impl PreparedSelection {
             ir_available,
             automatic,
             retain_standing: false,
+            enrollment_choice: choice.is_some(),
         })
     }
 }
@@ -251,6 +272,125 @@ impl Drop for CameraRequestScope<'_> {
 }
 
 impl Engine {
+    /// Check operation-scoped primary compatibility before daemon camera work.
+    /// The enrollment entry repeats this check against its own loaded store.
+    ///
+    /// # Errors
+    /// Refuses unreadable enrollment, stale selection or a non-reset operation
+    /// whose existing binding or scans lack the same complete primary binding.
+    /// An empty, unbound enrollment may start on the chosen pair.
+    pub fn validate_enrollment_camera_primary(
+        &self,
+        user: &str,
+        replace: bool,
+    ) -> irlume_common::Result<()> {
+        self.validate_camera_request()?;
+        if replace
+            || !self
+                .camera_selection
+                .as_ref()
+                .is_some_and(PreparedSelection::enrollment_choice)
+        {
+            return Ok(());
+        }
+        let enrollment = irlume_core::storage::load_unmoved(user)?
+            .unwrap_or_else(|| irlume_core::storage::Enrollment::new(user));
+        self.validate_operation_primary(&enrollment, replace)
+    }
+
+    pub(super) fn validate_operation_primary(
+        &self,
+        enrollment: &irlume_core::storage::Enrollment,
+        replace: bool,
+    ) -> irlume_common::Result<()> {
+        if !replace
+            && self
+                .camera_selection
+                .as_ref()
+                .is_some_and(PreparedSelection::enrollment_choice)
+            && (enrollment.camera_binding.is_some()
+                || enrollment
+                    .profiles
+                    .iter()
+                    .any(|profile| !profile.scans.is_empty()))
+            && enrollment
+                .camera_binding
+                .as_ref()
+                .and_then(|binding| binding.complete_key())
+                != self.current_binding().complete_key()
+        {
+            return Err(Error::Policy("this enrollment belongs to another or unbound camera; use --add-camera or explicitly --reset".into()));
+        }
+        Ok(())
+    }
+
+    /// Prepare a guarded ordinary choice for this enrollment operation only.
+    ///
+    /// # Errors
+    /// Refuses invalid configuration, stale/wrong-role/split choices, forbidden
+    /// external cameras or an attempt to replace a nested request's choice.
+    pub fn prepare_enrollment_camera(
+        &mut self,
+        choice: &irlume_common::live_camera::EnrollmentCameraChoice,
+    ) -> irlume_common::Result<CameraRequestScope<'_>> {
+        choice
+            .validate()
+            .map_err(|reason| Error::Policy(reason.into()))?;
+        if self.camera_selection.is_some() {
+            return Err(Error::Policy(
+                "enrollment choice cannot replace a prepared request".into(),
+            ));
+        }
+        let mut prepared = PreparedSelection::observe_choice(
+            &self.rgb_dev,
+            &self.ir_dev,
+            self.ir_available,
+            Some(choice),
+        )?;
+        let previous = (self.rgb_dev.clone(), self.ir_dev.clone(), self.ir_available);
+        self.set_devices(&prepared.rgb, &prepared.ir);
+        // A resolved Current pair supplies both classified sides. As with
+        // account selection, a racy path-existence check must not demote it.
+        // The operator's forced-convenience override still wins.
+        prepared.ir_available = !irlume_camera::ir_forced_off();
+        self.ir_available = prepared.ir_available;
+        prepared.automatic = false;
+        self.camera_selection = Some(prepared);
+        Ok(CameraRequestScope {
+            engine: self,
+            previous: Some(previous),
+        })
+    }
+
+    /// The retained ordinary runtime proof, for enrollment preflight/probe work.
+    #[must_use]
+    pub fn prepared_camera_lease(&self) -> Option<irlume_camera::lease::OrdinaryLeaseRequest> {
+        self.camera_selection
+            .as_ref()
+            .and_then(PreparedSelection::expected_lease)
+    }
+
+    /// Commit only under the retained camera proof, after caller-owned preparation.
+    /// The callback must be persistence-only and its receipt is never revalidated.
+    pub(super) fn with_prepared_camera_publication<R>(
+        &self,
+        publish: impl FnOnce() -> irlume_common::Result<R>,
+    ) -> irlume_common::Result<R> {
+        match self.prepared_camera_lease() {
+            Some(expected) => irlume_camera::with_selected_camera_publication(&expected, publish)
+                .map_err(crate::lease_unavailable)?,
+            None if self
+                .camera_selection
+                .as_ref()
+                .is_some_and(PreparedSelection::enrollment_choice) =>
+            {
+                Err(Error::Policy(
+                    "operation camera publication has no retained proof".into(),
+                ))
+            }
+            None => publish(),
+        }
+    }
     pub(super) fn pre_open_account_refusal(&self) -> Option<crate::Outcome> {
         if let Some(scope) = &self.primary_attempt {
             if let Some(refusal) = scope.boundary_refusal(&mut *self.request_key()) {
@@ -370,5 +510,36 @@ impl Engine {
             engine: self,
             previous: Some(previous),
         })
+    }
+
+    /// Read fd-derived qualification using the retained ordinary incarnation.
+    ///
+    /// # Errors
+    /// Refuses changed request facts, stale/uncovered cameras or unreadable
+    /// qualification. A legacy unprepared caller retains its existing lookup.
+    pub fn capture_qualification_for_request(
+        &self,
+    ) -> irlume_common::Result<irlume_camera::capture_qualification::QualificationResolution> {
+        self.validate_camera_request()?;
+        if self.prepared_camera_lease().is_none() {
+            return irlume_camera::stored_capture_qualification(&self.rgb_dev, &self.ir_dev);
+        }
+        let operation = self
+            .acquire_account_camera(
+                &[&self.rgb_dev, &self.ir_dev],
+                irlume_camera::lease::CameraOperationKind::Diagnostics,
+                std::time::Duration::from_secs(2),
+            )
+            .map_err(crate::lease_unavailable)?;
+        let state = irlume_camera::stored_capture_qualification_state_in_operation(
+            &self.rgb_dev,
+            &self.ir_dev,
+            &operation,
+        )?;
+        operation
+            .lease()
+            .validate()
+            .map_err(crate::lease_unavailable)?;
+        Ok(state.resolution)
     }
 }

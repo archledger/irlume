@@ -1,0 +1,1 @@
+{"AddCameraGroupOn":{"user":"alice","profile":"main","scans":1,"pair":{"rgb":"/dev/video0","ir":"/dev/video1","expected":{"supervisor_id":"11111111111111111111111111111111","candidate":{"instance_id":"22222222222222222222222222222222","generation":7,"endpoint_paths":["/dev/video0","/dev/video1"]}}}}}

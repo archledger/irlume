@@ -145,6 +145,33 @@ pub fn connected_pairs_with_split(
 ) -> ResolvedConnectedPairs {
     backend::connected_pairs_with_split(records)
 }
+
+/// Resolve an operation's displayed guard and ordinary roles under one inventory lock.
+/// Reads passive facts only; does not initialize a supervisor or open a camera.
+///
+/// # Errors
+/// Refuses malformed/stale guards, unavailable inventory, wrong roles, split or
+/// ambiguous endpoints. The returned view is observation, not a camera lease.
+pub fn enrollment_connected_pairs(
+    choice: &irlume_common::live_camera::EnrollmentCameraChoice,
+    records: &[irlume_common::split_schema::AuthorizationRecord],
+) -> Result<ResolvedConnectedPairs, &'static str> {
+    backend::enrollment_connected_pairs(choice, records)
+}
+
+/// Validate the retained ordinary pair and serialize persistence with inventory changes.
+/// This passive guard neither initializes a supervisor nor acquires a camera lease.
+/// The callback must not re-enter camera inventory or perform key/lock preparation.
+///
+/// # Errors
+/// Refuses stale/unavailable/poisoned inventory before invoking the callback.
+/// After invocation, the callback's actual persistence receipt is returned unchanged.
+pub fn with_selected_camera_publication<R>(
+    expected: &lease::OrdinaryLeaseRequest,
+    commit: impl FnOnce() -> R,
+) -> Result<R, lease::CameraLeaseError> {
+    backend::with_selected_camera_publication(expected, commit)
+}
 pub mod measurement;
 mod media_graph;
 mod mmap_capture;
@@ -8912,16 +8939,36 @@ pub fn measure_capture_qualification_with_progress(
         std::time::Duration::from_secs(2),
     )
     .map_err(|error| Error::Hardware(error.to_string()))?;
-    let before = collect_qualification_context_in_operation(rgb_dev, ir_dev, &operation)?;
+    measure_capture_qualification_in_operation(rgb_dev, ir_dev, rounds, progress, &operation)
+}
+
+/// Measure the complete stream contract using an already bound camera operation.
+/// Existing fd-derived context, continuity and pre/post measurement checks apply.
+///
+/// # Errors
+/// Refuses stale or uncovered endpoints and unsafe/incomplete measurements.
+pub fn measure_capture_qualification_in_operation(
+    rgb_dev: &str,
+    ir_dev: &str,
+    rounds: usize,
+    progress: &Progress,
+    operation: &lease::CameraOperationSession,
+) -> irlume_common::Result<CaptureQualificationMeasurement> {
+    if operation.lease().is_split_pair() {
+        return Err(Error::Hardware(
+            "split capture qualification is not supported".into(),
+        ));
+    }
+    let before = collect_qualification_context_in_operation(rgb_dev, ir_dev, operation)?;
     let report = measure_contention_in_operation(
         rgb_dev,
         ir_dev,
         rounds,
         progress,
-        &operation,
+        operation,
         Some(&before),
     )?;
-    let after = collect_qualification_context_in_operation(rgb_dev, ir_dev, &operation)?;
+    let after = collect_qualification_context_in_operation(rgb_dev, ir_dev, operation)?;
     let context_key = before
         .runtime_key()
         .map_err(|error| Error::Hardware(error.to_string()))?;
@@ -8986,11 +9033,20 @@ pub fn current_capture_qualification_context(
     collect_qualification_context(rgb_dev, ir_dev)
 }
 
-fn collect_qualification_context_in_operation(
+/// Collect fd-derived ordinary context under an existing exact camera operation.
+///
+/// # Errors
+/// Refuses split/stale/uncovered endpoints, failed negotiation or incomplete topology.
+pub fn collect_qualification_context_in_operation(
     rgb_dev: &str,
     ir_dev: &str,
     operation: &lease::CameraOperationSession,
 ) -> irlume_common::Result<capture_qualification::QualificationContext> {
+    if operation.lease().is_split_pair() {
+        return Err(Error::Hardware(
+            "split capture qualification is not supported".into(),
+        ));
+    }
     let rgb = {
         operation
             .open_rgb(rgb_dev)

@@ -150,6 +150,19 @@ pub fn publish_with_intent(
     new_store: &SecondaryStore,
     primary_snapshot_sha256: &str,
 ) -> Result<(), CommitError> {
+    prepare_with_intent(secondary_path, new_store, primary_snapshot_sha256)?.publish()
+}
+
+/// Prepare a one-shot encrypted publication without authorizing recover-forward.
+/// Key resolution and validation finish before the caller's admission boundary.
+///
+/// # Errors
+/// Returns key, validation, encryption or serialization errors; writes no intent/store.
+pub fn prepare_with_intent(
+    secondary_path: &Path,
+    new_store: &SecondaryStore,
+    primary_snapshot_sha256: &str,
+) -> Result<PreparedSecondaryCommit, CommitError> {
     // Production key resolution: the account template key of the store's
     // owner (the file stem), mirroring the primary store's at-write
     // resolution. Journal and store both carry the ENCRYPTED bytes, so no
@@ -159,7 +172,7 @@ pub fn publish_with_intent(
         .map(|s| s.to_string_lossy().into_owned())
         .ok_or_else(|| CommitError::Io("secondary path has no file stem".into()))?;
     let key = super::production_key_for(&user)?;
-    publish_with_intent_key(
+    prepare_with_intent_key(
         secondary_path,
         new_store,
         primary_snapshot_sha256,
@@ -176,20 +189,32 @@ pub fn publish_with_intent(
 /// Returns [`CommitError`] when validation or any durable step fails. A
 /// failure before the commit point leaves the previous store authoritative
 /// and the journal for [`resolve_commit`] to finish or discard.
+#[cfg(test)]
 pub(crate) fn publish_with_intent_key(
     secondary_path: &Path,
     new_store: &SecondaryStore,
     primary_snapshot_sha256: &str,
     key: Option<&[u8]>,
 ) -> Result<(), CommitError> {
+    prepare_with_intent_key(secondary_path, new_store, primary_snapshot_sha256, key)?.publish()
+}
+
+fn prepare_with_intent_key(
+    secondary_path: &Path,
+    new_store: &SecondaryStore,
+    primary_snapshot_sha256: &str,
+    key: Option<&[u8]>,
+) -> Result<PreparedSecondaryCommit, CommitError> {
     new_store.validate()?;
     if new_store.primary_snapshot_sha256 != primary_snapshot_sha256 {
         return Err(CommitError::Store(SecondaryStoreError::Invalid(
             "store binding disagrees with the transaction's primary digest".into(),
         )));
     }
-    let plaintext = serde_json::to_vec(new_store).map_err(|e| CommitError::Io(e.to_string()))?;
-    let bytes: Vec<u8> = match key {
+    let plaintext = zeroize::Zeroizing::new(
+        serde_json::to_vec(new_store).map_err(|e| CommitError::Io(e.to_string()))?,
+    );
+    let bytes = zeroize::Zeroizing::new(match key {
         Some(key) => {
             let blob = crate::crypto::encrypt(key, &plaintext)
                 .map_err(|e| CommitError::Io(e.to_string()))?;
@@ -201,8 +226,8 @@ pub(crate) fn publish_with_intent_key(
             });
             serde_json::to_vec(&envelope).map_err(|e| CommitError::Io(e.to_string()))?
         }
-        None => plaintext,
-    };
+        None => plaintext.to_vec(),
+    });
     // Writers create the store's directory before publication (the fixed
     // location sits in a `cameras/` subdirectory legacy code never made).
     if let Some(parent) = secondary_path.parent() {
@@ -213,17 +238,47 @@ pub(crate) fn publish_with_intent_key(
         format_version: INTENT_FORMAT_VERSION,
         generation: new_store.generation,
         primary_snapshot_sha256: primary_snapshot_sha256.to_owned(),
-        new_secondary_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        new_secondary_b64: base64::engine::general_purpose::STANDARD.encode(bytes.as_slice()),
     };
-    let journal = serde_json::to_vec(&intent).map_err(|e| CommitError::Io(e.to_string()))?;
+    let journal = zeroize::Zeroizing::new(
+        serde_json::to_vec(&intent).map_err(|e| CommitError::Io(e.to_string()))?,
+    );
     let intent_path = intent_path_for(secondary_path);
-    durable_write(&intent_path, &journal)?;
-    // Commit point: the durable rename of the new store.
-    durable_write(secondary_path, &bytes)?;
-    std::fs::remove_file(&intent_path)
-        .map_err(|e| CommitError::Io(e.to_string()))
-        .and_then(|()| fsync_dir(intent_path.parent().unwrap_or_else(|| Path::new("."))))?;
-    Ok(())
+    Ok(PreparedSecondaryCommit {
+        secondary_path: secondary_path.to_owned(),
+        intent_path,
+        bytes,
+        journal,
+    })
+}
+
+/// Prepared private persistence payload. Admission must precede consuming publish.
+/// It is neither cloneable nor printable, retains no key, and zeroizes its payloads.
+/// Documented no-TPM publication retains plaintext bytes under owner-only protection.
+pub struct PreparedSecondaryCommit {
+    secondary_path: std::path::PathBuf,
+    intent_path: std::path::PathBuf,
+    bytes: zeroize::Zeroizing<Vec<u8>>,
+    journal: zeroize::Zeroizing<Vec<u8>>,
+}
+
+impl PreparedSecondaryCommit {
+    /// Authorize recover-forward with the intent, then publish and remove it.
+    ///
+    /// # Errors
+    /// A persistence error may leave an already authorized recoverable intent.
+    /// Camera admission must not be rechecked between intent and store writes.
+    pub fn publish(self) -> Result<(), CommitError> {
+        durable_write(&self.intent_path, &self.journal)?;
+        // Commit point: the durable rename of the new store.
+        durable_write(&self.secondary_path, &self.bytes)?;
+        std::fs::remove_file(&self.intent_path)
+            .map_err(|e| CommitError::Io(e.to_string()))
+            .and_then(|()| {
+                fsync_dir(self.intent_path.parent().unwrap_or_else(|| Path::new(".")))
+            })?;
+        Ok(())
+    }
 }
 
 /// Resolves any leftover journal deterministically (recover-forward): if a
@@ -797,6 +852,32 @@ mod tests {
         ));
         assert!(load_secondary(&secondary_path).expect("load").is_some());
         let _ = std::fs::remove_dir_all(secondary_path.parent().unwrap());
+    }
+
+    #[test]
+    fn prepared_secondary_refusal_leaves_no_recover_forward_intent() {
+        let (path, _) = paths("prepared-refusal");
+        let digest = irlume_common::sha256_hex(b"primary-v1");
+        let old = store_for(&digest, 1);
+        publish_with_intent_key(&path, &old, &digest, None).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let prepared =
+            prepare_with_intent_key(&path, &store_for(&digest, 2), &digest, None).unwrap();
+        assert!(
+            !intent_path_for(&path).exists(),
+            "preparation must not authorize recovery"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(prepared); // Admission refused; the one-shot payload is never published.
+        assert!(matches!(resolve_commit(&path), Ok(CommitResolution::Clean)));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        prepare_with_intent_key(&path, &store_for(&digest, 2), &digest, None)
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_eq!(load_secondary(&path).unwrap().unwrap().generation, 2);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

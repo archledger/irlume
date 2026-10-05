@@ -215,6 +215,38 @@ impl Guard {
                 .invalidate_all()
         }
     }
+
+    /// Invalidate one synthetic camera, retaining its peer's original facts.
+    ///
+    /// # Panics
+    /// Panics if no fixture is installed, its endpoint is absent or its mutex
+    /// was poisoned. This observer opens and redirects no device.
+    pub fn endpoint_invalidation_observer(
+        &self,
+        endpoint: &str,
+    ) -> impl Fn() + Send + Sync + 'static {
+        let (inventory, topology) = TEST_SUPERVISOR.with(|slot| {
+            let slot = slot.borrow();
+            let supervisor = slot.as_ref().expect("installed fixture supervisor");
+            let topology = supervisor
+                .inventory
+                .lock()
+                .expect("fixture inventory poisoned")
+                .reference_for_endpoints(&[endpoint])
+                .expect("fixture endpoint")
+                .descriptor()
+                .physical_id()
+                .topology_path()
+                .to_owned();
+            (Arc::clone(&supervisor.inventory), topology)
+        });
+        move || {
+            inventory
+                .lock()
+                .expect("fixture inventory poisoned")
+                .invalidate_topologies(&[topology.clone()].into())
+        }
+    }
 }
 
 impl Drop for Guard {
@@ -229,6 +261,154 @@ impl Drop for Guard {
 #[must_use]
 pub fn grey_fixture() -> Vec<u8> {
     crate::decode_ir(&[0, 64, 128, 255], crate::IrPixel::Grey8, 2, 2)
+}
+
+/// Uniform non-biometric pixels with synthetic transport facts and a supplied
+/// lease binding. Never a negotiated stream or physical qualification receipt.
+///
+/// # Panics
+/// Panics if the fixed synthetic frame facts violate the provenance contract.
+#[must_use]
+pub fn bound_uniform_frame(
+    binding: crate::frame_provenance::FrameBinding,
+    taken: Instant,
+) -> crate::Frame {
+    let illumination = match binding.stream_role() {
+        crate::contracts::StreamRole::Rgb => crate::contracts::IlluminationProvenance::Unknown,
+        crate::contracts::StreamRole::Ir => crate::contracts::IlluminationProvenance::ActiveIr,
+    };
+    bound_uniform_frame_with(binding, taken, illumination, true, false)
+}
+
+/// Uniform pixels with explicitly scripted transport/illumination failures.
+///
+/// # Panics
+/// Panics if the fixed synthetic frame facts violate the provenance constructor.
+#[must_use]
+pub fn bound_uniform_frame_with(
+    binding: crate::frame_provenance::FrameBinding,
+    taken: Instant,
+    illumination: crate::contracts::IlluminationProvenance,
+    meets_floor: bool,
+    discontinuous: bool,
+) -> crate::Frame {
+    use crate::contracts::StreamRole;
+    use crate::frame_provenance::*;
+    let role = binding.stream_role();
+    let (spectrum, fourcc, channels) = match role {
+        StreamRole::Rgb => (crate::Spectrum::Rgb, *b"RGB3", 3),
+        StreamRole::Ir => (crate::Spectrum::Ir, *b"GREY", 1),
+    };
+    let data = vec![80; 32 * 32 * channels];
+    let raw = if discontinuous { 3 } else { 1 };
+    let metadata = v4l::buffer::Metadata {
+        bytesused: u32::try_from(data.len()).unwrap(),
+        sequence: raw,
+        timestamp: v4l::timestamp::Timestamp::new(i64::from(raw), 0),
+        flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+        ..Default::default()
+    };
+    let mut sequence_tracker = SequenceTracker::new();
+    let mut timestamp_tracker = TimestampTracker::new();
+    if discontinuous {
+        sequence_tracker.observe(1).unwrap();
+        timestamp_tracker
+            .observe(
+                1_000_000,
+                TimestampClock::Monotonic,
+                TimestampSource::EndOfFrame,
+            )
+            .unwrap();
+    }
+    let sequence = sequence_tracker.observe(raw).unwrap();
+    let timestamp = timestamp_tracker
+        .observe(
+            i64::from(raw) * 1_000_000,
+            TimestampClock::Monotonic,
+            TimestampSource::EndOfFrame,
+        )
+        .unwrap();
+    let mut format = v4l::Format::new(32, 32, v4l::FourCC::new(&fourcc));
+    format.stride = u32::try_from(32 * channels).unwrap();
+    format.size = metadata.bytesused;
+    let provenance = crate::checked_single_provenance(
+        binding,
+        ValidatedFormatIdentity::from_stable_format(&format),
+        DequeuedBufferFacts::from_v4l(&metadata, data.len()).unwrap(),
+        sequence,
+        timestamp,
+        taken,
+        illumination,
+        DeliveredRateEvidence::new(
+            role,
+            (1, 15),
+            (1, 15),
+            (15, 1),
+            98,
+            30,
+            2_000_000,
+            if meets_floor { (15, 1) } else { (5, 1) },
+            66_667,
+            meets_floor,
+            &sequence,
+            &timestamp,
+        ),
+    )
+    .unwrap();
+    crate::Frame::from_provenance(32, 32, spectrum, data, provenance).unwrap()
+}
+
+/// Synthetic statistics for the uniform IR fixture, not device measurements.
+#[must_use]
+pub fn uniform_ir_stats() -> crate::IrCaptureStats {
+    crate::IrCaptureStats {
+        lit_mean: 80.0,
+        ambient_mean: 0.0,
+        ambient_observed: false,
+        burst_frames: 1,
+        camera_classified_frames: 1,
+        camera_lit_frames: 1,
+        white_level: Some(255),
+        lit_saturated_frac: Some(0.0),
+        ambient_saturated_frac: None,
+        persistent_saturated_frac: None,
+        saturation_frame: None,
+    }
+}
+
+/// Exercise the real complete-pair factory with synthetic uniform captures.
+/// Neither native camera open nor physical qualification is represented here.
+///
+/// # Errors
+/// Returns operation, cancellation or complete-pair factory refusals.
+pub fn capture_uniform_split_pair(
+    operation: &crate::lease::CameraOperationSession,
+    rgb_dev: &str,
+    ir_dev: &str,
+) -> irlume_common::Result<crate::SplitPairCapture> {
+    let capture = |endpoint, role| {
+        operation
+            .lease()
+            .start_stream()
+            .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
+        let binding = operation
+            .lease()
+            .frame_binding(endpoint, role)
+            .map_err(|error| irlume_common::Error::Hardware(error.to_string()));
+        operation.lease().stop_stream();
+        Ok(bound_uniform_frame(binding?, Instant::now()))
+    };
+    crate::split_capture::capture_split_pair_with(
+        rgb_dev,
+        ir_dev,
+        operation,
+        &crate::CaptureControl::with_progress(crate::no_progress()),
+        || capture(rgb_dev, crate::contracts::StreamRole::Rgb),
+        || {
+            capture(ir_dev, crate::contracts::StreamRole::Ir)
+                .map(|frame| (frame, uniform_ir_stats()))
+        },
+    )
 }
 
 #[cfg(test)]

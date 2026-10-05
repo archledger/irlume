@@ -657,6 +657,56 @@ The YUYV exposure change required by the T480 remains separate from these
 phases. Neither accepting this ADR nor completing an intermediate phase
 establishes supported face authentication on that hardware.
 
+## Amendment 2026-10-05: sequential diagnostic capture and assessment provenance
+
+Camera code captures a split pair through the production one-shot RGB and IR
+paths under the original two-incarnation operation. RGB releases its resources
+before IR starts. Cancellation, deadline expiry, either-side loss or an invalid
+frame refuses the complete capture; no partial pair, replacement lookup or
+single-side recovery escapes this path. Ordinary qualification and capture
+remain separate.
+
+Before native configuration, each opened descriptor must match its retained
+side's USB identity, physical path, qualified location and fd-classified role.
+Both lease references are revalidated around those read-only observations.
+Captured frames retain the existing format, delivered-rate, continuity and
+illumination checks.
+
+`SplitPairCapture` has a private constructor and owns both frames, their IR
+statistics and the original lease. Revalidation requires the same operation
+capability, not merely equal instance IDs and generations. The assessment
+boundary consumes this complete receipt; separated frames cannot enter a split
+assessment. Every paired split assessment has sequential posture at any skew,
+including deferred identity work. Existing pairing budgets, stale-RGB discard
+and IR-identity-verified grant restrictions are unchanged.
+
+Cleanup authority is narrower than capture authority. After confirmed producer
+quiescence, an owned BLC or emitter restore validates the surviving camera's
+original reference and fd. Loss of its peer cannot strand that owned change,
+and cleanup never repairs the invalid pair or permits another capture. The
+immediate undo of an unconfirmed BLC setting uses the same original-fd check.
+Readback, record retirement and unconfirmed-shutdown resource retention remain
+in force.
+
+`Engine::assess_split_in_operation` is a non-granting diagnostic entry. It rejects
+pending Engine request state, disabled IR and invalid operation/endpoints before
+mutating votes or setup accounting. Its diagnostic state is cleared on return,
+error and unwind. It loads no account enrollment and releases no credential.
+
+Attended archhost checks on 2026-10-05 completed both BRIO-RGB/NexiGo-IR and
+NexiGo-RGB/BRIO-IR capture, plus cancellation after RGB in each direction.
+Ioctl evidence confirmed non-overlapping image streams and successful image and
+metadata cleanup; BLC and metadata formats returned to their original values.
+The test recorded no images or authentication results. This qualifies the
+diagnostic transport on those connections, not split-account authentication.
+Both cameras retain their ordinary device claims under the resolver.
+
+The enrollment/authentication activation gate stays closed. Guarded split
+operation choices, account request routing, enrollment publication, final
+authorization/grant checks and the complete acceptance matrix remain required
+before a separate reviewed activation change. The YUYV exposure and T480 gates
+are unchanged.
+
 ## Sources for USB location
 
 - [ADR-0007](0007-context-bound-capture-qualification.md), durable identity and

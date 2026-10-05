@@ -424,6 +424,7 @@ impl Engine {
         service: Option<&str>,
         cameras: &(irlume_camera::RgbCamera, irlume_camera::IrCamera),
         mode: &CaptureModeSelection,
+        operation: &irlume_camera::lease::CameraOperationSession,
         deadline: Instant,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Outcome> {
@@ -470,11 +471,10 @@ impl Engine {
                     let detected = engine.detect_rgb_assessment(&rgb, None, diagnostics)?;
                     engine
                         .assess_captured_pair(
-                            rgb,
-                            ir,
-                            stats,
+                            PairCapture::Ordinary(rgb, ir, stats),
                             detected,
                             PairAssessmentContext {
+                                operation,
                                 sequential: true,
                                 pair_sequential_retried: false,
                                 rgb_hard_retried: false,

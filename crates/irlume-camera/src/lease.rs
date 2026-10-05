@@ -467,6 +467,9 @@ pub struct CameraLease {
 }
 
 impl CameraLease {
+    pub(crate) fn same_operation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
     pub(crate) fn acquire(
         authority: &Arc<LeaseAuthority>,
         inventory: Arc<Mutex<CameraInventory>>,
@@ -666,6 +669,150 @@ impl CameraLease {
             }
         }
         Ok(())
+    }
+
+    /// Split-only native admission before any format/control write. Ordinary
+    /// opens keep their existing contract. The fd supplies identity and role;
+    /// a path lookup cannot stand in for the descriptor that will be configured.
+    pub(crate) fn require_split_descriptor(
+        &self,
+        endpoint: &str,
+        device: &v4l::Device,
+        role: StreamRole,
+    ) -> irlume_common::Result<()> {
+        use v4l::video::Capture;
+        let Some(_) = self.inner.split.as_ref() else {
+            return Ok(());
+        };
+        self.require_stream_role(endpoint, role)
+            .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
+        let identity =
+            crate::uvc_descriptor::identity_from_fd(device.handle().fd()).map_err(|_| {
+                irlume_common::Error::Hardware("opened descriptor identity is unavailable".into())
+            })?;
+        self.require_split_fd_identity(endpoint, &identity)?;
+        let formats = device.enum_formats().map_err(|_| {
+            irlume_common::Error::Hardware("opened descriptor formats are unavailable".into())
+        })?;
+        let formats: Vec<_> = formats.iter().map(|format| format.fourcc.repr).collect();
+        let actual_role =
+            crate::role_with_ir_attestation(&formats, || identity.ir_function_evidence().is_ok());
+        let wanted = match role {
+            StreamRole::Rgb => crate::Role::Rgb,
+            StreamRole::Ir => crate::Role::Ir,
+        };
+        if actual_role != wanted {
+            return Err(irlume_common::Error::Hardware(
+                "opened descriptor role differs from selected camera".into(),
+            ));
+        }
+        self.require_stream_role(endpoint, role)
+            .map_err(|error| irlume_common::Error::Hardware(error.to_string()))
+    }
+
+    fn require_split_fd_identity(
+        &self,
+        endpoint: &str,
+        identity: &crate::uvc_descriptor::CameraIdentity,
+    ) -> irlume_common::Result<()> {
+        let expected = self.inner.split.as_ref().ok_or_else(|| {
+            irlume_common::Error::Hardware("split fd identity requires a split lease".into())
+        })?;
+        let side = if endpoint == expected.rgb.endpoint {
+            &expected.rgb
+        } else if endpoint == expected.ir.endpoint {
+            &expected.ir
+        } else {
+            return Err(irlume_common::Error::Hardware(
+                "opened descriptor is not covered".into(),
+            ));
+        };
+        let reference = self
+            .inner
+            .references
+            .iter()
+            .find(|reference| {
+                reference
+                    .endpoint_paths()
+                    .iter()
+                    .any(|path| path == endpoint)
+            })
+            .ok_or_else(|| {
+                irlume_common::Error::Hardware("opened descriptor is not covered".into())
+            })?;
+        let binding = crate::binding_identity(
+            &format!("{:04x}:{:04x}", identity.vid, identity.pid),
+            identity.serial.as_deref(),
+        );
+        if identity.usb_devpath != reference.descriptor().physical_id().topology_path()
+            || binding != side.identity
+        {
+            return Err(irlume_common::Error::Hardware(
+                "opened descriptor differs from selected camera".into(),
+            ));
+        }
+        let location = crate::usb_controller_location(&identity.usb_devpath).ok_or_else(|| {
+            irlume_common::Error::Hardware("opened descriptor location is unavailable".into())
+        })?;
+        let domain = match location.domain {
+            crate::RootHubDomain::Usb2 => "usb2",
+            crate::RootHubDomain::SuperSpeed => "superspeed",
+        };
+        if location.controller != side.controller
+            || domain != side.domain
+            || location.ports != side.ports
+        {
+            return Err(irlume_common::Error::Hardware(
+                "opened descriptor differs from selected camera".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Cleanup-only admission for an already owned original fd. The caller must
+    /// establish producer quiescence and ownership/readback before its restore.
+    /// This never resets the invalid whole-pair capability or authorizes capture.
+    pub(crate) fn require_restore_fd(
+        &self,
+        endpoint: &str,
+        fd: std::os::fd::RawFd,
+    ) -> irlume_common::Result<()> {
+        if !self.is_split_pair() {
+            return self
+                .require_endpoint(endpoint)
+                .map_err(|error| irlume_common::Error::Hardware(error.to_string()));
+        }
+        let reference = self
+            .inner
+            .references
+            .iter()
+            .find(|reference| {
+                reference
+                    .endpoint_paths()
+                    .iter()
+                    .any(|path| path == endpoint)
+            })
+            .ok_or_else(|| {
+                irlume_common::Error::Hardware("restore descriptor is not covered".into())
+            })?;
+        let live = || {
+            self.inner
+                .inventory
+                .lock()
+                .map_err(|_| {
+                    irlume_common::Error::Hardware("restore inventory is unavailable".into())
+                })?
+                .validate_reference(reference)
+                .map_err(|_| {
+                    irlume_common::Error::Hardware("restore camera incarnation changed".into())
+                })
+        };
+        live()?;
+        let identity = crate::uvc_descriptor::identity_from_fd(fd).map_err(|_| {
+            irlume_common::Error::Hardware("restore descriptor identity is unavailable".into())
+        })?;
+        self.require_split_fd_identity(endpoint, &identity)?;
+        live()
     }
 
     /// Whether this permit reserves two matched incarnations. Capture
@@ -1085,6 +1232,67 @@ mod tests {
             CameraOperationKind::Diagnostics,
             Instant::now() + Duration::from_secs(5),
         )
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn split_receipt_rejects_a_different_capability_for_the_same_incarnations() {
+        use crate::test_support::{bound_uniform_frame, uniform_ir_stats};
+        let fixture = split_fixture();
+        let original = CameraOperationSession::new(
+            acquire_fixture_split(&fixture, &fixture.expected).unwrap(),
+        );
+        let rgb = &fixture.expected.rgb.endpoint;
+        let ir = &fixture.expected.ir.endpoint;
+        let capture = crate::split_capture::capture_split_pair_with(
+            rgb,
+            ir,
+            &original,
+            &crate::CaptureControl::with_progress(crate::no_progress()),
+            || {
+                Ok(bound_uniform_frame(
+                    original
+                        .lease()
+                        .frame_binding(rgb, StreamRole::Rgb)
+                        .unwrap(),
+                    Instant::now(),
+                ))
+            },
+            || {
+                Ok((
+                    bound_uniform_frame(
+                        original.lease().frame_binding(ir, StreamRole::Ir).unwrap(),
+                        Instant::now(),
+                    ),
+                    uniform_ir_stats(),
+                ))
+            },
+        )
+        .unwrap();
+        // Deliberately distinct test authority with identical frozen inventory:
+        // incarnation equality must not stand in for capability identity.
+        let other = CameraOperationSession::new(
+            CameraLease::acquire_split(
+                &Arc::default(),
+                fixture.inventory.clone(),
+                &fixture.expected,
+                CameraOperationKind::Diagnostics,
+                Instant::now(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            original
+                .lease()
+                .frame_binding(rgb, StreamRole::Rgb)
+                .unwrap(),
+            other.lease().frame_binding(rgb, StreamRole::Rgb).unwrap()
+        );
+        assert!(capture.revalidate(&original).is_ok());
+        assert!(
+            capture.revalidate(&other).is_err(),
+            "another capability with equal incarnations must refuse the receipt"
+        );
     }
 
     fn observe_split_waiter(fixture: &SplitFixture, held: &CameraLease) {

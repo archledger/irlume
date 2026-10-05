@@ -275,6 +275,7 @@ impl Engine {
         service: Option<&str>,
         cameras: &'c (irlume_camera::RgbCamera, irlume_camera::IrCamera),
         mode: &CaptureModeSelection,
+        operation: &irlume_camera::lease::CameraOperationSession,
         deadline: Instant,
         held_pair_failed: &mut bool,
         diagnostics: &'d dyn irlume_common::diagnostics::DiagnosticSink,
@@ -290,6 +291,7 @@ impl Engine {
             service,
             cameras,
             mode,
+            operation,
             deadline,
             held_pair_failed,
             diagnostics,
@@ -306,6 +308,7 @@ impl Engine {
         service: Option<&str>,
         cameras: &'c (irlume_camera::RgbCamera, irlume_camera::IrCamera),
         mode: &CaptureModeSelection,
+        operation: &irlume_camera::lease::CameraOperationSession,
         deadline: Instant,
         held_pair_failed: &mut bool,
         diagnostics: &'d dyn irlume_common::diagnostics::DiagnosticSink,
@@ -355,6 +358,7 @@ impl Engine {
                                 rgb,
                                 ir,
                                 mode,
+                                operation,
                                 &mut windows,
                                 diagnostics,
                             )?;
@@ -412,6 +416,7 @@ impl Engine {
         rgb: &mut irlume_camera::RgbSession<'_>,
         ir: &mut irlume_camera::IrSession<'_>,
         mode: &CaptureModeSelection,
+        operation: &irlume_camera::lease::CameraOperationSession,
         windows: &mut PairWindows,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> Result<PreparedPairAuthentication, CapturePathError> {
@@ -511,11 +516,10 @@ impl Engine {
             self.check_request_active()?;
             let detections = self.detect_rgb_assessment(&rgb_frame, Some(rgb_ms), diagnostics)?;
             let evidence = self.assess_captured_pair(
-                rgb_frame,
-                ir_frame,
-                ir_stats,
+                PairCapture::Ordinary(rgb_frame, ir_frame, ir_stats),
                 detections,
                 PairAssessmentContext {
+                    operation,
                     sequential: false,
                     pair_sequential_retried: false,
                     rgb_hard_retried: false,

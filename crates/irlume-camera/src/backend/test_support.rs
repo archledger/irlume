@@ -192,6 +192,29 @@ impl Guard {
         });
         move || leases.counts_for_test()
     }
+
+    /// Invalidate only this synthetic publication from a coordinating thread.
+    /// This callback cannot refresh facts, acquire a lease or open a camera.
+    ///
+    /// # Panics
+    /// Panics if no fixture is installed or the fixture inventory was poisoned.
+    pub fn invalidation_observer(&self) -> impl Fn() + Send + Sync + 'static {
+        let inventory = TEST_SUPERVISOR.with(|slot| {
+            Arc::clone(
+                &slot
+                    .borrow()
+                    .as_ref()
+                    .expect("installed fixture supervisor")
+                    .inventory,
+            )
+        });
+        move || {
+            inventory
+                .lock()
+                .expect("fixture inventory poisoned")
+                .invalidate_all()
+        }
+    }
 }
 
 impl Drop for Guard {
@@ -211,6 +234,104 @@ pub fn grey_fixture() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn publication_fixture() -> Guard {
+        Guard::install(&[Camera {
+            topology: "/devices/fixture/publication".into(),
+            identity: "1234:0001:publication".into(),
+            fixed: true,
+            controller: "0000:00:14.0".into(),
+            domain: irlume_common::split_key::SplitDomain::Usb2,
+            ports: vec![8],
+            endpoints: vec![
+                Endpoint {
+                    path: "/dev/publication-rgb".into(),
+                    formats: vec![*b"YUYV"],
+                },
+                Endpoint {
+                    path: "/dev/publication-ir".into(),
+                    formats: vec![*b"GREY"],
+                },
+            ],
+        }])
+        .unwrap()
+    }
+
+    fn publication_expectation() -> crate::lease::OrdinaryLeaseRequest {
+        let view = crate::connected_pairs();
+        crate::lease::OrdinaryLeaseRequest {
+            supervisor_id: view.supervisor_id.unwrap(),
+            pair: view.pairs[0].clone(),
+        }
+    }
+
+    #[test]
+    fn selected_publication_refuses_changed_facts_without_invoking_the_publisher() {
+        let guard = publication_fixture();
+        let expected = publication_expectation();
+        assert_eq!(
+            crate::with_selected_camera_publication(&expected, || 7).unwrap(),
+            7
+        );
+        let mut wrong = Vec::new();
+        let mut changed = expected.clone();
+        changed.supervisor_id = "99999999999999999999999999999999".into();
+        wrong.push(changed);
+        let mut changed = expected.clone();
+        changed.pair.generation += 1;
+        wrong.push(changed);
+        let mut changed = expected.clone();
+        std::mem::swap(&mut changed.pair.rgb, &mut changed.pair.ir);
+        wrong.push(changed);
+        let mut changed = expected.clone();
+        changed.pair.identity = "1234:0001:other".into();
+        wrong.push(changed);
+        let calls = std::cell::Cell::new(0);
+        for changed in wrong {
+            assert!(matches!(
+                crate::with_selected_camera_publication(&changed, || calls.set(calls.get() + 1)),
+                Err(CameraLeaseError::Stale)
+            ));
+        }
+        guard.invalidation_observer()();
+        assert!(matches!(
+            crate::with_selected_camera_publication(&expected, || calls.set(calls.get() + 1)),
+            Err(CameraLeaseError::Stale)
+        ));
+        assert_eq!(calls.get(), 0);
+        assert!(
+            guard.calls().is_empty(),
+            "publication must neither acquire nor open a camera"
+        );
+    }
+
+    #[test]
+    fn selected_publication_excludes_inventory_writers_and_preserves_visible_receipt() {
+        let guard = publication_fixture();
+        let expected = publication_expectation();
+        let inventory =
+            TEST_SUPERVISOR.with(|slot| slot.borrow().as_ref().unwrap().inventory.clone());
+        let receipt = crate::with_selected_camera_publication(&expected, || {
+            std::thread::scope(|threads| {
+                assert!(threads
+                    .spawn(|| matches!(
+                        inventory.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ))
+                    .join()
+                    .unwrap());
+            });
+            irlume_common::AtomicWrite::VisibleNotDurable(std::io::Error::other(
+                "publication receipt",
+            ))
+        })
+        .unwrap();
+        assert!(
+            matches!(receipt, irlume_common::AtomicWrite::VisibleNotDurable(ref error) if error.to_string() == "publication receipt")
+        );
+        assert!(inventory.try_lock().is_ok());
+        assert!(guard.calls().is_empty());
+    }
 
     #[test]
     fn ordinary_fixture_reaches_real_lease_and_recorded_open_without_a_device() {

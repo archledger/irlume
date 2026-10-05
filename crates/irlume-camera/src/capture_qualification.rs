@@ -1377,6 +1377,8 @@ pub enum QualificationStoreError {
     RevisionExhausted,
     /// The new record is visible, but its directory fsync failed.
     VisibleNotDurable(String),
+    /// The late publisher refused admission without writing this record.
+    PublicationRefused(String),
 }
 
 impl std::fmt::Display for QualificationStoreError {
@@ -1393,6 +1395,9 @@ impl std::fmt::Display for QualificationStoreError {
                 f,
                 "qualification was published but may not survive power loss: {error}"
             ),
+            Self::PublicationRefused(error) => {
+                write!(f, "qualification publication refused: {error}")
+            }
         }
     }
 }
@@ -1515,6 +1520,26 @@ impl QualificationStore {
         attempt: QualificationAttempt,
         expected_revision: Option<u64>,
     ) -> Result<CaptureQualificationRecord, QualificationStoreError> {
+        self.save_attempt_with_publisher(attempt, expected_revision, |path, body| {
+            irlume_common::write_atomic_reporting(path, body, 0o600)
+                .map_err(|error| io_error("publish", path, &error))
+        })
+    }
+
+    /// Compare-and-set with an atomic publisher after lock/CAS/serialization work.
+    /// The publisher must preserve owner-only atomic-write and receipt semantics.
+    ///
+    /// # Errors
+    /// Returns preparation, CAS, publication-admission or durability errors.
+    pub fn save_attempt_with_publisher(
+        &self,
+        attempt: QualificationAttempt,
+        expected_revision: Option<u64>,
+        publish: impl FnOnce(
+            &Path,
+            &[u8],
+        ) -> Result<irlume_common::AtomicWrite, QualificationStoreError>,
+    ) -> Result<CaptureQualificationRecord, QualificationStoreError> {
         attempt.validate()?;
         self.ensure_dir()?;
         let path = self.record_path(attempt.context());
@@ -1542,9 +1567,7 @@ impl QualificationStore {
         if body.len() > MAX_RECORD_BYTES {
             return Err(QualificationError::RecordTooLarge.into());
         }
-        match irlume_common::write_atomic_reporting(&path, &body, 0o600)
-            .map_err(|error| io_error("publish", &path, &error))?
-        {
+        match publish(&path, &body)? {
             irlume_common::AtomicWrite::Durable => Ok(record),
             irlume_common::AtomicWrite::VisibleNotDurable(error) => Err(
                 QualificationStoreError::VisibleNotDurable(format!("{}: {error}", path.display())),
@@ -2570,6 +2593,142 @@ mod tests {
                 expected: None,
                 actual: Some(1),
             })
+        );
+    }
+
+    #[test]
+    // The synthetic supervisor is opt-in; workspace request-test dependencies
+    // enable it, and a standalone invocation must select test-support.
+    #[cfg(feature = "test-support")]
+    fn selected_qualification_refuses_inventory_loss_before_store_lock_admission() {
+        let temp = TempStore::new("selected-lock-loss");
+        let store = temp.store();
+        let attempt = concurrent_attempt("/devices/pci0000:00/usb3/3-2");
+        store.save_attempt(attempt.clone(), None).unwrap();
+        let path = store.record_path(attempt.context());
+        let before = std::fs::read(&path).unwrap();
+        std::thread::scope(|threads| {
+            let held = StoreLock::acquire(&path.with_extension("lock")).unwrap();
+            let (ready, observed) = std::sync::mpsc::channel();
+            let store = &store;
+            let attempt = &attempt;
+            let writer = threads.spawn(move || {
+                use crate::backend::test_support::{Camera, Endpoint, Guard};
+                let fixture = Guard::install(&[Camera {
+                    topology: "/devices/fixture/qualification".into(),
+                    identity: "1234:0001:qualification".into(),
+                    fixed: true,
+                    controller: "0000:00:14.0".into(),
+                    domain: irlume_common::split_key::SplitDomain::Usb2,
+                    ports: vec![8],
+                    endpoints: vec![
+                        Endpoint {
+                            path: "/dev/qualification-rgb".into(),
+                            formats: vec![*b"YUYV"],
+                        },
+                        Endpoint {
+                            path: "/dev/qualification-ir".into(),
+                            formats: vec![*b"GREY"],
+                        },
+                    ],
+                }])
+                .unwrap();
+                let view = crate::connected_pairs();
+                let expected = crate::lease::OrdinaryLeaseRequest {
+                    supervisor_id: view.supervisor_id.unwrap(),
+                    pair: view.pairs[0].clone(),
+                };
+                crate::with_selected_camera_publication(&expected, || ()).unwrap();
+                ready.send(fixture.invalidation_observer()).unwrap();
+                let result =
+                    store.save_attempt_with_publisher(attempt.clone(), Some(1), |path, bytes| {
+                        crate::with_selected_camera_publication(&expected, || {
+                            irlume_common::write_atomic_reporting(path, bytes, 0o600)
+                                .map_err(|error| io_error("publish", path, &error))
+                        })
+                        .map_err(|error| {
+                            QualificationStoreError::PublicationRefused(error.to_string())
+                        })?
+                    });
+                assert!(fixture.calls().is_empty());
+                result
+            });
+            // Initial camera admission succeeds while a different writer owns the
+            // store lock. Loss is forced before that lock can be granted.
+            observed
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()();
+            drop(held);
+            assert!(matches!(
+                writer.join().unwrap(),
+                Err(QualificationStoreError::PublicationRefused(_))
+            ));
+        });
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            store.load(attempt.context()).unwrap().unwrap().revision(),
+            1
+        );
+    }
+
+    #[test]
+    fn qualification_publisher_runs_under_store_lock_and_cas_precedes_it() {
+        use std::os::fd::AsRawFd as _;
+        let temp = TempStore::new("publisher-lock-cas");
+        let store = temp.store();
+        let attempt = concurrent_attempt("/devices/pci0000:00/usb3/3-2");
+        let record = store
+            .save_attempt_with_publisher(attempt.clone(), None, |path, bytes| {
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path.with_extension("lock"))
+                    .unwrap();
+                // SAFETY: flock only examines this live, separately opened fd.
+                let locked =
+                    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                assert_eq!(locked, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                irlume_common::write_atomic_reporting(path, bytes, 0o600)
+                    .map_err(|error| io_error("publish", path, &error))
+            })
+            .unwrap();
+        assert_eq!(record.revision(), 1);
+        let calls = std::cell::Cell::new(0);
+        assert!(matches!(
+            store.save_attempt_with_publisher(attempt, None, |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(irlume_common::AtomicWrite::Durable)
+            }),
+            Err(QualificationStoreError::StaleRevision { .. })
+        ));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn qualification_publisher_preserves_visible_not_durable_receipt() {
+        let temp = TempStore::new("publisher-visible");
+        let store = temp.store();
+        let attempt = concurrent_attempt("/devices/pci0000:00/usb3/3-2");
+        let result = store.save_attempt_with_publisher(attempt.clone(), None, |path, bytes| {
+            assert!(matches!(
+                irlume_common::write_atomic_reporting(path, bytes, 0o600).unwrap(),
+                irlume_common::AtomicWrite::Durable
+            ));
+            Ok(irlume_common::AtomicWrite::VisibleNotDurable(
+                std::io::Error::other("injected sync failure"),
+            ))
+        });
+        assert!(matches!(
+            result,
+            Err(QualificationStoreError::VisibleNotDurable(_))
+        ));
+        assert_eq!(
+            store.load(attempt.context()).unwrap().unwrap().revision(),
+            1
         );
     }
 

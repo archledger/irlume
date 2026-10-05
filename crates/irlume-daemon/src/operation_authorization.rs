@@ -38,13 +38,17 @@ pub(super) fn required(req: &Request, peer: &Peer) -> bool {
 // approval without a compiler error.
 fn approval_operation(req: &Request) -> Option<(&'static str, &'static str)> {
     Some(match req {
-        Request::Enroll { reset: true, .. } => (ACTION, "replace enrolled faces"),
-        Request::Enroll { .. } | Request::EnrollmentSession { improve: false, .. } => {
-            (ACTION, "enroll a face")
+        Request::Enroll { reset: true, .. } | Request::EnrollOn { reset: true, .. } => {
+            (ACTION, "replace enrolled faces")
         }
+        Request::Enroll { .. }
+        | Request::EnrollOn { .. }
+        | Request::EnrollmentSession { improve: false, .. } => (ACTION, "enroll a face"),
         // A camera-group addition adds trusted templates on a new camera
         // (ADR-0024 §4): the same enrollment-trust approval class.
-        Request::AddCameraGroup { .. } => (ACTION, "enroll a face on another camera"),
+        Request::AddCameraGroup { .. } | Request::AddCameraGroupOn { .. } => {
+            (ACTION, "enroll a face on another camera")
+        }
         // Removal deletes that camera's templates and binding together.
         Request::RemoveCameraGroup { .. } => (ACTION, "remove an enrolled camera"),
         Request::AddScan { .. } | Request::EnrollmentSession { improve: true, .. } => {
@@ -781,6 +785,67 @@ mod tests {
                 },
             ] {
                 assert!(grant().consume(&changed, &peer).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn operation_choice_approval_binds_endpoints_and_displayed_incarnation() {
+        let _passwd = crate::tests::passwd_lock();
+        let peer = peer();
+        let user = crate::users::name_for_uid(peer.uid).unwrap();
+        let pair = irlume_common::live_camera::EnrollmentCameraChoice {
+            rgb: "/dev/fixture-rgb".into(),
+            ir: "/dev/fixture-ir".into(),
+            expected: irlume_common::live_camera::CameraSelection {
+                supervisor_id: "11111111111111111111111111111111".into(),
+                candidate: irlume_common::live_camera::CameraCandidate {
+                    instance_id: "22222222222222222222222222222222".into(),
+                    generation: 1,
+                    endpoint_paths: vec!["/dev/fixture-rgb".into(), "/dev/fixture-ir".into()],
+                },
+            },
+        };
+        for req in [
+            Request::EnrollOn {
+                user: user.clone(),
+                profile: None,
+                scans: Some(1),
+                reset: false,
+                pair: Box::new(pair.clone()),
+            },
+            Request::AddCameraGroupOn {
+                user: user.clone(),
+                profile: None,
+                scans: Some(1),
+                pair: Box::new(pair.clone()),
+            },
+        ] {
+            let grant = || Grant {
+                subject: Subject::capture(&peer).unwrap(),
+                request: request_binding(&req).unwrap(),
+                approved: Instant::now(),
+            };
+            grant().consume(&req, &peer).unwrap();
+            for change in 0..4 {
+                let mut changed = req.clone();
+                let pair = match &mut changed {
+                    Request::EnrollOn { pair, .. } | Request::AddCameraGroupOn { pair, .. } => pair,
+                    _ => unreachable!(),
+                };
+                match change {
+                    0 => std::mem::swap(&mut pair.rgb, &mut pair.ir),
+                    1 => pair.expected.supervisor_id = "33333333333333333333333333333333".into(),
+                    2 => pair.expected.candidate.generation += 1,
+                    _ => {
+                        pair.expected.candidate.instance_id =
+                            "44444444444444444444444444444444".into()
+                    }
+                }
+                assert!(
+                    grant().consume(&changed, &peer).is_err(),
+                    "altered operation choice reused approval"
+                );
             }
         }
     }

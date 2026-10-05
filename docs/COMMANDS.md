@@ -46,7 +46,7 @@ Conventions that apply everywhere:
 
 | Command | What it does |
 |---|---|
-| `irlume enroll [--name N] [--scans K] [--reset] [--add-camera]` | capture a face profile; `--reset` replaces profiles and camera binding after successful capture, keeping the template key and recovery setup. `--add-camera` (ADR-0024) enrolls a SECOND camera as its own group with a separate store: the daemon measures the new pair and the existing enrollment is untouched |
+| `irlume enroll [--name N] [--scans K] [--reset] [--add-camera] [--camera-choice JSON]` | capture a face profile; `--reset` replaces profiles and camera binding after successful capture, keeping the template key and recovery setup. `--add-camera` (ADR-0024) enrolls a SECOND camera as its own group with a separate store: the daemon measures the new pair and the existing enrollment is untouched. `--camera-choice` uses an explicitly guarded ordinary pair for this operation, preserving the standing pair and `cameras.conf` |
 | `irlume profiles` (or `profiles list`) | list profiles and their scans; `profiles list --json` uses the read-only public [machine API](MACHINE-API.md) |
 | `irlume profiles add-scan --profile P [--scans N]` | add scans to profile P: improves recognition in new conditions, and adds templates for a second recognizer without re-enrolling as a new person (scans belong to the recognizer the daemon has loaded). If authentication reports no scans for the current recognition model, add scans to an existing profile; retained scans from other models are preserved |
 | `irlume profiles remove-camera --group ID` | remove one enrolled camera group (its store and scans); the primary enrollment and other groups are untouched. Find the group ID in `profiles list`, which shows every enrolled camera |
@@ -172,6 +172,28 @@ the daemon; the TUI ships it as Diagnostics -> Test Infrared Camera) and the
 - NixOS module instead of imperative wiring: [NIXOS.md](NIXOS.md)
 
 ### Authorization before enrollment
+
+`--camera-choice` is a low-level ordinary-pair socket option (ADR-0029 section 3).
+Its JSON contains `rgb`, `ir` and `expected`, where `expected` is the unchanged
+`CameraSelection` guard copied from one displayed `LiveStatus` candidate:
+
+```json
+{"rgb":"/dev/video0","ir":"/dev/video1","expected":{"supervisor_id":"11111111111111111111111111111111","candidate":{"instance_id":"22222222222222222222222222222222","generation":7,"endpoint_paths":["/dev/video0","/dev/video1"]}}}
+```
+
+Use actual displayed IDs, generation and endpoints, not these example values.
+The daemon verifies current roles, ordinary class and external-camera policy
+before probe, preflight or capture. A stale or wrong-role choice refuses; it
+does not select another camera. Quote the JSON in the shell. Missing, repeated
+or malformed values are usage errors before a request is sent.
+
+For an existing enrollment, non-reset capture requires the same complete
+primary binding. To use a different camera, explicitly add a camera group or
+reset after authorization. The old commands without this option retain their
+behavior. An older daemon reports that operation-scoped choice needs an upgrade;
+the client does not retry a legacy enrollment or persist a camera pin. Guided
+session choices and split enrollment remain separate work. This option does not
+extend the public machine `--json` contract.
 
 Adding or replacing trusted faces requires OS authorization for a non-root account owner. This covers `enroll`, `enroll --reset`, and `profiles add-scan`, including the guided TUI and direct socket clients. Each request needs its own authorization; root retains administrative access. A successful replacement preserves the existing template key and recovery setup, and failed capture preserves the old enrollment.
 

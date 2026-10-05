@@ -296,6 +296,191 @@ mod request_preparation_gates {
         engine.set_devices(NO_RGB, NO_IR);
     }
 
+    fn operation_choice(user: &str, variant: &str) -> Request {
+        let inventory = irlume_auth::camera_inventory_snapshot();
+        let candidate = inventory.candidates.iter()
+            .find(|camera| camera.endpoint_paths.contains(&RGB.to_owned()))
+            .unwrap();
+        let mut payload = serde_json::json!({
+            "user": user, "profile": null, "scans": 1,
+            "pair": {"rgb": RGB, "ir": IR, "expected": {
+                "supervisor_id": inventory.supervisor_id,
+                "candidate": candidate
+            }}
+        });
+        if variant == "EnrollOn" {
+            payload["reset"] = serde_json::json!(true);
+        }
+        serde_json::from_value(serde_json::json!({variant: payload}))
+            .expect("operation-scoped enrollment request must be supported")
+    }
+
+    #[test]
+    fn operation_choice_dispatch_uses_chosen_camera_and_restores_standing_pair() {
+        let _guard = env_lock();
+        let mut engine = engine();
+        let sb = sandbox("operation-camera-choice");
+        let _environment = Environment::clear();
+        let recorder = fixture(false);
+        let user = users::name_for_uid(0).unwrap();
+        let mut enrollment = enrollment_with(&user, &["Face Scan 1"]);
+        enrollment.camera_binding = Some(irlume_core::storage::CameraBinding::Ordinary {
+            rgb: Some("standing-camera".into()), ir: Some("standing-camera".into()),
+        });
+        write_enrollment(&sb.dir, &enrollment);
+        engine.set_devices(NO_RGB, NO_IR);
+        let before = std::fs::read(sb.dir.join(format!("{user}.json"))).unwrap();
+        for variant in ["EnrollOn", "AddCameraGroupOn"] {
+            let first_call = recorder.calls().len();
+            let response = dispatch(operation_choice(&user, variant), &peer(0), &mut engine);
+            assert!(!is_face_grant(&response), "fixture never grants: {response:?}");
+            let all_calls = recorder.calls();
+            let calls = &all_calls[first_call..];
+            assert!(calls.contains(&Call::OpenRgb(RGB.into())),
+                "{variant} must capture on the operation's camera, not the standing pair: {response:?} {calls:?}");
+            assert!(!calls.contains(&Call::OpenRgb(NO_RGB.into())), "{calls:?}");
+            assert_eq!(engine.rgb_device(), NO_RGB);
+            assert_eq!(engine.ir_device(), NO_IR);
+            assert!(!sb.dir.join("config/cameras.conf").exists());
+            assert_eq!(std::fs::read(sb.dir.join(format!("{user}.json"))).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn operation_choice_nonreset_dispatch_refuses_foreign_primary_before_any_probe() {
+        let _guard = env_lock();
+        let mut engine = engine();
+        let sb = sandbox("operation-choice-primary-dispatch");
+        let _environment = Environment::clear();
+        let recorder = fixture(false);
+        let user = users::name_for_uid(0).unwrap();
+        let mut enrollment = enrollment_with(&user, &["Face Scan 1"]);
+        enrollment.camera_binding = Some(irlume_core::storage::CameraBinding::Ordinary {
+            rgb: Some("standing-primary".into()), ir: Some("standing-primary".into()),
+        });
+        write_enrollment(&sb.dir, &enrollment);
+        let before = std::fs::read(sb.dir.join(format!("{user}.json"))).unwrap();
+        let mut request = operation_choice(&user, "EnrollOn");
+        if let Request::EnrollOn { reset, .. } = &mut request { *reset = false; }
+        let response = dispatch(request, &peer(0), &mut engine);
+        assert!(matches!(response, Response::Error(_)), "{response:?}");
+        assert!(recorder.calls().is_empty(), "foreign primary reached qualification/probe: {:?}", recorder.calls());
+        assert_eq!(std::fs::read(sb.dir.join(format!("{user}.json"))).unwrap(), before);
+    }
+
+    #[test]
+    fn operation_choice_empty_bound_primary_refuses_before_any_probe() {
+        let _guard = env_lock();
+        let mut engine = engine();
+        let sb = sandbox("operation-choice-empty-bound-primary");
+        let _environment = Environment::clear();
+        let recorder = fixture(false);
+        let user = users::name_for_uid(0).unwrap();
+        for binding in [
+            irlume_core::storage::CameraBinding::Ordinary {
+                rgb: Some("standing-primary".into()), ir: Some("standing-primary".into()),
+            },
+            irlume_core::storage::CameraBinding::Ordinary { rgb: None, ir: None },
+        ] {
+            let mut enrollment = enrollment_with(&user, &[]);
+            enrollment.camera_binding = Some(binding);
+            write_enrollment(&sb.dir, &enrollment);
+            let before = std::fs::read(sb.dir.join(format!("{user}.json"))).unwrap();
+            let mut request = operation_choice(&user, "EnrollOn");
+            if let Request::EnrollOn { reset, .. } = &mut request { *reset = false; }
+            let response = dispatch(request, &peer(0), &mut engine);
+            assert!(matches!(response, Response::Error(_)), "{response:?}");
+            assert!(recorder.calls().is_empty(), "an empty bound primary reached camera work: {:?}", recorder.calls());
+            assert_eq!(std::fs::read(sb.dir.join(format!("{user}.json"))).unwrap(), before);
+            assert!(!sb.dir.join("capture-qualifications").exists());
+        }
+    }
+
+    fn publication_attempt() -> irlume_auth::QualificationAttempt {
+        use irlume_camera::capture_qualification::*;
+        let endpoint = |role| CameraEndpoint::new(
+            "ab".repeat(32), 0x046d, 0x085e, None,
+            if role == QualifiedStreamRole::Rgb { 0 } else { 2 },
+            "/devices/fixture/qualification".into(), role,
+            ConnectionContext::new("/devices/fixture/controller".into(), 5_000_000,
+                "uvcvideo".into(), "v4l2-uvc".into()).unwrap(),
+        ).unwrap();
+        let stream = |role, fourcc: &str, height| StreamContract::new(
+            role,
+            RequestedStream::new(640, height, fourcc.into(), ExactInterval::new(1, 30).unwrap()).unwrap(),
+            AcceptedStream::new(640, height, fourcc.into(), 1280, 640 * height * 2,
+                0, 8, 1, 1, 0, ExactInterval::new(1, 30).unwrap()).unwrap(),
+            if role == QualifiedStreamRole::Rgb { ExactRate::new(15, 2).unwrap() } else { ExactRate::new(15, 1).unwrap() },
+        ).unwrap();
+        let context = QualificationContext::new(
+            endpoint(QualifiedStreamRole::Rgb), endpoint(QualifiedStreamRole::Ir),
+            stream(QualifiedStreamRole::Rgb, "YUYV", 480),
+            stream(QualifiedStreamRole::Ir, "GREY", 400),
+        ).unwrap();
+        let arm = ArmEvidence::new(6, 6, 0, 6, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0,
+            Default::default(), Default::default(), 0, 140.0, 120.0, 850).unwrap();
+        QualificationAttempt::new(1_786_944_000, context, arm.clone(), arm, false,
+            AttemptOutcome::ConcurrentQualified, None).unwrap()
+    }
+
+    #[test]
+    fn operation_choice_qualification_publisher_uses_real_selected_save_composition() {
+        let _guard = env_lock();
+        let mut engine = engine();
+        let sb = sandbox("operation-choice-selected-save");
+        let _environment = Environment::clear();
+        let recorder = fixture(false);
+        let user = users::name_for_uid(0).unwrap();
+        let choice = match operation_choice(&user, "EnrollOn") {
+            Request::EnrollOn { pair, .. } => pair,
+            _ => unreachable!(),
+        };
+        let request = engine.prepare_enrollment_camera(&choice).unwrap();
+        let expected = request.prepared_camera_lease().unwrap();
+        let store = irlume_auth::QualificationStore::system();
+        let attempt = publication_attempt();
+        let record = save_selected_capture_qualification(&store, attempt.clone(), None, Some(&expected)).unwrap();
+        assert_eq!(record.revision(), 1);
+        let record_path = std::fs::read_dir(sb.dir.join("capture-qualifications")).unwrap()
+            .map(|entry| entry.unwrap().path()).find(|path| path.extension().is_some_and(|ext| ext == "json")).unwrap();
+        let before = std::fs::read(&record_path).unwrap();
+        recorder.invalidation_observer()();
+        assert!(matches!(save_selected_capture_qualification(&store, attempt.clone(), Some(1), Some(&expected)),
+            Err(irlume_auth::QualificationStoreError::PublicationRefused(_))));
+        assert_eq!(std::fs::read(record_path).unwrap(), before);
+        assert_eq!(store.load(attempt.context()).unwrap().unwrap().revision(), 1);
+        assert!(recorder.calls().is_empty());
+    }
+
+    #[test]
+    fn operation_choice_nonroot_socket_refuses_foreign_account_before_queueing() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let _guard = env_lock();
+        let sb = sandbox("operation-choice-socket-refusal");
+        let _environment = Environment::clear();
+        let recorder = fixture(false);
+        let user = users::name_for_uid(0).unwrap();
+        let arbiter = arbiter::Arbiter::<Queued>::new();
+        arbiter.close();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let diagnostics = diagnostics::DiagnosticState::default();
+        for variant in ["EnrollOn", "AddCameraGroupOn"] {
+            let request = operation_choice(&user, variant);
+            let response = with_serve_as_peer_and_diagnostics(&arbiter, &ready, &diagnostics, peer(NOBODY), |client| {
+                serde_json::to_writer(client, &request).unwrap();
+                (&*client).write_all(b"\n").unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                serde_json::from_str::<Response>(&line).unwrap()
+            });
+            assert!(matches!(response, Response::Error(ref message) if message == &format!("not authorized to enroll '{user}'")), "{response:?}");
+        }
+        assert!(arbiter.take().is_none());
+        assert!(recorder.calls().is_empty());
+        assert!(!sb.dir.join("capture-qualifications").exists());
+        assert!(!sb.dir.join("config/cameras.conf").exists());
+    }
+
     #[test]
     fn automatic_enrolled_pair_defers_standing_tier_and_retains_admitted_charges() {
         let _guard = env_lock();

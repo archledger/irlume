@@ -594,6 +594,98 @@ pub(crate) fn connected_pairs_with_split(
     connected_pairs_with_split_from_slot(&DEFAULT_CAMERA_SUPERVISOR, records)
 }
 
+pub(crate) fn enrollment_connected_pairs(
+    choice: &irlume_common::live_camera::EnrollmentCameraChoice,
+    records: &[irlume_common::split_schema::AuthorizationRecord],
+) -> Result<ResolvedConnectedPairs, &'static str> {
+    choice.validate()?;
+    let resolve = |supervisor: &CameraSupervisor| {
+        let inventory = supervisor
+            .inventory
+            .lock()
+            .map_err(|_| "camera inventory is poisoned")?;
+        if !choice
+            .expected
+            .matches(&inventory.snapshot(), &choice.rgb, &choice.ir)
+        {
+            return Err("enrollment camera connection changed; select it again");
+        }
+        let view = inventory.connected_pairs_with_split(records);
+        if view
+            .ordinary
+            .pairs
+            .iter()
+            .filter(|pair| {
+                pair.rgb == choice.rgb
+                    && pair.ir == choice.ir
+                    && pair.instance_id == choice.expected.candidate.instance_id
+                    && pair.generation == choice.expected.candidate.generation
+            })
+            .count()
+            != 1
+        {
+            return Err("enrollment choice is not a unique classified ordinary pair");
+        }
+        Ok(view)
+    };
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
+        return resolve(&supervisor);
+    }
+    resolve(
+        DEFAULT_CAMERA_SUPERVISOR
+            .get()
+            .ok_or("camera inventory is not initialized")?,
+    )
+}
+
+pub(crate) fn with_selected_camera_publication<R>(
+    expected: &crate::lease::OrdinaryLeaseRequest,
+    commit: impl FnOnce() -> R,
+) -> Result<R, CameraLeaseError> {
+    let publish = |supervisor: &CameraSupervisor| {
+        let inventory = supervisor
+            .inventory
+            .lock()
+            .map_err(|_| CameraLeaseError::Poisoned)?;
+        let snapshot = inventory.snapshot();
+        if snapshot.state != CameraInventoryState::Current
+            || snapshot.validate().is_err()
+            || snapshot.supervisor_id.as_deref() != Some(expected.supervisor_id.as_str())
+            || inventory
+                .connected_pairs()
+                .pairs
+                .iter()
+                .filter(|pair| *pair == &expected.pair)
+                .count()
+                != 1
+        {
+            return Err(CameraLeaseError::Stale);
+        }
+        let reference = inventory
+            .reference_for_endpoints(&[&expected.pair.rgb, &expected.pair.ir])
+            .map_err(|_| CameraLeaseError::Stale)?;
+        if reference.descriptor().camera_instance_id().as_str() != expected.pair.instance_id
+            || reference.descriptor().generation().get() != expected.pair.generation
+        {
+            return Err(CameraLeaseError::Stale);
+        }
+        // No validation after commit: its receipt may already describe visible data.
+        let result = commit();
+        drop(inventory);
+        Ok(result)
+    };
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
+        return publish(&supervisor);
+    }
+    publish(
+        DEFAULT_CAMERA_SUPERVISOR
+            .get()
+            .ok_or(CameraLeaseError::Stale)?,
+    )
+}
+
 pub(crate) fn default_camera_supervisor() -> &'static CameraSupervisor {
     DEFAULT_CAMERA_SUPERVISOR
         .get_or_init(|| {
@@ -994,6 +1086,24 @@ pub(crate) mod tests {
         assert!(session.lease().covers_endpoint("/dev/video1"));
         assert!(!session.lease().covers_endpoint("/dev/video9"));
         assert!(session.lease().is_split_pair());
+        assert!(crate::collect_qualification_context_in_operation(
+            "/dev/video0",
+            "/dev/video1",
+            &session,
+        )
+        .is_err());
+        assert!(crate::measure_capture_qualification_in_operation(
+            "/dev/video0",
+            "/dev/video1",
+            1,
+            &crate::no_progress(),
+            &session,
+        )
+        .is_err());
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "ordinary operation qualification helpers must refuse split before backend opens"
+        );
         let rgb = session
             .lease()
             .frame_binding("/dev/video0", crate::contracts::StreamRole::Rgb)

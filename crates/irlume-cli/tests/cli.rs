@@ -4758,6 +4758,68 @@ fn profiles_empty_legacy_listing_keeps_the_targeted_cleanup() {
     );
 }
 
+const ENROLLMENT_CHOICE: &str = r#"{"rgb":"/dev/video0","ir":"/dev/video1","expected":{"supervisor_id":"11111111111111111111111111111111","candidate":{"instance_id":"22222222222222222222222222222222","generation":7,"endpoint_paths":["/dev/video0","/dev/video1"]}}}"#;
+
+#[test]
+fn operation_camera_choice_cli_sends_exact_guard_and_never_retries_old_daemon() {
+    for add in [false, true] {
+        let sb = Sandbox::new(if add {
+            "operation-choice-add"
+        } else {
+            "operation-choice-enroll"
+        });
+        let log = serve(&sock(&sb), |_| Response::Error("bad request".into()));
+        let mut args = vec![
+            "enroll",
+            "--user",
+            "tester",
+            "--camera-choice",
+            ENROLLMENT_CHOICE,
+        ];
+        if add {
+            args.push("--add-camera");
+        }
+        let (code, _, err) = run(&mut sb.cmd(&args));
+        assert_eq!(code, 1);
+        assert!(err.contains("needs a newer irlumed"), "{err}");
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.len(),
+            1,
+            "an unsupported choice must never retry another operation"
+        );
+        let value = serde_json::to_value(&log[0]).unwrap();
+        let name = if add { "AddCameraGroupOn" } else { "EnrollOn" };
+        assert_eq!(
+            value[name]["pair"],
+            serde_json::from_str::<serde_json::Value>(ENROLLMENT_CHOICE).unwrap()
+        );
+        assert!(!sb.path("cfg/cameras.conf").exists());
+    }
+}
+
+#[test]
+fn operation_camera_choice_cli_refuses_malformed_missing_and_repeated_values_before_request() {
+    let sb = Sandbox::new("operation-choice-usage");
+    let log = serve(&sock(&sb), |_| Response::Error("unexpected capture".into()));
+    for flags in [
+        vec!["--camera-choice"],
+        vec!["--camera-choice", "{}"],
+        vec![
+            "--camera-choice",
+            ENROLLMENT_CHOICE,
+            "--camera-choice",
+            ENROLLMENT_CHOICE,
+        ],
+    ] {
+        let mut args = vec!["enroll", "--user", "tester"];
+        args.extend(flags);
+        let (code, _, err) = run(&mut sb.cmd(&args));
+        assert_eq!(code, 2, "{err}");
+    }
+    assert!(log.lock().unwrap().is_empty());
+}
+
 #[test]
 fn enroll_reports_a_new_profile_and_forwards_the_flags() {
     let sb = Sandbox::new("enrollnew");

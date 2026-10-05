@@ -93,6 +93,57 @@ impl CameraSelection {
     }
 }
 
+/// One ordinary RGB/IR choice for an enrollment operation, copied before approval.
+/// The daemon derives roles, binding identity and policy from current camera facts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "EnrollmentChoiceWire")]
+pub struct EnrollmentCameraChoice {
+    /// Intended RGB endpoint copied from the displayed candidate.
+    pub rgb: String,
+    /// Intended IR endpoint; the daemon verifies its classified role.
+    pub ir: String,
+    /// Unchanged connection guard retained through confirmation and OS approval.
+    pub expected: CameraSelection,
+}
+
+impl EnrollmentCameraChoice {
+    /// Validate distinct endpoints covered by the displayed physical candidate.
+    ///
+    /// # Errors
+    /// Returns a static reason for malformed or uncovered choice metadata.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.expected.validate()?;
+        if self.rgb == self.ir
+            || !self.expected.candidate.endpoint_paths.contains(&self.rgb)
+            || !self.expected.candidate.endpoint_paths.contains(&self.ir)
+        {
+            return Err("enrollment choice needs two distinct displayed endpoints");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollmentChoiceWire {
+    rgb: String,
+    ir: String,
+    expected: CameraSelection,
+}
+
+impl TryFrom<EnrollmentChoiceWire> for EnrollmentCameraChoice {
+    type Error = &'static str;
+    fn try_from(w: EnrollmentChoiceWire) -> Result<Self, Self::Error> {
+        let choice = Self {
+            rgb: w.rgb,
+            ir: w.ir,
+            expected: w.expected,
+        };
+        choice.validate()?;
+        Ok(choice)
+    }
+}
+
 impl CameraInventorySnapshot {
     /// Validate the closed, bounded display contract without accessing hardware.
     ///

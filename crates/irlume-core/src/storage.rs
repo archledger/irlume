@@ -774,6 +774,19 @@ pub fn save(e: &Enrollment) -> irlume_common::Result<()> {
     save_with_key(e, save_key)
 }
 
+/// Save using a late atomic publisher after state locking and key preparation.
+/// The publisher must preserve owner-only atomic-write and receipt semantics.
+///
+/// # Errors
+/// Returns preparation or publication errors; replacement settlement still runs
+/// when the publisher refuses before writing.
+pub fn save_with_publisher(
+    e: &Enrollment,
+    publish: impl FnOnce(&Path, &[u8]) -> irlume_common::Result<irlume_common::AtomicWrite>,
+) -> irlume_common::Result<()> {
+    save_with_key_and_publisher(e, save_key, publish)
+}
+
 /// Publish a replacement enrollment, preserving an existing template key and
 /// recovery envelope. An encrypted store cannot become plaintext if its key
 /// is missing or the TPM becomes unavailable.
@@ -782,15 +795,33 @@ pub fn save(e: &Enrollment) -> irlume_common::Result<()> {
 /// Returns key, serialization, or filesystem errors. If publication succeeded
 /// but directory synchronization failed, the error explicitly says so.
 pub fn save_replacement(e: &Enrollment) -> irlume_common::Result<()> {
-    save_with_key(e, |user, account| {
-        replacement_key(
-            user,
-            account,
-            template_key::load_key_unmoved_as,
-            template_key::move_kept_key,
-            save_key,
-        )
+    save_replacement_with_publisher(e, |path, bytes| {
+        persist_enrollment(path, bytes).map_err(|error| irlume_common::Error::Io(error.to_string()))
     })
+}
+
+/// Replacement save with admission at the final atomic publication boundary.
+/// Existing template-key retention, rollback and durability settlement apply.
+///
+/// # Errors
+/// Returns key, serialization or publisher errors without skipping settlement.
+pub fn save_replacement_with_publisher(
+    e: &Enrollment,
+    publish: impl FnOnce(&Path, &[u8]) -> irlume_common::Result<irlume_common::AtomicWrite>,
+) -> irlume_common::Result<()> {
+    save_with_key_and_publisher(
+        e,
+        |user, account| {
+            replacement_key(
+                user,
+                account,
+                template_key::load_key_unmoved_as,
+                template_key::move_kept_key,
+                save_key,
+            )
+        },
+        publish,
+    )
 }
 
 /// The key a replacement enrollment is written under; `account` is the
@@ -846,6 +877,19 @@ fn save_with_key(
         &mut Account<'_>,
     ) -> irlume_common::Result<Option<template_key::WriteKey>>,
 ) -> irlume_common::Result<()> {
+    save_with_key_and_publisher(e, resolve_key, |path, bytes| {
+        persist_enrollment(path, bytes).map_err(|error| irlume_common::Error::Io(error.to_string()))
+    })
+}
+
+fn save_with_key_and_publisher(
+    e: &Enrollment,
+    resolve_key: impl FnOnce(
+        &str,
+        &mut Account<'_>,
+    ) -> irlume_common::Result<Option<template_key::WriteKey>>,
+    publish: impl FnOnce(&Path, &[u8]) -> irlume_common::Result<irlume_common::AtomicWrite>,
+) -> irlume_common::Result<()> {
     let _state = template_key::UserStateLock::acquire(&e.user)?;
     let dir = state_dir();
     fs::create_dir_all(&dir).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
@@ -881,7 +925,7 @@ fn save_with_key(
         &stamped
     };
     let written = serialize_enrollment(e, key.as_ref().map(template_key::WriteKey::as_slice))
-        .map(|bytes| persist_enrollment(&path, &bytes));
+        .map(|bytes| publish(&path, &bytes));
     let published = match &written {
         Ok(Ok(published)) => Some(published),
         _ => None,
@@ -901,7 +945,7 @@ fn save_with_key(
         _ => Ok(()),
     };
     settled?;
-    publication_result(written?)
+    publication_result(Ok(written??))
 }
 
 /// Load an enrollment, transparently decrypting v2/v3 and migrating the legacy
@@ -2041,6 +2085,205 @@ mod tests {
         fs::write(&store, b"synthetic camera store").unwrap();
         fs::write(&journal, b"synthetic commit journal").unwrap();
         (store, journal)
+    }
+
+    struct PublicationSandbox {
+        dir: PathBuf,
+        previous: Option<std::ffi::OsString>,
+    }
+    impl PublicationSandbox {
+        fn new(tag: &str) -> Self {
+            let previous = std::env::var_os("IRLUME_STATE_DIR");
+            Self {
+                dir: uid_sandbox(tag),
+                previous,
+            }
+        }
+    }
+    impl Drop for PublicationSandbox {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("IRLUME_STATE_DIR", value),
+                None => std::env::remove_var("IRLUME_STATE_DIR"),
+            }
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn late_publisher_refuses_loss_during_key_preparation_without_replacing_primary() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let sandbox = PublicationSandbox::new("late-key-loss");
+        let user = "late-key-loss";
+        let _account = crate::account::remember(user, 6811);
+        let before = plant_plaintext(&sandbox.dir, user, Some(6811));
+        let current = std::cell::Cell::new(true);
+        let calls = std::cell::Cell::new(0);
+        let mut replacement = sample();
+        replacement.user = user.into();
+        replacement.uid = Some(6811);
+        replacement.profiles[0].name = "New profile".into();
+        let error = save_with_key_and_publisher(
+            &replacement,
+            |_, _| {
+                current.set(false); // The retained admission is lost during blocking preparation.
+                Ok(None)
+            },
+            |_, _| {
+                calls.set(calls.get() + 1);
+                assert!(!current.get(), "the publisher ran before key preparation");
+                Err(irlume_common::Error::Policy(
+                    "camera continuity lost".into(),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, irlume_common::Error::Policy(ref message) if message == "camera continuity lost")
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(fs::read(profile_path(user)).unwrap(), before);
+        assert!(!crate::replacement::record_path(user).exists());
+    }
+
+    #[test]
+    fn late_publisher_refusal_restores_another_accounts_key_before_returning() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let _sandbox = PublicationSandbox::new("late-key-rollback");
+        let user = "late-key-rollback";
+        let key_before = plant_replaced(user, &[41u8; 32], 6821);
+        let primary_before = fs::read(profile_path(user)).unwrap();
+        let recovery = template_key::recovery_path(user);
+        let store = crate::multi_camera::secondary_store_path(user);
+        let intent = crate::multi_camera::commit::intent_path_for(&store);
+        let recovery_before = fs::read(&recovery).unwrap();
+        let store_before = fs::read(&store).unwrap();
+        let intent_before = fs::read(&intent).unwrap();
+        let _account = crate::account::remember(user, 6822);
+        let mut replacement = sample();
+        replacement.user = user.into();
+        replacement.uid = Some(6822);
+        let error = save_with_key_and_publisher(
+            &replacement,
+            |user, account| {
+                template_key::ensure_key_with(
+                    user,
+                    account,
+                    Some(&key_is_another_accounts),
+                    fake_load,
+                    no_move,
+                    fake_seal,
+                )
+                .map(Some)
+            },
+            |_, _| {
+                assert!(
+                    fs::read(template_key::key_path(user)).unwrap() != key_before,
+                    "key preparation did not replace the other account's key"
+                );
+                assert!(crate::replacement::record_path(user).exists());
+                Err(irlume_common::Error::Policy("late camera refusal".into()))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, irlume_common::Error::Policy(ref message) if message == "late camera refusal")
+        );
+        assert!(
+            fs::read(template_key::key_path(user)).unwrap() == key_before,
+            "the refused publication did not restore the original key"
+        );
+        assert!(
+            fs::read(profile_path(user)).unwrap() == primary_before,
+            "primary changed on refusal"
+        );
+        assert!(
+            fs::read(recovery).unwrap() == recovery_before,
+            "recovery changed on refusal"
+        );
+        assert!(
+            fs::read(store).unwrap() == store_before,
+            "secondary changed on refusal"
+        );
+        assert!(
+            fs::read(intent).unwrap() == intent_before,
+            "intent changed on refusal"
+        );
+        assert!(
+            !crate::replacement::record_path(user).exists(),
+            "rollback must precede the refusal return"
+        );
+    }
+
+    #[test]
+    fn late_publisher_visible_receipt_keeps_replacement_pending_instead_of_rollback() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let _sandbox = PublicationSandbox::new("late-visible-receipt");
+        let user = "late-visible-receipt";
+        let key_before = plant_replaced(user, &[42u8; 32], 6831);
+        let primary_before = fs::read(profile_path(user)).unwrap();
+        let _account = crate::account::remember(user, 6832);
+        let mut replacement = sample();
+        replacement.user = user.into();
+        replacement.uid = Some(6832);
+        let error = save_with_key_and_publisher(
+            &replacement,
+            |user, account| {
+                template_key::ensure_key_with(
+                    user,
+                    account,
+                    Some(&key_is_another_accounts),
+                    fake_load,
+                    no_move,
+                    fake_seal,
+                )
+                .map(Some)
+            },
+            |path, bytes| {
+                assert!(matches!(
+                    persist_enrollment(path, bytes)
+                        .map_err(|error| irlume_common::Error::Io(error.to_string()))?,
+                    irlume_common::AtomicWrite::Durable
+                ));
+                Ok(irlume_common::AtomicWrite::VisibleNotDurable(
+                    std::io::Error::other("injected directory sync failure"),
+                ))
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("published") && error.contains("durability"),
+            "{error}"
+        );
+        assert!(
+            fs::read(profile_path(user)).unwrap() != primary_before,
+            "the receipt describes no visible primary change"
+        );
+        assert!(
+            fs::read(template_key::key_path(user)).unwrap() != key_before,
+            "the visible publication rolled back its key"
+        );
+        assert!(crate::replacement::record_path(user).exists());
+        assert!(template_key::recovery_path(user).exists());
+        assert!(crate::multi_camera::secondary_store_path(user).exists());
+        drop(template_key::UserStateLock::acquire(user).unwrap());
+        assert!(!crate::replacement::record_path(user).exists());
+        assert!(!template_key::recovery_path(user).exists());
+        assert!(!crate::multi_camera::secondary_store_path(user).exists());
+        assert!(
+            fs::read(template_key::key_path(user)).unwrap() != key_before,
+            "settlement rolled back the published key"
+        );
     }
 
     /// An enrollment records the uid it was written for. Every loader reads

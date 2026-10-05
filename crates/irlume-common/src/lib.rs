@@ -577,6 +577,17 @@ pub enum Request {
         #[serde(default)]
         reset: bool,
     },
+    /// Enroll on one displayed ordinary pair for this operation only (ADR-0029 §3).
+    /// Root or target account, with the same OS approval as Enroll. An older
+    /// daemon answers Error("bad request"); never retry on a different camera.
+    EnrollOn {
+        user: String,
+        profile: Option<String>,
+        scans: Option<usize>,
+        #[serde(default)]
+        reset: bool,
+        pair: Box<live_camera::EnrollmentCameraChoice>,
+    },
     /// One authorized guided operation. Only this opt-in request receives
     /// streamed enrollment events and can answer a merge on the same socket.
     EnrollmentSession {
@@ -637,6 +648,15 @@ pub enum Request {
         /// DEFAULT_ENROLL_SCANS, the add-camera target (ADR-0024 §3).
         #[serde(default)]
         scans: Option<usize>,
+    },
+    /// Add a camera group using this operation's displayed ordinary pair.
+    /// Root or target account, with credential-management OS approval. An older
+    /// daemon refuses this new variant; no fallback or saved selection write.
+    AddCameraGroupOn {
+        user: String,
+        profile: Option<String>,
+        scans: Option<usize>,
+        pair: Box<live_camera::EnrollmentCameraChoice>,
     },
     /// Remove one secondary camera group (ADR-0024 §4.2): its binding,
     /// scans, and derived state go together under the same
@@ -2419,6 +2439,91 @@ mod tests {
             serde_json::to_value(&removal).unwrap(),
             serde_json::json!({"RemoveCameraGroup": {"user": "alice", "group": "cam-046d-desk"}})
         );
+    }
+
+    #[test]
+    fn operation_camera_choice_requests_preserve_the_guard_and_fail_old_readers() {
+        #[derive(Deserialize)]
+        enum OldRequest {
+            Enroll { user: String },
+            AddCameraGroup { user: String },
+        }
+        for variant in ["EnrollOn", "AddCameraGroupOn"] {
+            let mut payload = serde_json::json!({
+                "user": "alice", "profile": null, "scans": 1,
+                "pair": {
+                    "rgb": "/dev/video0", "ir": "/dev/video1",
+                    "expected": {
+                        "supervisor_id": "11111111111111111111111111111111",
+                        "candidate": {
+                            "instance_id": "22222222222222222222222222222222",
+                            "generation": 7,
+                            "endpoint_paths": ["/dev/video0", "/dev/video1"]
+                        }
+                    }
+                }
+            });
+            if variant == "EnrollOn" {
+                payload["reset"] = serde_json::json!(true);
+            }
+            let wire = serde_json::json!({variant: payload});
+            let request: Request = serde_json::from_value(wire.clone())
+                .expect("operation-scoped enrollment must be a supported request");
+            assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+            assert!(serde_json::from_value::<OldRequest>(wire).is_err());
+        }
+        // Frozen variants retain their accepted shape and username.
+        for wire in [
+            serde_json::json!({"Enroll": {"user": "alice"}}),
+            serde_json::json!({"AddCameraGroup": {"user": "alice"}}),
+        ] {
+            let user = match serde_json::from_value::<OldRequest>(wire).unwrap() {
+                OldRequest::Enroll { user } | OldRequest::AddCameraGroup { user } => user,
+            };
+            assert_eq!(user, "alice");
+        }
+    }
+
+    #[test]
+    fn operation_camera_choice_requests_reject_an_unbound_or_open_choice() {
+        let valid = serde_json::json!({
+            "rgb": "/dev/video0", "ir": "/dev/video1",
+            "expected": {
+                "supervisor_id": "11111111111111111111111111111111",
+                "candidate": {
+                    "instance_id": "22222222222222222222222222222222",
+                    "generation": 7,
+                    "endpoint_paths": ["/dev/video0", "/dev/video1"]
+                }
+            }
+        });
+        // Establish the positive control first: blanket unknown-variant refusal
+        // cannot masquerade as validation of the malformed choices below.
+        let request = |pair| {
+            serde_json::json!({"EnrollOn": {
+                "user": "alice", "profile": null, "scans": 1, "reset": false, "pair": pair
+            }})
+        };
+        assert!(serde_json::from_value::<Request>(request(valid.clone())).is_ok());
+        let mut bad = Vec::new();
+        let mut pair = valid.clone();
+        pair["ir"] = serde_json::json!("/dev/video0");
+        bad.push(pair);
+        let mut pair = valid.clone();
+        pair["ir"] = serde_json::json!("/dev/video9");
+        bad.push(pair);
+        let mut pair = valid.clone();
+        pair["class"] = serde_json::json!("split");
+        bad.push(pair);
+        let mut pair = valid.clone();
+        pair["expected"]["candidate"]["generation"] = serde_json::json!(0);
+        bad.push(pair);
+        let mut pair = valid;
+        pair.as_object_mut().unwrap().remove("expected");
+        bad.push(pair);
+        for pair in bad {
+            assert!(serde_json::from_value::<Request>(request(pair)).is_err());
+        }
     }
 
     #[test]

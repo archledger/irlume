@@ -118,11 +118,13 @@ pub fn classify(req: &Request) -> Class {
         // The account-scoped recognition test captures like Identify.
         | IdentifyFor { .. }
         | Enroll { .. }
+        | EnrollOn { .. }
         | EnrollmentSession { .. }
         | AddScan { .. }
         // An added camera group is an attended capture on the live pair
         // (ADR-0024 §4): same camera class as enrollment.
         | AddCameraGroup { .. }
+        | AddCameraGroupOn { .. }
         | SetupIrEmitter { .. }
         | TuneCaptureMode { .. }
         | CaptureModeStatus

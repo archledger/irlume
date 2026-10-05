@@ -333,3 +333,45 @@ requirement to updates that both authorize and select a split pair.
 - Hardware: on the reference desk, automatic mode chooses the BRIO with both
   connected and the NexiGo with the BRIO unplugged, in the dual and IR-only
   policies, each attended attempt recorded on the shared ledger.
+## Amendment 2026-10-05: guarded ordinary operation choices
+
+`EnrollOn` and `AddCameraGroupOn` carry a closed `EnrollmentCameraChoice`
+containing role-labelled `rgb` and `ir` endpoints plus the existing bounded
+`CameraSelection` connection guard. The guard is copied before confirmation
+and OS approval, not refreshed afterward. It supplies no classification or
+trust: camera code resolves one unique Current ordinary pair under the same
+inventory lock that checks the displayed supervisor, candidate, generation and
+complete endpoint set. Split, ambiguous, wrong-role and stale choices refuse.
+Existing closed candidate and reply shapes remain unchanged.
+
+The variants retain their corresponding root-or-account capture posture and
+credential-management approval. Approval binds the complete original request.
+The daemon prepares the choice after authorization and account ownership,
+before summary invalidation, probe or preflight. Invalid or unreadable coherent
+configuration and unresolved split references still refuse before any explicit
+choice. A proven ordinary operation choice may override valid configured
+selection, with both external-camera policy gates applied.
+
+The Engine retains an expected ordinary lease request across preflight, probe
+and enrollment acquisition. It checks continuity before opens and at publication
+after blocking storage/key preparation, before the atomic write or first intent,
+and restores standing endpoints and IR availability on return, cancellation,
+error or unwind. Current classified pair facts establish IR availability while
+the existing forced-IR-off override wins. The scope never persists a machine
+selection and never uses authentication's standing-choice retention.
+
+Non-reset operation-scoped enrollment on a store with a binding or scans requires
+the same complete primary binding. An empty, unbound store may start enrollment
+on the chosen pair. A different or incomplete primary needs an
+explicit reset or a separately authorized camera-group addition; new scans are
+not assigned to a foreign primary. Add-camera approval and publication use the
+same retained whole ordinary binding. Ordinary qualification helpers reject
+split leases before any backend open and retain existing fd/context checks.
+
+The CLI exposes this slice through `enroll --camera-choice JSON`, including
+`--reset` and `--add-camera`. Old daemons reject the new request variants; the
+client reports unsupported choice without falling back to another operation.
+Legacy requests retain their encodings and behavior. Guided choice, fresh-install
+ranked selection, the proposed handle-facing interface in ADR-0030 and complete
+split request/capture integration remain later slices. Split activation stays
+closed and hardware acceptance is not established by the synthetic tests.

@@ -4,6 +4,7 @@
 use super::*;
 use irlume_camera::test_support::{Call, Camera, Endpoint, Guard};
 use irlume_common::split_schema::{AuthorizationRecord, SideFields};
+use irlume_core::storage;
 use std::{cell::Cell, ffi::OsString, path::PathBuf};
 
 struct Fixture {
@@ -38,6 +39,7 @@ impl Fixture {
             "IRLUME_CAMERA_REQUIRE_FIXED",
             "IRLUME_TEMPLATE_KEY_DIR",
             "IRLUME_GRACE_MS",
+            "IRLUME_TCTI",
         ];
         let saved = keys
             .into_iter()
@@ -46,6 +48,9 @@ impl Fixture {
         std::env::set_var("IRLUME_CONFIG_DIR", &dir);
         std::env::set_var("IRLUME_STATE_DIR", &dir);
         std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", dir.join("private-template-keys"));
+        // Publication tests may resolve a key. An explicit failed transport
+        // cannot fall back to the host TPM, even outside the private runner.
+        std::env::set_var("IRLUME_TCTI", "device:/nonexistent/irlume-test-tpm");
         for key in [
             "IRLUME_RGB_DEVICE",
             "IRLUME_IR_DEVICE",
@@ -121,6 +126,28 @@ impl Fixture {
         .unwrap();
         irlume_common::split_publish::publish_split(&[record], Some(&key)).unwrap();
     }
+
+    fn replace_camera(&self) -> Guard {
+        Guard::install(&[Camera {
+            topology: "/devices/fixture/replacement".into(),
+            identity: "1234:0001:ordinary".into(),
+            fixed: true,
+            controller: "0000:00:14.0".into(),
+            domain: irlume_common::split_key::SplitDomain::Usb2,
+            ports: vec![8],
+            endpoints: vec![
+                Endpoint {
+                    path: self.rgb.clone(),
+                    formats: vec![*b"YUYV"],
+                },
+                Endpoint {
+                    path: self.ir.clone(),
+                    formats: vec![*b"GREY"],
+                },
+            ],
+        }])
+        .unwrap()
+    }
 }
 
 impl Drop for Fixture {
@@ -174,6 +201,444 @@ impl EnrollmentObserver for StopAfterOpens {
             Ok(())
         }
     }
+}
+
+fn enrollment_choice(fixture: &Fixture) -> irlume_common::live_camera::EnrollmentCameraChoice {
+    let inventory = irlume_camera::camera_inventory_snapshot();
+    let candidate = inventory
+        .candidates
+        .iter()
+        .find(|candidate| candidate.endpoint_paths.contains(&fixture.rgb))
+        .unwrap()
+        .clone();
+    irlume_common::live_camera::EnrollmentCameraChoice {
+        rgb: fixture.rgb.clone(),
+        ir: fixture.ir.clone(),
+        expected: irlume_common::live_camera::CameraSelection {
+            supervisor_id: inventory.supervisor_id.unwrap(),
+            candidate,
+        },
+    }
+}
+
+#[test]
+fn operation_choice_engine_captures_chosen_pair_and_restores_on_error_and_unwind() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(false);
+    let choice = enrollment_choice(&fixture);
+    let previous = (
+        shared.engine.rgb_dev.clone(),
+        shared.engine.ir_dev.clone(),
+        shared.engine.ir_available,
+    );
+    {
+        let mut request = shared.engine.prepare_enrollment_camera(&choice).unwrap();
+        assert!(request
+            .enroll_profile_observed(
+                "operation-fixture",
+                None,
+                1,
+                |_| true,
+                &(),
+                &StopAfterOpens(Cell::new(0))
+            )
+            .is_err());
+    }
+    assert!(fixture
+        .recorder
+        .calls()
+        .contains(&Call::OpenRgb(fixture.rgb.clone())));
+    assert!(fixture
+        .recorder
+        .calls()
+        .contains(&Call::OpenIr(fixture.ir.clone())));
+    assert!(fixture.recorder.calls().iter().any(|call| matches!(
+        call,
+        Call::Lease {
+            kind: irlume_camera::lease::CameraOperationKind::Enrollment,
+            ..
+        }
+    )));
+    assert_eq!(
+        (
+            &shared.engine.rgb_dev,
+            &shared.engine.ir_dev,
+            shared.engine.ir_available
+        ),
+        (&previous.0, &previous.1, previous.2)
+    );
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _request = shared.engine.prepare_enrollment_camera(&choice).unwrap();
+        panic!("operation choice unwind");
+    }));
+    assert!(unwound.is_err());
+    assert!(shared.engine.camera_selection.is_none());
+    assert_eq!(
+        (
+            &shared.engine.rgb_dev,
+            &shared.engine.ir_dev,
+            shared.engine.ir_available
+        ),
+        (&previous.0, &previous.1, previous.2)
+    );
+    assert!(!fixture.dir.join("cameras.conf").exists());
+}
+
+#[test]
+fn operation_choice_engine_refuses_stale_guards_wrong_roles_and_invalid_configuration() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(false);
+    let choice = enrollment_choice(&fixture);
+    // Positive scope control prevents absent inventory or a blanket refusal
+    // from satisfying the negative cases below.
+    drop(shared.engine.prepare_enrollment_camera(&choice).unwrap());
+    let mut wrong = Vec::new();
+    let mut changed = choice.clone();
+    changed.expected.supervisor_id = "99999999999999999999999999999999".into();
+    wrong.push(changed);
+    let mut changed = choice.clone();
+    changed.expected.candidate.generation += 1;
+    wrong.push(changed);
+    let mut changed = choice.clone();
+    std::mem::swap(&mut changed.rgb, &mut changed.ir);
+    wrong.push(changed);
+    let mut changed = choice.clone();
+    changed
+        .expected
+        .candidate
+        .endpoint_paths
+        .push("/dev/unobserved".into());
+    wrong.push(changed);
+    for changed in wrong {
+        assert!(shared.engine.prepare_enrollment_camera(&changed).is_err());
+    }
+    std::fs::write(fixture.dir.join("cameras.conf"), "mode=pinned\n").unwrap();
+    assert!(shared.engine.prepare_enrollment_camera(&choice).is_err());
+    assert!(fixture.recorder.calls().is_empty());
+}
+
+#[test]
+fn operation_choice_nonreset_enrollment_cannot_mix_a_different_primary_camera() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(false);
+    let choice = enrollment_choice(&fixture);
+    let (mut enrollment, _) = pad_matching_fixture(0.2, false);
+    enrollment.user = "operation-fixture".into();
+    enrollment.camera_binding = Some(irlume_core::storage::CameraBinding::Ordinary {
+        rgb: Some("standing-primary".into()),
+        ir: Some("standing-primary".into()),
+    });
+    let bytes = serde_json::to_vec(&enrollment).unwrap();
+    let path = fixture.dir.join("operation-fixture.json");
+    std::fs::write(&path, &bytes).unwrap();
+    let mut request = shared.engine.prepare_enrollment_camera(&choice).unwrap();
+    let result = request.enroll_profile_observed(
+        "operation-fixture",
+        Some("New".into()),
+        1,
+        |_| true,
+        &(),
+        &StopAfterOpens(Cell::new(0)),
+    );
+    assert!(result.is_err());
+    assert!(
+        fixture.recorder.calls().is_empty(),
+        "changing the primary capture pair needs reset or an added group, before camera work: {:?}",
+        fixture.recorder.calls()
+    );
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+}
+
+#[test]
+fn operation_choice_engine_refuses_loss_during_registered_enrollment_lease_wait() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(false);
+    let choice = enrollment_choice(&fixture);
+    let mut request = shared.engine.prepare_enrollment_camera(&choice).unwrap();
+    let held = irlume_camera::lease::acquire_camera_operation(
+        &[fixture.rgb.as_str()],
+        irlume_camera::lease::CameraOperationKind::Setup,
+        std::time::Duration::ZERO,
+    )
+    .unwrap();
+    let counts = fixture.recorder.lease_counts_observer();
+    let invalidate = fixture.recorder.invalidation_observer();
+    std::thread::scope(|threads| {
+        let writer = threads.spawn(|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while counts().1 == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "enrollment did not register its waiter"
+                );
+                std::thread::yield_now();
+            }
+            invalidate();
+            drop(held);
+        });
+        assert!(request
+            .enroll_profile_observed("operation-fixture", None, 1, |_| true, &(), &())
+            .is_err());
+        writer.join().unwrap();
+    });
+    assert!(!fixture
+        .recorder
+        .calls()
+        .iter()
+        .any(|call| matches!(call, Call::OpenRgb(_) | Call::OpenIr(_))));
+    assert_eq!(counts(), (0, 0), "no lease or waiter may survive refusal");
+}
+
+#[test]
+fn operation_choice_ancillary_helpers_refuse_a_replacement_at_the_same_paths() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(false);
+    let choice = enrollment_choice(&fixture);
+    let mut request = shared.engine.prepare_enrollment_camera(&choice).unwrap();
+    let shape = CaptureShape {
+        held_sessions: true,
+        attempts: 3,
+        ir_only_attempts: 3,
+        rgb_mean_sum: 30.0,
+        consecutive_ir_only: 3,
+    };
+    // Each healthy helper reaches a real open attempt. Its error is only the
+    // non-granting backend, so unconditional refusal cannot satisfy this test.
+    for helper in 0..3 {
+        let before = fixture.recorder.calls().len();
+        match helper {
+            0 => {
+                assert!(request.capture_qualification_for_request().is_err());
+            }
+            1 => {
+                assert!(request.solo_rgb_starvation_probe(shape).is_none());
+            }
+            _ => {
+                assert!(!request.aba_check_confirms(10.0, 100.0));
+            }
+        }
+        let calls = fixture.recorder.calls();
+        assert!(
+            calls[before..].contains(&Call::OpenRgb(fixture.rgb.clone())),
+            "helper {helper}: {calls:?}"
+        );
+    }
+    let replacement = fixture.replace_camera();
+    assert_eq!(
+        irlume_camera::camera_inventory_snapshot().state,
+        irlume_common::live_camera::CameraInventoryState::Current
+    );
+    assert!(request.capture_qualification_for_request().is_err());
+    assert!(
+        replacement.calls().is_empty(),
+        "qualification re-resolved stale paths"
+    );
+    assert!(request.solo_rgb_starvation_probe(shape).is_none());
+    assert!(
+        replacement.calls().is_empty(),
+        "solo probe re-resolved stale paths"
+    );
+    assert!(!request.aba_check_confirms(10.0, 100.0));
+    assert!(
+        replacement.calls().is_empty(),
+        "A/B/A probe re-resolved stale paths"
+    );
+}
+
+#[test]
+fn operation_choice_runtime_degradation_lookup_refuses_a_replacement() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(false);
+    let choice = enrollment_choice(&fixture);
+    let mut request = shared.engine.prepare_enrollment_camera(&choice).unwrap();
+    request.maybe_switch_capture_mode_from_enrolment(3, 10.0, 100.0);
+    assert!(
+        fixture
+            .recorder
+            .calls()
+            .contains(&Call::OpenRgb(fixture.rgb.clone())),
+        "the healthy control must reach the qualification lookup"
+    );
+    let replacement = fixture.replace_camera();
+    request.maybe_switch_capture_mode_from_enrolment(3, 10.0, 100.0);
+    assert!(
+        replacement.calls().is_empty(),
+        "runtime degradation refreshed the selected incarnation: {:?}",
+        replacement.calls()
+    );
+}
+
+#[test]
+fn operation_choice_primary_publisher_refuses_loss_after_storage_preparation() {
+    let _env = env_guard();
+    let mut shared = shared();
+    for replacing in [false, true] {
+        let fixture = Fixture::new(false);
+        let choice = enrollment_choice(&fixture);
+        let request = shared.engine.prepare_enrollment_camera(&choice).unwrap();
+        assert!(request.prepared_camera_lease().is_some());
+        let (mut enrollment, _) = pad_matching_fixture(0.2, false);
+        enrollment.user = "operation-publication".into();
+        let path = fixture.dir.join("operation-publication.json");
+        let before = serde_json::to_vec(&enrollment).unwrap();
+        std::fs::write(&path, &before).unwrap();
+        enrollment.profiles[0].name = "New profile".into();
+        let healthy = |path: &std::path::Path, bytes: &[u8]| {
+            request.with_prepared_camera_publication(|| {
+                irlume_common::write_atomic_reporting(path, bytes, 0o600)
+                    .map_err(|error| irlume_common::Error::Io(error.to_string()))
+            })
+        };
+        if replacing {
+            storage::save_replacement_with_publisher(&enrollment, healthy).unwrap();
+        } else {
+            storage::save_with_publisher(&enrollment, healthy).unwrap();
+        }
+        assert!(
+            std::fs::read(&path).unwrap() != before,
+            "healthy publication must actually replace bytes"
+        );
+        std::fs::write(&path, &before).unwrap();
+        let called = Cell::new(false);
+        let publish = |path: &std::path::Path, bytes: &[u8]| {
+            called.set(true);
+            fixture.recorder.invalidation_observer()();
+            request.with_prepared_camera_publication(|| {
+                irlume_common::write_atomic_reporting(path, bytes, 0o600)
+                    .map_err(|error| irlume_common::Error::Io(error.to_string()))
+            })
+        };
+        let result = if replacing {
+            storage::save_replacement_with_publisher(&enrollment, publish)
+        } else {
+            storage::save_with_publisher(&enrollment, publish)
+        };
+        assert!(
+            called.get(),
+            "storage/key preparation never reached the admission boundary"
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert!(fixture.recorder.calls().is_empty());
+        drop(request);
+    }
+}
+
+#[test]
+fn operation_choice_group_refusal_after_preparation_cannot_recover_forward() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(false);
+    let choice = enrollment_choice(&fixture);
+    let request = shared.engine.prepare_enrollment_camera(&choice).unwrap();
+    assert!(request.prepared_camera_lease().is_some());
+    let (mut enrollment, _) = pad_matching_fixture(0.2, false);
+    enrollment.user = "operation-group-publication".into();
+    enrollment.camera_binding = Some(storage::CameraBinding::Ordinary {
+        rgb: Some("standing-primary".into()),
+        ir: Some("standing-primary".into()),
+    });
+    let primary = serde_json::to_vec(&enrollment).unwrap();
+    let primary_path = fixture.dir.join("operation-group-publication.json");
+    std::fs::write(&primary_path, &primary).unwrap();
+    let pair = irlume_core::multi_camera::GroupPair::Ordinary {
+        rgb: Some("1234:0001:ordinary".into()),
+        ir: Some("1234:0001:ordinary".into()),
+    };
+    let authorization = irlume_core::multi_camera::authz::EnrollmentAuthorization::mint(
+        enrollment.user.clone(),
+        irlume_core::multi_camera::authz::EnrollmentOperation::add_group(
+            "cam-1234-0001-ordinary".into(),
+            &pair,
+        ),
+        1_000_000,
+        900,
+        enrollment.user.clone(),
+        irlume_core::multi_camera::authz::AuthorizationVia::ElevatedPeer { uid: 0 },
+    )
+    .unwrap();
+    let profile = irlume_core::multi_camera::SecondaryProfileScans {
+        profile: enrollment.profiles[0].name.clone(),
+        scans: enrollment.profiles[0].scans.clone(),
+        ir_calibs: Default::default(),
+    };
+    let path = irlume_core::multi_camera::secondary_store_path(&enrollment.user);
+    let intent = irlume_core::multi_camera::commit::intent_path_for(&path);
+    let called = Cell::new(false);
+    let result = publish_camera_group_with(
+        CameraGroupPublication {
+            user: &enrollment.user,
+            pair: &pair,
+            group_id: "cam-1234-0001-ordinary",
+            profile: &profile,
+            start_enr: &enrollment,
+            authorization: &authorization,
+            now_unix: 1_000_300,
+        },
+        |prepared| {
+            called.set(true);
+            assert!(
+                !intent.exists(),
+                "preparation already authorized recover-forward"
+            );
+            fixture.recorder.invalidation_observer()();
+            request.with_prepared_camera_publication(|| {
+                prepared
+                    .publish()
+                    .map_err(|error| irlume_common::Error::Protocol(error.to_string()))
+            })
+        },
+    );
+    assert!(
+        called.get(),
+        "the real group preparation must precede this injected loss"
+    );
+    assert!(result.is_err());
+    assert!(!path.exists() && !intent.exists());
+    assert!(matches!(
+        irlume_core::multi_camera::commit::resolve_commit(&path),
+        Ok(irlume_core::multi_camera::commit::CommitResolution::Clean)
+    ));
+    assert_eq!(std::fs::read(primary_path).unwrap(), primary);
+    assert!(fixture.recorder.calls().is_empty());
+    drop(request);
+    let _replacement = fixture.replace_camera();
+    let current = enrollment_choice(&fixture);
+    let request = shared.engine.prepare_enrollment_camera(&current).unwrap();
+    let published = publish_camera_group_with(
+        CameraGroupPublication {
+            user: &enrollment.user,
+            pair: &pair,
+            group_id: "cam-1234-0001-ordinary",
+            profile: &profile,
+            start_enr: &enrollment,
+            authorization: &authorization,
+            now_unix: 1_000_300,
+        },
+        |prepared| {
+            request.with_prepared_camera_publication(|| {
+                prepared
+                    .publish()
+                    .map_err(|error| irlume_common::Error::Protocol(error.to_string()))
+            })
+        },
+    )
+    .unwrap();
+    assert_eq!(published, "cam-1234-0001-ordinary");
+    assert_eq!(
+        irlume_core::multi_camera::load_secondary(&path)
+            .unwrap()
+            .unwrap()
+            .generation,
+        1
+    );
+    assert!(!intent.exists());
 }
 
 #[test]

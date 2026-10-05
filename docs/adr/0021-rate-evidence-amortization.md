@@ -104,3 +104,28 @@ a working day of unlocks; the entry is still removed by every invalidating
 event and by a daemon restart, and `IRLUME_RATE_AMORTIZATION=0` still
 disables reuse.
 
+## Amendment 2026-10-05: parked buffers before paired admission
+
+Native capture may park at most two ERROR-marked startup buffers before delivering
+a sound frame, provided the original ring retains capacity. Those buffers stay
+unviewed and unrequeued until teardown. The paired startup fill may consume only
+this exact operation-specific pending return before any observation, prior health
+admission or recovery epoch. Companion cancellation, deadline, endpoint, privacy
+and producer checks run between every attempt. A Parked return counts neither as
+a sound startup flush nor as delivered-rate evidence.
+
+Handling a Parked return prevents this stream's continuity-probe admission. Once
+both preparation workers have finished and joined, any handled Parked revokes
+both streams' cached completions, prior readiness and windows. One additional
+bounded fill on the same serviced streams owes a fresh sound seed and full
+30-delta window on both sides after the last Parked. A second pending phase is
+not admitted. A failed Parked preparation or fresh phase also revokes both sides
+before returning its original refusal. The same role floors and subsequent
+sliding judgments remain in force. Other Interrupted returns, uncertain queue or
+start failures, third startup errors, post-sound corruption, exhausted rings and
+authority refusals remain terminal; no hidden restart or device replacement occurs.
+
+This corrects the paired startup policy's propagation of a pending return that
+adaptive single-stream warm-up already handles. It does not establish why a device
+reported ERROR, qualify concurrent split capture or enable split authentication
+(#995; ADR-0032).

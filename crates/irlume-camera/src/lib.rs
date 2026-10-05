@@ -2769,20 +2769,63 @@ fn establish_concurrent_rate_with_cancel<A: ValidatedStream + Send, B: Validated
     secondary: &mut TrackedStream<B>,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<()> {
+    let (preparation, parked) = establish_paired_rate_pass(primary, secondary, &cancelled);
+    if parked {
+        // Neither worker's preparation readiness survives a paired Parked.
+        // Both workers have joined. Revoke both contributions even if that
+        // preparation failed. On success, owe a single new full paired fill
+        // entirely after the last Parked, without reopening either stream.
+        invalidate_paired_rate_admission(primary);
+        invalidate_paired_rate_admission(secondary);
+    }
+    preparation?;
+    if parked {
+        let (fresh, pending) = establish_paired_rate_pass(primary, secondary, &cancelled);
+        if fresh.is_err() || pending {
+            invalidate_paired_rate_admission(primary);
+            invalidate_paired_rate_admission(secondary);
+        }
+        fresh?;
+        if pending {
+            return Err(std::io::Error::other(
+                "paired startup remained pending after the bounded preparation phase",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn invalidate_paired_rate_admission<S: ValidatedStream>(stream: &mut TrackedStream<S>) {
+    stream.health_admitted = false;
+    stream.rate_window.reset();
+    if let Some(key) = &stream.amort_key {
+        rate_amortization::invalidate(key);
+    }
+}
+
+fn establish_paired_rate_pass<A: ValidatedStream + Send, B: ValidatedStream + Send>(
+    primary: &mut TrackedStream<A>,
+    secondary: &mut TrackedStream<B>,
+    cancelled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> (std::io::Result<()>, bool) {
     let ready_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    std::thread::scope(|scope| {
+    let mut primary_parked = 0;
+    let mut secondary_parked = 0;
+    let result = std::thread::scope(|scope| {
         let a = {
             let count = std::sync::Arc::clone(&ready_count);
-            let cancelled = std::sync::Arc::clone(&cancelled);
+            let cancelled = std::sync::Arc::clone(cancelled);
+            let parked = &mut primary_parked;
             scope.spawn(hostfs::inherit(move || {
-                drain_until_both_ready(primary, &count, &cancelled)
+                drain_until_both_ready(primary, &count, &cancelled, parked)
             }))
         };
         let b = {
             let count = std::sync::Arc::clone(&ready_count);
-            let cancelled = std::sync::Arc::clone(&cancelled);
+            let cancelled = std::sync::Arc::clone(cancelled);
+            let parked = &mut secondary_parked;
             scope.spawn(hostfs::inherit(move || {
-                drain_until_both_ready(secondary, &count, &cancelled)
+                drain_until_both_ready(secondary, &count, &cancelled, parked)
             }))
         };
         // A panic in a fill thread is a software defect, never a camera
@@ -2794,13 +2837,51 @@ fn establish_concurrent_rate_with_cancel<A: ValidatedStream + Send, B: Validated
             .join()
             .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
         match (a, b) {
-            (Ok(()), Ok(())) => Ok(()),
+            (Ok(_), Ok(_)) => Ok(()),
             (Err(_), Err(b)) if is_privacy_boundary_error(&b) => Err(b),
             (Err(a), Err(b)) if paired_rate_fill_cancelled(&a) => Err(b),
             (Err(a), _) => Err(a),
             (_, Err(b)) => Err(b),
         }
-    })
+    });
+    // Preserve the handled-Parked evidence even when preparation failed.
+    (result, primary_parked != 0 || secondary_parked != 0)
+}
+
+// Consume only bounded native Parked returns before this original stream has
+// observed any frame. Every sound discard retains its normal tracker checks.
+fn next_paired_startup_discard<S: ValidatedStream>(
+    stream: &mut TrackedStream<S>,
+    parked: &mut u32,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<()> {
+    use std::sync::atomic::Ordering;
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(paired_rate_cancel_error());
+        }
+        match stream.next_discarded() {
+            Err(error)
+                if mmap_capture::parked(&error)
+                    && *parked < mmap_capture::MAX_PARKED_STARTUP_ERRORS
+                    && stream.observations == 0
+                    && !stream.health_admitted
+                    && !stream.recovery_epoch_pending =>
+            {
+                // The original ring retains the parked index without exposing
+                // or requeueing its mapping.
+                // Only a new pre-admission stream may consume this exact return.
+                *parked += 1;
+                stream.rate_window.reset();
+                if let Some(key) = &stream.amort_key {
+                    rate_amortization::invalidate(key);
+                }
+                // next_discarded checks cancellation/deadline/privacy/lease
+                // boundaries on every attempt; no sleep or hidden restart here.
+            }
+            result => return result,
+        }
+    }
 }
 
 /// Fill one stream's delivered-rate window and keep discarding until BOTH
@@ -2814,7 +2895,8 @@ fn drain_until_both_ready<S: ValidatedStream>(
     stream: &mut TrackedStream<S>,
     ready_count: &std::sync::atomic::AtomicUsize,
     cancelled: &std::sync::atomic::AtomicBool,
-) -> std::io::Result<()> {
+    parked_startup: &mut u32,
+) -> std::io::Result<bool> {
     use std::sync::atomic::Ordering;
     // Flush the STREAMON transient (per role, measured; see
     // [`rate_gate::startup_flush`]); its delivery pattern would poison the
@@ -2823,7 +2905,7 @@ fn drain_until_both_ready<S: ValidatedStream>(
         if cancelled.load(Ordering::Acquire) {
             return Err(paired_rate_cancel_error());
         }
-        if let Err(error) = stream.next_discarded() {
+        if let Err(error) = next_paired_startup_discard(stream, parked_startup, cancelled) {
             cancelled.store(true, Ordering::Release);
             return Err(error);
         }
@@ -2843,7 +2925,7 @@ fn drain_until_both_ready<S: ValidatedStream>(
     if let Some(key) = stream
         .amort_key
         .clone()
-        .filter(rate_amortization::amortizable)
+        .filter(|key| *parked_startup == 0 && rate_amortization::amortizable(key))
     {
         let mut attempts = 0;
         while stream.rate_window.count() < rate_amortization::CONTINUITY_PROBE_DELTAS
@@ -2852,7 +2934,7 @@ fn drain_until_both_ready<S: ValidatedStream>(
             if cancelled.load(Ordering::Acquire) {
                 return Err(paired_rate_cancel_error());
             }
-            if let Err(error) = stream.next_discarded() {
+            if let Err(error) = next_paired_startup_discard(stream, parked_startup, cancelled) {
                 cancelled.store(true, Ordering::Release);
                 return Err(error);
             }
@@ -2875,16 +2957,18 @@ fn drain_until_both_ready<S: ValidatedStream>(
             if cancelled.load(Ordering::Acquire) {
                 return Err(paired_rate_cancel_error());
             }
-            if let Err(error) = stream.next_discarded() {
+            if let Err(error) = next_paired_startup_discard(stream, parked_startup, cancelled) {
                 cancelled.store(true, Ordering::Release);
                 return Err(error);
             }
         }
-        if stream.rate_window.meets_floor(
-            policy.floor_num(),
-            policy.floor_den(),
-            policy.tolerance_percent(),
-        ) {
+        if *parked_startup == 0
+            && stream.rate_window.meets_floor(
+                policy.floor_num(),
+                policy.floor_den(),
+                policy.tolerance_percent(),
+            )
+        {
             stream.health_admitted = true;
             ready_count.fetch_add(1, Ordering::AcqRel);
             reported = true;
@@ -2921,7 +3005,7 @@ fn drain_until_both_ready<S: ValidatedStream>(
         if cancelled.load(Ordering::Acquire) {
             return Err(paired_rate_cancel_error());
         }
-        if let Err(error) = stream.next_discarded() {
+        if let Err(error) = next_paired_startup_discard(stream, parked_startup, cancelled) {
             cancelled.store(true, Ordering::Release);
             return Err(error);
         }
@@ -2953,7 +3037,7 @@ fn drain_until_both_ready<S: ValidatedStream>(
             rate_amortization::record_completion(key.clone());
         }
     }
-    Ok(())
+    Ok(*parked_startup != 0)
 }
 
 fn install_recovered_resources<S, M, G, E>(

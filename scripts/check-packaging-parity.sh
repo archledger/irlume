@@ -31,6 +31,7 @@ fail=0
 
 echo "== desktop launcher and icon in supported install paths =="
 python3 scripts/test-desktop-integration.py || fail=1
+python3 scripts/test-lightdm-packaging.py || fail=1
 echo
 
 echo "== pamsm consumed from the maintained fork only =="

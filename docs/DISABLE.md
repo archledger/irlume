@@ -330,8 +330,18 @@ lines and other services stay untouched by this safety pass. A continued or
 unrecognized PAM line, a link, or an explicit non-inert `PAM_IGNORE` action
 refuses the rewrite and is reported. If capabilities remain unavailable,
 reconcile exits 1 after the safety pass; it does not refresh overrides or add
-or restore authentication rules. This does not exclude `pam_fprintd` from
-LightDM's shared stacks or install a hook before LightDM starts.
+or restore authentication rules.
+
+When irlume's LightDM units are installed, LightDM also runs against a
+private, read-only PAM view: `irlume-lightdm-prepare.service` rebuilds it from
+the configuration LightDM is about to load before every start, and while
+XDMCP or VNC is enabled the view replaces `pam_fprintd` and irlume's
+credential rules with inert slots without rewriting the shared stacks.
+Removing irlume takes the `lightdm.service.d` drop-in and the view units away
+with it, and `irlume uninstall` removes its own copies; LightDM then starts
+on the ordinary shared stacks again. Runtime view files under
+`/run/irlume-lightdm` stay until reboot so sessions that inherited the view
+keep working.
 
 ## Keep some surfaces
 

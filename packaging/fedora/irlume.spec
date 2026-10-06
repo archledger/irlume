@@ -154,6 +154,7 @@ install -Dm0644 packaging/desktop/io.github.archledger.Irlume.desktop %{buildroo
 install -Dm0644 packaging/desktop/io.github.archledger.Irlume.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.github.archledger.Irlume.svg
 desktop-file-validate %{buildroot}%{_datadir}/applications/io.github.archledger.Irlume.desktop
 install -Dm0644 target/release/libpam_irlume.so %{buildroot}%{_libdir}/security/pam_irlume.so
+install -Dm0644 target/release/libpam_irlume_view.so %{buildroot}%{_libdir}/security/pam_irlume_view.so
 # The KDE wallet handoff helper. libexec, not bindir: it is not a command a
 # user runs, it takes a secret on stdin, and it is only meaningful inside a
 # PAM transaction.
@@ -177,6 +178,11 @@ install -Dm0644 packaging/systemd/irlumed.socket %{buildroot}%{_unitdir}/irlumed
 install -Dm0644 packaging/systemd/irlume-reconcile.path %{buildroot}%{_unitdir}/irlume-reconcile.path
 install -Dm0644 packaging/systemd/irlume-reconcile.service %{buildroot}%{_unitdir}/irlume-reconcile.service
 install -Dm0644 packaging/systemd/irlume-reconcile.timer %{buildroot}%{_unitdir}/irlume-reconcile.timer
+install -Dm0644 packaging/systemd/irlume-lightdm-prepare.service %{buildroot}%{_unitdir}/irlume-lightdm-prepare.service
+install -Dm0644 packaging/systemd/irlume-lightdm-refresh.service %{buildroot}%{_unitdir}/irlume-lightdm-refresh.service
+install -Dm0644 packaging/systemd/irlume-lightdm-refresh.path %{buildroot}%{_unitdir}/irlume-lightdm-refresh.path
+install -Dm0644 packaging/systemd/irlume-lightdm-refresh.timer %{buildroot}%{_unitdir}/irlume-lightdm-refresh.timer
+install -Dm0644 packaging/lightdm/50-irlume-pam.conf %{buildroot}%{_unitdir}/lightdm.service.d/50-irlume-pam.conf
 # Bundled onnxruntime runtime + a drop-in pointing ORT_DYLIB_PATH at it (cp -a
 # to preserve the .so version symlinks).
 install -d %{buildroot}%{_datadir}/%{name}/onnxruntime/lib
@@ -300,6 +306,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/applications/io.github.archledger.Irlume.desktop
 %{_datadir}/icons/hicolor/scalable/apps/io.github.archledger.Irlume.svg
 %{_libdir}/security/pam_irlume.so
+%{_libdir}/security/pam_irlume_view.so
 %dir %{_libexecdir}/%{name}
 %{_libexecdir}/%{name}/irlume-kwallet-init
 %{_libexecdir}/%{name}/irlume-gkr-unlock
@@ -324,6 +331,11 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_unitdir}/irlume-reconcile.path
 %{_unitdir}/irlume-reconcile.service
 %{_unitdir}/irlume-reconcile.timer
+%{_unitdir}/irlume-lightdm-prepare.service
+%{_unitdir}/irlume-lightdm-refresh.service
+%{_unitdir}/irlume-lightdm-refresh.path
+%{_unitdir}/irlume-lightdm-refresh.timer
+%{_unitdir}/lightdm.service.d/50-irlume-pam.conf
 %{_presetdir}/90-irlume.preset
 %{_tmpfilesdir}/irlume.conf
 

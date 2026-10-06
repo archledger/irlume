@@ -66,6 +66,8 @@ contents:
     dst: /usr/bin/irlume
   - src: ../../target/release/libpam_irlume.so
     dst: /usr/lib/x86_64-linux-gnu/security/pam_irlume.so
+  - src: ../../target/release/libpam_irlume_view.so
+    dst: /usr/lib/x86_64-linux-gnu/security/pam_irlume_view.so
   # KDE wallet handoff helper. libexec, not bin: it is not a command a user
   # runs, it takes a secret on stdin, and it is only meaningful inside a PAM
   # transaction.
@@ -131,6 +133,16 @@ contents:
     dst: /usr/lib/systemd/system/irlume-reconcile.service
   - src: ../systemd/irlume-reconcile.timer
     dst: /usr/lib/systemd/system/irlume-reconcile.timer
+  - src: ../systemd/irlume-lightdm-prepare.service
+    dst: /usr/lib/systemd/system/irlume-lightdm-prepare.service
+  - src: ../systemd/irlume-lightdm-refresh.service
+    dst: /usr/lib/systemd/system/irlume-lightdm-refresh.service
+  - src: ../systemd/irlume-lightdm-refresh.path
+    dst: /usr/lib/systemd/system/irlume-lightdm-refresh.path
+  - src: ../systemd/irlume-lightdm-refresh.timer
+    dst: /usr/lib/systemd/system/irlume-lightdm-refresh.timer
+  - src: ../lightdm/50-irlume-pam.conf
+    dst: /usr/lib/systemd/system/lightdm.service.d/50-irlume-pam.conf
   # tmpfiles.d: setgid root:video lock directory for the IR-emitter exclusion
   # locks (#542); the daemon's bounding set has no CAP_CHOWN, so the group
   # must be inherited at creation.

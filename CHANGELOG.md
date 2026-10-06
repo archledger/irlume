@@ -16,6 +16,22 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- LightDM runs against a private, read-only PAM view when irlume's LightDM
+  units are installed. A preparation unit ordered before every LightDM start
+  reads the prospective configuration with `lightdm --show-config` and, while
+  XDMCP or VNC is enabled, publishes include copies in which `pam_fprintd`
+  and irlume's own credential rules become inert, jump-preserving slots. The
+  shared host stacks are never rewritten, other services and desktop sessions
+  keep fingerprint, and a failed preparation or view check prevents an
+  unprotected LightDM start (#859).
+
+- The LightDM preparation hook ships in every packaging lane (Fedora, Arch,
+  Debian/nfpm, PPA, NixOS and the source installer) through a
+  `lightdm.service.d` drop-in, and a path unit watching the PAM directories
+  with `PathModified` (which replacement by rename cannot escape) refreshes
+  the view of a running LightDM, so a `sed -i` configuration change can no
+  longer leave face lines served until the reconcile timer fires (#859).
+
 - Split-camera diagnostics capture RGB then IR under one retained two-device
   operation and return an operation-bound complete-pair receipt. Assessment
   carries split sequential posture at every skew. Native opens validate the

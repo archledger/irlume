@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh policy in LightDM's private PAM view
+Documentation=https://github.com/archledger/irlume
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/irlume login lightdm-refresh
+TimeoutStartSec=3s
+KillMode=control-group
+PrivateDevices=yes
+PrivateTmp=yes

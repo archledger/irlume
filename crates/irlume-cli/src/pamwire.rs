@@ -40,6 +40,7 @@ use std::process::{Command, ExitCode};
 mod autologin;
 mod files;
 mod grammar;
+mod lightdm_view;
 mod lock;
 mod overrides;
 mod remote_seats;
@@ -271,6 +272,9 @@ const LOGIN_USAGE: &str = "usage: irlume login <status|enable|disable|reconcile>
      [--with-polkit] [--apply] [--force] [--adjust-jumps]";
 
 pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
+    if let Some(action @ ("lightdm-prestart" | "lightdm-refresh" | "lightdm-view-check")) = action {
+        return lightdm_view::run(action, args);
+    }
     let apply = args.iter().any(|a| a == "--apply");
     let with_sudo = args.iter().any(|a| a == "--with-sudo");
     let with_polkit = args.iter().any(|a| a == "--with-polkit");

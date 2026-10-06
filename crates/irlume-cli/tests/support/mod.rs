@@ -19,7 +19,24 @@ pub(crate) fn isolated_root_command(
     hidden: &[&str],
     binds: &[(&Path, &str)],
 ) -> Command {
-    namespace_command(root, bin, args, tools, hidden, binds, true)
+    namespace_command(root, bin, args, tools, hidden, binds, Namespace::Private)
+}
+
+/// Private namespace with CAP_SYS_ADMIN in its own user namespace only, for
+/// executing the session view-detachment module. The host root stays read-only.
+#[allow(
+    dead_code,
+    reason = "only LightDM namespace tests use the mount capability"
+)]
+pub(crate) fn isolated_mount_root_command(
+    root: &Path,
+    bin: &str,
+    args: &[&str],
+    tools: &[&str],
+    hidden: &[&str],
+    binds: &[(&Path, &str)],
+) -> Command {
+    namespace_command(root, bin, args, tools, hidden, binds, Namespace::Mount)
 }
 
 /// [`isolated_root_command`] in the host's PID namespace, for a test whose
@@ -38,7 +55,7 @@ pub(crate) fn isolated_root_command_with_host_pids(
     hidden: &[&str],
     binds: &[(&Path, &str)],
 ) -> Command {
-    namespace_command(root, bin, args, tools, hidden, binds, false)
+    namespace_command(root, bin, args, tools, hidden, binds, Namespace::HostPids)
 }
 
 /// Where the namespace sees the whole host root, read-only, while a missing
@@ -96,7 +113,29 @@ fn rebuild_parent(
             real_dirs.push(mount.file_name().expect("a named mount").to_owned());
         }
     }
-    for entry in std::fs::read_dir(parent).expect("read the destination's parent") {
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A wholly absent parent has no host entries to preserve. A
+            // dangling link, including an ancestor, must not become empty.
+            for ancestor in parent.ancestors() {
+                match std::fs::symlink_metadata(ancestor) {
+                    Ok(_) => {
+                        assert!(
+                            ancestor.is_dir(),
+                            "a directory ancestor, not a dangling link"
+                        );
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("read the destination's ancestor: {error}"),
+                }
+            }
+            None
+        }
+        Err(error) => panic!("read the destination's parent: {error}"),
+    };
+    for entry in entries.into_iter().flatten() {
         let entry = entry.expect("a directory entry");
         let name = entry.file_name();
         if !real_dirs.contains(&name) {
@@ -116,6 +155,12 @@ fn rebuild_parent(
     ]);
 }
 
+enum Namespace {
+    Private,
+    HostPids,
+    Mount,
+}
+
 fn namespace_command(
     root: &Path,
     bin: &str,
@@ -123,8 +168,9 @@ fn namespace_command(
     tools: &[&str],
     hidden: &[&str],
     binds: &[(&Path, &str)],
-    unshare_pid: bool,
+    mode: Namespace,
 ) -> Command {
+    let unshare_pid = !matches!(mode, Namespace::HostPids);
     let shell = std::fs::canonicalize("/bin/sh").expect("resolve /bin/sh for sandbox");
     let usr_bin = std::fs::canonicalize("/usr/bin").expect("resolve /usr/bin for sandbox");
     let bin_dir = std::fs::canonicalize("/bin").expect("resolve /bin for sandbox");
@@ -230,7 +276,13 @@ fn namespace_command(
         command.args(["--ro-bind", "/", HOST_VIEW]);
     }
     for (parent, names) in &parents {
-        rebuild_parent(&mut command, root, parent, names, &later);
+        if parent.starts_with("/run") {
+            // /run is already a fresh writable tmpfs. Rebuilding it from host
+            // entries would hide that tmpfs behind a read-only parent bind.
+            command.args(["--dir", parent.to_str().unwrap()]);
+        } else {
+            rebuild_parent(&mut command, root, parent, names, &later);
+        }
     }
     for (source, destination) in &missing {
         command.args(["--bind", source.to_str().unwrap(), destination]);
@@ -259,6 +311,9 @@ fn namespace_command(
     // `/proc`, read-only under the root bind, stays in place.
     if unshare_pid {
         command.args(["--proc", "/proc"]);
+    }
+    if matches!(mode, Namespace::Mount) {
+        command.args(["--cap-add", "CAP_SYS_ADMIN"]);
     }
     command
         .args(["--bind", root.to_str().unwrap(), root.to_str().unwrap()])
@@ -362,12 +417,110 @@ done
         supplied,
         supplied,
     );
-    let output = namespace_command(root, "/usr/bin/sh", &["-c", &script], tools, &[], &[], true)
-        .output()
-        .expect("spawn isolated command-path assertion");
+    let output = namespace_command(
+        root,
+        "/usr/bin/sh",
+        &["-c", &script],
+        tools,
+        &[],
+        &[],
+        Namespace::Private,
+    )
+    .output()
+    .expect("spawn isolated command-path assertion");
     assert!(
         output.status.success(),
         "isolated command-path assertion failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[cfg(test)]
+mod parent_tests {
+    use super::*;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "irlume-parent-fixture-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn build(&self, parent: &Path) -> PathBuf {
+            let destination = parent.join("child");
+            rebuild_parent(
+                &mut Command::new("/usr/bin/bwrap"),
+                &self.0,
+                parent,
+                &[destination.to_str().unwrap()],
+                &[],
+            );
+            self.0
+                .join("namespace-parents")
+                .join(parent.strip_prefix("/").unwrap())
+        }
+        fn refuses(&self, parent: &Path) {
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.build(parent)
+            }))
+            .is_err());
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_parent_builds_a_real_destination_directory() {
+        let fixture = Fixture::new();
+        let built = fixture.build(&fixture.0.join("absent/deeper"));
+        assert!(built.join("child").is_dir());
+        assert!(!built.join("child").is_symlink());
+    }
+
+    #[test]
+    fn existing_parent_keeps_its_neighbor_entries() {
+        let fixture = Fixture::new();
+        let parent = fixture.0.join("existing");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("neighbor"), "keep\n").unwrap();
+        let built = fixture.build(&parent);
+        assert!(built.join("child").is_dir());
+        assert!(built.join("neighbor").is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(parent.join("neighbor")).unwrap(),
+            "keep\n"
+        );
+    }
+
+    #[test]
+    fn dangling_parent_is_refused() {
+        let fixture = Fixture::new();
+        let parent = fixture.0.join("dangling");
+        std::os::unix::fs::symlink(fixture.0.join("absent"), &parent).unwrap();
+        fixture.refuses(&parent);
+    }
+
+    #[test]
+    fn dangling_parent_ancestor_is_refused() {
+        let fixture = Fixture::new();
+        let link = fixture.0.join("dangling");
+        std::os::unix::fs::symlink(fixture.0.join("absent"), &link).unwrap();
+        fixture.refuses(&link.join("child"));
+    }
+
+    #[test]
+    fn non_directory_parent_is_refused() {
+        let fixture = Fixture::new();
+        let parent = fixture.0.join("file");
+        std::fs::write(&parent, "not a directory\n").unwrap();
+        fixture.refuses(&parent);
+    }
 }

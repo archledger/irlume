@@ -581,6 +581,18 @@ watches, and the reconcile timer then applies the rule within 30 minutes. After
 turning XDMCP or VNC on that way, run `sudo irlume login reconcile` before
 restarting LightDM.
 
+Where irlume's LightDM units are installed, that rename gap is closed before
+every start rather than after it: `irlume-lightdm-prepare.service`, ordered
+before `lightdm.service` through a package drop-in, reads the configuration
+LightDM is about to load (`lightdm --show-config` runs before LightDM starts
+its servers) and republishes the private, read-only PAM view that the unit
+binds over `/etc/pam.d`. A configuration replaced by rename can therefore not
+produce an unprotected start, and a failed or masked preparation stops the
+LightDM start instead of allowing one; nothing in that hook waits for
+`irlumed`. A path unit watching the PAM directories (`PathModified`, which
+renames cannot escape) refreshes the view of a running LightDM when the
+distribution regenerates the shared stacks.
+
 What the module cannot tell apart, and has to be handled outside it:
 
 - Remote-control software attached to the real login screen or desktop
@@ -594,11 +606,17 @@ What the module cannot tell apart, and has to be handled outside it:
   Login is enabled.
 - A fingerprint reader in a shared stack. `irlume fingerprint enable` puts
   `pam_fprintd` into the distribution's shared stack (`common-auth`,
-  `system-auth`), which LightDM's login screen includes; irlume keeps its own
-  lines out of a LightDM that serves remote login screens, but not that
-  module, so a finger presented at this machine could answer an XDMCP or VNC
-  login. Do not enable fingerprint login together with LightDM's remote
-  servers.
+  `system-auth`), which LightDM's login screen includes. Where irlume's
+  LightDM units are installed, the private PAM view answers this: while
+  XDMCP or VNC is enabled, the view's copies replace each `pam_fprintd`
+  rule with an inert, jump-preserving slot, so a finger presented at the
+  machine cannot answer a remote LightDM login; the shared files, other
+  services and desktop sessions keep fingerprint, and a LightDM started
+  with both servers off keeps it too. Residual: an installation without
+  the LightDM preparation units (a source install that skipped them, or an
+  uninstall that removed the drop-in), or a LightDM started outside its
+  systemd unit. Without the view, do not enable fingerprint login together
+  with LightDM's remote servers.
 - A command an SSH user starts inside their service manager
   (`systemd-run --user`), a consent agent or an elevation command alike, is
   judged by their display session, which is local while they are also

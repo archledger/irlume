@@ -17,7 +17,7 @@ done
 [[ -n "$ORT" && -f "$ORT" ]] || { echo "need --ort <libonnxruntime.so> (found: '$ORT')" >&2; exit 2; }
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-for b in irlumed irlume irlume-password-verify; do
+for b in irlumed irlume irlume-password-verify libpam_irlume_view.so; do
     [[ -f "$REPO/target/release/$b" ]] || { echo "missing $REPO/target/release/$b; build first" >&2; exit 1; }
 done
 for m in face_detection_yunet_2023mar.onnx glintr100.onnx face_landmark.onnx blaze_face_short_range.onnx liveness_vit.onnx flir.onnx; do
@@ -99,6 +99,22 @@ RestartSec=2
 [Install]
 WantedBy=multi-user.target
 EOF
+
+# The private PAM view is prepared before LightDM, independently of irlumed.
+# Bind every helper command to this source installation's binary.
+# Locate the existing Linux-PAM module directory rather than a distro label.
+PAM_MODULE_DIR=""
+for dir in /usr/lib64/security /usr/lib/security /usr/lib/x86_64-linux-gnu/security /lib/x86_64-linux-gnu/security; do
+    if [[ -f "$dir/pam_permit.so" ]]; then PAM_MODULE_DIR="$dir"; break; fi
+done
+[[ -n "$PAM_MODULE_DIR" ]] || { echo 'cannot locate the Linux-PAM module directory' >&2; exit 1; }
+install -Dm0644 "$REPO/target/release/libpam_irlume_view.so" "$PAM_MODULE_DIR/pam_irlume_view.so"
+for unit in irlume-lightdm-prepare.service irlume-lightdm-refresh.service irlume-lightdm-refresh.path irlume-lightdm-refresh.timer; do
+    install -Dm0644 "$REPO/packaging/systemd/$unit" "/etc/systemd/system/$unit"
+    sed -i 's|/usr/bin/irlume |/usr/local/bin/irlume |g' "/etc/systemd/system/$unit"
+done
+install -Dm0644 "$REPO/packaging/lightdm/50-irlume-pam.conf" /etc/systemd/system/lightdm.service.d/50-irlume-pam.conf
+sed -i 's|/usr/bin/irlume |/usr/local/bin/irlume |g' /etc/systemd/system/lightdm.service.d/50-irlume-pam.conf
 
 systemctl daemon-reload
 systemctl enable --now irlumed

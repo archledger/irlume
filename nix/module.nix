@@ -56,6 +56,11 @@
 
 let
   cfg = config.services.irlume;
+  lightdmEnabled = config.services.xserver.displayManager.lightdm.enable;
+  lightdmExec = ''
+    export PATH=${pkgs.lightdm}/sbin:$PATH
+    exec ${pkgs.lightdm}/sbin/lightdm
+  '';
 
   # Well-known PAM services and the profile each one needs. A name not listed
   # here defaults to "login" (the safe choice for an unrecognised greeter);
@@ -365,6 +370,65 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = !lightdmEnabled || config.services.displayManager.generic.execCmd == lightdmExec;
+        message = "irlume's LightDM PAM view requires the standard LightDM execCmd; a custom launcher needs an explicit configuration proof.";
+      }
+    ];
+
+    # Declarative PAM files stay untouched. Only LightDM gets this private view.
+    systemd.services.display-manager = lib.mkIf lightdmEnabled {
+      requires = [ "irlume-lightdm-prepare.service" ];
+      after = [ "irlume-lightdm-prepare.service" ];
+      wants = [ "irlume-lightdm-refresh.path" "irlume-lightdm-refresh.timer" ];
+      serviceConfig = {
+        BindReadOnlyPaths = [
+          "/etc/pam.d:/run/irlume-lightdm-source/etc"
+          "-/usr/lib/pam.d:/run/irlume-lightdm-source/vendor"
+          "/run/irlume-lightdm/pam.d:/etc/pam.d"
+          "/run/irlume-lightdm"
+        ];
+        ExecPaths = [ "/run/irlume-lightdm" ];
+        ExecStartPre = lib.mkAfter [ "${cfg.package}/bin/irlume login lightdm-view-check" ];
+      };
+    };
+    systemd.services.irlume-lightdm-prepare = lib.mkIf lightdmEnabled {
+      description = "Prepare LightDM's private PAM view";
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${cfg.package}/bin/irlume login lightdm-prestart ${pkgs.lightdm}/sbin/lightdm --permit-module ${config.security.pam.package}/lib/security/pam_permit.so --session-module ${cfg.package}/lib/security/pam_irlume_view.so";
+        TimeoutStartSec = "3s";
+        KillMode = "control-group";
+        PrivateDevices = true;
+        PrivateTmp = true;
+      };
+    };
+    systemd.services.irlume-lightdm-refresh = lib.mkIf lightdmEnabled {
+      description = "Refresh policy in LightDM's private PAM view";
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${cfg.package}/bin/irlume login lightdm-refresh";
+        TimeoutStartSec = "3s";
+        KillMode = "control-group";
+        PrivateDevices = true;
+        PrivateTmp = true;
+      };
+    };
+    systemd.paths.irlume-lightdm-refresh = lib.mkIf lightdmEnabled {
+      pathConfig = {
+        PathModified = [ "/etc/pam.d" "/usr/lib/pam.d" ];
+        Unit = "irlume-lightdm-refresh.service";
+      };
+    };
+    systemd.timers.irlume-lightdm-refresh = lib.mkIf lightdmEnabled {
+      timerConfig = {
+        OnActiveSec = "30s";
+        OnUnitInactiveSec = "30s";
+        AccuracySec = "1s";
+        Unit = "irlume-lightdm-refresh.service";
+      };
+    };
     environment.systemPackages = [ cfg.package ] ++ lib.optional cfg.kcm.enable cfg.kcm.package;
     security.polkit.enable = true;
     # polkit links /share/polkit-1 from environment.systemPackages.

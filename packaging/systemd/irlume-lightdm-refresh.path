@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch PAM policy for LightDM's private view
+
+[Path]
+# Parent directory changes include atomic rename updates. In-place changes
+# to a linked file outside these directories are covered by the timer.
+PathModified=/etc/pam.d
+PathModified=/usr/lib/pam.d
+Unit=irlume-lightdm-refresh.service

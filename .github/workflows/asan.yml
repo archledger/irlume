@@ -171,11 +171,12 @@ jobs:
             -p irlume-pam-view --lib --target x86_64-unknown-linux-gnu \
             --message-format=json | python3 -c '
           import json, sys
-          paths = [row["executable"] for row in map(json.loads, sys.stdin)
+          paths = [name for row in map(json.loads, sys.stdin)
                    if row.get("reason") == "compiler-artifact"
                    and row.get("target", {}).get("name") == "pam_irlume_view"
                    and "cdylib" in row.get("target", {}).get("kind", [])
-                   and row.get("executable")]
+                   for name in row.get("filenames", [])
+                   if name.endswith(".so")]
           assert len(paths) == 1, paths
           print(paths[0])
           ')

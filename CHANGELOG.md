@@ -64,6 +64,20 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The GDM and LightDM autologin readers keep a value's trailing whitespace,
+  as GLib's key file parser does, and read the enable and server switches
+  exactly as each daemon does (GDM: case-insensitive `true` or `1` on the
+  raw value; LightDM: trailing whitespace stripped, then an exact lowercase
+  `true`). A trailing space no longer names an account, and `yes` or `True`
+  no longer turns a login manager's switch on (#859).
+
+- The SDDM and Plasma Login autologin readers order each `conf.d` layer the
+  way the login manager reads it, Qt's `QDir::LocaleAware` collation, so
+  drop-ins whose names differ in case (`Z.conf`, `a.conf`) set conflicting
+  `[Autologin] User=` values to the account the manager actually autologs
+  in. Names outside the modeled collation keep the earlier unknown answer
+  (#859).
+
 - Paired startup consumes bounded native Parked returns before admission while
   keeping ERROR buffers unviewed and unrequeued. A handled startup park revokes
   both streams' cached admission and requires fresh clean full paired windows;

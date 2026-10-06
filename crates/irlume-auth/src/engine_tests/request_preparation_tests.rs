@@ -15,6 +15,940 @@ struct Fixture {
     recorder: Guard,
 }
 
+fn split_choice(
+    fixture: &Fixture,
+) -> (
+    irlume_common::split_wire::SplitMutationGuard,
+    irlume_common::split_publish::Published,
+) {
+    fixture.select_split();
+    let snapshot = irlume_common::split_publish::read_camera_selection();
+    let records = match snapshot.split() {
+        irlume_common::split_publish::SplitReadState::Valid { records, .. } => records,
+        state => panic!("fixture publication refused: {state:?}"),
+    };
+    let pair = irlume_camera::connected_pairs_with_split(records)
+        .split_pairs
+        .remove(0);
+    let lease = pair.lease_request();
+    let side =
+        |expected: irlume_camera::SplitSideExpectation| irlume_common::split_wire::SplitSideGuard {
+            instance_id: expected.instance_id,
+            generation: expected.generation,
+            endpoint: expected.endpoint,
+        };
+    let guard = irlume_common::split_wire::SplitMutationGuard {
+        supervisor_id: lease.supervisor_id,
+        revision: lease.revision,
+        rgb: side(lease.rgb),
+        ir: side(lease.ir),
+    };
+    let irlume_common::config::SplitConfObservation::Reference {
+        generation, digest, ..
+    } = snapshot.observation().split.clone()
+    else {
+        panic!("missing reference")
+    };
+    (
+        guard,
+        irlume_common::split_publish::Published { generation, digest },
+    )
+}
+
+fn fixture_split_binding() -> storage::CameraBinding {
+    storage::CameraBinding::Split(
+        irlume_common::split_key::SplitPairKey::parse_canonical(
+            "split1;1234:0001:rgb|0000:00:14.0|usb2|8;1234:0002:ir|0000:00:14.0|usb2|5",
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn guarded_split_preparation_keeps_whole_binding_and_restores_without_camera_work() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(true);
+    let (guard, publication) = split_choice(&fixture);
+    let config_before = std::fs::read(fixture.dir.join("cameras.conf")).unwrap();
+    let previous = (
+        shared.engine.rgb_dev.clone(),
+        shared.engine.ir_dev.clone(),
+        shared.engine.ir_available,
+    );
+    {
+        let request = shared
+            .engine
+            .prepare_split_enrollment_camera(&guard, &publication)
+            .unwrap();
+        assert_eq!(
+            request.prepared_enrollment_binding().unwrap(),
+            fixture_split_binding()
+        );
+        assert_eq!(request.current_binding(), fixture_split_binding());
+        assert_eq!(request.live_pair(), fixture_split_binding());
+        assert!(request.prepared_camera_lease().is_none());
+        assert!(request.validate_enrollment_camera_activation().is_err());
+        assert!(fixture.recorder.calls().is_empty());
+    }
+    assert_eq!(
+        (
+            shared.engine.rgb_dev.clone(),
+            shared.engine.ir_dev.clone(),
+            shared.engine.ir_available
+        ),
+        previous
+    );
+    assert!(shared.engine.camera_selection.is_none());
+    assert_eq!(
+        std::fs::read(fixture.dir.join("cameras.conf")).unwrap(),
+        config_before
+    );
+}
+
+#[test]
+fn guarded_split_primary_requires_exact_key_even_when_bound_store_is_empty() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(true);
+    let (guard, publication) = split_choice(&fixture);
+    let request = shared
+        .engine
+        .prepare_split_enrollment_camera(&guard, &publication)
+        .unwrap();
+    let mut enrollment = storage::Enrollment::new("split-primary-check");
+    request
+        .validate_operation_primary(&enrollment, false)
+        .unwrap();
+    enrollment.camera_binding = Some(fixture_split_binding());
+    request
+        .validate_operation_primary(&enrollment, false)
+        .unwrap();
+    let primary_path = fixture.dir.join("split-primary-check.json");
+    std::fs::write(&primary_path, serde_json::to_vec(&enrollment).unwrap()).unwrap();
+    request
+        .validate_enrollment_camera_primary("split-primary-check", false)
+        .unwrap();
+    let storage::CameraBinding::Split(mut different) = fixture_split_binding() else {
+        unreachable!()
+    };
+    different.ir.ports = vec![6];
+    for binding in [
+        storage::CameraBinding::Split(different),
+        storage::CameraBinding::Ordinary {
+            rgb: Some("1234:0001:rgb".into()),
+            ir: Some("1234:0002:ir".into()),
+        },
+        storage::CameraBinding::Ordinary {
+            rgb: Some("1234:0001:rgb".into()),
+            ir: None,
+        },
+    ] {
+        enrollment.camera_binding = Some(binding);
+        assert!(request
+            .validate_operation_primary(&enrollment, false)
+            .is_err());
+        request
+            .validate_operation_primary(&enrollment, true)
+            .unwrap();
+        std::fs::write(&primary_path, serde_json::to_vec(&enrollment).unwrap()).unwrap();
+        assert!(request
+            .validate_enrollment_camera_primary("split-primary-check", false)
+            .is_err());
+        request
+            .validate_enrollment_camera_primary("split-primary-check", true)
+            .unwrap();
+    }
+    let storage::CameraBinding::Split(key) = fixture_split_binding() else {
+        unreachable!()
+    };
+    for rgb in [true, false] {
+        for field in ["controller", "domain", "ports", "identity"] {
+            let mut changed = key.clone();
+            let side = if rgb {
+                &mut changed.rgb
+            } else {
+                &mut changed.ir
+            };
+            match field {
+                "controller" => side.controller = "0000:00:15.0".into(),
+                "domain" => side.domain = irlume_common::split_key::SplitDomain::SuperSpeed,
+                "ports" => side.ports = vec![10],
+                "identity" => side.identity = "1234:9999:other".into(),
+                _ => unreachable!(),
+            }
+            enrollment.camera_binding = Some(storage::CameraBinding::Split(changed));
+            assert!(
+                request
+                    .validate_operation_primary(&enrollment, false)
+                    .is_err(),
+                "{rgb}/{field}"
+            );
+        }
+    }
+    enrollment.camera_binding = Some(storage::CameraBinding::Split(
+        irlume_common::split_key::SplitPairKey {
+            rgb: key.ir,
+            ir: key.rgb,
+        },
+    ));
+    assert!(request
+        .validate_operation_primary(&enrollment, false)
+        .is_err());
+    let (mut unbound_scans, _) = pad_matching_fixture(0.2, false);
+    unbound_scans.camera_binding = None;
+    assert!(request
+        .validate_operation_primary(&unbound_scans, false)
+        .is_err());
+    assert!(fixture.recorder.calls().is_empty());
+}
+
+#[test]
+fn guarded_split_operation_can_choose_unselected_authorization_without_writing_selection() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(true);
+    let (guard, _) = split_choice(&fixture);
+    let snapshot = irlume_common::split_publish::read_camera_selection();
+    let irlume_common::split_publish::SplitReadState::Valid { records, .. } = snapshot.split()
+    else {
+        unreachable!()
+    };
+    let mut other = records[0].clone();
+    other.rgb.identity = "1234:0003:other-rgb".into();
+    other.rgb.path = "/dev/unselected-other-rgb".into();
+    other.rgb.ports = vec![3];
+    other.ir.identity = "1234:0004:other-ir".into();
+    other.ir.path = "/dev/unselected-other-ir".into();
+    other.ir.ports = vec![4];
+    let other_key = other.pair_key();
+    for selected in [Some(&other_key), None] {
+        let publication = irlume_common::split_publish::publish_split(
+            &[other.clone(), records[0].clone()],
+            selected,
+        )
+        .unwrap();
+        let before = std::fs::read(fixture.dir.join("cameras.conf")).unwrap();
+        let request = shared
+            .engine
+            .prepare_split_enrollment_camera(&guard, &publication)
+            .unwrap();
+        assert_eq!(
+            request.prepared_enrollment_binding().unwrap(),
+            fixture_split_binding()
+        );
+        drop(request);
+        assert_eq!(
+            std::fs::read(fixture.dir.join("cameras.conf")).unwrap(),
+            before
+        );
+    }
+    assert!(fixture.recorder.calls().is_empty());
+}
+
+#[test]
+fn guarded_split_preparation_applies_external_policy_to_either_side() {
+    let _env = env_guard();
+    let mut shared = shared();
+    for (rgb_fixed, ir_fixed) in [(false, true), (true, false), (false, false)] {
+        let mut fixture = Fixture::new(true);
+        fixture.saved.push((
+            "IRLUME_FORBID_EXTERNAL_CAMERAS",
+            std::env::var_os("IRLUME_FORBID_EXTERNAL_CAMERAS"),
+        ));
+        let camera = |rgb: bool| Camera {
+            topology: if rgb {
+                "/devices/fixture/rgb"
+            } else {
+                "/devices/fixture/ir"
+            }
+            .into(),
+            identity: if rgb { "1234:0001:rgb" } else { "1234:0002:ir" }.into(),
+            fixed: if rgb { rgb_fixed } else { ir_fixed },
+            controller: "0000:00:14.0".into(),
+            domain: irlume_common::split_key::SplitDomain::Usb2,
+            ports: vec![if rgb { 8 } else { 5 }],
+            endpoints: vec![Endpoint {
+                path: if rgb {
+                    fixture.rgb.clone()
+                } else {
+                    fixture.ir.clone()
+                },
+                formats: vec![if rgb { *b"YUYV" } else { *b"GREY" }],
+            }],
+        };
+        let recorder = Guard::install(&[camera(true), camera(false)]).unwrap();
+        let (guard, publication) = split_choice(&fixture);
+        std::env::set_var("IRLUME_FORBID_EXTERNAL_CAMERAS", "0");
+        std::env::remove_var("IRLUME_CAMERA_REQUIRE_FIXED");
+        drop(
+            shared
+                .engine
+                .prepare_split_enrollment_camera(&guard, &publication)
+                .unwrap(),
+        );
+        std::env::set_var("IRLUME_FORBID_EXTERNAL_CAMERAS", "1");
+        assert!(shared
+            .engine
+            .prepare_split_enrollment_camera(&guard, &publication)
+            .is_err());
+        std::env::set_var("IRLUME_FORBID_EXTERNAL_CAMERAS", "0");
+        std::env::set_var("IRLUME_CAMERA_REQUIRE_FIXED", "1");
+        assert!(shared
+            .engine
+            .prepare_split_enrollment_camera(&guard, &publication)
+            .is_err());
+        assert!(recorder.calls().is_empty());
+    }
+}
+
+#[test]
+fn guarded_split_scope_clears_whole_proof_on_unwind_and_refuses_device_drift() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(true);
+    let (guard, publication) = split_choice(&fixture);
+    drop(
+        shared
+            .engine
+            .prepare_split_enrollment_camera(&guard, &publication)
+            .unwrap(),
+    );
+    let previous = (
+        shared.engine.rgb_dev.clone(),
+        shared.engine.ir_dev.clone(),
+        shared.engine.ir_available,
+    );
+    std::env::set_var("IRLUME_FORCE_NO_IR", "1");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut request = shared
+            .engine
+            .prepare_split_enrollment_camera(&guard, &publication)
+            .unwrap();
+        assert!(!request.ir_available());
+        assert!(request
+            .prepare_split_enrollment_camera(&guard, &publication)
+            .is_err());
+        request.set_devices("/dev/changed-split-rgb", "/dev/changed-split-ir");
+        assert!(request.prepared_enrollment_binding().is_err());
+        // Even a lost proof never manufactures an ordinary identity projection.
+        assert!(matches!(
+            request.current_binding(),
+            storage::CameraBinding::Split(_)
+        ));
+        panic!("synthetic split unwind");
+    }));
+    assert!(result.is_err());
+    assert!(shared.engine.camera_selection.is_none());
+    assert_eq!(
+        (
+            shared.engine.rgb_dev.clone(),
+            shared.engine.ir_dev.clone(),
+            shared.engine.ir_available
+        ),
+        previous
+    );
+    assert!(fixture.recorder.calls().is_empty());
+}
+
+#[test]
+fn guarded_split_preparation_refuses_each_original_side_and_machine_publication_drift() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(true);
+    let (guard, publication) = split_choice(&fixture);
+    drop(
+        shared
+            .engine
+            .prepare_split_enrollment_camera(&guard, &publication)
+            .unwrap(),
+    );
+    let mut changed_guards = Vec::new();
+    let mut changed = guard.clone();
+    changed.revision += 1;
+    changed_guards.push(changed);
+    let mut changed = guard.clone();
+    changed.supervisor_id = "a".repeat(32);
+    changed_guards.push(changed);
+    for rgb in [true, false] {
+        for field in ["instance", "generation", "endpoint"] {
+            let mut changed = guard.clone();
+            let side = if rgb {
+                &mut changed.rgb
+            } else {
+                &mut changed.ir
+            };
+            match field {
+                "instance" => side.instance_id = "b".repeat(32),
+                "generation" => side.generation += 1,
+                "endpoint" => side.endpoint = "/dev/wrong-split-endpoint".into(),
+                _ => unreachable!(),
+            }
+            changed_guards.push(changed);
+        }
+    }
+    for changed in changed_guards {
+        assert!(shared
+            .engine
+            .prepare_split_enrollment_camera(&changed, &publication)
+            .is_err());
+        assert!(shared.engine.camera_selection.is_none());
+    }
+    for changed in [
+        irlume_common::split_publish::Published {
+            generation: publication.generation + 1,
+            ..publication.clone()
+        },
+        irlume_common::split_publish::Published {
+            digest: format!("sha256:{}", "0".repeat(64)),
+            ..publication.clone()
+        },
+    ] {
+        assert!(shared
+            .engine
+            .prepare_split_enrollment_camera(&guard, &changed)
+            .is_err());
+    }
+    std::fs::write(fixture.dir.join("cameras.conf"), "mode=pinned\n").unwrap();
+    assert!(shared
+        .engine
+        .prepare_split_enrollment_camera(&guard, &publication)
+        .is_err());
+    assert!(fixture.recorder.calls().is_empty());
+}
+
+#[test]
+fn guarded_split_preparation_refuses_all_invalid_configuration_classes_without_environment_fallback(
+) {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(true);
+    let (guard, publication) = split_choice(&fixture);
+    let config = fixture.dir.join("cameras.conf");
+    let valid = std::fs::read_to_string(&config).unwrap();
+    std::env::set_var("IRLUME_RGB_DEVICE", &fixture.rgb);
+    std::env::set_var("IRLUME_IR_DEVICE", &fixture.ir);
+    for text in [
+        String::new(),
+        "mode=automatic\n".into(),
+        "mode=pinned\n".into(),
+        valid.replace(&publication.digest, &format!("sha256:{}", "0".repeat(64))),
+        valid.replace(
+            &format!("split_generation={}", publication.generation),
+            "split_generation=0",
+        ),
+        valid.replace("usb2|5", "usb2|6"),
+    ] {
+        std::fs::write(&config, text).unwrap();
+        assert!(shared
+            .engine
+            .prepare_split_enrollment_camera(&guard, &publication)
+            .is_err());
+        assert!(shared.engine.camera_selection.is_none());
+    }
+    let generation = fixture
+        .dir
+        .join("split-pairs")
+        .join(format!("{}.conf", publication.generation));
+    let generation_bytes = std::fs::read(&generation).unwrap();
+    std::fs::write(&config, &valid).unwrap();
+    std::fs::remove_file(&generation).unwrap();
+    assert!(shared
+        .engine
+        .prepare_split_enrollment_camera(&guard, &publication)
+        .is_err());
+    std::fs::create_dir(&generation).unwrap();
+    assert!(shared
+        .engine
+        .prepare_split_enrollment_camera(&guard, &publication)
+        .is_err());
+    std::fs::remove_dir(&generation).unwrap();
+    std::fs::write(&generation, b"not a split generation").unwrap();
+    let bad_digest = format!(
+        "sha256:{}",
+        irlume_common::sha256_hex(b"not a split generation")
+    );
+    std::fs::write(&config, valid.replace(&publication.digest, &bad_digest)).unwrap();
+    let malformed = irlume_common::split_publish::Published {
+        generation: publication.generation,
+        digest: bad_digest,
+    };
+    assert!(shared
+        .engine
+        .prepare_split_enrollment_camera(&guard, &malformed)
+        .is_err());
+    std::fs::write(&generation, generation_bytes).unwrap();
+    std::fs::remove_file(&config).unwrap();
+    std::fs::create_dir(&config).unwrap();
+    assert!(shared
+        .engine
+        .prepare_split_enrollment_camera(&guard, &publication)
+        .is_err());
+    assert!(fixture.recorder.calls().is_empty());
+}
+
+#[test]
+fn guarded_split_retained_scope_refuses_direct_trust_entries_before_preflight_or_storage() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(true);
+    let (guard, publication) = split_choice(&fixture);
+    let (mut enrollment, _) = pad_matching_fixture(0.2, false);
+    enrollment.user = "guarded-direct".into();
+    let before = serde_json::to_vec(&enrollment).unwrap();
+    let path = fixture.dir.join("guarded-direct.json");
+    std::fs::write(&path, &before).unwrap();
+    let authorization = irlume_core::multi_camera::authz::EnrollmentAuthorization::mint(
+        enrollment.user.clone(),
+        irlume_core::multi_camera::authz::EnrollmentOperation::add_group(
+            "new-split".into(),
+            &fixture_split_binding(),
+        ),
+        1_000_000,
+        900,
+        "guarded-direct".into(),
+        irlume_core::multi_camera::authz::AuthorizationVia::ElevatedPeer { uid: 0 },
+    )
+    .unwrap();
+    let mut request = shared
+        .engine
+        .prepare_split_enrollment_camera(&guard, &publication)
+        .unwrap();
+    let preflight = Cell::new(0);
+    assert!(request
+        .enroll_profile_with_ir_preflight("guarded-direct", None, 1, |_| {
+            preflight.set(preflight.get() + 1);
+            true
+        })
+        .is_err());
+    assert!(request
+        .replace_enrollment_with_ir_preflight_and_diagnostics(
+            "guarded-direct",
+            None,
+            1,
+            |_| {
+                preflight.set(preflight.get() + 1);
+                true
+            },
+            &()
+        )
+        .is_err());
+    assert!(request
+        .add_camera_group_observed(
+            "guarded-direct",
+            None,
+            1,
+            &authorization,
+            |_| {
+                preflight.set(preflight.get() + 1);
+                true
+            },
+            &(),
+            &()
+        )
+        .is_err());
+    assert!(request.prepare_camera_request().is_err());
+    assert!(request.capture_qualification_for_request().is_err());
+    let closed = "split enrollment and authentication are not enabled";
+    assert!(request
+        .add_scan_observed(
+            "guarded-direct",
+            "fixture",
+            1,
+            |_| {
+                preflight.set(preflight.get() + 1);
+                true
+            },
+            &()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains(closed));
+    for policy in [
+        irlume_common::config::FaceSensorPolicy::Dual,
+        irlume_common::config::FaceSensorPolicy::IrOnlyExperimental,
+    ] {
+        for purpose in [
+            AuthenticationPurpose::Verify,
+            AuthenticationPurpose::CredentialRelease,
+        ] {
+            assert!(request
+                .authenticate_for_in_window_with_policy(
+                    "guarded-direct",
+                    None,
+                    purpose,
+                    AuthenticationWindow::new(1000),
+                    policy,
+                    &()
+                )
+                .unwrap_err()
+                .to_string()
+                .contains(closed));
+        }
+    }
+    assert!(request
+        .identify_with_diagnostics(&())
+        .unwrap_err()
+        .to_string()
+        .contains(closed));
+    assert!(request
+        .identify_within_with_diagnostics("guarded-direct", &())
+        .unwrap_err()
+        .to_string()
+        .contains(closed));
+    assert!(request
+        .position_sample(None)
+        .unwrap_err()
+        .to_string()
+        .contains(closed));
+    assert!(request
+        .position_session(None, &Position)
+        .unwrap_err()
+        .to_string()
+        .contains(closed));
+    assert_eq!(preflight.get(), 0);
+    assert!(fixture.recorder.calls().is_empty());
+    assert_eq!(std::fs::read(path).unwrap(), before);
+    let secondary = irlume_core::multi_camera::secondary_store_path("guarded-direct");
+    assert!(!secondary.exists());
+    assert!(!irlume_core::multi_camera::commit::intent_path_for(&secondary).exists());
+    assert!(!request.request_key().holds_key());
+    assert!(request.primary_attempt.is_none() && request.secondary_attempt.is_none());
+}
+
+#[test]
+fn guarded_split_real_primary_publishers_refuse_revocation_after_preparation() {
+    let _env = env_guard();
+    let mut shared = shared();
+    for replace in [false, true] {
+        let fixture = Fixture::new(true);
+        let (guard, publication) = split_choice(&fixture);
+        let request = shared
+            .engine
+            .prepare_split_enrollment_camera(&guard, &publication)
+            .unwrap();
+        let (mut enrollment, _) = pad_matching_fixture(0.2, false);
+        enrollment.user = "guarded-split-publication".into();
+        enrollment.camera_binding = Some(fixture_split_binding());
+        let path = fixture.dir.join("guarded-split-publication.json");
+        let before = serde_json::to_vec(&enrollment).unwrap();
+        std::fs::write(&path, &before).unwrap();
+        enrollment.profiles[0].name = "new split profile".into();
+        let healthy = |path: &std::path::Path, bytes: &[u8]| {
+            request.with_prepared_camera_publication(|| {
+                irlume_common::write_atomic_reporting(path, bytes, 0o600)
+                    .map_err(|error| irlume_common::Error::Io(error.to_string()))
+            })
+        };
+        if replace {
+            storage::save_replacement_with_publisher(&enrollment, healthy).unwrap();
+        } else {
+            storage::save_with_publisher(&enrollment, healthy).unwrap();
+        }
+        assert_ne!(std::fs::read(&path).unwrap(), before);
+        std::fs::write(&path, &before).unwrap();
+        let called = Cell::new(false);
+        let revoked = |path: &std::path::Path, bytes: &[u8]| {
+            called.set(true);
+            irlume_common::split_publish::publish_split(&[], None).unwrap();
+            request.with_prepared_camera_publication(|| {
+                irlume_common::write_atomic_reporting(path, bytes, 0o600)
+                    .map_err(|error| irlume_common::Error::Io(error.to_string()))
+            })
+        };
+        let result = if replace {
+            storage::save_replacement_with_publisher(&enrollment, revoked)
+        } else {
+            storage::save_with_publisher(&enrollment, revoked)
+        };
+        assert!(
+            called.get(),
+            "real storage preparation must reach late admission"
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(fixture.recorder.calls().is_empty());
+    }
+}
+
+#[test]
+fn guarded_split_secondary_real_intent_is_issued_only_after_retained_machine_admission() {
+    let _env = env_guard();
+    let mut shared = shared();
+    for revoke in [true, false] {
+        let fixture = Fixture::new(true);
+        let (guard, publication) = split_choice(&fixture);
+        let request = shared
+            .engine
+            .prepare_split_enrollment_camera(&guard, &publication)
+            .unwrap();
+        let pair = request.prepared_enrollment_binding().unwrap();
+        let (mut enrollment, _) = pad_matching_fixture(0.2, false);
+        enrollment.user = "guarded-split-secondary".into();
+        enrollment.camera_binding = Some(storage::CameraBinding::Ordinary {
+            rgb: Some("standing-primary".into()),
+            ir: Some("standing-primary".into()),
+        });
+        let primary = serde_json::to_vec(&enrollment).unwrap();
+        let primary_path = fixture.dir.join("guarded-split-secondary.json");
+        std::fs::write(&primary_path, &primary).unwrap();
+        let empty = irlume_core::multi_camera::SecondaryStore {
+            format_version: irlume_core::multi_camera::SECONDARY_STORE_VERSION,
+            owner: enrollment.user.clone(),
+            generation: 0,
+            primary_snapshot_sha256: String::new(),
+            groups: vec![],
+        };
+        let group = irlume_core::multi_camera::derive_group_id(
+            &empty,
+            pair.rgb_identity(),
+            pair.ir_identity(),
+        )
+        .as_str()
+        .to_owned();
+        let authorization = irlume_core::multi_camera::authz::EnrollmentAuthorization::mint(
+            enrollment.user.clone(),
+            irlume_core::multi_camera::authz::EnrollmentOperation::add_group(group.clone(), &pair),
+            1_000_000,
+            900,
+            "guarded-secondary".into(),
+            irlume_core::multi_camera::authz::AuthorizationVia::ElevatedPeer { uid: 0 },
+        )
+        .unwrap();
+        let payload = irlume_core::multi_camera::SecondaryProfileScans {
+            profile: enrollment.profiles[0].name.clone(),
+            scans: enrollment.profiles[0].scans.clone(),
+            ir_calibs: Default::default(),
+        };
+        let path = irlume_core::multi_camera::secondary_store_path(&enrollment.user);
+        let intent = irlume_core::multi_camera::commit::intent_path_for(&path);
+        let called = Cell::new(false);
+        let result = publish_camera_group_with(
+            CameraGroupPublication {
+                user: &enrollment.user,
+                pair: &pair,
+                group_id: &group,
+                profile: &payload,
+                start_enr: &enrollment,
+                start_primary_sha256: &irlume_common::sha256_hex(&primary),
+                authorization: &authorization,
+                now_unix: 1_000_300,
+            },
+            |prepared| {
+                called.set(true);
+                assert!(
+                    !intent.exists(),
+                    "preparation cannot authorize recover-forward"
+                );
+                if revoke {
+                    irlume_common::split_publish::publish_split(&[], None).unwrap();
+                }
+                request.with_prepared_camera_publication(|| prepared.publish())
+            },
+            || 1_000_300,
+        );
+        assert!(called.get());
+        assert_eq!(std::fs::read(primary_path).unwrap(), primary);
+        assert!(!intent.exists());
+        if revoke {
+            assert!(result.is_err());
+            assert!(!path.exists());
+            assert!(matches!(
+                irlume_core::multi_camera::commit::resolve_commit(&path),
+                Ok(irlume_core::multi_camera::commit::CommitResolution::Clean)
+            ));
+        } else {
+            assert_eq!(result.unwrap(), group);
+            let store = irlume_core::multi_camera::load_secondary(&path)
+                .unwrap()
+                .unwrap();
+            assert_eq!(store.groups[0].pair, fixture_split_binding());
+            assert_eq!(store.generation, 1);
+        }
+        assert!(fixture.recorder.calls().is_empty());
+    }
+}
+
+#[test]
+fn guarded_split_replacement_keeps_visible_not_durable_receipt_without_postwrite_revalidation() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(true);
+    let (guard, publication) = split_choice(&fixture);
+    let request = shared
+        .engine
+        .prepare_split_enrollment_camera(&guard, &publication)
+        .unwrap();
+    let (mut enrollment, _) = pad_matching_fixture(0.2, false);
+    enrollment.user = "guarded-split-visible".into();
+    enrollment.camera_binding = Some(fixture_split_binding());
+    let path = fixture.dir.join("guarded-split-visible.json");
+    let before = serde_json::to_vec(&enrollment).unwrap();
+    std::fs::write(&path, &before).unwrap();
+    enrollment.profiles[0].name = "visible split replacement".into();
+    let error = storage::save_replacement_with_publisher(&enrollment, |path, bytes| {
+        request.with_prepared_camera_publication(|| {
+            irlume_common::write_atomic_reporting(path, bytes, 0o600)
+                .map_err(|error| irlume_common::Error::Io(error.to_string()))?;
+            // Deliberate noncooperative fault AFTER visible publication, only in
+            // the isolated temporary config. It cannot turn the receipt into
+            // a claim that storage published nothing.
+            std::fs::write(fixture.dir.join("cameras.conf"), "mode=pinned\n")
+                .map_err(|error| irlume_common::Error::Io(error.to_string()))?;
+            Ok(irlume_common::AtomicWrite::VisibleNotDurable(
+                std::io::Error::other("injected directory sync failure"),
+            ))
+        })
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("published") && error.contains("durability"),
+        "{error}"
+    );
+    assert_ne!(std::fs::read(path).unwrap(), before);
+    assert!(fixture.recorder.calls().is_empty());
+}
+
+#[test]
+fn guarded_split_retained_proof_refuses_either_side_loss_and_revocation_across_diagnostic_wait() {
+    use irlume_camera::lease::{acquire_split_camera_operation, CameraOperationKind};
+    let _env = env_guard();
+    let mut shared = shared();
+    for drift in ["rgb", "ir", "authorization"] {
+        let fixture = Fixture::new(true);
+        let (guard, publication) = split_choice(&fixture);
+        let request = shared
+            .engine
+            .prepare_split_enrollment_camera(&guard, &publication)
+            .unwrap();
+        let snapshot = irlume_common::split_publish::read_camera_selection();
+        let irlume_common::split_publish::SplitReadState::Valid { records, .. } = snapshot.split()
+        else {
+            unreachable!()
+        };
+        let expected = irlume_camera::connected_pairs_with_split(records)
+            .split_pairs
+            .remove(0)
+            .lease_request();
+        let held = acquire_split_camera_operation(
+            &expected,
+            CameraOperationKind::Diagnostics,
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        let counts = fixture.recorder.lease_counts_observer();
+        let invalidate = fixture
+            .recorder
+            .endpoint_invalidation_observer(if drift == "ir" {
+                &fixture.ir
+            } else {
+                &fixture.rgb
+            });
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while counts().1 == 0 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "diagnostic waiter never registered"
+                    );
+                    std::thread::yield_now();
+                }
+                if drift == "authorization" {
+                    irlume_common::split_publish::publish_split(&[], None).unwrap();
+                } else {
+                    invalidate();
+                }
+                drop(held);
+            });
+            let waited = acquire_split_camera_operation(
+                &expected,
+                CameraOperationKind::Diagnostics,
+                std::time::Duration::from_secs(5),
+            );
+            writer.join().unwrap();
+            if drift == "authorization" {
+                drop(waited.expect("lease does not confer machine configuration authority"));
+            } else {
+                assert!(waited.is_err(), "retired side acquired a diagnostic lease");
+            }
+        });
+        assert!(request.prepared_enrollment_binding().is_err());
+        let called = Cell::new(false);
+        assert!(request
+            .with_prepared_camera_publication(|| {
+                called.set(true);
+                Ok(())
+            })
+            .is_err());
+        assert!(!called.get());
+        assert!(matches!(
+            request.current_binding(),
+            storage::CameraBinding::Split(_)
+        ));
+        assert_eq!(counts(), (0, 0));
+        assert!(!fixture
+            .recorder
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::OpenRgb(_) | Call::OpenIr(_))));
+    }
+}
+
+#[test]
+fn guarded_split_publication_holds_config_writer_lock_and_releases_on_error_and_unwind() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(true);
+    let (guard, publication) = split_choice(&fixture);
+    let request = shared
+        .engine
+        .prepare_split_enrollment_camera(&guard, &publication)
+        .unwrap();
+    let try_writer = || {
+        std::process::Command::new("flock")
+            .args(["--exclusive", "--nonblock"])
+            .arg(fixture.dir.join("cameras.conf.lock"))
+            .arg("true")
+            .status()
+            .unwrap()
+            .code()
+    };
+    assert_eq!(try_writer(), Some(0));
+    for unwind in [false, true] {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            request.with_prepared_camera_publication::<()>(|| {
+                assert_eq!(
+                    try_writer(),
+                    Some(1),
+                    "config writer entered admitted publication"
+                );
+                if unwind {
+                    panic!("synthetic persistence unwind");
+                }
+                Err(irlume_common::Error::Io(
+                    "synthetic persistence error".into(),
+                ))
+            })
+        }));
+        if unwind {
+            assert!(result.is_err());
+        } else {
+            assert!(result.unwrap().is_err());
+        }
+        assert_eq!(try_writer(), Some(0));
+        // Re-entry establishes release; an unwound std mutex stays poisoned
+        // and must refuse, whereas a normal callback error keeps proof usable.
+        if unwind {
+            assert!(request.prepared_enrollment_binding().is_err());
+        } else {
+            assert!(request.prepared_enrollment_binding().is_ok());
+        }
+    }
+    assert!(fixture.recorder.calls().is_empty());
+}
+
 impl Fixture {
     fn new(split: bool) -> Self {
         Self::with_fixed(split, true)
@@ -578,6 +1512,7 @@ fn operation_choice_group_refusal_after_preparation_cannot_recover_forward() {
             group_id: "cam-1234-0001-ordinary",
             profile: &profile,
             start_enr: &enrollment,
+            start_primary_sha256: &irlume_common::sha256_hex(&primary),
             authorization: &authorization,
             now_unix: 1_000_300,
         },
@@ -594,6 +1529,7 @@ fn operation_choice_group_refusal_after_preparation_cannot_recover_forward() {
                     .map_err(|error| irlume_common::Error::Protocol(error.to_string()))
             })
         },
+        || 1_000_300,
     );
     assert!(
         called.get(),
@@ -618,6 +1554,7 @@ fn operation_choice_group_refusal_after_preparation_cannot_recover_forward() {
             group_id: "cam-1234-0001-ordinary",
             profile: &profile,
             start_enr: &enrollment,
+            start_primary_sha256: &irlume_common::sha256_hex(&primary),
             authorization: &authorization,
             now_unix: 1_000_300,
         },
@@ -628,6 +1565,7 @@ fn operation_choice_group_refusal_after_preparation_cannot_recover_forward() {
                     .map_err(|error| irlume_common::Error::Protocol(error.to_string()))
             })
         },
+        || 1_000_300,
     )
     .unwrap();
     assert_eq!(published, "cam-1234-0001-ordinary");

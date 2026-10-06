@@ -16,6 +16,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Guarded split enrollment and add-camera operation requests retain both displayed
+  camera guards and an opaque machine-publication proof through approval and
+  camera-free preparation. Whole-pair publication revalidation preserves ordinary
+  device claims and saved selection. Split trust operations remain disabled
+  (ADR-0032, guarded split operation-choice amendment; #995).
+
 - LightDM runs against a private, read-only PAM view when irlume's LightDM
   units are installed. A preparation unit ordered before every LightDM start
   reads the prospective configuration with `lightdm --show-config` and, while
@@ -79,6 +85,12 @@ All notable changes to irlume are documented here. This project adheres to
   authentication stay refused until the later steps.
 
 ### Fixed
+
+- Secondary camera-group publication rechecks exact primary and secondary source
+  state, account authority and fresh time after key preparation under the account
+  lock. Prepared encrypted payloads retain their key-envelope context; drift
+  refuses before the first intent write, with existing recovery and publication
+  receipts preserved (ADR-0032, guarded publication boundary; #995).
 
 - A failed finger or password no longer releases the sealed keyring secret.
   The fingerprint lane's `keyring` auth line made its release request from

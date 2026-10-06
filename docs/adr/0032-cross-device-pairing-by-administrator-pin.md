@@ -942,3 +942,135 @@ behavior, unwind cleanup, read-only journal refusal with a recovery control,
 and actual daemon tier/charge ordering. Synthetic backends refuse all opens.
 These tests establish software boundaries, not successful physical capture or
 split acceptance. Split activation remains closed.
+
+## Amendment 2026-10-06: guarded split enrollment operation choice
+
+An enrollment/reset or camera-group addition may choose any currently authorized,
+resolvable split pair for that operation. The saved selection stays unchanged.
+The operation follows ADR-0029 section 3's approval and scope rules, retaining
+both displayed incarnations and the machine-authorization publication through
+confirmation, OS approval and queueing.
+
+The wire uses separate `Request::EnrollSplitOn` and
+`Request::AddSplitCameraGroupOn` variants. Both carry `user`, `profile`, `scans`
+and `pair: Box<SplitEnrollmentCameraChoice>`; enrollment also carries `reset`,
+defaulting to false. `SplitEnrollmentCameraChoice` contains:
+
+- `expected: SplitMutationGuard`, with the original `supervisor_id`, `revision`,
+  and role-ordered `rgb`/`ir` side guards (`instance_id`, `generation`, `endpoint`);
+- `authorization: SplitAuthorizationGuard`, containing a nonzero `generation`
+  and `token`, exactly 64 lowercase ASCII hex bytes.
+
+The token is an opaque, daemon-instance-keyed comparison of the verified machine
+publication, using full digest output under a distinct domain. It exposes neither
+the raw file digest nor account/capture authority. The daemon compares it with
+its current coherently read generation/digest; client-provided token shape alone
+proves nothing. Root and non-root callers retain the same publication proof.
+Endpoint guards remain literal paths for root and existing daemon-instance
+endpoint tokens for non-root callers. Current classified server facts supply
+roles, complete credential keys and qualified locations.
+
+`SplitPublicationView.authorization` is optional, defaults to absent and is
+omitted when absent. The producer supplies it only for a verified valid machine
+publication. Legacy replies and invalid publications supply no choice authority.
+A present malformed proof fails decoding; it is never silently converted to
+absence. The existing open listing decoder permits this additive field. Closed
+ordinary candidate, selection and enrollment-choice decoders remain unchanged.
+
+Only the new operation-choice decoder closes all nested guard objects. It rejects
+unknown or duplicate controls, missing proof, malformed IDs, zero inventory
+revision or side generation, same-instance or same-endpoint sides, empty
+endpoints, endpoints over the existing 96-byte bound, and control characters.
+The existing split-management guard decoder retains its compatibility behavior.
+The daemon's 64 KiB request framing bound remains unchanged; serde validation
+bounds accepted field values after decoding, not every parser allocation.
+
+Old request decoders reject both new variants, and old daemons respond
+`Error("bad request")`. Clients report unsupported operation choice and never
+retry as ordinary enrollment, ordinary camera-group addition or a camera setter.
+Widening an ordinary choice with an optional split field would be unsafe because
+an old decoder could discard that field and run the ordinary operation.
+
+Approval binds the complete original request. Preparation must resolve both
+retained sides against one Current publication and the original machine proof,
+apply external-camera policy to both sides, and refuse stale/revoked/malformed
+state before opening a device. Late account publication preserves the existing
+inventory then `cameras.conf` lock order and real persistence settlement receipts.
+No refresh, replacement selection or independently authorized hybrid pair is
+permitted after approval. These are consumer integration requirements; the wire
+contract alone does not implement approval, preparation or publication checks.
+
+Split enrollment, authentication and face-backed credential release remain
+disabled pending the separate reviewed activation and complete software/physical
+acceptance matrix. Diagnostic capture, YUYV exposure and T480 acceptance retain
+their existing gates.
+
+### Operation-choice acceptance and source evidence
+
+- Round-trip both variants with the exact original side and publication proofs;
+  omitted reset is false and explicit reset survives.
+- Refuse missing, malformed, unknown, duplicate and oversized choice controls,
+  with valid controls proving the decoder does not reject every request.
+- Frozen ordinary request readers reject the split variants while ordinary
+  enrollment, addition, choice and setter encodings remain accepted unchanged.
+- A frozen open listing reader accepts the added proof. New readers preserve
+  it, preserve absence from old replies and refuse malformed present proof.
+- Non-root proof uses only generation and opaque token; producer redaction tests
+  must cover populated listings, errors and events at the real daemon boundary.
+- Daemon/auth integration must prove original-request approval, publication
+  invalidation across queueing and late writes, no ordinary/setter fallback,
+  both-side policy refusal, and closed activation before any capture/trust write.
+
+These choices follow `crates/irlume-daemon/AGENTS.md` "Wire compatibility",
+`crates/irlume-common/src/live_camera.rs`'s bounded ordinary choice, and the real
+daemon `read_request` and `split_list_response` consumers. The locked serde and
+serde_json versions are 1.0.229 and 1.0.151 in both workspaces. Version-matched
+primary source confirms
+[TryFrom validation](https://docs.rs/crate/serde_derive/1.0.229/source/src/de.rs),
+[unknown/duplicate-field handling](https://docs.rs/crate/serde_derive/1.0.229/source/src/de/struct_.rs),
+[unknown-variant refusal](https://docs.rs/crate/serde_derive/1.0.229/source/src/de/identifier.rs)
+and the
+[JSON enum decoder](https://docs.rs/crate/serde_json/1.0.151/source/src/de.rs).
+The existing `ipc_request` fuzz target calls that same `from_str::<Request>`
+entry. Wire tests and new seeds exercise it with synthetic non-root tokens.
+
+### Gated preparation and late publication boundary
+
+The daemon consumes approval against the complete original request before
+translating endpoint handles into a separate literal guard. Engine preparation
+independently verifies the retained machine generation and digest, resolves the
+whole pair using current server facts and applies policy to both sides. Its
+fallible binding accessor retains split class rather than projecting identities.
+The scope restores standing request state on return or unwind. Explicit activation
+refusal precedes ordinary qualification, probe, preflight and trust mutation.
+
+Late publication resolves the original ordered authorization records through the
+canonical camera resolver under one Current inventory lock. It checks the original
+supervisor, revision and complete two-side expectation, including role changes
+that do not advance revision. Its callback then locks `cameras.conf` and verifies
+the same machine generation, digest and membership before persistence.
+
+Primary storage already owns the user-state lock through its publisher. Secondary
+payload and key preparation completes before acquiring the late account scope.
+`PreparedSecondaryCommit::with_account_publication` owns that private account lock
+and supplies a lifetime-bound, consuming publication token. Encrypted preparation
+records the resulting key-envelope fingerprint under its key-resolution lock;
+late admission rejects changed encryption context without another unseal.
+
+Within that account scope, Engine publication enters inventory and configuration,
+preserving the order user-state, inventory, `cameras.conf`. Inside that machine
+boundary it checks exact retained primary and secondary source fingerprints,
+held-request account authority and fresh time after all lock waits, then consumes
+the persistence-only core token. No key preparation runs inside machine locks.
+The actual persistence receipt is returned
+unchanged; no authority recheck interrupts intent/store writes or follows a
+possibly visible publication. Existing replacement rollback, recover-forward and
+`VisibleNotDurable` settlement remain in force.
+
+Account comparison preserves the daemon's held-request UID policy; it does not
+claim fresh NSS remapping detection during that hold. The new account scope covers
+prepared camera-group addition, not every legacy removal or recovery writer.
+
+Camera-free preparation and synthetic real-publisher tests qualify these guarded
+boundaries. They do not establish successful split enrollment or authentication;
+the complete production-path acceptance and separate activation change remain.

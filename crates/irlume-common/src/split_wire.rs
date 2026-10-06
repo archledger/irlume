@@ -42,6 +42,150 @@ pub struct SplitMutationGuard {
     pub ir: SplitSideGuard,
 }
 
+/// A displayed, verified machine-authorization publication. The opaque token
+/// compares publications within one daemon instance, not account or capture
+/// authority. It exposes no raw generation digest or binding identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "AuthorizationGuardWire")]
+pub struct SplitAuthorizationGuard {
+    /// Original nonzero immutable generation, copied before approval.
+    pub generation: u64,
+    /// Daemon-authored comparison token: exactly 64 lowercase hex bytes.
+    pub token: String,
+}
+
+impl SplitAuthorizationGuard {
+    /// Validate the generation and bounded opaque comparison token.
+    ///
+    /// # Errors
+    /// Refuses generation zero or a token other than 64 lowercase hex bytes.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.generation == 0
+            || self.token.len() != 64
+            || !self
+                .token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("invalid split authorization guard");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorizationGuardWire {
+    generation: u64,
+    token: String,
+}
+
+impl TryFrom<AuthorizationGuardWire> for SplitAuthorizationGuard {
+    type Error = &'static str;
+    fn try_from(wire: AuthorizationGuardWire) -> Result<Self, Self::Error> {
+        let guard = Self {
+            generation: wire.generation,
+            token: wire.token,
+        };
+        guard.validate()?;
+        Ok(guard)
+    }
+}
+
+/// One split-pair choice scoped to enrollment/reset or camera-group addition.
+/// Retain both original displayed guards through approval and queueing. The
+/// daemon derives roles, locations and credential identity from current facts;
+/// this payload alone neither authorizes capture nor changes saved selection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SplitEnrollmentChoiceWire")]
+pub struct SplitEnrollmentCameraChoice {
+    /// Original two-incarnation inventory guard, never silently refreshed.
+    pub expected: SplitMutationGuard,
+    /// Original machine publication's generation and opaque comparison proof.
+    pub authorization: SplitAuthorizationGuard,
+}
+
+impl SplitEnrollmentCameraChoice {
+    /// Validate distinct, bounded sides and the original publication proof.
+    /// Does not resolve tokens or verify current machine/account authority.
+    ///
+    /// # Errors
+    /// Refuses malformed or zero guards, same-instance/endpoint sides,
+    /// oversized or control-containing endpoints, or an invalid publication proof.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.expected.validate()?;
+        self.authorization.validate()?;
+        if self.expected.revision == 0
+            || self.expected.rgb.generation == 0
+            || self.expected.ir.generation == 0
+            || self.expected.rgb.instance_id == self.expected.ir.instance_id
+            || self.expected.rgb.endpoint == self.expected.ir.endpoint
+            || [&self.expected.rgb.endpoint, &self.expected.ir.endpoint]
+                .iter()
+                .any(|endpoint| {
+                    endpoint.len() > crate::live_camera::MAX_CAMERA_ENDPOINT_BYTES
+                        || endpoint.chars().any(char::is_control)
+                })
+        {
+            return Err("split enrollment requires two distinct bounded displayed sides");
+        }
+        Ok(())
+    }
+}
+
+// Close only the new operation's nested guard shape. Existing management guard
+// decoders retain their published compatibility contract.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollmentSideWire {
+    instance_id: String,
+    generation: u64,
+    endpoint: String,
+}
+
+impl From<EnrollmentSideWire> for SplitSideGuard {
+    fn from(wire: EnrollmentSideWire) -> Self {
+        Self {
+            instance_id: wire.instance_id,
+            generation: wire.generation,
+            endpoint: wire.endpoint,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollmentMutationWire {
+    supervisor_id: String,
+    revision: u64,
+    rgb: EnrollmentSideWire,
+    ir: EnrollmentSideWire,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SplitEnrollmentChoiceWire {
+    expected: EnrollmentMutationWire,
+    authorization: SplitAuthorizationGuard,
+}
+
+impl TryFrom<SplitEnrollmentChoiceWire> for SplitEnrollmentCameraChoice {
+    type Error = &'static str;
+    fn try_from(wire: SplitEnrollmentChoiceWire) -> Result<Self, Self::Error> {
+        let choice = Self {
+            expected: SplitMutationGuard {
+                supervisor_id: wire.expected.supervisor_id,
+                revision: wire.expected.revision,
+                rgb: wire.expected.rgb.into(),
+                ir: wire.expected.ir.into(),
+            },
+            authorization: wire.authorization,
+        };
+        choice.validate()?;
+        Ok(choice)
+    }
+}
+
 /// Share-safe projection of one authorization side (ADR-0032 §6).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SplitSideProjection {
@@ -140,6 +284,11 @@ pub struct SplitPublicationView {
     /// from older replies; an empty list grants no mutation authority.
     #[serde(default)]
     pub candidates: Vec<SplitCandidateView>,
+    /// Verified machine-publication proof. Omitted for older replies or invalid
+    /// stores; absence grants no operation-choice authority. Non-root peers get
+    /// the same opaque proof, never the raw digest or complete binding key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<SplitAuthorizationGuard>,
 }
 
 /// One side available for a guarded add or selection. Root gets the literal
@@ -395,6 +544,7 @@ mod tests {
     fn store_states_round_trip() {
         let view = SplitPublicationView {
             candidates: Vec::new(),
+            authorization: None,
             supervisor_id: SUPER.into(),
             revision: 7,
             store_state: SplitStoreState::Valid,

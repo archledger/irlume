@@ -339,6 +339,25 @@ pub(crate) fn ensure_camera_store_key(
     )
 }
 
+/// Finish key-dependent preparation before releasing the account lock. The
+/// callback may retain envelope context but must not reacquire the state lock.
+pub(crate) fn with_camera_store_key<R>(
+    user: &str,
+    is_other: KeyIsAnotherAccounts<'_>,
+    finish: impl FnOnce(Zeroizing<Vec<u8>>, &UserStateLock) -> Result<R>,
+) -> Result<R> {
+    let _state = UserStateLock::acquire(user)?;
+    let key = camera_store_key_with(
+        user,
+        &mut Account::new(user),
+        is_other,
+        load_key_unmoved_as,
+        move_kept_key,
+        reseal_key_unlocked,
+    )?;
+    finish(key, &_state)
+}
+
 /// [`ensure_camera_store_key`] once the user state lock is held, with the
 /// unseal (`load`, which must write nothing), the move of a kept key to a
 /// stronger policy (`move_kept`) and the seal (`reseal`) passed in. A key

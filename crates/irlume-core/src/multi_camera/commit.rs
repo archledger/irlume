@@ -171,13 +171,28 @@ pub fn prepare_with_intent(
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .ok_or_else(|| CommitError::Io("secondary path has no file stem".into()))?;
-    let key = super::production_key_for(&user)?;
-    prepare_with_intent_key(
-        secondary_path,
-        new_store,
-        primary_snapshot_sha256,
-        key.as_deref().map(|v| &**v),
-    )
+    if crate::template_key::tpm_available() {
+        return crate::template_key::with_camera_store_key(
+            &user,
+            &crate::storage::key_is_another_accounts,
+            |key, state| {
+                Ok(prepare_with_key_context(
+                    secondary_path,
+                    new_store,
+                    primary_snapshot_sha256,
+                    &key,
+                    &user,
+                    state,
+                ))
+            },
+        )
+        .map_err(|error| {
+            CommitError::Store(SecondaryStoreError::Invalid(format!(
+                "the account template key is unavailable: {error}"
+            )))
+        })?;
+    }
+    prepare_with_intent_key(secondary_path, new_store, primary_snapshot_sha256, None)
 }
 
 /// [`publish_with_intent`] with an explicit key: `Some` journals and writes
@@ -245,24 +260,110 @@ fn prepare_with_intent_key(
     );
     let intent_path = intent_path_for(secondary_path);
     Ok(PreparedSecondaryCommit {
+        owner: new_store.owner.clone(),
         secondary_path: secondary_path.to_owned(),
         intent_path,
         bytes,
         journal,
+        key_context: None,
     })
+}
+
+fn prepare_with_key_context(
+    secondary_path: &Path,
+    new_store: &SecondaryStore,
+    primary_snapshot_sha256: &str,
+    key: &[u8],
+    user: &str,
+    _state: &crate::template_key::UserStateLock,
+) -> Result<PreparedSecondaryCommit, CommitError> {
+    let mut prepared = prepare_with_intent_key(
+        secondary_path,
+        new_store,
+        primary_snapshot_sha256,
+        Some(key),
+    )?;
+    let path = crate::template_key::key_path(user);
+    let envelope = std::fs::read(&path).map_err(|error| CommitError::Io(error.to_string()))?;
+    prepared.key_context = Some((path, irlume_common::sha256_hex(&envelope)));
+    Ok(prepared)
 }
 
 /// Prepared private persistence payload. Admission must precede consuming publish.
 /// It is neither cloneable nor printable, retains no key, and zeroizes its payloads.
 /// Documented no-TPM publication retains plaintext bytes under owner-only protection.
 pub struct PreparedSecondaryCommit {
+    owner: String,
     secondary_path: std::path::PathBuf,
     intent_path: std::path::PathBuf,
     bytes: zeroize::Zeroizing<Vec<u8>>,
     journal: zeroize::Zeroizing<Vec<u8>>,
+    key_context: Option<(PathBuf, String)>,
 }
 
 impl PreparedSecondaryCommit {
+    /// Enter the account's late publication boundary after key/payload preparation.
+    /// The retained store owner and configured store path must both name `user`.
+    /// Production encrypted preparation retains the exact sealed-key envelope
+    /// after key resolution, under its lock. A changed/missing envelope refuses
+    /// here, without another unseal; first sealing and preparation's legitimate
+    /// policy upgrade are observed after they finish, not mistaken for drift.
+    /// Core holds the private account-state lock, settling an interrupted primary
+    /// replacement before invoking `publication`. The one-shot token cannot escape
+    /// this scope, and its publisher does no key resolution or lock acquisition.
+    ///
+    /// The caller must revalidate current primary/secondary bytes, account and
+    /// operation authority, and fresh time after any inventory/configuration wait
+    /// and before consuming the token. Machine locks follow the account lock;
+    /// AUTH performs its final admission inside that boundary. Use unlocked readers
+    /// with an already loaded key: account-locking loaders or key helpers inside
+    /// this scope would deadlock.
+    /// This is serialization, not authorization. No check runs after the callback,
+    /// so its actual persistence result (including recoverable errors) is preserved.
+    ///
+    /// The scoped token cannot be returned for publication after lock release:
+    ///
+    /// ```compile_fail
+    /// use irlume_core::multi_camera::commit::{AccountSecondaryPublication, PreparedSecondaryCommit};
+    /// fn escape(prepared: PreparedSecondaryCommit) -> irlume_common::Result<AccountSecondaryPublication<'static>> {
+    ///     prepared.with_account_publication("alice", |publication| Ok(publication))
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns account binding, locking, settlement or callback errors.
+    pub fn with_account_publication<R>(
+        self,
+        user: &str,
+        publication: impl for<'a> FnOnce(AccountSecondaryPublication<'a>) -> irlume_common::Result<R>,
+    ) -> irlume_common::Result<R> {
+        if Path::new(user).file_name() != Some(std::ffi::OsStr::new(user))
+            || user.contains('\0')
+            || self.owner != user
+            || self.secondary_path != super::secondary_store_path(user)
+        {
+            return Err(irlume_common::Error::Policy(
+                "prepared secondary publication does not belong to the target account store".into(),
+            ));
+        }
+        let state = crate::template_key::UserStateLock::acquire(user)?;
+        if let Some((path, digest)) = &self.key_context {
+            let unchanged = path == &crate::template_key::key_path(user)
+                && std::fs::read(path)
+                    .is_ok_and(|bytes| irlume_common::sha256_hex(&bytes) == *digest);
+            if !unchanged {
+                return Err(irlume_common::Error::Policy(
+                    "the account template key changed after secondary publication preparation"
+                        .into(),
+                ));
+            }
+        }
+        publication(AccountSecondaryPublication {
+            commit: self,
+            _state: &state,
+        })
+    }
+
     /// Authorize recover-forward with the intent, then publish and remove it.
     ///
     /// # Errors
@@ -278,6 +379,22 @@ impl PreparedSecondaryCommit {
                 fsync_dir(self.intent_path.parent().unwrap_or_else(|| Path::new(".")))
             })?;
         Ok(())
+    }
+}
+
+/// One-shot persistence confined to a held account publication scope.
+pub struct AccountSecondaryPublication<'a> {
+    commit: PreparedSecondaryCommit,
+    _state: &'a crate::template_key::UserStateLock,
+}
+
+impl AccountSecondaryPublication<'_> {
+    /// Consume the existing intent/store publisher without new admission checks.
+    ///
+    /// # Errors
+    /// A persistence error may leave an already authorized recoverable intent.
+    pub fn publish(self) -> Result<(), CommitError> {
+        self.commit.publish()
     }
 }
 
@@ -838,6 +955,419 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         (dir.join("secondary.json"), dir.join("primary.json"))
+    }
+
+    struct AccountFixture {
+        dir: PathBuf,
+        old_state: Option<std::ffi::OsString>,
+        old_keys: Option<std::ffi::OsString>,
+    }
+
+    impl AccountFixture {
+        fn new(tag: &str) -> Self {
+            let (path, _) = paths(tag);
+            let dir = path.parent().unwrap().to_owned();
+            let fixture = Self {
+                old_state: std::env::var_os("IRLUME_STATE_DIR"),
+                old_keys: std::env::var_os("IRLUME_TEMPLATE_KEY_DIR"),
+                dir,
+            };
+            std::env::set_var("IRLUME_STATE_DIR", &fixture.dir);
+            std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", fixture.dir.join("keys"));
+            fixture
+        }
+
+        fn prepare(&self, owner: &str, generation: u64) -> PreparedSecondaryCommit {
+            let digest = irlume_common::sha256_hex(b"primary-v1");
+            let mut store = store_for(&digest, generation);
+            store.owner = owner.into();
+            store.groups[0].pair = split_pair();
+            prepare_with_intent_key(
+                &super::super::secondary_store_path("alice"),
+                &store,
+                &digest,
+                Some(&[0x51; 32]),
+            )
+            .unwrap()
+        }
+    }
+
+    impl Drop for AccountFixture {
+        fn drop(&mut self) {
+            for (name, old) in [
+                ("IRLUME_STATE_DIR", &self.old_state),
+                ("IRLUME_TEMPLATE_KEY_DIR", &self.old_keys),
+            ] {
+                match old {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    // Independent open description: tests real contention, not lock-file existence.
+    fn state_lock_available(user: &str) -> bool {
+        use std::os::fd::AsRawFd;
+        let path = crate::template_key::key_dir().join(".locks").join(format!(
+            "{}.lock",
+            irlume_common::sha256_hex(user.as_bytes())
+        ));
+        let Ok(file) = std::fs::OpenOptions::new().read(true).open(path) else {
+            return true;
+        };
+        // SAFETY: the independently opened file owns a live descriptor until return.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            true // Closing this independent description releases its lock.
+        } else {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EWOULDBLOCK)
+            );
+            false
+        }
+    }
+
+    fn commit_error(error: CommitError) -> irlume_common::Error {
+        irlume_common::Error::Io(error.to_string())
+    }
+
+    #[test]
+    fn account_publication_holds_real_lock_through_checks_and_publish_once() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = AccountFixture::new("account-once");
+        let prepared = fixture.prepare("alice", 2);
+        drop(crate::template_key::UserStateLock::acquire("bob").unwrap());
+        assert!(
+            state_lock_available("alice"),
+            "preparation retains no transaction lock"
+        );
+        let path = super::super::secondary_store_path("alice");
+        let mut calls = 0;
+        let result = prepared
+            .with_account_publication("alice", |publication| {
+                calls += 1;
+                assert!(
+                    !state_lock_available("alice"),
+                    "late admission must exclude account writers"
+                );
+                assert!(
+                    state_lock_available("bob"),
+                    "other accounts are independent"
+                );
+                assert!(!intent_path_for(&path).exists());
+                publication.publish().map_err(commit_error)?;
+                assert!(
+                    !state_lock_available("alice"),
+                    "guard must survive consuming persistence"
+                );
+                Ok(37)
+            })
+            .unwrap();
+        assert_eq!(result, 37);
+        assert_eq!(calls, 1);
+        assert!(state_lock_available("alice"));
+        let store = super::super::load_secondary_with_key(&path, Some(&[0x51; 32]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.generation, 2);
+        assert_eq!(store.groups[0].pair, split_pair());
+        assert_eq!(resolve_commit(&path).unwrap(), CommitResolution::Clean);
+    }
+
+    #[test]
+    fn account_publication_denied_admission_changes_neither_store_nor_intent() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = AccountFixture::new("account-denied");
+        let path = super::super::secondary_store_path("alice");
+        fixture.prepare("alice", 1).publish().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut calls = 0;
+        let result: irlume_common::Result<()> = fixture
+            .prepare("alice", 2)
+            .with_account_publication("alice", |_publication| {
+                calls += 1;
+                assert!(!state_lock_available("alice"));
+                Err(irlume_common::Error::Policy("admission denied".into()))
+            });
+        assert!(
+            matches!(result, Err(irlume_common::Error::Policy(ref s)) if s == "admission denied")
+        );
+        assert_eq!(calls, 1);
+        assert!(state_lock_available("alice"));
+        assert!(!intent_path_for(&path).exists());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(resolve_commit(&path).unwrap(), CommitResolution::Clean);
+    }
+
+    #[test]
+    fn account_publication_rejects_wrong_user_owner_and_path_before_callback() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = AccountFixture::new("account-binding");
+        let path = super::super::secondary_store_path("alice");
+        for (owner, user) in [("alice", "bob"), ("bob", "alice")] {
+            let result = fixture
+                .prepare(owner, 1)
+                .with_account_publication(user, |publication| {
+                    publication.publish().map_err(commit_error)
+                });
+            assert!(matches!(result, Err(irlume_common::Error::Policy(_))));
+            assert!(!path.exists());
+            assert!(!intent_path_for(&path).exists());
+        }
+        let digest = irlume_common::sha256_hex(b"primary-v1");
+        let alias = fixture.dir.join("alice.json");
+        let prepared =
+            prepare_with_intent_key(&alias, &store_for(&digest, 1), &digest, None).unwrap();
+        assert!(prepared
+            .with_account_publication("alice", |_| -> irlume_common::Result<()> {
+                panic!("foreign store path must never enter admission")
+            })
+            .is_err());
+        assert!(!alias.exists());
+        assert!(!intent_path_for(&alias).exists());
+    }
+
+    #[test]
+    fn account_publication_unwind_releases_lock_without_authorizing_recovery() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = AccountFixture::new("account-unwind");
+        let mut entered = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fixture.prepare("alice", 1).with_account_publication(
+                "alice",
+                |_| -> irlume_common::Result<()> {
+                    entered = true;
+                    assert!(!state_lock_available("alice"));
+                    panic!("admission unwind")
+                },
+            )
+        }));
+        assert!(entered);
+        let panic = result.expect_err("callback must unwind");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"admission unwind"));
+        assert!(state_lock_available("alice"));
+        let path = super::super::secondary_store_path("alice");
+        assert!(!path.exists());
+        assert_eq!(resolve_commit(&path).unwrap(), CommitResolution::Clean);
+    }
+
+    #[test]
+    fn account_publication_store_failure_retains_admitted_intent_for_recovery() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = AccountFixture::new("account-recovery");
+        let path = super::super::secondary_store_path("alice");
+        fixture.prepare("alice", 1).publish().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let prepared = fixture.prepare("alice", 2);
+        let staging = super::super::staging_path(&path, super::super::COMMIT_STAGING_TAG);
+        std::fs::write(&staging, b"block store staging only").unwrap();
+        let mut entered = false;
+        let result = prepared.with_account_publication("alice", |publication| {
+            entered = true;
+            assert!(!state_lock_available("alice"));
+            publication.publish().map_err(commit_error)
+        });
+        assert!(entered);
+        assert!(result.is_err());
+        assert!(state_lock_available("alice"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            intent_path_for(&path).is_file(),
+            "already admitted intent must survive error"
+        );
+        std::fs::remove_file(staging).unwrap();
+        assert_eq!(resolve_commit(&path).unwrap(), CommitResolution::Completed);
+        assert_eq!(
+            super::super::load_secondary_with_key(&path, Some(&[0x51; 32]))
+                .unwrap()
+                .unwrap()
+                .generation,
+            2
+        );
+    }
+
+    #[test]
+    fn account_publication_returns_post_visible_callback_error_without_rollback() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = AccountFixture::new("account-visible");
+        let path = super::super::secondary_store_path("alice");
+        let result: irlume_common::Result<()> = fixture
+            .prepare("alice", 4)
+            .with_account_publication("alice", |publication| {
+                publication.publish().map_err(commit_error)?;
+                Err(irlume_common::Error::Io(
+                    "caller observed visible publication".into(),
+                ))
+            });
+        assert!(
+            matches!(result, Err(irlume_common::Error::Io(ref s)) if s == "caller observed visible publication")
+        );
+        assert!(state_lock_available("alice"));
+        assert_eq!(
+            super::super::load_secondary_with_key(&path, Some(&[0x51; 32]))
+                .unwrap()
+                .unwrap()
+                .generation,
+            4
+        );
+        assert_eq!(resolve_commit(&path).unwrap(), CommitResolution::Clean);
+    }
+
+    #[test]
+    fn account_publication_settles_visible_primary_replacement_before_admission() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = AccountFixture::new("account-settlement");
+        let primary = super::super::primary_enrollment_path("alice");
+        std::fs::write(&primary, b"old primary bytes").unwrap();
+        fixture.prepare("alice", 1).publish().unwrap();
+        let prepared = fixture.prepare("alice", 2);
+        {
+            let _state = crate::template_key::UserStateLock::acquire("alice").unwrap();
+            crate::replacement::begin("alice", None).unwrap();
+            std::fs::write(&primary, b"visible replacement primary bytes").unwrap();
+        }
+        let path = super::super::secondary_store_path("alice");
+        assert!(path.exists());
+        assert!(crate::replacement::record_path("alice").exists());
+        let mut entered = false;
+        let result: irlume_common::Result<()> = prepared.with_account_publication("alice", |_| {
+            entered = true;
+            assert!(!state_lock_available("alice"));
+            assert!(
+                !path.exists(),
+                "replacement must settle before secondary admission"
+            );
+            assert!(!crate::replacement::record_path("alice").exists());
+            assert_eq!(
+                std::fs::read(&primary).unwrap(),
+                b"visible replacement primary bytes"
+            );
+            Err(irlume_common::Error::Policy(
+                "source snapshot changed".into(),
+            ))
+        });
+        assert!(entered);
+        assert!(result.is_err());
+        assert!(!path.exists());
+        assert!(state_lock_available("alice"));
+        assert_eq!(resolve_commit(&path).unwrap(), CommitResolution::Clean);
+    }
+
+    fn prepare_synthetic_account_key(
+        fixture: &AccountFixture,
+    ) -> (PreparedSecondaryCommit, zeroize::Zeroizing<Vec<u8>>) {
+        let user = "alice";
+        let state = crate::template_key::UserStateLock::acquire(user).unwrap();
+        let persisted = std::cell::RefCell::new(zeroize::Zeroizing::new(vec![0x51; 32]));
+        let key = crate::template_key::camera_store_key_with(
+            user,
+            &mut crate::account::Account::new(user),
+            &|_, _, _| Ok(false),
+            |_, _| Ok(persisted.borrow().clone()),
+            |user, _| {
+                std::fs::write(
+                    crate::template_key::key_path(user),
+                    b"upgraded seal of same key",
+                )
+                .unwrap()
+            },
+            |user, key, _| {
+                *persisted.borrow_mut() = zeroize::Zeroizing::new(key.to_vec());
+                std::fs::write(crate::template_key::key_path(user), b"first synthetic seal")
+                    .map_err(|e| irlume_common::Error::Io(e.to_string()))
+            },
+        )
+        .unwrap();
+        assert!(fixture.dir.exists());
+        let digest = irlume_common::sha256_hex(b"primary-v1");
+        let prepared = prepare_with_key_context(
+            &super::super::secondary_store_path(user),
+            &store_for(&digest, 2),
+            &digest,
+            &key,
+            user,
+            &state,
+        )
+        .unwrap();
+        (prepared, key)
+    }
+
+    #[test]
+    fn account_publication_refuses_key_envelope_drift_after_preparation() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = AccountFixture::new("account-key-drift");
+        let _account = crate::account::remember("alice", 41001);
+        for replacement in [Some(b"different seal".as_slice()), None] {
+            let (prepared, _key) = prepare_synthetic_account_key(&fixture);
+            let key_path = crate::template_key::key_path("alice");
+            match replacement {
+                Some(bytes) => std::fs::write(&key_path, bytes).unwrap(),
+                None => std::fs::remove_file(&key_path).unwrap(),
+            }
+            let mut entered = false;
+            let result = prepared.with_account_publication("alice", |publication| {
+                entered = true;
+                publication.publish().map_err(commit_error)
+            });
+            assert!(result.is_err(), "changed encryption context must refuse");
+            assert!(!entered, "key drift must precede AUTH admission");
+            let path = super::super::secondary_store_path("alice");
+            assert!(!path.exists());
+            assert_eq!(resolve_commit(&path).unwrap(), CommitResolution::Clean);
+            assert!(state_lock_available("alice"));
+        }
+    }
+
+    #[test]
+    fn account_publication_accepts_first_seal_and_legitimate_preparation_upgrade() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = AccountFixture::new("account-key-upgrade");
+        let _account = crate::account::remember("alice", 41001);
+        for expected in [
+            b"first synthetic seal".as_slice(),
+            b"upgraded seal of same key".as_slice(),
+        ] {
+            let (prepared, key) = prepare_synthetic_account_key(&fixture);
+            assert_eq!(
+                std::fs::read(crate::template_key::key_path("alice")).unwrap(),
+                expected
+            );
+            prepared
+                .with_account_publication("alice", |publication| {
+                    assert!(!state_lock_available("alice"));
+                    publication.publish().map_err(commit_error)
+                })
+                .unwrap();
+            let path = super::super::secondary_store_path("alice");
+            assert_eq!(
+                super::super::load_secondary_with_key(&path, Some(&key))
+                    .unwrap()
+                    .unwrap()
+                    .generation,
+                2
+            );
+        }
     }
 
     #[test]

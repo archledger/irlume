@@ -686,6 +686,54 @@ pub(crate) fn with_selected_camera_publication<R>(
     )
 }
 
+pub(crate) fn with_selected_split_camera_publication<R>(
+    expected: &crate::lease::SplitLeaseRequest,
+    records: &[irlume_common::split_schema::AuthorizationRecord],
+    commit: impl FnOnce() -> R,
+) -> Result<R, CameraLeaseError> {
+    let publish = |supervisor: &CameraSupervisor| {
+        let inventory = supervisor
+            .inventory
+            .lock()
+            .map_err(|_| CameraLeaseError::Poisoned)?;
+        let snapshot = inventory.snapshot();
+        if snapshot.state != CameraInventoryState::Current
+            || snapshot.validate().is_err()
+            || snapshot.supervisor_id.as_deref() != Some(expected.supervisor_id.as_str())
+            || snapshot.revision != expected.revision
+        {
+            return Err(CameraLeaseError::Stale);
+        }
+        // Role-cache updates do not advance revision. Resolve again under this
+        // lock, including ordinary claims and ordered split overlaps; checking
+        // the two retained sides independently would admit unauthorized hybrids.
+        let resolved = inventory.connected_pairs_with_split(records);
+        if resolved
+            .split_pairs
+            .iter()
+            .filter(|pair| pair.lease_request() == *expected)
+            .count()
+            != 1
+        {
+            return Err(CameraLeaseError::Stale);
+        }
+        // The callback checks current configuration before persistence. Its
+        // receipt may describe visible data, so no post-commit revalidation.
+        let result = commit();
+        drop(inventory);
+        Ok(result)
+    };
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
+        return publish(&supervisor);
+    }
+    publish(
+        DEFAULT_CAMERA_SUPERVISOR
+            .get()
+            .ok_or(CameraLeaseError::Stale)?,
+    )
+}
+
 pub(crate) fn default_camera_supervisor() -> &'static CameraSupervisor {
     DEFAULT_CAMERA_SUPERVISOR
         .get_or_init(|| {

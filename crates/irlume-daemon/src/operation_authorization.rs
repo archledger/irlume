@@ -38,17 +38,18 @@ pub(super) fn required(req: &Request, peer: &Peer) -> bool {
 // approval without a compiler error.
 fn approval_operation(req: &Request) -> Option<(&'static str, &'static str)> {
     Some(match req {
-        Request::Enroll { reset: true, .. } | Request::EnrollOn { reset: true, .. } => {
-            (ACTION, "replace enrolled faces")
-        }
+        Request::Enroll { reset: true, .. }
+        | Request::EnrollOn { reset: true, .. }
+        | Request::EnrollSplitOn { reset: true, .. } => (ACTION, "replace enrolled faces"),
         Request::Enroll { .. }
         | Request::EnrollOn { .. }
+        | Request::EnrollSplitOn { .. }
         | Request::EnrollmentSession { improve: false, .. } => (ACTION, "enroll a face"),
         // A camera-group addition adds trusted templates on a new camera
         // (ADR-0024 §4): the same enrollment-trust approval class.
-        Request::AddCameraGroup { .. } | Request::AddCameraGroupOn { .. } => {
-            (ACTION, "enroll a face on another camera")
-        }
+        Request::AddCameraGroup { .. }
+        | Request::AddCameraGroupOn { .. }
+        | Request::AddSplitCameraGroupOn { .. } => (ACTION, "enroll a face on another camera"),
         // Removal deletes that camera's templates and binding together.
         Request::RemoveCameraGroup { .. } => (ACTION, "remove an enrolled camera"),
         Request::AddScan { .. } | Request::EnrollmentSession { improve: true, .. } => {
@@ -847,6 +848,112 @@ mod tests {
                     "altered operation choice reused approval"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn split_choice_approval_consumes_only_the_complete_original_request() {
+        let _passwd = crate::tests::passwd_lock();
+        let caller = peer();
+        let user = crate::users::name_for_uid(caller.uid).unwrap();
+        let choice = serde_json::json!({
+            "expected": {
+                "supervisor_id": "11".repeat(16), "revision": 7,
+                "rgb": {"instance_id": "22".repeat(16), "generation": 3, "endpoint": "0123456789abcdef"},
+                "ir": {"instance_id": "33".repeat(16), "generation": 4, "endpoint": "fedcba9876543210"}
+            },
+            "authorization": {"generation": 5, "token": "ab".repeat(32)}
+        });
+        for variant in ["EnrollSplitOn", "AddSplitCameraGroupOn"] {
+            let mut payload =
+                serde_json::json!({"user": user, "profile": "Face", "scans": 2, "pair": choice});
+            if variant == "EnrollSplitOn" {
+                payload["reset"] = serde_json::json!(true);
+            }
+            let original: Request =
+                serde_json::from_value(serde_json::json!({variant: payload.clone()})).unwrap();
+            assert!(required(
+                &original,
+                &Peer {
+                    uid: 1000,
+                    ..caller.clone()
+                }
+            ));
+            assert!(!required(
+                &original,
+                &Peer {
+                    uid: 0,
+                    ..caller.clone()
+                }
+            ));
+            let grant = || Grant {
+                subject: Subject::capture(&caller).unwrap(),
+                request: request_binding(&original).unwrap(),
+                approved: Instant::now(),
+            };
+            grant().consume(&original, &caller).unwrap();
+            let mut mutations = vec![
+                ("/user", serde_json::json!("different-owner")),
+                ("/profile", serde_json::json!("Different")),
+                ("/scans", serde_json::json!(3)),
+                (
+                    "/pair/expected/supervisor_id",
+                    serde_json::json!("44".repeat(16)),
+                ),
+                ("/pair/expected/revision", serde_json::json!(8)),
+                (
+                    "/pair/expected/rgb/instance_id",
+                    serde_json::json!("55".repeat(16)),
+                ),
+                (
+                    "/pair/expected/ir/instance_id",
+                    serde_json::json!("66".repeat(16)),
+                ),
+                ("/pair/expected/rgb/generation", serde_json::json!(6)),
+                ("/pair/expected/ir/generation", serde_json::json!(7)),
+                (
+                    "/pair/expected/rgb/endpoint",
+                    serde_json::json!("different-rgb"),
+                ),
+                (
+                    "/pair/expected/ir/endpoint",
+                    serde_json::json!("different-ir"),
+                ),
+                ("/pair/authorization/generation", serde_json::json!(6)),
+                (
+                    "/pair/authorization/token",
+                    serde_json::json!("cd".repeat(32)),
+                ),
+            ];
+            if variant == "EnrollSplitOn" {
+                mutations.push(("/reset", serde_json::json!(false)));
+            }
+            for (field, value) in mutations {
+                let mut changed = payload.clone();
+                *changed.pointer_mut(field).unwrap() = value;
+                let changed: Request =
+                    serde_json::from_value(serde_json::json!({variant: changed})).unwrap();
+                assert!(
+                    grant().consume(&changed, &caller).is_err(),
+                    "{variant} {field} reused approval"
+                );
+            }
+            let mut expired = grant();
+            expired.approved = Instant::now() - QUEUE_FRESHNESS;
+            assert!(expired.consume(&original, &caller).is_err());
+            let other = if variant == "EnrollSplitOn" {
+                "AddSplitCameraGroupOn"
+            } else {
+                "EnrollSplitOn"
+            };
+            let mut other_payload = payload.clone();
+            other_payload.as_object_mut().unwrap().remove("reset");
+            let changed: Request =
+                serde_json::from_value(serde_json::json!({other: other_payload})).unwrap();
+            assert!(
+                grant().consume(&changed, &caller).is_err(),
+                "variant changed under approval"
+            );
         }
     }
 

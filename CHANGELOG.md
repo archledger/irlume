@@ -5,6 +5,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- Refresh both Cargo lockfiles to current compatible transitive releases,
+  including `libc` 0.2.190 and `spki` 0.8.1. `aes` stays at 0.9.2 and `uuid`
+  at 1.26.0 because their newer releases declare Rust 1.89 while the
+  workspace MSRV remains 1.88, and the pinned `edgefirst-tflite` 0.10.2 /
+  `edgefirst-tflite-sys` pair stays synchronized pending a reviewed 0.10.3
+  bump.
+
 ### Added
 
 - Split-camera diagnostics capture RGB then IR under one retained two-device

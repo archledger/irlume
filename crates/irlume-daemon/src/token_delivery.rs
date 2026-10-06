@@ -312,6 +312,185 @@ pub(crate) mod tests {
         assert!(!fixture.excluded());
     }
 
+    /// Every path the dynamic loader must see inside the private root before
+    /// it can start a copied image: the image's ELF interpreter, the search
+    /// directories its own and its dependencies' `DT_RPATH`/`DT_RUNPATH`
+    /// name, and the resolved file behind each library name. The last part
+    /// matters because a store can split one library across outputs behind a
+    /// symlink (`libgcc_s.so.1` in the gcc output points into the libgcc
+    /// output). Resolution mirrors the loader: each object's `DT_NEEDED`
+    /// names are looked up in the search directories, and the objects found
+    /// that way are inspected in turn until the closure stops growing. The
+    /// interpreter is listed first; the binder groups the directories before
+    /// the files so a file bind can land on top of the symlink a directory
+    /// bind exposes.
+    fn loader_inputs(image: &Path) -> Vec<PathBuf> {
+        /// The interpreter, the `DT_NEEDED` names and the `DT_RPATH` /
+        /// `DT_RUNPATH` directories of one ELF64 little-endian image.
+        fn dynamic(
+            bytes: &[u8],
+            image: &Path,
+        ) -> Option<(Option<PathBuf>, Vec<PathBuf>, Vec<PathBuf>)> {
+            fn cstr(bytes: &[u8], start: usize) -> Option<PathBuf> {
+                let rest = bytes.get(start..)?;
+                let end = start + rest.iter().position(|&b| b == 0)?;
+                std::str::from_utf8(bytes.get(start..end)?)
+                    .ok()
+                    .map(PathBuf::from)
+            }
+
+            // ELF64 little-endian headers; any other image is left to the
+            // FHS binds above, exactly as before this walk existed.
+            if bytes.len() < 0x40 || bytes[..4] != *b"\x7fELF" || bytes[4] != 2 || bytes[5] != 1 {
+                return None;
+            }
+            let u16_at =
+                |at: usize| u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize;
+            let u64_at =
+                |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+            let (phoff, phentsize, phnum) = (u64_at(0x20), u16_at(0x36), u16_at(0x38));
+            let mut interp = None;
+            let mut dynamic = None;
+            let mut loads = Vec::new();
+            for index in 0..phnum {
+                let ph = phoff + index * phentsize;
+                if ph + 0x38 > bytes.len() {
+                    return None;
+                }
+                let p_type = u32::from_le_bytes(bytes[ph..ph + 4].try_into().unwrap());
+                let (p_offset, p_vaddr, p_filesz) =
+                    (u64_at(ph + 0x08), u64_at(ph + 0x10), u64_at(ph + 0x20));
+                match p_type {
+                    1 => loads.push((p_vaddr, p_offset, p_filesz)),
+                    2 => dynamic = Some((p_offset, p_filesz)),
+                    3 => interp = cstr(bytes, p_offset),
+                    _ => {}
+                }
+            }
+            let mut needed = Vec::new();
+            let mut search = Vec::new();
+            if let Some((dyn_offset, dyn_size)) = dynamic {
+                // Dynamic entries pair a tag with a value; the string offsets
+                // below refer to DT_STRTAB, itself a virtual address that the
+                // PT_LOAD map turns back into a file offset.
+                let mut strtab = None;
+                let mut strings = Vec::new();
+                let mut rpath = Vec::new();
+                let mut offset = 0;
+                while offset + 16 <= dyn_size {
+                    let at = dyn_offset + offset;
+                    if at + 16 > bytes.len() {
+                        break;
+                    }
+                    let (tag, value) = (u64_at(at), u64_at(at + 8));
+                    match tag {
+                        0 => break,
+                        1 => strings.push(value),
+                        5 => strtab = Some(value),
+                        15 | 29 => rpath.push(value),
+                        _ => {}
+                    }
+                    offset += 16;
+                }
+                let origin_dir = image
+                    .parent()
+                    .map(|origin| origin.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let strings_at = strtab.and_then(|strtab| {
+                    loads.iter().find_map(|(vaddr, file, filesz)| {
+                        (*vaddr..*vaddr + *filesz)
+                            .contains(&strtab)
+                            .then_some(*file + (strtab - *vaddr))
+                    })
+                });
+                if let Some(strings_at) = strings_at {
+                    for entry in strings {
+                        if let Some(name) = cstr(bytes, strings_at + entry) {
+                            needed.push(name);
+                        }
+                    }
+                    for entry in rpath {
+                        let Some(entry) = cstr(bytes, strings_at + entry) else {
+                            continue;
+                        };
+                        for dir in entry.to_string_lossy().split(':') {
+                            // `$ORIGIN` is the image's own directory. The walk
+                            // reads the host image, so this expands to the host
+                            // path of the copy's source, which is what the
+                            // loader needs bound to follow the same entry.
+                            let dir = dir
+                                .replace("${ORIGIN}", &origin_dir)
+                                .replace("$ORIGIN", &origin_dir);
+                            if dir.is_empty() {
+                                continue;
+                            }
+                            let dir = PathBuf::from(dir);
+                            if dir.exists() && !search.contains(&dir) {
+                                search.push(dir);
+                            }
+                        }
+                    }
+                }
+            }
+            Some((interp, needed, search))
+        }
+
+        let mut inputs: Vec<PathBuf> = Vec::new();
+        let mut seen: Vec<PathBuf> = Vec::new();
+        let mut search: Vec<PathBuf> = Vec::new();
+        let mut files: Vec<PathBuf> = Vec::new();
+        let mut pending = vec![image.to_path_buf()];
+        while let Some(object) = pending.pop() {
+            let canonical = object.canonicalize().unwrap_or_else(|_| object.clone());
+            if seen.contains(&canonical) {
+                continue;
+            }
+            seen.push(canonical);
+            let Ok(bytes) = std::fs::read(&object) else {
+                continue;
+            };
+            let Some((interp, needed, dirs)) = dynamic(&bytes, &object) else {
+                continue;
+            };
+            if let Some(interp) = interp {
+                for path in [
+                    interp.clone(),
+                    interp.canonicalize().unwrap_or(interp.clone()),
+                ] {
+                    if !files.contains(&path) {
+                        files.push(path);
+                    }
+                }
+                pending.push(interp);
+            }
+            for dir in dirs {
+                if !search.contains(&dir) {
+                    search.push(dir.clone());
+                }
+                if !inputs.contains(&dir) {
+                    inputs.push(dir);
+                }
+            }
+            for name in needed {
+                let Some(hit) = search
+                    .iter()
+                    .map(|dir| dir.join(&name))
+                    .find(|hit| hit.exists())
+                else {
+                    continue;
+                };
+                if let Ok(target) = hit.canonicalize() {
+                    if !files.contains(&target) {
+                        files.push(target);
+                    }
+                }
+                pending.push(hit);
+            }
+        }
+        files.append(&mut inputs);
+        files
+    }
+
     #[test]
     fn installed_sibling_and_real_cli_helper_work_in_a_private_root() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -341,8 +520,8 @@ pub(crate) mod tests {
         for dir in ["trusted", "pam", "units", "lock"] {
             std::fs::create_dir(fixture.0.join(dir)).unwrap();
         }
-        std::fs::copy(exe, fixture.0.join("trusted/irlumed")).unwrap();
-        std::fs::copy(cli, fixture.0.join("trusted/irlume")).unwrap();
+        std::fs::copy(&exe, fixture.0.join("trusted/irlumed")).unwrap();
+        std::fs::copy(&cli, fixture.0.join("trusted/irlume")).unwrap();
         std::fs::copy("/usr/bin/true", fixture.0.join("trusted/success-only")).unwrap();
         for name in ["trusted/irlumed", "trusted/irlume", "trusted/success-only"] {
             std::fs::set_permissions(fixture.0.join(name), std::fs::Permissions::from_mode(0o755))
@@ -361,6 +540,9 @@ pub(crate) mod tests {
         // A new root with root-owned ancestry, not a mount of host /: mapped
         // host uid 0 is nobody in a single-user namespace. Only libraries and
         // our synthetic files are visible. No PAM, bus, TPM or camera is bound.
+        // The library trees bound are the FHS ones plus whatever the copied
+        // images name for their own loading, so a store-linked image starts
+        // here instead of failing execve before any assertion.
         let mut command = Command::new("/usr/bin/bwrap");
         command.args([
             "--unshare-all",
@@ -388,6 +570,34 @@ pub(crate) mod tests {
                 "usr/lib64",
                 "/lib64",
             ]);
+        }
+        // The binds above cover a distro toolchain. An image linked against
+        // somewhere else (the NixOS runner links against the store) names its
+        // interpreter, its libraries and their search paths outside those
+        // trees, and the kernel answers execve with ENOENT for an interpreter
+        // the root does not contain. Bind every loader input of the three
+        // copied images that the FHS roots do not already provide, read-only
+        // and at its absolute path, so the sandbox stays "libraries and our
+        // synthetic files" on every toolchain. A silent empty result would
+        // only show up on such a host, so the interpreter is asserted below.
+        let mut fhs = vec![PathBuf::from("/usr/lib"), PathBuf::from("/lib")];
+        if Path::new("/usr/lib64").is_dir() {
+            fhs.push(PathBuf::from("/usr/lib64"));
+            fhs.push(PathBuf::from("/lib64"));
+        }
+        let mut inputs: Vec<PathBuf> = Vec::new();
+        for image in [&exe, &cli, &PathBuf::from("/usr/bin/true")] {
+            for input in loader_inputs(image) {
+                if !fhs.iter().any(|root| input.starts_with(root)) && !inputs.contains(&input) {
+                    inputs.push(input);
+                }
+            }
+        }
+        for input in inputs.iter().filter(|path| path.is_dir()) {
+            command.arg("--ro-bind").arg(input).arg(input);
+        }
+        for input in inputs.iter().filter(|path| !path.is_dir()) {
+            command.arg("--ro-bind").arg(input).arg(input);
         }
         command
             .args([
@@ -424,6 +634,13 @@ pub(crate) mod tests {
                 "token_delivery::tests::root_helper_child",
                 "--nocapture",
             ]);
+        assert!(
+            loader_inputs(&exe)
+                .first()
+                .is_some_and(|interp| interp.is_file()),
+            "the copied images are dynamically linked; the test binary must name its \
+             ELF interpreter for the loader binds to cover it"
+        );
         let output = irlume_common::process::output_until(
             &mut command,
             Instant::now() + Duration::from_secs(15),

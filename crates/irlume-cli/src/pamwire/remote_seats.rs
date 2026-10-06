@@ -21,6 +21,7 @@
 //! login screens a file no longer turns on.
 
 mod evidence;
+mod managed_start;
 
 use super::autologin::{assignments, on, LIGHTDM_DROP_IN_DIRS, LIGHTDM_MAIN};
 use evidence::{files as lightdm_files, read};

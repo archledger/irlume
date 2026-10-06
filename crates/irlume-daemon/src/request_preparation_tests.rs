@@ -315,6 +315,133 @@ mod request_preparation_gates {
             .expect("operation-scoped enrollment request must be supported")
     }
 
+    fn split_operation_choice(user: &str, variant: &str, reset: bool) -> Request {
+        use irlume_common::split_wire::{SplitCandidateRole, SplitMutationGuard, SplitEnrollmentCameraChoice};
+        let Response::SplitInventory(view) = split_list_response(uid_of(user).unwrap(), &irlume_auth::camera_inventory_publication()) else { panic!("listing"); };
+        let rgb = view.candidates.iter().find(|c| c.role == SplitCandidateRole::Rgb).unwrap();
+        let ir = view.candidates.iter().find(|c| c.role == SplitCandidateRole::Ir).unwrap();
+        let pair = Box::new(SplitEnrollmentCameraChoice {
+            expected: SplitMutationGuard { supervisor_id: view.supervisor_id, revision: view.revision, rgb: rgb.guard.clone(), ir: ir.guard.clone() },
+            authorization: view.authorization.expect("verified listing proof"),
+        });
+        if variant == "EnrollSplitOn" {
+            Request::EnrollSplitOn { user: user.into(), profile: None, scans: Some(1), reset, pair }
+        } else {
+            Request::AddSplitCameraGroupOn { user: user.into(), profile: None, scans: Some(1), pair }
+        }
+    }
+
+    #[test]
+    fn guarded_split_dispatch_refuses_activation_before_camera_or_account_mutation() {
+        let _guard = env_lock();
+        let mut engine = engine();
+        let sb = sandbox("guarded-split-closed");
+        let _environment = Environment::clear();
+        let recorder = fixture(true);
+        select_split();
+        let irlume_common::split_publish::SplitReadState::Valid { records, .. } = irlume_common::split_publish::read_split() else { panic!("verified authorization"); };
+        irlume_common::split_publish::publish_split(&records, None).unwrap();
+        let user = users::name_for_uid(0).unwrap();
+        write_enrollment(&sb.dir, &enrollment_with(&user, &["Face Scan 1"]));
+        engine.set_devices(NO_RGB, NO_IR);
+        let account = sb.dir.join(format!("{user}.json"));
+        let before = std::fs::read(&account).unwrap();
+        let config = std::fs::read(sb.dir.join("config/cameras.conf")).unwrap();
+        let listing = Request::ListProfiles { user: user.clone(), structured_errors: false, handles: false };
+        assert!(matches!(dispatch(listing.clone(), &peer(0), &mut engine), Response::Enrollment { .. }));
+        assert!(dispatch_status(&listing, &peer(0)).is_some());
+        for (variant, reset) in [("EnrollSplitOn", false), ("EnrollSplitOn", true), ("AddSplitCameraGroupOn", false)] {
+            let request = split_operation_choice(&user, variant, reset);
+            let response = dispatch(request, &peer(0), &mut engine);
+            assert!(matches!(response, Response::Error(ref reason) if reason.contains(CLOSED)), "{response:?}");
+            assert!(recorder.calls().is_empty(), "closed activation spent camera work: {:?}", recorder.calls());
+            assert_eq!(std::fs::read(&account).unwrap(), before);
+            assert_eq!(std::fs::read(sb.dir.join("config/cameras.conf")).unwrap(), config);
+            assert_eq!(engine.rgb_device(), NO_RGB);
+            assert_eq!(engine.ir_device(), NO_IR);
+            assert!(!sb.dir.join("capture-qualifications").exists());
+            assert!(dispatch_status(&listing, &peer(0)).is_some(), "closed split request invalidated the published summary");
+        }
+    }
+
+    #[test]
+    fn guarded_split_queued_original_refuses_publication_or_either_side_drift() {
+        let _guard = env_lock();
+        let mut engine = engine();
+        let sb = sandbox("guarded-split-queue-drift");
+        let _environment = Environment::clear();
+        // SAFETY: credential getters have no preconditions.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let owner = Peer { uid, gid, pid: std::process::id() as i32 };
+        let user = users::name_for_uid(uid).unwrap();
+        let _seat = seat_fixture("guarded-split-queue-drift", Some(uid));
+        for (variant, drift) in ["EnrollSplitOn", "AddSplitCameraGroupOn"].into_iter().flat_map(|variant| (0..3).map(move |drift| (variant, drift))) {
+            let recorder = fixture(true);
+            select_split();
+            let request = split_operation_choice(&user, variant, true);
+            let original = serde_json::to_vec(&request).unwrap();
+            let (server, _client) = std::os::unix::net::UnixStream::pair().unwrap();
+            let authorization = operation_authorization::authorize_for_test(&request, &owner, &server).unwrap();
+            assert_eq!(authorization.is_some(), uid != 0);
+            let diagnostics = diagnostics::DiagnosticState::default();
+            let scope = diagnostics.begin_for(diagnostic_operation_class(&request), diagnostic_owner(&request, &owner));
+            let (reply, _answer) = std::sync::mpsc::channel();
+            let class = arbiter::classify(&request);
+            let queued = Queued {
+                authorization, session: None, position: None, req: request, peer: owner.clone(), reply,
+                link: std::sync::Arc::new(ClientLink::default()), scope,
+                enqueued_at: std::time::Instant::now(), attempt: None,
+            };
+            let arbiter = arbiter::Arbiter::<Queued>::new();
+            arbiter.submit(class, uid, queued).unwrap();
+            match drift {
+                0 => select_split(),
+                1 => recorder.endpoint_invalidation_observer(RGB)(),
+                _ => recorder.endpoint_invalidation_observer(IR)(),
+            }
+            let queued = arbiter.take().unwrap().payload;
+            assert_eq!(serde_json::to_vec(&queued.req).unwrap(), original, "queue refreshed displayed choice");
+            let before = std::fs::read(sb.dir.join("config/cameras.conf")).unwrap();
+            let response = dispatch_scoped(queued.req, &queued.peer, &mut engine, &queued.scope, queued.authorization);
+            assert!(matches!(response, Response::Error(ref why) if why.contains("list and confirm")), "{response:?}");
+            assert!(recorder.calls().is_empty());
+            assert_eq!(std::fs::read(sb.dir.join("config/cameras.conf")).unwrap(), before);
+            assert!(!sb.dir.join(format!("{user}.json")).exists());
+            arbiter.close();
+        }
+    }
+
+    #[test]
+    fn guarded_split_socket_refuses_foreign_account_before_approval_and_queue() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let _guard = env_lock();
+        let sb = sandbox("guarded-split-socket-refusal");
+        let _environment = Environment::clear();
+        let recorder = fixture(true);
+        select_split();
+        let before = std::fs::read(sb.dir.join("config/cameras.conf")).unwrap();
+        let user = users::name_for_uid(0).unwrap();
+        let arbiter = arbiter::Arbiter::<Queued>::new();
+        arbiter.close();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let diagnostics = diagnostics::DiagnosticState::default();
+        for variant in ["EnrollSplitOn", "AddSplitCameraGroupOn"] {
+            let request = split_operation_choice(&user, variant, false);
+            let response = with_serve_as_peer_and_diagnostics(&arbiter, &ready, &diagnostics, peer(NOBODY), |client| {
+                serde_json::to_writer(client, &request).unwrap();
+                (&*client).write_all(b"\n").unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                serde_json::from_str::<Response>(&line).unwrap()
+            });
+            assert!(matches!(response, Response::Error(ref why) if why == &format!("not authorized to enroll '{user}'")), "{response:?}");
+        }
+        assert!(arbiter.take().is_none());
+        assert!(recorder.calls().is_empty());
+        assert_eq!(std::fs::read(sb.dir.join("config/cameras.conf")).unwrap(), before);
+        assert!(!sb.dir.join("capture-qualifications").exists());
+    }
+
     #[test]
     fn operation_choice_dispatch_uses_chosen_camera_and_restores_standing_pair() {
         let _guard = env_lock();

@@ -31,6 +31,9 @@ pub mod split_key;
 pub mod split_publish;
 pub mod split_schema;
 pub mod split_wire;
+
+#[cfg(test)]
+mod guarded_split_wire_tests;
 pub mod storage_encryption;
 
 pub use storage_encryption::StorageDirectory;
@@ -588,6 +591,18 @@ pub enum Request {
         reset: bool,
         pair: Box<live_camera::EnrollmentCameraChoice>,
     },
+    /// Enroll or reset on this operation's displayed administrator-authorized
+    /// split pair. Root or target account, with the same OS approval as Enroll.
+    /// An older daemon answers Error("bad request"); no ordinary fallback or
+    /// saved camera-selection write. Split trust activation remains disabled.
+    EnrollSplitOn {
+        user: String,
+        profile: Option<String>,
+        scans: Option<usize>,
+        #[serde(default)]
+        reset: bool,
+        pair: Box<split_wire::SplitEnrollmentCameraChoice>,
+    },
     /// One authorized guided operation. Only this opt-in request receives
     /// streamed enrollment events and can answer a merge on the same socket.
     EnrollmentSession {
@@ -657,6 +672,16 @@ pub enum Request {
         profile: Option<String>,
         scans: Option<usize>,
         pair: Box<live_camera::EnrollmentCameraChoice>,
+    },
+    /// Add a group on this operation's displayed administrator-authorized split
+    /// pair. Root or target account, with credential-management OS approval.
+    /// An older daemon answers Error("bad request"); no saved-selection write or
+    /// ordinary fallback. Split trust activation remains disabled.
+    AddSplitCameraGroupOn {
+        user: String,
+        profile: Option<String>,
+        scans: Option<usize>,
+        pair: Box<split_wire::SplitEnrollmentCameraChoice>,
     },
     /// Remove one secondary camera group (ADR-0024 §4.2): its binding,
     /// scans, and derived state go together under the same

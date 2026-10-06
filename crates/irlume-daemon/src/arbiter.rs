@@ -119,12 +119,14 @@ pub fn classify(req: &Request) -> Class {
         | IdentifyFor { .. }
         | Enroll { .. }
         | EnrollOn { .. }
+        | EnrollSplitOn { .. }
         | EnrollmentSession { .. }
         | AddScan { .. }
         // An added camera group is an attended capture on the live pair
         // (ADR-0024 §4): same camera class as enrollment.
         | AddCameraGroup { .. }
         | AddCameraGroupOn { .. }
+        | AddSplitCameraGroupOn { .. }
         | SetupIrEmitter { .. }
         | TuneCaptureMode { .. }
         | CaptureModeStatus

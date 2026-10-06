@@ -564,4 +564,380 @@ mod tests {
             ]
         );
     }
+
+    fn split_publication_fixture() -> (Guard, Vec<irlume_common::split_schema::AuthorizationRecord>)
+    {
+        use irlume_common::split_schema::{AuthorizationRecord, SideFields};
+        let cameras: Vec<_> = [
+            ("a", "1234:0001:a", 8, *b"YUYV"),
+            ("b", "1234:0002:b", 5, *b"GREY"),
+            ("c", "1234:0003:c", 9, *b"YUYV"),
+            ("d", "1234:0004:d", 6, *b"GREY"),
+        ]
+        .into_iter()
+        .map(|(name, identity, port, format)| Camera {
+            topology: format!("/devices/fixture/split-publication-{name}"),
+            identity: identity.into(),
+            fixed: true,
+            controller: "0000:00:14.0".into(),
+            domain: irlume_common::split_key::SplitDomain::Usb2,
+            ports: vec![port],
+            endpoints: vec![
+                Endpoint {
+                    path: format!("/dev/split-publication-{name}"),
+                    formats: vec![format],
+                },
+                Endpoint {
+                    path: format!("/dev/split-publication-{name}-spare"),
+                    formats: vec![*b"META"],
+                },
+            ],
+        })
+        .collect();
+        let side = |index: usize| SideFields {
+            identity: cameras[index].identity.clone(),
+            path: cameras[index].endpoints[0].path.clone(),
+            controller: cameras[index].controller.clone(),
+            domain: cameras[index].domain,
+            ports: cameras[index].ports.clone(),
+        };
+        let records = vec![
+            AuthorizationRecord {
+                rgb: side(0),
+                ir: side(1),
+            },
+            AuthorizationRecord {
+                rgb: side(2),
+                ir: side(3),
+            },
+        ];
+        (Guard::install(&cameras).unwrap(), records)
+    }
+
+    fn split_publication_expectation(
+        records: &[irlume_common::split_schema::AuthorizationRecord],
+    ) -> crate::lease::SplitLeaseRequest {
+        let view = crate::connected_pairs_with_split(records);
+        assert_eq!(view.ordinary.state, CameraInventoryState::Current);
+        assert!(view.ordinary.pairs.is_empty());
+        assert!(view.split_refusals.is_empty());
+        view.split_pairs[0].lease_request()
+    }
+
+    fn split_supervisor() -> Arc<CameraSupervisor> {
+        TEST_SUPERVISOR.with(|slot| slot.borrow().as_ref().unwrap().clone())
+    }
+
+    #[test]
+    fn selected_split_publication_commits_real_bytes_under_the_original_resolved_pair() {
+        let (guard, records) = split_publication_fixture();
+        let expected = split_publication_expectation(&records);
+        assert_eq!(expected.rgb.identity, "1234:0001:a");
+        assert_eq!(expected.rgb.endpoint, "/dev/split-publication-a");
+        assert_eq!(expected.rgb.ports, [8]);
+        assert_eq!(expected.ir.identity, "1234:0002:b");
+        assert_eq!(expected.ir.endpoint, "/dev/split-publication-b");
+        assert_eq!(expected.ir.ports, [5]);
+        assert_ne!(expected.rgb.instance_id, expected.ir.instance_id);
+        let mut before = crate::camera_inventory_publication();
+        before.0.observed_ago_ms = None;
+        let supervisor = split_supervisor();
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-split-publication-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("receipt");
+        std::fs::write(&path, b"old").unwrap();
+        let receipt = crate::with_selected_split_camera_publication(&expected, &records, || {
+            std::thread::scope(|threads| {
+                assert!(threads
+                    .spawn(|| matches!(
+                        supervisor.inventory.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ))
+                    .join()
+                    .unwrap());
+            });
+            irlume_common::write_atomic_reporting(&path, b"new whole pair", 0o600)
+        })
+        .unwrap()
+        .unwrap();
+        assert!(matches!(receipt, irlume_common::AtomicWrite::Durable));
+        assert_eq!(std::fs::read(&path).unwrap(), b"new whole pair");
+        let mut after = crate::camera_inventory_publication();
+        after.0.observed_ago_ms = None;
+        assert_eq!(after, before);
+        assert!(supervisor.inventory.try_lock().is_ok());
+        assert_eq!(guard.lease_counts_observer()(), (0, 0));
+        assert!(guard.calls().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn selected_split_publication_refuses_supervisor_revision_and_each_side_fact_drift() {
+        let (guard, records) = split_publication_fixture();
+        let expected = split_publication_expectation(&records);
+        let calls = std::cell::Cell::new(0);
+        let mut wrong = Vec::new();
+        let mut changed = expected.clone();
+        changed.supervisor_id = "99999999999999999999999999999999".into();
+        wrong.push(changed);
+        let mut changed = expected.clone();
+        changed.revision += 1;
+        wrong.push(changed);
+        for rgb in [true, false] {
+            for field in 0..7 {
+                let mut changed = expected.clone();
+                let side = if rgb {
+                    &mut changed.rgb
+                } else {
+                    &mut changed.ir
+                };
+                match field {
+                    0 => side.instance_id = "99999999999999999999999999999999".into(),
+                    1 => side.generation += 1,
+                    2 => side.endpoint.push_str("-wrong"),
+                    3 => side.identity.push_str("-wrong"),
+                    4 => side.controller = "0000:00:15.0".into(),
+                    5 => side.domain = "superspeed".into(),
+                    6 => side.ports = vec![10],
+                    _ => unreachable!(),
+                }
+                wrong.push(changed);
+            }
+        }
+        let mut swapped = expected.clone();
+        std::mem::swap(&mut swapped.rgb, &mut swapped.ir);
+        wrong.push(swapped);
+        for changed in wrong {
+            assert!(
+                matches!(
+                    crate::with_selected_split_camera_publication(&changed, &records, || calls
+                        .set(calls.get() + 1)),
+                    Err(CameraLeaseError::Stale)
+                ),
+                "{changed:?}"
+            );
+        }
+        assert_eq!(calls.get(), 0);
+        assert!(guard.calls().is_empty());
+    }
+
+    #[test]
+    fn selected_split_publication_refuses_either_retired_incarnation_and_unavailable_inventory() {
+        for endpoint in ["/dev/split-publication-a", "/dev/split-publication-b"] {
+            let (guard, records) = split_publication_fixture();
+            let expected = split_publication_expectation(&records);
+            guard.endpoint_invalidation_observer(endpoint)();
+            let calls = std::cell::Cell::new(0);
+            assert!(matches!(
+                crate::with_selected_split_camera_publication(&expected, &records, || calls.set(1)),
+                Err(CameraLeaseError::Stale)
+            ));
+            assert_eq!(calls.get(), 0);
+            assert_eq!(guard.lease_counts_observer()(), (0, 0));
+            assert!(guard.calls().is_empty());
+        }
+        let (guard, records) = split_publication_fixture();
+        let expected = split_publication_expectation(&records);
+        split_supervisor()
+            .mark_inventory_unavailable(CameraInventoryReason::Inventory)
+            .unwrap();
+        assert!(matches!(
+            crate::with_selected_split_camera_publication(&expected, &records, || panic!(
+                "unavailable publication committed"
+            )),
+            Err(CameraLeaseError::Stale)
+        ));
+        assert!(guard.calls().is_empty());
+    }
+
+    #[test]
+    fn selected_split_publication_rechecks_role_cache_without_a_revision_change() {
+        for endpoint in ["/dev/split-publication-a", "/dev/split-publication-b"] {
+            let (guard, records) = split_publication_fixture();
+            let expected = split_publication_expectation(&records);
+            let supervisor = split_supervisor();
+            let mut before = supervisor.inventory_publication();
+            before.0.observed_ago_ms = None;
+            supervisor.record_roles(
+                &supervisor.endpoint_generations(),
+                [(endpoint, Role::Other)],
+            );
+            let mut after = supervisor.inventory_publication();
+            after.0.observed_ago_ms = None;
+            assert_eq!(
+                before.0, after.0,
+                "role cache does not change closed publication revision"
+            );
+            assert_ne!(before.1, after.1);
+            assert!(crate::connected_pairs_with_split(&records)
+                .split_pairs
+                .iter()
+                .all(|pair| pair.lease_request() != expected));
+            assert!(matches!(
+                crate::with_selected_split_camera_publication(&expected, &records, || panic!(
+                    "wrong role committed"
+                )),
+                Err(CameraLeaseError::Stale)
+            ));
+            assert!(guard.calls().is_empty());
+        }
+    }
+
+    #[test]
+    fn selected_split_publication_preserves_new_ordinary_claims_at_the_same_revision() {
+        let (guard, records) = split_publication_fixture();
+        let expected = split_publication_expectation(&records);
+        let supervisor = split_supervisor();
+        let mut before = supervisor.inventory_publication().0;
+        before.observed_ago_ms = None;
+        supervisor.record_roles(
+            &supervisor.endpoint_generations(),
+            [("/dev/split-publication-a-spare", Role::Ir)],
+        );
+        // Production role recording clears a conflicting answer first; a later
+        // classification records the new answer without changing the revision.
+        supervisor.record_roles(
+            &supervisor.endpoint_generations(),
+            [("/dev/split-publication-a-spare", Role::Ir)],
+        );
+        let mut after = supervisor.inventory_publication().0;
+        after.observed_ago_ms = None;
+        assert_eq!(after, before);
+        let view = crate::connected_pairs_with_split(&records);
+        assert_eq!(view.ordinary.pairs.len(), 1);
+        assert_eq!(view.ordinary.pairs[0].identity, "1234:0001:a");
+        // Both retained selected sides still have their original roles/facts.
+        crate::revalidate_against(
+            &expected.rgb,
+            &expected.ir,
+            &supervisor.inventory_publication(),
+        )
+        .unwrap();
+        assert!(view
+            .split_pairs
+            .iter()
+            .all(|pair| pair.lease_request() != expected));
+        assert!(matches!(
+            crate::with_selected_split_camera_publication(&expected, &records, || panic!(
+                "ordinary device claim bypassed"
+            )),
+            Err(CameraLeaseError::Stale)
+        ));
+        assert!(guard.calls().is_empty());
+    }
+
+    #[test]
+    fn selected_split_publication_requires_whole_membership_and_ordered_overlap_resolution() {
+        let (guard, records) = split_publication_fixture();
+        let expected = split_publication_expectation(&records);
+        let independent = split_publication_expectation(&records[1..]);
+        let mut hybrid = expected.clone();
+        hybrid.ir = independent.ir;
+        crate::revalidate_against(
+            &hybrid.rgb,
+            &hybrid.ir,
+            &crate::camera_inventory_publication(),
+        )
+        .unwrap();
+        let overlapping = irlume_common::split_schema::AuthorizationRecord {
+            rgb: records[0].rgb.clone(),
+            ir: records[1].ir.clone(),
+        };
+        let overlap_expected = split_publication_expectation(std::slice::from_ref(&overlapping));
+        let ordered = vec![records[0].clone(), overlapping.clone()];
+        let view = crate::connected_pairs_with_split(&ordered);
+        assert_eq!(view.split_pairs.len(), 1);
+        assert_eq!(view.split_pairs[0].lease_request(), expected);
+        assert_eq!(
+            view.split_refusals[0].reason,
+            crate::PinRefusal::SideAlreadyClaimed
+        );
+        assert!(matches!(
+            crate::with_selected_split_camera_publication(&overlap_expected, &ordered, || panic!(
+                "overlap committed"
+            )),
+            Err(CameraLeaseError::Stale)
+        ));
+        for (candidate, membership) in [
+            (&expected, &[][..]),
+            (&expected, &records[1..]),
+            (&hybrid, records.as_slice()),
+        ] {
+            assert!(matches!(
+                crate::with_selected_split_camera_publication(candidate, membership, || panic!(
+                    "nonmember or hybrid committed"
+                )),
+                Err(CameraLeaseError::Stale)
+            ));
+        }
+        let reverse = vec![overlapping, records[0].clone()];
+        assert!(matches!(
+            crate::with_selected_split_camera_publication(&expected, &reverse, || panic!(
+                "losing reordered overlap committed"
+            )),
+            Err(CameraLeaseError::Stale)
+        ));
+        assert_eq!(
+            crate::with_selected_split_camera_publication(&overlap_expected, &reverse, || {
+                "first whole record"
+            })
+            .unwrap(),
+            "first whole record"
+        );
+        assert!(guard.calls().is_empty());
+    }
+
+    #[test]
+    fn selected_split_publication_accepts_independent_record_reordering_and_preserves_receipts() {
+        let (guard, mut records) = split_publication_fixture();
+        let expected = split_publication_expectation(&records);
+        records.reverse();
+        let receipt = crate::with_selected_split_camera_publication(&expected, &records, || {
+            irlume_common::AtomicWrite::VisibleNotDurable(std::io::Error::other(
+                "actual callback receipt",
+            ))
+        })
+        .unwrap();
+        assert!(
+            matches!(receipt, irlume_common::AtomicWrite::VisibleNotDurable(ref error) if error.to_string() == "actual callback receipt")
+        );
+        let result = crate::with_selected_split_camera_publication(&expected, &records, || {
+            Err::<(), _>("persistence failure")
+        })
+        .unwrap();
+        assert_eq!(result, Err("persistence failure"));
+        assert!(split_supervisor().inventory.try_lock().is_ok());
+        assert!(guard.calls().is_empty());
+    }
+
+    #[test]
+    fn selected_split_publication_releases_inventory_on_unwind_and_refuses_poison() {
+        let (guard, records) = split_publication_fixture();
+        let expected = split_publication_expectation(&records);
+        let supervisor = split_supervisor();
+        let called = std::cell::Cell::new(false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = crate::with_selected_split_camera_publication(&expected, &records, || {
+                called.set(true);
+                panic!("synthetic persistence unwind")
+            });
+        }));
+        assert!(called.get());
+        assert!(result.is_err());
+        match supervisor.inventory.try_lock() {
+            Err(std::sync::TryLockError::Poisoned(_)) => {}
+            _ => panic!("unwound inventory remained locked or failed to preserve poison"),
+        }
+        assert!(matches!(
+            crate::with_selected_split_camera_publication(&expected, &records, || panic!(
+                "poison committed"
+            )),
+            Err(CameraLeaseError::Poisoned)
+        ));
+        assert!(guard.calls().is_empty());
+    }
 }

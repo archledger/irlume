@@ -503,6 +503,9 @@ fn publish_camera_group(
     authorization: &irlume_core::multi_camera::authz::EnrollmentAuthorization,
     now_unix: u64,
 ) -> irlume_common::Result<String> {
+    let primary_bytes = std::fs::read(irlume_core::multi_camera::primary_enrollment_path(user))
+        .map_err(|error| irlume_common::Error::Io(error.to_string()))?;
+    let primary_digest = irlume_common::sha256_hex(&primary_bytes);
     publish_camera_group_with(
         CameraGroupPublication {
             user,
@@ -510,14 +513,12 @@ fn publish_camera_group(
             group_id,
             profile,
             start_enr,
+            start_primary_sha256: &primary_digest,
             authorization,
             now_unix,
         },
-        |prepared| {
-            prepared
-                .publish()
-                .map_err(|error| irlume_common::Error::Protocol(error.to_string()))
-        },
+        |prepared| prepared.publish(),
+        || now_unix,
     )
 }
 
@@ -527,15 +528,91 @@ struct CameraGroupPublication<'a> {
     group_id: &'a str,
     profile: &'a irlume_core::multi_camera::SecondaryProfileScans,
     start_enr: &'a irlume_core::storage::Enrollment,
+    start_primary_sha256: &'a str,
     authorization: &'a irlume_core::multi_camera::authz::EnrollmentAuthorization,
     now_unix: u64,
 }
 
+/// Persistence payload plus account authority, checked only when the caller
+/// consumes it inside its final camera/config publication boundary.
+struct PreparedCameraGroupCommit<'a> {
+    commit: irlume_core::multi_camera::commit::AccountSecondaryPublication<'a>,
+    primary_path: std::path::PathBuf,
+    primary_digest: String,
+    secondary_path: std::path::PathBuf,
+    secondary_digest: Option<String>,
+    account: irlume_core::account::Resolution,
+    user: &'a str,
+    authorization: &'a irlume_core::multi_camera::authz::EnrollmentAuthorization,
+    operation: irlume_core::multi_camera::authz::EnrollmentOperation,
+    now: &'a dyn Fn() -> u64,
+}
+
+impl PreparedCameraGroupCommit<'_> {
+    fn publish(self) -> irlume_common::Result<()> {
+        let current = std::fs::read(&self.primary_path)
+            .map(irlume_common::SecretBytes::new)
+            .map_err(|error| irlume_common::Error::Io(error.to_string()))?;
+        if irlume_common::sha256_hex(current.expose()) != self.primary_digest {
+            return Err(irlume_common::Error::Protocol("the primary enrollment changed during capture or publication preparation; retry the addition".into()));
+        }
+        if optional_file_digest(&self.secondary_path)? != self.secondary_digest {
+            return Err(irlume_common::Error::Protocol(
+                "the secondary store changed during publication preparation; retry the addition"
+                    .into(),
+            ));
+        }
+        if irlume_core::account::resolve(self.user) != self.account {
+            return Err(irlume_common::Error::Policy(
+                "the account changed during publication preparation".into(),
+            ));
+        }
+        self.authorization
+            .validate_for(self.user, &self.operation, (self.now)())
+            .map_err(|error| irlume_common::Error::Policy(error.to_string()))?;
+        // All account and camera admission precedes the first recoverable intent.
+        self.commit
+            .publish()
+            .map_err(|error| irlume_common::Error::Protocol(error.to_string()))
+    }
+}
+
+fn optional_file_digest(path: &std::path::Path) -> irlume_common::Result<Option<String>> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let bytes = irlume_common::SecretBytes::new(bytes);
+            Ok(Some(irlume_common::sha256_hex(bytes.expose())))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(irlume_common::Error::Io(error.to_string())),
+    }
+}
+
 fn publish_camera_group_with(
     input: CameraGroupPublication<'_>,
-    publish: impl FnOnce(
+    publish: impl FnOnce(PreparedCameraGroupCommit<'_>) -> irlume_common::Result<()>,
+    now: impl Fn() -> u64,
+) -> irlume_common::Result<String> {
+    publish_camera_group_preparing_with(
+        input,
+        irlume_core::multi_camera::commit::prepare_with_intent,
+        publish,
+        now,
+    )
+}
+
+fn publish_camera_group_preparing_with(
+    input: CameraGroupPublication<'_>,
+    prepare: impl FnOnce(
+        &std::path::Path,
+        &irlume_core::multi_camera::SecondaryStore,
+        &str,
+    ) -> Result<
         irlume_core::multi_camera::commit::PreparedSecondaryCommit,
-    ) -> irlume_common::Result<()>,
+        irlume_core::multi_camera::commit::CommitError,
+    >,
+    publish: impl FnOnce(PreparedCameraGroupCommit<'_>) -> irlume_common::Result<()>,
+    now: impl Fn() -> u64,
 ) -> irlume_common::Result<String> {
     let CameraGroupPublication {
         user,
@@ -543,6 +620,7 @@ fn publish_camera_group_with(
         group_id,
         profile,
         start_enr,
+        start_primary_sha256,
         authorization,
         now_unix,
     } = input;
@@ -552,6 +630,8 @@ fn publish_camera_group_with(
         .validate_for(user, &operation, now_unix)
         .map_err(|error| irlume_common::Error::Policy(error.to_string()))?;
     let secondary_path = irlume_core::multi_camera::secondary_store_path(user);
+    let secondary_digest = optional_file_digest(&secondary_path)?;
+    let account = irlume_core::account::resolve(user);
     let store = irlume_core::multi_camera::load_secondary(&secondary_path)
         .map_err(|error| irlume_common::Error::Protocol(error.to_string()))?
         .unwrap_or(irlume_core::multi_camera::SecondaryStore {
@@ -583,6 +663,11 @@ fn publish_camera_group_with(
     let primary_path = irlume_core::multi_camera::primary_enrollment_path(user);
     let primary_bytes = std::fs::read(&primary_path)
         .map_err(|error| irlume_common::Error::Io(error.to_string()))?;
+    if irlume_common::sha256_hex(&primary_bytes) != start_primary_sha256 {
+        return Err(irlume_common::Error::Protocol(
+            "the primary enrollment changed during capture; retry the addition".into(),
+        ));
+    }
     inactive_store_write_refusal(&store, &primary_bytes)?;
     let current_enr = irlume_core::storage::load_path_unlocked(user, &primary_path)
         .map_err(|error| irlume_common::Error::Protocol(error.to_string()))?
@@ -612,13 +697,30 @@ fn publish_camera_group_with(
     });
     ensure_not_consumed(authorization, next.generation, None)
         .map_err(|error| irlume_common::Error::Policy(error.to_string()))?;
-    let prepared = irlume_core::multi_camera::commit::prepare_with_intent(
-        &secondary_path,
-        &next,
-        &next.primary_snapshot_sha256,
-    )
-    .map_err(|error| irlume_common::Error::Protocol(error.to_string()))?;
-    publish(prepared)?;
+    if optional_file_digest(&secondary_path)? != secondary_digest {
+        return Err(irlume_common::Error::Protocol(
+            "the secondary store changed while loading; retry the addition".into(),
+        ));
+    }
+    let prepared = prepare(&secondary_path, &next, &next.primary_snapshot_sha256)
+        .map_err(|error| irlume_common::Error::Protocol(error.to_string()))?;
+    // Key preparation is finished. Core owns the stable account transaction
+    // before this callback may enter inventory -> cameras.conf. The borrowed
+    // one-shot token cannot escape that lock, including on error or unwind.
+    prepared.with_account_publication(user, |commit| {
+        publish(PreparedCameraGroupCommit {
+            commit,
+            primary_path,
+            primary_digest: start_primary_sha256.to_owned(),
+            secondary_path,
+            secondary_digest,
+            account,
+            user,
+            authorization,
+            operation,
+            now: &now,
+        })
+    })?;
     Ok(group_id.to_owned())
 }
 
@@ -9336,6 +9438,15 @@ impl Engine {
     /// requires at least one bound side.
     #[must_use]
     pub fn live_pair(&self) -> irlume_core::multi_camera::GroupPair {
+        if let Some(pair @ irlume_core::multi_camera::GroupPair::Split(_)) = self
+            .camera_selection
+            .as_ref()
+            .and_then(|selection| selection.binding())
+        {
+            // This is retained binding data, not live operation authority.
+            // Operation consumers use prepared_enrollment_binding's refusal.
+            return pair;
+        }
         if self.camera_selection.as_ref().is_some_and(|selection| {
             !selection.matches_devices(&self.rgb_dev, &self.ir_dev, self.ir_available)
                 || !selection.ordinary_is_current()
@@ -9411,8 +9522,26 @@ impl Engine {
     ) -> irlume_common::Result<String> {
         use irlume_core::storage::{self, MAX_SCANS_PER_PROFILE};
         observer.check()?;
+        let primary_path = irlume_core::multi_camera::primary_enrollment_path(user);
+        let primary_bytes = std::fs::read(&primary_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                irlume_common::Error::Protocol(format!("'{user}' is not enrolled"))
+            } else {
+                irlume_common::Error::Io(error.to_string())
+            }
+        })?;
+        let primary_bytes = irlume_common::SecretBytes::new(primary_bytes);
+        let start_primary_sha256 = irlume_common::sha256_hex(primary_bytes.expose());
         let enr = storage::load_unmoved(user)?
             .ok_or_else(|| irlume_common::Error::Protocol(format!("'{user}' is not enrolled")))?;
+        if optional_file_digest(&primary_path)?.as_deref() != Some(start_primary_sha256.as_str()) {
+            return Err(irlume_common::Error::Protocol(
+                "the primary enrollment changed while loading; retry the addition".into(),
+            ));
+        }
+        // Preserve the unmoved-key load and retain exact capture-start bytes.
+        // Publication checks both this digest and the loaded enrollment, so a
+        // conflicting rewrite cannot bind the captured profile to other bytes.
         // The group's scans belong to ONE primary profile: resolve it now,
         // before the camera opens. `None` is only unambiguous when the
         // enrollment has exactly one profile.
@@ -9590,16 +9719,18 @@ impl Engine {
                     ir_calibs: group_profile.ir_calibs.clone(),
                 },
                 start_enr: &enr,
+                start_primary_sha256: &start_primary_sha256,
                 authorization,
                 now_unix,
             },
             |prepared| {
-                let publish = || {
-                    prepared
-                        .publish()
-                        .map_err(|error| irlume_common::Error::Protocol(error.to_string()))
-                };
+                let publish = || prepared.publish();
                 self.with_prepared_camera_publication(publish)
+            },
+            || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs())
             },
         )
     }

@@ -172,6 +172,31 @@ pub fn with_selected_camera_publication<R>(
 ) -> Result<R, lease::CameraLeaseError> {
     backend::with_selected_camera_publication(expected, commit)
 }
+
+/// Resolve and validate the retained split pair while serializing persistence
+/// with inventory changes. Uses the supplied ordered immutable authorization
+/// records and the current role cache, preserving ordinary and earlier split
+/// device claims. This passive check creates no lease, fd or capture authority,
+/// reads no configuration and never initializes a supervisor.
+///
+/// The caller must verify the same retained machine authorization under the
+/// configuration lock inside `commit`, before persistence. Lock order is user
+/// state (if held), inventory, then configuration. The callback must not re-enter
+/// camera inventory or perform key, account-lock, lease or capture preparation.
+/// Its actual result is returned unchanged; do not revalidate after publication.
+///
+/// # Errors
+/// Refuses stale supervisor/revision, either side's incarnation, role, identity,
+/// qualified location or endpoint, unresolved/claimed pairs and unavailable or
+/// poisoned inventory before invoking the callback. Records alone establish no
+/// current machine or account authorization and do not enable split activation.
+pub fn with_selected_split_camera_publication<R>(
+    expected: &lease::SplitLeaseRequest,
+    records: &[irlume_common::split_schema::AuthorizationRecord],
+    commit: impl FnOnce() -> R,
+) -> Result<R, lease::CameraLeaseError> {
+    backend::with_selected_split_camera_publication(expected, records, commit)
+}
 pub mod measurement;
 mod media_graph;
 mod mmap_capture;

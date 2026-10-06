@@ -20,6 +20,7 @@ use irlume_core::multi_camera::{
     SecondaryProfileScans, SecondaryStore, SECONDARY_STORE_VERSION,
 };
 use irlume_core::storage::{CameraBinding, Enrollment, FaceScan};
+use std::cell::Cell;
 
 fn mint(
     user: &str,
@@ -789,6 +790,236 @@ fn publish_camera_group_requires_the_exact_split_operation_and_key() {
     assert_eq!(store.groups.len(), 1);
     assert_eq!(store.groups[0].pair, pair);
     assert_eq!(store.groups[0].id.as_str(), "cam-046d-desk");
+}
+
+#[test]
+fn guarded_group_publication_refuses_exact_primary_bytes_or_authorization_drift_after_preparation()
+{
+    let _g = env_guard();
+    for drift in [
+        "before-prepare-bytes",
+        "after-prepare-bytes",
+        "after-prepare-expiry",
+    ] {
+        let sandbox = Sandbox::new(drift);
+        let (enr, _) = pad_matching_fixture(0.2, false);
+        let before = sandbox.write_primary("pad-contract", &enr);
+        let pair = GroupPair::Split(split_desk_key());
+        let authorization = mint(
+            "pad-contract",
+            EnrollmentOperation::add_group("cam-046d-desk".into(), &pair),
+        );
+        let payload = desk_profile_payload();
+        let primary_path = irlume_core::multi_camera::primary_enrollment_path("pad-contract");
+        let rewrite = || {
+            let mut semantically_equal = before.clone();
+            semantically_equal.push(b'\n');
+            std::fs::write(&primary_path, &semantically_equal).unwrap();
+        };
+        if drift == "before-prepare-bytes" {
+            rewrite();
+        }
+        let prepared_called = Cell::new(false);
+        let published_called = Cell::new(false);
+        let result = publish_camera_group_preparing_with(
+            CameraGroupPublication {
+                user: "pad-contract",
+                pair: &pair,
+                group_id: "cam-046d-desk",
+                profile: &payload,
+                start_enr: &enr,
+                start_primary_sha256: &irlume_common::sha256_hex(&before),
+                authorization: &authorization,
+                now_unix: 1_000_300,
+            },
+            |path, next, digest| {
+                let prepared =
+                    irlume_core::multi_camera::commit::prepare_with_intent(path, next, digest)?;
+                prepared_called.set(true);
+                if drift == "after-prepare-bytes" {
+                    rewrite();
+                }
+                Ok(prepared)
+            },
+            |prepared| {
+                published_called.set(true);
+                prepared
+                    .publish()
+                    .map_err(|error| irlume_common::Error::Protocol(error.to_string()))
+            },
+            || {
+                if drift == "after-prepare-expiry" {
+                    2_000_000
+                } else {
+                    1_000_300
+                }
+            },
+        );
+        assert!(
+            result.is_err(),
+            "{drift}: publication accepted changed authority"
+        );
+        assert_eq!(
+            published_called.get(),
+            drift != "before-prepare-bytes",
+            "late account admission belongs inside the consuming publication callback"
+        );
+        assert_eq!(prepared_called.get(), drift != "before-prepare-bytes");
+        let path = secondary_store_path("pad-contract");
+        assert!(!path.exists());
+        assert!(!irlume_core::multi_camera::commit::intent_path_for(&path).exists());
+    }
+}
+
+#[test]
+fn guarded_group_publication_preserves_a_concurrent_secondary_write_after_preparation() {
+    let _g = env_guard();
+    let sandbox = Sandbox::new("secondary-preparation-race");
+    let (enr, _) = pad_matching_fixture(0.2, false);
+    let primary = sandbox.write_primary("pad-contract", &enr);
+    let pair = GroupPair::Split(split_desk_key());
+    let authorization = mint(
+        "pad-contract",
+        EnrollmentOperation::add_group("cam-046d-desk".into(), &pair),
+    );
+    let path = secondary_store_path("pad-contract");
+    let concurrent = desk_store(
+        "pad-contract",
+        &primary,
+        "046d:concurrent",
+        "fixture",
+        enr.profiles[0].scans.clone(),
+    );
+    let expected = serde_json::to_vec(&concurrent).unwrap();
+    let result = publish_camera_group_preparing_with(
+        CameraGroupPublication {
+            user: "pad-contract",
+            pair: &pair,
+            group_id: "cam-046d-desk",
+            profile: &desk_profile_payload(),
+            start_enr: &enr,
+            start_primary_sha256: &irlume_common::sha256_hex(&primary),
+            authorization: &authorization,
+            now_unix: 1_000_300,
+        },
+        |path, next, digest| {
+            let prepared =
+                irlume_core::multi_camera::commit::prepare_with_intent(path, next, digest)?;
+            // A real cooperative publisher completes while key preparation's
+            // account lock is absent, before the final publication admission.
+            irlume_core::multi_camera::commit::publish_with_intent(path, &concurrent, digest)?;
+            Ok(prepared)
+        },
+        |prepared| prepared.publish(),
+        || 1_000_300,
+    );
+    assert!(
+        result.is_err(),
+        "stale prepared addition overwrote a concurrent group"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), expected);
+    assert!(!irlume_core::multi_camera::commit::intent_path_for(&path).exists());
+    assert_eq!(
+        std::fs::read(sandbox.primary_path("pad-contract")).unwrap(),
+        primary
+    );
+}
+
+#[test]
+fn guarded_group_publication_holds_account_lock_through_consuming_callback() {
+    let _g = env_guard();
+    let sandbox = Sandbox::new("account-publication-lock");
+    let (enr, _) = pad_matching_fixture(0.2, false);
+    let primary = sandbox.write_primary("pad-contract", &enr);
+    // The normal passive loader creates the real stable account lock.
+    irlume_core::storage::load_unmoved("pad-contract")
+        .unwrap()
+        .unwrap();
+    let key_dir = irlume_core::template_key::key_dir();
+    let lock = key_dir.join(".locks").join(format!(
+        "{}.lock",
+        irlume_common::sha256_hex(b"pad-contract")
+    ));
+    let try_writer = || {
+        std::process::Command::new("flock")
+            .args(["--exclusive", "--nonblock"])
+            .arg(&lock)
+            .arg("true")
+            .status()
+            .expect("fixture flock probe")
+            .code()
+    };
+    assert_eq!(try_writer(), Some(0), "healthy unlocked control");
+    let pair = GroupPair::Split(split_desk_key());
+    let authorization = mint(
+        "pad-contract",
+        EnrollmentOperation::add_group("cam-046d-desk".into(), &pair),
+    );
+    let result = publish_camera_group_with(
+        CameraGroupPublication {
+            user: "pad-contract",
+            pair: &pair,
+            group_id: "cam-046d-desk",
+            profile: &desk_profile_payload(),
+            start_enr: &enr,
+            start_primary_sha256: &irlume_common::sha256_hex(&primary),
+            authorization: &authorization,
+            now_unix: 1_000_300,
+        },
+        |prepared| {
+            assert_eq!(
+                try_writer(),
+                Some(1),
+                "account writer entered before publication"
+            );
+            prepared.publish()
+        },
+        || 1_000_300,
+    );
+    result.unwrap();
+    assert_eq!(
+        try_writer(),
+        Some(0),
+        "publication released the account lock"
+    );
+    assert!(secondary_store_path("pad-contract").exists());
+}
+
+#[test]
+fn guarded_group_publication_refuses_account_drift_after_preparation() {
+    let _g = env_guard();
+    let sandbox = Sandbox::new("account-preparation-race");
+    let (enr, _) = pad_matching_fixture(0.2, false);
+    let primary = sandbox.write_primary("pad-contract", &enr);
+    let pair = GroupPair::Split(split_desk_key());
+    let authorization = mint(
+        "pad-contract",
+        EnrollmentOperation::add_group("cam-046d-desk".into(), &pair),
+    );
+    let drift = std::cell::RefCell::new(None);
+    let result = publish_camera_group_preparing_with(
+        CameraGroupPublication {
+            user: "pad-contract",
+            pair: &pair,
+            group_id: "cam-046d-desk",
+            profile: &desk_profile_payload(),
+            start_enr: &enr,
+            start_primary_sha256: &irlume_common::sha256_hex(&primary),
+            authorization: &authorization,
+            now_unix: 1_000_300,
+        },
+        |path, next, digest| {
+            let prepared =
+                irlume_core::multi_camera::commit::prepare_with_intent(path, next, digest)?;
+            *drift.borrow_mut() = Some(irlume_core::account::remember("pad-contract", 424242));
+            Ok(prepared)
+        },
+        |prepared| prepared.publish(),
+        || 1_000_300,
+    );
+    assert!(result.unwrap_err().to_string().contains("account changed"));
+    let path = secondary_store_path("pad-contract");
+    assert!(!path.exists() && !irlume_core::multi_camera::commit::intent_path_for(&path).exists());
 }
 
 #[test]

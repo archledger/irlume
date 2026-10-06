@@ -4260,19 +4260,22 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             enrollment: AddsTrust,
             camera: Captures,
         },
-        Enroll { user, .. } | EnrollOn { user, .. } | EnrollmentSession { user, .. } => {
-            RequestPosture {
-                privilege: RootOrTarget { verb: "enroll" },
-                user: Some(user.as_str()),
-                enrollment: AddsTrust,
-                camera: Captures,
-            }
-        }
+        Enroll { user, .. }
+        | EnrollOn { user, .. }
+        | EnrollSplitOn { user, .. }
+        | EnrollmentSession { user, .. } => RequestPosture {
+            privilege: RootOrTarget { verb: "enroll" },
+            user: Some(user.as_str()),
+            enrollment: AddsTrust,
+            camera: Captures,
+        },
         // A camera-group addition is an enrollment addition on another
         // camera (ADR-0024 §4): same trust, same approval class. Removal
         // rewrites the secondary store only; the primary summary stays
         // valid until group reporting ships.
-        AddCameraGroup { user, .. } | AddCameraGroupOn { user, .. } => RequestPosture {
+        AddCameraGroup { user, .. }
+        | AddCameraGroupOn { user, .. }
+        | AddSplitCameraGroupOn { user, .. } => RequestPosture {
             privilege: RootOrTarget { verb: "enroll" },
             user: Some(user.as_str()),
             enrollment: AddsTrust,
@@ -4846,6 +4849,13 @@ fn resolve_group_id_in<'a>(ids: impl Iterator<Item = &'a str>, group: &str) -> S
 }
 
 fn pair_handle_keyed(domain: &[u8], value: &str) -> String {
+    pair_handle_keyed_full(domain, value)
+        .chars()
+        .take(16)
+        .collect()
+}
+
+fn pair_handle_keyed_full(domain: &[u8], value: &str) -> String {
     use sha2::{Digest as _, Sha256};
     static SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
     let secret = SECRET.get_or_init(|| {
@@ -4860,10 +4870,101 @@ fn pair_handle_keyed(domain: &[u8], value: &str) -> String {
     h.update(secret);
     h.update(domain);
     h.update(value.as_bytes());
-    h.finalize()[..8]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Comparison proof for one verified machine publication, never account authority.
+fn split_authorization_guard(
+    selection: &irlume_common::split_publish::CameraSelectionSnapshot,
+) -> Option<irlume_common::split_wire::SplitAuthorizationGuard> {
+    use irlume_common::{config::SplitConfObservation, split_publish::SplitReadState};
+    let SplitReadState::Valid { generation, .. } = selection.split() else {
+        return None;
+    };
+    let SplitConfObservation::Reference {
+        generation: referenced,
+        digest,
+        ..
+    } = &selection.observation().split
+    else {
+        return None;
+    };
+    if generation != referenced || *generation == 0 {
+        return None;
+    }
+    Some(irlume_common::split_wire::SplitAuthorizationGuard {
+        generation: *generation,
+        token: pair_handle_keyed_full(
+            b"irlume-split-authorization\0",
+            &format!("{generation}\0{digest}"),
+        ),
+    })
+}
+
+/// Called only after approval consumes the original request. The displayed
+/// guard stays untouched; this separate guard carries server-resolved paths.
+fn resolve_split_enrollment_choice(
+    choice: &irlume_common::split_wire::SplitEnrollmentCameraChoice,
+    peer_uid: u32,
+    publication: &(
+        irlume_common::live_camera::CameraInventorySnapshot,
+        Vec<irlume_auth::ClassifiedEndpoint>,
+    ),
+) -> Result<
+    (
+        irlume_common::split_wire::SplitMutationGuard,
+        irlume_common::split_publish::Published,
+    ),
+    &'static str,
+> {
+    const REFUSED: &str =
+        "split enrollment choice changed or is unavailable; list and confirm the pair again";
+    choice.validate().map_err(|_| REFUSED)?;
+    let selection = irlume_common::split_publish::read_camera_selection();
+    let current = split_authorization_guard(&selection).ok_or(REFUSED)?;
+    if choice.authorization != current {
+        return Err(REFUSED);
+    }
+    let irlume_common::config::SplitConfObservation::Reference {
+        generation, digest, ..
+    } = &selection.observation().split
+    else {
+        return Err(REFUSED);
+    };
+    let mut expected = choice.expected.clone();
+    for (side, role) in [
+        (&mut expected.rgb, irlume_auth::CameraRole::Rgb),
+        (&mut expected.ir, irlume_auth::CameraRole::Ir),
+    ] {
+        let matches: Vec<_> = publication
+            .1
+            .iter()
+            .filter(|endpoint| {
+                endpoint.instance_id == side.instance_id
+                    && endpoint.generation == side.generation
+                    && endpoint.role == role
+            })
+            .collect();
+        if matches.len() != 1 {
+            return Err(REFUSED);
+        }
+        let endpoint = matches[0];
+        if !(peer_uid == 0 && side.endpoint == endpoint.endpoint)
+            && side.endpoint != pair_handle_keyed(b"irlume-split-endpoint\0", &endpoint.endpoint)
+        {
+            return Err(REFUSED);
+        }
+        side.endpoint = endpoint.endpoint.clone();
+    }
+    irlume_common::split_wire::verify_split_guard(&expected, &publication.0)
+        .map_err(|_| REFUSED)?;
+    Ok((
+        expected,
+        irlume_common::split_publish::Published {
+            generation: *generation,
+            digest: digest.clone(),
+        },
+    ))
 }
 
 /// `vid:pid` of a binding identity (`vid:pid[:serial]`): what an ordinary
@@ -6747,10 +6848,12 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | SealPassword { .. } => OperationClass::Authentication,
         Enroll { .. }
         | EnrollOn { .. }
+        | EnrollSplitOn { .. }
         | EnrollmentSession { .. }
         | AddScan { .. }
         | AddCameraGroup { .. }
         | AddCameraGroupOn { .. }
+        | AddSplitCameraGroupOn { .. }
         | RemoveCameraGroup { .. }
         | PositionSample { .. }
         | PositionSession { .. } => OperationClass::Enrollment,
@@ -7307,22 +7410,28 @@ fn split_list_response(
         SplitSideProjection, SplitStoreState,
     };
     let (snapshot, _) = publication;
-    let (store_state, records, selected, resolves) =
-        match irlume_common::split_publish::read_split() {
-            SplitReadState::Valid {
-                records, selected, ..
-            } => (SplitStoreState::Valid, records, selected, true),
-            SplitReadState::Absent => (SplitStoreState::Absent, Vec::new(), None, true),
-            SplitReadState::Unreadable => (SplitStoreState::Unreadable, Vec::new(), None, false),
-            SplitReadState::Malformed
-            | SplitReadState::MalformedGeneration { .. }
-            | SplitReadState::UnresolvedSelection { .. } => {
-                (SplitStoreState::Malformed, Vec::new(), None, false)
-            }
-            SplitReadState::DigestMismatch { .. } => {
-                (SplitStoreState::DigestMismatch, Vec::new(), None, false)
-            }
-        };
+    let selection = irlume_common::split_publish::read_camera_selection();
+    let authorization = split_authorization_guard(&selection);
+    let (store_state, records, selected, resolves) = match selection.split() {
+        SplitReadState::Valid {
+            records, selected, ..
+        } => (
+            SplitStoreState::Valid,
+            records.clone(),
+            selected.clone(),
+            true,
+        ),
+        SplitReadState::Absent => (SplitStoreState::Absent, Vec::new(), None, true),
+        SplitReadState::Unreadable => (SplitStoreState::Unreadable, Vec::new(), None, false),
+        SplitReadState::Malformed
+        | SplitReadState::MalformedGeneration { .. }
+        | SplitReadState::UnresolvedSelection { .. } => {
+            (SplitStoreState::Malformed, Vec::new(), None, false)
+        }
+        SplitReadState::DigestMismatch { .. } => {
+            (SplitStoreState::DigestMismatch, Vec::new(), None, false)
+        }
+    };
     let root = peer_uid == 0;
     let side_view = |side: &irlume_common::split_schema::SideFields| {
         if root {
@@ -7355,6 +7464,7 @@ fn split_list_response(
         supervisor_id: snapshot.supervisor_id.clone().unwrap_or_default(),
         revision: snapshot.revision,
         store_state,
+        authorization,
         records: records
             .iter()
             .map(|record| SplitRecordView {
@@ -8085,6 +8195,39 @@ fn dispatch_scoped_session_inner(
             return Response::Error(error);
         }
     }
+    if let Request::EnrollSplitOn { pair, .. } | Request::AddSplitCameraGroupOn { pair, .. } = &req
+    {
+        // Approval bound the original request, including both displayed tokens.
+        // Resolve a separate internal guard only after consuming that approval.
+        let resolved = irlume_auth::with_camera_inventory_publication(|publication| {
+            resolve_split_enrollment_choice(pair, peer.uid, publication)
+        });
+        let (expected, authorization) = match resolved {
+            Ok(Ok(resolved)) => resolved,
+            _ => return Response::Error("split enrollment choice changed or is unavailable; list and confirm the pair again".into()),
+        };
+        let camera_request = match engine.prepare_split_enrollment_camera(&expected, &authorization) {
+            Ok(request) => request,
+            Err(_) => return Response::Error("split enrollment choice changed or is unavailable; list and confirm the pair again".into()),
+        };
+        match camera_request.prepared_enrollment_binding() {
+            Ok(irlume_core::multi_camera::GroupPair::Split(_)) => {}
+            _ => return Response::Error("split enrollment choice changed or is unavailable; list and confirm the pair again".into()),
+        }
+        // No ordinary probe, emitter preflight, enrollment event or summary
+        // invalidation may precede the explicit closed trust gate.
+        if let Err(error) = camera_request.validate_enrollment_camera_activation() {
+            return Response::Error(error.to_string());
+        }
+        if let Request::EnrollSplitOn { user, reset, .. } = &req {
+            if let Err(error) = camera_request.validate_enrollment_camera_primary(user, *reset) {
+                return Response::Error(error.to_string());
+            }
+        }
+        // Capture activation needs a separately reviewed split handler. Never
+        // lower these requests to an ordinary operation, even if a gate changes.
+        return Response::Error("split enrollment and authentication are not enabled".into());
+    }
     if let Request::EnrollOn { pair, .. } | Request::AddCameraGroupOn { pair, .. } = &req {
         let mut camera_request = match engine.prepare_enrollment_camera(pair) {
             Ok(request) => request,
@@ -8242,7 +8385,10 @@ fn dispatch_after_authorization(
         invalidate_enrollment_summary(user);
     }
     match req {
-        Request::EnrollOn { .. } | Request::AddCameraGroupOn { .. } => {
+        Request::EnrollOn { .. }
+        | Request::AddCameraGroupOn { .. }
+        | Request::EnrollSplitOn { .. }
+        | Request::AddSplitCameraGroupOn { .. } => {
             Response::Error("operation camera choice requires its prepared request scope".into())
         }
         Request::RetryStatus { .. } | Request::RetryReset { .. } => {
@@ -12588,6 +12734,31 @@ mod tests {
         })
     }
 
+    fn catalog_split_enrollment_choice(
+    ) -> Box<irlume_common::split_wire::SplitEnrollmentCameraChoice> {
+        use irlume_common::split_wire::*;
+        Box::new(SplitEnrollmentCameraChoice {
+            expected: SplitMutationGuard {
+                supervisor_id: "11".repeat(16),
+                revision: 7,
+                rgb: SplitSideGuard {
+                    instance_id: "22".repeat(16),
+                    generation: 1,
+                    endpoint: "rgb-token".into(),
+                },
+                ir: SplitSideGuard {
+                    instance_id: "33".repeat(16),
+                    generation: 2,
+                    endpoint: "ir-token".into(),
+                },
+            },
+            authorization: SplitAuthorizationGuard {
+                generation: 1,
+                token: "ab".repeat(32),
+            },
+        })
+    }
+
     request_catalog! {
         u, secret;
         Authenticate => Request::Authenticate {
@@ -12607,6 +12778,10 @@ mod tests {
             user: u(), profile: None, scans: None, reset: false,
             pair: catalog_enrollment_choice(),
         },
+        EnrollSplitOn => Request::EnrollSplitOn {
+            user: u(), profile: None, scans: None, reset: false,
+            pair: catalog_split_enrollment_choice(),
+        },
         AddCameraGroup => Request::AddCameraGroup {
             user: u(),
             profile: None,
@@ -12614,6 +12789,9 @@ mod tests {
         },
         AddCameraGroupOn => Request::AddCameraGroupOn {
             user: u(), profile: None, scans: None, pair: catalog_enrollment_choice(),
+        },
+        AddSplitCameraGroupOn => Request::AddSplitCameraGroupOn {
+            user: u(), profile: None, scans: None, pair: catalog_split_enrollment_choice(),
         },
         RemoveCameraGroup => Request::RemoveCameraGroup {
             user: u(),
@@ -12935,8 +13113,10 @@ mod tests {
                 "EnrollmentSession",
                 "Enroll",
                 "EnrollOn",
+                "EnrollSplitOn",
                 "AddCameraGroup",
                 "AddCameraGroupOn",
+                "AddSplitCameraGroupOn",
                 "RemoveCameraGroup",
                 "AddScan",
                 "DeleteProfile",
@@ -13286,10 +13466,12 @@ mod tests {
                 "AddCameraGroup",
                 "AddCameraGroupOn",
                 "AddScan",
+                "AddSplitCameraGroupOn",
                 "Authenticate",
                 "CameraDiagnostics",
                 "Enroll",
                 "EnrollOn",
+                "EnrollSplitOn",
                 "EnrollmentSession",
                 "Identify",
                 "IdentifyFor",
@@ -15504,10 +15686,12 @@ mod tests {
         let mutates = [
             "Enroll",
             "EnrollOn",
+            "EnrollSplitOn",
             "EnrollmentSession",
             "AddScan",
             "AddCameraGroup",
             "AddCameraGroupOn",
+            "AddSplitCameraGroupOn",
             "RemoveCameraGroup",
             "DeleteProfile",
             "DeleteScan",
@@ -15557,6 +15741,19 @@ mod tests {
         // the grant check this test is about.
         let _seat = seat_fixture("enrollment-authorization", Some(owner.uid));
         for request in [
+            Request::EnrollSplitOn {
+                user: user.into(),
+                profile: None,
+                scans: Some(1),
+                reset: false,
+                pair: catalog_split_enrollment_choice(),
+            },
+            Request::AddSplitCameraGroupOn {
+                user: user.into(),
+                profile: None,
+                scans: Some(1),
+                pair: catalog_split_enrollment_choice(),
+            },
             Request::Enroll {
                 user: user.into(),
                 profile: None,
@@ -26077,6 +26274,151 @@ mod split_management_tests {
             other => panic!("expected Valid, got {other:?}"),
         }
         drop(env);
+    }
+
+    #[test]
+    fn split_operation_listing_proof_is_full_opaque_and_tracks_verified_publication() {
+        let env = env();
+        let pubn = publication();
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &pubn),
+            Response::Ok(_)
+        ));
+        let listed = |uid| serde_json::to_value(split_list_response(uid, &pubn)).unwrap();
+        let first = listed(1000);
+        let proof = first["SplitInventory"]["authorization"].clone();
+        assert_eq!(proof["generation"], 1);
+        let token = proof["token"].as_str().expect("verified publication proof");
+        assert_eq!(token.len(), 64);
+        assert!(token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert_eq!(listed(0)["SplitInventory"]["authorization"], proof);
+        assert_eq!(listed(1000)["SplitInventory"]["authorization"], proof);
+        let current = irlume_common::split_publish::read_camera_selection();
+        if let irlume_common::config::SplitConfObservation::Reference { digest, .. } =
+            &current.observation().split
+        {
+            assert!(!serde_json::to_string(&first).unwrap().contains(digest));
+        } else {
+            panic!("verified reference absent");
+        }
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &pubn),
+            Response::Ok(_)
+        ));
+        let second = listed(1000);
+        assert_eq!(second["SplitInventory"]["authorization"]["generation"], 2);
+        assert_ne!(second["SplitInventory"]["authorization"]["token"], token);
+        std::fs::write(env.dir.join("cameras.conf"), "mode=invalid\n").unwrap();
+        assert!(listed(1000)["SplitInventory"]
+            .get("authorization")
+            .is_none());
+        std::fs::remove_file(env.dir.join("cameras.conf")).unwrap();
+        assert!(listed(1000)["SplitInventory"]
+            .get("authorization")
+            .is_none());
+    }
+
+    #[test]
+    fn split_operation_normalization_preserves_original_and_refuses_either_side_drift() {
+        let _env = env();
+        let pubn = publication();
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &pubn),
+            Response::Ok(_)
+        ));
+        let current = irlume_common::split_publish::read_camera_selection();
+        let mut choice = irlume_common::split_wire::SplitEnrollmentCameraChoice {
+            expected: guard(),
+            authorization: split_authorization_guard(&current).unwrap(),
+        };
+        choice.expected.rgb.endpoint = pair_handle_keyed(b"irlume-split-endpoint\0", "/dev/video0");
+        choice.expected.ir.endpoint = pair_handle_keyed(b"irlume-split-endpoint\0", "/dev/video1");
+        let original = choice.clone();
+        let (normalized, published) =
+            resolve_split_enrollment_choice(&choice, 1000, &pubn).unwrap();
+        assert_eq!(normalized, guard());
+        assert_eq!(published.generation, 1);
+        assert_eq!(choice, original);
+        for field in 0..9 {
+            let mut changed = choice.clone();
+            match field {
+                0 => changed.expected.supervisor_id = "cc".repeat(16),
+                1 => changed.expected.revision += 1,
+                2 => changed.expected.rgb.generation += 1,
+                3 => changed.expected.ir.generation += 1,
+                4 => changed.expected.rgb.endpoint = "unknown-rgb".into(),
+                5 => changed.expected.ir.endpoint = "unknown-ir".into(),
+                6 => changed.authorization.generation += 1,
+                7 => changed.authorization.token = "00".repeat(32),
+                _ => std::mem::swap(&mut changed.expected.rgb, &mut changed.expected.ir),
+            }
+            let error = resolve_split_enrollment_choice(&changed, 1000, &pubn).unwrap_err();
+            assert!(error.contains("list and confirm"), "{field}: {error}");
+            for private in [
+                "/dev/video",
+                "s1",
+                "s2",
+                "0000:00:14.0",
+                published.digest.as_str(),
+            ] {
+                assert!(!error.contains(private), "{field}: leaked {private}");
+            }
+        }
+        let mut literal = choice.clone();
+        literal.expected = guard();
+        assert!(resolve_split_enrollment_choice(&literal, 0, &pubn).is_ok());
+        assert!(resolve_split_enrollment_choice(&literal, 1000, &pubn).is_err());
+        let mut ambiguous = pubn.clone();
+        ambiguous.1.push(ambiguous.1[0].clone());
+        assert!(resolve_split_enrollment_choice(&choice, 1000, &ambiguous).is_err());
+        let mut wrong_role = pubn.clone();
+        wrong_role.1[1].role = irlume_auth::CameraRole::Rgb;
+        assert!(resolve_split_enrollment_choice(&choice, 1000, &wrong_role).is_err());
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &pubn),
+            Response::Ok(_)
+        ));
+        assert!(resolve_split_enrollment_choice(&original, 1000, &pubn).is_err());
+    }
+
+    #[test]
+    fn split_operation_proof_refuses_same_generation_with_different_verified_digest() {
+        let env = env();
+        let pubn = publication();
+        assert!(matches!(
+            split_add_response(&guard(), &rgb_facts(), &ir_facts(), &pubn),
+            Response::Ok(_)
+        ));
+        let selection = irlume_common::split_publish::read_camera_selection();
+        let choice = irlume_common::split_wire::SplitEnrollmentCameraChoice {
+            expected: guard(),
+            authorization: split_authorization_guard(&selection).unwrap(),
+        };
+        assert!(resolve_split_enrollment_choice(&choice, 0, &pubn).is_ok());
+        let path = env.dir.join("split-pairs/1.conf");
+        let original = std::fs::read_to_string(&path).unwrap();
+        let changed = original.replace("s1", "different-unit");
+        assert_ne!(changed, original);
+        std::fs::write(&path, &changed).unwrap();
+        assert!(
+            split_authorization_guard(&irlume_common::split_publish::read_camera_selection())
+                .is_none(),
+            "digest mismatch minted a proof"
+        );
+        irlume_common::config::write_kv(
+            "cameras.conf",
+            "split_digest",
+            &format!("sha256:{}", irlume_common::sha256_hex(changed.as_bytes())),
+        )
+        .unwrap();
+        let current =
+            split_authorization_guard(&irlume_common::split_publish::read_camera_selection())
+                .expect("new digest verified");
+        assert_eq!(current.generation, choice.authorization.generation);
+        assert_ne!(current.token, choice.authorization.token);
+        assert!(resolve_split_enrollment_choice(&choice, 0, &pubn).is_err());
     }
 
     #[test]

@@ -166,8 +166,12 @@ jobs:
           export IRLUME_TEST_CLI="$cli"
           # Same artifact-receipt discovery for the session-module cdylib the
           # LightDM enforcement tests copy into their private PAM roots: its
-          # ASan build does not land beside the test executable either.
-          view_module=$(cargo +nightly build --locked \
+          # ASan build does not land beside the test executable either. The
+          # module itself is built without the sanitizer: the runtime is a
+          # static archive, which cannot be dlopened into the plain C probe,
+          # and the shim only forwards pam_sm_* calls to umount2. Every Rust
+          # line of the workspace stays instrumented in this lane.
+          view_module=$(env RUSTFLAGS= cargo +nightly build --locked \
             -p irlume-pam-view --lib --target x86_64-unknown-linux-gnu \
             --message-format=json | python3 -c '
           import json, sys

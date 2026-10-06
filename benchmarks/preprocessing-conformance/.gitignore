@@ -3,3 +3,5 @@
 /results.json
 /checks.json
 /checks.json.tmp
+build-current/
+/pad-vit-current-comparison.json

@@ -21,17 +21,6 @@ All notable changes to irlume are documented here. This project adheres to
   camera-free preparation. Whole-pair publication revalidation preserves ordinary
   device claims and saved selection. Split trust operations remain disabled
   (ADR-0032, guarded split operation-choice amendment; #995).
-- The LightDM restart gate gains a managed-start policy evidence reader: a
-  versioned, fail-closed receipt bound to one systemd invocation (invocation
-  id, main pid, monotonic start) and a verdict machine that samples the
-  manager before and after the receipt and compares identity by equality,
-  never wall-clock ordering, without reading `/proc`. Its production source
-  reads the manager's launch identity with `systemctl show`, a root-owned
-  receipt under `/run/irlume-lightdm` and the target's lifetime through a
-  process descriptor, so root and unprivileged callers read the same facts.
-  It stays unwired until the qualified producer ships, so every verdict today
-  is `unknown` and the existing timestamp rule is unchanged (#859).
-
 - LightDM runs against a private, read-only PAM view when irlume's LightDM
   units are installed. A preparation unit ordered before every LightDM start
   reads the prospective configuration with `lightdm --show-config` and, while
@@ -95,6 +84,17 @@ All notable changes to irlume are documented here. This project adheres to
   authentication stay refused until the later steps.
 
 ### Fixed
+
+- The LightDM restart gate proves which configuration the running LightDM
+  loaded by content, not by comparing a wall-clock change time with its
+  start, and without reading `/proc`. irlume's drop-in records a digest of
+  every file LightDM reads before it starts and checks it again once
+  LightDM has loaded its configuration and taken its bus name, then
+  publishes a receipt bound to that launch's invocation, main process and
+  monotonic start. `login plan` and `login apply` compare that receipt with
+  the current configuration, so a clock step can no longer hide a change,
+  and an unprivileged plan under `hidepid` reaches the same answer as root.
+  A LightDM started without the drop-in keeps the previous rule (#859).
 
 - Secondary camera-group publication rechecks exact primary and secondary source
   state, account authority and fresh time after key preparation under the account

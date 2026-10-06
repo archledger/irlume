@@ -29,10 +29,12 @@
 //! qualified-absence authority, and root and unprivileged callers must feed
 //! the same source the same facts.
 
-// Wired into plan/apply by the managed-start adapter; every item is exercised
-// by the tests below before that wiring exists.
+// The restart gate reads `Running`; the qualified-absence authority and parts
+// of the receipt are defined for producers that do not exist yet.
 #![allow(dead_code)]
 
+mod loader;
+mod producer;
 mod system;
 
 use std::fmt;
@@ -260,6 +262,57 @@ pub(crate) fn evaluate(source: &dyn Source) -> Verdict {
             config_generation,
         }
     }
+}
+
+/// What the managed-start evidence establishes about the running LightDM,
+/// for the restart gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Running {
+    /// The running launch loaded the configuration named by `generation`;
+    /// `remote` when that configuration turns a remote server on.
+    Loaded { generation: String, remote: bool },
+    /// No qualified evidence; the existing rule decides.
+    Unknown(String),
+}
+
+/// Observe the running LightDM through the production source.
+pub(super) fn running_lightdm() -> Running {
+    running_from(&system::SystemSource::lightdm())
+}
+
+fn running_from(source: &dyn Source) -> Running {
+    match evaluate(source) {
+        Verdict::VerifiedOff {
+            config_generation, ..
+        } => Running::Loaded {
+            generation: config_generation,
+            remote: false,
+        },
+        Verdict::RemoteOn {
+            config_generation, ..
+        } => Running::Loaded {
+            generation: config_generation,
+            remote: true,
+        },
+        Verdict::Absent => Running::Unknown("absent".into()),
+        Verdict::Unknown(reason) => Running::Unknown(reason),
+    }
+}
+
+/// The digest of the configuration LightDM would load now. Every input must
+/// be readable by anyone, so root and an unprivileged plan agree.
+pub(super) fn current_generation() -> Result<String, String> {
+    loader::observe(
+        std::path::Path::new("/"),
+        &loader::Profile::standard(),
+        true,
+    )
+    .map(|seen| seen.digest)
+}
+
+/// The drop-in's producer commands.
+pub(super) fn run_producer(action: &str, args: &[String]) -> std::process::ExitCode {
+    producer::run(action, args)
 }
 
 fn is_lower_hex(text: &str, len: usize) -> bool {

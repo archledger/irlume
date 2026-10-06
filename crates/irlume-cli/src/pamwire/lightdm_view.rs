@@ -16,7 +16,7 @@ use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
 pub(super) const RUN: &str = "/run/irlume-lightdm";
-const VIEW: &str = "/run/irlume-lightdm/pam.d";
+pub(super) const VIEW: &str = "/run/irlume-lightdm/pam.d";
 const SOURCE: &str = "/run/irlume-lightdm-source/etc";
 const PREFIX: &str = "irlume-lightdm-copy-";
 const MAX_FILE: u64 = 64 * 1024;

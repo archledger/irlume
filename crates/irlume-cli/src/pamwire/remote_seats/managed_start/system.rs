@@ -76,6 +76,19 @@ impl SystemSource {
     }
 }
 
+#[cfg(test)]
+impl SystemSource {
+    /// A production source over a test runtime root, owner and manager.
+    pub(crate) fn for_tests(runtime_root: PathBuf, trusted_uid: u32, show: Show) -> Self {
+        SystemSource {
+            unit: LIGHTDM_UNIT,
+            runtime_root,
+            trusted_uid,
+            show,
+        }
+    }
+}
+
 impl Source for SystemSource {
     fn observe_manager(&self) -> Option<ManagerObservation> {
         let text = (self.show)(self.unit).ok()?;
@@ -97,7 +110,7 @@ impl Source for SystemSource {
     }
 }
 
-fn systemctl_show(unit: &str) -> Result<String, String> {
+pub(crate) fn systemctl_show(unit: &str) -> Result<String, String> {
     let mut command = Command::new("systemctl");
     command.args(["show", unit, "--no-pager"]);
     for property in PROPERTIES {
@@ -164,6 +177,19 @@ pub(crate) fn read_receipt(
     runtime_root: &Path,
     trusted_uid: u32,
 ) -> Option<Result<Receipt, String>> {
+    read_trusted_text(runtime_root, RECEIPT_NAME, trusted_uid)
+        .map(|text| text.and_then(|text| Receipt::from_json(&text)))
+}
+
+/// Read one bounded, trusted record named `name` directly under
+/// `runtime_root`: both owned by `trusted_uid` and writable by nobody else,
+/// the record a regular file read without following a link or waiting on a
+/// FIFO. `None` when the root or the record does not exist.
+pub(crate) fn read_trusted_text(
+    runtime_root: &Path,
+    name: &str,
+    trusted_uid: u32,
+) -> Option<Result<String, String>> {
     let root = match std::fs::symlink_metadata(runtime_root) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -172,7 +198,7 @@ pub(crate) fn read_receipt(
     if let Err(e) = trusted(&root, trusted_uid, true) {
         return Some(Err(format!("{}: {e}", runtime_root.display())));
     }
-    let path = runtime_root.join(RECEIPT_NAME);
+    let path = runtime_root.join(name);
     // No symlink, no wait on a FIFO, no controlling terminal: the type and
     // owner are checked on the open descriptor before any byte is read.
     let file = match OpenOptions::new()
@@ -184,7 +210,7 @@ pub(crate) fn read_receipt(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => return Some(Err(format!("{}: {e}", path.display()))),
     };
-    Some(read_trusted(file, &path, trusted_uid).and_then(|text| Receipt::from_json(&text)))
+    Some(read_trusted(file, &path, trusted_uid))
 }
 
 fn read_trusted(file: File, path: &Path, trusted_uid: u32) -> Result<String, String> {

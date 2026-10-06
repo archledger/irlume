@@ -649,6 +649,11 @@ impl PayloadLayout {
         }
         Ok(())
     }
+
+    /// Bytes of the tightly packed image itself: the checked minimum payload.
+    pub(crate) const fn image_bytes(self) -> usize {
+        self.minimum
+    }
 }
 
 /// Owned kernel facts copied from one reusable V4L2 dequeue slot.

@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# The cross-crate test seams (template_key::test_support): a dependent crate's
+# test binary enables this from dev-dependencies to pin what `tpm_available()`
+# answers. Resolver 2 keeps it out of release builds, so no production binary
+# ships the override.
+test-support = []
+
 [dependencies]
 irlume-common.workspace = true
 irlume-vision.workspace = true

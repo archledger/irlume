@@ -220,6 +220,7 @@ pub use split_capture::{
 // path grows a reader of these files.
 pub mod stream_record;
 pub mod uvc_descriptor;
+mod yuyv_exposure;
 
 /// Serializes unit tests that mutate process-global environment variables, and
 /// the RAII guard that restores them.
@@ -517,20 +518,18 @@ pub struct IrCaptureStats {
     /// irlume does: `IrCamera::open` stores `fmt.quantization` and
     /// `clipping_white_level` already takes it.
     ///
-    /// Carrying it is still not enough to compute their ceiling, and each
-    /// draft of this comment has mislocated why, which is itself the lesson:
-    /// `Quantization::Default` is not an effective range, V4L2 resolves it
-    /// with `V4L2_MAP_QUANTIZATION_DEFAULT(is_rgb_or_hsv, colsp, ycbcr_enc)`.
+    /// Carrying it is still not enough to compute their ceiling:
+    /// `Quantization::Default` is not an effective range, and V4L2 resolves
+    /// it with `V4L2_MAP_QUANTIZATION_DEFAULT(is_rgb_or_hsv, colsp, ycbcr_enc)`.
     /// Since #427 `IrCamera` retains the negotiated `v4l::Format` with its
     /// colorspace, but the pinned v4l 0.14 `Format` drops the driver-echoed
-    /// Y'CbCr ENCODING on conversion, and the encoding is a live input:
-    /// default YUV is full range for JPEG colorspace AND for XV601/XV709
-    /// encodings, limited otherwise (the Codex round on this PR caught the
-    /// second draft classifying every non-JPEG case as limited, a
-    /// 235-ceiling that would falsely refuse legitimate frames). The
-    /// resolution is therefore still not generally computable here, and no
-    /// NV12 or YUYV IR camera exists in this project's record to validate
-    /// either arm against.
+    /// Y'CbCr encoding on conversion. Current UAPI maps default Y'CbCr to
+    /// limited range except for the JPEG colorspace and ignores the encoding,
+    /// but limited quantization is not a 235 ceiling: XV601 and XV709 are
+    /// extended gamut and carry values outside it, which is why ADR-0031 §4
+    /// refuses them under either quantization and needs the raw encoding. The
+    /// T480 (ADR-0031 §4) is the first YUYV IR camera on record, and its
+    /// frames have not been judged against those gates.
     ///
     /// The `None` is also load-bearing, which matters more than either.
     /// Discovery calls a node advertising NV12 `Role::Rgb`, and a node
@@ -16465,8 +16464,9 @@ mod tests {
     /// "the sensor's full-scale sample" ONLY for the native 8-bit greys: the
     /// Y16 family is rescaled by a shift taken from the frame's own maximum.
     /// The YUV pair is a different case and this comment used to get it wrong:
-    /// irlume does carry their raw quantization, but resolving `Default` also
-    /// needs the colorspace, which `IrCamera` discards. The `None` is there
+    /// irlume does carry their raw quantization, and `IrCamera` retains the
+    /// colorspace since #427, but resolving their ceiling also needs the
+    /// Y'CbCr encoding, which the pinned v4l crate drops. The `None` is there
     /// mainly because the refusal it produces is what stops a colour node that
     /// arrives in the IR slot some other way (#385). Discovery reaches a YUYV
     /// IR decode since #887, for descriptor-attested nodes only, and the

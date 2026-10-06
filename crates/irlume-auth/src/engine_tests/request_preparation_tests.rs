@@ -13,6 +13,10 @@ struct Fixture {
     ir: String,
     saved: Vec<(&'static str, Option<OsString>)>,
     recorder: Guard,
+    /// Every fixture test takes the no-TPM plaintext branch: the dead
+    /// `IRLUME_TCTI` below cannot reach a TPM, and on a host with /dev/tpm*
+    /// the device-node probe would otherwise force a seal onto it.
+    _no_tpm: irlume_core::template_key::test_support::TpmPresence,
 }
 
 fn split_choice(
@@ -955,6 +959,7 @@ impl Fixture {
     }
 
     fn with_fixed(split: bool, fixed: bool) -> Self {
+        let no_tpm = irlume_core::template_key::test_support::TpmPresence::force(false);
         let dir = std::env::temp_dir().join(format!(
             "irlume-request-prep-{}-{:?}",
             std::process::id(),
@@ -1039,6 +1044,7 @@ impl Fixture {
             ir,
             saved,
             recorder,
+            _no_tpm: no_tpm,
         }
     }
 

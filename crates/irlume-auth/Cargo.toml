@@ -28,6 +28,9 @@ serde_json.workspace = true
 
 [dev-dependencies]
 irlume-camera = { workspace = true, features = ["test-support"] }
+# The TPM-presence pin in the request fixtures (template_key::test_support).
+# A dev-dependency feature: resolver 2 keeps it out of release builds.
+irlume-core = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

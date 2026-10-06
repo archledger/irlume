@@ -57,21 +57,33 @@ fn desk_profile_payload() -> SecondaryProfileScans {
     }
 }
 
-/// Sandboxes `IRLUME_STATE_DIR` for one test (the env guard is held for the
-/// test's life) and plants plaintext primaries at the exact path the
-/// coordinator resolves. Raw bytes, never `storage::save`: the pin digests
-/// the exact primary bytes, and the TPM must stay out of unit tests.
+/// Sandboxes `IRLUME_STATE_DIR` and `IRLUME_CONFIG_DIR` for one test (the env
+/// guard is held for the test's life) and plants plaintext primaries at the
+/// exact path the coordinator resolves. Raw bytes, never `storage::save`: the
+/// pin digests the exact primary bytes, and the TPM must stay out of unit
+/// tests. The config dir goes too because camera-selection observation reads
+/// `cameras.conf` first: pointed at the host's real `/etc/irlume`, a root-only
+/// file there reads as Unreadable and fails every request before the behavior
+/// under test runs.
 struct Sandbox {
     dir: std::path::PathBuf,
+    /// Keeps the TPM out for the sandbox's life: on a host with /dev/tpm* the
+    /// device-node probe would otherwise seal stores with the real TPM.
+    _no_tpm: irlume_core::template_key::test_support::TpmPresence,
 }
 
 impl Sandbox {
     fn new(tag: &str) -> Self {
+        let no_tpm = irlume_core::template_key::test_support::TpmPresence::force(false);
         let dir = std::env::temp_dir().join(format!("irlume-mc2-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::env::set_var("IRLUME_STATE_DIR", &dir);
-        Self { dir }
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        Self {
+            dir,
+            _no_tpm: no_tpm,
+        }
     }
 
     fn primary_path(&self, user: &str) -> std::path::PathBuf {
@@ -88,6 +100,7 @@ impl Sandbox {
 impl Drop for Sandbox {
     fn drop(&mut self) {
         std::env::remove_var("IRLUME_STATE_DIR");
+        std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

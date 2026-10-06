@@ -16,6 +16,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Split-camera enrollment, camera-group addition and authentication run end to
+  end behind the camera trust predicate, which stays closed in every shipped
+  build. One split lease covers both original sides and capture runs RGB then
+  IR; a pinned or automatic split routes once per request with no ordinary,
+  legacy or standing fallback; split evidence never grants through the
+  RGB-primary or fusion arms; IR-only requests refuse a split choice before any
+  lease; and a split denial releases no credential and keeps its retry charge
+  (ADR-0032, retained split runtime amendment; #995).
+
 - Guarded split enrollment and add-camera operation requests retain both displayed
   camera guards and an opaque machine-publication proof through approval and
   camera-free preparation. Whole-pair publication revalidation preserves ordinary

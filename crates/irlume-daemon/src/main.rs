@@ -8131,7 +8131,10 @@ fn authenticate_for_dispatch(
     admission: irlume_auth::PreparationAdmission<'_>,
     deliver: irlume_auth::DecisionDelivery<'_>,
 ) -> irlume_common::Result<irlume_auth::Outcome> {
-    let mut camera_request = engine.prepare_camera_request()?;
+    // The account-routed authentication scope: identical to the generic one
+    // while split activation is closed, and once admitted the scope in which
+    // a saved selected split routes, as it does for `UnsealPassword`.
+    let mut camera_request = engine.prepare_authentication_camera_request()?;
     let engine = &mut *camera_request;
     // Only the test binary can replace the biometric result. Request policy,
     // completion checks and socket delivery remain the production code path.
@@ -8206,7 +8209,7 @@ fn dispatch_scoped_session_inner(
             Ok(Ok(resolved)) => resolved,
             _ => return Response::Error("split enrollment choice changed or is unavailable; list and confirm the pair again".into()),
         };
-        let camera_request = match engine.prepare_split_enrollment_camera(&expected, &authorization) {
+        let mut camera_request = match engine.prepare_split_enrollment_camera(&expected, &authorization) {
             Ok(request) => request,
             Err(_) => return Response::Error("split enrollment choice changed or is unavailable; list and confirm the pair again".into()),
         };
@@ -8224,9 +8227,11 @@ fn dispatch_scoped_session_inner(
                 return Response::Error(error.to_string());
             }
         }
-        // Capture activation needs a separately reviewed split handler. Never
-        // lower these requests to an ordinary operation, even if a gate changes.
-        return Response::Error("split enrollment and authentication are not enabled".into());
+        // Past every gate, the dedicated Engine split entry runs on this
+        // retained scope. Never lower these requests to an ordinary operation
+        // or to `dispatch_after_authorization`, whose backstop refuses both.
+        let response = split_enrollment_handler(&req, peer, &mut camera_request, scope);
+        return split_reply_for_peer(&req, response, peer.uid);
     }
     if let Request::EnrollOn { pair, .. } | Request::AddCameraGroupOn { pair, .. } = &req {
         let mut camera_request = match engine.prepare_enrollment_camera(pair) {
@@ -8279,6 +8284,128 @@ fn dispatch_scoped_session_inner(
     dispatch_after_authorization(
         req, peer, engine, scope, session, position, completion, delivery,
     )
+}
+
+/// The dedicated split enrollment handlers (ADR-0032 Step 5). The caller runs
+/// them only on the retained split scope of the original request, after its
+/// approval, the explicit activation gate and, for enrollment, the primary
+/// check. The published summary is dropped here: past every refusal that
+/// leaves state unchanged, before the Engine split entry runs (#349). Neither
+/// side gets a probe, an emitter preflight or a qualification read; the
+/// Engine entry leases both original sides once per capture loop.
+fn split_enrollment_handler(
+    req: &Request,
+    peer: &Peer,
+    engine: &mut irlume_auth::Engine,
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+) -> Response {
+    if let Some(user) = enrollment_mutating_user(req) {
+        invalidate_enrollment_summary(user);
+    }
+    match req {
+        Request::EnrollSplitOn {
+            user,
+            profile,
+            scans,
+            reset,
+            ..
+        } => {
+            let want = scans.unwrap_or(irlume_core::storage::DEFAULT_ENROLL_SCANS);
+            match engine.enroll_split_prepared(user, profile.clone(), want, *reset, diagnostics) {
+                Ok(outcome) => enroll_response(outcome),
+                Err(error) => Response::Error(error.to_string()),
+            }
+        }
+        Request::AddSplitCameraGroupOn {
+            user,
+            profile,
+            scans,
+            ..
+        } => {
+            let authorization = match split_group_authorization(engine, peer, user) {
+                Ok(authorization) => authorization,
+                Err(error) => return Response::Error(error),
+            };
+            let want = scans.unwrap_or(irlume_core::storage::DEFAULT_ENROLL_SCANS);
+            match engine.add_split_camera_group_prepared(
+                user,
+                profile.clone(),
+                want,
+                &authorization,
+                diagnostics,
+            ) {
+                Ok(id) => Response::Ok(format!(
+                    "camera group '{id}' enrolled on this split pair; it can now authenticate \
+                     this account"
+                )),
+                Err(error) => Response::Error(error.to_string()),
+            }
+        }
+        // The caller passes only the two requests above.
+        _ => Response::Error("operation camera choice requires its prepared request scope".into()),
+    }
+}
+
+/// The add-group authorization for the retained split pair (ADR-0024 section
+/// 4), minted for this already-approved peer. Its scope is the one the Engine
+/// derives: `AddSplitGroup` over the whole re-proven split key, never an
+/// identity projection, and the group id that the account's secondary store
+/// as it is now gives that key's identities. The Engine refuses any other
+/// scope before capture.
+fn split_group_authorization(
+    engine: &irlume_auth::Engine,
+    peer: &Peer,
+    user: &str,
+) -> Result<irlume_core::multi_camera::authz::EnrollmentAuthorization, String> {
+    let pair = engine
+        .prepared_enrollment_binding()
+        .map_err(|error| error.to_string())?;
+    let store = irlume_core::multi_camera::load_secondary(
+        &irlume_core::multi_camera::secondary_store_path(user),
+    )
+    .map_err(|error| error.to_string())?
+    .unwrap_or_else(|| irlume_core::multi_camera::SecondaryStore {
+        format_version: irlume_core::multi_camera::SECONDARY_STORE_VERSION,
+        owner: user.to_owned(),
+        generation: 0,
+        primary_snapshot_sha256: String::new(),
+        groups: Vec::new(),
+    });
+    let group =
+        irlume_core::multi_camera::derive_group_id(&store, pair.rgb_identity(), pair.ir_identity())
+            .as_str()
+            .to_owned();
+    let operation = irlume_core::multi_camera::authz::EnrollmentOperation::add_group(group, &pair);
+    mint_group_authorization(peer, user, operation).map_err(|error| error.to_string())
+}
+
+/// What the split enrollment handlers tell a peer other than root (ADR-0032
+/// section 6): one fixed reply per request.
+const SPLIT_ENROLL_REFUSED: &str = "split camera enrollment did not complete";
+const SPLIT_GROUP_REFUSED: &str = "split camera group enrollment did not complete";
+const SPLIT_GROUP_ENROLLED: &str =
+    "split camera group enrolled; it can now authenticate this account";
+
+/// The reply a split enrollment handler sends `peer_uid`. Root gets the
+/// Engine's own text. Any other peer gets only the fixed reply of its
+/// request, because the Engine text and the group id can name a device node,
+/// a USB identity or serial, or the complete binding key. An enrollment's
+/// `Enrolled` reply names only the profile and its scans, as an ordinary
+/// enrollment's does, and passes unchanged; anything else is a refusal.
+/// Replies to other requests are not this projection's to change.
+fn split_reply_for_peer(req: &Request, response: Response, peer_uid: u32) -> Response {
+    if peer_uid == 0 {
+        return response;
+    }
+    match (req, response) {
+        (Request::EnrollSplitOn { .. }, enrolled @ Response::Enrolled { .. }) => enrolled,
+        (Request::EnrollSplitOn { .. }, _) => Response::Error(SPLIT_ENROLL_REFUSED.into()),
+        (Request::AddSplitCameraGroupOn { .. }, Response::Ok(_)) => {
+            Response::Ok(SPLIT_GROUP_ENROLLED.into())
+        }
+        (Request::AddSplitCameraGroupOn { .. }, _) => Response::Error(SPLIT_GROUP_REFUSED.into()),
+        (_, response) => response,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12264,11 +12391,23 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 17] = [
+        let sources: [(&str, &str); 20] = [
             ("main.rs", include_str!("main.rs")),
             (
                 "request_preparation_tests.rs",
                 include_str!("request_preparation_tests.rs"),
+            ),
+            (
+                "split_runtime_tests.rs",
+                include_str!("split_runtime_tests.rs"),
+            ),
+            (
+                "split_authentication_runtime_tests.rs",
+                include_str!("split_authentication_runtime_tests.rs"),
+            ),
+            (
+                "split_closed_matrix_tests.rs",
+                include_str!("split_closed_matrix_tests.rs"),
             ),
             ("attempt_record.rs", include_str!("attempt_record.rs")),
             ("shared_unlock.rs", include_str!("shared_unlock.rs")),
@@ -17870,6 +18009,9 @@ mod tests {
 
     include!("shared_greeter_tests.rs");
     include!("request_preparation_tests.rs");
+    include!("split_runtime_tests.rs");
+    include!("split_authentication_runtime_tests.rs");
+    include!("split_closed_matrix_tests.rs");
 
     /// A waiver is a claim about the machine's policy, not about the caller, so
     /// the daemon has to agree with it independently. A root PAM client saying

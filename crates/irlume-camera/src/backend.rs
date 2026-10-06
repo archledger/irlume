@@ -750,6 +750,12 @@ pub(crate) fn default_camera_supervisor() -> &'static CameraSupervisor {
 thread_local! {
     static TEST_SUPERVISOR: std::cell::RefCell<Option<Arc<CameraSupervisor>>> =
         const { std::cell::RefCell::new(None) };
+    /// Split trust kinds admitted for one installed non-granting fixture on
+    /// this thread. Only the fixture `Guard` adds an entry and only its
+    /// admission token removes it; `lease::split_trust_admitted` reads it.
+    #[cfg(feature = "test-support")]
+    static SPLIT_TRUST_ADMISSIONS: std::cell::RefCell<test_support::SplitTrustAdmissions> =
+        const { std::cell::RefCell::new(test_support::SplitTrustAdmissions::new()) };
 }
 
 /// Route one compatibility operation through the process supervisor.

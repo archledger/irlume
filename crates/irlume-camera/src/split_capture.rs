@@ -6,7 +6,7 @@
 use crate::{
     contracts::{IlluminationProvenance, StreamRole},
     frame_provenance::FrameBinding,
-    lease::{CameraOperationKind, CameraOperationSession},
+    lease::{split_trust_admitted, CameraOperationKind, CameraOperationSession},
     CaptureControl, Frame, IrCaptureStats, Spectrum,
 };
 use irlume_common::{Error, Result};
@@ -209,13 +209,17 @@ fn split_bindings(
     ir_dev: &str,
     operation: &CameraOperationSession,
 ) -> Result<(FrameBinding, FrameBinding)> {
+    // The same admission rule as split acquisition, checked again on every
+    // capture and receipt check: Capture is never admitted, and a trust kind
+    // only while `split_trust_admitted` admits it.
+    let kind = operation.lease().operation();
     if !operation.lease().is_split_pair()
-        || !matches!(
-            operation.lease().operation(),
+        || !(matches!(
+            kind,
             CameraOperationKind::Diagnostics
                 | CameraOperationKind::Setup
                 | CameraOperationKind::Preview
-        )
+        ) || split_trust_admitted(kind))
     {
         return Err(Error::Hardware(
             "split capture requires a supported two-device operation".into(),

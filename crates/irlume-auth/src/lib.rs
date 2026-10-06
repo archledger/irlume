@@ -13,6 +13,7 @@ pub use ir_assessment::{IrOnlyPreflight, IrOnlyRefusal};
 mod request_preparation;
 pub use request_preparation::CameraRequestScope;
 mod account_selection;
+mod split_runtime;
 
 /// Non-granting developer IR evaluation; absent from normal builds.
 #[cfg(feature = "ir-only-evaluation")]
@@ -1077,6 +1078,65 @@ impl EnrollmentObserver for () {}
 struct EnrollmentPublication<'a> {
     replace: bool,
     observer: &'a dyn EnrollmentObserver,
+}
+
+/// One capture loop of the declared split enrollment entry: `count` scans
+/// for this pitch neutral, folded into the enrollment's one tally.
+type SplitScanLoop<'a> = dyn FnMut(
+        &mut Engine,
+        usize,
+        Option<f32>,
+        &mut CaptureShape,
+        &dyn EnrollmentObserver,
+    ) -> irlume_common::Result<Vec<CapturedScan>>
+    + 'a;
+
+/// How a prepared enrollment reaches the camera. The Engine entry chooses
+/// it; nothing below derives it from engine or selection state.
+enum EnrollmentRoute<'a, P> {
+    /// A user-present IR preflight may downgrade the request to RGB-only
+    /// capture, then held or per-frame capture on the ordinary pair.
+    Ordinary(P),
+    /// The declared split trust entry: no preflight, both original sides,
+    /// one split lease per capture loop (`split_runtime`, ADR-0032).
+    Split(&'a mut SplitScanLoop<'a>),
+}
+
+impl<'a> EnrollmentRoute<'a, fn(&mut irlume_vision::Detector) -> bool> {
+    fn split(scans: &'a mut SplitScanLoop<'a>) -> Self {
+        Self::Split(scans)
+    }
+}
+
+/// The capture a prepared enrollment admitted before any camera work.
+enum EnrollmentCapture<'a> {
+    Ordinary { force_rgb_only: bool },
+    Split(&'a mut SplitScanLoop<'a>),
+}
+
+impl EnrollmentCapture<'_> {
+    /// One capture loop of `count` scans on the admitted route.
+    fn scans(
+        &mut self,
+        engine: &mut Engine,
+        count: usize,
+        pitch_neutral: Option<f32>,
+        observed: &mut CaptureShape,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        observer: &dyn EnrollmentObserver,
+    ) -> irlume_common::Result<Vec<CapturedScan>> {
+        match self {
+            Self::Ordinary { force_rgb_only } => engine.capture_scans_observed(
+                count,
+                pitch_neutral,
+                observed,
+                *force_rgb_only,
+                diagnostics,
+                observer,
+            ),
+            Self::Split(scans) => scans(engine, count, pitch_neutral, observed, observer),
+        }
+    }
 }
 
 struct EnrollmentProgress<'a> {
@@ -6624,7 +6684,10 @@ impl Engine {
                 "face disabled (fingerprint mode)",
             ));
         }
-        let mut request = self.prepare_camera_request()?;
+        // The account-routed authentication call: a saved selected split is
+        // retained as a pending pin for classified routing only while split
+        // Authentication is admitted, which production never does.
+        let mut request = self.prepare_authentication_camera_request()?;
         request.authenticate_prepared(
             user,
             service,
@@ -6693,20 +6756,21 @@ impl Engine {
             irlume_camera::device_identity(&self.rgb_dev),
             irlume_camera::device_identity(&self.ir_dev),
         );
-        let automatic = self
+        // Classified account routing (plan C4, C5, C7, D8): an automatic
+        // selection, or a pending pinned split that only this call routes.
+        // While split Authentication is not admitted, which production keeps,
+        // this is the ordinary-only routing with every split closed.
+        let routes_accounts = self
             .camera_selection
             .as_ref()
-            .is_some_and(|selection| selection.automatic());
-        let enr = if automatic {
+            .is_some_and(|selection| selection.routes_accounts());
+        let enr = if routes_accounts {
             let selected = {
                 let mut keys = self.request_key();
-                account_selection::select_account(
+                account_selection::select_account_classified(
                     user,
                     snapshot,
-                    self.camera_selection
-                        .as_ref()
-                        .expect("prepared selection")
-                        .view(),
+                    self.camera_selection.as_ref().expect("prepared selection"),
                     |enrollment| {
                         enrollment
                             .profiles
@@ -6717,32 +6781,45 @@ impl Engine {
                     false,
                 )
             };
-            match selected {
+            let (enrollment, scope) = match selected {
                 Err(outcome) => return Ok(outcome),
-                Ok(account_selection::AccountChoice::Legacy(snapshot)) => {
+                Ok(account_selection::ClassifiedChoice::Legacy(snapshot)) => {
                     match self.enrollment_policy_refusal_for(user, &snapshot.enrollment, &live_pair)
                     {
                         Some(refusal) => return Ok(refusal),
-                        None => snapshot.enrollment,
+                        None => (snapshot.enrollment, None),
                     }
                 }
-                Ok(account_selection::AccountChoice::Selected {
+                Ok(account_selection::ClassifiedChoice::Ordinary {
                     enrollment,
                     pair,
                     scope,
                 }) => {
                     self.select_account_camera(pair)?;
-                    match scope {
-                        ir_assessment::IrOnlyScope::Primary { .. } => {
-                            self.primary_attempt = Some(scope)
-                        }
-                        ir_assessment::IrOnlyScope::Secondary(context) => {
-                            self.secondary_attempt = Some(*context)
-                        }
-                    }
-                    enrollment
+                    (enrollment, Some(scope))
                 }
+                // Installs both original sides for this call's own
+                // Authentication entry, with no standing choice, ordinary
+                // fallback or rerank (plan C5, D8).
+                Ok(account_selection::ClassifiedChoice::Split {
+                    enrollment,
+                    split,
+                    scope,
+                }) => {
+                    self.select_account_split_camera(*split)?;
+                    (enrollment, Some(scope))
+                }
+            };
+            match scope {
+                Some(scope @ ir_assessment::IrOnlyScope::Primary { .. }) => {
+                    self.primary_attempt = Some(scope)
+                }
+                Some(ir_assessment::IrOnlyScope::Secondary(context)) => {
+                    self.secondary_attempt = Some(*context)
+                }
+                None => {}
             }
+            enrollment
         } else {
             match self.resolve_attempt_snapshot(user, snapshot, &live_pair) {
                 Ok(enrollment) => enrollment,
@@ -6798,6 +6875,20 @@ impl Engine {
             return Ok(refusal);
         }
         self.check_request_active()?;
+        // A routed split never opens a held pair, resolves a capture schedule
+        // from a stored qualification or takes the grouped or managed route:
+        // every attempt captures both original sides sequentially under this
+        // one split Authentication operation (ADR-0032 section 5).
+        if self.installed_split_key().is_some() {
+            return self.authenticate_split_routed(
+                &enr,
+                purpose,
+                service,
+                request_window,
+                &camera_operation,
+                diagnostics,
+            );
+        }
         let camera_open_started = std::time::Instant::now();
         // On an RGB-only (convenience-tier) box the IR node may still OPEN
         // (forced-off is an engine tier, not device absence), so keying the
@@ -7446,6 +7537,13 @@ impl Engine {
                     ));
                 }
             }
+        }
+        // A routed split decides only under its late machine authority, with
+        // both original sides and IR, its account scope, its own complete
+        // binding and evidence from its split capture (plan C6, D10;
+        // ADR-0032 case 15). The arms below keep its sequential posture.
+        if let Some(refusal) = self.split_grant_refusal(enr, &a) {
+            return Ok(refusal);
         }
         // An unreadable frame is reported as unreadable before anything derived
         // from it is consulted. Uncertain is the only verdict this promotes; a
@@ -8687,18 +8785,65 @@ impl Engine {
             user,
             profile_name,
             want,
-            ir_preflight,
+            EnrollmentRoute::Ordinary(ir_preflight),
             diagnostics,
             publication,
         )
     }
 
+    /// Run a prepared enrollment's one pre-camera step, after its storage-only
+    /// refusals, and keep the answer for every capture loop of the request.
+    fn admit_enrollment_route<'a>(
+        &mut self,
+        route: EnrollmentRoute<'a, impl FnOnce(&mut irlume_vision::Detector) -> bool>,
+    ) -> irlume_common::Result<EnrollmentCapture<'a>> {
+        match route {
+            EnrollmentRoute::Ordinary(ir_preflight) => {
+                // A dark IR preflight downgrades to RGB-only convenience
+                // capture, which on a non-concurrent pair stores a profile that
+                // could never authenticate: refuse it before any camera work
+                // (#618). Only the dark case pays the store read; the preflight
+                // itself still runs only when an IR pair exists (the &&
+                // short-circuits).
+                let preflight_dark = self.ir_available && !ir_preflight(&mut self.det);
+                if preflight_dark {
+                    dark_ir_rgb_only_enrollment_refusal(|| {
+                        matches!(
+                            self.capture_qualification_for_request(),
+                            Ok(QualificationResolution::ConcurrentQualified)
+                        )
+                    })?;
+                }
+                Ok(EnrollmentCapture::Ordinary {
+                    force_rgb_only: !self.ir_available || preflight_dark,
+                })
+            }
+            EnrollmentRoute::Split(scans) => {
+                // No preflight, qualification read or RGB-only downgrade. Split
+                // capture applies the known emitter control itself, its IR
+                // frames need active-IR provenance and admission needs RGB and
+                // IR PAD, so a dark IR side ends as a short capture that saves
+                // nothing. Without IR there is no split enrollment at all.
+                if !self.ir_available {
+                    return Err(irlume_common::Error::Policy(
+                        "split camera trust needs both sides and IR is unavailable or forced off"
+                            .into(),
+                    ));
+                }
+                Ok(EnrollmentCapture::Split(scans))
+            }
+        }
+    }
+
+    /// Enroll or reset the primary on this prepared request. The split trust
+    /// entry passes `EnrollmentRoute::Split`; every other caller passes its
+    /// IR preflight as `EnrollmentRoute::Ordinary`.
     fn enroll_profile_capture_prepared(
         &mut self,
         user: &str,
         profile_name: Option<String>,
         want: usize,
-        ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
+        route: EnrollmentRoute<'_, impl FnOnce(&mut irlume_vision::Detector) -> bool>,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
         publication: EnrollmentPublication<'_>,
     ) -> irlume_common::Result<EnrollOutcome> {
@@ -8721,21 +8866,7 @@ impl Engine {
                 )));
             }
         }
-        // A dark IR preflight downgrades to RGB-only convenience capture,
-        // which on a non-concurrent pair stores a profile that could never
-        // authenticate: refuse it before any camera work (#618). Only the
-        // dark case pays the store read; the preflight itself still runs
-        // only when an IR pair exists (the && short-circuits).
-        let preflight_dark = self.ir_available && !ir_preflight(&mut self.det);
-        if preflight_dark {
-            dark_ir_rgb_only_enrollment_refusal(|| {
-                matches!(
-                    self.capture_qualification_for_request(),
-                    Ok(QualificationResolution::ConcurrentQualified)
-                )
-            })?;
-        }
-        let force_rgb_only = !self.ir_available || preflight_dark;
+        let mut capture = self.admit_enrollment_route(route)?;
         let mut completed = 0;
         let (enr, outcome) = self.capture_enrollment_observed(
             enr,
@@ -8751,14 +8882,8 @@ impl Engine {
                         completed + count
                     },
                 };
-                let scans = engine.capture_scans_observed(
-                    count,
-                    pitch,
-                    observed,
-                    force_rgb_only,
-                    diagnostics,
-                    &progress,
-                )?;
+                let scans =
+                    capture.scans(engine, count, pitch, observed, diagnostics, &progress)?;
                 completed += scans.len();
                 Ok(scans)
             },
@@ -9503,12 +9628,15 @@ impl Engine {
             profile_name,
             want,
             authorization,
-            ir_preflight,
+            EnrollmentRoute::Ordinary(ir_preflight),
             diagnostics,
             observer,
         )
     }
 
+    /// Add this prepared request's pair as a secondary group. The split trust
+    /// entry passes `EnrollmentRoute::Split` and binds the retained whole
+    /// split key; every other caller passes its IR preflight.
     #[allow(clippy::too_many_arguments)]
     fn add_camera_group_prepared(
         &mut self,
@@ -9516,7 +9644,7 @@ impl Engine {
         profile_name: Option<String>,
         want: usize,
         authorization: &irlume_core::multi_camera::authz::EnrollmentAuthorization,
-        ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
+        route: EnrollmentRoute<'_, impl FnOnce(&mut irlume_vision::Detector) -> bool>,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
         observer: &dyn EnrollmentObserver,
     ) -> irlume_common::Result<String> {
@@ -9563,7 +9691,12 @@ impl Engine {
                 }
             },
         };
-        let pair = self.live_pair();
+        // A split group binds the retained whole operation key, re-proven
+        // passively here; it never falls back to an identity projection.
+        let pair = match &route {
+            EnrollmentRoute::Split(_) => self.prepared_enrollment_binding()?,
+            EnrollmentRoute::Ordinary(_) => self.live_pair(),
+        };
         if pair.rgb_identity().is_none() && pair.ir_identity().is_none() {
             return Err(irlume_common::Error::Protocol(
                 "the current cameras expose no USB identity; a camera group cannot bind to them"
@@ -9617,19 +9750,9 @@ impl Engine {
         authorization
             .validate_for(user, &operation, now_unix)
             .map_err(|error| irlume_common::Error::Policy(error.to_string()))?;
-        // A dark IR preflight downgrades to RGB-only convenience capture,
-        // which could never authenticate on this pair: refuse before any
-        // camera work (the #618 rule, applied to group enrollment too).
-        let preflight_dark = self.ir_available && !ir_preflight(&mut self.det);
-        if preflight_dark {
-            dark_ir_rgb_only_enrollment_refusal(|| {
-                matches!(
-                    self.capture_qualification_for_request(),
-                    Ok(QualificationResolution::ConcurrentQualified)
-                )
-            })?;
-        }
-        let force_rgb_only = !self.ir_available || preflight_dark;
+        // The #618 dark-IR rule applies to group enrollment too: an ordinary
+        // dark preflight refuses before any camera work.
+        let mut capture = self.admit_enrollment_route(route)?;
         // Capture into a scratch enrollment: the group starts from
         // fresh-enrollment defaults (§3) and borrows nothing, so the
         // scratch's empty pitch neutral gives the bootstrap framing band.
@@ -9654,14 +9777,8 @@ impl Engine {
                         completed + count
                     },
                 };
-                let scans = engine.capture_scans_observed(
-                    count,
-                    pitch,
-                    observed,
-                    force_rgb_only,
-                    diagnostics,
-                    &progress,
-                )?;
+                let scans =
+                    capture.scans(engine, count, pitch, observed, diagnostics, &progress)?;
                 completed += scans.len();
                 Ok(scans)
             },
@@ -13453,7 +13570,11 @@ mod engine_tests {
     mod request_preparation_tests;
     mod secondary_camera_tests;
     mod split_admission_tests;
+    mod split_authentication_tests;
     mod split_capture_tests;
+    mod split_enrollment_tests;
+    mod split_ir_only_tests;
+    mod split_routing_tests;
     use super::tests::env_guard;
     use super::*;
     use irlume_core::storage::{CameraBinding, Enrollment, FaceProfile, FaceScan};

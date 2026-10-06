@@ -7,7 +7,10 @@ license.workspace = true
 [features]
 default = []
 capture-timing = []
-# Non-granting, current-thread fixture used by downstream request tests.
+# Non-granting, current-thread fixture used by downstream request tests. It
+# also holds the only split trust admission override: bound to the installed
+# fixture and its thread, Enrollment or Authentication only, never Capture.
+# Only dev-dependencies enable it; no environment or configuration switch.
 test-support = []
 
 [dependencies]

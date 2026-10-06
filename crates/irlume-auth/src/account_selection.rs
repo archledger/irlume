@@ -2,6 +2,7 @@
 // Copyright the irlume contributors.
 //! Account-scoped selection from one primary and secondary read snapshot.
 
+use crate::request_preparation::{PreparedSelection, SplitChoice, SplitTrustEntry};
 use crate::{legacy_eye_policy, Outcome, OutcomeCause, OutcomeKind};
 use irlume_core::{
     multi_camera::{
@@ -22,33 +23,107 @@ enum Handle {
     Split(usize),
 }
 
-pub(super) enum AccountChoice {
+/// A class-aware account choice (ADR-0032 Step 5, plan C4). `Split` exists
+/// only while the camera activation predicate admits Authentication, which
+/// production never does; `ConnectedPair` stays one physical camera.
+pub(super) enum ClassifiedChoice {
     Legacy(PrimarySnapshot),
-    Selected {
+    Ordinary {
         enrollment: irlume_core::storage::Enrollment,
         pair: irlume_camera::ConnectedPair,
         scope: crate::ir_assessment::IrOnlyScope,
     },
+    Split {
+        enrollment: irlume_core::storage::Enrollment,
+        split: Box<SplitChoice>,
+        scope: crate::ir_assessment::IrOnlyScope,
+    },
 }
 
-pub(super) fn select_account(
+/// How split candidates take part in one ranking.
+enum SplitRouting<'a> {
+    /// The closed boundary: a split primary binding refuses before any
+    /// secondary load, and a ranked split candidate refuses without rerank.
+    Closed,
+    /// Authentication is admitted: a ranked split candidate becomes a choice
+    /// built from the retained snapshot. A pending pin ranks only its key.
+    Admitted {
+        selection: &'a PreparedSelection,
+        pin: Option<&'a irlume_common::split_key::SplitPairKey>,
+    },
+}
+
+impl SplitRouting<'_> {
+    fn pin(&self) -> Option<&irlume_common::split_key::SplitPairKey> {
+        match self {
+            Self::Closed => None,
+            Self::Admitted { pin, .. } => *pin,
+        }
+    }
+}
+
+/// The class-aware account choice over one prepared request (plan C4, C7).
+///
+/// While the camera activation predicate does not admit Authentication, a
+/// split candidate keeps the closed refusal, before any secondary load,
+/// and so does a request that does not route accounts: a proven ordinary
+/// override or an operation-scoped enrollment choice never routes a split.
+/// Once admitted, a ranked split candidate becomes a [`SplitChoice`] built
+/// only from the request's retained snapshot, and a pending pin ranks only
+/// its own key: an unenrolled or absent pin denies, with no legacy or
+/// standing fallback. Nothing is reranked after a refusal.
+pub(super) fn select_account_classified(
     user: &str,
     primary: PrimarySnapshot,
-    view: &irlume_camera::ResolvedConnectedPairs,
+    selection: &PreparedSelection,
     eligible: impl Fn(&irlume_core::storage::Enrollment) -> bool,
     keys: &mut dyn TemplateKeySource,
     read_only: bool,
-) -> Result<AccountChoice, Outcome> {
+) -> Result<ClassifiedChoice, Outcome> {
+    let pin = selection.pending_pin();
+    let routing = if !selection.routes_accounts() {
+        SplitRouting::Closed
+    } else if SplitTrustEntry::Authentication.admitted() {
+        SplitRouting::Admitted { selection, pin }
+    } else if pin.is_some() {
+        // A pin outlived its admission: nothing routes.
+        return Err(closed_split());
+    } else {
+        SplitRouting::Closed
+    };
+    classify(
+        user,
+        primary,
+        selection.view(),
+        &routing,
+        eligible,
+        keys,
+        read_only,
+    )
+}
+
+fn classify(
+    user: &str,
+    primary: PrimarySnapshot,
+    view: &irlume_camera::ResolvedConnectedPairs,
+    routing: &SplitRouting<'_>,
+    eligible: impl Fn(&irlume_core::storage::Enrollment) -> bool,
+    keys: &mut dyn TemplateKeySource,
+    read_only: bool,
+) -> Result<ClassifiedChoice, Outcome> {
     if let Err(reason) = legacy_eye_policy(&primary.enrollment) {
         return Err(Outcome::deny(OutcomeKind::SetupUnavailable, reason));
     }
     // Preserve the closed primary credential boundary until split activation.
-    if matches!(
-        primary.enrollment.camera_binding,
-        Some(irlume_core::storage::CameraBinding::Split(_))
-    ) {
+    if matches!(routing, SplitRouting::Closed)
+        && matches!(
+            primary.enrollment.camera_binding,
+            Some(irlume_core::storage::CameraBinding::Split(_))
+        )
+    {
         return Err(closed_split());
     }
+    let pin = routing.pin();
     let secondary_path = multi_camera::secondary_store_path(user);
     let secondary = if read_only {
         // A readiness query cannot recover-forward a pending journal.
@@ -80,7 +155,13 @@ pub(super) fn select_account(
         .filter(|store| store.owner == user);
     let views = CameraScopedViews::compose(&primary.enrollment, &primary.bytes, loaded).ok();
     let mut candidates = Vec::new();
-    for (index, pair) in view.ordinary.pairs.iter().enumerate() {
+    // A pinned split ranks only its own key: no ordinary candidate.
+    let ordinary = if pin.is_some() {
+        &[][..]
+    } else {
+        view.ordinary.pairs.as_slice()
+    };
+    for (index, pair) in ordinary.iter().enumerate() {
         candidates.push(BoundCandidatePair {
             key: Handle::Ordinary(index),
             pair: irlume_common::binding_key::CompletePairKey::Ordinary {
@@ -93,6 +174,9 @@ pub(super) fn select_account(
     }
     for (index, pair) in view.split_pairs.iter().enumerate() {
         if let Ok(key) = pair.pair_key() {
+            if pin.is_some_and(|pin| *pin != key) {
+                continue;
+            }
             candidates.push(BoundCandidatePair {
                 key: Handle::Split(index),
                 pair: irlume_common::binding_key::CompletePairKey::Split(key),
@@ -120,7 +204,15 @@ pub(super) fn select_account(
             .unwrap_or(true),
     );
     let selected = match selection {
-        SelectionOutcome::NotApplicable { .. } => return Ok(AccountChoice::Legacy(primary)),
+        // A pinned split has no legacy or standing fallback.
+        SelectionOutcome::NotApplicable { .. } if pin.is_some() => {
+            return Err(Outcome::deny_because(
+                OutcomeKind::SetupUnavailable,
+                OutcomeCause::NotEnrolledOnThisCamera,
+                "the selected split camera pair is not enrolled for this account; use your password",
+            ))
+        }
+        SelectionOutcome::NotApplicable { .. } => return Ok(ClassifiedChoice::Legacy(primary)),
         SelectionOutcome::Refused { cause, .. } => {
             return Err(Outcome::deny_because(
                 OutcomeKind::SetupUnavailable,
@@ -130,18 +222,33 @@ pub(super) fn select_account(
         }
         SelectionOutcome::Selected(selected) => selected,
     };
-    let pair = match selected.key {
-        Handle::Ordinary(index) => view.ordinary.pairs[index].clone(),
-        Handle::Split(index) => {
-            let _ = &view.split_pairs[index];
-            return Err(closed_split());
-        }
-    };
-    let scope = match selected.scope {
-        CandidateScope::Primary => crate::ir_assessment::IrOnlyScope::Primary {
-            path: multi_camera::primary_enrollment_path(user),
-            digest: irlume_common::sha256_hex(&primary.bytes),
+    let chosen = match selected.key {
+        Handle::Ordinary(index) => Chosen::Ordinary(ordinary[index].clone()),
+        Handle::Split(index) => match routing {
+            SplitRouting::Closed => {
+                let _ = &view.split_pairs[index];
+                return Err(closed_split());
+            }
+            SplitRouting::Admitted { selection, .. } => Chosen::Split(Box::new(
+                selection.split_choice(index).map_err(unavailable)?,
+            )),
         },
+    };
+    let mut bound = None;
+    let scope = match selected.scope {
+        CandidateScope::Primary => {
+            if matches!(chosen, Chosen::Split(_)) {
+                bound = primary
+                    .enrollment
+                    .camera_binding
+                    .as_ref()
+                    .and_then(irlume_core::storage::CameraBinding::complete_key);
+            }
+            crate::ir_assessment::IrOnlyScope::Primary {
+                path: multi_camera::primary_enrollment_path(user),
+                digest: irlume_common::sha256_hex(&primary.bytes),
+            }
+        }
         CandidateScope::Secondary { index } => {
             let store =
                 loaded.ok_or_else(|| unavailable("selected secondary snapshot is unavailable"))?;
@@ -171,9 +278,21 @@ pub(super) fn select_account(
             {
                 return Err(unavailable("selected secondary ordinal/generation changed"));
             }
+            bound = Some(key);
             crate::ir_assessment::IrOnlyScope::Secondary(Box::new(context))
         }
     };
+    // The ranker matched the exact complete key; refuse any disagreement
+    // between the split choice and the binding it routes to.
+    if let Chosen::Split(split) = &chosen {
+        if bound.as_ref()
+            != Some(&irlume_common::binding_key::CompletePairKey::Split(
+                split.key().clone(),
+            ))
+        {
+            return Err(unavailable("selected split binding changed"));
+        }
+    }
     if !read_only {
         if let Some(refusal) = scope.boundary_refusal(keys) {
             return Err(refusal);
@@ -185,11 +304,23 @@ pub(super) fn select_account(
             context.group_view().matching_enrollment(user)
         }
     };
-    Ok(AccountChoice::Selected {
-        enrollment,
-        pair,
-        scope,
+    Ok(match chosen {
+        Chosen::Ordinary(pair) => ClassifiedChoice::Ordinary {
+            enrollment,
+            pair,
+            scope,
+        },
+        Chosen::Split(split) => ClassifiedChoice::Split {
+            enrollment,
+            split,
+            scope,
+        },
     })
+}
+
+enum Chosen {
+    Ordinary(irlume_camera::ConnectedPair),
+    Split(Box<SplitChoice>),
 }
 
 fn unavailable(reason: &str) -> Outcome {

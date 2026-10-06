@@ -2202,6 +2202,44 @@ fn readiness_refusal(readiness: irlume_common::IrOnlyReadiness) -> Outcome {
     Outcome::deny_because(OutcomeKind::SetupUnavailable, cause, reason)
 }
 
+/// IR-only experimental authentication never runs on a split pair (ADR-0032
+/// Step 5, plan D9). A split lease does not cover the IR metadata companion
+/// that an exact IR capture target needs, so an attempt whose classified
+/// account choice is a split pair refuses before any admission hook or
+/// lease, and readiness reports the existing `BindingMismatch`.
+const SPLIT_IR_ONLY_REFUSAL: &str =
+    "split camera IR-only authentication is not supported; use your password";
+
+/// The D9 refusal. Its kind is `SetupUnavailable`, so the daemon's retry
+/// throttle spends no account strike on it and replenishes none, unlike the
+/// `OtherDeny` closed split refusal. It fires before any capture or match,
+/// like the other pre-capture IR-only setup refusals, so it reveals nothing
+/// about the face. The cause names the setting, not the camera, because the
+/// account is enrolled on that pair.
+fn split_ir_only_refusal() -> Outcome {
+    Outcome::deny_because(
+        OutcomeKind::SetupUnavailable,
+        irlume_common::OutcomeCause::SetupUnavailable,
+        SPLIT_IR_ONLY_REFUSAL,
+    )
+}
+
+/// Whether an IR-only request takes classified account routing; this is the
+/// branch condition itself, not only the branch body. It equals
+/// `pending_pin().is_some() || (automatic() && has_account_candidates())`:
+/// an automatic selection with account candidates, as before, or any
+/// pending pinned split, which ranks only its own key (plan C7, D8). A pin
+/// routes whether cameras.conf holds only split keys (`automatic()` true)
+/// or ordinary `rgb=`/`ir=` lines beside the selected split (`automatic()`
+/// false), and also when no candidate is connected, so neither readiness
+/// nor authentication reaches the configured IR target inside a pin scope.
+/// Production never retains a pin, so there this is the automatic rule
+/// alone.
+fn routes_ir_only_accounts(selection: &crate::request_preparation::PreparedSelection) -> bool {
+    selection.routes_accounts()
+        && (selection.pending_pin().is_some() || selection.has_account_candidates())
+}
+
 fn target_issue(error: &irlume_camera::IrTargetError) -> irlume_common::IrTargetIssue {
     use irlume_camera::IrTargetError as Error;
     use irlume_common::IrTargetIssue as Issue;
@@ -2354,8 +2392,8 @@ impl Engine {
         let Some(selection) = self.camera_selection.as_ref().or(observed.as_ref()) else {
             return IrOnlyPreflight::target(Ready::TargetUnavailable, Issue::Unavailable);
         };
-        if selection.automatic() && selection.has_account_candidates() {
-            return self.ir_only_automatic_preflight(user, selection);
+        if routes_ir_only_accounts(selection) {
+            return self.ir_only_routed_preflight(user, selection);
         }
         let window = AuthenticationWindow::new(GRACE_WINDOW_MS);
         let target = match irlume_camera::configured_ir_target() {
@@ -2425,9 +2463,9 @@ impl Engine {
         if self
             .camera_selection
             .as_ref()
-            .is_some_and(|selection| selection.automatic() && selection.has_account_candidates())
+            .is_some_and(routes_ir_only_accounts)
         {
-            return self.authenticate_ir_automatic(user, window, diagnostics, admission);
+            return self.authenticate_ir_routed(user, window, diagnostics, admission);
         }
         let target = match irlume_camera::configured_ir_target() {
             Ok(target) => target,
@@ -2475,7 +2513,11 @@ impl Engine {
         )
     }
 
-    fn ir_only_automatic_preflight(
+    /// Readiness over classified account routing, read-only: no journal is
+    /// recovered and no lock file is created. A split choice reports the
+    /// existing `BindingMismatch` (plan D9), and so does any routing refusal,
+    /// including a pinned split that does not resolve.
+    fn ir_only_routed_preflight(
         &self,
         user: &str,
         selection: &crate::request_preparation::PreparedSelection,
@@ -2491,17 +2533,19 @@ impl Engine {
         }
         let mut keys = irlume_core::template_key::RequestTemplateKey::production();
         keys.adopt(user, snapshot.key.take());
-        let choice = crate::account_selection::select_account(
+        let choice = crate::account_selection::select_account_classified(
             user,
             snapshot,
-            selection.view(),
+            selection,
             |enrollment| self.compatible_ir_templates(enrollment) != 0,
             &mut keys,
             true,
         );
         let (target, resolution, chosen) = match choice {
-            Err(_) => return IrOnlyPreflight::unscoped(Ready::BindingMismatch),
-            Ok(crate::account_selection::AccountChoice::Selected {
+            Err(_) | Ok(crate::account_selection::ClassifiedChoice::Split { .. }) => {
+                return IrOnlyPreflight::unscoped(Ready::BindingMismatch)
+            }
+            Ok(crate::account_selection::ClassifiedChoice::Ordinary {
                 enrollment,
                 pair,
                 scope,
@@ -2520,7 +2564,7 @@ impl Engine {
                 };
                 (target, IrOnlyResolution { enrollment, scope }, Some(pair))
             }
-            Ok(crate::account_selection::AccountChoice::Legacy(snapshot)) => {
+            Ok(crate::account_selection::ClassifiedChoice::Legacy(snapshot)) => {
                 let target = match irlume_camera::ir_target_for_pair(&self.rgb_dev, &self.ir_dev) {
                     Ok(target) => target,
                     Err(error) => {
@@ -2574,7 +2618,14 @@ impl Engine {
         }
     }
 
-    fn authenticate_ir_automatic(
+    /// IR-only authentication over classified account routing. A split
+    /// choice refuses with the D9 text before the admission hook and any
+    /// lease; nothing is installed, so the request keeps its standing
+    /// devices and a pending pin stays pending. A pending pin whose declared
+    /// Authentication entry ended, or whose admission ended, refuses with
+    /// the closed text before the account is loaded or its pending journal
+    /// recovered.
+    fn authenticate_ir_routed(
         &mut self,
         user: &str,
         window: AuthenticationWindow,
@@ -2582,6 +2633,14 @@ impl Engine {
         admission: PreparationAdmission<'_>,
     ) -> irlume_common::Result<Outcome> {
         use irlume_common::IrOnlyReadiness as Ready;
+        // Production never retains a pin, so this adds no check there.
+        if self
+            .camera_selection
+            .as_ref()
+            .is_some_and(|selection| selection.pending_pin().is_some())
+        {
+            self.validate_camera_request()?;
+        }
         let mut snapshot =
             match self.load_request_enrollment(user, window, false, Some(diagnostics))? {
                 Some(snapshot) => snapshot,
@@ -2590,13 +2649,10 @@ impl Engine {
         self.request_key().adopt(user, snapshot.key.take());
         let selected = {
             let mut keys = self.request_key();
-            crate::account_selection::select_account(
+            crate::account_selection::select_account_classified(
                 user,
                 snapshot,
-                self.camera_selection
-                    .as_ref()
-                    .expect("prepared selection")
-                    .view(),
+                self.camera_selection.as_ref().expect("prepared selection"),
                 |enrollment| self.compatible_ir_templates(enrollment) != 0,
                 &mut *keys,
                 false,
@@ -2604,7 +2660,10 @@ impl Engine {
         };
         let (target, resolution) = match selected {
             Err(outcome) => return Ok(outcome),
-            Ok(crate::account_selection::AccountChoice::Selected {
+            Ok(crate::account_selection::ClassifiedChoice::Split { .. }) => {
+                return Ok(split_ir_only_refusal())
+            }
+            Ok(crate::account_selection::ClassifiedChoice::Ordinary {
                 enrollment,
                 pair,
                 scope,
@@ -2616,7 +2675,7 @@ impl Engine {
                 };
                 (target, IrOnlyResolution { enrollment, scope })
             }
-            Ok(crate::account_selection::AccountChoice::Legacy(snapshot)) => {
+            Ok(crate::account_selection::ClassifiedChoice::Legacy(snapshot)) => {
                 let target = match irlume_camera::ir_target_for_pair(&self.rgb_dev, &self.ir_dev) {
                     Ok(target) => target,
                     Err(_) => return Ok(readiness_refusal(Ready::TargetUnavailable)),

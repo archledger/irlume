@@ -177,6 +177,12 @@ reference resolver; that is not a new production refusal policy. [S5, U3]
 
 ## Recommended next correction and gates
 
+Implemented by the issue-#795 correction in `crates/irlume-vision/src/lib.rs`
+(`pad_vit_input` plus its private `pad_vit_crop`/`pad_vit_resize_rgb8`
+helpers), qualified by `gen_pad_vit_fixtures.py`, `compare_current.py` and
+`docs/research/2026-10-06-pad-preprocessing-qualification-plan.md`. The text
+below records the gates that correction was designed against.
+
 The smallest independent next patch is the pure PAD crop/resize helper in vision,
 after the maintainer confirms the documented recorded-scorer contract. Adopt
 integer half-open ROI bounds, clamp interpolation to that ROI, and reproduce the
@@ -221,9 +227,13 @@ whole-file digest changes when the experiment revision changes even if numerical
 measurements remain identical. Compare the measurement fields separately when
 comparing runs across revisions.
 
-Generated files stay in the ignored `build/`, `__pycache__/`, `results.json` and
-`checks.json` paths. The experiment does not change production preprocessing,
-thresholds, qualification records or authentication policy.
+Generated files stay in the ignored `build/`, `build-current/`, `__pycache__/`,
+`results.json`, `checks.json` and `pad-vit-current-comparison.json` paths;
+`pad-vit-fixtures-receipt.json` is committed because `gen_pad_vit_fixtures.py
+--check` compares against it. The baseline experiment itself does not change
+production preprocessing, thresholds, qualification records or authentication
+policy; the issue-#795 correction above does change production preprocessing
+and is gated separately.
 
 Prevention lesson: the old extent-31 assertion agreed with its implementation,
 so it could not detect reference drift. Keep independent scorer/oracle fixtures,

@@ -1391,7 +1391,11 @@ mod onnx {
     /// of its width/height per side, CLAMP to the frame (no fill — the margin
     /// sweep in docs/research/2026-08-21-vit-liveness-pad-evaluation.md showed
     /// the crop margin is part of the operating point; tight and m25 overlap
-    /// genuine), bilinear-resize to 224.
+    /// genuine), resize to 224. Since the issue-#795 conformance patch the
+    /// crop and resize reproduce the recorded scorer exactly (integer ROI,
+    /// RGB8 fixed-point `INTER_LINEAR`); the qualification gates for that
+    /// preprocessing change are in
+    /// docs/research/2026-10-06-pad-preprocessing-qualification-plan.md.
     pub struct PadVit {
         session: Session,
     }
@@ -1431,53 +1435,205 @@ mod onnx {
         }
     }
 
-    /// Build the ViT PAD input tensor: m96 bbox expansion (clamped, no fill),
-    /// bilinear resize to `size`, RGB, `(px/255 - 0.5)/0.5`, CHW. Pure and
-    /// separate so the preprocessing arithmetic is testable without weights.
+    /// Independently generated regression fixtures for [`pad_vit_input`]
+    /// (generated file; regenerate with
+    /// `benchmarks/preprocessing-conformance/gen_pad_vit_fixtures.py`).
+    #[cfg(test)]
+    mod pad_vit_fixtures {
+        include!("pad_vit_fixtures.rs");
+    }
+
+    /// Build the ViT PAD input tensor under the recorded-scorer
+    /// preprocessing contract (issue #795): m96 integer ROI expansion
+    /// (truncation toward zero, half-open, clipped to the frame, no fill),
+    /// RGB8 fixed-point `INTER_LINEAR` resize to `size` (an exact 2x
+    /// downsample uses the matching area average), RGB,
+    /// `(px/255 - 0.5)/0.5`, CHW. Pure and separate so the preprocessing
+    /// arithmetic is testable without weights.
     fn pad_vit_input(frame: &align::RgbView, bbox: &[f32; 4], size: usize) -> Vec<f32> {
-        const MARGIN: f32 = 96.0 / 112.0;
-        let (fw, fh) = (frame.width as f32, frame.height as f32);
-        // Degenerate 0-dimension frame (misbehaving V4L2 driver): f32::clamp
-        // asserts min<=max, so 0 would panic BEFORE sample_bilinear's own
-        // degenerate guard runs. Return zeros (an all--1.0 tensor after
-        // normalization is impossible to hit here, but a uniform input is the
-        // fail-safe: the cue reads no signal and denies nothing).
-        if fw <= 0.0 || fh <= 0.0 {
-            return vec![0.0; 3 * size * size];
-        }
-        let (bw, bh) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
-        let x1 = (bbox[0] - bw * MARGIN).max(0.0);
-        let y1 = (bbox[1] - bh * MARGIN).max(0.0);
-        let x2 = (bbox[2] + bw * MARGIN).min(fw - 1.0);
-        let y2 = (bbox[3] + bh * MARGIN).min(fh - 1.0);
-        let (cw, ch) = ((x2 - x1).max(1.0), (y2 - y1).max(1.0));
         let mut t = vec![0.0f32; 3 * size * size];
+        if size == 0 {
+            return t;
+        }
+        // Degenerate inputs share one bounded fail-safe: a uniform zero
+        // tensor (the cue reads no signal). A 0-dimension frame comes from a
+        // misbehaving V4L2 driver. Non-finite boxes cannot pass
+        // decode_short_range_best's finiteness check, but non-positive-area
+        // and fully clipped boxes CAN occur when a regression head yields
+        // negative extents or large offsets, so this branch is live and
+        // pinned by tests. A short buffer keeps its old per-pixel black
+        // fallback below.
+        let (fw, fh) = (frame.width, frame.height);
+        let Some([x1, y1, x2, y2]) = pad_vit_crop(bbox, fw, fh) else {
+            return t;
+        };
+        let (rw, rh) = ((x2 - x1) as usize, (y2 - y1) as usize);
+        let mut roi = vec![0u8; rw * rh * 3];
+        for ry in 0..rh {
+            for rx in 0..rw {
+                let i = ((y1 as usize + ry) * fw as usize + x1 as usize + rx) * 3;
+                let o = (ry * rw + rx) * 3;
+                // A short buffer keeps the old black fallback.
+                if let Some(px) = frame.data.get(i..i + 3) {
+                    roi[o..o + 3].copy_from_slice(px);
+                }
+            }
+        }
+        let bytes = pad_vit_resize_rgb8(&roi, rw, rh, size);
         let plane = size * size;
-        for oy in 0..size {
-            for ox in 0..size {
-                // dst center -> source coord (bilinear, cv2 INTER_LINEAR
-                // convention); pixel() clamps sampling at the frame edge.
-                let fx = x1 + (ox as f32 + 0.5) * cw / size as f32 - 0.5;
-                let fy = y1 + (oy as f32 + 0.5) * ch / size as f32 - 0.5;
-                let p = frame.sample_bilinear(fx.clamp(0.0, fw - 1.0), fy.clamp(0.0, fh - 1.0));
-                let o = oy * size + ox;
-                t[o] = (p[0] / 255.0 - 0.5) / 0.5;
-                t[plane + o] = (p[1] / 255.0 - 0.5) / 0.5;
-                t[2 * plane + o] = (p[2] / 255.0 - 0.5) / 0.5;
+        for o in 0..plane {
+            for (c, plane_off) in (0..3).map(|c| (c, c * plane)) {
+                t[plane_off + o] = (f32::from(bytes[o * 3 + c]) / 255.0 - 0.5) / 0.5;
             }
         }
         t
     }
 
-    /// Preprocessing arithmetic tests for [`pad_vit_input`]: the m96
-    /// expansion, edge clamping, RGB order, and `(px/255 - 0.5)/0.5`
-    /// normalization. The crop margin IS part of the measured operating
-    /// point (docs/research/2026-08-21-vit-liveness-pad-evaluation.md:
+    /// The recorded scorer's m96 integer ROI: bbox width/height
+    /// reconstructed from float32 xyxy, expanded by 96/112 of the box per
+    /// side in float32 (the scorer's `crop`, benchmarks/pad-candidates/
+    /// vit_liveness_score.py), bounds truncated toward zero and clipped to
+    /// a half-open frame rectangle. `None` for non-finite, non-positive-area
+    /// or fully clipped bboxes, where the scorer would compute an empty
+    /// slice.
+    fn pad_vit_crop(bbox: &[f32; 4], fw: u32, fh: u32) -> Option<[i32; 4]> {
+        if !bbox.iter().all(|v| v.is_finite()) || fw == 0 || fh == 0 {
+            return None;
+        }
+        let (bw, bh) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
+        // Finite inputs are guaranteed above, so `<=` is the NaN-safe
+        // `!(v > 0.0)` guard without the negated comparison.
+        if bw <= 0.0 || bh <= 0.0 {
+            return None;
+        }
+        const MARGIN: f32 = 96.0 / 112.0;
+        let (mx, my) = (bw * MARGIN, bh * MARGIN);
+        // `as i32` truncates toward zero exactly like the scorer's `int()`;
+        // the saturating cast only differs out of i32 range, where the
+        // min/max below clip to the same frame bounds.
+        let x1 = ((bbox[0] - mx) as i32).max(0);
+        let y1 = ((bbox[1] - my) as i32).max(0);
+        let x2 = ((bbox[0] + bw + mx) as i32).min(fw as i32);
+        let y2 = ((bbox[1] + bh + my) as i32).min(fh as i32);
+        if x2 <= x1 || y2 <= y1 {
+            return None;
+        }
+        Some([x1, y1, x2, y2])
+    }
+
+    /// RGB8 resize matching the recorded scorer's
+    /// `cv2.resize(..., (224, 224), interpolation=cv2.INTER_LINEAR)` byte
+    /// contract (OpenCV 5.0 `modules/imgproc/src/resize.cpp`): half-pixel
+    /// centers with edge replication, 11-bit fixed-point coefficients
+    /// (round-to-nearest-even), horizontal integer accumulation and the
+    /// staged 8s8u output `((b0*(h0>>4))>>16) + ((b1*(h1>>4))>>16) + 2) >> 2`.
+    /// An exact 2x downsample dispatches to OpenCV's area-fast average
+    /// `(sum + 2) >> 2`. Coefficient ties are not observable in this
+    /// contract: the exact-rational coefficient sits at least 1/14 away
+    /// from a half-integer, while f32 rounding of the half-pixel coordinate
+    /// moves it at most about rw*2^-13 (2^-5 at the 336/448 scales), below
+    /// that margin for ROI widths under roughly 585 at `size == 224`.
+    /// Every pinned case is well inside, and any tie would resolve
+    /// ties-even like x86 `cvRound`.
+    fn pad_vit_resize_rgb8(roi: &[u8], rw: usize, rh: usize, size: usize) -> Vec<u8> {
+        let mut out = vec![0u8; size * size * 3];
+        if rw == 0 || rh == 0 || size == 0 {
+            return out;
+        }
+        if rw == size * 2 && rh == size * 2 {
+            for oy in 0..size {
+                for ox in 0..size {
+                    for c in 0..3 {
+                        let mut sum = 0u32;
+                        for sy in 0..2usize {
+                            for sx in 0..2usize {
+                                let i = ((oy * 2 + sy) * rw + ox * 2 + sx) * 3 + c;
+                                sum += u32::from(roi[i]);
+                            }
+                        }
+                        out[(oy * size + ox) * 3 + c] = ((sum + 2) >> 2) as u8;
+                    }
+                }
+            }
+            return out;
+        }
+        fn coef(v: f32) -> i16 {
+            (v * 2048.0).round_ties_even() as i16
+        }
+        let scale_x = 1.0 / (size as f64 / rw as f64);
+        let scale_y = 1.0 / (size as f64 / rh as f64);
+        let mut xofs = vec![0usize; size];
+        let mut ax = vec![[0i16; 2]; size];
+        // Dst columns at/after the first right-clamped sample copy one
+        // source sample scaled by the coefficient base (OpenCV's xmax).
+        let mut xmax = size;
+        for dx in 0..size {
+            let mut fx = ((dx as f64 + 0.5) * scale_x - 0.5) as f32;
+            let mut sx = fx.floor() as i32;
+            fx -= sx as f32;
+            if sx < 0 {
+                fx = 0.0;
+                sx = 0;
+            }
+            if sx + 1 >= rw as i32 {
+                xmax = xmax.min(dx);
+                if sx >= rw as i32 - 1 {
+                    fx = 0.0;
+                    sx = rw as i32 - 1;
+                }
+            }
+            xofs[dx] = sx as usize;
+            ax[dx] = [coef(1.0 - fx), coef(fx)];
+        }
+        let mut rows = [vec![0i32; size * 3], vec![0i32; size * 3]];
+        for oy in 0..size {
+            let fy0 = ((oy as f64 + 0.5) * scale_y - 0.5) as f32;
+            let sy = fy0.floor() as i32;
+            let fy = fy0 - sy as f32;
+            let b = [coef(1.0 - fy), coef(fy)];
+            // Rows clamp at the ROI border (OpenCV clips to [0, rh-1]);
+            // beta still comes from the unclamped fraction.
+            let src_rows = [
+                (sy.max(0) as usize).min(rh - 1),
+                ((sy + 1).max(0) as usize).min(rh - 1),
+            ];
+            for (k, &r) in src_rows.iter().enumerate() {
+                let base = r * rw * 3;
+                for dx in 0..size {
+                    let s = xofs[dx] * 3;
+                    for c in 0..3 {
+                        rows[k][dx * 3 + c] = if dx < xmax {
+                            i32::from(roi[base + s + c]) * i32::from(ax[dx][0])
+                                + i32::from(roi[base + s + 3 + c]) * i32::from(ax[dx][1])
+                        } else {
+                            i32::from(roi[base + s + c]) * 2048
+                        };
+                    }
+                }
+            }
+            for ox in 0..size {
+                for c in 0..3 {
+                    let e = ox * 3 + c;
+                    let t0 = (i32::from(b[0]) * (rows[0][e] >> 4)) >> 16;
+                    let t1 = (i32::from(b[1]) * (rows[1][e] >> 4)) >> 16;
+                    out[(oy * size + ox) * 3 + c] = ((t0 + t1 + 2) >> 2) as u8;
+                }
+            }
+        }
+        out
+    }
+
+    /// Preprocessing arithmetic tests for [`pad_vit_input`]: the recorded
+    /// m96 integer-ROI contract and the RGB8 fixed-point `INTER_LINEAR`
+    /// resize contract, pinned by independently generated fixtures (see
+    /// `benchmarks/preprocessing-conformance/gen_pad_vit_fixtures.py`).
+    /// The crop margin IS part of the measured operating point
+    /// (docs/research/2026-08-21-vit-liveness-pad-evaluation.md:
     /// tight/m25 overlap genuine; m96 separates), so a preprocessing drift
     /// is a threshold drift and these pin it.
     #[cfg(test)]
     mod pad_vit_input_tests {
-        use super::pad_vit_input;
+        use super::{pad_vit_crop, pad_vit_input, pad_vit_resize_rgb8};
         use crate::align::RgbView;
 
         struct Frame {
@@ -1511,8 +1667,91 @@ mod onnx {
             }
         }
 
+        /// Deterministic fixture frame recipes, mirrored exactly in
+        /// `gen_pad_vit_fixtures.py`; the fixture hashes bind the two.
+        #[derive(Clone, Copy)]
+        pub(super) enum Recipe {
+            Ramp32,
+            Wide,
+            Steps,
+            Grid48x40,
+            White64BlackRoi,
+            Pattern448,
+            Pattern224,
+            Pattern336,
+        }
+
+        impl Recipe {
+            fn wh(self) -> (u32, u32) {
+                match self {
+                    Recipe::Ramp32 => (32, 32),
+                    Recipe::Wide => (256, 128),
+                    Recipe::Steps => (512, 384),
+                    Recipe::Grid48x40 => (48, 40),
+                    Recipe::White64BlackRoi => (64, 64),
+                    Recipe::Pattern448 => (448, 448),
+                    Recipe::Pattern224 => (224, 224),
+                    Recipe::Pattern336 => (336, 336),
+                }
+            }
+
+            fn pixel(self, x: u32, y: u32) -> [u8; 3] {
+                match self {
+                    Recipe::Ramp32 => [
+                        ((x * 8) & 0xff) as u8,
+                        ((y * 8) & 0xff) as u8,
+                        (((x + y) * 4) & 0xff) as u8,
+                    ],
+                    Recipe::Wide => [
+                        (x & 0xff) as u8,
+                        ((y * 2) & 0xff) as u8,
+                        ((x + y) & 0xff) as u8,
+                    ],
+                    Recipe::Steps => [
+                        (((x / 16) % 2) * 255) as u8,
+                        (((y / 16) % 2) * 255) as u8,
+                        ((((x + y) / 16) % 2) * 255) as u8,
+                    ],
+                    Recipe::Grid48x40 => {
+                        [(x & 0xff) as u8, (y & 0xff) as u8, ((x + y) & 0xff) as u8]
+                    }
+                    Recipe::White64BlackRoi => {
+                        if (18..37).contains(&x) && (18..37).contains(&y) {
+                            [0, 0, 0]
+                        } else {
+                            [255, 255, 255]
+                        }
+                    }
+                    Recipe::Pattern448 => [
+                        ((x * 73 + y * 151) & 0xff) as u8,
+                        ((x * 151 + y * 73) & 0xff) as u8,
+                        ((x ^ y) & 0xff) as u8,
+                    ],
+                    Recipe::Pattern224 => [
+                        ((x * 5) & 0xff) as u8,
+                        ((y * 7) & 0xff) as u8,
+                        ((x * y) & 0xff) as u8,
+                    ],
+                    Recipe::Pattern336 => [
+                        ((x * 11 + y * 23) & 0xff) as u8,
+                        ((x * 23 + y * 11) & 0xff) as u8,
+                        (((x * 3) ^ (y * 5)) & 0xff) as u8,
+                    ],
+                }
+            }
+
+            fn frame(self) -> Frame {
+                let (w, h) = self.wh();
+                Frame::new(w, h, |x, y| self.pixel(x, y))
+            }
+        }
+
         const S: usize = 224;
         const PLANE: usize = S * S;
+
+        fn normalized(byte: u8) -> f32 {
+            (f32::from(byte) / 255.0 - 0.5) / 0.5
+        }
 
         #[test]
         fn uniform_gray_normalizes_to_its_own_value() {
@@ -1520,7 +1759,7 @@ mod onnx {
             // uniform frame is uniform, so EVERY element sits there.
             let f = Frame::new(64, 48, |_, _| [128, 128, 128]);
             let t = pad_vit_input(&f.view(), &[16.0, 8.0, 48.0, 40.0], S);
-            let want = (128.0 / 255.0 - 0.5) / 0.5;
+            let want = normalized(128);
             assert!(t.iter().all(|&v| (v - want).abs() < 1e-6));
         }
 
@@ -1530,49 +1769,237 @@ mod onnx {
             // swap fails this.
             let f = Frame::new(16, 16, |_, _| [255, 0, 0]);
             let t = pad_vit_input(&f.view(), &[2.0, 2.0, 12.0, 12.0], S);
-            let hi = (255.0 / 255.0 - 0.5) / 0.5;
-            let lo = (0.0 / 255.0 - 0.5) / 0.5;
+            let (hi, lo) = (normalized(255), normalized(0));
             assert!(t[..PLANE].iter().all(|&v| (v - hi).abs() < 1e-6));
             assert!(t[PLANE..2 * PLANE].iter().all(|&v| (v - lo).abs() < 1e-6));
             assert!(t[2 * PLANE..].iter().all(|&v| (v - lo).abs() < 1e-6));
         }
 
+        /// ROI isolation (wave-3 gate: must fail on the original helper,
+        /// which leaked the white surround into the chip).
         #[test]
-        fn full_frame_bbox_clamps_without_fill() {
-            // A full-frame bbox expands past every edge and must clamp to
-            // the frame: dst (0,0) samples clamped source (0,0), and the
-            // last dst pixel samples source x2*(223.5/224)-0.5 < 31 (not a
-            // fill value). A 127-fill variant (the FLIR convention) would
-            // read ~0.0 there instead of the frame's own pixels.
-            let f = Frame::new(32, 32, |x, y| [(x * 8) as u8, (y * 8) as u8, 0]);
+        fn black_roi_white_outside_isolates_the_roi() {
+            let f = Recipe::White64BlackRoi.frame();
+            let t = pad_vit_input(&f.view(), &[24.0, 24.0, 31.0, 31.0], S);
+            let want = normalized(0);
+            assert!(
+                t.iter().all(|&v| v == want),
+                "first element {} (want {want}): the chip must be exactly the black ROI",
+                t[0]
+            );
+        }
+
+        /// Crop extent (wave-3 gate: must fail on the original helper, which
+        /// clamped the extent to width-1/height-1 and under-weighted the last
+        /// row and column).
+        #[test]
+        fn full_frame_extent_includes_the_last_row_and_column() {
+            let f = Recipe::Grid48x40.frame();
+            let t = pad_vit_input(&f.view(), &[0.0, 0.0, 48.0, 40.0], S);
+            let fx = super::pad_vit_fixtures::FIXTURES
+                .iter()
+                .find(|f| f.name == "full_frame_last_row_col")
+                .expect("fixture present");
+            for &(p, y, x, want) in fx.tensor_probes {
+                let got = t[p as usize * PLANE + y as usize * S + x as usize];
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "plane {p} ({x},{y}): got {got} want {want}"
+                );
+            }
+        }
+
+        /// The wave-3 rounding counterexample: RGB8 fixed-point
+        /// `INTER_LINEAR` answers byte 0 at (x=4,y=0,B) where a float
+        /// pipeline plus `round()` answers 1.
+        #[test]
+        fn ramp_rounding_matches_rgb8_fixed_point_inter_linear() {
+            let f = Recipe::Ramp32.frame();
             let t = pad_vit_input(&f.view(), &[0.0, 0.0, 32.0, 32.0], S);
-            let want00 = (0.0 / 255.0 - 0.5) / 0.5;
-            assert!((t[0] - want00).abs() < 1e-6, "R(0,0)={}", t[0]);
-            // x1 clamps to 0, x2 to 31; the last dst column samples
-            // fx = 223.5*31/224 - 0.5 ≈ 30.43 → R ≈ 8*30.43 = 243.4.
-            let fx = (S as f32 - 0.5) * 31.0 / S as f32 - 0.5;
-            let want_px = (fx * 8.0).min(255.0);
-            let want = (want_px / 255.0 - 0.5) / 0.5;
-            let last = t[PLANE - 1];
-            assert!((last - want).abs() < 0.02, "R(last)={last} want {want}");
+            assert_eq!(t[2 * PLANE + 4], normalized(0), "B(4,0) must be byte 0");
+            assert_eq!(t[4], normalized(1), "R(4,0) must be byte 1");
         }
 
         #[test]
-        fn m96_margin_arithmetic_matches_the_measured_convention() {
-            // bbox x 100..148 (w=48): margin 48*96/112 per side. A horizontal
-            // R=x*4 gradient frame makes dst (0,0) a linear readout of the
-            // sampled fx, pinning the margin arithmetic end to end.
-            let f = Frame::new(256, 64, |x, _| [(x * 4) as u8, 0, 0]);
-            let t = pad_vit_input(&f.view(), &[100.0, 8.0, 148.0, 56.0], S);
-            let x1 = 100.0 - 48.0 * 96.0 / 112.0;
-            let cw = (148.0 + 48.0 * 96.0 / 112.0) - x1;
-            let fx = x1 + 0.5 * cw / S as f32 - 0.5;
-            let want_px = (fx.max(0.0) * 4.0).min(255.0);
-            let want = (want_px / 255.0 - 0.5) / 0.5;
-            assert!((t[0] - want).abs() < 0.02, "t[0]={} want {want}", t[0]);
+        fn fixture_tensors_match_the_recorded_scorer_contract() {
+            for fx in super::pad_vit_fixtures::FIXTURES {
+                let f = fx.recipe.frame();
+                let t = pad_vit_input(&f.view(), &fx.bbox, S);
+                assert_eq!(t.len(), 3 * PLANE, "{}", fx.name);
+                for &(p, y, x, want) in fx.tensor_probes {
+                    let got = t[p as usize * PLANE + y as usize * S + x as usize];
+                    assert!(
+                        (got - want).abs() < 1e-6,
+                        "{} plane {p} ({x},{y}): got {got} want {want}",
+                        fx.name
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn identity_224_tensor_is_the_exact_normalized_copy() {
+            let f = Recipe::Pattern224.frame();
+            let t = pad_vit_input(&f.view(), &[0.0, 0.0, 224.0, 224.0], S);
+            for y in 0..S {
+                for x in 0..S {
+                    let p = Recipe::Pattern224.pixel(x as u32, y as u32);
+                    for (c, &b) in p.iter().enumerate() {
+                        assert_eq!(
+                            t[c * PLANE + y * S + x],
+                            normalized(b),
+                            "channel {c} ({x},{y})"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn malformed_bboxes_fail_safe_to_zero_tensors() {
+            let f = Recipe::Grid48x40.frame();
+            let v = f.view();
+            for bbox in [
+                [f32::NAN, 0.0, 4.0, 4.0],
+                [0.0, 0.0, f32::INFINITY, 4.0],
+                [4.0, 4.0, 2.0, 8.0],
+                [4.0, 4.0, 8.0, 2.0],
+                [4.0, 4.0, 4.0, 8.0],
+                [100.0, 100.0, 120.0, 120.0],
+            ] {
+                let t = pad_vit_input(&v, &bbox, S);
+                assert_eq!(t.len(), 3 * PLANE);
+                assert!(t.iter().all(|&x| x == 0.0), "bbox {bbox:?}");
+            }
+        }
+
+        #[test]
+        fn degenerate_frames_fail_safe_without_panicking() {
+            let empty = Frame {
+                data: vec![],
+                width: 0,
+                height: 0,
+            };
+            let t = pad_vit_input(&empty.view(), &[0.0, 0.0, 4.0, 4.0], S);
+            assert!(t.iter().all(|&x| x == 0.0));
+
+            // A short buffer (misbehaving V4L2 driver) samples black, the
+            // same bounded fallback as before this change.
+            let short = Frame {
+                data: vec![0u8; 3],
+                width: 4,
+                height: 4,
+            };
+            let t = pad_vit_input(&short.view(), &[0.0, 0.0, 4.0, 4.0], S);
+            assert!(t.iter().all(|&x| x == normalized(0)));
+        }
+
+        fn fnv1a64(data: &[u8]) -> u64 {
+            let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+            for &b in data {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            h
+        }
+
+        fn fixture_roi(fx: &super::pad_vit_fixtures::Fixture) -> Vec<u8> {
+            let [x1, y1, x2, y2] = fx.crop;
+            let (rw, rh) = ((x2 - x1) as u32, (y2 - y1) as u32);
+            let mut roi = vec![0u8; (rw * rh * 3) as usize];
+            for ry in 0..rh {
+                for rx in 0..rw {
+                    let p = fx.recipe.pixel(x1 as u32 + rx, y1 as u32 + ry);
+                    let i = ((ry * rw + rx) * 3) as usize;
+                    roi[i..i + 3].copy_from_slice(&p);
+                }
+            }
+            roi
+        }
+
+        #[test]
+        fn fixture_crop_bounds_match_the_scorer_contract() {
+            for fx in super::pad_vit_fixtures::FIXTURES {
+                let (w, h) = fx.recipe.wh();
+                assert_eq!(
+                    pad_vit_crop(&fx.bbox, w, h),
+                    Some(fx.crop),
+                    "crop bounds: {}",
+                    fx.name
+                );
+            }
+        }
+
+        #[test]
+        fn fixture_resize_bytes_match_the_rgb8_linear_contract() {
+            for fx in super::pad_vit_fixtures::FIXTURES {
+                let [x1, y1, x2, y2] = fx.crop;
+                let (rw, rh) = ((x2 - x1) as usize, (y2 - y1) as usize);
+                let roi = fixture_roi(fx);
+                let bytes = pad_vit_resize_rgb8(&roi, rw, rh, S);
+                assert_eq!(bytes.len(), 3 * PLANE, "{}", fx.name);
+                assert_eq!(fnv1a64(&bytes), fx.rgb8_fnv1a64, "rgb8 bytes: {}", fx.name);
+                for &(x, y, rgb) in fx.probes {
+                    let i = (y as usize * S + x as usize) * 3;
+                    assert_eq!(&bytes[i..i + 3], &rgb, "probe ({x},{y}): {}", fx.name);
+                }
+            }
+        }
+
+        #[test]
+        fn crop_bounds_truncate_at_integer_transitions() {
+            // The expansion lands just above/below 18.0: truncation toward
+            // zero answers 18 and 17, where rounding would answer 18 twice.
+            assert_eq!(
+                pad_vit_crop(&[19.0, 8.0, 20.1666, 9.0], 64, 64),
+                Some([18, 7, 21, 9])
+            );
+            assert_eq!(
+                pad_vit_crop(&[19.0, 8.0, 20.1668, 9.0], 64, 64),
+                Some([17, 7, 21, 9])
+            );
+            // Sub-integer expansion and the half-open right/bottom clip.
+            assert_eq!(
+                pad_vit_crop(&[18.0, 8.0, 18.001, 8.001], 64, 64),
+                Some([17, 7, 18, 8])
+            );
+            assert_eq!(
+                pad_vit_crop(&[61.0, 5.0, 63.5, 6.0], 64, 64),
+                Some([58, 4, 64, 6])
+            );
+        }
+
+        #[test]
+        fn exact_2x_downsample_averages_round_half_up() {
+            // 2x2 -> 1x1 with sum 2: the area-fast dispatch answers
+            // (2 + 2) >> 2 = 1; round-half-even would answer 0.
+            let roi = [2u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            assert_eq!(pad_vit_resize_rgb8(&roi, 2, 2, 1), vec![1, 0, 0]);
+            // Sum 10 answers (10 + 2) >> 2 = 3; round-half-even would
+            // answer 2. (The 448 fixture pins the same rule over 50,176
+            // tie blocks.)
+            let roi = [4u8, 4, 0, 3, 3, 0, 3, 3, 0, 0, 0, 0];
+            assert_eq!(pad_vit_resize_rgb8(&roi, 2, 2, 1), vec![3, 3, 0]);
+        }
+
+        #[test]
+        fn identity_resize_is_byte_exact() {
+            let f = Recipe::Pattern224.frame();
+            assert_eq!(pad_vit_resize_rgb8(&f.data, 224, 224, 224), f.data);
+        }
+
+        #[test]
+        fn one_pixel_roi_resizes_by_passthrough() {
+            // A 1x1 ROI (and a 1-wide strip) must replicate, not vanish.
+            assert_eq!(pad_vit_resize_rgb8(&[9u8, 8, 7], 1, 1, S), {
+                let mut v = vec![0u8; 3 * PLANE];
+                for px in v.chunks_exact_mut(3) {
+                    px.copy_from_slice(&[9, 8, 7]);
+                }
+                v
+            });
         }
     }
-
     /// IR PAD classifier (the SHIPPED FLIR liveness model, ADR-0013).
     /// Built for the DAMO FLIR IR liveness model: 112x112x3, (px-127.5)/128,
     /// NCHW, two output LOGITS where softmax index 0 is P(fake). Preprocessing

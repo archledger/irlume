@@ -86,6 +86,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The ViT RGB PAD input matches the recorded m96 scorer preprocessing
+  exactly (issue #795): the crop is the scorer's integer ROI (float32 box
+  width/height reconstruction, 96/112 expansion, truncation toward zero,
+  half-open clip to the frame) and the resize is OpenCV's RGB8 fixed-point
+  `INTER_LINEAR` (exact 2x downsample uses the matching area average),
+  quantized to bytes before `(px/255 - 0.5)/0.5`. The previous fractional
+  crop clamped the extent one pixel short and a float bilinear sampler fed
+  unquantized samples to the model. Independently generated fixtures pin
+  the crop bounds and the resize bytes; the 0.55 threshold, the five-frame
+  median, mandatory PAD and the IR cues are unchanged. Controlled
+  genuine/attack qualification (docs/research/2026-10-06-pad-preprocessing-
+  qualification-plan.md) gates any release carrying this change.
+
 - Secondary camera-group publication rechecks exact primary and secondary source
   state, account authority and fresh time after key preparation under the account
   lock. Prepared encrypted payloads retain their key-envelope context; drift

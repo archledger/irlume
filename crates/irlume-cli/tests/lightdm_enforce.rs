@@ -594,7 +594,7 @@ fn session_module_asan_runtime() -> Option<String> {
         if !left.trim().contains("asan") {
             return None;
         }
-        let path = right.trim().split_whitespace().next()?;
+        let path = right.split_whitespace().next()?;
         std::path::Path::new(path)
             .is_file()
             .then(|| path.to_string())

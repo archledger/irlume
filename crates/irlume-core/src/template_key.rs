@@ -158,19 +158,57 @@ pub fn recovery_path(user: &str) -> PathBuf {
 /// Whether a TPM is present. When false, [`crate::storage`] keeps templates as
 /// root-only plaintext (dev boxes / no-TPM hosts) instead of failing.
 pub fn tpm_available() -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(present) = *TPM_PRESENT.lock().unwrap_or_else(|e| e.into_inner()) {
         return present;
     }
     Path::new("/dev/tpmrm0").exists() || Path::new("/dev/tpm0").exists()
 }
 
-/// Test-only: what [`tpm_available`] answers, when a test has set it. The
-/// swtpm lane reaches its TPM through `IRLUME_TCTI` and has no device node,
-/// so a test of the TPM branch sets this instead. Taken under
-/// `testenv::ENV_LOCK` and cleared by the test that set it.
-#[cfg(test)]
+/// What [`tpm_available`] answers, when a test has pinned it. The swtpm lane
+/// reaches its TPM through `IRLUME_TCTI` and has no device node, so a test of
+/// the TPM branch pins this instead. Taken under `testenv::ENV_LOCK` and
+/// cleared by the test that set it. Compiled for this crate's own tests and,
+/// behind `test-support`, for a dependent crate's tests; a release build has
+/// no override to reach.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) static TPM_PRESENT: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// The cross-crate view of the `TPM_PRESENT` override for dependent crates'
+/// tests. Their test binaries link this crate without `cfg(test)`, so the
+/// plain static is not compiled for them; the `test-support` feature is what
+/// makes this module exist. No production behavior changes: with the feature
+/// off the probe above runs exactly as before, and nothing here runs in a
+/// release build.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support {
+    /// Pins what [`super::tpm_available`] answers until dropped, then restores
+    /// whatever override (if any) was in force. Restoring on drop, rather than
+    /// a bare clear, keeps a panicking test from leaking its pin into the next
+    /// test that shares the process.
+    pub struct TpmPresence(Option<bool>);
+
+    impl TpmPresence {
+        /// Answer `present` from [`super::tpm_available`] for the guard's life.
+        /// Hold the crate env lock (`testenv::ENV_LOCK`, or the dependent
+        /// crate's equivalent) across the guard, as the `TPM_PRESENT` override's
+        /// own users do: the probe is process-global.
+        pub fn force(present: bool) -> Self {
+            let previous = super::TPM_PRESENT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .replace(present);
+            Self(previous)
+        }
+    }
+
+    impl Drop for TpmPresence {
+        fn drop(&mut self) {
+            *super::TPM_PRESENT.lock().unwrap_or_else(|e| e.into_inner()) = self.0.take();
+        }
+    }
+}
 
 /// Whether a sealed template key exists for `user`.
 pub fn has_key(user: &str) -> bool {

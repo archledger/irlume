@@ -57,10 +57,12 @@ pub(super) const PERMIT_LANDING: &str =
 
 pub(super) const RESEAL_AUTH: &str = "auth       optional                     pam_irlume.so reseal";
 
-/// Post-auth login-keyring unlock for the FINGERPRINT path: runs after a trusted
-/// factor succeeded; if no password is present (fingerprint login) it unseals
-/// the TPM-sealed password and sets PAM_AUTHTOK so pam_gnome_keyring opens the
-/// wallet. No-op when the keyring isn't armed or a password is already set.
+/// Post-auth landing marker for the FINGERPRINT path. The line itself
+/// requests nothing: PAM keeps `optional` lines running after a failed
+/// factor, and the module cannot ask what the lines above it returned, so
+/// the release happens in the matching `reseal` session line, which PAM runs
+/// only after authentication succeeded (ADR-0003, 2026-10-06 amendment).
+/// The line stays so `login status` and unwire keep recognizing the landing.
 pub(super) const KEYRING_UNSEAL: &str =
     "auth       optional                     pam_irlume.so keyring";
 
@@ -74,10 +76,12 @@ pub(super) const KEYRING_TAG: &str = "# irlume-keyring";
 
 /// GDM's `gdm-fingerprint` stack carries NO keyring module at all (verified on
 /// upstream `data/pam-redhat/gdm-fingerprint.pam` through GDM 50.0), so the
-/// `KEYRING_UNSEAL` line above would set a token nothing reads. These are the
-/// two halves gnome-keyring needs, added only when the stack has no consumer of
-/// its own. The leading `-` is PAM's "do not complain if the module is missing",
-/// so a machine without gnome-keyring installed is unaffected.
+/// session-phase release would find no daemon to deliver to. These are the
+/// two halves gnome-keyring needs, added only when the stack has no consumer
+/// of its own: the session half starts the daemon (auto_start) whose control
+/// socket the release delivers over. The leading `-` is PAM's "do not
+/// complain if the module is missing", so a machine without gnome-keyring
+/// installed is unaffected.
 pub(super) const FP_GKR_AUTH: &str =
     "-auth      optional                     pam_gnome_keyring.so   # irlume-keyring";
 

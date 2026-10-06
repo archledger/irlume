@@ -888,8 +888,10 @@ pub enum Request {
     },
     /// Release the TPM-sealed password to unlock the login keyring WITHOUT a
     /// face match, for the fingerprint path, where `pam_fprintd` has already
-    /// authenticated the user in this PAM transaction (this request only runs at
-    /// the post-auth landing). The daemon cannot re-verify a fingerprint
+    /// authenticated the user in this PAM transaction (a current module sends
+    /// this from the session phase, after authentication and account
+    /// management succeeded; ADR-0003, 2026-10-06 amendment). The daemon cannot
+    /// re-verify a fingerprint
     /// (fprintd owns the sensor), so the gate is: root peer + a login/unlock
     /// service class. Preserves at-rest protection (a stolen disk still can't
     /// unseal); a live root attacker in a login context can obtain it; see
@@ -904,16 +906,21 @@ pub enum Request {
         /// [`Response::KeyringUnlockNotNeeded`] without touching the TPM. For a
         /// `GnomeKeyringToken` envelope the typed password does NOT open the
         /// keyring, so the unseal proceeds regardless. The decision lives in
-        /// the daemon because only it can read the envelope's kind. Defaults to
-        /// `false`, which preserves the old always-unseal behaviour for a PAM
-        /// module from before this field.
+        /// the daemon because only it can read the envelope's kind. The
+        /// session-line caller reports verified evidence only (a wallet this
+        /// login started, or a stashed password the daemon accepted for
+        /// resealing), never a token merely cached in `PAM_AUTHTOK`
+        /// (ADR-0003, 2026-10-06 amendment). Defaults to `false`, which
+        /// preserves the old always-unseal behaviour for a PAM module from
+        /// before this field.
         #[serde(default)]
         have_password: bool,
-        /// Sent by the auth-phase `keyring` line, which is what a lock-screen
-        /// unlock of a running desktop sends. The daemon releases nothing to
+        /// Sent by the auth-phase `keyring` line of a module from before the
+        /// 2026-10-06 session-phase release (ADR-0003); a current module
+        /// makes no auth-phase request. The daemon releases nothing to
         /// such a request while the account has a live local desktop. A
-        /// request without it is served as before: the session-phase GNOME
-        /// keyring token delivery of a login whose auth phase stashed none
+        /// request without it is served as before: the session-phase
+        /// delivery query of a login whose auth phase released nothing
         /// (a session being opened, whose own desktop logind already lists
         /// as live), and any module from before this field, so an older
         /// module meeting a newer daemon during an upgrade still gets its

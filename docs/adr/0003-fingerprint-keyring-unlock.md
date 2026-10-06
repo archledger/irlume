@@ -22,7 +22,8 @@ This ADR extends that to fingerprint.
 
 ## Decision
 
-The auth/session rules below are amended by the 2026-10-01 section.
+The auth/session rules below are amended by the 2026-10-01 and 2026-10-06
+sections.
 
 Add `pam_irlume.so keyring`, wired at the **post-auth landing** of the greeter /
 lock-screen stack (after `@include common-auth`, before `pam_gnome_keyring`). It
@@ -219,9 +220,9 @@ contracts, as the table records.
 
 A later migration needs a tested delivery path for all three kinds, including
 vendor hook ordering, cold first login, second login, password fallback and
-mixed module/daemon versions. The #859 amendment item is therefore only
-partially addressed if it also requires that migration. The separate GNOME
-waiter initialization race is outside this amendment.
+mixed module/daemon versions. The separate GNOME waiter initialization race is
+outside this amendment. The migration itself is the 2026-10-06 amendment
+below, which answers these requirements.
 
 ### Acceptance tests
 
@@ -295,3 +296,126 @@ The daemon tests exercise the installed sibling in a private root, reject
 missing, writable-ancestry and success-only helpers, retain descriptors after
 helper exit, and preserve envelopes when proof fails. Software-TPM tests use
 real subprocess/lock fixtures while keeping their existing seal assertions.
+
+## Amendment 2026-10-06: the fingerprint lane releases from the session phase
+
+The 2026-10-01 section 3 deferred moving every fingerprint-lane release to
+`open_session`. This amendment performs that migration (#859, plan items 2.1
+and 2.2). A PAM stack keeps executing `optional` lines after a failed
+`required` anchor or a failed substack, and the module cannot ask what the
+lines above it returned, so any auth-phase release could follow a failed
+factor: a wrong finger or a timeout released the sealed secret into a
+transaction that was about to fail (the audit's X4/F17). `pam_open_session`
+runs only after `pam_authenticate` and `pam_acct_mgmt` both succeeded, which
+is the proof the auth phase never had.
+
+### 1. The auth-phase `keyring` line releases nothing
+
+The line stays in every stack the wiring writes, as the post-auth landing
+marker `login status` and unwire recognize, but it makes no request, sets no
+token and runs no probe: it returns `PAM_IGNORE` immediately. The bounded
+module-side warm guard of #863/#977 (`keyring_session::auth_release_allowed`,
+with its `getent` child and logind scan) is deleted with it: a module that
+never sends an auth-phase `UnsealKeyring` needs no guard on one, which is a
+strictly stronger form of the same guarantee. The daemon-side warm rule of
+section 1 above is unchanged and keeps covering modules from before this
+amendment, which still send `auth_phase: true` until they are replaced.
+
+### 2. The `reseal` session line releases, at most once per handle
+
+`pam_sm_open_session` with the `reseal` argument now performs the release
+after the self-heal reseal:
+
+- A GNOME keyring token the auth phase stashed (the face `unseal` line's
+  release) is delivered without a new request, as before.
+- Otherwise one `UnsealKeyring { have_password, auth_phase: false }` request
+  serves the fingerprint lane and the stash-less logins together. The reply
+  is routed by kind: a GNOME token and a login password both go to
+  `irlume-gkr-unlock` (the control socket takes the keyring's own secret; a
+  password-keyed keyring's secret is the login password, and the #850 waiter
+  handles a `--login` daemon that is not initialized yet), and a KDE wallet
+  key goes to `irlume-kwallet-init`, which at this phase finds
+  `/run/user/<uid>` in place (#821's delivery moment). The
+  `KeyringUnlockNotNeeded` and error replies deliver nothing; the vendor
+  password path keeps whatever it had.
+
+The emptied-stash sentinel remains the once-guard: a second `open_session`
+on the same handle neither asks again nor starts a second helper. A
+transaction makes at most one release request, in line with ADR-0025's
+one-unseal discipline.
+
+### 3. `have_password` is verified evidence, not presence
+
+The query's flag now reports evidence, not a cached token: a wallet this
+login already started (`PAM_KWALLET5_LOGIN`), or a stashed password the
+daemon just accepted for resealing, counts as a password; a token merely
+cached in `PAM_AUTHTOK` does not, because it may be a typo the stack
+recovered from by granting on another factor (the audit's F23 residual
+half: after a wrong password and a successful fingerprint, the release now
+still happens and the keyring still unlocks). A typed-password login on a
+wired stack still reports `true`: the `reseal` auth line stashed the
+password the stack accepted and the daemon's reseal reply confirms it, so
+the daemon answers `KeyringUnlockNotNeeded` for a password-derived envelope
+without touching the TPM, exactly as before. Where the daemon cannot read
+the login hash (the Debian-family AppArmor profile, LDAP, SSSD), its
+acceptance cannot verify anything and the typo residual of #836 remains:
+the flag stays `true` and the release is skipped, as before this amendment.
+
+### 4. Phase contracts after the move
+
+| Kind | `keyring` auth line | `reseal` session line |
+|---|---|---|
+| Login password | Requests nothing | Released when no password evidence exists and delivered to the keyring control socket |
+| KDE wallet key | Requests nothing | Released when no password evidence exists; `irlume-kwallet-init` starts the wallet (the not-ready exit is final: no stash, no later phase) |
+| GNOME keyring token | Requests nothing | Stash delivered if auth released one (face lane); otherwise released and delivered via `irlume-gkr-unlock` |
+
+Assigning `PAM_AUTHTOK` in the session hook would supply neither vendor
+stash (the GNOME and KDE auth hooks have already run), which is why the
+login password goes to the control socket instead. A hand-written stack
+whose keyring line has no matching `reseal` session line therefore leaves
+the keyring locked after a fingerprint login; the wiring writes the session
+line everywhere it writes the keyring line, and the arm-time delivery
+checks of #865/#982 already require a provably reached session rule for
+token arms. Extending that arm-time requirement to password and wallet-key
+arms is follow-up work.
+
+### 5. Mixed versions
+
+- New module, old daemon: the module sends no auth-phase request; the one
+  session request omits nothing an old daemon needs (older daemons ignore
+  `auth_phase` and answer it as they always answered session queries), and
+  delivery is module-side, so it works against every daemon that releases.
+- Old module, new daemon: unchanged behavior, warm rule included, until the
+  package replaces the module.
+- Neither version double-releases: each release query belongs to one
+  `open_session` on one handle, and the once-guard sentinel holds the
+  second one back.
+
+The warm-second-login question for password and wallet-key kinds (a second
+login of an account whose desktop already runs) keeps the shape section 1
+left it: the session query is exempt from the warm rule because the session
+being opened needs its secret, and lock-state-aware delivery for warm
+accounts is the separate setcred follow-up the plan records as item 2.3.
+
+### Acceptance tests
+
+`crates/irlume-pam/tests/pamwrap.rs` drives the real module through
+pam_wrapper:
+
+- `pamwrap_fp_keyring_failed_{substack,required_anchor,fedora_greeter_landing}_sends_no_unseal`:
+  three stack shapes whose factor fails send no `UnsealKeyring` (one was
+  sent from the auth phase before).
+- `pamwrap_fp_keyring_success_releases_once_in_the_session_phase` and
+  `pamwrap_fp_keyring_session_query_ignores_a_cached_wrong_token`: a
+  successful factor releases exactly once, from the session phase, and a
+  cached wrong token does not count as password evidence.
+- `pamwrap_keyring_upgrade_withholds_warm_release_and_preserves_password`
+  and `pamwrap_keyring_auth_line_is_inert_under_hostile_account_state`:
+  the auth-phase line asks nothing, warm or cold, typed or not, under
+  hostile account state, and never consumes the password or grants.
+- The GNOME token, KDE wallet and reseal suites pin the session-phase
+  delivery, the once-guard, the running-wallet interlock and the evidence
+  rule per kind.
+
+Daemon-side warm withholding keeps its own tests in `irlume-daemon`
+(`a_warm_unlock_releases_no_keyring_secret` and the unseal gates).

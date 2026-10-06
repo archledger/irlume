@@ -335,23 +335,23 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tflite"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04572c5bb8674557ffad483fa278829b933e98ad584290ed331f791b3ecd80c3"
+checksum = "e515498b06278583eb95070b779f0932e32428b3d7c5c097316f630bc1efd28c"
 dependencies = [
  "edgefirst-tflite-sys",
  "flatbuffers",
  "libloading 0.9.0",
  "log",
- "num-derive",
+ "num-derive 0.5.1",
  "num-traits",
 ]
 
 [[package]]
 name = "edgefirst-tflite-sys"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a73bebc09b5eb609ccc976bfb944f882bee016fb6e7cc54e54d470e01026a277"
+checksum = "458c8adba94ceeb5f15a6c7d28553f5622110dd29b74b5b9b535a3988f5eaba5"
 dependencies = [
  "flate2",
  "libloading 0.9.0",
@@ -400,7 +400,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -820,6 +820,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-derive"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4e98dc3b890f6c23a0f9d3d491a2823d0dea0fa656302a13dd225fa924112a8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
 name = "num-integer"
 version = "0.1.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1157,7 +1168,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1464,7 +1475,7 @@ dependencies = [
  "hostname-validator",
  "log",
  "mbox",
- "num-derive",
+ "num-derive 0.4.2",
  "num-traits",
  "oid",
  "picky-asn1",

@@ -51,8 +51,8 @@ fn source_with_gdm(
             };
             gdm_source(&[custom, runtime], user)
         }
-        // System drop-ins, then the admin's, then the main file. Their Qt
-        // collation need not match this CLI's locale or byte ordering.
+        // System drop-ins, then the admin's, then the main file, each
+        // directory in the login manager's QDir::LocaleAware order.
         "sddm" => last_user_in(
             root,
             &["usr/lib/sddm/sddm.conf.d", "etc/sddm.conf.d"],
@@ -105,8 +105,8 @@ pub(super) fn read(path: &Path) -> Result<Option<String>, String> {
 }
 
 /// Candidate files, in deterministic byte order; none when `dir` is absent.
-/// LightDM consumes this order and `*.conf` filter. Qt callers use the files
-/// as an unordered layer, since byte order does not establish Qt collation.
+/// LightDM consumes this order and `*.conf` filter. Qt callers reorder each
+/// layer through [`qt_read_order`], since byte order is not Qt collation.
 fn drop_ins(dir: &Path, conf_only: bool) -> Result<Vec<PathBuf>, String> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -288,9 +288,11 @@ fn gdm_source(files: &[PathBuf], user: &str) -> Result<Option<PathBuf>, String> 
     Ok(None)
 }
 
-/// Each directory is a priority layer. Without the daemon's Qt backend and
-/// locale, conservatively consider every file as a potential last assignment.
-/// Decide only when they agree about this account; a later layer replaces them.
+/// Each directory is a priority layer the login manager reads in Qt's
+/// locale-aware collation, a later layer replacing an earlier one and the
+/// main file read last. A layer whose file names the modeled collation does
+/// not cover keeps every file a potential last assignment, decided only
+/// when they agree about this account.
 fn last_user_in(
     root: &Path,
     dirs: &[&str],
@@ -302,11 +304,24 @@ fn last_user_in(
     // assignment. Each can inherit from or override a preceding layer.
     let mut candidates: [Vec<(String, PathBuf)>; 2] = [Vec::new(), Vec::new()];
     for dir in dirs {
+        let files = drop_ins(&root.join(dir), false)?;
         let mut layer = [Vec::new(), Vec::new()];
-        for path in drop_ins(&root.join(dir), false)? {
-            for (lane, value) in layer.iter_mut().zip(qt_users_in(&path, plasma, false)?) {
-                if let Some(value) = value {
-                    lane.push((value, path.clone()));
+        if let Some(order) = qt_read_order(&files) {
+            // A file read later overrides the same key, so per parser
+            // interpretation only the last User= survives.
+            for path in order {
+                for (lane, value) in layer.iter_mut().zip(qt_users_in(path, plasma, false)?) {
+                    if let Some(value) = value {
+                        *lane = vec![(value, path.to_path_buf())];
+                    }
+                }
+            }
+        } else {
+            for path in &files {
+                for (lane, value) in layer.iter_mut().zip(qt_users_in(path, plasma, false)?) {
+                    if let Some(value) = value {
+                        lane.push((value, path.clone()));
+                    }
                 }
             }
         }
@@ -336,6 +351,63 @@ fn last_user_in(
         return Ok(Some(path.clone()));
     }
     Ok(None)
+}
+
+/// The order a login manager reads `files` in. SDDM (ConfigReader.cpp,
+/// cff7df4) and Plasma Login (MainConfigLoader.cpp, d66f6882) enumerate
+/// each drop-in directory with `QDir::entryInfoList(QDir::Files |
+/// QDir::NoDotAndDotDot, QDir::LocaleAware)`, and Qt sorts LocaleAware
+/// with a default-constructed QCollator (Qt 6 qdir.cpp sortFileList;
+/// Qt 5 QString::localeAwareCompare, which wraps the same collator):
+/// case sensitive, numeric mode off, punctuation not ignorable, ICU
+/// default (tertiary) strength. For names confined to
+/// `[0-9A-Za-z._-]` that collation is the DUCET order, which CLDR's
+/// root collation has equalled since CLDR 46 (UTS#35 "Root
+/// Collation"): `_` < `-` < `.` < digits < letters, letters compared
+/// case-insensitively with lowercase before uppercase at the case
+/// level. The daemon's own collation locale is not observable here: a
+/// C locale makes Qt fall back to byte order, and locales can tailor
+/// even this ASCII order; neither is modeled. A name outside the
+/// alphabet is not modeled either. Returns `None` then, so the
+/// caller keeps every file a potential last assignment.
+fn qt_read_order(files: &[PathBuf]) -> Option<Vec<&Path>> {
+    let mut keyed = Vec::with_capacity(files.len());
+    for (index, path) in files.iter().enumerate() {
+        keyed.push((qt_collation_key(path.file_name()?.to_str()?)?, index));
+    }
+    // Distinct supported names never share a key, so the index only
+    // keeps the sort total.
+    keyed.sort();
+    Some(
+        keyed
+            .into_iter()
+            .map(|(_, index)| files[index].as_path())
+            .collect(),
+    )
+}
+
+/// The modeled collation key of a file name: primary ranks, then the
+/// case level. DUCET primary weights (UCA 15.1.0 allkeys.txt): `_`
+/// 020B, `-` 020D, `.` 0281, digits 209F through 20A8, letters 20A9
+/// through 23A9; every secondary weight is common, and a letter's
+/// lowercase tertiary 0002 sorts below its uppercase 0008.
+fn qt_collation_key(name: &str) -> Option<(Vec<u8>, Vec<bool>)> {
+    let mut primary = Vec::with_capacity(name.len());
+    let mut case = Vec::with_capacity(name.len());
+    for c in name.chars() {
+        let (rank, upper) = match c {
+            '_' => (0, false),
+            '-' => (1, false),
+            '.' => (2, false),
+            '0'..='9' => (3 + (c as u8 - b'0'), false),
+            'a'..='z' => (13 + (c as u8 - b'a'), false),
+            'A'..='Z' => (13 + (c as u8 - b'A'), true),
+            _ => return None,
+        };
+        primary.push(rank);
+        case.push(upper);
+    }
+    Some((primary, case))
 }
 
 fn qt_users_in(path: &Path, plasma: bool, main: bool) -> Result<[Option<String>; 2], String> {
@@ -778,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn qt_order_sensitive_autologin_is_unknown_without_daemon_collation() {
+    fn conflicting_drop_ins_decide_in_qt_locale_aware_order() {
         let root = Root::new("qt-order");
         for dm in ["sddm", "plasmalogin"] {
             root.put(
@@ -789,13 +861,64 @@ mod tests {
                 &format!("etc/{dm}.conf.d/a.conf"),
                 "[Autologin]\nUser=bob\n",
             );
-            assert!(root.source(dm, "alice").is_err(), "{dm}");
-            assert!(root.source(dm, "bob").is_err(), "{dm}");
+            // QDir::LocaleAware reads a.conf before Z.conf (a before z at
+            // primary strength), the opposite of this process's byte order,
+            // so the file read last names the account.
+            let last = root.0.join(format!("etc/{dm}.conf.d/Z.conf"));
+            assert_eq!(root.source(dm, "alice"), Ok(Some(last)), "{dm}");
+            assert_eq!(root.source(dm, "bob"), Ok(None), "{dm}");
             assert_eq!(root.source(dm, "carol"), Ok(None));
             // The main file decides irrespective of the drop-in comparator.
             let main = root.put(&format!("etc/{dm}.conf"), "[Autologin]\nUser=alice\n");
             assert_eq!(root.source(dm, "alice"), Ok(Some(main)));
             assert_eq!(root.source(dm, "bob"), Ok(None));
+        }
+    }
+
+    #[test]
+    fn qt_collation_case_level_and_punctuation_ranks() {
+        // Same letter, lowercase read before uppercase at the case level:
+        // user.conf, then User.conf, whose value survives. Byte order would
+        // read User.conf first and keep alice.
+        let case = Root::new("qt-case");
+        case.put("etc/sddm.conf.d/user.conf", "[Autologin]\nUser=alice\n");
+        let upper = case.put("etc/sddm.conf.d/User.conf", "[Autologin]\nUser=bob\n");
+        assert_eq!(case.source("sddm", "bob"), Ok(Some(upper)));
+        assert_eq!(case.source("sddm", "alice"), Ok(None));
+
+        // '_' reads before '-' (U+005F primary 020B, U+002D 020D), the
+        // opposite of byte order, so the hyphenated file is read last.
+        let punct = Root::new("qt-punct");
+        punct.put("etc/sddm.conf.d/_a.conf", "[Autologin]\nUser=carol\n");
+        let hyphen = punct.put("etc/sddm.conf.d/-a.conf", "[Autologin]\nUser=dave\n");
+        assert_eq!(punct.source("sddm", "dave"), Ok(Some(hyphen)));
+        assert_eq!(punct.source("sddm", "carol"), Ok(None));
+
+        // Digits (primaries 209F..) read before letters (20A9..), as in
+        // byte order: a.conf is still the last one read.
+        let digits = Root::new("qt-digits");
+        digits.put("etc/sddm.conf.d/1z.conf", "[Autologin]\nUser=erin\n");
+        let letter = digits.put("etc/sddm.conf.d/a.conf", "[Autologin]\nUser=frank\n");
+        assert_eq!(digits.source("sddm", "frank"), Ok(Some(letter)));
+        assert_eq!(digits.source("sddm", "erin"), Ok(None));
+    }
+
+    #[test]
+    fn unmodeled_drop_in_names_stay_unknown_without_collation() {
+        let root = Root::new("qt-unsupported-name");
+        for name in ["ü.conf", "a b.conf"] {
+            root.put("etc/sddm.conf.d/a.conf", "[Autologin]\nUser=alice\n");
+            root.put(
+                &format!("etc/sddm.conf.d/{name}"),
+                "[Autologin]\nUser=carol\n",
+            );
+            // A name outside the modeled collation leaves the layer's read
+            // order unknown, so conflicting accounts stay unknown too.
+            assert!(root.source("sddm", "alice").is_err(), "{name}");
+            assert!(root.source("sddm", "carol").is_err(), "{name}");
+            assert_eq!(root.source("sddm", "bob"), Ok(None), "{name}");
+            std::fs::remove_file(root.0.join("etc/sddm.conf.d/a.conf")).unwrap();
+            std::fs::remove_file(root.0.join(format!("etc/sddm.conf.d/{name}"))).unwrap();
         }
     }
 

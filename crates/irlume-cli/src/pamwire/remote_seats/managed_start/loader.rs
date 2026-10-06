@@ -50,6 +50,11 @@ pub(crate) struct Profile {
 pub(crate) struct Observed {
     /// Sixty-four lowercase hex digits over the whole input closure.
     pub(crate) digest: String,
+    /// Sixty-four lowercase hex digits over every input's identity and
+    /// change times. Compared only for equality between two reads of one
+    /// launch, so a clock step cannot matter; a write that restored the same
+    /// bytes still changes it.
+    pub(crate) stability: String,
     pub(crate) xdmcp_enabled: bool,
     pub(crate) vnc_enabled: bool,
 }
@@ -122,6 +127,7 @@ fn defaults(value: Option<&OsStr>, default: &[PathBuf]) -> bool {
 pub(crate) fn observe(root: &Path, profile: &Profile, public: bool) -> Result<Observed, String> {
     let mut digest = Sha256::new();
     digest.update(b"irlume-lightdm-loader-v1\n");
+    let mut stability = Sha256::new();
     let mut loaded = Vec::new();
     let mut entries = 0;
     let named = profile.directories(Path::new("/"));
@@ -135,7 +141,7 @@ pub(crate) fn observe(root: &Path, profile: &Profile, public: bool) -> Result<Ob
             Ok(meta) if !meta.is_dir() => {
                 return Err(format!("{}: not a directory", name.display()));
             }
-            Ok(_) => {}
+            Ok(meta) => stability.update(format!("dir\t{}\t{}\n", name.display(), identity(&meta))),
         }
         if public {
             readable_by_anyone(dir, true).map_err(|e| format!("{}: {e}", name.display()))?;
@@ -166,10 +172,11 @@ pub(crate) fn observe(root: &Path, profile: &Profile, public: bool) -> Result<Ob
                 .filter(|text| !text.chars().any(char::is_control))
                 .ok_or_else(|| format!("{}: unsupported file name", name.display()))?;
             let path = dir.join(text);
-            let bytes = read_candidate(&path, public)
+            let (bytes, meta) = read_candidate(&path, public)
                 .map_err(|e| format!("{}/{text}: {e}", name.display()))?
                 .ok_or_else(|| format!("{}/{text}: disappeared while reading", name.display()))?;
             digest.update(format!("file\t{text}\t{}\n", fingerprint(&bytes)));
+            stability.update(format!("file\t{text}\t{}\n", identity(&meta)));
             loaded.push((name.join(text), bytes));
         }
     }
@@ -177,13 +184,17 @@ pub(crate) fn observe(root: &Path, profile: &Profile, public: bool) -> Result<Ob
     match read_candidate(&profile.main_file(root), public)
         .map_err(|e| format!("{}: {e}", main_name.display()))?
     {
-        None => digest.update(format!("main\t{}\tmissing\n", main_name.display())),
-        Some(bytes) => {
+        None => {
+            digest.update(format!("main\t{}\tmissing\n", main_name.display()));
+            stability.update(b"main\tmissing\n");
+        }
+        Some((bytes, meta)) => {
             digest.update(format!(
                 "main\t{}\t{}\n",
                 main_name.display(),
                 fingerprint(&bytes)
             ));
+            stability.update(format!("main\t{}\n", identity(&meta)));
             loaded.push((main_name, bytes));
         }
     }
@@ -206,6 +217,7 @@ pub(crate) fn observe(root: &Path, profile: &Profile, public: bool) -> Result<Ob
     }
     Ok(Observed {
         digest: hex(&digest.finalize()),
+        stability: hex(&stability.finalize()),
         xdmcp_enabled,
         vnc_enabled,
     })
@@ -214,7 +226,7 @@ pub(crate) fn observe(root: &Path, profile: &Profile, public: bool) -> Result<Ob
 /// The bytes of one candidate, following symlinks as LightDM does, or `None`
 /// when nothing is there. Anything but a bounded regular file is refused, and
 /// the descriptor read is checked to be the file that was examined.
-fn read_candidate(path: &Path, public: bool) -> Result<Option<Vec<u8>>, String> {
+fn read_candidate(path: &Path, public: bool) -> Result<Option<(Vec<u8>, Metadata)>, String> {
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -242,7 +254,21 @@ fn read_candidate(path: &Path, public: bool) -> Result<Option<Vec<u8>>, String> 
     if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err("not a bounded regular file".into());
     }
-    Ok(Some(bytes))
+    Ok(Some((bytes, opened)))
+}
+
+/// Device, inode, size and both change times in nanoseconds.
+fn identity(meta: &Metadata) -> String {
+    format!(
+        "{}\t{}\t{}\t{}.{:09}\t{}.{:09}",
+        meta.dev(),
+        meta.ino(),
+        meta.size(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+        meta.ctime_nsec()
+    )
 }
 
 /// Whether a user with no special rights could read `path` the same way:
@@ -467,6 +493,23 @@ mod tests {
             tree.observe().unwrap().digest,
             "a non-candidate name is not read"
         );
+    }
+
+    #[test]
+    fn a_rewrite_of_the_same_bytes_changes_stability_but_not_the_digest() {
+        let tree = Tree::new("stability");
+        let main = tree.put("etc/lightdm/lightdm.conf", XDMCP_OFF);
+        let before = tree.observe().unwrap();
+        assert_eq!(before, tree.observe().unwrap(), "two quiet reads agree");
+        std::fs::File::options()
+            .write(true)
+            .open(&main)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(9))
+            .unwrap();
+        let after = tree.observe().unwrap();
+        assert_eq!(before.digest, after.digest);
+        assert_ne!(before.stability, after.stability);
     }
 
     #[test]

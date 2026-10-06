@@ -29,7 +29,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
 use super::loader::{self, Profile};
-use super::system::{parse_manager, read_trusted_text, RECEIPT_NAME};
+use super::system::{read_trusted_text, MANAGED_RUN, RECEIPT_NAME};
 use super::{Receipt, LIGHTDM_UNIT, SCHEMA_VERSION};
 
 /// The prepare-time record, private to root.
@@ -45,6 +45,9 @@ struct Prepared {
     unit: String,
     invocation_id: String,
     digest: String,
+    /// Metadata of every input, compared by equality at commit so a rewrite
+    /// restored before the commit is still seen.
+    stability: String,
     xdmcp_enabled: bool,
     vnc_enabled: bool,
 }
@@ -65,11 +68,9 @@ pub(crate) struct Target {
 /// Everything the producer observes, so tests can supply it.
 pub(crate) trait Host {
     fn env(&self, name: &str) -> Option<OsString>;
-    /// `systemctl show` output for `unit` with the properties
-    /// [`parse_manager`] needs.
-    fn show(&self, unit: &str) -> Result<String, String>;
-    /// The unit's `Type=` as the manager reports it.
-    fn unit_type(&self, unit: &str) -> Result<String, String>;
+    /// `systemctl show` output for `unit` with the launch properties
+    /// [`parse_launch`] reads: state, identity and `Type=`, in one sample.
+    fn launch(&self, unit: &str) -> Result<String, String>;
     fn target(&self, pid: u32) -> Result<Target, String>;
     /// Device and inode of an executable path, following links.
     fn identity(&self, path: &Path) -> Result<(u64, u64), String>;
@@ -93,12 +94,8 @@ impl Host for RealHost {
         std::env::var_os(name)
     }
 
-    fn show(&self, unit: &str) -> Result<String, String> {
-        super::system::systemctl_show(unit)
-    }
-
-    fn unit_type(&self, unit: &str) -> Result<String, String> {
-        super::system::systemctl_unit_type(unit)
+    fn launch(&self, unit: &str) -> Result<String, String> {
+        super::system::systemctl_show_launch(unit)
     }
 
     fn target(&self, pid: u32) -> Result<Target, String> {
@@ -162,7 +159,7 @@ impl Host for RealHost {
     }
 
     fn runtime(&self) -> &Path {
-        Path::new(super::super::super::lightdm_view::RUN)
+        Path::new(MANAGED_RUN)
     }
 
     fn trusted_uid(&self) -> u32 {
@@ -196,6 +193,7 @@ pub(crate) fn run(action: &str, args: &[String]) -> std::process::ExitCode {
 
 /// Record the configuration LightDM is about to load.
 pub(crate) fn prepare(host: &dyn Host, unit: &str) -> Result<(), String> {
+    runtime_root(host, true)?;
     // A new launch retires whatever the previous one published.
     retire(host)?;
     supported_unit(unit)?;
@@ -211,6 +209,7 @@ pub(crate) fn prepare(host: &dyn Host, unit: &str) -> Result<(), String> {
         unit: unit.into(),
         invocation_id,
         digest: observed.digest,
+        stability: observed.stability,
         xdmcp_enabled: observed.xdmcp_enabled,
         vnc_enabled: observed.vnc_enabled,
     };
@@ -221,6 +220,7 @@ pub(crate) fn prepare(host: &dyn Host, unit: &str) -> Result<(), String> {
 /// Bind the loaded configuration to the running invocation and publish the
 /// public receipt.
 pub(crate) fn commit(host: &dyn Host, unit: &str) -> Result<Receipt, String> {
+    runtime_root(host, false)?;
     retire(host)?;
     supported_unit(unit)?;
     let invocation_id = invocation(host)?;
@@ -242,15 +242,6 @@ pub(crate) fn commit(host: &dyn Host, unit: &str) -> Result<Receipt, String> {
     {
         return Err("the prepared record names another launch".into());
     }
-    // Only Type=dbus starts ExecStartPost= after the bus name, which LightDM
-    // takes after loading configuration; any other type could run this
-    // before the load and bind bytes LightDM had not read yet.
-    let unit_type = host.unit_type(unit)?;
-    if unit_type != "dbus" {
-        return Err(format!(
-            "{unit} has Type={unit_type}; only dbus orders this commit after the load"
-        ));
-    }
     let before = launch(host, unit, &invocation_id, main_pid)?;
     let target = host.target(main_pid)?;
     supported_target(host, &target)?;
@@ -261,6 +252,7 @@ pub(crate) fn commit(host: &dyn Host, unit: &str) -> Result<Receipt, String> {
     .ok_or("the running LightDM's XDG search path is not GLib's default")?;
     let observed = loader::observe(host.root(), &profile, true)?;
     if observed.digest != record.digest
+        || observed.stability != record.stability
         || observed.xdmcp_enabled != record.xdmcp_enabled
         || observed.vnc_enabled != record.vnc_enabled
     {
@@ -305,19 +297,106 @@ fn invocation(host: &dyn Host) -> Result<String, String> {
         .ok_or_else(|| "INVOCATION_ID is missing or malformed".into())
 }
 
-/// The manager's monotonic start of the running launch, after checking it is
-/// this invocation with this main process.
+/// One sample of the manager's view while this commit runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Launch {
+    load: String,
+    active: String,
+    sub: String,
+    main_pid: u32,
+    invocation_id: String,
+    exec_start_monotonic_us: u64,
+    unit_type: String,
+}
+
+const LAUNCH_PROPERTIES: [&str; 7] = [
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "MainPID",
+    "InvocationID",
+    "ExecMainStartTimestampMonotonic",
+    "Type",
+];
+
+/// Strictly parse `systemctl show` output for [`LAUNCH_PROPERTIES`]: every
+/// property exactly once and nothing else.
+fn parse_launch(text: &str) -> Option<Launch> {
+    let mut values: [Option<&str>; 7] = [None; 7];
+    for line in text.lines() {
+        let (name, value) = line.split_once('=')?;
+        let slot = LAUNCH_PROPERTIES.iter().position(|p| *p == name)?;
+        if values[slot].replace(value).is_some() {
+            return None;
+        }
+    }
+    let [Some(load), Some(active), Some(sub), Some(pid), Some(invocation), Some(start), Some(kind)] =
+        values
+    else {
+        return None;
+    };
+    let digits = |text: &str| -> Option<u64> {
+        (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| text.parse().ok())
+            .flatten()
+    };
+    Some(Launch {
+        load: load.into(),
+        active: active.into(),
+        sub: sub.into(),
+        main_pid: u32::try_from(digits(pid)?).ok()?,
+        invocation_id: invocation.into(),
+        exec_start_monotonic_us: digits(start)?,
+        unit_type: kind.into(),
+    })
+}
+
+/// The manager's monotonic start of this launch, after checking it is this
+/// invocation with this main process, in the state systemd gives every
+/// `ExecStartPost=` command (`activating`, `start-post`), and of a type that
+/// starts that command only after LightDM took its bus name. LightDM takes
+/// it after loading configuration; any other type could run the commit
+/// before the load and bind bytes LightDM had not read yet.
 fn launch(host: &dyn Host, unit: &str, invocation_id: &str, main_pid: u32) -> Result<u64, String> {
-    let seen = parse_manager(unit, &host.show(unit)?)
-        .ok_or("the manager's view of LightDM is unsettled or unreadable")?;
-    if !seen.active
+    let seen = parse_launch(&host.launch(unit)?)
+        .ok_or("the manager's view of LightDM is incomplete or malformed")?;
+    if seen.unit_type != "dbus" {
+        return Err(format!(
+            "{unit} has Type={}; only dbus orders this commit after the load",
+            seen.unit_type
+        ));
+    }
+    if seen.load != "loaded"
+        || seen.active != "activating"
+        || seen.sub != "start-post"
         || seen.invocation_id != invocation_id
         || seen.main_pid != main_pid
         || seen.exec_start_monotonic_us == 0
     {
-        return Err("the manager does not report this launch as running".into());
+        return Err("the manager does not report this launch in its start-post phase".into());
     }
     Ok(seen.exec_start_monotonic_us)
+}
+
+/// The records' directory: owned by the trusted user, a real directory and
+/// writable by nobody else. Prepare creates it when it is missing; the drop-in
+/// leaves LightDM's own runtime root read-only, so records live beside it.
+fn runtime_root(host: &dyn Host, create: bool) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+    let dir = host.runtime();
+    if create {
+        match std::fs::DirBuilder::new().mode(0o755).create(dir) {
+            Ok(()) => std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("{}: {e}", dir.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("{}: {e}", dir.display())),
+        }
+    }
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if !meta.is_dir() || meta.uid() != host.trusted_uid() || meta.mode() & 0o022 != 0 {
+        return Err(format!("{}: not a trusted record directory", dir.display()));
+    }
+    Ok(())
 }
 
 /// The target runs a supported LightDM executable with no arguments, and
@@ -370,9 +449,11 @@ fn publish(path: &Path, text: &str, mode: u32) -> Result<(), String> {
         file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
         std::fs::rename(&staging, path).map_err(|e| format!("{}: {e}", path.display()))?;
-        std::fs::File::open(dir)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|e| e.to_string())
+        // Once renamed the record stands; flushing the directory entry is
+        // best effort on this tmpfs and must not report a published record
+        // as a failure.
+        let _ = std::fs::File::open(dir).and_then(|dir| dir.sync_all());
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&staging);
@@ -397,7 +478,6 @@ mod tests {
         runtime: PathBuf,
         env: RefCell<Vec<(&'static str, Option<OsString>)>>,
         manager: RefCell<String>,
-        unit_type: RefCell<String>,
         target: RefCell<Result<Target, String>>,
         identities: RefCell<Vec<(PathBuf, (u64, u64))>>,
     }
@@ -424,8 +504,7 @@ mod tests {
                     ("INVOCATION_ID", Some(INVOCATION.into())),
                     ("MAINPID", Some(PID.to_string().into())),
                 ]),
-                manager: RefCell::new(running(PID)),
-                unit_type: RefCell::new("dbus".into()),
+                manager: RefCell::new(start_post(PID)),
                 target: RefCell::new(Ok(target("/usr/sbin/lightdm"))),
                 identities: RefCell::new(vec![("/usr/sbin/lightdm".into(), EXE)]),
             }
@@ -463,11 +542,8 @@ mod tests {
                 .find(|(key, _)| *key == name)
                 .and_then(|(_, value)| value.clone())
         }
-        fn show(&self, _unit: &str) -> Result<String, String> {
+        fn launch(&self, _unit: &str) -> Result<String, String> {
             Ok(self.manager.borrow().clone())
-        }
-        fn unit_type(&self, _unit: &str) -> Result<String, String> {
-            Ok(self.unit_type.borrow().clone())
         }
         fn target(&self, _pid: u32) -> Result<Target, String> {
             self.target.borrow().clone()
@@ -500,6 +576,14 @@ mod tests {
         format!(
             "LoadState=loaded\nActiveState=active\nMainPID={pid}\n\
              InvocationID={INVOCATION}\nExecMainStartTimestampMonotonic=15720777\n"
+        )
+    }
+
+    /// What the manager reports while an `ExecStartPost=` command runs.
+    fn start_post(pid: u32) -> String {
+        format!(
+            "LoadState=loaded\nActiveState=activating\nSubState=start-post\nMainPID={pid}\n\
+             InvocationID={INVOCATION}\nExecMainStartTimestampMonotonic=15720777\nType=dbus\n"
         )
     }
 
@@ -577,7 +661,7 @@ mod tests {
             "[VNCServer]\nenabled=true\n",
         );
         fake.set_env("MAINPID", Some(&child.id().to_string()));
-        *fake.manager.borrow_mut() = running(child.id());
+        *fake.manager.borrow_mut() = start_post(child.id());
         LIVE_PID.with(|cell| cell.set(child.id()));
         prepare(&fake, LIGHTDM_UNIT).unwrap();
         commit(&fake, LIGHTDM_UNIT).unwrap();
@@ -615,13 +699,23 @@ mod tests {
     #[test]
     fn commit_requires_the_managers_own_launch_identity() {
         for manager in [
-            running(PID + 1),
-            running(PID).replace(INVOCATION, &"b".repeat(32)),
-            running(PID).replace("ActiveState=active", "ActiveState=activating"),
-            running(PID).replace(
+            start_post(PID + 1),
+            start_post(PID).replace(INVOCATION, &"b".repeat(32)),
+            // The consumer's settled state is not a start-post phase.
+            start_post(PID).replace(
+                "ActiveState=activating\nSubState=start-post",
+                "ActiveState=active\nSubState=running",
+            ),
+            // ExecStartPre= and the main start are other phases.
+            start_post(PID).replace("SubState=start-post", "SubState=start-pre"),
+            start_post(PID).replace("SubState=start-post", "SubState=start"),
+            start_post(PID).replace("LoadState=loaded", "LoadState=masked"),
+            start_post(PID).replace(
                 "ExecMainStartTimestampMonotonic=15720777",
                 "ExecMainStartTimestampMonotonic=0",
             ),
+            start_post(PID).replace("Type=dbus\n", ""),
+            format!("{}MainPID={PID}\n", start_post(PID)),
         ] {
             let fake = Fake::new("identity");
             prepare(&fake, LIGHTDM_UNIT).unwrap();
@@ -697,10 +791,11 @@ mod tests {
         // Only Type=dbus orders ExecStartPost= after LightDM's bus name,
         // which it takes after loading configuration. Any other type could
         // run the commit before the load.
-        for unit_type in ["simple", "exec", "notify", "forking", "oneshot", ""] {
+        for unit_type in ["simple", "exec", "notify", "forking", "oneshot", "idle", ""] {
             let fake = Fake::new("type");
             prepare(&fake, LIGHTDM_UNIT).unwrap();
-            *fake.unit_type.borrow_mut() = unit_type.into();
+            *fake.manager.borrow_mut() =
+                start_post(PID).replace("Type=dbus", &format!("Type={unit_type}"));
             assert!(commit(&fake, LIGHTDM_UNIT).is_err(), "{unit_type:?}");
             assert!(!fake.runtime.join(RECEIPT_NAME).exists());
         }
@@ -713,7 +808,7 @@ mod tests {
         commit(&fake, LIGHTDM_UNIT).unwrap();
         assert!(fake.runtime.join(RECEIPT_NAME).exists());
         fake.set_env("INVOCATION_ID", Some(&"c".repeat(32)));
-        *fake.manager.borrow_mut() = running(PID).replace(INVOCATION, &"c".repeat(32));
+        *fake.manager.borrow_mut() = start_post(PID).replace(INVOCATION, &"c".repeat(32));
         assert!(
             commit(&fake, LIGHTDM_UNIT).is_err(),
             "no record for the new launch"
@@ -722,5 +817,49 @@ mod tests {
             !fake.runtime.join(RECEIPT_NAME).exists(),
             "a later launch must not leave the old receipt standing"
         );
+    }
+
+    #[test]
+    fn prepare_creates_its_record_directory_beside_the_read_only_view() {
+        let fake = Fake::new("mkdir");
+        std::fs::remove_dir(&fake.runtime).unwrap();
+        prepare(&fake, LIGHTDM_UNIT).expect("prepared");
+        let meta = std::fs::metadata(&fake.runtime).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o755);
+        assert!(commit(&fake, LIGHTDM_UNIT).is_ok());
+    }
+
+    #[test]
+    fn records_refuse_a_directory_others_could_change_or_a_missing_one() {
+        let fake = Fake::new("untrusted");
+        std::fs::set_permissions(&fake.runtime, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(prepare(&fake, LIGHTDM_UNIT).is_err());
+        std::fs::set_permissions(&fake.runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prepare(&fake, LIGHTDM_UNIT).unwrap();
+        std::fs::remove_dir_all(&fake.runtime).unwrap();
+        assert!(
+            commit(&fake, LIGHTDM_UNIT).is_err(),
+            "commit never creates the directory"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_restored_before_the_commit_publishes_nothing() {
+        let fake = Fake::new("restored");
+        fake.config("etc/lightdm/lightdm.conf", "[XDMCPServer]\nenabled=false\n");
+        prepare(&fake, LIGHTDM_UNIT).unwrap();
+        // Same bytes again, as after an edit that was put back: the content
+        // digest matches, but the file is not the one prepare saw unchanged.
+        let main = fake.root.join("etc/lightdm/lightdm.conf");
+        std::fs::write(&main, "[XDMCPServer]\nenabled=false\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&main)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7))
+            .unwrap();
+        assert!(commit(&fake, LIGHTDM_UNIT).is_err());
+        assert!(!fake.runtime.join(RECEIPT_NAME).exists());
     }
 }

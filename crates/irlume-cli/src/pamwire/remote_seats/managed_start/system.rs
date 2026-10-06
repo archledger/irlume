@@ -36,7 +36,12 @@ use std::time::{Duration, Instant};
 
 use super::{AbsenceProof, ManagerObservation, Receipt, Source, LIGHTDM_UNIT};
 
-/// The receipt's name inside LightDM's runtime root.
+/// The records' directory, beside LightDM's runtime root: the drop-in binds
+/// that root read-only inside the unit, where the producer runs, so records
+/// cannot live in it. Root-owned and readable by anyone.
+pub(crate) const MANAGED_RUN: &str = "/run/irlume-lightdm-managed";
+
+/// The receipt's name inside [`MANAGED_RUN`].
 pub(crate) const RECEIPT_NAME: &str = "managed-start.json";
 
 /// A receipt is a few hundred bytes; anything near this is not one.
@@ -69,7 +74,7 @@ impl SystemSource {
     pub(crate) fn lightdm() -> Self {
         SystemSource {
             unit: LIGHTDM_UNIT,
-            runtime_root: PathBuf::from(super::super::super::lightdm_view::RUN),
+            runtime_root: PathBuf::from(MANAGED_RUN),
             trusted_uid: 0,
             show: systemctl_show,
         }
@@ -124,18 +129,28 @@ pub(crate) fn systemctl_show(unit: &str) -> Result<String, String> {
     String::from_utf8(out.stdout).map_err(|_| format!("systemctl show {unit}: not UTF-8"))
 }
 
-/// The unit's `Type=` as the manager reports it, bounded like every query.
-pub(crate) fn systemctl_unit_type(unit: &str) -> Result<String, String> {
+/// `systemctl show` for the producer's launch sample: state, sub-state,
+/// identity and `Type=` together, bounded like every query.
+pub(crate) fn systemctl_show_launch(unit: &str) -> Result<String, String> {
     let mut command = Command::new("systemctl");
-    command.args(["show", unit, "--no-pager", "--value", "-p", "Type"]);
+    command.args(["show", unit, "--no-pager"]);
+    for property in [
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "MainPID",
+        "InvocationID",
+        "ExecMainStartTimestampMonotonic",
+        "Type",
+    ] {
+        command.args(["-p", property]);
+    }
     let out = irlume_common::process::output_until(&mut command, Instant::now() + SHOW_DEADLINE)
         .map_err(|e| format!("systemctl show {unit}: {e}"))?;
     if !out.status.success() {
         return Err(format!("systemctl show {unit} failed"));
     }
-    String::from_utf8(out.stdout)
-        .map(|text| text.trim_end_matches('\n').to_string())
-        .map_err(|_| format!("systemctl show {unit}: not UTF-8"))
+    String::from_utf8(out.stdout).map_err(|_| format!("systemctl show {unit}: not UTF-8"))
 }
 
 /// Read one sample of the manager's view of `unit` from `systemctl show`

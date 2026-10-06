@@ -122,7 +122,8 @@ fn drop_ins(dir: &Path, conf_only: bool) -> Result<Vec<PathBuf>, String> {
         if !conf_only && entry.file_name().as_encoded_bytes().starts_with(b".") {
             continue;
         }
-        if conf_only && path.extension().is_none_or(|ext| ext != "conf") {
+        // LightDM tries every name ending in ".conf", the bare name included.
+        if conf_only && !entry.file_name().as_encoded_bytes().ends_with(b".conf") {
             continue;
         }
         // Files only, following links as the login managers do. A link to

@@ -34,7 +34,12 @@ pub(super) fn files(root: &Path) -> Result<Vec<PathBuf>, String> {
                 return Err("too many LightDM configuration entries".into());
             }
             let path = entry.map_err(|e| format!("{}: {e}", dir.display()))?.path();
-            if path.extension().is_some_and(|ext| ext == "conf") {
+            // LightDM tries every name ending in ".conf", the bare name
+            // included; Path::extension would miss ".conf".
+            if path
+                .file_name()
+                .is_some_and(|name| name.as_encoded_bytes().ends_with(b".conf"))
+            {
                 group.push(path);
             }
         }

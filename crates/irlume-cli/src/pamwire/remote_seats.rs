@@ -355,6 +355,23 @@ mod tests {
     }
 
     #[test]
+    fn a_drop_in_named_only_conf_counts_as_lightdm_loads_it() {
+        // LightDM tries every name ending in ".conf", the bare name included.
+        let root = Root::new("bare-conf");
+        root.put(
+            "etc/lightdm/lightdm.conf.d/.conf",
+            "[XDMCPServer]\nenabled=true\n",
+        );
+        assert_eq!(
+            root.servers()
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            vec!["XDMCP"]
+        );
+    }
+
+    #[test]
     fn malformed_gkeyfile_cannot_clear_a_remote_server() {
         let root = Root::new("malformed-gkeyfile");
         root.put(

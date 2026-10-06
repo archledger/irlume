@@ -87,7 +87,13 @@ class Packaging(unittest.TestCase):
                 actual = (units / name).read_text()
                 self.assertNotIn("ExecStart=/usr/bin/irlume", actual)
                 self.assertNotIn("ExecStartPre=/usr/bin/irlume", actual)
+                # Prefixed commands ("-", "+", ...) must be rewritten too.
+                live = [line for line in actual.splitlines() if not line.lstrip().startswith("#")]
+                self.assertEqual([line for line in live if "/usr/bin/irlume" in line], [], name)
             self.assertIn("ExecStart=/usr/local/bin/irlume login lightdm-prestart", (units / UNITS[0]).read_text())
+            dropin = (units / DROPIN).read_text().splitlines()
+            self.assertIn("ExecStartPre=-/usr/local/bin/irlume login lightdm-managed-prepare lightdm.service", dropin)
+            self.assertIn("ExecStartPost=-/usr/local/bin/irlume login lightdm-managed-commit lightdm.service", dropin)
 
     def test_session_module_is_installed_in_every_fhs_lane(self):
         for lane, relative in (("packaging/fedora/irlume.spec", "usr/lib64/security/pam_irlume_view.so"),

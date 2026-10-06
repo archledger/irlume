@@ -55,6 +55,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Paired startup consumes bounded native Parked returns before admission while
+  keeping ERROR buffers unviewed and unrequeued. A handled startup park revokes
+  both streams' cached admission and requires fresh clean full paired windows;
+  other capture and authority failures retain their refusals. Split activation
+  remains closed (ADR-0021, parked-buffer amendment; #995).
+
 - Authentication rechecks retained account stores after preparation admission
   and lease contention, before opening cameras. IR readiness refuses pending
   secondary journals without recovery, while no-candidate IR requests preserve

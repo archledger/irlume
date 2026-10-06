@@ -604,6 +604,13 @@ pub(crate) struct IlluminationLog {
     lifecycle: Option<std::sync::Arc<std::sync::Mutex<tests::lifecycle::FakeDevice>>>,
 }
 
+#[cfg(test)]
+pub(crate) fn composed_startup_test_log(
+    events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+) -> (IlluminationLog, impl Fn(i64), impl FnOnce()) {
+    tests::lifecycle::composed_startup_log(events)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MetadataSelection<'a> {
     Discover,

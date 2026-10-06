@@ -96,7 +96,7 @@ pub(super) fn warmup_retry(error: &io::Error) -> Option<bool> {
 /// ERROR-marked buffers that may be parked before a stream delivers its first
 /// frame. A Logitech BRIO marks exactly one: the first IR buffer after its RGB
 /// sensor path was used. Two leaves margin without hiding a failing stream.
-const MAX_PARKED_STARTUP_ERRORS: u32 = 2;
+pub(super) const MAX_PARKED_STARTUP_ERRORS: u32 = 2;
 
 /// A parked start-up buffer: the driver returned at once and more frames are
 /// already waiting, so the caller may dequeue again without a gap.

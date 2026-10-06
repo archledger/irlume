@@ -26,6 +26,9 @@ pub(crate) struct FakeDevice {
     /// Scripted DQBUF flags, consumed before the one-shot `error_frame` path.
     frame_flags: std::collections::VecDeque<u32>,
     delivered: u32,
+    payload: Option<Vec<u8>>,
+    timestamps: std::collections::VecDeque<i64>,
+    shared_events: Option<Arc<Mutex<Vec<&'static str>>>>,
 }
 
 impl FakeDevice {
@@ -46,6 +49,9 @@ impl FakeDevice {
             dequeued: false,
             frame_flags: std::collections::VecDeque::new(),
             delivered: 0,
+            payload: None,
+            timestamps: std::collections::VecDeque::new(),
+            shared_events: None,
         }
     }
 
@@ -53,6 +59,9 @@ impl FakeDevice {
         assert!(self.mapped > 0, "unmap without a live metadata mapping");
         self.mapped -= 1;
         self.events.push("unmap".into());
+        if let Some(events) = &self.shared_events {
+            events.lock().unwrap().push("metadata-unmap");
+        }
     }
 
     pub(crate) fn view_created(&mut self) {
@@ -62,6 +71,9 @@ impl FakeDevice {
     pub(crate) fn closed(&mut self) {
         self.closes += 1;
         self.events.push("close".into());
+        if let Some(events) = &self.shared_events {
+            events.lock().unwrap().push("metadata-close");
+        }
     }
 
     // SAFETY: the caller must pass the initialized, writable ABI type matching
@@ -73,6 +85,14 @@ impl FakeDevice {
         what: &str,
     ) -> Result<(), String> {
         self.events.push(what.into());
+        if let Some(events) = &self.shared_events {
+            if what == "STREAMOFF" {
+                events.lock().unwrap().push("metadata-stop");
+            }
+            if what == "REQBUFS(0)" {
+                events.lock().unwrap().push("metadata-release");
+            }
+        }
         if self.fail == Some(what) && request != vidioc_s_fmt() {
             return Err(format!("injected {what} failure"));
         }
@@ -116,8 +136,15 @@ impl FakeDevice {
                 };
                 buf.index = self.delivered % self.count;
                 self.delivered += 1;
-                buf.bytesused = 16;
+                buf.bytesused = self
+                    .payload
+                    .as_ref()
+                    .map_or(16, |payload| payload.len() as u32);
                 buf.flags = flags;
+                if let Some(timestamp) = self.timestamps.pop_front() {
+                    buf.timestamp.sec = timestamp / 1_000_000;
+                    buf.timestamp.usec = timestamp % 1_000_000;
+                }
                 return Ok(());
             }
             if self.dequeued {
@@ -164,6 +191,25 @@ pub(crate) fn map_buffer(
         )
     };
     assert_ne!(ptr, libc::MAP_FAILED);
+    if let Some(payload) = &state.payload {
+        assert!(payload.len() <= buf.length as usize);
+        assert_eq!(
+            // SAFETY: this positive-size anonymous mapping is exclusively owned by
+            // the fixture; temporarily grant write access to initialize known bytes.
+            unsafe { libc::mprotect(ptr, buf.length as usize, libc::PROT_READ | libc::PROT_WRITE) },
+            0
+        );
+        // SAFETY: the checked payload fits the mapping and the nonoverlapping
+        // Vec source remains live while the fixture copies its synthetic record.
+        unsafe {
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), ptr.cast::<u8>(), payload.len());
+        }
+        assert_eq!(
+            // SAFETY: restore the original read-only mapping before any real log view.
+            unsafe { libc::mprotect(ptr, buf.length as usize, libc::PROT_READ) },
+            0
+        );
+    }
     state.mapped += 1;
     Ok(MappedBuffer {
         ptr,
@@ -551,6 +597,50 @@ fn startup_error_metadata_is_parked_and_later_records_still_drain() {
     );
     drop(log);
     assert_closed(&device, peer);
+}
+
+pub(crate) fn composed_startup_log(
+    events: Arc<Mutex<Vec<&'static str>>>,
+) -> (IlluminationLog, impl Fn(i64), impl FnOnce()) {
+    let device = Arc::new(Mutex::new(FakeDevice::new((UVCH, 10240))));
+    let mut payload = vec![0u8; 28];
+    payload[10] = 18;
+    payload[11] = 2; // UVC EOF, then one complete illumination item
+    payload[12..16].copy_from_slice(&METADATA_ID_FRAME_ILLUMINATION.to_le_bytes());
+    payload[16..20].copy_from_slice(&16u32.to_le_bytes());
+    payload[20..24].copy_from_slice(&1u32.to_le_bytes());
+    {
+        let mut fake = device.lock().unwrap();
+        fake.payload = Some(payload);
+        fake.frame_flags = [0x40, 0].into();
+        fake.timestamps = [1000, 0].into();
+        fake.shared_events = Some(events);
+    }
+    let (mut log, peer) = log_for(&device);
+    log.start().unwrap();
+    let update = device.clone();
+    (
+        log,
+        move |timestamp| {
+            update.lock().unwrap().timestamps = [1000, timestamp].into();
+        },
+        move || {
+            assert_eq!(
+                count(&device, "view"),
+                1,
+                "only the sound metadata is viewed"
+            );
+            assert_eq!(
+                count(&device, "QBUF"),
+                3,
+                "two initial queues plus the one sound requeue"
+            );
+            assert_eq!(count(&device, "STREAMOFF"), 1);
+            assert_eq!(count(&device, "REQBUFS(0)"), 1);
+            assert_eq!(device.lock().unwrap().mapped, 0);
+            assert_closed(&device, peer);
+        },
+    )
 }
 
 #[test]

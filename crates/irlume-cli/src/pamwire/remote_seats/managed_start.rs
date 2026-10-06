@@ -33,6 +33,8 @@
 // by the tests below before that wiring exists.
 #![allow(dead_code)]
 
+mod system;
+
 use std::fmt;
 
 /// The canonical unit this evidence is defined for.

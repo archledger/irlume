@@ -99,6 +99,8 @@
       "recipe": "ramp32",
       "rgb8_bytes_sha256": "8f03e9b79357547bbc59de98d51e90dbf1ccdbc6ce015e05df910a6b1944103a",
       "rgb8_fnv1a64": 14368852088474096517,
+      "tensor_f32le_fnv1a64": 16742026604142949559,
+      "tensor_f32le_sha256": "9ddc71a7bfb2b776791abffb1f11fed17e622a2dcd215c991ad02481e2af2f84",
       "tensor_probes": [
         [
           0,
@@ -256,6 +258,8 @@
       "recipe": "white64_blackroi",
       "rgb8_bytes_sha256": "0a3f0ee9e3cbab26f89ed53b7b20e22cb985b650fd4c52ef57e4aeb27560d773",
       "rgb8_fnv1a64": 5990016019207426853,
+      "tensor_f32le_fnv1a64": 10732991384215225125,
+      "tensor_f32le_sha256": "811b0abfb7b806545700b3a1b9513d4ff52fd7da3ac337ae9ca69772f74e8415",
       "tensor_probes": [
         [
           0,
@@ -413,6 +417,8 @@
       "recipe": "grid48x40",
       "rgb8_bytes_sha256": "640a4b2f968cff879b4e13f3796e1e9bfd4cc36a10654b65088ae70f4b9650b5",
       "rgb8_fnv1a64": 17228462290365584660,
+      "tensor_f32le_fnv1a64": 14970671923826795286,
+      "tensor_f32le_sha256": "98be1acabb7268515d32bd11d2248103f5af248dd22bf185904be9a309574247",
       "tensor_probes": [
         [
           0,
@@ -570,6 +576,8 @@
       "recipe": "wide",
       "rgb8_bytes_sha256": "2c45659aa0b1182b9be4bea5269eb532e6e37946d0ea864c99e8bafa7a8b80a3",
       "rgb8_fnv1a64": 2698843503779020049,
+      "tensor_f32le_fnv1a64": 8959031213717765949,
+      "tensor_f32le_sha256": "0e414bcfb3c3ad7c579e1af626bdd4165beda19a9ba3e0fa74fe654cb7b34bda",
       "tensor_probes": [
         [
           0,
@@ -727,6 +735,8 @@
       "recipe": "wide",
       "rgb8_bytes_sha256": "350e456210abb595a6ee8046658f948f54b2afb10feb98ccbd1ae7d4d1167ee5",
       "rgb8_fnv1a64": 12722421742906362936,
+      "tensor_f32le_fnv1a64": 5056877007181209215,
+      "tensor_f32le_sha256": "98ddd20f6991177b1836b6c5bf2b9db0e3da5ea08c9e0d2f1ae6312f9fb95a98",
       "tensor_probes": [
         [
           0,
@@ -884,6 +894,8 @@
       "recipe": "wide",
       "rgb8_bytes_sha256": "0b53a4801486f07c17570c118bfc923f0bf7b96580aeb37d99b91b272f623c65",
       "rgb8_fnv1a64": 5166114330283047835,
+      "tensor_f32le_fnv1a64": 5452076755082301926,
+      "tensor_f32le_sha256": "019406eb573a74ba7228d8f52caeb193332c0e502376756344e7f75c16f24de4",
       "tensor_probes": [
         [
           0,
@@ -1041,6 +1053,8 @@
       "recipe": "wide",
       "rgb8_bytes_sha256": "3314b3cb24c40e229c6c97b7bd19adbab038106433463308bb45710606dc25f2",
       "rgb8_fnv1a64": 890270352896051877,
+      "tensor_f32le_fnv1a64": 6228089780541421797,
+      "tensor_f32le_sha256": "8a74dd242e484e34bed359694764842d3cbb288186f81b475a558df41cba806b",
       "tensor_probes": [
         [
           0,
@@ -1198,6 +1212,8 @@
       "recipe": "pattern224",
       "rgb8_bytes_sha256": "b9fccc5c6bb73c6cbac52fcd3140816bb400a0488f3be48a63894047ab1188f9",
       "rgb8_fnv1a64": 14899878811855554021,
+      "tensor_f32le_fnv1a64": 12100472374354166995,
+      "tensor_f32le_sha256": "0433dbfdce64a7ed954fd7b536a984c5f9f807ef332beab45aefb663a4bbdf8e",
       "tensor_probes": [
         [
           0,
@@ -1355,6 +1371,8 @@
       "recipe": "pattern448",
       "rgb8_bytes_sha256": "8af6902b48d52edf4188b622b879ebc1f85619bde1973e130b88d2d606f185b7",
       "rgb8_fnv1a64": 8575605195683314853,
+      "tensor_f32le_fnv1a64": 10324919688930376169,
+      "tensor_f32le_sha256": "fa4ef28cfdf679e88a349dd40d1063bf7c6f44c48486bddc80e1e8e5b269a893",
       "tensor_probes": [
         [
           0,
@@ -1434,7 +1452,7 @@
       ],
       "exact_2x": false,
       "name": "downscale_336",
-      "note": "non-exact-2x downscale (336 to 224): the production-typical ROI>224 regime",
+      "note": "exact 1.5x downscale (336 to 224): only 0.25/0.75 coefficients, no 11-bit rounding",
       "probes": [
         [
           0,
@@ -1512,6 +1530,8 @@
       "recipe": "pattern336",
       "rgb8_bytes_sha256": "695f020c89bd739632cff6fed8ff67d86d117a5825a492a12f8de7588d1d214d",
       "rgb8_fnv1a64": 8901689231271569989,
+      "tensor_f32le_fnv1a64": 610182621959504405,
+      "tensor_f32le_sha256": "838bc7e0a2042090271e43fae96c1da9aedf750e23f5838ed683b82148085024",
       "tensor_probes": [
         [
           0,
@@ -1669,6 +1689,8 @@
       "recipe": "steps",
       "rgb8_bytes_sha256": "be496453d1ab01b6d8669adaa22d1d87433488137861f9d4e0c743e147fc229a",
       "rgb8_fnv1a64": 15005906011673168659,
+      "tensor_f32le_fnv1a64": 12088094312905741526,
+      "tensor_f32le_sha256": "17f1d17ed75afc35d7e030c3d16f347b10872c19f96b72c64a9a8e400093fc38",
       "tensor_probes": [
         [
           0,
@@ -1726,15 +1748,561 @@
         ]
       ],
       "tie_sums_2_mod_8": 0
+    },
+    {
+      "bbox": [
+        254.0,
+        170.0,
+        364.5,
+        265.75
+      ],
+      "bbox_f32_bits": [
+        1132331008,
+        1126825984,
+        1136017408,
+        1132781568
+      ],
+      "crop": [
+        159,
+        87,
+        459,
+        347
+      ],
+      "exact_2x": false,
+      "name": "face_roi_300x260",
+      "note": "interior face ROI 300x260 in a 640x480 frame (scales 1.339/1.161)",
+      "probes": [
+        [
+          0,
+          0,
+          [
+            119,
+            196,
+            173
+          ]
+        ],
+        [
+          223,
+          0,
+          [
+            161,
+            119,
+            250
+          ]
+        ],
+        [
+          0,
+          223,
+          [
+            138,
+            186,
+            171
+          ]
+        ],
+        [
+          223,
+          223,
+          [
+            181,
+            88,
+            238
+          ]
+        ],
+        [
+          112,
+          112,
+          [
+            163,
+            196,
+            140
+          ]
+        ],
+        [
+          4,
+          0,
+          [
+            188,
+            110,
+            225
+          ]
+        ],
+        [
+          223,
+          112,
+          [
+            47,
+            135,
+            112
+          ]
+        ],
+        [
+          112,
+          223,
+          [
+            41,
+            56,
+            14
+          ]
+        ]
+      ],
+      "recipe": "camera640",
+      "rgb8_bytes_sha256": "45cc062729f7565f68eb3a18c50fbc2595cec9acfcd8b113b528e5a6bbaa376a",
+      "rgb8_fnv1a64": 18373808607581367158,
+      "tensor_f32le_fnv1a64": 17744257515894157691,
+      "tensor_f32le_sha256": "4c83fa2c72ee6d68efd41ee1c84bac451cfd4b1e7e8684ede97ee2b7f1b50074",
+      "tensor_probes": [
+        [
+          0,
+          0,
+          0,
+          -0.06666666269302368
+        ],
+        [
+          0,
+          223,
+          223,
+          0.41960787773132324
+        ],
+        [
+          0,
+          112,
+          112,
+          0.27843141555786133
+        ],
+        [
+          1,
+          0,
+          0,
+          0.5372549295425415
+        ],
+        [
+          1,
+          223,
+          223,
+          -0.30980390310287476
+        ],
+        [
+          1,
+          112,
+          112,
+          0.5372549295425415
+        ],
+        [
+          2,
+          0,
+          0,
+          0.35686278343200684
+        ],
+        [
+          2,
+          223,
+          223,
+          0.8666666746139526
+        ],
+        [
+          2,
+          112,
+          112,
+          0.09803926944732666
+        ]
+      ],
+      "tie_sums_2_mod_8": 0
+    },
+    {
+      "bbox": [
+        0.0,
+        0.0,
+        640.0,
+        480.0
+      ],
+      "bbox_f32_bits": [
+        0,
+        0,
+        1142947840,
+        1139802112
+      ],
+      "crop": [
+        0,
+        0,
+        640,
+        480
+      ],
+      "exact_2x": false,
+      "name": "full_frame_640x480",
+      "note": "full 640x480 frame (scales 2.857/2.143): wider than the 585 px tie-margin bound",
+      "probes": [
+        [
+          0,
+          0,
+          [
+            16,
+            0,
+            3
+          ]
+        ],
+        [
+          223,
+          0,
+          [
+            107,
+            45,
+            249
+          ]
+        ],
+        [
+          0,
+          223,
+          [
+            33,
+            55,
+            225
+          ]
+        ],
+        [
+          223,
+          223,
+          [
+            124,
+            150,
+            27
+          ]
+        ],
+        [
+          112,
+          112,
+          [
+            224,
+            179,
+            115
+          ]
+        ],
+        [
+          4,
+          0,
+          [
+            165,
+            1,
+            49
+          ]
+        ],
+        [
+          223,
+          112,
+          [
+            233,
+            97,
+            9
+          ]
+        ],
+        [
+          112,
+          223,
+          [
+            97,
+            146,
+            97
+          ]
+        ]
+      ],
+      "recipe": "camera640",
+      "rgb8_bytes_sha256": "834bf2b739c2bd2ef5086830e111454eef11f0f2a9e92295150b714ebf9d17d2",
+      "rgb8_fnv1a64": 16365365324154705921,
+      "tensor_f32le_fnv1a64": 5380998035065616856,
+      "tensor_f32le_sha256": "0904d8b061ba27cd8d27efe4c744503a4c3c64818aba8ed0ea3aea2b94737810",
+      "tensor_probes": [
+        [
+          0,
+          0,
+          0,
+          -0.8745098114013672
+        ],
+        [
+          0,
+          223,
+          223,
+          -0.027450978755950928
+        ],
+        [
+          0,
+          112,
+          112,
+          0.7568627595901489
+        ],
+        [
+          1,
+          0,
+          0,
+          -1.0
+        ],
+        [
+          1,
+          223,
+          223,
+          0.17647063732147217
+        ],
+        [
+          1,
+          112,
+          112,
+          0.40392160415649414
+        ],
+        [
+          2,
+          0,
+          0,
+          -0.9764705896377563
+        ],
+        [
+          2,
+          223,
+          223,
+          -0.7882353067398071
+        ],
+        [
+          2,
+          112,
+          112,
+          -0.09803920984268188
+        ]
+      ],
+      "tie_sums_2_mod_8": 0
+    },
+    {
+      "bbox": [
+        290.5,
+        188.5,
+        490.5,
+        388.5
+      ],
+      "bbox_f32_bits": [
+        1133592576,
+        1128038400,
+        1140146176,
+        1136803840
+      ],
+      "crop": [
+        119,
+        17,
+        640,
+        480
+      ],
+      "exact_2x": false,
+      "name": "clipped_roi_521x463",
+      "note": "close face clipped right/bottom: odd ROI 521x463 (scales 2.326/2.067)",
+      "probes": [
+        [
+          0,
+          0,
+          [
+            142,
+            125,
+            207
+          ]
+        ],
+        [
+          223,
+          0,
+          [
+            229,
+            118,
+            232
+          ]
+        ],
+        [
+          0,
+          223,
+          [
+            41,
+            75,
+            14
+          ]
+        ],
+        [
+          223,
+          223,
+          [
+            128,
+            124,
+            27
+          ]
+        ],
+        [
+          112,
+          112,
+          [
+            29,
+            58,
+            249
+          ]
+        ],
+        [
+          4,
+          0,
+          [
+            16,
+            26,
+            20
+          ]
+        ],
+        [
+          223,
+          112,
+          [
+            57,
+            155,
+            7
+          ]
+        ],
+        [
+          112,
+          223,
+          [
+            99,
+            189,
+            23
+          ]
+        ]
+      ],
+      "recipe": "camera640",
+      "rgb8_bytes_sha256": "e550b447515c2fe7190a94bf270cd544b5d5b47f4d5d8adc589296c205a2bdb2",
+      "rgb8_fnv1a64": 16308089591683892949,
+      "tensor_f32le_fnv1a64": 7541523329163108655,
+      "tensor_f32le_sha256": "daf72bf3830d40721b0691b4bc33815f59d47addc18f974b58b6171979d69ffe",
+      "tensor_probes": [
+        [
+          0,
+          0,
+          0,
+          0.11372554302215576
+        ],
+        [
+          0,
+          223,
+          223,
+          0.003921627998352051
+        ],
+        [
+          0,
+          112,
+          112,
+          -0.772549033164978
+        ],
+        [
+          1,
+          0,
+          0,
+          -0.019607841968536377
+        ],
+        [
+          1,
+          223,
+          223,
+          -0.027450978755950928
+        ],
+        [
+          1,
+          112,
+          112,
+          -0.545098066329956
+        ],
+        [
+          2,
+          0,
+          0,
+          0.6235294342041016
+        ],
+        [
+          2,
+          223,
+          223,
+          -0.7882353067398071
+        ],
+        [
+          2,
+          112,
+          112,
+          0.9529411792755127
+        ]
+      ],
+      "tie_sums_2_mod_8": 0
+    }
+  ],
+  "crop_cases": [
+    {
+      "bbox": [
+        202.28570556640625,
+        120.0,
+        263.28570556640625,
+        181.0
+      ],
+      "bbox_f32_bits": [
+        1128941860,
+        1123024896,
+        1132700818,
+        1127546880
+      ],
+      "crop": [
+        150,
+        67,
+        315,
+        233
+      ],
+      "crop_float64": [
+        149,
+        67,
+        315,
+        233
+      ],
+      "frame": [
+        640,
+        480
+      ],
+      "name": "f32_margin_left_bound",
+      "note": "x - mx lands within float32 rounding of 150: float32 answers 150, float64 149"
+    },
+    {
+      "bbox": [
+        288.5714111328125,
+        120.0,
+        348.5714111328125,
+        180.0
+      ],
+      "bbox_f32_bits": [
+        1133529380,
+        1123024896,
+        1135495460,
+        1127481344
+      ],
+      "crop": [
+        237,
+        68,
+        400,
+        231
+      ],
+      "crop_float64": [
+        237,
+        68,
+        399,
+        231
+      ],
+      "frame": [
+        640,
+        480
+      ],
+      "name": "f32_margin_right_bound",
+      "note": "x + bw + mx lands within float32 rounding of 400: float32 answers 400, float64 399"
     }
   ],
   "generator": "benchmarks/preprocessing-conformance/gen_pad_vit_fixtures.py",
-  "generator_sha256": "8d5046004317e23f5100c0627be5a1c4a9946e4a8c097f66306d257326fe772e",
+  "generator_sha256": "c099586dd4ce00d972bb150879ff02f86cf3a6a4e2df3fc4defddfc25764453e",
   "oracle": {
-    "cv2": "5.0.0",
-    "numpy": "2.5.2",
-    "platform": "Linux x86_64",
-    "python": "3.14.7",
+    "environment": {
+      "cv2": "5.0.0",
+      "numpy": "2.5.2",
+      "opencv_python": "5.0.0.93",
+      "platform": "Linux x86_64",
+      "python": "3.14.7"
+    },
     "scorer_baseline": "6ee8ef5ca48f9f1ec7f9ee9b2eac876915a92820",
     "scorer_source": "benchmarks/pad-candidates/vit_liveness_score.py",
     "scorer_source_sha256": "9c1206f889c39d12604a7c22b98776da396aac927ec8da6f3e8d0624ad5aea0d",
@@ -1746,8 +2314,48 @@
       "use_optimized": false
     }
   },
-  "source_sha256": {
-    "crates/irlume-vision/src/align.rs": "7cd0bcde9bb6b0c31611598108a306a7acaffbca9ae8435907efd2ebc0253b8c",
-    "crates/irlume-vision/src/lib.rs": "a1a0c1b63df8499b19b8097709478b54703ab765c67c1319a2d347fc8671cebc"
-  }
+  "wrap_cases": [
+    {
+      "bbox": [
+        -300.0,
+        100.0,
+        -200.0,
+        200.0
+      ],
+      "bbox_f32_bits": [
+        3281387520,
+        1120403456,
+        3276275712,
+        1128792064
+      ],
+      "name": "negative_stop_left_of_frame",
+      "note": "x2 = int(-114.29) = -114: the scorer slices columns 0..526",
+      "recipe": "camera640",
+      "scorer_chip_wh": [
+        526,
+        271
+      ]
+    },
+    {
+      "bbox": [
+        10.0,
+        100.0,
+        -10.0,
+        200.0
+      ],
+      "bbox_f32_bits": [
+        1092616192,
+        1120403456,
+        3240099840,
+        1128792064
+      ],
+      "name": "negative_width",
+      "note": "bw = -20: x1 = 27, x2 = -27, the scorer slices columns 27..613",
+      "recipe": "camera640",
+      "scorer_chip_wh": [
+        586,
+        271
+      ]
+    }
+  ]
 }

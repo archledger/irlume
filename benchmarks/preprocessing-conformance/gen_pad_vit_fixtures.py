@@ -23,14 +23,19 @@ Run from the repository root:
     python3 benchmarks/preprocessing-conformance/gen_pad_vit_fixtures.py
     python3 benchmarks/preprocessing-conformance/gen_pad_vit_fixtures.py --check
 
-`--check` regenerates and fails if the emitted Rust fixtures or the receipt
-would change. The receipt records the oracle versions, dispatch settings and
-source hashes used for the generation.
+`--check` regenerates and fails if any fixture value, the generator hash, the
+dispatch settings or the scorer pin would change. The receipt also records
+the oracle environment (cv2, opencv-python, NumPy, Python, platform) of the
+committed generation; a different environment that reproduces every value
+exactly passes with a warning, and `--strict-env` makes it fail. Committed
+fixtures are generated only in the recorded environment (README).
 """
 
 import argparse
 import ast
+import functools
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -155,6 +160,8 @@ def recipe_pixel(name, x, y):
         return (x * 5) & 0xFF, (y * 7) & 0xFF, (x * y) & 0xFF
     if name == "pattern336":
         return (x * 11 + y * 23) & 0xFF, (x * 23 + y * 11) & 0xFF, ((x * 3) ^ (y * 5)) & 0xFF
+    if name == "camera640":
+        return (x * 13 + y * 7) & 0xFF, ((x * y) >> 3) & 0xFF, (x * 3 + (y ^ x)) & 0xFF
     raise ValueError(name)
 
 
@@ -167,15 +174,18 @@ RECIPES = {
     "pattern448": (448, 448),
     "pattern224": (224, 224),
     "pattern336": (336, 336),
+    "camera640": (640, 480),
 }
 
 
+@functools.cache
 def make_frame(name):
     w, h = RECIPES[name]
     frame = np.zeros((h, w, 3), dtype=np.uint8)
     for y in range(h):
         for x in range(w):
             frame[y, x] = recipe_pixel(name, x, y)
+    frame.setflags(write=False)
     return frame
 
 
@@ -209,9 +219,35 @@ CASES = [
     ("downsample_448", "pattern448", [0.0, 0.0, 448.0, 448.0],
      "exact 2x downsample dispatch (area-fast rounding)"),
     ("downscale_336", "pattern336", [0.0, 0.0, 336.0, 336.0],
-     "non-exact-2x downscale (336 to 224): the production-typical ROI>224 regime"),
+     "exact 1.5x downscale (336 to 224): only 0.25/0.75 coefficients, no 11-bit rounding"),
     ("constant_rgb_channels", "steps", [8.0, 8.0, 24.0, 24.0],
      "channel order through crop+resize on constant blocks"),
+    ("face_roi_300x260", "camera640", [254.0, 170.0, 364.5, 265.75],
+     "interior face ROI 300x260 in a 640x480 frame (scales 1.339/1.161)"),
+    ("full_frame_640x480", "camera640", [0.0, 0.0, 640.0, 480.0],
+     "full 640x480 frame (scales 2.857/2.143): wider than the 585 px tie-margin bound"),
+    ("clipped_roi_521x463", "camera640", [290.5, 188.5, 490.5, 388.5],
+     "close face clipped right/bottom: odd ROI 521x463 (scales 2.326/2.067)"),
+]
+
+# Crop-only cases: bounds whose float32 m96 expansion truncates to a
+# different integer than the same arithmetic in float64. (name, frame w/h,
+# bbox, note)
+CROP_CASES = [
+    ("f32_margin_left_bound", (640, 480), [202.28570556640625, 120.0, 263.28570556640625, 181.0],
+     "x - mx lands within float32 rounding of 150: float32 answers 150, float64 149"),
+    ("f32_margin_right_bound", (640, 480), [288.5714111328125, 120.0, 348.5714111328125, 180.0],
+     "x + bw + mx lands within float32 rounding of 400: float32 answers 400, float64 399"),
+]
+
+# Boxes where the scorer's NumPy slice gets a negative stop, which counts from
+# the end of the axis and yields a non-empty chip. pad_vit_crop deliberately
+# returns None there (the zero tensor). (name, recipe, bbox, note)
+WRAP_CASES = [
+    ("negative_stop_left_of_frame", "camera640", [-300.0, 100.0, -200.0, 200.0],
+     "x2 = int(-114.29) = -114: the scorer slices columns 0..526"),
+    ("negative_width", "camera640", [10.0, 100.0, -10.0, 200.0],
+     "bw = -20: x1 = 27, x2 = -27, the scorer slices columns 27..613"),
 ]
 
 PROBES = [(0, 0), (223, 0), (0, 223), (223, 223), (112, 112), (4, 0), (223, 112), (112, 223)]
@@ -228,6 +264,7 @@ def build_cases():
         for plane in range(3):
             for x, y in ((0, 0), (223, 223), (112, 112)):
                 tprobes.append((plane, y, x, float(tensor[plane, y, x])))
+        tensor_le = np.ascontiguousarray(tensor).astype("<f4").tobytes()
         out.append({
             "name": name,
             "recipe": recipe,
@@ -239,8 +276,59 @@ def build_cases():
             "rgb8_bytes_sha256": sha(raw),
             "probes": probes,
             "tensor_probes": tprobes,
+            "tensor_f32le_fnv1a64": fnv1a64(tensor_le),
+            "tensor_f32le_sha256": sha(tensor_le),
             "exact_2x": x2 - x1 == OUT * 2 and y2 - y1 == OUT * 2,
             "tie_sums_2_mod_8": tie_count(chip, x2 - x1, y2 - y1),
+        })
+    return out
+
+
+def crop_bounds_f64(w, h, bbox):
+    """The m96 bounds in float64: the arithmetic the crop cases must reject."""
+    x, y = float(np.float32(bbox[0])), float(np.float32(bbox[1]))
+    bw = float(np.float32(bbox[2])) - x
+    bh = float(np.float32(bbox[3])) - y
+    mx, my = bw * (96.0 / 112.0), bh * (96.0 / 112.0)
+    return (max(0, int(x - mx)), max(0, int(y - my)),
+            min(w, int(x + bw + mx)), min(h, int(y + bh + my)))
+
+
+def build_crop_cases():
+    out = []
+    for name, (w, h), bbox, note in CROP_CASES:
+        rgb = np.zeros((h, w, 3), dtype=np.uint8)
+        (x1, y1, x2, y2), _, _, _ = reference(rgb, bbox)
+        if (x1, y1, x2, y2) == crop_bounds_f64(w, h, bbox):
+            raise AssertionError(f"{name}: float64 gives the same bounds; must differ")
+        out.append({
+            "name": name,
+            "frame": [w, h],
+            "bbox": [float(v) for v in bbox],
+            "bbox_f32_bits": [int(np.float32(v).view(np.uint32)) for v in bbox],
+            "crop": [x1, y1, x2, y2],
+            "crop_float64": list(crop_bounds_f64(w, h, bbox)),
+            "note": note,
+        })
+    return out
+
+
+def build_wrap_cases():
+    out = []
+    for name, recipe, bbox, note in WRAP_CASES:
+        w, h = RECIPES[recipe]
+        x1f, y1f, x2f, y2f = np.asarray(bbox, dtype=np.float32)
+        face = np.array([x1f, y1f, x2f - x1f, y2f - y1f], dtype=np.float32)
+        chip = CROP(np.zeros((h, w, 3), dtype=np.uint8), face, 96.0 / 112.0)
+        if chip.size == 0:
+            raise AssertionError(f"{name}: the scorer chip is empty; not a wrapping case")
+        out.append({
+            "name": name,
+            "recipe": recipe,
+            "bbox": [float(v) for v in bbox],
+            "bbox_f32_bits": [int(np.float32(v).view(np.uint32)) for v in bbox],
+            "scorer_chip_wh": [int(chip.shape[1]), int(chip.shape[0])],
+            "note": note,
         })
     return out
 
@@ -253,26 +341,54 @@ RUST_HEADER = """\
 // Generated by benchmarks/preprocessing-conformance/gen_pad_vit_fixtures.py
 // (sha256 {gen_sha}). Regenerate with that script and re-review any diff.
 //
-// Oracle: {cv2_ver} (cv2 {cv2_mod}), NumPy {np_ver}, Python {py_ver} on
-// {platform}; cv2 threads=1, optimized dispatch/OpenCL/IPP disabled.
+// Oracle environment: cv2 {cv2} (opencv-python {opencv_python}), NumPy {numpy},
+// Python {python} on {platform}; cv2 threads=1, optimized dispatch/OpenCL/IPP
+// disabled.
 // Contract: recorded scorer m96 integer crop (immutable scorer source at
 // 6ee8ef5c) + RGB8 cv2.resize INTER_LINEAR, normalized (px/255-0.5)/0.5.
-// Each case pins the exact crop bounds and the exact 224x224x3 RGB8 resize
-// output (FNV-1a-64 + probe pixels) and float32 tensor probe values.
+// Each FIXTURES case pins the exact crop bounds, the exact 224x224x3 RGB8
+// resize output (FNV-1a-64 + probe pixels), the exact float32 CHW tensor
+// (FNV-1a-64 of its little-endian bytes) and float32 tensor probe values.
+// CROP_FIXTURES pin float32 m96 bounds that float64 arithmetic misses.
+// SCORER_WRAP_CASES are boxes whose scorer slice wraps to a non-empty chip.
 
 use super::pad_vit_input_tests::Recipe;
 """
 
+RECIPE_NAMES = {
+    "ramp32": "Ramp32",
+    "wide": "Wide",
+    "steps": "Steps",
+    "grid48x40": "Grid48x40",
+    "white64_blackroi": "White64BlackRoi",
+    "pattern448": "Pattern448",
+    "pattern224": "Pattern224",
+    "pattern336": "Pattern336",
+    "camera640": "Camera640",
+}
 
-def emit_rust(cases, gen_sha):
-    lines = [RUST_HEADER.format(
-        gen_sha=gen_sha,
-        cv2_ver=cv2.__version__,
-        cv2_mod="opencv-python (runtime module version above)",
-        np_ver=np.__version__,
-        py_ver=platform.python_version(),
-        platform=f"{platform.system()} {platform.machine()}",
-    )]
+
+def f32_literal(v):
+    """Shortest decimal that parses back to the same float32."""
+    return str(np.float32(v))
+
+
+def oracle_environment():
+    try:
+        wheel = importlib.metadata.version("opencv-python")
+    except importlib.metadata.PackageNotFoundError:
+        wheel = "not installed"
+    return {
+        "cv2": cv2.__version__,
+        "opencv_python": wheel,
+        "numpy": np.__version__,
+        "python": platform.python_version(),
+        "platform": f"{platform.system()} {platform.machine()}",
+    }
+
+
+def emit_rust(cases, crop_cases, wrap_cases, gen_sha, env):
+    lines = [RUST_HEADER.format(gen_sha=gen_sha, **env)]
     lines.append("pub(super) struct Fixture {\n"
                  "    pub name: &'static str,\n"
                  "    pub recipe: Recipe,\n"
@@ -281,6 +397,8 @@ def emit_rust(cases, gen_sha):
                  "    pub crop: [i32; 4],\n"
                  "    /// FNV-1a-64 of the 224*224*3 RGB8 resize output.\n"
                  "    pub rgb8_fnv1a64: u64,\n"
+                 "    /// FNV-1a-64 of the 3*224*224 float32 CHW tensor, little-endian.\n"
+                 "    pub tensor_fnv1a64: u64,\n"
                  "    /// (x, y, [r, g, b]) probes of the RGB8 resize output.\n"
                  "    pub probes: &'static [(u16, u16, [u8; 3])],\n"
                  "    /// (plane, y, x, normalized value) probes.\n"
@@ -288,18 +406,7 @@ def emit_rust(cases, gen_sha):
                  "}\n")
     lines.append("pub(super) const FIXTURES: &[Fixture] = &[")
     for c in cases:
-        recipe = c["recipe"]
-        rname = {
-            "ramp32": "Ramp32",
-            "wide": "Wide",
-            "steps": "Steps",
-            "grid48x40": "Grid48x40",
-            "white64_blackroi": "White64BlackRoi",
-            "pattern448": "Pattern448",
-            "pattern224": "Pattern224",
-            "pattern336": "Pattern336",
-        }[recipe]
-        bbox = ", ".join(repr(v) for v in c["bbox"])
+        bbox = ", ".join(f32_literal(v) for v in c["bbox"])
         crop = ", ".join(str(v) for v in c["crop"])
         probes = ", ".join(f"({x}, {y}, [{r}, {g}, {b}])"
                            for x, y, (r, g, b) in c["probes"])
@@ -307,25 +414,57 @@ def emit_rust(cases, gen_sha):
                             for p, y, x, v in c["tensor_probes"])
         lines.append(f"    Fixture {{\n"
                      f"        name: \"{c['name']}\",\n"
-                     f"        recipe: Recipe::{rname},\n"
+                     f"        recipe: Recipe::{RECIPE_NAMES[c['recipe']]},\n"
                      f"        bbox: [{bbox}],\n"
                      f"        crop: [{crop}],\n"
                      f"        rgb8_fnv1a64: 0x{c['rgb8_fnv1a64']:016X},\n"
+                     f"        tensor_fnv1a64: 0x{c['tensor_f32le_fnv1a64']:016X},\n"
                      f"        probes: &[{probes}],\n"
                      f"        tensor_probes: &[{tprobes}],\n"
+                     f"    }},")
+    lines.append("];\n")
+    lines.append("pub(super) struct CropFixture {\n"
+                 "    pub name: &'static str,\n"
+                 "    /// Frame width and height.\n"
+                 "    pub frame: (u32, u32),\n"
+                 "    pub bbox: [f32; 4],\n"
+                 "    /// Half-open [x1, y1, x2, y2] from the scorer's float32 expansion.\n"
+                 "    pub crop: [i32; 4],\n"
+                 "    /// The same expansion in float64, which the contract rejects.\n"
+                 "    pub crop_float64: [i32; 4],\n"
+                 "}\n")
+    lines.append("pub(super) const CROP_FIXTURES: &[CropFixture] = &[")
+    for c in crop_cases:
+        w, h = c["frame"]
+        lines.append(f"    CropFixture {{\n"
+                     f"        name: \"{c['name']}\",\n"
+                     f"        frame: ({w}, {h}),\n"
+                     f"        bbox: [{', '.join(f32_literal(v) for v in c['bbox'])}],\n"
+                     f"        crop: [{', '.join(str(v) for v in c['crop'])}],\n"
+                     f"        crop_float64: [{', '.join(str(v) for v in c['crop_float64'])}],\n"
+                     f"    }},")
+    lines.append("];\n")
+    lines.append("pub(super) struct WrapCase {\n"
+                 "    pub name: &'static str,\n"
+                 "    pub recipe: Recipe,\n"
+                 "    pub bbox: [f32; 4],\n"
+                 "    /// Width and height of the non-empty chip the scorer slices.\n"
+                 "    pub scorer_chip_wh: [usize; 2],\n"
+                 "}\n")
+    lines.append("pub(super) const SCORER_WRAP_CASES: &[WrapCase] = &[")
+    for c in wrap_cases:
+        cw, ch = c["scorer_chip_wh"]
+        lines.append(f"    WrapCase {{\n"
+                     f"        name: \"{c['name']}\",\n"
+                     f"        recipe: Recipe::{RECIPE_NAMES[c['recipe']]},\n"
+                     f"        bbox: [{', '.join(f32_literal(v) for v in c['bbox'])}],\n"
+                     f"        scorer_chip_wh: [{cw}, {ch}],\n"
                      f"    }},")
     lines.append("];")
     return "\n".join(lines) + "\n"
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--check", action="store_true",
-                    help="fail if the emitted files would change")
-    args = ap.parse_args()
-
-    gen_sha = sha(Path(__file__).read_bytes())
-    cases = build_cases()
+def self_check(cases, wrap_cases):
     for c in cases:
         if c["exact_2x"] and c["tie_sums_2_mod_8"] == 0:
             raise AssertionError(f"{c['name']}: no rounding-tie blocks; recipe must pin ties")
@@ -345,16 +484,71 @@ def main():
             _, _, rgb224, _ = reference(rgb, c["bbox"])
             if np.any(rgb224 != 0):
                 raise AssertionError("black ROI chip must resize to all-zero")
+    for c in wrap_cases:
+        # The helper's None rule: non-positive extent or empty clipped bounds.
+        x1f, y1f, x2f, y2f = np.asarray(c["bbox"], dtype=np.float32)
+        w, h = RECIPES[c["recipe"]]
+        x1, y1, x2, y2 = crop_bounds(np.zeros((h, w, 3), dtype=np.uint8), c["bbox"])
+        if x2f - x1f > 0 and y2f - y1f > 0 and x2 > x1 and y2 > y1:
+            raise AssertionError(f"{c['name']}: pad_vit_crop would not return None")
 
-    rust = emit_rust(cases, gen_sha)
+
+def describe(env):
+    if not env:
+        return "(none recorded)"
+    return ", ".join(f"{k} {env[k]}" for k in sorted(env))
+
+
+def check(cases, crop_cases, wrap_cases, gen_sha, receipt, strict_env):
+    """Compare every fixture value exactly; report the environment apart."""
+    committed = json.loads(RECEIPT.read_text()) if RECEIPT.exists() else {}
+    env = receipt["oracle"]["environment"]
+    recorded = committed.get("oracle", {}).get("environment")
+    env_note = ""
+    if recorded != env:
+        env_note = (f"\nthe oracle environment ({describe(env)}) differs from the recorded "
+                    f"one ({describe(recorded)}); committed fixtures are generated only in "
+                    f"the recorded environment (README.md)")
+    # Render with the recorded environment so only values and the generator
+    # hash decide the comparison.
+    expected_rust = emit_rust(cases, crop_cases, wrap_cases, gen_sha, recorded or env)
+    current_rust = RUST_OUT.read_text() if RUST_OUT.exists() else ""
+    if current_rust != expected_rust:
+        raise SystemExit(f"{os.path.relpath(RUST_OUT, ROOT)}: fixture values or generator hash "
+                         f"differ from this regeneration{env_note}")
+    expected = json.loads(json.dumps(receipt))
+    for snapshot in (committed, expected):
+        snapshot.get("oracle", {}).pop("environment", None)
+    if committed != expected:
+        raise SystemExit(f"{RECEIPT.name}: fixture values, settings or generator hash differ "
+                         f"from this regeneration{env_note}")
+    if env_note:
+        if strict_env:
+            raise SystemExit(f"--strict-env:{env_note}")
+        print(f"warning: every fixture value matches;{env_note}")
+    print("fixtures and receipt are current")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--check", action="store_true",
+                    help="fail if any fixture value or the generator hash would change")
+    ap.add_argument("--strict-env", action="store_true",
+                    help="with --check, also fail when the oracle environment differs")
+    args = ap.parse_args()
+
+    gen_sha = sha(Path(__file__).read_bytes())
+    cases = build_cases()
+    crop_cases = build_crop_cases()
+    wrap_cases = build_wrap_cases()
+    self_check(cases, wrap_cases)
+
+    env = oracle_environment()
     receipt = {
         "generator": f"{REL}/gen_pad_vit_fixtures.py",
         "generator_sha256": gen_sha,
         "oracle": {
-            "cv2": cv2.__version__,
-            "numpy": np.__version__,
-            "python": platform.python_version(),
-            "platform": f"{platform.system()} {platform.machine()}",
+            "environment": env,
             "settings": {
                 "threads": 1, "use_optimized": False, "opencl": False, "ipp": False,
                 "interpolation": "cv2.INTER_LINEAR (RGB8)",
@@ -363,36 +557,19 @@ def main():
             "scorer_source_sha256": SCORER_SHA256,
             "scorer_baseline": "6ee8ef5ca48f9f1ec7f9ee9b2eac876915a92820",
         },
-        "source_sha256": {
-            "crates/irlume-vision/src/lib.rs": sha(
-                (ROOT / "crates/irlume-vision/src/lib.rs").read_bytes()),
-            "crates/irlume-vision/src/align.rs": sha(
-                (ROOT / "crates/irlume-vision/src/align.rs").read_bytes()),
-        },
         "cases": cases,
+        "crop_cases": crop_cases,
+        "wrap_cases": wrap_cases,
     }
-    receipt_text = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
 
     if args.check:
-        current_rust = RUST_OUT.read_text() if RUST_OUT.exists() else ""
-        if current_rust != rust:
-            raise SystemExit(f"{RUST_OUT.relative_to(ROOT)} is stale; regenerate")
-        # The receipt's source_sha256 records the generation-time source
-        # state and is informational; the oracle, cases and generator hashes
-        # must match a regeneration exactly.
-        current_receipt = json.loads(RECEIPT.read_text()) if RECEIPT.exists() else {}
-        expected = json.loads(receipt_text)
-        for snapshot in (current_receipt, expected):
-            snapshot.pop("source_sha256", None)
-        if current_receipt != expected:
-            raise SystemExit(f"{RECEIPT.name} is stale; regenerate")
-        print("fixtures and receipt are current")
+        check(cases, crop_cases, wrap_cases, gen_sha, receipt, args.strict_env)
         return
 
-    RUST_OUT.write_text(rust)
-    RECEIPT.write_text(receipt_text)
+    RUST_OUT.write_text(emit_rust(cases, crop_cases, wrap_cases, gen_sha, env))
+    RECEIPT.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
     print(f"wrote {RUST_OUT.relative_to(ROOT)} and {RECEIPT.name}: "
-          f"{len(cases)} cases, "
+          f"{len(cases)} cases, {len(crop_cases)} crop cases, {len(wrap_cases)} wrap cases, "
           + ", ".join(f"{c['name']} ties={c['tie_sums_2_mod_8']}" for c in cases
                       if c['exact_2x']))
 

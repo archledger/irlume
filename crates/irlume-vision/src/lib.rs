@@ -1494,8 +1494,13 @@ mod onnx {
     /// side in float32 (the scorer's `crop`, benchmarks/pad-candidates/
     /// vit_liveness_score.py), bounds truncated toward zero and clipped to
     /// a half-open frame rectangle. `None` for non-finite, non-positive-area
-    /// or fully clipped bboxes, where the scorer would compute an empty
-    /// slice.
+    /// or fully clipped bboxes. The scorer's slice is empty for most of
+    /// these, but NumPy counts a negative x2/y2 stop from the end of the
+    /// axis (`W + x2`), so bbox [-300,100,-200,200] on a 640x480 frame gives
+    /// the scorer a non-empty 526x271 chip from the frame's left side. This
+    /// helper deliberately diverges there and answers `None` (the zero
+    /// tensor) rather than reproducing the wrapped chip; the generated
+    /// `SCORER_WRAP_CASES` pin the divergence.
     fn pad_vit_crop(bbox: &[f32; 4], fw: u32, fh: u32) -> Option<[i32; 4]> {
         if !bbox.iter().all(|v| v.is_finite()) || fw == 0 || fh == 0 {
             return None;
@@ -1524,16 +1529,19 @@ mod onnx {
     /// RGB8 resize matching the recorded scorer's
     /// `cv2.resize(..., (224, 224), interpolation=cv2.INTER_LINEAR)` byte
     /// contract (OpenCV 5.0 `modules/imgproc/src/resize.cpp`): half-pixel
-    /// centers with edge replication, 11-bit fixed-point coefficients
-    /// (round-to-nearest-even), horizontal integer accumulation and the
-    /// staged 8s8u output `((b0*(h0>>4))>>16) + ((b1*(h1>>4))>>16) + 2) >> 2`.
+    /// centers with edge replication, source coordinates computed in f64
+    /// and then rounded to f32 (`(float)((dx + 0.5) * scale - 0.5)`; f32
+    /// coordinate math changes bytes of the 640- and 521-wide fixtures),
+    /// 11-bit fixed-point coefficients (round-to-nearest-even), horizontal
+    /// integer accumulation and the staged 32s8u output (int32 rows to
+    /// uint8) `(((b0*(h0>>4))>>16) + ((b1*(h1>>4))>>16) + 2) >> 2`.
     /// An exact 2x downsample dispatches to OpenCV's area-fast average
-    /// `(sum + 2) >> 2`. Coefficient ties are not observable in this
-    /// contract: the exact-rational coefficient sits at least 1/14 away
-    /// from a half-integer, while f32 rounding of the half-pixel coordinate
-    /// moves it at most about rw*2^-13 (2^-5 at the 336/448 scales), below
-    /// that margin for ROI widths under roughly 585 at `size == 224`.
-    /// Every pinned case is well inside, and any tie would resolve
+    /// `(sum + 2) >> 2`. Coefficient ties cannot occur for ROI sides under
+    /// roughly 585 at `size == 224`: the exact-rational coefficient sits at
+    /// least 1/14 away from a half-integer, while f32 rounding of the
+    /// half-pixel coordinate moves it at most about rw*2^-13 (2^-5 at the
+    /// 336/448 scales). The 521- and 640-wide fixtures lie beyond that bound
+    /// and are pinned against the oracle directly; any tie would resolve
     /// ties-even like x86 `cvRound`.
     fn pad_vit_resize_rgb8(roi: &[u8], rw: usize, rh: usize, size: usize) -> Vec<u8> {
         let mut out = vec![0u8; size * size * 3];
@@ -1632,7 +1640,7 @@ mod onnx {
     /// tight/m25 overlap genuine; m96 separates), so a preprocessing drift
     /// is a threshold drift and these pin it.
     #[cfg(test)]
-    mod pad_vit_input_tests {
+    pub(crate) mod pad_vit_input_tests {
         use super::{pad_vit_crop, pad_vit_input, pad_vit_resize_rgb8};
         use crate::align::RgbView;
 
@@ -1679,6 +1687,7 @@ mod onnx {
             Pattern448,
             Pattern224,
             Pattern336,
+            Camera640,
         }
 
         impl Recipe {
@@ -1692,6 +1701,7 @@ mod onnx {
                     Recipe::Pattern448 => (448, 448),
                     Recipe::Pattern224 => (224, 224),
                     Recipe::Pattern336 => (336, 336),
+                    Recipe::Camera640 => (640, 480),
                 }
             }
 
@@ -1737,6 +1747,11 @@ mod onnx {
                         ((x * 23 + y * 11) & 0xff) as u8,
                         (((x * 3) ^ (y * 5)) & 0xff) as u8,
                     ],
+                    Recipe::Camera640 => [
+                        ((x * 13 + y * 7) & 0xff) as u8,
+                        (((x * y) >> 3) & 0xff) as u8,
+                        ((x * 3 + (y ^ x)) & 0xff) as u8,
+                    ],
                 }
             }
 
@@ -1744,6 +1759,17 @@ mod onnx {
                 let (w, h) = self.wh();
                 Frame::new(w, h, |x, y| self.pixel(x, y))
             }
+        }
+
+        /// A generated fixture's frame (RGB bytes, width, height) and bbox,
+        /// for the real-model test in `model_tests`.
+        pub(crate) fn fixture_frame(name: &str) -> (Vec<u8>, u32, u32, [f32; 4]) {
+            let fx = super::pad_vit_fixtures::FIXTURES
+                .iter()
+                .find(|f| f.name == name)
+                .expect("fixture present");
+            let f = fx.recipe.frame();
+            (f.data, f.width, f.height, fx.bbox)
         }
 
         const S: usize = 224;
@@ -1820,12 +1846,23 @@ mod onnx {
             assert_eq!(t[4], normalized(1), "R(4,0) must be byte 1");
         }
 
+        /// End to end: every element of `pad_vit_input`'s float32 CHW
+        /// tensor (FNV-1a-64 of its little-endian bytes) equals the scorer
+        /// oracle's, so the ROI copy, resize and normalization are pinned
+        /// together on every fixture.
         #[test]
         fn fixture_tensors_match_the_recorded_scorer_contract() {
             for fx in super::pad_vit_fixtures::FIXTURES {
                 let f = fx.recipe.frame();
                 let t = pad_vit_input(&f.view(), &fx.bbox, S);
                 assert_eq!(t.len(), 3 * PLANE, "{}", fx.name);
+                let le: Vec<u8> = t.iter().flat_map(|v| v.to_le_bytes()).collect();
+                assert_eq!(
+                    fnv1a64(&le),
+                    fx.tensor_fnv1a64,
+                    "full float32 tensor: {}",
+                    fx.name
+                );
                 for &(p, y, x, want) in fx.tensor_probes {
                     let got = t[p as usize * PLANE + y as usize * S + x as usize];
                     assert!(
@@ -1870,6 +1907,31 @@ mod onnx {
                 let t = pad_vit_input(&v, &bbox, S);
                 assert_eq!(t.len(), 3 * PLANE);
                 assert!(t.iter().all(|&x| x == 0.0), "bbox {bbox:?}");
+            }
+        }
+
+        /// Negative x2/y2 stops: the scorer's NumPy slice counts them from
+        /// the end of the axis and crops a non-empty chip (`scorer_chip_wh`,
+        /// recorded from the scorer), while this helper deliberately answers
+        /// `None` and the zero tensor instead of a chip from the far side
+        /// of the frame.
+        #[test]
+        fn scorer_wrapping_boxes_deliberately_fail_safe_to_the_zero_tensor() {
+            for wc in super::pad_vit_fixtures::SCORER_WRAP_CASES {
+                let f = wc.recipe.frame();
+                let [cw, ch] = wc.scorer_chip_wh;
+                assert_eq!(
+                    pad_vit_crop(&wc.bbox, f.width, f.height),
+                    None,
+                    "{}: the scorer crops {cw}x{ch} here",
+                    wc.name
+                );
+                let t = pad_vit_input(&f.view(), &wc.bbox, S);
+                assert!(
+                    t.iter().all(|&v| v == 0.0),
+                    "{}: the zero tensor, not the scorer's wrapped {cw}x{ch} chip",
+                    wc.name
+                );
             }
         }
 
@@ -1943,6 +2005,28 @@ mod onnx {
                     let i = (y as usize * S + x as usize) * 3;
                     assert_eq!(&bytes[i..i + 3], &rgb, "probe ({x},{y}): {}", fx.name);
                 }
+            }
+        }
+
+        /// The m96 expansion is float32 arithmetic: each case's expanded
+        /// bound lands within float32 rounding of an integer, where float64
+        /// arithmetic truncates to the neighbor (`crop_float64`).
+        #[test]
+        fn crop_fixtures_pin_the_float32_margin_arithmetic() {
+            for cf in super::pad_vit_fixtures::CROP_FIXTURES {
+                let (w, h) = cf.frame;
+                assert_ne!(
+                    cf.crop, cf.crop_float64,
+                    "{}: must separate f32 and f64",
+                    cf.name
+                );
+                assert_eq!(
+                    pad_vit_crop(&cf.bbox, w, h),
+                    Some(cf.crop),
+                    "{}: float32 bounds (float64 gives {:?})",
+                    cf.name,
+                    cf.crop_float64
+                );
             }
         }
 
@@ -2623,6 +2707,48 @@ mod model_tests {
             a < 0.7,
             "uniform frame scored {a}; the measured genuine band tops at 0.551"
         );
+    }
+
+    /// Textured frames through the whole `p_spoof` path (crop, resize,
+    /// normalization, inference) must reproduce the scores recorded for
+    /// them. Their input tensors are pinned bit-exact to the scorer oracle
+    /// by `fixture_tensors_match_the_recorded_scorer_contract`, so these are
+    /// the recorded scorer pipeline's scores on the shipped weights
+    /// (recorded under ONNX Runtime 1.28.1 and 1.29.0, equal to 9 digits).
+    /// The 1e-4 tolerance absorbs runtime and CPU kernel drift. A one-pixel
+    /// crop shift moves the scores by 3.2e-3 to 3.5e-3 and must move each
+    /// past twice the tolerance, so the test keeps seeing crop changes.
+    #[test]
+    fn pad_vit_textured_fixture_frames_reproduce_recorded_scores() {
+        const TOL: f32 = 1e-4;
+        let mut pad = pad_vit();
+        for (name, recorded) in [
+            ("face_roi_300x260", 0.496_063_f32),
+            ("clipped_roi_521x463", 0.466_778_f32),
+        ] {
+            let (data, width, height, bbox) = crate::onnx::pad_vit_input_tests::fixture_frame(name);
+            let view = align::RgbView {
+                data: &data,
+                width,
+                height,
+            };
+            let p = pad.p_spoof(&view, &bbox).expect("score");
+            let again = pad.p_spoof(&view, &bbox).expect("score");
+            assert!(
+                (p - again).abs() < 1e-6,
+                "{name}: nondeterministic {p} vs {again}"
+            );
+            assert!(
+                (p - recorded).abs() < TOL,
+                "{name}: p_spoof {p}, recorded {recorded}"
+            );
+            let shifted = [bbox[0] + 1.0, bbox[1], bbox[2] + 1.0, bbox[3]];
+            let moved = pad.p_spoof(&view, &shifted).expect("score");
+            assert!(
+                (moved - p).abs() > 2.0 * TOL,
+                "{name}: a one-pixel crop shift moved p_spoof only {p} -> {moved}"
+            );
+        }
     }
 
     /// Deterministic pseudo-textured 112x112 chip (the embedder's input shape).

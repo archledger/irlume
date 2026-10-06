@@ -235,6 +235,24 @@ production preprocessing, thresholds, qualification records or authentication
 policy; the issue-#795 correction above does change production preprocessing
 and is gated separately.
 
+`gen_pad_vit_fixtures.py --check` compares every fixture value (crop bounds,
+RGB8 and tensor hashes, probes, crop-only and scorer-wrap cases), the
+generator hash, the oracle settings and the scorer pin exactly. The receipt
+also records the oracle environment, compared apart: a different environment
+that reproduces every value passes with a warning, `--strict-env` makes it
+fail, and a value mismatch names both environments. Committed fixtures are
+generated only in the recorded environment: Python 3.14.7, NumPy 2.5.2,
+`opencv-python` 5.0.0.93 (`cv2` 5.0.0) on Linux x86_64. The generator reads
+the scorer from Git object `6ee8ef5c`, so that object must be present.
+`compare_current.py` needs the same Python packages and a rustup
+`rustc +1.88.0` (it refuses any other version); its receipt records the
+rustc version, the checkout's HEAD and any measured file (the three
+sources, the fixtures, the generator, `run.py`, `probe.rs` and the script
+itself) that differs from it. `--require-clean` refuses to run while that
+list is non-empty: use it on a clean checkout for the receipt archived for
+a PR head. `cargo test` checks the same per-case equality through the
+fixtures' full-tensor hashes, so CI does not depend on either script.
+
 Prevention lesson: the old extent-31 assertion agreed with its implementation,
 so it could not detect reference drift. Keep independent scorer/oracle fixtures,
 exact source hashes and execution-version receipts. Uniform colors alone miss

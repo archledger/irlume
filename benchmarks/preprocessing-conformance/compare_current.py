@@ -8,7 +8,12 @@ Separately identified from the #972 baseline replay: this compiles the
 object), runs it over the generated fixture cases and compares every output
 element against the live recorded-scorer oracle (scorer crop + RGB8
 `cv2.resize` INTER_LINEAR + normalization). Exact source hashes of every
-input are recorded in the receipt.
+input, the rustc version, the checkout's HEAD commit and any uncommitted
+change to the measured files are recorded in the receipt, so a receipt names
+the commit it covers. `--require-clean` refuses to run while any measured
+file differs from HEAD; use it for the receipt archived for a PR head.
+`cargo test` enforces the same per-case equality through the fixtures'
+full-tensor hashes; this script is the element-wise cross-check.
 
 The #972 `verify.py` replay measures immutable baseline 6ee8ef5c and must
 never be used as this helper's regression gate; `gen_pad_vit_fixtures.py`
@@ -16,9 +21,10 @@ fixtures plus this comparison are the current-candidate evidence.
 
 Run from the repository root:
 
-    python3 benchmarks/preprocessing-conformance/compare_current.py
+    python3 benchmarks/preprocessing-conformance/compare_current.py [--require-clean]
 """
 
+import argparse
 import hashlib
 import json
 import os
@@ -55,17 +61,53 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+SOURCE_PATHS = [
+    "crates/irlume-camera/src/lib.rs",
+    "crates/irlume-vision/src/lib.rs",
+    "crates/irlume-vision/src/align.rs",
+]
+MEASURED_PATHS = [
+    *SOURCE_PATHS,
+    "crates/irlume-vision/src/pad_vit_fixtures.rs",
+    f"{REL}/gen_pad_vit_fixtures.py",
+    f"{REL}/compare_current.py",
+    f"{REL}/run.py",
+    f"{REL}/probe.rs",
+]
+
+
 def current_sources():
     """The measured inputs come from the working tree, hashed, never `git show`."""
-    paths = [
-        "crates/irlume-camera/src/lib.rs",
-        "crates/irlume-vision/src/lib.rs",
-        "crates/irlume-vision/src/align.rs",
-    ]
     out = {}
-    for name in paths:
+    for name in SOURCE_PATHS:
         data = (ROOT / name).read_bytes()
         out[name] = {"sha256": sha(data)}
+    return out
+
+
+def checkout_state(root=ROOT):
+    """HEAD and the measured paths (sources, oracle, this script) that differ from it."""
+    git = ["git", "-C", str(root)]
+    head = subprocess.run([*git, "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+    status = subprocess.run([*git, "status", "--porcelain", "--", *MEASURED_PATHS], check=True,
+                            capture_output=True, text=True).stdout
+    return {"head": head, "modified_measured_paths": sorted(line[3:] for line in status.splitlines())}
+
+
+def require_clean(state):
+    """Refuse a receipt that would not describe the commit it names."""
+    if state["modified_measured_paths"]:
+        raise SystemExit(
+            f"--require-clean: measured paths differ from HEAD {state['head']}: "
+            + ", ".join(state["modified_measured_paths"]))
+
+
+def rustc_version():
+    out = subprocess.run(["rustc", "+1.88.0", "--version"], check=True,
+                         capture_output=True, text=True, cwd=ROOT).stdout.strip()
+    if not out.startswith("rustc 1.88.0 "):
+        raise SystemExit(f"rustc +1.88.0 resolved to {out!r}; a rustup toolchain is required")
     return out
 
 
@@ -100,7 +142,15 @@ def rust_pad(image, w, h, bbox):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--require-clean", action="store_true",
+                        help="fail unless every measured path matches HEAD")
+    args = parser.parse_args()
     sources = current_sources()
+    state = checkout_state()
+    if args.require_clean:
+        require_clean(state)
+    rustc = rustc_version()
     pure_sha = compile_probe()
     cases = []
     worst = 0.0
@@ -121,7 +171,9 @@ def main():
     receipt = {
         "probe": f"{REL}/compare_current.py",
         "pure_source_sha256": pure_sha,
+        "rustc": rustc,
         "source_sha256": sources,
+        "checkout": state,
         "oracle": {
             "cv2": cv2.__version__,
             "numpy": np.__version__,
@@ -132,7 +184,9 @@ def main():
         "worst_max_abs": worst,
     }
     RECEIPT.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
-    print(f"compared {len(cases)} cases; worst |delta| = {worst}")
+    modified = ", ".join(state["modified_measured_paths"]) or "none"
+    print(f"compared {len(cases)} cases at HEAD {state['head']} "
+          f"(modified measured paths: {modified}); worst |delta| = {worst}")
     for c in cases:
         print(f"  {c['case']}: max_abs={c['max_abs']:.3e} "
               f"differing={c['differing_elements']}/{c['elements']}")

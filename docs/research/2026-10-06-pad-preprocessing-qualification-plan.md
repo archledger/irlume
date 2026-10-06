@@ -36,26 +36,60 @@ measurements.
 ## Evidence already in hand (software)
 
 - Independent fixtures generated from the scorer crop plus the installed
-  OpenCV RGB8 `INTER_LINEAR` oracle (`opencv-python` 5.0.0, threads=1,
-  optimized dispatch/OpenCL/IPP disabled), pinned in
+  OpenCV RGB8 `INTER_LINEAR` oracle (Python 3.14.7, NumPy 2.5.2,
+  `opencv-python` 5.0.0.93, threads=1, optimized dispatch/OpenCL/IPP
+  disabled), pinned in
   `benchmarks/preprocessing-conformance/pad-vit-fixtures-receipt.json` with
-  generator and source hashes. Eleven cases cover the wave-3 list plus the
-  production-typical regime: full-frame last row/column, black-ROI-on-white
-  isolation, fractional, negative and clipped bounds, a one-pixel strip, 224
-  identity, 448-to-224 downsample, 336-to-224 non-exact-2x downscale, constant
-  channels and the wave-3 rounding counterexample.
-- Crop extent and ROI isolation fail on the original helper and pass on the
-  new one; the resize output pins exact RGB8 bytes (FNV-1a-64 plus probes),
-  including 50,176 exact-2x rounding-tie blocks that a round-half-even
-  implementation would answer differently.
+  the generator hash and oracle environment. Fourteen frame cases: the
+  wave-3 list (full-frame last row/column, black-ROI-on-white isolation,
+  fractional, negative and clipped bounds, a one-pixel strip, 224 identity,
+  448-to-224 exact 2x downsample, constant channels and the rounding
+  counterexample), a 336-to-224 exact 1.5x downscale (only 0.25/0.75
+  coefficients), and three crops of a 640x480 frame at the sizes face ROIs
+  reach on 640x480 cameras: a 300x260 interior ROI, a 521x463
+  right/bottom-clipped ROI and the full 640x480 frame. Two crop-only cases
+  pin the float32 m96 arithmetic where float64 truncates to the neighbor,
+  and two scorer-wrap cases pin the deliberate zero tensor where the
+  scorer's NumPy slice wraps a negative x2 stop into a 526x271 or 586x271
+  chip.
+- `cargo test` pins, per case, the crop bounds, the RGB8 resize bytes
+  (FNV-1a-64 plus probes) and every element of the float32 tensor
+  `pad_vit_input` returns (FNV-1a-64 of its little-endian bytes), so CI
+  enforces end-to-end bit-exactness on every head. Crop extent and ROI
+  isolation fail on the original helper; the 448 case holds 50,176 exact-2x
+  rounding-tie blocks that a round-half-even implementation would answer
+  differently.
+- Mutations run against these tests on 2026-10-06 (archhost copy, never
+  committed): f32 coordinate math in the resize passes the original 11
+  cases and fails `full_frame_640x480` and `clipped_roi_521x463`
+  (`face_roi_300x260` is below 449 px, the smallest ROI side where that
+  variant changes any coefficient or offset); f64 margin math passes all
+  14 frame cases and the hand-written truncation cases and fails both
+  crop-only cases; copying the wrong frame row into one ROI row when the
+  ROI does not start at row 0 passes every check that existed before the
+  full-tensor hash and fails that hash on 4 cases.
 - The current-candidate comparison
   (`benchmarks/preprocessing-conformance/compare_current.py`) compiled the
-  working-tree helper and matched the live oracle bit-exactly across all ten
-  cases (1,505,280 tensor elements, worst absolute delta 0.0).
-- The real shipped `liveness_vit.onnx` (SHA-256 pinned in `models/SHA256SUMS`)
-  passes its deterministic uniform-frame low-spoof test under the new
-  preprocessing, and the rest of the vision suite passes (96 tests, 0
-  failures).
+  working-tree helper and matched the live oracle bit-exactly across all
+  fourteen cases (2,107,392 tensor elements, worst absolute delta 0.0). Its
+  receipt records the checkout's HEAD, any measured file that differs from
+  it and the rustc version. Before merge,
+  `compare_current.py --require-clean` runs on a clean checkout of the PR
+  head; it refuses to run while any measured file differs from HEAD, so
+  its receipt names exactly the commit it measured. That receipt, archived
+  with its SHA-256, is the comparison evidence for the head; a
+  working-tree run is not.
+- The real shipped `liveness_vit.onnx` (SHA-256 pinned in
+  `models/SHA256SUMS`) scores the `face_roi_300x260` and
+  `clipped_roi_521x463` fixture frames at their recorded p_spoof (0.496063
+  and 0.466778, equal to 9 digits under ONNX Runtime 1.28.1 and 1.29.0)
+  within 1e-4, and a one-pixel crop shift moves each score by 3.2e-3 to
+  3.5e-3. Widening the crop by one column (1.0e-3), dropping the resize
+  rounding term (1.4e-4) or copying the wrong frame row (2.5e-4) each
+  fails that test; f32 coordinate math (4.4e-6) does not and is caught by
+  the fixtures. The uniform-frame test shows determinism and a low score
+  only; a uniform frame cannot show a crop or resize change. The vision
+  unit suite passes with the real models (99 passed, 0 failed, 4 ignored).
 
 None of this measures genuine or attack scores. Synthetic conformance cannot
 establish the deployed operating point on any camera.

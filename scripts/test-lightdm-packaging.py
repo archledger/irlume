@@ -87,7 +87,13 @@ class Packaging(unittest.TestCase):
                 actual = (units / name).read_text()
                 self.assertNotIn("ExecStart=/usr/bin/irlume", actual)
                 self.assertNotIn("ExecStartPre=/usr/bin/irlume", actual)
+                # Prefixed commands ("-", "+", ...) must be rewritten too.
+                live = [line for line in actual.splitlines() if not line.lstrip().startswith("#")]
+                self.assertEqual([line for line in live if "/usr/bin/irlume" in line], [], name)
             self.assertIn("ExecStart=/usr/local/bin/irlume login lightdm-prestart", (units / UNITS[0]).read_text())
+            dropin = (units / DROPIN).read_text().splitlines()
+            self.assertIn("ExecStartPre=-/usr/local/bin/irlume login lightdm-managed-prepare lightdm.service", dropin)
+            self.assertIn("ExecStartPost=-/usr/local/bin/irlume login lightdm-managed-commit lightdm.service", dropin)
 
     def test_session_module_is_installed_in_every_fhs_lane(self):
         for lane, relative in (("packaging/fedora/irlume.spec", "usr/lib64/security/pam_irlume_view.so"),
@@ -142,9 +148,16 @@ class Packaging(unittest.TestCase):
         # or masked preparation unit stops the LightDM start.
         dropin = (ROOT / "packaging/lightdm/50-irlume-pam.conf").read_text()
         prefixes = ("-", "+", ":", "!")
-        check = [line for line in dropin.splitlines() if line.startswith("ExecStartPre=")]
-        self.assertEqual(len(check), 1)
-        self.assertFalse(check[0][len("ExecStartPre="):][0] in prefixes, check[0])
+        pre = [line for line in dropin.splitlines() if line.startswith("ExecStartPre=")]
+        post = [line for line in dropin.splitlines() if line.startswith("ExecStartPost=")]
+        # The view check is the first precommand and the only unprefixed one.
+        check = [line for line in pre if line[len("ExecStartPre="):][0] not in prefixes]
+        self.assertEqual(check, ["ExecStartPre=/usr/bin/irlume login lightdm-view-check"])
+        self.assertEqual(pre[0], check[0])
+        # The managed-start receipt hooks (#859) may fail without stopping
+        # LightDM: "-" and nothing else, bound to the canonical unit.
+        self.assertEqual(pre[1:], ["ExecStartPre=-/usr/bin/irlume login lightdm-managed-prepare lightdm.service"])
+        self.assertEqual(post, ["ExecStartPost=-/usr/bin/irlume login lightdm-managed-commit lightdm.service"])
         for bind in ("BindReadOnlyPaths=/etc/pam.d:/run/irlume-lightdm-source/etc",
                      "BindReadOnlyPaths=-/usr/lib/pam.d:/run/irlume-lightdm-source/vendor",
                      "BindReadOnlyPaths=/run/irlume-lightdm/pam.d:/etc/pam.d",

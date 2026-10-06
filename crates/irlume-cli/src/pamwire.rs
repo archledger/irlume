@@ -275,6 +275,9 @@ pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
     if let Some(action @ ("lightdm-prestart" | "lightdm-refresh" | "lightdm-view-check")) = action {
         return lightdm_view::run(action, args);
     }
+    if let Some(action @ ("lightdm-managed-prepare" | "lightdm-managed-commit")) = action {
+        return remote_seats::run_managed_start(action, args);
+    }
     let apply = args.iter().any(|a| a == "--apply");
     let with_sudo = args.iter().any(|a| a == "--with-sudo");
     let with_polkit = args.iter().any(|a| a == "--with-polkit");

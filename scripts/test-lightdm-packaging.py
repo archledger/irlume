@@ -60,15 +60,26 @@ class Packaging(unittest.TestCase):
         block = "# The private PAM view is prepared before LightDM" + block
         with tempfile.TemporaryDirectory() as temp:
             block = block.replace("/etc/systemd/system", temp + "/etc/systemd/system")
-            for module_dir in ("/usr/lib64/security", "/usr/lib/security", "/usr/lib/x86_64-linux-gnu/security", "/lib/x86_64-linux-gnu/security"):
-                block = block.replace(module_dir, temp + module_dir)
+            # Two phases: replacing the bare multiarch path after the /usr one
+            # would re-match its suffix inside the already-replaced string.
+            module_dirs = ("/usr/lib64/security", "/usr/lib/security", "/usr/lib/x86_64-linux-gnu/security", "/lib/x86_64-linux-gnu/security")
+            for marker, module_dir in enumerate(module_dirs):
+                block = block.replace(module_dir, f"@@MODDIR{marker}@@")
+            for marker, module_dir in enumerate(module_dirs):
+                block = block.replace(f"@@MODDIR{marker}@@", temp + module_dir)
             module_dir = Path(temp) / "usr/lib64/security"
             module_dir.mkdir(parents=True)
             (module_dir / "pam_permit.so").write_bytes(b"synthetic installed PAM directory")
             module = Path(temp) / "module.so"
             module.write_bytes(b"synthetic module payload")
             block = block.replace('"$REPO/target/release/libpam_irlume_view.so"', shlex.quote(str(module)))
-            subprocess.run(["bwrap", "--unshare-all", "--die-with-parent", "--ro-bind", "/", "/", "--bind", temp, temp,
+            # No network namespace: this lane does not load the runner's
+            # bwrap AppArmor profile, and Ubuntu 24.04 denies unprivileged
+            # loopback setup (RTM_NEWADDR EPERM) inside a new net namespace.
+            # The installer block only writes under the bound temporary root.
+            subprocess.run(["bwrap", "--die-with-parent", "--unshare-user", "--uid", "0", "--gid", "0",
+                            "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try",
+                            "--ro-bind", "/", "/", "--bind", temp, temp,
                             "--dev", "/dev", "bash", "-eu", "-c", block], env={**os.environ, "REPO": str(ROOT)}, check=True)
             self.assertEqual((module_dir / "pam_irlume_view.so").read_bytes(), module.read_bytes())
             units = Path(temp) / "etc/systemd/system"

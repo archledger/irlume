@@ -578,6 +578,29 @@ fn prestart_preserves_local_lightdm_fingerprint_and_rejects_cycles() {
     );
 }
 
+/// The sanitizer lane builds the session module instrumented while this probe
+/// stays a plain C binary, so the runtime the module was linked against must
+/// be preloaded for its dlopen to initialize. Found through ldd against the
+/// artifact the lane exported; every other layout returns None.
+fn session_module_asan_runtime() -> Option<String> {
+    let module = std::env::var_os("IRLUME_TEST_VIEW_MODULE")?;
+    let output = std::process::Command::new("ldd")
+        .arg(module)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines().find_map(|line| {
+        let (left, right) = line.split_once("=>")?;
+        if !left.trim().contains("asan") {
+            return None;
+        }
+        let path = right.trim().split_whitespace().next()?;
+        std::path::Path::new(path)
+            .is_file()
+            .then(|| path.to_string())
+    })
+}
+
 #[test]
 fn real_pam_remote_view_preserves_password_fallback_jumps_and_local_fingerprint() {
     let bed = Bed::new("real-pam-view", false);
@@ -610,7 +633,7 @@ fn real_pam_remote_view_preserves_password_fallback_jumps_and_local_fingerprint(
     std::fs::create_dir(bed.root.join("source")).unwrap();
     std::os::unix::fs::symlink(bed.root.join("pam"), bed.root.join("source/etc")).unwrap();
     let probe = |service: &str| {
-        support::isolated_root_command(
+        let mut command = support::isolated_root_command(
             &bed.root,
             driver.to_str().unwrap(),
             &[service],
@@ -624,9 +647,11 @@ fn real_pam_remote_view_preserves_password_fallback_jumps_and_local_fingerprint(
                 ),
                 (&bed.root.join("view/pam.d"), "/etc/pam.d"),
             ],
-        )
-        .output()
-        .unwrap()
+        );
+        if let Some(runtime) = session_module_asan_runtime() {
+            command.env("LD_PRELOAD", runtime);
+        }
+        command.output().unwrap()
     };
     // Linux-PAM upstream (and Fedora) has include/substack; Debian adds
     // @include downstream. The projection tests above preserve that dialect,
@@ -697,16 +722,18 @@ fn real_pam_remote_view_preserves_password_fallback_jumps_and_local_fingerprint(
                 (vendor_dir.as_path(), "/run/irlume-lightdm-source/vendor"),
             );
         }
-        let session = support::isolated_mount_root_command(
+        let mut session = support::isolated_mount_root_command(
             &bed.root,
             driver.to_str().unwrap(),
             &["lightdm", mode],
             &[],
             &[],
             &binds,
-        )
-        .output()
-        .unwrap();
+        );
+        if let Some(runtime) = session_module_asan_runtime() {
+            session.env("LD_PRELOAD", runtime);
+        }
+        let session = session.output().unwrap();
         assert!(
             session.status.success(),
             "an authenticated session must leave the private read-only PAM view: {session:?}"

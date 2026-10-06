@@ -213,6 +213,10 @@ descriptor and the frames being judged rather than to the cached role:
 - a decode that expands limited range to full range, so the ceiling after
   expansion is 255.
 
+Amendment 2026-10-06 below fixes the metadata domain and preliminary
+footroom and chroma bounds for these conditions, refuses XV601 and XV709
+under either quantization, and adds no ceiling.
+
 Measured on the T480 (5986:1141) by @maurerr, the reporter of #887:
 
 - The node offers YUYV only, at 340x340 and 640x480, both at 30 fps. The
@@ -369,3 +373,62 @@ Output Terminal as a source. They stay `Role::Rgb`, and one that offers
 only YUYV now names a malformed descriptor instead of its earlier refusal.
 The streaming interface's `bTerminalLink` naming an Output Terminal of the
 function is not checked; the fixtures, the BRIO and the NexiGo satisfy it.
+
+## Amendment 2026-10-06: preliminary §4 metadata and frame-content bounds
+
+#887. §4 stays pending: `clipping_white_level` still answers `None` for
+YUYV luma, and every credential-releasing attempt on a YUYV IR stream
+still refuses. This amendment fixes, for the later change §4 describes,
+the metadata domain and the per-frame bounds that a pure camera-crate
+helper (`crates/irlume-camera/src/yuyv_exposure.rs`) checks on synthetic
+input. Nothing calls the helper yet. The bounds are preliminary and
+uncalibrated: they come from the UAPI and from the T480 measurements
+recorded in §4, and attended acceptance on the T480 can change them.
+
+- **Metadata read.** The helper judges raw `VIDIOC_G_FMT` values of a
+  single-planar capture YUYV format, and only when the node advertises
+  `V4L2_CAP_EXT_PIX_FORMAT` and `priv` holds `V4L2_PIX_FMT_PRIV_MAGIC`;
+  otherwise the extended fields are undefined and the range is
+  unresolved.
+- **Supported domain.** The colorspace is one of SMPTE170M, 470_SYSTEM_M,
+  470_SYSTEM_BG, SRGB, OPRGB, JPEG, REC709, DCI_P3, BT2020 and SMPTE240M,
+  the ones `videodev2.h` documents a default Y'CbCr encoding for. The
+  encoding is DEFAULT, resolved by that table, or one of 601, 709, XV601,
+  XV709, BT2020 and SMPTE240M. The quantization is DEFAULT, FULL_RANGE or
+  LIM_RANGE. Everything else leaves the range unresolved and refuses: an
+  unknown value of any of the three, colorspace DEFAULT (no format field
+  resolves it, and the frame size is not used to guess), the deprecated
+  BT878 colorspace and SYCC encoding, the RAW colorspace, BT2020_CONST_LUM
+  and the HSV encodings. No raw value is converted to an enum.
+- **Limited range.** Explicit LIM_RANGE, or DEFAULT with any colorspace
+  but JPEG, which is how `V4L2_MAP_QUANTIZATION_DEFAULT` resolves Y'CbCr.
+  FULL_RANGE, and DEFAULT with JPEG, are full range and refused.
+- **Extended gamut.** XV601 and XV709 are refused under either
+  quantization, explicit LIM_RANGE included. xvYCC is limited range that
+  allows values outside it, so 235 is not its ceiling. This widens the
+  second condition of §4, which excluded them only from the default. Under
+  DEFAULT or LIM_RANGE they stay nominally limited, not full range; an
+  explicit FULL_RANGE, which the UAPI never pairs with xvYCC, refuses as
+  full range like any other encoding.
+- **JPEG.** Explicit LIM_RANGE with the JPEG colorspace is refused:
+  `videodev2.h` defines JPEG as sRGB with BT.601 encoding at full range,
+  so the tuple contradicts itself.
+- **Footroom.** A frame fails when more than 0.5% of its pixels have raw
+  luma below 15. Both Y bytes of every macropixel in the frame's
+  `2 * width * height` image bytes count, and payload bytes after the
+  image never do. In integers this is `below_15 > pixels / 200`; raw 15
+  does not count.
+- **Flat chroma.** A frame fails when its U and V bytes together span
+  more than 2 codes, `max(U, V) - min(U, V) > 2` over the whole frame.
+  Flatness is judged within one frame, with no test for closeness to 128
+  and no comparison between frames. §4 records a span of 2 on the T480,
+  so this bound has no margin.
+
+Passing these is not a ceiling and not a grant. The helper's combined
+verdict has no way to state the first condition of §4, the attestation
+re-derived from the open file descriptor, so it refuses whatever the
+metadata and frames show; that evidence belongs to the later fd-bound
+change. The session latch, the current-burst emitter alternation and the
+limited-to-full expansion stay unimplemented, and which frames feed the
+latch and how expansion rounds stay open for the changes that implement
+them. Synthetic tests in the helper's module check each case above.

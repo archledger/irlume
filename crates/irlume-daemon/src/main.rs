@@ -16102,7 +16102,15 @@ mod tests {
 
     #[test]
     fn guided_enrollment_rejects_invalid_budgets_and_missing_improvement_targets() {
-        let _passwd = passwd_lock();
+        // The dispatch observes the camera selection before the guided
+        // live-connection check, so the sandbox has to go up first: pointed at
+        // the host's real /etc/irlume, a root-only cameras.conf there reads as
+        // Unreadable and fails every request with the camera-selection
+        // password refusal before the guided check runs. The sandbox writes
+        // the environment, so this takes the exclusive guard, not the shared
+        // passwd one.
+        let _g = env_lock();
+        let _sb = sandbox("guided-enrollment");
         let root = peer(0);
         for (scans, profile, improve) in [
             (0, None, false),
@@ -17987,6 +17995,11 @@ mod tests {
     fn root_support_probe_executes_and_returns_bounded_categorical_evidence() {
         use irlume_common::diagnostics::{ProbeOutcome, ShareSafeEventKind};
         let _g = env_lock();
+        // The probe request observes the camera selection before its arm runs,
+        // so the sandbox goes up first: a root-only host /etc/irlume/
+        // cameras.conf would turn this into the camera-selection password
+        // refusal instead of a typed probe response.
+        let _sb = sandbox("root-support-probe");
         let mut engine = engine();
         let state = diagnostics::DiagnosticState::default();
         let scope = state.begin(irlume_common::diagnostics::OperationClass::SupportProbe);

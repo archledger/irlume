@@ -267,6 +267,37 @@ mod tests {
                 true
             }
         }
+        /// Whether the fixture lock comes free, waiting out the kernel's
+        /// teardown window. See [`flock_exclusive_when_released`].
+        fn released(&self) -> bool {
+            let file = File::open(self.0.join("lock")).unwrap();
+            flock_exclusive_when_released(file.as_raw_fd()) == 0
+        }
+    }
+
+    /// Acquire `LOCK_EX` on `fd` once the kernel has finished releasing the
+    /// lock, or report failure after a bounded wait.
+    ///
+    /// A flock is released only when the last reference to its open file
+    /// description drops, and a concurrent `Command::spawn` in this test binary
+    /// briefly inherits every open descriptor: fork copies the fd table, and
+    /// CLOEXEC closes the copy only at execve. A close that lands in that
+    /// window releases its lock when the child execs, microseconds to
+    /// milliseconds later, so a one-shot nonblocking acquire can observe
+    /// `EWOULDBLOCK` for a lock that is already going away (measured 2059 of
+    /// 350056 immediate rechecks while a spawner thread ran, 0 of 2000
+    /// without one). A description that is actually leaked never frees and
+    /// still fails the caller's assert after the wait.
+    fn flock_exclusive_when_released(fd: std::os::fd::RawFd) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            // SAFETY: the caller owns the live descriptor; LOCK_NB never waits.
+            let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 || Instant::now() >= deadline {
+                return result;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -291,7 +322,7 @@ mod tests {
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
         assert!(fixture.excluded());
         drop(received);
-        assert!(!fixture.excluded());
+        assert!(fixture.released());
     }
 
     #[test]
@@ -304,7 +335,7 @@ mod tests {
         send(&sender, &[file], deadline).unwrap();
         assert!(receive(&receiver, wrong, deadline).is_err());
         assert!(
-            !fixture.excluded(),
+            fixture.released(),
             "rejection must close every received description"
         );
     }
@@ -341,10 +372,11 @@ mod tests {
         let busy = unsafe { libc::flock(competitor.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_ne!(busy, 0);
         drop(received);
-        // SAFETY: the same live descriptor, after the guard is dropped.
-        let free = unsafe { libc::flock(competitor.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        // The same live descriptor, after the guard is dropped. The retry
+        // waits out the kernel teardown window the helper documents.
+        let free = flock_exclusive_when_released(competitor.as_raw_fd());
         assert_eq!(free, 0);
-        assert!(!fixture.excluded());
+        assert!(fixture.released());
     }
 
     #[test]
@@ -386,7 +418,7 @@ mod tests {
         drop(files);
         drop(file);
         assert!(receive(&receiver, owner, deadline).is_err());
-        assert!(!fixture.excluded());
+        assert!(fixture.released());
     }
 
     #[test]
@@ -411,7 +443,7 @@ mod tests {
         send(&sender, &[file], deadline).unwrap();
         assert!(receive(&receiver, owner, deadline).is_err());
         assert!(
-            !fixture.excluded(),
+            fixture.released(),
             "an extra control message must not leak rights"
         );
     }

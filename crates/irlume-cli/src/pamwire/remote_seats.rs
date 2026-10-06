@@ -21,6 +21,7 @@
 //! login screens a file no longer turns on.
 
 mod evidence;
+mod managed_start;
 
 use super::autologin::{assignments, on, LIGHTDM_DROP_IN_DIRS, LIGHTDM_MAIN};
 use evidence::{files as lightdm_files, read};
@@ -71,11 +72,38 @@ pub(super) fn governs(service: &str) -> bool {
 /// LightDM configuration that cannot be read counts as one: whether it serves
 /// remote login screens is then unknown, and the password is the floor.
 pub(super) fn face_blocked(service: &str) -> Option<String> {
-    reason_with(
-        service,
-        lightdm_remote_servers,
+    reason_with(service, lightdm_remote_servers, running_lightdm_is_stale)
+}
+
+/// The drop-in's managed-start producer commands.
+pub(super) fn run_managed_start(action: &str, args: &[String]) -> std::process::ExitCode {
+    managed_start::run_producer(action, args)
+}
+
+/// Whether the running LightDM may serve a configuration other than the
+/// current one. A launch the managed-start producer bound answers by content,
+/// with no clock and no `/proc`; any other launch keeps the existing rule.
+fn running_lightdm_is_stale() -> Result<bool, String> {
+    stale_with(
+        managed_start::running_lightdm,
+        managed_start::current_generation,
         running_lightdm_predates_its_configuration,
     )
+}
+
+fn stale_with(
+    running: impl FnOnce() -> managed_start::Running,
+    current: impl FnOnce() -> Result<String, String>,
+    legacy: impl FnOnce() -> Result<bool, String>,
+) -> Result<bool, String> {
+    match running() {
+        managed_start::Running::Loaded { remote: true, .. } => Ok(true),
+        managed_start::Running::Loaded {
+            generation,
+            remote: false,
+        } => Ok(current()? != generation),
+        managed_start::Running::Unknown(_) => legacy(),
+    }
 }
 
 fn reason_with(
@@ -123,8 +151,8 @@ fn running_lightdm_predates_its_configuration() -> Result<bool, String> {
 }
 
 fn running_lightdm_predates_in(root: &Path, proc: &Path) -> Result<bool, String> {
-    // Retain the existing wall-clock gate. Clock-step-independent positive
-    // proof remains separate work; current unit timestamps alone cannot fix it.
+    // The wall-clock rule for launches without a managed-start receipt:
+    // legacy instances and unsupported profiles. Bound launches never reach it.
     let changed = latest_change(root)?;
     Ok(predates(lightdm_started_in(proc)?, changed))
 }
@@ -327,6 +355,23 @@ mod tests {
     }
 
     #[test]
+    fn a_drop_in_named_only_conf_counts_as_lightdm_loads_it() {
+        // LightDM tries every name ending in ".conf", the bare name included.
+        let root = Root::new("bare-conf");
+        root.put(
+            "etc/lightdm/lightdm.conf.d/.conf",
+            "[XDMCPServer]\nenabled=true\n",
+        );
+        assert_eq!(
+            root.servers()
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            vec!["XDMCP"]
+        );
+    }
+
+    #[test]
     fn malformed_gkeyfile_cannot_clear_a_remote_server() {
         let root = Root::new("malformed-gkeyfile");
         root.put(
@@ -420,6 +465,77 @@ mod tests {
             why.contains("could not read /etc/lightdm/lightdm.conf"),
             "{why}"
         );
+    }
+
+    fn bound(remote: bool) -> impl FnOnce() -> managed_start::Running {
+        move || managed_start::Running::Loaded {
+            generation: "a".repeat(64),
+            remote,
+        }
+    }
+
+    #[test]
+    fn a_bound_launch_is_current_by_content_whatever_the_clock_says() {
+        // The legacy rule would call it stale (a clock stepped back after
+        // start); the bound launch loaded exactly the current bytes.
+        assert_eq!(
+            stale_with(bound(false), || Ok("a".repeat(64)), || Ok(true)),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn a_bound_launch_with_changed_configuration_is_stale_whatever_the_clock_says() {
+        // The legacy rule would call it current (the change was stamped
+        // before the start after a clock step); the bytes differ.
+        assert_eq!(
+            stale_with(bound(false), || Ok("b".repeat(64)), || Ok(false)),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn a_bound_launch_never_consults_proc() {
+        // Under hidepid the legacy rule cannot see LightDM. A bound launch
+        // answers without it, identically for root and unprivileged plans.
+        let mut asked = false;
+        let verdict = stale_with(
+            bound(false),
+            || Ok("a".repeat(64)),
+            || {
+                asked = true;
+                Err("/proc/1/stat unavailable".into())
+            },
+        );
+        assert_eq!(verdict, Ok(false));
+        assert!(!asked);
+    }
+
+    #[test]
+    fn a_bound_launch_that_loaded_a_remote_server_is_stale() {
+        assert_eq!(
+            stale_with(bound(true), || Ok("a".repeat(64)), || Ok(false)),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_current_configuration_is_no_answer_for_a_bound_launch() {
+        assert!(stale_with(bound(false), || Err("unreadable".into()), || Ok(false)).is_err());
+    }
+
+    #[test]
+    fn a_launch_without_a_receipt_keeps_the_existing_rule() {
+        let unknown = || managed_start::Running::Unknown("no managed-start receipt".into());
+        assert_eq!(
+            stale_with(unknown, || Ok("a".repeat(64)), || Ok(true)),
+            Ok(true)
+        );
+        assert_eq!(
+            stale_with(unknown, || Ok("a".repeat(64)), || Ok(false)),
+            Ok(false)
+        );
+        assert!(stale_with(unknown, || Ok("a".repeat(64)), || Err("x".into())).is_err());
     }
 
     #[test]

@@ -21,7 +21,6 @@ All notable changes to irlume are documented here. This project adheres to
   camera-free preparation. Whole-pair publication revalidation preserves ordinary
   device claims and saved selection. Split trust operations remain disabled
   (ADR-0032, guarded split operation-choice amendment; #995).
-
 - LightDM runs against a private, read-only PAM view when irlume's LightDM
   units are installed. A preparation unit ordered before every LightDM start
   reads the prospective configuration with `lightdm --show-config` and, while
@@ -85,6 +84,17 @@ All notable changes to irlume are documented here. This project adheres to
   authentication stay refused until the later steps.
 
 ### Fixed
+
+- The LightDM restart gate proves which configuration the running LightDM
+  loaded by content, not by comparing a wall-clock change time with its
+  start, and without reading `/proc`. irlume's drop-in records a digest of
+  every file LightDM reads before it starts and checks it again once
+  LightDM has loaded its configuration and taken its bus name, then
+  publishes a receipt bound to that launch's invocation, main process and
+  monotonic start. `login plan` and `login apply` compare that receipt with
+  the current configuration, so a clock step can no longer hide a change,
+  and an unprivileged plan under `hidepid` reaches the same answer as root.
+  A LightDM started without the drop-in keeps the previous rule (#859).
 
 - Secondary camera-group publication rechecks exact primary and secondary source
   state, account authority and fresh time after key preparation under the account

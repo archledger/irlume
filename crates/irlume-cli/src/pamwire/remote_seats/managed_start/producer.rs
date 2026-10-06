@@ -68,6 +68,8 @@ pub(crate) trait Host {
     /// `systemctl show` output for `unit` with the properties
     /// [`parse_manager`] needs.
     fn show(&self, unit: &str) -> Result<String, String>;
+    /// The unit's `Type=` as the manager reports it.
+    fn unit_type(&self, unit: &str) -> Result<String, String>;
     fn target(&self, pid: u32) -> Result<Target, String>;
     /// Device and inode of an executable path, following links.
     fn identity(&self, path: &Path) -> Result<(u64, u64), String>;
@@ -93,6 +95,10 @@ impl Host for RealHost {
 
     fn show(&self, unit: &str) -> Result<String, String> {
         super::system::systemctl_show(unit)
+    }
+
+    fn unit_type(&self, unit: &str) -> Result<String, String> {
+        super::system::systemctl_unit_type(unit)
     }
 
     fn target(&self, pid: u32) -> Result<Target, String> {
@@ -235,6 +241,15 @@ pub(crate) fn commit(host: &dyn Host, unit: &str) -> Result<Receipt, String> {
         || record.invocation_id != invocation_id
     {
         return Err("the prepared record names another launch".into());
+    }
+    // Only Type=dbus starts ExecStartPost= after the bus name, which LightDM
+    // takes after loading configuration; any other type could run this
+    // before the load and bind bytes LightDM had not read yet.
+    let unit_type = host.unit_type(unit)?;
+    if unit_type != "dbus" {
+        return Err(format!(
+            "{unit} has Type={unit_type}; only dbus orders this commit after the load"
+        ));
     }
     let before = launch(host, unit, &invocation_id, main_pid)?;
     let target = host.target(main_pid)?;
@@ -382,6 +397,7 @@ mod tests {
         runtime: PathBuf,
         env: RefCell<Vec<(&'static str, Option<OsString>)>>,
         manager: RefCell<String>,
+        unit_type: RefCell<String>,
         target: RefCell<Result<Target, String>>,
         identities: RefCell<Vec<(PathBuf, (u64, u64))>>,
     }
@@ -409,6 +425,7 @@ mod tests {
                     ("MAINPID", Some(PID.to_string().into())),
                 ]),
                 manager: RefCell::new(running(PID)),
+                unit_type: RefCell::new("dbus".into()),
                 target: RefCell::new(Ok(target("/usr/sbin/lightdm"))),
                 identities: RefCell::new(vec![("/usr/sbin/lightdm".into(), EXE)]),
             }
@@ -448,6 +465,9 @@ mod tests {
         }
         fn show(&self, _unit: &str) -> Result<String, String> {
             Ok(self.manager.borrow().clone())
+        }
+        fn unit_type(&self, _unit: &str) -> Result<String, String> {
+            Ok(self.unit_type.borrow().clone())
         }
         fn target(&self, _pid: u32) -> Result<Target, String> {
             self.target.borrow().clone()
@@ -670,6 +690,20 @@ mod tests {
         )
         .unwrap();
         assert!(prepare(&fake, LIGHTDM_UNIT).is_ok(), "positive control");
+    }
+
+    #[test]
+    fn commit_requires_a_unit_that_starts_post_commands_after_the_load() {
+        // Only Type=dbus orders ExecStartPost= after LightDM's bus name,
+        // which it takes after loading configuration. Any other type could
+        // run the commit before the load.
+        for unit_type in ["simple", "exec", "notify", "forking", "oneshot", ""] {
+            let fake = Fake::new("type");
+            prepare(&fake, LIGHTDM_UNIT).unwrap();
+            *fake.unit_type.borrow_mut() = unit_type.into();
+            assert!(commit(&fake, LIGHTDM_UNIT).is_err(), "{unit_type:?}");
+            assert!(!fake.runtime.join(RECEIPT_NAME).exists());
+        }
     }
 
     #[test]

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
-const RUN: &str = "/run/irlume-lightdm";
+pub(super) const RUN: &str = "/run/irlume-lightdm";
 const VIEW: &str = "/run/irlume-lightdm/pam.d";
 const SOURCE: &str = "/run/irlume-lightdm-source/etc";
 const PREFIX: &str = "irlume-lightdm-copy-";

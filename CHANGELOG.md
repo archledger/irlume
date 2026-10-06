@@ -25,9 +25,12 @@ All notable changes to irlume are documented here. This project adheres to
   versioned, fail-closed receipt bound to one systemd invocation (invocation
   id, main pid, monotonic start) and a verdict machine that samples the
   manager before and after the receipt and compares identity by equality,
-  never wall-clock ordering, without reading `/proc`. It stays unwired until
-  the qualified producer ships, so every verdict today is `unknown` and the
-  existing timestamp rule is unchanged (#859).
+  never wall-clock ordering, without reading `/proc`. Its production source
+  reads the manager's launch identity with `systemctl show`, a root-owned
+  receipt under `/run/irlume-lightdm` and the target's lifetime through a
+  process descriptor, so root and unprivileged callers read the same facts.
+  It stays unwired until the qualified producer ships, so every verdict today
+  is `unknown` and the existing timestamp rule is unchanged (#859).
 
 - LightDM runs against a private, read-only PAM view when irlume's LightDM
   units are installed. A preparation unit ordered before every LightDM start

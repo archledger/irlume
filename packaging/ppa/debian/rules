@@ -56,6 +56,8 @@ override_dh_auto_install:
 	install -D -m0755 target/release/irlume debian/irlume/usr/bin/irlume
 	install -D -m0644 target/release/libpam_irlume.so \
 		debian/irlume/usr/lib/$(DEB_HOST_MULTIARCH)/security/pam_irlume.so
+	install -D -m0644 target/release/libpam_irlume_view.so \
+		debian/irlume/usr/lib/$(DEB_HOST_MULTIARCH)/security/pam_irlume_view.so
 	# KDE wallet handoff helper; libexec because it takes a secret on stdin
 	# and is only meaningful inside a PAM transaction.
 	install -D -m0755 target/release/irlume-kwallet-init \
@@ -115,6 +117,16 @@ override_dh_auto_install:
 # failure it was built for.
 	install -D -m0644 packaging/systemd/irlume-reconcile.timer \
 		debian/irlume/usr/lib/systemd/system/irlume-reconcile.timer
+	install -D -m0644 packaging/systemd/irlume-lightdm-prepare.service \
+		debian/irlume/usr/lib/systemd/system/irlume-lightdm-prepare.service
+	install -D -m0644 packaging/systemd/irlume-lightdm-refresh.service \
+		debian/irlume/usr/lib/systemd/system/irlume-lightdm-refresh.service
+	install -D -m0644 packaging/systemd/irlume-lightdm-refresh.path \
+		debian/irlume/usr/lib/systemd/system/irlume-lightdm-refresh.path
+	install -D -m0644 packaging/systemd/irlume-lightdm-refresh.timer \
+		debian/irlume/usr/lib/systemd/system/irlume-lightdm-refresh.timer
+	install -D -m0644 packaging/lightdm/50-irlume-pam.conf \
+		debian/irlume/usr/lib/systemd/system/lightdm.service.d/50-irlume-pam.conf
 # tmpfiles.d: the setgid root:video lock directory for the IR-emitter
 # exclusion locks (#542). The daemon's bounding set has no CAP_CHOWN, so the
 # group must be inherited at creation; postinst creates it before any start.

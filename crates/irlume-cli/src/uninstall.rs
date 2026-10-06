@@ -415,6 +415,7 @@ fn source_file_targets() -> Vec<PathBuf> {
         "/lib/x86_64-linux-gnu/security",
     ] {
         targets.push(PathBuf::from(d).join("pam_irlume.so"));
+        targets.push(PathBuf::from(d).join("pam_irlume_view.so"));
     }
     targets.push(PathBuf::from(
         "/usr/share/polkit-1/actions/org.irlume.enroll.policy",
@@ -423,6 +424,21 @@ fn source_file_targets() -> Vec<PathBuf> {
         "/usr/share/polkit-1/actions/org.irlume.recovery-manage.policy",
     ));
     targets.push(PathBuf::from("/etc/systemd/system/irlumed.service"));
+    for dir in [
+        "/etc/systemd/system",
+        "/usr/lib/systemd/system",
+        "/lib/systemd/system",
+    ] {
+        for unit in [
+            "irlume-lightdm-prepare.service",
+            "irlume-lightdm-refresh.service",
+            "irlume-lightdm-refresh.path",
+            "irlume-lightdm-refresh.timer",
+            "lightdm.service.d/50-irlume-pam.conf",
+        ] {
+            targets.push(PathBuf::from(dir).join(unit));
+        }
+    }
     // Package-path unit copies: orphaned whenever this function runs (a
     // package entry would have routed removal through the package manager).
     for d in ["/usr/lib/systemd/system", "/lib/systemd/system"] {
@@ -877,6 +893,9 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
             "irlume-reconcile.path",
             "irlume-reconcile.timer",
             "irlume-reconcile.service",
+            "irlume-lightdm-refresh.path",
+            "irlume-lightdm-refresh.timer",
+            "irlume-lightdm-refresh.service",
             "irlume-runner-prune.service",
         ] {
             let _ = systemctl(&["disable", "--now", unit]);
@@ -895,6 +914,10 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
             "irlume-reconcile.service",
             "irlumed.socket",
             "irlumed.service",
+            "irlume-lightdm-prepare.service",
+            "irlume-lightdm-refresh.path",
+            "irlume-lightdm-refresh.timer",
+            "irlume-lightdm-refresh.service",
         ] {
             let _ = systemctl(&["reset-failed", unit]);
             let p = std::path::Path::new("/etc/systemd/system").join(unit);
@@ -902,6 +925,10 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
                 let _ = std::fs::remove_file(&p);
             }
         }
+        // Never stop the preparation unit: its reverse Requires dependency could
+        // stop LightDM. Keep runtime view files until reboot for sessions that
+        // inherited its namespace; ordinary PAM aliases still follow host policy.
+        let _ = std::fs::remove_file("/etc/systemd/system/lightdm.service.d/50-irlume-pam.conf");
         // Reload so a later `systemctl list-unit-files` reflects the removal.
         let _ = systemctl(&["daemon-reload"]);
         // AppArmor: removing the package deletes /etc/apparmor.d/usr.bin.irlumed

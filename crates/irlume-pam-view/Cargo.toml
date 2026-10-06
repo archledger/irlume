@@ -1,0 +1,15 @@
+[package]
+name = "irlume-pam-view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "pam_irlume_view"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

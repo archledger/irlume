@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh LightDM's PAM view after external policy changes
+
+[Timer]
+OnActiveSec=30s
+OnUnitInactiveSec=30s
+AccuracySec=1s
+Unit=irlume-lightdm-refresh.service

@@ -1,0 +1,12 @@
+[Unit]
+Description=Prepare LightDM's private PAM view before startup
+Documentation=https://github.com/archledger/irlume
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/irlume login lightdm-prestart lightdm.service
+TimeoutStartSec=3s
+KillMode=control-group
+PrivateDevices=yes
+PrivateTmp=yes
+# No RemainAfterExit: preparation must run again at every LightDM restart.

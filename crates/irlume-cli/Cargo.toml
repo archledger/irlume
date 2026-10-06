@@ -22,6 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 libc.workspace = true   # restore default SIGPIPE so `irlume … | head` doesn't panic
+irlume-pam-view = { path = "../irlume-pam-view" }
 rand.workspace = true   # session and operation identifiers for the machine event stream
 image = { workspace = true }
 rpassword = "7"   # no-echo password prompt for `keyring arm`

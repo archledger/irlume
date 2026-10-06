@@ -164,6 +164,27 @@ jobs:
           print(paths[0])
           ')
           export IRLUME_TEST_CLI="$cli"
+          # Same artifact-receipt discovery for the session-module cdylib the
+          # LightDM enforcement tests copy into their private PAM roots: its
+          # ASan build does not land beside the test executable either. The
+          # module itself is built without the sanitizer: the runtime is a
+          # static archive, which cannot be dlopened into the plain C probe,
+          # and the shim only forwards pam_sm_* calls to umount2. Every Rust
+          # line of the workspace stays instrumented in this lane.
+          view_module=$(env RUSTFLAGS= cargo +nightly build --locked \
+            -p irlume-pam-view --lib --target x86_64-unknown-linux-gnu \
+            --message-format=json | python3 -c '
+          import json, sys
+          paths = [name for row in map(json.loads, sys.stdin)
+                   if row.get("reason") == "compiler-artifact"
+                   and row.get("target", {}).get("name") == "pam_irlume_view"
+                   and "cdylib" in row.get("target", {}).get("kind", [])
+                   for name in row.get("filenames", [])
+                   if name.endswith(".so")]
+          assert len(paths) == 1, paths
+          print(paths[0])
+          ')
+          export IRLUME_TEST_VIEW_MODULE="$view_module"
           # print_suppressions puts "Suppressions used:" in the log, so a reader
           # can see the deliberate leak was matched rather than assume it.
           # Guarded because `cargo test` exits 0 even when it discovers no tests

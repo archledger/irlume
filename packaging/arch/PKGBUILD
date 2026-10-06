@@ -74,6 +74,7 @@ package_irlume() {
     install -Dm0644 packaging/desktop/io.github.archledger.Irlume.desktop "$pkgdir/usr/share/applications/io.github.archledger.Irlume.desktop"
     install -Dm0644 packaging/desktop/io.github.archledger.Irlume.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.archledger.Irlume.svg"
     install -Dm0644 target/release/libpam_irlume.so "$pkgdir/usr/lib/security/pam_irlume.so"
+    install -Dm0644 target/release/libpam_irlume_view.so "$pkgdir/usr/lib/security/pam_irlume_view.so"
     # KDE wallet handoff helper. Not in /usr/bin: it is not a command a user
     # runs, it takes a secret on stdin, and it is only meaningful inside a PAM
     # transaction.
@@ -120,6 +121,11 @@ package_irlume() {
     install -Dm0644 packaging/systemd/irlume-reconcile.path "$pkgdir/usr/lib/systemd/system/irlume-reconcile.path"
     install -Dm0644 packaging/systemd/irlume-reconcile.service "$pkgdir/usr/lib/systemd/system/irlume-reconcile.service"
     install -Dm0644 packaging/systemd/irlume-reconcile.timer "$pkgdir/usr/lib/systemd/system/irlume-reconcile.timer"
+    install -Dm0644 packaging/systemd/irlume-lightdm-prepare.service "$pkgdir/usr/lib/systemd/system/irlume-lightdm-prepare.service"
+    install -Dm0644 packaging/systemd/irlume-lightdm-refresh.service "$pkgdir/usr/lib/systemd/system/irlume-lightdm-refresh.service"
+    install -Dm0644 packaging/systemd/irlume-lightdm-refresh.path "$pkgdir/usr/lib/systemd/system/irlume-lightdm-refresh.path"
+    install -Dm0644 packaging/systemd/irlume-lightdm-refresh.timer "$pkgdir/usr/lib/systemd/system/irlume-lightdm-refresh.timer"
+    install -Dm0644 packaging/lightdm/50-irlume-pam.conf "$pkgdir/usr/lib/systemd/system/lightdm.service.d/50-irlume-pam.conf"
     # tmpfiles.d: the setgid root:video lock directory for the IR-emitter
     # exclusion locks (#542). The daemon's bounding set has no CAP_CHOWN, so
     # the group must be inherited at creation, not corrected in-process.

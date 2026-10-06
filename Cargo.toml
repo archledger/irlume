@@ -15,6 +15,7 @@ members = [
     "crates/irlume-fingerprint",
     "crates/irlume-daemon",
     "crates/irlume-pam",
+    "crates/irlume-pam-view",
     "crates/irlume-cli",
 ]
 # The cargo-fuzz harness is its own workspace (needs nightly + libfuzzer-sys);

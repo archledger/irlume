@@ -857,6 +857,61 @@ pub(super) fn write_atomic(path: &Path, contents: &str) -> Result<(), WriteError
     write_atomic_inner(path, contents, Attrs::Carried, Expect::Any, &|| Ok(()))
 }
 
+/// Publish a root-only generated PAM view without a world-readable interval.
+pub(super) fn write_private_checked(
+    path: &Path,
+    contents: &str,
+    expected: Option<&str>,
+    label: Option<&[u8]>,
+) -> Result<(), WriteError> {
+    write_private_bytes_checked(
+        path,
+        contents.as_bytes(),
+        expected.map(str::as_bytes),
+        label,
+    )
+}
+
+/// The same checked, private publication for the retained session module.
+pub(super) fn write_private_bytes_checked(
+    path: &Path,
+    contents: &[u8],
+    expected: Option<&[u8]>,
+    label: Option<&[u8]>,
+) -> Result<(), WriteError> {
+    let expect = expected.map_or(Expect::Absent, Expect::Bytes);
+    write_atomic_prepared(
+        path,
+        contents,
+        Attrs::Given((0o600, 0, 0)),
+        expect,
+        &|| Ok(()),
+        &|file| {
+            use std::os::fd::AsRawFd as _;
+            if let Some(label) = label {
+                // SAFETY: file is live, the name is NUL-terminated, and label has
+                // exactly the length passed. Set the label before publication.
+                if unsafe {
+                    libc::fsetxattr(
+                        file.as_raw_fd(),
+                        c"security.selinux".as_ptr(),
+                        label.as_ptr().cast(),
+                        label.len(),
+                        0,
+                    )
+                } != 0
+                {
+                    return Err(format!(
+                        "preserve PAM SELinux label: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
 /// Test-only: [`write_atomic_checked_if`] with no further condition.
 #[cfg(test)]
 pub(super) fn write_atomic_checked(
@@ -1189,6 +1244,17 @@ fn write_atomic_inner(
     expect: Expect<'_>,
     still: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), WriteError> {
+    write_atomic_prepared(path, contents.as_bytes(), attrs, expect, still, &|_| Ok(()))
+}
+
+fn write_atomic_prepared(
+    path: &Path,
+    contents: &[u8],
+    attrs: Attrs,
+    expect: Expect<'_>,
+    still: &dyn Fn() -> Result<(), String>,
+    prepare: &dyn Fn(&std::fs::File) -> Result<(), String>,
+) -> Result<(), WriteError> {
     use std::io::Write as _;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     // What the target is right now. A rename REPLACES whatever the name refers
@@ -1224,7 +1290,7 @@ fn write_atomic_inner(
             .metadata()
             .map_err(|e| format!("stat {}: {e}", tmp.display()))?;
         ours = Some((meta.dev(), meta.ino()));
-        file.write_all(contents.as_bytes())
+        file.write_all(contents)
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
         if let Some((mode, uid, gid)) = attrs {
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
@@ -1235,6 +1301,7 @@ fn write_atomic_inner(
             std::os::unix::fs::chown(&tmp, Some(uid), Some(gid))
                 .map_err(|e| format!("chown {}: {e}", tmp.display()))?;
         }
+        prepare(&file)?;
         file.sync_all()
             .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
         drop(file);

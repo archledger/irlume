@@ -1062,6 +1062,7 @@ dependencies = [
  "irlume-core",
  "irlume-fingerprint",
  "irlume-liveness",
+ "irlume-pam-view",
  "irlume-vision",
  "libc",
  "rand 0.10.3",
@@ -1168,6 +1169,13 @@ dependencies = [
  "pamsm",
  "serde_json",
  "zeroize",
+]
+
+[[package]]
+name = "irlume-pam-view"
+version = "0.15.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

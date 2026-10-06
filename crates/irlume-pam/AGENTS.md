@@ -46,16 +46,24 @@ login or locks a person out. It is critical-tier
   (release refused before any face attempt) falls back to one identity-only
   `try_verify`; a denial, transport error or failed delivery never does
   (`wait` retries those until the budget runs out); and the `reseal` session
-  line can send `ResealPassword` and then an `UnsealKeyring` query
-  (`try_reseal_session`, `deliver_gnome_token`).
-- The `keyring` auth line first requires bounded evidence that the account
-  has no live local graphical session (`keyring_session::auth_release_allowed`).
-  Warm or unknown state returns IGNORE before even an older daemon can release
-  a secret. The guard uses a bounded UID helper and explicit logind records,
-  never `loginctl` or runtime-directory presence. Keep the session-phase GNOME
-  query independent of this check (ADR-0003's 2026-10-01 amendment).
-  `IRLUME_GETENT` and `IRLUME_LOGIND_DIR` are fixture overrides read through
-  `secure_env`; setuid callers use the fixed system paths.
+  line can send `ResealPassword` and then one `UnsealKeyring` query
+  (`try_reseal_session`, `deliver_keyring_secret`).
+- The `keyring` auth line requests nothing: PAM keeps running `optional`
+  lines after a failed `required` anchor or substack, and the module cannot
+  ask what the lines above it returned, so the release happens in
+  `open_session` on the `reseal` session line, which PAM runs only after
+  authentication and account management succeeded (ADR-0003's 2026-10-06
+  amendment). That session query is exempt from the warm rule: the session
+  being opened needs its secret although logind already lists the account as
+  live. The reply is routed by kind (a login password and a GNOME token to
+  the keyring control socket, a wallet key to `irlume-kwallet-init`), and an
+  emptied-stash sentinel makes each handle deliver at most once. irlumed
+  still withholds auth-phase releases on a warm or unreadable account for
+  modules from before that amendment. `IRLUME_LOGIND_DIR` is a fixture
+  override read through `secure_env`; setuid callers use the fixed system
+  paths. The pamwrap harness keeps `IRLUME_GETENT` as a tripwire pointing
+  at hostile scripts: nothing in the module may run an account probe on the
+  PAM path again, and a re-introduced one fails the inert-line test on time.
 - It runs in setuid stacks with the caller's environment: read socket and
   helper paths only through `irlume_common::client::secure_env` (`socket_path`,
   `secure_helper_path`). Anything else that environment can change, such as

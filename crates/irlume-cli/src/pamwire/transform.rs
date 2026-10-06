@@ -247,8 +247,9 @@ pub(super) fn wire_lock(content: &str) -> (String, bool) {
 }
 
 /// Wire the `keyring` unseal line into a fingerprint login service
-/// (`gdm-fingerprint`): insert it right after the `pam_fprintd.so` auth line so
-/// the sealed password is set before pam_gnome_keyring's auth line runs.
+/// (`gdm-fingerprint`): insert it right after the `pam_fprintd.so` auth line,
+/// where it marks the post-auth landing (the release itself happens in the
+/// `reseal` session line; ADR-0003, 2026-10-06 amendment).
 pub(super) fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
     if has_line_continuation(content) || unreadable_line(content).is_some() {
         return (content.to_string(), false);

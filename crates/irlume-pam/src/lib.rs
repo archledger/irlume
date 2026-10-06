@@ -179,18 +179,6 @@ const RESEAL_STASH_KEY: &str = "pam_irlume_reseal_authtok";
 /// it as the Unix password and fail the login it was meant to decorate.
 const GKR_TOKEN_STASH_KEY: &str = "pam_irlume_gkr_token";
 
-/// PAM-data key for a released KDE wallet key, carried from the auth phase to
-/// `open_session` only on the fingerprint `keyring` path, and only when
-/// `irlume-kwallet-init` reports the session is not ready yet (a cold-boot
-/// first login). Delivered from the `reseal` session line irlume wires after
-/// the include that runs `pam_systemd`, so `/run/user/<uid>` exists there. A
-/// stack with the `keyring` auth line but no `reseal` session line (a
-/// hand-written one) never picks up the stash, so its wallet stays locked
-/// after a cold boot. The face `unseal` path never defers: it decides the
-/// login outcome, so a stack without the `reseal` line would turn a stash
-/// into a face login with a locked wallet.
-const KWALLET_KEY_STASH_KEY: &str = "pam_irlume_kwallet_key";
-
 struct IrlumePam;
 
 /// Panic firewall for the PAM entry points. Unwinding across the C FFI boundary
@@ -537,8 +525,6 @@ fn session_is_local(
     })
 }
 
-mod keyring_session;
-
 impl PamServiceModule for IrlumePam {
     fn authenticate(pamh: Pam, _flags: PamFlags, args: Vec<String>) -> PamError {
         firewall(move || {
@@ -572,86 +558,19 @@ impl PamServiceModule for IrlumePam {
             // Opt-in, so the Fedora success=1 layout (no `kr`) is unchanged.
             let kr = args.iter().any(|a| a == "kr");
 
-            // `keyring` mode: post-auth login-keyring unlock for the FINGERPRINT
-            // path. This line sits at the auth landing, after a trusted factor has
-            // already succeeded. If a password is present (the user typed one, or an
-            // earlier face `unseal` set it) the keyring unlocks from it; do nothing.
-            // If PAM_AUTHTOK is empty (a fingerprint login provides no password), ask
-            // the daemon to release the TPM-sealed password and set it, so a later
-            // pam_gnome_keyring/pam_kwallet opens the wallet. ALWAYS IGNORE: keyring
-            // unlock is best-effort and must never fail or block the login.
+            // `keyring` mode: the fingerprint lane's post-auth landing. This
+            // line makes no request and releases nothing. PAM keeps running
+            // `optional` lines after a failed `required` anchor or a failed
+            // substack, and the module cannot tell whether the trusted factor
+            // above it succeeded, so any release here could follow a failed
+            // factor (the audit's X4). The release happens in `open_session`
+            // on the matching `reseal` session line, which PAM runs only after
+            // authentication and account management succeeded (ADR-0003,
+            // 2026-10-06 amendment). The line stays in the wired stacks as the
+            // landing marker `login status` and unwire recognize. ALWAYS
+            // IGNORE: keyring unlock is best-effort and must never fail or
+            // block a login.
             if keyring {
-                // During upgrades an older daemon may ignore auth_phase. Do
-                // not even request a secret while the account has a desktop,
-                // or when bounded observation cannot establish that it has none.
-                // Session-phase token delivery remains independent of this guard.
-                if !keyring_session::auth_release_allowed(&user) {
-                    return PamError::IGNORE;
-                }
-                // A typed password used to be an early return here. It cannot
-                // be one any more: a token-armed keyring (#250) does not open
-                // with the typed password, so the release must proceed even
-                // then. The daemon makes that call, because only it can read
-                // the envelope's kind: for `have_password: true` against a
-                // password envelope it answers KeyringUnlockNotNeeded without
-                // spending a TPM unseal, which is the old early return, moved
-                // to where the deciding fact lives.
-                //
-                // A wallet daemon that an earlier irlume line started in this
-                // login (a warm face `unseal` ahead of this line) counts too.
-                // In the auth phase only such a start sets
-                // `PAM_KWALLET5_LOGIN`, and with the flag set the daemon
-                // answers KeyringUnlockNotNeeded for a wallet key without a
-                // second TPM unseal, instead of sending the key into this
-                // process again. A GNOME token is still released.
-                let have_password = matches!(
-                    pamh.get_cached_authtok(),
-                    Ok(Some(tok)) if !tok.to_bytes().is_empty()
-                ) || kwallet_login_set(&pamh);
-                let service = pamh
-                    .get_service()
-                    .ok()
-                    .flatten()
-                    .and_then(|c| c.to_str().ok().map(str::to_string));
-                // Marked as the auth phase: irlumed releases nothing to it
-                // while the account has a live local desktop, which is what
-                // a lock-screen unlock of that desktop is.
-                if let Ok(Response::PasswordUnsealed { secret, kind }) =
-                    request(&Request::UnsealKeyring {
-                        user: user.clone(),
-                        service,
-                        have_password,
-                        auth_phase: true,
-                    })
-                {
-                    // Routed by kind, not assumed: on KDE this starts the
-                    // wallet daemon, or stashes the key for `open_session`
-                    // when the session is not ready yet; a GNOME token is
-                    // always stashed for the session helper; and only a login
-                    // password becomes an AUTHTOK. Best-effort either way;
-                    // the IGNORE below never becomes a failed login.
-                    if kind == irlume_common::KeyringSecretKind::KdeWalletKey {
-                        // On a cold-boot first login `/run/user/<uid>` does
-                        // not exist yet: stash the key rather than lose it,
-                        // so `open_session`'s `reseal` line can start the
-                        // daemon once the session (and that directory)
-                        // exist. Only this line defers: its result decides
-                        // nothing, so a stash no session line picks up
-                        // changes nothing. The `unseal` path goes through
-                        // `release_secret`, which never stashes a wallet key.
-                        if matches!(
-                            hand_key_to_wallet_daemon(&pamh, &user, secret.expose()),
-                            WalletHandoff::NotReady
-                        ) {
-                            let _ = pamh.send_secret(
-                                KWALLET_KEY_STASH_KEY,
-                                pamsm::PamSecretBytes::new(secret.expose().to_vec()),
-                            );
-                        }
-                    } else {
-                        let _ = release_secret(&pamh, &user, &secret, kind);
-                    }
-                }
                 return PamError::IGNORE;
             }
             // `facefirst` (GNOME/GDM wiring): GDM's PAM conversation BLOCKS on the
@@ -861,18 +780,19 @@ impl PamServiceModule for IrlumePam {
         firewall(|| PamError::SUCCESS)
     }
 
-    /// `reseal` SESSION line: the actual self-heal, plus the two deferred
-    /// deliveries auth stashed. Reached ONLY after auth + account succeeded, so
-    /// the password the `reseal` AUTH line stashed is one the system accepted.
-    /// Hand it to the daemon, which re-binds the TPM-sealed password to today's
-    /// PCRs iff it is armed and has gone stale (PCR move or a changed
-    /// password). Then deliver a stashed GNOME keyring token and a stashed KDE
-    /// wallet key, both of which need this session phase to exist because
-    /// `/run/user/<uid>` (the GNOME keyring control socket's directory, and the
-    /// one `irlume-kwallet-init` requires) is not guaranteed to exist until
-    /// logind opens the session. Best-effort and always IGNORE: a session must
-    /// never fail because of this, and other modes (unseal/verify/wait) wire no
-    /// session line so they fall straight through.
+    /// `reseal` SESSION line: the self-heal, plus the fingerprint lane's
+    /// release and every deferred delivery. Reached ONLY after auth + account
+    /// succeeded, which is what makes it the right home for the release: a
+    /// failed finger or password never gets here, so it never unseals
+    /// (ADR-0003, 2026-10-06 amendment). The password the `reseal` AUTH line
+    /// stashed is one the system accepted, or one a later factor proved
+    /// replaceable; hand it to the daemon, which re-binds the TPM-sealed
+    /// password to today's PCRs iff it is armed and has gone stale. Then
+    /// release and deliver the keyring secret this login still needs: a GNOME
+    /// keyring token stashed by the auth phase, or a session query serving
+    /// every kind. Best-effort and always IGNORE: a session must never fail
+    /// because of this, and other modes (unseal/verify/wait) wire no session
+    /// line so they fall straight through.
     fn open_session(pamh: Pam, _flags: PamFlags, args: Vec<String>) -> PamError {
         firewall(move || {
             if args.iter().any(|a| a == "reseal") {
@@ -881,10 +801,20 @@ impl PamServiceModule for IrlumePam {
                     // Reseal first: on a typed-password login after PCR drift
                     // it repairs the token envelope from its password wrap, so
                     // the delivery below can then unseal what a moment ago
-                    // could not be unsealed.
-                    try_reseal_session(&pamh, &user);
-                    deliver_gnome_token(&pamh, &user);
-                    deliver_kde_wallet_key(&pamh, &user);
+                    // could not be unsealed. Its reply is also the password
+                    // evidence for the release query below.
+                    let accepted_password = try_reseal_session(&pamh, &user);
+                    // Evidence, not presence: a token merely cached in
+                    // PAM_AUTHTOK says nothing (it may be a typo the stack
+                    // recovered from by granting on another factor), so only a
+                    // wallet this login already started, or a stashed password
+                    // the daemon accepted for resealing, counts. Where the
+                    // daemon cannot check the password (no readable login
+                    // hash), its acceptance says nothing and the release
+                    // query's `have_password` stays the conservative skip it
+                    // always was there.
+                    let have_password = accepted_password || kwallet_login_set(&pamh);
+                    deliver_keyring_secret(&pamh, &user, have_password);
                 }
             }
             PamError::IGNORE
@@ -916,52 +846,65 @@ fn stash_authtok(pamh: &Pam) {
 /// daemon to re-seal it if the envelope is armed and stale (the daemon checks
 /// it against the login hash where it can read one).
 /// Best-effort and silent: a login session must never fail because of this.
-fn try_reseal_session(pamh: &Pam, user: &str) {
+/// Returns whether the daemon accepted a stashed password, which is the
+/// password evidence the release query below reports: a refusal (a password
+/// that failed the login-hash check), a missing stash, an unreadable wallet
+/// salt or a transport failure all return `false`.
+fn try_reseal_session(pamh: &Pam, user: &str) -> bool {
     // SAFETY: the key was registered by `stash_authtok` in this same PAM
     // transaction and is not replaced while the borrow is live; the borrow
     // ends inside the first match arm, before `SecretBytes` copies it.
     let pw = match unsafe { pamh.get_secret(RESEAL_STASH_KEY) } {
         Ok(stash) if !stash.is_empty() => SecretBytes::new(stash.expose().to_vec()),
         // No stash (e.g. a pure face login that submitted a blank field, or auth
-        // took a path that never set a token); nothing to heal.
-        _ => return,
+        // took a path that never set a token); nothing to heal, and nothing to
+        // verify: this login carries no password evidence.
+        _ => return false,
     };
     let wallet_salt = match irlume_common::client::read_wallet_salt(user) {
         Ok(salt) => salt,
-        Err(_) => return,
+        Err(_) => return false,
     };
-    let _ = request(&Request::ResealPassword {
-        user: user.to_string(),
-        password: pw,
-        wallet_salt,
-        wallet_salt_checked: true,
-    });
+    matches!(
+        request(&Request::ResealPassword {
+            user: user.to_string(),
+            password: pw,
+            wallet_salt,
+            wallet_salt_checked: true,
+        }),
+        Ok(Response::PasswordResealed { .. })
+    )
 }
 
-/// SESSION-phase delivery of a GNOME keyring token (#250): the keyring is
-/// keyed to a random token only the TPM (or a password login's reseal) can
-/// produce, so EVERY session open on a token-armed account must send it to the
-/// keyring daemon's control socket; the typed password `pam_gnome_keyring`
-/// stashed, when there is one, no longer opens anything.
+/// SESSION-phase release and delivery of the keyring secret this login still
+/// needs (ADR-0003, 2026-10-06 amendment). Two sources, in order:
 ///
-/// The token normally arrives in the auth-phase stash (face or fingerprint
-/// release). Without one (a typed-password login, or a topology where auth
-/// ran in a different PAM transaction) ask the daemon: `have_password: true`
-/// makes that free for password-armed users (no TPM touched), so the extra
-/// round trip costs only token users, only on their stash-less logins.
+/// 1. A GNOME keyring token the AUTH phase stashed (the face `unseal` line's
+///    release) delivers without a new request.
+/// 2. Otherwise one `UnsealKeyring` query serves the fingerprint lane and the
+///    stash-less logins alike: after the session-phase move, a fingerprint
+///    login releases its secret here (the auth-phase `keyring` line requests
+///    nothing), and a typed-password login still asks for a token, which the
+///    typed password does not open. `have_password` carries the verified
+///    password evidence from [`try_reseal_session`] and the running-wallet
+///    interlock, so a daemon answers `KeyringUnlockNotNeeded` for a
+///    password-derived secret that is already served without touching the TPM.
 ///
-/// gnome-keyring may not accept the token yet at this point: a
-/// `pam_gnome_keyring --login` daemon refuses it until the session's first
-/// Secret Service client initializes it, after this phase has returned. The
-/// helper therefore hands the token to a detached waiter of its own and
-/// returns within about a second; the waiter delivers it later and logs the
-/// outcome to the journal. Each handle delivers at most once: the stash is
-/// emptied first, on both paths, so a second `open_session` on this handle
-/// neither asks the daemon again nor starts a second waiter. Best-effort like
-/// everything else in the session phase: nothing reaches the prompt and the
-/// session opens either way, but a failed hand-off to the helper writes one
-/// journal warning ([`hand_token_to_keyring_daemon`]).
-fn deliver_gnome_token(pamh: &Pam, user: &str) {
+/// Delivery is routed by kind, never assumed interchangeable: a GNOME token
+/// and a login password both go to the keyring daemon's control socket (the
+/// password IS the keyring secret a password-keyed keyring unlocks with; the
+/// helper's waiter handles a `--login` daemon that is not initialized yet),
+/// and a KDE wallet key starts the wallet daemon, which at this phase finds
+/// `/run/user/<uid>` in place.
+///
+/// Each handle delivers at most once: the stash is emptied first on both
+/// paths, and a run with no stash registers the empty sentinel, so a second
+/// `open_session` on this handle neither asks the daemon again nor starts a
+/// second helper. Best-effort like everything else in the session phase:
+/// nothing reaches the prompt and the session opens either way, but a failed
+/// hand-off to the GNOME helper writes one journal warning
+/// ([`hand_token_to_keyring_daemon`]).
+fn deliver_keyring_secret(pamh: &Pam, user: &str, have_password: bool) {
     // SAFETY: the key was registered by this module in the same PAM
     // transaction and is not replaced while the borrow is live; the borrow
     // ends inside the match arms, before `SecretBytes` copies it.
@@ -973,80 +916,44 @@ fn deliver_gnome_token(pamh: &Pam, user: &str) {
         Err(_) => None,
     };
     // Empty the stash before anything else can fail. The replacement also
-    // wipes the stashed copy.
+    // wipes the stashed copy, and doubles as the once-guard for stash-less
+    // runs: the next `open_session` reads the empty sentinel and returns.
     let _ = pamh.send_secret(GKR_TOKEN_STASH_KEY, pamsm::PamSecretBytes::new(Vec::new()));
-    let token = match stashed {
-        Some(token) => token,
+    let (secret, kind) = match stashed {
+        Some(token) => (token, irlume_common::KeyringSecretKind::GnomeKeyringToken),
         None => {
             let service = pamh
                 .get_service()
                 .ok()
                 .flatten()
                 .and_then(|c| c.to_str().ok().map(str::to_string));
-            // `true` is accurate here, not a convenient lie. The flag drives
-            // exactly one decision: whether a password-derived keyring secret is
-            // already served. By the session phase it always is, either
-            // because the user typed a password or because the auth phase
-            // released the sealed one into `PAM_AUTHTOK`; and if neither
-            // happened, nothing can open that keyring anyway. Passing `false`
-            // instead would make the daemon unseal a login password on every
-            // session open, which this hook then discards, spending a TPM
-            // round trip (seconds on a discrete TPM) per login for nothing.
-            // KDE wallet keys are password-derived too. This GNOME-only hook
-            // cannot deliver one, so the daemon must skip them here as well.
+            // This session is being opened, so it is a login, not a
+            // lock-screen unlock of a running desktop, although logind
+            // lists it as live already.
             match request(&Request::UnsealKeyring {
                 user: user.to_string(),
                 service,
-                have_password: true,
-                // This session is being opened, so it is a login, not a
-                // lock-screen unlock of a running desktop, although logind
-                // lists it as live already.
+                have_password,
                 auth_phase: false,
             }) {
-                // Only a token belongs on the control socket. A password or a
-                // wallet key reaching here would mean the user is armed for a
-                // different backend, and this session hook has no business
-                // delivering it.
-                Ok(Response::PasswordUnsealed {
-                    secret,
-                    kind: irlume_common::KeyringSecretKind::GnomeKeyringToken,
-                }) => secret,
+                Ok(Response::PasswordUnsealed { secret, kind }) => (secret, kind),
+                // Not needed, an error, or a reply shape this hook cannot
+                // act on: the vendor password path keeps whatever it had.
                 _ => return,
             }
         }
     };
-    let _ = hand_token_to_keyring_daemon(pamh, user, &token);
-}
-
-/// SESSION-phase delivery of a KDE wallet key deferred by the auth phase: the
-/// fingerprint `keyring` path stashes only when `irlume-kwallet-init` reported
-/// the session was not ready yet (a cold-boot first login), because
-/// `/run/user/<uid>` did not exist there. The face `unseal` path never
-/// defers. A warm login starts the daemon straight from auth and leaves no
-/// stash, so this is a no-op then. A stash is delivered at most once, and not
-/// at all when `PAM_KWALLET5_LOGIN` already names a running daemon (see
-/// [`hand_key_to_wallet_daemon`]). No daemon fallback here, unlike the GNOME
-/// token: a stash-less KDE login either already has a typed password driving
-/// `pam_kwallet5` normally, or auth already started the daemon, or the helper
-/// failed outright, or the stash could not be written, or nothing was
-/// released at all.
-fn deliver_kde_wallet_key(pamh: &Pam, user: &str) {
-    // SAFETY: the key was registered by this module in the same PAM
-    // transaction and is not replaced while the borrow is live; the borrow
-    // ends inside the match arm, before `SecretBytes` copies it.
-    let key = match unsafe { pamh.get_secret(KWALLET_KEY_STASH_KEY) } {
-        Ok(stash) if !stash.is_empty() => SecretBytes::new(stash.expose().to_vec()),
-        _ => return,
-    };
-    // Overwrite the stash with an empty value, which the check above reads
-    // as absent, so a second `open_session` on this handle cannot start
-    // another daemon with the same key. The replacement also wipes the
-    // stashed copy.
-    let _ = pamh.send_secret(
-        KWALLET_KEY_STASH_KEY,
-        pamsm::PamSecretBytes::new(Vec::new()),
-    );
-    let _ = hand_key_to_wallet_daemon(pamh, user, key.expose());
+    use irlume_common::KeyringSecretKind as K;
+    match kind {
+        // The control socket takes the keyring's own secret: the token of a
+        // token-keyed keyring, or the login password of a password-keyed one.
+        K::GnomeKeyringToken | K::LoginPassword => {
+            let _ = hand_token_to_keyring_daemon(pamh, user, &secret);
+        }
+        K::KdeWalletKey => {
+            let _ = hand_key_to_wallet_daemon(pamh, user, secret.expose());
+        }
+    }
 }
 
 /// Resolve a helper binary, ignoring the environment override under
@@ -1070,17 +977,18 @@ fn secure_helper_path(var: &str, compiled: &str) -> String {
         .unwrap_or_else(|| compiled.to_string())
 }
 
-/// Spawn the unlock helper with the token on stdin. The helper drops to the
-/// target user before touching their runtime directory (the daemon's control
-/// socket authenticates the peer uid, and root pathname work inside a
+/// Spawn the unlock helper with the keyring secret (a GNOME keyring token, or
+/// a login password on a password-keyed keyring) on stdin. The helper drops
+/// to the target user before touching their runtime directory (the daemon's
+/// control socket authenticates the peer uid, and root pathname work inside a
 /// user-owned directory is the CVE-2018-10380 shape irlume-kwallet-init
 /// already refuses to repeat). It then forks a detached waiter, which
-/// delivers the token at once if gnome-keyring is already initialized and
+/// delivers the secret at once if gnome-keyring is already initialized and
 /// otherwise waits for it, and exits at the waiter's first report or after
 /// one second, whichever comes first. Only the helper process itself is
 /// waited for, never the waiter.
 ///
-/// Exit status 0 means the token was delivered or handed to the waiter,
+/// Exit status 0 means the secret was delivered or handed to the waiter,
 /// which logs its own outcome under `irlume-gkr-unlock`; that returns `true`
 /// and writes nothing here. Anything else writes one warning through
 /// `pam_syslog` ([`log_hand_off_failure`]): the helper is missing, cannot be
@@ -1088,12 +996,12 @@ fn secure_helper_path(var: &str, compiled: &str) -> String {
 /// error before the hand-off, or a waiter that failed or died within its
 /// first second), ends on a signal, is killed at [`HELPER_BUDGET`], or cannot
 /// be waited for. The helper's own stderr goes to /dev/null, so for an error
-/// before the hand-off that line is the only trace of a token that never
+/// before the hand-off that line is the only trace of a secret that never
 /// reached the keyring.
 fn hand_token_to_keyring_daemon(
     pamh: &Pam,
     user: &str,
-    token: &irlume_common::SecretBytes,
+    secret: &irlume_common::SecretBytes,
 ) -> bool {
     use std::io::Write;
     use std::os::unix::process::ExitStatusExt as _;
@@ -1118,12 +1026,12 @@ fn hand_token_to_keyring_daemon(
         }
     };
     if let Some(mut sin) = child.stdin.take() {
-        if sin.write_all(token.expose()).is_err() {
+        if sin.write_all(secret.expose()).is_err() {
             kill_bounded(&mut child);
             log_hand_off_failure(pamh, HandOffFailure::Input);
             return false;
         }
-        // EOF tells the helper the token is complete.
+        // EOF tells the helper the secret is complete.
         drop(sin);
     }
     // Bounded, because this is the PAM session phase and the login blocks on
@@ -1527,12 +1435,13 @@ fn release_secret(
         }
         K::KdeWalletKey => match hand_key_to_wallet_daemon(pamh, user, secret.expose()) {
             WalletHandoff::Started => Released::WalletStarted,
-            // Never stashed here: the face `unseal` path's result decides the
-            // login, and a stack without a `reseal` session line (the NixOS
-            // module) would turn a stash into a face login with a locked
-            // wallet. A session that is not ready yet falls to the password
-            // like any other failure. Only the fingerprint `keyring` line,
-            // whose result decides nothing, defers the key to `open_session`.
+            // Never deferred here: the face `unseal` path's result decides
+            // the login, and a stack without a `reseal` session line (the
+            // NixOS module) would leave the wallet locked after a face grant
+            // anyway. A session that is not ready yet falls to the password
+            // like any other failure. The fingerprint lane no longer releases
+            // in the auth phase at all (ADR-0003, 2026-10-06 amendment), so
+            // nothing here stashes either.
             WalletHandoff::NotReady | WalletHandoff::Failed => Released::Failed,
         },
         K::GnomeKeyringToken => {

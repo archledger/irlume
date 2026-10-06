@@ -80,6 +80,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- A failed finger or password no longer releases the sealed keyring secret.
+  The fingerprint lane's `keyring` auth line made its release request from
+  the auth phase, where a PAM stack keeps running `optional` lines after a
+  failed `required` anchor or substack, so a wrong finger or a timeout
+  unsealed the secret into a login that was about to fail. The line now
+  requests nothing; the release happens in the `reseal` session line, which
+  PAM runs only after authentication succeeded, once per login, with a login
+  password delivered to the keyring's control socket and a wallet key to
+  `irlume-kwallet-init`. The session query reports a password only when the
+  daemon accepted one for resealing or a wallet already runs, so a cached
+  typo no longer suppresses the release. The module-side warm guard of #863
+  and #977 is subsumed: a module that makes no auth-phase release request
+  needs no guard on one, and the daemon keeps withholding for modules from
+  before this change (ADR-0003, 2026-10-06 amendment; #859).
+
 - The GDM and LightDM autologin readers keep a value's trailing whitespace,
   as GLib's key file parser does, and read the enable and server switches
   exactly as each daemon does (GDM: case-insensitive `true` or `1` on the

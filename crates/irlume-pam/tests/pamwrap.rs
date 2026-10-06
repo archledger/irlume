@@ -1765,11 +1765,11 @@ fn pamwrap_nonprivileged_modes_never_show_privileged_confirmation() {
         &reqs[1],
         Request::UnsealPassword { service: Some(service), .. } if service == "sddm"
     ));
-    assert!(matches!(
-        &reqs[2],
-        Request::UnsealKeyring { service: Some(service), .. } if service == "sddm"
-    ));
-    assert_eq!(reqs.len(), 3, "reseal and sshd must send nothing: {reqs:?}");
+    assert_eq!(
+        reqs.len(),
+        2,
+        "keyring (session-phase release), reseal and sshd must send nothing: {reqs:?}"
+    );
 }
 
 /// The login path (`unseal`): submitting an EMPTY password is the face
@@ -2209,12 +2209,14 @@ fn pamwrap_failed_unseal_never_starts_another_face_attempt() {
 }
 
 /// `keyring` mode on a cold account (fingerprint path, post-auth landing):
-/// the module asks the daemon, and REPORTS whether the transaction holds a
-/// password rather than deciding on it. That decision moved daemon-side with
-/// #250: a token-armed keyring does not open with the typed password, so only
-/// the daemon, which can read the envelope's kind, can tell whether the unseal
-/// is pointless. Either way the module returns IGNORE (best-effort), so the
-/// trailing pam_permit decides the stack.
+/// the auth line itself asks for nothing (a failed factor must not release),
+/// and the session line asks the daemon once, REPORTING whether the
+/// transaction holds verified password evidence rather than deciding on it.
+/// That decision moved daemon-side with #250: a token-armed keyring does not
+/// open with the typed password, so only the daemon, which can read the
+/// envelope's kind, can tell whether the unseal is pointless. Either way the
+/// module returns IGNORE (best-effort), so the trailing pam_permit decides
+/// the stack.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_keyring_mode_reports_whether_a_password_is_present() {
@@ -2223,26 +2225,36 @@ fn pamwrap_keyring_mode_reports_whether_a_password_is_present() {
     };
     let log = serve(&h.socket, |req| match req {
         Request::UnsealKeyring { .. } => unsealed("hunter2"),
+        Request::ResealPassword { .. } => Response::PasswordResealed {
+            armed: true,
+            changed: false,
+        },
         _ => Response::Error("unexpected request".into()),
     });
     h.write_service(
         "irlume-fp",
         &[
-            h.auth_line("required", "keyring"),
+            h.auth_line("optional", "keyring"),
             "auth required pam_permit.so".into(),
+            format!("session optional {} reseal", h.module.display()),
+            "session required pam_permit.so".into(),
         ],
     );
     h.write_service(
         "irlume-fp-pw",
         &[
             format!("auth required {}", h.set_items.display()),
-            h.auth_line("required", "keyring"),
+            h.auth_line("optional", "keyring"),
+            format!("auth optional {} reseal", h.module.display()),
             "auth required pam_permit.so".into(),
+            format!("session optional {} reseal", h.module.display()),
+            "session required pam_permit.so".into(),
         ],
     );
 
-    // No password in the transaction: unseal the keyring secret.
-    let (ok, out) = h.run("irlume-fp", &["authenticate"], "", None);
+    // No password in the transaction: the auth line releases nothing, and the
+    // session line unseals the keyring secret, reporting no password.
+    let (ok, out) = h.run("irlume-fp", &["authenticate", "open_session"], "", None);
     assert!(ok, "keyring mode must never block the login: {out}");
     {
         let reqs = log.lock().unwrap();
@@ -2257,36 +2269,257 @@ fn pamwrap_keyring_mode_reports_whether_a_password_is_present() {
                 assert_eq!(user, "tester");
                 assert_eq!(service.as_deref(), Some("irlume-fp"));
                 assert!(!have_password, "no password was set in this transaction");
-                assert!(auth_phase, "the keyring line runs in the auth phase");
+                assert!(
+                    !auth_phase,
+                    "the release belongs to the session phase, after auth succeeded"
+                );
             }
             other => panic!("expected UnsealKeyring, daemon saw {other:?}"),
         }
         // (drop the guard before the next run appends)
     }
 
-    // Password already present: still asked, but flagged, so the daemon can
-    // answer KeyringUnlockNotNeeded for a password envelope without spending a
-    // TPM unseal, and can still release a token for a token envelope.
-    let (ok, out) = h.run("irlume-fp-pw", &["authenticate"], "", Some("hunter2"));
+    // Password accepted by the daemon's reseal: still asked, but flagged, so
+    // the daemon can answer KeyringUnlockNotNeeded for a password envelope
+    // without spending a TPM unseal, and can still release a token for a
+    // token envelope.
+    let (ok, out) = h.run(
+        "irlume-fp-pw",
+        &["authenticate", "open_session"],
+        "",
+        Some("hunter2"),
+    );
     assert!(ok, "{out}");
     let reqs = log.lock().unwrap();
     assert_eq!(
         reqs.len(),
-        2,
+        3,
         "the daemon decides, so it must be asked: {reqs:?}"
     );
-    match &reqs[1] {
+    assert!(
+        matches!(&reqs[1], Request::ResealPassword { password, .. }
+            if password.expose() == b"hunter2"),
+        "the session reseal presents the stash first: {reqs:?}"
+    );
+    match &reqs[2] {
         Request::UnsealKeyring { have_password, .. } => assert!(
             *have_password,
-            "a password IS present; reporting false would make the daemon spend a \
-             pointless TPM unseal"
+            "a password the daemon accepted IS evidence; reporting false would make the \
+             daemon spend a pointless TPM unseal"
         ),
         other => panic!("expected UnsealKeyring, daemon saw {other:?}"),
     }
 }
 
-/// An old daemon ignores the phase flag. The module must withhold the request
-/// itself on a warm desktop, without consuming the password or granting auth.
+/// The fingerprint lane must release nothing from the auth phase. A PAM stack
+/// keeps executing `optional` lines after a failed `required` line or a failed
+/// substack, and the module cannot tell whether the trusted factor above it
+/// succeeded, so the `keyring` auth line makes no request at all: the release
+/// happens in `open_session`, which PAM runs only after authentication and
+/// account management succeeded (ADR-0003, 2026-10-06 amendment). Three stack
+/// shapes from the audit, each with a stand-in factor that FAILS: a
+/// gdm-fingerprint-style substack, an Ubuntu-style `required` anchor, and the
+/// Fedora greeter landing after a password substack. On main each sends one
+/// `UnsealKeyring` from the auth phase: the defect these tests pin.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_fp_keyring_failed_substack_sends_no_unseal() {
+    let Some(h) = Harness::try_new("fp-fail-substack") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| match req {
+        Request::UnsealKeyring { .. } => unsealed("defect-login-password"),
+        _ => Response::Error("unexpected request".into()),
+    });
+    h.write_service(
+        "irlume-fp-sub",
+        &[
+            "auth substack fingerprint-auth".into(),
+            h.auth_line("optional", "keyring"),
+            "auth optional pam_permit.so".into(),
+        ],
+    );
+    h.write_service(
+        "fingerprint-auth",
+        &[
+            "auth [success=done default=bad] pam_deny.so".into(),
+            "auth required pam_deny.so".into(),
+        ],
+    );
+    let (ok, out) = h.run("irlume-fp-sub", &["authenticate"], "", None);
+    assert!(!ok, "the failed factor must fail the login: {out}");
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "a failed substack factor must send no UnsealKeyring"
+    );
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_fp_keyring_failed_required_anchor_sends_no_unseal() {
+    let Some(h) = Harness::try_new("fp-fail-required") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| match req {
+        Request::UnsealKeyring { .. } => unsealed("defect-login-password"),
+        _ => Response::Error("unexpected request".into()),
+    });
+    // Ubuntu's gdm-fingerprint shape: the anchor module is `required`, so a
+    // failed finger keeps the stack running through the `optional` keyring
+    // line below it on its way to a failed verdict.
+    h.write_service(
+        "irlume-fp-req",
+        &[
+            "auth required pam_deny.so".into(),
+            h.auth_line("optional", "keyring"),
+            "auth optional pam_permit.so".into(),
+        ],
+    );
+    let (ok, out) = h.run("irlume-fp-req", &["authenticate"], "", None);
+    assert!(!ok, "the failed factor must fail the login: {out}");
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "a failed required anchor must send no UnsealKeyring"
+    );
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_fp_keyring_failed_fedora_greeter_landing_sends_no_unseal() {
+    let Some(h) = Harness::try_new("fp-fail-landing") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| match req {
+        Request::UnsealKeyring { .. } => unsealed("defect-login-password"),
+        _ => Response::Error("unexpected request".into()),
+    });
+    // The Fedora greeter: the keyring line sits after the landing that ends
+    // the face jump. A wrong password is cached in PAM_AUTHTOK (pam_set_items
+    // stands in for pam_unix having prompted and been answered wrongly), the
+    // password substack still fails, and the login fails with the token
+    // cached: a cached wrong token is not password evidence anywhere.
+    h.write_service(
+        "password-auth",
+        &[
+            "auth sufficient pam_deny.so".into(),
+            "auth required pam_deny.so".into(),
+        ],
+    );
+    h.write_service(
+        "irlume-greeter",
+        &[
+            format!("auth required {}", h.set_items.display()),
+            "auth substack password-auth".into(),
+            "auth optional pam_permit.so   # irlume-landing".into(),
+            h.auth_line("optional", "keyring"),
+        ],
+    );
+    let (ok, out) = h.run("irlume-greeter", &["authenticate"], "", Some("wrong-token"));
+    assert!(!ok, "the failed password must fail the login: {out}");
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "a failed greeter landing must send no UnsealKeyring, cached token or not"
+    );
+}
+
+/// The success side of the same move: a stack whose factor succeeds releases
+/// exactly once, and the request is the session line's (`auth_phase: false`),
+/// not the auth line's. Authenticate runs alone first, so the request log
+/// after it must be empty; `open_session` (a fresh pamtester transaction, as
+/// its own handle has no PAM_AUTHTOK and no stash) then makes the one request.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_fp_keyring_success_releases_once_in_the_session_phase() {
+    let Some(h) = Harness::try_new("fp-success-session") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| match req {
+        Request::UnsealKeyring { .. } => unsealed("sealed-login-password"),
+        _ => Response::Error("unexpected request".into()),
+    });
+    h.write_service(
+        "irlume-fp-ok",
+        &[
+            "auth required pam_permit.so".into(),
+            h.auth_line("optional", "keyring"),
+            format!("session optional {} reseal", h.module.display()),
+            "session required pam_permit.so".into(),
+        ],
+    );
+    let (ok, out) = h.run("irlume-fp-ok", &["authenticate"], "", None);
+    assert!(ok, "the successful factor carries the login: {out}");
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "authenticate alone must release nothing"
+    );
+    let (ok, out) = h.run("irlume-fp-ok", &["open_session"], "", None);
+    assert!(ok, "the session must open: {out}");
+    assert!(
+        matches!(
+            log.lock().unwrap().as_slice(),
+            [Request::UnsealKeyring {
+                have_password: false,
+                auth_phase: false,
+                ..
+            }]
+        ),
+        "exactly one release, from the session phase, reporting no password"
+    );
+}
+
+/// The `have_password` the session query reports is evidence, not presence: a
+/// token merely cached in PAM_AUTHTOK (here a wrong one, the audit's typo
+/// case) counts as no password, so a daemon that can check it answers the
+/// release instead of KeyringUnlockNotNeeded and the keyring still unlocks
+/// after a typo followed by a successful factor.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_fp_keyring_session_query_ignores_a_cached_wrong_token() {
+    let Some(h) = Harness::try_new("fp-wrong-token") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| match req {
+        Request::UnsealKeyring { .. } => unsealed("sealed-login-password"),
+        _ => Response::Error("unexpected request".into()),
+    });
+    h.write_service(
+        "irlume-fp-typo",
+        &[
+            format!("auth required {}", h.set_items.display()),
+            "auth required pam_permit.so".into(),
+            "auth optional pam_permit.so   # irlume-landing".into(),
+            h.auth_line("optional", "keyring"),
+            format!("session optional {} reseal", h.module.display()),
+            "session required pam_permit.so".into(),
+        ],
+    );
+    let (ok, out) = h.run(
+        "irlume-fp-typo",
+        &["authenticate", "open_session"],
+        "",
+        Some("wrong-token"),
+    );
+    assert!(ok, "the successful factor carries the login: {out}");
+    assert!(
+        matches!(
+            log.lock().unwrap().as_slice(),
+            [Request::UnsealKeyring {
+                have_password: false,
+                auth_phase: false,
+                ..
+            }]
+        ),
+        "one session release, and the cached wrong token is not password evidence"
+    );
+}
+
+/// The auth-phase `keyring` line must never ask any daemon, new or old, for
+/// a secret: the release lives in the session phase now (ADR-0003, 2026-10-06
+/// amendment), and an old daemon that ignores `auth_phase` would answer an
+/// auth-phase request during the upgrade window. Warm desktop, typed
+/// password, failed factor: none of it produces a request, the typed
+/// password survives untouched for the stack's password module, and the line
+/// grants nothing on its own.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_keyring_upgrade_withholds_warm_release_and_preserves_password() {
@@ -2320,7 +2553,7 @@ fn pamwrap_keyring_upgrade_withholds_warm_release_and_preserves_password() {
     assert!(ok, "typed password must survive: {out}");
     assert!(
         log.lock().unwrap().is_empty(),
-        "old daemon must never be asked"
+        "the auth-phase keyring line must never be asked, warm or not"
     );
     h.write_service(
         "gdm-fingerprint",
@@ -2330,14 +2563,23 @@ fn pamwrap_keyring_upgrade_withholds_warm_release_and_preserves_password() {
         ],
     );
     let (ok, out) = h.run("gdm-fingerprint", &["authenticate"], "", None);
-    assert!(!ok, "keyring guard must not authenticate: {out}");
+    assert!(!ok, "the keyring line must not authenticate: {out}");
     assert!(log.lock().unwrap().is_empty());
 }
 
+/// The auth-phase `keyring` line runs no account probe and reads no session
+/// state: with the release gone from the auth phase, the bounded getent child
+/// and logind scan the old guard spent are gone with it, and nothing that
+/// looks like account state may hang or widen the auth phase again. Hostile
+/// fixtures stand in for every shape the deleted guard had to bound: a
+/// stalled or malformed getent, a missing logind directory, oversized,
+/// directory, symlinked and FIFO session records, and more session files
+/// than the old scan cap. Each run must stay fast, keep the login working
+/// and send nothing.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
-fn pamwrap_keyring_upgrade_unknown_state_withholds_release() {
-    let Some(h) = Harness::try_new("keyring-unknown") else {
+fn pamwrap_keyring_auth_line_is_inert_under_hostile_account_state() {
+    let Some(h) = Harness::try_new("keyring-inert") else {
         return;
     };
     let log = serve(&h.socket, |_| unsealed("old-daemon-secret"));
@@ -2348,183 +2590,82 @@ fn pamwrap_keyring_upgrade_unknown_state_withholds_release() {
             "auth required pam_permit.so".into(),
         ],
     );
-    let missing = h.root.join("missing-logind");
-    let (ok, out) = h.run_with_env(
-        "sddm",
-        &["authenticate"],
-        "",
-        None,
-        &[("IRLUME_LOGIND_DIR", missing.to_str().unwrap())],
-    );
-    assert!(ok, "other-factor login must survive: {out}");
-    assert!(log.lock().unwrap().is_empty(), "unknown is not cold");
-}
-
-#[test]
-#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
-fn pamwrap_keyring_upgrade_requires_explicit_graphical_evidence() {
-    let Some(h) = Harness::try_new("keyring-evidence") else {
-        return;
-    };
-    let log = serve(&h.socket, |_| Response::KeyringUnlockNotNeeded);
-    h.write_service(
-        "sddm",
-        &[
-            h.auth_line("optional", "keyring"),
-            "auth required pam_permit.so".into(),
-        ],
-    );
-    // A runtime directory or bus alone is not evidence of a graphical user.
-    std::fs::create_dir_all(h.root.join("runtime/4242")).unwrap();
-    std::fs::write(h.root.join("runtime/4242/bus"), "not a desktop").unwrap();
-    for (facts, release) in [
-        (
-            "UID=4242\nCLASS=user\nSTATE=active\nTYPE=x11\nREMOTE=0\n",
-            false,
-        ),
-        (
-            "UID=4242\nCLASS=user\nSTATE=online\nTYPE=mir\nREMOTE=0\n",
-            false,
-        ),
-        (
-            "UID=4242\nCLASS=user\nSTATE=active\nTYPE=wayland\nREMOTE=1\n",
-            true,
-        ),
-        (
-            "UID=4242\nCLASS=user\nSTATE=active\nTYPE=tty\nREMOTE=0\n",
-            true,
-        ),
-        (
-            "UID=4242\nCLASS=greeter\nSTATE=active\nTYPE=wayland\nREMOTE=0\n",
-            true,
-        ),
-        (
-            "UID=4242\nCLASS=user\nSTATE=closing\nTYPE=wayland\nREMOTE=0\n",
-            true,
-        ),
-        (
-            "UID=4243\nCLASS=user\nSTATE=active\nTYPE=wayland\nREMOTE=0\n",
-            true,
-        ),
-        ("UID=4242\nCLASS=user\nSTATE=active\nTYPE=wayland\n", false),
-        ("UID=4242\nCLASS=user\nSTATE=active\nREMOTE=0\n", false),
-        (
-            "UID=4242\nUID=4243\nCLASS=user\nSTATE=active\nTYPE=wayland\nREMOTE=0\n",
-            false,
-        ),
-        (
-            "UID=4242\nCLASS=user\nSTATE=active\nTYPE=wayland\nREMOTE=garbage\n",
-            false,
-        ),
-    ] {
-        std::fs::write(h.root.join("logind/sessions/9"), facts).unwrap();
-        log.lock().unwrap().clear();
-        let (ok, out) = h.run_with_env(
-            "sddm",
-            &["authenticate"],
-            "",
-            None,
-            &[(
-                "XDG_RUNTIME_DIR",
-                h.root.join("runtime/4242").to_str().unwrap(),
-            )],
-        );
-        assert!(ok, "{facts}: {out}");
-        assert_eq!(!log.lock().unwrap().is_empty(), release, "{facts}");
-    }
-}
-
-#[test]
-#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
-fn pamwrap_keyring_upgrade_account_probe_is_bounded_and_fail_closed() {
-    let Some(h) = Harness::try_new("keyring-probe") else {
-        return;
-    };
-    let log = serve(&h.socket, |_| unsealed("old-daemon-secret"));
-    h.write_service(
-        "sddm",
-        &[
-            h.auth_line("optional", "keyring"),
-            "auth required pam_permit.so".into(),
-        ],
-    );
-    for body in [
+    for getent in [
         "exit 2",
-        "printf 'tester:x:bad:4242::/nonexistent:/bin/sh\\n'",
-        "printf 'different:x:4242:4242::/nonexistent:/bin/sh\\n'",
-        "printf 'tester:x:4242:4242::/nonexistent:/bin/sh\\ntester:x:4243:4243::/:/bin/sh\\n'",
+        "printf 'tester:x:bad:4242::/nonexistent:/bin/sh\n'",
         "exec head -c 70000 /dev/zero",
         "exec sleep 20",
     ] {
-        std::fs::write(h.root.join("getent"), format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::write(h.root.join("getent"), format!("#!/bin/sh\n{getent}\n")).unwrap();
         let start = std::time::Instant::now();
         let (ok, out) = h.run("sddm", &["authenticate"], "", None);
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
-            "probe hung: {body}"
+            "a hostile account helper hung the auth phase: {getent}"
         );
-        assert!(ok, "login must survive failed probe: {out}");
+        assert!(ok, "login must survive: {out}");
         assert!(
             log.lock().unwrap().is_empty(),
-            "failed probe allowed release: {body}"
+            "no request may leave the auth phase: {getent}"
         );
     }
-}
-
-#[test]
-#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
-fn pamwrap_keyring_upgrade_cold_password_reaches_auth_consumer() {
-    let Some(h) = Harness::try_new("keyring-cold") else {
-        return;
-    };
-    let log = serve(&h.socket, |_| unsealed("legacy-login-password"));
-    let check = h.token_checker("cold", "legacy-login-password");
-    h.write_service(
-        "sddm",
-        &[
-            h.auth_line("optional", "keyring"),
-            format!(
-                "auth required pam_exec.so expose_authtok {}",
-                check.display()
-            ),
-        ],
-    );
-    let (ok, out) = h.run("sddm", &["authenticate"], "", None);
-    assert!(ok, "the auth consumer must get the password: {out}");
-    assert!(matches!(
-        log.lock().unwrap().as_slice(),
-        [Request::UnsealKeyring {
-            auth_phase: true,
-            have_password: false,
-            ..
-        }]
-    ));
-}
-
-#[test]
-#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
-fn pamwrap_keyring_upgrade_session_files_are_bounded_and_nofollow() {
-    let Some(h) = Harness::try_new("keyring-files") else {
-        return;
-    };
-    let log = serve(&h.socket, |_| Response::KeyringUnlockNotNeeded);
-    h.write_service(
-        "sddm",
-        &[
-            h.auth_line("optional", "keyring"),
-            "auth required pam_permit.so".into(),
-        ],
-    );
+    std::fs::write(
+        h.root.join("getent"),
+        "#!/bin/sh\n[ \"$1\" = passwd ] && [ \"$2\" = tester ] && [ \"$#\" -eq 2 ] || exit 2\nprintf 'tester:x:4242:4242::/nonexistent:/bin/sh\\n'\n",
+    )
+    .unwrap();
     let path = h.root.join("logind/sessions/9");
-    for case in ["oversized", "directory", "symlink", "fifo"] {
+    let missing = h.root.join("missing-logind");
+    for case in [
+        "missing-dir",
+        "oversized",
+        "directory",
+        "symlink",
+        "fifo",
+        "flood",
+    ] {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&path);
+        if case == "missing-dir" {
+            let start = std::time::Instant::now();
+            let (ok, out) = h.run_with_env(
+                "sddm",
+                &["authenticate"],
+                "",
+                None,
+                &[("IRLUME_LOGIND_DIR", missing.to_str().unwrap())],
+            );
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "missing-dir hung"
+            );
+            assert!(ok, "missing-dir: {out}");
+            assert!(
+                log.lock().unwrap().is_empty(),
+                "missing-dir produced a request"
+            );
+            continue;
+        }
         match case {
-            "oversized" => std::fs::write(&path, vec![b'x'; 17000]).unwrap(),
-            "directory" => std::fs::create_dir(&path).unwrap(),
-            "symlink" => std::os::unix::fs::symlink(h.root.join("missing"), &path).unwrap(),
+            "oversized" => {
+                std::fs::write(&path, vec![b'x'; 17000]).unwrap();
+            }
+            "directory" => {
+                std::fs::create_dir(&path).unwrap();
+            }
+            "symlink" => {
+                std::os::unix::fs::symlink(h.root.join("missing"), &path).unwrap();
+            }
             "fifo" => {
                 let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
                 // SAFETY: a valid C string naming this test's private FIFO.
                 assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+            "flood" => {
+                for id in 0..1024 {
+                    std::fs::write(h.root.join(format!("logind/sessions/c{id}")), "UID=1000\n")
+                        .unwrap();
+                }
             }
             _ => unreachable!(),
         }
@@ -2535,37 +2676,56 @@ fn pamwrap_keyring_upgrade_session_files_are_bounded_and_nofollow() {
             "{case} hung"
         );
         assert!(ok, "{case}: {out}");
-        assert!(log.lock().unwrap().is_empty(), "{case} permitted release");
-        if case == "directory" {
-            std::fs::remove_dir(&path).unwrap();
-        } else {
-            std::fs::remove_file(&path).unwrap();
-        }
+        assert!(log.lock().unwrap().is_empty(), "{case} produced a request");
     }
-    // Legacy logind reference FIFOs are not session records, and must not hang
-    // or suppress a cold login just because they share the directory.
-    let reference = path.with_extension("ref");
-    let name = std::ffi::CString::new(reference.as_os_str().as_encoded_bytes()).unwrap();
-    // SAFETY: a valid C string naming this test's private reference FIFO.
-    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-    let (ok, out) = h.run("sddm", &["authenticate"], "", None);
-    assert!(ok, "{out}");
-    assert_eq!(
-        log.lock().unwrap().len(),
-        1,
-        "reference FIFO is not a session"
+}
+
+/// A cold account's sealed login password is released only in the session
+/// phase now, and the consumer is the keyring daemon's control socket: the
+/// password IS the secret a password-keyed login keyring unlocks with, so it
+/// goes to `irlume-gkr-unlock` on stdin exactly like a token, and the
+/// auth-phase stack below the keyring line sees no `PAM_AUTHTOK` from it.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_keyring_upgrade_cold_password_reaches_auth_consumer() {
+    let Some(mut h) = Harness::try_new("keyring-cold") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| match req {
+        Request::UnsealKeyring { .. } => unsealed("legacy-login-password"),
+        _ => Response::Error("unexpected request".into()),
+    });
+    h.set_gkr_unlock(write_gkr_fake_helper(&h.root, "detach"));
+    h.write_service(
+        "sddm",
+        &[
+            h.auth_line("optional", "keyring"),
+            "auth required pam_permit.so".into(),
+            format!("session optional {} reseal", h.module.display()),
+            "session required pam_permit.so".into(),
+        ],
     );
-    log.lock().unwrap().clear();
-    for id in 0..1024 {
-        std::fs::write(h.root.join(format!("logind/sessions/c{id}")), "UID=1000\n").unwrap();
-    }
-    let start = std::time::Instant::now();
-    let (ok, out) = h.run("sddm", &["authenticate"], "", None);
-    assert!(start.elapsed() < std::time::Duration::from_secs(2));
-    assert!(ok, "{out}");
+    let (ok, out) = h.run("sddm", &["authenticate", "open_session"], "", None);
+    assert!(ok, "the login must proceed: {out}");
+    kill_recorded(&h, "gkr-waiter.pid");
     assert!(
-        log.lock().unwrap().is_empty(),
-        "incomplete scan is not cold"
+        matches!(
+            log.lock().unwrap().as_slice(),
+            [Request::UnsealKeyring {
+                auth_phase: false,
+                have_password: false,
+                ..
+            }]
+        ),
+        "one release, from the session phase"
+    );
+    assert_eq!(gkr_record(&h, "gkr-argv"), ["tester"], "the user is argv");
+    const LEGACY_PASSWORD_SHA256: &str =
+        "3b202204fe5ae24522b84a80aebfd967c8f0354fffa6bd14075a6bf2729e84ee";
+    assert_eq!(
+        gkr_record(&h, "gkr-stdin"),
+        [LEGACY_PASSWORD_SHA256],
+        "the released password, exactly, is on the helper's stdin"
     );
 }
 
@@ -2735,13 +2895,15 @@ fn pamwrap_reseal_stashes_on_auth_and_reseals_on_session() {
         "an empty stash must never produce a SECOND reseal request: {reqs:?}"
     );
     match &reqs[2] {
-        // `true` even though nothing was typed: the flag means "a
-        // password-keyed keyring is already served", which by the session
-        // phase it is, and answering it saves the daemon a TPM unseal this
-        // hook would only discard.
+        // `false`, because the flag is verified evidence now: nothing was
+        // typed, no stash reached the daemon's reseal, and no wallet runs.
+        // A cached token alone would not count either (it may be a typo the
+        // stack recovered from by granting on another factor), so the daemon
+        // answers a release for a password envelope rather than
+        // KeyringUnlockNotNeeded, and the keyring still unlocks.
         Request::UnsealKeyring { have_password, .. } => assert!(
-            *have_password,
-            "the session-phase delivery query always reports a served keyring"
+            !*have_password,
+            "only an accepted password or a running wallet is password evidence"
         ),
         other => panic!("expected only the delivery query, got {other:?}"),
     }
@@ -2904,11 +3066,13 @@ fn kill_recorded(h: &Harness, file: &str) {
     }
 }
 
-/// A token-armed typed-password login: the session line asks the daemon for
-/// the token and hands it to the helper, which leaves a waiter running. The
+/// A token-armed stash-less login (typed password, or a fingerprint login
+/// after the session-phase move): the session line asks the daemon for the
+/// token and hands it to the helper, which leaves a waiter running. The
 /// session must not wait for that waiter: the real helper returns within
 /// about a second and gnome-keyring is initialized only after the PAM stack
-/// has returned.
+/// has returned. This stack has no reseal auth line and no wallet running,
+/// so the query carries no password evidence.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_gnome_token_session_returns_while_the_waiter_runs() {
@@ -2947,7 +3111,7 @@ fn pamwrap_gnome_token_session_returns_while_the_waiter_runs() {
             reqs.as_slice(),
             [Request::UnsealKeyring {
                 user,
-                have_password: true,
+                have_password: false,
                 auth_phase: false,
                 ..
             }] if user == "tester"
@@ -2956,10 +3120,10 @@ fn pamwrap_gnome_token_session_returns_while_the_waiter_runs() {
     );
 }
 
-/// A face or fingerprint login: the `keyring` auth line stashes the token,
-/// and the session line delivers it without asking the daemon again. A
-/// second `open_session` on the same handle finds the stash emptied and
-/// starts no second helper.
+/// A fingerprint login on a token-armed account: the auth-phase `keyring`
+/// line releases nothing, and the session line asks exactly once and hands
+/// the token to the helper. A second `open_session` on the same handle finds
+/// the once-guard sentinel set and starts no second helper.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_gnome_token_from_the_auth_stash_is_delivered_once() {
@@ -2994,17 +3158,18 @@ fn pamwrap_gnome_token_from_the_auth_stash_is_delivered_once() {
             reqs.as_slice(),
             [Request::UnsealKeyring {
                 have_password: false,
-                auth_phase: true,
+                auth_phase: false,
                 ..
             }]
         ),
-        "one UnsealKeyring in the whole transaction, from the auth line: {reqs:?}"
+        "one UnsealKeyring in the whole transaction, from the session line: {reqs:?}"
     );
 }
 
-/// A second login for an already-running account is warm during auth, but
-/// opening its session still needs its GNOME token. The legacy daemon ignores
-/// auth_phase; verify the only request actually sent is the session request.
+/// A second login for an already-running account is warm, and its new session
+/// still needs its GNOME token: the session request is served regardless of
+/// the desktop logind already lists, which is why the warm rule stays an
+/// auth-phase rule (ADR-0003, 2026-10-01 section 1).
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_keyring_upgrade_still_delivers_gnome_token_in_session() {
@@ -3038,7 +3203,7 @@ fn pamwrap_keyring_upgrade_still_delivers_gnome_token_in_session() {
         log.lock().unwrap().as_slice(),
         [Request::UnsealKeyring {
             auth_phase: false,
-            have_password: true,
+            have_password: false,
             ..
         }]
     ));
@@ -3071,41 +3236,96 @@ fn pamwrap_gnome_token_without_a_stash_is_asked_for_once() {
     assert_eq!(log.lock().unwrap().len(), 1, "one daemon query");
 }
 
-/// Only a GNOME keyring token goes to the GNOME helper: a login password, a
-/// KDE wallet key or "not needed" from the daemon never runs it.
+/// Session-phase delivery is routed by kind: a login password goes to the
+/// GNOME helper (it IS the secret a password-keyed keyring unlocks with), a
+/// KDE wallet key goes to `irlume-kwallet-init`, and "not needed" runs
+/// nothing. A KDE key must never reach the GNOME helper's stdin, and a
+/// password must never start a wallet daemon.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_other_keyring_replies_never_run_the_gnome_helper() {
-    for (name, reply) in [
-        ("gkr-login-password", unsealed("hunter2")),
-        ("gkr-not-needed", Response::KeyringUnlockNotNeeded),
-        (
-            "gkr-kde-key",
-            Response::PasswordUnsealed {
-                kind: irlume_common::KeyringSecretKind::KdeWalletKey,
-                secret: irlume_common::SecretBytes::new(vec![
-                    0x42;
-                    irlume_common::kwallet_wire::KEY_LEN
-                ]),
-            },
-        ),
-    ] {
-        let Some(mut h) = Harness::try_new(name) else {
+    // A login password reaches the keyring control socket through the GNOME
+    // helper, exactly like a token would.
+    {
+        let Some(mut h) = Harness::try_new("gkr-login-password") else {
             return;
         };
-        let log = serve(&h.socket, move |req| match req {
-            Request::UnsealKeyring { .. } => reply.clone(),
+        let log = serve(&h.socket, |req| match req {
+            Request::UnsealKeyring { .. } => unsealed("hunter2"),
             _ => Response::Error("unexpected request".into()),
         });
         h.set_gkr_unlock(write_gkr_fake_helper(&h.root, "detach"));
         gkr_service(&h, false);
         let (ok, out) = h.run("irlume-gkr", &["open_session"], "", None);
         kill_recorded(&h, "gkr-waiter.pid");
-        assert!(ok, "{name}: {out}");
-        assert_eq!(log.lock().unwrap().len(), 1, "{name}: the daemon was asked");
+        assert!(ok, "{out}");
+        assert_eq!(log.lock().unwrap().len(), 1, "the daemon was asked");
+        const HUNTER2_SHA256: &str =
+            "f52fbd32b2b3b86ff88ef6c490628285f482af15ddcb29541f94bcf526a3f6c7";
+        assert_eq!(
+            gkr_record(&h, "gkr-stdin"),
+            [HUNTER2_SHA256],
+            "the released password, exactly, is on the helper's stdin"
+        );
+    }
+    // A KDE wallet key starts the wallet daemon instead, and never reaches
+    // the GNOME helper.
+    {
+        let Some(mut h) = Harness::try_new("gkr-kde-key") else {
+            return;
+        };
+        let log = serve(&h.socket, |req| match req {
+            Request::UnsealKeyring { .. } => Response::PasswordUnsealed {
+                kind: irlume_common::KeyringSecretKind::KdeWalletKey,
+                secret: irlume_common::SecretBytes::new(vec![
+                    0x42;
+                    irlume_common::kwallet_wire::KEY_LEN
+                ]),
+            },
+            _ => Response::Error("unexpected request".into()),
+        });
+        h.set_gkr_unlock(write_gkr_fake_helper(&h.root, "detach"));
+        let deliveries = h.root.join("deliveries.log");
+        let counter = h.root.join("deliveries.count");
+        h.set_kwallet_init(write_kde_fake_helper(
+            &h.root,
+            &deliveries,
+            &counter,
+            "warm",
+        ));
+        gkr_service(&h, false);
+        let (ok, out) = h.run("irlume-gkr", &["open_session"], "", None);
+        kill_recorded(&h, "gkr-waiter.pid");
+        assert!(ok, "{out}");
+        assert_eq!(log.lock().unwrap().len(), 1, "the daemon was asked");
         assert!(
             gkr_record(&h, "gkr-argv").is_empty(),
-            "{name}: the GNOME helper ran"
+            "the GNOME helper ran"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&deliveries).unwrap_or_default(),
+            "deliver tester 56\n",
+            "the wallet key reached irlume-kwallet-init, exactly once"
+        );
+    }
+    // "Not needed" delivers nothing at all.
+    {
+        let Some(mut h) = Harness::try_new("gkr-not-needed") else {
+            return;
+        };
+        let log = serve(&h.socket, |req| match req {
+            Request::UnsealKeyring { .. } => Response::KeyringUnlockNotNeeded,
+            _ => Response::Error("unexpected request".into()),
+        });
+        h.set_gkr_unlock(write_gkr_fake_helper(&h.root, "detach"));
+        gkr_service(&h, false);
+        let (ok, out) = h.run("irlume-gkr", &["open_session"], "", None);
+        kill_recorded(&h, "gkr-waiter.pid");
+        assert!(ok, "{out}");
+        assert_eq!(log.lock().unwrap().len(), 1, "the daemon was asked");
+        assert!(
+            gkr_record(&h, "gkr-argv").is_empty(),
+            "the GNOME helper ran"
         );
     }
 }
@@ -3391,8 +3611,12 @@ fn write_kde_fake_helper(root: &Path, log: &Path, counter: &Path, mode: &str) ->
 /// session lines go ahead of the `reseal` line. A last pam_exec line fails
 /// the session unless `PAM_KWALLET5_LOGIN` in the PAM environment is
 /// `login_env`, or unset for `None`.
-fn kde_wallet_service(h: &Harness, earlier: &[String], login_env: Option<&str>) {
-    serve(&h.socket, |req| match req {
+fn kde_wallet_service(
+    h: &Harness,
+    earlier: &[String],
+    login_env: Option<&str>,
+) -> Arc<Mutex<Vec<Request>>> {
+    let log = serve(&h.socket, |req| match req {
         Request::UnsealKeyring { .. } => Response::PasswordUnsealed {
             secret: irlume_common::SecretBytes::new(vec![
                 0x42;
@@ -3422,6 +3646,7 @@ fn kde_wallet_service(h: &Harness, earlier: &[String], login_env: Option<&str>) 
         format!("session required pam_exec.so quiet {}", check.display()),
     ]);
     h.write_service("irlume-kwallet", &lines);
+    log
 }
 
 /// Writes a pam_env config that sets `PAM_KWALLET5_LOGIN` to `value` and
@@ -3499,28 +3724,32 @@ fn pamwrap_kde_wallet_fake_helper_commands_skip_pam_wrapper() {
     );
 }
 
-/// Cold boot: `irlume-kwallet-init` refuses to run before `/run/user/<uid>`
-/// exists, so the AUTH `keyring` line can only stash the unsealed key; the
-/// session's `reseal` line retries and delivers it once the helper reports
-/// ready.
+/// Cold boot: the wallet key is released and delivered from the SESSION
+/// phase only (ADR-0003, 2026-10-06 amendment), because `pam_open_session`
+/// is the first moment the stack has proved the login succeeded and the
+/// first moment `/run/user/<uid>` can exist. Authenticate alone releases
+/// nothing and runs no helper, whatever the helper would answer.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_kde_wallet_cold_boot_defers_to_session() {
     let Some(mut h) = Harness::try_new("kwallet-cold") else {
         return;
     };
-    kde_wallet_service(&h, &[], Some(FAKE_KWALLET_SOCK));
+    let reqs = kde_wallet_service(&h, &[], Some(FAKE_KWALLET_SOCK));
 
     let log = h.root.join("deliveries.log");
     let counter = h.root.join("deliveries.count");
-    h.set_kwallet_init(write_kde_fake_helper(&h.root, &log, &counter, "cold"));
+    h.set_kwallet_init(write_kde_fake_helper(&h.root, &log, &counter, "warm"));
 
     let (ok, out) = h.run("irlume-kwallet", &["authenticate"], "", None);
     assert!(ok, "auth-only must pass: {out}");
-    assert_eq!(
-        std::fs::read_to_string(&log).unwrap_or_default(),
-        "notready tester 56\n",
-        "authenticate alone must hit the not-ready helper and stash, not deliver"
+    assert!(
+        std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+        "authenticate alone must not run the helper"
+    );
+    assert!(
+        reqs.lock().unwrap().is_empty(),
+        "authenticate alone must not release a key"
     );
 
     let _ = std::fs::remove_file(&log);
@@ -3538,18 +3767,31 @@ fn pamwrap_kde_wallet_cold_boot_defers_to_session() {
     );
     assert_eq!(
         std::fs::read_to_string(&log).unwrap(),
-        "notready tester 56\ndeliver tester 56\n",
-        "auth defers on the not-ready helper, then the session reseal delivers"
+        "deliver tester 56\n",
+        "the session line releases the key and starts the wallet exactly once"
+    );
+    assert!(
+        matches!(
+            reqs.lock().unwrap().as_slice(),
+            [Request::UnsealKeyring {
+                have_password: false,
+                auth_phase: false,
+                ..
+            }]
+        ),
+        "one release, from the session phase"
     );
 }
 
-/// Warm login: `/run/user/<uid>` already exists, so the AUTH `keyring` line
-/// starts the wallet directly and exports `PAM_KWALLET5_LOGIN`, on which the
-/// session's `reseal` line stands down. The next test checks that no stash
-/// is left behind either.
+/// A warm login (the user manager already kept `/run/user/<uid>` alive)
+/// starts the wallet from the SESSION phase: the interlock variable the
+/// delivery exports is what a later `pam_kwallet5` session hook and a second
+/// `open_session` on this handle both stand down on. With the variable unset
+/// again ahead of the `reseal` line, no second delivery may appear: the
+/// once-guard sentinel, not the environment, stops it.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
-fn pamwrap_kde_wallet_warm_login_starts_in_auth_only() {
+fn pamwrap_kde_wallet_warm_login_starts_one_wallet_in_the_session() {
     let Some(mut h) = Harness::try_new("kwallet-warm") else {
         return;
     };
@@ -3572,47 +3814,14 @@ fn pamwrap_kde_wallet_warm_login_starts_in_auth_only() {
     assert_eq!(
         std::fs::read_to_string(&log).unwrap(),
         "deliver tester 56\n",
-        "auth starts the wallet directly and the session starts no second one"
-    );
-}
-
-/// Warm login with `PAM_KWALLET5_LOGIN` unset again ahead of the session's
-/// `reseal` line. The variable the auth phase exports would make that line
-/// stand down, which hides a key the `keyring` line stashed although it had
-/// already started the wallet. With the variable unset, such a stash is
-/// delivered a second time and fails the log and environment checks.
-#[test]
-#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
-fn pamwrap_kde_wallet_warm_login_leaves_no_stash() {
-    let Some(mut h) = Harness::try_new("kwallet-warm-unset") else {
-        return;
-    };
-    kde_wallet_service(&h, &[kwallet_env_line(&h, "")], None);
-
-    let log = h.root.join("deliveries.log");
-    let counter = h.root.join("deliveries.count");
-    h.set_kwallet_init(write_kde_fake_helper(&h.root, &log, &counter, "warm"));
-
-    let (ok, out) = h.run(
-        "irlume-kwallet",
-        &["authenticate", "open_session"],
-        "",
-        None,
-    );
-    assert!(
-        ok,
-        "auth + session must pass and leave PAM_KWALLET5_LOGIN unset: {out}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&log).unwrap(),
-        "deliver tester 56\n",
-        "auth starts the wallet directly and stashes nothing for the session"
+        "the session line starts the wallet exactly once, with no auth-phase \
+         attempt and nothing left to deliver twice"
     );
 }
 
 /// A wallet-init helper that fails outright (not the not-ready exit code)
-/// must not be retried from the session, must not fail the login, and must
-/// leave `PAM_KWALLET5_LOGIN` unset.
+/// is tried once, from the session phase, is not retried, must not fail the
+/// login, and must leave `PAM_KWALLET5_LOGIN` unset.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_kde_wallet_helper_failure_is_not_retried() {
@@ -3642,18 +3851,18 @@ fn pamwrap_kde_wallet_helper_failure_is_not_retried() {
     );
 }
 
-/// The stash is delivered at most once. A helper that keeps reporting the
-/// session not ready never exports `PAM_KWALLET5_LOGIN`, so that interlock
-/// cannot stop a later attempt here; only emptying the stash when the first
-/// `open_session` reads it does. A second `open_session` on the same handle
-/// must find nothing to deliver.
+/// The session is the one delivery attempt: a helper that still reports the
+/// session not ready at `open_session` leaves the wallet locked (the key is
+/// not stashed anywhere a later phase could pick up; the auth phase released
+/// nothing), the login survives, and a second `open_session` on the same
+/// handle is stopped by the once-guard sentinel, not by a stash.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_kde_wallet_stash_is_delivered_once() {
     let Some(mut h) = Harness::try_new("kwallet-once") else {
         return;
     };
-    kde_wallet_service(&h, &[], None);
+    let reqs = kde_wallet_service(&h, &[], None);
 
     let log = h.root.join("deliveries.log");
     let counter = h.root.join("deliveries.count");
@@ -3676,8 +3885,18 @@ fn pamwrap_kde_wallet_stash_is_delivered_once() {
     );
     assert_eq!(
         std::fs::read_to_string(&log).unwrap(),
-        "notready tester 56\nnotready tester 56\n",
-        "auth stashes, the first open_session retries once, the second finds the stash empty"
+        "notready tester 56\n",
+        "one attempt, from the session phase; the second open_session is \
+         stopped by the once-guard, with no second request behind it"
+    );
+    assert_eq!(
+        reqs.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r, Request::UnsealKeyring { .. }))
+            .count(),
+        1,
+        "one release request for both open_session calls"
     );
 }
 
@@ -3685,8 +3904,9 @@ fn pamwrap_kde_wallet_stash_is_delivered_once() {
 /// pam_kwallet5's, and pam_kwallet5 may already have started its own daemon
 /// from a password typed at its prompt, which sets `PAM_KWALLET5_LOGIN`. A
 /// pam_env line stands in for it. irlume stands down on that variable, as
-/// pam_kwallet5 does: no second helper run, and the earlier socket stays the
-/// one exported.
+/// pam_kwallet5 does: the hand-off runs no second helper, the earlier socket
+/// stays the one exported, and the release query reports the running wallet
+/// as the password evidence it is.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_kde_wallet_session_stands_down_for_a_running_wallet() {
@@ -3694,7 +3914,7 @@ fn pamwrap_kde_wallet_session_stands_down_for_a_running_wallet() {
         return;
     };
     const EARLIER_SOCK: &str = "/tmp/earlier-kwallet.sock";
-    kde_wallet_service(
+    let reqs = kde_wallet_service(
         &h,
         &[kwallet_env_line(&h, EARLIER_SOCK)],
         Some(EARLIER_SOCK),
@@ -3714,18 +3934,30 @@ fn pamwrap_kde_wallet_session_stands_down_for_a_running_wallet() {
         ok,
         "auth + session must pass and keep the earlier PAM_KWALLET5_LOGIN: {out}"
     );
-    assert_eq!(
-        std::fs::read_to_string(&log).unwrap(),
-        "notready tester 56\n",
-        "a stash must not start a second daemon over the one PAM_KWALLET5_LOGIN names"
+    assert!(
+        std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+        "no second daemon may be started over the one PAM_KWALLET5_LOGIN names"
+    );
+    assert!(
+        matches!(
+            reqs.lock().unwrap().as_slice(),
+            [Request::UnsealKeyring {
+                have_password: true,
+                auth_phase: false,
+                ..
+            }]
+        ),
+        "a running wallet is password evidence, so a daemon that can skip \
+         the release does"
     );
 }
 
-/// The face `unseal` path never defers a `NotReady` wallet key, unlike the
-/// fingerprint `keyring` path above: a stack without a `reseal` session line
-/// (the NixOS module) would otherwise turn a stash into a face login with a
-/// locked wallet. So a not-ready helper on this path is a plain failure, and
-/// `open_session`'s `reseal` line finds nothing to deliver.
+/// The face `unseal` path never defers a `NotReady` wallet key: its result
+/// decides the login, so a not-ready helper on this path is a plain failure.
+/// The `reseal` session line below then asks the daemon once for the
+/// fingerprint lane's release; this mock refuses that request (as an
+/// unarmed account's daemon would), the refusal delivers nothing, and the
+/// helper log keeps exactly the face line's single not-ready attempt.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_kde_wallet_face_unseal_is_not_deferred() {
@@ -3787,19 +4019,17 @@ fn pamwrap_kde_wallet_face_unseal_is_not_deferred() {
     assert_eq!(
         std::fs::read_to_string(&log).unwrap_or_default(),
         "notready tester 56\n",
-        "the unseal path never stashes, so open_session has nothing to deliver"
+        "the unseal path never defers, and the session query this mock refuses \
+         delivers nothing on top of it"
     );
 }
 
 /// A warm face `unseal` starts the wallet during auth and sets
-/// `PAM_KWALLET5_LOGIN`. The `keyring` line past the landing must then tell
-/// irlumed a wallet already runs (`have_password`), so a real irlumed
-/// unseals nothing a second time. The mock releases the key anyway, as an
-/// irlumed older than that flag would, and the line must still leave the
-/// running wallet alone: no second helper run, which would unlink the first
-/// daemon's socket and orphan it, and no stash either. The session unsets
-/// the variable ahead of its `reseal` line, so a stash would show up there
-/// as a second delivery instead of being hidden by the same interlock.
+/// `PAM_KWALLET5_LOGIN`. The session's release query must then report the
+/// running wallet as the password evidence it is (`have_password`), so a
+/// daemon that can skip the release answers KeyringUnlockNotNeeded and the
+/// wallet the face line started is left alone: no second helper run, which
+/// would unlink the first daemon's socket and orphan it.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_kde_wallet_face_then_keyring_starts_one_daemon() {
@@ -3807,15 +4037,25 @@ fn pamwrap_kde_wallet_face_then_keyring_starts_one_daemon() {
         return;
     };
     let reqs = serve(&h.socket, |req| match req {
-        Request::UnsealPassword { .. } | Request::UnsealKeyring { .. } => {
-            Response::PasswordUnsealed {
-                secret: irlume_common::SecretBytes::new(vec![
-                    0x42;
-                    irlume_common::kwallet_wire::KEY_LEN
-                ]),
-                kind: irlume_common::KeyringSecretKind::KdeWalletKey,
-            }
+        Request::UnsealPassword { .. } => Response::PasswordUnsealed {
+            secret: irlume_common::SecretBytes::new(vec![
+                0x42;
+                irlume_common::kwallet_wire::KEY_LEN
+            ]),
+            kind: irlume_common::KeyringSecretKind::KdeWalletKey,
+        },
+        // The session query arrives flagged with the running-wallet
+        // evidence; a real daemon skips the release for it.
+        Request::UnsealKeyring { have_password, .. } if *have_password => {
+            Response::KeyringUnlockNotNeeded
         }
+        Request::UnsealKeyring { .. } => Response::PasswordUnsealed {
+            secret: irlume_common::SecretBytes::new(vec![
+                0x42;
+                irlume_common::kwallet_wire::KEY_LEN
+            ]),
+            kind: irlume_common::KeyringSecretKind::KdeWalletKey,
+        },
         _ => Response::Error("unexpected request".into()),
     });
 
@@ -3830,7 +4070,6 @@ fn pamwrap_kde_wallet_face_then_keyring_starts_one_daemon() {
             "auth requisite pam_deny.so".into(),
             "auth required pam_permit.so".into(),
             h.auth_line("optional", "keyring"),
-            kwallet_env_line(&h, ""),
             format!("session optional {} reseal", h.module.display()),
             "session required pam_permit.so".into(),
         ],
@@ -3856,15 +4095,15 @@ fn pamwrap_kde_wallet_face_then_keyring_starts_one_daemon() {
         .collect();
     assert_eq!(
         keyring_reqs,
-        [true, true],
-        "the keyring line must have run, or the single delivery below proves nothing, \
-         and must report the running wallet as have_password (the second request is \
-         the session's GNOME token lookup, which always sends true)"
+        [true],
+        "exactly one keyring request, from the session, reporting the wallet \
+         the face line started"
     );
     assert_eq!(
         std::fs::read_to_string(&log).unwrap_or_default(),
         "deliver tester 56\n",
-        "the keyring line must leave the wallet the face line started alone and stash nothing"
+        "only the face line's delivery runs; the skipped session release \
+         starts no second daemon"
     );
 }
 

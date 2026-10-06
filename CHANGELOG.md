@@ -16,6 +16,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- The LightDM restart gate gains a managed-start policy evidence reader: a
+  versioned, fail-closed receipt bound to one systemd invocation (invocation
+  id, main pid, monotonic start) and a verdict machine that samples the
+  manager before and after the receipt and compares identity by equality,
+  never wall-clock ordering, without reading `/proc`. It stays unwired until
+  the qualified producer ships, so every verdict today is `unknown` and the
+  existing timestamp rule is unchanged (#859).
+
 - LightDM runs against a private, read-only PAM view when irlume's LightDM
   units are installed. A preparation unit ordered before every LightDM start
   reads the prospective configuration with `lightdm --show-config` and, while

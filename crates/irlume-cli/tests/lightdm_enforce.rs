@@ -493,11 +493,19 @@ fn prepare_view_with_state(bed: &Bed, remote: bool, state: &str) -> std::process
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let module = bed.root.join("pam_irlume_view.so");
-    let built = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("libpam_irlume_view.so");
+    // The ASan lane builds this cdylib under its own target and nightly layout,
+    // so it exports the exact artifact path the way it does for the CLI binary;
+    // every other layout finds the module beside this test executable.
+    let built = std::env::var_os("IRLUME_TEST_VIEW_MODULE").map_or_else(
+        || {
+            std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("libpam_irlume_view.so")
+        },
+        std::path::PathBuf::from,
+    );
     std::fs::copy(built, &module).expect("the CLI's session-module dependency must be built");
     bed.run_args(
         &[

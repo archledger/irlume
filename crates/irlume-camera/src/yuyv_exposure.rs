@@ -1568,6 +1568,16 @@ mod tests {
             }
         }
         assert_eq!(latch.inspected(), 32);
+        // A clean frame of the exact length clears no other reason either.
+        for (first, reason) in [
+            (&[16, 100, 16, 103][..], CHROMA),
+            (&L01[..3], PAYLOAD_LENGTH),
+        ] {
+            let mut latch = fresh(2, 1);
+            assert_eq!(latch.observe(first), Some(reason));
+            assert_eq!(latch.observe(&L01), None);
+            assert_eq!(latch.refusal(), Some(reason), "{reason}");
+        }
     }
 
     #[test]

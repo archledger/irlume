@@ -12736,10 +12736,21 @@ mod tests {
     /// latch is session state outside the decoder, built once from the
     /// camera's fd evidence and never reassigned, so later captures,
     /// `recover()` and a privacy teardown keep it. Recovery needs a held
-    /// camera to reach, so the lifetime is pinned by shape; the latch's own
-    /// rules run in `yuyv_exposure`'s tests.
+    /// camera to reach, so the lifetime is pinned by shape: only the session
+    /// literal builds a latch, and every code line that names the field in
+    /// `lib.rs` and `paired_processing.rs`, the code that holds an
+    /// `IrSession`, is listed, so a reset through any binding shows up. The
+    /// latch's own rules run in `yuyv_exposure`'s tests.
     #[test]
     fn the_yuyv_content_latch_lives_on_the_session_and_outlives_recovery() {
+        // `content` as a whole identifier, not inside `contention`.
+        fn names_content(line: &str) -> bool {
+            let identifier = |c: char| c.is_ascii_alphanumeric() || c == '_';
+            line.match_indices("content").any(|(at, word)| {
+                let after = &line[at + word.len()..];
+                !line[..at].ends_with(identifier) && !after.starts_with(identifier)
+            })
+        }
         let lib = include_str!("lib.rs");
         let production = &lib[..lib
             .find("\n#[cfg(test)]\nmod tests {")
@@ -12767,6 +12778,29 @@ mod tests {
             1,
             "only the burst borrows the latch; nothing reassigns or clears it"
         );
+        assert_eq!(
+            production.matches("YuyvContentLatch::new(").count(),
+            1,
+            "only the IrSession literal builds a latch"
+        );
+        assert_eq!(
+            source_code_lines(production)
+                .filter(|line| names_content(line))
+                .collect::<Vec<_>>(),
+            [
+                "            content: self",
+                "    content: Option<yuyv_exposure::YuyvContentLatch>,",
+                "        let content = &mut self.content;",
+                "            if let Some(newly) = content.as_mut().and_then(|latch| latch.observe(buf)) {",
+                "                    \"[ir] {}: YUYV content latch refuses this session: {newly}\",",
+            ],
+            "the literal builds the latch, the field holds it, and only the burst's borrow \
+             and its observe touch it; a line that reassigns, takes or clears it fails here"
+        );
+        assert!(
+            !source_code_lines(include_str!("paired_processing.rs")).any(names_content),
+            "the paired drains hold the IR session too and must not touch its latch"
+        );
         let session = &production[production
             .find("\nimpl IrSession<'_> {")
             .expect("impl IrSession moved; update this test")..];
@@ -12793,7 +12827,10 @@ mod tests {
     /// Every frame a capture's burst dequeues reaches the session's content
     /// latch before it is decoded, so a violation in a frame the gate
     /// selection passes over, or after which the burst ends early, still
-    /// latches (ADR-0031 §4, Amendment 2026-10-07).
+    /// latches (ADR-0031 §4, Amendment 2026-10-07). The observation is one
+    /// statement directly in the loop body with no condition of its own,
+    /// and nothing between the dequeue and the decode skips ahead; an error
+    /// there fails the capture with the frame undecoded.
     #[test]
     fn every_ir_burst_frame_reaches_the_content_latch_before_decode() {
         let lib = include_str!("lib.rs");
@@ -12829,6 +12866,33 @@ mod tests {
             1,
             "one observation per dequeued frame"
         );
+        let (_, burst) = capture
+            .split_once("\n        for _ in 0..IR_BURST {\n")
+            .expect("the burst loop moved; update this test");
+        let (burst, _) = burst
+            .split_once("\n        }\n")
+            .expect("the burst loop ends at column 8");
+        let dequeued = burst
+            .find("stream.next()")
+            .expect("the burst dequeues in its body");
+        let observed = burst
+            .find(
+                "\n            if let Some(newly) = content.as_mut().and_then(|latch| latch.observe(buf)) {\n",
+            )
+            .expect("every frame is observed, unconditionally and directly in the loop body");
+        let decoded = burst
+            .find("\n            let data = dec.decode(buf, w, h);\n")
+            .expect("every frame is decoded directly in the loop body");
+        assert!(
+            dequeued < observed && observed < decoded,
+            "the observation sits between the dequeue and the decode"
+        );
+        for skip in ["continue", "break", "return", ".filter("] {
+            assert!(
+                !source_code_lines(&burst[dequeued..decoded]).any(|line| line.contains(skip)),
+                "{skip} between the dequeue and the decode could pass a frame by the latch"
+            );
+        }
     }
 
     #[test]

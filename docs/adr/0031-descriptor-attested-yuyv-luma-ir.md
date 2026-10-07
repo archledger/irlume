@@ -498,11 +498,12 @@ open: which frames feed the latch, and how expansion rounds.
   an attested camera whose binding refused have no evidence and no latch.
 - **Frames judged.** Every frame a capture's burst dequeues is inspected
   before it is decoded: up to 10 per capture, including frames the gate
-  selection passes over and the ambient partner. Warm-up, the startup
-  flush, the delivered-rate fill and its probe, the refill after a
-  recovery, the paired concurrent fill and the paired tail drains discard
-  their frames undecoded and are not inspected; the latch does not claim
-  them.
+  selection passes over and the ambient partner. A frame whose endpoint
+  recheck after the dequeue fails is neither inspected nor decoded, and
+  its capture fails. Warm-up, the startup flush, the delivered-rate fill
+  and its probe, the refill after a recovery, the paired concurrent fill
+  and the paired tail drains discard their frames undecoded and are not
+  inspected; the latch does not claim them.
 - **Per frame.** Footroom and flat chroma as the 2026-10-06 amendment
   defines them, on raw bytes before any expansion, over the frame's
   `2 * width * height` image bytes. A payload of any other length latches
@@ -541,8 +542,12 @@ open: which frames feed the latch, and how expansion rounds.
   the burst proof, and keeps the content checks and the optical means on
   raw bytes.
 
-Synthetic tests check the latch and every input of the expansion, and
-source-shape tests pin that each burst frame reaches the latch before
-decode and that recovery keeps it. No real-kernel lane streams attested
-YUYV (the loopback feeder is GREY), so the T480 still needs attended
-qualification. The burst's emitter alternation and the ceiling remain.
+Synthetic tests check the latch and every input of the expansion.
+Source-shape tests pin that each burst frame reaches the latch before
+decode, with no condition and nothing between dequeue and decode that
+skips it, and that only the session's construction builds the latch and
+no code holding the session reassigns or clears it, so later captures,
+`recover()` and a privacy teardown keep it. No real-kernel lane streams
+attested YUYV (the loopback feeder is GREY), so the T480 still needs
+attended qualification. The burst's emitter alternation and the ceiling
+remain.

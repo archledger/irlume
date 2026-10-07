@@ -7272,9 +7272,10 @@ pub struct IrSession<'a> {
     stream: TrackedStream<SafeStream<'a>>,
     dec: IrDecoder,
     /// ADR-0031 §4's footroom and chroma latch, built once from the camera's
-    /// fd evidence and `None` without it. Every frame a burst dequeues is
-    /// offered to it before decode; recovery and privacy teardown keep it,
-    /// unlike `dec`. It only refuses, and nothing reads it until the ceiling.
+    /// fd evidence and `None` without it. Every frame the stream delivers to
+    /// a burst is offered to it before decode. Recovery recreates `dec` but
+    /// keeps the latch, and privacy teardown keeps both. It only refuses, and
+    /// nothing reads it until the ceiling.
     content: Option<yuyv_exposure::YuyvContentLatch>,
     lit: bool,
     /// The camera's own per-frame illumination reporting, when it has any.
@@ -7451,7 +7452,7 @@ impl IrSession<'_> {
             }
             if let Some(newly) = content.as_mut().and_then(|latch| latch.observe(buf)) {
                 irlume_common::dlog!(
-                    "[ir] {}: YUYV content latch refuses this session: {newly}",
+                    "[ir] {}: YUYV content latch set for this session (not yet enforced): {newly}",
                     camera_text(device)
                 );
             }
@@ -12735,12 +12736,14 @@ mod tests {
     /// ADR-0031 §4 (Amendment 2026-10-07, session content latch): the
     /// latch is session state outside the decoder, built once from the
     /// camera's fd evidence and never reassigned, so later captures,
-    /// `recover()` and a privacy teardown keep it. Recovery needs a held
-    /// camera to reach, so the lifetime is pinned by shape: only the session
-    /// literal builds a latch, and every code line that names the field in
-    /// `lib.rs` and `paired_processing.rs`, the code that holds an
-    /// `IrSession`, is listed, so a reset through any binding shows up. The
-    /// latch's own rules run in `yuyv_exposure`'s tests.
+    /// `recover()` and a privacy teardown keep it. Here the lifetime is
+    /// pinned by shape: only the session literal builds a latch, and every
+    /// code line that names the field in `lib.rs` and `paired_processing.rs`,
+    /// the code that holds an `IrSession`, is listed, so a reset through any
+    /// binding shows up. The v4l2loopback lane runs the latch through a real
+    /// recovery on GREY frames
+    /// (`loopback_frozen_raw_format_holds_through_a_real_session_and_recovery`),
+    /// and the latch's own rules run in `yuyv_exposure`'s tests.
     #[test]
     fn the_yuyv_content_latch_lives_on_the_session_and_outlives_recovery() {
         // `content` as a whole identifier, not inside `contention`.
@@ -12792,7 +12795,7 @@ mod tests {
                 "    content: Option<yuyv_exposure::YuyvContentLatch>,",
                 "        let content = &mut self.content;",
                 "            if let Some(newly) = content.as_mut().and_then(|latch| latch.observe(buf)) {",
-                "                    \"[ir] {}: YUYV content latch refuses this session: {newly}\",",
+                "                    \"[ir] {}: YUYV content latch set for this session (not yet enforced): {newly}\",",
             ],
             "the literal builds the latch, the field holds it, and only the burst's borrow \
              and its observe touch it; a line that reassigns, takes or clears it fails here"
@@ -12824,13 +12827,14 @@ mod tests {
         }
     }
 
-    /// Every frame a capture's burst dequeues reaches the session's content
-    /// latch before it is decoded, so a violation in a frame the gate
-    /// selection passes over, or after which the burst ends early, still
-    /// latches (ADR-0031 §4, Amendment 2026-10-07). The observation is one
-    /// statement directly in the loop body with no condition of its own,
-    /// and nothing between the dequeue and the decode skips ahead; an error
-    /// there fails the capture with the frame undecoded.
+    /// Every frame the stream delivers to a capture's burst reaches the
+    /// session's content latch before it is decoded, so a violation in a
+    /// frame the gate selection passes over, or after which the burst ends
+    /// early, still latches (ADR-0031 §4, Amendment 2026-10-07). The
+    /// observation is one statement directly in the loop body with no
+    /// condition of its own, and nothing between the dequeue and the decode
+    /// skips ahead; an error there fails the capture with the frame
+    /// undecoded.
     #[test]
     fn every_ir_burst_frame_reaches_the_content_latch_before_decode() {
         let lib = include_str!("lib.rs");
@@ -21463,10 +21467,22 @@ mod tests {
     /// recovered stream's first dequeue, which carries the recovery marker.
     /// The GREY-fed node is not YUYV, so the evidence is frozen straight from
     /// its fd; production binding adds the list and descriptor checks in
-    /// front of the same rechecks.
+    /// front of the same rechecks. The evidence also seeds the session's
+    /// content latch (Amendment 2026-10-07): warm-up and the rate fill never
+    /// reach it, each burst frame does, a GREY frame has no YUYV layout and
+    /// latches `uninspectable` alone, and recovery keeps the latch for the
+    /// recovered stream's burst.
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_frozen_raw_format_holds_through_a_real_session_and_recovery() {
+        /// Frames the session's latch has judged, and what it latched.
+        fn latched(session: &IrSession<'_>) -> (u64, Option<yuyv_exposure::ContentRefusal>) {
+            let latch = session
+                .content
+                .as_ref()
+                .expect("fd evidence builds a latch");
+            (latch.inspected(), latch.refusal())
+        }
         let (_, ir_path) = loopback_pair();
         let operation = lease::acquire_camera_operation(
             &[ir_path.as_str()],
@@ -21488,17 +21504,42 @@ mod tests {
             "{error}"
         );
 
+        let unreadable = yuyv_exposure::ContentRefusal {
+            uninspectable: true,
+            ..yuyv_exposure::ContentRefusal::NONE
+        };
+        // A YUYV node run by name is judged on its scene, so there only the
+        // count and the persistence are checked.
+        let yuyv = frozen.raw().fourcc == *b"YUYV";
         camera.format_evidence = Some(frozen);
         let mut session = camera.session().expect("the driver keeps its tuple");
+        assert_eq!(latched(&session), (0, None), "warm-up and the rate fill");
         session
             .capture_with_stats()
             .expect("a capture through every boundary");
+        let (first, refused) = latched(&session);
+        assert!((1..=IR_BURST as u64).contains(&first), "{first} judged");
+        if !yuyv {
+            assert_eq!(refused, Some(unreadable));
+        }
         session.recover().expect("recovery reopens and rechecks");
+        assert_eq!(latched(&session), (first, refused), "recovery keeps it");
         let (_, _, sequence, _, _) = session
             .stream
             .next()
             .expect("the recovered stream's first dequeue rechecks and delivers");
         assert!(sequence.discontinuity(), "the recovery marker");
+        session
+            .capture_with_stats()
+            .expect("a capture on the recovered stream");
+        let (total, refused) = latched(&session);
+        assert!(
+            (first + 1..=first + IR_BURST as u64).contains(&total),
+            "the recovered burst adds to the same latch: {first}, then {total}"
+        );
+        if !yuyv {
+            assert_eq!(refused, Some(unreadable));
+        }
     }
 
     /// What a recovered capture must look like: the burst aggregates, its

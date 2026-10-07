@@ -11,13 +11,13 @@
 //! raw value is converted to an enum: unknown and unsupported values stay
 //! unresolved and refuse. Nothing here opens a device or logs: `yuyv_fd`
 //! reads the format from the fd, and `IrSession` offers the latch every frame
-//! its bursts dequeue. The latch only refuses and nothing reads it yet; the
-//! expansion has no caller until the ceiling.
+//! the stream delivers to its bursts. The latch only refuses and nothing
+//! reads it yet; the expansion has no caller until the ceiling.
 #![cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "ADR-0031 §4 pure prerequisite; exposure_prerequisite and the limited-to-full expansion gain a production caller with the ceiling"
+        reason = "ADR-0031 §4 pure prerequisite; inspect_yuyv_frame, exposure_prerequisite, the frame facts' accessors, the latch's verdict and the limited-to-full expansion have no production caller before the ceiling"
     )
 )]
 
@@ -520,10 +520,10 @@ impl std::fmt::Display for ContentRefusal {
 
 /// ADR-0031 §4's session latch over the footroom and flat-chroma conditions.
 /// `IrSession` holds one for a camera with fd-bound format evidence and
-/// offers it every frame its bursts dequeue, before decode. Nothing resets
-/// it, so a violation holds through later captures and `recover()` until the
-/// session ends. It only refuses: an empty latch is the absence of a refusal,
-/// not proof, and it yields no ceiling.
+/// offers it every frame the stream delivers to its bursts, before decode.
+/// Nothing resets it, so a violation holds through later captures and
+/// `recover()` until the session ends. It only refuses: an empty latch is
+/// the absence of a refusal, not proof, and it yields no ceiling.
 #[derive(Debug)]
 pub(crate) struct YuyvContentLatch {
     /// The fd-bound raw format every frame is read with.
@@ -1632,6 +1632,10 @@ mod tests {
             Some(PAYLOAD_LENGTH)
         );
         assert_eq!(surplus.refusal(), Some(PAYLOAD_LENGTH));
+        // A later frame of exactly the image clears nothing.
+        assert_eq!(surplus.observe(&L01), None);
+        assert_eq!(surplus.refusal(), Some(PAYLOAD_LENGTH));
+        assert_eq!(surplus.inspected(), 2);
         // Surplus never dilutes the image: 2 of its 200 pixels are low, 2 of
         // 400 would pass.
         let mut diluted = fresh(100, 2);

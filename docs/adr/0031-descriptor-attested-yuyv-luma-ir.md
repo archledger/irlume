@@ -496,14 +496,16 @@ open: which frames feed the latch, and how expansion rounds.
   keeps one content latch (`crates/irlume-camera/src/yuyv_exposure.rs`)
   for the session's life. GREY, the Y16 family, NV12, unattested YUYV and
   an attested camera whose binding refused have no evidence and no latch.
-- **Frames judged.** Every frame a capture's burst dequeues is inspected
-  before it is decoded: up to 10 per capture, including frames the gate
-  selection passes over and the ambient partner. A frame whose endpoint
-  recheck after the dequeue fails is neither inspected nor decoded, and
-  its capture fails. Warm-up, the startup flush, the delivered-rate fill
-  and its probe, the refill after a recovery, the paired concurrent fill
-  and the paired tail drains discard their frames undecoded and are not
-  inspected; the latch does not claim them.
+- **Frames judged.** Every frame the stream delivers to a capture's burst
+  is inspected before it is decoded: up to 10 per capture, including
+  frames the gate selection passes over and the ambient partner. A frame
+  the stream refuses after its dequeue (the rate floor, or a sequence,
+  timestamp or rate-window fault), or whose endpoint recheck then fails,
+  is neither inspected nor decoded, and its capture fails. Warm-up, the
+  startup flush, the delivered-rate fill and its probe, the refill after
+  a recovery, the paired concurrent fill and the paired tail drains
+  discard their frames undecoded and are not inspected; the latch does
+  not claim them.
 - **Per frame.** Footroom and flat chroma as the 2026-10-06 amendment
   defines them, on raw bytes before any expansion, over the frame's
   `2 * width * height` image bytes. A payload of any other length latches
@@ -512,11 +514,13 @@ open: which frames feed the latch, and how expansion rounds.
   image at the `2 * width` stride the layout requires, and flags a buffer
   of any other length as an error (Linux v7.2 `uvc_driver.c` L299-301,
   `uvc_video.c` L214-218 and L1535-1541). A frame whose format has no
-  tight YUYV layout also latches a refusal.
+  tight YUYV layout, or whose raw luma sum overflows, also latches a
+  refusal.
 - **Delivery faults.** A buffer flagged `V4L2_BUF_FLAG_ERROR`, which
   uvcvideo delivers by default (`nodrop` is 1, v7.2 `uvc_driver.c` L35,
-  `uvc_queue.c` L359-366), exposes no payload and fails its capture, and
-  a frame the kernel drops leaves only a sequence gap; neither can be
+  `uvc_queue.c` L359-366), exposes no payload: in a burst it fails its
+  capture, while the warm-up and the rate fills skip it and carry on. A
+  frame the kernel drops leaves only a sequence gap. Neither can be
   inspected. The latch only refuses, so a gap or discontinuity never
   exempts the frames around it. Requiring a gap-free burst belongs to the
   burst proof and the ceiling.
@@ -524,6 +528,12 @@ open: which frames feed the latch, and how expansion rounds.
   that capture later fails, and holds through later captures, `recover()`
   and a privacy teardown until the session ends. A new session starts
   with an empty latch, which is the absence of a refusal, not proof.
+  A one-shot IR capture opens a session of its own, so its latch covers a
+  single burst. The sequential capture schedule, the default when none is
+  stored, captures IR that way outside a sequential batch; a held
+  concurrent pair and a sequential batch keep one IR session across their
+  captures. Whether a violation should outlive a capture, per request or
+  per device, is for the ceiling change to decide.
 - **Output.** The latch answers a refusal or nothing: no ceiling, no
   clipping level, and nothing consumes it yet. With `IRLUME_LOG=debug`
   the frame that first latches each reason logs the reason's name,
@@ -547,7 +557,10 @@ Source-shape tests pin that each burst frame reaches the latch before
 decode, with no condition and nothing between dequeue and decode that
 skips it, and that only the session's construction builds the latch and
 no code holding the session reassigns or clears it, so later captures,
-`recover()` and a privacy teardown keep it. No real-kernel lane streams
-attested YUYV (the loopback feeder is GREY), so the T480 still needs
-attended qualification. The burst's emitter alternation and the ceiling
-remain.
+`recover()` and a privacy teardown keep it. The v4l2loopback CI lane
+checks the latch on a real kernel with evidence frozen from the GREY-fed
+node: warm-up and the rate fill leave it empty, each burst frame latches
+`uninspectable` alone, and recovery keeps its count and verdict for the
+recovered stream's burst. No real-kernel lane streams attested YUYV, so
+the T480 still needs attended qualification. The burst's emitter
+alternation and the ceiling remain.

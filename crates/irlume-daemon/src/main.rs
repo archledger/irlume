@@ -25224,6 +25224,10 @@ mod tests {
     #[test]
     fn remove_camera_group_removes_the_group_through_dispatch() {
         let _g = env_lock();
+        // Planting the secondary store encrypts it under the account's
+        // template key: on a host with /dev/tpm* the device-node probe would
+        // otherwise seal that key with the real TPM (#1004).
+        let _no_tpm = irlume_core::template_key::test_support::TpmPresence::force(false);
         let mut e = engine();
         let sb = sandbox("remcam");
         // A plaintext primary plus a secondary store holding one group.

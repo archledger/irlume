@@ -2943,6 +2943,11 @@ fn concurrent_pair_degradation(
     missing_runtime_contract: bool,
     recovered_side: bool,
 ) -> RuntimeDegradation {
+    // A recovered frame keeps its recovery marker, so a recovered side's
+    // continuity violation reports as stream recovery.
+    if recovered_side && violation == Some(irlume_camera::RuntimePairViolation::Continuity) {
+        return RuntimeDegradation::StreamRecovery;
+    }
     violation.map_or_else(
         || {
             if missing_runtime_contract {
@@ -3723,6 +3728,61 @@ mod capture_mode_switch_tests {
         assert!(!concurrent_pair_requires_fallback(
             false, false, false, false, false
         ));
+    }
+
+    #[test]
+    fn recovered_side_continuity_violation_keeps_the_stream_recovery_label() {
+        use irlume_camera::RuntimePairViolation as Violation;
+        // A recovered frame keeps its recovery marker, so the pair it joins
+        // fails continuity; the held pair still reports the recovery.
+        assert_eq!(
+            concurrent_pair_degradation(Some(Violation::Continuity), false, true),
+            RuntimeDegradation::StreamRecovery
+        );
+        assert_eq!(
+            concurrent_pair_degradation(Some(Violation::Continuity), false, false),
+            RuntimeDegradation::ContinuityLoss
+        );
+        assert_eq!(
+            concurrent_pair_degradation(Some(Violation::ActiveIr), false, true),
+            RuntimeDegradation::ActiveIrMissing
+        );
+        assert_eq!(
+            concurrent_pair_degradation(None, false, true),
+            RuntimeDegradation::StreamRecovery
+        );
+        assert_eq!(
+            concurrent_pair_degradation(None, true, true),
+            RuntimeDegradation::MissingRuntimeContract
+        );
+    }
+
+    #[test]
+    fn recovered_side_other_violations_keep_their_own_labels() {
+        use irlume_camera::RuntimePairViolation as Violation;
+        // Only continuity is relabelled on a recovered side; a pair that
+        // also changed generation or contract, or ran below its floor,
+        // reports that violation.
+        for (violation, label) in [
+            (
+                Violation::CameraGeneration,
+                RuntimeDegradation::CameraGenerationChanged,
+            ),
+            (
+                Violation::StreamContract,
+                RuntimeDegradation::StreamContractMismatch,
+            ),
+            (
+                Violation::DeliveredRate,
+                RuntimeDegradation::DeliveredRateShortfall,
+            ),
+        ] {
+            assert_eq!(
+                concurrent_pair_degradation(Some(violation), false, true),
+                label,
+                "{violation:?}"
+            );
+        }
     }
 
     /// #586 proactive degradation: a concurrent capture that SUCCEEDED but

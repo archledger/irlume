@@ -108,6 +108,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- An RGB or IR burst captured after an in-place stream recovery no longer
+  fails as an invalid aggregate. Its first frame keeps the recovery marker
+  and is accepted only after a discarded frame of the new stream, so the
+  burst stays non-continuous: the concurrent pair check and IR recognition
+  still refuse it, and a held pair with a recovered side still falls back
+  (ADR-0007).
+
+- A recovered stream drops its rate-probe admission and re-establishes its
+  30-delta delivered-rate window before its next frame (ADR-0021, decision
+  item 3).
+
 - `irlume camera diagnostics --json` measures the selected split camera pair,
   both sides in one diagnostic operation, instead of the RGB camera the daemon
   falls back to on a split-only machine, which reported the pair's IR as

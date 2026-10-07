@@ -1173,3 +1173,14 @@ checks model determinism on any detected face frame; it stays on the standing
 RGB device with its own single-endpoint lease and never opens a split pair's
 other side. The liveness self-test keeps refusing a selected split until a
 separate change routes it to `Engine::assess_split_in_operation`.
+
+An attended check on archhost on 2026-10-07 ran the same measurement through
+the release `split_capture_probe --rate-diagnostics` (no `test-support`) in the
+offline container with only the camera nodes passed in, after pausing the
+installed daemon and the CI runner. BRIO RGB with NexiGo IR and NexiGo RGB with
+BRIO IR each reported both roles `measured` above their floors with no drops or
+sequence gaps, and the IR side's illumination metadata present with lit and
+dark frames observed. Both reservations were released; formats and backlight
+compensation of every node matched before and after; the services returned
+active. No images were saved and no account state was mounted. This qualifies
+the diagnostic measurement on those connections, not split authentication.

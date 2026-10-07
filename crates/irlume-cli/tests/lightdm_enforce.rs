@@ -601,6 +601,18 @@ fn session_module_asan_runtime() -> Option<String> {
     })
 }
 
+/// The C compiler that builds this test's PAM probe and modules: `$CC` when
+/// set, else `cc` from `PATH`, the toolchain that links this crate. A fixed
+/// `/usr/bin/cc` is absent where the toolchain lives elsewhere, such as the
+/// NixOS hardware runner (#1017).
+fn c_compiler() -> Command {
+    Command::new(
+        std::env::var_os("CC")
+            .filter(|cc| !cc.is_empty())
+            .unwrap_or_else(|| "cc".into()),
+    )
+}
+
 #[test]
 fn real_pam_remote_view_preserves_password_fallback_jumps_and_local_fingerprint() {
     let bed = Bed::new("real-pam-view", false);
@@ -610,7 +622,7 @@ fn real_pam_remote_view_preserves_password_fallback_jumps_and_local_fingerprint(
     let finger = bed.root.join("pam_fprintd.so");
     let password = bed.root.join("pam_unix.so");
     for output in [&driver, &finger, &password] {
-        let mut cc = Command::new("/usr/bin/cc");
+        let mut cc = c_compiler();
         cc.args(["-Wall", "-Wextra", "-Werror"]);
         if output != &driver {
             cc.args(["-DMODULE", "-shared", "-fPIC"]);

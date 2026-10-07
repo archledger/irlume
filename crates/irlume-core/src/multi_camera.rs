@@ -1472,6 +1472,10 @@ mod tests {
     #[test]
     fn secondary_store_path_sits_outside_the_legacy_enrollment_namespace() {
         let _guard = crate::testenv::ENV_LOCK.lock().expect("env lock");
+        // The save below takes the plaintext branch: on a host with /dev/tpm*
+        // the device-node probe would otherwise seal a template key with the
+        // real TPM (#1004, #1017).
+        let _no_tpm = crate::template_key::test_support::TpmPresence::force(false);
         let dir = std::env::temp_dir().join(format!("irlume-sec-path-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("IRLUME_STATE_DIR", &dir);

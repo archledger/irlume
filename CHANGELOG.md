@@ -7,6 +7,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- An attested YUYV IR camera freezes its raw format from the open device
+  once negotiation is final, including the Y'CbCr encoding the v4l crate
+  drops, after reading the device's whole format list and re-checking its
+  USB descriptor. A capture then refuses as format drift if any of it
+  changes at a buffer claim, the first frame or a recovery. YUYV IR still
+  has no exposure ceiling (ADR-0031 §4, fd-bound format evidence
+  amendment; #887).
+
 - Refresh both Cargo lockfiles to current compatible transitive releases,
   including `libc` 0.2.190 and `spki` 0.8.1. `aes` stays at 0.9.2 and `uuid`
   at 1.26.0 because their newer releases declare Rust 1.89 while the

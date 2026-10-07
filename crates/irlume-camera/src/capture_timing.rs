@@ -96,7 +96,7 @@ impl RateFillFailure {
             if inner.is::<crate::lease::CameraLeaseError>() {
                 return Self::LeaseBoundary;
             }
-            if inner.is::<irlume_common::Error>() {
+            if inner.is::<irlume_common::Error>() || inner.is::<crate::FormatEvidenceRefusal>() {
                 return Self::StreamState;
             }
             if let Some(error) = inner.downcast_ref::<crate::CaptureEvidenceError>() {
@@ -515,6 +515,12 @@ mod tests {
             (
                 Error::other(irlume_common::Error::Hardware(
                     "private stream payload 123456789".into(),
+                )),
+                "stream_state",
+            ),
+            (
+                Error::other(crate::FormatEvidenceRefusal(
+                    irlume_common::Error::Hardware("private evidence payload 123456789".into()),
                 )),
                 "stream_state",
             ),

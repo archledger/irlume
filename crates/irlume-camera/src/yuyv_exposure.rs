@@ -9,13 +9,13 @@
 //! Discriminants always come from the generated `v4l::v4l_sys` constants. No
 //! raw value is converted to an enum: unknown and unsupported values stay
 //! unresolved and refuse. Nothing here opens a device, logs or keeps state
-//! between frames; the fd adapter, the session latch and limited-to-full
-//! expansion are later changes.
+//! between frames: `yuyv_fd` reads the format from the fd, and the session
+//! latch and limited-to-full expansion are later changes.
 #![cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "ADR-0031 §4 pure prerequisite; the fd adapter slice adds the first production caller"
+        reason = "ADR-0031 §4 pure prerequisite; the frame checks gain a production caller with the session latch"
     )
 )]
 
@@ -23,8 +23,8 @@ use crate::frame_provenance::{DequeuedBufferError, PayloadLayout};
 use crate::ValidatedDequeueError;
 use v4l::v4l_sys;
 
-/// Raw `VIDIOC_G_FMT` facts of a single-planar format, as the later fd
-/// adapter will copy them.
+/// Raw `VIDIOC_G_FMT` facts of a single-planar format, as `yuyv_fd` copies
+/// them from the fd.
 ///
 /// Field names follow bindgen's `v4l2_pix_format`, except that `buffer_type`
 /// is `v4l2_format.type_`, `fourcc` is `pixelformat` as little-endian bytes
@@ -35,7 +35,8 @@ use v4l::v4l_sys;
 /// only `buffer_type`, `fourcc`, `ext_pix_format_supported`, `priv_`,
 /// `colorspace`, `ycbcr_enc` and `quantization`; frame inspection adds
 /// `width`, `height` and `bytesperline`. `field`, `xfer_func`, `flags` and
-/// `sizeimage` are identity only, and the fd adapter validates them.
+/// `sizeimage` are identity only: `yuyv_fd` compares them with the
+/// negotiation and at every stream boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RawYuyvFormat {
     pub(crate) buffer_type: u32,
@@ -207,15 +208,17 @@ pub(crate) enum YuyvFrameError {
 }
 
 /// What the open file descriptor proved about the §1 attestation. There is no
-/// proving variant in this slice; the fd adapter slice adds the only one.
+/// proving variant: `yuyv_fd::FormatEvidence` is that proof, and the change
+/// that gives YUYV a ceiling joins it with the session latch and the burst's
+/// emitter alternation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FdAttestation {
     Absent,
     Refused,
 }
 
-/// The combined §4 prerequisite verdict. In this slice it is always a
-/// refusal, because `FdAttestation` cannot prove the first condition; the
+/// The combined §4 prerequisite verdict. It is always a refusal, because
+/// `FdAttestation` cannot prove the first condition; the
 /// remaining fields say which other conditions also fail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PrerequisiteRefusal {

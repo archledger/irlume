@@ -221,6 +221,7 @@ pub use split_capture::{
 pub mod stream_record;
 pub mod uvc_descriptor;
 mod yuyv_exposure;
+mod yuyv_fd;
 
 /// Serializes unit tests that mutate process-global environment variables, and
 /// the RAII guard that restores them.
@@ -839,6 +840,13 @@ trait CameraState {
         self.require_endpoint().map_err(std::io::Error::other)
     }
     fn compare_format(&self, expected: &Format, current: &Format) -> Option<String>;
+    /// Re-read the raw format evidence this state froze at open, if it
+    /// carries any (ADR-0031 §4, #887): the fields the v4l wrapper drops,
+    /// such as the Y'CbCr encoding, can move while `compare_format` sees
+    /// nothing. States without evidence have nothing to compare.
+    fn verify_format_evidence(&self, _dev: &Self::Device) -> Result<(), yuyv_fd::FormatDrift> {
+        Ok(())
+    }
     fn claim_buffers<'a>(&self, dev: &'a Self::Device) -> std::io::Result<Self::Claim<'a>>;
     fn accepted_interval(&self) -> Option<frame_interval::FrameInterval>;
     fn current_format(&self, dev: &Self::Device) -> std::io::Result<Format>;
@@ -960,6 +968,9 @@ struct V4l2CameraState {
     lease: lease::CameraLease,
     accepted_interval: Option<frame_interval::FrameInterval>,
     privacy_boundary: PrivacyBoundary,
+    /// ADR-0031 §4 evidence an attested YUYV IR camera froze at open, re-read
+    /// at every stream boundary (#887). `None` everywhere else.
+    format_evidence: Option<yuyv_fd::FormatEvidence>,
     #[cfg(test)]
     privacy_refusal_countdown: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -977,6 +988,7 @@ impl V4l2CameraState {
             lease,
             accepted_interval: None,
             privacy_boundary: PrivacyBoundary::LeaseOnly,
+            format_evidence: None,
             #[cfg(test)]
             privacy_refusal_countdown: Default::default(),
             #[cfg(test)]
@@ -998,6 +1010,7 @@ impl V4l2CameraState {
             lease,
             accepted_interval: Some(accepted_interval),
             privacy_boundary: PrivacyBoundary::LeaseOnly,
+            format_evidence: None,
             #[cfg(test)]
             privacy_refusal_countdown: Default::default(),
             #[cfg(test)]
@@ -1009,16 +1022,21 @@ impl V4l2CameraState {
         }
     }
 
+    /// The state of one IR stream. `format_evidence` is the open camera's
+    /// ADR-0031 §4 evidence, which every boundary then re-reads; IR paths
+    /// outside an [`IrCamera`] pass `None`, as they never judge exposure.
     fn with_ir_interval(
         device: &str,
         lease: lease::CameraLease,
         accepted_interval: frame_interval::FrameInterval,
+        format_evidence: Option<yuyv_fd::FormatEvidence>,
     ) -> Self {
         Self {
             device: device.to_owned(),
             lease,
             accepted_interval: Some(accepted_interval),
             privacy_boundary: PrivacyBoundary::RequireReleased,
+            format_evidence,
             #[cfg(test)]
             privacy_refusal_countdown: Default::default(),
             #[cfg(test)]
@@ -1112,6 +1130,13 @@ impl CameraState for V4l2CameraState {
 
     fn compare_format(&self, expected: &Format, current: &Format) -> Option<String> {
         format_moved(expected, current)
+    }
+
+    fn verify_format_evidence(&self, dev: &Device) -> Result<(), yuyv_fd::FormatDrift> {
+        match &self.format_evidence {
+            Some(evidence) => evidence.recheck(&yuyv_fd::DeviceReads::new(dev)),
+            None => Ok(()),
+        }
     }
 
     fn claim_buffers<'a>(&self, dev: &'a Device) -> std::io::Result<Self::Claim<'a>> {
@@ -1434,6 +1459,14 @@ fn verify_stream_snapshot<S: CameraState>(
             "{device}: stream state drift at {stage}: {moved}; refusing this capture"
         )));
     }
+    state
+        .verify_format_evidence(dev)
+        .map_err(|drift| match drift {
+            yuyv_fd::FormatDrift::Read(error) => map_io(device, error),
+            drift => Error::Hardware(format!(
+                "{device}: stream state drift at {stage}: {drift}; refusing this capture"
+            )),
+        })?;
     let query = frame_interval::FrameIntervalQuery::new(
         expected_format.fourcc.repr,
         expected_format.width,
@@ -6368,6 +6401,29 @@ fn discrete_frame_sizes(dev: &Device, fourcc: &[u8; 4]) -> Vec<(u32, u32)> {
         .unwrap_or_default()
 }
 
+/// ADR-0031 §4's fd-bound format evidence for an attested YUYV IR open,
+/// taken once negotiation is final, or `None` when the fd does not prove it.
+/// The debug journal names the frozen tuple and its range verdict, or the
+/// refusal, for attended qualification; no exposure ceiling follows either
+/// way yet.
+fn bind_format_evidence(
+    device: &str,
+    dev: &Device,
+    negotiated: &Format,
+) -> Option<yuyv_fd::FormatEvidence> {
+    let device = camera_text(device);
+    match yuyv_fd::FormatEvidence::bind(&yuyv_fd::DeviceReads::new(dev), negotiated) {
+        Ok(evidence) => {
+            irlume_common::dlog!("[ir] {device}: fd format evidence frozen: {evidence}");
+            Some(evidence)
+        }
+        Err(refusal) => {
+            irlume_common::dlog!("[ir] {device}: no fd format evidence: {refusal}");
+            None
+        }
+    }
+}
+
 /// The line an IR open prints when it streams YUYV luma from a node whose
 /// descriptor does not attest an infrared function (ADR-0031 §1), or `None`.
 ///
@@ -6791,6 +6847,11 @@ pub struct IrCamera {
     /// Immutable negotiation evidence published by the delivered-rate slice.
     requested_interval: frame_interval::FrameInterval,
     accepted_interval: frame_interval::FrameInterval,
+    /// ADR-0031 §4's fd-bound format evidence, bound at open for an attested
+    /// YUYV node and re-read by every stream this camera opens (#887). No
+    /// ceiling follows from it yet; without it the camera captures as it
+    /// always has.
+    format_evidence: Option<yuyv_fd::FormatEvidence>,
     width: u32,
     height: u32,
     card: String,
@@ -6834,6 +6895,11 @@ impl IrCamera {
             eprintln!("{line}");
         }
         let interval = negotiate_interval_after_format(&state, device, &dev, &fmt)?;
+        let format_evidence = if negotiation.luma_attested {
+            bind_format_evidence(device, &dev, &fmt)
+        } else {
+            None
+        };
         let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
         Ok(Self {
             lease,
@@ -6847,6 +6913,7 @@ impl IrCamera {
             requested: negotiation.requested,
             requested_interval: interval.requested,
             accepted_interval: interval.accepted,
+            format_evidence,
             width: fmt.width,
             height: fmt.height,
             card,
@@ -7027,6 +7094,7 @@ impl IrCamera {
                         &self.device,
                         self.lease.clone(),
                         self.accepted_interval,
+                        self.format_evidence,
                     ),
                     &self.device,
                     &self.dev,
@@ -7681,6 +7749,7 @@ impl IrSession<'_> {
                 &self.cam.device,
                 self.cam.lease.clone(),
                 self.cam.accepted_interval,
+                self.cam.format_evidence,
             ),
             &self.cam.device,
             &self.cam.dev,
@@ -7972,7 +8041,12 @@ pub mod ir_probe {
         // lands before streaming starts.
         let mode;
         let stream = super::SafeStream::open(
-            super::V4l2CameraState::with_ir_interval(device, permit.clone(), interval.accepted),
+            super::V4l2CameraState::with_ir_interval(
+                device,
+                permit.clone(),
+                interval.accepted,
+                None,
+            ),
             device,
             &dev,
             &fmt,
@@ -8136,6 +8210,7 @@ pub mod startup_probe {
                 device,
                 cam.lease.clone(),
                 cam.accepted_interval,
+                cam.format_evidence,
             ),
             device,
             &cam.dev,
@@ -8279,7 +8354,7 @@ pub fn capture_ir_streaming<B>(
     // lands before streaming starts.
     let _mode;
     let stream = SafeStream::open(
-        V4l2CameraState::with_ir_interval(device, permit.clone(), interval.accepted),
+        V4l2CameraState::with_ir_interval(device, permit.clone(), interval.accepted, None),
         device,
         &dev,
         &fmt,
@@ -8430,7 +8505,7 @@ pub fn capture_ir_sequence(
     // lands before streaming starts.
     let _mode;
     let stream = SafeStream::open(
-        V4l2CameraState::with_ir_interval(device, permit.clone(), interval.accepted),
+        V4l2CameraState::with_ir_interval(device, permit.clone(), interval.accepted, None),
         device,
         &dev,
         &fmt,
@@ -11067,7 +11142,7 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
     let stream = SafeStream::open(
-        V4l2CameraState::with_ir_interval(device, permit.clone(), interval.accepted),
+        V4l2CameraState::with_ir_interval(device, permit.clone(), interval.accepted, None),
         device,
         &dev,
         &fmt,
@@ -11755,6 +11830,10 @@ mod tests {
         fail_dequeue_boundary_at: Option<usize>,
         fail_claim: bool,
         fail_dequeue: bool,
+        /// Frozen raw-format evidence: `Some` counts its rechecks, and the
+        /// recheck numbered `evidence_drift_at` reports an encoding move.
+        evidence_checks: Option<std::cell::Cell<usize>>,
+        evidence_drift_at: Option<usize>,
     }
 
     impl FakeCameraState {
@@ -11781,6 +11860,8 @@ mod tests {
                     fail_dequeue_boundary_at: None,
                     fail_claim: false,
                     fail_dequeue: false,
+                    evidence_checks: None,
+                    evidence_drift_at: None,
                 },
                 calls,
             )
@@ -11845,6 +11926,24 @@ mod tests {
         fn compare_format(&self, expected: &Format, current: &Format) -> Option<String> {
             self.calls.borrow_mut().push("check_format");
             format_moved(expected, current)
+        }
+
+        fn verify_format_evidence(&self, _dev: &()) -> Result<(), yuyv_fd::FormatDrift> {
+            let Some(checks) = &self.evidence_checks else {
+                return Ok(());
+            };
+            self.calls.borrow_mut().push("raw_fmt");
+            let check = checks.get() + 1;
+            checks.set(check);
+            if self.evidence_drift_at == Some(check) {
+                Err(yuyv_fd::FormatDrift::Moved {
+                    field: "ycbcr_enc",
+                    now: 2,
+                    frozen: 1,
+                })
+            } else {
+                Ok(())
+            }
         }
 
         fn claim_buffers<'a>(&self, _dev: &'a ()) -> std::io::Result<Self::Claim<'a>> {
@@ -12347,6 +12446,146 @@ mod tests {
                 assert!(calls.ends_with(&["cleanup", "stop"]));
             }
         }
+    }
+
+    /// ADR-0031 §4 (#887): a state that froze raw-format evidence re-reads
+    /// it right after the wrapper comparison at every boundary the wrapper
+    /// is checked at, and only there: before and after the buffer claim and
+    /// after the first dequeue, never again for later frames.
+    #[test]
+    fn frozen_raw_format_is_rechecked_at_every_stream_boundary() {
+        let format = fake_format(b"YUYV");
+        let (mut state, calls) = FakeCameraState::new(format);
+        state.evidence_checks = Some(std::cell::Cell::new(0));
+        let mut stream = CameraStateStream::open(state, "/dev/fake-ir", &(), &format)
+            .expect("an unchanged raw format opens");
+        stream.next().expect("first frame");
+        stream.next().expect("second frame");
+        drop(stream);
+        let calls = calls.borrow();
+        let checks: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| **call == "check_format")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(checks.len(), 3, "{calls:?}");
+        for at in checks {
+            assert_eq!(calls[at + 1], "raw_fmt", "{calls:?}");
+        }
+        assert_eq!(
+            calls.iter().filter(|call| **call == "raw_fmt").count(),
+            3,
+            "{calls:?}"
+        );
+    }
+
+    /// Raw drift the wrapper cannot see refuses the capture at the boundary
+    /// that read it, naming the stage and the field, and tears down exactly
+    /// as wrapper drift does.
+    #[test]
+    fn raw_format_drift_refuses_at_each_boundary_and_tears_down() {
+        let format = fake_format(b"YUYV");
+        for (drift_at, stage) in [
+            (1, "before buffer claim"),
+            (2, "after buffer claim"),
+            (3, "after first dequeue"),
+        ] {
+            let (mut state, calls) = FakeCameraState::new(format);
+            state.evidence_checks = Some(std::cell::Cell::new(0));
+            state.evidence_drift_at = Some(drift_at);
+            let error = match CameraStateStream::open(state, "/dev/fake-ir", &(), &format) {
+                Err(error) if drift_at <= 2 => error.to_string(),
+                Ok(mut stream) if drift_at == 3 => {
+                    let error = stream.next().expect_err("drift returns no frame");
+                    drop(stream);
+                    error.to_string()
+                }
+                Ok(_) => panic!("{stage}: drift must refuse the open"),
+                Err(error) => panic!("{stage}: refused too early: {error}"),
+            };
+            assert!(
+                error.contains(&format!(
+                    "/dev/fake-ir: stream state drift at {stage}: raw ycbcr_enc is now 2, \
+                     frozen at open as 1; refusing this capture"
+                )),
+                "{stage}: {error}"
+            );
+            let calls = calls.borrow();
+            assert_eq!(
+                calls.contains(&"reqbufs"),
+                drift_at > 1,
+                "{stage}: {calls:?}"
+            );
+            assert_eq!(
+                calls.contains(&"cleanup"),
+                drift_at > 1,
+                "{stage}: {calls:?}"
+            );
+            assert_eq!(calls.contains(&"start"), drift_at > 2, "{stage}: {calls:?}");
+            if drift_at > 2 {
+                assert!(calls.ends_with(&["cleanup", "stop"]), "{stage}: {calls:?}");
+            }
+        }
+    }
+
+    /// The camera's evidence reaches every stream an [`IrCamera`] opens:
+    /// its session, each recovery and the startup probe. Recovery needs a
+    /// held camera to reach, so the wiring is pinned by shape; the boundary
+    /// checks themselves run in the two tests above. The open binds only for
+    /// an attested YUYV negotiation.
+    #[test]
+    fn every_ir_camera_stream_carries_its_frozen_format_evidence() {
+        let lib = include_str!("lib.rs");
+        let production = &lib[..lib
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the tests module moved; update this test")];
+        // The last argument of every IR stream state built outside tests.
+        let mut evidence: Vec<String> = production
+            .match_indices("V4l2CameraState::with_ir_interval(")
+            .map(|(at, call)| {
+                let args = &production[at + call.len()..];
+                let mut depth = 0_u32;
+                let mut last = 0;
+                for (i, c) in args.char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' if depth == 0 => {
+                            return args[last..i].trim().trim_end_matches(',').trim().to_owned()
+                        }
+                        ')' => depth -= 1,
+                        ',' if depth == 0 && !args[i + 1..].trim_start().starts_with(')') => {
+                            last = i + 1
+                        }
+                        _ => {}
+                    }
+                }
+                panic!("an unclosed with_ir_interval call")
+            })
+            .collect();
+        evidence.sort();
+        assert_eq!(
+            evidence,
+            [
+                "None",
+                "None",
+                "None",
+                "None",
+                "cam.format_evidence",
+                "self.cam.format_evidence",
+                "self.format_evidence",
+            ],
+            "the session, each recovery and the startup probe carry the camera's \
+             evidence; the IR paths outside an IrCamera judge no exposure"
+        );
+        let ir_impl = source_body(lib, "\nimpl IrCamera {");
+        assert!(
+            ir_impl.contains(
+                "let format_evidence = if negotiation.luma_attested {\n            \
+                 bind_format_evidence(device, &dev, &fmt)"
+            ),
+            "the open must bind only for an attested YUYV negotiation"
+        );
     }
 
     #[test]
@@ -17898,6 +18137,12 @@ mod tests {
             "{device} must be attested by its USB descriptor"
         );
         let cam = IrCamera::open(&device).expect("open the IR camera");
+        // ADR-0031 §4's fd-bound evidence, printed for the attended record:
+        // the frozen raw tuple and its range verdict.
+        let evidence = cam
+            .format_evidence
+            .expect("an attested YUYV-only node binds fd format evidence");
+        eprintln!("{device}: {evidence}");
         assert_eq!(cam.requested, (340, 340));
         assert_eq!((cam.width, cam.height), (340, 340), "the driver's echo");
         let (_, contract) = cam.qualification_facts().expect("qualification facts");
@@ -20448,6 +20693,113 @@ mod tests {
             err.contains("refusing"),
             "virtual node must be refused: {err}"
         );
+    }
+
+    /// ADR-0031 §4 (#887) on a real kernel: the raw `VIDIOC_G_FMT` copy of a
+    /// fed node agrees with the v4l wrapper's readback of it, its extended
+    /// fields are defined (the V4L2 core supplies the capability and the
+    /// `priv` magic for every single-planar capture driver), the format list
+    /// ends with EINVAL and matches the wrapper's, and binding refuses for
+    /// the reason the node gives: the YUYV-fed node lists YUYV alone but
+    /// has no USB descriptor, and the GREY-fed node is not YUYV. Run by name
+    /// against a real camera's nodes, it checks the same on its driver.
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_raw_format_reads_agree_with_the_wrapper_and_binding_refuses() {
+        use crate::yuyv_fd::{self, BindRefusal, FormatReads as _};
+        let (rgb, ir) = loopback_pair();
+        for device in [&rgb, &ir] {
+            let _permit = lease::permit_for_endpoint(
+                device,
+                lease::CameraOperationKind::Diagnostics,
+                std::time::Duration::from_secs(2),
+            )
+            .expect("a diagnostics permit");
+            let dev = hostfs::open_video(device).expect("open the fed node");
+            let reads = yuyv_fd::DeviceReads::new(&dev);
+            let raw = reads.raw_format().expect("raw VIDIOC_G_FMT");
+            let wrapped = Capture::format(&dev).expect("the wrapper's VIDIOC_G_FMT");
+            assert_eq!(
+                yuyv_fd::disagreement(&raw, &wrapped),
+                None,
+                "{device}: {raw:?}"
+            );
+            assert!(raw.ext_pix_format_supported, "{device}: {raw:?}");
+            assert_eq!(
+                raw.priv_,
+                v4l::v4l_sys::V4L2_PIX_FMT_PRIV_MAGIC,
+                "{device}: {raw:?}"
+            );
+            let listed = yuyv_fd::listed_formats(|index| reads.listed_format(index))
+                .expect("a format list that ends with EINVAL");
+            let wrapped_list: Vec<[u8; 4]> = Capture::enum_formats(&dev)
+                .expect("the wrapper's list")
+                .iter()
+                .map(|desc| desc.fourcc.repr)
+                .collect();
+            assert_eq!(listed, wrapped_list, "{device}");
+            let bound = yuyv_fd::FormatEvidence::bind(&reads, &wrapped);
+            match (
+                offers_only_luma_ir_container(&listed),
+                reads.descriptor_attested(),
+            ) {
+                (false, _) => assert_eq!(bound, Err(BindRefusal::NotYuyvOnly), "{device}"),
+                (true, false) => assert_eq!(bound, Err(BindRefusal::NotAttested), "{device}"),
+                (true, true) => {
+                    let evidence = bound.expect("an attested YUYV-only node binds");
+                    evidence
+                        .recheck(&reads)
+                        .expect("an idle node keeps its format");
+                }
+            }
+            eprintln!("{device}: listed {listed:?}, binding {bound:?}");
+        }
+    }
+
+    /// ADR-0031 §4 (#887) on a real kernel: the boundary rechecks are the
+    /// production code reading the real driver. A frozen tuple one field off
+    /// refuses the session before any buffer is claimed, and the tuple
+    /// frozen from the camera's own fd carries a real session through its
+    /// buffer claim and first dequeue, a capture, a recovery reopen and the
+    /// recovered stream's first dequeue, which carries the recovery marker.
+    /// The GREY-fed node is not YUYV, so the evidence is frozen straight from
+    /// its fd; production binding adds the list and descriptor checks in
+    /// front of the same rechecks.
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_frozen_raw_format_holds_through_a_real_session_and_recovery() {
+        let (_, ir_path) = loopback_pair();
+        let operation = lease::acquire_camera_operation(
+            &[ir_path.as_str()],
+            lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire IR operation");
+        let mut camera = operation.open_ir(&ir_path).expect("open IR camera");
+        let frozen = yuyv_fd::FormatEvidence::frozen_from(&yuyv_fd::DeviceReads::new(&camera.dev))
+            .expect("raw reads on the open fd");
+
+        camera.format_evidence = Some(frozen.with_raw(|raw| raw.ycbcr_enc += 1));
+        let error = match camera.session() {
+            Ok(_) => panic!("a tuple the driver does not hold must refuse the session"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("stream state drift at before buffer claim: raw ycbcr_enc is now"),
+            "{error}"
+        );
+
+        camera.format_evidence = Some(frozen);
+        let mut session = camera.session().expect("the driver keeps its tuple");
+        session
+            .capture_with_stats()
+            .expect("a capture through every boundary");
+        session.recover().expect("recovery reopens and rechecks");
+        let (_, _, sequence, _, _) = session
+            .stream
+            .next()
+            .expect("the recovered stream's first dequeue rechecks and delivers");
+        assert!(sequence.discontinuity(), "the recovery marker");
     }
 
     /// Writing an empty value is what CLEARS the origin stamp, which is the

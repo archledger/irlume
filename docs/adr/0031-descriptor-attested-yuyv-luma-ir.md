@@ -215,7 +215,9 @@ descriptor and the frames being judged rather than to the cached role:
 
 Amendment 2026-10-06 below fixes the metadata domain and preliminary
 footroom and chroma bounds for these conditions, refuses XV601 and XV709
-under either quantization, and adds no ceiling.
+under either quantization, and adds no ceiling. Amendment 2026-10-07
+binds the first two conditions to the open file descriptor, again without
+a ceiling.
 
 Measured on the T480 (5986:1141) by @maurerr, the reporter of #887:
 
@@ -432,3 +434,49 @@ change. The session latch, the current-burst emitter alternation and the
 limited-to-full expansion stay unimplemented, and which frames feed the
 latch and how expansion rounds stay open for the changes that implement
 them. Synthetic tests in the helper's module check each case above.
+
+## Amendment 2026-10-07: fd-bound format evidence
+
+#887. §4 stays pending: `clipping_white_level` still answers `None` for
+YUYV luma, and every credential-releasing attempt on a YUYV IR stream
+still refuses. This amendment binds §4's first two conditions to the open
+file descriptor (`crates/irlume-camera/src/yuyv_fd.rs`).
+
+- **Binding.** An IR open whose negotiation is descriptor-attested YUYV
+  (§5) binds evidence once the format and frame interval are final. On the
+  open fd, in order: `fstat` names the node; `VIDIOC_ENUM_FMT` is read until
+  EINVAL ends the list, and any other errno, an answer for another index or
+  buffer type, or more than 64 entries leaves it incomplete; the complete
+  list must be YUYV alone; the §1 attestation is re-derived from the fd's
+  USB descriptor; and `VIDIOC_QUERYCAP` and a single-planar `VIDIOC_G_FMT`
+  are copied field by field. Every field the v4l crate's format keeps (type,
+  fourcc, size, field, stride, image size, colorspace, flags, quantization
+  and transfer function) must equal the negotiated readback. The fields it
+  drops (the Y'CbCr encoding, `priv` and flag bits it does not know) and
+  the `V4L2_CAP_EXT_PIX_FORMAT` capability are frozen as read, and the
+  2026-10-06 amendment judges the range from them.
+- **Rechecks.** The node and the whole frozen tuple are read again at each
+  boundary where the negotiated format is already compared (#427): before
+  and after the buffer claim, after a stream's first dequeue, and on every
+  reopen after recovery. A moved field, another node or a failed read
+  refuses that capture as stream state drift, as a moved format field
+  does.
+- **Without evidence.** A camera whose binding fails has no evidence and
+  captures exactly as before; only the ceiling, which no YUYV stream has,
+  needs it. IR paths outside an `IrCamera` (emitter setup and the raw and
+  sequence probes) carry none, as they judge no exposure.
+- **Journal.** With `IRLUME_LOG=debug`, the open logs the frozen tuple and
+  its range verdict, or why binding refused, for attended qualification.
+- **Evidence.** Synthetic tests cover each refusal and each compared field.
+  On real kernels, the v4l2loopback CI lane and an attended run on archhost
+  (Linux 7.2.8, uvcvideo; Logitech BRIO 046d:085e and NexiGo N930W
+  3443:c803) found the raw tuple equal to the format's readback, the
+  extended fields defined, every list ended by EINVAL, and the tuple
+  unchanged through real IR sessions with a capture, a recovery reopen and
+  the recovered stream's first dequeue, while a second fd read 1,097
+  identical `VIDIOC_G_FMT` answers. Neither camera's nodes are YUYV alone,
+  so both refuse binding; the T480's own node still needs attended
+  qualification.
+
+Binding is not a ceiling and not a grant. The session latch, the burst's
+emitter alternation and the limited-to-full expansion remain.

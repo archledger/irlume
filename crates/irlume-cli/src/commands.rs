@@ -2032,9 +2032,10 @@ SETUP & STATUS
 ENROLLMENT & AUTH
   enroll [--name N] [--scans K] [--reset] [--add-camera]
          [--camera-choice JSON] [--split-camera-choice JSON]
-                        capture a face on a guarded ordinary pair or an
-                        authorized split pair (or a second camera group:
-                        ADR-0024)
+                        capture a face profile (or a second camera group:
+                        ADR-0024); a choice flag names a guarded ordinary
+                        or authorized split pair for this operation only
+                        (split stays refused until activation)
   profiles [list|add-scan|remove-camera|rename|delete|forget-model|eyes-open off]   manage profiles
                         (one-release migration only: clears the retired gate;
                         it cannot be turned on, see issue #386)

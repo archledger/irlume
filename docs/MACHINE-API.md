@@ -497,9 +497,10 @@ The configured pair is the daemon's standing camera pair, unless a split pair
 ADR-0032) is the saved selection and no `IRLUME_RGB_DEVICE`/`IRLUME_IR_DEVICE`
 override is set. Then both sides of the selected pair are measured, RGB then
 IR, under one split diagnostic operation, never the RGB camera the daemon
-would otherwise fall back to. A selected pair that is not connected reports
-both roles `"missing"`; a split configuration that cannot be verified reports
-both roles `"unknown"`, and no camera is opened. Both carry `known: true`.
+would otherwise fall back to. A selected pair that does not resolve (not
+connected, or a side that an ordinary RGB+IR camera claims) reports both roles
+`"missing"`; a split configuration that cannot be verified reports both roles
+`"unknown"`, and no camera is opened. Both carry `known: true`.
 
 ```json
 {

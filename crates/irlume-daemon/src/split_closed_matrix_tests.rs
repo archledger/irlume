@@ -4,10 +4,11 @@
 // The closed default for the remaining camera entries (ADR-0032 acceptance
 // case 15, plan W4). With a saved selected split and no admission token,
 // elevation, app-consent and login `Authenticate`, `UnsealPassword`,
-// `SupportProbe`, `TuneCaptureMode`, `CaptureModeStatus` and the liveness
-// `SelfTest` never lease or open either side. `CameraDiagnostics` measures
-// the selected pair under one split Diagnostics operation, never a trust
-// kind (ADR-0032, selection-aware diagnostics amendment). The alignment
+// `SupportProbe`, `TuneCaptureMode` and `CaptureModeStatus` never lease or
+// open either side. `CameraDiagnostics` and the liveness `SelfTest` use the
+// selected pair under one split Diagnostics operation, never a trust kind
+// (ADR-0032, selection-aware diagnostics and split liveness self-test
+// amendments). The alignment
 // `SelfTest` checks model determinism on any face frame and keeps the
 // standing device, with at most one single-endpoint Capture lease, never a
 // split lease or both sides. No row grants, releases or writes trust or
@@ -126,6 +127,16 @@ mod split_closed_matrix {
         calls == [lease, Call::OpenRgb(RGB.into()), Call::OpenIr(IR.into())]
     }
 
+    /// The liveness self-test on the selected split: one split Diagnostics
+    /// operation, ending at the fixture's refused RGB side.
+    fn split_assessment(calls: &[Call]) -> bool {
+        let lease = Call::Lease {
+            endpoints: vec![RGB.into(), IR.into()],
+            kind: CameraOperationKind::Diagnostics,
+        };
+        calls == [lease, Call::OpenRgb(RGB.into())]
+    }
+
     /// What one row may do at the camera boundary.
     #[derive(Clone, Copy)]
     enum Expect {
@@ -135,6 +146,8 @@ mod split_closed_matrix {
         Standing,
         /// [`split_diagnostic`].
         SplitDiagnostics,
+        /// [`split_assessment`].
+        SplitAssessment,
     }
 
     fn authenticate(user: &str, service: &str) -> Request {
@@ -190,7 +203,7 @@ mod split_closed_matrix {
             ("capture mode", Expect::Nothing, Request::CaptureModeStatus),
             (
                 "liveness self-test",
-                Expect::Nothing,
+                Expect::SplitAssessment,
                 self_test(irlume_common::SelfTestKind::Liveness),
             ),
             (
@@ -228,6 +241,11 @@ mod split_closed_matrix {
                     split_diagnostic(&calls),
                     "{row}: diagnostics measure the selected pair under one split Diagnostics \
                      operation: {calls:?} -> {response:?}"
+                ),
+                Expect::SplitAssessment => assert!(
+                    split_assessment(&calls),
+                    "{row}: the self-test assesses the selected pair under one split \
+                     Diagnostics operation: {calls:?} -> {response:?}"
                 ),
             }
         }

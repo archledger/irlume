@@ -450,8 +450,9 @@ file descriptor (`crates/irlume-camera/src/yuyv_fd.rs`).
   list must be YUYV alone; the §1 attestation is re-derived from the fd's
   USB descriptor; and `VIDIOC_QUERYCAP` and a single-planar `VIDIOC_G_FMT`
   are copied field by field. Every field the v4l crate's format keeps (type,
-  fourcc, size, field, stride, image size, colorspace, flags, quantization
-  and transfer function) must equal the negotiated readback. The fields it
+  fourcc, size, field, stride, image size, colorspace, the flag bits it
+  knows, quantization and transfer function) must equal the negotiated
+  readback. The fields it
   drops (the Y'CbCr encoding, `priv` and flag bits it does not know) and
   the `V4L2_CAP_EXT_PIX_FORMAT` capability are frozen as read, and the
   2026-10-06 amendment judges the range from them.
@@ -459,8 +460,9 @@ file descriptor (`crates/irlume-camera/src/yuyv_fd.rs`).
   boundary where the negotiated format is already compared (#427): before
   and after the buffer claim, after a stream's first dequeue, and on every
   reopen after recovery. A moved field, another node or a failed read
-  refuses that capture as stream state drift, as a moved format field
-  does.
+  refuses that capture as stream state drift. At the first dequeue the
+  refusal also ends warm-up, which retries other dequeue failures, so a
+  later clean read cannot heal it.
 - **Without evidence.** A camera whose binding fails has no evidence and
   captures exactly as before; only the ceiling, which no YUYV stream has,
   needs it. IR paths outside an `IrCamera` (emitter setup and the raw and

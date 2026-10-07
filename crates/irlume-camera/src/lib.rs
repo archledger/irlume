@@ -1440,7 +1440,55 @@ fn verify_stream_state<S: CameraState>(
         expected_format,
         expected_interval,
         stage,
-    )
+    )?;
+    verify_format_evidence_at(state, device, dev, stage).map_err(|refusal| refusal.0)
+}
+
+/// A stream boundary's refusal of the camera's frozen ADR-0031 §4 format
+/// evidence (#887). Typed so that warm-up, which retries an ordinary
+/// `ErrorKind::Other` dequeue failure, ends instead: a later frame's clean
+/// read cannot undo a drift or failed read this boundary already saw.
+#[derive(Debug)]
+pub(crate) struct FormatEvidenceRefusal(Error);
+
+impl std::fmt::Display for FormatEvidenceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for FormatEvidenceRefusal {}
+
+impl FormatEvidenceRefusal {
+    /// The boundary's own error out of an I/O error that carries a
+    /// refusal, or the I/O error back when it does not.
+    fn take(error: std::io::Error) -> Result<Error, std::io::Error> {
+        if !error.get_ref().is_some_and(|inner| inner.is::<Self>()) {
+            return Err(error);
+        }
+        match error.into_inner().map(|inner| inner.downcast::<Self>()) {
+            Some(Ok(refusal)) => Ok(refusal.0),
+            Some(Err(inner)) => Err(std::io::Error::other(inner)),
+            None => Err(std::io::Error::other("format evidence refusal")),
+        }
+    }
+}
+
+/// Re-read the state's frozen format evidence at `stage`, if it carries any.
+fn verify_format_evidence_at<S: CameraState>(
+    state: &S,
+    device: &str,
+    dev: &S::Device,
+    stage: &'static str,
+) -> Result<(), FormatEvidenceRefusal> {
+    state.verify_format_evidence(dev).map_err(|drift| {
+        FormatEvidenceRefusal(match drift {
+            yuyv_fd::FormatDrift::Read(error) => map_io(device, error),
+            drift => Error::Hardware(format!(
+                "{device}: stream state drift at {stage}: {drift}; refusing this capture"
+            )),
+        })
+    })
 }
 
 fn verify_stream_snapshot<S: CameraState>(
@@ -1459,14 +1507,6 @@ fn verify_stream_snapshot<S: CameraState>(
             "{device}: stream state drift at {stage}: {moved}; refusing this capture"
         )));
     }
-    state
-        .verify_format_evidence(dev)
-        .map_err(|drift| match drift {
-            yuyv_fd::FormatDrift::Read(error) => map_io(device, error),
-            drift => Error::Hardware(format!(
-                "{device}: stream state drift at {stage}: {drift}; refusing this capture"
-            )),
-        })?;
     let query = frame_interval::FrameIntervalQuery::new(
         expected_format.fourcc.repr,
         expected_format.width,
@@ -1794,6 +1834,8 @@ impl<'a, S: CameraState> CameraStateStream<'a, S> {
                 "after first dequeue",
             )
             .map_err(|error| ValidatedDequeueError::Io(std::io::Error::other(error)))?;
+            verify_format_evidence_at(state, device, dev, "after first dequeue")
+                .map_err(|refusal| ValidatedDequeueError::Io(std::io::Error::other(refusal)))?;
             *stream_started_validated = true;
         }
         Ok(dequeued)
@@ -11420,6 +11462,10 @@ where
                 {
                     return Err(map_io(device, e));
                 }
+                let e = match FormatEvidenceRefusal::take(e) {
+                    Ok(refusal) => return Err(refusal),
+                    Err(e) => e,
+                };
                 let retryable = mmap_capture::warmup_retry(&e).unwrap_or_else(|| {
                     matches!(
                         e.kind(),
@@ -12449,8 +12495,8 @@ mod tests {
     }
 
     /// ADR-0031 §4 (#887): a state that froze raw-format evidence re-reads
-    /// it right after the wrapper comparison at every boundary the wrapper
-    /// is checked at, and only there: before and after the buffer claim and
+    /// it right after the format and interval comparison at every boundary
+    /// they run at, and only there: before and after the buffer claim and
     /// after the first dequeue, never again for later frames.
     #[test]
     fn frozen_raw_format_is_rechecked_at_every_stream_boundary() {
@@ -12471,7 +12517,11 @@ mod tests {
             .collect();
         assert_eq!(checks.len(), 3, "{calls:?}");
         for at in checks {
-            assert_eq!(calls[at + 1], "raw_fmt", "{calls:?}");
+            assert_eq!(
+                calls[at + 1..at + 3],
+                ["get_interval", "raw_fmt"],
+                "{calls:?}"
+            );
         }
         assert_eq!(
             calls.iter().filter(|call| **call == "raw_fmt").count(),
@@ -12527,6 +12577,81 @@ mod tests {
                 assert!(calls.ends_with(&["cleanup", "stop"]), "{stage}: {calls:?}");
             }
         }
+    }
+
+    /// Warm-up retries an ordinary `ErrorKind::Other` dequeue failure, but
+    /// a format-evidence refusal ends it on the first try with the
+    /// boundary's own error: a later clean read cannot heal it (#887).
+    #[test]
+    fn warm_up_ends_on_a_format_evidence_refusal() {
+        let mut tries = 0;
+        let mut sleeps = 0;
+        let error = warm_up_with(
+            "/dev/fake-ir",
+            || {
+                tries += 1;
+                Err(std::io::Error::other(FormatEvidenceRefusal(
+                    Error::Hardware("raw evidence drift".into()),
+                )))
+            },
+            |_| sleeps += 1,
+            &no_progress(),
+        )
+        .expect_err("a refusal is terminal");
+        assert!(
+            matches!(&error, Error::Hardware(message) if message == "raw evidence drift"),
+            "{error:?}"
+        );
+        assert_eq!((tries, sleeps), (1, 0));
+
+        let mut tries = 0;
+        warm_up_with(
+            "/dev/fake-ir",
+            || {
+                tries += 1;
+                Err(std::io::Error::other(Error::Hardware("plain".into())))
+            },
+            |_| {},
+            &no_progress(),
+        )
+        .expect_err("the budget runs out");
+        assert_eq!(
+            tries, WARMUP_TRIES,
+            "ordinary Other failures keep their retries"
+        );
+    }
+
+    /// End to end over the stream: raw drift seen at the first dequeue ends
+    /// warm-up after that one dequeue, though the next read would match.
+    #[test]
+    fn first_dequeue_evidence_drift_ends_warm_up_without_a_retry() {
+        let format = fake_format(b"YUYV");
+        let (mut state, calls) = FakeCameraState::new(format);
+        state.evidence_checks = Some(std::cell::Cell::new(0));
+        state.evidence_drift_at = Some(3);
+        let stream = CameraStateStream::open(state, "/dev/fake-ir", &(), &format)
+            .expect("the claim boundaries pass");
+        let mut tracked = TrackedStream::new(stream, test_rate_config(contracts::StreamRole::Ir));
+        let error = warm_up_stream("/dev/fake-ir", &mut tracked, &no_progress())
+            .expect_err("the first-dequeue refusal ends warm-up");
+        assert!(
+            error
+                .to_string()
+                .contains("stream state drift at after first dequeue: raw ycbcr_enc is now 2"),
+            "{error}"
+        );
+        drop(tracked);
+        let calls = calls.borrow();
+        assert_eq!(
+            calls.iter().filter(|call| **call == "dequeue").count(),
+            1,
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls.iter().filter(|call| **call == "raw_fmt").count(),
+            3,
+            "{calls:?}"
+        );
     }
 
     /// The camera's evidence reaches every stream an [`IrCamera`] opens:

@@ -311,6 +311,8 @@ impl FormatEvidence {
 
 /// The first field of `raw` the v4l wrapper keeps that differs from the
 /// negotiated readback, or a buffer type other than single-planar capture.
+/// The wrapper truncates flag bits it does not know, so only the bits it can
+/// represent are compared; the whole raw word is what binding freezes.
 pub(crate) fn disagreement(raw: &RawYuyvFormat, negotiated: &v4l::Format) -> Option<&'static str> {
     [
         ("type", raw.buffer_type == CAPTURE),
@@ -321,7 +323,10 @@ pub(crate) fn disagreement(raw: &RawYuyvFormat, negotiated: &v4l::Format) -> Opt
         ("bytesperline", raw.bytesperline == negotiated.stride),
         ("sizeimage", raw.sizeimage == negotiated.size),
         ("colorspace", raw.colorspace == negotiated.colorspace as u32),
-        ("flags", raw.flags == negotiated.flags.bits()),
+        (
+            "flags",
+            v4l::format::Flags::from(raw.flags).bits() == negotiated.flags.bits(),
+        ),
         (
             "quantization",
             raw.quantization == negotiated.quantization as u32,
@@ -768,8 +773,9 @@ mod tests {
             ("colorspace", |raw| {
                 raw.colorspace = v4l_sys::v4l2_colorspace_V4L2_COLORSPACE_REC709;
             }),
-            // V4L2_PIX_FMT_FLAG_SET_CSC: a bit the pinned wrapper truncates.
-            ("flags", |raw| raw.flags = 2),
+            ("flags", |raw| {
+                raw.flags = v4l_sys::V4L2_PIX_FMT_FLAG_PREMUL_ALPHA;
+            }),
             ("quantization", |raw| {
                 raw.quantization = v4l_sys::v4l2_quantization_V4L2_QUANTIZATION_LIM_RANGE;
             }),
@@ -817,6 +823,32 @@ mod tests {
             crate::yuyv_exposure::limited_range_eligibility(&evidence.raw),
             Err(MetadataRefusal::Unresolved(_))
         ));
+    }
+
+    /// A flag bit the pinned wrapper does not know, such as
+    /// `V4L2_PIX_FMT_FLAG_SET_CSC`, is absent from its readback of the same
+    /// answer. It binds, is frozen in the whole raw word, and losing it later
+    /// is drift.
+    #[test]
+    fn b06_a_flag_bit_the_wrapper_drops_binds_and_is_frozen_whole() {
+        let mut raw = t480_raw();
+        raw.flags = v4l_sys::V4L2_PIX_FMT_FLAG_SET_CSC;
+        let negotiated = wrapper(&raw);
+        assert_eq!(negotiated.flags.bits(), 0, "the wrapper truncates the bit");
+        let reads = FakeReads::attested_yuyv();
+        reads.raw.borrow_mut().push_back(Ok(raw));
+        let evidence = FormatEvidence::bind(&reads, &negotiated).expect("binds");
+        assert_eq!(evidence.raw.flags, v4l_sys::V4L2_PIX_FMT_FLAG_SET_CSC);
+
+        reads.raw.borrow_mut().push_back(Ok(t480_raw()));
+        match evidence.recheck(&reads) {
+            Err(FormatDrift::Moved {
+                field: "flags",
+                now: 0,
+                frozen,
+            }) => assert_eq!(frozen, v4l_sys::V4L2_PIX_FMT_FLAG_SET_CSC),
+            other => panic!("{other:?}"),
+        }
     }
 
     // Rechecks at a stream boundary.

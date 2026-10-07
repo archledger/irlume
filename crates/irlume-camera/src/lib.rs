@@ -20113,6 +20113,177 @@ mod tests {
         );
     }
 
+    /// What one side of a held pair paid after an in-place recovery.
+    struct HeldRecovery {
+        admitted_after_recover: bool,
+        recover_ms: u128,
+        capture_ms: u128,
+        discarded: u64,
+        delivered: u64,
+    }
+
+    trait HeldCounters {
+        /// Observations, discarded observations and the probe admission.
+        fn counters(&self) -> (u64, u64, bool);
+    }
+
+    impl HeldCounters for RgbSession<'_> {
+        fn counters(&self) -> (u64, u64, bool) {
+            let (observed, discarded, _) = self.stream.accounting();
+            (observed, discarded, self.stream.health_admitted)
+        }
+    }
+
+    impl HeldCounters for IrSession<'_> {
+        fn counters(&self) -> (u64, u64, bool) {
+            let (observed, discarded, _) = self.stream.accounting();
+            (observed, discarded, self.stream.health_admitted)
+        }
+    }
+
+    /// Recover a held session in place, then capture, as `irlume-auth`'s
+    /// held capture does after a mid-stream fault.
+    fn measure_held_recovery<S: HeldCounters, T>(
+        session: &mut S,
+        recover: impl FnOnce(&mut S) -> irlume_common::Result<()>,
+        capture: impl FnOnce(&mut S) -> irlume_common::Result<T>,
+        measured: &mut Option<HeldRecovery>,
+    ) -> irlume_common::Result<T> {
+        let started = std::time::Instant::now();
+        recover(session)?;
+        let recover_ms = started.elapsed().as_millis();
+        let (observed, discarded, admitted_after_recover) = session.counters();
+        let started = std::time::Instant::now();
+        let result = capture(session);
+        let capture_ms = started.elapsed().as_millis();
+        let (observed_after, discarded_after, _) = session.counters();
+        *measured = Some(HeldRecovery {
+            admitted_after_recover,
+            recover_ms,
+            capture_ms,
+            discarded: discarded_after - discarded,
+            delivered: (observed_after - observed) - (discarded_after - discarded),
+        });
+        result
+    }
+
+    /// ADR-0021 decision item 3 on a real pair: a held pair admitted by the
+    /// continuity probe recovers one side in place, as a held capture does
+    /// after a mid-stream fault. The recovery revokes that side's admission,
+    /// so its next capture discards a full window in the new epoch before
+    /// its burst, and the burst keeps the recovery marker on its first
+    /// contributor. Each role is measured before any assertion, and the
+    /// `HELD-RECOVERY` lines report what the held-pair fallback waits for.
+    #[test]
+    #[ignore = "needs a real RGB+IR camera pair; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE"]
+    fn held_pair_recovery_after_a_probe_admission_refills_its_window() {
+        use contracts::StreamRole;
+        let (rgb_path, ir_path) = loopback_pair();
+        let operation = lease::acquire_camera_operation(
+            &[rgb_path.as_str(), ir_path.as_str()],
+            lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire pair operation");
+        let rgb_camera = operation.open_rgb(&rgb_path).expect("open RGB camera");
+        let ir_camera = operation.open_ir(&ir_path).expect("open IR camera");
+        let arm = || {
+            let rgb = rgb_camera.session().expect("arm RGB");
+            let ir = ir_camera
+                .session_for_pair_with_progress(&no_progress())
+                .expect("arm IR");
+            (rgb, ir)
+        };
+        let mut outcomes = Vec::new();
+        for role in [StreamRole::Rgb, StreamRole::Ir] {
+            // A first held pair completes full windows on both nodes, so the
+            // next pair may admit on the continuity probe.
+            {
+                let (mut rgb, mut ir) = arm();
+                establish_pair_rate(&mut rgb, &mut ir).expect("full paired fill");
+            }
+            let (mut rgb, mut ir) = arm();
+            establish_pair_rate(&mut rgb, &mut ir).expect("paired probe");
+            assert!(
+                rgb.stream.health_admitted && ir.stream.health_admitted,
+                "{role:?}: both sides must be probe-admitted to measure the revocation"
+            );
+            let (rgb_before, ir_before) = capture_pair_with(
+                &mut rgb,
+                &mut ir,
+                |s| s.denoised(),
+                |s| s.capture_with_stats(),
+            );
+            let rgb_before = rgb_before.expect("held RGB capture");
+            let (ir_before, _) = ir_before.expect("held IR capture");
+            let (mut rgb_measured, mut ir_measured) = (None, None);
+            let started = std::time::Instant::now();
+            let (rgb_after, ir_after) = capture_pair_with(
+                &mut rgb,
+                &mut ir,
+                |s| match role {
+                    StreamRole::Rgb => measure_held_recovery(
+                        s,
+                        |s| s.recover(),
+                        |s| s.denoised(),
+                        &mut rgb_measured,
+                    ),
+                    StreamRole::Ir => s.denoised(),
+                },
+                |s| match role {
+                    StreamRole::Ir => measure_held_recovery(
+                        s,
+                        |s| s.recover(),
+                        |s| s.capture_with_stats(),
+                        &mut ir_measured,
+                    ),
+                    StreamRole::Rgb => s.capture_with_stats(),
+                },
+            );
+            let pair_ms = started.elapsed().as_millis();
+            let describe = |error: Option<&irlume_common::Error>| {
+                error.map_or_else(|| "ok".to_owned(), |error| format!("err({error})"))
+            };
+            let measured = match role {
+                StreamRole::Rgb => rgb_measured,
+                StreamRole::Ir => ir_measured,
+            }
+            .unwrap_or_else(|| panic!("{role:?}: recover in place"));
+            eprintln!(
+                "HELD-RECOVERY role={role:?} pair_ms={pair_ms} recover_ms={} capture_ms={} \
+                 discarded={} delivered={} admitted_after_recover={} rgb={} ir={}",
+                measured.recover_ms,
+                measured.capture_ms,
+                measured.discarded,
+                measured.delivered,
+                measured.admitted_after_recover,
+                describe(rgb_after.as_ref().err()),
+                describe(ir_after.as_ref().err()),
+            );
+            let (before, after) = match role {
+                StreamRole::Rgb => (rgb_before, rgb_after),
+                StreamRole::Ir => (ir_before, ir_after.map(|(frame, _)| frame)),
+            };
+            outcomes.push((role, measured, before, after));
+        }
+        for (role, measured, before, after) in outcomes {
+            assert!(
+                !measured.admitted_after_recover,
+                "{role:?}: a recovery epoch revokes the probe admission (ADR-0021 item 3)"
+            );
+            let full_fill =
+                (rate_gate::startup_flush(role) + rate_gate::RATE_WINDOW_CAPACITY + 1) as u64;
+            assert!(
+                measured.discarded >= full_fill,
+                "{role:?}: {} discards in the recovered epoch, a full fill is {full_fill}",
+                measured.discarded
+            );
+            let after =
+                after.unwrap_or_else(|error| panic!("{role:?}: recovered capture: {error}"));
+            assert_recovered_capture(&before, &after);
+        }
+    }
+
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_rgb_single_and_denoised_agree_on_geometry() {

@@ -3757,6 +3757,34 @@ mod capture_mode_switch_tests {
         );
     }
 
+    #[test]
+    fn recovered_side_other_violations_keep_their_own_labels() {
+        use irlume_camera::RuntimePairViolation as Violation;
+        // Only continuity is relabelled on a recovered side; a pair that
+        // also changed generation or contract, or ran below its floor,
+        // reports that violation.
+        for (violation, label) in [
+            (
+                Violation::CameraGeneration,
+                RuntimeDegradation::CameraGenerationChanged,
+            ),
+            (
+                Violation::StreamContract,
+                RuntimeDegradation::StreamContractMismatch,
+            ),
+            (
+                Violation::DeliveredRate,
+                RuntimeDegradation::DeliveredRateShortfall,
+            ),
+        ] {
+            assert_eq!(
+                concurrent_pair_degradation(Some(violation), false, true),
+                label,
+                "{violation:?}"
+            );
+        }
+    }
+
     /// #586 proactive degradation: a concurrent capture that SUCCEEDED but
     /// carried provenance warning signs should trip runtime degradation so
     /// the NEXT capture goes sequential, not wait for a hard failure.

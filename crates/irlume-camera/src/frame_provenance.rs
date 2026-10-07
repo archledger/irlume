@@ -2712,6 +2712,43 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_refuses_a_recovery_marker_on_every_later_contributor() {
+        // Four contributors, so the second, a middle one and the last are
+        // distinct indices. Each marked contributor has its predecessor
+        // inside the aggregate, so only its position refuses it.
+        for first_marked in [false, true] {
+            for index in 1..4 {
+                let mut series = runtime_series(
+                    &[5, 6, 7, 8],
+                    &[100, 200, 300, 400],
+                    &[IlluminationProvenance::Unknown; 4],
+                );
+                if first_marked {
+                    // The accepted recovered first contributor.
+                    series[0].sequence.advance = Some(1);
+                    series[0].sequence.discontinuity = true;
+                    series[0].timestamp.delta_micros = Some(100);
+                    series[0].timestamp.discontinuity = true;
+                }
+                assert!(
+                    series[index].sequence.advance.is_some()
+                        && series[index].timestamp.delta_micros.is_some()
+                );
+                series[index].sequence.discontinuity = true;
+                series[index].timestamp.discontinuity = true;
+                assert_eq!(
+                    super::AggregateFrameProvenance::new(
+                        series,
+                        super::ContributorSelection::ReducedOverAll
+                    ),
+                    Err(super::RuntimeProvenanceError::ContributorDiscontinuity),
+                    "marker on contributor {index} of 4, first marked: {first_marked}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn aggregate_rejects_mixed_continuity_epoch() {
         let mut broken =
             runtime_series(&[5, 6], &[100, 200], &[IlluminationProvenance::Unknown; 2]);

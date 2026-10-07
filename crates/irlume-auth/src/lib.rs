@@ -296,6 +296,35 @@ enum PairCapture {
     Split(irlume_camera::SplitPairCapture),
 }
 
+/// The selected split's two sides as this Engine's endpoints for one
+/// liveness self-test. A Current split pair has its IR side, so only the
+/// IR-off policy, checked before the lease, disables IR. The standing
+/// endpoints and IR availability come back on drop, including on unwind.
+struct SplitSelfTestEndpoints<'a> {
+    engine: &'a mut Engine,
+    previous: (String, String, bool),
+}
+
+impl<'a> SplitSelfTestEndpoints<'a> {
+    fn enter(engine: &'a mut Engine, rgb: &str, ir: &str) -> Self {
+        let previous = (
+            std::mem::replace(&mut engine.rgb_dev, rgb.into()),
+            std::mem::replace(&mut engine.ir_dev, ir.into()),
+            std::mem::replace(&mut engine.ir_available, true),
+        );
+        Self { engine, previous }
+    }
+}
+
+impl Drop for SplitSelfTestEndpoints<'_> {
+    fn drop(&mut self) {
+        let (rgb, ir, available) = std::mem::take(&mut self.previous);
+        self.engine.rgb_dev = rgb;
+        self.engine.ir_dev = ir;
+        self.engine.ir_available = available;
+    }
+}
+
 struct SplitDiagnosticState<'a> {
     engine: &'a mut Engine,
 }
@@ -8094,9 +8123,40 @@ impl Engine {
     /// IR liveness self-test: capture and run the algorithmic PAD gate, reporting
     /// the verdict plus the cues behind it. Backs the TUI Calibrate screen and
     /// `Request::SelfTest { Liveness }`.
-    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    ///
+    /// A top-level self-test follows the saved camera selection as camera
+    /// diagnostics do (ADR-0032, split liveness self-test amendment): with a
+    /// split pair selected and no ordinary environment override, the
+    /// non-granting split assessment runs under one split Diagnostics
+    /// operation over both original sides, RGB then IR; otherwise the standing
+    /// pair is assessed as before. Inside an already prepared request the
+    /// request's own rules decide, so a pending pin or routed split keeps the
+    /// closed refusal before any lease. Neither path loads an enrollment,
+    /// matches an account, grants or releases anything.
+    ///
+    /// # Errors
+    /// Refuses a selected split pair that is not connected or cannot be
+    /// verified, IR that is forced off for a split pair, and every error of
+    /// the assessment itself.
     pub fn liveness_selftest(&mut self) -> irlume_common::Result<(bool, String)> {
-        let a = self.assess()?;
+        // Nested in a prepared request: that request decides, with no lease.
+        let target = if self.camera_selection.is_some() {
+            camera_diagnostics::Target::Standing
+        } else {
+            camera_diagnostics::target()
+        };
+        let a = match target {
+            camera_diagnostics::Target::Standing => self.assess()?,
+            camera_diagnostics::Target::Split(pair) => self.assess_selected_split(&pair)?,
+            camera_diagnostics::Target::NotConnected(reason) => {
+                return Err(camera_diagnostics::unresolved_split(reason.as_ref()))
+            }
+            camera_diagnostics::Target::Unverified => {
+                return Err(irlume_common::Error::Policy(
+                    "the split camera selection cannot be verified".into(),
+                ))
+            }
+        };
         let s = &a.signals;
         let live = a.verdict == Verdict::Live;
         let detail = if live {
@@ -8114,6 +8174,29 @@ impl Engine {
             format!("{:?}: {}", a.verdict, a.reason)
         };
         Ok((live, detail))
+    }
+
+    /// The non-granting split assessment on the saved selected split pair:
+    /// one split Diagnostics operation over both original sides, with this
+    /// Engine's endpoints on those sides only for the call and restored on
+    /// return or unwind. IR forced off refuses before any lease.
+    fn assess_selected_split(
+        &mut self,
+        pair: &irlume_camera::SplitPair,
+    ) -> irlume_common::Result<Assessment> {
+        if irlume_camera::ir_forced_off() {
+            return Err(irlume_common::Error::Hardware(
+                "split camera diagnostics need both sides and IR is forced off".into(),
+            ));
+        }
+        let operation = irlume_camera::lease::acquire_split_camera_operation(
+            &pair.lease_request(),
+            irlume_camera::lease::CameraOperationKind::Diagnostics,
+            std::time::Duration::from_secs(2),
+        )
+        .map_err(lease_unavailable)?;
+        let endpoints = SplitSelfTestEndpoints::enter(self, &pair.rgb.path, &pair.ir.path);
+        endpoints.engine.assess_split_in_operation(&operation, &())
     }
 
     /// Alignment-determinism self-test: embed the same aligned chip twice; the

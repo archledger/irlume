@@ -14,14 +14,16 @@
 use irlume_common::split_publish::SplitReadState;
 use irlume_common::{CameraDiagnosticsReport, CameraRoleDiagnostic};
 
-/// What a diagnostics request measures.
-enum Target {
+/// What a diagnostics request measures. The liveness self-test follows the
+/// same rule (`Engine::liveness_selftest`).
+pub(crate) enum Target {
     /// The standing devices, as every diagnostics request did before.
     Standing,
     /// The selected split pair, resolved exactly once in a Current view.
     Split(Box<irlume_camera::SplitPair>),
-    /// A selected split pair that is not connected exactly once.
-    NotConnected,
+    /// A selected split pair that is not connected exactly once, with the
+    /// resolver's reason for its record when it gave one.
+    NotConnected(Option<irlume_camera::PinRefusal>),
     /// A split publication or inventory that cannot say what is selected.
     Unverified,
 }
@@ -52,12 +54,12 @@ pub fn camera_diagnostics(
     match target() {
         Target::Standing => irlume_camera::camera_rate_diagnostics(rgb, ir),
         Target::Split(pair) => Ok(irlume_camera::split_camera_rate_diagnostics(&pair)),
-        Target::NotConnected => Ok(irlume_camera::unmeasured_pair_report(role("missing"))),
+        Target::NotConnected(_) => Ok(irlume_camera::unmeasured_pair_report(role("missing"))),
         Target::Unverified => Ok(irlume_camera::unmeasured_pair_report(role("unknown"))),
     }
 }
 
-fn target() -> Target {
+pub(crate) fn target() -> Target {
     // An explicit ordinary pair decides, as it does for every request.
     if crate::request_preparation::ordinary_environment_pair().is_some() {
         return Target::Standing;
@@ -91,12 +93,42 @@ fn target() -> Target {
     if view.ordinary.state != irlume_common::live_camera::CameraInventoryState::Current {
         return Target::Unverified;
     }
+    let reason = records
+        .iter()
+        .position(|record| record.pair_key() == *key)
+        .and_then(|index| {
+            view.split_refusals
+                .iter()
+                .find(|refusal| refusal.record_index == index)
+        })
+        .map(|refusal| refusal.reason.clone());
     let mut selected = view
         .split_pairs
         .into_iter()
         .filter(|pair| pair.pair_key().is_ok_and(|candidate| candidate == *key));
     match (selected.next(), selected.next()) {
         (Some(pair), None) => Target::Split(Box::new(pair)),
-        _ => Target::NotConnected,
+        _ => Target::NotConnected(reason),
+    }
+}
+
+/// Why a selected split pair cannot be used right now, for a root-only
+/// reply. A side that an ordinary RGB+IR camera claims never resolves as
+/// split (ADR-0032 case 8), however connected it is.
+pub(crate) fn unresolved_split(reason: Option<&irlume_camera::PinRefusal>) -> irlume_common::Error {
+    use irlume_camera::{PinRefusal, SideRefusal};
+    match reason {
+        Some(
+            PinRefusal::RgbSide(SideRefusal::OrdinaryPair)
+            | PinRefusal::IrSide(SideRefusal::OrdinaryPair)
+            | PinRefusal::SameDevice,
+        ) => irlume_common::Error::Policy(
+            "a side of the selected split camera pair belongs to an ordinary RGB+IR camera; \
+             a split pair uses two separate single-role cameras"
+                .into(),
+        ),
+        _ => {
+            irlume_common::Error::Hardware("the selected split camera pair is not connected".into())
+        }
     }
 }

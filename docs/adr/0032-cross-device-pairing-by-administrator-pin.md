@@ -1171,8 +1171,8 @@ Diagnostics is not a trust kind, so this does not involve the split activation
 predicate and cannot enroll, authenticate or grant. The alignment self-test
 checks model determinism on any detected face frame; it stays on the standing
 RGB device with its own single-endpoint lease and never opens a split pair's
-other side. The liveness self-test keeps refusing a selected split until a
-separate change routes it to `Engine::assess_split_in_operation`.
+other side. The liveness self-test follows the same selection rule; see the
+split liveness self-test amendment below.
 
 An attended check on archhost on 2026-10-07 ran the same measurement through
 the release `split_capture_probe --rate-diagnostics` (no `test-support`) in the
@@ -1184,3 +1184,42 @@ dark frames observed. Both reservations were released; formats and backlight
 compensation of every node matched before and after; the services returned
 active. No images were saved and no account state was mounted. This qualifies
 the diagnostic measurement on those connections, not split authentication.
+
+## Amendment 2026-10-07: split liveness self-test
+
+The liveness self-test (`SelfTest { Liveness }`, `irlume selftest liveness`
+and the TUI's infrared camera test) refused a selected split with the closed
+text, so a split pair had no attended liveness reading before activation.
+
+It now follows the selection rule of camera diagnostics. With a split pair
+selected and no ordinary environment override, it runs the non-granting
+`Engine::assess_split_in_operation` under one split Diagnostics operation over
+both original sides: the split capture's two-incarnation, retained-descriptor,
+delivery and active-IR checks apply, and the assessment carries split
+provenance and the sequential posture. The Engine's endpoints sit on the two
+sides only for the request and return on completion or unwind. IR forced off,
+a selected pair that is not connected exactly once in a Current view and split
+configuration that cannot be verified each refuse before any lease, with no
+standing fallback. A pair the resolver refuses because an ordinary RGB+IR
+camera claims one of its sides (case 8) is named as such rather than as
+unplugged. A self-test inside an already prepared request keeps that
+request's rules, so a pending pin or routed split still refuses with the
+closed text. Otherwise the standing pair is assessed as before.
+
+The request stays root-only. The self-test loads no enrollment, matches no
+account, grants nothing and releases no credential, and the split activation
+predicate is not involved. Its verdict and cues are diagnostic only; they do
+not qualify split authentication, which still needs the separate activation
+change and its physical acceptance matrix.
+
+An attended end-to-end run on archhost on 2026-10-07 used the release
+`irlumed` and `irlume` built from this change, with the daemon's
+configuration, state and socket on tmpfs in the offline container and only
+the camera nodes passed in. The CLI authorized and selected BRIO RGB with
+NexiGo IR and the reverse, then removed each record. Both are complete RGB+IR
+cameras, so neither split resolves: the self-test named the ordinary-camera
+claim and camera diagnostics reported both roles missing, each without
+opening a camera, and every node's format and backlight compensation matched
+before and after. A positive physical run needs two separate single-role
+cameras; the fixture rows and the 2026-10-05 transport check cover that path
+until then.

@@ -16,6 +16,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- The liveness self-test (`irlume selftest liveness`, the TUI's infrared camera
+  test) runs on a selected split camera pair, both sides in one diagnostic
+  operation, instead of refusing it; it grants and releases nothing, and an
+  unplugged pair or IR forced off refuses before any camera opens (ADR-0032,
+  split liveness self-test amendment; #995).
+
 - Split-camera enrollment, camera-group addition and authentication run end to
   end behind the camera trust predicate, which stays closed in every shipped
   build. One split lease covers both original sides and capture runs RGB then

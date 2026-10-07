@@ -1074,3 +1074,72 @@ prepared camera-group addition, not every legacy removal or recovery writer.
 Camera-free preparation and synthetic real-publisher tests qualify these guarded
 boundaries. They do not establish successful split enrollment or authentication;
 the complete production-path acceptance and separate activation change remain.
+
+## Amendment 2026-10-06: retained split runtime behind the closed activation predicate
+
+The split enrollment, camera-group and authentication runtime now exists end
+to end in software, and every entry still refuses in production. The single
+switch is `irlume_camera`'s split trust predicate, which is constant false in
+shipped builds. Only the `test-support` feature can admit a kind, through a
+thread-local token held for one call; release builds do not contain it, and
+there is no environment or configuration switch. With the predicate closed,
+ordinary enrollment, authentication, IR-only readiness and credential release
+behave and reply exactly as before.
+
+**Entries.** Enrollment declares its split entry once through the Engine and
+leaves it on return. Only the account-routed authentication call declares the
+Authentication entry: `prepare_authentication_camera_request` retains a saved
+selected split as a pending pin while Authentication is admitted, and the
+call that routes it holds the entry for its own scope. A nested scope ends the
+entry when it drops. Every nested generic entry, ordinary lease, publication,
+qualification or second authentication call inside that scope refuses with
+the closed text, and an authentication call never nests inside a split
+enrollment or over a routed split.
+
+**Enrollment.** `EnrollSplitOn` (reset or not) and `AddSplitCameraGroupOn`
+consume approval, resolve and prepare the original choice, pass the explicit
+activation gate and, for enrollment, the primary check, and only then drop the
+enrollment summary and run the Engine split entry. One split Enrollment lease
+covers both original sides; capture is sequential, RGB then IR. There is no
+probe, no stored qualification read or write, no single-endpoint lease and no
+secondary intent for a refused addition. They never lower to `Enroll`,
+`AddCameraGroup`, a setter or `dispatch_after_authorization`. Replies to a
+peer other than root carry a fixed reason per variant.
+
+**Account routing.** Classified routing keys on `routes_accounts()` (automatic
+or a pending pin), never on `automatic()` alone, so a pin beside ordinary
+`rgb=`/`ir=` lines and a pin in a split-keys-only file both route through the
+pin. A pin ranks only its own key: an unplugged or unenrolled pin denies, with
+no legacy, standing or configured-target fallback. Routing runs at most once
+per request in both directions: after an ordinary route a split never
+installs, and once a split install was offered, accepted or refused, the
+request never routes or leases an ordinary or standing pair. The same split
+may install again once its refusal's cause clears; that is a retry, not a
+rerank.
+
+**Authentication.** A routed split takes one split Authentication lease over
+both original sides and captures RGB then IR with split provenance; it never
+opens a held pair, a grouped collector or a stored qualification. Before any
+grant arm, `split_grant_refusal` refuses in this order: lock-free machine
+authority and the declared, admitted entry (case 15); IR off or the request's
+devices no longer on the installed sides; a request with no account scope; an
+enrollment whose complete binding is not the installed key; evidence without
+split provenance. Split evidence carries the sequential posture, so the
+RGB-primary and fusion arms never grant it; only the IR-identity-verified arms
+can. The daemon's `Authenticate` outer scope is the account-routed preparation,
+so a pinned split routes there as it does for `UnsealPassword`. A split denial
+releases no credential, leaves the sealed envelope unchanged and keeps the
+request's retry charge.
+
+**IR-only.** IR-only readiness and authentication route through the same
+classified choice. A split choice answers readiness with `BindingMismatch`,
+read-only, with no `cameras.conf` lock and no journal recovery, and refuses
+IR-only authentication with "split camera IR-only authentication is not
+supported; use your password" before the admission hook and any lease. That
+refusal is `SetupUnavailable`: it spends no short-history strike, and the
+request keeps its budget charge.
+
+These are software boundaries proven with fixtures that refuse every open.
+They do not establish a successful split capture, grant or enrollment. Turning
+the predicate on stays a separate reviewed change that needs the complete
+physical acceptance matrix on real split hardware.

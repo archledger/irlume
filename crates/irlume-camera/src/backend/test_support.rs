@@ -86,6 +86,9 @@ impl CameraBackend for Recorder {
 pub struct Guard {
     previous: Option<Arc<CameraSupervisor>>,
     calls: Arc<Mutex<Vec<Call>>>,
+    /// The non-granting supervisor this guard installed; split trust
+    /// admissions apply only while it is this thread's installed fixture.
+    installed: std::sync::Weak<CameraSupervisor>,
     _thread: PhantomData<Rc<()>>,
 }
 
@@ -155,10 +158,12 @@ impl Guard {
                 })
             }),
         );
+        let installed = Arc::downgrade(&supervisor);
         let previous = TEST_SUPERVISOR.with(|slot| slot.borrow_mut().replace(supervisor));
         Ok(Self {
             previous,
             calls,
+            installed,
             _thread: PhantomData,
         })
     }
@@ -247,6 +252,136 @@ impl Guard {
                 .invalidate_topologies(&[topology.clone()].into())
         }
     }
+
+    /// Admit only Enrollment/Authentication on this thread's non-granting
+    /// fixture; any other kind is refused (never admitted).
+    ///
+    /// While the token lives and this guard's supervisor is the thread's
+    /// installed fixture, `lease::split_trust_admitted` answers true for the
+    /// admitted kinds, so split acquisition and capture accept them. Every
+    /// backend open of this fixture still fails, so an admission reaches no
+    /// device and no grant from capture. Another thread, another installed
+    /// fixture or a dropped token sees the closed default.
+    #[must_use = "the admission closes when the token drops"]
+    pub fn admit_split_trust(&self, kinds: &[CameraOperationKind]) -> SplitTrustAdmission<'_> {
+        let token = SPLIT_TRUST_ADMISSIONS
+            .try_with(|admissions| {
+                admissions
+                    .try_borrow_mut()
+                    .ok()
+                    .and_then(|mut admissions| admissions.admit(&self.installed, kinds))
+            })
+            .ok()
+            .flatten();
+        SplitTrustAdmission {
+            token,
+            _fixture: PhantomData,
+            _thread: PhantomData,
+        }
+    }
+}
+
+/// One split trust admission for the installing thread's fixture. It is not
+/// `Send`, so it cannot move threads. Dropping it, also on unwind, closes the
+/// kinds it admitted unless another live token on this thread admits them.
+pub struct SplitTrustAdmission<'a> {
+    token: Option<u64>,
+    _fixture: PhantomData<&'a Guard>,
+    _thread: PhantomData<Rc<()>>,
+}
+
+impl Drop for SplitTrustAdmission<'_> {
+    fn drop(&mut self) {
+        let Some(token) = self.token else {
+            return;
+        };
+        let _ = SPLIT_TRUST_ADMISSIONS.try_with(|admissions| {
+            if let Ok(mut admissions) = admissions.try_borrow_mut() {
+                admissions.revoke(token);
+            }
+        });
+    }
+}
+
+/// Live split trust admissions on one thread. Entries name only Enrollment or
+/// Authentication and the fixture supervisor they were granted for.
+pub(crate) struct SplitTrustAdmissions {
+    next: u64,
+    live: Vec<AdmittedSplitTrust>,
+}
+
+struct AdmittedSplitTrust {
+    token: u64,
+    fixture: std::sync::Weak<CameraSupervisor>,
+    kind: CameraOperationKind,
+}
+
+impl SplitTrustAdmissions {
+    pub(crate) const fn new() -> Self {
+        Self {
+            next: 0,
+            live: Vec::new(),
+        }
+    }
+
+    fn admit(
+        &mut self,
+        fixture: &std::sync::Weak<CameraSupervisor>,
+        kinds: &[CameraOperationKind],
+    ) -> Option<u64> {
+        let token = self.next.checked_add(1)?;
+        self.next = token;
+        for &kind in kinds {
+            if matches!(
+                kind,
+                CameraOperationKind::Enrollment | CameraOperationKind::Authentication
+            ) {
+                self.live.push(AdmittedSplitTrust {
+                    token,
+                    fixture: fixture.clone(),
+                    kind,
+                });
+            }
+        }
+        Some(token)
+    }
+
+    fn revoke(&mut self, token: u64) {
+        self.live.retain(|entry| entry.token != token);
+    }
+
+    fn admits(&self, installed: &Arc<CameraSupervisor>, kind: CameraOperationKind) -> bool {
+        matches!(
+            kind,
+            CameraOperationKind::Enrollment | CameraOperationKind::Authentication
+        ) && self.live.iter().any(|entry| {
+            entry.kind == kind && std::ptr::eq(entry.fixture.as_ptr(), Arc::as_ptr(installed))
+        })
+    }
+}
+
+/// Whether this thread's installed fixture admits one split trust kind. Fails
+/// closed with no fixture, another installed fixture or during thread-local
+/// teardown. Only `lease::split_trust_admitted` calls it.
+pub(crate) fn admits_split_trust(kind: CameraOperationKind) -> bool {
+    let installed = TEST_SUPERVISOR
+        .try_with(|slot| {
+            slot.try_borrow()
+                .ok()
+                .and_then(|slot| slot.as_ref().map(Arc::clone))
+        })
+        .ok()
+        .flatten();
+    let Some(installed) = installed else {
+        return false;
+    };
+    SPLIT_TRUST_ADMISSIONS
+        .try_with(|admissions| {
+            admissions
+                .try_borrow()
+                .is_ok_and(|admissions| admissions.admits(&installed, kind))
+        })
+        .unwrap_or(false)
 }
 
 impl Drop for Guard {
@@ -386,29 +521,71 @@ pub fn capture_uniform_split_pair(
     rgb_dev: &str,
     ir_dev: &str,
 ) -> irlume_common::Result<crate::SplitPairCapture> {
-    let capture = |endpoint, role| {
-        operation
-            .lease()
-            .start_stream()
-            .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
-        let binding = operation
-            .lease()
-            .frame_binding(endpoint, role)
-            .map_err(|error| irlume_common::Error::Hardware(error.to_string()));
-        operation.lease().stop_stream();
-        Ok(bound_uniform_frame(binding?, Instant::now()))
-    };
+    capture_uniform_split_pair_timed(operation, rgb_dev, ir_dev, Instant::now, Instant::now)
+}
+
+/// [`capture_uniform_split_pair`] with scripted capture instants, for skew
+/// grids. The frames stay uniform and faceless; each one-shot window is its
+/// single instant, so the RGB-to-IR skew is `ir_at - rgb_at`.
+///
+/// # Errors
+/// Returns operation, cancellation or complete-pair factory refusals,
+/// including an IR window that starts before the RGB window ends.
+pub fn capture_uniform_split_pair_at(
+    operation: &crate::lease::CameraOperationSession,
+    rgb_dev: &str,
+    ir_dev: &str,
+    rgb_at: Instant,
+    ir_at: Instant,
+) -> irlume_common::Result<crate::SplitPairCapture> {
+    capture_uniform_split_pair_timed(operation, rgb_dev, ir_dev, || rgb_at, || ir_at)
+}
+
+fn capture_uniform_split_pair_timed(
+    operation: &crate::lease::CameraOperationSession,
+    rgb_dev: &str,
+    ir_dev: &str,
+    rgb_at: impl FnOnce() -> Instant,
+    ir_at: impl FnOnce() -> Instant,
+) -> irlume_common::Result<crate::SplitPairCapture> {
     crate::split_capture::capture_split_pair_with(
         rgb_dev,
         ir_dev,
         operation,
         &crate::CaptureControl::with_progress(crate::no_progress()),
-        || capture(rgb_dev, crate::contracts::StreamRole::Rgb),
         || {
-            capture(ir_dev, crate::contracts::StreamRole::Ir)
+            uniform_one_shot(
+                operation,
+                rgb_dev,
+                crate::contracts::StreamRole::Rgb,
+                rgb_at,
+            )
+        },
+        || {
+            uniform_one_shot(operation, ir_dev, crate::contracts::StreamRole::Ir, ir_at)
                 .map(|frame| (frame, uniform_ir_stats()))
         },
     )
+}
+
+/// One synthetic sequential one-shot: a stream start/stop on the original
+/// lease, then a uniform frame bound to its endpoint and taken at `taken()`.
+fn uniform_one_shot(
+    operation: &crate::lease::CameraOperationSession,
+    endpoint: &str,
+    role: crate::contracts::StreamRole,
+    taken: impl FnOnce() -> Instant,
+) -> irlume_common::Result<crate::Frame> {
+    operation
+        .lease()
+        .start_stream()
+        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
+    let binding = operation
+        .lease()
+        .frame_binding(endpoint, role)
+        .map_err(|error| irlume_common::Error::Hardware(error.to_string()));
+    operation.lease().stop_stream();
+    Ok(bound_uniform_frame(binding?, taken()))
 }
 
 #[cfg(test)]

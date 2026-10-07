@@ -275,9 +275,46 @@ pub struct SplitLeaseRequest {
     pub ir: crate::SplitSideExpectation,
 }
 
+/// Whether the split acquisition and capture gates admit one trust kind.
+///
+/// Production: false for Authentication, Enrollment and Capture, so both
+/// gates keep refusing every split trust operation. Diagnostics, Setup and
+/// Preview are not trust kinds; the gates admit them on their own and this
+/// returns false for them too. The reviewed activation change edits only
+/// this body. No environment or configuration input is read.
+///
+/// A `test-support` build also asks the non-granting fixture installed on
+/// the calling thread, whose admission can name only Enrollment or
+/// Authentication and whose backend refuses every open.
+#[must_use]
+pub fn split_trust_admitted(kind: CameraOperationKind) -> bool {
+    match kind {
+        CameraOperationKind::Enrollment | CameraOperationKind::Authentication => {
+            fixture_admits_split_trust(kind)
+        }
+        CameraOperationKind::Capture
+        | CameraOperationKind::Preview
+        | CameraOperationKind::Diagnostics
+        | CameraOperationKind::Setup => false,
+    }
+}
+
+/// No split trust override exists outside `test-support` builds.
+#[cfg(not(feature = "test-support"))]
+fn fixture_admits_split_trust(_kind: CameraOperationKind) -> bool {
+    false
+}
+
+/// The calling thread's installed non-granting fixture admission.
+#[cfg(feature = "test-support")]
+fn fixture_admits_split_trust(kind: CameraOperationKind) -> bool {
+    crate::backend::test_support::admits_split_trust(kind)
+}
+
 /// Reserve both split-camera instances atomically and bind all subsequent
-/// endpoint/stream validation to the supplied facts. Only diagnostics, setup
-/// and preview may use this primitive while the activation gate is closed.
+/// endpoint/stream validation to the supplied facts. Diagnostics, setup and
+/// preview may use this primitive; a trust kind only when
+/// [`split_trust_admitted`] admits it, which production never does.
 ///
 /// # Errors
 /// Refuses stale facts, contention, unsupported operations or unavailable
@@ -301,7 +338,8 @@ pub fn acquire_split_camera_operation(
         CameraOperationKind::Diagnostics
             | CameraOperationKind::Setup
             | CameraOperationKind::Preview
-    ) {
+    ) && !split_trust_admitted(operation)
+    {
         return Err(CameraLeaseError::SplitActivationDisabled);
     }
     let deadline =
@@ -1815,3 +1853,7 @@ mod tests {
         assert_eq!(session.state(), CameraSessionState::Released);
     }
 }
+
+#[cfg(test)]
+#[path = "split_trust_tests.rs"]
+mod split_trust_tests;

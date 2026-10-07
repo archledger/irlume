@@ -2069,6 +2069,9 @@ impl<S> TrackedStream<S> {
         // fill to re-run, which is where `begin_recovered_continuity_epoch`
         // then re-seeds the baseline in the new epoch.
         self.rate_window.reset();
+        // A recovery epoch also revokes a probe admission (ADR-0021, decision
+        // item 3), as `invalidate_paired_rate_admission` does.
+        self.health_admitted = false;
         Ok(())
     }
 }
@@ -13634,6 +13637,209 @@ mod tests {
         assert!(evidence.meets_floor());
     }
 
+    /// A stream that delivered one frame, lost it and installed a
+    /// replacement in place, as `RgbSession::recover` and
+    /// `IrSession::recover` do. `gated` keeps the 30-delta rate window;
+    /// otherwise no fill discards before the first delivery.
+    fn recovered_fixture(
+        role: contracts::StreamRole,
+        gated: bool,
+    ) -> TrackedStream<QueuedContinuityFixture> {
+        let mut stream = rate_fill_fixture(role, 40, 66_667);
+        if !gated {
+            stream = TrackedStream::new(stream.take().expect("fixture"), test_rate_config(role));
+        }
+        stream.next().expect("pre-recovery delivery");
+        assert!(stream.take().is_some());
+        stream
+            .install_recovered(&mut rate_fill_fixture(role, 100, 66_667).take())
+            .expect("recovery epoch");
+        stream
+    }
+
+    /// One delivered frame's provenance, built as the RGB and IR bursts
+    /// build theirs.
+    fn delivered_contributor(
+        stream: &mut TrackedStream<QueuedContinuityFixture>,
+        role: contracts::StreamRole,
+        illumination: contracts::IlluminationProvenance,
+    ) -> frame_provenance::SingleFrameProvenance {
+        let (_, facts, sequence, timestamp, rate_evidence) = stream.next().expect("delivery");
+        checked_single_evidence(
+            frame_provenance::FrameBinding::new(
+                contracts::CameraInstanceId::new("4".repeat(32)).expect("test identity"),
+                contracts::CameraGeneration::INITIAL,
+                role,
+            ),
+            frame_provenance::ValidatedFormatIdentity::from_stable_format(&v4l::Format::new(
+                1,
+                1,
+                v4l::FourCC::new(b"GREY"),
+            )),
+            facts,
+            sequence,
+            timestamp,
+            std::time::Instant::now(),
+            illumination,
+            rate_evidence,
+        )
+        .expect("a single frame carries the recovery marker")
+    }
+
+    fn assert_recovery_marker_only_on_the_first(
+        aggregate: &frame_provenance::AggregateFrameProvenance,
+    ) {
+        let (first, rest) = aggregate
+            .contributors()
+            .split_first()
+            .expect("aggregate contributors");
+        assert!(first.sequence().discontinuity() && first.timestamp().discontinuity());
+        assert_eq!(first.sequence().stream_epoch(), 1);
+        assert!(first.sequence().advance().is_some() && first.timestamp().delta_micros().is_some());
+        assert!(rest
+            .iter()
+            .all(|c| !c.sequence().discontinuity() && !c.timestamp().discontinuity()));
+    }
+
+    #[test]
+    fn rgb_median_after_recovery_keeps_the_marker_and_aggregates() {
+        let mut stream = recovered_fixture(contracts::StreamRole::Rgb, true);
+        // RgbSession::recover clears `warmed`, so the next burst warms up as
+        // RgbSession::warm_up does before its first delivery.
+        warm_up_stream("fixture", &mut stream, &no_progress()).expect("recovered warm-up");
+        for _ in 0..AE_WARMUP {
+            stream.next_discarded().expect("AE settle discard");
+        }
+        let frames = (0..RGB_BURST)
+            .map(|_| {
+                let single = delivered_contributor(
+                    &mut stream,
+                    contracts::StreamRole::Rgb,
+                    contracts::IlluminationProvenance::Unknown,
+                );
+                Frame::from_provenance(
+                    1,
+                    1,
+                    Spectrum::Rgb,
+                    vec![80],
+                    frame_provenance::RuntimeFrameProvenance::Single(single),
+                )
+                .expect("frame")
+            })
+            .collect::<Vec<_>>();
+        let median = median_frame(frames).expect("the recovered burst aggregates");
+        let frame_provenance::RuntimeFrameProvenance::Aggregate(aggregate) = median.provenance()
+        else {
+            panic!("a multi-frame median is an aggregate");
+        };
+        assert_recovery_marker_only_on_the_first(aggregate);
+        assert!(
+            !median.provenance().is_continuous(),
+            "the recovered median stays non-continuous"
+        );
+    }
+
+    #[test]
+    fn ir_aggregate_after_recovery_keeps_the_marker_and_aggregates() {
+        let mut stream = recovered_fixture(contracts::StreamRole::Ir, true);
+        // IrSession::capture_with_stats fills the rate window before its burst.
+        stream.fill_rate_evidence().expect("recovered rate fill");
+        let contributors = (0..IR_BURST)
+            .map(|index| {
+                let illumination = if index % 2 == 0 {
+                    contracts::IlluminationProvenance::ActiveIr
+                } else {
+                    contracts::IlluminationProvenance::Ambient
+                };
+                delivered_contributor(&mut stream, contracts::StreamRole::Ir, illumination)
+            })
+            .collect::<Vec<_>>();
+        for selection in [
+            frame_provenance::ContributorSelection::Selected { index: 0 },
+            frame_provenance::ContributorSelection::Subtracted {
+                lit_index: 0,
+                ambient_index: 1,
+            },
+        ] {
+            let provenance = checked_aggregate_provenance(contributors.clone(), selection)
+                .unwrap_or_else(|error| panic!("{selection:?}: {error}"));
+            let frame_provenance::RuntimeFrameProvenance::Aggregate(aggregate) = &provenance else {
+                panic!("an IR burst is an aggregate");
+            };
+            assert_recovery_marker_only_on_the_first(aggregate);
+            assert!(!provenance.is_continuous(), "{selection:?}");
+        }
+    }
+
+    #[test]
+    fn recovered_first_delivery_without_a_discard_still_refuses_the_aggregate() {
+        let mut stream = recovered_fixture(contracts::StreamRole::Ir, false);
+        let contributors = (0..3)
+            .map(|_| {
+                delivered_contributor(
+                    &mut stream,
+                    contracts::StreamRole::Ir,
+                    contracts::IlluminationProvenance::Unknown,
+                )
+            })
+            .collect::<Vec<_>>();
+        let first = &contributors[0];
+        assert!(first.sequence().discontinuity() && first.timestamp().discontinuity());
+        assert_eq!(first.sequence().advance(), None);
+        assert_eq!(first.timestamp().delta_micros(), None);
+        let error = checked_aggregate_provenance(
+            contributors,
+            frame_provenance::ContributorSelection::ReducedOverAll,
+        )
+        .expect_err("a marked first frame with no predecessor in its epoch");
+        assert!(
+            error
+                .to_string()
+                .contains("aggregate contributor reports a discontinuity"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn recovery_revokes_a_probe_admission_and_refills_the_rate_window() {
+        // Admission depends on the kill switch being clear.
+        let _guard = crate::testenv::env_lock();
+        let node = "/dev/video-recovery-admission";
+        for role in [contracts::StreamRole::Rgb, contracts::StreamRole::Ir] {
+            let key = rate_amortization::Key::new(node, role);
+            rate_amortization::test_support::force_completion(key.clone(), None);
+            let mut first = rate_fill_fixture(role, 40, 66_667).with_rate_amortization(node);
+            first
+                .fill_rate_evidence()
+                .expect("full fill records completion");
+            let mut stream = rate_fill_fixture(role, 40, 66_667).with_rate_amortization(node);
+            stream.fill_rate_evidence().expect("probe admission");
+            assert!(stream.health_admitted, "{role:?}: the probe admitted");
+            stream.next().expect("admitted delivery");
+
+            assert!(stream.take().is_some());
+            stream
+                .install_recovered(&mut rate_fill_fixture(role, 100, 66_667).take())
+                .expect("recovery epoch");
+            assert!(
+                !stream.health_admitted,
+                "{role:?}: a recovery epoch revokes the probe admission (ADR-0021 item 3)"
+            );
+            stream.fill_rate_evidence().expect("recovered fill");
+            assert!(stream.rate_window.ready(), "{role:?}: the window refills");
+            let (_, _, sequence, timestamp, evidence) =
+                stream.next().expect("first recovered delivery");
+            assert!(sequence.discontinuity() && timestamp.discontinuity());
+            assert!(
+                sequence.advance().is_some() && timestamp.delta_micros().is_some(),
+                "{role:?}: the fill discarded a predecessor in the recovered epoch"
+            );
+            assert_eq!(evidence.window_count(), 30, "{role:?}");
+            assert!(evidence.meets_floor(), "{role:?}");
+            rate_amortization::test_support::force_completion(key, None);
+        }
+    }
+
     #[test]
     fn paired_startup_leaves_ir_unstarted_until_rgb_has_a_buffer() {
         let mut rgb = rate_fill_fixture(contracts::StreamRole::Rgb, 100, 66_667);
@@ -20925,6 +21131,76 @@ mod tests {
             .next()
             .expect("the recovered stream's first dequeue rechecks and delivers");
         assert!(sequence.discontinuity(), "the recovery marker");
+    }
+
+    /// What a recovered capture must look like: the burst aggregates, its
+    /// first contributor keeps the recovery marker after an in-epoch
+    /// discard, and the frame stays non-continuous, so pairing and
+    /// recognition still refuse it (ADR-0007).
+    fn assert_recovered_capture(before: &Frame, after: &Frame) {
+        assert_eq!(
+            (before.width, before.height),
+            (after.width, after.height),
+            "the recovered stream must carry the same negotiated geometry"
+        );
+        let frame_provenance::RuntimeFrameProvenance::Aggregate(aggregate) = after.provenance()
+        else {
+            panic!("a burst capture is an aggregate");
+        };
+        let first = &aggregate.contributors()[0];
+        assert!(
+            first.sequence().discontinuity() && first.timestamp().discontinuity(),
+            "the recovery marker"
+        );
+        assert!(
+            first.sequence().advance().is_some() && first.timestamp().delta_micros().is_some(),
+            "a discarded predecessor in the recovered epoch"
+        );
+        assert!(!after.provenance().is_continuous());
+    }
+
+    /// In-place IR recovery then capture through a real session, the
+    /// sequence `irlume-auth`'s held IR capture runs.
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_ir_capture_after_recovery_keeps_the_marker_and_aggregates() {
+        let (_, ir_path) = loopback_pair();
+        let operation = lease::acquire_camera_operation(
+            &[ir_path.as_str()],
+            lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire IR operation");
+        let camera = operation.open_ir(&ir_path).expect("open IR camera");
+        let mut session = camera.session().expect("open IR session");
+        let (before, _) = session
+            .capture_with_stats()
+            .expect("capture before recovery");
+        session.recover().expect("recover in place");
+        let (after, _) = session
+            .capture_with_stats()
+            .expect("capture after recovery");
+        assert_recovered_capture(&before, &after);
+    }
+
+    /// In-place RGB recovery then a denoised capture through a real
+    /// session, the sequence `irlume-auth`'s held RGB capture runs.
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_rgb_denoised_after_recovery_keeps_the_marker_and_aggregates() {
+        let (rgb_path, _) = loopback_pair();
+        let operation = lease::acquire_camera_operation(
+            &[rgb_path.as_str()],
+            lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire RGB operation");
+        let camera = operation.open_rgb(&rgb_path).expect("open RGB camera");
+        let mut session = camera.session().expect("open RGB session");
+        let before = session.denoised().expect("denoised before recovery");
+        session.recover().expect("recover in place");
+        let after = session.denoised().expect("denoised after recovery");
+        assert_recovered_capture(&before, &after);
     }
 
     /// Writing an empty value is what CLEARS the origin stamp, which is the

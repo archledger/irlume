@@ -4820,6 +4820,89 @@ fn operation_camera_choice_cli_refuses_malformed_missing_and_repeated_values_bef
     assert!(log.lock().unwrap().is_empty());
 }
 
+const SPLIT_ENROLLMENT_CHOICE: &str = r#"{"expected":{"supervisor_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","revision":3,"rgb":{"instance_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":7,"endpoint":"/dev/video0"},"ir":{"instance_id":"cccccccccccccccccccccccccccccccc","generation":7,"endpoint":"/dev/video1"}},"authorization":{"generation":9,"token":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}"#;
+
+const SPLIT_ENROLLMENT_CHOICE_ZERO_REVISION: &str = r#"{"expected":{"supervisor_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","revision":0,"rgb":{"instance_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":7,"endpoint":"/dev/video0"},"ir":{"instance_id":"cccccccccccccccccccccccccccccccc","generation":7,"endpoint":"/dev/video1"}},"authorization":{"generation":9,"token":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}"#;
+
+#[test]
+fn split_camera_choice_cli_sends_exact_guard_and_never_retries_old_daemon() {
+    for add in [false, true] {
+        let sb = Sandbox::new(if add {
+            "split-choice-add"
+        } else {
+            "split-choice-enroll"
+        });
+        let log = serve(&sock(&sb), |_| Response::Error("bad request".into()));
+        let mut args = vec![
+            "enroll",
+            "--user",
+            "tester",
+            "--split-camera-choice",
+            SPLIT_ENROLLMENT_CHOICE,
+        ];
+        if add {
+            args.push("--add-camera");
+        } else {
+            args.push("--reset");
+        }
+        let (code, _, err) = run(&mut sb.cmd(&args));
+        assert_eq!(code, 1);
+        assert!(err.contains("needs a newer irlumed"), "{err}");
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.len(),
+            1,
+            "an unsupported split choice must never retry another operation"
+        );
+        let value = serde_json::to_value(&log[0]).unwrap();
+        let name = if add {
+            "AddSplitCameraGroupOn"
+        } else {
+            "EnrollSplitOn"
+        };
+        assert_eq!(
+            value[name]["pair"],
+            serde_json::from_str::<serde_json::Value>(SPLIT_ENROLLMENT_CHOICE).unwrap()
+        );
+        if !add {
+            assert_eq!(value[name]["reset"], true);
+        }
+        assert!(!sb.path("cfg/cameras.conf").exists());
+    }
+}
+
+#[test]
+fn split_camera_choice_cli_refuses_malformed_missing_repeated_and_combined_values_before_request() {
+    let sb = Sandbox::new("split-choice-usage");
+    let log = serve(&sock(&sb), |_| Response::Error("unexpected capture".into()));
+    for flags in [
+        vec!["--split-camera-choice"],
+        vec!["--split-camera-choice", "{}"],
+        vec![
+            "--split-camera-choice",
+            SPLIT_ENROLLMENT_CHOICE_ZERO_REVISION,
+        ],
+        vec![
+            "--split-camera-choice",
+            SPLIT_ENROLLMENT_CHOICE,
+            "--split-camera-choice",
+            SPLIT_ENROLLMENT_CHOICE,
+        ],
+        vec![
+            "--camera-choice",
+            ENROLLMENT_CHOICE,
+            "--split-camera-choice",
+            SPLIT_ENROLLMENT_CHOICE,
+        ],
+    ] {
+        let mut args = vec!["enroll", "--user", "tester"];
+        args.extend(flags);
+        let (code, _, err) = run(&mut sb.cmd(&args));
+        assert_eq!(code, 2, "{err}");
+    }
+    assert!(log.lock().unwrap().is_empty());
+}
+
 #[test]
 fn enroll_reports_a_new_profile_and_forwards_the_flags() {
     let sb = Sandbox::new("enrollnew");

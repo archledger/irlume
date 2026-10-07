@@ -46,7 +46,7 @@ Conventions that apply everywhere:
 
 | Command | What it does |
 |---|---|
-| `irlume enroll [--name N] [--scans K] [--reset] [--add-camera] [--camera-choice JSON]` | capture a face profile; `--reset` replaces profiles and camera binding after successful capture, keeping the template key and recovery setup. `--add-camera` (ADR-0024) enrolls a SECOND camera as its own group with a separate store: the daemon measures the new pair and the existing enrollment is untouched. `--camera-choice` uses an explicitly guarded ordinary pair for this operation, preserving the standing pair and `cameras.conf` |
+| `irlume enroll [--name N] [--scans K] [--reset] [--add-camera] [--camera-choice JSON] [--split-camera-choice JSON]` | capture a face profile; `--reset` replaces profiles and camera binding after successful capture, keeping the template key and recovery setup. `--add-camera` (ADR-0024) enrolls a SECOND camera as its own group with a separate store: the daemon measures the new pair and the existing enrollment is untouched. `--camera-choice` uses an explicitly guarded ordinary pair for this operation, `--split-camera-choice` an authorized split pair (ADR-0032), each preserving the standing pair and `cameras.conf` |
 | `irlume profiles` (or `profiles list`) | list profiles and their scans; `profiles list --json` uses the read-only public [machine API](MACHINE-API.md) |
 | `irlume profiles add-scan --profile P [--scans N]` | add scans to profile P: improves recognition in new conditions, and adds templates for a second recognizer without re-enrolling as a new person (scans belong to the recognizer the daemon has loaded). If authentication reports no scans for the current recognition model, add scans to an existing profile; retained scans from other models are preserved |
 | `irlume profiles remove-camera --group ID` | remove one enrolled camera group (its store and scans); the primary enrollment and other groups are untouched. Find the group ID in `profiles list`, which shows every enrolled camera |
@@ -192,8 +192,19 @@ primary binding. To use a different camera, explicitly add a camera group or
 reset after authorization. The old commands without this option retain their
 behavior. An older daemon reports that operation-scoped choice needs an upgrade;
 the client does not retry a legacy enrollment or persist a camera pin. Guided
-session choices and split enrollment remain separate work. This option does not
+session choices remain separate work. This option does not
 extend the public machine `--json` contract.
+
+`--split-camera-choice` is the split-pair counterpart (ADR-0032): its JSON
+contains `expected` (the unchanged `SplitMutationGuard` copied from one
+`irlume split list` display: supervisor, revision and both sides in role
+order) and `authorization` (the opaque generation-plus-token proof from the
+same listing). Non-root listings carry endpoint tokens rather than node
+paths; the client forwards the guards and the proof unchanged and never
+resolves tokens or refreshes guards. The same usage-error, unsupported-daemon
+and no-fallback rules apply; a split choice and `--camera-choice` cannot be
+combined. The daemon still refuses split enrollment and authentication until
+activation, and reports that refusal as is.
 
 Adding or replacing trusted faces requires OS authorization for a non-root account owner. This covers `enroll`, `enroll --reset`, and `profiles add-scan`, including the guided TUI and direct socket clients. Each request needs its own authorization; root retains administrative access. A successful replacement preserves the existing template key and recovery setup, and failed capture preserves the old enrollment.
 

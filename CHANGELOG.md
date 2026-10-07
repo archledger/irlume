@@ -24,6 +24,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `irlume enroll --split-camera-choice` sends `EnrollSplitOn`, and
+  `enroll --add-camera --split-camera-choice` sends
+  `AddSplitCameraGroupOn`, carrying the side guards and opaque
+  authorization proof copied from `irlume split list`, with `--reset`
+  support on enrollment. Malformed, repeated or combined choices fail
+  before sending; an older daemon's refusal reports unsupported with no
+  fallback to ordinary requests; the closed split gate's refusal is
+  reported as is (ADR-0032; #1030).
+
 - The liveness self-test (`irlume selftest liveness`, the TUI's infrared camera
   test) runs on a selected split camera pair, both sides in one diagnostic
   operation, instead of refusing it; it grants and releases nothing, and an

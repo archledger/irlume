@@ -27,8 +27,13 @@ fn run() -> Result<(), &'static str> {
         return Err("root required");
     }
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if !(2..=3).contains(&args.len()) || (args.len() == 3 && args[2] != "--cancel-after-rgb") {
-        eprintln!("usage: split_capture_probe RGB_NODE IR_NODE [--cancel-after-rgb]");
+    if !(2..=3).contains(&args.len())
+        || (args.len() == 3
+            && !["--cancel-after-rgb", "--rate-diagnostics"].contains(&args[2].as_str()))
+    {
+        eprintln!(
+            "usage: split_capture_probe RGB_NODE IR_NODE [--cancel-after-rgb | --rate-diagnostics]"
+        );
         return Err("arguments");
     }
     // Explicit classification of the complete observed inventory, not a filtered
@@ -66,9 +71,27 @@ fn run() -> Result<(), &'static str> {
         Duration::from_secs(2),
     )
     .map_err(|_| "lease refused")?;
+    if args.len() == 3 && args[2] == "--rate-diagnostics" {
+        // The daemon's split diagnostics measurement, under this operation.
+        let started = Instant::now();
+        let report = irlume_camera::camera_rate_diagnostics_in_split_operation(
+            &operation, &args[0], &args[1],
+        );
+        drop(operation);
+        released(&args)?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "outcome":"rate_diagnostics", "split":true, "sequential":true,
+                "report":report, "reservations_released":true,
+                "elapsed_ms":started.elapsed().as_millis(), "account_authorization":false,
+            })
+        );
+        return Ok(());
+    }
     let cancelled = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&cancelled);
-    let cancel_after_rgb = args.len() == 3;
+    let cancel_after_rgb = args.len() == 3 && args[2] == "--cancel-after-rgb";
     let control = CaptureControl::new(
         irlume_camera::no_progress(),
         Arc::new(move || flag.load(Ordering::SeqCst)),
@@ -107,8 +130,21 @@ fn run() -> Result<(), &'static str> {
         _ => return Err("capture refused"),
     };
     drop(operation);
-    // New diagnostic reservations prove neither side remained owned by this
-    // process. They open no camera and establish no cross-process exclusivity.
+    released(&args)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "outcome":outcome, "split":true, "sequential":true,
+            "reservations_released":true, "elapsed_ms":started.elapsed().as_millis(),
+            "account_authorization":false,
+        })
+    );
+    Ok(())
+}
+
+/// New diagnostic reservations prove neither side remained owned by this
+/// process. They open no camera and establish no cross-process exclusivity.
+fn released(args: &[String]) -> Result<(), &'static str> {
     for endpoint in [&args[0], &args[1]] {
         let released = irlume_camera::lease::acquire_camera_operation(
             &[endpoint.as_str()],
@@ -118,13 +154,5 @@ fn run() -> Result<(), &'static str> {
         .map_err(|_| "reservation retained")?;
         drop(released);
     }
-    println!(
-        "{}",
-        serde_json::json!({
-            "outcome":outcome, "split":true, "sequential":true,
-            "reservations_released":true, "elapsed_ms":started.elapsed().as_millis(),
-            "account_authorization":false,
-        })
-    );
     Ok(())
 }

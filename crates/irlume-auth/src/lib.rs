@@ -13,6 +13,8 @@ pub use ir_assessment::{IrOnlyPreflight, IrOnlyRefusal};
 mod request_preparation;
 pub use request_preparation::CameraRequestScope;
 mod account_selection;
+mod camera_diagnostics;
+pub use camera_diagnostics::camera_diagnostics;
 mod split_runtime;
 
 /// Non-granting developer IR evaluation; absent from normal builds.
@@ -8117,6 +8119,12 @@ impl Engine {
     /// Alignment-determinism self-test: embed the same aligned chip twice; the
     /// cosine MUST be ~1.0. Catches the AuraFace alignment/normalization trap
     /// (the "identical images score 0.6" failure). `Request::SelfTest { AlignmentIdentity }`.
+    ///
+    /// It tests the models, not a camera: any detected face frame serves, so
+    /// it reads one frame from the standing RGB device whatever the camera
+    /// selection, through that device's own single-endpoint lease. It grants
+    /// nothing and never opens a split pair's other side (ADR-0032,
+    /// selection-aware diagnostics amendment).
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn alignment_selftest(&mut self) -> irlume_common::Result<(bool, String)> {
         let rgb = irlume_camera::capture_rgb_denoised_with_progress(

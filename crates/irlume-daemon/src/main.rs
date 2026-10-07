@@ -9586,9 +9586,12 @@ fn dispatch_after_authorization(
             }
         }
         Request::CameraDiagnostics => {
+            // The configured pair: the selected split when one is saved
+            // (both sides under one split Diagnostics operation, never the
+            // standing fallback camera), else the standing devices.
             let rgb = engine.rgb_device();
             let ir = engine.ir_available().then(|| engine.ir_device());
-            match irlume_auth::camera_rate_diagnostics(rgb, ir) {
+            match irlume_auth::camera_diagnostics(rgb, ir) {
                 Ok(report) => Response::CameraDiagnostics(Box::new(report)),
                 Err(error) => Response::Error(error.to_string()),
             }
@@ -12391,7 +12394,7 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 20] = [
+        let sources: [(&str, &str); 21] = [
             ("main.rs", include_str!("main.rs")),
             (
                 "request_preparation_tests.rs",
@@ -12408,6 +12411,10 @@ mod tests {
             (
                 "split_closed_matrix_tests.rs",
                 include_str!("split_closed_matrix_tests.rs"),
+            ),
+            (
+                "split_diagnostics_tests.rs",
+                include_str!("split_diagnostics_tests.rs"),
             ),
             ("attempt_record.rs", include_str!("attempt_record.rs")),
             ("shared_unlock.rs", include_str!("shared_unlock.rs")),
@@ -18012,6 +18019,7 @@ mod tests {
     include!("split_runtime_tests.rs");
     include!("split_authentication_runtime_tests.rs");
     include!("split_closed_matrix_tests.rs");
+    include!("split_diagnostics_tests.rs");
 
     /// A waiver is a claim about the machine's policy, not about the caller, so
     /// the daemon has to agree with it independently. A root PAM client saying

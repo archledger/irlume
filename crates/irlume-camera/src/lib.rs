@@ -5041,6 +5041,82 @@ pub fn camera_rate_diagnostics(
     })
 }
 
+/// [`camera_rate_diagnostics`] for an administrator-authorized split pair
+/// (ADR-0032, sequential diagnostic capture and selection-aware diagnostics
+/// amendments): the same per-role evidence and illumination state, measured
+/// RGB then IR under one split Diagnostics operation that reserves both
+/// original sides for the whole report. Each native open takes that
+/// operation's permit and is checked against its retained side before any
+/// format or control write, so no single-endpoint lease reaches either side.
+///
+/// Diagnostics is not a trust kind: this enrolls, authenticates and grants
+/// nothing, whatever the split activation predicate says. An operation that
+/// cannot be acquired, or that is no longer valid when the report is done,
+/// reads as both roles unknown rather than as evidence from a camera that
+/// may have changed.
+#[must_use]
+pub fn split_camera_rate_diagnostics(pair: &SplitPair) -> irlume_common::CameraDiagnosticsReport {
+    let unmeasured = || {
+        unmeasured_pair_report(irlume_common::CameraRoleDiagnostic {
+            known: true,
+            state: "unknown".into(),
+            evidence: None,
+        })
+    };
+    let Ok(operation) = lease::acquire_split_camera_operation(
+        &pair.lease_request(),
+        lease::CameraOperationKind::Diagnostics,
+        std::time::Duration::from_secs(2),
+    ) else {
+        return unmeasured();
+    };
+    camera_rate_diagnostics_in_split_operation(&operation, &pair.rgb.path, &pair.ir.path)
+}
+
+/// The measurement half of [`split_camera_rate_diagnostics`], under a split
+/// Diagnostics operation the caller already holds over `rgb` then `ir`: the
+/// attended hardware probe acquires its own. Any other operation, a stale one
+/// or one that is no longer valid when the report is done reads as both
+/// roles unknown, and nothing is measured outside the operation.
+#[must_use]
+pub fn camera_rate_diagnostics_in_split_operation(
+    operation: &lease::CameraOperationSession,
+    rgb: &str,
+    ir: &str,
+) -> irlume_common::CameraDiagnosticsReport {
+    let unmeasured = || {
+        unmeasured_pair_report(irlume_common::CameraRoleDiagnostic {
+            known: true,
+            state: "unknown".into(),
+            evidence: None,
+        })
+    };
+    if !operation.lease().is_split_pair()
+        || operation.lease().operation() != lease::CameraOperationKind::Diagnostics
+    {
+        return unmeasured();
+    }
+    match operation.run(|| camera_rate_diagnostics(rgb, Some(ir))) {
+        Ok(Ok(report)) => report,
+        Ok(Err(_)) | Err(_) => unmeasured(),
+    }
+}
+
+/// A diagnostics report in which both roles carry `role` and nothing was
+/// measured: no evidence, skew or illumination.
+#[must_use]
+pub fn unmeasured_pair_report(
+    role: irlume_common::CameraRoleDiagnostic,
+) -> irlume_common::CameraDiagnosticsReport {
+    irlume_common::CameraDiagnosticsReport {
+        rgb: role.clone(),
+        ir: role,
+        skew_us: None,
+        capture_strategy: "burst".into(),
+        illumination: None,
+    }
+}
+
 /// The discovery scan and the pairs over its classified nodes, so the
 /// supervisor can keep the whole scan while pairing callers get the pairs.
 pub(crate) fn uvc_pairing_scan() -> (NodeScan, Vec<CameraPair>) {
@@ -20974,3 +21050,7 @@ mod session_traits {
         assert_send::<super::RgbSession<'_>>();
     }
 }
+
+#[cfg(all(test, feature = "test-support"))]
+#[path = "split_diagnostics_tests.rs"]
+mod split_diagnostics_tests;

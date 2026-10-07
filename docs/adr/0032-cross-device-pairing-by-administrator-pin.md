@@ -1143,3 +1143,44 @@ These are software boundaries proven with fixtures that refuse every open.
 They do not establish a successful split capture, grant or enrollment. Turning
 the predicate on stays a separate reviewed change that needs the complete
 physical acceptance matrix on real split hardware.
+
+## Amendment 2026-10-07: selection-aware camera diagnostics
+
+On a machine whose only cameras are a split pair, no single physical device
+exposes both roles, so the daemon's standing camera is the first RGB node it
+finds, usually the selected split's own RGB side, and has no IR. Delivered-rate
+diagnostics (#462, #568) measured that node and reported the configured pair's
+IR as missing.
+
+`CameraDiagnostics` now follows the saved selection. With a split pair selected
+and no ordinary environment override, it measures both original sides, RGB then
+IR, under one split Diagnostics operation from the 2026-10-05 sequential
+diagnostic capture: the operation reserves both incarnations for the whole
+report, each native open takes its permit and passes the retained-side
+descriptor check before any format or control write, and no single-endpoint
+lease reaches either side. The report keeps its existing shape and per-role
+`measured`, `fail` and `unknown` meanings, including an under-rate stream. A
+selected pair that is not connected exactly once in a Current view reports both
+roles `missing`; a split publication or inventory that cannot be verified
+reports both roles `unknown`; neither opens a camera or falls back to the
+standing device. Without a selected split, with an ordinary override, or with
+an unreadable or malformed `cameras.conf`, the standing devices are measured as
+before.
+
+Diagnostics is not a trust kind, so this does not involve the split activation
+predicate and cannot enroll, authenticate or grant. The alignment self-test
+checks model determinism on any detected face frame; it stays on the standing
+RGB device with its own single-endpoint lease and never opens a split pair's
+other side. The liveness self-test keeps refusing a selected split until a
+separate change routes it to `Engine::assess_split_in_operation`.
+
+An attended check on archhost on 2026-10-07 ran the same measurement through
+the release `split_capture_probe --rate-diagnostics` (no `test-support`) in the
+offline container with only the camera nodes passed in, after pausing the
+installed daemon and the CI runner. BRIO RGB with NexiGo IR and NexiGo RGB with
+BRIO IR each reported both roles `measured` above their floors with no drops or
+sequence gaps, and the IR side's illumination metadata present with lit and
+dark frames observed. Both reservations were released; formats and backlight
+compensation of every node matched before and after; the services returned
+active. No images were saved and no account state was mounted. This qualifies
+the diagnostic measurement on those connections, not split authentication.

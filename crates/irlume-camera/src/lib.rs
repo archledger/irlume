@@ -6893,9 +6893,9 @@ pub struct IrCamera {
     requested_interval: frame_interval::FrameInterval,
     accepted_interval: frame_interval::FrameInterval,
     /// ADR-0031 §4's fd-bound format evidence, bound at open for an attested
-    /// YUYV node and re-read by every stream this camera opens (#887). No
-    /// ceiling follows from it yet; without it the camera captures as it
-    /// always has.
+    /// YUYV node and re-read by every stream this camera opens (#887). It
+    /// also seeds each session's content latch. No ceiling follows from it
+    /// yet; without it the camera captures as it always has.
     format_evidence: Option<yuyv_fd::FormatEvidence>,
     width: u32,
     height: u32,
@@ -7220,6 +7220,10 @@ impl IrCamera {
             cam: self,
             stream,
             dec: IrDecoder::new(self.pix, self.quantization),
+            content: self
+                .format_evidence
+                .as_ref()
+                .map(|evidence| yuyv_exposure::YuyvContentLatch::new(*evidence.raw())),
             lit: mode.lit(),
             _mode: mode,
             meta,
@@ -7267,6 +7271,11 @@ pub struct IrSession<'a> {
     /// down. Recovery must open a fresh stream before capture can resume.
     stream: TrackedStream<SafeStream<'a>>,
     dec: IrDecoder,
+    /// ADR-0031 §4's footroom and chroma latch, built once from the camera's
+    /// fd evidence and `None` without it. Every frame a burst dequeues is
+    /// offered to it before decode; recovery and privacy teardown keep it,
+    /// unlike `dec`. It only refuses, and nothing reads it until the ceiling.
+    content: Option<yuyv_exposure::YuyvContentLatch>,
     lit: bool,
     /// The camera's own per-frame illumination reporting, when it has any.
     /// `None` means this camera cannot say, and brightness decides as before.
@@ -7387,6 +7396,7 @@ impl IrSession<'_> {
         .map_err(|error| map_io(device, error))?;
         let stream = &mut self.stream;
         let dec = &mut self.dec;
+        let content = &mut self.content;
         // The emitter may STROBE (pulse), so grab a burst and keep the brightest
         // frame, the lit strobe phase (linhello lesson). Keep every frame so the
         // optional ambient subtraction below can pair the lit frame with an
@@ -7438,6 +7448,12 @@ impl IrSession<'_> {
             // against a 67ms frame interval.
             if let Some(log) = meta.as_mut() {
                 log.drain();
+            }
+            if let Some(newly) = content.as_mut().and_then(|latch| latch.observe(buf)) {
+                irlume_common::dlog!(
+                    "[ir] {}: YUYV content latch refuses this session: {newly}",
+                    camera_text(device)
+                );
             }
             let data = dec.decode(buf, w, h);
             means.push(data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64);
@@ -12713,6 +12729,105 @@ mod tests {
                  bind_format_evidence(device, &dev, &fmt)"
             ),
             "the open must bind only for an attested YUYV negotiation"
+        );
+    }
+
+    /// ADR-0031 §4 (Amendment 2026-10-07, session content latch): the
+    /// latch is session state outside the decoder, built once from the
+    /// camera's fd evidence and never reassigned, so later captures,
+    /// `recover()` and a privacy teardown keep it. Recovery needs a held
+    /// camera to reach, so the lifetime is pinned by shape; the latch's own
+    /// rules run in `yuyv_exposure`'s tests.
+    #[test]
+    fn the_yuyv_content_latch_lives_on_the_session_and_outlives_recovery() {
+        let lib = include_str!("lib.rs");
+        let production = &lib[..lib
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the tests module moved; update this test")];
+        let compact = |text: &str| text.split_whitespace().collect::<String>();
+        assert!(
+            source_body(production, "\npub struct IrSession<'a> {")
+                .contains("\n    content: Option<yuyv_exposure::YuyvContentLatch>,\n"),
+            "the session must hold the content latch"
+        );
+        assert_eq!(
+            production.matches(" IrSession {\n").count(),
+            1,
+            "one IrSession literal"
+        );
+        assert!(
+            compact(source_body(production, "\nimpl IrCamera {")).contains(
+                "content:self.format_evidence.as_ref().map(|evidence|\
+                 yuyv_exposure::YuyvContentLatch::new(*evidence.raw())),"
+            ),
+            "the session must build its latch from the camera's fd evidence"
+        );
+        assert_eq!(
+            production.matches("self.content").count(),
+            1,
+            "only the burst borrows the latch; nothing reassigns or clears it"
+        );
+        let session = &production[production
+            .find("\nimpl IrSession<'_> {")
+            .expect("impl IrSession moved; update this test")..];
+        let method = |signature: &str| {
+            let start = session
+                .find(signature)
+                .unwrap_or_else(|| panic!("IrSession {signature} moved; update this test"));
+            let end = session[start..]
+                .find("\n    }\n")
+                .expect("a method that ends at column 4");
+            &session[start..start + end]
+        };
+        for signature in [
+            "pub fn recover(&mut self)",
+            "fn stop_after_privacy_refusal(",
+        ] {
+            assert!(
+                !method(signature).contains("content"),
+                "{signature} must keep the session's content latch"
+            );
+        }
+    }
+
+    /// Every frame a capture's burst dequeues reaches the session's content
+    /// latch before it is decoded, so a violation in a frame the gate
+    /// selection passes over, or after which the burst ends early, still
+    /// latches (ADR-0031 §4, Amendment 2026-10-07).
+    #[test]
+    fn every_ir_burst_frame_reaches_the_content_latch_before_decode() {
+        let lib = include_str!("lib.rs");
+        let session = &lib[lib
+            .find("\nimpl IrSession<'_> {")
+            .expect("impl IrSession moved; update this test")..];
+        let start = session
+            .find("fn capture_with_stats_inner(")
+            .expect("capture_with_stats_inner moved; update this test");
+        let end = session[start..]
+            .find("\n    }\n")
+            .expect("a method that ends at column 4");
+        let capture = &session[start..start + end];
+        assert!(
+            capture.contains("let content = &mut self.content;"),
+            "the burst must borrow the session's latch"
+        );
+        let mut from = 0;
+        for step in [
+            "for _ in 0..IR_BURST {",
+            "stream.next()",
+            "latch.observe(buf)",
+            "dec.decode(buf, w, h)",
+            "if let Some(w) = white_level",
+        ] {
+            let at = capture[from..]
+                .find(step)
+                .unwrap_or_else(|| panic!("{step} is missing or out of order"));
+            from += at + step.len();
+        }
+        assert_eq!(
+            capture.matches("observe(").count(),
+            1,
+            "one observation per dequeued frame"
         );
     }
 
@@ -18599,6 +18714,24 @@ mod tests {
         // Grey16 goes through the depth-estimating converter.
         let buf: Vec<u8> = [1023u16, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
         assert_eq!(decode_ir(&buf, IrPixel::Grey16, 2, 1), vec![255, 0]);
+    }
+
+    /// The limited-to-full expansion stays unwired (ADR-0031 §4, Amendment
+    /// 2026-10-07): a YUYV session decodes the raw luma bytes under every
+    /// reported quantization and still claims no ceiling.
+    #[test]
+    fn a_yuyv_session_still_decodes_raw_luma() {
+        let payload: Vec<u8> = (0..=u8::MAX).flat_map(|luma| [luma, 128]).collect();
+        let raw: Vec<u8> = (0..=u8::MAX).collect();
+        for quantization in [
+            Quantization::Default,
+            Quantization::FullRange,
+            Quantization::LimitedRange,
+        ] {
+            let mut session = IrDecoder::new(IrPixel::YuyvLuma, quantization);
+            assert_eq!(session.decode(&payload, 256, 1), raw, "{quantization:?}");
+            assert_eq!(session.white_level(), None, "{quantization:?}");
+        }
     }
 
     #[test]

@@ -217,6 +217,8 @@ Amendment 2026-10-06 below fixes the metadata domain and preliminary
 footroom and chroma bounds for these conditions, refuses XV601 and XV709
 under either quantization, and adds no ceiling. Amendment 2026-10-07
 binds the first two conditions to the open file descriptor, again without
+a ceiling. A second amendment of that date latches the footroom and
+chroma conditions for the session and fixes the expansion, still without
 a ceiling.
 
 Measured on the T480 (5986:1141) by @maurerr, the reporter of #887:
@@ -482,3 +484,65 @@ file descriptor (`crates/irlume-camera/src/yuyv_fd.rs`).
 
 Binding is not a ceiling and not a grant. The session latch, the burst's
 emitter alternation and the limited-to-full expansion remain.
+
+## Amendment 2026-10-07: session content latch and fixed expansion
+
+#887. §4 stays pending: `clipping_white_level` still answers `None` for
+YUYV luma, and every credential-releasing attempt on a YUYV IR stream
+still refuses. This amendment settles what the 2026-10-06 amendment left
+open: which frames feed the latch, and how expansion rounds.
+
+- **Scope.** An `IrSession` whose camera holds fd-bound format evidence
+  keeps one content latch (`crates/irlume-camera/src/yuyv_exposure.rs`)
+  for the session's life. GREY, the Y16 family, NV12, unattested YUYV and
+  an attested camera whose binding refused have no evidence and no latch.
+- **Frames judged.** Every frame a capture's burst dequeues is inspected
+  before it is decoded: up to 10 per capture, including frames the gate
+  selection passes over and the ambient partner. Warm-up, the startup
+  flush, the delivered-rate fill and its probe, the refill after a
+  recovery, the paired concurrent fill and the paired tail drains discard
+  their frames undecoded and are not inspected; the latch does not claim
+  them.
+- **Per frame.** Footroom and flat chroma as the 2026-10-06 amendment
+  defines them, on raw bytes before any expansion, over the frame's
+  `2 * width * height` image bytes. A payload of any other length latches
+  a refusal of its own, and its image bytes are still judged: uvcvideo
+  sizes an uncompressed frame at `bpp * width * height / 8`, which is the
+  image at the `2 * width` stride the layout requires, and flags a buffer
+  of any other length as an error (Linux v7.2 `uvc_driver.c` L299-301,
+  `uvc_video.c` L214-218 and L1535-1541). A frame whose format has no
+  tight YUYV layout also latches a refusal.
+- **Delivery faults.** A buffer flagged `V4L2_BUF_FLAG_ERROR`, which
+  uvcvideo delivers by default (`nodrop` is 1, v7.2 `uvc_driver.c` L35,
+  `uvc_queue.c` L359-366), exposes no payload and fails its capture, and
+  a frame the kernel drops leaves only a sequence gap; neither can be
+  inspected. The latch only refuses, so a gap or discontinuity never
+  exempts the frames around it. Requiring a gap-free burst belongs to the
+  burst proof and the ceiling.
+- **Lifetime.** A violation latches at the frame that shows it, even when
+  that capture later fails, and holds through later captures, `recover()`
+  and a privacy teardown until the session ends. A new session starts
+  with an empty latch, which is the absence of a refusal, not proof.
+- **Output.** The latch answers a refusal or nothing: no ceiling, no
+  clipping level, and nothing consumes it yet. With `IRLUME_LOG=debug`
+  the frame that first latches each reason logs the reason's name,
+  without pixel values.
+- **Expansion.** Limited to full luma is fixed: `0` for `Y <= 16`, `255`
+  for `Y >= 235`, and `round((Y - 16) * 255 / 219)` between, which never
+  lands on a half because 219 is odd. It equals FFmpeg n9.0.2's
+  limited-to-full conversion of YUYV luma on all 256 codes; the 298/256
+  approximation and libyuv's BT.601 constants read 8 and 10 codes one
+  low. `E(234) = 254`, and `E(Y) = 255` exactly when `Y >= 235`. The
+  function is pure and unwired: decoding YUYV through it now would move
+  IR face detection, the gate frame and the enrollment preflight's lit
+  test (raw face means from 40 to about 50 would read dark), changing
+  denial kinds and the RGB-only enrollment choice while credential
+  release still refuses. The ceiling change wires it after the latch and
+  the burst proof, and keeps the content checks and the optical means on
+  raw bytes.
+
+Synthetic tests check the latch and every input of the expansion, and
+source-shape tests pin that each burst frame reaches the latch before
+decode and that recovery keeps it. No real-kernel lane streams attested
+YUYV (the loopback feeder is GREY), so the T480 still needs attended
+qualification. The burst's emitter alternation and the ceiling remain.

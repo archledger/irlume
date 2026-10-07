@@ -2,20 +2,22 @@
 // Copyright the irlume contributors.
 
 //! ADR-0031 §4 prerequisite facts for YUYV luma: the reported range of a raw
-//! single-planar format and one frame's footroom and chroma. Pure. It yields
-//! no ceiling and no attestation, and `clipping_white_level` stays `None` for
+//! single-planar format, one frame's footroom and chroma, the session latch
+//! over them and the fixed limited-to-full luma expansion. Pure. It yields no
+//! ceiling and no attestation, and `clipping_white_level` stays `None` for
 //! YUYV.
 //!
 //! Discriminants always come from the generated `v4l::v4l_sys` constants. No
 //! raw value is converted to an enum: unknown and unsupported values stay
-//! unresolved and refuse. Nothing here opens a device, logs or keeps state
-//! between frames: `yuyv_fd` reads the format from the fd, and the session
-//! latch and limited-to-full expansion are later changes.
+//! unresolved and refuse. Nothing here opens a device or logs: `yuyv_fd`
+//! reads the format from the fd, and `IrSession` offers the latch every frame
+//! its bursts dequeue. The latch only refuses and nothing reads it yet; the
+//! expansion has no caller until the ceiling.
 #![cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "ADR-0031 §4 pure prerequisite; the frame checks gain a production caller with the session latch"
+        reason = "ADR-0031 §4 pure prerequisite; exposure_prerequisite and the limited-to-full expansion gain a production caller with the ceiling"
     )
 )]
 
@@ -119,9 +121,9 @@ pub(crate) const FOOTROOM_PIXELS_PER_ALLOWED_LOW: usize = 200;
 /// uncalibrated (ADR-0031, Amendment 2026-10-06).
 pub(crate) const MAX_COMBINED_CHROMA_SPAN: u8 = 2;
 
-/// Footroom and chroma facts of one validated YUYV frame. Only
-/// `inspect_yuyv_frame` builds one, so its counts always describe a whole
-/// image of at least one macropixel.
+/// Footroom and chroma facts of one validated YUYV frame. Only `scan_image`
+/// builds one, from an image the tight layout defines, so its counts always
+/// describe a whole image of at least one macropixel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct YuyvFrameFacts {
     pixels: usize,
@@ -366,11 +368,7 @@ pub(crate) fn inspect_yuyv_frame(
     mapped: &[u8],
     metadata: &v4l::buffer::Metadata,
 ) -> Result<YuyvFrameFacts, YuyvFrameError> {
-    if raw.buffer_type != v4l_sys::v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE || raw.fourcc != YUYV {
-        return Err(YuyvFrameError::NotYuyv);
-    }
-    let layout = PayloadLayout::new(YUYV, raw.width, raw.height, raw.bytesperline)
-        .map_err(YuyvFrameError::Layout)?;
+    let layout = yuyv_layout(raw)?;
     let (payload, _) =
         crate::validate_dequeued(mapped, metadata, layout).map_err(YuyvFrameError::Dequeue)?;
     // `validate_dequeued` already refused a payload shorter than the image;
@@ -383,6 +381,30 @@ pub(crate) fn inspect_yuyv_frame(
             },
         )));
     };
+    scan_image(image)
+}
+
+/// The tight layout of `raw`'s image, before any byte is read.
+///
+/// # Errors
+///
+/// Returns `YuyvFrameError::NotYuyv` when `raw` is not a single-planar
+/// capture YUYV format, and the existing layout refusal unchanged.
+fn yuyv_layout(raw: &RawYuyvFormat) -> Result<PayloadLayout, YuyvFrameError> {
+    if raw.buffer_type != v4l_sys::v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE || raw.fourcc != YUYV {
+        return Err(YuyvFrameError::NotYuyv);
+    }
+    PayloadLayout::new(YUYV, raw.width, raw.height, raw.bytesperline)
+        .map_err(YuyvFrameError::Layout)
+}
+
+/// Footroom and chroma facts of `image`, which the caller has already cut to
+/// the layout's image bytes.
+///
+/// # Errors
+///
+/// Returns `YuyvFrameError::LumaSumOverflow` if the raw luma sum overflows.
+fn scan_image(image: &[u8]) -> Result<YuyvFrameFacts, YuyvFrameError> {
     let mut below_15 = 0_usize;
     let mut raw_luma_sum = 0_u64;
     let (mut u_min, mut u_max) = (u8::MAX, u8::MIN);
@@ -424,6 +446,169 @@ pub(crate) fn exposure_prerequisite(
         metadata: limited_range_eligibility(raw).err(),
         footroom_violated: facts.footroom_violated(),
         chroma_not_flat: !facts.chroma_flat(),
+    }
+}
+
+/// Why a session's content latch refuses. Each reason is set by the first
+/// frame that shows it and never cleared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ContentRefusal {
+    /// A frame had more than 0.5% of its pixels below raw luma 15.
+    pub(crate) footroom: bool,
+    /// A frame's U and V bytes together spanned more than
+    /// `MAX_COMBINED_CHROMA_SPAN` codes.
+    pub(crate) chroma: bool,
+    /// A payload was not exactly the `2 * width * height` image bytes.
+    pub(crate) payload_length: bool,
+    /// A frame could not be read: the format has no tight single-planar YUYV
+    /// layout, or the raw luma sum overflowed.
+    pub(crate) uninspectable: bool,
+}
+
+impl ContentRefusal {
+    /// No reason set.
+    pub(crate) const NONE: Self = Self {
+        footroom: false,
+        chroma: false,
+        payload_length: false,
+        uninspectable: false,
+    };
+
+    const fn any(self) -> bool {
+        self.footroom || self.chroma || self.payload_length || self.uninspectable
+    }
+
+    const fn union(self, other: Self) -> Self {
+        Self {
+            footroom: self.footroom || other.footroom,
+            chroma: self.chroma || other.chroma,
+            payload_length: self.payload_length || other.payload_length,
+            uninspectable: self.uninspectable || other.uninspectable,
+        }
+    }
+
+    /// The reasons set here and not in `before`.
+    const fn without(self, before: Self) -> Self {
+        Self {
+            footroom: self.footroom && !before.footroom,
+            chroma: self.chroma && !before.chroma,
+            payload_length: self.payload_length && !before.payload_length,
+            uninspectable: self.uninspectable && !before.uninspectable,
+        }
+    }
+}
+
+impl std::fmt::Display for ContentRefusal {
+    /// The set reasons by name, for the debug journal; never a pixel value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reasons = [
+            (self.footroom, "footroom"),
+            (self.chroma, "chroma span"),
+            (self.payload_length, "payload length"),
+            (self.uninspectable, "uninspectable frame"),
+        ];
+        let mut separator = "";
+        for (set, name) in reasons {
+            if set {
+                write!(f, "{separator}{name}")?;
+                separator = ", ";
+            }
+        }
+        Ok(())
+    }
+}
+
+/// ADR-0031 §4's session latch over the footroom and flat-chroma conditions.
+/// `IrSession` holds one for a camera with fd-bound format evidence and
+/// offers it every frame its bursts dequeue, before decode. Nothing resets
+/// it, so a violation holds through later captures and `recover()` until the
+/// session ends. It only refuses: an empty latch is the absence of a refusal,
+/// not proof, and it yields no ceiling.
+#[derive(Debug)]
+pub(crate) struct YuyvContentLatch {
+    /// The fd-bound raw format every frame is read with.
+    raw: RawYuyvFormat,
+    inspected: u64,
+    refused: ContentRefusal,
+}
+
+impl YuyvContentLatch {
+    /// An empty latch for frames of `raw`, the camera's frozen format.
+    pub(crate) const fn new(raw: RawYuyvFormat) -> Self {
+        Self {
+            raw,
+            inspected: 0,
+            refused: ContentRefusal::NONE,
+        }
+    }
+
+    /// Judge one dequeued payload and latch what it shows. Returns only the
+    /// reasons this frame newly latched. It never fails: a frame that cannot
+    /// be read latches `uninspectable` instead.
+    pub(crate) fn observe(&mut self, payload: &[u8]) -> Option<ContentRefusal> {
+        let shown = frame_refusal(&self.raw, payload);
+        self.inspected = self.inspected.saturating_add(1);
+        let newly = shown.without(self.refused);
+        self.refused = self.refused.union(shown);
+        newly.any().then_some(newly)
+    }
+
+    /// Every reason latched so far, or `None` when no frame offered so far
+    /// violated. `None` is not a proof, a ceiling or a clipping level.
+    pub(crate) fn refusal(&self) -> Option<ContentRefusal> {
+        self.refused.any().then_some(self.refused)
+    }
+
+    /// Frames offered so far, readable or not, saturating.
+    pub(crate) const fn inspected(&self) -> u64 {
+        self.inspected
+    }
+}
+
+/// What one payload shows against `raw`'s layout, on raw bytes before any
+/// expansion. A payload other than exactly the image refuses on its own and
+/// its image part is still read; bytes after the image never are.
+fn frame_refusal(raw: &RawYuyvFormat, payload: &[u8]) -> ContentRefusal {
+    let Ok(layout) = yuyv_layout(raw) else {
+        return ContentRefusal {
+            uninspectable: true,
+            ..ContentRefusal::NONE
+        };
+    };
+    let image_bytes = layout.image_bytes();
+    let mut shown = ContentRefusal {
+        payload_length: payload.len() != image_bytes,
+        ..ContentRefusal::NONE
+    };
+    match payload.get(..image_bytes).map(scan_image) {
+        Some(Ok(facts)) => {
+            shown.footroom = facts.footroom_violated();
+            shown.chroma = !facts.chroma_flat();
+        }
+        Some(Err(_)) => shown.uninspectable = true,
+        // Shorter than the image: `payload_length` is already set.
+        None => {}
+    }
+    shown
+}
+
+/// Limited-range raw luma expanded to full range: 0 for `y <= 16`, 255 for
+/// `y >= 235`, and `round((y - 16) * 255 / 219)` between, which never lands
+/// on a half because 219 is odd, so `E(234) = 254`. A fixed map, never
+/// scaled by a frame's own values (ADR-0031 §4, Amendment 2026-10-07).
+///
+/// The content checks run on raw bytes before it, since raw 14, 15 and 16
+/// all expand to 0. Nothing calls it until the ceiling: decoding YUYV
+/// through it now would move IR face detection, the gate frame and the
+/// enrollment preflight's lit test.
+pub(crate) const fn expand_limited_luma(y: u8) -> u8 {
+    if y <= 16 {
+        0
+    } else if y >= 235 {
+        u8::MAX
+    } else {
+        // At most 218 * 510 + 219 = 111,399, whose quotient is 254.
+        (((y - 16) as u32 * 510 + 219) / 438) as u8
     }
 }
 
@@ -1220,6 +1405,367 @@ mod tests {
             let facts = frame(2, 1, &[16, chroma, 16, chroma]);
             assert_eq!(facts.combined_chroma_span(), 0, "chroma {chroma}");
             assert!(facts.chroma_flat(), "chroma {chroma}");
+        }
+    }
+
+    const FOOTROOM: ContentRefusal = ContentRefusal {
+        footroom: true,
+        ..ContentRefusal::NONE
+    };
+    const CHROMA: ContentRefusal = ContentRefusal {
+        chroma: true,
+        ..ContentRefusal::NONE
+    };
+    const FOOTROOM_AND_CHROMA: ContentRefusal = ContentRefusal {
+        footroom: true,
+        chroma: true,
+        ..ContentRefusal::NONE
+    };
+    const PAYLOAD_LENGTH: ContentRefusal = ContentRefusal {
+        payload_length: true,
+        ..ContentRefusal::NONE
+    };
+    const UNINSPECTABLE: ContentRefusal = ContentRefusal {
+        uninspectable: true,
+        ..ContentRefusal::NONE
+    };
+
+    /// A session's latch for `base()` at `width` x `height` with a tight
+    /// stride.
+    fn fresh(width: u32, height: u32) -> YuyvContentLatch {
+        YuyvContentLatch::new(with(|raw| {
+            raw.width = width;
+            raw.height = height;
+            raw.bytesperline = 2 * width;
+        }))
+    }
+
+    /// A `width` x `height` image of raw luma `luma` and constant chroma
+    /// `chroma` in both U and V.
+    fn flat_bytes(width: usize, height: usize, luma: u8, chroma: u8) -> Vec<u8> {
+        [luma, chroma].repeat(width * height)
+    }
+
+    /// An emitter-off frame as §4 records the T480's: raw luma cycling
+    /// through 16 to 20 and chroma 137, with raw luma 10 at each listed pixel.
+    fn dark_bytes(width: usize, height: usize, low_pixels: &[usize]) -> Vec<u8> {
+        let mut bytes: Vec<u8> = (16_u8..=20)
+            .cycle()
+            .take(width * height)
+            .flat_map(|luma| [luma, 137])
+            .collect();
+        for &pixel in low_pixels {
+            bytes[2 * pixel] = 10;
+        }
+        bytes
+    }
+
+    /// `count` pixel indexes spread across an image, 199 apart.
+    fn spread(count: usize) -> Vec<usize> {
+        (0..count).map(|i| i * 199).collect()
+    }
+
+    #[test]
+    fn k01_a_new_latch_holds_no_refusal() {
+        let latch = fresh(2, 1);
+        assert_eq!(latch.refusal(), None);
+        assert_eq!(latch.inspected(), 0);
+    }
+
+    #[test]
+    fn k02_exactly_half_a_percent_keeps_the_latch_clear() {
+        let mut one = fresh(100, 2);
+        assert_eq!(one.observe(&luma_bytes(100, 2, 16, &[57])), None);
+        assert_eq!(one.refusal(), None);
+        let mut two = fresh(100, 2);
+        assert_eq!(
+            two.observe(&luma_bytes(100, 2, 16, &[3, 150])),
+            Some(FOOTROOM)
+        );
+        assert_eq!(two.refusal(), Some(FOOTROOM));
+        // 340x340 is 115,600 pixels, which allow 578 low ones.
+        let mut at = fresh(340, 340);
+        assert_eq!(at.observe(&luma_bytes(340, 340, 16, &spread(578))), None);
+        assert_eq!(at.refusal(), None);
+        let mut above = fresh(340, 340);
+        assert_eq!(
+            above.observe(&luma_bytes(340, 340, 16, &spread(579))),
+            Some(FOOTROOM)
+        );
+        assert_eq!(above.refusal(), Some(FOOTROOM));
+    }
+
+    #[test]
+    fn k03_raw_14_counts_and_raw_15_and_16_do_not() {
+        for luma in [15, 16] {
+            let mut latch = fresh(100, 2);
+            assert_eq!(
+                latch.observe(&luma_bytes(100, 2, luma, &[])),
+                None,
+                "luma {luma}"
+            );
+            assert_eq!(latch.refusal(), None, "luma {luma}");
+        }
+        let mut latch = fresh(100, 2);
+        assert_eq!(latch.observe(&luma_bytes(100, 2, 14, &[])), Some(FOOTROOM));
+        assert_eq!(latch.refusal(), Some(FOOTROOM));
+    }
+
+    #[test]
+    fn k04_a_violation_in_an_unselected_dark_frame_latches() {
+        let (width, height) = (20, 10);
+        // Lit and dark frames alternate; dark frame 1 has 4 of its 200 pixels
+        // (2%) at raw luma 10.
+        let burst: Vec<Vec<u8>> = (0..10)
+            .map(|i| match i {
+                1 => dark_bytes(width, height, &[0, 50, 100, 150]),
+                i if i % 2 == 1 => dark_bytes(width, height, &[]),
+                _ => flat_bytes(width, height, 120, 128),
+            })
+            .collect();
+        let means: Vec<f64> = burst
+            .iter()
+            .map(|frame| {
+                let luma = crate::decode_ir(frame, crate::IrPixel::YuyvLuma, 20, 10);
+                luma.iter().map(|&y| f64::from(y)).sum::<f64>() / luma.len() as f64
+            })
+            .collect();
+        let selected = crate::ir_metadata::best_gate_frame(&means, &[None; 10], None)
+            .expect("a burst always has a gate frame");
+        assert_eq!(
+            selected % 2,
+            0,
+            "the gate frame is a lit one, not {selected}"
+        );
+        let mut alone = fresh(20, 10);
+        assert_eq!(alone.observe(&burst[selected]), None);
+        assert_eq!(alone.refusal(), None);
+        let mut session = fresh(20, 10);
+        for frame in &burst {
+            session.observe(frame);
+        }
+        assert_eq!(session.refusal(), Some(FOOTROOM));
+        assert_eq!(session.inspected(), 10);
+    }
+
+    #[test]
+    fn k05_later_frames_and_captures_never_clear_the_latch() {
+        let clean = luma_bytes(100, 2, 16, &[]);
+        let violating = luma_bytes(100, 2, 16, &[3, 150]);
+        let mut latch = fresh(100, 2);
+        assert_eq!(latch.observe(&clean), None);
+        assert_eq!(latch.refusal(), None);
+        assert_eq!(latch.observe(&violating), Some(FOOTROOM));
+        // Three more 10-frame captures, every frame clean.
+        for capture in 0..3 {
+            for frame in 0..10 {
+                assert_eq!(latch.observe(&clean), None);
+                assert_eq!(
+                    latch.refusal(),
+                    Some(FOOTROOM),
+                    "capture {capture} frame {frame}"
+                );
+            }
+        }
+        assert_eq!(latch.inspected(), 32);
+    }
+
+    #[test]
+    fn k06_chroma_is_judged_within_each_frame() {
+        let mut apart = fresh(2, 1);
+        assert_eq!(apart.observe(&[16, 40, 16, 40]), None);
+        assert_eq!(apart.observe(&[16, 200, 16, 200]), None);
+        assert_eq!(apart.refusal(), None, "frames are never pooled");
+        // §4's T480 pattern: lit frames at 128, dark frames at 137 to 138.
+        let mut t480 = fresh(2, 1);
+        assert_eq!(t480.observe(&[120, 128, 121, 128]), None);
+        assert_eq!(t480.observe(&[17, 137, 18, 138]), None);
+        assert_eq!(t480.refusal(), None);
+        let mut two = fresh(2, 1);
+        assert_eq!(two.observe(&[16, 100, 16, 102]), None);
+        assert_eq!(two.refusal(), None);
+        let mut three = fresh(2, 1);
+        assert_eq!(three.observe(&[16, 100, 16, 103]), Some(CHROMA));
+        assert_eq!(three.refusal(), Some(CHROMA));
+        for (channel, bytes) in [
+            ("U", [16, 100, 16, 100, 16, 103, 16, 100]),
+            ("V", [16, 100, 16, 100, 16, 100, 16, 103]),
+        ] {
+            let mut latch = fresh(4, 1);
+            assert_eq!(latch.observe(&bytes), Some(CHROMA), "{channel} only");
+            assert_eq!(latch.refusal(), Some(CHROMA), "{channel} only");
+        }
+    }
+
+    #[test]
+    fn k07_reasons_latch_independently_and_accumulate() {
+        let footroom = [14, 128, 14, 128];
+        let chroma = [16, 100, 16, 103];
+        for order in [[footroom, chroma], [chroma, footroom]] {
+            let mut latch = fresh(2, 1);
+            for frame in order {
+                latch.observe(&frame);
+            }
+            assert_eq!(latch.refusal(), Some(FOOTROOM_AND_CHROMA), "{order:?}");
+        }
+    }
+
+    #[test]
+    fn k08_a_payload_other_than_the_image_latches_its_own_refusal() {
+        let mut exact = fresh(2, 1);
+        assert_eq!(exact.observe(&L01), None);
+        assert_eq!(exact.refusal(), None);
+        // Read as image, the surplus would fail footroom and chroma too.
+        let mut surplus = fresh(2, 1);
+        assert_eq!(
+            surplus.observe(&[16, 128, 235, 128, 0, 0, 0, 255]),
+            Some(PAYLOAD_LENGTH)
+        );
+        assert_eq!(surplus.refusal(), Some(PAYLOAD_LENGTH));
+        // Surplus never dilutes the image: 2 of its 200 pixels are low, 2 of
+        // 400 would pass.
+        let mut diluted = fresh(100, 2);
+        let mut bytes = luma_bytes(100, 2, 16, &[3, 150]);
+        bytes.extend(luma_bytes(100, 2, 16, &[]));
+        let both = ContentRefusal {
+            footroom: true,
+            payload_length: true,
+            ..ContentRefusal::NONE
+        };
+        assert_eq!(diluted.observe(&bytes), Some(both));
+        assert_eq!(diluted.refusal(), Some(both));
+        let mut short = fresh(2, 1);
+        assert_eq!(short.observe(&[16, 128, 235]), Some(PAYLOAD_LENGTH));
+        assert_eq!(short.observe(&[]), None);
+        assert_eq!(short.refusal(), Some(PAYLOAD_LENGTH));
+        assert_eq!(short.inspected(), 2);
+    }
+
+    #[test]
+    fn k09_an_unreadable_frame_latches_uninspectable() {
+        let unreadable = [
+            with(|raw| raw.fourcc = *b"GREY"),
+            with(|raw| raw.buffer_type = CAPTURE_MPLANE),
+            with(|raw| {
+                raw.width = 3;
+                raw.bytesperline = 6;
+            }),
+            with(|raw| raw.width = 0),
+            with(|raw| raw.bytesperline = 6),
+        ];
+        for raw in unreadable {
+            let mut latch = YuyvContentLatch::new(raw);
+            assert_eq!(latch.observe(&L01), Some(UNINSPECTABLE), "{raw:?}");
+            assert_eq!(latch.observe(&[]), None, "{raw:?}");
+            assert_eq!(latch.refusal(), Some(UNINSPECTABLE), "{raw:?}");
+            assert_eq!(latch.inspected(), 2, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn k10_observe_reports_each_reason_once() {
+        let mut latch = fresh(2, 1);
+        assert_eq!(latch.observe(&L01), None);
+        assert_eq!(latch.observe(&[14, 128, 14, 128]), Some(FOOTROOM));
+        assert_eq!(latch.observe(&[14, 128, 14, 128]), None);
+        assert_eq!(latch.observe(&[14, 100, 14, 103]), Some(CHROMA));
+        assert_eq!(latch.observe(&[14, 100, 14, 103]), None);
+        assert_eq!(latch.refusal(), Some(FOOTROOM_AND_CHROMA));
+    }
+
+    #[test]
+    fn k11_each_session_starts_its_own_latch() {
+        let mut first = fresh(2, 1);
+        assert_eq!(first.observe(&[14, 128, 14, 128]), Some(FOOTROOM));
+        assert_eq!(first.refusal(), Some(FOOTROOM));
+        let second = fresh(2, 1);
+        assert_eq!(second.refusal(), None);
+        assert_eq!(second.inspected(), 0);
+    }
+
+    #[test]
+    fn k12_the_journal_names_reasons_without_measurements() {
+        assert_eq!(FOOTROOM.to_string(), "footroom");
+        assert_eq!(FOOTROOM_AND_CHROMA.to_string(), "footroom, chroma span");
+        let every = ContentRefusal {
+            footroom: true,
+            chroma: true,
+            payload_length: true,
+            uninspectable: true,
+        };
+        assert_eq!(
+            every.to_string(),
+            "footroom, chroma span, payload length, uninspectable frame"
+        );
+    }
+
+    #[test]
+    fn x01_expansion_matches_exact_rounding_on_every_input() {
+        for y in 0..=u8::MAX {
+            // `(Y - 16) * 255 / 219` never lands on a half: 510 * (Y - 16) is
+            // even and 219 is odd, so the f64 rounding mode cannot matter.
+            if (16..=235).contains(&y) {
+                assert_ne!(510 * (u32::from(y) - 16) % 438, 219, "Y {y}");
+            }
+            let exact = ((f64::from(y) - 16.0) * 255.0 / 219.0)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            assert_eq!(expand_limited_luma(y), exact, "Y {y}");
+        }
+    }
+
+    #[test]
+    fn x02_expansion_endpoints_and_footroom() {
+        for (y, expanded) in [
+            (0, 0),
+            (14, 0),
+            (15, 0),
+            (16, 0),
+            (17, 1),
+            (40, 28),
+            (50, 40),
+            (234, 254),
+            (235, 255),
+            (255, 255),
+        ] {
+            assert_eq!(expand_limited_luma(y), expanded, "Y {y}");
+        }
+        for y in 0..=u8::MAX {
+            assert_eq!(expand_limited_luma(y) == 255, y >= 235, "Y {y}");
+            assert_eq!(expand_limited_luma(y) == 0, y <= 16, "Y {y}");
+        }
+        for y in 111..=116 {
+            assert_eq!(expand_limited_luma(y), y, "Y {y} is a fixed point");
+        }
+    }
+
+    #[test]
+    fn x03_expansion_is_monotone() {
+        for y in 0..u8::MAX {
+            let (low, high) = (expand_limited_luma(y), expand_limited_luma(y + 1));
+            assert!(low <= high, "Y {y}");
+            assert!(high - low <= 2, "Y {y}");
+        }
+    }
+
+    #[test]
+    fn x04_expansion_does_not_round_low_like_298_over_256() {
+        for (y, expanded) in [
+            (86, 82),
+            (147, 153),
+            (153, 160),
+            (159, 167),
+            (214, 231),
+            (220, 238),
+            (226, 245),
+            (232, 252),
+        ] {
+            assert_eq!(expand_limited_luma(y), expanded, "Y {y}");
+            assert_eq!(
+                ((u32::from(y) - 16) * 298 + 128) >> 8,
+                u32::from(expanded) - 1,
+                "298/256 reads Y {y} one low"
+            );
         }
     }
 }

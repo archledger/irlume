@@ -492,6 +492,15 @@ the MS-XU illumination stream state (#568). Runs through the daemon: one
 bounded, gated capture per present role. No device path, account identity, or
 template data is exposed.
 
+The configured pair is the daemon's standing camera pair, unless a split pair
+(an administrator-authorized RGB camera and IR camera on separate USB devices,
+ADR-0032) is the saved selection and no `IRLUME_RGB_DEVICE`/`IRLUME_IR_DEVICE`
+override is set. Then both sides of the selected pair are measured, RGB then
+IR, under one split diagnostic operation, never the RGB camera the daemon
+would otherwise fall back to. A selected pair that is not connected reports
+both roles `"missing"`; a split configuration that cannot be verified reports
+both roles `"unknown"`, and no camera is opened. Both carry `known: true`.
+
 ```json
 {
   "rgb": { "known": true, "state": "measured", "evidence": { ... } },

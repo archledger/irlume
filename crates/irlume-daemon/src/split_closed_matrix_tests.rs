@@ -5,12 +5,13 @@
 // case 15, plan W4). With a saved selected split and no admission token,
 // elevation, app-consent and login `Authenticate`, `UnsealPassword`,
 // `SupportProbe`, `TuneCaptureMode`, `CaptureModeStatus` and the liveness
-// `SelfTest` never lease or open either side. `CameraDiagnostics` and the
-// alignment `SelfTest` keep their existing diagnostic gate (ADR-0032,
-// guarded split operation-choice amendment): they act on the standing
-// device with at most one single-endpoint Capture lease, never a split
-// lease, a trust kind or both sides. No row grants, releases or writes
-// trust or qualification. The enrollment, identify, position and
+// `SelfTest` never lease or open either side. `CameraDiagnostics` measures
+// the selected pair under one split Diagnostics operation, never a trust
+// kind (ADR-0032, selection-aware diagnostics amendment). The alignment
+// `SelfTest` checks model determinism on any face frame and keeps the
+// standing device, with at most one single-endpoint Capture lease, never a
+// split lease or both sides. No row grants, releases or writes trust or
+// qualification. The enrollment, identify, position and
 // unlock-service rows live in `request_preparation_tests.rs`.
 
 mod split_closed_matrix {
@@ -72,7 +73,13 @@ mod split_closed_matrix {
             }],
         };
         Guard::install(&[
-            camera("/devices/split-closed/rgb", "1234:0001:rgb", 8, RGB, *b"YUYV"),
+            camera(
+                "/devices/split-closed/rgb",
+                "1234:0001:rgb",
+                8,
+                RGB,
+                *b"YUYV",
+            ),
             camera("/devices/split-closed/ir", "1234:0002:ir", 5, IR, *b"GREY"),
         ])
         .unwrap()
@@ -109,6 +116,27 @@ mod split_closed_matrix {
         calls.is_empty() || calls == [lease, Call::OpenRgb(RGB.into())]
     }
 
+    /// What the selection-aware diagnostics do for the selected split: one
+    /// split Diagnostics operation over both original sides, RGB then IR.
+    fn split_diagnostic(calls: &[Call]) -> bool {
+        let lease = Call::Lease {
+            endpoints: vec![RGB.into(), IR.into()],
+            kind: CameraOperationKind::Diagnostics,
+        };
+        calls == [lease, Call::OpenRgb(RGB.into()), Call::OpenIr(IR.into())]
+    }
+
+    /// What one row may do at the camera boundary.
+    #[derive(Clone, Copy)]
+    enum Expect {
+        /// Lease and open nothing.
+        Nothing,
+        /// [`standing_diagnostic`].
+        Standing,
+        /// [`split_diagnostic`].
+        SplitDiagnostics,
+    }
+
     fn authenticate(user: &str, service: &str) -> Request {
         Request::Authenticate {
             structured_errors: false,
@@ -143,29 +171,41 @@ mod split_closed_matrix {
             emit_record_path: None,
         };
         let self_test = |kind| Request::SelfTest { kind };
-        // (row, a diagnostic entry on the standing device, request)
+        // (row, what it may do at the camera boundary, request)
         let requests = [
-            ("elevation", false, authenticate(&user, "sudo")),
-            ("app consent", false, authenticate(&user, "polkit-1")),
-            ("login", false, authenticate(&user, "login")),
-            ("unseal", false, unseal),
-            ("support probe", false, Request::SupportProbe { since_ms: 0 }),
-            ("tune", false, tune),
-            ("capture mode", false, Request::CaptureModeStatus),
+            ("elevation", Expect::Nothing, authenticate(&user, "sudo")),
+            (
+                "app consent",
+                Expect::Nothing,
+                authenticate(&user, "polkit-1"),
+            ),
+            ("login", Expect::Nothing, authenticate(&user, "login")),
+            ("unseal", Expect::Nothing, unseal),
+            (
+                "support probe",
+                Expect::Nothing,
+                Request::SupportProbe { since_ms: 0 },
+            ),
+            ("tune", Expect::Nothing, tune),
+            ("capture mode", Expect::Nothing, Request::CaptureModeStatus),
             (
                 "liveness self-test",
-                false,
+                Expect::Nothing,
                 self_test(irlume_common::SelfTestKind::Liveness),
             ),
-            ("diagnostics", true, Request::CameraDiagnostics),
+            (
+                "diagnostics",
+                Expect::SplitDiagnostics,
+                Request::CameraDiagnostics,
+            ),
             (
                 "alignment self-test",
-                true,
+                Expect::Standing,
                 self_test(irlume_common::SelfTestKind::AlignmentIdentity),
             ),
         ];
         let mut seen = 0;
-        for (row, diagnostic, request) in requests {
+        for (row, expect, request) in requests {
             let response = dispatch(request, &peer(0), &mut engine);
             assert!(!is_face_grant(&response), "{row}: {response:?}");
             assert!(
@@ -174,17 +214,21 @@ mod split_closed_matrix {
             );
             let calls = recorder.calls()[seen..].to_vec();
             seen += calls.len();
-            if diagnostic {
-                assert!(
-                    standing_diagnostic(&calls),
-                    "{row}: a diagnostic entry stays on the standing device: {calls:?} -> {response:?}"
-                );
-            } else {
-                assert!(
+            match expect {
+                Expect::Nothing => assert!(
                     calls.is_empty(),
                     "{row}: a selected split leases and opens nothing while activation is closed: \
                      {calls:?} -> {response:?}"
-                );
+                ),
+                Expect::Standing => assert!(
+                    standing_diagnostic(&calls),
+                    "{row}: a diagnostic entry stays on the standing device: {calls:?} -> {response:?}"
+                ),
+                Expect::SplitDiagnostics => assert!(
+                    split_diagnostic(&calls),
+                    "{row}: diagnostics measure the selected pair under one split Diagnostics \
+                     operation: {calls:?} -> {response:?}"
+                ),
             }
         }
         assert_eq!(std::fs::read(&account).unwrap(), enrolled);

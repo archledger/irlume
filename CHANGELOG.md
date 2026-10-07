@@ -94,6 +94,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume camera diagnostics --json` measures the selected split camera pair,
+  both sides in one diagnostic operation, instead of the RGB camera the daemon
+  falls back to on a split-only machine, which reported the pair's IR as
+  missing. A selected pair that is not connected reports both roles missing
+  and opens nothing (ADR-0032, selection-aware diagnostics amendment; #995).
+
 - The ViT RGB PAD input matches the recorded m96 scorer preprocessing
   exactly (ADR-0013 §4, #795): the crop is the scorer's integer ROI
   (float32 box width/height reconstruction, 96/112 expansion, truncation

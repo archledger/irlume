@@ -762,7 +762,7 @@ fn split_activation_refusal() -> Error {
     Error::Policy(irlume_camera::lease::CameraLeaseError::SplitActivationDisabled.to_string())
 }
 
-fn ordinary_environment_pair() -> Option<(String, String)> {
+pub(crate) fn ordinary_environment_pair() -> Option<(String, String)> {
     let rgb = std::env::var("IRLUME_RGB_DEVICE").ok()?;
     let ir = std::env::var("IRLUME_IR_DEVICE").ok()?;
     (!rgb.trim().is_empty() && !ir.trim().is_empty()).then_some((rgb, ir))

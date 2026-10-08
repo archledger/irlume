@@ -15,6 +15,12 @@ pub use request_preparation::CameraRequestScope;
 mod account_selection;
 mod camera_diagnostics;
 pub use camera_diagnostics::camera_diagnostics;
+/// Test-support split evidence scripts for whole-call rows (ADR-0032 step
+/// 5). The registry, install functions and builders exist only with the
+/// `test-support` feature, enabled by dependent crates under
+/// `[dev-dependencies]` only; without it the consult functions return
+/// `Ok(None)` and the production paths run unchanged.
+pub mod split_evidence;
 mod split_runtime;
 
 /// Non-granting developer IR evaluation; absent from normal builds.
@@ -494,21 +500,21 @@ pub struct IdentifyOutcome {
 }
 
 /// One live enrollment scan, as captured by [`Engine::capture_scans`].
-struct CapturedScan {
+pub(crate) struct CapturedScan {
     /// RGB-face embedding, the primary identity template.
-    rgb: Vec<f32>,
+    pub(crate) rgb: Vec<f32>,
     /// IR-face embedding, when an IR face was captured (engine `ir_space`).
-    ir: Option<Vec<f32>>,
+    pub(crate) ir: Option<Vec<f32>>,
     /// IR center/edge brightness ratio at capture (feeds the per-user floor).
-    center_edge_ratio: f32,
+    pub(crate) center_edge_ratio: f32,
     /// Mean IR face brightness at capture (0-255 grey).
-    brightness: f32,
+    pub(crate) brightness: f32,
     /// Head pitch fraction at capture (calibrates this user's pitch neutral).
-    pitch: f32,
+    pub(crate) pitch: f32,
     /// Room's share of the IR lit-frame brightness at capture
     /// ([`Assessment::ir_ambient_share`]); `None` = no emitter-off frame
     /// was observed, which never counts as ambient-lit.
-    ambient_share: Option<f32>,
+    pub(crate) ambient_share: Option<f32>,
 }
 
 /// Enrollment may deliberately use the convenience-tier RGB path after a
@@ -1419,7 +1425,7 @@ fn rgb_primary_grant_admissible(score: f32, threshold: f32, sequential_pair: boo
 /// The budget that admitted the pair (`pairing_limit`) is schedule-aware, so
 /// a concurrent capture can never pair beyond `MAX_CROSS_SPECTRUM_SKEW`
 /// (`eligible_pair_evidence` demotes it to IrOnly first).
-fn pair_admitted_sequentially(skew: std::time::Duration, paired: bool) -> bool {
+pub(crate) fn pair_admitted_sequentially(skew: std::time::Duration, paired: bool) -> bool {
     paired && skew > MAX_CROSS_SPECTRUM_SKEW
 }
 
@@ -2135,7 +2141,7 @@ mod adapter_match_tests {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum PadEvidence {
+pub(crate) enum PadEvidence {
     NotApplicable,
     Unavailable,
     InferenceFailed,
@@ -7456,6 +7462,29 @@ impl Engine {
                 return self.authenticate_assessment(enr, purpose, service, a, diagnostics);
             }
         };
+        // Whole-call rows (ADR-0032 step 5) script the attempt evidence
+        // through the test-support registry instead of capturing. The lease
+        // above is already acquired and the operation resolved; the script
+        // is consulted before any native open, and only a script bound to
+        // the installed complete key on a live split Authentication
+        // operation is honored. On a hit the shared path below
+        // (attempt facts, grant boundary, arms, delivery, accounting) runs
+        // unchanged; with no script installed the real capture below runs.
+        if let Some(assessment) =
+            crate::split_evidence::take_assessment(operation, self.installed_split_key())?
+        {
+            // The skipped capture would have cast PAD votes; prime the ring
+            // with the evidence's own score so qualification sees the
+            // complete window real capture leaves it. Test-support scripts
+            // only: without an installed script this never runs.
+            #[cfg(feature = "test-support")]
+            if let crate::PadEvidence::Score(p) = assessment.rgb_pad {
+                self.vit_scores
+                    .extend(std::iter::repeat_n(p, crate::VIT_PAD_VOTE_N));
+            }
+            self.last_attempt_facts = AttemptFacts::from_assessment(&assessment);
+            return self.authenticate_assessment(enr, purpose, service, assessment, diagnostics);
+        }
         let finish = |engine: &mut Self, evidence| {
             engine
                 .prepare_ordinary_pair_authentication_with(evidence, |engine, evidence| {

@@ -238,6 +238,178 @@ mod split_runtime_gates {
 
     // RED: these need the dedicated split handlers (plan D5, D6).
 
+    /// Whole-call enrollment with scripted capture (ADR-0032 step 5 rows):
+    /// a real `EnrollSplitOn` dispatch publishes a real enrollment while the
+    /// evidence script replaces only the capture loop body. The complete-key
+    /// binding itself is proven by the authenticate rows, whose grant
+    /// boundary refuses anything but the installed complete key.
+    #[test]
+    fn split_enroll_publishes_with_scripted_capture_and_no_opens() {
+        use irlume_auth::split_evidence::{
+            clear_evidence_log, evidence_events, install_capture_script, synthetic_scan,
+            EvidenceEvent,
+        };
+        let _guard = env_lock();
+        // Publishing seals under the account's template key: on a host with
+        // /dev/tpm* the device-node probe would otherwise seal that key with
+        // the real TPM, so pin the software path exactly as the
+        // remove-camera-group dispatch test does.
+        let _no_tpm = irlume_core::template_key::test_support::TpmPresence::force(false);
+        let mut engine = engine();
+        let sb = sandbox("split-whole-enroll");
+        let _environment = Environment::clear();
+        engine.set_devices(NO_RGB, NO_IR);
+        let user = users::name_for_uid(0).unwrap();
+        let account = sb.dir.join(format!("{user}.json"));
+        for (variant, reset) in [("EnrollSplitOn", false), ("EnrollSplitOn", true)] {
+            let row = format!("{variant}/{reset}");
+            let recorder = fixture();
+            let counts = recorder.lease_counts_observer();
+            let _admitted = recorder.admit_split_trust(&[CameraOperationKind::Enrollment]);
+            authorize();
+            write_enrollment(&sb.dir, &primary(&user, variant, reset));
+            publish_summary(&mut engine, &user);
+            let before = std::fs::read(&account).unwrap();
+            clear_evidence_log();
+            let _script =
+                install_capture_script(SplitPairKey::parse_canonical(KEY).unwrap(), vec![vec![synthetic_scan()]]);
+            let response = dispatch(choice(&user, variant, reset), &peer(0), &mut engine);
+            assert!(
+                matches!(response, Response::Enrolled { .. }),
+                "{row}: scripted capture must publish: {response:?}"
+            );
+            assert_ne!(
+                std::fs::read(&account).unwrap(),
+                before,
+                "{row}: the enrollment file changed"
+            );
+            let published = irlume_core::storage::load(&user)
+                .expect("published enrollment loads")
+                .expect("published enrollment present");
+            assert_eq!(
+                published.camera_binding,
+                Some(CameraBinding::Split(SplitPairKey::parse_canonical(
+                    KEY
+                ).unwrap())),
+                "{row}: the published enrollment binds the complete split key"
+            );
+            assert_eq!(
+                recorder.calls(),
+                vec![split_lease()],
+                "{row}: one split Enrollment lease and no opens: {:?}",
+                recorder.calls()
+            );
+            assert_eq!(counts(), (0, 0), "{row}: both reservations released");
+            assert_eq!(
+                evidence_events(),
+                vec![EvidenceEvent::CaptureBatchConsumed { scans: 1 }],
+                "{row}: exactly one scripted batch consumed"
+            );
+            assert_eq!(
+                (engine.rgb_device(), engine.ir_device()),
+                (NO_RGB, NO_IR),
+                "{row}: the request scope restores the standing pair"
+            );
+        }
+    }
+
+    /// An installed-but-empty capture script fails the enrollment closed:
+    /// the loop errors naming exhaustion with the lease held, publishing,
+    /// opening and consuming nothing. A consumed script stays registered
+    /// while its guard lives: a repeated consult errors rather than falling
+    /// through as if no script existed.
+    #[test]
+    fn split_empty_capture_script_refuses_without_open_or_publish() {
+        use irlume_auth::split_evidence::{
+            clear_evidence_log, evidence_events, install_capture_script, synthetic_scan,
+            EvidenceEvent,
+        };
+        let _guard = env_lock();
+        let _no_tpm = irlume_core::template_key::test_support::TpmPresence::force(false);
+        let mut engine = engine();
+        let sb = sandbox("split-whole-exhausted");
+        let _environment = Environment::clear();
+        engine.set_devices(NO_RGB, NO_IR);
+        let user = users::name_for_uid(0).unwrap();
+        let account = sb.dir.join(format!("{user}.json"));
+        let recorder = fixture();
+        let counts = recorder.lease_counts_observer();
+        let _admitted = recorder.admit_split_trust(&[CameraOperationKind::Enrollment]);
+        authorize();
+        write_enrollment(&sb.dir, &primary(&user, "EnrollSplitOn", false));
+        publish_summary(&mut engine, &user);
+        let before = std::fs::read(&account).unwrap();
+        // Consume the last item, then consult again with the guard alive:
+        // the repeated consult fails closed on exhaustion.
+        clear_evidence_log();
+        {
+            let _one = install_capture_script(SplitPairKey::parse_canonical(KEY).unwrap(), vec![vec![synthetic_scan()]]);
+            let published = dispatch(choice(&user, "EnrollSplitOn", false), &peer(0), &mut engine);
+            assert!(
+                matches!(published, Response::Enrolled { .. }),
+                "one batch publishes: {published:?}"
+            );
+            assert_eq!(
+                evidence_events(),
+                vec![EvidenceEvent::CaptureBatchConsumed { scans: 1 }],
+                "the single batch was consumed"
+            );
+            let published_bytes = std::fs::read(&account).unwrap();
+            assert_ne!(published_bytes, before, "the first dispatch published");
+            let repeated = dispatch(choice(&user, "EnrollSplitOn", false), &peer(0), &mut engine);
+            let Response::Error(reason) = &repeated else {
+                panic!("exhaustion must refuse, not publish again: {repeated:?}");
+            };
+            assert!(
+                reason.contains("exhausted"),
+                "the repeated consult names exhaustion: {reason}"
+            );
+            assert_eq!(
+                evidence_events(),
+                vec![EvidenceEvent::CaptureBatchConsumed { scans: 1 }],
+                "no second batch was available to consume"
+            );
+            assert_eq!(
+                std::fs::read(&account).unwrap(),
+                published_bytes,
+                "the refused dispatch published nothing further"
+            );
+        }
+        // A fresh installation that starts empty fails closed the same way.
+        clear_evidence_log();
+        {
+            let _empty = install_capture_script(SplitPairKey::parse_canonical(KEY).unwrap(), Vec::new());
+            let response =
+                dispatch(choice(&user, "EnrollSplitOn", false), &peer(0), &mut engine);
+            let Response::Error(reason) = &response else {
+                panic!("exhaustion must refuse, not publish: {response:?}");
+            };
+            assert!(
+                reason.contains("exhausted"),
+                "the refusal names exhaustion: {reason}"
+            );
+            assert!(
+                evidence_events().is_empty(),
+                "no batch was available to consume"
+            );
+        }
+        assert_eq!(
+            recorder.calls()
+                .iter()
+                .filter(|call| !matches!(call, Call::Lease { .. }))
+                .count(),
+            0,
+            "leases only, never an open: {:?}",
+            recorder.calls()
+        );
+        assert_eq!(counts(), (0, 0), "both reservations released");
+        assert_eq!(
+            (engine.rgb_device(), engine.ir_device()),
+            (NO_RGB, NO_IR),
+            "the request scope restores the standing pair"
+        );
+    }
+
     #[test]
     fn split_runtime_admitted_enrollment_leases_both_sides_then_meets_the_refused_rgb_open() {
         let _guard = env_lock();

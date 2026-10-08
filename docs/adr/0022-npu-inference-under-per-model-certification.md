@@ -99,6 +99,10 @@ OpenVINO C API only under a versioned soname (`libopenvino_c.so.2620` for
      below it on the NPU.
    - The NPU plugin accepts only f16 and i8 as `INFERENCE_PRECISION_HINT`
      ("Supported values: f16, i8"); there is no f32 inference on the NPU.
+   - `NPU_COMPILER_TYPE` defaults to `PREFER_PLUGIN`, which resolved to the
+     plugin compiler (output bit-identical to a forced `PLUGIN`); `DRIVER`
+     is not available with the 1.38.0 driver
+     (`ZE_RESULT_ERROR_UNSUPPORTED_FEATURE`).
    - As root, inside the daemon's sandbox properties (`systemd-run`), the
      firmware build reads back from debugfs and debugfs is read-only.
    - OpenVINO 2026.2.0 refuses the TFLite mesh read from a memory buffer
@@ -110,11 +114,14 @@ OpenVINO C API only under a versioned soname (`libopenvino_c.so.2620` for
 presentations measured 0.594 to 0.656 against the 0.55 deny line (0.044
 above it), and the FLIR attack floor is 0.941 against 0.9 (0.041). On real
 frames the NPU's f16 arithmetic moves the FLIR by up to 0.0139 and the ViT by
-up to 0.0027, against allowances of about 0.0020 and 0.0022 under section 7,
-and one ViT attack frame went from deny to pass at frame level (production
-votes the median of five). Synthetic inputs showed neither
+up to 0.0027, a third and a sixteenth of those margins, and one ViT attack
+frame went from deny to pass at frame level (production votes the median of
+five). Synthetic inputs showed neither
 (0.000007 and 0.000032 on the same compiled models). The recognizer moved by
-0.00038 at most.
+0.00038 at most. The recognizer's classes overlap at its threshold instead:
+on LFW at 0.55 the false-accept rate is 0.00002 and the false-reject rate
+0.2974, and between 0.50 and 0.55 the false-reject rate moves about 0.24
+points per 0.001 of threshold.
 
 **Runtime facts.** The NPU plugin compiles static shapes; OpenVINO documents
 dynamic shapes on the NPU as a preview limited to bounded dimensions.
@@ -153,22 +160,27 @@ certifies.
 Device selection is per model and decided by a table compiled into
 `irlume-vision`. An entry binds three things: the model's SHA-256, a platform
 identity (section 4), and the CPU reference it was certified against: the
-ONNX Runtime version, the wired thresholds that consume the output, and a
+ONNX Runtime version, the wired thresholds that consume the output, a
 fingerprint of the CPU session's decoded outputs for fixed synthetic inputs
-through irlume's own preprocessing. A model runs on the NPU only when its
-digest, the running identity and the loaded ONNX Runtime version all match an
-entry; any other combination runs on CPU. Tests recompute the thresholds and
-the fingerprint from the current code, so a change to preprocessing,
-decoding, a threshold or the ONNX Runtime output fails them until the entry
-is certified again or removed in the same change. There is no `AUTO`,
+through irlume's own preprocessing, and a fingerprint of the recognition
+decision downstream of them (for fixed synthetic score pairs and brightness
+weights, the cosine match, Platt scaling, brightness weighting, fusion,
+template selection and every grant verdict the production code returns). A
+model runs on the NPU only when its digest, the running identity and the
+loaded ONNX Runtime version all match an entry; any other combination runs on
+CPU. Tests recompute the thresholds and both fingerprints from the current
+code, so a change to preprocessing, decoding, the decision code, a threshold
+or the ONNX Runtime output fails them until the entry is certified again or
+removed in the same change. There is no `AUTO`,
 `HETERO` or `MULTI` device, no GPU, and no selection by device availability or
 speed. An entry is added only by a reviewed change that cites its
 certification evidence (section 7).
 
 Only the recognizer is eligible. The PAD cues are deny-only evidence with
 attack margins of 0.041 to 0.044; on the qualified stack their NPU drift
-exceeds the section 7 allowance, in the passing direction for the ViT, and
-the NPU offers no f32 to reduce it, so they stay on CPU. The detectors and the
+is a third (FLIR) and a sixteenth (ViT) of those margins, one ViT attack
+frame went from deny to pass, and the NPU offers no f32 to reduce it, so
+they stay on CPU. The detectors and the
 ONNX mesh fallback shape other models' inputs, so their entries would have to
 bind every downstream model as well; together they are about 13 ms of the
 339 ms, and they stay on CPU too. TFLite models are not eligible (section
@@ -189,8 +201,11 @@ the driver version. The kernel reports the loaded build in the device's
 kernel lockdown still permits read-only debugfs entries. A firmware build that
 cannot be read makes the identity unreadable, and every model runs on CPU. A
 difference in any field is a different identity. The kernel release is not a
-field: the kernel driver computes no outputs, Fedora ships a kernel every few
-days, and section 10 bounds a crash a kernel could cause.
+field: Fedora ships a kernel every few days, and keying on it would keep the
+NPU off most of the time. A kernel driver fault that returned plausible but
+wrong output is what the parity check of section 8 catches, and a kernel
+update always brings a reboot and so a new engine build; section 10 bounds a
+crash. Doctor reports the running kernel release.
 
 ### 5. System OpenVINO, loaded at run time
 
@@ -216,10 +231,14 @@ loader fixes a dynamic batch dimension to 1; a model with any other dynamic
 dimension is ineligible and runs on CPU. A graph with a dynamic batch is never
 handed to the NPU compiler ([npu_compiler#352]). The checksummed file bytes
 are what OpenVINO reads; the reshape happens in memory. The rest of the
-compile configuration is fixed in the code too: the latency performance
-hint, the plugin's default inference precision (f16, the only floating-point
-precision it accepts) and no `NPU_TURBO`. It changes outputs, so it is a field
-of the identity, and changing it leaves no entry matching.
+compile configuration is fixed in the code too: the plugin's own compiler,
+forced (`NPU_COMPILER_TYPE=PLUGIN`) and read back, because the default may
+fall back to the driver's compiler, a different NPU program; the latency
+performance hint; the plugin's default inference precision (f16, the only
+floating-point precision it accepts); and no `NPU_TURBO`. It changes
+outputs, so it is a field of the identity, and changing it leaves no entry
+matching. A host where the plugin compiler cannot be selected runs the
+model on CPU.
 
 ### 7. What certification requires
 
@@ -236,14 +255,24 @@ A table entry requires all of:
 3. **Real evaluation data.** The genuine and impostor pairs of the corpora
    that set the recognizer's thresholds (LFW and FairFace for RGB; CBSR NIR
    and Tufts for IR), each comparison an NPU probe against a CPU template.
-4. **Zero verdict flips.** Every wired threshold that consumes the output,
-   the fusion floors included, gives the same verdict for every evaluation
-   sample, on CPU and on the NPU.
-5. **Drift inside the margin.** At each such threshold, the maximum absolute
-   output delta is at most 5% of the smaller class margin: the distance from
-   the threshold to the 1st percentile of the CPU scores of the class that
-   must stay above it, or to the 99th percentile of the class that must stay
-   below it.
+   Because the fusion arm combines an RGB and an IR score with both
+   brightness weights, paired cases also run through the production fusion
+   and profile-selection code: recorded RGB+IR pairs where they exist, and
+   otherwise every combination of the corpora's RGB and IR comparisons over
+   the recorded brightness range.
+4. **Error rates no worse.** At every threshold and fusion floor the
+   decision applies, the NPU probes' false-accept rate is not above the CPU
+   probes' (one pair in 100,000 allowed for ties), and their false-reject
+   rate is not above the CPU's by more than 0.2 percentage points. Every
+   verdict that differs is listed, and each lies within the measured maximum
+   drift of its threshold.
+5. **Drift small against the threshold.** The maximum absolute score drift
+   d, read as a shift of the threshold on the CPU scores, moves the
+   false-accept rate by at most 10% of its value (one pair in 100,000 when
+   it is zero) and the false-reject rate by at most 0.2 points. This stays
+   meaningful where the classes overlap at the threshold, as they do for the
+   recognizer; the recognizer's measured 0.00038 would move LFW's
+   false-reject rate at 0.55 by about 0.09 points.
 6. **Repeatable.** An input gives the same output bits every time on one
    compiled model: repeated, interleaved with other inputs, and after the NPU
    has runtime-suspended.
@@ -258,10 +287,13 @@ A table entry requires all of:
 
 NPU sessions are compiled when the engine is built, after its CPU sessions and
 before the daemon reports ready, at startup and at every engine rebuild. No
-compilation happens inside an authentication attempt. From the cache the
-recognizer adds 0.4 to 0.5 s before ready; after an identity change the first
-start compiles it cold, 2.3 to 5.2 s. Until ready, clients get the existing
-"still starting" answer and use the password.
+compilation happens inside an authentication attempt. Before the recognizer
+answers from the NPU, every engine build runs three fixed reference inputs
+through both of its sessions; an embedding cosine below 0.9999 (measured
+0.9999982) keeps it on CPU, and doctor says so. From the cache the recognizer
+adds 0.4 to 0.5 s before ready; after an identity change the first start
+compiles it cold, 2.3 to 5.2 s. Until ready, clients get the existing "still
+starting" answer and use the password.
 
 ### 9. Failure falls back to the CPU session
 
@@ -277,27 +309,29 @@ unchanged.
 ### 10. A crash or a hang costs one restart
 
 Before compiling a model, and before every NPU inference, the daemon writes a
-marker named by the model digest, holding the boot ID, into the cache
-directory of the identity, and removes it when the call returns (13 µs per
-inference, measured). A marker from the current boot found at startup means a
-compile or an inference did not return (a crash, or a hang a watchdog restart
-ended): that model stays on CPU for that identity for the rest of the boot,
-and doctor says so. A marker from an earlier boot allows one new attempt, so a
-power loss does not pin a model to CPU. A compile counts as worker activity
-for the watchdog, startup included, so one that does not return within
+marker named by the identity and model digests, holding the boot ID, into the
+cache's marker directory, and removes it when the call returns (13 µs per
+inference, measured). Markers are kept across identity changes within a boot,
+so a rollback to an identity that crashed still finds its marker; startup
+removes those of earlier boots. A marker from the current boot found at startup
+means a compile or an inference did not return (a crash, or a hang a watchdog
+restart ended): that model stays on CPU for that identity for the rest of the
+boot, and doctor says so. A marker from an earlier boot allows one new attempt,
+so a power loss does not pin a model to CPU. A compile counts as worker
+activity for the watchdog, startup included, so one that does not return within
 `WatchdogSec=` (90 s, against a longest measured cold compile of 5.2 s) stops
 the pings and ends in a restart rather than a hang. With `Restart=on-failure`,
 a crashing or wedged compile or inference costs one restart, never a loop.
 
 ### 11. A daemon-owned cache
 
-The OpenVINO cache lives in `/var/cache/irlume/npu/<identity digest>/`,
-root-owned, mode 0700. Compiled blobs are code the NPU executes, so no user
-can write them. With `CACHE_DIR` set it is the only blob cache (the driver's
-own is bypassed), and a blob OpenVINO cannot import is deleted and compiled
-again. A new identity gets a new directory; others are removed. The
-recognizer's blob takes 127 MiB. The CLI never uses the NPU and never creates
-this directory.
+The OpenVINO cache lives in `/var/cache/irlume/npu/<identity digest>/` and the
+markers in `/var/cache/irlume/npu/markers/`, root-owned, mode 0700. Compiled
+blobs are code the NPU executes, so no user can write them. With `CACHE_DIR`
+set it is the only blob cache (the driver's own is bypassed), and a blob
+OpenVINO cannot import is deleted and compiled again. A new identity gets a new
+blob directory; the others' are removed. The recognizer's blob takes 127 MiB.
+The CLI never uses the NPU and never creates this directory.
 
 ### 12. A kill switch
 
@@ -315,9 +349,9 @@ setting that cannot be understood selects the reference path.
 `irlume doctor`, its `--json` form and the daemon's status report each model's
 device and, on CPU, the reason: not built, disabled, not certified for this
 identity and reference, runtime absent, identity unreadable, ineligible,
-compile failed, a compile or inference did not return earlier in this boot,
-or retired after an inference error. A platform row gives the identity. New
-wire and JSON fields are additive.
+compile failed, failed the parity check, a compile or inference did not return
+earlier in this boot, or retired after an inference error. A platform row gives
+the identity. New wire and JSON fields are additive.
 
 ### 14. TFLite models stay on LiteRT
 
@@ -384,12 +418,17 @@ face unacceptable latency.
   re-hash and rebuild 260 MB inside an attempt.
 - **A fresh infer request for every inference**, as Frigate does for ArcFace
   models. Repeatability is measured and required instead (section 7).
-- **The kernel release in the identity.** It would move hosts to CPU every few
-  days for a component that computes no outputs (section 4).
+- **The kernel release or the `intel_vpu` module build in the identity.** It
+  would move hosts to CPU every few days; the parity check at every engine
+  build catches a driver that returns wrong output (sections 4, 8).
 - **`NPU_TURBO`.** More power for an attempt that is capture-bound.
-- **The PAD cues on the NPU.** Measured on real frames, the FLIR drifts seven
-  times its allowance and one ViT attack frame went from deny to pass; the NPU
-  computes in f16 only, so no setting reduces it. A later stack or a
+- **Zero flips and a percentile margin.** The recognizer's classes overlap at
+  its threshold (29.7% of LFW genuine pairs fall below 0.55), so a margin to
+  a class percentile can be negative and some flips are certain on a large
+  corpus; the rate rules of section 7 bound what matters.
+- **The PAD cues on the NPU.** Measured on real frames, the FLIR drifts by a
+  third of its attack margin and one ViT attack frame went from deny to pass;
+  the NPU computes in f16 only, so no setting reduces it. A later stack or a
   mixed-precision compile could be re-measured under a new amendment.
 
 ## Phasing
@@ -409,8 +448,14 @@ face unacceptable latency.
   entry matches only its exact digest, identity and ONNX Runtime version;
   changing any one identity field, the compile configuration included,
   resolves to CPU.
-- Reference: changing a recorded threshold, the preprocessing or the decoding
-  of a certified model fails the fingerprint and threshold tests.
+- Reference: changing a recorded threshold, the preprocessing, the decoding
+  or the recognition decision code (Platt scaling, brightness weighting,
+  fusion, matching, template selection) fails the fingerprint and threshold
+  tests.
+- Compiler: the plugin compiler is set and read back; a host where it cannot
+  be selected runs the model on CPU.
+- Parity: an NPU whose output differs from CPU on the reference inputs leaves
+  the model on CPU before it answers a request.
 - Eligibility: only the recognizer can have an entry; the PAD cues, the
   detectors, the ONNX mesh fallback and TFLite models never do.
 - Enrollment: with the recognizer on the NPU, enrollment scans come from the
@@ -432,7 +477,7 @@ face unacceptable latency.
   earlier-boot marker allows one attempt; a returned compile or inference
   removes it; a marker left by an inference (a killed process) keeps the
   model on CPU after the restart; a new identity ignores markers of the old
-  one.
+  one, and a return to the old identity in the same boot still sees them.
 - Watchdog: a compile that does not return stops the watchdog pings, at
   startup and at a rebuild.
 - Cache: the directory is 0700 root and per identity, other identities'

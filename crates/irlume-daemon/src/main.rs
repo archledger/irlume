@@ -273,7 +273,10 @@ mod npu_placement {
             irlume_auth::npu::Context::disabled()
         };
         if let Err(error) = engine.place_recognizer_on_npu(weights, &mut context) {
-            irlume_common::jout_warn!("irlumed: the recognizer stays on CPU: {error}");
+            irlume_common::jout_warn!(
+                "irlumed: the recognizer stays on CPU: {}",
+                irlume_common::single_line(&error.to_string(), 300)
+            );
         }
         if busy {
             super::note_worker_progress();

@@ -1524,6 +1524,31 @@ pub enum PadModelStatus {
     LoadFailed,
 }
 
+/// `text` as one bounded line, safe for the journal, a terminal and a
+/// support report: every control character (C0, DEL, C1) and the Unicode
+/// line and paragraph separators become spaces, runs of whitespace collapse,
+/// and anything past `max_chars` characters is cut and marked with `...`.
+/// For error text that comes from outside irlume, such as a runtime or a
+/// driver.
+pub fn single_line(text: &str, max_chars: usize) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let mut line = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() > max_chars {
+        line = line.chars().take(max_chars).collect::<String>();
+        line.push_str("...");
+    }
+    line
+}
+
 /// Where the recognizer computes authentication probes (ADR-0022 §13).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecognizerPlacement {
@@ -2309,6 +2334,17 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn single_line_cannot_forge_a_line_and_is_bounded() {
+        assert_eq!(
+            super::single_line("compile failed:\nirlumed: granted\r\u{1b}[2J\u{2028}x", 200),
+            "compile failed: irlumed: granted [2J x"
+        );
+        assert_eq!(super::single_line("  a \t b  ", 200), "a b");
+        assert_eq!(super::single_line("abcdef", 3), "abc...");
+        assert_eq!(super::single_line("\u{85}\u{7f}", 10), "");
+    }
     #[test]
     fn observed_state_directory_does_not_borrow_the_callers_override() {
         use std::ffi::OsStr;

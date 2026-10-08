@@ -145,7 +145,12 @@ impl Engine {
                 Some("an IR adapter is configured, which keeps the recognizer on CPU".to_owned()),
             ),
             irlume_vision::npu::Device::Npu => ("npu", None),
-            irlume_vision::npu::Device::Cpu(reason) => ("cpu", Some(reason.to_string())),
+            // The reason can carry runtime or driver error text: one bounded
+            // line before it reaches the journal, Health or doctor.
+            irlume_vision::npu::Device::Cpu(reason) => (
+                "cpu",
+                Some(irlume_common::single_line(&reason.to_string(), 300)),
+            ),
         };
         #[cfg(not(feature = "npu"))]
         let (device, reason) = ("cpu", Some("not built with NPU support".to_owned()));

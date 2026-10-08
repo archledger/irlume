@@ -435,6 +435,11 @@ mod npu_reference_tests {
             irlume_common::sha256_hex(&bytes),
             "9a91f1f7135fdea10c61809da8f2142738d7286de12f7caff66ddb76a1384293"
         );
+        let raw = npu_reference::raw_chip();
+        assert_eq!(
+            irlume_common::sha256_hex(&raw),
+            "6ca09bfb23b07c6e1614b1a47d8836cc029e45c820cbca8d0ea6bdabe4ca495b"
+        );
         let (frame, w, h) = npu_reference::frame();
         assert_eq!((w, h), (640, 480));
         assert_eq!(
@@ -1007,21 +1012,6 @@ mod npu_hardware {
                 &irlume_common::sha256_hex(&bits)[..16]
             );
         }
-    }
-
-    /// The marker's cost per inference on this disk.
-    #[test]
-    #[ignore = "measures the filesystem under $HOME"]
-    fn npu_hw_marker_cost() {
-        let home = std::env::var("HOME").unwrap();
-        let dir = tempfile::tempdir_in(&home).unwrap();
-        let marker = dir.path().join("marker");
-        let t = Instant::now();
-        for _ in 0..1000 {
-            std::fs::write(&marker, "boot").unwrap();
-            std::fs::remove_file(&marker).unwrap();
-        }
-        eprintln!("marker write + remove: {:?} each", t.elapsed() / 1000);
     }
 
     fn pnm(raw: &[u8]) -> Option<(char, u32, u32, &[u8])> {

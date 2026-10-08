@@ -2477,6 +2477,14 @@ mod onnx {
                 .collect()
         }
 
+        /// A 112x112 RGB chip as raw bytes, so the fingerprint also passes
+        /// through the production preprocessing (`align::preprocess_arcface`):
+        /// a change to its scaling, channel order or layout changes it.
+        pub(super) fn raw_chip() -> Vec<u8> {
+            let n = crate::align::OUT_SIZE as usize;
+            (0..3 * n * n).map(|i| ((i * 53 + 7) % 256) as u8).collect()
+        }
+
         /// A 640x480 RGB frame with structure in every channel, for the PAD
         /// measurements of the hardware tests.
         #[cfg(test)]
@@ -2525,9 +2533,16 @@ mod onnx {
         use crate::npu::Role;
         match role {
             Role::Recognizer => {
-                let embedding = Embedder::load_from_memory(model)?
-                    .embed_preprocessed(&npu_reference::chip(0))?;
-                Ok(embedding[..npu_reference::EMBEDDING_PREFIX].to_vec())
+                // The synthetic tensor the exact digests also use, then a raw
+                // chip through the production preprocessing and embedding.
+                let mut embedder = Embedder::load_from_memory(model)?;
+                let synthetic = embedder.embed_preprocessed(&npu_reference::chip(0))?;
+                let raw = embedder.on_cpu().embed(&npu_reference::raw_chip())?;
+                Ok(synthetic[..npu_reference::EMBEDDING_PREFIX]
+                    .iter()
+                    .chain(&raw[..npu_reference::EMBEDDING_PREFIX])
+                    .copied()
+                    .collect())
             }
         }
     }

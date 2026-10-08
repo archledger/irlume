@@ -1196,7 +1196,23 @@ impl Platform {
                 CpuReason::CompileFailed("the OpenVINO binding panicked while compiling".into()),
             ) {
                 Ok(inner) => inner,
-                Err(reason) => return (Err(reason), true),
+                // Refused before OpenVINO compiled anything.
+                Err(reason @ CpuReason::Ineligible(_)) => return (Err(reason), true),
+                // A compile that failed after OpenVINO may have written its
+                // cache output (a failed device query or infer request)
+                // leaves nothing to import.
+                Err(reason) => {
+                    return match discard_blobs(&cache.blobs()) {
+                        Ok(()) => (Err(reason), true),
+                        Err(error) => (
+                            Err(CpuReason::CompileFailed(format!(
+                                "{reason}; its cache output could not be removed ({error}), so \
+                                 its marker stays for this boot"
+                            ))),
+                            false,
+                        ),
+                    };
+                }
             };
             // The libraries compiling loaded must be the ones the identity
             // hashed (ADR-0022 §4).
@@ -1812,6 +1828,39 @@ mod tests {
             let later = suspended(Bound::AtLeast).unwrap();
             assert!(baseline <= later, "{baseline:?} > {later:?}");
         }
+    }
+
+    /// The cost of the marker around every NPU inference, on the shipped
+    /// path (`arm`: temporary file, permissions, rename, read-back; then
+    /// `disarm`), in a directory on the home filesystem, or on the one
+    /// `IRLUME_NPU_MARKER_DIR` names.
+    #[test]
+    #[ignore = "a filesystem measurement, not a check"]
+    fn npu_hw_marker_cost() {
+        let base = std::env::var_os("IRLUME_NPU_MARKER_DIR")
+            .or_else(|| std::env::var_os("HOME"))
+            .unwrap();
+        let dir = tempfile::tempdir_in(base).unwrap();
+        let cache = Cache::prepare(dir.path(), &identity(), &boot_id().unwrap()).unwrap();
+        let marker = cache.marker_file(&"4".repeat(64));
+        for _ in 0..100 {
+            marker.arm().unwrap();
+            marker.disarm().unwrap();
+        }
+        let mut each = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            for _ in 0..1000 {
+                marker.arm().unwrap();
+                marker.disarm().unwrap();
+            }
+            each.push(started.elapsed() / 1000);
+        }
+        each.sort();
+        eprintln!(
+            "marker arm + disarm on the shipped path: median {:?}, range {:?} to {:?} (5 runs of 1,000)",
+            each[2], each[0], each[4]
+        );
     }
 
     #[test]

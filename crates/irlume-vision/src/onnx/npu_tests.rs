@@ -147,6 +147,89 @@ mod npu_enrollment_tests {
         );
     }
 
+    /// A suspend during the parity check itself leaves the next call to
+    /// check again: the baseline is read before the first reference
+    /// inference.
+    #[test]
+    fn a_suspend_during_the_parity_check_is_seen() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let path = format!("{}/../../models/glintr100.onnx", env!("CARGO_MANIFEST_DIR"));
+        let bytes = std::fs::read(&path).expect("models/glintr100.onnx (scripts/fetch-models.sh)");
+        let mut cpu = Embedder::load_from_memory(&bytes).unwrap();
+        let suspend = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut embedder = Embedder {
+            session: build(&bytes).unwrap(),
+            npu: crate::npu::Slot::certified(
+                Box::new(SuspendsDuring {
+                    suspend: suspend.clone(),
+                    changed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                }),
+                test_entry(
+                    &bytes,
+                    cpu.cpu_reference_digest().unwrap(),
+                    constant_digest(),
+                ),
+            ),
+        };
+        embedder.check_npu_parity().unwrap();
+        assert!(
+            !suspend.load(SeqCst),
+            "the suspend happened inside the check"
+        );
+        assert_eq!(embedder.npu_device(), crate::npu::Device::Npu);
+        assert!(
+            embedder.npu.resumed_since_check(),
+            "the suspend inside the check is not hidden by its baseline"
+        );
+        embedder
+            .embed_preprocessed_with_norm(&npu_reference::chip(1))
+            .unwrap();
+        assert!(!embedder.npu.resumed_since_check());
+    }
+
+    /// An "NPU" whose second inference fails.
+    struct FailsSecond {
+        calls: usize,
+    }
+
+    impl crate::npu::Infer for FailsSecond {
+        fn infer(&mut self, _input: &[f32]) -> Result<Vec<f32>, String> {
+            self.calls += 1;
+            if self.calls == 2 {
+                return Err("injected failure".into());
+            }
+            Ok(vec![1.0; EMBED_DIM])
+        }
+    }
+
+    /// A TTA embedding is whole on one device: when the flipped half fails
+    /// on the NPU, both halves are computed on CPU.
+    #[test]
+    fn a_tta_embedding_is_never_mixed() {
+        let path = format!("{}/../../models/glintr100.onnx", env!("CARGO_MANIFEST_DIR"));
+        let bytes = std::fs::read(&path).expect("models/glintr100.onnx (scripts/fetch-models.sh)");
+        let mut cpu = Embedder::load_from_memory(&bytes).unwrap();
+        let mut embedder = Embedder {
+            session: build(&bytes).unwrap(),
+            npu: crate::npu::Slot::npu(Box::new(FailsSecond { calls: 0 })),
+        };
+        let n = align::OUT_SIZE as usize;
+        let chip: Vec<u8> = (0..n * n * 3).map(|i| (i * 17 % 253) as u8).collect();
+        let answer = embedder.embed_tta(&chip).unwrap();
+        assert!(matches!(
+            embedder.npu_device(),
+            crate::npu::Device::Cpu(crate::npu::CpuReason::Retired(_))
+        ));
+        let expected = cpu.embed_tta(&chip).unwrap();
+        assert!(
+            answer
+                .iter()
+                .zip(&expected)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "both halves came from CPU"
+        );
+    }
+
     /// After a system resume the NPU must reproduce its reference digest
     /// again before it answers (ADR-0022 §8); between resumes it is not
     /// rechecked.
@@ -387,13 +470,19 @@ mod npu_hardware {
 
     /// The platform, with the real firmware build for root and an
     /// "unverified" label otherwise.
+    /// A debugfs stand-in with an unverified firmware build, for a normal
+    /// user who cannot read the kernel's.
+    fn fake_debugfs(scratch: &std::path::Path) -> std::path::PathBuf {
+        let bus = std::fs::canonicalize("/sys/class/accel/accel0/device").unwrap();
+        let entry = scratch.join("debugfs").join(bus.file_name().unwrap());
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("fw_version"), "unverified (not root)\n").unwrap();
+        scratch.join("debugfs")
+    }
+
     fn platform(scratch: &std::path::Path) -> Platform {
         let mut platform = Platform::open().unwrap_or_else(|_| {
-            let bus = std::fs::canonicalize("/sys/class/accel/accel0/device").unwrap();
-            let entry = scratch.join("debugfs").join(bus.file_name().unwrap());
-            std::fs::create_dir_all(&entry).unwrap();
-            std::fs::write(entry.join("fw_version"), "unverified (not root)\n").unwrap();
-            Platform::open_with_debugfs(&scratch.join("debugfs")).expect("NPU platform")
+            Platform::open_with_debugfs(&fake_debugfs(scratch), true).expect("NPU platform")
         });
         // An experiment outside the certified configuration, e.g. "f32".
         if let Ok(precision) = std::env::var("IRLUME_NPU_TEST_PRECISION") {
@@ -796,7 +885,14 @@ mod npu_hardware {
         let mut outputs = Vec::new();
         for kind in ["default", "PLUGIN", "DRIVER"] {
             let scratch = tempfile::tempdir().unwrap();
-            let mut platform = platform(scratch.path());
+            // The default case leaves OpenVINO's own compiler type, which
+            // the production open would force to PLUGIN.
+            let mut platform = if kind == "default" {
+                Platform::open_with_debugfs(&fake_debugfs(scratch.path()), false)
+                    .expect("NPU platform")
+            } else {
+                platform(scratch.path())
+            };
             eprintln!(
                 "{kind}: before setting, NPU_COMPILER_TYPE reads {:?}",
                 platform.npu_property("NPU_COMPILER_TYPE")
@@ -1089,18 +1185,30 @@ mod npu_hardware {
         // The recognizer on one face, CPU and NPU, scored against the first
         // genuine frame of the same modality (the owner, as an enrolled
         // template would be).
+        // RGB goes through the TTA embedding production authenticates RGB
+        // with; IR through the plain one.
         let mut recognize = |view: &align::RgbView<'_>,
                              landmarks: &crate::Landmarks5,
                              reference: &mut Option<Embedding>,
                              attack: bool,
                              stats: &mut Stats,
-                             cosine_min: &mut f32| {
+                             cosine_min: &mut f32,
+                             tta: bool| {
             let Ok(chip) = align::align_to_arcface(view, landmarks) else {
                 return;
             };
-            let data = align::preprocess_arcface(&chip);
-            let (ce, _) = cpu_emb.embed_preprocessed_with_norm(&data).unwrap();
-            let (ne, _) = npu_emb.embed_preprocessed_with_norm(&data).unwrap();
+            let (ce, ne) = if tta {
+                (
+                    cpu_emb.embed_tta(&chip).unwrap(),
+                    npu_emb.embed_tta(&chip).unwrap(),
+                )
+            } else {
+                let data = align::preprocess_arcface(&chip);
+                (
+                    cpu_emb.embed_preprocessed_with_norm(&data).unwrap().0,
+                    npu_emb.embed_preprocessed_with_norm(&data).unwrap().0,
+                )
+            };
             let cosine: f32 = ce.iter().zip(&ne).map(|(x, y)| x * y).sum();
             *cosine_min = cosine_min.min(cosine);
             if reference.is_none() && attack {
@@ -1189,6 +1297,7 @@ mod npu_hardware {
                         attack,
                         stats,
                         &mut cosine_min,
+                        false,
                     );
                 } else {
                     let (c, n) = (
@@ -1212,6 +1321,7 @@ mod npu_hardware {
                         attack,
                         stats,
                         &mut cosine_min,
+                        true,
                     );
                 }
             }
@@ -1239,11 +1349,11 @@ mod npu_hardware {
         );
         eprintln!(
             "{}",
-            match_rgb_live.line("recognizer genuine RGB vs first genuine RGB frame at 0.55")
+            match_rgb_live.line("recognizer TTA genuine RGB vs first genuine RGB frame at 0.55")
         );
         eprintln!(
             "{}",
-            match_rgb_attack.line("recognizer RGB attacks vs first genuine RGB frame at 0.55")
+            match_rgb_attack.line("recognizer TTA RGB attacks vs first genuine RGB frame at 0.55")
         );
         eprintln!("recognizer CPU vs NPU embedding cosine, lowest {cosine_min:.6}");
         eprintln!("{}", vit_live.line("ViT genuine RGB at 0.55"));

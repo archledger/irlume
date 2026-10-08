@@ -57,6 +57,9 @@ struct Sources<'a> {
     accel_class: &'a Path,
     debugfs_accel: &'a Path,
     maps: &'a Path,
+    /// Apply `NPU_COMPILER_TYPE` from [`COMPILE_CONFIGURATION`]; only a
+    /// hardware experiment measuring OpenVINO's default leaves it.
+    force_compiler: bool,
 }
 
 /// The platform a compiled NPU model depends on (ADR-0022 §4). Any field
@@ -381,10 +384,12 @@ impl Slot {
         }
     }
 
-    /// Record that the entry's digests were just reproduced.
-    pub(crate) fn note_checked(&mut self) {
+    /// Record that the entry's digests were reproduced by a check that
+    /// started at `baseline`, a [`Bound::AtMost`] reading taken before its
+    /// first inference, so a suspend during or after the check is seen.
+    pub(crate) fn note_checked(&mut self, baseline: Option<Duration>) {
         if let State::Npu { checked_at, .. } = &mut self.state {
-            *checked_at = suspended(Bound::AtMost);
+            *checked_at = baseline;
         }
     }
 
@@ -1005,6 +1010,7 @@ impl Platform {
             accel_class: Path::new("/sys/class/accel"),
             debugfs_accel: Path::new("/sys/kernel/debug/accel"),
             maps: Path::new("/proc/self/maps"),
+            force_compiler: true,
         })
     }
 
@@ -1058,22 +1064,24 @@ impl Platform {
                 // back so a fallback cannot pass for it, and the latency
                 // hint; the default precision and no NPU_TURBO are left as
                 // they are.
-                core.set_property(
-                    &DeviceType::NPU,
-                    &RwPropertyKey::Other("NPU_COMPILER_TYPE".into()),
-                    COMPILER_TYPE,
-                )
-                .map_err(|error| absent(format!("NPU_COMPILER_TYPE: {error}")))?;
-                let compiler = core
-                    .get_property(
+                if sources.force_compiler {
+                    core.set_property(
                         &DeviceType::NPU,
-                        &PropertyKey::Other("NPU_COMPILER_TYPE".into()),
+                        &RwPropertyKey::Other("NPU_COMPILER_TYPE".into()),
+                        COMPILER_TYPE,
                     )
                     .map_err(|error| absent(format!("NPU_COMPILER_TYPE: {error}")))?;
-                if compiler != COMPILER_TYPE {
-                    return Err(absent(format!(
-                        "NPU_COMPILER_TYPE reads {compiler:?}, not {COMPILER_TYPE}"
-                    )));
+                    let compiler = core
+                        .get_property(
+                            &DeviceType::NPU,
+                            &PropertyKey::Other("NPU_COMPILER_TYPE".into()),
+                        )
+                        .map_err(|error| absent(format!("NPU_COMPILER_TYPE: {error}")))?;
+                    if compiler != COMPILER_TYPE {
+                        return Err(absent(format!(
+                            "NPU_COMPILER_TYPE reads {compiler:?}, not {COMPILER_TYPE}"
+                        )));
+                    }
                 }
                 core.set_property(
                     &DeviceType::NPU,
@@ -1094,14 +1102,19 @@ impl Platform {
 
     /// [`Self::open`] with the firmware build read from `debugfs_accel`
     /// instead of the kernel's debugfs, for the hardware tests a normal user
-    /// runs.
+    /// runs, and with `force_compiler` false to leave OpenVINO's default
+    /// compiler type for an experiment that measures it.
     #[cfg(test)]
-    pub(crate) fn open_with_debugfs(debugfs_accel: &Path) -> Result<Self, CpuReason> {
+    pub(crate) fn open_with_debugfs(
+        debugfs_accel: &Path,
+        force_compiler: bool,
+    ) -> Result<Self, CpuReason> {
         Self::open_with(&Sources {
             library_dirs: OPENVINO_LIBRARY_DIRS,
             accel_class: Path::new("/sys/class/accel"),
             debugfs_accel,
             maps: Path::new("/proc/self/maps"),
+            force_compiler,
         })
     }
 
@@ -1148,26 +1161,29 @@ impl Platform {
         model_sha256: &str,
     ) -> Result<Box<dyn Infer>, CpuReason> {
         let marker = cache.marker_file(model_sha256);
+        // The marker stays armed until the loaded libraries are validated
+        // and anything a compile with other bytes wrote is discarded.
         let inner = compile_guarded(&marker, || {
-            catch_binding(
+            let inner = catch_binding(
                 || self.compile_unguarded(cache, model),
                 CpuReason::CompileFailed("the OpenVINO binding panicked while compiling".into()),
-            )
-        })?;
-        // The libraries compiling loaded must be the ones the identity hashed
-        // (ADR-0022 §4); what a compile with other bytes wrote is discarded.
-        let loaded = fs::read_to_string(&self.maps)
-            .map_err(|error| format!("maps: {error}"))
-            .and_then(|maps| loaded_as_hashed(&maps, &self.libraries));
-        if let Err(why) = loaded {
-            drop(inner);
-            if let Ok(entries) = fs::read_dir(cache.blobs()) {
-                for entry in entries.flatten() {
-                    let _ = fs::remove_file(entry.path());
+            )?;
+            // The libraries compiling loaded must be the ones the identity
+            // hashed (ADR-0022 §4).
+            let loaded = fs::read_to_string(&self.maps)
+                .map_err(|error| format!("maps: {error}"))
+                .and_then(|maps| loaded_as_hashed(&maps, &self.libraries));
+            if let Err(why) = loaded {
+                drop(inner);
+                if let Ok(entries) = fs::read_dir(cache.blobs()) {
+                    for entry in entries.flatten() {
+                        let _ = fs::remove_file(entry.path());
+                    }
                 }
+                return Err(CpuReason::CompileFailed(why));
             }
-            return Err(CpuReason::CompileFailed(why));
-        }
+            Ok(inner)
+        })?;
         Ok(Box::new(Marked { inner, marker }))
     }
 
@@ -2088,6 +2104,7 @@ mod tests {
             accel_class: Path::new("/sys/class/accel"),
             debugfs_accel: Path::new("/sys/kernel/debug/accel"),
             maps: Path::new("/proc/self/maps"),
+            force_compiler: true,
         }) else {
             panic!("an absent library cannot open");
         };

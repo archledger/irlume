@@ -632,17 +632,41 @@ mod onnx {
             let Some(entry) = self.npu.certification() else {
                 return;
             };
+            // Read before the first reference inference: a suspend during
+            // or after the check makes the next call check again.
+            let baseline = crate::npu::suspended(crate::npu::Bound::AtMost);
             let Some(digest) = self.npu_reference_digest() else {
                 return; // the NPU failed and the slot retired itself
             };
             if digest == entry.npu_reference_digest {
-                self.npu.note_checked();
+                self.npu.note_checked(baseline);
             } else {
                 self.npu = crate::npu::Slot::cpu(crate::npu::CpuReason::ParityMismatch(format!(
                     "{when}reference output digest {digest}, certified {}",
                     entry.npu_reference_digest
                 )));
             }
+        }
+
+        /// Every input embedded on the NPU, or `None` for the caller to
+        /// compute all of them on CPU: the model is not on the NPU, the NPU
+        /// failed and retired, or the system suspended between the last
+        /// check and the end of these inferences, whose outputs are then
+        /// discarded and the digest checked again (ADR-0022 §8, §9).
+        #[cfg(feature = "npu")]
+        fn npu_embed_all(&mut self, inputs: &[&[f32]]) -> Option<Vec<(Embedding, f32)>> {
+            if self.npu.resumed_since_check() {
+                self.check_npu_digest("after a system resume, ");
+            }
+            let mut embedded = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                embedded.push(self.npu.run(input, embedding_and_norm)?);
+            }
+            if self.npu.resumed_since_check() {
+                self.check_npu_digest("after a system resume, ");
+                return None;
+            }
+            Some(embedded)
         }
 
         /// SHA-256 of the NPU's raw output bits for the reference inputs, or
@@ -713,6 +737,17 @@ mod onnx {
         /// slightly worse at low FAR), so the IR path keeps plain `embed`.
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn embed_tta(&mut self, chip_rgb: &[u8]) -> irlume_common::Result<Embedding> {
+            // Both halves come from one device: certification measured whole
+            // NPU probes and whole CPU probes, never a mix (ADR-0022 §9).
+            #[cfg(feature = "npu")]
+            if self.npu.device() == crate::npu::Device::Npu {
+                let a = align::preprocess_arcface(chip_rgb);
+                let b = align::preprocess_arcface(&crate::align::flip_h(chip_rgb));
+                if let Some(both) = self.npu_embed_all(&[&a, &b]) {
+                    return Ok(tta_mean(&both[0].0, &both[1].0));
+                }
+                return self.on_cpu().embed_tta(chip_rgb);
+            }
             let a = self.embed(chip_rgb)?;
             let b = self.embed(&crate::align::flip_h(chip_rgb))?;
             Ok(tta_mean(&a, &b))
@@ -776,17 +811,8 @@ mod onnx {
             }
             #[cfg(feature = "npu")]
             if npu_allowed {
-                if self.npu.resumed_since_check() {
-                    self.check_npu_digest("after a system resume, ");
-                }
-                if let Some(embedded) = self.npu.run(data, embedding_and_norm) {
-                    // A suspend between the last check and the end of this
-                    // inference: the output is discarded, the digest is
-                    // checked again, and this call is computed on CPU.
-                    if !self.npu.resumed_since_check() {
-                        return Ok(embedded);
-                    }
-                    self.check_npu_digest("after a system resume, ");
+                if let Some(mut embedded) = self.npu_embed_all(&[data]) {
+                    return Ok(embedded.remove(0));
                 }
             }
             let tensor = Tensor::from_array(([1i64, 3, n, n], data.to_vec())).map_err(err)?;

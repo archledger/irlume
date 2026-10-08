@@ -21,11 +21,8 @@ libc = "0.2"
 dbus.workspace = true
 
 [dev-dependencies]
-irlume-camera = { workspace = true, features = ["test-support"] }
-# Whole-call split rows (ADR-0032 step 5) install evidence scripts through
-# irlume-auth's test-support seam. A dev-dependency feature like the camera
-# and core ones above: resolver 2 keeps it out of release builds.
 irlume-auth = { workspace = true, features = ["test-support"] }
+irlume-camera = { workspace = true, features = ["test-support"] }
 # The TPM-presence pin for tests that write account stores
 # (template_key::test_support). A dev-dependency feature: resolver 2 keeps
 # it out of release builds.

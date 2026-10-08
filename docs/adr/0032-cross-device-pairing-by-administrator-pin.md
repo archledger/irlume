@@ -1223,3 +1223,58 @@ opening a camera, and every node's format and backlight compensation matched
 before and after. A positive physical run needs two separate single-role
 cameras; the fixture rows and the 2026-10-05 transport check cover that path
 until then.
+
+## Amendment 2026-10-08: software whole-call assessment qualification
+
+The #1030 software tests now exercise successful split enrollment, authentication
+and face-backed credential release through real Engine entries and daemon worker
+handlers. A non-default auth `test-support` fixture supplies assessments only
+under the original retained two-side operation and independently admitted trust
+kind. It checks that context before and after each callback and closes on return
+or unwind. Default production split trust remains closed; normal release artifacts
+exclude this fixture and the camera admission token.
+
+The tests supply synthetic assessments, raw PAD scores and arithmetic embedding
+vectors. The 2999, 3000 and 3001 ms cases supply skew-dependent assessment posture;
+they measure no physical capture timing. Physical camera opens, descriptor checks,
+image processing and model inference are outside this fixture's evidence. Engine
+preparation, machine/account authorization, both-side leases, raw PAD settlement,
+five-vote qualification, identity matching, grant checks and storage publication
+remain real. No fixture supplies an Outcome, publication receipt, credential
+result or completion result.
+
+The new test families are:
+
+| Family | Software evidence |
+|---|---|
+| Auth `engine_tests::test_support_tests::{whole_entry_*,support_*,pad_*}` | Whole enrollment/authentication entries, exact retained context, fixture lifetime/error controls, deny-only PAD settlement and vote/model-error refusals. |
+| Daemon `tests::split_whole_call::split_whole_*` | Nonreset/reset/add-group publication followed by a fresh Authenticate; automatic/pinned primary/secondary IR identity at supplied skews; delivered and undelivered retry accounting. |
+| Daemon `tests::split_whole_call::boundaries::split_whole_*` | Final-sample machine, either-side and primary/secondary drift; complete-key mismatch and missing split provenance refuse before grant/release. |
+| Daemon `tests::split_whole_call::credentials::tpm_split_whole_*` | Real encrypted account stores and uid-bound swtpm credential release once; delivered-only retry reset, disconnected-client retention and malformed-envelope refusal. |
+| Daemon `tests::split_whole_call::centroid::{split_whole_*,tpm_split_whole_*}` | Real calibration fit and IR calibrated-centroid matching, including one real swtpm credential release. |
+| Daemon `tests::split_whole_call::publication::{split_whole_*,tpm_split_whole_*}` | Nonreset merge, final-sample publication refusal and encrypted reset retaining the actual template key, followed by fresh authentication. |
+
+The feature-only core `keyring::test_support::UnsealObserver` counts public
+credential-unseal entries and successful returns on the execution thread without
+substituting their results. Template-key unseals are separate. The swtpm rows
+require an explicit simulator transport and absent host TPM nodes. They compare
+the returned synthetic secret and kind, and use the real `WorkerReply::respond`
+socket write and `FaceCompletion` accounting; a failed write keeps the charge.
+The daemon CI `tpm_` sweep retains its existing selection and minimum and requires
+each of these exact names, so a rename cannot silently remove a row:
+
+```text
+tpm_split_whole_unseal_releases_once_at_each_skew_and_resets_only_after_delivery
+tpm_split_whole_unwritten_credential_keeps_the_charge_after_one_real_release
+tpm_split_whole_broken_credential_envelope_refuses_release_and_keeps_charge
+tpm_split_whole_centroid_identity_releases_once_at_each_skew
+tpm_split_whole_reset_preserves_template_key_and_next_authenticate_routes
+```
+
+The runner dispatches original Requests with a constructed root peer. It skips
+incoming parsing, serve/queue, `SO_PEERCRED` and the production early reply channel;
+it does not qualify non-root OS approval, installed PAM or filesystem ownership.
+No physical cameras or real TPM are exercised or changed. These software rows
+leave final integrated gate qualification, physical split acceptance and the
+separate reviewed activation change pending. This ADR remains Proposed; the YUYV
+exposure and T480 acceptance gates remain in force.

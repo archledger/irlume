@@ -11,9 +11,7 @@ license.workspace = true
 [features]
 default = []
 ir-only-evaluation = ["dep:libc", "irlume-camera/capture-timing"]
-# Test-support evidence scripts for whole-call split rows (ADR-0032 step 5).
-# Enabled by dependent crates under [dev-dependencies] only; resolver v2
-# keeps it out of release builds, like irlume-camera's own test-support.
+# Downstream tests only. This fixture supplies assessments, never admission.
 test-support = []
 
 [[example]]

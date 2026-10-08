@@ -12394,7 +12394,7 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 22] = [
+        let sources: [(&str, &str); 27] = [
             ("main.rs", include_str!("main.rs")),
             (
                 "request_preparation_tests.rs",
@@ -12407,6 +12407,26 @@ mod tests {
             (
                 "split_authentication_runtime_tests.rs",
                 include_str!("split_authentication_runtime_tests.rs"),
+            ),
+            (
+                "split_whole_call_tests.rs",
+                include_str!("split_whole_call_tests.rs"),
+            ),
+            (
+                "split_whole_call_boundary_tests.rs",
+                include_str!("split_whole_call_boundary_tests.rs"),
+            ),
+            (
+                "split_whole_call_credential_tests.rs",
+                include_str!("split_whole_call_credential_tests.rs"),
+            ),
+            (
+                "split_whole_call_centroid_tests.rs",
+                include_str!("split_whole_call_centroid_tests.rs"),
+            ),
+            (
+                "split_whole_call_publication_tests.rs",
+                include_str!("split_whole_call_publication_tests.rs"),
             ),
             (
                 "split_closed_matrix_tests.rs",
@@ -18022,6 +18042,7 @@ mod tests {
     include!("request_preparation_tests.rs");
     include!("split_runtime_tests.rs");
     include!("split_authentication_runtime_tests.rs");
+    include!("split_whole_call_tests.rs");
     include!("split_closed_matrix_tests.rs");
     include!("split_diagnostics_tests.rs");
     include!("split_liveness_tests.rs");

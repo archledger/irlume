@@ -685,9 +685,14 @@ mod onnx {
 
         /// SHA-256 of the CPU session's raw output bits for the reference
         /// inputs. On one host and runtime the CPU session is deterministic,
-        /// so an entry records these exact bits (ADR-0022 §3).
-        #[cfg(feature = "npu")]
-        fn cpu_reference_digest(&mut self) -> irlume_common::Result<String> {
+        /// so a certification entry records these exact bits (ADR-0022 §3),
+        /// and enrollment records them as the producer of its templates
+        /// (ADR-0022 §2).
+        ///
+        /// # Errors
+        ///
+        /// When the CPU session fails.
+        pub fn cpu_reference_digest(&mut self) -> irlume_common::Result<String> {
             let n = align::OUT_SIZE as i64;
             let mut bits = Vec::new();
             for k in 0..3 {
@@ -2465,9 +2470,10 @@ mod onnx {
     #[path = "npu_tests.rs"]
     mod npu_tests;
 
-    /// Fixed synthetic inputs of the CPU reference fingerprint
-    /// (ADR-0022 §3), shared with the hardware tests.
-    #[cfg(feature = "npu")]
+    /// Fixed synthetic inputs of the CPU reference fingerprint and digests
+    /// (ADR-0022 §3), shared with the hardware tests. The digest inputs are
+    /// in every build: enrollment records the CPU reference that produced a
+    /// template whether or not this build can use an NPU.
     mod npu_reference {
         /// A preprocessed 112x112 recognizer input; `k` varies the pattern.
         pub(super) fn chip(k: usize) -> Vec<f32> {
@@ -2480,6 +2486,7 @@ mod onnx {
         /// A 112x112 RGB chip as raw bytes, so the fingerprint also passes
         /// through the production preprocessing (`align::preprocess_arcface`):
         /// a change to its scaling, channel order or layout changes it.
+        #[cfg(feature = "npu")]
         pub(super) fn raw_chip() -> Vec<u8> {
             let n = crate::align::OUT_SIZE as usize;
             (0..3 * n * n).map(|i| ((i * 53 + 7) % 256) as u8).collect()
@@ -2487,7 +2494,7 @@ mod onnx {
 
         /// A 640x480 RGB frame with structure in every channel, for the PAD
         /// measurements of the hardware tests.
-        #[cfg(test)]
+        #[cfg(all(test, feature = "npu"))]
         pub(super) fn frame() -> (Vec<u8>, u32, u32) {
             let (w, h) = (640u32, 480u32);
             let mut data = Vec::with_capacity((w * h * 3) as usize);
@@ -2502,18 +2509,19 @@ mod onnx {
         }
 
         /// The face box the PAD cues read in [`frame`].
-        #[cfg(test)]
+        #[cfg(all(test, feature = "npu"))]
         pub(super) const BBOX: [f32; 4] = [200.0, 120.0, 440.0, 400.0];
 
         /// How many leading embedding components the recognizer's
         /// fingerprint keeps.
+        #[cfg(feature = "npu")]
         pub(super) const EMBEDDING_PREFIX: usize = 16;
 
         /// How far a recomputed fingerprint component may be from the
         /// recorded one: far above run-to-run noise, far below any
         /// preprocessing or runtime change. Tests on any host use it; the
         /// runtime gate compares exact digests.
-        #[cfg(test)]
+        #[cfg(all(test, feature = "npu"))]
         pub(super) const FINGERPRINT_TOLERANCE: f32 = 1e-4;
     }
 

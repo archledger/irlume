@@ -590,6 +590,7 @@ mod tests {
                 ir: Some(probe.clone()),
                 ir_space: Some("raw".into()),
                 embed_space: None,
+                embed_producer: None,
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,

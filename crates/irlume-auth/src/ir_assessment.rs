@@ -1058,6 +1058,7 @@ mod tests {
                 ir: with_ir.then(|| vec![0.25; 4]),
                 ir_space: Some("raw".into()),
                 embed_space: Some("embed:test".into()),
+                embed_producer: None,
                 ir_center_edge_ratio: 2.0,
                 ir_brightness: 1.0,
                 pitch,

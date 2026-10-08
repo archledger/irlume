@@ -80,6 +80,20 @@ pub struct FaceScan {
     /// provenance is independent: an absent `ir_space` remains unknown.
     #[serde(default)]
     pub embed_space: Option<String>,
+    /// The CPU reference that computed this scan's embeddings, from
+    /// [`embed_producer`]: the recognizer digest, the ONNX Runtime version and
+    /// the digest of that session's exact outputs on fixed inputs.
+    ///
+    /// `embed_space` names the model; this names the arithmetic. An NPU
+    /// probe is certified against templates from one CPU reference only, so
+    /// an authentication uses the NPU only when every scan it can match
+    /// carries the certified producer (ADR-0022 §2). `None`: a scan from
+    /// before the field, or one whose producer could not be computed; such a
+    /// scan matches exactly as before, with a CPU probe. Absent, it is not
+    /// written, so a scan without it re-serialises byte for byte (see
+    /// `captured_at`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_producer: Option<String>,
     /// Per-scan IR liveness calibration: the center/edge brightness ratio of the
     /// face region at capture, and the face brightness. The on-disk key stays
     /// `ir_depth` (the name it shipped under) so an enrollment written here still
@@ -272,6 +286,17 @@ pub fn recognizer_space_matches(have: Option<&str>, want: &str) -> bool {
         Some(have) => have == want,
         None => want == LEGACY_RECOGNIZER_SPACE,
     }
+}
+
+/// The producer tag of a scan embedded by the recognizer with weights
+/// `recognizer_sha256` on ONNX Runtime `onnx_runtime`, whose CPU session
+/// gives `cpu_reference_digest` on the fixed reference inputs (ADR-0022 §2).
+pub fn embed_producer(
+    recognizer_sha256: &str,
+    onnx_runtime: &str,
+    cpu_reference_digest: &str,
+) -> String {
+    format!("cpu:{recognizer_sha256}:ort-{onnx_runtime}:{cpu_reference_digest}")
 }
 
 /// The IR embedding space of the shipped pipeline with no adapter loaded.
@@ -502,6 +527,7 @@ fn migrate(old: LegacyProfile) -> Enrollment {
             embed_space: None, // and predate recognizer tagging
 
             ir_center_edge_ratio: old.ir_depth_samples.get(i).copied().unwrap_or(0.0),
+            embed_producer: None,
             ir_brightness: old.ir_brightness_samples.get(i).copied().unwrap_or(0.0),
             pitch: 0.0,        // legacy scans predate pitch calibration
             captured_at: None, // and record no capture time
@@ -1395,6 +1421,25 @@ pub fn list_users_at(dir: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_scan_records_its_producer_and_older_scans_load_without_one() {
+        // ADR-0022 §2: additive and optional, so an older binary ignores the
+        // field and a scan written before it loads with none.
+        let producer = embed_producer("abc", "1.28.1", "d1g3st");
+        assert_eq!(producer, "cpu:abc:ort-1.28.1:d1g3st");
+        let mut scan = scan("s", 0.5, Some("embed:x"));
+        scan.embed_producer = Some(producer.clone());
+        let json = serde_json::to_string(&scan).unwrap();
+        let back: FaceScan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.embed_producer.as_deref(), Some(producer.as_str()));
+        let mut old: serde_json::Value = serde_json::from_str(&json).unwrap();
+        old.as_object_mut().unwrap().remove("embed_producer");
+        let legacy: FaceScan = serde_json::from_value(old).unwrap();
+        assert_eq!(legacy.embed_producer, None);
+        // Absent, it is not written: an older scan rewrites to its own bytes.
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("embed_producer"));
+    }
     #[test]
     fn retag_marker_is_written_no_looser_than_0600() {
         let _env = crate::testenv::ENV_LOCK
@@ -1782,6 +1827,7 @@ mod tests {
             ir: None,
             ir_space: None,
             embed_space: space.map(str::to_string),
+            embed_producer: None,
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
@@ -2039,6 +2085,7 @@ mod tests {
                     ir: Some(vec![0.5, 0.6]),
                     ir_space: None,
                     embed_space: None,
+                    embed_producer: None,
                     ir_center_edge_ratio: 1.4,
                     ir_brightness: 90.0,
                     pitch: 0.52,
@@ -4357,6 +4404,7 @@ mod tests {
             ir: Some(vec![0.2; 4]),
             ir_space: None,
             embed_space: None,
+            embed_producer: None,
             ir_center_edge_ratio: ratio,
             ir_brightness: bright,
             pitch: 0.0,
@@ -4371,6 +4419,7 @@ mod tests {
             ir: None,
             ir_space: None,
             embed_space: None,
+            embed_producer: None,
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch,
@@ -4424,6 +4473,7 @@ mod tests {
             ir: Some(vec![0.2; dim]),
             ir_space: space.map(Into::into),
             embed_space: None,
+            embed_producer: None,
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
@@ -4523,6 +4573,7 @@ mod tests {
                     ir: None,
                     ir_space: None,
                     embed_space: None,
+                    embed_producer: None,
                     ir_center_edge_ratio: 0.0,
                     ir_brightness: 0.0,
                     pitch: 0.0,
@@ -4835,6 +4886,7 @@ mod tests {
             ir: Some(vec![0.0; 4]),
             ir_space: space.map(String::from),
             embed_space: None,
+            embed_producer: None,
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,

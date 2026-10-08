@@ -13,6 +13,8 @@ default = []
 ir-only-evaluation = ["dep:libc", "irlume-camera/capture-timing"]
 # Downstream tests only. This fixture supplies assessments, never admission.
 test-support = []
+# Optional NPU inference for authentication probes (ADR-0022).
+npu = ["irlume-vision/npu"]
 
 [[example]]
 name = "ir_only_evaluation"

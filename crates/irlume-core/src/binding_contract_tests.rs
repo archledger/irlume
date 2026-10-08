@@ -65,6 +65,7 @@ fn secondary(pair: GroupPair, primary: &[u8]) -> SecondaryStore {
                     ir: None,
                     ir_space: None,
                     embed_space: None,
+                    embed_producer: None,
                     ir_center_edge_ratio: 0.0,
                     ir_brightness: 0.0,
                     pitch: 0.0,

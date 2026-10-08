@@ -117,6 +117,7 @@ impl Bed {
                                     ir_pad: None,
                                     version: String::new(),
                                     apparmor: None,
+                                    recognizer: None,
                                 },
                                 _ => irlume_common::Response::Error("unexpected request".into()),
                             }

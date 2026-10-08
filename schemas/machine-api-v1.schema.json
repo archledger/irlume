@@ -523,6 +523,34 @@
         "fingerprint_known": {
           "description": "Whether the bounded tooling and reader probe completed. When false, fingerprint=false means unknown, not confirmed absent. Optional for compatibility with older contract 1 engines.",
           "type": "boolean"
+        },
+        "recognizer": {
+          "description": "Where the daemon's recognizer computes authentication probes (ADR-0022). Optional for compatibility with older contract 1 engines.",
+          "type": "object",
+          "required": [
+            "known"
+          ],
+          "properties": {
+            "known": {
+              "description": "Whether the daemon reported the placement. When false, no other field is present.",
+              "type": "boolean"
+            },
+            "device": {
+              "type": "string",
+              "enum": [
+                "npu",
+                "cpu"
+              ]
+            },
+            "reason": {
+              "description": "On CPU, why.",
+              "type": "string"
+            },
+            "platform": {
+              "description": "The NPU platform identity digest, when one was read.",
+              "type": "string"
+            }
+          }
         }
       }
     },

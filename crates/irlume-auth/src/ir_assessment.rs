@@ -1058,6 +1058,7 @@ mod tests {
                 ir: with_ir.then(|| vec![0.25; 4]),
                 ir_space: Some("raw".into()),
                 embed_space: Some("embed:test".into()),
+                embed_producer: None,
                 ir_center_edge_ratio: 2.0,
                 ir_brightness: 1.0,
                 pitch,
@@ -2504,6 +2505,9 @@ impl Engine {
             Ok(resolution) => resolution,
             Err(refusal) => return Ok(readiness_refusal(refusal.readiness)),
         };
+        // The same NPU admission as the dual-sensor path (ADR-0022 §2); the
+        // request's scope clears it.
+        self.npu_probe = self.npu_probe_admitted(&enrollment);
         self.authenticate_ir_resolution(
             window,
             diagnostics,

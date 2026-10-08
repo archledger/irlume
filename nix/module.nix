@@ -528,6 +528,10 @@ in
         ConfigurationDirectory = "irlume";
         RuntimeDirectory = "irlume-recovery";
         RuntimeDirectoryMode = "0700";
+        # The NPU compile cache and its crash markers (ADR-0022 §10, §11), root
+        # only, as in packaging/systemd/irlumed.service.
+        CacheDirectory = "irlume/npu";
+        CacheDirectoryMode = "0700";
         PrivateTmp = true;
         ProtectKernelTunables = true;
         ProtectKernelModules = true;

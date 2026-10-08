@@ -203,6 +203,7 @@ mod split_whole_call {
                 ir: Some(probe(1.0).to_vec()),
                 ir_space: Some(engine.ir_space().into()),
                 embed_space: Some(engine.embed_space().into()),
+                embed_producer: None,
                 ir_center_edge_ratio: 1.3,
                 ir_brightness: 35.0,
                 pitch: 0.5,

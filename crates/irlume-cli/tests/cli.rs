@@ -2691,6 +2691,7 @@ fn login_changes_on_nixos_name_the_module_and_touch_nothing() {
             ir_pad: None,
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
+            recognizer: None,
         },
         _ => Response::Error("unexpected request".into()),
     });
@@ -3594,6 +3595,7 @@ session    optional                     pam_irlume.so reseal\n";
             ir_pad: None,
             version: String::new(),
             apparmor: None,
+            recognizer: None,
         },
         _ => Response::Error("unexpected request".into()),
     });
@@ -3787,6 +3789,7 @@ impl LightdmBed {
                 ir_pad: None,
                 version: String::new(),
                 apparmor: None,
+                recognizer: None,
             },
             _ => Response::Error("unexpected request".into()),
         });
@@ -4472,6 +4475,7 @@ fn status_takes_the_camera_pair_from_the_daemon_not_a_local_probe() {
             ir_pad: Some(irlume_common::PadModelStatus::Loaded),
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
+            recognizer: None,
         },
         _ => Response::Error("unexpected request".into()),
     });
@@ -5425,6 +5429,7 @@ fn setup_walks_every_step_noninteractively() {
             ir_pad: Some(irlume_common::PadModelStatus::Loaded),
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
+            recognizer: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: Vec::new(),

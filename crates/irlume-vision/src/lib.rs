@@ -366,7 +366,7 @@ mod onnx {
                 libc::dlclose(handle);
             }
             match verdict {
-                Ok(version) => Ok(format!("{version}, mapped from {mapped}")),
+                Ok(version) => Ok(describe_runtime(&version, &mapped)),
                 Err(why) => Err(format!("{why} (the loader mapped {mapped})")),
             }
         }
@@ -492,6 +492,32 @@ mod onnx {
             .map_err(irlume_common::Error::Hardware)
     }
 
+    /// The text `runtime_resolution` reports for a runtime of `version`
+    /// mapped from `mapped`.
+    fn describe_runtime(version: &str, mapped: &str) -> String {
+        format!("{version}{RUNTIME_MAPPED_FROM}{mapped}")
+    }
+
+    /// The separator between the version and the mapped path in that text.
+    const RUNTIME_MAPPED_FROM: &str = ", mapped from ";
+
+    /// The ONNX Runtime version alone from [`describe_runtime`]'s text.
+    fn runtime_version(described: &str) -> &str {
+        described
+            .split_once(RUNTIME_MAPPED_FROM)
+            .map_or(described, |(version, _)| version)
+    }
+
+    /// The version of the ONNX Runtime this process resolves, without its
+    /// path: what a template's producer and an NPU certification record
+    /// (ADR-0022 §2, §3), so moving the same runtime changes neither.
+    pub fn onnx_runtime_version() -> Option<String> {
+        runtime_resolution()
+            .1
+            .ok()
+            .map(|described| runtime_version(&described).to_owned())
+    }
+
     /// What the onnxruntime resolver would use in this process, for `irlume
     /// doctor`: the candidate (an explicit or packaged path, or the system
     /// loader when `None`) plus the probe's verdict on it, `Ok` carrying the
@@ -589,13 +615,36 @@ mod onnx {
             model: &irlume_common::HashedModel,
             npu: &mut crate::npu::Context,
         ) -> irlume_common::Result<Self> {
-            let session = build(model.bytes())?;
             let mut embedder = Self {
-                session,
-                npu: npu.slot(model.bytes(), model.sha256()),
+                session: build(model.bytes())?,
+                npu: crate::npu::Slot::default(),
             };
-            embedder.check_npu_parity()?;
+            embedder.place_on_npu(model, npu)?;
             Ok(embedder)
+        }
+
+        /// [`Self::load_with_npu`] for an embedder already loaded from
+        /// `model`: places it without rebuilding its CPU session. An error
+        /// of the parity check's CPU session leaves the model on CPU.
+        ///
+        /// # Errors
+        ///
+        /// When the CPU session fails on the parity check's reference
+        /// inputs.
+        #[cfg(feature = "npu")]
+        pub fn place_on_npu(
+            &mut self,
+            model: &irlume_common::HashedModel,
+            npu: &mut crate::npu::Context,
+        ) -> irlume_common::Result<()> {
+            self.npu = npu.slot(model.bytes(), model.sha256());
+            if let Err(error) = self.check_npu_parity() {
+                self.npu = crate::npu::Slot::cpu(crate::npu::CpuReason::ParityMismatch(format!(
+                    "the parity check failed: {error}"
+                )));
+                return Err(error);
+            }
+            Ok(())
         }
 
         /// Before the NPU answers a request, require it to reproduce the
@@ -685,9 +734,14 @@ mod onnx {
 
         /// SHA-256 of the CPU session's raw output bits for the reference
         /// inputs. On one host and runtime the CPU session is deterministic,
-        /// so an entry records these exact bits (ADR-0022 §3).
-        #[cfg(feature = "npu")]
-        fn cpu_reference_digest(&mut self) -> irlume_common::Result<String> {
+        /// so a certification entry records these exact bits (ADR-0022 §3),
+        /// and enrollment records them as the producer of its templates
+        /// (ADR-0022 §2).
+        ///
+        /// # Errors
+        ///
+        /// When the CPU session fails.
+        pub fn cpu_reference_digest(&mut self) -> irlume_common::Result<String> {
             let n = align::OUT_SIZE as i64;
             let mut bits = Vec::new();
             for k in 0..3 {
@@ -2465,9 +2519,10 @@ mod onnx {
     #[path = "npu_tests.rs"]
     mod npu_tests;
 
-    /// Fixed synthetic inputs of the CPU reference fingerprint
-    /// (ADR-0022 §3), shared with the hardware tests.
-    #[cfg(feature = "npu")]
+    /// Fixed synthetic inputs of the CPU reference fingerprint and digests
+    /// (ADR-0022 §3), shared with the hardware tests. The digest inputs are
+    /// in every build: enrollment records the CPU reference that produced a
+    /// template whether or not this build can use an NPU.
     mod npu_reference {
         /// A preprocessed 112x112 recognizer input; `k` varies the pattern.
         pub(super) fn chip(k: usize) -> Vec<f32> {
@@ -2480,6 +2535,7 @@ mod onnx {
         /// A 112x112 RGB chip as raw bytes, so the fingerprint also passes
         /// through the production preprocessing (`align::preprocess_arcface`):
         /// a change to its scaling, channel order or layout changes it.
+        #[cfg(feature = "npu")]
         pub(super) fn raw_chip() -> Vec<u8> {
             let n = crate::align::OUT_SIZE as usize;
             (0..3 * n * n).map(|i| ((i * 53 + 7) % 256) as u8).collect()
@@ -2487,7 +2543,7 @@ mod onnx {
 
         /// A 640x480 RGB frame with structure in every channel, for the PAD
         /// measurements of the hardware tests.
-        #[cfg(test)]
+        #[cfg(all(test, feature = "npu"))]
         pub(super) fn frame() -> (Vec<u8>, u32, u32) {
             let (w, h) = (640u32, 480u32);
             let mut data = Vec::with_capacity((w * h * 3) as usize);
@@ -2502,18 +2558,19 @@ mod onnx {
         }
 
         /// The face box the PAD cues read in [`frame`].
-        #[cfg(test)]
+        #[cfg(all(test, feature = "npu"))]
         pub(super) const BBOX: [f32; 4] = [200.0, 120.0, 440.0, 400.0];
 
         /// How many leading embedding components the recognizer's
         /// fingerprint keeps.
+        #[cfg(feature = "npu")]
         pub(super) const EMBEDDING_PREFIX: usize = 16;
 
         /// How far a recomputed fingerprint component may be from the
         /// recorded one: far above run-to-run noise, far below any
         /// preprocessing or runtime change. Tests on any host use it; the
         /// runtime gate compares exact digests.
-        #[cfg(test)]
+        #[cfg(all(test, feature = "npu"))]
         pub(super) const FINGERPRINT_TOLERANCE: f32 = 1e-4;
     }
 
@@ -2779,6 +2836,17 @@ mod onnx {
         }
 
         #[test]
+        fn the_runtime_version_is_the_version_alone() {
+            let described = describe_runtime("1.28.1", "/usr/lib64/libonnxruntime.so.1.28.1");
+            assert_eq!(
+                described,
+                "1.28.1, mapped from /usr/lib64/libonnxruntime.so.1.28.1"
+            );
+            assert_eq!(runtime_version(&described), "1.28.1");
+            assert_eq!(runtime_version("1.28.1"), "1.28.1");
+        }
+
+        #[test]
         fn a_null_api_base_is_refused() {
             #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
             let err = unsafe { inspect_api_base(std::ptr::null()) }.unwrap_err();
@@ -2795,9 +2863,9 @@ pub use onnx::npu_reference_fingerprint;
 #[cfg(feature = "onnx")]
 pub use onnx::{
     blaze_anchors, blaze_letterbox_input, decode_short_range_best, map_checked_mesh_output,
-    mesh_box_valid, mesh_output_plausible, runtime_resolution, selftest_alignment_identity,
-    Adapter, BlazeRescue, Detector, Embedder, FaceMesh, OnCpu, PadIr, PadVit, BLAZE_INPUT,
-    BLAZE_SCORE_THRESHOLD, MESH_INPUT, MESH_N, MESH_N_IRIS,
+    mesh_box_valid, mesh_output_plausible, onnx_runtime_version, runtime_resolution,
+    selftest_alignment_identity, Adapter, BlazeRescue, Detector, Embedder, FaceMesh, OnCpu, PadIr,
+    PadVit, BLAZE_INPUT, BLAZE_SCORE_THRESHOLD, MESH_INPUT, MESH_N, MESH_N_IRIS,
 };
 
 /// Pure decode tests for the short-range head: the reject half (floor, NaN)

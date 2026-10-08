@@ -34,6 +34,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `irlume doctor` reports where the daemon's recognizer computes
+  authentication probes (`recognizer-device`: NPU, or CPU with the reason)
+  and the NPU platform it read (`npu-platform`), and `irlume status --json`
+  gains an optional `recognizer` object. irlumed built with the default-off
+  `npu` feature can place the recognizer on a certified Intel NPU; no
+  platform is certified yet, so it runs on CPU everywhere. New face scans
+  record the CPU reference that embedded them, an optional field older
+  releases ignore (ADR-0022).
+
 - `irlume enroll --split-camera-choice JSON` asks irlumed to enroll, with or
   without `--reset`, on an authorized split pair for this operation only,
   and `enroll --add-camera --split-camera-choice JSON` to add that pair as a

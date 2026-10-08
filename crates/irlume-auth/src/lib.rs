@@ -97,6 +97,17 @@ pub struct Engine {
     /// weights. Stamped onto every scan enrolled and required to match at
     /// verification: cosine scores are only meaningful inside one space.
     embed_space: String,
+    /// The producer tag of the scans this engine embeds (ADR-0022 §2),
+    /// computed once from the CPU reference; `None` until computed or when
+    /// it cannot be.
+    embed_producer: Option<String>,
+    /// The NPU platform identity digest the recognizer was placed for, when
+    /// discovery read one (ADR-0022 §13).
+    npu_platform: Option<String>,
+    /// Whether this request's probes may run on the NPU: set only by an
+    /// authentication whose enrollment admits it, and cleared when that
+    /// request's scope ends (ADR-0022 §2). Every other path embeds on CPU.
+    npu_probe: bool,
     /// The RGB match threshold for THIS recognizer. Always the shipped
     /// constant for the shipped model (the third-party recognizer lane was
     /// removed by ADR-0015); a threshold is a property of one model's cosine
@@ -273,7 +284,13 @@ impl Assessment {
 // An unfinished assessment cannot enter the public identity-admission boundary.
 // Its identity inputs carry actual detected faces, not placeholder embeddings.
 mod authentication_window;
+mod identity_arms;
+mod npu_probe;
 pub use authentication_window::AuthenticationWindow;
+pub use identity_arms::decision_fingerprint;
+/// The NPU runtime the daemon opens for the recognizer (ADR-0022).
+#[cfg(feature = "npu")]
+pub use irlume_vision::npu;
 mod grouped_auth;
 mod managed_pad;
 
@@ -2055,6 +2072,7 @@ mod adapter_match_tests {
                 ir: Some(template),
                 ir_space: Some("adapter-test".into()),
                 embed_space: None,
+                embed_producer: None,
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,
@@ -4100,6 +4118,9 @@ impl Engine {
             ir_adapter_required: false,
             ir_space: "raw".into(),
             embed_space,
+            embed_producer: None,
+            npu_platform: None,
+            npu_probe: false,
             rgb_threshold: irlume_core::RGB_MATCH_THRESHOLD,
             mesh: None,
             blaze: None,
@@ -5075,10 +5096,7 @@ impl Engine {
                     width: image.width,
                     height: image.height,
                 };
-                Some(
-                    self.emb
-                        .embed_tta(&align::align_to_arcface(&view, &image.face.landmarks)?)?,
-                )
+                Some(self.embed_rgb_probe(&align::align_to_arcface(&view, &image.face.landmarks)?)?)
             }
             None => None,
         };
@@ -6451,7 +6469,7 @@ impl Engine {
                     height: image.height,
                 };
                 let chip = align::align_to_arcface(&view, &image.face.landmarks)?;
-                Some(self.emb.embed_tta(&chip)?)
+                Some(self.embed_rgb_probe(&chip)?)
             }
             None => None,
         };
@@ -6466,7 +6484,7 @@ impl Engine {
                     height: image.height,
                 };
                 let chip = align::align_to_arcface(&view, &image.face.landmarks)?;
-                let raw = self.emb.embed(&chip)?;
+                let raw = self.embed_ir_probe(&chip)?;
                 Some(match &mut self.ir_adapter {
                     Some(a) => a.apply(&raw)?,
                     None => raw.to_vec(),
@@ -6953,6 +6971,10 @@ impl Engine {
                 Err(outcome) => return Ok(outcome),
             }
         };
+        // Probes may run on the NPU only for an enrollment whose every scan
+        // came from the certified CPU reference (ADR-0022 §2); the request's
+        // scope clears this on every return path.
+        self.npu_probe = self.npu_probe_admitted(&enr);
         let request_window = request_window.clipped_to(self.authentication_window_from(
             request_window.origin(),
             service,
@@ -7721,20 +7743,6 @@ impl Engine {
             ));
         }
 
-        // best match over a labeled set of templates -> (score, profile name).
-        let best = |probe: &[f32], scans: &[(&str, &str, &[f32])]| -> (f32, String) {
-            // Fold over borrowed names and allocate only the winner's String, not
-            // one per template. `>` keeps the first template on a tie (unchanged).
-            let (score, who) = scans
-                .iter()
-                .map(|(prof, _scan, t)| (align::cosine(probe, t), *prof))
-                .fold(
-                    (f32::NEG_INFINITY, ""),
-                    |acc, x| if x.0 > acc.0 { x } else { acc },
-                );
-            (score, who.to_string())
-        };
-
         // Primary path: a visible-light (RGB) face -> full cross-spectrum gate +
         // RGB recognition across all profiles' scans.
         if let Some(probe) = a.embedding {
@@ -7780,9 +7788,17 @@ impl Engine {
                     ));
                 }
             }
+            // The decisions are identity_arms' pure functions (the decision
+            // fingerprint of ADR-0022 §3 runs the same code); this block
+            // traces them in the order they are reached.
             let scans = enr.rgb_scans_in(&self.embed_space);
-            let thr = self.rgb_grant_threshold(scans.len());
-            let (score, who) = best(&probe, &scans);
+            let (score, who) = identity_arms::best_rgb(&probe, &scans);
+            let (thr, rgb_grants) = identity_arms::rgb_arm(
+                score,
+                self.rgb_threshold,
+                scans.len(),
+                a.sequential_posture(),
+            );
             irlume_common::dlog!(
                 "match(rgb): best {score:.3} vs thr {thr:.3} ({} scans, best profile '{who}')",
                 scans.len()
@@ -7794,7 +7810,7 @@ impl Engine {
                 thr,
                 score >= thr,
             );
-            if rgb_primary_grant_admissible(score, thr, a.sequential_posture()) {
+            if rgb_grants {
                 return Ok(Outcome::grant(score, format!("match: {who} (rgb)")));
             }
             if a.sequential_posture() && score >= thr {
@@ -7822,13 +7838,18 @@ impl Engine {
                 let m = self.ir_match(enr, ir_probe);
                 if m.n_templates > 0 {
                     let (ir_score, ir_who) = (m.best, m.best_who.clone());
-                    // (a) brightness-weighted score fusion: the dim/mixed-light path.
-                    let f = irlume_core::fusion::fuse(
-                        irlume_core::fusion::rgb_genuine_prob(score),
-                        irlume_core::fusion::rgb_quality_weight(a.signals.rgb_face_brightness),
-                        irlume_core::fusion::ir_genuine_prob(ir_score),
-                        irlume_core::fusion::ir_quality_weight(true, a.ir_brightness),
+                    // (a) brightness-weighted score fusion, (b) pure IR
+                    // fallback, (c) calibrated centroid (ADR-0004).
+                    let arms = identity_arms::lit_ir_arms(
+                        score,
+                        a.signals.rgb_face_brightness,
+                        &m,
+                        a.ir_brightness,
+                        a.sequential_posture(),
+                        self.ir_adapter.is_some(),
+                        enr.profiles.len(),
                     );
+                    let f = arms.fusion;
                     irlume_common::dlog!("match(fusion): p={:.3} grant={} (rgb {score:.3} bright {:.0} / ir {ir_score:.3} bright {:.0})",
                         f.prob, f.grant, a.signals.rgb_face_brightness, a.ir_brightness);
                     emit_trace_match(
@@ -7838,7 +7859,7 @@ impl Engine {
                         irlume_core::fusion::FUSION_PROB_THRESHOLD,
                         f.grant,
                     );
-                    if f.grant && !a.sequential_posture() {
+                    if arms.grant == Some(identity_arms::IrArm::Fusion) {
                         let who = if ir_score >= score { ir_who } else { who };
                         return Ok(
                     Outcome::grant(f.prob,
@@ -7851,16 +7872,7 @@ impl Engine {
                             f.prob
                         );
                     }
-                    // (b) pure IR fallback: still valid when IR alone is clearly strong
-                    // (e.g. IR-only enrollment, or RGB template absent). Stricter than the
-                    // dark path (+IR_FALLBACK_MARGIN) for the second-modality risk.
-                    let ir_base = if self.ir_adapter.is_some() {
-                        irlume_core::IR_ADAPTED_MATCH_THRESHOLD
-                    } else {
-                        irlume_core::IR_MATCH_THRESHOLD
-                    };
-                    let ir_thr = irlume_core::scaled_threshold(ir_base, m.n_templates)
-                        + irlume_core::IR_FALLBACK_MARGIN;
+                    let ir_thr = arms.fallback_threshold;
                     irlume_common::dlog!(
                         "match(ir-fallback): {ir_score:.3} vs thr {ir_thr:.3} (adapter={})",
                         self.ir_adapter.is_some()
@@ -7872,7 +7884,7 @@ impl Engine {
                         ir_thr,
                         ir_score >= ir_thr,
                     );
-                    if ir_score >= ir_thr {
+                    if arms.grant == Some(identity_arms::IrArm::Fallback) {
                         return Ok(Outcome::grant(
                             ir_score,
                             format!(
@@ -7880,12 +7892,7 @@ impl Engine {
                             ),
                         ));
                     }
-                    // (c) calibrated-centroid fallback (ADR-0004): the mean-
-                    // template score carries no best-of-N FAR inflation, so it
-                    // uses the base threshold scaled only by profile count.
-                    if let Some((cs, cwho)) = &m.centroid {
-                        let cthr = irlume_core::scaled_threshold(ir_base, enr.profiles.len())
-                            + irlume_core::IR_FALLBACK_MARGIN;
+                    if let (Some((cs, cwho)), Some(cthr)) = (&m.centroid, arms.centroid_threshold) {
                         irlume_common::dlog!("match(ir-centroid): {cs:.3} vs thr {cthr:.3}");
                         emit_trace_match(
                             diagnostics,
@@ -7894,7 +7901,7 @@ impl Engine {
                             cthr,
                             *cs >= cthr,
                         );
-                        if *cs >= cthr {
+                        if arms.grant == Some(identity_arms::IrArm::Centroid) {
                             return Ok(
                     Outcome::grant(*cs,
                                 format!("match: {cwho} (calibrated centroid, dim light; rgb {score:.2}<{thr:.2})")));
@@ -8351,8 +8358,8 @@ impl Engine {
             ));
         };
         let chip = align::align_to_arcface(&view, &f.landmarks)?;
-        let emb_first = self.emb.embed(&chip)?;
-        let emb_second = self.emb.embed(&chip)?;
+        let emb_first = self.emb.on_cpu().embed(&chip)?;
+        let emb_second = self.emb.on_cpu().embed(&chip)?;
         let cos = align::cosine(&emb_first, &emb_second);
         Ok((
             cos > 0.999,
@@ -9276,6 +9283,8 @@ impl Engine {
             let mut ambient_lit = 0usize;
             // One capture session, one date (ADR-0030 §2).
             let captured_at = irlume_core::storage::capture_time_now();
+            // The CPU reference that embedded these scans (ADR-0022 §2).
+            let embed_producer = self.embed_producer();
             for s in captured.into_iter().take(room) {
                 if s.ambient_share.is_some_and(|v| v >= AMBIENT_LIT_SHARE) {
                     ambient_lit += 1;
@@ -9289,6 +9298,7 @@ impl Engine {
                     ir: s.ir,
                     ir_space,
                     embed_space: Some(self.embed_space.clone()),
+                    embed_producer: embed_producer.clone(),
                     ir_center_edge_ratio: s.center_edge_ratio,
                     ir_brightness: s.brightness,
                     pitch: s.pitch,
@@ -9329,6 +9339,8 @@ impl Engine {
         // One capture session, one date (ADR-0030 §2); an added camera's
         // scans are captured here too and keep it in the camera store.
         let captured_at = irlume_core::storage::capture_time_now();
+        // The CPU reference that embedded these scans (ADR-0022 §2).
+        let embed_producer = self.embed_producer();
         for s in captured {
             if s.ambient_share.is_some_and(|v| v >= AMBIENT_LIT_SHARE) {
                 ambient_lit += 1;
@@ -9341,6 +9353,7 @@ impl Engine {
                 ir: s.ir,
                 ir_space,
                 embed_space: Some(self.embed_space.clone()),
+                embed_producer: embed_producer.clone(),
                 ir_center_edge_ratio: s.center_edge_ratio,
                 ir_brightness: s.brightness,
                 pitch: s.pitch,
@@ -9727,6 +9740,8 @@ impl Engine {
         let mut ambient_lit = 0usize;
         // One capture session, one date (ADR-0030 §2).
         let captured_at = storage::capture_time_now();
+        // The CPU reference that embedded these scans (ADR-0022 §2).
+        let embed_producer = self.embed_producer();
         for c in captured {
             if c.ambient_share.is_some_and(|v| v >= AMBIENT_LIT_SHARE) {
                 ambient_lit += 1;
@@ -9739,6 +9754,7 @@ impl Engine {
                 ir: c.ir,
                 ir_space,
                 embed_space: Some(self.embed_space.clone()),
+                embed_producer: embed_producer.clone(),
                 ir_center_edge_ratio: c.center_edge_ratio,
                 ir_brightness: c.brightness,
                 pitch: c.pitch,
@@ -11141,6 +11157,7 @@ mod tests {
                 ir: Some(ir.clone()),
                 ir_space: Some("raw".into()),
                 embed_space: None,
+                embed_producer: None,
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,
@@ -11904,14 +11921,29 @@ mod tests {
             .split("\nmod tests {")
             .next()
             .unwrap();
+        // The arms are identity_arms' pure functions: the engine hands them
+        // the posture, and they apply it.
+        let rgb_arm_call = source
+            .split("identity_arms::rgb_arm(")
+            .nth(1)
+            .and_then(|rest| rest.split(");").next())
+            .expect("the RGB-primary arm is called");
         assert!(
-            source.contains("rgb_primary_grant_admissible(score, thr, a.sequential_posture())"),
+            rgb_arm_call.contains("a.sequential_posture()"),
             "the RGB-primary arm must read the posture"
         );
+        let ir_arms_call = source
+            .split("identity_arms::lit_ir_arms(")
+            .nth(1)
+            .and_then(|rest| rest.split(");").next())
+            .expect("the IR arms are called");
         assert!(
-            source.matches("a.sequential_posture()").count() >= 3,
-            "RGB-primary and both fusion gates must read the posture"
+            ir_arms_call.contains("a.sequential_posture()"),
+            "both fusion gates must read the posture"
         );
+        let arms = include_str!("identity_arms.rs");
+        assert!(arms.contains("rgb_primary_grant_admissible(score, threshold, sequential)"));
+        assert!(arms.contains("fusion.grant && !sequential"));
     }
 
     #[test]
@@ -12026,6 +12058,7 @@ mod tests {
             ir: None,
             ir_space: None,
             embed_space: None,
+            embed_producer: None,
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
@@ -13030,6 +13063,7 @@ mod tests {
                 ir: Some(v.to_vec()),
                 ir_space: Some("raw".into()),
                 embed_space: None,
+                embed_producer: None,
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,
@@ -13973,6 +14007,7 @@ mod engine_tests {
             ir: ir.then(|| unit512(seed + 100)),
             ir_space: space.map(String::from),
             embed_space: None,
+            embed_producer: None,
             ir_center_edge_ratio: 1.3,
             ir_brightness: 90.0,
             pitch: 0.5,
@@ -13994,6 +14029,7 @@ mod engine_tests {
                 ir: None,
                 ir_space: None,
                 embed_space: None,
+                embed_producer: None,
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.5,
@@ -15099,6 +15135,79 @@ mod engine_tests {
         s.engine.refit_profile_calib(&mut fresh);
         assert!(fresh.ir_calib.is_none(), "adapter mode must not fit anew");
         s.engine.ir_adapter = None; // restore the shared baseline
+    }
+
+    #[test]
+    fn new_scans_record_the_cpu_reference_that_embedded_them() {
+        // ADR-0022 §2: the producer names the recognizer, the loaded ONNX
+        // Runtime and the CPU session's exact outputs; it is computed once.
+        let _g = env_guard();
+        let _s = shared();
+        let bytes = std::fs::read(model_path("glintr100.onnx")).unwrap();
+        let sha = irlume_common::sha256_hex(&bytes);
+        let mut engine = Engine::load_with_recognizer_weights(
+            &model_path("face_detection_yunet_2023mar.onnx"),
+            &irlume_common::HashedModel::new(bytes),
+        )
+        .expect("engine from bytes");
+        let runtime = irlume_vision::onnx_runtime_version().expect("ONNX Runtime");
+        assert!(
+            !runtime.is_empty() && runtime.chars().all(|c| c.is_ascii_digit() || c == '.'),
+            "the version alone, without the library path: {runtime}"
+        );
+        let producer = engine.embed_producer().expect("a producer");
+        assert!(
+            producer.starts_with(&format!("cpu:{sha}:ort-{runtime}:")),
+            "{producer}"
+        );
+        assert_eq!(
+            producer.len(),
+            format!("cpu:{sha}:ort-{runtime}:").len() + 64
+        );
+        assert_eq!(engine.embed_producer().as_deref(), Some(producer.as_str()));
+        // Without a recognizer placed on the NPU, no enrollment admits an
+        // NPU probe, even one made entirely by this producer.
+        let mut enr = Enrollment::new("u");
+        enr.profiles.push(irlume_core::storage::FaceProfile {
+            name: "p".into(),
+            scans: vec![FaceScan {
+                name: "s".into(),
+                rgb: vec![0.0; EMBED_DIM],
+                ir: None,
+                ir_space: None,
+                embed_space: Some(engine.embed_space().to_owned()),
+                embed_producer: Some(producer),
+                ir_center_edge_ratio: 0.0,
+                ir_brightness: 0.0,
+                pitch: 0.0,
+                captured_at: None,
+            }],
+            ir_calib: None,
+            ir_calibs: std::collections::BTreeMap::new(),
+        });
+        assert!(!engine.npu_probe_admitted(&enr));
+        assert!(!engine.npu_probe);
+    }
+
+    #[test]
+    fn the_npu_thresholds_are_the_wired_ones() {
+        let _g = env_guard();
+        let _s = shared();
+        let engine = Engine::load(
+            &model_path("face_detection_yunet_2023mar.onnx"),
+            &model_path("glintr100.onnx"),
+        )
+        .expect("engine");
+        let thresholds = engine.npu_thresholds();
+        assert_eq!(
+            thresholds[0],
+            ("RGB_MATCH_THRESHOLD", irlume_core::RGB_MATCH_THRESHOLD)
+        );
+        let names: Vec<&str> = thresholds.iter().map(|(name, _)| *name).collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "each name once");
     }
 
     #[test]

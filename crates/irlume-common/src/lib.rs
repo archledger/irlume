@@ -1524,6 +1524,47 @@ pub enum PadModelStatus {
     LoadFailed,
 }
 
+/// `text` as one bounded line, safe for the journal, a terminal and a
+/// support report: every control character (C0, DEL, C1) and the Unicode
+/// line and paragraph separators become spaces, runs of whitespace collapse,
+/// and anything past `max_chars` characters is cut and marked with `...`.
+/// For error text that comes from outside irlume, such as a runtime or a
+/// driver.
+pub fn single_line(text: &str, max_chars: usize) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let mut line = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() > max_chars {
+        line = line.chars().take(max_chars).collect::<String>();
+        line.push_str("...");
+    }
+    line
+}
+
+/// Where the recognizer computes authentication probes (ADR-0022 §13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecognizerPlacement {
+    /// `"npu"` or `"cpu"`.
+    pub device: String,
+    /// On CPU, why: not built with NPU support, disabled, not certified for
+    /// this platform and reference, no NPU runtime, identity unreadable,
+    /// ineligible, compile failed, output differs from CPU, did not return
+    /// earlier in this boot, or retired after an inference error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The NPU platform identity digest, when discovery read one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+}
+
 /// Prospective cumulative face-request budget, independent of password recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FaceRetryBudget {
@@ -1930,6 +1971,10 @@ pub enum Response {
         /// failed to load it and the daemon is actually unconfined.
         #[serde(default)]
         apparmor: Option<String>,
+        /// Where the recognizer runs (ADR-0022 §13). `None` means the
+        /// daemon predates this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recognizer: Option<RecognizerPlacement>,
     },
     /// A framing-guide sample (`PositionSample`).
     Position(PositionReport),
@@ -2289,6 +2334,17 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn single_line_cannot_forge_a_line_and_is_bounded() {
+        assert_eq!(
+            super::single_line("compile failed:\nirlumed: granted\r\u{1b}[2J\u{2028}x", 200),
+            "compile failed: irlumed: granted [2J x"
+        );
+        assert_eq!(super::single_line("  a \t b  ", 200), "a b");
+        assert_eq!(super::single_line("abcdef", 3), "abc...");
+        assert_eq!(super::single_line("\u{85}\u{7f}", 10), "");
+    }
     #[test]
     fn observed_state_directory_does_not_borrow_the_callers_override() {
         use std::ffi::OsStr;

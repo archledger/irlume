@@ -24,6 +24,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `irlume enroll --split-camera-choice JSON` asks irlumed to enroll, with or
+  without `--reset`, on an authorized split pair for this operation only,
+  and `enroll --add-camera --split-camera-choice JSON` to add that pair as a
+  camera group. The choice carries the side guards and opaque authorization
+  proof built from `irlume split list` and goes unchanged in one
+  `EnrollSplitOn` or `AddSplitCameraGroupOn` request. Malformed, repeated
+  or combined choices fail before sending; the client reports an older
+  daemon's `bad request` as unsupported and does not fall back to an
+  ordinary request, and it prints any other refusal as is. Split
+  enrollment stays disabled until activation (ADR-0032, guarded split
+  operation-choice amendment; #1030).
+
 - The liveness self-test (`irlume selftest liveness`, the TUI's infrared camera
   test) runs on a selected split camera pair, both sides in one diagnostic
   operation, instead of refusing it; it grants and releases nothing, and an
@@ -107,6 +119,17 @@ All notable changes to irlume are documented here. This project adheres to
   authentication stay refused until the later steps.
 
 ### Fixed
+
+- An RGB or IR burst captured after an in-place stream recovery no longer
+  fails as an invalid aggregate. Its first frame keeps the recovery marker
+  and is accepted only after a discarded frame of the new stream, so the
+  burst stays non-continuous: the concurrent pair check and IR recognition
+  still refuse it, and a held pair with a recovered side still falls back
+  (ADR-0007).
+
+- A recovered stream drops its rate-probe admission and re-establishes its
+  30-delta delivered-rate window before its next frame (ADR-0021, decision
+  item 3).
 
 - `irlume camera diagnostics --json` measures the selected split camera pair,
   both sides in one diagnostic operation, instead of the RGB camera the daemon

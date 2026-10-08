@@ -427,7 +427,8 @@ impl SequenceTracker {
     /// Mark a successfully replaced stream as a new discontinuous epoch.
     ///
     /// The marker remains pending until the next observed (delivered) frame, so
-    /// discarded warm-up dequeues cannot consume the recovery evidence.
+    /// discarded warm-up dequeues cannot consume the recovery evidence. The
+    /// marker survives aggregation and keeps that frame non-continuous.
     ///
     /// # Errors
     ///
@@ -1388,10 +1389,18 @@ impl AggregateFrameProvenance {
         }) {
             return Err(RuntimeProvenanceError::MixedContinuityEpoch);
         }
-        if contributors.iter().any(|contributor| {
+        // A contributor's marker describes the edge to its predecessor. For
+        // the first one that predecessor is outside the aggregate, so its
+        // recovery marker is kept, and accepted only after a discarded
+        // dequeue in the same epoch (an advance and a delta). Any later
+        // marker and any corruption are refused.
+        if contributors.iter().enumerate().any(|(index, contributor)| {
             contributor.facts().driver_reported_corruption()
-                || contributor.sequence().discontinuity()
-                || contributor.timestamp().discontinuity()
+                || ((contributor.sequence().discontinuity()
+                    || contributor.timestamp().discontinuity())
+                    && (index > 0
+                        || contributor.sequence().advance().is_none()
+                        || contributor.timestamp().delta_micros().is_none()))
         }) {
             return Err(RuntimeProvenanceError::ContributorDiscontinuity);
         }
@@ -2622,6 +2631,121 @@ mod tests {
             ),
             Err(super::RuntimeProvenanceError::CounterUnderflow)
         );
+    }
+
+    /// The first delivered frame of a recovered epoch, after one discarded
+    /// dequeue in that epoch: it carries the recovery marker together with
+    /// an advance and a delta to the discarded frame.
+    fn recovered_series() -> Vec<super::SingleFrameProvenance> {
+        let mut series = runtime_series(
+            &[5, 6, 7],
+            &[100, 200, 300],
+            &[
+                IlluminationProvenance::ActiveIr,
+                IlluminationProvenance::Ambient,
+                IlluminationProvenance::ActiveIr,
+            ],
+        );
+        series[0].sequence.advance = Some(1);
+        series[0].sequence.discontinuity = true;
+        series[0].timestamp.delta_micros = Some(100);
+        series[0].timestamp.discontinuity = true;
+        series
+    }
+
+    #[test]
+    fn aggregate_accepts_a_recovery_marker_on_its_first_contributor_after_a_discard() {
+        for selection in [
+            super::ContributorSelection::ReducedOverAll,
+            super::ContributorSelection::Selected { index: 1 },
+            super::ContributorSelection::Subtracted {
+                lit_index: 0,
+                ambient_index: 1,
+            },
+        ] {
+            let aggregate = super::AggregateFrameProvenance::new(recovered_series(), selection)
+                .unwrap_or_else(|error| panic!("{selection:?}: {error}"));
+            let first = &aggregate.contributors()[0];
+            assert!(first.sequence().discontinuity(), "{selection:?}");
+            assert!(first.timestamp().discontinuity(), "{selection:?}");
+            assert!(
+                !super::RuntimeFrameProvenance::Aggregate(aggregate).is_continuous(),
+                "{selection:?}: the marker keeps the aggregate non-continuous"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_refuses_a_recovery_marker_on_a_first_contributor_without_a_predecessor() {
+        for (advance, delta_micros) in [(None, Some(100)), (Some(1), None), (None, None)] {
+            let mut series = recovered_series();
+            series[0].sequence.advance = advance;
+            series[0].timestamp.delta_micros = delta_micros;
+            assert_eq!(
+                super::AggregateFrameProvenance::new(
+                    series,
+                    super::ContributorSelection::ReducedOverAll
+                ),
+                Err(super::RuntimeProvenanceError::ContributorDiscontinuity),
+                "advance {advance:?}, delta {delta_micros:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_refuses_corruption_on_its_first_contributor() {
+        let unmarked = runtime_series(
+            &[5, 6, 7],
+            &[100, 200, 300],
+            &[IlluminationProvenance::Unknown; 3],
+        );
+        for mut series in [unmarked, recovered_series()] {
+            series[0].facts.known_flags |= v4l::buffer::Flags::ERROR.bits();
+            assert_eq!(
+                super::AggregateFrameProvenance::new(
+                    series,
+                    super::ContributorSelection::ReducedOverAll
+                ),
+                Err(super::RuntimeProvenanceError::ContributorDiscontinuity)
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_refuses_a_recovery_marker_on_every_later_contributor() {
+        // Four contributors, so the second, a middle one and the last are
+        // distinct indices. Each marked contributor has its predecessor
+        // inside the aggregate, so only its position refuses it.
+        for first_marked in [false, true] {
+            for index in 1..4 {
+                let mut series = runtime_series(
+                    &[5, 6, 7, 8],
+                    &[100, 200, 300, 400],
+                    &[IlluminationProvenance::Unknown; 4],
+                );
+                if first_marked {
+                    // The accepted recovered first contributor.
+                    series[0].sequence.advance = Some(1);
+                    series[0].sequence.discontinuity = true;
+                    series[0].timestamp.delta_micros = Some(100);
+                    series[0].timestamp.discontinuity = true;
+                }
+                assert!(
+                    series[index].sequence.advance.is_some()
+                        && series[index].timestamp.delta_micros.is_some()
+                );
+                series[index].sequence.discontinuity = true;
+                series[index].timestamp.discontinuity = true;
+                assert_eq!(
+                    super::AggregateFrameProvenance::new(
+                        series,
+                        super::ContributorSelection::ReducedOverAll
+                    ),
+                    Err(super::RuntimeProvenanceError::ContributorDiscontinuity),
+                    "marker on contributor {index} of 4, first marked: {first_marked}"
+                );
+            }
+        }
     }
 
     #[test]

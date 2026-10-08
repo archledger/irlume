@@ -2069,6 +2069,9 @@ impl<S> TrackedStream<S> {
         // fill to re-run, which is where `begin_recovered_continuity_epoch`
         // then re-seeds the baseline in the new epoch.
         self.rate_window.reset();
+        // A recovery epoch also revokes a probe admission (ADR-0021, decision
+        // item 3), as `invalidate_paired_rate_admission` does.
+        self.health_admitted = false;
         Ok(())
     }
 }
@@ -6890,9 +6893,9 @@ pub struct IrCamera {
     requested_interval: frame_interval::FrameInterval,
     accepted_interval: frame_interval::FrameInterval,
     /// ADR-0031 §4's fd-bound format evidence, bound at open for an attested
-    /// YUYV node and re-read by every stream this camera opens (#887). No
-    /// ceiling follows from it yet; without it the camera captures as it
-    /// always has.
+    /// YUYV node and re-read by every stream this camera opens (#887). It
+    /// also seeds each session's content latch. No ceiling follows from it
+    /// yet; without it the camera captures as it always has.
     format_evidence: Option<yuyv_fd::FormatEvidence>,
     width: u32,
     height: u32,
@@ -7217,6 +7220,10 @@ impl IrCamera {
             cam: self,
             stream,
             dec: IrDecoder::new(self.pix, self.quantization),
+            content: self
+                .format_evidence
+                .as_ref()
+                .map(|evidence| yuyv_exposure::YuyvContentLatch::new(*evidence.raw())),
             lit: mode.lit(),
             _mode: mode,
             meta,
@@ -7264,6 +7271,12 @@ pub struct IrSession<'a> {
     /// down. Recovery must open a fresh stream before capture can resume.
     stream: TrackedStream<SafeStream<'a>>,
     dec: IrDecoder,
+    /// ADR-0031 §4's footroom and chroma latch, built once from the camera's
+    /// fd evidence and `None` without it. Every frame the stream delivers to
+    /// a burst is offered to it before decode. Recovery recreates `dec` but
+    /// keeps the latch, and privacy teardown keeps both. It only refuses, and
+    /// nothing reads it until the ceiling.
+    content: Option<yuyv_exposure::YuyvContentLatch>,
     lit: bool,
     /// The camera's own per-frame illumination reporting, when it has any.
     /// `None` means this camera cannot say, and brightness decides as before.
@@ -7384,6 +7397,7 @@ impl IrSession<'_> {
         .map_err(|error| map_io(device, error))?;
         let stream = &mut self.stream;
         let dec = &mut self.dec;
+        let content = &mut self.content;
         // The emitter may STROBE (pulse), so grab a burst and keep the brightest
         // frame, the lit strobe phase (linhello lesson). Keep every frame so the
         // optional ambient subtraction below can pair the lit frame with an
@@ -7435,6 +7449,12 @@ impl IrSession<'_> {
             // against a 67ms frame interval.
             if let Some(log) = meta.as_mut() {
                 log.drain();
+            }
+            if let Some(newly) = content.as_mut().and_then(|latch| latch.observe(buf)) {
+                irlume_common::dlog!(
+                    "[ir] {}: YUYV content latch set for this session (not yet enforced): {newly}",
+                    camera_text(device)
+                );
             }
             let data = dec.decode(buf, w, h);
             means.push(data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64);
@@ -12713,6 +12733,172 @@ mod tests {
         );
     }
 
+    /// ADR-0031 §4 (Amendment 2026-10-07, session content latch): the
+    /// latch is session state outside the decoder, built once from the
+    /// camera's fd evidence and never reassigned, so later captures,
+    /// `recover()` and a privacy teardown keep it. Here the lifetime is
+    /// pinned by shape: only the session literal builds a latch, and every
+    /// code line that names the field in `lib.rs` and `paired_processing.rs`,
+    /// the code that holds an `IrSession`, is listed, so a reset through any
+    /// binding shows up. The v4l2loopback lane runs the latch through a real
+    /// recovery on GREY frames
+    /// (`loopback_frozen_raw_format_holds_through_a_real_session_and_recovery`),
+    /// and the latch's own rules run in `yuyv_exposure`'s tests.
+    #[test]
+    fn the_yuyv_content_latch_lives_on_the_session_and_outlives_recovery() {
+        // `content` as a whole identifier, not inside `contention`.
+        fn names_content(line: &str) -> bool {
+            let identifier = |c: char| c.is_ascii_alphanumeric() || c == '_';
+            line.match_indices("content").any(|(at, word)| {
+                let after = &line[at + word.len()..];
+                !line[..at].ends_with(identifier) && !after.starts_with(identifier)
+            })
+        }
+        let lib = include_str!("lib.rs");
+        let production = &lib[..lib
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the tests module moved; update this test")];
+        let compact = |text: &str| text.split_whitespace().collect::<String>();
+        assert!(
+            source_body(production, "\npub struct IrSession<'a> {")
+                .contains("\n    content: Option<yuyv_exposure::YuyvContentLatch>,\n"),
+            "the session must hold the content latch"
+        );
+        assert_eq!(
+            production.matches(" IrSession {\n").count(),
+            1,
+            "one IrSession literal"
+        );
+        assert!(
+            compact(source_body(production, "\nimpl IrCamera {")).contains(
+                "content:self.format_evidence.as_ref().map(|evidence|\
+                 yuyv_exposure::YuyvContentLatch::new(*evidence.raw())),"
+            ),
+            "the session must build its latch from the camera's fd evidence"
+        );
+        assert_eq!(
+            production.matches("self.content").count(),
+            1,
+            "only the burst borrows the latch; nothing reassigns or clears it"
+        );
+        assert_eq!(
+            production.matches("YuyvContentLatch::new(").count(),
+            1,
+            "only the IrSession literal builds a latch"
+        );
+        assert_eq!(
+            source_code_lines(production)
+                .filter(|line| names_content(line))
+                .collect::<Vec<_>>(),
+            [
+                "            content: self",
+                "    content: Option<yuyv_exposure::YuyvContentLatch>,",
+                "        let content = &mut self.content;",
+                "            if let Some(newly) = content.as_mut().and_then(|latch| latch.observe(buf)) {",
+                "                    \"[ir] {}: YUYV content latch set for this session (not yet enforced): {newly}\",",
+            ],
+            "the literal builds the latch, the field holds it, and only the burst's borrow \
+             and its observe touch it; a line that reassigns, takes or clears it fails here"
+        );
+        assert!(
+            !source_code_lines(include_str!("paired_processing.rs")).any(names_content),
+            "the paired drains hold the IR session too and must not touch its latch"
+        );
+        let session = &production[production
+            .find("\nimpl IrSession<'_> {")
+            .expect("impl IrSession moved; update this test")..];
+        let method = |signature: &str| {
+            let start = session
+                .find(signature)
+                .unwrap_or_else(|| panic!("IrSession {signature} moved; update this test"));
+            let end = session[start..]
+                .find("\n    }\n")
+                .expect("a method that ends at column 4");
+            &session[start..start + end]
+        };
+        for signature in [
+            "pub fn recover(&mut self)",
+            "fn stop_after_privacy_refusal(",
+        ] {
+            assert!(
+                !method(signature).contains("content"),
+                "{signature} must keep the session's content latch"
+            );
+        }
+    }
+
+    /// Every frame the stream delivers to a capture's burst reaches the
+    /// session's content latch before it is decoded, so a violation in a
+    /// frame the gate selection passes over, or after which the burst ends
+    /// early, still latches (ADR-0031 §4, Amendment 2026-10-07). The
+    /// observation is one statement directly in the loop body with no
+    /// condition of its own, and nothing between the dequeue and the decode
+    /// skips ahead; an error there fails the capture with the frame
+    /// undecoded.
+    #[test]
+    fn every_ir_burst_frame_reaches_the_content_latch_before_decode() {
+        let lib = include_str!("lib.rs");
+        let session = &lib[lib
+            .find("\nimpl IrSession<'_> {")
+            .expect("impl IrSession moved; update this test")..];
+        let start = session
+            .find("fn capture_with_stats_inner(")
+            .expect("capture_with_stats_inner moved; update this test");
+        let end = session[start..]
+            .find("\n    }\n")
+            .expect("a method that ends at column 4");
+        let capture = &session[start..start + end];
+        assert!(
+            capture.contains("let content = &mut self.content;"),
+            "the burst must borrow the session's latch"
+        );
+        let mut from = 0;
+        for step in [
+            "for _ in 0..IR_BURST {",
+            "stream.next()",
+            "latch.observe(buf)",
+            "dec.decode(buf, w, h)",
+            "if let Some(w) = white_level",
+        ] {
+            let at = capture[from..]
+                .find(step)
+                .unwrap_or_else(|| panic!("{step} is missing or out of order"));
+            from += at + step.len();
+        }
+        assert_eq!(
+            capture.matches("observe(").count(),
+            1,
+            "one observation per dequeued frame"
+        );
+        let (_, burst) = capture
+            .split_once("\n        for _ in 0..IR_BURST {\n")
+            .expect("the burst loop moved; update this test");
+        let (burst, _) = burst
+            .split_once("\n        }\n")
+            .expect("the burst loop ends at column 8");
+        let dequeued = burst
+            .find("stream.next()")
+            .expect("the burst dequeues in its body");
+        let observed = burst
+            .find(
+                "\n            if let Some(newly) = content.as_mut().and_then(|latch| latch.observe(buf)) {\n",
+            )
+            .expect("every frame is observed, unconditionally and directly in the loop body");
+        let decoded = burst
+            .find("\n            let data = dec.decode(buf, w, h);\n")
+            .expect("every frame is decoded directly in the loop body");
+        assert!(
+            dequeued < observed && observed < decoded,
+            "the observation sits between the dequeue and the decode"
+        );
+        for skip in ["continue", "break", "return", ".filter("] {
+            assert!(
+                !source_code_lines(&burst[dequeued..decoded]).any(|line| line.contains(skip)),
+                "{skip} between the dequeue and the decode could pass a frame by the latch"
+            );
+        }
+    }
+
     #[test]
     fn recovery_open_uses_immutable_accepted_interval_and_never_sets_it() {
         let format = fake_format(b"GREY");
@@ -13632,6 +13818,209 @@ mod tests {
         assert_eq!(evidence.window_count(), 30);
         assert_eq!(evidence.window_span_us(), 30 * 100_000);
         assert!(evidence.meets_floor());
+    }
+
+    /// A stream that delivered one frame, lost it and installed a
+    /// replacement in place, as `RgbSession::recover` and
+    /// `IrSession::recover` do. `gated` keeps the 30-delta rate window;
+    /// otherwise no fill discards before the first delivery.
+    fn recovered_fixture(
+        role: contracts::StreamRole,
+        gated: bool,
+    ) -> TrackedStream<QueuedContinuityFixture> {
+        let mut stream = rate_fill_fixture(role, 40, 66_667);
+        if !gated {
+            stream = TrackedStream::new(stream.take().expect("fixture"), test_rate_config(role));
+        }
+        stream.next().expect("pre-recovery delivery");
+        assert!(stream.take().is_some());
+        stream
+            .install_recovered(&mut rate_fill_fixture(role, 100, 66_667).take())
+            .expect("recovery epoch");
+        stream
+    }
+
+    /// One delivered frame's provenance, built as the RGB and IR bursts
+    /// build theirs.
+    fn delivered_contributor(
+        stream: &mut TrackedStream<QueuedContinuityFixture>,
+        role: contracts::StreamRole,
+        illumination: contracts::IlluminationProvenance,
+    ) -> frame_provenance::SingleFrameProvenance {
+        let (_, facts, sequence, timestamp, rate_evidence) = stream.next().expect("delivery");
+        checked_single_evidence(
+            frame_provenance::FrameBinding::new(
+                contracts::CameraInstanceId::new("4".repeat(32)).expect("test identity"),
+                contracts::CameraGeneration::INITIAL,
+                role,
+            ),
+            frame_provenance::ValidatedFormatIdentity::from_stable_format(&v4l::Format::new(
+                1,
+                1,
+                v4l::FourCC::new(b"GREY"),
+            )),
+            facts,
+            sequence,
+            timestamp,
+            std::time::Instant::now(),
+            illumination,
+            rate_evidence,
+        )
+        .expect("a single frame carries the recovery marker")
+    }
+
+    fn assert_recovery_marker_only_on_the_first(
+        aggregate: &frame_provenance::AggregateFrameProvenance,
+    ) {
+        let (first, rest) = aggregate
+            .contributors()
+            .split_first()
+            .expect("aggregate contributors");
+        assert!(first.sequence().discontinuity() && first.timestamp().discontinuity());
+        assert_eq!(first.sequence().stream_epoch(), 1);
+        assert!(first.sequence().advance().is_some() && first.timestamp().delta_micros().is_some());
+        assert!(rest
+            .iter()
+            .all(|c| !c.sequence().discontinuity() && !c.timestamp().discontinuity()));
+    }
+
+    #[test]
+    fn rgb_median_after_recovery_keeps_the_marker_and_aggregates() {
+        let mut stream = recovered_fixture(contracts::StreamRole::Rgb, true);
+        // RgbSession::recover clears `warmed`, so the next burst warms up as
+        // RgbSession::warm_up does before its first delivery.
+        warm_up_stream("fixture", &mut stream, &no_progress()).expect("recovered warm-up");
+        for _ in 0..AE_WARMUP {
+            stream.next_discarded().expect("AE settle discard");
+        }
+        let frames = (0..RGB_BURST)
+            .map(|_| {
+                let single = delivered_contributor(
+                    &mut stream,
+                    contracts::StreamRole::Rgb,
+                    contracts::IlluminationProvenance::Unknown,
+                );
+                Frame::from_provenance(
+                    1,
+                    1,
+                    Spectrum::Rgb,
+                    vec![80],
+                    frame_provenance::RuntimeFrameProvenance::Single(single),
+                )
+                .expect("frame")
+            })
+            .collect::<Vec<_>>();
+        let median = median_frame(frames).expect("the recovered burst aggregates");
+        let frame_provenance::RuntimeFrameProvenance::Aggregate(aggregate) = median.provenance()
+        else {
+            panic!("a multi-frame median is an aggregate");
+        };
+        assert_recovery_marker_only_on_the_first(aggregate);
+        assert!(
+            !median.provenance().is_continuous(),
+            "the recovered median stays non-continuous"
+        );
+    }
+
+    #[test]
+    fn ir_aggregate_after_recovery_keeps_the_marker_and_aggregates() {
+        let mut stream = recovered_fixture(contracts::StreamRole::Ir, true);
+        // IrSession::capture_with_stats fills the rate window before its burst.
+        stream.fill_rate_evidence().expect("recovered rate fill");
+        let contributors = (0..IR_BURST)
+            .map(|index| {
+                let illumination = if index % 2 == 0 {
+                    contracts::IlluminationProvenance::ActiveIr
+                } else {
+                    contracts::IlluminationProvenance::Ambient
+                };
+                delivered_contributor(&mut stream, contracts::StreamRole::Ir, illumination)
+            })
+            .collect::<Vec<_>>();
+        for selection in [
+            frame_provenance::ContributorSelection::Selected { index: 0 },
+            frame_provenance::ContributorSelection::Subtracted {
+                lit_index: 0,
+                ambient_index: 1,
+            },
+        ] {
+            let provenance = checked_aggregate_provenance(contributors.clone(), selection)
+                .unwrap_or_else(|error| panic!("{selection:?}: {error}"));
+            let frame_provenance::RuntimeFrameProvenance::Aggregate(aggregate) = &provenance else {
+                panic!("an IR burst is an aggregate");
+            };
+            assert_recovery_marker_only_on_the_first(aggregate);
+            assert!(!provenance.is_continuous(), "{selection:?}");
+        }
+    }
+
+    #[test]
+    fn recovered_first_delivery_without_a_discard_still_refuses_the_aggregate() {
+        let mut stream = recovered_fixture(contracts::StreamRole::Ir, false);
+        let contributors = (0..3)
+            .map(|_| {
+                delivered_contributor(
+                    &mut stream,
+                    contracts::StreamRole::Ir,
+                    contracts::IlluminationProvenance::Unknown,
+                )
+            })
+            .collect::<Vec<_>>();
+        let first = &contributors[0];
+        assert!(first.sequence().discontinuity() && first.timestamp().discontinuity());
+        assert_eq!(first.sequence().advance(), None);
+        assert_eq!(first.timestamp().delta_micros(), None);
+        let error = checked_aggregate_provenance(
+            contributors,
+            frame_provenance::ContributorSelection::ReducedOverAll,
+        )
+        .expect_err("a marked first frame with no predecessor in its epoch");
+        assert!(
+            error
+                .to_string()
+                .contains("aggregate contributor reports a discontinuity"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn recovery_revokes_a_probe_admission_and_refills_the_rate_window() {
+        // Admission depends on the kill switch being clear.
+        let _guard = crate::testenv::env_lock();
+        let node = "/dev/video-recovery-admission";
+        for role in [contracts::StreamRole::Rgb, contracts::StreamRole::Ir] {
+            let key = rate_amortization::Key::new(node, role);
+            rate_amortization::test_support::force_completion(key.clone(), None);
+            let mut first = rate_fill_fixture(role, 40, 66_667).with_rate_amortization(node);
+            first
+                .fill_rate_evidence()
+                .expect("full fill records completion");
+            let mut stream = rate_fill_fixture(role, 40, 66_667).with_rate_amortization(node);
+            stream.fill_rate_evidence().expect("probe admission");
+            assert!(stream.health_admitted, "{role:?}: the probe admitted");
+            stream.next().expect("admitted delivery");
+
+            assert!(stream.take().is_some());
+            stream
+                .install_recovered(&mut rate_fill_fixture(role, 100, 66_667).take())
+                .expect("recovery epoch");
+            assert!(
+                !stream.health_admitted,
+                "{role:?}: a recovery epoch revokes the probe admission (ADR-0021 item 3)"
+            );
+            stream.fill_rate_evidence().expect("recovered fill");
+            assert!(stream.rate_window.ready(), "{role:?}: the window refills");
+            let (_, _, sequence, timestamp, evidence) =
+                stream.next().expect("first recovered delivery");
+            assert!(sequence.discontinuity() && timestamp.discontinuity());
+            assert!(
+                sequence.advance().is_some() && timestamp.delta_micros().is_some(),
+                "{role:?}: the fill discarded a predecessor in the recovered epoch"
+            );
+            assert_eq!(evidence.window_count(), 30, "{role:?}");
+            assert!(evidence.meets_floor(), "{role:?}");
+            rate_amortization::test_support::force_completion(key, None);
+        }
     }
 
     #[test]
@@ -18395,6 +18784,24 @@ mod tests {
         assert_eq!(decode_ir(&buf, IrPixel::Grey16, 2, 1), vec![255, 0]);
     }
 
+    /// The limited-to-full expansion stays unwired (ADR-0031 §4, Amendment
+    /// 2026-10-07): a YUYV session decodes the raw luma bytes under every
+    /// reported quantization and still claims no ceiling.
+    #[test]
+    fn a_yuyv_session_still_decodes_raw_luma() {
+        let payload: Vec<u8> = (0..=u8::MAX).flat_map(|luma| [luma, 128]).collect();
+        let raw: Vec<u8> = (0..=u8::MAX).collect();
+        for quantization in [
+            Quantization::Default,
+            Quantization::FullRange,
+            Quantization::LimitedRange,
+        ] {
+            let mut session = IrDecoder::new(IrPixel::YuyvLuma, quantization);
+            assert_eq!(session.decode(&payload, 256, 1), raw, "{quantization:?}");
+            assert_eq!(session.white_level(), None, "{quantization:?}");
+        }
+    }
+
     #[test]
     fn ir_candidates_prefer_native_grey_then_grey16_then_luma() {
         use super::{IrPixel, IR_CANDIDATES};
@@ -19907,6 +20314,177 @@ mod tests {
         );
     }
 
+    /// What one side of a held pair paid after an in-place recovery.
+    struct HeldRecovery {
+        admitted_after_recover: bool,
+        recover_ms: u128,
+        capture_ms: u128,
+        discarded: u64,
+        delivered: u64,
+    }
+
+    trait HeldCounters {
+        /// Observations, discarded observations and the probe admission.
+        fn counters(&self) -> (u64, u64, bool);
+    }
+
+    impl HeldCounters for RgbSession<'_> {
+        fn counters(&self) -> (u64, u64, bool) {
+            let (observed, discarded, _) = self.stream.accounting();
+            (observed, discarded, self.stream.health_admitted)
+        }
+    }
+
+    impl HeldCounters for IrSession<'_> {
+        fn counters(&self) -> (u64, u64, bool) {
+            let (observed, discarded, _) = self.stream.accounting();
+            (observed, discarded, self.stream.health_admitted)
+        }
+    }
+
+    /// Recover a held session in place, then capture, as `irlume-auth`'s
+    /// held capture does after a mid-stream fault.
+    fn measure_held_recovery<S: HeldCounters, T>(
+        session: &mut S,
+        recover: impl FnOnce(&mut S) -> irlume_common::Result<()>,
+        capture: impl FnOnce(&mut S) -> irlume_common::Result<T>,
+        measured: &mut Option<HeldRecovery>,
+    ) -> irlume_common::Result<T> {
+        let started = std::time::Instant::now();
+        recover(session)?;
+        let recover_ms = started.elapsed().as_millis();
+        let (observed, discarded, admitted_after_recover) = session.counters();
+        let started = std::time::Instant::now();
+        let result = capture(session);
+        let capture_ms = started.elapsed().as_millis();
+        let (observed_after, discarded_after, _) = session.counters();
+        *measured = Some(HeldRecovery {
+            admitted_after_recover,
+            recover_ms,
+            capture_ms,
+            discarded: discarded_after - discarded,
+            delivered: (observed_after - observed) - (discarded_after - discarded),
+        });
+        result
+    }
+
+    /// ADR-0021 decision item 3 on a real pair: a held pair admitted by the
+    /// continuity probe recovers one side in place, as a held capture does
+    /// after a mid-stream fault. The recovery revokes that side's admission,
+    /// so its next capture discards a full window in the new epoch before
+    /// its burst, and the burst keeps the recovery marker on its first
+    /// contributor. Each role is measured before any assertion, and the
+    /// `HELD-RECOVERY` lines report what the held-pair fallback waits for.
+    #[test]
+    #[ignore = "needs a real RGB+IR camera pair; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE"]
+    fn held_pair_recovery_after_a_probe_admission_refills_its_window() {
+        use contracts::StreamRole;
+        let (rgb_path, ir_path) = loopback_pair();
+        let operation = lease::acquire_camera_operation(
+            &[rgb_path.as_str(), ir_path.as_str()],
+            lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire pair operation");
+        let rgb_camera = operation.open_rgb(&rgb_path).expect("open RGB camera");
+        let ir_camera = operation.open_ir(&ir_path).expect("open IR camera");
+        let arm = || {
+            let rgb = rgb_camera.session().expect("arm RGB");
+            let ir = ir_camera
+                .session_for_pair_with_progress(&no_progress())
+                .expect("arm IR");
+            (rgb, ir)
+        };
+        let mut outcomes = Vec::new();
+        for role in [StreamRole::Rgb, StreamRole::Ir] {
+            // A first held pair completes full windows on both nodes, so the
+            // next pair may admit on the continuity probe.
+            {
+                let (mut rgb, mut ir) = arm();
+                establish_pair_rate(&mut rgb, &mut ir).expect("full paired fill");
+            }
+            let (mut rgb, mut ir) = arm();
+            establish_pair_rate(&mut rgb, &mut ir).expect("paired probe");
+            assert!(
+                rgb.stream.health_admitted && ir.stream.health_admitted,
+                "{role:?}: both sides must be probe-admitted to measure the revocation"
+            );
+            let (rgb_before, ir_before) = capture_pair_with(
+                &mut rgb,
+                &mut ir,
+                |s| s.denoised(),
+                |s| s.capture_with_stats(),
+            );
+            let rgb_before = rgb_before.expect("held RGB capture");
+            let (ir_before, _) = ir_before.expect("held IR capture");
+            let (mut rgb_measured, mut ir_measured) = (None, None);
+            let started = std::time::Instant::now();
+            let (rgb_after, ir_after) = capture_pair_with(
+                &mut rgb,
+                &mut ir,
+                |s| match role {
+                    StreamRole::Rgb => measure_held_recovery(
+                        s,
+                        |s| s.recover(),
+                        |s| s.denoised(),
+                        &mut rgb_measured,
+                    ),
+                    StreamRole::Ir => s.denoised(),
+                },
+                |s| match role {
+                    StreamRole::Ir => measure_held_recovery(
+                        s,
+                        |s| s.recover(),
+                        |s| s.capture_with_stats(),
+                        &mut ir_measured,
+                    ),
+                    StreamRole::Rgb => s.capture_with_stats(),
+                },
+            );
+            let pair_ms = started.elapsed().as_millis();
+            let describe = |error: Option<&irlume_common::Error>| {
+                error.map_or_else(|| "ok".to_owned(), |error| format!("err({error})"))
+            };
+            let measured = match role {
+                StreamRole::Rgb => rgb_measured,
+                StreamRole::Ir => ir_measured,
+            }
+            .unwrap_or_else(|| panic!("{role:?}: recover in place"));
+            eprintln!(
+                "HELD-RECOVERY role={role:?} pair_ms={pair_ms} recover_ms={} capture_ms={} \
+                 discarded={} delivered={} admitted_after_recover={} rgb={} ir={}",
+                measured.recover_ms,
+                measured.capture_ms,
+                measured.discarded,
+                measured.delivered,
+                measured.admitted_after_recover,
+                describe(rgb_after.as_ref().err()),
+                describe(ir_after.as_ref().err()),
+            );
+            let (before, after) = match role {
+                StreamRole::Rgb => (rgb_before, rgb_after),
+                StreamRole::Ir => (ir_before, ir_after.map(|(frame, _)| frame)),
+            };
+            outcomes.push((role, measured, before, after));
+        }
+        for (role, measured, before, after) in outcomes {
+            assert!(
+                !measured.admitted_after_recover,
+                "{role:?}: a recovery epoch revokes the probe admission (ADR-0021 item 3)"
+            );
+            let full_fill =
+                (rate_gate::startup_flush(role) + rate_gate::RATE_WINDOW_CAPACITY + 1) as u64;
+            assert!(
+                measured.discarded >= full_fill,
+                "{role:?}: {} discards in the recovered epoch, a full fill is {full_fill}",
+                measured.discarded
+            );
+            let after =
+                after.unwrap_or_else(|error| panic!("{role:?}: recovered capture: {error}"));
+            assert_recovered_capture(&before, &after);
+        }
+    }
+
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_rgb_single_and_denoised_agree_on_geometry() {
@@ -20889,10 +21467,22 @@ mod tests {
     /// recovered stream's first dequeue, which carries the recovery marker.
     /// The GREY-fed node is not YUYV, so the evidence is frozen straight from
     /// its fd; production binding adds the list and descriptor checks in
-    /// front of the same rechecks.
+    /// front of the same rechecks. The evidence also seeds the session's
+    /// content latch (Amendment 2026-10-07): warm-up and the rate fill never
+    /// reach it, each burst frame does, a GREY frame has no YUYV layout and
+    /// latches `uninspectable` alone, and recovery keeps the latch for the
+    /// recovered stream's burst.
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_frozen_raw_format_holds_through_a_real_session_and_recovery() {
+        /// Frames the session's latch has judged, and what it latched.
+        fn latched(session: &IrSession<'_>) -> (u64, Option<yuyv_exposure::ContentRefusal>) {
+            let latch = session
+                .content
+                .as_ref()
+                .expect("fd evidence builds a latch");
+            (latch.inspected(), latch.refusal())
+        }
         let (_, ir_path) = loopback_pair();
         let operation = lease::acquire_camera_operation(
             &[ir_path.as_str()],
@@ -20914,17 +21504,112 @@ mod tests {
             "{error}"
         );
 
+        let unreadable = yuyv_exposure::ContentRefusal {
+            uninspectable: true,
+            ..yuyv_exposure::ContentRefusal::NONE
+        };
+        // A YUYV node run by name is judged on its scene, so there only the
+        // count and the persistence are checked.
+        let yuyv = frozen.raw().fourcc == *b"YUYV";
         camera.format_evidence = Some(frozen);
         let mut session = camera.session().expect("the driver keeps its tuple");
+        assert_eq!(latched(&session), (0, None), "warm-up and the rate fill");
         session
             .capture_with_stats()
             .expect("a capture through every boundary");
+        let (first, refused) = latched(&session);
+        assert!((1..=IR_BURST as u64).contains(&first), "{first} judged");
+        if !yuyv {
+            assert_eq!(refused, Some(unreadable));
+        }
         session.recover().expect("recovery reopens and rechecks");
+        assert_eq!(latched(&session), (first, refused), "recovery keeps it");
         let (_, _, sequence, _, _) = session
             .stream
             .next()
             .expect("the recovered stream's first dequeue rechecks and delivers");
         assert!(sequence.discontinuity(), "the recovery marker");
+        session
+            .capture_with_stats()
+            .expect("a capture on the recovered stream");
+        let (total, refused) = latched(&session);
+        assert!(
+            (first + 1..=first + IR_BURST as u64).contains(&total),
+            "the recovered burst adds to the same latch: {first}, then {total}"
+        );
+        if !yuyv {
+            assert_eq!(refused, Some(unreadable));
+        }
+    }
+
+    /// What a recovered capture must look like: the burst aggregates, its
+    /// first contributor keeps the recovery marker after an in-epoch
+    /// discard, and the frame stays non-continuous, so pairing and
+    /// recognition still refuse it (ADR-0007).
+    fn assert_recovered_capture(before: &Frame, after: &Frame) {
+        assert_eq!(
+            (before.width, before.height),
+            (after.width, after.height),
+            "the recovered stream must carry the same negotiated geometry"
+        );
+        let frame_provenance::RuntimeFrameProvenance::Aggregate(aggregate) = after.provenance()
+        else {
+            panic!("a burst capture is an aggregate");
+        };
+        let first = &aggregate.contributors()[0];
+        assert!(
+            first.sequence().discontinuity() && first.timestamp().discontinuity(),
+            "the recovery marker"
+        );
+        assert!(
+            first.sequence().advance().is_some() && first.timestamp().delta_micros().is_some(),
+            "a discarded predecessor in the recovered epoch"
+        );
+        assert!(!after.provenance().is_continuous());
+    }
+
+    /// In-place IR recovery then capture through a real session, the
+    /// sequence `irlume-auth`'s held IR capture runs.
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_ir_capture_after_recovery_keeps_the_marker_and_aggregates() {
+        let (_, ir_path) = loopback_pair();
+        let operation = lease::acquire_camera_operation(
+            &[ir_path.as_str()],
+            lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire IR operation");
+        let camera = operation.open_ir(&ir_path).expect("open IR camera");
+        let mut session = camera.session().expect("open IR session");
+        let (before, _) = session
+            .capture_with_stats()
+            .expect("capture before recovery");
+        session.recover().expect("recover in place");
+        let (after, _) = session
+            .capture_with_stats()
+            .expect("capture after recovery");
+        assert_recovered_capture(&before, &after);
+    }
+
+    /// In-place RGB recovery then a denoised capture through a real
+    /// session, the sequence `irlume-auth`'s held RGB capture runs.
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_rgb_denoised_after_recovery_keeps_the_marker_and_aggregates() {
+        let (rgb_path, _) = loopback_pair();
+        let operation = lease::acquire_camera_operation(
+            &[rgb_path.as_str()],
+            lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire RGB operation");
+        let camera = operation.open_rgb(&rgb_path).expect("open RGB camera");
+        let mut session = camera.session().expect("open RGB session");
+        let before = session.denoised().expect("denoised before recovery");
+        session.recover().expect("recover in place");
+        let after = session.denoised().expect("denoised after recovery");
+        assert_recovered_capture(&before, &after);
     }
 
     /// Writing an empty value is what CLEARS the origin stamp, which is the

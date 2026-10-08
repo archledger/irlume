@@ -4781,7 +4781,12 @@ fn operation_camera_choice_cli_sends_exact_guard_and_never_retries_old_daemon() 
         }
         let (code, _, err) = run(&mut sb.cmd(&args));
         assert_eq!(code, 1);
-        assert!(err.contains("needs a newer irlumed"), "{err}");
+        let verb = if add { "add-camera" } else { "enroll" };
+        let unsupported = format!(
+            "{verb} failed: operation-scoped camera choice needs a newer irlumed; restart it \
+             after the upgrade (no fallback attempted)"
+        );
+        assert!(err.lines().any(|line| line == unsupported), "{err}");
         let log = log.lock().unwrap();
         assert_eq!(
             log.len(),
@@ -4795,6 +4800,35 @@ fn operation_camera_choice_cli_sends_exact_guard_and_never_retries_old_daemon() 
             serde_json::from_str::<serde_json::Value>(ENROLLMENT_CHOICE).unwrap()
         );
         assert!(!sb.path("cfg/cameras.conf").exists());
+    }
+}
+
+#[test]
+fn enrollment_without_a_choice_prints_a_daemon_bad_request_as_is() {
+    // Only a choice request reads `bad request` as an older daemon; a plain
+    // enroll or add-camera prints the daemon's text unchanged.
+    for add in [false, true] {
+        let sb = Sandbox::new(if add {
+            "choice-free-bad-request-add"
+        } else {
+            "choice-free-bad-request-enroll"
+        });
+        let log = serve(&sock(&sb), |_| Response::Error("bad request".into()));
+        let mut args = vec!["enroll", "--user", "tester"];
+        if add {
+            args.push("--add-camera");
+        }
+        let (code, _, err) = run(&mut sb.cmd(&args));
+        assert_eq!(code, 1, "{args:?}: {err}");
+        let verb = if add { "add-camera" } else { "enroll" };
+        let reported = format!("{verb} failed: bad request");
+        assert!(err.lines().any(|line| line == reported), "{err}");
+        assert!(!err.contains("newer irlumed"), "{err}");
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1, "a refusal must never retry another operation");
+        let value = serde_json::to_value(&log[0]).unwrap();
+        let name = if add { "AddCameraGroup" } else { "Enroll" };
+        assert_eq!(value[name]["user"], "tester", "{value}");
     }
 }
 
@@ -4818,6 +4852,361 @@ fn operation_camera_choice_cli_refuses_malformed_missing_and_repeated_values_bef
         assert_eq!(code, 2, "{err}");
     }
     assert!(log.lock().unwrap().is_empty());
+}
+
+const SPLIT_ENROLLMENT_CHOICE: &str = r#"{"expected":{"supervisor_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","revision":3,"rgb":{"instance_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":7,"endpoint":"/dev/video0"},"ir":{"instance_id":"cccccccccccccccccccccccccccccccc","generation":7,"endpoint":"/dev/video1"}},"authorization":{"generation":9,"token":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}"#;
+
+const SPLIT_ENROLLMENT_CHOICE_ZERO_REVISION: &str = r#"{"expected":{"supervisor_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","revision":0,"rgb":{"instance_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":7,"endpoint":"/dev/video0"},"ir":{"instance_id":"cccccccccccccccccccccccccccccccc","generation":7,"endpoint":"/dev/video1"}},"authorization":{"generation":9,"token":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}"#;
+
+/// The same choice as a non-root `irlume split list` shows it: both endpoints
+/// are 16-hex daemon-keyed tokens, not node paths.
+fn split_enrollment_choice_with_endpoint_tokens() -> String {
+    SPLIT_ENROLLMENT_CHOICE
+        .replace("/dev/video0", "0123456789abcdef")
+        .replace("/dev/video1", "fedcba9876543210")
+}
+
+#[test]
+fn split_camera_choice_cli_sends_exact_guard_and_never_retries_old_daemon() {
+    let joined = format!("--split-camera-choice={SPLIT_ENROLLMENT_CHOICE}");
+    for add in [false, true] {
+        for equals in [false, true] {
+            let sb = Sandbox::new(&format!("split-choice-{add}-{equals}"));
+            let log = serve(&sock(&sb), |_| Response::Error("bad request".into()));
+            let mut args = vec!["enroll", "--user", "tester"];
+            if equals {
+                args.push(joined.as_str());
+            } else {
+                args.extend(["--split-camera-choice", SPLIT_ENROLLMENT_CHOICE]);
+            }
+            if add {
+                args.push("--add-camera");
+            } else {
+                args.push("--reset");
+            }
+            let (code, _, err) = run(&mut sb.cmd(&args));
+            assert_eq!(code, 1, "{args:?}: {err}");
+            let verb = if add { "add-camera" } else { "enroll" };
+            let unsupported = format!(
+                "{verb} failed: split enrollment needs a newer irlumed; restart it after the \
+                 upgrade (no fallback attempted)"
+            );
+            assert!(err.lines().any(|line| line == unsupported), "{err}");
+            let log = log.lock().unwrap();
+            assert_eq!(
+                log.len(),
+                1,
+                "an unsupported split choice must never retry another operation"
+            );
+            let value = serde_json::to_value(&log[0]).unwrap();
+            let name = if add {
+                "AddSplitCameraGroupOn"
+            } else {
+                "EnrollSplitOn"
+            };
+            assert_eq!(
+                value[name]["pair"],
+                serde_json::from_str::<serde_json::Value>(SPLIT_ENROLLMENT_CHOICE).unwrap(),
+                "{args:?}"
+            );
+            if !add {
+                assert_eq!(value[name]["reset"], true);
+            }
+            assert!(!sb.path("cfg/cameras.conf").exists());
+        }
+    }
+}
+
+#[test]
+fn split_camera_choice_cli_forwards_user_profile_and_scans_without_reset() {
+    let pair = serde_json::from_str::<serde_json::Value>(SPLIT_ENROLLMENT_CHOICE).unwrap();
+    let sb = Sandbox::new("split-choice-forward-enroll");
+    let log = serve(&sock(&sb), |_| Response::Enrolled {
+        profile: "Night".into(),
+        created: true,
+        added: 3,
+        total: 3,
+        room: Some(27),
+        added_scans: vec!["Scan 1".into(), "Scan 2".into(), "Scan 3".into()],
+        ambient_lit: None,
+    });
+    let (code, out, err) = run(&mut sb.cmd(&[
+        "enroll",
+        "--user",
+        "tester",
+        "--name",
+        "Night",
+        "--scans",
+        "3",
+        "--split-camera-choice",
+        SPLIT_ENROLLMENT_CHOICE,
+    ]));
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("[enroll] enrolled 'Night' with 3 scans"),
+        "{out}"
+    );
+    let log = log.lock().unwrap();
+    match log.as_slice() {
+        [Request::EnrollSplitOn {
+            user,
+            profile,
+            scans,
+            reset,
+            pair: sent,
+        }] => {
+            assert_eq!(user, "tester");
+            assert_eq!(profile.as_deref(), Some("Night"));
+            assert_eq!(*scans, Some(3));
+            assert!(!reset, "--reset was not passed");
+            assert_eq!(serde_json::to_value(sent).unwrap(), pair);
+        }
+        other => panic!("expected one EnrollSplitOn request, got {other:?}"),
+    }
+
+    let sb = Sandbox::new("split-choice-forward-add");
+    let log = serve(&sock(&sb), |_| {
+        Response::Ok("split camera group enrolled; it can now authenticate this account".into())
+    });
+    let (code, out, err) = run(&mut sb.cmd(&[
+        "enroll",
+        "--user",
+        "tester",
+        "--add-camera",
+        "--name",
+        "Night",
+        "--scans",
+        "2",
+        "--split-camera-choice",
+        SPLIT_ENROLLMENT_CHOICE,
+    ]));
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains(
+            "[add-camera] split camera group enrolled; it can now authenticate this account"
+        ),
+        "{out}"
+    );
+    let log = log.lock().unwrap();
+    match log.as_slice() {
+        [Request::AddSplitCameraGroupOn {
+            user,
+            profile,
+            scans,
+            pair: sent,
+        }] => {
+            assert_eq!(user, "tester");
+            assert_eq!(profile.as_deref(), Some("Night"));
+            assert_eq!(*scans, Some(2));
+            assert_eq!(serde_json::to_value(sent).unwrap(), pair);
+        }
+        other => panic!("expected one AddSplitCameraGroupOn request, got {other:?}"),
+    }
+}
+
+#[test]
+fn split_camera_choice_cli_reports_daemon_refusals_as_is() {
+    let choice = split_enrollment_choice_with_endpoint_tokens();
+    let pair = serde_json::from_str::<serde_json::Value>(&choice).unwrap();
+    for add in [false, true] {
+        // The closed activation gate, a stale or unknown choice, and the fixed
+        // text a non-root caller gets when the split enrollment itself fails.
+        let fixed = if add {
+            "split camera group enrollment did not complete"
+        } else {
+            "split camera enrollment did not complete"
+        };
+        for (tag, reply) in [
+            (
+                "closed",
+                "policy: split enrollment and authentication are not enabled",
+            ),
+            (
+                "stale",
+                "split enrollment choice changed or is unavailable; list and confirm the pair again",
+            ),
+            ("fixed", fixed),
+        ] {
+            let sb = Sandbox::new(&format!("split-choice-refusal-{tag}-{add}"));
+            let log = serve(&sock(&sb), move |_| Response::Error(reply.into()));
+            let mut args = vec![
+                "enroll",
+                "--user",
+                "tester",
+                "--split-camera-choice",
+                choice.as_str(),
+            ];
+            if add {
+                args.push("--add-camera");
+            }
+            let (code, _, err) = run(&mut sb.cmd(&args));
+            assert_eq!(code, 1, "{args:?}: {err}");
+            let verb = if add { "add-camera" } else { "enroll" };
+            let reported = format!("{verb} failed: {reply}");
+            assert!(err.lines().any(|line| line == reported), "{err}");
+            assert!(!err.contains("newer irlumed"), "{err}");
+            let log = log.lock().unwrap();
+            assert_eq!(log.len(), 1, "a refusal must never retry another operation");
+            let value = serde_json::to_value(&log[0]).unwrap();
+            let name = if add {
+                "AddSplitCameraGroupOn"
+            } else {
+                "EnrollSplitOn"
+            };
+            assert_eq!(value[name]["pair"], pair, "{value}");
+        }
+    }
+}
+
+#[test]
+fn enrollment_notices_describe_the_pair_each_choice_captures_on() {
+    let sb = Sandbox::new("choice-notices");
+    let measured_enroll = "[enroll] if this camera pair has no measured capture mode yet, \
+                           irlume measures it first (one time, up to a minute; the IR emitter \
+                           fires)";
+    let measured_add = "[add-camera] an unmeasured pair is measured first (one time, up to a \
+                        minute; the IR emitter fires)";
+    let standing_add = "[add-camera] 'tester': capturing this face on the CURRENT camera pair;";
+    let chosen_add = "[add-camera] 'tester': capturing this face on the chosen pair;";
+    let split_enroll =
+        "[enroll] capturing RGB then IR on the chosen split pair (no capture-mode measurement)";
+    let split_add =
+        "[add-camera] capturing RGB then IR on the chosen split pair (no capture-mode measurement)";
+    for (flags, add, shown) in [
+        (vec![], false, vec![measured_enroll]),
+        (vec![], true, vec![standing_add, measured_add]),
+        (
+            vec!["--camera-choice", ENROLLMENT_CHOICE],
+            false,
+            vec![measured_enroll],
+        ),
+        (
+            vec!["--camera-choice", ENROLLMENT_CHOICE],
+            true,
+            vec![chosen_add, measured_add],
+        ),
+        (
+            vec!["--split-camera-choice", SPLIT_ENROLLMENT_CHOICE],
+            false,
+            vec![split_enroll],
+        ),
+        (
+            vec!["--split-camera-choice", SPLIT_ENROLLMENT_CHOICE],
+            true,
+            vec![chosen_add, split_add],
+        ),
+    ] {
+        let mut args = vec!["enroll", "--user", "tester"];
+        args.extend(flags.iter().copied());
+        if add {
+            args.push("--add-camera");
+        }
+        // No daemon listens: every notice precedes the request.
+        let (code, _, err) = run(&mut sb.cmd(&args));
+        assert_eq!(code, 1, "{args:?}: {err}");
+        assert!(err.contains("irlumed is not running"), "{args:?}: {err}");
+        for notice in [
+            measured_enroll,
+            measured_add,
+            standing_add,
+            chosen_add,
+            split_enroll,
+            split_add,
+        ] {
+            assert_eq!(
+                err.lines().any(|line| line.starts_with(notice)),
+                shown.contains(&notice),
+                "{args:?}: {notice}: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn split_camera_choice_cli_refuses_malformed_missing_repeated_and_combined_values_before_request() {
+    let sb = Sandbox::new("split-choice-usage");
+    let log = serve(&sock(&sb), |_| Response::Error("unexpected capture".into()));
+    let joined = format!("--split-camera-choice={SPLIT_ENROLLMENT_CHOICE}");
+    let ordinary_joined = format!("--camera-choice={ENROLLMENT_CHOICE}");
+    let missing = "[enroll] --split-camera-choice needs a JSON choice";
+    // The invalid reason is fixed. A choice that fails the choice's own
+    // top-level check (revision 0, same endpoint) has no position; every
+    // other decode failure, including a bad authorization token, adds it.
+    let invalid = "[enroll] invalid --split-camera-choice: not a valid split choice";
+    let invalid_empty = format!("{invalid} (JSON line 1, column 2)");
+    let invalid_member = format!("{invalid} (JSON line 1, column 18)");
+    let repeated = "[enroll] --split-camera-choice may be given only once";
+    let combined = "[enroll] --camera-choice and --split-camera-choice cannot be combined";
+    let cases = [
+        (vec!["--split-camera-choice"], missing),
+        (vec!["--split-camera-choice="], missing),
+        // A following flag is not the choice, as in `irlume split`.
+        (vec!["--split-camera-choice", "--reset"], missing),
+        (vec!["--split-camera-choice", "{}"], invalid_empty.as_str()),
+        (
+            vec!["--split-camera-choice", r#"{"unlisted_member":1}"#],
+            invalid_member.as_str(),
+        ),
+        (
+            vec![
+                "--split-camera-choice",
+                SPLIT_ENROLLMENT_CHOICE_ZERO_REVISION,
+            ],
+            invalid,
+        ),
+        (
+            vec![
+                "--split-camera-choice",
+                SPLIT_ENROLLMENT_CHOICE,
+                "--split-camera-choice",
+                SPLIT_ENROLLMENT_CHOICE,
+            ],
+            repeated,
+        ),
+        (
+            vec![
+                "--split-camera-choice",
+                SPLIT_ENROLLMENT_CHOICE,
+                joined.as_str(),
+            ],
+            repeated,
+        ),
+        (
+            vec![
+                "--camera-choice",
+                ENROLLMENT_CHOICE,
+                "--split-camera-choice",
+                SPLIT_ENROLLMENT_CHOICE,
+            ],
+            combined,
+        ),
+        (vec![ordinary_joined.as_str(), joined.as_str()], combined),
+    ];
+    for add in [false, true] {
+        for (flags, reason) in &cases {
+            let mut args = vec!["enroll", "--user", "tester"];
+            if add {
+                args.push("--add-camera");
+            }
+            args.extend(flags.iter().copied());
+            let (code, _, err) = run(&mut sb.cmd(&args));
+            assert_eq!(code, 2, "{args:?}: {err}");
+            assert!(err.lines().any(|line| line == *reason), "{args:?}: {err}");
+        }
+    }
+    assert!(log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn help_lists_both_enrollment_camera_choice_flags() {
+    let sb = Sandbox::new("help-enroll-choices");
+    let (code, out, err) = run(&mut sb.cmd(&["--help"]));
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("[--camera-choice JSON] [--split-camera-choice JSON]"),
+        "{out}"
+    );
+    assert!(out.contains("capture a face profile"), "{out}");
 }
 
 #[test]

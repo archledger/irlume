@@ -6,9 +6,10 @@
 //! to its end, and the raw `VIDIOC_G_FMT` tuple the range is judged from,
 //! frozen after negotiation and re-read at every stream boundary.
 //!
-//! Evidence is not a ceiling. `clipping_white_level` stays `None` for YUYV;
-//! the session content latch, the burst's emitter alternation and the
-//! limited-to-full expansion are later changes.
+//! Evidence is not a ceiling. `clipping_white_level` stays `None` for YUYV.
+//! Each `IrSession` builds its content latch (`yuyv_exposure`) from this
+//! evidence; the burst's emitter alternation and the ceiling are later
+//! changes.
 
 use crate::yuyv_exposure::RawYuyvFormat;
 use v4l::v4l_sys;
@@ -271,6 +272,12 @@ impl FormatEvidence {
             return Err(BindRefusal::Disagrees { field });
         }
         Ok(Self { raw, node })
+    }
+
+    /// The raw format frozen at binding, which every stream boundary
+    /// rechecks.
+    pub(crate) const fn raw(&self) -> &RawYuyvFormat {
+        &self.raw
     }
 
     /// Re-read the fd and compare the whole raw tuple with the frozen one.

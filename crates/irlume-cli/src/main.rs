@@ -330,10 +330,18 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
         Ok(choice) => choice,
         Err(code) => return code,
     };
+    let split_choice = match enrollment_split_camera_choice_flag(args) {
+        Ok(choice) => choice,
+        Err(code) => return code,
+    };
+    if choice.is_some() && split_choice.is_some() {
+        eprintln!("[enroll] --camera-choice and --split-camera-choice cannot be combined");
+        return std::process::ExitCode::from(2);
+    }
     let reset = args.iter().any(|a| a == "--reset");
     let add_camera = args.iter().any(|a| a == "--add-camera");
     if add_camera {
-        return enroll_add_camera(&user, name, scans, choice);
+        return enroll_add_camera(&user, name, scans, choice, split_choice);
     }
     eprintln!("[enroll] approve the system authentication dialog before capture; each additional scan request needs approval");
     if reset {
@@ -342,28 +350,45 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
     eprintln!(
         "[enroll] '{user}': capturing a new face profile; stay in frame, look at the camera…"
     );
-    // The daemon probes an unmeasured camera pair before the first scan
-    // (#340), and that probe holds the line above for up to a minute with no
-    // output; without this notice the wait reads as a hang.
-    eprintln!(
-        "[enroll] if this camera pair has no measured capture mode yet, irlume measures \
-         it first (one time, up to a minute; the IR emitter fires)"
-    );
-    let explicit = choice.is_some();
-    let request = match choice {
-        Some(pair) => Request::EnrollOn {
+    // The daemon probes an unmeasured ordinary camera pair before the first
+    // scan (#340), and that probe holds the line above for up to a minute with
+    // no output; without this notice the wait reads as a hang. A split pair
+    // gets no probe or emitter preflight (ADR-0032).
+    if split_choice.is_some() {
+        eprintln!(
+            "[enroll] capturing RGB then IR on the chosen split pair (no capture-mode \
+             measurement)"
+        );
+    } else {
+        eprintln!(
+            "[enroll] if this camera pair has no measured capture mode yet, irlume measures \
+             it first (one time, up to a minute; the IR emitter fires)"
+        );
+    }
+    let request = if let Some(pair) = split_choice {
+        Request::EnrollSplitOn {
             user: user.clone(),
             profile: name,
             scans,
             reset,
             pair,
-        },
-        None => Request::Enroll {
-            user: user.clone(),
-            profile: name,
-            scans,
-            reset,
-        },
+        }
+    } else {
+        match choice {
+            Some(pair) => Request::EnrollOn {
+                user: user.clone(),
+                profile: name,
+                scans,
+                reset,
+                pair,
+            },
+            None => Request::Enroll {
+                user: user.clone(),
+                profile: name,
+                scans,
+                reset,
+            },
+        }
     };
     match daemon_request(&request) {
         Ok(Response::Enrolled {
@@ -393,7 +418,7 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         Ok(Response::Error(e)) => {
-            eprintln!("enroll failed: {}", enrollment_choice_error(&e, explicit));
+            eprintln!("enroll failed: {}", enrollment_choice_error(&e, &request));
             std::process::ExitCode::FAILURE
         }
         Ok(other) => {
@@ -437,48 +462,129 @@ fn enrollment_camera_choice_flag(
     }
 }
 
-fn enrollment_choice_error(error: &str, explicit: bool) -> String {
-    if explicit && error == "bad request" {
-        "operation-scoped camera choice needs a newer irlumed; restart it after the upgrade (no fallback attempted)".into()
-    } else {
-        error.into()
+/// The refusal text for the enrollment `request` that was sent. An older
+/// daemon answers a choice request it cannot decode with `bad request`: that
+/// means an upgrade, and the client never retries another operation.
+fn enrollment_choice_error(error: &str, request: &irlume_common::Request) -> String {
+    use irlume_common::Request;
+    if error != "bad request" {
+        return error.into();
+    }
+    match request {
+        Request::EnrollSplitOn { .. } | Request::AddSplitCameraGroupOn { .. } => {
+            "split enrollment needs a newer irlumed; restart it after the upgrade (no fallback attempted)".into()
+        }
+        Request::EnrollOn { .. } | Request::AddCameraGroupOn { .. } => {
+            "operation-scoped camera choice needs a newer irlumed; restart it after the upgrade (no fallback attempted)".into()
+        }
+        _ => error.into(),
     }
 }
 
-/// `irlume enroll --add-camera [--name P]`: enroll the CURRENT camera pair
-/// as a secondary camera group (ADR-0024 §4). Attended capture on the new
-/// pair; the daemon derives the group from the pair's USB identities and
-/// authorizes the addition through the system authentication dialog - the
-/// new camera never authorizes its own addition.
+/// `--split-camera-choice JSON`: a split enrollment choice built from
+/// `irlume split list` (side guards plus the opaque authorization proof).
+/// Malformed choices are usage errors before any request; decoding also
+/// validates the choice.
+fn enrollment_split_camera_choice_flag(
+    args: &[String],
+) -> Result<
+    Option<Box<irlume_common::split_wire::SplitEnrollmentCameraChoice>>,
+    std::process::ExitCode,
+> {
+    let count = args
+        .iter()
+        .filter(|arg| {
+            arg.as_str() == "--split-camera-choice" || arg.starts_with("--split-camera-choice=")
+        })
+        .count();
+    if count == 0 {
+        return Ok(None);
+    }
+    let parse = || {
+        if count != 1 {
+            return Err("--split-camera-choice may be given only once".to_owned());
+        }
+        // An empty value or a following flag is a missing choice, as in `split`.
+        let text = flag(args, "--split-camera-choice")
+            .filter(|text| !text.is_empty() && !text.starts_with("--"))
+            .ok_or_else(|| "--split-camera-choice needs a JSON choice".to_owned())?;
+        // A fixed reason for an unparseable choice, as `split add` gives, with
+        // the JSON position when the decoder has one.
+        serde_json::from_str(text).map_err(|error: serde_json::Error| {
+            let reason = "invalid --split-camera-choice: not a valid split choice";
+            match (error.line(), error.column()) {
+                (0, _) => reason.to_owned(),
+                (line, column) => format!("{reason} (JSON line {line}, column {column})"),
+            }
+        })
+    };
+    match parse() {
+        Ok(choice) => Ok(Some(choice)),
+        Err(reason) => {
+            eprintln!("[enroll] {reason}");
+            Err(std::process::ExitCode::from(2))
+        }
+    }
+}
+
+/// `irlume enroll --add-camera [--name P] [--camera-choice JSON |
+/// --split-camera-choice JSON]`: enroll the CURRENT camera pair, or the pair
+/// a choice flag names for this operation only, as a secondary camera group
+/// (ADR-0024 §4). Attended capture on that pair; the daemon derives the
+/// group from the pair's USB identities and authorizes the addition through
+/// the system authentication dialog - the new camera never authorizes its
+/// own addition. An unmeasured ordinary pair is measured first; a split pair
+/// (ADR-0032) never is.
 fn enroll_add_camera(
     user: &str,
     profile: Option<String>,
     scans: Option<usize>,
     choice: Option<Box<irlume_common::live_camera::EnrollmentCameraChoice>>,
+    split_choice: Option<Box<irlume_common::split_wire::SplitEnrollmentCameraChoice>>,
 ) -> std::process::ExitCode {
     use irlume_common::{Request, Response};
+    let target = if choice.is_some() || split_choice.is_some() {
+        "the chosen pair"
+    } else {
+        "the CURRENT camera pair"
+    };
     eprintln!("[add-camera] approve the system authentication dialog before capture");
     eprintln!(
-        "[add-camera] '{user}': capturing this face on the CURRENT camera pair; stay in \
+        "[add-camera] '{user}': capturing this face on {target}; stay in \
          frame, look at the camera…"
     );
-    eprintln!(
-        "[add-camera] an unmeasured pair is measured first (one time, up to a minute; \
-         the IR emitter fires)"
-    );
-    let explicit = choice.is_some();
-    let request = match choice {
-        Some(pair) => Request::AddCameraGroupOn {
+    if split_choice.is_some() {
+        eprintln!(
+            "[add-camera] capturing RGB then IR on the chosen split pair (no capture-mode \
+             measurement)"
+        );
+    } else {
+        eprintln!(
+            "[add-camera] an unmeasured pair is measured first (one time, up to a minute; \
+             the IR emitter fires)"
+        );
+    }
+    let request = if let Some(pair) = split_choice {
+        Request::AddSplitCameraGroupOn {
             user: user.to_owned(),
             profile,
             scans,
             pair,
-        },
-        None => Request::AddCameraGroup {
-            user: user.to_owned(),
-            profile,
-            scans,
-        },
+        }
+    } else {
+        match choice {
+            Some(pair) => Request::AddCameraGroupOn {
+                user: user.to_owned(),
+                profile,
+                scans,
+                pair,
+            },
+            None => Request::AddCameraGroup {
+                user: user.to_owned(),
+                profile,
+                scans,
+            },
+        }
     };
     match daemon_request(&request) {
         Ok(Response::Ok(message)) => {
@@ -492,7 +598,7 @@ fn enroll_add_camera(
         Ok(Response::Error(e)) => {
             eprintln!(
                 "add-camera failed: {}",
-                enrollment_choice_error(&e, explicit)
+                enrollment_choice_error(&e, &request)
             );
             std::process::ExitCode::FAILURE
         }
@@ -2059,9 +2165,11 @@ pub(crate) fn daemon_request(
         req,
         irlume_common::Request::Enroll { .. }
             | irlume_common::Request::EnrollOn { .. }
+            | irlume_common::Request::EnrollSplitOn { .. }
             | irlume_common::Request::AddScan { .. }
             | irlume_common::Request::AddCameraGroup { .. }
             | irlume_common::Request::AddCameraGroupOn { .. }
+            | irlume_common::Request::AddSplitCameraGroupOn { .. }
             | irlume_common::Request::RemoveCameraGroup { .. }
             | irlume_common::Request::RecoverySetup { .. }
             | irlume_common::Request::RecoveryForget { .. }

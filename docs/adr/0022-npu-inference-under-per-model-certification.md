@@ -203,26 +203,35 @@ string, the NPU plugin version, the plugin's `NPU_DRIVER_VERSION` and
 the accelerator node, the build of the firmware the kernel loaded, the compile
 configuration of section 6, and the SHA-256 of every runtime library the daemon
 maps once the NPU is enumerated (OpenVINO and its plugins, the Level Zero
-loader, the NPU user-mode driver) plus the NPU compiler and ONNX frontend that
+loader, the NPU user-mode driver) plus the NPU compiler loader that applying
+the configuration loads and the NPU compiler and IR and ONNX frontends that
 compiling loads, which are resolved by path beside the mapped plugin and core
 and hashed before any compile, so the identity, its cache directory and its
 markers are known before the first compile and whether or not a cache import
-maps them. A rebuilt library that keeps its version string, or a distribution
-update of the Level Zero loader, is therefore a different identity; hashing the
-libraries makes discovery take about 0.5 s. The driver accepts other kernel and
-firmware combinations, and the qualified stack already pairs a compiler and a
-firmware of different interface versions, so the firmware is not implied by the
-driver version. The kernel reports the loaded build in the device's
-`fw_version` debugfs entry; it is readable by root, the daemon's
-`ProtectKernelTunables=` mounts debugfs read-only rather than hiding it, and
-kernel lockdown still permits read-only debugfs entries. A firmware build that
-cannot be read makes the identity unreadable, and every model runs on CPU. A
-difference in any field is a different identity. The kernel release is not a
-field: Fedora ships a kernel every few days, and keying on it would keep the
-NPU off most of the time. A kernel driver fault that returned plausible but
-wrong output is what the parity check of section 8 catches, and a kernel update
-always brings a reboot and so a new engine build; section 10 bounds a crash.
-Doctor reports the running kernel release.
+maps them. Each library is hashed through one open file whose inode is kept.
+When the platform opens and after every compile, every OpenVINO or Level Zero
+library the process has mapped must be one of them with the same inode;
+otherwise the model stays on CPU and what that compile wrote to the cache is
+discarded, so a package update between hashing and loading cannot run bytes the
+identity does not name. The device is not compared, because on btrfs `stat` and
+the memory map report different devices for the same file (measured), and an
+update renames a new file into place, so it always has a new inode. A rebuilt
+library that keeps its version string, or a distribution update of the Level
+Zero loader, is therefore a different identity; hashing the libraries makes
+discovery take about 0.5 s. The driver accepts other kernel and firmware
+combinations, and the qualified stack already pairs a compiler and a firmware
+of different interface versions, so the firmware is not implied by the driver
+version. The kernel reports the loaded build in the device's `fw_version`
+debugfs entry; it is readable by root, the daemon's `ProtectKernelTunables=`
+mounts debugfs read-only rather than hiding it, and kernel lockdown still
+permits read-only debugfs entries. A firmware build that cannot be read makes
+the identity unreadable, and every model runs on CPU. A difference in any field
+is a different identity. The kernel release is not a field: Fedora ships a
+kernel every few days, and keying on it would keep the NPU off most of the
+time. A kernel driver fault that returned plausible but wrong output is what
+the parity check of section 8 catches, and a kernel update always brings a
+reboot and so a new engine build; section 10 bounds a crash. Doctor reports the
+running kernel release.
 
 ### 5. System OpenVINO, loaded at run time
 
@@ -281,12 +290,14 @@ A table entry requires all of:
    count, so the corpora also run as production-shaped enrollments across the
    supported template counts, and rules 4 and 5 compare the final grant
    decisions, not only pairs.
-4. **Error rates no worse.** At every threshold and fusion floor the
-   decision applies, the NPU probes' false-accept rate is not above the CPU
-   probes' (one pair in 100,000 allowed for ties), and their false-reject
-   rate is not above the CPU's by more than 0.2 percentage points. Every
-   verdict that differs is listed, and each lies within the measured maximum
-   drift of its threshold.
+4. **No new impostor grant; error rates no worse.** No impostor comparison
+   that the CPU denies may be granted on the NPU, at any threshold, fusion
+   floor or production-shaped decision, whatever the aggregate rates do. Beyond
+   that, the NPU probes' false-accept rate is not above the CPU probes', and
+   their false-reject rate is not above the CPU's by more than 0.2 percentage
+   points; genuine pairs may change verdict within that budget. Every verdict
+   that differs is listed, and each lies within the measured maximum drift of
+   its threshold.
 5. **Drift small against the threshold.** The maximum absolute score drift
    d, read as a shift of the threshold on the CPU scores, moves the
    false-accept rate by at most 10% of its value (one pair in 100,000 when
@@ -495,6 +506,8 @@ face unacceptable latency.
 - Adapter: with an IR adapter configured, the recognizer stays on CPU.
 - Libraries: changing the bytes of any runtime library in the identity, the
   Level Zero loader included, changes the identity.
+- Loaded as hashed: a runtime library replaced after it was hashed, deleted
+  while mapped, or mapped without being hashed keeps the model on CPU.
 - Discovery: a discovery marker from the current boot keeps every model on
   CPU without loading the plugin again.
 - Packaging: under the enforcing AppArmor profile, the identity reads back

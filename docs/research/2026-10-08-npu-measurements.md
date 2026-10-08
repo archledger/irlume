@@ -17,12 +17,13 @@
   `c7d54204...43d5`.
 - **Identity** (ADR-0022 §4, read as root with the compile configuration
   `batch=1;NPU_COMPILER_TYPE=PLUGIN;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=default(f16);NPU_TURBO=unset`
-  and the runtime library digests): `a6eedd958a05fab88168936a5f4a7453efa1743b1dde8c5967717369f72b69dc`.
+  and the runtime library digests, the NPU compiler loader and the IR frontend
+  included): `4bccf18e7f6e6b5a9d8774b9eeee175a5d3ef398b72914b1e7c488a0ad3b55ed`.
   NPU reference digest of the recognizer on the three reference inputs:
   `9fa7f653f9330e60e4305d5ddac80675fe2ac7deec0e35b3d732b384ef2bede8`, the
   same in every process.
 - **How:** the ignored tests in `crates/irlume-vision/src/onnx/npu_tests.rs`
-  at commit `1cb6ea926880e0e4614baa204d69c1664eacdf7d` (branch
+  at commit `0c72b1d9e1a202da2ecf3324b62d4977fc058c37` (branch
   `feat/npu-vision-runtime`, which implements this ADR and adds the `npu`
   feature), for example
   `ulimit -c 0; cargo test -p irlume-vision --features npu --release --lib -- --ignored npu_hw_ --test-threads 1 --nocapture`
@@ -94,7 +95,11 @@ median of five frames). Impostor pairs were not part of this set.
 - As root, inside a `systemd-run` unit with irlumed's sandbox properties,
   `/sys/kernel/debug/accel/0000:00:0b.0/fw_version` reads back the loaded
   firmware build and debugfs is read-only.
-- After the platform opens, the process maps the OpenVINO core and C API, the
-  auto, hetero, CPU, GPU and NPU plugins, the NPU compiler loader, the Level
-  Zero loader and tracing layer, and the NPU user-mode driver; compiling adds
-  the NPU compiler and the IR and ONNX frontends.
+- Once the NPU is enumerated, the process maps the OpenVINO core and C API,
+  the auto, hetero, CPU, GPU and NPU plugins, the Level Zero loader and
+  tracing layer, and the NPU user-mode driver; setting `NPU_COMPILER_TYPE`
+  adds the NPU compiler loader, and compiling adds the NPU compiler and the IR
+  and ONNX frontends.
+- On the host's btrfs root, `stat` reports a library's subvolume device (0:37)
+  and `/proc/self/maps` the filesystem's (00:23) for the same inode, so the
+  check that the mapped libraries are the hashed ones compares inodes.

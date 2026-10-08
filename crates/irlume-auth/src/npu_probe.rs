@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Where the recognizer computes an embedding (ADR-0022 §2).
 //!
 //! Every stored template comes from the CPU reference, and each new scan
@@ -70,7 +73,7 @@ impl Engine {
         } else {
             match self.embed_producer() {
                 None => Some("this engine's producer is unknown"),
-                Some(producer) if !every_scan_from(enrollment, &producer) => {
+                Some(producer) if !every_scan_from(enrollment, &self.embed_space, &producer) => {
                     Some("a scan of this enrollment comes from another CPU reference")
                 }
                 Some(_) => None,
@@ -83,6 +86,13 @@ impl Engine {
             }
         }
         refusal.is_none()
+    }
+
+    /// Whether this engine's probes could ever run on the NPU: an IR
+    /// adapter, loaded or required, keeps the recognizer on CPU (ADR-0022
+    /// §2), so the daemon does not open the NPU for it.
+    pub fn npu_eligible(&self) -> bool {
+        self.ir_adapter.is_none() && !self.ir_adapter_required
     }
 
     #[cfg(feature = "npu")]
@@ -198,12 +208,22 @@ impl Engine {
     }
 }
 
-/// Whether `enrollment` has scans and every one records `producer`.
-fn every_scan_from(enrollment: &irlume_core::storage::Enrollment, producer: &str) -> bool {
+/// Whether `enrollment` has scans this engine's recognizer (`embed_space`)
+/// can match, and every one of them records `producer`. A scan from another
+/// recognizer never takes part in this engine's matching, so it neither
+/// admits nor refuses the NPU.
+fn every_scan_from(
+    enrollment: &irlume_core::storage::Enrollment,
+    embed_space: &str,
+    producer: &str,
+) -> bool {
     let mut scans = enrollment
         .profiles
         .iter()
         .flat_map(|profile| &profile.scans)
+        .filter(|scan| {
+            irlume_core::storage::recognizer_space_matches(scan.embed_space.as_deref(), embed_space)
+        })
         .peekable();
     scans.peek().is_some() && scans.all(|scan| scan.embed_producer.as_deref() == Some(producer))
 }
@@ -214,12 +234,16 @@ mod tests {
     use irlume_core::storage::{Enrollment, FaceProfile, FaceScan};
 
     fn scan(producer: Option<&str>) -> FaceScan {
+        scan_in("embed:test", producer)
+    }
+
+    fn scan_in(space: &str, producer: Option<&str>) -> FaceScan {
         FaceScan {
             name: "s".into(),
             rgb: vec![0.0; 4],
             ir: None,
             ir_space: None,
-            embed_space: Some("embed:test".into()),
+            embed_space: Some(space.into()),
             embed_producer: producer.map(str::to_owned),
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
@@ -248,19 +272,45 @@ mod tests {
     fn only_an_enrollment_entirely_from_the_producer_admits_the_npu() {
         let producer = "cpu:a:ort-1.28.1:c";
         let ours = Some(producer);
+        let space = "embed:test";
         assert!(every_scan_from(
             &enrollment(&[&[ours, ours], &[ours]]),
+            space,
             producer
         ));
-        assert!(!every_scan_from(&enrollment(&[&[ours, None]]), producer));
+        assert!(!every_scan_from(
+            &enrollment(&[&[ours, None]]),
+            space,
+            producer
+        ));
         assert!(!every_scan_from(
             &enrollment(&[&[ours], &[Some("cpu:a:ort-1.27.0:d")]]),
+            space,
             producer
         ));
-        assert!(!every_scan_from(&enrollment(&[]), producer), "no scans");
         assert!(
-            !every_scan_from(&enrollment(&[&[]]), producer),
+            !every_scan_from(&enrollment(&[]), space, producer),
+            "no scans"
+        );
+        assert!(
+            !every_scan_from(&enrollment(&[&[]]), space, producer),
             "an empty profile"
+        );
+        // A scan from another recognizer cannot be matched, so it does not
+        // refuse the NPU; an enrollment with only such scans does not admit it.
+        let mut mixed = enrollment(&[&[ours, ours]]);
+        mixed.profiles[0].scans.push(scan_in("embed:other", None));
+        assert!(every_scan_from(&mixed, space, producer));
+        let mut foreign = enrollment(&[]);
+        foreign.profiles.push(irlume_core::storage::FaceProfile {
+            name: "f".into(),
+            scans: vec![scan_in("embed:other", ours)],
+            ir_calib: None,
+            ir_calibs: std::collections::BTreeMap::new(),
+        });
+        assert!(
+            !every_scan_from(&foreign, space, producer),
+            "nothing this engine can match"
         );
     }
 
@@ -280,6 +330,11 @@ mod tests {
         // Only the admission sets the flag, and the request scope clears it.
         assert_eq!(source.matches("self.npu_probe = ").count(), 1);
         assert!(source.contains("self.npu_probe = self.npu_probe_admitted(&enr);"));
+        // ir_assessment.rs has a test module before its production code,
+        // so the whole file is searched; its tests do not set the flag.
+        let ir_only = include_str!("ir_assessment.rs");
+        assert_eq!(ir_only.matches("self.npu_probe = ").count(), 1);
+        assert!(ir_only.contains("self.npu_probe = self.npu_probe_admitted(&enrollment);"));
         assert!(include_str!("authentication_window.rs").contains("self.engine.npu_probe = false;"));
     }
 

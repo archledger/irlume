@@ -234,16 +234,12 @@ fn verify_models(paths: &[&str], keep: Option<&str>) -> Option<irlume_common::Ha
 fn load_shipped_recognizer(
     det_path: &str,
     model_path: &str,
-    verified: Option<irlume_common::HashedModel>,
+    verified: Option<&irlume_common::HashedModel>,
 ) -> irlume_common::Result<irlume_auth::Engine> {
     match verified {
-        // This function owns the serialized buffer: it is dropped on return,
-        // including errors, before the caller loads any auxiliary sessions.
-        // The NPU is offered only these verified bytes (ADR-0022).
-        Some(weights) => {
-            let engine = irlume_auth::Engine::load_with_recognizer_weights(det_path, &weights)?;
-            Ok(npu_placement::place(engine, &weights))
-        }
+        // The caller owns the serialized buffer and drops it before it loads
+        // any auxiliary sessions.
+        Some(weights) => irlume_auth::Engine::load_with_recognizer_weights(det_path, weights),
         None => irlume_auth::Engine::load(det_path, model_path),
     }
 }
@@ -258,6 +254,12 @@ mod npu_placement {
         mut engine: irlume_auth::Engine,
         weights: &irlume_common::HashedModel,
     ) -> irlume_auth::Engine {
+        // An IR adapter keeps every probe on CPU (ADR-0022 §2): opening and
+        // compiling for the NPU would only cost memory and startup time.
+        if !engine.npu_eligible() {
+            log(&engine);
+            return engine;
+        }
         // Discovery, compile and the parity check run as worker progress, so
         // a hang withholds the watchdog ping and costs one restart, after
         // which this boot's marker keeps the recognizer on CPU (ADR-0022 §10).
@@ -603,10 +605,20 @@ fn build_engine_from_config(
     irlume_common::PadModelStatus,
     irlume_common::PadModelStatus,
 )> {
-    load_shipped_recognizer(&config.det, &config.model, recognizer)
+    let engine = load_shipped_recognizer(&config.det, &config.model, recognizer.as_ref())
         .map(|engine| engine.with_devices(&config.rgb_dev, &config.ir_dev))
         .and_then(|engine| engine.with_ir_adapter(&config.adapter))
         .map(|engine| engine.with_ir_adapter_required(config.adapter_required))
+        // The NPU is offered only the verified bytes, once the adapter is
+        // configured, because an adapter keeps the recognizer on CPU
+        // (ADR-0022 §2).
+        .map(|engine| match &recognizer {
+            Some(weights) => npu_placement::place(engine, weights),
+            None => engine,
+        });
+    // The verified buffer is released before the auxiliary sessions load.
+    drop(recognizer);
+    engine
         // FaceMesh load failure disables rescue alignment only; recognition
         // and the PAM-conversation intent confirmation do not need the mesh.
         // Outside strict mode the daemon therefore stays available; strict
@@ -1349,6 +1361,9 @@ fn main() {
                                     }
                                 }
                             }
+                            // A failed NPU inference or a resume recheck may have
+                            // moved the recognizer to CPU (ADR-0022 §9, §13).
+                            publish_recognizer_placement(&engine);
                             // Back to waiting for work: idle is healthy, and leaving the
                             // last job's timestamp behind would read as a wedge (#141).
                             note_worker_idle();
@@ -4712,6 +4727,27 @@ fn publish_engine_bits_raw(bits: EngineBits) {
 fn publish_engine_camera_selection(engine: &irlume_auth::Engine) {
     let mut bits = engine_bits().lock().unwrap_or_else(|e| e.into_inner());
     copy_engine_camera_selection(&mut bits, engine);
+}
+
+/// Publish where the recognizer runs now, journaling a move off the NPU.
+fn publish_recognizer_placement(engine: &irlume_auth::Engine) {
+    let placement = engine.recognizer_placement();
+    let mut bits = engine_bits().lock().unwrap_or_else(|e| e.into_inner());
+    if bits.recognizer.as_ref() == Some(&placement) {
+        return;
+    }
+    if bits
+        .recognizer
+        .as_ref()
+        .is_some_and(|previous| previous.device == "npu")
+        && placement.device != "npu"
+    {
+        jout_warn!(
+            "irlumed: the recognizer left the NPU: {}",
+            placement.reason.as_deref().unwrap_or("no reason given")
+        );
+    }
+    bits.recognizer = Some(placement);
 }
 
 fn copy_engine_camera_selection(bits: &mut EngineBits, engine: &irlume_auth::Engine) {
@@ -11725,14 +11761,26 @@ mod tests {
     }
 
     #[test]
-    fn shipped_recognizer_loader_owns_the_transient_model() {
-        // Ownership at this return boundary releases the recognizer buffer
-        // before build_engine_from_config starts any auxiliary model sessions.
+    fn the_recognizer_buffer_is_released_before_the_auxiliary_sessions() {
+        // build_engine_from_config owns the verified recognizer buffer: the
+        // loader borrows it, the NPU placement (after the IR adapter is
+        // configured, ADR-0022 §2) borrows it, and it is dropped before any
+        // auxiliary model session starts.
         let _: fn(
             &str,
             &str,
-            Option<irlume_common::HashedModel>,
+            Option<&irlume_common::HashedModel>,
         ) -> irlume_common::Result<irlume_auth::Engine> = load_shipped_recognizer;
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn build_engine_from_config(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("build_engine_from_config");
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(at("with_ir_adapter_required") < at("npu_placement::place"));
+        assert!(at("npu_placement::place") < at("drop(recognizer);"));
+        assert!(at("drop(recognizer);") < at("with_mesh"));
     }
 
     #[test]
@@ -11976,7 +12024,7 @@ mod tests {
             Err(e) => e.to_string(),
         };
         let weights = irlume_common::HashedModel::new(b"pinned recognizer weights".to_vec());
-        let err = why(load_shipped_recognizer(det, model, Some(weights)));
+        let err = why(load_shipped_recognizer(det, model, Some(&weights)));
         assert!(
             !err.contains(model),
             "the recognizer path was read despite bytes in hand: {err}"

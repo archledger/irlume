@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! The identity arms that turn match scores into a grant, as pure
 //! functions. Authentication calls them, and [`decision_fingerprint`] runs
 //! exactly this code on fixed synthetic inputs, so a certified NPU entry is

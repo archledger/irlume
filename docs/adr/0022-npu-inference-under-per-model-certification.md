@@ -74,9 +74,11 @@ OpenVINO C API only under a versioned soname (`libopenvino_c.so.2620` for
    batch still crashes 2026.2.0.
 4. 2026-10-08, the implementation of this ADR (`irlume-vision`, release
    build) on the UX5406S and the qualified stack, models through irlume's own
-   structs against their ONNX Runtime CPU sessions:
+   structs against their ONNX Runtime CPU sessions; the aggregates, the
+   identity and reference digests and the commands are in the
+   [measurement record][measurement 4]:
    - The recognizer, the ViT and the FLIR compiled with the batch fixed to 1
-     and reported `EXECUTION_DEVICES=NPU` in every run. Cold compile: 2.3 to
+     and reported `EXECUTION_DEVICES=NPU` in every run. Cold compile: 2.2 to
      5.2 s, 3.4 to 8.0 s and 0.15 to 0.35 s; from the OpenVINO cache: 0.38 to
      0.53 s, 0.59 to 0.90 s and 0.02 s. Their CPU sessions build in 0.43
      to 0.44 s and 0.23 to 0.28 s (recognizer, ViT). The three blobs take
@@ -86,7 +88,9 @@ OpenVINO C API only under a versioned soname (`libopenvino_c.so.2620` for
    - Synthetic parity: recognizer cosine 0.9999982, ViT delta 0.000032, FLIR
      delta 0.000007. Interleaving three inputs on one infer request and
      repeating them returned identical bits; so did an inference after the
-     NPU had runtime-suspended.
+     NPU had runtime-suspended, and so did separate processes. The
+     recognizer's NPU embeddings of the reference inputs lie 0.0017 to
+     0.0026 (L2) from the CPU's.
    - Real recorded frames: 2,397 local frames (1,851 with a face; genuine IR
      sessions, paper, screen, phone, video-replay and banner IR attacks, RGB
      genuine and banner frames), each through both backends at the wired
@@ -153,7 +157,10 @@ the CPU session would, and the same code consumes them. Enrollment embeds on
 CPU: every stored template comes from the CPU reference, so no template
 depends on the NPU, a fallback or a stack update, and the only mixed
 comparison is an NPU probe against a CPU template, which section 7
-certifies.
+certifies. When an IR adapter is configured (`IRLUME_IR_ADAPTER`; none ships
+since ADR-0004), the recognizer stays on CPU: an adapter is user-supplied,
+transforms the raw IR embedding before its own threshold, and is part of no
+certification.
 
 ### 3. A per-model certification table in the source
 
@@ -191,21 +198,26 @@ bind every downstream model as well; together they are about 13 ms of the
 The identity is the loaded `libopenvino_c` path, the OpenVINO runtime build
 string, the NPU plugin version, the plugin's `NPU_DRIVER_VERSION` and
 `NPU_COMPILER_VERSION`, its `DEVICE_ARCHITECTURE`, the PCI vendor and device of
-the accelerator node, the build of the firmware the kernel loaded, and the
-compile configuration of section 6. The driver accepts other kernel and
-firmware combinations, and the qualified stack already pairs a compiler and
-a firmware of different interface versions, so the firmware is not implied by
-the driver version. The kernel reports the loaded build in the device's
-`fw_version` debugfs entry; it is readable by root, the daemon's
-`ProtectKernelTunables=` mounts debugfs read-only rather than hiding it, and
-kernel lockdown still permits read-only debugfs entries. A firmware build that
-cannot be read makes the identity unreadable, and every model runs on CPU. A
-difference in any field is a different identity. The kernel release is not a
-field: Fedora ships a kernel every few days, and keying on it would keep the
-NPU off most of the time. A kernel driver fault that returned plausible but
-wrong output is what the parity check of section 8 catches, and a kernel
-update always brings a reboot and so a new engine build; section 10 bounds a
-crash. Doctor reports the running kernel release.
+the accelerator node, the build of the firmware the kernel loaded, the compile
+configuration of section 6, and the SHA-256 of every runtime library the daemon
+maps once the NPU is enumerated (OpenVINO and its plugins, the Level Zero
+loader, the NPU user-mode driver) plus the NPU compiler and ONNX frontend that
+compiling loads. A rebuilt library that keeps its version string, or a
+distribution update of the Level Zero loader, is therefore a different
+identity; hashing the libraries makes discovery take about 0.5 s. The driver
+accepts other kernel and firmware combinations, and the qualified stack already
+pairs a compiler and a firmware of different interface versions, so the
+firmware is not implied by the driver version. The kernel reports the loaded
+build in the device's `fw_version` debugfs entry; it is readable by root, the
+daemon's `ProtectKernelTunables=` mounts debugfs read-only rather than hiding
+it, and kernel lockdown still permits read-only debugfs entries. A firmware
+build that cannot be read makes the identity unreadable, and every model runs
+on CPU. A difference in any field is a different identity. The kernel release
+is not a field: Fedora ships a kernel every few days, and keying on it would
+keep the NPU off most of the time. A kernel driver fault that returned
+plausible but wrong output is what the parity check of section 8 catches, and a
+kernel update always brings a reboot and so a new engine build; section 10
+bounds a crash. Doctor reports the running kernel release.
 
 ### 5. System OpenVINO, loaded at run time
 
@@ -259,7 +271,11 @@ A table entry requires all of:
    brightness weights, paired cases also run through the production fusion
    and profile-selection code: recorded RGB+IR pairs where they exist, and
    otherwise every combination of the corpora's RGB and IR comparisons over
-   the recorded brightness range.
+   the recorded brightness range. Production takes the best score over up to
+   90 scans (3 profiles of 30) against a threshold scaled by the template
+   count, so the corpora also run as production-shaped enrollments across the
+   supported template counts, and rules 4 and 5 compare the final grant
+   decisions, not only pairs.
 4. **Error rates no worse.** At every threshold and fusion floor the
    decision applies, the NPU probes' false-accept rate is not above the CPU
    probes' (one pair in 100,000 allowed for ties), and their false-reject
@@ -287,12 +303,16 @@ A table entry requires all of:
 
 NPU sessions are compiled when the engine is built, after its CPU sessions and
 before the daemon reports ready, at startup and at every engine rebuild. No
-compilation happens inside an authentication attempt. Before the recognizer
-answers from the NPU, every engine build runs three fixed reference inputs
-through both of its sessions; an embedding cosine below 0.9999 (measured
-0.9999982) keeps it on CPU, and doctor says so. From the cache the recognizer
-adds 0.4 to 0.5 s before ready; after an identity change the first start
-compiles it cold, 2.3 to 5.2 s. Until ready, clients get the existing "still
+compilation happens inside an authentication attempt. Each entry records the
+SHA-256 of the NPU's output bits for three fixed reference inputs. The NPU
+repeats those bits exactly, across inferences and across processes (measurement
+4), so every engine build requires the recorded digest before the recognizer
+answers from the NPU; any other bits keep it on CPU, and doctor says so. A
+kernel, driver or firmware change that alters the NPU's numerics therefore
+needs a new certification, and one that does not alter them does not. Discovery
+with the library digests takes about 0.5 s; from the cache the recognizer then
+adds 0.4 to 0.5 s before ready, and after an identity change the first start
+compiles it cold, 2.2 to 5.2 s. Until ready, clients get the existing "still
 starting" answer and use the password.
 
 ### 9. Failure falls back to the CPU session
@@ -317,11 +337,14 @@ removes those of earlier boots. A marker from the current boot found at startup
 means a compile or an inference did not return (a crash, or a hang a watchdog
 restart ended): that model stays on CPU for that identity for the rest of the
 boot, and doctor says so. A marker from an earlier boot allows one new attempt,
-so a power loss does not pin a model to CPU. A compile counts as worker
-activity for the watchdog, startup included, so one that does not return within
-`WatchdogSec=` (90 s, against a longest measured cold compile of 5.2 s) stops
-the pings and ends in a restart rather than a hang. With `Restart=on-failure`,
-a crashing or wedged compile or inference costs one restart, never a loop.
+so a power loss does not pin a model to CPU. Discovery (loading the plugin,
+enumerating the device, reading the identity) has its own boot-scoped marker,
+so a crash or hang there is not repeated either. Discovery and every compile
+count as worker activity for the watchdog, startup included, so one that does
+not return within `WatchdogSec=` (90 s, against a longest measured cold compile
+of 5.2 s) stops the pings and ends in a restart rather than a hang. With
+`Restart=on-failure`, a crashing or wedged compile or inference costs one
+restart, never a loop.
 
 ### 11. A daemon-owned cache
 
@@ -386,9 +409,12 @@ face unacceptable latency.
 - The driver's interface-version warnings appear in the daemon's journal at
   every compile.
 - Packaging follows certification: the Fedora package turns on `npu`, adds
-  `CacheDirectory=`, an AppArmor rule for `/dev/accel/accel[0-9]*` and the
-  OpenVINO libraries, and a weak dependency on the stack only when the table
-  has an entry for an identity that package can meet. Other lanes are
+  `CacheDirectory=`, a weak dependency on the stack only when the table has
+  an entry for an identity that package can meet, and AppArmor rules for
+  `/dev/accel/accel[0-9]*` (read and write), the OpenVINO and Level Zero
+  libraries (map and read), `/sys/kernel/debug/accel/*/fw_version` (read)
+  and `/var/cache/irlume/npu/**` (read and write); without the last two the
+  identity is unreadable and nothing can be cached. Other lanes are
   unchanged.
 - The gain is the recognizer's: per call 118 to 183 ms on CPU against 6.7
   to 6.8 ms on the NPU, and 227 to 328 ms of CPU time against 0.15 to 0.24
@@ -454,8 +480,15 @@ face unacceptable latency.
   tests.
 - Compiler: the plugin compiler is set and read back; a host where it cannot
   be selected runs the model on CPU.
-- Parity: an NPU whose output differs from CPU on the reference inputs leaves
+- Parity: an NPU that does not reproduce its entry's reference digest leaves
   the model on CPU before it answers a request.
+- Adapter: with an IR adapter configured, the recognizer stays on CPU.
+- Libraries: changing the bytes of any runtime library in the identity, the
+  Level Zero loader included, changes the identity.
+- Discovery: a discovery marker from the current boot keeps every model on
+  CPU without loading the plugin again.
+- Packaging: under the enforcing AppArmor profile, the identity reads back
+  (firmware included) and the cache and markers are written.
 - Eligibility: only the recognizer can have an entry; the PAD cues, the
   detectors, the ONNX mesh fallback and TFLite models never do.
 - Enrollment: with the recognizer on the NPU, enrollment scans come from the
@@ -483,7 +516,9 @@ face unacceptable latency.
 - Cache: the directory is 0700 root and per identity, other identities'
   directories are removed, and the CLI never creates it.
 - Decisions: with a model on the NPU, grants and denials come from the same
-  thresholds, votes and PAD availability rules as on CPU.
+  thresholds, votes and PAD availability rules as on CPU; certification
+  compares final grant decisions on production-shaped enrollments of 1 to 90
+  scans.
 - Wire: new status fields decode with a frozen copy of the pre-change client
   types, and a pre-change daemon's status decodes in the new client.
 - Hardware (`#[ignore]`, Lunar Lake): the identity reads back; every
@@ -495,3 +530,4 @@ face unacceptable latency.
 [intel-npu-stack]: https://github.com/archledger/intel-npu-stack
 [intel-npu-stack#20]: https://github.com/archledger/intel-npu-stack/issues/20
 [npu_compiler#352]: https://github.com/openvinotoolkit/npu_compiler/issues/352
+[measurement 4]: ../research/2026-10-08-npu-measurements.md

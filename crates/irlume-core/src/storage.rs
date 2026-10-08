@@ -1438,7 +1438,9 @@ mod tests {
         let legacy: FaceScan = serde_json::from_value(old).unwrap();
         assert_eq!(legacy.embed_producer, None);
         // Absent, it is not written: an older scan rewrites to its own bytes.
-        assert!(!serde_json::to_string(&legacy).unwrap().contains("embed_producer"));
+        assert!(!serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("embed_producer"));
     }
     #[test]
     fn retag_marker_is_written_no_looser_than_0600() {

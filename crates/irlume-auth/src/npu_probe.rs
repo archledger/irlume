@@ -82,6 +82,30 @@ impl Engine {
         false
     }
 
+    /// The wired thresholds that consume the recognizer's output, by
+    /// constant name, at this engine's values: an NPU entry applies only at
+    /// these operating points (ADR-0022 §3). The adapter threshold is absent
+    /// because an IR adapter keeps the recognizer on CPU.
+    pub fn npu_thresholds(&self) -> [(&'static str, f32); 6] {
+        [
+            ("RGB_MATCH_THRESHOLD", self.rgb_threshold),
+            ("IR_MATCH_THRESHOLD", irlume_core::IR_MATCH_THRESHOLD),
+            (
+                "IR_DARK_MATCH_THRESHOLD",
+                irlume_core::IR_DARK_MATCH_THRESHOLD,
+            ),
+            ("IR_FALLBACK_MARGIN", irlume_core::IR_FALLBACK_MARGIN),
+            (
+                "FUSION_PROB_THRESHOLD",
+                irlume_core::fusion::FUSION_PROB_THRESHOLD,
+            ),
+            (
+                "FUSION_MIN_PER_MODALITY_PROB",
+                irlume_core::fusion::FUSION_MIN_PER_MODALITY_PROB,
+            ),
+        ]
+    }
+
     /// Where the recognizer runs, for status and `doctor` (ADR-0022 §13).
     #[cfg(feature = "npu")]
     pub fn recognizer_device(&self) -> irlume_vision::npu::Device {
@@ -164,14 +188,20 @@ mod tests {
     fn only_an_enrollment_entirely_from_the_producer_admits_the_npu() {
         let producer = "cpu:a:ort-1.28.1:c";
         let ours = Some(producer);
-        assert!(every_scan_from(&enrollment(&[&[ours, ours], &[ours]]), producer));
+        assert!(every_scan_from(
+            &enrollment(&[&[ours, ours], &[ours]]),
+            producer
+        ));
         assert!(!every_scan_from(&enrollment(&[&[ours, None]]), producer));
         assert!(!every_scan_from(
             &enrollment(&[&[ours], &[Some("cpu:a:ort-1.27.0:d")]]),
             producer
         ));
         assert!(!every_scan_from(&enrollment(&[]), producer), "no scans");
-        assert!(!every_scan_from(&enrollment(&[&[]]), producer), "an empty profile");
+        assert!(
+            !every_scan_from(&enrollment(&[&[]]), producer),
+            "an empty profile"
+        );
     }
 
     /// Production code embeds only through the two probe helpers or the CPU

@@ -98,30 +98,43 @@ the CPU session would, and the same code consumes them.
 ### 3. A per-model certification table in the source
 
 Device selection is per model and decided by a table compiled into
-`irlume-vision`, keyed by the model's SHA-256 and a platform identity
-(section 4). A model whose digest and the running identity match an entry
-runs on the NPU; any other combination runs on CPU. There is no `AUTO`,
+`irlume-vision`. An entry binds three things: the model's SHA-256, a platform
+identity (section 4), and the CPU reference it was certified against: the
+ONNX Runtime version, the wired thresholds that consume the output, and a
+fingerprint of the CPU session's decoded outputs for fixed synthetic inputs
+through irlume's own preprocessing. A model runs on the NPU only when its
+digest, the running identity and the loaded ONNX Runtime version all match an
+entry; any other combination runs on CPU. Tests recompute the thresholds and
+the fingerprint from the current code, so a change to preprocessing,
+decoding, a threshold or the ONNX Runtime output fails them until the entry
+is certified again or removed in the same change. There is no `AUTO`,
 `HETERO` or `MULTI` device, no GPU, and no selection by device availability or
 speed. An entry is added only by a reviewed change that cites its
 certification evidence (section 7).
 
 ### 4. Platform identity
 
-The identity is the tuple the daemon can read without privileges beyond its
-own: the loaded `libopenvino_c` soname, the OpenVINO runtime build string, the
-NPU plugin version, the plugin's `NPU_DRIVER_VERSION` and
-`NPU_COMPILER_VERSION`, its `DEVICE_ARCHITECTURE`, and the PCI vendor and
-device of the accelerator node. NPU firmware is not readable from the
-sandboxed daemon; the stack ships firmware and driver as one release, and the
-certification evidence records the firmware version. A difference in any
-field is a different identity.
+The identity is the loaded `libopenvino_c` path, the OpenVINO runtime build
+string, the NPU plugin version, the plugin's `NPU_DRIVER_VERSION` and
+`NPU_COMPILER_VERSION`, its `DEVICE_ARCHITECTURE`, the PCI vendor and device of
+the accelerator node, and the build of the firmware the kernel loaded. The
+driver accepts other kernel and firmware combinations, so the firmware is not
+implied by the driver version. The kernel reports the loaded build in the
+device's `fw_version` debugfs entry; it is readable by root, the daemon's
+`ProtectKernelTunables=` mounts debugfs read-only rather than hiding it, and
+kernel lockdown still permits read-only debugfs entries. A firmware build that
+cannot be read makes the identity unreadable, and every model runs on CPU. A
+difference in any field is a different identity.
 
 ### 5. System OpenVINO, loaded at run time
 
-The daemon loads the certified OpenVINO C API through the system loader by its
-versioned soname (`libopenvino_c.so.2620` for 2026.2.0), so another OpenVINO
-release reads as absent. It never searches environment-supplied or `/opt`
-paths and never bundles OpenVINO. Absence, a missing symbol, a load error or an
+The daemon loads the certified OpenVINO C API from an absolute path: its
+versioned soname (`libopenvino_c.so.2620` for 2026.2.0) in a fixed list of
+distribution library directories (`/usr/lib64`, `/usr/lib/x86_64-linux-gnu`,
+`/usr/lib`), as the TFLite runtime is found. A bare name is never handed to
+the loader, so neither `LD_LIBRARY_PATH` nor the loader cache can substitute
+another library, and another OpenVINO release reads as absent. It never
+bundles OpenVINO. Absence, a missing symbol, a load error or an
 identity outside the table is a recoverable "no NPU" answer, like the TFLite
 library probe, never an error that stops the daemon. The code sits behind an
 `irlume-vision` Cargo feature, `npu`, off by default; a build without it is
@@ -176,19 +189,25 @@ compilation happens inside an authentication attempt.
 The CPU session of a model on the NPU stays loaded. A load or compile failure
 leaves that model on CPU for the engine's lifetime. An inference error makes
 the same call return the CPU session's result and retires the NPU session for
-the engine's lifetime. Neither path changes a threshold, a vote or the
-evidence policy, so an NPU fault cannot widen authentication; if the CPU
-session fails too, ADR-0019 and the core-model startup rules apply unchanged.
+the engine's lifetime. An inference that crashes the daemon or hangs until the
+watchdog kills it is covered by section 10. No path changes a threshold, a
+vote or the evidence policy, so an NPU fault cannot widen authentication; if
+the CPU session fails too, ADR-0019 and the core-model startup rules apply
+unchanged.
 
-### 10. A compiler crash costs one restart
+### 10. A crash or a hang costs one restart
 
-Before compiling a model, the daemon writes a marker named by the model
-digest, the identity and the boot ID into the cache directory, and removes it
-when the compile returns. A marker from the current boot found at startup
-means a compile did not return: that model stays on CPU for that identity,
-and doctor says so. A marker from an earlier boot allows one new attempt, so a
-power loss does not pin a model to CPU. With `Restart=on-failure`, a crashing
-compiler costs one restart, never a loop.
+Before compiling a model, and before every NPU inference, the daemon writes a
+marker named by the model digest, holding the boot ID, into the cache
+directory of the identity, and removes it when the call returns. A marker
+from the current boot found at startup means a compile or an inference did
+not return (a crash, or a hang the `WatchdogSec=` restart ended): that model
+stays on CPU for that identity for the rest of the boot, and doctor says so.
+A marker from an earlier boot allows one new attempt, so a power loss does
+not pin a model to CPU. With `Restart=on-failure`, a crashing compiler or a
+crashing or wedged inference costs one restart, never a loop. The marker
+costs a file create and remove per inference, against 6 to 15 ms of NPU
+time.
 
 ### 11. A daemon-owned cache
 
@@ -199,17 +218,23 @@ CLI never uses the NPU and never creates this directory.
 
 ### 12. A kill switch
 
-`IRLUME_NPU=0` or `npu=0` in `settings.conf` disables all NPU use, with the
-same parsing as `pad_vit`. A value that cannot be read disables it, the
-direction of the reference path.
+`IRLUME_NPU` and the `npu` key of `settings.conf` switch NPU use off. Each is
+read the same way: absent leaves the table to decide; after trimming, ASCII
+`1`, `true`, `yes` or `on` in any case leaves the table to decide; `0`,
+`false`, `no` or `off` disables; any other value, an empty value, a value
+that is not UTF-8, or a `settings.conf` that exists but cannot be read
+disables. Either source disabling wins. This is deliberately stricter than the
+`pad_vit` switch, which treats only a recognized off value as off: here a
+setting that cannot be understood selects the reference path.
 
 ### 13. Reporting
 
 `irlume doctor`, its `--json` form and the daemon's status report each model's
 device and, on CPU, the reason: not built, disabled, not certified for this
-identity, runtime absent, identity unreadable, compile failed, a compile did
-not return, or retired after an inference error. A platform row gives the
-identity. New wire and JSON fields are additive.
+identity and reference, runtime absent, identity unreadable, ineligible,
+compile failed, a compile or inference did not return earlier in this boot,
+or retired after an inference error. A platform row gives the identity. New
+wire and JSON fields are additive.
 
 ### 14. The production mesh stays on LiteRT
 
@@ -272,18 +297,28 @@ face unacceptable latency.
 - Table: an empty table resolves every model to CPU on every identity; an
   entry matches only its exact digest and identity; changing any one identity
   field resolves to CPU.
-- Kill switch: `IRLUME_NPU=0`, `npu=0` and a malformed value disable the NPU;
-  unset leaves the table to decide.
-- Absence: with no `libopenvino_c.so.2620`, a missing symbol or a load error,
-  every model is on CPU with the matching reason, and nothing panics.
+- Reference: an entry whose recorded ONNX Runtime version differs from the
+  loaded one resolves to CPU; changing a recorded threshold, the
+  preprocessing or the decoding of a certified model fails the fingerprint
+  and threshold tests.
+- Identity: an unreadable firmware build resolves every model to CPU.
+- Kill switch: `IRLUME_NPU=0`, `npu=0`, an empty, malformed or non-UTF-8
+  value and an unreadable `settings.conf` disable the NPU; absent and
+  recognized on values leave the table to decide.
+- Absence: with no `libopenvino_c.so.2620` in the listed directories, a
+  missing symbol or a load error, every model is on CPU with the matching
+  reason, and nothing panics; a library reachable only through
+  `LD_LIBRARY_PATH` is not loaded.
 - Batch: a model with a dynamic batch is compiled only with the batch fixed to
   1; a model with another dynamic dimension is ineligible.
 - Fallback: an injected compile error leaves the model on CPU; an injected
   inference error returns the CPU result for that call and keeps later calls
   on CPU.
 - Marker: a current-boot marker keeps the model on CPU without compiling; an
-  earlier-boot marker allows one attempt; a successful compile removes it; a
-  new identity ignores markers of the old one.
+  earlier-boot marker allows one attempt; a returned compile or inference
+  removes it; a marker left by an inference (a killed process) keeps the
+  model on CPU after the restart; a new identity ignores markers of the old
+  one.
 - Cache: the directory is 0700 root and per identity, other identities'
   directories are removed, and the CLI never creates it.
 - Decisions: with a model on the NPU, grants and denials come from the same

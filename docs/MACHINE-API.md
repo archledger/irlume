@@ -148,7 +148,8 @@ asked about.
   "recovery": { "known": true, "passphrase_set": true, "key_present": true },
   "camera": { "known": true, "rgb": true, "ir": true },
   "fingerprint": false,
-  "fingerprint_known": true
+  "fingerprint_known": true,
+  "recognizer": { "known": true, "device": "cpu", "reason": "…" }
 }
 ```
 
@@ -176,6 +177,12 @@ nodes. `fingerprint_known` says the bounded tooling/reader probe completed; when
 false, the retained `fingerprint: false` boolean is an unobserved fallback rather
 than confirmed absence. These added fields are optional for older contract-1
 producers; consumers should not infer an observation when they are absent.
+
+`recognizer` says where the daemon's recognizer computes authentication probes
+(ADR-0022): `device` is `npu` or `cpu`, with `reason` on CPU and `platform`, the
+NPU platform identity digest, when one was read. `known` is false, with no other
+field, when the daemon did not answer or predates the report. It is optional for
+older contract-1 producers.
 
 `templates` is `encrypted`, `plaintext`, or `unknown`.
 
@@ -249,6 +256,8 @@ reused for a different meaning. The registry as of this contract:
 | `ort-dylib-path` | the `ORT_DYLIB_PATH` override, when one is set |
 | `onnxruntime` | the ONNX Runtime the resolver would load in this shell: the resolved path (or the system library) and its version. `fail` when that library is unloadable or below the API level irlume needs, because model loading cannot succeed against it (#187) |
 | `tflite-runtime` | the TFLite C runtime the mesh runs on, loaded in this shell. `fail` when an explicit `IRLUME_TFLITE_LIB` is set but invalid or unloadable (an operator mistake this shell can see); `warn` when nothing resolved, because the daemon's unit may set its own path this shell cannot observe |
+| `recognizer-device` | where the daemon's recognizer computes authentication probes (ADR-0022): `NPU`, or `CPU:` with the reason (not built with NPU support, disabled, not certified for this platform and reference, no NPU runtime, and so on). `info`; `unknown` when the daemon did not answer or predates the report |
+| `npu-platform` | the NPU platform identity digest the daemon read for the recognizer, or that none was read. `info`; `unknown` as for `recognizer-device` |
 | `fingerprint-reader` | whether a fingerprint reader was found |
 | `templates` | face templates encrypted at rest for the account asked about |
 | `recovery-passphrase` | whether a recovery passphrase is set |

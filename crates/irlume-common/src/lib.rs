@@ -1524,6 +1524,22 @@ pub enum PadModelStatus {
     LoadFailed,
 }
 
+/// Where the recognizer computes authentication probes (ADR-0022 §13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecognizerPlacement {
+    /// `"npu"` or `"cpu"`.
+    pub device: String,
+    /// On CPU, why: not built with NPU support, disabled, not certified for
+    /// this platform and reference, no NPU runtime, identity unreadable,
+    /// ineligible, compile failed, output differs from CPU, did not return
+    /// earlier in this boot, or retired after an inference error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The NPU platform identity digest, when discovery read one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+}
+
 /// Prospective cumulative face-request budget, independent of password recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FaceRetryBudget {
@@ -1930,6 +1946,10 @@ pub enum Response {
         /// failed to load it and the daemon is actually unconfined.
         #[serde(default)]
         apparmor: Option<String>,
+        /// Where the recognizer runs (ADR-0022 §13). `None` means the
+        /// daemon predates this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recognizer: Option<RecognizerPlacement>,
     },
     /// A framing-guide sample (`PositionSample`).
     Position(PositionReport),

@@ -589,13 +589,36 @@ mod onnx {
             model: &irlume_common::HashedModel,
             npu: &mut crate::npu::Context,
         ) -> irlume_common::Result<Self> {
-            let session = build(model.bytes())?;
             let mut embedder = Self {
-                session,
-                npu: npu.slot(model.bytes(), model.sha256()),
+                session: build(model.bytes())?,
+                npu: crate::npu::Slot::default(),
             };
-            embedder.check_npu_parity()?;
+            embedder.place_on_npu(model, npu)?;
             Ok(embedder)
+        }
+
+        /// [`Self::load_with_npu`] for an embedder already loaded from
+        /// `model`: places it without rebuilding its CPU session. An error
+        /// of the parity check's CPU session leaves the model on CPU.
+        ///
+        /// # Errors
+        ///
+        /// When the CPU session fails on the parity check's reference
+        /// inputs.
+        #[cfg(feature = "npu")]
+        pub fn place_on_npu(
+            &mut self,
+            model: &irlume_common::HashedModel,
+            npu: &mut crate::npu::Context,
+        ) -> irlume_common::Result<()> {
+            self.npu = npu.slot(model.bytes(), model.sha256());
+            if let Err(error) = self.check_npu_parity() {
+                self.npu = crate::npu::Slot::cpu(crate::npu::CpuReason::ParityMismatch(format!(
+                    "the parity check failed: {error}"
+                )));
+                return Err(error);
+            }
+            Ok(())
         }
 
         /// Before the NPU answers a request, require it to reproduce the

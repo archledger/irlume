@@ -239,8 +239,91 @@ fn load_shipped_recognizer(
     match verified {
         // This function owns the serialized buffer: it is dropped on return,
         // including errors, before the caller loads any auxiliary sessions.
-        Some(weights) => irlume_auth::Engine::load_with_recognizer_weights(det_path, &weights),
+        // The NPU is offered only these verified bytes (ADR-0022).
+        Some(weights) => {
+            let engine = irlume_auth::Engine::load_with_recognizer_weights(det_path, &weights)?;
+            Ok(npu_placement::place(engine, &weights))
+        }
         None => irlume_auth::Engine::load(det_path, model_path),
+    }
+}
+
+/// Where the recognizer computes authentication probes (ADR-0022).
+mod npu_placement {
+    /// Place the recognizer on the NPU when the build, the switch and the
+    /// certification table allow it, otherwise keep it on CPU with the
+    /// reason; either way the placement is logged.
+    #[cfg(feature = "npu")]
+    pub(super) fn place(
+        mut engine: irlume_auth::Engine,
+        weights: &irlume_common::HashedModel,
+    ) -> irlume_auth::Engine {
+        // Discovery, compile and the parity check run as worker progress, so
+        // a hang withholds the watchdog ping and costs one restart, after
+        // which this boot's marker keeps the recognizer on CPU (ADR-0022 §10).
+        let busy = super::worker_progress()
+            .lock()
+            .map_or(true, |progress| progress.is_some());
+        super::note_worker_progress();
+        let mut context = if switch_allows() {
+            engine.open_npu_context(&cache_base())
+        } else {
+            irlume_auth::npu::Context::disabled()
+        };
+        if let Err(error) = engine.place_recognizer_on_npu(weights, &mut context) {
+            irlume_common::jout_warn!("irlumed: the recognizer stays on CPU: {error}");
+        }
+        if busy {
+            super::note_worker_progress();
+        } else {
+            super::note_worker_idle();
+        }
+        log(&engine);
+        engine
+    }
+
+    #[cfg(not(feature = "npu"))]
+    pub(super) fn place(
+        engine: irlume_auth::Engine,
+        _weights: &irlume_common::HashedModel,
+    ) -> irlume_auth::Engine {
+        engine
+    }
+
+    #[cfg(feature = "npu")]
+    fn log(engine: &irlume_auth::Engine) {
+        let placement = engine.recognizer_placement();
+        match &placement.reason {
+            None => irlume_common::jout_info!(
+                "irlumed: recognizer on the NPU (platform {})",
+                placement.platform.as_deref().unwrap_or("unknown")
+            ),
+            Some(reason) => {
+                irlume_common::jout_info!("irlumed: recognizer on CPU: {reason}");
+            }
+        }
+    }
+
+    /// The NPU cache: systemd's `CacheDirectory=irlume/npu`, else its path.
+    #[cfg(feature = "npu")]
+    fn cache_base() -> std::path::PathBuf {
+        std::env::var_os("CACHE_DIRECTORY")
+            .filter(|dir| !dir.is_empty())
+            .map_or_else(|| "/var/cache/irlume/npu".into(), std::path::PathBuf::from)
+    }
+
+    /// The `IRLUME_NPU` / `npu` switch (ADR-0022 §12).
+    #[cfg(feature = "npu")]
+    fn switch_allows() -> bool {
+        let file = std::fs::read(irlume_common::config::config_path("settings.conf"));
+        let setting = match &file {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                irlume_auth::npu::Setting::Absent
+            }
+            Err(_) => irlume_auth::npu::Setting::Unreadable,
+            Ok(bytes) => irlume_auth::npu::settings_conf_value(bytes),
+        };
+        irlume_auth::npu::switch_allows(std::env::var_os("IRLUME_NPU").as_deref(), setting)
     }
 }
 
@@ -4611,6 +4694,8 @@ struct EngineBits {
     /// Private class-aware live binding for summary selection. Device paths
     /// alone cannot reconstruct a split key's role-labelled locations.
     live_binding: irlume_core::multi_camera::GroupPair,
+    /// Where the recognizer runs (ADR-0022 §13).
+    recognizer: Option<irlume_common::RecognizerPlacement>,
 }
 
 fn engine_bits() -> &'static std::sync::Mutex<EngineBits> {
@@ -4655,6 +4740,7 @@ fn publish_engine_bits(
         adapter: engine.has_ir_adapter(),
         rgb_pad: Some(rgb_pad),
         ir_pad: Some(ir_pad),
+        recognizer: Some(engine.recognizer_placement()),
         ..EngineBits::default()
     };
     copy_engine_camera_selection(&mut bits, engine);
@@ -5972,6 +6058,7 @@ fn dispatch_status_with_diagnostics(
                 ir_pad: bits.ir_pad,
                 version: env!("CARGO_PKG_VERSION").into(),
                 apparmor: apparmor_confinement(),
+                recognizer: bits.recognizer.clone(),
             }
         }
         // The peer's right to ask about this account was settled by the
@@ -16855,6 +16942,11 @@ mod tests {
             rgb_dev: None,
             ir_dev: None,
             live_binding: Default::default(),
+            recognizer: Some(irlume_common::RecognizerPlacement {
+                device: "cpu".into(),
+                reason: Some("not certified".into()),
+                platform: Some("ab12".into()),
+            }),
         });
         let peer = Peer {
             uid: 0,
@@ -16868,11 +16960,16 @@ mod tests {
                 adapter,
                 rgb_pad,
                 ir_pad,
+                recognizer,
                 ..
             } => {
                 assert!(mesh && adapter);
                 assert_eq!(rgb_pad, Some(irlume_common::PadModelStatus::Loaded));
                 assert_eq!(ir_pad, Some(irlume_common::PadModelStatus::Disabled));
+                let recognizer = recognizer.expect("the placement is reported");
+                assert_eq!(recognizer.device, "cpu");
+                assert_eq!(recognizer.reason.as_deref(), Some("not certified"));
+                assert_eq!(recognizer.platform.as_deref(), Some("ab12"));
             }
             other => panic!("expected Health, got {other:?}"),
         }

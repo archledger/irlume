@@ -245,6 +245,31 @@ pub enum Setting<'a> {
     Unreadable,
 }
 
+/// The `npu` key of a `settings.conf` file's bytes: absent when no line
+/// names it; otherwise the first value that does not allow the NPU, or else
+/// the first value, so any line switching it off wins. A file that is not
+/// UTF-8 is unreadable, which selects CPU (ADR-0022 §12).
+pub fn settings_conf_value(bytes: &[u8]) -> Setting<'_> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Setting::Unreadable;
+    };
+    let values: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_once('='))
+        .filter(|(key, _)| key.trim() == "npu")
+        .map(|(_, value)| value.trim())
+        .collect();
+    let off = values
+        .iter()
+        .find(|value| !switch_allows(None, Setting::Value(value.as_bytes())));
+    match off.or(values.first()) {
+        Some(value) => Setting::Value(value.as_bytes()),
+        None => Setting::Absent,
+    }
+}
+
 /// The `IRLUME_NPU` / `npu` switch (ADR-0022 §12): `true` leaves the table
 /// to decide, `false` keeps every model on CPU. Only an absent source or a
 /// recognized on value (`1`, `true`, `yes`, `on`, trimmed, any ASCII case)
@@ -1630,6 +1655,21 @@ mod tests {
             &[("RGB_MATCH_THRESHOLD", 0.55), ("IR_MATCH_THRESHOLD", 0.5)],
             &[("IR_MATCH_THRESHOLD", 0.5), ("RGB_MATCH_THRESHOLD", 0.55)],
         ));
+    }
+
+    #[test]
+    fn the_settings_file_selects_cpu_unless_every_npu_line_allows_it() {
+        let allows = |file: &[u8]| switch_allows(None, settings_conf_value(file));
+        assert!(allows(b""), "no npu line: the table decides");
+        assert!(allows(b"pad_vit=0\n# npu=0\n"));
+        assert!(allows(b"npu=1\n"));
+        assert!(allows(b" npu = on \n"));
+        assert!(!allows(b"npu=0\n"));
+        assert!(!allows(b"npu=\n"), "an empty value");
+        assert!(!allows(b"npu=maybe\n"), "a value not understood");
+        assert!(!allows(b"npu=1\nnpu=off\n"), "any line off wins");
+        assert!(!allows(b"npu=1\n\xff\n"), "not UTF-8");
+        assert!(matches!(settings_conf_value(b"other=1"), Setting::Absent));
     }
 
     #[test]

@@ -186,6 +186,7 @@ jobs:
           cargo test --locked -p irlume-vision --features npu --lib
           RUSTDOCFLAGS="-D warnings" cargo doc --locked -p irlume-vision --features npu --no-deps
           cargo clippy --locked -p irlume-auth --features npu --all-targets -- -D warnings
+          cargo clippy --locked -p irlume-daemon --features npu --all-targets -- -D warnings
           cargo test --locked -p irlume-auth --features npu --lib -- npu_probe new_scans_record_the_cpu_reference
 
       # Optional ONNX Runtime execution providers are compile-time APIs. The

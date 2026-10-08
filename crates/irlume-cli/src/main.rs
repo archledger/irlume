@@ -4929,6 +4929,43 @@ fn doctor_run(
         dout!(report, "  {}: {line}", s.stage);
         report.check_detail(id, state, line);
     }
+    // --- recognizer placement (ADR-0022 §13) --------------------------------
+    // Where the daemon's recognizer computes authentication probes, as the
+    // daemon reports it. Without its answer this is unknown, not CPU.
+    match irlume_common::client::request_poll(&irlume_common::Request::Health) {
+        Ok(irlume_common::Response::Health {
+            recognizer: Some(placement),
+            ..
+        }) => {
+            let line = match &placement.reason {
+                None => "NPU".to_owned(),
+                Some(reason) => format!("CPU: {reason}"),
+            };
+            dout!(report, "[doctor] recognizer: {line}");
+            report.check_detail("recognizer-device", State::Info, line);
+            let platform = placement
+                .platform
+                .unwrap_or_else(|| "no NPU platform identity was read".to_owned());
+            dout!(report, "[doctor] NPU platform: {platform}");
+            report.check_detail("npu-platform", State::Info, platform);
+        }
+        Ok(irlume_common::Response::Health { .. }) => {
+            report.check_detail(
+                "recognizer-device",
+                State::Unknown,
+                "the daemon predates this report",
+            );
+            report.check("npu-platform", State::Unknown);
+        }
+        _ => {
+            report.check_detail(
+                "recognizer-device",
+                State::Unknown,
+                "the daemon did not answer",
+            );
+            report.check("npu-platform", State::Unknown);
+        }
+    }
     // --- companion factors / data-at-rest ----------------------------------
     let fp_names = irlume_fingerprint::device_names();
     let fp = match fp_names.len() {

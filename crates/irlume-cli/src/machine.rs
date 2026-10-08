@@ -430,24 +430,31 @@ pub fn status(args: &[String]) -> ExitCode {
     };
     // Observe Health once. Management status never needs to open cameras; a
     // configured-path fallback remains explicitly unobserved.
-    let camera = match observe(&Request::Health) {
+    let (camera, recognizer) = match observe(&Request::Health) {
         Some(Response::Health {
             tier,
             rgb_dev,
             ir_dev,
+            recognizer,
             ..
-        }) => json!({
-            "known": true,
-            "rgb": (rgb_dev.is_some() || tier == "secure") && rgb_dev.as_deref().is_some_and(|p| std::path::Path::new(p).exists()),
-            "ir": tier == "secure" && ir_dev.as_deref().is_some_and(|p| std::path::Path::new(p).exists()),
-        }),
+        }) => (
+            json!({
+                "known": true,
+                "rgb": (rgb_dev.is_some() || tier == "secure") && rgb_dev.as_deref().is_some_and(|p| std::path::Path::new(p).exists()),
+                "ir": tier == "secure" && ir_dev.as_deref().is_some_and(|p| std::path::Path::new(p).exists()),
+            }),
+            recognizer_json(recognizer),
+        ),
         _ => {
             let pair = irlume_camera::configured_pair_no_probe();
-            json!({
-                "known": false,
-                "rgb": pair.as_ref().is_some_and(|(rgb, _)| std::path::Path::new(rgb).exists()),
-                "ir": pair.as_ref().is_some_and(|(_, ir)| std::path::Path::new(ir).exists()),
-            })
+            (
+                json!({
+                    "known": false,
+                    "rgb": pair.as_ref().is_some_and(|(rgb, _)| std::path::Path::new(rgb).exists()),
+                    "ir": pair.as_ref().is_some_and(|(_, ir)| std::path::Path::new(ir).exists()),
+                }),
+                recognizer_json(None),
+            )
         }
     };
     let keyring = match observe(&Request::KeyringMetadata { user: user.clone() }) {
@@ -513,11 +520,31 @@ pub fn status(args: &[String]) -> ExitCode {
                 // the device is a narrower question and disagreed with both.
                 "fingerprint": fingerprint.unwrap_or(false),
                 "fingerprint_known": fingerprint.is_some(),
+                "recognizer": recognizer,
             }),
             contract,
         ),
         ExitCode::SUCCESS,
     )
+}
+
+/// Where the daemon's recognizer computes authentication probes
+/// (ADR-0022 §13). Unknown is not CPU: without the daemon's answer the
+/// device is absent rather than guessed.
+fn recognizer_json(placement: Option<irlume_common::RecognizerPlacement>) -> serde_json::Value {
+    match placement {
+        Some(placement) => {
+            let mut value = json!({ "known": true, "device": placement.device });
+            if let Some(reason) = placement.reason {
+                value["reason"] = json!(reason);
+            }
+            if let Some(platform) = placement.platform {
+                value["platform"] = json!(platform);
+            }
+            value
+        }
+        None => json!({ "known": false }),
+    }
 }
 
 fn valid_status_args(args: &[String]) -> bool {

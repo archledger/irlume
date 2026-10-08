@@ -1281,6 +1281,9 @@ impl LightState {
                 ir_pad,
                 version,
                 apparmor,
+                // Where the recognizer runs is doctor's and status's to
+                // report (ADR-0022 §13).
+                recognizer: _,
             }) => Some(HealthInfo {
                 tier,
                 rgb_dev,

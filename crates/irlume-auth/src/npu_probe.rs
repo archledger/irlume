@@ -112,29 +112,76 @@ impl Engine {
         self.emb.npu_device()
     }
 
+    /// Where the recognizer runs and, on CPU, why, with the NPU platform it
+    /// was placed for (ADR-0022 §13).
+    pub fn recognizer_placement(&self) -> irlume_common::RecognizerPlacement {
+        #[cfg(feature = "npu")]
+        let (device, reason) = match self.emb.npu_device() {
+            _ if self.ir_adapter.is_some() || self.ir_adapter_required => (
+                "cpu",
+                Some("an IR adapter is configured, which keeps the recognizer on CPU".to_owned()),
+            ),
+            irlume_vision::npu::Device::Npu => ("npu", None),
+            irlume_vision::npu::Device::Cpu(reason) => ("cpu", Some(reason.to_string())),
+        };
+        #[cfg(not(feature = "npu"))]
+        let (device, reason) = ("cpu", Some("not built with NPU support".to_owned()));
+        irlume_common::RecognizerPlacement {
+            device: device.into(),
+            reason,
+            platform: self.npu_platform.clone(),
+        }
+    }
+
+    /// Open the NPU runtime for this engine's recognizer under `cache_base`,
+    /// as a consumer with this engine's wired thresholds, the recognition
+    /// decision fingerprint and the loaded ONNX Runtime (ADR-0022 §3). A
+    /// failure is kept in the context as the reason the recognizer stays on
+    /// CPU.
+    #[cfg(feature = "npu")]
+    pub fn open_npu_context(&self, cache_base: &std::path::Path) -> irlume_vision::npu::Context {
+        let runtime = irlume_vision::runtime_resolution().1.unwrap_or_default();
+        let thresholds = self.npu_thresholds();
+        let fingerprint = super::decision_fingerprint();
+        irlume_vision::npu::Context::open(
+            cache_base,
+            &irlume_vision::npu::Consumer {
+                onnx_runtime: &runtime,
+                thresholds: &thresholds,
+                decision_fingerprint: &fingerprint,
+            },
+        )
+    }
+
     /// Place the recognizer for `npu`: on the NPU when its entry certifies
     /// this platform and consumer and it compiles and reproduces the entry's
     /// digests, on CPU with the reason otherwise (ADR-0022 §3, §8, §9). The
-    /// producer is computed now, so an authentication never pays for it.
+    /// CPU session is kept, not rebuilt. The producer is computed now, so an
+    /// authentication never pays for it.
     ///
     /// # Errors
     ///
-    /// When the CPU session cannot be rebuilt from `weights`.
+    /// When `weights` are not the loaded recognizer's, or its CPU session
+    /// fails the parity check's reference inputs; the recognizer then stays
+    /// on CPU and the engine stays usable.
     #[cfg(feature = "npu")]
-    pub fn with_npu_recognizer(
-        mut self,
+    pub fn place_recognizer_on_npu(
+        &mut self,
         weights: &irlume_common::HashedModel,
         npu: &mut irlume_vision::npu::Context,
-    ) -> irlume_common::Result<Self> {
+    ) -> irlume_common::Result<()> {
         if format!("embed:{}", weights.sha256()) != self.embed_space {
             return Err(irlume_common::Error::Policy(
                 "the NPU recognizer must be the loaded recognizer".into(),
             ));
         }
-        self.emb = irlume_vision::Embedder::load_with_npu(weights, npu)?;
-        self.embed_producer = None;
+        self.npu_platform = npu
+            .identity()
+            .ok()
+            .map(irlume_vision::npu::Identity::digest);
+        self.emb.place_on_npu(weights, npu)?;
         let _ = self.embed_producer();
-        Ok(self)
+        Ok(())
     }
 }
 

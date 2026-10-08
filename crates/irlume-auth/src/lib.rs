@@ -101,6 +101,9 @@ pub struct Engine {
     /// computed once from the CPU reference; `None` until computed or when
     /// it cannot be.
     embed_producer: Option<String>,
+    /// The NPU platform identity digest the recognizer was placed for, when
+    /// discovery read one (ADR-0022 §13).
+    npu_platform: Option<String>,
     /// Whether this request's probes may run on the NPU: set only by an
     /// authentication whose enrollment admits it, and cleared when that
     /// request's scope ends (ADR-0022 §2). Every other path embeds on CPU.
@@ -285,6 +288,9 @@ mod identity_arms;
 mod npu_probe;
 pub use authentication_window::AuthenticationWindow;
 pub use identity_arms::decision_fingerprint;
+/// The NPU runtime the daemon opens for the recognizer (ADR-0022).
+#[cfg(feature = "npu")]
+pub use irlume_vision::npu;
 mod grouped_auth;
 mod managed_pad;
 
@@ -4113,6 +4119,7 @@ impl Engine {
             ir_space: "raw".into(),
             embed_space,
             embed_producer: None,
+            npu_platform: None,
             npu_probe: false,
             rgb_threshold: irlume_core::RGB_MATCH_THRESHOLD,
             mesh: None,

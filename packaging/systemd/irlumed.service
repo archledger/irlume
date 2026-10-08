@@ -115,6 +115,10 @@ ProtectSystem=full
 # directive systemd does NOT chown to User=, and this unit has no User=
 # anyway; the files inside are written 0600 by the daemon.
 ConfigurationDirectory=irlume
+# The NPU compile cache and its crash markers (ADR-0022 §10, §11), root only.
+# Unused unless irlumed is built with NPU support and the switch allows it.
+CacheDirectory=irlume/npu
+CacheDirectoryMode=0700
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

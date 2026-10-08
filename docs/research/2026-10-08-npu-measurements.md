@@ -48,7 +48,10 @@
 
 Opening the platform takes 0.02 to 0.12 s, and 0.56 s with the runtime
 library digests of the identity. Every compile reported
-`EXECUTION_DEVICES=NPU`. A marker write and remove costs 13 µs.
+`EXECUTION_DEVICES=NPU`. A marker write and remove costs 13 µs; the marker
+as shipped (temporary file, permissions, rename, read-back, removal) costs
+47.6 µs on `/var/cache` and 52 µs on the home filesystem (re-measured
+2026-10-08 for #1042).
 
 ## Speed
 

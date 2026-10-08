@@ -23,6 +23,8 @@ pub mod blaze_full;
 pub mod detect;
 pub mod light;
 pub mod moire;
+#[cfg(feature = "npu")]
+pub mod npu;
 #[cfg(feature = "tflite")]
 pub mod tflite;
 
@@ -558,6 +560,8 @@ mod onnx {
     /// AuraFace embedder (ONNX). Loaded once in the daemon.
     pub struct Embedder {
         session: Session,
+        #[cfg(feature = "npu")]
+        npu: crate::npu::Slot,
     }
 
     impl Embedder {
@@ -565,7 +569,141 @@ mod onnx {
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             Ok(Self {
                 session: build(model)?,
+                #[cfg(feature = "npu")]
+                npu: crate::npu::Slot::default(),
             })
+        }
+
+        /// Load the CPU session, then place the model on the NPU when `npu`
+        /// certifies it for this platform and its parity check passes
+        /// (ADR-0022 §3, §8). The CPU session stays loaded for the fallback
+        /// (§9).
+        ///
+        /// # Errors
+        ///
+        /// When the CPU session cannot be built or fails the parity check's
+        /// reference inputs; an NPU failure is not an error, it leaves the
+        /// model on CPU.
+        #[cfg(feature = "npu")]
+        pub fn load_with_npu(
+            model: &irlume_common::HashedModel,
+            npu: &mut crate::npu::Context,
+        ) -> irlume_common::Result<Self> {
+            let session = build(model.bytes())?;
+            let mut embedder = Self {
+                session,
+                npu: npu.slot(model.bytes(), model.sha256()),
+            };
+            embedder.check_npu_parity()?;
+            Ok(embedder)
+        }
+
+        /// Before the NPU answers a request, require it to reproduce the
+        /// exact output bits its certification recorded for the reference
+        /// inputs, and keep the model on CPU otherwise. The NPU is
+        /// deterministic across processes on the qualified stack, so this
+        /// catches any driver, firmware or kernel change that alters its
+        /// numerics, at every engine build (ADR-0022 §8).
+        #[cfg(feature = "npu")]
+        fn check_npu_parity(&mut self) -> irlume_common::Result<()> {
+            let Some(entry) = self.npu.certification() else {
+                return Ok(());
+            };
+            // The live CPU reference first, bit for bit: a runtime that
+            // computes differently on this host does not inherit the
+            // certification (ADR-0022 §3).
+            let cpu = self.cpu_reference_digest()?;
+            if cpu != entry.cpu_reference_digest {
+                self.npu = crate::npu::Slot::cpu(crate::npu::CpuReason::ParityMismatch(format!(
+                    "CPU reference digest {cpu}, certified {}",
+                    entry.cpu_reference_digest
+                )));
+                return Ok(());
+            }
+            self.check_npu_digest("");
+            Ok(())
+        }
+
+        /// The NPU half of the parity check: the exact reference digest,
+        /// at engine build and again after every system resume (ADR-0022
+        /// §8). A mismatch retires the model to CPU.
+        #[cfg(feature = "npu")]
+        fn check_npu_digest(&mut self, when: &str) {
+            let Some(entry) = self.npu.certification() else {
+                return;
+            };
+            // Read before the first reference inference: a suspend during
+            // or after the check makes the next call check again.
+            let baseline = crate::npu::suspended(crate::npu::Bound::AtMost);
+            let Some(digest) = self.npu_reference_digest() else {
+                return; // the NPU failed and the slot retired itself
+            };
+            if digest == entry.npu_reference_digest {
+                self.npu.note_checked(baseline);
+            } else {
+                self.npu = crate::npu::Slot::cpu(crate::npu::CpuReason::ParityMismatch(format!(
+                    "{when}reference output digest {digest}, certified {}",
+                    entry.npu_reference_digest
+                )));
+            }
+        }
+
+        /// Every input embedded on the NPU, or `None` for the caller to
+        /// compute all of them on CPU: the model is not on the NPU, the NPU
+        /// failed and retired, or the system suspended between the last
+        /// check and the end of these inferences, whose outputs are then
+        /// discarded and the digest checked again (ADR-0022 §8, §9).
+        #[cfg(feature = "npu")]
+        fn npu_embed_all(&mut self, inputs: &[&[f32]]) -> Option<Vec<(Embedding, f32)>> {
+            if self.npu.resumed_since_check() {
+                self.check_npu_digest("after a system resume, ");
+            }
+            let mut embedded = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                embedded.push(self.npu.run(input, embedding_and_norm)?);
+            }
+            if self.npu.resumed_since_check() {
+                self.check_npu_digest("after a system resume, ");
+                return None;
+            }
+            Some(embedded)
+        }
+
+        /// SHA-256 of the NPU's raw output bits for the reference inputs, or
+        /// `None` when the model is not on the NPU or the NPU failed.
+        #[cfg(feature = "npu")]
+        fn npu_reference_digest(&mut self) -> Option<String> {
+            let mut bits = Vec::new();
+            for k in 0..3 {
+                let raw = self
+                    .npu
+                    .run(&npu_reference::chip(k), |raw| Ok(raw.to_vec()))?;
+                bits.extend(raw.iter().flat_map(|v| v.to_le_bytes()));
+            }
+            Some(irlume_common::sha256_hex(&bits))
+        }
+
+        /// SHA-256 of the CPU session's raw output bits for the reference
+        /// inputs. On one host and runtime the CPU session is deterministic,
+        /// so an entry records these exact bits (ADR-0022 §3).
+        #[cfg(feature = "npu")]
+        fn cpu_reference_digest(&mut self) -> irlume_common::Result<String> {
+            let n = align::OUT_SIZE as i64;
+            let mut bits = Vec::new();
+            for k in 0..3 {
+                let tensor =
+                    Tensor::from_array(([1i64, 3, n, n], npu_reference::chip(k))).map_err(err)?;
+                let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
+                let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
+                bits.extend(raw.iter().flat_map(|v| v.to_le_bytes()));
+            }
+            Ok(irlume_common::sha256_hex(&bits))
+        }
+
+        /// Where this model runs (ADR-0022 §13).
+        #[cfg(feature = "npu")]
+        pub fn npu_device(&self) -> crate::npu::Device {
+            self.npu.device()
         }
 
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
@@ -599,14 +737,27 @@ mod onnx {
         /// slightly worse at low FAR), so the IR path keeps plain `embed`.
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn embed_tta(&mut self, chip_rgb: &[u8]) -> irlume_common::Result<Embedding> {
+            // Both halves come from one device: certification measured whole
+            // NPU probes and whole CPU probes, never a mix (ADR-0022 §9).
+            #[cfg(feature = "npu")]
+            if self.npu.device() == crate::npu::Device::Npu {
+                let a = align::preprocess_arcface(chip_rgb);
+                let b = align::preprocess_arcface(&crate::align::flip_h(chip_rgb));
+                if let Some(both) = self.npu_embed_all(&[&a, &b]) {
+                    return Ok(tta_mean(&both[0].0, &both[1].0));
+                }
+                return self.on_cpu().embed_tta(chip_rgb);
+            }
             let a = self.embed(chip_rgb)?;
             let b = self.embed(&crate::align::flip_h(chip_rgb))?;
-            let mut out = [0.0f32; EMBED_DIM];
-            for k in 0..EMBED_DIM {
-                out[k] = a[k] + b[k];
-            }
-            l2_normalize(&mut out);
-            Ok(out)
+            Ok(tta_mean(&a, &b))
+        }
+
+        /// The same embeddings computed on the CPU session only, whatever
+        /// device the model is on. Enrollment embeds through this view, so
+        /// every stored template comes from the CPU reference (ADR-0022 §2).
+        pub fn on_cpu(&mut self) -> OnCpu<'_> {
+            OnCpu { embedder: self }
         }
 
         /// Embed AND return the PRE-normalization L2 norm of the raw feature: an
@@ -637,6 +788,19 @@ mod onnx {
             &mut self,
             data: &[f32],
         ) -> irlume_common::Result<(Embedding, f32)> {
+            self.embed_preprocessed_on(data, true)
+        }
+
+        /// `npu_allowed` false keeps the call on the CPU session.
+        fn embed_preprocessed_on(
+            &mut self,
+            data: &[f32],
+            #[cfg_attr(
+                not(feature = "npu"),
+                expect(unused_variables, reason = "only the npu build places models")
+            )]
+            npu_allowed: bool,
+        ) -> irlume_common::Result<(Embedding, f32)> {
             let n = align::OUT_SIZE as i64;
             let expected = (3 * n * n) as usize;
             if data.len() != expected {
@@ -645,19 +809,82 @@ mod onnx {
                     data.len()
                 )));
             }
+            #[cfg(feature = "npu")]
+            if npu_allowed {
+                if let Some(mut embedded) = self.npu_embed_all(&[data]) {
+                    return Ok(embedded.remove(0));
+                }
+            }
             let tensor = Tensor::from_array(([1i64, 3, n, n], data.to_vec())).map_err(err)?;
             // Positional input (single-input model); avoids needing the input name.
             let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
             let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
-            if raw.len() != EMBED_DIM {
-                return Err(err(format!("expected {EMBED_DIM}-D, got {}", raw.len())));
-            }
-            let mut out = [0.0f32; EMBED_DIM];
-            out.copy_from_slice(raw);
-            let norm = out.iter().map(|x| x * x).sum::<f32>().sqrt();
-            l2_normalize(&mut out);
-            Ok((out, norm))
+            embedding_and_norm(raw)
         }
+    }
+
+    /// [`Embedder`] restricted to its CPU session, from [`Embedder::on_cpu`].
+    pub struct OnCpu<'a> {
+        embedder: &'a mut Embedder,
+    }
+
+    impl OnCpu<'_> {
+        /// [`Embedder::embed`] on the CPU session.
+        ///
+        /// # Errors
+        ///
+        /// When the CPU session fails or returns a malformed embedding.
+        pub fn embed(&mut self, chip_rgb: &[u8]) -> irlume_common::Result<Embedding> {
+            Ok(self.embed_with_norm(chip_rgb)?.0)
+        }
+
+        /// [`Embedder::embed_tta`] on the CPU session.
+        ///
+        /// # Errors
+        ///
+        /// When the CPU session fails or returns a malformed embedding.
+        pub fn embed_tta(&mut self, chip_rgb: &[u8]) -> irlume_common::Result<Embedding> {
+            let a = self.embed(chip_rgb)?;
+            let b = self.embed(&crate::align::flip_h(chip_rgb))?;
+            Ok(tta_mean(&a, &b))
+        }
+
+        /// [`Embedder::embed_with_norm`] on the CPU session.
+        ///
+        /// # Errors
+        ///
+        /// When the CPU session fails or returns a malformed embedding.
+        pub fn embed_with_norm(
+            &mut self,
+            chip_rgb: &[u8],
+        ) -> irlume_common::Result<(Embedding, f32)> {
+            let data = align::preprocess_arcface(chip_rgb);
+            self.embedder.embed_preprocessed_on(&data, false)
+        }
+    }
+
+    /// The flip test-time augmentation: the renormalized sum of an embedding
+    /// and its mirror's.
+    fn tta_mean(a: &Embedding, b: &Embedding) -> Embedding {
+        let mut out = [0.0f32; EMBED_DIM];
+        for k in 0..EMBED_DIM {
+            out[k] = a[k] + b[k];
+        }
+        l2_normalize(&mut out);
+        out
+    }
+
+    /// The recognizer's raw output as an L2-normalized embedding and the
+    /// pre-normalization norm; one decoder for the CPU and NPU outputs.
+    fn embedding_and_norm(raw: &[f32]) -> irlume_common::Result<(Embedding, f32)> {
+        if raw.len() != EMBED_DIM {
+            return Err(err(format!("expected {EMBED_DIM}-D, got {}", raw.len())));
+        }
+        let mut out = [0.0f32; EMBED_DIM];
+        out.copy_from_slice(raw);
+        let norm = out.iter().map(|x| x * x).sum::<f32>().sqrt();
+        l2_normalize(&mut out);
+        Ok((out, norm))
     }
 
     /// Optional IR embedding adapter (512→512) applied to AuraFace IR embeddings
@@ -1398,6 +1625,10 @@ mod onnx {
     /// docs/research/2026-10-06-pad-preprocessing-qualification-plan.md.
     pub struct PadVit {
         session: Session,
+        /// Never placed on the NPU in production (ADR-0022 §3); the hardware
+        /// tests place it to measure the cue's NPU drift.
+        #[cfg(feature = "npu")]
+        npu: crate::npu::Slot,
     }
 
     impl PadVit {
@@ -1405,12 +1636,20 @@ mod onnx {
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             Ok(Self {
                 session: build(model)?,
+                #[cfg(feature = "npu")]
+                npu: crate::npu::Slot::default(),
             })
         }
+
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
             let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
             Self::load_from_memory(&bytes)
+        }
+
+        #[cfg(all(test, feature = "npu"))]
+        fn npu_device(&self) -> crate::npu::Device {
+            self.npu.device()
         }
 
         /// P(spoof) for the face at `bbox` (frame pixel coords, `[x1,y1,x2,y2]`).
@@ -1421,18 +1660,28 @@ mod onnx {
             bbox: &[f32; 4],
         ) -> irlume_common::Result<f32> {
             let t = pad_vit_input(frame, bbox, 224);
+            #[cfg(feature = "npu")]
+            if let Some(p) = self.npu.run(&t, vit_p_spoof) {
+                return Ok(p);
+            }
             let tensor = Tensor::from_array(([1i64, 3, 224, 224], t)).map_err(err)?;
             let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
             let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
-            if raw.len() < 2 {
-                return Err(err("ViT PAD model: expected 2 output logits"));
-            }
-            // id2label: 0 = real, 1 = spoof.
-            let (a, b) = (raw[0], raw[1]);
-            let m = a.max(b);
-            let (ea, eb) = ((a - m).exp(), (b - m).exp());
-            Ok(eb / (ea + eb))
+            vit_p_spoof(raw)
         }
+    }
+
+    /// P(spoof) from the ViT PAD logits; one decoder for the CPU and NPU
+    /// outputs.
+    fn vit_p_spoof(raw: &[f32]) -> irlume_common::Result<f32> {
+        if raw.len() < 2 {
+            return Err(err("ViT PAD model: expected 2 output logits"));
+        }
+        // id2label: 0 = real, 1 = spoof.
+        let (a, b) = (raw[0], raw[1]);
+        let m = a.max(b);
+        let (ea, eb) = ((a - m).exp(), (b - m).exp());
+        Ok(eb / (ea + eb))
     }
 
     /// Independently generated regression fixtures for [`pad_vit_input`]
@@ -2095,6 +2344,10 @@ mod onnx {
     /// the center 112.
     pub struct PadIr {
         session: Session,
+        /// Never placed on the NPU in production (ADR-0022 §3); the hardware
+        /// tests place it to measure the cue's NPU drift.
+        #[cfg(feature = "npu")]
+        npu: crate::npu::Slot,
     }
 
     impl PadIr {
@@ -2102,12 +2355,20 @@ mod onnx {
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             Ok(Self {
                 session: build(model)?,
+                #[cfg(feature = "npu")]
+                npu: crate::npu::Slot::default(),
             })
         }
+
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
             let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
             Self::load_from_memory(&bytes)
+        }
+
+        #[cfg(all(test, feature = "npu"))]
+        fn npu_device(&self) -> crate::npu::Device {
+            self.npu.device()
         }
 
         /// P(fake) for the face at `bbox` (frame pixel coords, `[x1,y1,x2,y2]`).
@@ -2177,16 +2438,112 @@ mod onnx {
                     t[2 * plane + o] = (p[2] - 127.5) * 0.007_812_5;
                 }
             }
+            #[cfg(feature = "npu")]
+            if let Some(p) = self.npu.run(&t, ir_p_fake) {
+                return Ok(p);
+            }
             let tensor = Tensor::from_array(([1i64, 3, 112, 112], t)).map_err(err)?;
             let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
             let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
-            if raw.len() < 2 {
-                return Err(err("PAD model: expected 2 output logits"));
+            ir_p_fake(raw)
+        }
+    }
+
+    /// P(fake) from the FLIR PAD logits; one decoder for the CPU and NPU
+    /// outputs.
+    fn ir_p_fake(raw: &[f32]) -> irlume_common::Result<f32> {
+        if raw.len() < 2 {
+            return Err(err("PAD model: expected 2 output logits"));
+        }
+        let (a, b2) = (raw[0], raw[1]);
+        let m = a.max(b2);
+        let (ea, eb) = ((a - m).exp(), (b2 - m).exp());
+        Ok(ea / (ea + eb)) // softmax index 0 = P(fake)
+    }
+
+    #[cfg(all(test, feature = "npu"))]
+    #[path = "npu_tests.rs"]
+    mod npu_tests;
+
+    /// Fixed synthetic inputs of the CPU reference fingerprint
+    /// (ADR-0022 §3), shared with the hardware tests.
+    #[cfg(feature = "npu")]
+    mod npu_reference {
+        /// A preprocessed 112x112 recognizer input; `k` varies the pattern.
+        pub(super) fn chip(k: usize) -> Vec<f32> {
+            let n = crate::align::OUT_SIZE as usize;
+            (0..3 * n * n)
+                .map(|i| (((i * (37 + 16 * k)) % 255) as f32 - 127.5) / 128.0)
+                .collect()
+        }
+
+        /// A 112x112 RGB chip as raw bytes, so the fingerprint also passes
+        /// through the production preprocessing (`align::preprocess_arcface`):
+        /// a change to its scaling, channel order or layout changes it.
+        pub(super) fn raw_chip() -> Vec<u8> {
+            let n = crate::align::OUT_SIZE as usize;
+            (0..3 * n * n).map(|i| ((i * 53 + 7) % 256) as u8).collect()
+        }
+
+        /// A 640x480 RGB frame with structure in every channel, for the PAD
+        /// measurements of the hardware tests.
+        #[cfg(test)]
+        pub(super) fn frame() -> (Vec<u8>, u32, u32) {
+            let (w, h) = (640u32, 480u32);
+            let mut data = Vec::with_capacity((w * h * 3) as usize);
+            for y in 0..h {
+                for x in 0..w {
+                    data.push(((x * 255) / w) as u8);
+                    data.push(((y * 255) / h) as u8);
+                    data.push((((x ^ y) & 0x3f) * 4) as u8);
+                }
             }
-            let (a, b2) = (raw[0], raw[1]);
-            let m = a.max(b2);
-            let (ea, eb) = ((a - m).exp(), (b2 - m).exp());
-            Ok(ea / (ea + eb)) // softmax index 0 = P(fake)
+            (data, w, h)
+        }
+
+        /// The face box the PAD cues read in [`frame`].
+        #[cfg(test)]
+        pub(super) const BBOX: [f32; 4] = [200.0, 120.0, 440.0, 400.0];
+
+        /// How many leading embedding components the recognizer's
+        /// fingerprint keeps.
+        pub(super) const EMBEDDING_PREFIX: usize = 16;
+
+        /// How far a recomputed fingerprint component may be from the
+        /// recorded one: far above run-to-run noise, far below any
+        /// preprocessing or runtime change. Tests on any host use it; the
+        /// runtime gate compares exact digests.
+        #[cfg(test)]
+        pub(super) const FINGERPRINT_TOLERANCE: f32 = 1e-4;
+    }
+
+    /// The decoded CPU outputs of a model for the fixed synthetic inputs:
+    /// what a certification entry records as its reference and what its test
+    /// recomputes from the current code (ADR-0022 §3): the first 16
+    /// components of the recognizer's embedding.
+    ///
+    /// # Errors
+    ///
+    /// When the model cannot be loaded or run on its CPU session.
+    #[cfg(feature = "npu")]
+    pub fn npu_reference_fingerprint(
+        role: crate::npu::Role,
+        model: &[u8],
+    ) -> irlume_common::Result<Vec<f32>> {
+        use crate::npu::Role;
+        match role {
+            Role::Recognizer => {
+                // The synthetic tensor the exact digests also use, then a raw
+                // chip through the production preprocessing and embedding.
+                let mut embedder = Embedder::load_from_memory(model)?;
+                let synthetic = embedder.embed_preprocessed(&npu_reference::chip(0))?;
+                let raw = embedder.on_cpu().embed(&npu_reference::raw_chip())?;
+                Ok(synthetic[..npu_reference::EMBEDDING_PREFIX]
+                    .iter()
+                    .chain(&raw[..npu_reference::EMBEDDING_PREFIX])
+                    .copied()
+                    .collect())
+            }
         }
     }
 
@@ -2433,11 +2790,13 @@ mod onnx {
     }
 }
 
+#[cfg(feature = "npu")]
+pub use onnx::npu_reference_fingerprint;
 #[cfg(feature = "onnx")]
 pub use onnx::{
     blaze_anchors, blaze_letterbox_input, decode_short_range_best, map_checked_mesh_output,
     mesh_box_valid, mesh_output_plausible, runtime_resolution, selftest_alignment_identity,
-    Adapter, BlazeRescue, Detector, Embedder, FaceMesh, PadIr, PadVit, BLAZE_INPUT,
+    Adapter, BlazeRescue, Detector, Embedder, FaceMesh, OnCpu, PadIr, PadVit, BLAZE_INPUT,
     BLAZE_SCORE_THRESHOLD, MESH_INPUT, MESH_N, MESH_N_IRIS,
 };
 

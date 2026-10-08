@@ -116,7 +116,8 @@ OpenVINO C API only under a versioned soname (`libopenvino_c.so.2620` for
    - OpenVINO 2026.2.0 refuses the TFLite mesh read from a memory buffer
      ("Unable to read the model"), the only way irlume reads a model it has
      verified.
-   - A marker write and remove costs 13 µs on the laptop's disk.
+   - A marker write and remove costs 13 µs on the laptop's disk; the marker
+     as shipped costs about 50 µs (Amendment 2026-10-08).
 
 **Drift and margins.** The measured attack margins are narrow: ViT attack
 presentations measured 0.594 to 0.656 against the 0.55 deny line (0.044
@@ -376,24 +377,25 @@ unchanged.
 
 Before compiling a model, and before every NPU inference, the daemon writes a
 marker named by the identity and model digests, holding the boot ID, into the
-cache's marker directory, and removes it when the call returns (13 µs per
-inference, measured). The marker is committed before OpenVINO is entered:
-written to a temporary file, renamed into place and read back; if that fails,
-the call is not made and the model stays on CPU. A marker that exists but
-cannot be read, or holds no boot ID, counts as one from the current boot.
-Markers are kept across identity changes within a boot, so a rollback to an
-identity that crashed still finds its marker; startup removes those of earlier
-boots. A marker from the current boot found at startup means a compile or an
-inference did not return (a crash, or a hang a watchdog restart ended): that
-model stays on CPU for that identity for the rest of the boot, and doctor says
-so. A marker from an earlier boot allows one new attempt, so a power loss does
-not pin a model to CPU. Discovery (loading the plugin, enumerating the device,
-reading the identity) has its own boot-scoped marker, so a crash or hang there
-is not repeated either. Discovery and every compile count as worker activity
-for the watchdog, startup included, so one that does not return within
-`WatchdogSec=` (90 s, against a longest measured cold compile of 5.2 s) stops
-the pings and ends in a restart rather than a hang. With `Restart=on-failure`,
-a crashing or wedged compile or inference costs one restart, never a loop.
+cache's marker directory, and removes it when the call returns (about 50 µs per
+inference on the shipped path, measured; Amendment 2026-10-08). The marker is
+committed before OpenVINO is entered: written to a temporary file, renamed into
+place and read back; if that fails, the call is not made and the model stays on
+CPU. A marker that exists but cannot be read, or holds no boot ID, counts as
+one from the current boot. Markers are kept across identity changes within a
+boot, so a rollback to an identity that crashed still finds its marker; startup
+removes those of earlier boots. A marker from the current boot found at startup
+means a compile or an inference did not return (a crash, or a hang a watchdog
+restart ended): that model stays on CPU for that identity for the rest of the
+boot, and doctor says so. A marker from an earlier boot allows one new attempt,
+so a power loss does not pin a model to CPU. Discovery (loading the plugin,
+enumerating the device, reading the identity) has its own boot-scoped marker,
+so a crash or hang there is not repeated either. Discovery and every compile
+count as worker activity for the watchdog, startup included, so one that does
+not return within `WatchdogSec=` (90 s, against a longest measured cold compile
+of 5.2 s) stops the pings and ends in a restart rather than a hang. With
+`Restart=on-failure`, a crashing or wedged compile or inference costs one
+restart, never a loop.
 
 ### 11. A daemon-owned cache
 
@@ -589,6 +591,15 @@ face unacceptable latency.
   `EXECUTION_DEVICES=NPU`; outputs track ONNX Runtime CPU on fixed synthetic
   inputs and on recorded frames, with the PAD cues' drift reported;
   interleaved and post-suspend inferences repeat bit for bit.
+
+## Amendment 2026-10-08: marker cost on the shipped path
+
+Measurement 4's 13 µs timed a plain write and remove. The marker as section
+10 ships it (a temporary file, its permissions, a rename and a read-back,
+then the removal) costs 47.6 µs per inference on the qualified laptop's
+`/var/cache` and 52 µs on its home filesystem, both btrfs (median of five
+runs of 1,000; #1042). That is under 1% of a 7 ms recognizer inference, so
+section 10's marker around every inference stands.
 
 [intel-npu-stack]: https://github.com/archledger/intel-npu-stack
 [intel-npu-stack#20]: https://github.com/archledger/intel-npu-stack/issues/20

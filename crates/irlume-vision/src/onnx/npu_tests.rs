@@ -40,6 +40,7 @@ mod npu_enrollment_tests {
             identity_digest: "test",
             onnx_runtime: "test",
             thresholds: &[],
+            decision_fingerprint: "test",
             fingerprint: Box::leak(
                 npu_reference_fingerprint(crate::npu::Role::Recognizer, bytes)
                     .unwrap()
@@ -62,6 +63,88 @@ mod npu_enrollment_tests {
             let changed = self.changed.load(std::sync::atomic::Ordering::SeqCst);
             Ok(vec![if changed { 2.0 } else { 1.0 }; EMBED_DIM])
         }
+    }
+
+    /// An "NPU" during whose next inference the system suspends, returning
+    /// [`Constant`]'s output or, once `changed` is set, another one.
+    struct SuspendsDuring {
+        suspend: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::npu::Infer for SuspendsDuring {
+        fn infer(&mut self, _input: &[f32]) -> Result<Vec<f32>, String> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.suspend.swap(false, SeqCst) {
+                crate::npu::simulate_suspend(std::time::Duration::from_secs(2));
+            }
+            let changed = self.changed.load(SeqCst);
+            Ok(vec![if changed { 2.0 } else { 1.0 }; EMBED_DIM])
+        }
+    }
+
+    /// A suspend during an NPU inference discards its output: the digest is
+    /// checked again and that call is computed on CPU (ADR-0022 §8).
+    #[test]
+    fn an_inference_that_spans_a_suspend_is_not_used() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let path = format!("{}/../../models/glintr100.onnx", env!("CARGO_MANIFEST_DIR"));
+        let bytes = std::fs::read(&path).expect("models/glintr100.onnx (scripts/fetch-models.sh)");
+        let mut cpu = Embedder::load_from_memory(&bytes).unwrap();
+        let suspend = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut embedder = Embedder {
+            session: build(&bytes).unwrap(),
+            npu: crate::npu::Slot::certified(
+                Box::new(SuspendsDuring {
+                    suspend: suspend.clone(),
+                    changed: changed.clone(),
+                }),
+                test_entry(
+                    &bytes,
+                    cpu.cpu_reference_digest().unwrap(),
+                    constant_digest(),
+                ),
+            ),
+        };
+        embedder.check_npu_parity().unwrap();
+        assert_eq!(embedder.npu_device(), crate::npu::Device::Npu);
+        let chip = npu_reference::chip(1);
+        let (expected, _) = cpu.embed_preprocessed_with_norm(&chip).unwrap();
+        let from_cpu = |answer: &Embedding| {
+            answer
+                .iter()
+                .zip(&expected)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        };
+
+        // Same bits after the suspend: the recheck passes and the model
+        // stays on the NPU, but this call's answer comes from CPU.
+        suspend.store(true, SeqCst);
+        let (answer, _) = embedder.embed_preprocessed_with_norm(&chip).unwrap();
+        assert!(
+            from_cpu(&answer),
+            "the output that spanned a suspend was used"
+        );
+        assert_eq!(embedder.npu_device(), crate::npu::Device::Npu);
+        assert!(!embedder.npu.resumed_since_check());
+        let (answer, _) = embedder.embed_preprocessed_with_norm(&chip).unwrap();
+        assert!(!from_cpu(&answer), "the next call answers from the NPU");
+
+        // Other bits after the suspend: retired to CPU.
+        suspend.store(true, SeqCst);
+        changed.store(true, SeqCst);
+        let (answer, _) = embedder.embed_preprocessed_with_norm(&chip).unwrap();
+        assert!(from_cpu(&answer));
+        assert!(
+            matches!(
+                embedder.npu_device(),
+                crate::npu::Device::Cpu(crate::npu::CpuReason::ParityMismatch(ref why))
+                    if why.starts_with("after a system resume")
+            ),
+            "{:?}",
+            embedder.npu_device()
+        );
     }
 
     /// After a system resume the NPU must reproduce its reference digest
@@ -441,6 +524,7 @@ mod npu_hardware {
                 identity_digest: "hardware test",
                 onnx_runtime: "hardware test",
                 thresholds: &[],
+                decision_fingerprint: "hardware test",
                 fingerprint: Box::leak(
                     npu_reference_fingerprint(crate::npu::Role::Recognizer, glint.bytes())
                         .unwrap()

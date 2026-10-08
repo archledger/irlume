@@ -780,7 +780,13 @@ mod onnx {
                     self.check_npu_digest("after a system resume, ");
                 }
                 if let Some(embedded) = self.npu.run(data, embedding_and_norm) {
-                    return Ok(embedded);
+                    // A suspend between the last check and the end of this
+                    // inference: the output is discarded, the digest is
+                    // checked again, and this call is computed on CPU.
+                    if !self.npu.resumed_since_check() {
+                        return Ok(embedded);
+                    }
+                    self.check_npu_digest("after a system resume, ");
                 }
             }
             let tensor = Tensor::from_array(([1i64, 3, n, n], data.to_vec())).map_err(err)?;

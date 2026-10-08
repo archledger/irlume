@@ -147,6 +147,12 @@ pub struct Certification {
     /// The wired thresholds that consume the output, by constant name, at
     /// their certified values.
     pub thresholds: &'static [(&'static str, f32)],
+    /// The recognition decision downstream of the output, as irlume-auth
+    /// fingerprints it: the SHA-256 of what the production decision code
+    /// (IR calibration, Platt scaling, brightness weighting, fusion,
+    /// template selection and the grant verdicts) returns for fixed
+    /// synthetic scores and brightness weights (ADR-0022 §3).
+    pub decision_fingerprint: &'static str,
     /// The decoded CPU outputs for the fixed synthetic inputs of
     /// `npu_reference_fingerprint`, at certification; tests on any host
     /// compare them within a tolerance to catch preprocessing changes.
@@ -169,38 +175,43 @@ pub struct Certification {
 /// (ADR-0022 Phasing 3), so every model runs on CPU on every platform.
 pub const CERTIFIED: &[Certification] = &[];
 
-/// The entry certifying `model_sha256` for `identity` against the loaded
-/// ONNX Runtime `onnx_runtime` and the wired `thresholds` that consume the
-/// output, if any (ADR-0022 §3). An entry certified at other threshold
-/// values, or for another set of thresholds, does not apply: its measured
-/// drift was judged at its own operating points.
+/// How the caller consumes the recognizer's output, live (ADR-0022 §3):
+/// the ONNX Runtime its CPU sessions load, the wired thresholds by constant
+/// name, and the fingerprint of its recognition decision code. An entry
+/// applies only when all of it matches: its measured drift was judged at
+/// its own operating points and through its own decision code.
+#[derive(Clone, Copy, Debug)]
+pub struct Consumer<'a> {
+    /// The loaded ONNX Runtime version.
+    pub onnx_runtime: &'a str,
+    /// The wired thresholds that consume the output, by constant name.
+    pub thresholds: &'a [(&'a str, f32)],
+    /// [`Certification::decision_fingerprint`], computed now.
+    pub decision_fingerprint: &'a str,
+}
+
+/// The entry certifying `model_sha256` for `identity` and `consumer`, if
+/// any (ADR-0022 §3).
 pub fn certification(
     model_sha256: &str,
     identity: &Identity,
-    onnx_runtime: &str,
-    thresholds: &[(&str, f32)],
+    consumer: &Consumer<'_>,
 ) -> Option<&'static Certification> {
-    certification_in(
-        CERTIFIED,
-        model_sha256,
-        &identity.digest(),
-        onnx_runtime,
-        thresholds,
-    )
+    certification_in(CERTIFIED, model_sha256, &identity.digest(), consumer)
 }
 
 fn certification_in<'t>(
     table: &'t [Certification],
     model_sha256: &str,
     identity_digest: &str,
-    onnx_runtime: &str,
-    thresholds: &[(&str, f32)],
+    consumer: &Consumer<'_>,
 ) -> Option<&'t Certification> {
     table.iter().find(|entry| {
         entry.model_sha256 == model_sha256
             && entry.identity_digest == identity_digest
-            && entry.onnx_runtime == onnx_runtime
-            && same_thresholds(entry.thresholds, thresholds)
+            && entry.onnx_runtime == consumer.onnx_runtime
+            && same_thresholds(entry.thresholds, consumer.thresholds)
+            && entry.decision_fingerprint == consumer.decision_fingerprint
     })
 }
 
@@ -497,7 +508,23 @@ pub(crate) fn suspended(bound: Bound) -> Option<Duration> {
             (read(libc::CLOCK_BOOTTIME)?, monotonic)
         }
     };
-    Some(boottime.saturating_sub(monotonic))
+    let measured = boottime.saturating_sub(monotonic);
+    #[cfg(test)]
+    let measured = measured + SIMULATED_SUSPEND.with(std::cell::Cell::get);
+    Some(measured)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Suspended time added to [`suspended`] on this thread, for tests.
+    static SIMULATED_SUSPEND: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+/// Pretend this thread's system suspended for `duration`, for tests.
+#[cfg(test)]
+pub(crate) fn simulate_suspend(duration: Duration) {
+    SIMULATED_SUSPEND.with(|suspended| suspended.set(suspended.get() + duration));
 }
 
 /// The boot this process runs in, for markers.
@@ -1292,6 +1319,7 @@ struct Open {
     cache: Cache,
     onnx_runtime: String,
     thresholds: Vec<(String, f32)>,
+    decision_fingerprint: String,
 }
 
 impl Context {
@@ -1302,22 +1330,16 @@ impl Context {
         }
     }
 
-    /// Open the platform and prepare its cache under `cache_base`, with
-    /// `onnx_runtime` the version of the ONNX Runtime the CPU sessions use
-    /// and `thresholds` the wired thresholds, by constant name, that consume
-    /// the recognizer's output. A failure is kept as the reason every model
-    /// then runs on CPU.
-    pub fn open(cache_base: &Path, onnx_runtime: &str, thresholds: &[(&str, f32)]) -> Self {
+    /// Open the platform and prepare its cache under `cache_base`, for a
+    /// caller that consumes the recognizer's output as `consumer` says. A
+    /// failure is kept as the reason every model then runs on CPU.
+    pub fn open(cache_base: &Path, consumer: &Consumer<'_>) -> Self {
         Self {
-            state: Self::open_state(cache_base, onnx_runtime, thresholds),
+            state: Self::open_state(cache_base, consumer),
         }
     }
 
-    fn open_state(
-        cache_base: &Path,
-        onnx_runtime: &str,
-        thresholds: &[(&str, f32)],
-    ) -> Result<Open, CpuReason> {
+    fn open_state(cache_base: &Path, consumer: &Consumer<'_>) -> Result<Open, CpuReason> {
         let boot = boot_id()
             .map_err(|error| CpuReason::IdentityUnreadable(format!("boot id: {error}")))?;
         // Discovery loads the plugin and queries the device before there
@@ -1341,11 +1363,13 @@ impl Context {
         Ok(Open {
             platform,
             cache,
-            onnx_runtime: onnx_runtime.to_owned(),
-            thresholds: thresholds
+            onnx_runtime: consumer.onnx_runtime.to_owned(),
+            thresholds: consumer
+                .thresholds
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), *value))
                 .collect(),
+            decision_fingerprint: consumer.decision_fingerprint.to_owned(),
         })
     }
 
@@ -1358,9 +1382,9 @@ impl Context {
         self.state.as_ref().map(|open| open.platform.identity())
     }
 
-    /// Place one model: on the NPU when it is certified for this platform,
-    /// CPU reference and thresholds and compiles, on CPU with the reason
-    /// otherwise (ADR-0022 §3, §9).
+    /// Place one model: on the NPU when it is certified for this platform
+    /// and consumer and compiles, on CPU with the reason otherwise
+    /// (ADR-0022 §3, §9).
     pub fn slot(&mut self, model: &[u8], model_sha256: &str) -> Slot {
         let open = match &mut self.state {
             Ok(open) => open,
@@ -1371,12 +1395,12 @@ impl Context {
             .iter()
             .map(|(name, value)| (name.as_str(), *value))
             .collect();
-        let Some(entry) = certification(
-            model_sha256,
-            open.platform.identity(),
-            &open.onnx_runtime,
-            &thresholds,
-        ) else {
+        let consumer = Consumer {
+            onnx_runtime: &open.onnx_runtime,
+            thresholds: &thresholds,
+            decision_fingerprint: &open.decision_fingerprint,
+        };
+        let Some(entry) = certification(model_sha256, open.platform.identity(), &consumer) else {
             return Slot::cpu(CpuReason::NotCertified);
         };
         match open.platform.compile(&open.cache, model, model_sha256) {
@@ -1443,7 +1467,12 @@ mod tests {
     fn the_shipped_table_certifies_nothing() {
         // Changes only with certification evidence (ADR-0022 Phasing 3).
         assert_eq!(CERTIFIED.len(), 0);
-        assert!(certification(&"0".repeat(64), &identity(), "1.28.1", &[]).is_none());
+        let consumer = Consumer {
+            onnx_runtime: "1.28.1",
+            thresholds: &[],
+            decision_fingerprint: "",
+        };
+        assert!(certification(&"0".repeat(64), &identity(), &consumer).is_none());
     }
 
     #[test]
@@ -1458,23 +1487,51 @@ mod tests {
             identity_digest: leaked_digest,
             onnx_runtime: "1.28.1",
             thresholds: &[("RGB_MATCH_THRESHOLD", 0.55)],
+            decision_fingerprint: "decision",
             fingerprint: &[0.5],
             cpu_reference_digest: "c",
             npu_reference_digest: "d",
             evidence: "test",
         }];
         let wired = [("RGB_MATCH_THRESHOLD", 0.55)];
-        let found = certification_in(&table, &model, &digest, "1.28.1", &wired);
+        let consumer = Consumer {
+            onnx_runtime: "1.28.1",
+            thresholds: &wired,
+            decision_fingerprint: "decision",
+        };
+        let found = certification_in(&table, &model, &digest, &consumer);
         assert_eq!(found.map(|entry| entry.role), Some(Role::Recognizer));
         assert_eq!(found.map(|entry| entry.npu_reference_digest), Some("d"));
-        assert!(certification_in(&table, &"b".repeat(64), &digest, "1.28.1", &wired).is_none());
+        assert!(certification_in(&table, &"b".repeat(64), &digest, &consumer).is_none());
         assert!(
-            certification_in(&table, &model, &digest, "1.29.0", &wired).is_none(),
+            certification_in(
+                &table,
+                &model,
+                &digest,
+                &Consumer {
+                    onnx_runtime: "1.29.0",
+                    ..consumer
+                }
+            )
+            .is_none(),
             "another CPU reference is not certified"
+        );
+        assert!(
+            certification_in(
+                &table,
+                &model,
+                &digest,
+                &Consumer {
+                    decision_fingerprint: "changed decision code",
+                    ..consumer
+                }
+            )
+            .is_none(),
+            "changed decision code is not certified"
         );
         let mut other = identity();
         other.firmware = "another firmware build".into();
-        assert!(certification_in(&table, &model, &other.digest(), "1.28.1", &wired).is_none());
+        assert!(certification_in(&table, &model, &other.digest(), &consumer).is_none());
         // A moved threshold, an added one, a missing one or a renamed one
         // is another operating point.
         for wired in [
@@ -1485,7 +1542,16 @@ mod tests {
             &[("RGB_MATCH_THRESHOLD", 0.55), ("RGB_MATCH_THRESHOLD", 0.55)][..],
         ] {
             assert!(
-                certification_in(&table, &model, &digest, "1.28.1", wired).is_none(),
+                certification_in(
+                    &table,
+                    &model,
+                    &digest,
+                    &Consumer {
+                        thresholds: wired,
+                        ..consumer
+                    }
+                )
+                .is_none(),
                 "{wired:?}"
             );
         }
@@ -1974,7 +2040,14 @@ mod tests {
             boot_id().unwrap(),
         )
         .unwrap();
-        let context = Context::open(base.path(), "1.28.1", &[]);
+        let context = Context::open(
+            base.path(),
+            &Consumer {
+                onnx_runtime: "1.28.1",
+                thresholds: &[],
+                decision_fingerprint: "",
+            },
+        );
         assert_eq!(context.identity().err(), Some(&CpuReason::DidNotReturn));
     }
 

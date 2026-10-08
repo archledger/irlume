@@ -20,9 +20,9 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 /// The certified OpenVINO C API, by the soname of its release (2026.2.0).
@@ -719,19 +719,59 @@ fn firmware_build(debugfs_accel: &Path, bus_address: &str) -> Result<String, Cpu
     Ok(build)
 }
 
+/// A runtime library as the identity hashed it: the file the bytes were read
+/// from, by inode. Not by device: on btrfs `stat` reports the subvolume's
+/// anonymous device and `/proc/self/maps` the filesystem's (0:37 and 00:23
+/// on the measured host). An update renames a new file into place, created
+/// while the old inode is still allocated, so it always has a new inode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HashedLibrary {
+    path: PathBuf,
+    inode: u64,
+}
+
+fn is_runtime_library(path: &str) -> bool {
+    path.starts_with('/') && (path.contains("openvino") || path.contains("/libze_"))
+}
+
+/// Every OpenVINO and Level Zero library the process has mapped must be one
+/// the identity hashed and still the same file, by inode (ADR-0022 §4), so
+/// a package update between hashing and loading cannot run bytes the
+/// identity does not name.
+fn loaded_as_hashed(maps: &str, hashed: &[HashedLibrary]) -> Result<(), String> {
+    for line in maps.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (Some(inode), Some(path)) = (fields.get(4), fields.get(5)) else {
+            continue;
+        };
+        if !is_runtime_library(path) {
+            continue;
+        }
+        let library = hashed
+            .iter()
+            .find(|library| library.path.as_os_str() == OsStr::new(path))
+            .ok_or_else(|| format!("{path} is mapped but was not hashed"))?;
+        // A seventh field is "(deleted)": the mapped file was replaced.
+        if inode.parse::<u64>().ok() != Some(library.inode) || fields.len() > 6 {
+            return Err(format!("{path} is not the file that was hashed"));
+        }
+    }
+    Ok(())
+}
+
 /// The runtime libraries of the identity, from the process's memory map:
-/// every mapped OpenVINO and Level Zero library, plus the NPU compiler beside
-/// the NPU plugin and the ONNX frontend beside the core, which compiling
-/// loads. The C API, the core, the NPU plugin, the Level Zero loader and the
-/// NPU user-mode driver must all be there.
-fn runtime_libraries(maps: &str) -> Result<String, CpuReason> {
+/// every mapped OpenVINO and Level Zero library, plus the NPU compiler loader
+/// beside the NPU plugin, which applying the compile configuration loads, and
+/// the NPU compiler beside the plugin and the IR and ONNX frontends beside
+/// the core, which compiling loads. The C API, the core, the NPU plugin, the Level Zero
+/// loader and the NPU user-mode driver must all be there, and every mapped
+/// one must be the file that was hashed.
+fn runtime_libraries(maps: &str) -> Result<(String, Vec<HashedLibrary>), CpuReason> {
     let unreadable = |why: String| CpuReason::IdentityUnreadable(why);
     let mut paths: Vec<PathBuf> = maps
         .lines()
         .filter_map(|line| line.split_whitespace().nth(5))
-        .filter(|path| {
-            path.starts_with('/') && (path.contains("openvino") || path.contains("/libze_"))
-        })
+        .filter(|path| is_runtime_library(path))
         .map(PathBuf::from)
         .collect();
     let named = |prefix: &str| {
@@ -762,27 +802,41 @@ fn runtime_libraries(maps: &str) -> Result<String, CpuReason> {
                 .map(str::to_owned)
         })
         .ok_or_else(|| unreadable("unversioned OpenVINO core".into()))?;
+    paths.push(plugin.with_file_name("libopenvino_intel_npu_compiler_loader.so"));
     paths.push(plugin.with_file_name("libopenvino_intel_npu_compiler.so"));
+    paths.push(core.with_file_name(format!("libopenvino_ir_frontend.so.{version}")));
     paths.push(core.with_file_name(format!("libopenvino_onnx_frontend.so.{version}")));
     paths.sort();
     paths.dedup();
     let mut lines = String::new();
+    let mut hashed = Vec::with_capacity(paths.len());
     for path in &paths {
-        let bytes =
-            fs::read(path).map_err(|error| unreadable(format!("{}: {error}", path.display())))?;
+        // Hashed through one open file, whose inode is kept.
+        let failed = |error: io::Error| unreadable(format!("{}: {error}", path.display()));
+        let mut file = fs::File::open(path).map_err(failed)?;
+        let metadata = file.metadata().map_err(failed)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(failed)?;
         lines.push_str(&format!(
             "{} {}\n",
             path.display(),
             irlume_common::sha256_hex(&bytes)
         ));
+        hashed.push(HashedLibrary {
+            path: path.clone(),
+            inode: metadata.ino(),
+        });
     }
-    Ok(lines)
+    loaded_as_hashed(maps, &hashed).map_err(unreadable)?;
+    Ok((lines, hashed))
 }
 
 /// The OpenVINO runtime and the NPU behind it.
 pub struct Platform {
     core: openvino::Core,
     identity: Identity,
+    libraries: Vec<HashedLibrary>,
+    maps: PathBuf,
 }
 
 impl Platform {
@@ -833,6 +887,9 @@ impl Platform {
                     .map(|(_, version)| version.build_number)
                     .next()
                     .ok_or_else(|| CpuReason::IdentityUnreadable("no NPU plugin version".into()))?;
+                let (libraries, hashed) = fs::read_to_string(sources.maps)
+                    .map_err(|error| CpuReason::IdentityUnreadable(format!("maps: {error}")))
+                    .and_then(|maps| runtime_libraries(&maps))?;
                 let identity = Identity {
                     library: library.display().to_string(),
                     openvino_build: openvino::version().build_number,
@@ -843,9 +900,7 @@ impl Platform {
                     pci_id,
                     firmware,
                     configuration: COMPILE_CONFIGURATION.to_owned(),
-                    libraries: fs::read_to_string(sources.maps)
-                        .map_err(|error| CpuReason::IdentityUnreadable(format!("maps: {error}")))
-                        .and_then(|maps| runtime_libraries(&maps))?,
+                    libraries,
                 };
                 // COMPILE_CONFIGURATION, applied: the plugin compiler, read
                 // back so a fallback cannot pass for it, and the latency
@@ -874,7 +929,12 @@ impl Platform {
                     "LATENCY",
                 )
                 .map_err(|error| absent(format!("PERFORMANCE_HINT: {error}")))?;
-                Ok(Self { core, identity })
+                Ok(Self {
+                    core,
+                    identity,
+                    libraries: hashed,
+                    maps: sources.maps.to_path_buf(),
+                })
             },
             CpuReason::RuntimeAbsent("the OpenVINO binding panicked while loading".into()),
         )
@@ -942,6 +1002,20 @@ impl Platform {
                 CpuReason::CompileFailed("the OpenVINO binding panicked while compiling".into()),
             )
         })?;
+        // The libraries compiling loaded must be the ones the identity hashed
+        // (ADR-0022 §4); what a compile with other bytes wrote is discarded.
+        let loaded = fs::read_to_string(&self.maps)
+            .map_err(|error| format!("maps: {error}"))
+            .and_then(|maps| loaded_as_hashed(&maps, &self.libraries));
+        if let Err(why) = loaded {
+            drop(inner);
+            if let Ok(entries) = fs::read_dir(cache.blobs()) {
+                for entry in entries.flatten() {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+            return Err(CpuReason::CompileFailed(why));
+        }
         Ok(Box::new(Marked { inner, marker }))
     }
 
@@ -1602,44 +1676,112 @@ mod tests {
         let files = [
             d.join("libopenvino_c.so.2026.2.0"),
             d.join("libopenvino.so.2026.2.0"),
+            d.join("libopenvino_ir_frontend.so.2026.2.0"),
             d.join("libopenvino_onnx_frontend.so.2026.2.0"),
             d.join("libze_loader.so.1.32.0"),
             d.join("libze_intel_npu.so.1.38.0"),
             plugins.join("libopenvino_intel_npu_plugin.so"),
             plugins.join("libopenvino_intel_npu_compiler.so"),
+            plugins.join("libopenvino_intel_npu_compiler_loader.so"),
         ];
         for (i, file) in files.iter().enumerate() {
             fs::write(file, vec![i as u8; 8]).unwrap();
         }
-        let map_line =
-            |path: &Path| format!("7f00-7f10 r-xp 00000000 00:1f 42   {}\n", path.display());
-        // The frontend and the compiler are not mapped yet; libc is ignored.
-        let maps: String = [&files[0], &files[1], &files[3], &files[4], &files[5]]
-            .iter()
-            .map(|p| map_line(p))
-            .chain(std::iter::once(
-                "7f20-7f30 r-xp 0 00:1f 7   /usr/lib64/libc.so.6\n".into(),
-            ))
-            .collect();
-        let libraries = runtime_libraries(&maps).unwrap();
-        assert_eq!(libraries.lines().count(), 7, "{libraries}");
+        // The frontends and the compiler are not mapped yet; libc is ignored.
+        let open = [&files[0], &files[1], &files[4], &files[5], &files[6]];
+        let maps = |mapped: &[&PathBuf]| -> String {
+            mapped
+                .iter()
+                .map(|path| map_line(path))
+                .chain(std::iter::once(
+                    "7f20-7f30 r-xp 0 00:1f 7   /usr/lib64/libc.so.6\n".into(),
+                ))
+                .collect()
+        };
+        let (libraries, hashed) = runtime_libraries(&maps(&open)).unwrap();
+        assert_eq!(libraries.lines().count(), 9, "{libraries}");
+        assert_eq!(hashed.len(), 9);
         assert!(libraries.contains("libopenvino_intel_npu_compiler.so"));
+        assert!(libraries.contains("libopenvino_intel_npu_compiler_loader.so"));
+        assert!(libraries.contains("libopenvino_ir_frontend.so.2026.2.0"));
         assert!(libraries.contains("libopenvino_onnx_frontend.so.2026.2.0"));
         assert!(!libraries.contains("libc.so"));
+        // After a compile maps the rest, they are the files that were hashed.
+        let compiled: Vec<&PathBuf> = files.iter().collect();
+        assert_eq!(loaded_as_hashed(&maps(&compiled), &hashed), Ok(()));
         let before = libraries.clone();
-        fs::write(&files[3], b"a rebuilt loader").unwrap();
+        fs::write(&files[4], b"a rebuilt loader").unwrap();
         assert_ne!(
-            runtime_libraries(&maps).unwrap(),
+            runtime_libraries(&maps(&open)).unwrap().0,
             before,
             "a rebuild changes it"
         );
 
-        let without_driver: String = [&files[0], &files[1], &files[3], &files[5]]
-            .iter()
-            .map(|p| map_line(p))
-            .collect();
+        let without_driver = maps(&[&files[0], &files[1], &files[4], &files[6]]);
         assert!(matches!(
             runtime_libraries(&without_driver),
+            Err(CpuReason::IdentityUnreadable(_))
+        ));
+    }
+
+    /// A mapping as btrfs shows it: the filesystem's device, which `stat`
+    /// does not report, and the file's inode.
+    fn map_line(path: &Path) -> String {
+        format!(
+            "7f00-7f10 r-xp 00000000 00:23 {}   {}\n",
+            fs::metadata(path).unwrap().ino(),
+            path.display()
+        )
+    }
+
+    #[test]
+    fn a_runtime_library_must_be_loaded_as_it_was_hashed() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let files = [
+            d.join("libopenvino_c.so.2026.2.0"),
+            d.join("libopenvino.so.2026.2.0"),
+            d.join("libze_loader.so.1.32.0"),
+            d.join("libze_intel_npu.so.1.38.0"),
+            d.join("libopenvino_intel_npu_plugin.so"),
+            d.join("libopenvino_intel_npu_compiler.so"),
+            d.join("libopenvino_ir_frontend.so.2026.2.0"),
+            d.join("libopenvino_onnx_frontend.so.2026.2.0"),
+            d.join("libopenvino_intel_npu_compiler_loader.so"),
+        ];
+        for (i, file) in files.iter().enumerate() {
+            fs::write(file, vec![i as u8; 8]).unwrap();
+        }
+        let open: String = files[..5].iter().map(|path| map_line(path)).collect();
+        let (_, hashed) = runtime_libraries(&open).unwrap();
+        let compiler = map_line(&files[5]);
+
+        // The compiler is replaced by a package update after it was hashed
+        // and before compiling loads it: a new inode at the same path.
+        let staged = d.join("staged");
+        fs::write(&staged, b"another compiler").unwrap();
+        fs::rename(&staged, &files[5]).unwrap();
+        let loaded = format!("{open}{}", map_line(&files[5]));
+        assert!(
+            loaded_as_hashed(&loaded, &hashed).is_err_and(|why| why.contains("not the file")),
+            "a library replaced after hashing"
+        );
+        // The file that was hashed, now deleted while mapped.
+        let deleted = format!("{open}{} (deleted)\n", compiler.trim_end());
+        assert!(loaded_as_hashed(&deleted, &hashed).is_err());
+        // A runtime library the identity never hashed.
+        let stray = d.join("libopenvino_tensorflow_frontend.so.2026.2.0");
+        fs::write(&stray, b"x").unwrap();
+        let unhashed = format!("{open}{}", map_line(&stray));
+        assert!(loaded_as_hashed(&unhashed, &hashed).is_err_and(|why| why.contains("not hashed")));
+        // A library swapped between mapping and hashing fails at open.
+        let staged = d.join("staged");
+        fs::write(&staged, b"another loader").unwrap();
+        let mapped_before = map_line(&files[2]);
+        fs::rename(&staged, &files[2]).unwrap();
+        let swapped = open.replace(&map_line(&files[2]), &mapped_before);
+        assert!(matches!(
+            runtime_libraries(&swapped),
             Err(CpuReason::IdentityUnreadable(_))
         ));
     }

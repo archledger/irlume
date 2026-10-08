@@ -1293,7 +1293,41 @@ fn a_split_choice_installs_only_into_the_request_that_built_it() {
     assert!(rig.recorder.calls().is_empty());
 }
 
-// Negative controls: GREEN from the stub on.
+// Refusal-context regressions and closed-gate controls.
+
+#[test]
+fn automatic_split_primary_names_activation_and_routes_only_after_admission() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let rig = Rig::new(SPLIT_ONLY);
+    rig.authorize(false);
+    let standing = Standing::new(&mut shared.engine);
+    for admitted in [false, true] {
+        let _admitted = admitted.then(|| rig.recorder.admit_split_trust(&[Authentication]));
+        let request = standing
+            .engine
+            .prepare_authentication_camera_request()
+            .unwrap();
+        let primary = rig.primary(split_binding());
+        let (choice, unseals) = route(&request, primary, false);
+        if admitted {
+            let (split, _) = expect_split(choice);
+            assert_eq!(split.key(), &Rig::key());
+        } else {
+            let outcome = expect_denied(choice);
+            assert_eq!(outcome.kind, crate::OutcomeKind::OtherDeny);
+            assert_eq!(
+                outcome.cause,
+                Some(crate::OutcomeCause::NotEnrolledOnThisCamera)
+            );
+            assert_eq!(outcome.reason, CLOSED);
+            assert!(!outcome.reason.contains(ORDINARY));
+            assert_eq!(unseals, 0);
+        }
+        assert!(rig.recorder.calls().is_empty());
+    }
+    assert!(standing.engine.camera_selection.is_none());
+}
 
 #[test]
 fn closed_default_classified_routing_keeps_the_closed_refusal() {
@@ -1311,7 +1345,7 @@ fn closed_default_classified_routing_keeps_the_closed_refusal() {
         // pending secondary intent is not recovered (plan D1, test 2450).
         let intent = plant_pending_intent();
         let (choice, unseals) = route(&request, rig.primary(split_binding()), false);
-        assert_eq!(expect_denied(choice).reason, ORDINARY);
+        assert_eq!(expect_denied(choice).reason, CLOSED);
         assert_eq!(unseals, 0);
         assert!(intent.exists() && !secondary_store_path(USER).exists());
         std::fs::remove_file(&intent).unwrap();
@@ -1339,10 +1373,10 @@ fn closed_default_classified_routing_keeps_the_closed_refusal() {
         assert!(request.split_grant_authority_refusal().is_none());
         assert!(request.pre_open_account_refusal().is_none());
     }
-    // A pinned split: every preparation is an ordinary entry meeting that
-    // saved selection, so each refuses for the ordinary path's own reason.
+    // Authentication can route the pin after admission; generic preparation
+    // never routes it, so these two entries keep distinct refusal reasons.
     rig.authorize(true);
-    assert!(refusal(standing.engine.prepare_authentication_camera_request()).contains(ORDINARY));
+    assert!(refusal(standing.engine.prepare_authentication_camera_request()).contains(CLOSED));
     assert!(refusal(standing.engine.prepare_camera_request()).contains(ORDINARY));
     assert!(standing.engine.camera_selection.is_none());
     assert!(rig.recorder.calls().is_empty());

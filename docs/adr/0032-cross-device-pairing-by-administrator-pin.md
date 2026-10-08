@@ -1278,3 +1278,49 @@ No physical cameras or real TPM are exercised or changed. These software rows
 leave final integrated gate qualification, physical split acceptance and the
 separate reviewed activation change pending. This ADR remains Proposed; the YUYV
 exposure and T480 acceptance gates remain in force.
+
+## Amendment 2026-10-08: refusal context for ordinary and split-capable requests
+
+This amends the reply wording in the request-configuration and pre-open-primary
+amendments of 2026-10-04 and the retained-runtime reply-preservation statement of
+2026-10-06. Admission, refusal conditions, routing, leases, capture, storage,
+outcome kinds/causes and password fallback are unchanged.
+
+An ordinary-only entry cannot open a split pair even when split trust is admitted.
+When a valid selected split meets generic preparation with no valid explicit
+ordinary override, the reply names that request limitation:
+
+```text
+this request uses the ordinary camera path, which never opens a split camera pair; explicit split enrollment uses `irlume enroll --split-camera-choice`
+```
+
+Generic enrollment, add-scan, identify, positioning and the support probe use this
+preparation refusal. A non-routing authentication context, such as a proven
+ordinary override or ordinary enrollment choice, also uses that reason when its
+account binding requires a split pair. It is not an activation refusal.
+
+Automatic or saved-pin authentication is split-capable. With Authentication
+admission closed, a selected split or split-bound primary keeps "split enrollment
+and authentication are not enabled"; after admission, the retained account route
+can select the split pair. An automatic split secondary, an explicit split
+enrollment entry, a retained pin's closed gate and withdrawn admission also retain
+the activation reason. A failed biometric decision still never reranks.
+
+Valid explicit ordinary overrides keep their earlier precedence over valid saved
+selection. Both environment endpoints, or an explicit ordinary enrollment choice,
+must prove a unique Current ordinary pair under the combined external-camera
+policy. Invalid or unreadable selection is refused before that override. A saved
+split selection does not imply every request refuses when such an override exists.
+
+The configuration refusal does not add account-binding checks to ordinary
+commands. Without a saved selected split, add-scan has no split-primary binding
+gate; this amendment makes no contrary guarantee. The named split-enrollment
+command is an entry point, not a remedy for identify, add-scan or positioning, and
+it refuses while Enrollment admission is closed.
+
+Regression evidence separates automatic closed/admitted routing, saved-pin
+authentication from generic preparation, and Verify/CredentialRelease with a
+proven ordinary override. Each rejected case retains its deny kind/cause and
+avoids lease/open attempts; the ordinary-override rows also retain primary bytes
+and clear request state. These are software checks. The physical acceptance and
+separate reviewed activation requirements remain unchanged.

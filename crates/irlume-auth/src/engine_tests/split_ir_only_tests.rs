@@ -38,9 +38,6 @@ const ABSENT_UNIT: &str = "5679:00ff:qabsent";
 const CONTROLLER: &str = "0000:00:14.0";
 const D9: &str = "split camera IR-only authentication is not supported; use your password";
 const CLOSED: &str = "split enrollment and authentication are not enabled";
-/// The production refusal text, referenced rather than copied so a wording
-/// change cannot leave these expectations stale.
-const ORDINARY: &str = crate::request_preparation::ORDINARY_PATH_SPLIT_REFUSAL;
 const NOT_CONNECTED: &str = "no eligible enrolled camera is connected";
 const PIN_NOT_ENROLLED: &str = "the selected split camera pair is not enrolled for this account";
 
@@ -772,32 +769,24 @@ fn closed_default_ir_only_split_keeps_the_closed_text_and_readiness() {
             AuthenticationPurpose::CredentialRelease,
         ] {
             let shown = ir_only_authenticate(standing.engine, purpose);
-            // A split-bound primary credential is the ordinary path's own
-            // encounter; a split group is a split-specific scope.
-            let expected = match bound {
-                Bound::Split => ORDINARY,
-                Bound::SplitGroup => CLOSED,
-                Bound::Ordinary | Bound::Unbound => {
-                    panic!("{bound:?} has no split credential to refuse")
-                }
-            };
+            // Automatic routing can select either split scope after admission,
+            // so both refusals name activation while it remains closed.
             assert_eq!(
                 shown,
-                format!("Ok(OtherDeny/Some(NotEnrolledOnThisCamera): {expected})"),
+                format!("Ok(OtherDeny/Some(NotEnrolledOnThisCamera): {CLOSED})"),
                 "{bound:?} {purpose:?}"
             );
         }
         let readiness = standing.engine.ir_only_preflight_details(USER);
         assert_eq!(readiness.readiness, Ready::BindingMismatch, "{bound:?}");
     }
-    // A saved selected split meeting a split-bound primary: an ordinary
-    // authentication entry, so it refuses for the ordinary path's own reason,
-    // and unscoped readiness stays TargetUnavailable.
+    // A saved selected split also routes only after admission; unscoped
+    // readiness stays TargetUnavailable while the predicate is closed.
     rig.authorize(true);
     rig.account(&spaces, Bound::Split);
     let shown = ir_only_authenticate(standing.engine, AuthenticationPurpose::Verify);
     assert!(
-        shown.starts_with("Err(") && shown.contains(ORDINARY),
+        shown.starts_with("Err(") && shown.contains(CLOSED),
         "{shown}"
     );
     let readiness = standing.engine.ir_only_preflight_details(USER);

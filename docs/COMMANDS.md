@@ -98,31 +98,43 @@ do not enable split-pair enrollment or authentication.
 
 ### Two different refusals
 
-Ordinary requests that encounter a saved split selection or split-bound
-primary credential refuse because the ordinary camera path does not open
-split camera pairs. Split-specific requests refused by the closed activation
-gate retain the separate activation message. The distinction is per request
-context, not per split-related state.
-
-Both refuse before any camera work, and neither falls back to another camera.
+Ordinary-only requests and split-capable authentication have different refusal
+reasons. A valid saved split selection is refused by an ordinary-only entry
+when it has no valid explicit ordinary override. Account-routed authentication
+can use a split pair after admission, so its closed refusal names activation.
+Each refusal occurs before camera work and never falls back to another camera.
 
 ```
 policy: this request uses the ordinary camera path, which never opens a split camera pair; explicit split enrollment uses `irlume enroll --split-camera-choice`
 ```
 
-The ordinary-path refusal covers `enroll` without a split choice,
-`profiles add-scan`, `identify`, positioning and the support probe. It describes
-the request that was made, so it stays accurate whatever the split activation
-state is, and it never reports a closed gate.
+With a saved split selection and no valid explicit ordinary override, the
+ordinary-path refusal covers `enroll` without a split choice, `profiles add-scan`,
+`identify`, positioning and the support probe. An authentication request with a
+proven ordinary override also uses this reason if its primary is split-bound:
+that explicit ordinary context cannot route a split, even after activation.
+
+Both `IRLUME_RGB_DEVICE` and `IRLUME_IR_DEVICE`, or an explicit ordinary
+enrollment choice, can select a unique Current ordinary pair instead. The
+combined external-camera policy still applies. An invalid or unreadable saved
+selection refuses before considering an override. A valid saved split selection
+alone therefore does not guarantee refusal when such an override is present.
+
+These statements describe request configuration and authentication binding
+checks. They do not promise a split-primary binding gate for every ordinary
+command. In particular, without a saved selected split, `profiles add-scan` does
+not have that binding refusal. This wording change adds no gate to add-scan.
 
 ```
 policy: split enrollment and authentication are not enabled
 ```
 
 That is the activation message. It covers `enroll --split-camera-choice`,
-`enroll --add-camera --split-camera-choice` and the declared split entries,
-which are refused because activation is closed rather than because of anything
-about the request. `irlume split` commands are unaffected by either refusal;
+`enroll --add-camera --split-camera-choice`, automatic or saved-pin authentication
+against split input, and the declared split entries. These contexts can use a
+split pair when the appropriate trust kind is admitted; production admission
+remains closed. Retained-pin gates and withdrawn admission also keep this
+activation message. `irlume split` commands are unaffected by either refusal;
 they report the authorization store.
 
 The trailing clause of the ordinary-path refusal names the explicit
@@ -270,10 +282,10 @@ malformed values are usage errors before a request is sent; and an older
 daemon reports that split enrollment needs an upgrade, with no retry as
 another operation. The two choice flags cannot be combined. The daemon refuses
 split enrollment until activation, and the client prints its reply as is. An
-ordinary `enroll` against a saved split selection or a split-bound account
-refuses for the separate ordinary-path reason described under
-[Two different refusals](#two-different-refusals); this flag is the supported
-alternative.
+ordinary `enroll` against a saved split selection, without a valid explicit
+ordinary override, refuses for the ordinary-path reason described under
+[Two different refusals](#two-different-refusals). This flag names the explicit
+split-enrollment entry point, which still refuses while activation is closed.
 
 Adding or replacing trusted faces requires OS authorization for a non-root account owner. This covers `enroll`, `enroll --reset`, and `profiles add-scan`, including the guided TUI and direct socket clients. Each request needs its own authorization; root retains administrative access. A successful replacement preserves the existing template key and recovery setup, and failed capture preserves the old enrollment.
 

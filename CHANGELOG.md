@@ -7,11 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
-- Ordinary requests that encounter a saved split selection or a split-bound
-  primary credential report the ordinary camera path's limitation instead of
-  blaming split activation. The refusal names the explicit split-enrollment
-  entry point without presenting it as a remedy for the refused operation.
-  Split-specific activation refusals remain unchanged (ADR-0032 step 5; #1030).
+- Ordinary-only requests with a saved split selection and no valid ordinary
+  override report the ordinary camera path's limitation. Authentication with a
+  proven ordinary override uses that reason for a split-bound primary too.
+  Automatic and saved-pin split authentication retain the activation refusal.
+  The ordinary reason names the explicit split-enrollment entry point without
+  presenting it as a remedy for every operation (ADR-0032 refusal-context
+  amendment 2026-10-08; #1030).
 
 - An attested YUYV IR camera freezes its raw format from the open device
   once negotiation is final, including the Y'CbCr encoding the v4l crate

@@ -42,6 +42,9 @@ pub(super) enum ClassifiedChoice {
 
 /// How split candidates take part in one ranking.
 enum SplitRouting<'a> {
+    /// A proven ordinary override or enrollment choice cannot route a split,
+    /// even if the activation predicate admits Authentication.
+    OrdinaryOnly,
     /// The closed boundary: a split primary binding refuses before any
     /// secondary load, and a ranked split candidate refuses without rerank.
     Closed,
@@ -56,7 +59,7 @@ enum SplitRouting<'a> {
 impl SplitRouting<'_> {
     fn pin(&self) -> Option<&irlume_common::split_key::SplitPairKey> {
         match self {
-            Self::Closed => None,
+            Self::OrdinaryOnly | Self::Closed => None,
             Self::Admitted { pin, .. } => *pin,
         }
     }
@@ -64,10 +67,10 @@ impl SplitRouting<'_> {
 
 /// The class-aware account choice over one prepared request (plan C4, C7).
 ///
-/// While the camera activation predicate does not admit Authentication, a
-/// split candidate keeps the closed refusal, before any secondary load,
-/// and so does a request that does not route accounts: a proven ordinary
-/// override or an operation-scoped enrollment choice never routes a split.
+/// An automatic split primary keeps the activation refusal before any
+/// secondary load while Authentication is not admitted. A request that does
+/// not route accounts refuses split input for the ordinary path's own reason:
+/// a proven ordinary override or enrollment choice never routes a split.
 /// Once admitted, a ranked split candidate becomes a [`SplitChoice`] built
 /// only from the request's retained snapshot, and a pending pin ranks only
 /// its own key: an unenrolled or absent pin denies, with no legacy or
@@ -82,7 +85,7 @@ pub(super) fn select_account_classified(
 ) -> Result<ClassifiedChoice, Outcome> {
     let pin = selection.pending_pin();
     let routing = if !selection.routes_accounts() {
-        SplitRouting::Closed
+        SplitRouting::OrdinaryOnly
     } else if SplitTrustEntry::Authentication.admitted() {
         SplitRouting::Admitted { selection, pin }
     } else if pin.is_some() {
@@ -114,17 +117,17 @@ fn classify(
     if let Err(reason) = legacy_eye_policy(&primary.enrollment) {
         return Err(Outcome::deny(OutcomeKind::SetupUnavailable, reason));
     }
-    // Preserve the closed primary credential boundary. A split credential is
-    // never ordinary input, and this request reached the ordinary path, so the
-    // refusal names that limitation rather than the activation predicate, which
-    // is not what is being refused here.
-    if matches!(routing, SplitRouting::Closed)
-        && matches!(
-            primary.enrollment.camera_binding,
-            Some(irlume_core::storage::CameraBinding::Split(_))
-        )
-    {
-        return Err(ordinary_path_refuses_split());
+    // Refusal precedes secondary loading in both non-admitted contexts, but
+    // only automatic routing can become a split route after activation.
+    if matches!(
+        primary.enrollment.camera_binding,
+        Some(irlume_core::storage::CameraBinding::Split(_))
+    ) {
+        match routing {
+            SplitRouting::OrdinaryOnly => return Err(ordinary_path_refuses_split()),
+            SplitRouting::Closed => return Err(closed_split()),
+            SplitRouting::Admitted { .. } => {}
+        }
     }
     let pin = routing.pin();
     let secondary_path = multi_camera::secondary_store_path(user);
@@ -228,6 +231,7 @@ fn classify(
     let chosen = match selected.key {
         Handle::Ordinary(index) => Chosen::Ordinary(ordinary[index].clone()),
         Handle::Split(index) => match routing {
+            SplitRouting::OrdinaryOnly => return Err(ordinary_path_refuses_split()),
             SplitRouting::Closed => {
                 let _ = &view.split_pairs[index];
                 return Err(closed_split());

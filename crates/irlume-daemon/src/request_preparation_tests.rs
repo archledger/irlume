@@ -178,7 +178,7 @@ mod request_preparation_gates {
                 &mut engine,
             );
             assert!(
-                matches!(response, Response::Error(ref reason) if reason.contains(ORDINARY)),
+                matches!(response, Response::Error(ref reason) if reason.contains(CLOSED)),
                 "{response:?}"
             );
             assert!(recorder.calls().is_empty());
@@ -190,7 +190,7 @@ mod request_preparation_gates {
         let envelope_before = std::fs::read(&envelope_path).unwrap();
         let response = do_unseal_password(&user, None, &mut engine);
         assert!(
-            matches!(response, Response::Error(ref reason) if reason.contains(ORDINARY)),
+            matches!(response, Response::Error(ref reason) if reason.contains(CLOSED)),
             "{response:?}"
         );
         assert!(recorder.calls().is_empty());

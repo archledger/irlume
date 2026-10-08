@@ -46,7 +46,7 @@ impl SplitTrustEntry {
 /// Which preparation observes the camera selection.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectionRoute {
-    /// Every request: a saved selected split keeps the closed refusal.
+    /// An ordinary-only request refuses a saved split for its own limitation.
     Generic,
     /// The account-routed authentication call: while the activation
     /// predicate admits Authentication, a saved selected split is retained
@@ -605,12 +605,13 @@ impl PreparedSelection {
             // standing fallback. Routing ranks only this key (plan C7).
             (rgb.to_owned(), ir.to_owned())
         } else if selected.is_some() || choice.is_some() {
-            // A saved selected split meets a request that names no pair of its
-            // own. This is the ordinary path's own limitation, not the closed
-            // predicate: it refuses the same way once split activation is
-            // admitted. An explicit choice carries its own environment, so only
-            // the selected-split case can land here.
-            let (rgb, ir) = env.ok_or_else(ordinary_path_split_refusal)?;
+            // A generic entry never routes a split. Authentication can retain
+            // the pin after admission, so its closed refusal names activation.
+            // An explicit ordinary choice carries its own environment.
+            let (rgb, ir) = env.ok_or_else(|| match route {
+                SelectionRoute::Generic => ordinary_path_split_refusal(),
+                SelectionRoute::Authentication => split_activation_refusal(),
+            })?;
             let proven = ordinary_pair(&view, &rgb, &ir).ok_or_else(|| {
                 Error::Policy(
                     "ordinary camera override is not a unique Current ordinary pair".into(),

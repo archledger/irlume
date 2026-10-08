@@ -33,9 +33,6 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 const CLOSED: &str = "split enrollment and authentication are not enabled";
-/// The production refusal text, referenced rather than copied so a wording
-/// change cannot leave these expectations stale.
-const ORDINARY: &str = crate::request_preparation::ORDINARY_PATH_SPLIT_REFUSAL;
 const LATE_REFUSAL: &str = "split camera authorization changed during the request";
 const NOT_CONNECTED: &str = "no eligible enrolled camera is connected";
 const IR_FORCED_OFF: &str = "needs both sides and IR is forced off";
@@ -872,10 +869,10 @@ fn split_authentication_stays_closed_without_authentication_admission() {
                 Some("login"),
                 AuthenticationPurpose::Verify,
             );
-            // Ordinary authentication against a split-bound primary refuses
-            // for the ordinary path's own reason, not the closed predicate.
+            // Automatic and pinned authentication can route after admission,
+            // so their refusal must name the activation predicate.
             assert!(
-                !granted(&result) && reply(&result).contains(ORDINARY),
+                !granted(&result) && reply(&result).contains(CLOSED),
                 "{case}: {}",
                 reply(&result)
             );

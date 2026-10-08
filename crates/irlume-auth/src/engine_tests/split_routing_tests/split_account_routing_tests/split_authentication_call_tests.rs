@@ -497,12 +497,13 @@ fn classified_routing_keeps_split_closed_for_an_override_or_enrollment_choice() 
         assert_eq!(unseals, 0);
         assert!(intent.exists() && !secondary_store_path(USER).exists());
         std::fs::remove_file(&intent).unwrap();
-        // A ranked split secondary refuses too, never a choice.
+        // A ranked split secondary is also refused by the ordinary-only
+        // context, despite Authentication being admitted above.
         let primary = rig.primary(absent_binding());
         rig.secondary(&primary, &[("split-desk", GroupPair::Split(Rig::key()))]);
         assert_eq!(
             expect_denied(route(&request, primary, false).0).reason,
-            CLOSED
+            ORDINARY
         );
         std::fs::remove_file(secondary_store_path(USER)).unwrap();
         // Ordinary routing is unchanged.

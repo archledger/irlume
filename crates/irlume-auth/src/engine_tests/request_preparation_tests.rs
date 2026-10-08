@@ -1741,6 +1741,7 @@ fn selected_split_direct_entry_matrix_stops_before_camera_and_publication() {
     let ordinary =
         "this request uses the ordinary camera path, which never opens a split camera pair";
     let mut refusals = Vec::new();
+    let mut authentication_refusals = Vec::new();
     refusals.push(
         devices
             .engine
@@ -1799,7 +1800,7 @@ fn selected_split_direct_entry_matrix_stops_before_camera_and_publication() {
             AuthenticationPurpose::Verify,
             AuthenticationPurpose::CredentialRelease,
         ] {
-            refusals.push(
+            authentication_refusals.push(
                 devices
                     .engine
                     .authenticate_for_in_window_with_policy(
@@ -1843,13 +1844,21 @@ fn selected_split_direct_entry_matrix_stops_before_camera_and_publication() {
             .unwrap_err()
             .to_string(),
     );
-    assert_eq!(refusals.len(), 11);
+    assert_eq!(refusals.len(), 7);
+    assert_eq!(authentication_refusals.len(), 4);
     for refusal in refusals {
         assert!(refusal.contains(ordinary), "{refusal}");
         assert!(
             !refusal.contains("split enrollment and authentication are not enabled"),
             "an ordinary refusal must not blame the closed predicate: {refusal}"
         );
+    }
+    for refusal in authentication_refusals {
+        assert!(
+            refusal.contains("split enrollment and authentication are not enabled"),
+            "account-routed authentication must name its activation gate: {refusal}"
+        );
+        assert!(!refusal.contains(ordinary), "{refusal}");
     }
     assert_eq!(preflights.get(), 0);
     assert!(
@@ -2524,9 +2533,9 @@ fn stored_split_primary_refuses_before_ordinary_camera_acquisition() {
         .unwrap();
     assert!(
         !outcome.granted
-            && outcome.reason.contains(
-                "this request uses the ordinary camera path, which never opens a split camera pair"
-            )
+            && outcome
+                .reason
+                .contains("split enrollment and authentication are not enabled")
     );
     assert!(fixture.recorder.calls().is_empty());
     assert_eq!(

@@ -63,13 +63,26 @@ impl Engine {
         &mut self,
         enrollment: &irlume_core::storage::Enrollment,
     ) -> bool {
-        if !self.recognizer_on_npu() || self.ir_adapter.is_some() || self.ir_adapter_required {
-            return false;
-        }
-        let Some(producer) = self.embed_producer() else {
-            return false;
+        let refusal = if !self.recognizer_on_npu() {
+            Some("the recognizer is on CPU")
+        } else if self.ir_adapter.is_some() || self.ir_adapter_required {
+            Some("an IR adapter is configured")
+        } else {
+            match self.embed_producer() {
+                None => Some("this engine's producer is unknown"),
+                Some(producer) if !every_scan_from(enrollment, &producer) => {
+                    Some("a scan of this enrollment comes from another CPU reference")
+                }
+                Some(_) => None,
+            }
         };
-        every_scan_from(enrollment, &producer)
+        match refusal {
+            None => irlume_common::dlog!("npu: this authentication's probes run on the NPU"),
+            Some(why) => {
+                irlume_common::dlog!("npu: this authentication's probes run on CPU: {why}")
+            }
+        }
+        refusal.is_none()
     }
 
     #[cfg(feature = "npu")]

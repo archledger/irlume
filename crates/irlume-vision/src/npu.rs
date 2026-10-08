@@ -702,17 +702,43 @@ fn compile_guarded<T>(
     marker: &MarkerFile,
     compile: impl FnOnce() -> Result<T, CpuReason>,
 ) -> Result<T, CpuReason> {
+    run_guarded(marker, || (compile(), true))
+}
+
+/// [`compile_guarded`] for an operation that can leave state a later
+/// attempt must not trust: when it answers `false` with its result, the
+/// marker stays armed, so the model stays on CPU for the rest of the boot
+/// (ADR-0022 §10).
+fn run_guarded<T>(
+    marker: &MarkerFile,
+    operation: impl FnOnce() -> (Result<T, CpuReason>, bool),
+) -> Result<T, CpuReason> {
     if marker.state() == Marker::CurrentBoot {
         return Err(CpuReason::DidNotReturn);
     }
     marker
         .arm()
         .map_err(|error| CpuReason::CompileFailed(format!("cannot write the marker: {error}")))?;
-    let compiled = compile();
-    marker
-        .disarm()
-        .map_err(|error| CpuReason::CompileFailed(format!("cannot clear the marker: {error}")))?;
-    compiled
+    let (result, clear) = operation();
+    if clear {
+        marker.disarm().map_err(|error| {
+            CpuReason::CompileFailed(format!("cannot clear the marker: {error}"))
+        })?;
+    }
+    result
+}
+
+/// Remove every file a rejected compile left in `blobs`; any failure is
+/// returned, not ignored.
+fn discard_blobs(blobs: &Path) -> io::Result<()> {
+    let entries = match fs::read_dir(blobs) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        entries => entries?,
+    };
+    for entry in entries {
+        fs::remove_file(entry?.path())?;
+    }
+    Ok(())
 }
 
 /// An NPU model whose every inference is bracketed by its marker, so a
@@ -1162,12 +1188,16 @@ impl Platform {
     ) -> Result<Box<dyn Infer>, CpuReason> {
         let marker = cache.marker_file(model_sha256);
         // The marker stays armed until the loaded libraries are validated
-        // and anything a compile with other bytes wrote is discarded.
-        let inner = compile_guarded(&marker, || {
-            let inner = catch_binding(
+        // and anything a compile with other bytes wrote is discarded; if that
+        // cannot be removed, it stays armed for the rest of the boot.
+        let inner = run_guarded(&marker, || {
+            let inner = match catch_binding(
                 || self.compile_unguarded(cache, model),
                 CpuReason::CompileFailed("the OpenVINO binding panicked while compiling".into()),
-            )?;
+            ) {
+                Ok(inner) => inner,
+                Err(reason) => return (Err(reason), true),
+            };
             // The libraries compiling loaded must be the ones the identity
             // hashed (ADR-0022 §4).
             let loaded = fs::read_to_string(&self.maps)
@@ -1175,14 +1205,18 @@ impl Platform {
                 .and_then(|maps| loaded_as_hashed(&maps, &self.libraries));
             if let Err(why) = loaded {
                 drop(inner);
-                if let Ok(entries) = fs::read_dir(cache.blobs()) {
-                    for entry in entries.flatten() {
-                        let _ = fs::remove_file(entry.path());
-                    }
-                }
-                return Err(CpuReason::CompileFailed(why));
+                return match discard_blobs(&cache.blobs()) {
+                    Ok(()) => (Err(CpuReason::CompileFailed(why)), true),
+                    Err(error) => (
+                        Err(CpuReason::CompileFailed(format!(
+                            "{why}; its cache output could not be removed ({error}), so its \
+                             marker stays for this boot"
+                        ))),
+                        false,
+                    ),
+                };
             }
-            Ok(inner)
+            (Ok(inner), true)
         })?;
         Ok(Box::new(Marked { inner, marker }))
     }
@@ -1778,6 +1812,30 @@ mod tests {
             let later = suspended(Bound::AtLeast).unwrap();
             assert!(baseline <= later, "{baseline:?} > {later:?}");
         }
+    }
+
+    #[test]
+    fn an_operation_that_leaves_untrusted_state_keeps_its_marker() {
+        let base = tempfile::tempdir().unwrap();
+        let cache = Cache::prepare(base.path(), &identity(), "boot-a").unwrap();
+        let sha = "3".repeat(64);
+        let result: Result<(), _> = run_guarded(&cache.marker_file(&sha), || {
+            (Err(CpuReason::CompileFailed("rejected".into())), false)
+        });
+        assert!(result.is_err());
+        assert_eq!(cache.marker(&sha), Marker::CurrentBoot, "kept armed");
+        let again: Result<(), _> = compile_guarded(&cache.marker_file(&sha), || Ok(()));
+        assert_eq!(again, Err(CpuReason::DidNotReturn), "not retried this boot");
+
+        // A cleanup that cannot remove what the compile left reports it.
+        let blobs = base.path().join("leftover");
+        fs::create_dir_all(blobs.join("a directory, not a blob")).unwrap();
+        assert!(discard_blobs(&blobs).is_err());
+        fs::remove_dir(blobs.join("a directory, not a blob")).unwrap();
+        fs::write(blobs.join("model.blob"), b"x").unwrap();
+        assert!(discard_blobs(&blobs).is_ok());
+        assert_eq!(fs::read_dir(&blobs).unwrap().count(), 0);
+        assert!(discard_blobs(&base.path().join("absent")).is_ok());
     }
 
     #[test]

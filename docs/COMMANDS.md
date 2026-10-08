@@ -96,6 +96,48 @@ Conventions that apply everywhere:
 These commands manage the authorization store described by ADR-0032; they
 do not enable split-pair enrollment or authentication.
 
+### Two different refusals
+
+Ordinary requests that encounter a saved split selection or split-bound
+primary credential refuse because the ordinary camera path does not open
+split camera pairs. Split-specific requests refused by the closed activation
+gate retain the separate activation message. The distinction is per request
+context, not per split-related state.
+
+Both refuse before any camera work, and neither falls back to another camera.
+
+```
+policy: this request uses the ordinary camera path, which never opens a split camera pair; explicit split enrollment uses `irlume enroll --split-camera-choice`
+```
+
+The ordinary-path refusal covers `enroll` without a split choice,
+`profiles add-scan`, `identify`, positioning and the support probe. It describes
+the request that was made, so it stays accurate whatever the split activation
+state is, and it never reports a closed gate.
+
+```
+policy: split enrollment and authentication are not enabled
+```
+
+That is the activation message. It covers `enroll --split-camera-choice`,
+`enroll --add-camera --split-camera-choice` and the declared split entries,
+which are refused because activation is closed rather than because of anything
+about the request. `irlume split` commands are unaffected by either refusal;
+they report the authorization store.
+
+The trailing clause of the ordinary-path refusal names the explicit
+split-enrollment entry point; it is not a remedy for the refused operation.
+`identify`, `profiles add-scan` and positioning have no split counterpart yet,
+and the `irlume split` subcommands below manage authorization only, so they are
+not a remedy for any of these refusals either. The enrollment entry point is
+itself refused while split activation is closed, and then reports the
+activation message above:
+
+```
+$ irlume enroll --split-camera-choice '<listing JSON>'
+policy: split enrollment and authentication are not enabled
+```
+
 | Command | Sudo | What it does |
 |---|---|---|
 | `irlume split list` | for full facts | list saved authorizations and current role-classified candidate sides, including when the store is empty |
@@ -227,7 +269,11 @@ enrollment requires the same complete primary binding; missing, repeated or
 malformed values are usage errors before a request is sent; and an older
 daemon reports that split enrollment needs an upgrade, with no retry as
 another operation. The two choice flags cannot be combined. The daemon refuses
-split enrollment until activation, and the client prints its reply as is.
+split enrollment until activation, and the client prints its reply as is. An
+ordinary `enroll` against a saved split selection or a split-bound account
+refuses for the separate ordinary-path reason described under
+[Two different refusals](#two-different-refusals); this flag is the supported
+alternative.
 
 Adding or replacing trusted faces requires OS authorization for a non-root account owner. This covers `enroll`, `enroll --reset`, and `profiles add-scan`, including the guided TUI and direct socket clients. Each request needs its own authorization; root retains administrative access. A successful replacement preserves the existing template key and recovery setup, and failed capture preserves the old enrollment.
 

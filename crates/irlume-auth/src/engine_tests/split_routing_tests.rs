@@ -22,6 +22,9 @@ use irlume_camera::lease::CameraOperationKind::{
 };
 
 const CLOSED: &str = "split enrollment and authentication are not enabled";
+/// The production refusal text, referenced rather than copied so a wording
+/// change cannot leave these expectations stale.
+pub(super) const ORDINARY: &str = crate::request_preparation::ORDINARY_PATH_SPLIT_REFUSAL;
 const RGB: &str = "/dev/irlume-split-routing-rgb";
 const IR: &str = "/dev/irlume-split-routing-ir";
 const SPLIT_KEY: &str = "split1;1234:0001:rgb|0000:00:14.0|usb2|8;1234:0002:ir|0000:00:14.0|usb2|5";

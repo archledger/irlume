@@ -605,11 +605,12 @@ impl PreparedSelection {
             // standing fallback. Routing ranks only this key (plan C7).
             (rgb.to_owned(), ir.to_owned())
         } else if selected.is_some() || choice.is_some() {
-            let (rgb, ir) = env.ok_or_else(|| {
-                Error::Policy(
-                    irlume_camera::lease::CameraLeaseError::SplitActivationDisabled.to_string(),
-                )
-            })?;
+            // A saved selected split meets a request that names no pair of its
+            // own. This is the ordinary path's own limitation, not the closed
+            // predicate: it refuses the same way once split activation is
+            // admitted. An explicit choice carries its own environment, so only
+            // the selected-split case can land here.
+            let (rgb, ir) = env.ok_or_else(ordinary_path_split_refusal)?;
             let proven = ordinary_pair(&view, &rgb, &ir).ok_or_else(|| {
                 Error::Policy(
                     "ordinary camera override is not a unique Current ordinary pair".into(),
@@ -760,6 +761,28 @@ fn split_external_policy(pair: &irlume_camera::SplitPair) -> irlume_common::Resu
 
 fn split_activation_refusal() -> Error {
     Error::Policy(irlume_camera::lease::CameraLeaseError::SplitActivationDisabled.to_string())
+}
+
+/// The ordinary path's own limitation, stated without reference to the split
+/// activation predicate: an ordinary request never opens a split camera pair,
+/// so this refusal stays true once split activation is admitted, and it never
+/// claims the predicate is what is refused.
+///
+/// One shared sentence serves identify, enrollment, add-scan, positioning and
+/// the support probe. The trailing clause names the explicit split-enrollment
+/// entry point; it is not a remedy for the refused operation. `identify`,
+/// `profiles add-scan` and positioning have no split counterpart. The
+/// `irlume split` subcommands are a separate, authorization-only interface and
+/// are not a remedy either. docs/COMMANDS.md carries this per request context,
+/// together with the closed-gate refusal a split-specific request keeps.
+pub(crate) const ORDINARY_PATH_SPLIT_REFUSAL: &str =
+    "this request uses the ordinary camera path, which never opens a split camera pair; \
+     explicit split enrollment uses `irlume enroll --split-camera-choice`";
+
+/// [`ORDINARY_PATH_SPLIT_REFUSAL`] as an [`Error`], for the camera-selection
+/// gates an ordinary request reaches.
+pub(crate) fn ordinary_path_split_refusal() -> Error {
+    Error::Policy(ORDINARY_PATH_SPLIT_REFUSAL.to_string())
 }
 
 pub(crate) fn ordinary_environment_pair() -> Option<(String, String)> {
@@ -1362,7 +1385,10 @@ impl Engine {
     /// The gate before every probe, preflight, capture, lease and publication.
     /// A retained split passes only for its declared, admitted Engine entry;
     /// every other caller, including public ordinary entries, keeps the closed
-    /// refusal. Non-split selections are validated exactly as before.
+    /// refusal. A retained pin or split entry belongs to split-specific
+    /// routing, so this gate is not where an ordinary request meets a saved
+    /// selection: observe_choice refuses that earlier, with the ordinary-path
+    /// reason. Non-split selections are validated exactly as before.
     pub(crate) fn validate_camera_request(&self) -> irlume_common::Result<()> {
         if self
             .camera_selection
@@ -1395,7 +1421,10 @@ impl Engine {
     pub fn prepare_camera_request(&mut self) -> irlume_common::Result<CameraRequestScope<'_>> {
         if let Some(selection) = &self.camera_selection {
             // No nested generic entry runs on a pending pin's standing
-            // devices or on a routed split's halves (plan D3, D8).
+            // devices or on a routed split's halves (plan D3, D8). A pin and a
+            // routed split entry both belong to split-specific routing, so this
+            // gate keeps the closed-activation refusal; the ordinary path's own
+            // encounters are refused earlier, in observe_choice.
             if selection.authentication_routed() {
                 return Err(split_activation_refusal());
             }

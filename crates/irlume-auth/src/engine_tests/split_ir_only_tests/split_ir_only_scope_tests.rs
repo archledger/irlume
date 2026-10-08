@@ -284,10 +284,12 @@ fn a_closed_pin_refuses_ir_only_authentication_before_any_storage_work() {
                 Some(&Rig::key()),
                 "{conf:?}"
             );
-            let closed = outer.validate_camera_request();
+            // A pending pin belongs to split-specific routing, so this gate
+            // keeps the closed-activation refusal.
+            let refused = outer.validate_camera_request();
             assert!(
-                matches!(&closed, Err(error) if error.to_string().contains(CLOSED)),
-                "{conf:?}: {closed:?}"
+                matches!(&refused, Err(error) if error.to_string().contains(CLOSED)),
+                "{conf:?}: {refused:?}"
             );
             // Readiness already validates first.
             let readiness = outer.ir_only_preflight_details(USER);

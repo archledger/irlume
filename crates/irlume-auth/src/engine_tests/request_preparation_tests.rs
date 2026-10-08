@@ -1585,6 +1585,45 @@ fn operation_choice_group_refusal_after_preparation_cannot_recover_forward() {
     assert!(!intent.exists());
 }
 
+/// A wording contract on the shared ordinary-path refusal, not an execution
+/// test of split activation.
+///
+/// This asserts properties of one constant. It never installs or enables the
+/// activation predicate, never admits a split trust entry and never reaches a
+/// camera, an engine or storage, so it says nothing about what a build with
+/// production activation would do at runtime. The admitted-state invariant is
+/// covered elsewhere, by
+/// `pinned_split_routes_only_its_key_with_no_legacy_or_ordinary_fallback`,
+/// which admits split authentication trust and shows an ordinary preparation
+/// refusing on a saved selection before any camera work.
+///
+/// What this pins is that the sentence stays true once activation is admitted:
+/// it must describe the ordinary path rather than the predicate, and the clause
+/// it carries must name the split-enrollment entry point without presenting
+/// that command as a remedy for every refused operation.
+#[test]
+fn ordinary_split_refusal_wording_is_activation_independent() {
+    let text = crate::request_preparation::ORDINARY_PATH_SPLIT_REFUSAL;
+    assert!(text.contains("ordinary camera path"), "{text}");
+    assert!(text.contains("never opens a split camera pair"), "{text}");
+    assert!(
+        text.contains("explicit split enrollment uses `irlume enroll --split-camera-choice`"),
+        "the split-enrollment entry point must be named: {text}"
+    );
+    for remedy in ["identify", "add-scan", "positioning", "remedy", "instead"] {
+        assert!(
+            !text.contains(remedy),
+            "the shared sentence must not offer {remedy} as a remedy: {text}"
+        );
+    }
+    for predicate in ["not enabled", "activation", "disabled", "is closed"] {
+        assert!(
+            !text.contains(predicate),
+            "an ordinary refusal may not depend on the activation predicate ({predicate}): {text}"
+        );
+    }
+}
+
 #[test]
 fn selected_split_enroll_refuses_before_preflight_and_lease() {
     let _env = env_guard();
@@ -1614,10 +1653,9 @@ fn selected_split_enroll_refuses_before_preflight_and_lease() {
         "{:?}",
         fixture.recorder.calls()
     );
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("split enrollment and authentication are not enabled"));
+    assert!(result.unwrap_err().to_string().contains(
+        "this request uses the ordinary camera path, which never opens a split camera pair"
+    ));
     assert!(!fixture.dir.join("request-fixture.json").exists());
 }
 
@@ -1700,7 +1738,8 @@ fn selected_split_direct_entry_matrix_stops_before_camera_and_publication() {
     )
     .unwrap();
     let preflights = Cell::new(0);
-    let closed = "split enrollment and authentication are not enabled";
+    let ordinary =
+        "this request uses the ordinary camera path, which never opens a split camera pair";
     let mut refusals = Vec::new();
     refusals.push(
         devices
@@ -1806,7 +1845,11 @@ fn selected_split_direct_entry_matrix_stops_before_camera_and_publication() {
     );
     assert_eq!(refusals.len(), 11);
     for refusal in refusals {
-        assert!(refusal.contains(closed), "{refusal}");
+        assert!(refusal.contains(ordinary), "{refusal}");
+        assert!(
+            !refusal.contains("split enrollment and authentication are not enabled"),
+            "an ordinary refusal must not blame the closed predicate: {refusal}"
+        );
     }
     assert_eq!(preflights.get(), 0);
     assert!(
@@ -2481,9 +2524,9 @@ fn stored_split_primary_refuses_before_ordinary_camera_acquisition() {
         .unwrap();
     assert!(
         !outcome.granted
-            && outcome
-                .reason
-                .contains("split enrollment and authentication are not enabled")
+            && outcome.reason.contains(
+                "this request uses the ordinary camera path, which never opens a split camera pair"
+            )
     );
     assert!(fixture.recorder.calls().is_empty());
     assert_eq!(

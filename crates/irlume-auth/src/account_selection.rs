@@ -114,14 +114,17 @@ fn classify(
     if let Err(reason) = legacy_eye_policy(&primary.enrollment) {
         return Err(Outcome::deny(OutcomeKind::SetupUnavailable, reason));
     }
-    // Preserve the closed primary credential boundary until split activation.
+    // Preserve the closed primary credential boundary. A split credential is
+    // never ordinary input, and this request reached the ordinary path, so the
+    // refusal names that limitation rather than the activation predicate, which
+    // is not what is being refused here.
     if matches!(routing, SplitRouting::Closed)
         && matches!(
             primary.enrollment.camera_binding,
             Some(irlume_core::storage::CameraBinding::Split(_))
         )
     {
-        return Err(closed_split());
+        return Err(ordinary_path_refuses_split());
     }
     let pin = routing.pin();
     let secondary_path = multi_camera::secondary_store_path(user);
@@ -331,5 +334,17 @@ fn closed_split() -> Outcome {
         OutcomeKind::OtherDeny,
         OutcomeCause::NotEnrolledOnThisCamera,
         "split enrollment and authentication are not enabled",
+    )
+}
+
+/// An ordinary request against a split-bound account: the ordinary path never
+/// opens a split camera pair. Kept separate from [`closed_split`], which is the
+/// genuine closed-predicate refusal for a split-specific request whose
+/// admission was withdrawn.
+fn ordinary_path_refuses_split() -> Outcome {
+    Outcome::deny_because(
+        OutcomeKind::OtherDeny,
+        OutcomeCause::NotEnrolledOnThisCamera,
+        crate::request_preparation::ORDINARY_PATH_SPLIT_REFUSAL,
     )
 }

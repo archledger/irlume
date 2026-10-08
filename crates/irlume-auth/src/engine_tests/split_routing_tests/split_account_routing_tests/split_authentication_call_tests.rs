@@ -487,12 +487,13 @@ fn classified_routing_keeps_split_closed_for_an_override_or_enrollment_choice() 
                 .unwrap()
         };
         assert!(!request.camera_selection.as_ref().unwrap().routes_accounts());
-        // A split primary refuses with the closed text before any
-        // secondary load, as with the closed predicate (plan D1, D8).
+        // A split primary refuses before any secondary load (plan D1, D8).
+        // An override or enrollment choice is an ordinary entry meeting that
+        // credential, so it refuses for the ordinary path's own reason.
         let intent = plant_pending_intent();
         let (choice, unseals) = route(&request, rig.primary(split_binding()), false);
         let denied = expect_denied(choice);
-        assert_eq!(denied.reason, CLOSED, "enrollment={enrollment_choice}");
+        assert_eq!(denied.reason, ORDINARY, "enrollment={enrollment_choice}");
         assert_eq!(unseals, 0);
         assert!(intent.exists() && !secondary_store_path(USER).exists());
         std::fs::remove_file(&intent).unwrap();

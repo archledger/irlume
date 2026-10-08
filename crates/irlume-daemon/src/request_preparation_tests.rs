@@ -9,6 +9,12 @@ mod request_preparation_gates {
     const RGB: &str = "/dev/irlume-request-fixture-rgb";
     const IR: &str = "/dev/irlume-request-fixture-ir";
     const CLOSED: &str = "split enrollment and authentication are not enabled";
+    /// An ordinary request that meets a saved split selection. It refuses
+    /// because the ordinary path never opens a split camera pair, which stays
+    /// true once split activation is admitted, so the text must not blame the
+    /// closed predicate.
+    const ORDINARY: &str =
+        "this request uses the ordinary camera path, which never opens a split camera pair";
 
     struct Environment(Vec<(&'static str, Option<std::ffi::OsString>)>);
     impl Environment {
@@ -140,12 +146,18 @@ mod request_preparation_gates {
             Request::Identify,
             Request::IdentifyFor { user: user.clone() },
             Request::PositionSample { user: None },
+            Request::PositionSession { user: None },
+            Request::SupportProbe { since_ms: 0 },
         ];
         for request in requests {
             let response = dispatch(request, &peer(0), &mut engine);
             assert!(
-                matches!(response, Response::Error(ref reason) if reason.contains(CLOSED)),
+                matches!(response, Response::Error(ref reason) if reason.contains(ORDINARY)),
                 "{response:?}"
+            );
+            assert!(
+                !format!("{response:?}").contains(CLOSED),
+                "an ordinary refusal must not blame the closed predicate: {response:?}"
             );
             assert!(recorder.calls().is_empty(), "{:?}", recorder.calls());
         }
@@ -165,7 +177,10 @@ mod request_preparation_gates {
                 &peer(0),
                 &mut engine,
             );
-            assert!(format!("{response:?}").contains(CLOSED), "{response:?}");
+            assert!(
+                matches!(response, Response::Error(ref reason) if reason.contains(ORDINARY)),
+                "{response:?}"
+            );
             assert!(recorder.calls().is_empty());
         }
         // The actual face-backed release helper retains its normal retry/key
@@ -175,7 +190,7 @@ mod request_preparation_gates {
         let envelope_before = std::fs::read(&envelope_path).unwrap();
         let response = do_unseal_password(&user, None, &mut engine);
         assert!(
-            matches!(response, Response::Error(ref reason) if reason.contains(CLOSED)),
+            matches!(response, Response::Error(ref reason) if reason.contains(ORDINARY)),
             "{response:?}"
         );
         assert!(recorder.calls().is_empty());
@@ -220,7 +235,7 @@ mod request_preparation_gates {
                 None,
             );
             assert!(
-                matches!(reply.response, Response::Error(ref reason) if reason.contains(CLOSED)),
+                matches!(reply.response, Response::Error(ref reason) if reason.contains(ORDINARY)),
                 "{:?}",
                 reply.response
             );
@@ -252,7 +267,7 @@ mod request_preparation_gates {
             Some(&worker),
         );
         assert!(
-            matches!(reply.response, Response::Error(ref reason) if reason.contains(CLOSED)),
+            matches!(reply.response, Response::Error(ref reason) if reason.contains(ORDINARY)),
             "{:?}",
             reply.response
         );

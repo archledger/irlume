@@ -9458,7 +9458,9 @@ impl Engine {
             ..
         } = snapshot;
         // Account-wide policy belongs to the real primary, not the bridge's
-        // default fields. Split credentials never become legacy ordinary input.
+        // default fields. Split credentials never become legacy ordinary input,
+        // and this attempt reached the ordinary path, so the refusal names that
+        // limitation rather than the activation predicate.
         if let Err(reason) = legacy_eye_policy(&primary) {
             return Err(Outcome::deny(OutcomeKind::SetupUnavailable, reason));
         }
@@ -9469,7 +9471,7 @@ impl Engine {
             return Err(Outcome::deny_because(
                 OutcomeKind::OtherDeny,
                 OutcomeCause::NotEnrolledOnThisCamera,
-                "split enrollment and authentication are not enabled",
+                request_preparation::ORDINARY_PATH_SPLIT_REFUSAL,
             ));
         }
         let live_binding = irlume_core::multi_camera::GroupPair::Ordinary {

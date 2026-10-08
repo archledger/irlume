@@ -27,9 +27,8 @@
   in three sessions of each of six processes pinned to P-cores, E-cores, both,
   and single cores of either type.
 - **How:** the ignored tests in `crates/irlume-vision/src/onnx/npu_tests.rs`
-  at commit `c970fe928330ad63b3aeaab8102a5d2f75876317` (branch
-  `feat/npu-vision-runtime`, which implements this ADR and adds the `npu`
-  feature), for example
+  at commit `a8175c5c9dca0d6be8fbe158583bf5a2003d5942` (pull request #1042,
+  which implements this ADR and adds the `npu` feature), for example
   `ulimit -c 0; cargo test -p irlume-vision --features npu --release --lib -- --ignored npu_hw_ --test-threads 1 --nocapture`
   (`IRLUME_NPU_TEST_MODELS` names the model directory, `IRLUME_NPU_EVAL_DIR`
   the recorded frames). The recorded frames are read into memory only; no

@@ -247,6 +247,17 @@ impl Engine {
         diagnostics: &dyn DiagnosticSink,
         observer: &dyn EnrollmentObserver,
     ) -> irlume_common::Result<Vec<CapturedScan>> {
+        // Whole-call rows (ADR-0032 step 5) script this loop's scans through
+        // the test-support evidence registry instead of opening devices. No
+        // script installed runs the real capture below; the lease, gates,
+        // validation and publication around it are unchanged either way.
+        // The retained enrollment scope names the expected complete key, so
+        // only a script bound to it is honored.
+        if let Some(batch) =
+            crate::split_evidence::take_capture_batch(operation, self.installed_split_key())?
+        {
+            return Ok(batch);
+        }
         let mode = split_capture_mode_selection();
         crate::emit_capture_context(&mode, true, diagnostics);
         self.capture_scan_loop(

@@ -176,6 +176,16 @@ jobs:
           cargo test --locked -p irlume-camera --features capture-timing --lib
           RUSTDOCFLAGS="-D warnings" cargo doc --locked -p irlume-auth -p irlume-camera --features irlume-auth/ir-only-evaluation --no-deps
 
+      # The default-off NPU backend (ADR-0022) is cfg-gated, so the default
+      # workspace checks skip it. Its tests need no NPU and no OpenVINO: an
+      # absent runtime is one of the CPU answers they check; the hardware
+      # test is ignored.
+      - name: Optional NPU inference checks (no NPU)
+        run: |
+          cargo clippy --locked -p irlume-vision --features npu --all-targets -- -D warnings
+          cargo test --locked -p irlume-vision --features npu --lib
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked -p irlume-vision --features npu --no-deps
+
       # Optional ONNX Runtime execution providers are compile-time APIs. The
       # default CPU build cannot catch an upstream rename in one of these paths
       # (issue #454), so compile every supported provider independently and in

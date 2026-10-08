@@ -213,6 +213,12 @@ mod npu_enrollment_tests {
             probe.iter().all(|v| (v - constant).abs() < 1e-6),
             "the probe came from the NPU"
         );
+        let certified_probe = passing.embed(&chip).unwrap();
+        assert!(
+            certified_probe.iter().all(|v| (v - constant).abs() < 1e-6),
+            "the certified embedder answered from the NPU"
+        );
+        assert_eq!(passing.npu_device(), crate::npu::Device::Npu);
         assert_eq!(placed.npu_device(), crate::npu::Device::Npu);
     }
 }
@@ -468,7 +474,10 @@ mod npu_hardware {
             .unwrap();
         assert_eq!(certified.npu_device(), Device::Npu);
         assert!(!certified.npu.resumed_since_check());
-        eprintln!("suspended so far this boot: {:?}", crate::npu::suspended());
+        eprintln!(
+            "suspended so far this boot: {:?}",
+            crate::npu::suspended(crate::npu::Bound::AtLeast)
+        );
         let (a, _) = cpu
             .embed_preprocessed_with_norm(&npu_reference::chip(0))
             .unwrap();

@@ -170,13 +170,23 @@ pub struct Certification {
 pub const CERTIFIED: &[Certification] = &[];
 
 /// The entry certifying `model_sha256` for `identity` against the loaded
-/// ONNX Runtime `onnx_runtime`, if any (ADR-0022 §3).
+/// ONNX Runtime `onnx_runtime` and the wired `thresholds` that consume the
+/// output, if any (ADR-0022 §3). An entry certified at other threshold
+/// values, or for another set of thresholds, does not apply: its measured
+/// drift was judged at its own operating points.
 pub fn certification(
     model_sha256: &str,
     identity: &Identity,
     onnx_runtime: &str,
+    thresholds: &[(&str, f32)],
 ) -> Option<&'static Certification> {
-    certification_in(CERTIFIED, model_sha256, &identity.digest(), onnx_runtime)
+    certification_in(
+        CERTIFIED,
+        model_sha256,
+        &identity.digest(),
+        onnx_runtime,
+        thresholds,
+    )
 }
 
 fn certification_in<'t>(
@@ -184,12 +194,30 @@ fn certification_in<'t>(
     model_sha256: &str,
     identity_digest: &str,
     onnx_runtime: &str,
+    thresholds: &[(&str, f32)],
 ) -> Option<&'t Certification> {
     table.iter().find(|entry| {
         entry.model_sha256 == model_sha256
             && entry.identity_digest == identity_digest
             && entry.onnx_runtime == onnx_runtime
+            && same_thresholds(entry.thresholds, thresholds)
     })
+}
+
+/// The same names, each once on both sides, with bit-identical values, in
+/// any order.
+fn same_thresholds(certified: &[(&str, f32)], wired: &[(&str, f32)]) -> bool {
+    let once = |list: &[(&str, f32)], name: &str| {
+        list.iter().filter(|(listed, _)| *listed == name).count() == 1
+    };
+    certified.len() == wired.len()
+        && certified.iter().all(|(name, value)| {
+            once(certified, name)
+                && once(wired, name)
+                && wired.iter().any(|(wired_name, wired_value)| {
+                    wired_name == name && wired_value.to_bits() == value.to_bits()
+                })
+        })
 }
 
 /// What `settings.conf` holds for the `npu` key.
@@ -345,7 +373,7 @@ impl Slot {
     /// Record that the entry's digests were just reproduced.
     pub(crate) fn note_checked(&mut self) {
         if let State::Npu { checked_at, .. } = &mut self.state {
-            *checked_at = suspended();
+            *checked_at = suspended(Bound::AtMost);
         }
     }
 
@@ -361,7 +389,7 @@ impl Slot {
         else {
             return false;
         };
-        match (checked_at, suspended()) {
+        match (checked_at, suspended(Bound::AtLeast)) {
             (Some(then), Some(now)) => now > *then + RESUME_GRANULARITY,
             _ => true,
         }
@@ -426,11 +454,24 @@ impl Default for Slot {
 /// Growth of [`suspended`] below this is read jitter, not a suspend.
 const RESUME_GRANULARITY: Duration = Duration::from_millis(1);
 
+/// Which side of the true value a [`suspended`] reading may fall on.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Bound {
+    /// Never more than the time suspended: for the baseline of a check.
+    AtMost,
+    /// Never less than the time suspended: for the comparison against it.
+    AtLeast,
+}
+
 /// How long the system has been suspended since boot: `CLOCK_BOOTTIME`
 /// counts suspended time and `CLOCK_MONOTONIC` does not (clock_gettime(2)).
 /// The NPU's runtime power-down while idle is not a system suspend and does
-/// not count.
-pub(crate) fn suspended() -> Option<Duration> {
+/// not count. A delay between the two reads, such as a preemption, moves
+/// the result toward `bound`: reading `CLOCK_BOOTTIME` first can only
+/// understate, and `CLOCK_MONOTONIC` first can only overstate. A baseline
+/// read [`Bound::AtMost`] and a later reading [`Bound::AtLeast`] therefore
+/// never hide a suspend; a delay can only cause an extra check.
+pub(crate) fn suspended(bound: Bound) -> Option<Duration> {
     fn read(clock: libc::clockid_t) -> Option<Duration> {
         let mut ts = libc::timespec {
             tv_sec: 0,
@@ -446,9 +487,17 @@ pub(crate) fn suspended() -> Option<Duration> {
             u32::try_from(ts.tv_nsec).ok()?,
         ))
     }
-    // Monotonic first, so read jitter only ever adds to the result.
-    let monotonic = read(libc::CLOCK_MONOTONIC)?;
-    read(libc::CLOCK_BOOTTIME)?.checked_sub(monotonic)
+    let (boottime, monotonic) = match bound {
+        Bound::AtMost => {
+            let boottime = read(libc::CLOCK_BOOTTIME)?;
+            (boottime, read(libc::CLOCK_MONOTONIC)?)
+        }
+        Bound::AtLeast => {
+            let monotonic = read(libc::CLOCK_MONOTONIC)?;
+            (read(libc::CLOCK_BOOTTIME)?, monotonic)
+        }
+    };
+    Some(boottime.saturating_sub(monotonic))
 }
 
 /// The boot this process runs in, for markers.
@@ -1242,6 +1291,7 @@ struct Open {
     platform: Platform,
     cache: Cache,
     onnx_runtime: String,
+    thresholds: Vec<(String, f32)>,
 }
 
 impl Context {
@@ -1253,15 +1303,21 @@ impl Context {
     }
 
     /// Open the platform and prepare its cache under `cache_base`, with
-    /// `onnx_runtime` the version of the ONNX Runtime the CPU sessions use.
-    /// A failure is kept as the reason every model then runs on CPU.
-    pub fn open(cache_base: &Path, onnx_runtime: &str) -> Self {
+    /// `onnx_runtime` the version of the ONNX Runtime the CPU sessions use
+    /// and `thresholds` the wired thresholds, by constant name, that consume
+    /// the recognizer's output. A failure is kept as the reason every model
+    /// then runs on CPU.
+    pub fn open(cache_base: &Path, onnx_runtime: &str, thresholds: &[(&str, f32)]) -> Self {
         Self {
-            state: Self::open_state(cache_base, onnx_runtime),
+            state: Self::open_state(cache_base, onnx_runtime, thresholds),
         }
     }
 
-    fn open_state(cache_base: &Path, onnx_runtime: &str) -> Result<Open, CpuReason> {
+    fn open_state(
+        cache_base: &Path,
+        onnx_runtime: &str,
+        thresholds: &[(&str, f32)],
+    ) -> Result<Open, CpuReason> {
         let boot = boot_id()
             .map_err(|error| CpuReason::IdentityUnreadable(format!("boot id: {error}")))?;
         // Discovery loads the plugin and queries the device before there
@@ -1286,6 +1342,10 @@ impl Context {
             platform,
             cache,
             onnx_runtime: onnx_runtime.to_owned(),
+            thresholds: thresholds
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), *value))
+                .collect(),
         })
     }
 
@@ -1298,16 +1358,25 @@ impl Context {
         self.state.as_ref().map(|open| open.platform.identity())
     }
 
-    /// Place one model: on the NPU when it is certified for this platform
-    /// and CPU reference and compiles, on CPU with the reason otherwise
-    /// (ADR-0022 §3, §9).
+    /// Place one model: on the NPU when it is certified for this platform,
+    /// CPU reference and thresholds and compiles, on CPU with the reason
+    /// otherwise (ADR-0022 §3, §9).
     pub fn slot(&mut self, model: &[u8], model_sha256: &str) -> Slot {
         let open = match &mut self.state {
             Ok(open) => open,
             Err(reason) => return Slot::cpu(reason.clone()),
         };
-        let Some(entry) = certification(model_sha256, open.platform.identity(), &open.onnx_runtime)
-        else {
+        let thresholds: Vec<(&str, f32)> = open
+            .thresholds
+            .iter()
+            .map(|(name, value)| (name.as_str(), *value))
+            .collect();
+        let Some(entry) = certification(
+            model_sha256,
+            open.platform.identity(),
+            &open.onnx_runtime,
+            &thresholds,
+        ) else {
             return Slot::cpu(CpuReason::NotCertified);
         };
         match open.platform.compile(&open.cache, model, model_sha256) {
@@ -1374,7 +1443,7 @@ mod tests {
     fn the_shipped_table_certifies_nothing() {
         // Changes only with certification evidence (ADR-0022 Phasing 3).
         assert_eq!(CERTIFIED.len(), 0);
-        assert!(certification(&"0".repeat(64), &identity(), "1.28.1").is_none());
+        assert!(certification(&"0".repeat(64), &identity(), "1.28.1", &[]).is_none());
     }
 
     #[test]
@@ -1394,17 +1463,41 @@ mod tests {
             npu_reference_digest: "d",
             evidence: "test",
         }];
-        let found = certification_in(&table, &model, &digest, "1.28.1");
+        let wired = [("RGB_MATCH_THRESHOLD", 0.55)];
+        let found = certification_in(&table, &model, &digest, "1.28.1", &wired);
         assert_eq!(found.map(|entry| entry.role), Some(Role::Recognizer));
         assert_eq!(found.map(|entry| entry.npu_reference_digest), Some("d"));
-        assert!(certification_in(&table, &"b".repeat(64), &digest, "1.28.1").is_none());
+        assert!(certification_in(&table, &"b".repeat(64), &digest, "1.28.1", &wired).is_none());
         assert!(
-            certification_in(&table, &model, &digest, "1.29.0").is_none(),
+            certification_in(&table, &model, &digest, "1.29.0", &wired).is_none(),
             "another CPU reference is not certified"
         );
         let mut other = identity();
         other.firmware = "another firmware build".into();
-        assert!(certification_in(&table, &model, &other.digest(), "1.28.1").is_none());
+        assert!(certification_in(&table, &model, &other.digest(), "1.28.1", &wired).is_none());
+        // A moved threshold, an added one, a missing one or a renamed one
+        // is another operating point.
+        for wired in [
+            &[("RGB_MATCH_THRESHOLD", 0.56)][..],
+            &[("RGB_MATCH_THRESHOLD", 0.55), ("IR_MATCH_THRESHOLD", 0.5)][..],
+            &[][..],
+            &[("IR_MATCH_THRESHOLD", 0.55)][..],
+            &[("RGB_MATCH_THRESHOLD", 0.55), ("RGB_MATCH_THRESHOLD", 0.55)][..],
+        ] {
+            assert!(
+                certification_in(&table, &model, &digest, "1.28.1", wired).is_none(),
+                "{wired:?}"
+            );
+        }
+        // A name listed twice in an entry cannot stand in for a missing one.
+        assert!(!same_thresholds(
+            &[("RGB_MATCH_THRESHOLD", 0.55), ("RGB_MATCH_THRESHOLD", 0.55)],
+            &[("RGB_MATCH_THRESHOLD", 0.55), ("IR_MATCH_THRESHOLD", 0.5)],
+        ));
+        assert!(same_thresholds(
+            &[("RGB_MATCH_THRESHOLD", 0.55), ("IR_MATCH_THRESHOLD", 0.5)],
+            &[("IR_MATCH_THRESHOLD", 0.5), ("RGB_MATCH_THRESHOLD", 0.55)],
+        ));
     }
 
     #[test]
@@ -1594,6 +1687,15 @@ mod tests {
             "a temporary file that was never renamed is cleared"
         );
         assert_eq!(cache.marker(&sha), Marker::Absent);
+    }
+
+    #[test]
+    fn a_suspend_baseline_never_exceeds_a_later_reading() {
+        for _ in 0..1000 {
+            let baseline = suspended(Bound::AtMost).unwrap();
+            let later = suspended(Bound::AtLeast).unwrap();
+            assert!(baseline <= later, "{baseline:?} > {later:?}");
+        }
     }
 
     #[test]
@@ -1872,7 +1974,7 @@ mod tests {
             boot_id().unwrap(),
         )
         .unwrap();
-        let context = Context::open(base.path(), "1.28.1");
+        let context = Context::open(base.path(), "1.28.1", &[]);
         assert_eq!(context.identity().err(), Some(&CpuReason::DidNotReturn));
     }
 

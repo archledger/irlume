@@ -166,22 +166,24 @@ certification.
 
 Device selection is per model and decided by a table compiled into
 `irlume-vision`. An entry binds three things: the model's SHA-256, a platform
-identity (section 4), and the CPU reference it was certified against: the
-ONNX Runtime version, the wired thresholds that consume the output, a
-fingerprint of the CPU session's decoded outputs for fixed synthetic inputs
-through irlume's own preprocessing, and a fingerprint of the recognition
-decision downstream of them (for fixed synthetic score pairs and brightness
-weights, the cosine match, Platt scaling, brightness weighting, fusion,
-template selection and every grant verdict the production code returns). A
-model runs on the NPU only when its digest, the running identity and the
-loaded ONNX Runtime version all match an entry; any other combination runs on
-CPU. Tests recompute the thresholds and both fingerprints from the current
-code, so a change to preprocessing, decoding, the decision code, a threshold
-or the ONNX Runtime output fails them until the entry is certified again or
-removed in the same change. There is no `AUTO`,
+identity (section 4), and the CPU reference it was certified against: the ONNX
+Runtime version, the wired thresholds that consume the output, a fingerprint of
+the CPU session's decoded outputs for fixed synthetic inputs through irlume's
+own preprocessing, and a fingerprint of the recognition decision downstream of
+them (for fixed synthetic score pairs and brightness weights, the cosine match,
+Platt scaling, brightness weighting, fusion, template selection and every grant
+verdict the production code returns). A model runs on the NPU only when its
+digest, the running identity and the loaded ONNX Runtime version all match an
+entry, and when at every engine build the live CPU session reproduces the
+entry's output fingerprint within 0.0001, so a runtime of the same version that
+computes differently on this host or CPU does not inherit the certification;
+any other combination runs on CPU. Tests recompute the thresholds and both
+fingerprints from the current code, so a change to preprocessing, decoding, the
+decision code, a threshold or the ONNX Runtime output fails them until the
+entry is certified again or removed in the same change. There is no `AUTO`,
 `HETERO` or `MULTI` device, no GPU, and no selection by device availability or
-speed. An entry is added only by a reviewed change that cites its
-certification evidence (section 7).
+speed. An entry is added only by a reviewed change that cites its certification
+evidence (section 7).
 
 Only the recognizer is eligible. The PAD cues are deny-only evidence with
 attack margins of 0.041 to 0.044; on the qualified stack their NPU drift
@@ -202,22 +204,25 @@ the accelerator node, the build of the firmware the kernel loaded, the compile
 configuration of section 6, and the SHA-256 of every runtime library the daemon
 maps once the NPU is enumerated (OpenVINO and its plugins, the Level Zero
 loader, the NPU user-mode driver) plus the NPU compiler and ONNX frontend that
-compiling loads. A rebuilt library that keeps its version string, or a
-distribution update of the Level Zero loader, is therefore a different
-identity; hashing the libraries makes discovery take about 0.5 s. The driver
-accepts other kernel and firmware combinations, and the qualified stack already
-pairs a compiler and a firmware of different interface versions, so the
-firmware is not implied by the driver version. The kernel reports the loaded
-build in the device's `fw_version` debugfs entry; it is readable by root, the
-daemon's `ProtectKernelTunables=` mounts debugfs read-only rather than hiding
-it, and kernel lockdown still permits read-only debugfs entries. A firmware
-build that cannot be read makes the identity unreadable, and every model runs
-on CPU. A difference in any field is a different identity. The kernel release
-is not a field: Fedora ships a kernel every few days, and keying on it would
-keep the NPU off most of the time. A kernel driver fault that returned
-plausible but wrong output is what the parity check of section 8 catches, and a
-kernel update always brings a reboot and so a new engine build; section 10
-bounds a crash. Doctor reports the running kernel release.
+compiling loads, which are resolved by path beside the mapped plugin and core
+and hashed before any compile, so the identity, its cache directory and its
+markers are known before the first compile and whether or not a cache import
+maps them. A rebuilt library that keeps its version string, or a distribution
+update of the Level Zero loader, is therefore a different identity; hashing the
+libraries makes discovery take about 0.5 s. The driver accepts other kernel and
+firmware combinations, and the qualified stack already pairs a compiler and a
+firmware of different interface versions, so the firmware is not implied by the
+driver version. The kernel reports the loaded build in the device's
+`fw_version` debugfs entry; it is readable by root, the daemon's
+`ProtectKernelTunables=` mounts debugfs read-only rather than hiding it, and
+kernel lockdown still permits read-only debugfs entries. A firmware build that
+cannot be read makes the identity unreadable, and every model runs on CPU. A
+difference in any field is a different identity. The kernel release is not a
+field: Fedora ships a kernel every few days, and keying on it would keep the
+NPU off most of the time. A kernel driver fault that returned plausible but
+wrong output is what the parity check of section 8 catches, and a kernel update
+always brings a reboot and so a new engine build; section 10 bounds a crash.
+Doctor reports the running kernel release.
 
 ### 5. System OpenVINO, loaded at run time
 
@@ -306,14 +311,15 @@ before the daemon reports ready, at startup and at every engine rebuild. No
 compilation happens inside an authentication attempt. Each entry records the
 SHA-256 of the NPU's output bits for three fixed reference inputs. The NPU
 repeats those bits exactly, across inferences and across processes (measurement
-4), so every engine build requires the recorded digest before the recognizer
-answers from the NPU; any other bits keep it on CPU, and doctor says so. A
-kernel, driver or firmware change that alters the NPU's numerics therefore
-needs a new certification, and one that does not alter them does not. Discovery
-with the library digests takes about 0.5 s; from the cache the recognizer then
-adds 0.4 to 0.5 s before ready, and after an identity change the first start
-compiles it cold, 2.2 to 5.2 s. Until ready, clients get the existing "still
-starting" answer and use the password.
+4), so every engine build requires the recorded digest, together with the live
+CPU fingerprint of section 3, before the recognizer answers from the NPU; any
+other bits keep it on CPU, and doctor says so. A kernel, driver or firmware
+change that alters the NPU's numerics therefore needs a new certification, and
+one that does not alter them does not. Discovery with the library digests takes
+about 0.5 s; from the cache the recognizer then adds 0.4 to 0.5 s before ready,
+and after an identity change the first start compiles it cold, 2.2 to 5.2 s.
+Until ready, clients get the existing "still starting" answer and use the
+password.
 
 ### 9. Failure falls back to the CPU session
 
@@ -331,20 +337,23 @@ unchanged.
 Before compiling a model, and before every NPU inference, the daemon writes a
 marker named by the identity and model digests, holding the boot ID, into the
 cache's marker directory, and removes it when the call returns (13 µs per
-inference, measured). Markers are kept across identity changes within a boot,
-so a rollback to an identity that crashed still finds its marker; startup
-removes those of earlier boots. A marker from the current boot found at startup
-means a compile or an inference did not return (a crash, or a hang a watchdog
-restart ended): that model stays on CPU for that identity for the rest of the
-boot, and doctor says so. A marker from an earlier boot allows one new attempt,
-so a power loss does not pin a model to CPU. Discovery (loading the plugin,
-enumerating the device, reading the identity) has its own boot-scoped marker,
-so a crash or hang there is not repeated either. Discovery and every compile
-count as worker activity for the watchdog, startup included, so one that does
-not return within `WatchdogSec=` (90 s, against a longest measured cold compile
-of 5.2 s) stops the pings and ends in a restart rather than a hang. With
-`Restart=on-failure`, a crashing or wedged compile or inference costs one
-restart, never a loop.
+inference, measured). The marker is committed before OpenVINO is entered:
+written to a temporary file, renamed into place and read back; if that fails,
+the call is not made and the model stays on CPU. A marker that exists but
+cannot be read, or holds no boot ID, counts as one from the current boot.
+Markers are kept across identity changes within a boot, so a rollback to an
+identity that crashed still finds its marker; startup removes those of earlier
+boots. A marker from the current boot found at startup means a compile or an
+inference did not return (a crash, or a hang a watchdog restart ended): that
+model stays on CPU for that identity for the rest of the boot, and doctor says
+so. A marker from an earlier boot allows one new attempt, so a power loss does
+not pin a model to CPU. Discovery (loading the plugin, enumerating the device,
+reading the identity) has its own boot-scoped marker, so a crash or hang there
+is not repeated either. Discovery and every compile count as worker activity
+for the watchdog, startup included, so one that does not return within
+`WatchdogSec=` (90 s, against a longest measured cold compile of 5.2 s) stops
+the pings and ends in a restart rather than a hang. With `Restart=on-failure`,
+a crashing or wedged compile or inference costs one restart, never a loop.
 
 ### 11. A daemon-owned cache
 
@@ -480,8 +489,9 @@ face unacceptable latency.
   tests.
 - Compiler: the plugin compiler is set and read back; a host where it cannot
   be selected runs the model on CPU.
-- Parity: an NPU that does not reproduce its entry's reference digest leaves
-  the model on CPU before it answers a request.
+- Parity: an NPU that does not reproduce its entry's reference digest, or a
+  CPU session that does not reproduce its fingerprint, leaves the model on
+  CPU before it answers a request.
 - Adapter: with an IR adapter configured, the recognizer stays on CPU.
 - Libraries: changing the bytes of any runtime library in the identity, the
   Level Zero loader included, changes the identity.
@@ -510,7 +520,10 @@ face unacceptable latency.
   earlier-boot marker allows one attempt; a returned compile or inference
   removes it; a marker left by an inference (a killed process) keeps the
   model on CPU after the restart; a new identity ignores markers of the old
-  one, and a return to the old identity in the same boot still sees them.
+  one, and a return to the old identity in the same boot still sees them; a
+  marker that cannot be written keeps the model on CPU without calling
+  OpenVINO, and one that cannot be read or holds no boot ID counts as
+  current.
 - Watchdog: a compile that does not return stops the watchdog pings, at
   startup and at a rebuild.
 - Cache: the directory is 0700 root and per identity, other identities'

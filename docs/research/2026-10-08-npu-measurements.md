@@ -21,8 +21,10 @@
   NPU reference digest of the recognizer on the three reference inputs:
   `9fa7f653f9330e60e4305d5ddac80675fe2ac7deec0e35b3d732b384ef2bede8`, the
   same in every process.
-- **How:** the ignored tests in `crates/irlume-vision/src/onnx/npu_tests.rs`,
-  for example
+- **How:** the ignored tests in `crates/irlume-vision/src/onnx/npu_tests.rs`
+  at commit `1cb6ea926880e0e4614baa204d69c1664eacdf7d` (branch
+  `feat/npu-vision-runtime`, which implements this ADR and adds the `npu`
+  feature), for example
   `ulimit -c 0; cargo test -p irlume-vision --features npu --release --lib -- --ignored npu_hw_ --test-threads 1 --nocapture`
   (`IRLUME_NPU_TEST_MODELS` names the model directory, `IRLUME_NPU_EVAL_DIR`
   the recorded frames). The recorded frames are read into memory only; no

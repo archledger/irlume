@@ -17,6 +17,10 @@ mod camera_diagnostics;
 pub use camera_diagnostics::camera_diagnostics;
 mod split_runtime;
 
+/// Current-thread assessment fixtures for downstream tests; absent by default.
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 /// Non-granting developer IR evaluation; absent from normal builds.
 #[cfg(feature = "ir-only-evaluation")]
 pub mod ir_only_evaluation;
@@ -2214,6 +2218,28 @@ fn pad_policy_refusal(
 /// rejection; a loaded cue can only tighten.
 pub fn pad_downgrades(verdict: Verdict, p_fake: Option<f32>, threshold: f32) -> bool {
     verdict == Verdict::Live && p_fake.is_some_and(|p| p >= threshold)
+}
+
+/// Settle the scored IR cue without changing any non-Live gate decision.
+fn settle_ir_pad(
+    verdict: Verdict,
+    reason: String,
+    deny_cause: irlume_liveness::DenyCause,
+    shipped_ir_fake: Option<f32>,
+) -> (Verdict, String, irlume_liveness::DenyCause) {
+    if pad_downgrades(verdict, shipped_ir_fake, IR_PAD_THRESHOLD) {
+        let pf = shipped_ir_fake.unwrap_or(1.0);
+        irlume_common::dlog!(
+            "pad-ir: p_fake {pf:.3} >= {IR_PAD_THRESHOLD:.2}; downgrading Live to Spoof"
+        );
+        (
+            Verdict::Spoof,
+            "IR PAD cue flags a spoof; use your password".into(),
+            irlume_liveness::DenyCause::Other,
+        )
+    } else {
+        (verdict, reason, deny_cause)
+    }
 }
 
 /// The shipped ViT PAD 5-frame-median vote (ADR-0013). Pure decision core of
@@ -4592,6 +4618,34 @@ impl Engine {
         vit_vote_denies(&self.vit_scores)
     }
 
+    /// Settle one raw RGB cue through the existing request-local vote ring.
+    fn settle_rgb_pad(
+        &mut self,
+        verdict: Verdict,
+        reason: String,
+        deny_cause: irlume_liveness::DenyCause,
+        rgb_pad: PadEvidence,
+    ) -> (Verdict, String, irlume_liveness::DenyCause) {
+        match rgb_pad {
+            PadEvidence::Score(p) => {
+                irlume_common::dlog!("pad-vit: p_spoof {p:.3}");
+                if self.vit_pad_votes_deny(p) {
+                    irlume_common::dlog!(
+                        "pad-vit: 5-frame median >= {VIT_PAD_THRESHOLD:.2}; downgrading Live to Spoof"
+                    );
+                    (
+                        Verdict::Spoof,
+                        "RGB PAD cue flags a spoof; use your password".into(),
+                        irlume_liveness::DenyCause::Other,
+                    )
+                } else {
+                    (verdict, reason, deny_cause)
+                }
+            }
+            _ => (verdict, reason, deny_cause),
+        }
+    }
+
     /// A produced score is not yet a completed five-score PAD decision.
     /// Both credential and enrollment admission must wait for that decision.
     /// A break in usable evidence invalidates the partial presentation window.
@@ -5284,6 +5338,16 @@ impl Engine {
         operation: &irlume_camera::lease::CameraOperationSession,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> Result<Assessment, CapturePathError> {
+        #[cfg(feature = "test-support")]
+        if held.is_none()
+            && operation.lease().is_split_pair()
+            && operation.lease().operation()
+                == irlume_camera::lease::CameraOperationKind::Enrollment
+        {
+            if let Some(assessment) = self.fixture_assessment(operation)? {
+                return Ok(assessment);
+            }
+        }
         self.assess_full_with_finish(
             held,
             capture_mode,
@@ -6273,19 +6337,7 @@ impl Engine {
             _ => None,
         };
         let (verdict, reason, deny_cause) =
-            if pad_downgrades(verdict, shipped_ir_fake, IR_PAD_THRESHOLD) {
-                let pf = shipped_ir_fake.unwrap_or(1.0);
-                irlume_common::dlog!(
-                    "pad-ir: p_fake {pf:.3} >= {IR_PAD_THRESHOLD:.2}; downgrading Live to Spoof"
-                );
-                (
-                    Verdict::Spoof,
-                    "IR PAD cue flags a spoof; use your password".into(),
-                    irlume_liveness::DenyCause::Other,
-                )
-            } else {
-                (verdict, reason, deny_cause)
-            };
+            settle_ir_pad(verdict, reason, deny_cause, shipped_ir_fake);
         // Shipped ViT RGB PAD cue (ADR-0013, default-on): score the RGB face
         // only on frames the (already post-IR-PAD) verdict still calls Live —
         // deny-only cues never need to run on frames that already deny, and
@@ -6315,24 +6367,8 @@ impl Engine {
             _ => PadEvidence::NotApplicable,
         };
         self.check_request_active()?;
-        let (verdict, reason, deny_cause) = match rgb_pad {
-            PadEvidence::Score(p) => {
-                irlume_common::dlog!("pad-vit: p_spoof {p:.3}");
-                if self.vit_pad_votes_deny(p) {
-                    irlume_common::dlog!(
-                        "pad-vit: 5-frame median >= {VIT_PAD_THRESHOLD:.2}; downgrading Live to Spoof"
-                    );
-                    (
-                        Verdict::Spoof,
-                        "RGB PAD cue flags a spoof; use your password".into(),
-                        irlume_liveness::DenyCause::Other,
-                    )
-                } else {
-                    (verdict, reason, deny_cause)
-                }
-            }
-            _ => (verdict, reason, deny_cause),
-        };
+        let (verdict, reason, deny_cause) =
+            self.settle_rgb_pad(verdict, reason, deny_cause, rgb_pad);
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
             stage: irlume_common::diagnostics::TraceStage::Liveness,
             elapsed_us: u64::try_from(liveness_started.elapsed().as_micros()).unwrap_or(u64::MAX),
@@ -7456,6 +7492,25 @@ impl Engine {
                 return self.authenticate_assessment(enr, purpose, service, a, diagnostics);
             }
         };
+        #[cfg(feature = "test-support")]
+        let mut held_pair_failed = held_pair_failed;
+        #[cfg(feature = "test-support")]
+        if cameras.is_none()
+            && operation.lease().is_split_pair()
+            && operation.lease().operation()
+                == irlume_camera::lease::CameraOperationKind::Authentication
+        {
+            if let Some(outcome) = self.fixture_authentication(
+                enr,
+                purpose,
+                service,
+                operation,
+                held_pair_failed.as_deref_mut(),
+                diagnostics,
+            ) {
+                return outcome;
+            }
+        }
         let finish = |engine: &mut Self, evidence| {
             engine
                 .prepare_ordinary_pair_authentication_with(evidence, |engine, evidence| {
@@ -7495,7 +7550,16 @@ impl Engine {
         ) -> irlume_common::Result<Assessment>,
     ) -> irlume_common::Result<PreparedPairAuthentication> {
         self.check_request_active()?;
-        let mut assessment = materialize(self, evidence)?;
+        let assessment = materialize(self, evidence)?;
+        self.prepare_assessed_pair_authentication(assessment)
+    }
+
+    /// Shared admission after eager identity materialization. Fixture inputs
+    /// reach the same qualification and finish boundary, never an Outcome hook.
+    fn prepare_assessed_pair_authentication(
+        &mut self,
+        mut assessment: Assessment,
+    ) -> irlume_common::Result<PreparedPairAuthentication> {
         self.check_request_active()?;
         self.qualify_rgb_pad_evidence(&mut assessment);
         Ok(PreparedPairAuthentication::Ready(Box::new(assessment)))
@@ -13716,6 +13780,10 @@ mod pad_cue_tests {
 /// build (the 512-D recognizer session), so one instance is shared.
 #[cfg(test)]
 mod engine_tests {
+    #[cfg(feature = "test-support")]
+    mod test_support_tests {
+        include!("test_support_tests.rs");
+    }
     mod budget_suggestion_tests;
     mod grouped_tests;
     mod managed_pad_tests;

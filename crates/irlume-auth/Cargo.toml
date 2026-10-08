@@ -11,6 +11,8 @@ license.workspace = true
 [features]
 default = []
 ir-only-evaluation = ["dep:libc", "irlume-camera/capture-timing"]
+# Downstream tests only. This fixture supplies assessments, never admission.
+test-support = []
 
 [[example]]
 name = "ir_only_evaluation"

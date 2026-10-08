@@ -21,6 +21,7 @@ libc = "0.2"
 dbus.workspace = true
 
 [dev-dependencies]
+irlume-auth = { workspace = true, features = ["test-support"] }
 irlume-camera = { workspace = true, features = ["test-support"] }
 # The TPM-presence pin for tests that write account stores
 # (template_key::test_support). A dev-dependency feature: resolver 2 keeps

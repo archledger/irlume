@@ -21,6 +21,10 @@ use irlume_common::{Error, Result};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
+
 /// Return the sealed-password directory used by this process so diagnostics
 /// and envelope operations resolve the same overrides and state directory.
 // See the template-key note: the fallback must honor `IRLUME_STATE_DIR`, or a
@@ -404,7 +408,16 @@ pub struct Unsealed {
 /// password and the wallet stays locked until the user re-arms.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn unseal_secret(user: &str) -> Result<Unsealed> {
-    unseal_secret_as(user, &mut Account::new(user))
+    #[cfg(any(test, feature = "test-support"))]
+    test_support::record_call();
+
+    let result = unseal_secret_as(user, &mut Account::new(user));
+
+    #[cfg(any(test, feature = "test-support"))]
+    if result.is_ok() {
+        test_support::record_success();
+    }
+    result
 }
 
 /// [`unseal_secret`], resolving the account through `account`. An envelope
@@ -760,6 +773,9 @@ pub fn forget_password_in(state_root: &Path, user: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod test_support_tests;
 
 #[cfg(test)]
 mod tests {

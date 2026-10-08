@@ -1136,6 +1136,26 @@ impl Engine {
             .and_then(PreparedSelection::expected_lease)
     }
 
+    /// Fixture context from the retained entry only: no authority refresh,
+    /// configuration read or reranking at the assessment boundary.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn retained_split_assessment_context(
+        &self,
+    ) -> Option<(
+        irlume_camera::lease::SplitLeaseRequest,
+        irlume_camera::lease::CameraOperationKind,
+    )> {
+        let selection = self.camera_selection.as_ref()?;
+        let split = selection.split()?;
+        if !self.ir_available
+            || !selection.matches_devices(&self.rgb_dev, &self.ir_dev, true)
+            || !selection.split_entry_active(split)
+        {
+            return None;
+        }
+        Some((split.expected.clone(), split.entry.kind()))
+    }
+
     /// Commit only under the retained camera proof, after caller-owned preparation.
     /// The callback must be persistence-only and its receipt is never revalidated.
     pub(super) fn with_prepared_camera_publication<R>(

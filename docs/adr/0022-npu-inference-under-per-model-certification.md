@@ -4,7 +4,8 @@
 
 Proposed 2026-10-08. First drafted 2026-09-15 and held unpublished;
 revised after the 1.38.0 platform retest and the root cause of the NPU
-compile crash ([intel-npu-stack#20]).
+compile crash ([intel-npu-stack#20]), then audited the same day against
+measurements of the implementation on the qualified stack (measurement 4).
 
 Depends on ADR-0013 (PAD cues are deny-only) and ADR-0019 (fail-closed PAD
 availability); amends neither. Replaces the experimental design for one
@@ -16,38 +17,44 @@ an experimental branch and never reached `main`.
 Irlume runs six ONNX models through ONNX Runtime on CPU: the YuNet detector
 (score floor 0.6), the BlazeFace rescue detector (0.5), the glintr100
 recognizer (match thresholds 0.55 RGB and IR, 0.635 IR dark, 0.40 adapted IR,
-all in `irlume-core`), the ViT RGB PAD cue (deny line 0.55), the FLIR IR PAD
-cue (deny line 0.9) and the ONNX FaceMesh fallback. The production FaceMesh
-runs on LiteRT. Every decision (score validation, thresholds, voting, PAD
-evidence policy, TPM, PAM) is computed on CPU from model outputs.
+and the fusion arm's 0.50 weighted and 0.10 per-modality floors, all in
+`irlume-core`), the ViT RGB PAD cue (deny line 0.55), the FLIR IR PAD cue
+(deny line 0.9) and the ONNX FaceMesh fallback. The production FaceMesh runs
+on LiteRT. Every decision (score validation, thresholds, voting, PAD evidence
+policy, TPM, PAM) is computed on CPU from model outputs.
 
 Authentication is capture-bound. On the UX5406S (Lunar Lake) the production
 CPU stage means are YuNet 7.1 to 7.8 ms, FaceMesh 5.6 ms, glintr100 121.3 ms,
 ViT 202.5 ms and FLIR 2.5 ms, 0.34 s in all, while a dual-sensor grant takes
 seconds (8.75 s on the BRIO in ADR-0028). The NPU is therefore not mainly a
 latency change. What it changes is CPU load and package power: the recognizer
-plus the ViT are 95% of that model time, and in the direct OpenVINO runs of
-measurement 1 below a model kept 235% to 288% of a core busy on CPU and 5% to
-35% on the NPU.
+plus the ViT are 95% of that model time, and per call the recognizer takes
+227 ms of CPU time on its CPU session and 0.15 ms on the NPU, the ViT 351 ms
+and 1.5 ms (measurement 4). Section 3 explains why only the recognizer, 36%
+of that time, may move.
 
 **Platform.** The [intel-npu-stack] profile `fedora-44-lunar-lake-x86_64`
 (stack 0.1.1) is qualified: NPU driver and firmware 1.38.0, OpenVINO and the
-NPU compiler 2026.2.0, Level Zero loader 1.32.0. The NPU is PCI 8086:643e,
-"Intel(R) AI Boost", architecture 4000, at `/dev/accel/accel0`. Fedora ships
-the OpenVINO C API only under a versioned soname (`libopenvino_c.so.2620` for
+NPU compiler 2026.2.0 (`NPU_COMPILER_VERSION` 8.2), Level Zero loader 1.32.0.
+The NPU is PCI 8086:643e, "Intel(R) AI Boost", architecture 4000, at
+`/dev/accel/accel0`; on the UX5406S the kernel (7.2.8) loaded the firmware
+build of 2026-08-20 (`6fc835a1`). The NPU runtime-suspends 100 ms after each
+use. At every compile the driver reports that the compiler and the loaded
+firmware speak different but compatible interface versions (ELF ABI 1.4.0
+against 1.2.2, mapped inference 11.15.0 against 11.4.10). Fedora ships the
+OpenVINO C API only under a versioned soname (`libopenvino_c.so.2620` for
 2026.2.0).
 
-**Measurements so far.**
+**Measurements.**
 
 1. 2026-09-01, isolated OpenVINO 2026.2.0 with driver 1.35.0, dynamic batch
    fixed to 1, synthetic inputs (#647): all six ONNX graphs compiled for
    `NPU` and reported `EXECUTION_DEVICES=NPU`. Warm NPU means were glintr100
    6.1 ms and ViT 9.3 ms; all six stayed compiled in one process, and the
    five-model sequence took 16.4 ms. Cold compilation of all six took 5.6 s
-   (ViT alone 2.4 s); with a warm cache, 176 ms. Synthetic parity: recognizer
-   cosine 0.999999, ViT P(spoof) delta 0.00028, FLIR P(fake) delta 0.00052,
-   YuNet score delta 0.0064, BlazeFace 0.000055, mesh 0.28 px. Synthetic
-   inputs show numerical compatibility, not decision parity.
+   (ViT alone 2.4 s); from the driver's own cache, 176 ms. Synthetic parity:
+   recognizer cosine 0.999999, ViT P(spoof) delta 0.00028, FLIR P(fake)
+   delta 0.00052, YuNet score delta 0.0064, BlazeFace 0.000055, mesh 0.28 px.
 2. 2026-09-15, Phase 0, a C API probe with driver 1.35.0 and eight real
    grayscale frames per model: YuNet and FLIR completed 3 of 3 runs, BlazeFace
    2 of 6, and the three dynamic-batch models (glintr100, ViT, ONNX mesh)
@@ -63,23 +70,65 @@ the OpenVINO C API only under a versioned soname (`libopenvino_c.so.2620` for
    intermittent BlazeFace failures are unconfirmed outside that probe. With
    the batch fixed to 1 (through the C++ and the typed C API) or an `N...`
    input layout, glintr100, ViT, the ONNX mesh and the TFLite mesh compile on
-   the packaged 1.38.0 stack and run with the layout. An unbounded dynamic
+   the packaged 1.38.0 stack when read from a file. An unbounded dynamic
    batch still crashes 2026.2.0.
+4. 2026-10-08, the implementation of this ADR (`irlume-vision`, release
+   build) on the UX5406S and the qualified stack, models through irlume's own
+   structs against their ONNX Runtime CPU sessions:
+   - The recognizer, the ViT and the FLIR compiled with the batch fixed to 1
+     and reported `EXECUTION_DEVICES=NPU` in every run. Cold compile: 2.3 to
+     5.2 s, 3.4 to 8.0 s and 0.15 to 0.35 s; from the OpenVINO cache: 0.38 to
+     0.53 s, 0.59 to 0.90 s and 0.02 s. Their CPU sessions build in 0.43
+     to 0.44 s and 0.23 to 0.28 s (recognizer, ViT). The three blobs take
+     298 MiB on disk (recognizer 127 MiB).
+   - Per call, CPU session against NPU: recognizer 118 ms against 6.8 ms,
+     ViT 182 ms against 14.7 ms, FLIR 2.2 ms against 0.44 ms.
+   - Synthetic parity: recognizer cosine 0.9999982, ViT delta 0.000032, FLIR
+     delta 0.000007. Interleaving three inputs on one infer request and
+     repeating them returned identical bits; so did an inference after the
+     NPU had runtime-suspended.
+   - Real recorded frames: 2,397 local frames (1,851 with a face; genuine IR
+     sessions, paper, screen, phone, video-replay and banner IR attacks, RGB
+     genuine and banner frames), each through both backends at the wired
+     thresholds. Recognizer: embedding cosine at least 0.999996, match
+     scores against a reference within 0.00038, no flip on 1,347 genuine
+     IR frames (impostor pairs were not part of this set). FLIR: deltas up
+     to 0.0139 on genuine frames (mean 0.0014) and 0.0060 on attacks, no
+     flip. ViT: deltas up to 0.0018 on genuine frames and 0.0027 on
+     attacks, and one attack frame 0.0009 above the deny line on CPU fell
+     below it on the NPU.
+   - The NPU plugin accepts only f16 and i8 as `INFERENCE_PRECISION_HINT`
+     ("Supported values: f16, i8"); there is no f32 inference on the NPU.
+   - As root, inside the daemon's sandbox properties (`systemd-run`), the
+     firmware build reads back from debugfs and debugfs is read-only.
+   - OpenVINO 2026.2.0 refuses the TFLite mesh read from a memory buffer
+     ("Unable to read the model"), the only way irlume reads a model it has
+     verified.
+   - A marker write and remove costs 13 µs on the laptop's disk.
 
 **Drift and margins.** The measured attack margins are narrow: ViT attack
 presentations measured 0.594 to 0.656 against the 0.55 deny line (0.044
-above it), and the FLIR attack floor is 0.941 against 0.9 (0.041). Phase
-0's 0.0117 FLIR delta on real frames is more than a quarter of that margin.
-Synthetic parity cannot settle this; only measurement at the wired
-thresholds on the evaluation corpora can.
+above it), and the FLIR attack floor is 0.941 against 0.9 (0.041). On real
+frames the NPU's f16 arithmetic moves the FLIR by up to 0.0139 and the ViT by
+up to 0.0027, against allowances of about 0.0020 and 0.0022 under section 7,
+and one ViT attack frame went from deny to pass at frame level (production
+votes the median of five). Synthetic inputs showed neither
+(0.000007 and 0.000032 on the same compiled models). The recognizer moved by
+0.00038 at most.
 
-**Runtime facts.** The NPU plugin compiles static shapes. Compiled blobs are
-not portable across driver or compiler versions. The bundled onnxruntime
-1.28.1 has no OpenVINO execution provider: reaching the NPU through it would
-mean shipping `libonnxruntime_providers_openvino.so` with a second, unqualified
-OpenVINO inside. The existing `ort` execution-provider features of
-`irlume-vision` (`cuda`, `openvino`, `tensorrt`, `coreml`) are compile-time
-developer options that no package enables; they are not part of this design.
+**Runtime facts.** The NPU plugin compiles static shapes; OpenVINO documents
+dynamic shapes on the NPU as a preview limited to bounded dimensions.
+Compiled blobs are not portable across OpenVINO, driver or compiler
+versions. With `CACHE_DIR` set the NPU plugin bypasses the driver's own blob
+cache, and OpenVINO deletes and recompiles a cached blob it fails to import
+(`core_impl.cpp`, 2026.2.0). The driver pins the memory it maps to the NPU,
+so it cannot be swapped. `NPU_TURBO` raises power and is documented as not
+meant for sustained use. The bundled onnxruntime 1.28.1 has no OpenVINO
+execution provider: reaching the NPU through it would mean shipping
+`libonnxruntime_providers_openvino.so` with a second, unqualified OpenVINO
+inside. The existing `ort` execution-provider features of `irlume-vision`
+(`cuda`, `openvino`, `tensorrt`, `coreml`) are compile-time developer options
+that no package enables; they are not part of this design.
 
 ## Decision
 
@@ -89,11 +138,15 @@ Every model is certified on CPU by definition. The ONNX Runtime CPU sessions,
 their construction and the bundled onnxruntime stay as they are. A model runs
 on the NPU only through section 3; everything else is CPU.
 
-### 2. The NPU computes model outputs, nothing else
+### 2. The NPU computes authentication outputs, nothing else
 
 Score validation, thresholds, voting, PAD evidence policy, the attempt record,
 TPM and PAM stay on CPU and unchanged. The NPU returns the same output tensors
-the CPU session would, and the same code consumes them.
+the CPU session would, and the same code consumes them. Enrollment embeds on
+CPU: every stored template comes from the CPU reference, so no template
+depends on the NPU, a fallback or a stack update, and the only mixed
+comparison is an NPU probe against a CPU template, which section 7
+certifies.
 
 ### 3. A per-model certification table in the source
 
@@ -112,19 +165,32 @@ is certified again or removed in the same change. There is no `AUTO`,
 speed. An entry is added only by a reviewed change that cites its
 certification evidence (section 7).
 
+Only the recognizer is eligible. The PAD cues are deny-only evidence with
+attack margins of 0.041 to 0.044; on the qualified stack their NPU drift
+exceeds the section 7 allowance, in the passing direction for the ViT, and
+the NPU offers no f32 to reduce it, so they stay on CPU. The detectors and the
+ONNX mesh fallback shape other models' inputs, so their entries would have to
+bind every downstream model as well; together they are about 13 ms of the
+339 ms, and they stay on CPU too. TFLite models are not eligible (section
+14). Moving another model needs an amendment with new evidence.
+
 ### 4. Platform identity
 
 The identity is the loaded `libopenvino_c` path, the OpenVINO runtime build
 string, the NPU plugin version, the plugin's `NPU_DRIVER_VERSION` and
 `NPU_COMPILER_VERSION`, its `DEVICE_ARCHITECTURE`, the PCI vendor and device of
-the accelerator node, and the build of the firmware the kernel loaded. The
-driver accepts other kernel and firmware combinations, so the firmware is not
-implied by the driver version. The kernel reports the loaded build in the
-device's `fw_version` debugfs entry; it is readable by root, the daemon's
+the accelerator node, the build of the firmware the kernel loaded, and the
+compile configuration of section 6. The driver accepts other kernel and
+firmware combinations, and the qualified stack already pairs a compiler and
+a firmware of different interface versions, so the firmware is not implied by
+the driver version. The kernel reports the loaded build in the device's
+`fw_version` debugfs entry; it is readable by root, the daemon's
 `ProtectKernelTunables=` mounts debugfs read-only rather than hiding it, and
 kernel lockdown still permits read-only debugfs entries. A firmware build that
 cannot be read makes the identity unreadable, and every model runs on CPU. A
-difference in any field is a different identity.
+difference in any field is a different identity. The kernel release is not a
+field: the kernel driver computes no outputs, Fedora ships a kernel every few
+days, and section 10 bounds a crash a kernel could cause.
 
 ### 5. System OpenVINO, loaded at run time
 
@@ -134,47 +200,57 @@ distribution library directories (`/usr/lib64`, `/usr/lib/x86_64-linux-gnu`,
 `/usr/lib`), as the TFLite runtime is found. A bare name is never handed to
 the loader, so neither `LD_LIBRARY_PATH` nor the loader cache can substitute
 another library, and another OpenVINO release reads as absent. It never
-bundles OpenVINO. Absence, a missing symbol, a load error or an
-identity outside the table is a recoverable "no NPU" answer, like the TFLite
-library probe, never an error that stops the daemon. The code sits behind an
+bundles OpenVINO. Absence, a missing symbol, a load error or an identity
+outside the table is a recoverable "no NPU" answer, like the TFLite library
+probe, never an error that stops the daemon. A soname is added to the list
+only after the binding's C declarations are compared with that release's
+headers (for 2026.2.0 they match the 2026.1.2 headers the binding was
+generated from, apart from one comment). The code sits behind an
 `irlume-vision` Cargo feature, `npu`, off by default; a build without it is
 the current daemon.
 
-### 6. The batch is fixed to 1 before compilation
+### 6. A fixed batch and a fixed compile configuration
 
 Irlume runs every model at batch 1. Before compiling a model for the NPU, the
 loader fixes a dynamic batch dimension to 1; a model with any other dynamic
 dimension is ineligible and runs on CPU. A graph with a dynamic batch is never
 handed to the NPU compiler ([npu_compiler#352]). The checksummed file bytes
-are what OpenVINO reads; the reshape happens in memory.
+are what OpenVINO reads; the reshape happens in memory. The rest of the
+compile configuration is fixed in the code too: the latency performance
+hint, the plugin's default inference precision (f16, the only floating-point
+precision it accepts) and no `NPU_TURBO`. It changes outputs, so it is a field
+of the identity, and changing it leaves no entry matching.
 
 ### 7. What certification requires
 
-A table entry for (model digest, identity) requires all of:
+A table entry requires all of:
 
 1. **Same artifact.** The bytes verified against `models/SHA256SUMS`, read
    from memory, `f32` at the API boundary. No converted, repacked or quantized
-   copy. The NPU's internal precision is the plugin default and is part of
-   what parity measures.
-2. **The production reference.** Parity is against the ONNX Runtime CPU
-   session irlume uses, not OpenVINO's CPU plugin.
-3. **Real evaluation data.** The genuine and attack corpora that set the
-   wired thresholds (the sun-campaign set and the PAD qualification sets).
-4. **Zero verdict flips.** Every wired threshold that consumes the output
-   gives the same verdict for every evaluation sample, on CPU and on the NPU.
+   copy. The NPU's internal precision is part of what parity measures.
+2. **The production reference and path.** Parity is against the ONNX Runtime
+   CPU session irlume uses, not OpenVINO's CPU plugin, and is measured
+   through irlume's own loader, preprocessing and decoders, not a separate
+   harness: Phase 0's harness mis-declared one C structure and reported
+   crashes and unranked inputs that were not there.
+3. **Real evaluation data.** The genuine and impostor pairs of the corpora
+   that set the recognizer's thresholds (LFW and FairFace for RGB; CBSR NIR
+   and Tufts for IR), each comparison an NPU probe against a CPU template.
+4. **Zero verdict flips.** Every wired threshold that consumes the output,
+   the fusion floors included, gives the same verdict for every evaluation
+   sample, on CPU and on the NPU.
 5. **Drift inside the margin.** At each such threshold, the maximum absolute
    output delta is at most 5% of the smaller class margin: the distance from
    the threshold to the 1st percentile of the CPU scores of the class that
    must stay above it, or to the 99th percentile of the class that must stay
-   below it. With today's measured windows that allows about 0.0022 for the
-   ViT and 0.0020 for the FLIR.
-   Detection and landmark models are judged end to end: identical detection
-   counts per frame, and rules 4 and 5 applied to the recognizer and PAD
-   decisions downstream of them.
-6. **Crash-free.** 20 cold compiles in separate processes with the cache
-   bypassed, 20 warm loads from the cache, and 1,000 inferences, without a
-   crash or an error.
-7. **Recorded.** The evidence (identity, model digest, run counts, deltas,
+   below it.
+6. **Repeatable.** An input gives the same output bits every time on one
+   compiled model: repeated, interleaved with other inputs, and after the NPU
+   has runtime-suspended.
+7. **Crash-free.** 20 cold compiles in separate processes with the cache
+   bypassed, 20 warm loads from the cache, and 1,000 inferences, some after
+   runtime suspends, without a crash or an error.
+8. **Recorded.** The evidence (identity, model digest, run counts, deltas,
    margins, verdict tables, no biometric data) is archived and cited by the
    change that adds the entry.
 
@@ -182,7 +258,10 @@ A table entry for (model digest, identity) requires all of:
 
 NPU sessions are compiled when the engine is built, after its CPU sessions and
 before the daemon reports ready, at startup and at every engine rebuild. No
-compilation happens inside an authentication attempt.
+compilation happens inside an authentication attempt. From the cache the
+recognizer adds 0.4 to 0.5 s before ready; after an identity change the first
+start compiles it cold, 2.3 to 5.2 s. Until ready, clients get the existing
+"still starting" answer and use the password.
 
 ### 9. Failure falls back to the CPU session
 
@@ -199,22 +278,26 @@ unchanged.
 
 Before compiling a model, and before every NPU inference, the daemon writes a
 marker named by the model digest, holding the boot ID, into the cache
-directory of the identity, and removes it when the call returns. A marker
-from the current boot found at startup means a compile or an inference did
-not return (a crash, or a hang the `WatchdogSec=` restart ended): that model
-stays on CPU for that identity for the rest of the boot, and doctor says so.
-A marker from an earlier boot allows one new attempt, so a power loss does
-not pin a model to CPU. With `Restart=on-failure`, a crashing compiler or a
-crashing or wedged inference costs one restart, never a loop. The marker
-costs a file create and remove per inference, against 6 to 15 ms of NPU
-time.
+directory of the identity, and removes it when the call returns (13 µs per
+inference, measured). A marker from the current boot found at startup means a
+compile or an inference did not return (a crash, or a hang a watchdog restart
+ended): that model stays on CPU for that identity for the rest of the boot,
+and doctor says so. A marker from an earlier boot allows one new attempt, so a
+power loss does not pin a model to CPU. A compile counts as worker activity
+for the watchdog, startup included, so one that does not return within
+`WatchdogSec=` (90 s, against a longest measured cold compile of 5.2 s) stops
+the pings and ends in a restart rather than a hang. With `Restart=on-failure`,
+a crashing or wedged compile or inference costs one restart, never a loop.
 
 ### 11. A daemon-owned cache
 
 The OpenVINO cache lives in `/var/cache/irlume/npu/<identity digest>/`,
 root-owned, mode 0700. Compiled blobs are code the NPU executes, so no user
-can write them. A new identity gets a new directory; others are removed. The
-CLI never uses the NPU and never creates this directory.
+can write them. With `CACHE_DIR` set it is the only blob cache (the driver's
+own is bypassed), and a blob OpenVINO cannot import is deleted and compiled
+again. A new identity gets a new directory; others are removed. The
+recognizer's blob takes 127 MiB. The CLI never uses the NPU and never creates
+this directory.
 
 ### 12. A kill switch
 
@@ -236,11 +319,15 @@ compile failed, a compile or inference did not return earlier in this boot,
 or retired after an inference error. A platform row gives the identity. New
 wire and JSON fields are additive.
 
-### 14. The production mesh stays on LiteRT
+### 14. TFLite models stay on LiteRT
 
-There is no LiteRT NPU delegate on Linux. OpenVINO's TFLite frontend compiles
-the production mesh on the NPU with a fixed batch, so a later change may
-certify it under the same table and rules; until then it runs on LiteRT CPU.
+The production mesh runs on LiteRT, which has no NPU delegate on Linux.
+OpenVINO's TFLite frontend compiles it from a file, but OpenVINO 2026.2.0
+refuses it from a memory buffer (measurement 4), and reading it from a path
+would reopen the file after irlume verified it. Its reference is also
+LiteRT's CPU output, not ONNX Runtime's. A TFLite model therefore has no
+entry under this ADR; one needs an amendment that defines a LiteRT reference
+(runtime version and fingerprint) and a read path for verified bytes.
 
 ### 15. No GPU
 
@@ -252,19 +339,26 @@ face unacceptable latency.
 - A build without `npu`, or with it and an empty table, makes the decisions it
   makes today on every host. `doctor` can report the platform before any model
   is certified.
-- An OpenVINO, driver or compiler update moves a host back to CPU until its new
-  identity is certified. This is deliberate: certification is per identity,
-  and the cost is a certification run per stack release.
-- The CPU sessions stay resident, as they are today; NPU sessions add their own
-  memory.
+- An OpenVINO, driver, compiler or firmware update, or a change to the
+  compile configuration, moves a host back to CPU until its new identity is
+  certified. This is deliberate: certification is per identity, and the cost
+  is a certification run per stack release.
+- Memory: the recognizer's NPU session adds 500 to 537 MiB of process memory
+  beside its CPU session (467 to 705 MiB), which stays resident as today and
+  can be swapped (on the UX5406S under memory pressure, 0.9 GB of
+  the CPU-only daemon was in swap); the driver also pins what it maps to the
+  NPU, which cannot be swapped.
+- Disk: 127 MiB of compiled blob under `/var/cache/irlume/npu`.
+- The driver's interface-version warnings appear in the daemon's journal at
+  every compile.
 - Packaging follows certification: the Fedora package turns on `npu`, adds
   `CacheDirectory=`, an AppArmor rule for `/dev/accel/accel[0-9]*` and the
   OpenVINO libraries, and a weak dependency on the stack only when the table
   has an entry for an identity that package can meet. Other lanes are
   unchanged.
-- The recognizer and the ViT are where the CPU time is, so they are the useful
-  first candidates. The FLIR's Phase 0 delta (0.0117) is nearly six times
-  its allowance, so it is likely to stay on CPU.
+- The gain is the recognizer's: per call 118 to 183 ms on CPU against 6.7
+  to 6.8 ms on the NPU, and 227 to 328 ms of CPU time against 0.15 to 0.24
+  ms. The ViT, the larger CPU cost, stays on CPU under this ADR.
 
 ## Rejected alternatives
 
@@ -279,28 +373,48 @@ face unacceptable latency.
 - **Compiling in a helper process.** It isolates a crash completely; the
   marker of section 10 bounds a crash to one restart without a second
   executable. Revisit if compile crashes become routine.
-- **Compiling on first use.** A cold compile takes up to 2.4 s per model inside
-  an attempt.
+- **Compiling on first use.** A cold compile of the recognizer takes up to
+  5.2 s, and a cache import up to 0.5 s, inside an attempt.
+- **Compiling after the daemon reports ready**, switching the recognizer
+  between attempts. It removes 0.4 to 0.5 s from startup at the cost of a
+  device switch during the daemon's life and compiler work beside a running
+  attempt.
+- **Dropping the recognizer's CPU session while it runs on the NPU.** It saves
+  memory that can be swapped anyway, and a fallback would have to re-read,
+  re-hash and rebuild 260 MB inside an attempt.
+- **A fresh infer request for every inference**, as Frigate does for ArcFace
+  models. Repeatability is measured and required instead (section 7).
+- **The kernel release in the identity.** It would move hosts to CPU every few
+  days for a component that computes no outputs (section 4).
+- **`NPU_TURBO`.** More power for an attempt that is capture-bound.
+- **The PAD cues on the NPU.** Measured on real frames, the FLIR drifts seven
+  times its allowance and one ViT attack frame went from deny to pass; the NPU
+  computes in f16 only, so no setting reduces it. A later stack or a
+  mixed-precision compile could be re-measured under a new amendment.
 
 ## Phasing
 
 1. This ADR.
 2. Loader, identity, empty table, kill switch, fixed-batch compile, cache and
-   marker, doctor and status rows, behind the default-off `npu` feature.
-   Hardware tests are `#[ignore]`.
-3. Certification runs on the qualified Fedora 44 Lunar Lake identity; one
-   table entry per model that passes section 7.
+   marker, doctor and status rows, behind the default-off `npu` feature, for
+   the recognizer. Hardware tests are `#[ignore]` and also measure the PAD
+   cues on the NPU, which production never places there.
+3. Certification of the recognizer on the qualified Fedora 44 Lunar Lake
+   identity; a table entry if it passes section 7.
 4. Packaging per Consequences.
 
 ## Acceptance tests
 
 - Table: an empty table resolves every model to CPU on every identity; an
-  entry matches only its exact digest and identity; changing any one identity
-  field resolves to CPU.
-- Reference: an entry whose recorded ONNX Runtime version differs from the
-  loaded one resolves to CPU; changing a recorded threshold, the
-  preprocessing or the decoding of a certified model fails the fingerprint
-  and threshold tests.
+  entry matches only its exact digest, identity and ONNX Runtime version;
+  changing any one identity field, the compile configuration included,
+  resolves to CPU.
+- Reference: changing a recorded threshold, the preprocessing or the decoding
+  of a certified model fails the fingerprint and threshold tests.
+- Eligibility: only the recognizer can have an entry; the PAD cues, the
+  detectors, the ONNX mesh fallback and TFLite models never do.
+- Enrollment: with the recognizer on the NPU, enrollment scans come from the
+  CPU session.
 - Identity: an unreadable firmware build resolves every model to CPU.
 - Kill switch: `IRLUME_NPU=0`, `npu=0`, an empty, malformed or non-UTF-8
   value and an unreadable `settings.conf` disable the NPU; absent and
@@ -319,6 +433,8 @@ face unacceptable latency.
   removes it; a marker left by an inference (a killed process) keeps the
   model on CPU after the restart; a new identity ignores markers of the old
   one.
+- Watchdog: a compile that does not return stops the watchdog pings, at
+  startup and at a rebuild.
 - Cache: the directory is 0700 root and per identity, other identities'
   directories are removed, and the CLI never creates it.
 - Decisions: with a model on the NPU, grants and denials come from the same
@@ -327,8 +443,9 @@ face unacceptable latency.
   types, and a pre-change daemon's status decodes in the new client.
 - Hardware (`#[ignore]`, Lunar Lake): the identity reads back; every
   eligible model compiles with the batch fixed to 1 and reports
-  `EXECUTION_DEVICES=NPU`; outputs match ONNX Runtime CPU on fixed synthetic
-  inputs within the bounds of section 7.
+  `EXECUTION_DEVICES=NPU`; outputs track ONNX Runtime CPU on fixed synthetic
+  inputs and on recorded frames, with the PAD cues' drift reported;
+  interleaved and post-suspend inferences repeat bit for bit.
 
 [intel-npu-stack]: https://github.com/archledger/intel-npu-stack
 [intel-npu-stack#20]: https://github.com/archledger/intel-npu-stack/issues/20

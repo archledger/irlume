@@ -48,7 +48,7 @@ that produced it and the dataset it ran on.
 
 | | |
 |:--|:--|
-| [`adr/`](adr/) | Architecture decision records, numbered (0022 is reserved for the unpushed NPU design; see ADR-0023's status) |
+| [`adr/`](adr/) | Architecture decision records, numbered |
 | [`pad-results/`](pad-results/) | Presentation-attack measurements |
 | [`recognition-results/`](recognition-results/) | Recognizer accuracy and demographic spread |
 | [`validation/`](validation/) | End-to-end grant-path validation runs |

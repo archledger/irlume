@@ -9,9 +9,8 @@ do, so sketch one in the PR early ([CONTRIBUTING.md](../../CONTRIBUTING.md)
 
 ## Recipe: write an ADR
 
-1. Take the next number after the highest file here; 0022 is reserved
-   ([docs/README.md](../README.md)). Name the file `NNNN-kebab-title.md` and
-   title it `# ADR-NNNN: Title`.
+1. Take the next number after the highest file here. Name the file
+   `NNNN-kebab-title.md` and title it `# ADR-NNNN: Title`.
 2. Use the sections of ADR-0021 onward: `## Status` (Proposed or Accepted, the
    date, and what it amends, supersedes or depends on), `## Context`,
    `## Decision` with numbered `### 1.` subsections (ADR-0024, 0025, 0030) or

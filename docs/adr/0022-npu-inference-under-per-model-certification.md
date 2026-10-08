@@ -158,13 +158,19 @@ on the NPU only through section 3; everything else is CPU.
 Score validation, thresholds, voting, PAD evidence policy, the attempt record,
 TPM and PAM stay on CPU and unchanged. The NPU returns the same output tensors
 the CPU session would, and the same code consumes them. Enrollment embeds on
-CPU: every stored template comes from the CPU reference, so no template
-depends on the NPU, a fallback or a stack update, and the only mixed
-comparison is an NPU probe against a CPU template, which section 7
-certifies. When an IR adapter is configured (`IRLUME_IR_ADAPTER`; none ships
-since ADR-0004), the recognizer stays on CPU: an adapter is user-supplied,
-transforms the raw IR embedding before its own threshold, and is part of no
-certification.
+CPU: every stored template comes from the CPU reference, so no template depends
+on the NPU, a fallback or a stack update, and the only mixed comparison is an
+NPU probe against a CPU template, which section 7 certifies. That holds only
+for templates the entry's own CPU reference produced, so each new scan also
+records its producer (the recognizer digest, the ONNX Runtime version and the
+CPU reference digest of section 3), an additive field beside `embed_space`,
+which today records the recognizer digest alone. An attempt uses an NPU probe
+only when every scan of the user's enrollment that it can match carries the
+entry's producer; otherwise, including for every enrollment made before this
+field, the probe is computed on CPU, as today, until the user enrolls again.
+When an IR adapter is configured (`IRLUME_IR_ADAPTER`; none ships since
+ADR-0004), the recognizer stays on CPU: an adapter is user-supplied, transforms
+the raw IR embedding before its own threshold, and is part of no certification.
 
 ### 3. A per-model certification table in the source
 
@@ -175,21 +181,23 @@ Runtime version, the wired thresholds that consume the output, a fingerprint of
 the CPU session's decoded outputs for fixed synthetic inputs through irlume's
 own preprocessing, the SHA-256 of the CPU session's raw output bits for the
 same inputs, and a fingerprint of the recognition decision downstream of them
-(for fixed synthetic score pairs and brightness weights, the cosine match,
-Platt scaling, brightness weighting, fusion, template selection and every grant
-verdict the production code returns). A model runs on the NPU only when its
-digest, the running identity and the loaded ONNX Runtime version all match an
-entry, and when at every engine build the live CPU session reproduces the
-entry's CPU output digest exactly. The CPU session repeats those bits across
-processes, core types and thread placement (measurement 4), so a runtime of the
-same version that computes differently on this host or CPU, by any amount, does
-not inherit the certification; any other combination runs on CPU. Tests
-recompute the thresholds and both fingerprints from the current code, so a
-change to preprocessing, decoding, the decision code, a threshold or the ONNX
-Runtime output fails them until the entry is certified again or removed in the
-same change. There is no `AUTO`, `HETERO` or `MULTI` device, no GPU, and no
-selection by device availability or speed. An entry is added only by a reviewed
-change that cites its certification evidence (section 7).
+(for fixed synthetic score pairs and brightness weights, the cosine match, the
+per-enrollment IR calibration (its fit, its map applied to probe and templates,
+and the calibrated-centroid arm), Platt scaling, brightness weighting, fusion,
+template selection and every grant verdict the production code returns). A
+model runs on the NPU only when its digest, the running identity and the loaded
+ONNX Runtime version all match an entry, and when at every engine build the
+live CPU session reproduces the entry's CPU output digest exactly. The CPU
+session repeats those bits across processes, core types and thread placement
+(measurement 4), so a runtime of the same version that computes differently on
+this host or CPU, by any amount, does not inherit the certification; any other
+combination runs on CPU. Tests recompute the thresholds and both fingerprints
+from the current code, so a change to preprocessing, decoding, the decision
+code, a threshold or the ONNX Runtime output fails them until the entry is
+certified again or removed in the same change. There is no `AUTO`, `HETERO` or
+`MULTI` device, no GPU, and no selection by device availability or speed. An
+entry is added only by a reviewed change that cites its certification evidence
+(section 7).
 
 Only the recognizer is eligible. The PAD cues are deny-only evidence with
 attack margins of 0.041 to 0.044; on the qualified stack their NPU drift
@@ -297,19 +305,21 @@ A table entry requires all of:
    recorded brightness range. Production takes the best score over up to 90
    scans (3 profiles of 30) against a threshold scaled by the template count,
    so the corpora also run as production-shaped enrollments across the
-   supported template counts, and rules 4 and 5 compare the final grant
-   decisions, not only pairs.
+   supported template counts, with each enrollment's IR calibration fitted as
+   enrollment fits it, so the calibrated probe, the calibrated templates and
+   the calibrated-centroid arm are all exercised, and rules 4 and 5 compare the
+   final grant decisions, not only pairs.
 4. **No new grant for an impostor or an attack; error rates no worse.** No
    impostor comparison that the CPU denies may be granted on the NPU, at any
    threshold, fusion floor or production-shaped decision, whatever the
-   aggregate rates do. No presentation attack that the CPU path denies may be
-   granted with the recognizer on the NPU and the PAD cues unchanged on CPU,
-   and every recognizer verdict on an attack that differs is listed. Beyond
-   that, the NPU probes' false-accept rate is not above the CPU probes', and
-   their false-reject rate is not above the CPU's by more than 0.2 percentage
-   points; genuine pairs may change verdict within that budget. Every verdict
-   that differs is listed, and each lies within the measured maximum drift of
-   its threshold.
+   aggregate rates do. No presentation attack whose recognizer verdict the CPU
+   denies may be granted by the recognizer on the NPU, whatever the PAD cues
+   decide, so a later change to the PAD cues cannot turn a masked difference
+   into a grant. Beyond that, the NPU probes' false-accept rate is not above
+   the CPU probes', and their false-reject rate is not above the CPU's by more
+   than 0.2 percentage points; genuine pairs may change verdict within that
+   budget. Every verdict that differs is listed, and each lies within the
+   measured maximum drift of its threshold.
 5. **Drift small against the threshold.** The maximum absolute score drift
    d, read as a shift of the threshold on the CPU scores, moves the
    false-accept rate by at most 10% of its value (one pair in 100,000 when
@@ -435,6 +445,9 @@ face unacceptable latency.
 - A build without `npu`, or with it and an empty table, makes the decisions it
   makes today on every host. `doctor` can report the platform before any model
   is certified.
+- Existing enrollments keep authenticating on CPU until the user enrolls
+  again, because their scans do not record the certified producer; an ONNX
+  Runtime update does the same for scans made before it.
 - An OpenVINO, driver, compiler or firmware update, or a change to the
   compile configuration, moves a host back to CPU until its new identity is
   certified. This is deliberate: certification is per identity, and the cost
@@ -514,9 +527,11 @@ face unacceptable latency.
   changing any one identity field, the compile configuration included,
   resolves to CPU.
 - Reference: changing a recorded threshold, the preprocessing, the decoding
-  or the recognition decision code (Platt scaling, brightness weighting,
-  fusion, matching, template selection) fails the fingerprint and threshold
-  tests.
+  or the recognition decision code (IR calibration, Platt scaling, brightness
+  weighting, fusion, matching, template selection) fails the fingerprint and
+  threshold tests.
+- Producer: an attempt against an enrollment with any scan that lacks the
+  entry's producer, or carries another one, computes its probe on CPU.
 - Compiler: the plugin compiler is set and read back; a host where it cannot
   be selected runs the model on CPU.
 - Parity: an NPU that does not reproduce its entry's reference digest, or a

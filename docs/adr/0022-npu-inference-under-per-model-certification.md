@@ -90,13 +90,17 @@ OpenVINO C API only under a versioned soname (`libopenvino_c.so.2620` for
      repeating them returned identical bits; so did an inference after the
      NPU had runtime-suspended, and so did separate processes. The
      recognizer's NPU embeddings of the reference inputs lie 0.0017 to
-     0.0026 (L2) from the CPU's.
+     0.0026 (L2) from the CPU's. The CPU session's output bits for the
+     same inputs are identical across processes, P-cores, E-cores and
+     thread placement.
    - Real recorded frames: 2,397 local frames (1,851 with a face; genuine IR
      sessions, paper, screen, phone, video-replay and banner IR attacks, RGB
      genuine and banner frames), each through both backends at the wired
      thresholds. Recognizer: embedding cosine at least 0.999996, match
      scores against a reference within 0.00038, no flip on 1,347 genuine
-     IR frames (impostor pairs were not part of this set). FLIR: deltas up
+     IR and 282 genuine RGB frames, and none on 222 IR and RGB attack
+     frames scored against the owner they present (zero-effort impostor
+     pairs were not part of this set). FLIR: deltas up
      to 0.0139 on genuine frames (mean 0.0014) and 0.0060 on attacks, no
      flip. ViT: deltas up to 0.0018 on genuine frames and 0.0027 on
      attacks, and one attack frame 0.0009 above the deny line on CPU fell
@@ -169,21 +173,23 @@ Device selection is per model and decided by a table compiled into
 identity (section 4), and the CPU reference it was certified against: the ONNX
 Runtime version, the wired thresholds that consume the output, a fingerprint of
 the CPU session's decoded outputs for fixed synthetic inputs through irlume's
-own preprocessing, and a fingerprint of the recognition decision downstream of
-them (for fixed synthetic score pairs and brightness weights, the cosine match,
+own preprocessing, the SHA-256 of the CPU session's raw output bits for the
+same inputs, and a fingerprint of the recognition decision downstream of them
+(for fixed synthetic score pairs and brightness weights, the cosine match,
 Platt scaling, brightness weighting, fusion, template selection and every grant
 verdict the production code returns). A model runs on the NPU only when its
 digest, the running identity and the loaded ONNX Runtime version all match an
 entry, and when at every engine build the live CPU session reproduces the
-entry's output fingerprint within 0.0001, so a runtime of the same version that
-computes differently on this host or CPU does not inherit the certification;
-any other combination runs on CPU. Tests recompute the thresholds and both
-fingerprints from the current code, so a change to preprocessing, decoding, the
-decision code, a threshold or the ONNX Runtime output fails them until the
-entry is certified again or removed in the same change. There is no `AUTO`,
-`HETERO` or `MULTI` device, no GPU, and no selection by device availability or
-speed. An entry is added only by a reviewed change that cites its certification
-evidence (section 7).
+entry's CPU output digest exactly. The CPU session repeats those bits across
+processes, core types and thread placement (measurement 4), so a runtime of the
+same version that computes differently on this host or CPU, by any amount, does
+not inherit the certification; any other combination runs on CPU. Tests
+recompute the thresholds and both fingerprints from the current code, so a
+change to preprocessing, decoding, the decision code, a threshold or the ONNX
+Runtime output fails them until the entry is certified again or removed in the
+same change. There is no `AUTO`, `HETERO` or `MULTI` device, no GPU, and no
+selection by device availability or speed. An entry is added only by a reviewed
+change that cites its certification evidence (section 7).
 
 Only the recognizer is eligible. The PAD cues are deny-only evidence with
 attack margins of 0.041 to 0.044; on the qualified stack their NPU drift
@@ -278,21 +284,27 @@ A table entry requires all of:
    through irlume's own loader, preprocessing and decoders, not a separate
    harness: Phase 0's harness mis-declared one C structure and reported
    crashes and unranked inputs that were not there.
-3. **Real evaluation data.** The genuine and impostor pairs of the corpora
-   that set the recognizer's thresholds (LFW and FairFace for RGB; CBSR NIR
-   and Tufts for IR), each comparison an NPU probe against a CPU template.
-   Because the fusion arm combines an RGB and an IR score with both
-   brightness weights, paired cases also run through the production fusion
-   and profile-selection code: recorded RGB+IR pairs where they exist, and
-   otherwise every combination of the corpora's RGB and IR comparisons over
-   the recorded brightness range. Production takes the best score over up to
-   90 scans (3 profiles of 30) against a threshold scaled by the template
-   count, so the corpora also run as production-shaped enrollments across the
+3. **Real evaluation data.** The genuine and impostor pairs of the corpora that
+   set the recognizer's thresholds (LFW for RGB; CBSR NIR and Tufts for IR) and
+   FairFace's impostor pairs as a demographic leg (FairFace has no identity
+   labels, so no genuine pairs), each comparison an NPU probe against a CPU
+   template; and the recorded presentation attacks of enrolled users that the
+   PAD cues are evaluated on, each scored against the presented user's
+   template. Because the fusion arm combines an RGB and an IR score with both
+   brightness weights, paired cases also run through the production fusion and
+   profile-selection code: recorded RGB+IR pairs where they exist, and
+   otherwise every combination of the corpora's RGB and IR comparisons over the
+   recorded brightness range. Production takes the best score over up to 90
+   scans (3 profiles of 30) against a threshold scaled by the template count,
+   so the corpora also run as production-shaped enrollments across the
    supported template counts, and rules 4 and 5 compare the final grant
    decisions, not only pairs.
-4. **No new impostor grant; error rates no worse.** No impostor comparison
-   that the CPU denies may be granted on the NPU, at any threshold, fusion
-   floor or production-shaped decision, whatever the aggregate rates do. Beyond
+4. **No new grant for an impostor or an attack; error rates no worse.** No
+   impostor comparison that the CPU denies may be granted on the NPU, at any
+   threshold, fusion floor or production-shaped decision, whatever the
+   aggregate rates do. No presentation attack that the CPU path denies may be
+   granted with the recognizer on the NPU and the PAD cues unchanged on CPU,
+   and every recognizer verdict on an attack that differs is listed. Beyond
    that, the NPU probes' false-accept rate is not above the CPU probes', and
    their false-reject rate is not above the CPU's by more than 0.2 percentage
    points; genuine pairs may change verdict within that budget. Every verdict
@@ -306,11 +318,13 @@ A table entry requires all of:
    recognizer; the recognizer's measured 0.00038 would move LFW's
    false-reject rate at 0.55 by about 0.09 points.
 6. **Repeatable.** An input gives the same output bits every time on one
-   compiled model: repeated, interleaved with other inputs, and after the NPU
-   has runtime-suspended.
+   compiled model: repeated, interleaved with other inputs, after the NPU has
+   runtime-suspended, and after a system suspend and resume of the certified
+   machine.
 7. **Crash-free.** 20 cold compiles in separate processes with the cache
    bypassed, 20 warm loads from the cache, and 1,000 inferences, some after
-   runtime suspends, without a crash or an error.
+   runtime suspends and some after system suspends, without a crash or an
+   error.
 8. **Recorded.** The evidence (identity, model digest, run counts, deltas,
    margins, verdict tables, no biometric data) is archived and cited by the
    change that adds the entry.
@@ -323,14 +337,19 @@ compilation happens inside an authentication attempt. Each entry records the
 SHA-256 of the NPU's output bits for three fixed reference inputs. The NPU
 repeats those bits exactly, across inferences and across processes (measurement
 4), so every engine build requires the recorded digest, together with the live
-CPU fingerprint of section 3, before the recognizer answers from the NPU; any
-other bits keep it on CPU, and doctor says so. A kernel, driver or firmware
-change that alters the NPU's numerics therefore needs a new certification, and
-one that does not alter them does not. Discovery with the library digests takes
-about 0.5 s; from the cache the recognizer then adds 0.4 to 0.5 s before ready,
-and after an identity change the first start compiles it cold, 2.2 to 5.2 s.
-Until ready, clients get the existing "still starting" answer and use the
-password.
+CPU digest of section 3, before the recognizer answers from the NPU; any other
+bits keep it on CPU, and doctor says so. A system suspend can outlive the
+engine, so after one the recognizer reproduces the NPU digest again before its
+next NPU answer (about 21 ms; the CPU session is not affected by a suspend, and
+its check is not repeated); a mismatch retires it to CPU and that answer is
+computed on CPU. A suspend is detected as growth of `CLOCK_BOOTTIME` over
+`CLOCK_MONOTONIC`, which counts system suspend only, not the NPU's runtime
+power-down while idle. A kernel, driver or firmware change that alters the
+NPU's numerics therefore needs a new certification, and one that does not alter
+them does not. Discovery with the library digests takes about 0.5 s; from the
+cache the recognizer then adds 0.4 to 0.5 s before ready, and after an identity
+change the first start compiles it cold, 2.2 to 5.2 s. Until ready, clients get
+the existing "still starting" answer and use the password.
 
 ### 9. Failure falls back to the CPU session
 
@@ -501,8 +520,11 @@ face unacceptable latency.
 - Compiler: the plugin compiler is set and read back; a host where it cannot
   be selected runs the model on CPU.
 - Parity: an NPU that does not reproduce its entry's reference digest, or a
-  CPU session that does not reproduce its fingerprint, leaves the model on
-  CPU before it answers a request.
+  CPU session that does not reproduce its entry's CPU digest bit for bit,
+  leaves the model on CPU before it answers a request.
+- Resume: after a system suspend the NPU digest is checked again before the
+  next NPU answer; a mismatch leaves the model on CPU and that answer comes
+  from the CPU session; without a suspend it is not rechecked.
 - Adapter: with an IR adapter configured, the recognizer stays on CPU.
 - Libraries: changing the bytes of any runtime library in the identity, the
   Level Zero loader included, changes the identity.

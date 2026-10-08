@@ -21,9 +21,13 @@
   included): `4bccf18e7f6e6b5a9d8774b9eeee175a5d3ef398b72914b1e7c488a0ad3b55ed`.
   NPU reference digest of the recognizer on the three reference inputs:
   `9fa7f653f9330e60e4305d5ddac80675fe2ac7deec0e35b3d732b384ef2bede8`, the
-  same in every process.
+  same in every process. CPU session (ONNX Runtime 1.28.1, two intra-op
+  threads) reference digest on the same inputs:
+  `cbee96a116304c8a6e1d7890258254f1f4db41896b3fa58ceb9a2b224fad4a7a`, the same
+  in three sessions of each of six processes pinned to P-cores, E-cores, both,
+  and single cores of either type.
 - **How:** the ignored tests in `crates/irlume-vision/src/onnx/npu_tests.rs`
-  at commit `0c72b1d9e1a202da2ecf3324b62d4977fc058c37` (branch
+  at commit `c970fe928330ad63b3aeaab8102a5d2f75876317` (branch
   `feat/npu-vision-runtime`, which implements this ADR and adds the `npu`
   feature), for example
   `ulimit -c 0; cargo test -p irlume-vision --features npu --release --lib -- --ignored npu_hw_ --test-threads 1 --nocapture`
@@ -73,15 +77,24 @@ attacks; RGB genuine and banner frames), each through both backends.
 | Output | Threshold | Frames | Max abs delta | Mean abs delta | Verdicts that differ |
 |---|---:|---:|---:|---:|---:|
 | Recognizer, genuine IR, score against a reference | 0.55 | 1,347 | 0.00038 | 0.000072 | 0 |
+| Recognizer, IR attacks, score against the genuine IR reference | 0.55 | 123 | 0.00024 | 0.000079 | 0 |
+| Recognizer, genuine RGB, score against an RGB reference | 0.55 | 282 | 0.00032 | 0.000069 | 0 |
+| Recognizer, RGB attacks, score against the genuine RGB reference | 0.55 | 99 | 0.00024 | 0.000078 | 0 |
 | FLIR P(fake), genuine IR | 0.9 | 1,347 | 0.0139 | 0.0014 | 0 |
 | FLIR P(fake), IR attacks | 0.9 | 123 | 0.0060 | 0.00011 | 0 |
 | ViT P(spoof), genuine RGB | 0.55 | 282 | 0.0018 | 0.00082 | 0 |
 | ViT P(spoof), RGB attacks | 0.55 | 99 | 0.0027 | 0.0012 | 1 |
 
-The lowest recognizer embedding cosine was 0.999996. The one ViT verdict that
-differed was an attack frame whose CPU score was 0.0009 above the deny line
-and whose NPU score fell below it, at frame level (production votes the
-median of five frames). Impostor pairs were not part of this set.
+The recognizer's reference for each modality is the CPU embedding of the
+first genuine frame of that modality (the owner, whom the attacks present).
+The lowest recognizer embedding cosine was 0.999996. No recognizer verdict
+differed, on genuine frames or on attacks, so no attack gained a recognizer
+grant on the NPU; the closest CPU scores to 0.55 were 0.0001 (genuine IR),
+0.032 (genuine RGB), 0.079 (IR attacks) and 0.164 (RGB attacks) away. The one
+ViT verdict that differed was an attack frame whose CPU score was 0.0009 above
+the deny line and whose NPU score fell below it, at frame level (production
+votes the median of five frames). Zero-effort impostor pairs were not part of
+this set.
 
 ## Configuration facts
 
@@ -100,6 +113,10 @@ median of five frames). Impostor pairs were not part of this set.
   tracing layer, and the NPU user-mode driver; setting `NPU_COMPILER_TYPE`
   adds the NPU compiler loader, and compiling adds the NPU compiler and the IR
   and ONNX frontends.
+- `CLOCK_BOOTTIME` minus `CLOCK_MONOTONIC`, read in that order, gave 34 ns on
+  a boot without a system suspend: read jitter is far below the 1 ms the
+  resume check treats as a suspend. Rechecking the NPU reference digest after
+  a resume runs three NPU inferences (about 21 ms).
 - On the host's btrfs root, `stat` reports a library's subvolume device (0:37)
   and `/proc/self/maps` the filesystem's (00:23) for the same inode, so the
   check that the mapped libraries are the hashed ones compares inodes.

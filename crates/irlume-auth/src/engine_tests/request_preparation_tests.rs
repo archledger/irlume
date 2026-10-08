@@ -2536,6 +2536,60 @@ fn stored_split_primary_refuses_before_ordinary_camera_acquisition() {
 }
 
 #[test]
+fn ordinary_override_refuses_split_primary_with_ordinary_reason_before_camera() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(false);
+    let devices = Devices::new(&mut shared.engine, &fixture);
+    let (mut enrollment, _) = pad_matching_fixture(0.2, false);
+    enrollment.user = "request-fixture".into();
+    enrollment.camera_binding = Some(fixture_split_binding());
+    let bytes = serde_json::to_vec(&enrollment).unwrap();
+    let path = fixture.dir.join("request-fixture.json");
+    std::fs::write(&path, &bytes).unwrap();
+    // A proven ordinary override bypasses automatic account ranking, so the
+    // actual authentication call must still refuse the split primary itself.
+    std::env::set_var("IRLUME_RGB_DEVICE", &fixture.rgb);
+    std::env::set_var("IRLUME_IR_DEVICE", &fixture.ir);
+    for admitted in [false, true] {
+        let _admitted = admitted.then(|| {
+            fixture
+                .recorder
+                .admit_split_trust(&[irlume_camera::lease::CameraOperationKind::Authentication])
+        });
+        for purpose in [
+            AuthenticationPurpose::Verify,
+            AuthenticationPurpose::CredentialRelease,
+        ] {
+            let outcome = devices
+                .engine
+                .authenticate_for_in_window_with_policy(
+                    "request-fixture",
+                    None,
+                    purpose,
+                    AuthenticationWindow::new(2000),
+                    irlume_common::config::FaceSensorPolicy::Dual,
+                    &(),
+                )
+                .unwrap();
+            assert!(!outcome.granted, "admitted={admitted} {purpose:?}");
+            assert_eq!(outcome.kind, OutcomeKind::OtherDeny);
+            assert_eq!(outcome.cause, Some(OutcomeCause::NotEnrolledOnThisCamera));
+            assert!(
+                outcome.reason.contains(
+                    "this request uses the ordinary camera path, which never opens a split camera pair"
+                ),
+                "admitted={admitted} {purpose:?}: {}",
+                outcome.reason
+            );
+            assert!(fixture.recorder.calls().is_empty());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert!(devices.engine.camera_selection.is_none());
+        }
+    }
+}
+
+#[test]
 fn automatic_ir_without_candidates_preserves_target_guard_before_protected_load() {
     use irlume_common::diagnostics::{DiagnosticSink, TraceEventKind, TraceStage};
     struct NoProtectedLoad;

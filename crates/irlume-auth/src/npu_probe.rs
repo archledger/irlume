@@ -45,7 +45,7 @@ impl Engine {
     pub(super) fn embed_producer(&mut self) -> Option<String> {
         if self.embed_producer.is_none() {
             let recognizer = self.embed_space.strip_prefix("embed:")?.to_owned();
-            let runtime = irlume_vision::runtime_resolution().1.ok()?;
+            let runtime = irlume_vision::onnx_runtime_version()?;
             let digest = self.emb.cpu_reference_digest().ok()?;
             self.embed_producer = Some(irlume_core::storage::embed_producer(
                 &recognizer,
@@ -153,7 +153,7 @@ impl Engine {
     /// CPU.
     #[cfg(feature = "npu")]
     pub fn open_npu_context(&self, cache_base: &std::path::Path) -> irlume_vision::npu::Context {
-        let runtime = irlume_vision::runtime_resolution().1.unwrap_or_default();
+        let runtime = irlume_vision::onnx_runtime_version().unwrap_or_default();
         let thresholds = self.npu_thresholds();
         let fingerprint = super::decision_fingerprint();
         irlume_vision::npu::Context::open(

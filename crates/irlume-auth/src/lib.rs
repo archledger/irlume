@@ -15150,7 +15150,11 @@ mod engine_tests {
             &irlume_common::HashedModel::new(bytes),
         )
         .expect("engine from bytes");
-        let runtime = irlume_vision::runtime_resolution().1.expect("ONNX Runtime");
+        let runtime = irlume_vision::onnx_runtime_version().expect("ONNX Runtime");
+        assert!(
+            !runtime.is_empty() && runtime.chars().all(|c| c.is_ascii_digit() || c == '.'),
+            "the version alone, without the library path: {runtime}"
+        );
         let producer = engine.embed_producer().expect("a producer");
         assert!(
             producer.starts_with(&format!("cpu:{sha}:ort-{runtime}:")),

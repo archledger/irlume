@@ -366,7 +366,7 @@ mod onnx {
                 libc::dlclose(handle);
             }
             match verdict {
-                Ok(version) => Ok(format!("{version}, mapped from {mapped}")),
+                Ok(version) => Ok(describe_runtime(&version, &mapped)),
                 Err(why) => Err(format!("{why} (the loader mapped {mapped})")),
             }
         }
@@ -490,6 +490,32 @@ mod onnx {
             })
             .clone()
             .map_err(irlume_common::Error::Hardware)
+    }
+
+    /// The text `runtime_resolution` reports for a runtime of `version`
+    /// mapped from `mapped`.
+    fn describe_runtime(version: &str, mapped: &str) -> String {
+        format!("{version}{RUNTIME_MAPPED_FROM}{mapped}")
+    }
+
+    /// The separator between the version and the mapped path in that text.
+    const RUNTIME_MAPPED_FROM: &str = ", mapped from ";
+
+    /// The ONNX Runtime version alone from [`describe_runtime`]'s text.
+    fn runtime_version(described: &str) -> &str {
+        described
+            .split_once(RUNTIME_MAPPED_FROM)
+            .map_or(described, |(version, _)| version)
+    }
+
+    /// The version of the ONNX Runtime this process resolves, without its
+    /// path: what a template's producer and an NPU certification record
+    /// (ADR-0022 §2, §3), so moving the same runtime changes neither.
+    pub fn onnx_runtime_version() -> Option<String> {
+        runtime_resolution()
+            .1
+            .ok()
+            .map(|described| runtime_version(&described).to_owned())
     }
 
     /// What the onnxruntime resolver would use in this process, for `irlume
@@ -2810,6 +2836,17 @@ mod onnx {
         }
 
         #[test]
+        fn the_runtime_version_is_the_version_alone() {
+            let described = describe_runtime("1.28.1", "/usr/lib64/libonnxruntime.so.1.28.1");
+            assert_eq!(
+                described,
+                "1.28.1, mapped from /usr/lib64/libonnxruntime.so.1.28.1"
+            );
+            assert_eq!(runtime_version(&described), "1.28.1");
+            assert_eq!(runtime_version("1.28.1"), "1.28.1");
+        }
+
+        #[test]
         fn a_null_api_base_is_refused() {
             #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
             let err = unsafe { inspect_api_base(std::ptr::null()) }.unwrap_err();
@@ -2826,9 +2863,9 @@ pub use onnx::npu_reference_fingerprint;
 #[cfg(feature = "onnx")]
 pub use onnx::{
     blaze_anchors, blaze_letterbox_input, decode_short_range_best, map_checked_mesh_output,
-    mesh_box_valid, mesh_output_plausible, runtime_resolution, selftest_alignment_identity,
-    Adapter, BlazeRescue, Detector, Embedder, FaceMesh, OnCpu, PadIr, PadVit, BLAZE_INPUT,
-    BLAZE_SCORE_THRESHOLD, MESH_INPUT, MESH_N, MESH_N_IRIS,
+    mesh_box_valid, mesh_output_plausible, onnx_runtime_version, runtime_resolution,
+    selftest_alignment_identity, Adapter, BlazeRescue, Detector, Embedder, FaceMesh, OnCpu, PadIr,
+    PadVit, BLAZE_INPUT, BLAZE_SCORE_THRESHOLD, MESH_INPUT, MESH_N, MESH_N_IRIS,
 };
 
 /// Pure decode tests for the short-range head: the reject half (floor, NaN)

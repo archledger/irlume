@@ -24,6 +24,7 @@ use std::io::{self, Read as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// The certified OpenVINO C API, by the soname of its release (2026.2.0).
 /// Another release carries another soname, so it reads as absent rather
@@ -147,8 +148,14 @@ pub struct Certification {
     /// their certified values.
     pub thresholds: &'static [(&'static str, f32)],
     /// The decoded CPU outputs for the fixed synthetic inputs of
-    /// `npu_reference_fingerprint`, at certification.
+    /// `npu_reference_fingerprint`, at certification; tests on any host
+    /// compare them within a tolerance to catch preprocessing changes.
     pub fingerprint: &'static [f32],
+    /// SHA-256 of the CPU session's raw output bits for the same reference
+    /// inputs, at certification. The CPU session is deterministic on one
+    /// host and runtime, so every engine build requires these exact bits
+    /// before the model answers from the NPU (ADR-0022 §3).
+    pub cpu_reference_digest: &'static str,
     /// SHA-256 of the NPU's raw output bits for the same reference inputs,
     /// at certification. The NPU is deterministic across processes on the
     /// qualified stack, so every engine build requires these exact bits
@@ -295,6 +302,9 @@ enum State {
     Npu {
         model: Box<dyn Infer>,
         entry: Option<&'static Certification>,
+        /// [`suspended`] when the entry's digests were last reproduced;
+        /// `None` until the first check.
+        checked_at: Option<Duration>,
     },
 }
 
@@ -311,7 +321,11 @@ impl Slot {
     #[cfg(test)]
     pub(crate) fn npu(model: Box<dyn Infer>) -> Self {
         Self {
-            state: State::Npu { model, entry: None },
+            state: State::Npu {
+                model,
+                entry: None,
+                checked_at: None,
+            },
         }
     }
 
@@ -323,7 +337,41 @@ impl Slot {
             state: State::Npu {
                 model,
                 entry: Some(entry),
+                checked_at: None,
             },
+        }
+    }
+
+    /// Record that the entry's digests were just reproduced.
+    pub(crate) fn note_checked(&mut self) {
+        if let State::Npu { checked_at, .. } = &mut self.state {
+            *checked_at = suspended();
+        }
+    }
+
+    /// Whether a certified model must reproduce its NPU reference digest
+    /// again before it answers: the system has suspended since the last
+    /// check, or the clocks cannot be read (ADR-0022 §8).
+    pub(crate) fn resumed_since_check(&self) -> bool {
+        let State::Npu {
+            entry: Some(_),
+            checked_at,
+            ..
+        } = &self.state
+        else {
+            return false;
+        };
+        match (checked_at, suspended()) {
+            (Some(then), Some(now)) => now > *then + RESUME_GRANULARITY,
+            _ => true,
+        }
+    }
+
+    /// Forget the last check, as a system resume would, for tests.
+    #[cfg(test)]
+    pub(crate) fn forget_check(&mut self) {
+        if let State::Npu { checked_at, .. } = &mut self.state {
+            *checked_at = None;
         }
     }
 
@@ -373,6 +421,34 @@ impl Default for Slot {
     fn default() -> Self {
         Self::cpu(CpuReason::Disabled)
     }
+}
+
+/// Growth of [`suspended`] below this is read jitter, not a suspend.
+const RESUME_GRANULARITY: Duration = Duration::from_millis(1);
+
+/// How long the system has been suspended since boot: `CLOCK_BOOTTIME`
+/// counts suspended time and `CLOCK_MONOTONIC` does not (clock_gettime(2)).
+/// The NPU's runtime power-down while idle is not a system suspend and does
+/// not count.
+pub(crate) fn suspended() -> Option<Duration> {
+    fn read(clock: libc::clockid_t) -> Option<Duration> {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: ts is a writable timespec and the clock IDs are Linux
+        // clocks.
+        if unsafe { libc::clock_gettime(clock, &mut ts) } != 0 {
+            return None;
+        }
+        Some(Duration::new(
+            u64::try_from(ts.tv_sec).ok()?,
+            u32::try_from(ts.tv_nsec).ok()?,
+        ))
+    }
+    // Monotonic first, so read jitter only ever adds to the result.
+    let monotonic = read(libc::CLOCK_MONOTONIC)?;
+    read(libc::CLOCK_BOOTTIME)?.checked_sub(monotonic)
 }
 
 /// The boot this process runs in, for markers.
@@ -1314,6 +1390,7 @@ mod tests {
             onnx_runtime: "1.28.1",
             thresholds: &[("RGB_MATCH_THRESHOLD", 0.55)],
             fingerprint: &[0.5],
+            cpu_reference_digest: "c",
             npu_reference_digest: "d",
             evidence: "test",
         }];

@@ -609,32 +609,40 @@ mod onnx {
             let Some(entry) = self.npu.certification() else {
                 return Ok(());
             };
-            // The live CPU reference first: a runtime that computes
-            // differently on this host does not inherit the certification
-            // (ADR-0022 §3).
-            let (cpu, _) = self.embed_preprocessed_on(&npu_reference::chip(0), false)?;
-            let live = &cpu[..npu_reference::EMBEDDING_PREFIX];
-            let reproduced = live.len() == entry.fingerprint.len()
-                && live
-                    .iter()
-                    .zip(entry.fingerprint)
-                    .all(|(now, then)| (now - then).abs() <= npu_reference::FINGERPRINT_TOLERANCE);
-            if !reproduced {
-                self.npu = crate::npu::Slot::cpu(crate::npu::CpuReason::ParityMismatch(
-                    "the CPU session does not reproduce the certified fingerprint".into(),
-                ));
+            // The live CPU reference first, bit for bit: a runtime that
+            // computes differently on this host does not inherit the
+            // certification (ADR-0022 §3).
+            let cpu = self.cpu_reference_digest()?;
+            if cpu != entry.cpu_reference_digest {
+                self.npu = crate::npu::Slot::cpu(crate::npu::CpuReason::ParityMismatch(format!(
+                    "CPU reference digest {cpu}, certified {}",
+                    entry.cpu_reference_digest
+                )));
                 return Ok(());
             }
-            let Some(digest) = self.npu_reference_digest() else {
-                return Ok(()); // the NPU failed and the slot retired itself
+            self.check_npu_digest("");
+            Ok(())
+        }
+
+        /// The NPU half of the parity check: the exact reference digest,
+        /// at engine build and again after every system resume (ADR-0022
+        /// §8). A mismatch retires the model to CPU.
+        #[cfg(feature = "npu")]
+        fn check_npu_digest(&mut self, when: &str) {
+            let Some(entry) = self.npu.certification() else {
+                return;
             };
-            if digest != entry.npu_reference_digest {
+            let Some(digest) = self.npu_reference_digest() else {
+                return; // the NPU failed and the slot retired itself
+            };
+            if digest == entry.npu_reference_digest {
+                self.npu.note_checked();
+            } else {
                 self.npu = crate::npu::Slot::cpu(crate::npu::CpuReason::ParityMismatch(format!(
-                    "reference output digest {digest}, certified {}",
+                    "{when}reference output digest {digest}, certified {}",
                     entry.npu_reference_digest
                 )));
             }
-            Ok(())
         }
 
         /// SHA-256 of the NPU's raw output bits for the reference inputs, or
@@ -649,6 +657,23 @@ mod onnx {
                 bits.extend(raw.iter().flat_map(|v| v.to_le_bytes()));
             }
             Some(irlume_common::sha256_hex(&bits))
+        }
+
+        /// SHA-256 of the CPU session's raw output bits for the reference
+        /// inputs. On one host and runtime the CPU session is deterministic,
+        /// so an entry records these exact bits (ADR-0022 §3).
+        #[cfg(feature = "npu")]
+        fn cpu_reference_digest(&mut self) -> irlume_common::Result<String> {
+            let n = align::OUT_SIZE as i64;
+            let mut bits = Vec::new();
+            for k in 0..3 {
+                let tensor =
+                    Tensor::from_array(([1i64, 3, n, n], npu_reference::chip(k))).map_err(err)?;
+                let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
+                let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
+                bits.extend(raw.iter().flat_map(|v| v.to_le_bytes()));
+            }
+            Ok(irlume_common::sha256_hex(&bits))
         }
 
         /// Where this model runs (ADR-0022 §13).
@@ -751,6 +776,9 @@ mod onnx {
             }
             #[cfg(feature = "npu")]
             if npu_allowed {
+                if self.npu.resumed_since_check() {
+                    self.check_npu_digest("after a system resume, ");
+                }
                 if let Some(embedded) = self.npu.run(data, embedding_and_norm) {
                     return Ok(embedded);
                 }
@@ -2443,7 +2471,9 @@ mod onnx {
 
         /// How far a recomputed fingerprint component may be from the
         /// recorded one: far above run-to-run noise, far below any
-        /// preprocessing or runtime change.
+        /// preprocessing or runtime change. Tests on any host use it; the
+        /// runtime gate compares exact digests.
+        #[cfg(test)]
         pub(super) const FINGERPRINT_TOLERANCE: f32 = 1e-4;
     }
 

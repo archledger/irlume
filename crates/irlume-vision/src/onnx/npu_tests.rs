@@ -20,6 +20,117 @@ mod npu_enrollment_tests {
         }
     }
 
+    /// The digest [`Constant`] gives for the reference inputs.
+    fn constant_digest() -> String {
+        let bits: Vec<u8> = (0..3)
+            .flat_map(|_| vec![1.0f32; EMBED_DIM])
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        irlume_common::sha256_hex(&bits)
+    }
+
+    fn test_entry(
+        bytes: &[u8],
+        cpu_reference_digest: String,
+        npu_reference_digest: String,
+    ) -> &'static crate::npu::Certification {
+        Box::leak(Box::new(crate::npu::Certification {
+            model_sha256: "test",
+            role: crate::npu::Role::Recognizer,
+            identity_digest: "test",
+            onnx_runtime: "test",
+            thresholds: &[],
+            fingerprint: Box::leak(
+                npu_reference_fingerprint(crate::npu::Role::Recognizer, bytes)
+                    .unwrap()
+                    .into_boxed_slice(),
+            ),
+            cpu_reference_digest: Box::leak(cpu_reference_digest.into_boxed_str()),
+            npu_reference_digest: Box::leak(npu_reference_digest.into_boxed_str()),
+            evidence: "test",
+        }))
+    }
+
+    /// An "NPU" that answers [`Constant`]'s output until `changed` is set,
+    /// then another one, as a resumed device returning other bits would.
+    struct Changing {
+        changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::npu::Infer for Changing {
+        fn infer(&mut self, _input: &[f32]) -> Result<Vec<f32>, String> {
+            let changed = self.changed.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![if changed { 2.0 } else { 1.0 }; EMBED_DIM])
+        }
+    }
+
+    /// After a system resume the NPU must reproduce its reference digest
+    /// again before it answers (ADR-0022 §8); between resumes it is not
+    /// rechecked.
+    #[test]
+    fn a_resumed_npu_reproduces_its_digest_before_it_answers() {
+        let path = format!("{}/../../models/glintr100.onnx", env!("CARGO_MANIFEST_DIR"));
+        let bytes = std::fs::read(&path).expect("models/glintr100.onnx (scripts/fetch-models.sh)");
+        let mut cpu = Embedder::load_from_memory(&bytes).unwrap();
+        let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut embedder = Embedder {
+            session: build(&bytes).unwrap(),
+            npu: crate::npu::Slot::certified(
+                Box::new(Changing {
+                    changed: changed.clone(),
+                }),
+                test_entry(
+                    &bytes,
+                    cpu.cpu_reference_digest().unwrap(),
+                    constant_digest(),
+                ),
+            ),
+        };
+        embedder.check_npu_parity().unwrap();
+        assert_eq!(embedder.npu_device(), crate::npu::Device::Npu);
+        assert!(!embedder.npu.resumed_since_check());
+        let chip = npu_reference::chip(1);
+
+        // No resume: the NPU answers without a new check, whatever it
+        // returns (a change here is the per-call fallback's business).
+        changed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (answer, _) = embedder.embed_preprocessed_with_norm(&chip).unwrap();
+        let two = 1.0 / (EMBED_DIM as f32).sqrt();
+        assert!(answer.iter().all(|v| (v - two).abs() < 1e-6));
+        assert_eq!(embedder.npu_device(), crate::npu::Device::Npu);
+
+        // A resume with unchanged bits: rechecked, still on the NPU.
+        changed.store(false, std::sync::atomic::Ordering::SeqCst);
+        embedder.npu.forget_check();
+        assert!(embedder.npu.resumed_since_check());
+        embedder.embed_preprocessed_with_norm(&chip).unwrap();
+        assert_eq!(embedder.npu_device(), crate::npu::Device::Npu);
+        assert!(
+            !embedder.npu.resumed_since_check(),
+            "the recheck is recorded"
+        );
+
+        // A resume after which the NPU returns other bits: retired to CPU
+        // before it answers, and this call is computed on CPU.
+        changed.store(true, std::sync::atomic::Ordering::SeqCst);
+        embedder.npu.forget_check();
+        let (answer, _) = embedder.embed_preprocessed_with_norm(&chip).unwrap();
+        assert!(
+            matches!(
+                embedder.npu_device(),
+                crate::npu::Device::Cpu(crate::npu::CpuReason::ParityMismatch(ref why))
+                    if why.starts_with("after a system resume")
+            ),
+            "{:?}",
+            embedder.npu_device()
+        );
+        let (expected, _) = cpu.embed_preprocessed_with_norm(&chip).unwrap();
+        assert!(answer
+            .iter()
+            .zip(&expected)
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+
     /// Enrollment embeds on CPU even with the recognizer on the NPU
     /// (ADR-0022 §2), and an authentication probe goes to the NPU.
     #[test]
@@ -49,53 +160,54 @@ mod npu_enrollment_tests {
 
         let probe = placed.embed(&chip).unwrap();
         assert_eq!(placed.npu_device(), crate::npu::Device::Npu);
-        // With the CPU fingerprint reproduced, an NPU that does not
-        // reproduce its certified reference digest fails the parity check;
-        // so does a CPU session that does not reproduce the fingerprint.
+        // With the CPU digest reproduced, an NPU that does not reproduce
+        // its certified reference digest fails the parity check; so does a
+        // CPU session that does not reproduce its digest bit for bit.
         // Either leaves the model on CPU before it answers any request.
-        let fingerprint: &'static [f32] = Box::leak(
-            npu_reference_fingerprint(crate::npu::Role::Recognizer, &bytes)
-                .unwrap()
-                .into_boxed_slice(),
-        );
-        let entry = |fingerprint: &'static [f32]| -> &'static crate::npu::Certification {
-            Box::leak(Box::new(crate::npu::Certification {
-                model_sha256: "test",
-                role: crate::npu::Role::Recognizer,
-                identity_digest: "test",
-                onnx_runtime: "test",
-                thresholds: &[],
-                fingerprint,
-                npu_reference_digest: "not the constant's digest",
-                evidence: "test",
-            }))
-        };
-        let wrong_fingerprint: &'static [f32] = Box::leak(
-            fingerprint
-                .iter()
-                .map(|v| v + 0.01)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        );
-        for (fingerprint, what) in [
-            (fingerprint, "NPU digest"),
-            (wrong_fingerprint, "CPU fingerprint"),
+        let cpu_digest = Embedder::load_from_memory(&bytes)
+            .unwrap()
+            .cpu_reference_digest()
+            .unwrap();
+        for (cpu_digest, npu_digest, what) in [
+            (
+                cpu_digest.clone(),
+                "not the constant's digest".to_owned(),
+                "reference output",
+            ),
+            (
+                "not the CPU digest".to_owned(),
+                constant_digest(),
+                "CPU reference",
+            ),
         ] {
             let mut checked = Embedder {
                 session: build(&bytes).unwrap(),
-                npu: crate::npu::Slot::certified(Box::new(Constant), entry(fingerprint)),
+                npu: crate::npu::Slot::certified(
+                    Box::new(Constant),
+                    test_entry(&bytes, cpu_digest, npu_digest),
+                ),
             };
             checked.check_npu_parity().unwrap();
             assert!(
                 matches!(
                     checked.npu_device(),
                     crate::npu::Device::Cpu(crate::npu::CpuReason::ParityMismatch(ref why))
-                        if why.contains(if what == "NPU digest" { "digest" } else { "fingerprint" })
+                        if why.starts_with(what)
                 ),
                 "{what}: {:?}",
                 checked.npu_device()
             );
         }
+        // Both reproduced: the model answers from the NPU.
+        let mut passing = Embedder {
+            session: build(&bytes).unwrap(),
+            npu: crate::npu::Slot::certified(
+                Box::new(Constant),
+                test_entry(&bytes, cpu_digest, constant_digest()),
+            ),
+        };
+        passing.check_npu_parity().unwrap();
+        assert_eq!(passing.npu_device(), crate::npu::Device::Npu);
         let constant = 1.0 / (EMBED_DIM as f32).sqrt();
         assert!(
             probe.iter().all(|v| (v - constant).abs() < 1e-6),
@@ -328,6 +440,9 @@ mod npu_hardware {
                         .unwrap()
                         .into_boxed_slice(),
                 ),
+                cpu_reference_digest: Box::leak(
+                    cpu.cpu_reference_digest().unwrap().into_boxed_str(),
+                ),
                 npu_reference_digest: Box::leak(digest.into_boxed_str()),
                 evidence: "hardware test",
             }));
@@ -346,6 +461,14 @@ mod npu_hardware {
             Device::Npu,
             "the real NPU reproduces its reference digest"
         );
+        // The recheck a system resume triggers passes on the real NPU.
+        certified.npu.forget_check();
+        certified
+            .embed_preprocessed_with_norm(&npu_reference::chip(2))
+            .unwrap();
+        assert_eq!(certified.npu_device(), Device::Npu);
+        assert!(!certified.npu.resumed_since_check());
+        eprintln!("suspended so far this boot: {:?}", crate::npu::suspended());
         let (a, _) = cpu
             .embed_preprocessed_with_norm(&npu_reference::chip(0))
             .unwrap();
@@ -622,6 +745,25 @@ mod npu_hardware {
         }
     }
 
+    /// The CPU session's exact output bits for the reference inputs, to
+    /// compare across processes, core types and thread placement.
+    #[test]
+    #[ignore = "needs the shipped models"]
+    fn npu_hw_cpu_reference_is_exact() {
+        let glint = model("glintr100.onnx");
+        let mut digests = Vec::new();
+        for _ in 0..3 {
+            let mut cpu = Embedder::load_from_memory(glint.bytes()).unwrap();
+            digests.push(cpu.cpu_reference_digest().unwrap());
+            digests.push(cpu.cpu_reference_digest().unwrap());
+        }
+        eprintln!("CPU reference digest {}", digests[0]);
+        assert!(
+            digests.iter().all(|d| d == &digests[0]),
+            "the CPU session repeats its bits: {digests:?}"
+        );
+    }
+
     /// What a fresh process maps after the platform opens and after the
     /// first compile, and the exact bits the NPU returns for the reference
     /// inputs, to compare across processes.
@@ -846,8 +988,36 @@ mod npu_hardware {
         let (mut flir_live, mut flir_attack) = (Stats::default(), Stats::default());
         let (mut vit_live, mut vit_attack) = (Stats::default(), Stats::default());
         let mut match_stats = Stats::default();
+        let (mut match_ir_attack, mut match_rgb_live, mut match_rgb_attack) =
+            (Stats::default(), Stats::default(), Stats::default());
         let mut cosine_min = f32::INFINITY;
         let mut reference: Option<Embedding> = None;
+        let mut reference_rgb: Option<Embedding> = None;
+        // The recognizer on one face, CPU and NPU, scored against the first
+        // genuine frame of the same modality (the owner, as an enrolled
+        // template would be).
+        let mut recognize = |view: &align::RgbView<'_>,
+                             landmarks: &crate::Landmarks5,
+                             reference: &mut Option<Embedding>,
+                             attack: bool,
+                             stats: &mut Stats,
+                             cosine_min: &mut f32| {
+            let Ok(chip) = align::align_to_arcface(view, landmarks) else {
+                return;
+            };
+            let data = align::preprocess_arcface(&chip);
+            let (ce, _) = cpu_emb.embed_preprocessed_with_norm(&data).unwrap();
+            let (ne, _) = npu_emb.embed_preprocessed_with_norm(&data).unwrap();
+            let cosine: f32 = ce.iter().zip(&ne).map(|(x, y)| x * y).sum();
+            *cosine_min = cosine_min.min(cosine);
+            if reference.is_none() && attack {
+                return; // no genuine reference yet
+            }
+            let reference = *reference.get_or_insert(ce);
+            let score =
+                |e: &Embedding| -> f32 { e.iter().zip(&reference).map(|(x, y)| x * y).sum() };
+            stats.add(score(&ce), score(&ne), 0.55);
+        };
         let (mut frames, mut faces) = (0usize, 0usize);
         for dir in &dirs {
             let name = dir.file_name().unwrap().to_string_lossy().into_owned();
@@ -914,21 +1084,19 @@ mod npu_hardware {
                     } else {
                         flir_live.add(c, n, 0.9)
                     }
-                    if !attack {
-                        let Ok(chip) = align::align_to_arcface(&view, &face.landmarks) else {
-                            continue;
-                        };
-                        let data = align::preprocess_arcface(&chip);
-                        let (ce, _) = cpu_emb.embed_preprocessed_with_norm(&data).unwrap();
-                        let (ne, _) = npu_emb.embed_preprocessed_with_norm(&data).unwrap();
-                        let cosine: f32 = ce.iter().zip(&ne).map(|(x, y)| x * y).sum();
-                        cosine_min = cosine_min.min(cosine);
-                        let reference = *reference.get_or_insert(ce);
-                        let score = |e: &Embedding| -> f32 {
-                            e.iter().zip(&reference).map(|(x, y)| x * y).sum()
-                        };
-                        match_stats.add(score(&ce), score(&ne), 0.55);
-                    }
+                    let stats = if attack {
+                        &mut match_ir_attack
+                    } else {
+                        &mut match_stats
+                    };
+                    recognize(
+                        &view,
+                        &face.landmarks,
+                        &mut reference,
+                        attack,
+                        stats,
+                        &mut cosine_min,
+                    );
                 } else {
                     let (c, n) = (
                         cpu_vit.p_spoof(&view, &face.bbox).unwrap(),
@@ -939,6 +1107,19 @@ mod npu_hardware {
                     } else {
                         vit_live.add(c, n, 0.55)
                     }
+                    let stats = if attack {
+                        &mut match_rgb_attack
+                    } else {
+                        &mut match_rgb_live
+                    };
+                    recognize(
+                        &view,
+                        &face.landmarks,
+                        &mut reference_rgb,
+                        attack,
+                        stats,
+                        &mut cosine_min,
+                    );
                 }
             }
         }
@@ -959,6 +1140,18 @@ mod npu_hardware {
             "{}",
             match_stats.line("recognizer genuine IR vs first frame at 0.55")
         );
+        eprintln!(
+            "{}",
+            match_ir_attack.line("recognizer IR attacks vs first genuine IR frame at 0.55")
+        );
+        eprintln!(
+            "{}",
+            match_rgb_live.line("recognizer genuine RGB vs first genuine RGB frame at 0.55")
+        );
+        eprintln!(
+            "{}",
+            match_rgb_attack.line("recognizer RGB attacks vs first genuine RGB frame at 0.55")
+        );
         eprintln!("recognizer CPU vs NPU embedding cosine, lowest {cosine_min:.6}");
         eprintln!("{}", vit_live.line("ViT genuine RGB at 0.55"));
         eprintln!("{}", vit_attack.line("ViT attack RGB at 0.55"));
@@ -976,9 +1169,13 @@ mod npu_hardware {
                 if flips == 0 && max <= allowance { "within rules 4 and 5" } else { "outside rules 4 and 5" }
             );
         }
+        let new_grants: usize = [&match_ir_attack, &match_rgb_attack]
+            .iter()
+            .map(|s| s.flips - s.flips_down)
+            .sum();
         eprintln!(
-            "recognizer: flips {} on genuine pairs only; impostor pairs need the recognition corpora",
-            match_stats.flips
+            "recognizer: genuine flips {}, new grants on presentation attacks {new_grants}; zero-effort impostor pairs need the recognition corpora",
+            match_stats.flips + match_rgb_live.flips
         );
     }
 }
